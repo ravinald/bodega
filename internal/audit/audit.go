@@ -116,6 +116,7 @@ const (
 	CacheMiss             = "cache_miss"        // fetched from upstream and cached
 	CacheChecksumMismatch = "checksum_mismatch" // upstream bytes disagreed with the pinned digest
 	CachePolicyViolation  = "policy_violation"  // upstream allow-list refused the candidate
+	CacheIndexFiltered    = "index_filtered"    // a proxied index went out with versions the age or OSV gate refuses withheld
 	CacheMalwareBlocked   = "malware_blocked"   // OSV records the version as malware and the malware action is block
 )
 
@@ -142,6 +143,7 @@ const (
 	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
 	DenialDistfileLicense   = "distfile_license"   // a port forbids redistributing the distfile
 	DenialDistfileClient    = "distfile_client"    // the client did not measure the environment distfiles are admitted in
+	DenialWithheldVersion   = "withheld_version"   // an artifact whose version the index filter withholds, requested directly
 	DenialHidden            = "hidden"             // package or version an operator hid; answered 404
 
 	// Refusals by the host profile bound to the requesting identity. Two

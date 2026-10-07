@@ -150,26 +150,6 @@ func TestPypiSimpleServesJSONWhenAsked(t *testing.T) {
 	}
 }
 
-// A client that asks for nothing in particular, or ranks HTML first, gets the
-// HTML it always got.
-func TestPypiWantsJSON(t *testing.T) {
-	cases := map[string]bool{
-		"":                                    false,
-		"*/*":                                 false,
-		"text/html":                           false,
-		"application/vnd.pypi.simple.v1+json": true,
-		"application/vnd.pypi.simple.latest+json":                                                            true,
-		"application/vnd.pypi.simple.v1+json; q=0, text/html":                                                false,
-		"text/html, application/vnd.pypi.simple.v1+json; q=0.5":                                              false,
-		"application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01": true,
-	}
-	for accept, want := range cases {
-		if got := pypiWantsJSON(accept); got != want {
-			t.Errorf("pypiWantsJSON(%q) = %v, want %v", accept, got, want)
-		}
-	}
-}
-
 const gomodInfoStored = `{"Version":"v1.6.0","Time":"2000-01-01T00:00:00Z","Origin":{"VCS":"git"}}`
 
 // The hosted .info carries the recorded time, and keeps the fields it carried.

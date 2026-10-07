@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"mime"
 	"net/url"
 	"path"
 	"regexp"
@@ -138,12 +139,25 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// the only version of it that exists for every later client. The cached
 	// copy is not lost by republishing upstream — every href lands on
 	// /pypi/wheels/, which answers from storage before it reaches the network.
+	//
+	// PEP 691 JSON is fetched through the format query parameter rather than an
+	// Accept header, which proxyOrCache does not forward. pypi.org honors it;
+	// an index that ignores it answers HTML, and the writer then serves HTML,
+	// which every client asking for JSON also accepts. The value goes out
+	// unescaped: pypi.org matches the raw query, and answers HTML to
+	// format=application%2Fvnd.pypi.simple.v1%2Bjson.
 	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+		w.Header().Add("Vary", "Accept")
 		upstream := s.pypiSimpleURL(normalized)
-		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit}
-		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
-			"pypi/simple/"+normalized+"/index.html",
-			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
+		fetch, key := upstream, "pypi/simple/"+normalized+"/index.html"
+		wantJSON := pypiWantsJSON(r.Header.Get("Accept"))
+		if wantJSON {
+			fetch, key = upstream+"?format="+pypiSimpleJSON, "pypi/simple/"+normalized+"/index.json"
+		}
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit, wantJSON: wantJSON,
+			withhold: s.indexWithholdFor(r, manifest.TypePypi, normalized)}
+		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi), key,
+			fetch, manifest.TypePypi, pkgName, pkgName, false, true)
 		if err := rw.flush(); err != nil {
 			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
 		}
@@ -283,32 +297,6 @@ type pypiJSONFile struct {
 	UploadTime string            `json:"upload-time,omitempty"`
 }
 
-// pypiWantsJSON reports whether an Accept header prefers the PEP 691 JSON form
-// to HTML. pip sends the JSON type at q=1 and the HTML forms below it; a
-// client that names neither, or ranks HTML higher, gets HTML as it always has.
-func pypiWantsJSON(accept string) bool {
-	jsonQ, htmlQ := -1.0, -1.0
-	for _, part := range strings.Split(accept, ",") {
-		fields := strings.Split(part, ";")
-		mediaType := strings.ToLower(strings.TrimSpace(fields[0]))
-		q := 1.0
-		for _, p := range fields[1:] {
-			if v, ok := strings.CutPrefix(strings.TrimSpace(p), "q="); ok {
-				if f, err := strconv.ParseFloat(v, 64); err == nil {
-					q = f
-				}
-			}
-		}
-		switch mediaType {
-		case pypiSimpleJSON, "application/vnd.pypi.simple.latest+json":
-			jsonQ = max(jsonQ, q)
-		case "application/vnd.pypi.simple.v1+html", "application/vnd.pypi.simple.latest+html", "text/html":
-			htmlQ = max(htmlQ, q)
-		}
-	}
-	return jsonQ > 0 && jsonQ >= htmlQ
-}
-
 // pypiUploadTime is the PEP 700 upload-time for a file of version, from the
 // manifest entry naming that version. Every file of a version carries the
 // version's time, which the fetch reads as the earliest upload among them.
@@ -380,6 +368,9 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	if dist != "" {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, normalized)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+			if s.refuseWithheld(w, r, manifest.TypePypi, normalized, distVersion) {
+				return
+			}
 			resolve := func(ctx context.Context) (string, error) {
 				return s.resolvePypiWheel(ctx, normalized, file)
 			}
@@ -459,8 +450,16 @@ type pypiIndexWriter struct {
 	// profile governs it. Applied before the href rewrite so the two passes
 	// read the upstream filenames rather than one reading the other's output.
 	permit func(string) bool
-	status int
-	body   bytes.Buffer
+	// withhold is the index filter's pass, nil when it is off for pypi. Run
+	// after the profile filter and before the rewrite, for the reason permit
+	// is: both read the upstream filenames.
+	withhold *indexWithhold
+	// wantJSON is the client preferring the PEP 691 JSON page. The body is
+	// still read before it is trusted to be JSON, since an upstream may have
+	// answered HTML.
+	wantJSON bool
+	status   int
+	body     bytes.Buffer
 	// tooBig records that the upstream ran past maxUpstreamBody. B33 settled
 	// the same question for the npm packument: serving an unrewritten body is
 	// the bypass the rewrite exists to close, so refusing is the honest answer
@@ -518,7 +517,24 @@ func (p *pypiIndexWriter) flush() error {
 			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 			return err
 		}
-		body = rewritePypiIndex(filterPypiSimplePage(body, p.pkg, p.permit), p.indexURL)
+		if p.wantJSON && bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+			out, err := republishPypiJSON(body, p.pkg, p.indexURL, p.permit, p.withhold)
+			if err != nil {
+				http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
+				return err
+			}
+			body = out
+			p.Header().Set("Content-Type", pypiSimpleJSON)
+		} else {
+			filtered := filterPypiSimplePage(body, p.pkg, p.permit)
+			if p.withhold != nil {
+				filtered = p.withhold.pypiPage(filtered)
+			}
+			body = rewritePypiIndex(filtered, p.indexURL)
+		}
+		if p.withhold != nil {
+			p.withhold.finish(p.Header())
+		}
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
 		// republished body with a validator for different bytes.
@@ -591,6 +607,145 @@ func rewritePypiIndex(body []byte, indexURL string) []byte {
 		out := pypiHrefPattern.ReplaceAll(tag, []byte(`href="`+html.EscapeString(href)+`"`))
 		return pypiMetadataAttrPattern.ReplaceAll(out, nil)
 	})
+}
+
+// pypiWantsJSON reports whether an Accept header ranks the PEP 691 JSON page
+// above HTML. A tie goes to HTML, which is what this route served before it
+// spoke JSON, so a browser or a client sending */* sees no change.
+func pypiWantsJSON(accept string) bool {
+	var qJSON, qHTML float64
+	for _, part := range strings.Split(accept, ",") {
+		mt, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		q := 1.0
+		if v, ok := params["q"]; ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				q = f
+			}
+		}
+		switch mt {
+		case pypiSimpleJSON, "application/vnd.pypi.simple.latest+json":
+			qJSON = max(qJSON, q)
+		case "application/vnd.pypi.simple.v1+html", "application/vnd.pypi.simple.latest+html", "text/html", "text/*", "*/*":
+			qHTML = max(qHTML, q)
+		}
+	}
+	return qJSON > 0 && qJSON > qHTML
+}
+
+// republishPypiJSON is filterPypiSimplePage, the index filter and
+// rewritePypiIndex for a PEP 691 JSON page, with the same rules: a file whose
+// version cannot be placed is kept, every url lands on /pypi/wheels/, and
+// the PEP 658 metadata keys go for the reason rewritePypiIndex gives. hashes
+// stays, since it is the JSON page's integrity check. The PEP 700 versions
+// list loses what the files lost, so it never names a version with no file.
+func republishPypiJSON(body []byte, pkg, indexURL string, permit func(string) bool, withhold *indexWithhold) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, fmt.Errorf("parse the JSON simple page for %s: %w", pkg, err)
+	}
+	raw, ok := doc["files"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("the JSON simple page for %s has no files array", pkg)
+	}
+	base, err := url.Parse(indexURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse the pypi simple index URL %s: %w", indexURL, err)
+	}
+
+	type file struct {
+		entry   map[string]any
+		version string
+	}
+	var files []file
+	var listed []string
+	seen := map[string]bool{}
+	uploaded := map[string]time.Time{}
+	for _, f := range raw {
+		entry, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := entry["filename"].(string)
+		v := pypiPageVersion(pkg, name)
+		if v != "" && permit != nil && !permit(v) {
+			continue
+		}
+		files = append(files, file{entry, v})
+		if v == "" {
+			continue
+		}
+		if !seen[v] {
+			seen[v] = true
+			listed = append(listed, v)
+		}
+		ts, _ := entry["upload-time"].(string)
+		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			if e, ok := uploaded[v]; !ok || t.Before(e) {
+				uploaded[v] = t
+			}
+		}
+	}
+	var withheld map[string]string
+	if withhold != nil {
+		withheld = withhold.pypiJSON(listed, uploaded)
+	}
+	gone := func(v string) bool {
+		_, w := withheld[v]
+		return v != "" && (w || (permit != nil && !permit(v)))
+	}
+
+	kept := make([]any, 0, len(files))
+	for _, f := range files {
+		if gone(f.version) {
+			continue
+		}
+		rewritePypiJSONFile(f.entry, base)
+		kept = append(kept, f.entry)
+	}
+	doc["files"] = kept
+	if versions, ok := doc["versions"].([]any); ok {
+		out := make([]any, 0, len(versions))
+		for _, x := range versions {
+			if v, _ := x.(string); !gone(v) {
+				out = append(out, x)
+			}
+		}
+		doc["versions"] = out
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(doc); err != nil {
+		return nil, fmt.Errorf("encode the JSON simple page for %s: %w", pkg, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// rewritePypiJSONFile points one PEP 691 file at bodega's wheel route. A url
+// that names no file is left as it stands, as rewritePypiIndex leaves an href.
+func rewritePypiJSONFile(entry map[string]any, base *url.URL) {
+	raw, _ := entry["url"].(string)
+	u, err := base.Parse(raw)
+	if err != nil {
+		return
+	}
+	name, err := url.PathUnescape(path.Base(u.Path))
+	if err != nil || name == "" || name == "." || name == "/" {
+		return
+	}
+	href := "/" + manifest.PypiWheelPrefix + url.PathEscape(name)
+	if u.Fragment != "" {
+		href += "#" + u.Fragment
+	}
+	entry["url"] = href
+	delete(entry, "core-metadata")
+	delete(entry, "dist-info-metadata")
 }
 
 // pypiHrefFilename recovers the filename one href names, unescaped. An href

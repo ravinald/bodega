@@ -2376,6 +2376,56 @@ A version with no `published_at` is left out rather than given an invented time:
 
 Proxy-mode packages are untouched: their index is upstream's own, times included.
 
+A blocking age gate refuses a too-new version; it does not steer a client away from one. To have the resolver pick the newest version that passes instead, turn on [`bodega policy filter`](#bodega-policy-filter-setlist) for the ecosystem.
+
+### `bodega policy filter <set|list>`
+
+Hides the versions the age and OSV gates block from the proxied indexes, so a client's resolver settles on the newest version that passes and fails only when nothing in its range does. Without it, `npm install widget@^4.1.0` is shown a 4.3.0 published yesterday, picks it, and is refused on the tarball with nothing it can do about it. With it, the packument lists 4.1.0 and 4.2.0, and the same install resolves 4.2.0. Sonatype's and JFrog's curation products and the client-side `pmg` work the same way.
+
+```bash
+bodega policy filter set npm on
+bodega policy filter set pypi on
+bodega policy filter set gomod off
+bodega policy filter list
+```
+
+```text
+$ bodega policy filter list
+ECOSYSTEM  FILTER  WITHHOLDS                 UPDATED
+gomod      off     nothing (no gate blocks)  -
+npm        on      age < 7d, osv records     2026-10-06
+pypi       on      age < 3d                  2026-10-06
+```
+
+`WITHHOLDS` is computed from the age and OSV policies in force and is shown for an ecosystem that is off too, so you can read what turning it on would do first. The filter is off by default, and the server reads the setting on every index request, so `set` takes effect without a restart.
+
+**What it withholds.** Only a gate whose action is `block`. A version OSV records as malicious is withheld whenever the malware action is `block`, which it is with no row set, whatever the advisory gate says: the artifact route refuses it either way. A version younger than the age gate's minimum, and a version the local OSV database (`osv_db_dir`) has a record for. A gate on `warn` or `ignore` withholds nothing, because the artifact route would serve that version and hiding it would refuse at the index what nobody refuses at the fetch. The filter never queries `api.osv.dev`, `osv_api_fallback` or not: one index read would be a query per listed version. A version the local database cannot answer for stays.
+
+**Which indexes.** The three bodega proxies from upstream:
+
+| Type  | Index                                                          | Proxied when                                                  | Dated by                                                                                                                                                                    |
+| ----- | -------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm   | the packument, `/npm/<pkg>`                                    | no manifest entry names the package, or a proxy-mode one does | `time[<version>]` in the upstream packument; for a proxy-mode entry, whose packument bodega generates, from `npm_upstream`'s copy                                           |
+| pypi  | the simple page, `/pypi/simple/<dist>/`, HTML and PEP 691 JSON | the distribution has a proxy-mode entry                       | the earliest PEP 700 `upload-time` per version on the upstream's JSON simple page; for a version with none, the JSON API the age gate reads (`/pypi/<dist>/<version>/json`) |
+| gomod | `/go/<module>/@v/list`                                         | no manifest entry names the module, or a proxy-mode one does  | `Time` in each version's `.info`, fetched once per version and kept in memory, so a list costs fetches only for versions it has not dated before                            |
+
+Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are the registries the client is being shown. An index bodega generates from a hosted entry lists versions admitted on import and is not filtered. A version whose publish time cannot be read stays in the index and is logged at `WARN` with its package and version, so an upstream hiccup never hides a release.
+
+**What the client sees.**
+
+- A pypi client whose `Accept` header ranks `application/vnd.pypi.simple.v1+json` above HTML, as pip and uv do, gets the PEP 691 JSON page, filtered the same way and with every `url` on `/pypi/wheels/`. bodega fetches it as `<pypi_upstream>/simple/<dist>/?format=application/vnd.pypi.simple.v1+json`; an index that ignores `format` and answers HTML gets that HTML served instead, which those clients also accept. The response carries `Vary: Accept`.
+- An npm `dist-tags.latest` that names a withheld version is repointed at the newest remaining non-prerelease version, so `npm install widget` with no range still works. Any other tag naming a withheld version is dropped.
+- The response carries `X-Bodega-Filtered: <n>; age=<a>; osv=<o>`, naming how many versions were withheld and by which gate. It is absent when nothing was.
+- When every version is withheld, the index is still served with none listed, so the client prints its own "no matching version" message rather than a transport error.
+- Each filtered response writes one `cache` audit row with status `index_filtered`, carrying the counts in `details`: `bodega audit events --type cache` shows the filter acting.
+
+**What it does not do.**
+
+- **It does not rewrite a lockfile.** `npm ci`, `pip install -r` with pinned versions and `go mod download` against an existing `go.sum` name the version without reading the index, so a pinned version that the gate blocks fails on the artifact, as it would without the filter.
+- **It never replaces the artifact-level gate.** With the filter on, the tarball, wheel or `.zip`/`.info`/`.mod` route refuses a withheld version requested directly with a `403` naming the gate, and writes a `denied` row with status `withheld_version`. The index is advice to a resolver; the artifact route is where the decision is enforced.
+- With the filter off, the proxied index lists every version upstream does, and the age and OSV gates refuse a too-new or flagged version when the client fetches its artifact (see the age gate above).
+- The gomod `@latest` document and the npm version route `/npm/<pkg>/<version>` are not filtered. `go` reads `@latest` only when the list is empty, and both lead to an artifact the route refuses.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
@@ -5579,6 +5629,7 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
 | `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record                              |
 | `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
+| `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
 
 One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.
 
@@ -5610,6 +5661,7 @@ An object cached before bodega kept origins, filled by a path that fetches nothi
 | `spool_artifact_too_large` | A proxied artifact over `spool_max_artifact_bytes`. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory)                                                                                                                                                                        |
 | `spool_budget_exhausted`   | A proxy fetch arriving while `spool_max_total_bytes` is already held by the fetches in flight. `details` carries the bytes held and the number of fetches holding them                                                                                                                                             |
 | `client_unidentified`      | A `/client/` request from a host no identity binding names. See [Client plan and per-system files](#client-plan-and-per-system-files)                                                                                                                                                                              |
+| `withheld_version`         | A direct request for an npm tarball, pypi wheel or gomod file whose version [`bodega policy filter`](#bodega-policy-filter-setlist) withholds from the index. `details` names the gate (`age` or `osv`)                                                                                                            |
 | `client_excluded`          | `GET /client/{system}` for a system the host's profile excludes. `details` carries the profile and its reason                                                                                                                                                                                                      |
 
 The first eight gates run in the middleware chain, before any handler; the rest are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.

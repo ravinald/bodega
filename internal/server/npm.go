@@ -64,6 +64,13 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		}
 
 		upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
+		// Both upstream-filled branches below, and neither of the others: a
+		// hosted tarball was admitted on import, and refusing it would be the
+		// mid-install 403 the index filter exists to prevent.
+		proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+		if proxied && s.refuseWithheld(w, r, manifest.TypeNpm, pkgName, reqVersion) {
+			return
+		}
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
@@ -150,6 +157,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + fullPath
 	s3Key := manifest.NpmPackumentKey(fullPath)
 	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: fullPath, permit: permit}
+	if reqVersion == "" {
+		rw.withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
@@ -237,6 +247,18 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 	versions, _ := doc["versions"].(map[string]any)
 	npmTimeBounds(doc)
 
+	// A proxy-mode entry's tarballs are filled from upstream through the
+	// withheld-version gate, so its packument withholds the same versions:
+	// listed, they are what npm picks and then gets refused. Ahead of latest
+	// so the tag names a version that survived.
+	var withhold *indexWithhold
+	if reqVersion == "" && packageMode(pm) == manifest.ModeProxy {
+		withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
+	if withhold != nil {
+		withhold.versionsMap(versions)
+	}
+
 	if reqVersion != "" {
 		entry, ok := versions[reqVersion]
 		if !ok {
@@ -260,6 +282,9 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 		s.logger.Error("packument generation failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument generation failed", http.StatusInternalServerError)
 		return
+	}
+	if withhold != nil {
+		withhold.finish(w.Header())
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
@@ -517,9 +542,13 @@ type npmPackumentWriter struct {
 	// profile governs it. Applied before the tarball rewrite, so a version the
 	// profile refuses never acquires a bodega URL to be fetched by.
 	permit func(string) bool
-	status int
-	body   bytes.Buffer
-	tooBig bool
+	// withhold is the index filter's pass, nil when it is off for npm. It
+	// runs after the profile filter, so it dates only versions this host
+	// could have been shown.
+	withhold *indexWithhold
+	status   int
+	body     bytes.Buffer
+	tooBig   bool
 }
 
 func (p *npmPackumentWriter) WriteHeader(code int) {
@@ -562,6 +591,13 @@ func (p *npmPackumentWriter) flush() error {
 		if err != nil {
 			http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
 			return err
+		}
+		if p.withhold != nil {
+			if filtered, err = p.withhold.packument(filtered); err != nil {
+				http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
+				return err
+			}
+			p.withhold.finish(p.Header())
 		}
 		rewritten, err := rewriteNpmPackument(filtered, p.base, p.pkg)
 		if err != nil {
