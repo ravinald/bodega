@@ -1,4 +1,5 @@
-# Arms GitHub's native auto-merge on Dependabot patch/minor PRs.
+# Arms GitHub's native auto-merge on Dependabot patch/minor PRs, except
+# GitHub Actions bumps, which wait on a human like a major bump does.
 #
 # Copy to .github/workflows/dependabot-auto-merge.yml. Needs two things the
 # workflow cannot grant itself: allow_auto_merge on the repo, and at least one
@@ -30,12 +31,19 @@ jobs:
     steps:
       - name: Fetch update metadata
         id: meta
-        uses: dependabot/fetch-metadata@v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # An action bump is never merged unread, whatever its semver: the release
+      # job runs actions with an OIDC token that signs what people install, and
+      # a minor tag on someone else's repository carries no promise about that.
+      # package-ecosystem is the segment of Dependabot's branch name
+      # (dependabot/github_actions/...), hence the underscore.
       - name: Enable auto-merge for patch and minor
-        if: contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.meta.outputs.update-type)
+        if: >-
+          contains(fromJSON('["version-update:semver-patch", "version-update:semver-minor"]'), steps.meta.outputs.update-type)
+          && steps.meta.outputs.package-ecosystem != 'github_actions'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -48,8 +56,10 @@ jobs:
       # the repo does not have ("'needs-review' not found"), which turns the one
       # path that exists to flag a major bump into a red X that flags nothing.
       # `--force` makes this idempotent, so no repo needs a setup step.
-      - name: Label major bumps for review
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+      - name: Label major bumps and action bumps for review
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major'
+          || steps.meta.outputs.package-ecosystem == 'github_actions'
         run: |
           gh label create needs-review --color d93f0b --force \
             --description "Dependency major bump waiting on a human"

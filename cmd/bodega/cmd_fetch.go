@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +15,7 @@ import (
 )
 
 func newFetchCmd(gf *globalFlags) *cobra.Command {
+	var backfillPublished bool
 	cmd := &cobra.Command{
 		Use:   "fetch [TYPE] [NAME] [force]",
 		Short: "Download source artifacts for one or more manifest types",
@@ -32,11 +35,19 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
 ` + typeOrderSentence("fetched") + `
 
 Append 'force' to re-fetch even if artifacts already exist.
-When a name is given after the type, only that entry is fetched.`,
+When a name is given after the type, only that entry is fetched.
+
+--backfill-published fetches nothing. It reads the upstream publish time of
+every npm, pypi, gomod and cargo version that has none recorded, at most one
+request every ` + builder.PublishedBackfillInterval.String() + `, and reports how many it filled and how
+many it could not. Versions fetched before bodega recorded publish times need
+it once before a hosted index can date them.`,
 		Example: `  bodega build fetch
   bodega build fetch git
   bodega build fetch apt python3
-  bodega build fetch force`,
+  bodega build fetch force
+  bodega build fetch --backfill-published
+  bodega build fetch npm --backfill-published`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			force := false
 			var positional []string
@@ -55,6 +66,14 @@ When a name is given after the type, only that entry is fetched.`,
 			types, err := resolveTypes(typeArgs)
 			if err != nil {
 				return err
+			}
+			if backfillPublished {
+				if force {
+					return fmt.Errorf("--backfill-published fetches nothing, so 'force' has nothing to re-fetch; run them separately")
+				}
+				if types, err = publishedTypes(types, len(typeArgs) > 0); err != nil {
+					return err
+				}
 			}
 
 			cfg, err := loadConfig(gf)
@@ -78,6 +97,15 @@ When a name is given after the type, only that entry is fetched.`,
 			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Force = force
 			bcfg.AuditDB = auditDB
+
+			if backfillPublished {
+				res := builder.BackfillPublished(bcfg, store, types, entryFilter, builder.PublishedBackfillInterval)
+				fmt.Printf("\nPublish times filled: %d  Could not fill: %d\n", res.Filled, res.Failed)
+				if res.Failed > 0 {
+					return fmt.Errorf("%d version(s) still have no publish time; each is named above with its reason", res.Failed)
+				}
+				return nil
+			}
 
 			var allSummaries []*builder.Summary
 
@@ -148,5 +176,24 @@ When a name is given after the type, only that entry is fetched.`,
 		},
 	}
 
+	cmd.Flags().BoolVar(&backfillPublished, "backfill-published", false,
+		"Record upstream publish times on versions that have none, instead of fetching")
 	return cmd
+}
+
+// publishedTypes narrows types to the ones a publish time can be read for. A
+// type the operator named that has no such source is refused rather than
+// skipped, since skipping reports a clean run over something never examined.
+func publishedTypes(types []string, named bool) ([]string, error) {
+	dated := policy.AgeEcosystems()
+	var out []string
+	for _, t := range types {
+		if slices.Contains(dated, t) {
+			out = append(out, t)
+		} else if named {
+			return nil, fmt.Errorf("%s has no upstream publish time to backfill; --backfill-published covers %s",
+				t, strings.Join(dated, ", "))
+		}
+	}
+	return out, nil
 }

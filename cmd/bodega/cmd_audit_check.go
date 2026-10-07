@@ -38,6 +38,7 @@ func newAuditCheckCmd(gf *globalFlags) *cobra.Command {
 			}
 
 			issues := 0
+			gitRoot := builder.NewConfig(cfg, nil).RootFor(manifest.TypeGit)
 
 			// 1. Check git entries have dependency links.
 			fmt.Println("Checking git dependency links...")
@@ -54,7 +55,7 @@ func newAuditCheckCmd(gf *globalFlags) *cobra.Command {
 					parentRef := fmt.Sprintf("git/%s@%s", name, ref)
 					children := store.ChildrenOf(parentRef)
 
-					worktree, _ := builder.GitWorktreePath(cfg.BuildRoot, name, ref)
+					worktree, _ := builder.GitWorktreePath(gitRoot, name, ref)
 					hasSource := worktree != ""
 
 					if len(children) == 0 && hasSource {

@@ -75,15 +75,20 @@ type Server struct {
 	cache         CacheConfig
 	auditDB       *audit.DB
 	policy        *policy.Checker
-	discoverMode  string             // "" or "observe" — see internal/server/discovery.go
-	discovery     *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
-	denyNets      []*net.IPNet
-	adminNets     []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
-	adminErr      error        // set when admin_permit_cidr parses to nothing; Start refuses on it
-	auditErr      error        // set when the configured audit sink will not record; Start refuses on it
-	pepperErr     error        // set when the pepper in force is unreadable; Start refuses on it
-	spool         *spoolLimiter
-	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
+	// indexFilter decides which versions a proxied index withholds; nil with
+	// no audit database, which holds its switch. publishTimes caches the
+	// upstream publish times it decides by.
+	indexFilter  *policy.IndexFilter
+	publishTimes publishTimes
+	discoverMode string             // "" or "observe" — see internal/server/discovery.go
+	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
+	denyNets     []*net.IPNet
+	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
+	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
+	auditErr     error        // set when the configured audit sink will not record; Start refuses on it
+	pepperErr    error        // set when the pepper in force is unreadable; Start refuses on it
+	spool        *spoolLimiter
+	spoolErr     error // set when spool_dir cannot be created or written; Start refuses on it
 	// fills holds a proxied key from the moment its bytes reach the store
 	// until its origin row does, so a hit arriving inside that window can
 	// still name the fetch it is reading. See internal/server/proxy.go.
@@ -141,6 +146,13 @@ type Server struct {
 	// repository never reaches this — its archives carry FreeBSD's signature
 	// and bodega adds none.
 	pkgSign atomic.Pointer[pkgSigning]
+
+	// attestSign is the key attestations are signed with and the public set
+	// GET /api/v1/attestation/keys serves. nil when no key is installed.
+	// Swapped whole on SIGHUP for the reason aptSign is.
+	attestSign atomic.Pointer[attestSigning]
+	// attestNoKeyWarned keeps the no-key WARN to one line per process.
+	attestNoKeyWarned atomic.Bool
 
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
@@ -357,6 +369,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			}
 			s.auditDB = db
 			s.policy = policy.NewChecker(db)
+			s.indexFilter = policy.NewIndexFilter(db, admit.OSVChecker(cfg, db))
 			logger.Info("audit store opened", "path", dbPath, "sink", db.SinkName(), "queryable", db.EventsQueryable())
 			if !db.EventsQueryable() {
 				// Not a failure: the operator chose a write-only sink. It
@@ -394,6 +407,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 
 	s.loadAptSigner()
 	s.loadPkgSigner()
+	s.loadAttestSigner()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -755,10 +769,11 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt and pkg signing keys, the CIDR access lists, the identity bindings and the profile bindings")
+	s.logger.Info("reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
 	s.loadPkgSigner()
+	s.loadAttestSigner()
 	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
 	s.refreshIdentities(ctx)
@@ -886,6 +901,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}", s.handleAPIPackage)
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}", s.handleAPIPackageVersion)
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}/attestation", s.handleAttestation)
+	m.HandleFunc("GET /api/v1/attestation/keys", s.handleAttestationKeys)
 	m.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
 	m.HandleFunc("GET /api/v1/config", s.handleAPIConfig)
 	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
@@ -1321,8 +1337,10 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": res.Reason})
 		return
 	case admit.PolicyBlocked:
-		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": res.Reason})
+		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason, "incident", res.Incident)
+		f := admitRefusal(t, pm.Name, admitBlock{check: res.Check, version: res.Version, incident: res.Incident, details: res.Details})
+		f.client = refusalClientAPI
+		f.write(w, r)
 		return
 	}
 
@@ -1333,6 +1351,12 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	if existing != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
 		return
+	}
+
+	dated := admit.Result{}
+	admit.RecordPublished(ctx, &pm, nil, &dated)
+	for _, warning := range dated.Warnings {
+		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
 	}
 
 	if err := s.store.SavePackage(ctx, &pm); err != nil {
@@ -1367,9 +1391,11 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 		// remove a pinned artifact". The middleware chain let the request
 		// through — the caller cleared the admin gate — which is what makes
 		// the attempt worth a record rather than noise.
+		f := frozenRefusal(t, name)
+		f.client = refusalClientAPI
 		recordDenial(s.auditDB, r, audit.DenialFrozenEntry,
-			map[string]string{"pkg_type": t, "pkg_name": name})
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "entry is frozen"})
+			map[string]string{"pkg_type": t, "pkg_name": name, "incident": f.incident})
+		f.write(w, r)
 		return
 	}
 
@@ -2141,6 +2167,10 @@ func (iw *cacheDirectiveWriter) Flush() {
 		f.Flush()
 	}
 }
+
+// Unwrap lets a pypi refusal reach the connection to write its own status
+// line; see refusal.writeWithReasonPhrase.
+func (iw *cacheDirectiveWriter) Unwrap() http.ResponseWriter { return iw.ResponseWriter }
 
 func (iw *cacheDirectiveWriter) begin(code int) {
 	if iw.started {

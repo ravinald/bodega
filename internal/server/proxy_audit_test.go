@@ -1,7 +1,10 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +22,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/placement"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -1135,5 +1139,59 @@ func TestARedirectLoopStopsAtTheHopBound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "stopped after") {
 		t.Errorf("openUpstream error = %v, want the redirect bound rather than a timeout", err)
+	}
+}
+
+// TestProxyFillRefusesKnownMalware: a proxy miss for a version OSV records as
+// malware is refused before the upstream is read, with no policy row of any
+// kind configured, and the refusal is in the audit trail.
+func TestProxyFillRefusesKnownMalware(t *testing.T) {
+	allowLoopbackUpstream(t)
+	var fetched atomic.Int32
+	files := gomodFixtureFiles(64)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetched.Add(1)
+		serveGomodFixture(w, r, files)
+	}))
+	t.Cleanup(up.Close)
+
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("MAL-2026-5.json")
+		_ = json.NewEncoder(f).Encode(map[string]any{
+			"id":      "MAL-2026-5",
+			"summary": "Malicious code in " + proxyAuditModule,
+			"affected": []any{map[string]any{
+				"package": map[string]any{"ecosystem": "Go", "name": proxyAuditModule},
+				"ranges":  []any{map[string]any{"type": "SEMVER", "events": []any{map[string]any{"introduced": "0"}}}},
+			}},
+		})
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+
+	s := newProxyAuditServer(t, up.URL, 0)
+	s.cfg.OSVDBDir = filepath.Join(t.TempDir(), "osv")
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(context.Background(), "Go"); err != nil {
+		t.Fatalf("sync Go: %v", err)
+	}
+
+	code, body := getProxy(t, s, "/go/"+proxyAuditModule+"/@v/"+proxyAuditVersion+".zip")
+	if code != http.StatusForbidden {
+		t.Fatalf("GET of a known-malware version = %d, want 403 (%s)", code, body)
+	}
+	if !strings.Contains(body, "MAL-2026-5") {
+		t.Errorf("the refusal must name the record: %q", body)
+	}
+	if n := fetched.Load(); n != 0 {
+		t.Errorf("the upstream was read %d time(s) for a refused version", n)
+	}
+	rows := cacheRows(t, s)
+	if len(rows) != 1 || rows[0].Status != audit.CacheMalwareBlocked || rows[0].PkgVersion != proxyAuditVersion {
+		t.Fatalf("cache rows = %+v, want one %s row", rows, audit.CacheMalwareBlocked)
 	}
 }

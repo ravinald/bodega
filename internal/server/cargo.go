@@ -96,7 +96,7 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	ctx := r.Context()
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeCargo, crate)
 	if pm != nil && isPackageHidden(pm) {
-		http.NotFound(w, r)
+		s.refuseHidden(w, r, manifest.TypeCargo, crate, "")
 		return
 	}
 
@@ -331,11 +331,11 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeCargo, crate)
 	if pm != nil {
 		if isPackageHidden(pm) {
-			http.NotFound(w, r)
+			s.refuseHidden(w, r, manifest.TypeCargo, crate, "")
 			return
 		}
 		if isVersionHidden(pm, version) {
-			http.NotFound(w, r)
+			s.refuseHidden(w, r, manifest.TypeCargo, crate, version)
 			return
 		}
 	}

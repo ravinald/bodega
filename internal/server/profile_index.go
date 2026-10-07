@@ -124,7 +124,13 @@ func filterPackumentVersions(body []byte, rejected func(string) bool) ([]byte, e
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, err
 	}
+	withholdPackumentVersions(doc, rejected)
+	return json.Marshal(doc)
+}
 
+// withholdPackumentVersions is filterPackumentVersions on a document already
+// parsed, for a caller that has more to do to it before it is serialized.
+func withholdPackumentVersions(doc map[string]any, rejected func(string) bool) {
 	if versions, ok := doc["versions"].(map[string]any); ok {
 		for v := range versions {
 			if rejected(v) {
@@ -153,8 +159,6 @@ func filterPackumentVersions(body []byte, rejected func(string) bool) ([]byte, e
 			}
 		}
 	}
-
-	return json.Marshal(doc)
 }
 
 // filterPackumentByProfile drops the versions a profile does not permit.

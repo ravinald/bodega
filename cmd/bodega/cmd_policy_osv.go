@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -53,6 +54,11 @@ when osv_api_fallback is on and the local copy cannot answer.
 Admission checks a version once, on the day it was imported. rescan is
 what turns that into an answer about today.
 
+Malware records (OSV ids beginning MAL-, and records whose
+database_specific marks the package malicious) answer to a separate
+action, set under 'malware'. It blocks by default with no configuration;
+set only governs the other advisories.
+
   bodega policy osv sync
   bodega policy osv set npm block
   bodega policy osv set apt block
@@ -62,6 +68,7 @@ what turns that into an answer about today.
 	}
 	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf),
 		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf),
+		newPolicyOSVMalwareCmd(gf),
 		// The policy subtree is quiet, and rescan is the one verb under it
 		// that rewrites manifests. Without this the server keeps serving the
 		// pre-rescan stamp for the life of the process, because
@@ -107,6 +114,133 @@ func newPolicyOSVSetCmd(gf *globalFlags) *cobra.Command {
 	}
 }
 
+func newPolicyOSVMalwareCmd(gf *globalFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "malware",
+		Short: "The action for OSV records of known-malicious packages",
+		Long: `A malware record says a package was published to do harm, not that a
+version has a flaw. OSV carries them under MAL- ids from OpenSSF's
+malicious-packages feed, and some other databases mark them in
+database_specific. They are evaluated apart from every other advisory,
+under an action that is block for every OSV-covered ecosystem until set
+otherwise, whether or not 'bodega policy osv set' was ever run.
+
+Only malware someone has already reported to that feed is caught.
+
+Setting ignore requires --reason, and every change writes an audit event
+naming who made it.
+
+  bodega policy osv malware list
+  bodega policy osv malware set npm warn
+  bodega policy osv malware set pypi ignore --reason "internal mirror vetted by sec-team"`,
+	}
+	cmd.AddCommand(newPolicyOSVMalwareSetCmd(gf), newPolicyOSVMalwareListCmd(gf))
+	return cmd
+}
+
+func newPolicyOSVMalwareSetCmd(gf *globalFlags) *cobra.Command {
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "set <ecosystem> block|warn|ignore",
+		Short: "Set the malware action for an ecosystem",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			eco, action := args[0], strings.ToLower(args[1])
+			if err := requireEcosystem(eco, policy.OSVEcosystems(), "OSV gate",
+				"the row would be stored and never read"); err != nil {
+				return err
+			}
+			if action != policy.ActionWarn && action != policy.ActionBlock && action != policy.ActionIgnore {
+				return fmt.Errorf("action must be block|warn|ignore, got %q", action)
+			}
+			reason = strings.TrimSpace(reason)
+			if action == policy.ActionIgnore && reason == "" {
+				return fmt.Errorf("ignore serves known malware for %s without a word in the log; pass --reason saying why", eco)
+			}
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return err
+			}
+			adb := openAuditDB(gf)
+			if adb == nil {
+				return fmt.Errorf("audit DB unavailable")
+			}
+			defer adb.Close()
+			ctx := cmd.Context()
+			actor := audit.CurrentActor()
+			if err := adb.SetOSVMalwarePolicy(ctx, audit.OSVMalwarePolicy{
+				Ecosystem: eco, Action: action, Reason: reason, Actor: actor,
+			}); err != nil {
+				return err
+			}
+			details, _ := json.Marshal(map[string]string{
+				"gate": "osv_malware", "action": action, "reason": reason,
+			})
+			if err := adb.Record(ctx, audit.Event{
+				EventType: audit.EventPolicy,
+				PkgType:   eco,
+				Actor:     actor,
+				Status:    "success",
+				Details:   string(details),
+			}); err != nil {
+				return fmt.Errorf("set %s malware action to %s, but the audit event was not written: %w", eco, action, err)
+			}
+			fmt.Printf("Set %s OSV malware action: %s\n", eco, action)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&reason, "reason", "", "Why; required for ignore and recorded with the change")
+	return cmd
+}
+
+func newPolicyOSVMalwareListCmd(gf *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List the malware action for every OSV-covered ecosystem",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			adb := openAuditDB(gf)
+			if adb == nil {
+				return fmt.Errorf("audit DB unavailable")
+			}
+			defer adb.Close()
+			rows, err := adb.ListOSVMalwarePolicies(cmd.Context())
+			if err != nil {
+				return err
+			}
+			set := make(map[string]audit.OSVMalwarePolicy, len(rows))
+			for _, p := range rows {
+				set[p.Ecosystem] = p
+			}
+			// Every covered ecosystem gets a row, because the unset ones are
+			// the ones blocking: listing only stored rows would print an
+			// empty table over a gate that is on everywhere.
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tSET BY\tUPDATED\tREASON")
+			for _, eco := range policy.OSVEcosystems() {
+				p, ok := set[eco]
+				if !ok {
+					fmt.Fprintf(w, "%s\tblock (default)\t-\t-\t-\n", eco)
+					continue
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", eco, p.Action, dash(p.Actor),
+					p.UpdatedAt.Format("2006-01-02"), dash(p.Reason))
+			}
+			return w.Flush()
+		},
+	}
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
 func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -128,7 +262,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if len(rows) == 0 {
-				fmt.Printf("No OSV policies configured.\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
+				fmt.Printf("No OSV policies configured; malware records still block unless 'bodega policy osv malware list' says otherwise.\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
 					db.Dir(), onOff(cfg.OSVAPIFallback))
 				return nil
 			}
@@ -466,10 +600,14 @@ today. Admission checked each version once, on the day it was imported;
 advisories published against versions already in the field are the normal
 case, so that answer ages out.
 
-rescan records and decides nothing. It never blocks, hides, freezes or
-deletes: an OSV data refresh that flags a base image would otherwise take
-a fleet offline with no operator in the loop. What it changes is the
-stamp, and the summary on stderr is what an operator acts on.
+rescan records advisories and decides nothing about them. It never
+blocks, freezes or deletes, and it hides a version for one reason only:
+a malware record no earlier stamp on that version named, in an ecosystem
+whose malware action is block. The hide is audited under the actor
+osv-malware. A frozen version is not hidden; it is reported as an ERROR
+and the run exits non-zero, because it is still being served. Under warn
+the version is listed and left alone; under ignore, nothing is said about
+it beyond the stamp.
 
 Versions the database cannot answer for keep the stamp they had. A
 version checked before the check date existed reads as unchecked rather
@@ -515,6 +653,16 @@ than gaining an invented date.
 			}
 
 			ctx := cmd.Context()
+			malwareAction := map[string]string{}
+			for _, t := range types {
+				action, err := ck.MalwareAction(ctx, t)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s malware action unreadable (%v); applying block\n", t, err)
+				}
+				malwareAction[t] = action
+			}
+			var hidden []malwareHide
+			var frozenMalware []string
 			var sum policy.OSVRescanSummary
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			rows := 0
@@ -557,6 +705,7 @@ than gaining an invented date.
 						continue
 					}
 					changed := false
+					var pkgHides []malwareHide
 					for i := range pm.Versions {
 						ve := &pm.Versions[i]
 						ch := ck.Rescan(ctx, pm, ve)
@@ -565,6 +714,22 @@ than gaining an invented date.
 							changed = true
 						}
 						state, detail := rescanRow(ch)
+						if len(ch.NewMalware) > 0 && malwareAction[t] != policy.ActionIgnore {
+							state = "malware (new)"
+							if malwareAction[t] == policy.ActionBlock {
+								switch {
+								case ve.Frozen:
+									state = "ERROR: frozen malware"
+									frozenMalware = append(frozenMalware, fmt.Sprintf("%s/%s@%s is frozen and matches newly published malware record(s) %s; it is still served",
+										t, pm.Name, ve.Version, strings.Join(ch.NewMalware, ", ")))
+								case !ve.Hidden:
+									ve.Hidden = true
+									changed = true
+									state = "hidden (malware)"
+									pkgHides = append(pkgHides, malwareHide{typ: t, name: pm.Name, version: ve.Version, ids: ch.NewMalware})
+								}
+							}
+						}
 						if state == "" {
 							continue
 						}
@@ -580,6 +745,7 @@ than gaining an invented date.
 							continue
 						}
 						saved++
+						hidden = append(hidden, pkgHides...)
 					}
 				}
 			}
@@ -587,6 +753,10 @@ than gaining an invented date.
 				return err
 			}
 			sum.Report(os.Stderr)
+			reportMalwareHides(ctx, adb, hidden)
+			for _, line := range frozenMalware {
+				fmt.Fprintf(os.Stderr, "ERROR: %s; unfreeze and hide it with 'bodega pkg freeze' and 'bodega pkg hide'\n", line)
+			}
 			if saved == 0 {
 				suppressReload(cmd)
 			}
@@ -605,6 +775,12 @@ than gaining an invented date.
 			// them here sends the operator to the wrong subsystem.
 			if sum.Answered == 0 && sum.Walked > 0 && failures == 0 {
 				return fmt.Errorf("nothing was re-checked: none of %d version(s) could be answered for; the reasons are above", sum.Walked)
+			}
+			if len(frozenMalware) > 0 {
+				if saved > 0 {
+					signalReloadNow(cmd, gf)
+				}
+				return fmt.Errorf("%d frozen version(s) match newly published malware records and are still served", len(frozenMalware))
 			}
 			if failures > 0 {
 				// The post-run hook fires only after a nil return, and a walk
@@ -658,5 +834,48 @@ func withReason(detail, reason string) string {
 		return reason
 	default:
 		return detail + "; " + reason
+	}
+}
+
+// malwareHide is one version a rescan hid because a malware record newly
+// matched it.
+type malwareHide struct {
+	typ, name, version string
+	ids                []string
+}
+
+// malwareHideActor is the actor a rescan's hide is recorded under. It names
+// the rule rather than the operator who ran the command, so a search for
+// every version bodega hid on its own is one filter.
+const malwareHideActor = "osv-malware"
+
+// reportMalwareHides writes the audit event for each hide that reached disk
+// and says on stderr what was hidden. A hide whose event cannot be written
+// stands: the manifest is the control, and the warning names the version so
+// the record can be reconstructed.
+func reportMalwareHides(ctx context.Context, adb *audit.DB, hides []malwareHide) {
+	if len(hides) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Hid %d version(s) matching newly published malware records (actor %s).\n",
+		len(hides), malwareHideActor)
+	for _, h := range hides {
+		fmt.Fprintf(os.Stderr, "  %s/%s@%s: %s\n", h.typ, h.name, h.version, strings.Join(h.ids, ", "))
+		if adb == nil {
+			continue
+		}
+		details, _ := json.Marshal(map[string]any{"malware": h.ids, "hidden": true})
+		if err := adb.Record(ctx, audit.Event{
+			EventType:  audit.EventHide,
+			PkgType:    h.typ,
+			PkgName:    h.name,
+			PkgVersion: h.version,
+			Actor:      malwareHideActor,
+			Status:     "success",
+			Details:    string(details),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: hid %s/%s@%s but the audit event was not written: %v\n",
+				h.typ, h.name, h.version, err)
+		}
 	}
 }

@@ -232,6 +232,9 @@ func TestProfileMembershipRefusalIsDistinguishable(t *testing.T) {
 	if details["rule"] != "membership" {
 		t.Errorf("the row does not name the rule that refused: %v", details)
 	}
+	if inc := bodyIncident(t, body, checkProfile); details["incident"] != inc {
+		t.Errorf("the body's incident %s is not the row's %q", inc, details["incident"])
+	}
 }
 
 // A version outside an entry's constraint is refused under a different status

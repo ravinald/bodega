@@ -221,6 +221,7 @@ var schemaStructs = map[string]any{
 	"StatusResponse":     statusResponse{},
 	"SpoolStats":         spoolStats{},
 	"BackendEntryStatus": backendEntryStatus{},
+	"AttestationKey":     attestationKey{},
 	"AptStatus":          aptStatus{},
 	"AptUnservedEntry":   aptUnservedEntry{},
 	"AptSources":         aptsources.Sources{},

@@ -269,3 +269,59 @@ func TestCreateEntryStoresTheOrigin(t *testing.T) {
 		t.Errorf("origins = %v, want [db01]", got)
 	}
 }
+
+// Both mutation routes date an imported version from the registry its url
+// names, with no audit database and so no age policy to read it on the way.
+func TestImportRoutesRecordUpstreamPublishTimes(t *testing.T) {
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/left-pad" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"time":{"1.3.0":"2018-04-09T01:22:46.500Z"}}`))
+	}))
+	defer registry.Close()
+	body := fmt.Sprintf(`{"name":"left-pad","type":"npm","versions":[{"version":"1.3.0","url":%q},{"version":"9.9.9","url":%q}]}`,
+		registry.URL, registry.URL)
+
+	check := func(t *testing.T, s *Server, warnings []string) {
+		t.Helper()
+		pm, _ := s.store.GetPackage(t.Context(), manifest.TypeNpm, "left-pad")
+		if pm == nil {
+			t.Fatal("left-pad not stored")
+		}
+		got := map[string]string{}
+		for _, ve := range pm.Versions {
+			got[ve.Version] = ve.PublishedAt
+		}
+		if got["1.3.0"] != "2018-04-09T01:22:46Z" {
+			t.Errorf("1.3.0 published_at = %q, want 2018-04-09T01:22:46Z", got["1.3.0"])
+		}
+		if got["9.9.9"] != "" {
+			t.Errorf("9.9.9 published_at = %q; upstream has no time for it", got["9.9.9"])
+		}
+		if warnings != nil && (len(warnings) != 1 || !strings.Contains(warnings[0], "9.9.9")) {
+			t.Errorf("warnings = %v, want one naming 9.9.9", warnings)
+		}
+	}
+
+	t.Run("bulk", func(t *testing.T) {
+		s, _, _ := refreshTestServer(t)
+		w, resp := postImport(t, s, body, "")
+		if w.Code != http.StatusOK || resp.Imported != 1 {
+			t.Fatalf("status = %d, imported = %d; body: %s", w.Code, resp.Imported, w.Body.String())
+		}
+		check(t, s, resp.Results[0].Warnings)
+	})
+	t.Run("create", func(t *testing.T) {
+		s, _, _ := refreshTestServer(t)
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/npm", strings.NewReader(body))
+		r.SetPathValue("type", manifest.TypeNpm)
+		w := httptest.NewRecorder()
+		s.handleCreateEntry(w, r)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+		}
+		check(t, s, nil)
+	})
+}
