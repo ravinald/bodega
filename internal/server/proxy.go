@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -135,6 +137,15 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// resolver. The row is written below, once there is a resolved URL to put
 	// in it.
 	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true)
+	if !ok {
+		if decision == audit.DecisionDenied && immutable {
+			s.recordFillRefusal(r, regType, policyCandidate, discoveryPkgName, s3Key)
+		}
+		return
+	}
+	// Before the resolve and the fetch, so a refused version's bytes never
+	// leave upstream; the allow-list above has already ruled on the name.
+	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable)
 	if !ok {
 		return
 	}
@@ -263,6 +274,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		http.Error(w, "checksum verification failed — upstream content may be tampered", http.StatusBadGateway)
 		return
 	}
+	s.pinFill(ctx, fill, s3Key, immutable)
 
 	// Cache to storage (best-effort — don't fail the response if caching fails).
 	// The read above and this write take the same store parameter: resolving
@@ -810,10 +822,171 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		}
 		s.logger.Warn("upstream blocked by policy", blocked...)
 		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
-		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
+		refuseByPolicy(w, audit.CheckAllowList)
 		return decision, false
 	}
 	return decision, true
+}
+
+// refuseByPolicy answers a fetch an admission check refused. Every check
+// answers with the same status and the same plain-text form, so a client that
+// handles the allow-list's 403 handles an age or OSV refusal the same way;
+// only the check named in the body differs.
+func refuseByPolicy(w http.ResponseWriter, check string) {
+	msg := "upstream blocked by allow-list"
+	if check != audit.CheckAllowList {
+		msg = "upstream blocked by " + check + " policy"
+	}
+	http.Error(w, msg, http.StatusForbidden)
+}
+
+// fetchGatedTypes are the types whose proxy fill runs the age and OSV checks:
+// the ones the age gate can date, which are also the ones whose storage key
+// names the version being fetched. A freebsd key's version slot holds the ABI
+// and an apt pool key's the binary's version rather than the one an advisory
+// is filed against, and checking either would answer for the wrong thing.
+var fetchGatedTypes = map[string]bool{
+	manifest.TypeNpm:   true,
+	manifest.TypePypi:  true,
+	manifest.TypeGomod: true,
+	manifest.TypeCargo: true,
+}
+
+// fetchCheckers is admit.VersionCheckers, held in a variable because the age
+// gate dates a version against the public registries: a test points it at
+// checkers it controls rather than reaching the internet.
+var fetchCheckers = admit.VersionCheckers
+
+// fillAdmission is the version a proxy fill was admitted as, carried from the
+// gate to the pin so both name it the same way. Zero when no row was written.
+type fillAdmission struct {
+	typ, name, version string
+}
+
+// fillIdentity names the version an immutable proxy request fetches. The name
+// is the one the route read off the request, which is what the allow-list and
+// discovery use; the key supplies the version, and for pypi the filename does,
+// because ParseKey places wheels only and an sdist is fetched the same way.
+func fillIdentity(regType, name, s3Key string) fillAdmission {
+	keyType, keyName, version := manifest.ParseKey(s3Key)
+	if regType == "" {
+		regType = keyType
+	}
+	if name == "" {
+		name = keyName
+	}
+	if regType == manifest.TypePypi {
+		_, version = wheelIdentity(path.Base(s3Key))
+	}
+	return fillAdmission{typ: regType, name: name, version: version}
+}
+
+// allowListVerdict renders the decision upstreamPolicyGate reached as the
+// allow-list entry of an admission row.
+func allowListVerdict(decision, candidate string) audit.AdmissionCheck {
+	switch decision {
+	case audit.DecisionAllowed:
+		return admit.AllowListCheck(true, candidate, nil)
+	case audit.DecisionNoPolicy:
+		return admit.AllowListCheck(false, candidate, nil)
+	case audit.DecisionDenied:
+		return admit.AllowListCheck(true, candidate, &policy.ViolationError{Candidate: candidate})
+	}
+	return audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone,
+		Status: audit.CheckNotEvaluated, Detail: "not run: no allow-list loaded"}
+}
+
+// versionPolicyGate is the proxy fill's admission: import's age and OSV checks
+// on the version an immutable request is about to fetch, with the decision
+// written to the admissions table whatever it is. A block is refused before
+// the fetch, so the refused bytes never leave upstream; a warn is logged and
+// the fetch goes ahead, since the client fetching has nowhere to read one.
+//
+// Mutable resources (a packument, an index, a version list) are not admitted:
+// they are not artifacts, nothing pins them, and a row per refresh would bury
+// the decisions an attestation cites.
+func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, name, s3Key, decision string, immutable bool) (fillAdmission, bool) {
+	if s.auditDB == nil || !immutable {
+		return fillAdmission{}, true
+	}
+	fill := fillIdentity(regType, name, s3Key)
+	var checkers []policy.VersionChecker
+	notRun := ""
+	if fetchGatedTypes[fill.typ] && fill.version != "" {
+		checkers = fetchCheckers(s.cfg, s.auditDB)
+	} else {
+		notRun = "not run: a " + fill.typ + " proxy fill names no version the age and OSV checks can evaluate"
+	}
+	ve := manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy}
+	res := admit.Fetch(r.Context(), s.auditDB, checkers, fill.typ, fill.name, ve,
+		allowListVerdict(decision, policyCandidate), admit.Who{Identity: Identity(r)}, notRun)
+	for _, warn := range res.Warns {
+		s.logger.Warn("upstream fetch admitted with a policy warning", "type", fill.typ, "package", fill.name,
+			"version", fill.version, "check", warn.Check, "reason", warn.Reason)
+	}
+	if res.Block == nil {
+		return fill, true
+	}
+	s.logger.Warn("upstream fetch blocked by policy", "type", fill.typ, "package", fill.name,
+		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason)
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType:  audit.EventCache,
+		PkgType:    fill.typ,
+		PkgName:    fill.name,
+		PkgVersion: fill.version,
+		Status:     audit.CachePolicyViolation,
+		Details:    truncateField(res.Block.Check+": "+res.Block.Reason, maxDetailField),
+		Identity:   Identity(r),
+	}); err != nil {
+		s.logger.Error("audit write failed, denial not recorded — still refusing",
+			"type", fill.typ, "package", fill.name, "version", fill.version, "error", err)
+	}
+	refuseByPolicy(w, res.Block.Check)
+	return fill, false
+}
+
+// recordFillRefusal writes the admission row for an immutable fetch the
+// allow-list refused, so a refusal leaves a decision behind like a pass does.
+func (s *Server) recordFillRefusal(r *http.Request, regType, policyCandidate, name, s3Key string) {
+	if s.auditDB == nil {
+		return
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	fill := fillIdentity(regType, name, s3Key)
+	admit.Fetch(ctx, s.auditDB, nil, fill.typ, fill.name, manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy},
+		allowListVerdict(audit.DecisionDenied, policyCandidate), admit.Who{Identity: Identity(r)}, "")
+}
+
+// pinFill attaches the object key to the admission row once the digest is
+// pinned or verified against the pin. A fill with no row of its own (no audit
+// database at the gate, or a route that bypassed it) falls through to the
+// not_evaluated row and the WARN, which is the honest record of bytes cached
+// with no decision behind them.
+func (s *Server) pinFill(ctx context.Context, fill fillAdmission, s3Key string, immutable bool) {
+	if s.auditDB == nil || !immutable {
+		return
+	}
+	if fill.typ == "" {
+		fill = fillIdentity("", "", s3Key)
+	}
+	s.pinAdmission(ctx, fill.typ, fill.name, fill.version, s3Key)
+}
+
+// pinAdmission attaches key to the newest admitted decision for the version,
+// and says so at WARN when there was none to attach to.
+func (s *Server) pinAdmission(ctx context.Context, typ, name, version, key string) {
+	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	switch {
+	case err != nil:
+		s.logger.Error("admission row not updated with its object key", "type", typ, "package", name,
+			"version", version, "key", key, "error", err)
+	case outcome == audit.PinUnadmitted:
+		s.logger.Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
+			"type", typ, "package", name, "version", version, "key", key)
+	}
 }
 
 // recordUpstreamAttempt writes the discovery row for one permitted upstream

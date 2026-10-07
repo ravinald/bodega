@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
@@ -86,6 +87,10 @@ type Config struct {
 	// run in that state say so on its own output.
 	policyChecker *policy.Checker
 	policyNotice  sync.Once
+	// app is the configuration NewConfig was built from, kept for the OSV
+	// gate's database and fallback settings. Nil on a Config built by hand,
+	// which leaves the gate with no database: it warns rather than passing.
+	app *config.Config
 	// CargoDLUpstream is the host crate tarballs are fetched from. crates.io
 	// splits the sparse index from the download host, and the index host serves
 	// no downloads, so composing a download URL from the index root 404s.
@@ -120,26 +125,85 @@ func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) err
 	return c.policyChecker.Check(ctx, regType, candidate)
 }
 
-// EnforcePolicy validates a single manifest entry's upstream against the
-// allow-list. On violation it records an audit event and returns the error so
-// the calling Fetch* function can log, bump Summary.Failures, and continue to
-// the next entry. Returns nil when policy is disabled or the entry is allowed.
-func (c *Config) EnforcePolicy(ctx context.Context, regType, name, version, url string) error {
-	candidate := policy.CandidateFor(regType, name, url)
-	if err := c.checkPolicy(ctx, regType, candidate); err != nil {
-		if c.AuditDB != nil {
-			_ = c.AuditDB.Record(ctx, audit.Event{
-				EventType:  audit.EventFetch,
-				PkgType:    regType,
-				PkgName:    name,
-				PkgVersion: version,
-				Status:     "policy_violation",
-				Details:    fmt.Sprintf("candidate=%s", candidate),
-			})
-		}
+// EnforcePolicy is the builder's admission of one manifest entry at fetch
+// time: the upstream allow-list, then the age and OSV checks import runs, with
+// the decision written to the admissions table. On a refusal it records an
+// audit event and returns the error so the calling Fetch* function can log,
+// bump Summary.Failures, and continue to the next entry. Returns nil when the
+// entry is admitted, a warn included.
+//
+// The per-version checks run here as well as at import because this is the
+// moment bytes arrive, and an import can be months old: the row a pin attaches
+// its object key to should be the decision made when those bytes were fetched.
+func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve manifest.VersionEntry) error {
+	candidate := policy.CandidateFor(regType, name, ve.URL)
+	version := ve.Version
+	if version == "" {
+		version = ve.Ref
+	}
+	err := c.checkPolicy(ctx, regType, candidate)
+	if err != nil && c.AuditDB != nil {
+		_ = c.AuditDB.Record(ctx, audit.Event{
+			EventType:  audit.EventFetch,
+			PkgType:    regType,
+			PkgName:    name,
+			PkgVersion: version,
+			Status:     "policy_violation",
+			Details:    fmt.Sprintf("candidate=%s", candidate),
+		})
+	}
+	if c.AuditDB == nil {
 		return err
 	}
+
+	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone,
+		Status: audit.CheckNotEvaluated, Detail: "not run: no allow-list loaded"}
+	if c.policyChecker != nil {
+		hasRules, _ := c.policyChecker.HasRules(ctx, regType)
+		allow = admit.AllowListCheck(hasRules, candidate, err)
+	}
+	res := admit.Fetch(ctx, c.AuditDB, fetchCheckers(c.app, c.AuditDB), regType, name, ve, allow,
+		admit.Who{Actor: audit.CurrentActor()}, "")
+	if err != nil {
+		return err
+	}
+	for _, w := range res.Warns {
+		c.logf("  policy: %s/%s@%s: %s: %s (warn)", regType, name, version, w.Check, w.Reason)
+	}
+	if res.Block != nil {
+		_ = c.AuditDB.Record(ctx, audit.Event{
+			EventType:  audit.EventFetch,
+			PkgType:    regType,
+			PkgName:    name,
+			PkgVersion: version,
+			Status:     "policy_violation",
+			Details:    res.Block.Check + ": " + res.Block.Reason,
+		})
+		return fmt.Errorf("policy blocked %s@%s: %s: %s", name, version, res.Block.Check, res.Block.Reason)
+	}
 	return nil
+}
+
+// fetchCheckers is admit.VersionCheckers, held in a variable because the age
+// gate dates a version against the public registries: a test points it at
+// checkers it controls rather than reaching the internet.
+var fetchCheckers = admit.VersionCheckers
+
+// pinAdmission attaches an object key to the admission decision for the
+// version whose digest was just pinned, or verified against the pin. A pin no
+// decision preceded is said out loud: those bytes reached the store with no
+// admission behind them, and the row written for them says not_evaluated.
+func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key string) {
+	if c.AuditDB == nil || key == "" {
+		return
+	}
+	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	switch {
+	case err != nil:
+		c.logf("  WARNING: %s/%s@%s: admission row not updated with object key %s: %v", typ, name, version, key, err)
+	case outcome == audit.PinUnadmitted:
+		c.logf("  WARNING: %s/%s@%s: pinned %s with no admission decision on record; recorded it as not_evaluated", typ, name, version, key)
+	}
 }
 
 // rootFor returns the effective build root for the given source type.
@@ -235,6 +299,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		AutoImportDeps: true,
 		BodegaVersion:  Version,
 		policyChecker:  pol,
+		app:            app,
 
 		CargoDLUpstream: app.CargoDLUpstream,
 		CargoUpstream:   app.CargoUpstream,

@@ -2,7 +2,9 @@ package policy
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -257,5 +259,91 @@ func TestPypiCanonicalFormIsTheSameThroughEveryPolicyCaller(t *testing.T) {
 		if got := osvPackageKey("PyPI", in); got != want {
 			t.Errorf("osvPackageKey(PyPI, %q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// digestStore is the three listings Digest reads, held in memory.
+type digestStore struct {
+	rules []audit.PolicyInfo
+	ages  []audit.AgePolicy
+	osvs  []audit.OSVPolicy
+}
+
+func (d *digestStore) ListPolicies(context.Context) ([]audit.PolicyInfo, error) { return d.rules, nil }
+func (d *digestStore) ListAgePolicies(context.Context) ([]audit.AgePolicy, error) {
+	return d.ages, nil
+}
+func (d *digestStore) ListOSVPolicies(context.Context) ([]audit.OSVPolicy, error) {
+	return d.osvs, nil
+}
+
+// TestDigestTracksPolicyContent pins the two properties an admission row's
+// policy_digest is cited for: decisions under unchanged policy share it, and
+// any edit that could change a verdict changes it.
+func TestDigestTracksPolicyContent(t *testing.T) {
+	base := func() *digestStore {
+		return &digestStore{
+			rules: []audit.PolicyInfo{
+				{ID: "1", RegistryType: "npm", RuleKind: KindPackage, Pattern: "lodash", Comment: "c", CreatedBy: "ravi"},
+				{ID: "2", RegistryType: "apt", RuleKind: KindHost, Pattern: "archive.ubuntu.com"},
+			},
+			ages: []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: ActionBlock}},
+			osvs: []audit.OSVPolicy{{Ecosystem: "pypi", Action: ActionWarn}},
+		}
+	}
+	digest := func(s *digestStore) string {
+		t.Helper()
+		d, err := Digest(context.Background(), s)
+		if err != nil {
+			t.Fatalf("Digest: %v", err)
+		}
+		return d
+	}
+	want := digest(base())
+	if !strings.HasPrefix(want, "sha256:") || len(want) != len("sha256:")+64 {
+		t.Fatalf("digest %q is not sha256:<64 hex>", want)
+	}
+
+	same := map[string]func(*digestStore){
+		"unchanged":                    func(*digestStore) {},
+		"rows_listed_in_another_order": func(s *digestStore) { s.rules[0], s.rules[1] = s.rules[1], s.rules[0] },
+		"rule_removed_and_re_added": func(s *digestStore) {
+			s.rules[0].ID, s.rules[0].Comment, s.rules[0].CreatedBy = "9", "", "someone"
+			s.rules[0].CreatedAt = time.Now()
+		},
+		"policy_row_touched_without_change": func(s *digestStore) { s.ages[0].UpdatedAt = time.Now() },
+	}
+	for name, edit := range same {
+		s := base()
+		edit(s)
+		if got := digest(s); got != want {
+			t.Errorf("%s: digest moved to %s under the same policy", name, got)
+		}
+	}
+
+	changed := map[string]func(*digestStore){
+		"rule_pattern_edited": func(s *digestStore) { s.rules[0].Pattern = "lodash-es" },
+		"rule_added": func(s *digestStore) {
+			s.rules = append(s.rules, audit.PolicyInfo{RegistryType: "npm", RuleKind: KindPackage, Pattern: "left-pad"})
+		},
+		"rule_removed":         func(s *digestStore) { s.rules = s.rules[:1] },
+		"rule_moved_to_a_type": func(s *digestStore) { s.rules[0].RegistryType = "cargo" },
+		"age_minimum_edited":   func(s *digestStore) { s.ages[0].MinAgeSeconds = 86400 },
+		"age_action_edited":    func(s *digestStore) { s.ages[0].Action = ActionWarn },
+		"age_policy_removed":   func(s *digestStore) { s.ages = nil },
+		"osv_action_edited":    func(s *digestStore) { s.osvs[0].Action = ActionBlock },
+		"osv_policy_added": func(s *digestStore) {
+			s.osvs = append(s.osvs, audit.OSVPolicy{Ecosystem: "npm", Action: ActionBlock})
+		},
+	}
+	seen := map[string]string{want: "base"}
+	for name, edit := range changed {
+		s := base()
+		edit(s)
+		got := digest(s)
+		if prior, dup := seen[got]; dup {
+			t.Errorf("%s: digest %s is the same as %s's", name, got, prior)
+		}
+		seen[got] = name
 	}
 }

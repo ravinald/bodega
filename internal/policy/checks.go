@@ -36,9 +36,19 @@ type VersionChecker interface {
 // non-pass result — "a block with context about what else was wrong is more
 // useful than a premature return."
 func RunChecks(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, checkers ...VersionChecker) Combined {
-	var out Combined
+	results := make([]Result, 0, len(checkers))
 	for _, c := range checkers {
-		r := c.Check(ctx, pm, ve)
+		results = append(results, c.Check(ctx, pm, ve))
+	}
+	return Combine(results)
+}
+
+// Combine sorts individual results into warns and blocks, dropping passes.
+// It is RunChecks' second half, for a caller that needs each result as well
+// as the aggregate: an admission row records every check, a pass included.
+func Combine(results []Result) Combined {
+	var out Combined
+	for _, r := range results {
 		switch r.Action {
 		case "", ActionPass, ActionIgnore:
 			continue

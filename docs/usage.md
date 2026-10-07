@@ -903,6 +903,21 @@ bodega audit events --identity build-07                # every request one host 
 
 The `CLIENT` and `IDENTITY` columns are printed together and neither substitutes for the other: the deny list matched on the address, and one identity holds several. `IDENTITY` is blank on a request no binding resolved, which is every request until `bodega identity bind` runs.
 
+### `bodega audit admissions <type> <name> [version]`
+
+Prints the admission decisions recorded for a package, newest first: the decision, every check's result, the digest of the policy it was decided under, who decided it, and the object key once the artifact's digest was pinned. Each check that did not pass is spelled out under its row. Refuses by name under `audit_sink: "syslog"` or `"jsonl"`, like `audit events`. See [Admission decisions](#admission-decisions).
+
+| Flag      | Default | Purpose                                                    |
+| --------- | ------- | ---------------------------------------------------------- |
+| `--json`  | off     | Emit the rows as a JSON array, with every check's `detail` |
+| `--limit` | `50`    | Max decisions to show                                      |
+
+```bash
+bodega audit admissions npm lodash                 # every decision on every version
+bodega audit admissions npm lodash 4.17.21         # one version
+bodega audit admissions gomod example.com/example-corp/widget-sdk v1.30.0 --json
+```
+
 ### `bodega audit check`
 
 Scans the manifest store and the dependency graph for four kinds of problem, and prints one line per finding:
@@ -5270,11 +5285,11 @@ The default is `sqlite`, so an existing install upgrades with no config change a
 **The write-only sinks refuse rather than lie.** Under `syslog` and `jsonl` there is no table to read back, so:
 
 - `GET /api/v1/audit` answers **501 Not Implemented** with the sink named in the body. Not 503: this is a configuration the server will keep having, and "try again later" would never come true.
-- `bodega audit events` exits non-zero naming the sink and pointing at `sqlite` or `postgres`.
+- `bodega audit events` and `bodega audit admissions` exit non-zero naming the sink and pointing at `sqlite` or `postgres`.
 - `bodega discover list`, `show`, `export`, `clear`, `promote-all` and `generate-manifests` do the same.
 - **`bodega discover promote` is unavailable.** It reads the discovery table to build the policy rule or the manifest entries it writes, and a stream that has already left the process is not a table. Promote from an instance running `sqlite` or `postgres`, or read the observations where your collector puts them and write the entries with `bodega pkg create`.
 
-The events themselves are one JSON object per line under both sinks, with a `kind` of `event` or `discovery` and field names matching the SQL columns the queryable sinks use, so a SIEM rule and a `postgres` query name the same things. `json.Marshal` escapes control characters, so a User-Agent carrying a newline cannot forge a second record.
+The events themselves are one JSON object per line under both sinks, with a `kind` of `event`, `discovery`, `admission` or `admission_pin` and field names matching the SQL columns the queryable sinks use, so a SIEM rule and a `postgres` query name the same things. `json.Marshal` escapes control characters, so a User-Agent carrying a newline cannot forge a second record.
 
 **A write-only sink cannot deduplicate.** The queryable sinks collapse repeat observations on `(registry_type, pattern_hint, pkg_name, pkg_version, decision)` and bump `request_count`. `syslog` and `jsonl` emit one record per request and leave the rollup to whatever consumes the stream.
 
@@ -5422,6 +5437,44 @@ An allow-list refusal is a `cache` event with `status=policy_violation` rather t
 
 A read-only audit database used to be the quieter version of the same loss: `Record` no-oped, `Query` kept answering, so `/api/v1/audit` responded and simply stopped growing. `bodega serve` now refuses to start on it, naming the file and the uid. Read commands still work against a database they cannot write, which is what keeps `bodega audit events` usable as a non-root user against a root-owned file.
 
+
+### Admission decisions
+
+Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 022 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
+
+| Column          | Holds                                                                                                                  |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                       |
+| `pkg_name`      | The package name as the manifest or the request names it                                                               |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none       |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                    |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                              |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age` and `osv`, plus `override`    |
+| `policy_digest` | `sha256:` over the allow-list rules and the `age_policy` and `osv_policy` rows in force at the decision                |
+| `actor`         | The OS user, for a CLI decision                                                                                        |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                              |
+| `decided_at`    | When the decision was made                                                                                             |
+
+In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
+
+The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
+
+**The policy digest** is computed by `policy.Digest` over the rule type, kind and pattern of every allow-list rule, the ecosystem, minimum age and action of every age policy, and the ecosystem and action of every OSV policy, sorted. A rule's id, comment, author and timestamp are left out, so removing a rule and adding it back is the same policy, while any edit that can change a verdict changes the digest. Two decisions under unchanged policy carry the same digest.
+
+**Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
+
+**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age and OSV checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` in the same plain-text form an allow-list refusal does, naming the check: `upstream blocked by osv policy`. A warn is logged and the fetch goes ahead. A fill of any other type records the allow-list's verdict and `not_evaluated` for age and OSV, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
+
+**The builder runs them too.** A build's fetch admits each entry under the allow-list and the age and OSV checks, and a block fails that entry the way an allow-list refusal does. Import may be months old by the time bytes are fetched, so the row a pin attaches to is the decision made when the bytes arrived.
+
+`audit_events` does not filter admissions: it selects which event types you keep, and a decision missing from this table is a version nothing can cite. A row that cannot be written is reported as a warning on the operation that decided, not as a refusal of it.
+
+```bash
+bodega audit admissions npm minimist
+bodega audit admissions npm minimist 1.2.8 --json
+```
+
+**Not yet covered.** The pypi build admits a package by name before pip resolves a version, so its wheels, and every transitive dependency in the closure, pin with a `not_evaluated` row and a WARN on first fetch. An apt or FreeBSD proxy fill records age and OSV as `not_evaluated` even where import would evaluate OSV for apt.
 ---
 
 ## TUI

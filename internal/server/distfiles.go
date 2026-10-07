@@ -383,7 +383,16 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 
 	// A digest says the bytes are right; it does not say the operator agreed
 	// to contact the host that would supply them.
-	if !s.enforceUpstreamPolicyRecording(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true) {
+	decision, ok := s.upstreamPolicyGate(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true)
+	if !ok {
+		if decision == audit.DecisionDenied {
+			s.recordFillRefusal(r, manifest.TypeDistfiles, upstream, name, key)
+		}
+		return
+	}
+	s.recordUpstreamAttempt(r, manifest.TypeDistfiles, upstream, upstream, name, key, decision)
+	fill, ok := s.versionPolicyGate(w, r, manifest.TypeDistfiles, upstream, name, key, decision, true)
+	if !ok {
 		return
 	}
 	s.logger.Info("distfiles: cache miss, fetching upstream", "name", name, "upstream", upstream)
@@ -427,6 +436,8 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// distinfo pinned the digest before the fetch, so matching it is the pin.
+	s.pinFill(ctx, fill, key, true)
 	s.fillCache(ctx, store, key, spool.path(), up.url, spool.sha256, spool.size)
 	s.recordCacheEvent(r, audit.CacheMiss, manifest.TypeDistfiles, up.url, name, name, key)
 

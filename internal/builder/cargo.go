@@ -192,7 +192,7 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				cfg.logf("  [cargo] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeCargo, name, ve.Version, ve.URL); err != nil {
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeCargo, name, ve); err != nil {
 				cfg.logf("  [cargo] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeCargo, Name: name, Err: err})

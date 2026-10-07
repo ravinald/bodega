@@ -365,7 +365,7 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeApt, name, ve.Version, ve.URL); err != nil {
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeApt, name, ve); err != nil {
 				cfg.logf("  [apt] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeApt, Name: name, Err: err})

@@ -165,7 +165,7 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 				cfg.logf("  [freebsd] %s@%s: proxy mode, nothing to mirror", repo, ve.Version)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeFreeBSD, repo, ve.Version, ve.URL); err != nil {
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeFreeBSD, repo, ve); err != nil {
 				cfg.logf("  [freebsd] %s@%s: BLOCKED by policy: %v", repo, ve.Version, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeFreeBSD, Name: repo, Err: err})
@@ -194,6 +194,9 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 				// naming another run's catalogue is a record that verifies
 				// against nothing.
 				stampFetchRecord(ctx, store, manifest.TypeFreeBSD, repo, ve, freeBSDCatalogPath(d, repo, ve), digest, nil)
+				// The catalogue is the object the digest is over, and the one
+				// whose records name every package the repository holds.
+				cfg.pinAdmission(ctx, manifest.TypeFreeBSD, repo, ve.Version, manifest.FreeBSDKey(ve.Version, repo, manifest.FreeBSDCatalogFile))
 			}
 			summary.Results = append(summary.Results, result)
 			summary.Total++

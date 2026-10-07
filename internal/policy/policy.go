@@ -6,6 +6,9 @@ package policy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -285,4 +288,78 @@ func firstSegment(p string) string {
 		return p[:idx]
 	}
 	return p
+}
+
+// DigestStore is what Digest reads: every row of the three tables an
+// admission decision is judged against. *audit.DB satisfies it.
+type DigestStore interface {
+	ListPolicies(ctx context.Context) ([]audit.PolicyInfo, error)
+	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
+	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
+}
+
+// Digest returns "sha256:<hex>" over a canonical serialization of the
+// allow-list rules and the age_policy and osv_policy rows, which is what an
+// admission row cites as the policy it was decided under.
+//
+// Only the fields that change a verdict are hashed. A rule's id, comment,
+// author and timestamp are left out, so removing a rule and adding it back is
+// the same policy, while editing a pattern, an action or a minimum age is not.
+// Rows are sorted first so the digest does not depend on the order a query
+// happens to return them in.
+func Digest(ctx context.Context, store DigestStore) (string, error) {
+	rules, err := store.ListPolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list allow-list rules: %w", err)
+	}
+	ages, err := store.ListAgePolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list age policies: %w", err)
+	}
+	osvs, err := store.ListOSVPolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list osv policies: %w", err)
+	}
+
+	type rule struct {
+		Type    string `json:"type"`
+		Kind    string `json:"kind"`
+		Pattern string `json:"pattern"`
+	}
+	type age struct {
+		Ecosystem     string `json:"ecosystem"`
+		MinAgeSeconds int64  `json:"min_age_seconds"`
+		Action        string `json:"action"`
+	}
+	type osv struct {
+		Ecosystem string `json:"ecosystem"`
+		Action    string `json:"action"`
+	}
+	canon := struct {
+		Version   int    `json:"v"`
+		AllowList []rule `json:"allowlist"`
+		Age       []age  `json:"age"`
+		OSV       []osv  `json:"osv"`
+	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}}
+	for _, r := range rules {
+		canon.AllowList = append(canon.AllowList, rule{r.RegistryType, r.RuleKind, r.Pattern})
+	}
+	for _, a := range ages {
+		canon.Age = append(canon.Age, age{a.Ecosystem, a.MinAgeSeconds, a.Action})
+	}
+	for _, o := range osvs {
+		canon.OSV = append(canon.OSV, osv{o.Ecosystem, o.Action})
+	}
+	slices.SortFunc(canon.AllowList, func(a, b rule) int {
+		return strings.Compare(a.Type+"\x00"+a.Kind+"\x00"+a.Pattern, b.Type+"\x00"+b.Kind+"\x00"+b.Pattern)
+	})
+	slices.SortFunc(canon.Age, func(a, b age) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
+	slices.SortFunc(canon.OSV, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
+
+	blob, err := json.Marshal(canon)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: %w", err)
+	}
+	sum := sha256.Sum256(blob)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }

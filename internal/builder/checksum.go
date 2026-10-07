@@ -165,9 +165,16 @@ func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version 
 			return fmt.Errorf("%s/%s@%s: %s mismatch against the pinned digest for %s: pinned=%s fetched=%s",
 				typ, name, version, cs.Algorithm, key, prior.Value, cs.Value)
 		}
+		// Bytes that match the pin are the pinned object, so the decision
+		// this fetch was admitted under names it as well.
+		c.pinAdmission(ctx, typ, name, version, key)
 		return nil
 	}
-	return c.AuditDB.StoreChecksum(ctx, key, typ, name, version, cs.Algorithm, cs.Value, checksumSourceBuild)
+	if err := c.AuditDB.StoreChecksum(ctx, key, typ, name, version, cs.Algorithm, cs.Value, checksumSourceBuild); err != nil {
+		return err
+	}
+	c.pinAdmission(ctx, typ, name, version, key)
+	return nil
 }
 
 // findAndUpdateGitChecksum updates Checksum and ChecksumVerified on a git VersionEntry and saves.

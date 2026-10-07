@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,8 @@ type capturedEvent = wireEvent
 
 type capturedDiscovery = wireDiscovery
 
+type capturedAdmission = wireAdmission
+
 // sinkHarness is one sink plus the way to read back what it received.
 type sinkHarness struct {
 	sink EventSink
@@ -42,6 +45,10 @@ type sinkHarness struct {
 
 	events      func(t *testing.T) []capturedEvent
 	discoveries func(t *testing.T) []capturedDiscovery
+	admissions  func(t *testing.T) []capturedAdmission
+	// pins is what a write-only sink emitted for PinAdmission. A queryable
+	// sink applies the pin to its row instead, so it returns nil.
+	pins func(t *testing.T) []wireAdmissionPin
 }
 
 // conformanceSinks builds a fresh harness per sink per case, so no assertion
@@ -93,6 +100,31 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		LastClient:   "10.4.5.6",
 	}
 
+	// Microsecond precision, because both queryable stores keep that much
+	// and no more; anything finer would fail the round trip on the store
+	// rather than on the sink.
+	fullAdmission := Admission{
+		PkgType:    "npm",
+		PkgName:    "@example-cloud/client-storage",
+		PkgVersion: "4.17.21",
+		Decision:   AdmissionAdmitted,
+		Checks: []AdmissionCheck{
+			{Check: CheckAllowList, Action: "block", Status: CheckPass, Detail: "matched: @example-cloud/client-storage"},
+			{Check: CheckAge, Action: "warn", Status: CheckWarn, Detail: "published 2h ago\nunder the \"7d\" minimum"},
+			{Check: CheckOSV, Action: ActionNone, Status: CheckPass, Detail: ""},
+		},
+		PolicyDigest: "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+		Actor:        "ravi",
+		Identity:     "build-07",
+		DecidedAt:    time.Date(2026, 10, 6, 12, 34, 56, 789012000, time.UTC),
+	}
+	wantAdmission := capturedAdmission{
+		PkgType: fullAdmission.PkgType, PkgName: fullAdmission.PkgName, PkgVersion: fullAdmission.PkgVersion,
+		Decision: fullAdmission.Decision, Checks: fullAdmission.Checks, PolicyDigest: fullAdmission.PolicyDigest,
+		Actor: fullAdmission.Actor, Identity: fullAdmission.Identity,
+		DecidedAt: fullAdmission.DecidedAt.Format(time.RFC3339Nano),
+	}
+
 	cases := []struct {
 		name string
 		// budget shrinks the SQLite busy_timeout every handle in this case
@@ -138,6 +170,45 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			}
 			if got[0] != want {
 				t.Errorf("discovery round trip differs:\n got %+v\nwant %+v", got[0], want)
+			}
+		}},
+
+		{"every_admission_field_survives", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
+			if err := h.sink.RecordAdmission(ctx, fullAdmission); err != nil {
+				t.Fatalf("RecordAdmission: %v", err)
+			}
+			got := h.admissions(t)
+			if len(got) != 1 {
+				t.Fatalf("read back %d admissions, want 1", len(got))
+			}
+			if !reflect.DeepEqual(got[0], wantAdmission) {
+				t.Errorf("admission round trip differs:\n got %+v\nwant %+v", got[0], wantAdmission)
+			}
+		}},
+
+		// A queryable sink attaches the key to the decision's row; a stream
+		// cannot be updated, so a write-only sink emits the pin as a record of
+		// its own for the consumer to join.
+		{"a_pin_reaches_the_decision_or_the_stream", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
+			if err := h.sink.RecordAdmission(ctx, fullAdmission); err != nil {
+				t.Fatalf("RecordAdmission: %v", err)
+			}
+			pin := AdmissionPin{PkgType: fullAdmission.PkgType, PkgName: fullAdmission.PkgName,
+				PkgVersion: fullAdmission.PkgVersion, ObjectKey: "npm/@example-cloud/client-storage/-/client-storage-4.17.21.tgz"}
+			if err := h.sink.PinAdmission(ctx, pin); err != nil {
+				t.Fatalf("PinAdmission: %v", err)
+			}
+			if h.queryable {
+				got := h.admissions(t)
+				if len(got) != 1 || got[0].ObjectKey != pin.ObjectKey {
+					t.Fatalf("pin did not reach the decision's row: %+v", got)
+				}
+				return
+			}
+			pins := h.pins(t)
+			want := wireAdmissionPin(pin)
+			if len(pins) != 1 || pins[0] != want {
+				t.Fatalf("write-only sink emitted %+v for one pin, want [%+v]", pins, want)
 			}
 		}},
 
@@ -390,7 +461,7 @@ func newPostgresHarness(t *testing.T) sinkHarness {
 	}
 	t.Cleanup(func() { _ = sink.Close() })
 	pg := sink.(*postgresSink)
-	for _, stmt := range []string{"DELETE FROM events", "DELETE FROM upstream_discovery"} {
+	for _, stmt := range []string{"DELETE FROM events", "DELETE FROM upstream_discovery", "DELETE FROM admissions"} {
 		if _, err := pg.db.Exec(stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
 		}
@@ -445,6 +516,24 @@ func sqlHarness(t *testing.T, sink EventSink) sinkHarness {
 			}
 			return out
 		},
+		admissions: func(t *testing.T) []capturedAdmission {
+			t.Helper()
+			rows, err := r.QueryAdmissions(context.Background(), AdmissionFilter{Limit: 10000})
+			if err != nil {
+				t.Fatalf("QueryAdmissions: %v", err)
+			}
+			out := make([]capturedAdmission, 0, len(rows))
+			for _, a := range rows {
+				out = append(out, capturedAdmission{
+					PkgType: a.PkgType, PkgName: a.PkgName, PkgVersion: a.PkgVersion,
+					ObjectKey: a.ObjectKey, Decision: a.Decision, Checks: a.Checks,
+					PolicyDigest: a.PolicyDigest, Actor: a.Actor, Identity: a.Identity,
+					DecidedAt: a.DecidedAt.UTC().Format(time.RFC3339Nano),
+				})
+			}
+			return out
+		},
+		pins: func(*testing.T) []wireAdmissionPin { return nil },
 	}
 }
 
@@ -568,6 +657,26 @@ func writeOnlyHarness(sink EventSink, read func(t *testing.T) []wireRecord) sink
 			for _, rec := range read(t) {
 				if rec.Kind == "discovery" && rec.Discovery != nil {
 					out = append(out, *rec.Discovery)
+				}
+			}
+			return out
+		},
+		admissions: func(t *testing.T) []capturedAdmission {
+			t.Helper()
+			var out []capturedAdmission
+			for _, rec := range read(t) {
+				if rec.Kind == "admission" && rec.Admission != nil {
+					out = append(out, *rec.Admission)
+				}
+			}
+			return out
+		},
+		pins: func(t *testing.T) []wireAdmissionPin {
+			t.Helper()
+			var out []wireAdmissionPin
+			for _, rec := range read(t) {
+				if rec.Kind == "admission_pin" && rec.AdmissionPin != nil {
+					out = append(out, *rec.AdmissionPin)
 				}
 			}
 			return out

@@ -32,10 +32,38 @@ const syslogFacility = syslog.LOG_INFO | syslog.LOG_LOCAL0
 // written against the syslog stream then name the same things, which is the
 // only sense in which "every sink writes the same event shape" is checkable.
 type wireRecord struct {
-	Kind      string         `json:"kind"` // "event" or "discovery"
-	Timestamp string         `json:"timestamp"`
-	Event     *wireEvent     `json:"event,omitempty"`
-	Discovery *wireDiscovery `json:"discovery,omitempty"`
+	Kind         string            `json:"kind"` // "event", "discovery", "admission" or "admission_pin"
+	Timestamp    string            `json:"timestamp"`
+	Event        *wireEvent        `json:"event,omitempty"`
+	Discovery    *wireDiscovery    `json:"discovery,omitempty"`
+	Admission    *wireAdmission    `json:"admission,omitempty"`
+	AdmissionPin *wireAdmissionPin `json:"admission_pin,omitempty"`
+}
+
+// wireAdmission carries the columns of the admissions table. checks is the
+// array itself rather than the column's JSON text, so a collector reads one
+// document instead of parsing a string inside it.
+type wireAdmission struct {
+	PkgType      string           `json:"pkg_type"`
+	PkgName      string           `json:"pkg_name"`
+	PkgVersion   string           `json:"pkg_version"`
+	ObjectKey    string           `json:"object_key"`
+	Decision     string           `json:"decision"`
+	Checks       []AdmissionCheck `json:"checks"`
+	PolicyDigest string           `json:"policy_digest"`
+	Actor        string           `json:"actor"`
+	Identity     string           `json:"identity"`
+	DecidedAt    string           `json:"decided_at"`
+}
+
+// wireAdmissionPin is the UPDATE a queryable sink applies to an admission
+// row, emitted as its own record because a stream cannot be updated. The
+// consumer joins it to the newest admission for the same version.
+type wireAdmissionPin struct {
+	PkgType    string `json:"pkg_type"`
+	PkgName    string `json:"pkg_name"`
+	PkgVersion string `json:"pkg_version"`
+	ObjectKey  string `json:"object_key"`
 }
 
 type wireEvent struct {
@@ -84,6 +112,44 @@ func encodeEvent(ev Event) ([]byte, error) {
 			Details:    ev.Details,
 			Actor:      ev.Actor,
 			Identity:   ev.Identity,
+		},
+	})
+}
+
+// encodeAdmission renders one decision, with the same escaping guarantee
+// encodeEvent gives.
+func encodeAdmission(a Admission) ([]byte, error) {
+	checks := a.Checks
+	if checks == nil {
+		checks = []AdmissionCheck{}
+	}
+	return json.Marshal(wireRecord{
+		Kind:      "admission",
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Admission: &wireAdmission{
+			PkgType:      a.PkgType,
+			PkgName:      a.PkgName,
+			PkgVersion:   a.PkgVersion,
+			ObjectKey:    a.ObjectKey,
+			Decision:     a.Decision,
+			Checks:       checks,
+			PolicyDigest: a.PolicyDigest,
+			Actor:        a.Actor,
+			Identity:     a.Identity,
+			DecidedAt:    a.DecidedAt.UTC().Format(time.RFC3339Nano),
+		},
+	})
+}
+
+func encodeAdmissionPin(p AdmissionPin) ([]byte, error) {
+	return json.Marshal(wireRecord{
+		Kind:      "admission_pin",
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		AdmissionPin: &wireAdmissionPin{
+			PkgType:    p.PkgType,
+			PkgName:    p.PkgName,
+			PkgVersion: p.PkgVersion,
+			ObjectKey:  p.ObjectKey,
 		},
 	})
 }
@@ -220,6 +286,22 @@ func (s *syslogSink) RecordDiscovery(_ context.Context, rows ...DiscoveryRow) (i
 	return len(rows), nil
 }
 
+func (s *syslogSink) RecordAdmission(_ context.Context, a Admission) error {
+	line, err := encodeAdmission(a)
+	if err != nil {
+		return fmt.Errorf("encode admission for %q: %w", SinkSyslog, err)
+	}
+	return s.w.Info(string(line))
+}
+
+func (s *syslogSink) PinAdmission(_ context.Context, p AdmissionPin) error {
+	line, err := encodeAdmissionPin(p)
+	if err != nil {
+		return fmt.Errorf("encode admission pin for %q: %w", SinkSyslog, err)
+	}
+	return s.w.Info(string(line))
+}
+
 // ---- jsonl ------------------------------------------------------------------
 
 // jsonlSink appends one JSON object per line to a file another collector
@@ -297,6 +379,22 @@ func (s *jsonlSink) RecordDiscovery(_ context.Context, rows ...DiscoveryRow) (in
 		return 0, err
 	}
 	return len(rows), nil
+}
+
+func (s *jsonlSink) RecordAdmission(_ context.Context, a Admission) error {
+	line, err := encodeAdmission(a)
+	if err != nil {
+		return fmt.Errorf("encode admission for %q: %w", SinkJSONL, err)
+	}
+	return s.write(line)
+}
+
+func (s *jsonlSink) PinAdmission(_ context.Context, p AdmissionPin) error {
+	line, err := encodeAdmissionPin(p)
+	if err != nil {
+		return fmt.Errorf("encode admission pin for %q: %w", SinkJSONL, err)
+	}
+	return s.write(line)
 }
 
 // ValidateSyslogDSN reports whether dsn is an address newSyslogSink can dial.

@@ -101,7 +101,7 @@ func (s *Server) handleBulkImport(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, importDecodeStatus(err), map[string]string{"error": importDecodeMessage(err)})
 			return
 		}
-		resp.record(s.importOne(ctx, &pm, merge))
+		resp.record(s.importOne(ctx, &pm, merge, Identity(r)))
 	}
 
 	if err := s.store.SaveIndex(ctx); err != nil {
@@ -118,14 +118,14 @@ func (s *Server) handleBulkImport(w http.ResponseWriter, r *http.Request) {
 
 // importOne runs the shared admit path and writes, mirroring what
 // 'bodega pkg import' does locally so the two surfaces cannot disagree.
-func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, merge bool) ImportResult {
+func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, merge bool, identity string) ImportResult {
 	out := ImportResult{Type: pm.Type, Name: pm.Name}
 
 	if !manifest.IsKnownType(pm.Type) {
 		out.Outcome, out.Reason = ImportInvalid, fmt.Sprintf("unknown type %q", pm.Type)
 		return out
 	}
-	res := admit.Admit(ctx, s.policy, s.auditDB, s.cfg, pm, "")
+	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, pm, admit.Who{Identity: identity})
 	out.Warnings = res.Warnings
 	switch res.Decision {
 	case admit.Invalid:
