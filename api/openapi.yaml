@@ -24,6 +24,8 @@ tags:
     description: What one class of host may fetch
   - name: client
     description: Configuration a client host reads to point its package systems at bodega
+  - name: attestation
+    description: Keys bodega signs attestations with
 
 paths:
   /healthz:
@@ -315,6 +317,32 @@ paths:
           description: Unknown type, package or version, or no attestation_uri recorded
         "502":
           description: attestation_uri is malformed or names an unsupported scheme
+
+  /api/v1/attestation/keys:
+    get:
+      summary: List the attestation signing keys
+      description: |
+        Every attestation key bodega publishes, in the order its key file holds
+        them. The last entry with `retired: false` is the one that signs; the
+        others stay listed so attestations they signed still verify. A retired
+        key's private half is gone from the server.
+
+        Unauthenticated, like the apt keyring routes. This route supplies the
+        key a key ID names; it does not tell a verifier which key ID to trust.
+        Pin that from a channel other than this server.
+
+        An empty array means no attestation key is installed.
+      operationId: listAttestationKeys
+      tags: [attestation]
+      responses:
+        "200":
+          description: The published keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AttestationKey"
 
   /api/v1/packages/{type}/{name}/hide:
     patch:
@@ -956,6 +984,29 @@ components:
         error:
           type: string
       required: [error]
+
+    AttestationKey:
+      type: object
+      properties:
+        keyid:
+          type: string
+          description: Lowercase hex SHA-256 of the DER SubjectPublicKeyInfo.
+          example: 3f1c0e8a9b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e
+        alg:
+          type: string
+          enum: [ed25519]
+        public_key_pem:
+          type: string
+          description: The public key as a PEM SubjectPublicKeyInfo block.
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When `bodega attest key generate` made the key. Null for a key made elsewhere.
+        retired:
+          type: boolean
+          description: True once `bodega attest key retire` has erased the private half. A retired key signs nothing new.
+      required: [keyid, alg, public_key_pem, created_at, retired]
 
     PackagesResponse:
       type: object

@@ -399,6 +399,19 @@ defence against:
   [runtime policy](usage.md#s3-setup) `bodega init --print-policy=runtime`
   prints is the minimum), short-lived credentials, audit-log forwarding
   off-box.
+- **A stolen attestation signing key.** Whoever holds `attest-signing.key`
+  can sign an attestation saying bodega admitted any artifact under any
+  policy, and every verifier that pins that key ID accepts it. That gets an
+  artifact bodega never saw past a CI gate or an audit that trusts bodega's
+  attestations. It does not sign an apt `InRelease` or a pkg catalogue, which
+  use separate keys, and it changes nothing bodega serves. The key is loaded
+  into the serving process, so a compromised bodega server is a stolen
+  attestation key, and so is a `bodega build run` that executes upstream build
+  steps on the same host; keeping the key from any process that runs
+  dependency code needs a separate signer, which bodega does not have.
+  `bodega attest key retire` erases the private half from the file and nowhere
+  else, so a copy taken earlier keeps signing. Retiring is not revocation:
+  verifiers stop trusting a stolen key only when they drop its key ID.
 - **Anything inside an opaque distribution bundle.** When a package format
   bundles its own dependencies in a way bodega cannot inspect (see below),
   the contents of that bundle are outside bodega's allow-list. Bodega may

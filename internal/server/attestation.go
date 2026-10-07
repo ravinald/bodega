@@ -1,9 +1,12 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/ravinald/bodega/internal/attestsign"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -117,4 +120,91 @@ func (s *Server) attestationStore(typ, bucket, key string) (storage.ObjectStore,
 		}
 	}
 	return s.typeStore(typ), key, ""
+}
+
+// attestSigning is the attestation key ring as the server holds it: the key
+// that signs and the published set, swapped whole on reload so the keys route
+// never lists a set the signer is not part of.
+type attestSigning struct {
+	signer attestsign.Signer
+	keys   []attestationKey
+}
+
+// attestationKey is one element of GET /api/v1/attestation/keys.
+type attestationKey struct {
+	KeyID        string     `json:"keyid"`
+	Alg          string     `json:"alg"`
+	PublicKeyPEM string     `json:"public_key_pem"`
+	CreatedAt    *time.Time `json:"created_at"`
+	Retired      bool       `json:"retired"`
+}
+
+// loadAttestSigner installs the attestation key ring, if one is present. It
+// runs at startup and on every SIGHUP.
+//
+// A reload never takes the signer away: a file that has gone missing or
+// become unusable leaves the loaded ring signing and publishing, and the
+// fault goes to the journal naming the file. A verifier pinned to the current
+// key ID would otherwise see attestations stop, or start arriving under no
+// key at all, because of a chmod. Dropping the key is a restart.
+//
+// No key at all is a supported configuration, warned about once per process
+// rather than on every reload.
+func (s *Server) loadAttestSigner() {
+	prev := s.attestSign.Load()
+	paths := attestsign.DefaultKeyPaths(s.cfg.StoragePath)
+	kr, err := attestsign.Load(paths)
+	switch {
+	case errors.Is(err, attestsign.ErrNoKey) && prev != nil:
+		s.logger.Warn("attestation signing key is gone from every search path; the loaded key keeps signing until a restart",
+			"keyid", prev.signer.KeyID(), "searched", strings.Join(paths, ", "))
+		return
+	case errors.Is(err, attestsign.ErrNoKey):
+		if s.attestNoKeyWarned.CompareAndSwap(false, true) {
+			s.logger.Warn("no attestation signing key installed; bodega signs no attestations until one is generated and the server reloaded",
+				"searched", strings.Join(paths, ", "))
+		}
+		return
+	case err != nil:
+		if prev != nil {
+			s.logger.Error("attestation signing key present but unusable; the previously loaded key keeps signing until a restart",
+				"error", err, "keyid", prev.signer.KeyID())
+			return
+		}
+		s.logger.Error("attestation signing key present but unusable; bodega signs no attestations until it loads",
+			"error", err)
+		return
+	}
+	signer := kr.Signer()
+	infos := kr.Keys()
+	keys := make([]attestationKey, 0, len(infos))
+	for _, k := range infos {
+		ak := attestationKey{
+			KeyID:        k.KeyID,
+			Alg:          k.Algorithm,
+			PublicKeyPEM: string(k.PublicKeyPEM),
+			Retired:      !k.Retired.IsZero(),
+		}
+		if !k.Created.IsZero() {
+			created := k.Created
+			ak.CreatedAt = &created
+		}
+		keys = append(keys, ak)
+	}
+	s.attestSign.Store(&attestSigning{signer: signer, keys: keys})
+	s.logger.Info("attestation signing key loaded",
+		"path", kr.Path(), "keyid", signer.KeyID(), "published", len(keys))
+}
+
+// handleAttestationKeys lists every published attestation key. Unauthenticated
+// like the apt keyring: a public key is what a verifier needs before it holds
+// anything else. The key ID a verifier pins comes from a separate channel;
+// this route only supplies the key that ID names.
+func (s *Server) handleAttestationKeys(w http.ResponseWriter, _ *http.Request) {
+	keys := []attestationKey{}
+	if a := s.attestSign.Load(); a != nil {
+		keys = a.keys
+	}
+	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, http.StatusOK, keys)
 }
