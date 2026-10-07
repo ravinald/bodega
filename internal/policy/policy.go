@@ -290,17 +290,20 @@ func firstSegment(p string) string {
 	return p
 }
 
-// DigestStore is what Digest reads: every row of the three tables an
+// DigestStore is what Digest reads: every row of the four tables an
 // admission decision is judged against. *audit.DB satisfies it.
 type DigestStore interface {
 	ListPolicies(ctx context.Context) ([]audit.PolicyInfo, error)
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
+	ListOSVMalwarePolicies(ctx context.Context) ([]audit.OSVMalwarePolicy, error)
 }
 
 // Digest returns "sha256:<hex>" over a canonical serialization of the
-// allow-list rules and the age_policy and osv_policy rows, which is what an
-// admission row cites as the policy it was decided under.
+// allow-list rules and the age_policy, osv_policy and osv_malware_policy rows,
+// which is what an admission row cites as the policy it was decided under.
+// The malware rows are in it because the OSV check refuses on them too, with
+// a default of block that an absent osv_policy row does not turn off.
 //
 // Only the fields that change a verdict are hashed. A rule's id, comment,
 // author and timestamp are left out, so removing a rule and adding it back is
@@ -319,6 +322,10 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	osvs, err := store.ListOSVPolicies(ctx)
 	if err != nil {
 		return "", fmt.Errorf("policy digest: list osv policies: %w", err)
+	}
+	malware, err := store.ListOSVMalwarePolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list osv malware policies: %w", err)
 	}
 
 	type rule struct {
@@ -340,7 +347,8 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 		AllowList []rule `json:"allowlist"`
 		Age       []age  `json:"age"`
 		OSV       []osv  `json:"osv"`
-	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}}
+		Malware   []osv  `json:"osv_malware"`
+	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}}
 	for _, r := range rules {
 		canon.AllowList = append(canon.AllowList, rule{r.RegistryType, r.RuleKind, r.Pattern})
 	}
@@ -350,11 +358,15 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	for _, o := range osvs {
 		canon.OSV = append(canon.OSV, osv{o.Ecosystem, o.Action})
 	}
+	for _, m := range malware {
+		canon.Malware = append(canon.Malware, osv{m.Ecosystem, m.Action})
+	}
 	slices.SortFunc(canon.AllowList, func(a, b rule) int {
 		return strings.Compare(a.Type+"\x00"+a.Kind+"\x00"+a.Pattern, b.Type+"\x00"+b.Kind+"\x00"+b.Pattern)
 	})
 	slices.SortFunc(canon.Age, func(a, b age) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 	slices.SortFunc(canon.OSV, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
+	slices.SortFunc(canon.Malware, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 
 	blob, err := json.Marshal(canon)
 	if err != nil {

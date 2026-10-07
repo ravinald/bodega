@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/json"
 	"strings"
+	"time"
 
 	"net/http"
 
@@ -27,7 +29,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeGomod, module)
 	if pm != nil && isPackageHidden(pm) {
-		http.NotFound(w, r)
+		s.refuseHidden(w, r, manifest.TypeGomod, module, "")
 		return
 	}
 
@@ -46,12 +48,32 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
 		return
 	}
+	// The index filter rewrites only a list answered from upstream, and the
+	// artifact gate refuses only what such a list would have withheld: a
+	// hosted module's list names versions admitted on import, and refusing
+	// their files would be the mid-install 403 the filter exists to prevent.
+	proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+	if proxied && s.refuseWithheld(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
+		return
+	}
 	if file == "list" {
-		if permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module); permit != nil {
+		permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module)
+		var withhold *indexWithhold
+		if proxied {
+			withhold = s.indexWithholdFor(r, manifest.TypeGomod, module)
+		}
+		if permit != nil || withhold != nil {
 			rw := &indexFilterWriter{
 				ResponseWriter: w,
 				subject:        module + "/@v/list",
-				filter:         func(b []byte) []byte { return filterGomodList(b, permit) },
+				filter: func(b []byte) []byte {
+					b = filterGomodList(b, permit)
+					if withhold != nil {
+						b = withhold.gomodList(b)
+						withhold.finish(w.Header())
+					}
+					return b
+				},
 			}
 			s.serveGomodFile(rw, r, pm, module, file, s3Key, upstream, immutable)
 			if err := rw.flush(); err != nil {
@@ -80,8 +102,7 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 					reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
 				}
 				if !versionAllowed(ver, reqVersion, vc) {
-					s.recordVersionRefusal(r, manifest.TypeGomod, module, ver, reqVersion, vc)
-					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					s.refuseVersionConstraint(w, r, manifest.TypeGomod, module, ver, reqVersion, vc)
 					return
 				}
 			}
@@ -107,7 +128,58 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 	if pm == nil {
 		s.recordNoManifest(ctx, r, manifest.TypeGomod, module, gomodVersionFromFile(file), upstream)
 	}
+	if published, ok := gomodRecordedTime(pm, file); ok {
+		rw := &indexFilterWriter{
+			ResponseWriter: w,
+			subject:        module + "/@v/" + file,
+			filter:         func(b []byte) []byte { return gomodInfoWithTime(b, published) },
+		}
+		s.proxyVersion(rw, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
+		if err := rw.flush(); err != nil {
+			s.logger.Error("gomod info response failed", "module", module, "error", err)
+		}
+		return
+	}
 	s.proxyVersion(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
+}
+
+// gomodRecordedTime returns the publish time recorded for the version a .info
+// request names. Any other file, or a version with none recorded, is served
+// as stored.
+func gomodRecordedTime(pm *manifest.PackageManifest, file string) (time.Time, bool) {
+	if pm == nil || !strings.HasSuffix(file, ".info") {
+		return time.Time{}, false
+	}
+	version := strings.TrimSuffix(file, ".info")
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return publishedTime(ve)
+		}
+	}
+	return time.Time{}, false
+}
+
+// gomodInfoWithTime sets Time in a stored .info document to the recorded
+// publish time, keeping every other field. The stored document is upstream's
+// own, so the two normally agree; the manifest is what every hosted index
+// answers from, and a .info disagreeing with the packument and the simple page
+// would give one module two ages. A document that does not parse is passed
+// through as it is, since the go command reports that better than this can.
+func gomodInfoWithTime(body []byte, published time.Time) []byte {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
+		return body
+	}
+	ts, err := json.Marshal(published.Format(time.RFC3339))
+	if err != nil {
+		return body
+	}
+	doc["Time"] = ts
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // gomodVersionFromFile recovers the manifest version from a proxy filename.

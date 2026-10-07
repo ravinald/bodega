@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -154,10 +155,15 @@ func TestBulkImportRecordsTheAdmission(t *testing.T) {
 }
 
 // TestProxyFillRecordsTheAdmission is requirement 4: a proxied version is
-// held to import's per-version checks before the fetch, refused with the
-// allow-list's status, and its row gains the object key once the digest is
-// pinned.
+// held to import's per-version checks before the fetch, refused through the
+// renderer an allow-list refusal goes through, and its row gains the object
+// key once the digest is pinned.
 func TestProxyFillRecordsTheAdmission(t *testing.T) {
+	// TestMain stubs the fill's checkers out; these cases need the real OSV
+	// gate, which gateNpmOSV keeps offline.
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
 	for _, tc := range admissionCases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := proxyingServer(t)
@@ -167,12 +173,23 @@ func TestProxyFillRecordsTheAdmission(t *testing.T) {
 			up.route(tarball, "tarball bytes "+tc.version)
 			s.cfg.NpmUpstream = up.ts.URL
 
-			status, body := getStatusAndBody(t, s, "/npm"+tarball)
+			rec := doRequest(s, http.MethodGet, "/npm"+tarball, nil)
+			status, body := rec.Code, rec.Body.String()
 			row := assertAdmission(t, s, tc, "")
 			key := manifest.NpmTarballKey("minimist", tc.version)
 			if tc.decision == audit.AdmissionPolicyBlocked {
-				if status != http.StatusForbidden || strings.TrimSpace(body) != "upstream blocked by osv policy" {
-					t.Errorf("refusal = %d %q, want 403 naming the osv policy", status, body)
+				if status != http.StatusForbidden {
+					t.Errorf("refusal = %d %q, want 403", status, body)
+				}
+				inc := refusalIncident(t, rec.Header(), checkOSV)
+				events, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+				if err != nil {
+					t.Fatalf("query: %v", err)
+				}
+				if !slices.ContainsFunc(events, func(e audit.StoredEvent) bool {
+					return e.Status == audit.CachePolicyViolation && strings.Contains(e.Details, `"incident":"`+inc+`"`)
+				}) {
+					t.Errorf("no policy_violation event carries the refusal's incident %s: %+v", inc, events)
 				}
 				if slices.Contains(up.paths(), tarball) {
 					t.Errorf("a refused version was fetched from upstream: %v", up.paths())
@@ -204,10 +221,11 @@ func TestProxyFillRecordsAnAllowListRefusal(t *testing.T) {
 	up := newRecordingUpstream(t)
 	s.cfg.NpmUpstream = up.ts.URL
 
-	status, body := getStatusAndBody(t, s, "/npm/minimist/-/minimist-1.2.8.tgz")
-	if status != http.StatusForbidden || strings.TrimSpace(body) != "upstream blocked by allow-list" {
-		t.Fatalf("refusal = %d %q, want the allow-list's 403", status, body)
+	rec := doRequest(s, http.MethodGet, "/npm/minimist/-/minimist-1.2.8.tgz", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("refusal = %d %q, want the allow-list's 403", rec.Code, rec.Body.String())
 	}
+	refusalIncident(t, rec.Header(), checkAllowList)
 	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgName: "minimist"})
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("Admissions = %d rows, %v; want 1", len(rows), err)

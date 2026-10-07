@@ -142,6 +142,13 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 		return out
 	}
 
+	dated := admit.Result{}
+	admit.RecordPublished(ctx, pm, existing, &dated)
+	out.Warnings = append(out.Warnings, dated.Warnings...)
+	for _, warning := range dated.Warnings {
+		s.logger.Warn("manifest imported with a warning", "type", pm.Type, "name", pm.Name, "warning", warning)
+	}
+
 	target := pm
 	outcome := ImportImported
 	if existing != nil {

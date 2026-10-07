@@ -27,6 +27,14 @@ if [ "${E2E_DRY_RUN:-no}" != yes ] &&
 fi
 
 E2E_HOST=server
+
+# The hosted npm entries were fetched by whatever run first stored them, which
+# may predate published_at. The backfill dates them before the restart below
+# loads the manifests, so SRV-AGE reads what a fetch today would record.
+e2e_bodega server "build fetch npm --backfill-published" || true
+check_eq SRV-AGE-01 "the backfill dates every hosted npm version" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_fetch.go:102" "bodega build fetch npm --backfill-published" "$E2E_RC"
+
 e2e_config_set server '.proxy_cache_enabled = false' || true
 e2e_restart server || true
 check_eq SRV-01 "the server restarts with proxy caching off" 0 "$E2E_RC" \
@@ -79,6 +87,69 @@ e2e_index_check SRV-ART-npm "npm serves the tarball" \
 	"/npm/color-convert/-/color-convert-2.0.1.tgz" "internal/server/npm.go:21"
 e2e_index_check SRV-ART-cargo "cargo serves the crate" \
 	"/cargo/form_urlencoded/1.2.2/download" "internal/server/cargo.go:122"
+
+# ---- client-side release-age cooldown -------------------------------------
+#
+# npm reads time[<version>] for min-release-age and treats a version with no
+# entry as old enough, so an undated packument passes every cooldown and only
+# the refusal proves the time is served. The client's own npm is Ubuntu's 9.2,
+# which predates the setting; 11.21.0 is installed into a scratch prefix from
+# the public registry, because it is the client tool under test and not a
+# package bodega serves. The age is read off the served packument rather than
+# assumed, so the two settings straddle whatever bodega published.
+
+E2E_HOST=client
+AGE_ROOT=/tmp/e2e-release-age
+e2e_on client "rm -rf $AGE_ROOT && mkdir -p $AGE_ROOT && \
+	npm install --silent --no-audit --no-fund --prefix $AGE_ROOT/npm11 --cache $AGE_ROOT/npm11-cache npm@11.21.0 >/dev/null 2>&1 && \
+	$AGE_ROOT/npm11/node_modules/.bin/npm --version" || true
+check_eq SRV-AGE-02 "npm 11.21.0 is available on the client" "11.21.0" "$E2E_OUT" \
+	"" "npm install --prefix $AGE_ROOT/npm11 npm@11.21.0" "$E2E_RC"
+
+e2e_on client "curl -s --max-time 30 '$E2E_BASE_URL/npm/color-convert' | python3 -c '
+import datetime, json, sys
+t = json.load(sys.stdin).get(\"time\", {}).get(\"2.0.1\")
+if t:
+    published = datetime.datetime.fromisoformat(t.replace(\"Z\", \"+00:00\"))
+    print((datetime.datetime.now(datetime.timezone.utc) - published).days)
+'" || true
+age_days="$E2E_OUT"
+# A dry run reads no packument; a placeholder walks the plan through the
+# install commands instead of the branch that reports a missing time.
+[ "${E2E_DRY_RUN:-no}" = yes ] && age_days=0
+check_matches SRV-AGE-03 "the hosted packument dates color-convert@2.0.1" '^[0-9]+$' "$age_days" \
+	"internal/server/npm.go:288" "curl $E2E_BASE_URL/npm/color-convert | jq '.time[\"2.0.1\"]'"
+
+# e2e_age_install <min-release-age days> — a fresh project and cache per run, so
+# neither attempt can answer from what the other fetched.
+e2e_age_install() {
+	e2e_on client "rm -rf $AGE_ROOT/proj $AGE_ROOT/cache && mkdir -p $AGE_ROOT/proj && cd $AGE_ROOT/proj && \
+		$AGE_ROOT/npm11/node_modules/.bin/npm install --no-audit --no-fund --cache $AGE_ROOT/cache \
+		--registry '$E2E_BASE_URL/npm' --min-release-age=$1 color-convert@2.0.1 2>&1 | tail -8"
+}
+
+if [ -n "$age_days" ] && [ "$age_days" -ge 0 ] 2>/dev/null; then
+	e2e_age_install "$((age_days + 30))" || true
+	check_ne SRV-AGE-04 "npm refuses a hosted version younger than --min-release-age" 0 "$E2E_RC" \
+		"internal/server/npm.go:332" "npm install --min-release-age=$((age_days + 30)) color-convert@2.0.1" "$E2E_RC"
+	check_contains SRV-AGE-05 "the refusal names the release date, not a transport failure" \
+		"with a date before" "$E2E_OUT$E2E_ERR" "internal/server/npm.go:288" \
+		"npm install --min-release-age=$((age_days + 30)) color-convert@2.0.1" "$E2E_RC"
+
+	e2e_age_install 1 || true
+	check_eq SRV-AGE-06 "npm installs a hosted version older than --min-release-age" 0 "$E2E_RC" \
+		"internal/server/npm.go:288" "npm install --min-release-age=1 color-convert@2.0.1" "$E2E_RC"
+	e2e_on client "test -f $AGE_ROOT/proj/node_modules/color-convert/package.json && echo present" || true
+	check_eq SRV-AGE-07 "the cooldown install lands in node_modules" "present" "$E2E_OUT" \
+		"internal/server/npm.go:21" "test -f node_modules/color-convert/package.json"
+else
+	for id in SRV-AGE-04 SRV-AGE-05 SRV-AGE-06 SRV-AGE-07; do
+		e2e_record "$id" FAIL "npm honors --min-release-age against a hosted package" \
+			"a publish time in the hosted packument" "$(e2e_excerpt "$age_days")" \
+			"curl $E2E_BASE_URL/npm/color-convert" 0 "internal/server/npm.go:288"
+	done
+fi
+e2e_on client "rm -rf $AGE_ROOT" || true
 
 # pypi's wheel filename is resolved rather than assumed: the index is the
 # client's only route to it, and asserting a name the index does not publish
@@ -175,4 +246,4 @@ e2e_http client "/no-such-path" || true
 check_eq SRV-05 "an unknown path under the web root is a 404" "404" "$E2E_OUT" \
 	"internal/server/web.go:14" "curl $E2E_BASE_URL/no-such-path"
 
-unset wheel fbrepo fbpath
+unset wheel fbrepo fbpath AGE_ROOT age_days

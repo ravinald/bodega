@@ -166,14 +166,40 @@ func TestDistfilesRefusesBytesDistinfoDidNotPin(t *testing.T) {
 		"other size":             distfileBody + " and a trailer",
 	} {
 		t.Run(name, func(t *testing.T) {
-			ts, mem, _ := distfilesFixture(t, distfilesPortsTree(t), body)
-			code, got := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
-			if code != http.StatusBadGateway || !strings.Contains(got, "do not match the ports tree's distinfo") {
-				t.Fatalf("GET = %d %q, want 502 naming the distinfo mismatch", code, got)
+			dbPath := filepath.Join(t.TempDir(), "audit.db")
+			ts, mem, _ := distfilesFixtureIn(t, distfilesPortsTree(t), body, func(c *config.Config) { c.AuditDB = dbPath })
+			resp, err := http.Get(ts.URL + "/distfiles/pcpustat/1.6.tar.bz2")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			got := string(raw)
+			if resp.StatusCode != http.StatusBadGateway || !strings.Contains(got, "do not match the ports tree's distinfo") {
+				t.Fatalf("GET = %d %q, want 502 naming the distinfo mismatch", resp.StatusCode, got)
+			}
+			inc := refusalIncident(t, resp.Header, checkChecksum)
+			if b := bodyIncident(t, got, checkChecksum); b != inc {
+				t.Errorf("body incident %s, header incident %s", b, inc)
 			}
 			if info, _ := mem.Head(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); info != nil && info.Exists {
 				t.Error("cached bytes that disagree with distinfo")
 			}
+			adb, err := audit.OpenReadOnly(dbPath)
+			if err != nil {
+				t.Fatalf("open audit db: %v", err)
+			}
+			defer func() { _ = adb.Close() }()
+			rows, err := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			for _, row := range rows {
+				if row.Status == audit.CacheChecksumMismatch && strings.Contains(row.Details, `"incident":"`+inc+`"`) {
+					return
+				}
+			}
+			t.Errorf("no checksum_mismatch row carries incident %s: %+v", inc, rows)
 		})
 	}
 }

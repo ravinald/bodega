@@ -1101,6 +1101,7 @@ func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix str
 func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	summary := fetchPypi(cfg, store)
 	if !summary.HasFailures() {
+		cfg.stampPypiPublished(context.Background(), store)
 		return summary
 	}
 

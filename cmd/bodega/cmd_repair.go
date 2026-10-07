@@ -297,7 +297,7 @@ func repairGitDepLinks(ctx context.Context, bcfg *builder.Config, store *manifes
 			}
 
 			// No edges -- check if the source exists on disk.
-			worktree, wtErr := builder.GitWorktreePath(bcfg.BuildRoot, name, ve.Ref)
+			worktree, wtErr := builder.GitWorktreePath(bcfg.RootFor(manifest.TypeGit), name, ve.Ref)
 			if wtErr != nil || worktree == "" {
 				_, _ = fmt.Fprintf(out, "  SKIP: %s source not on disk (fetch first)\n", parentRef)
 				continue

@@ -121,6 +121,20 @@ risk:
   matches the first one, so a compromised _first_ fetch is served faithfully
   and forever with `checksum_verified` beside it. The cooldown is what makes
   the first fetch late enough to be safe.
+- **A package already reported as malware.** OSV carries OpenSSF's
+  malicious-packages records under `MAL-` ids, and bodega blocks a version any
+  of them names, along with any record whose `database_specific` marks the
+  package malicious, on every OSV-covered ecosystem with no configuration: at
+  import, on a proxy cache miss for `npm`, `pypi`, `gomod` and `cargo`, and on
+  `bodega policy osv rescan`, which hides a version a newly published record
+  names. The limit is in what the feed is: only malware someone has already
+  identified and reported is caught. A package published an hour ago that
+  nobody has examined is not on the list, and bodega does not look inside a
+  package to decide for itself; the cooldown above is what covers that window.
+  When the OSV source is unreachable or stale, a version with no earlier
+  malware verdict is admitted with a warning rather than refused, so an outage
+  does not stop every install. See [Malware
+  records](usage.md#malware-records).
 - **A poisoned first fetch of a ports distfile.** The `distfiles` type does
   not pin what it first fetched. Every distfile's SHA-256 and size are already
   in the ports tree's `distinfo`, which bodega did not write, and a fetch is
@@ -399,6 +413,19 @@ defence against:
   [runtime policy](usage.md#s3-setup) `bodega init --print-policy=runtime`
   prints is the minimum), short-lived credentials, audit-log forwarding
   off-box.
+- **A stolen attestation signing key.** Whoever holds `attest-signing.key`
+  can sign an attestation saying bodega admitted any artifact under any
+  policy, and every verifier that pins that key ID accepts it. That gets an
+  artifact bodega never saw past a CI gate or an audit that trusts bodega's
+  attestations. It does not sign an apt `InRelease` or a pkg catalogue, which
+  use separate keys, and it changes nothing bodega serves. The key is loaded
+  into the serving process, so a compromised bodega server is a stolen
+  attestation key, and so is a `bodega build run` that executes upstream build
+  steps on the same host; keeping the key from any process that runs
+  dependency code needs a separate signer, which bodega does not have.
+  `bodega attest key retire` erases the private half from the file and nowhere
+  else, so a copy taken earlier keeps signing. Retiring is not revocation:
+  verifiers stop trusting a stolen key only when they drop its key ID.
 - **Anything inside an opaque distribution bundle.** When a package format
   bundles its own dependencies in a way bodega cannot inspect (see below),
   the contents of that bundle are outside bodega's allow-list. Bodega may
@@ -410,9 +437,13 @@ defence against:
   `apt`, `binary`, `git` or `helm` at all, because those have no upstream
   publish timestamp to date a version against. Every other control is off on a
   new install: the upstream allow-list is empty, which accepts every
-  candidate, and the OSV gate has no rows until an operator adds one. An
-  install created before the seed shipped gains nothing on upgrade, by
-  design: a new default must not change what a running fleet enforces.
+  candidate, and the OSV gate checks no advisory until an operator adds a row.
+  An install created before the seed shipped gains nothing on upgrade, by
+  design: a new default must not change what a running fleet enforces. The OSV
+  malware action is the one exception. It blocks on an upgraded install as on
+  a new one, because serving a package already reported as malware is not a
+  posture anyone chose, and an install with nothing synced warns on every
+  import until `bodega policy osv sync` runs.
 - **A ports build reaching the internet through `MASTER_SITE_OVERRIDE`.**
   Serving distfiles over HTTP preempts a port's own sites; it does not replace
   them. `do-fetch.sh` falls through to the port's `MASTER_SITES` on any answer

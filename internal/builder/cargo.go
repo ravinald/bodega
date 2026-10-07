@@ -280,6 +280,10 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: ok\n", pm.Name, ve.Version)
 					cfg.StampCargoEntry(store, name, ve)
 					stampFetchRecord(context.Background(), store, manifest.TypeCargo, name, ve, dest, computed, deps)
+					if ve.PublishedAt == "" {
+						published, pErr := cfg.upstreamPublishedAt(ctx, manifest.TypeCargo, pm.Name, ve.Version, "")
+						stampPublishedAt(ctx, out, store, manifest.TypeCargo, name, pm.Name+"@"+ve.Version, ve, published, pErr)
+					}
 				}
 			}
 

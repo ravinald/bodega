@@ -546,3 +546,37 @@ func TestOSVCheck_MatchBesideUnreadRecordIsNotDated(t *testing.T) {
 		t.Errorf("the stale date must not survive a partial read, got %q", got)
 	}
 }
+
+// TestOSVRescan_ReportsNewMalwareOnce: a MAL- record synced after admission is
+// new on the first run and seen on the second, which is what keeps a rescan
+// from re-hiding a version an operator chose to unhide. The record comes out
+// of the local database, so this also covers the sync keeping the summary.
+func TestOSVRescan_ReportsNewMalwareOnce(t *testing.T) {
+	dir := t.TempDir()
+	mal := npmAdvisory("MAL-2026-42", "minimist", "1.0.0", "9.9.9")
+	mal["summary"] = "Malicious code in minimist"
+	ck := rescanChecker(dbWithNpm(t, dir, mal))
+	ve := &manifest.VersionEntry{Version: "1.2.0"}
+
+	ch := ck.Rescan(context.Background(), npmPkg(), ve)
+	if len(ch.NewMalware) != 1 || ch.NewMalware[0] != "MAL-2026-42" {
+		t.Fatalf("first run: %+v", ch)
+	}
+	ch = ck.Rescan(context.Background(), npmPkg(), ve)
+	if len(ch.Malware) != 1 || len(ch.NewMalware) != 0 {
+		t.Errorf("second run should see the record and call none of it new: %+v", ch)
+	}
+}
+
+// TestOSVDatabase_KeepsDatabaseSpecificMalware: a record with no MAL- id is
+// still malware when database_specific says so, and the flag survives sync.
+func TestOSVDatabase_KeepsDatabaseSpecificMalware(t *testing.T) {
+	rec := npmAdvisory("GHSA-xxxx-yyyy-zzzz", "minimist", "1.0.0", "9.9.9")
+	rec["database_specific"] = map[string]any{"malicious-packages-origins": []any{map[string]any{"source": "ossf"}}}
+	ck := NewOSVChecker(&fakeOSVStore{})
+	ck.LocalDB = dbWithNpm(t, t.TempDir(), rec)
+	r := ck.Check(context.Background(), npmPkg(), &manifest.VersionEntry{Version: "1.2.0"})
+	if r.Action != ActionBlock || !strings.Contains(r.Reason, "GHSA-xxxx-yyyy-zzzz") {
+		t.Errorf("database_specific malware from the local database = block, got %+v", r)
+	}
+}

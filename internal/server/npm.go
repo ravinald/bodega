@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -41,11 +42,11 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil {
 			if isPackageHidden(pm) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, "")
 				return
 			}
 			if isVersionHidden(pm, reqVersion) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, reqVersion)
 				return
 			}
 			// 403 (not 404) below — the version exists upstream, we're
@@ -53,8 +54,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
 				if !versionAllowed(baseVer, reqVersion, vc) {
-					s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
-					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
 					return
 				}
 			}
@@ -64,6 +64,13 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		}
 
 		upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
+		// Both upstream-filled branches below, and neither of the others: a
+		// hosted tarball was admitted on import, and refusing it would be the
+		// mid-install 403 the index filter exists to prevent.
+		proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+		if proxied && s.refuseWithheld(w, r, manifest.TypeNpm, pkgName, reqVersion) {
+			return
+		}
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
@@ -105,20 +112,19 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	if pm != nil {
 		if isPackageHidden(pm) {
-			http.NotFound(w, r)
+			s.refuseHidden(w, r, manifest.TypeNpm, pkgName, "")
 			return
 		}
 		// The same two refusals the tarball branch makes, in the same shape:
 		// 404 for a hidden version, 403 for one the constraint excludes.
 		if reqVersion != "" {
 			if isVersionHidden(pm, reqVersion) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, reqVersion)
 				return
 			}
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, reqVersion, vc) {
-				s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
-				http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+				s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
 				return
 			}
 		}
@@ -151,6 +157,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + fullPath
 	s3Key := manifest.NpmPackumentKey(fullPath)
 	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: fullPath, permit: permit}
+	if reqVersion == "" {
+		rw.withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
@@ -195,11 +204,12 @@ func isVersionHidden(pm *manifest.PackageManifest, version string) bool {
 // serveManifestPackument answers a packument out of the manifest store, with
 // no upstream in the path at all.
 //
-// What bodega records about a version is the version, its checksum and where
-// its tarball lives. Everything else an upstream packument carries —
-// dependencies, engines, publish times — is absent rather than invented: a
-// client resolves against this document, and a dependency list bodega guessed
-// would be a claim nobody uploaded. A hosted package with dependencies needs
+// What bodega records about a version is the version, its checksum, where
+// its tarball lives, and what the fetch read: dependencies, executables and
+// the upstream publish time. Anything else an upstream packument carries is
+// absent rather than invented: a client resolves against this document, and a
+// dependency list or a publish time bodega guessed would be a claim nobody
+// uploaded. A hosted package with dependencies needs
 // each of them hosted too, which is the same requirement the tarball route has
 // always had.
 //
@@ -235,6 +245,19 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	versions, _ := doc["versions"].(map[string]any)
+	npmTimeBounds(doc)
+
+	// A proxy-mode entry's tarballs are filled from upstream through the
+	// withheld-version gate, so its packument withholds the same versions:
+	// listed, they are what npm picks and then gets refused. Ahead of latest
+	// so the tag names a version that survived.
+	var withhold *indexWithhold
+	if reqVersion == "" && packageMode(pm) == manifest.ModeProxy {
+		withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
+	if withhold != nil {
+		withhold.versionsMap(versions)
+	}
 
 	if reqVersion != "" {
 		entry, ok := versions[reqVersion]
@@ -260,6 +283,9 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "packument generation failed", http.StatusInternalServerError)
 		return
 	}
+	if withhold != nil {
+		withhold.finish(w.Header())
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	//nolint:gosec // G705: body is the generated JSON packument; Content-Type is set by the handler.
@@ -276,9 +302,13 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 // skipped rather than published as a version literally called "latest".
 func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest, logger *slog.Logger) map[string]any {
 	versions := map[string]any{}
+	times := map[string]any{}
 	for _, ve := range pm.Versions {
 		if ve.Version == "" || isNpmFloatingVersion(ve.Version) {
 			continue
+		}
+		if t, ok := publishedTime(ve); ok {
+			times[ve.Version] = t.Format(npmTimeLayout)
 		}
 		dist := map[string]any{
 			"tarball": base + "/" + npmEscapeName(pkgName) + "/-/" + npmTarballFilename(pkgName, ve.Version),
@@ -303,10 +333,49 @@ func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest
 		versions[ve.Version] = entry
 	}
 	doc := map[string]any{"name": pkgName, "versions": versions}
+	if len(times) > 0 {
+		doc["time"] = times
+	}
 	if pm.Description != "" {
 		doc["description"] = pm.Description
 	}
 	return doc
+}
+
+// npmTimeLayout is the form npmjs.org writes every time entry in. One fixed
+// width also makes the entries order as strings, which npmTimeBounds relies on.
+const npmTimeLayout = "2006-01-02T15:04:05.000Z"
+
+// npmTimeBounds sets time.created and time.modified to the earliest and latest
+// version time the document still carries, and drops time when it carries
+// none. It runs after the filters so neither bound can date a version the
+// caller was refused. A version with no recorded time stays out of time
+// altogether: npm reads a missing entry as old enough, so an invented one
+// would be the only way this document could lie to a release-age cooldown.
+func npmTimeBounds(doc map[string]any) {
+	times, ok := doc["time"].(map[string]any)
+	if !ok {
+		return
+	}
+	var first, last string
+	for v, t := range times {
+		ts, ok := t.(string)
+		if v == "created" || v == "modified" || !ok {
+			continue
+		}
+		if first == "" || ts < first {
+			first = ts
+		}
+		if ts > last {
+			last = ts
+		}
+	}
+	if first == "" {
+		delete(doc, "time")
+		return
+	}
+	times["created"] = first
+	times["modified"] = last
 }
 
 // isNpmFloatingVersion reports the dist-tag spellings the builder accepts in
@@ -473,9 +542,13 @@ type npmPackumentWriter struct {
 	// profile governs it. Applied before the tarball rewrite, so a version the
 	// profile refuses never acquires a bodega URL to be fetched by.
 	permit func(string) bool
-	status int
-	body   bytes.Buffer
-	tooBig bool
+	// withhold is the index filter's pass, nil when it is off for npm. It
+	// runs after the profile filter, so it dates only versions this host
+	// could have been shown.
+	withhold *indexWithhold
+	status   int
+	body     bytes.Buffer
+	tooBig   bool
 }
 
 func (p *npmPackumentWriter) WriteHeader(code int) {
@@ -518,6 +591,13 @@ func (p *npmPackumentWriter) flush() error {
 		if err != nil {
 			http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
 			return err
+		}
+		if p.withhold != nil {
+			if filtered, err = p.withhold.packument(filtered); err != nil {
+				http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
+				return err
+			}
+			p.withhold.finish(p.Header())
 		}
 		rewritten, err := rewriteNpmPackument(filtered, p.base, p.pkg)
 		if err != nil {
@@ -636,4 +716,18 @@ func npmEscapeName(name string) string {
 		parts[i] = url.PathEscape(seg)
 	}
 	return strings.Join(parts, "/")
+}
+
+// publishedTime parses a version's recorded publish time into UTC. A value
+// that does not parse is treated as absent, since publishing it would hand a
+// client a time it cannot read and some clients refuse the whole document.
+func publishedTime(ve manifest.VersionEntry) (time.Time, bool) {
+	if ve.PublishedAt == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, ve.PublishedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
 }

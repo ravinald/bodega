@@ -243,7 +243,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	)
 
 	// Top-level commands. A group classified here carries its whole subtree:
-	// apt, freebsd, token, acl, policy and discover write state the server
+	// apt, freebsd, attest, token, acl, policy and discover write state the server
 	// re-reads on its own cadence or on the reload their runbooks already
 	// name.
 	root.AddCommand(
@@ -252,6 +252,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		noReloadSignal(auditParent),
 		noReloadSignal(newAptCmd(gf)),
 		noReloadSignal(newFreeBSDCmd(gf)),
+		noReloadSignal(newAttestCmd(gf)),
 		noReloadSignal(newTokenCmd(gf)),
 		noReloadSignal(newACLCmd(gf)),
 		noReloadSignal(newIdentityCmd(gf)),

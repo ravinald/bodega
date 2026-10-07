@@ -143,6 +143,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		}
 		return
 	}
+	if !s.proxyMalwareGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable) {
+		return
+	}
 	// Before the resolve and the fetch, so a refused version's bytes never
 	// leave upstream; the allow-list above has already ruled on the name.
 	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable)
@@ -270,8 +273,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// have already handed the client an artifact by the time the mismatch is
 	// known, and a truncated response is not a refusal.
 	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
-		s.logger.Error("checksum verification failed", "key", s3Key, "error", err)
-		http.Error(w, "checksum verification failed — upstream content may be tampered", http.StatusBadGateway)
+		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
+		s.logger.Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
+		f.write(w, r)
 		return
 	}
 	s.pinFill(ctx, fill, s3Key, immutable)
@@ -683,12 +687,14 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 
 	// Verify against stored checksum.
 	if stored.Value != computed {
+		incident := audit.NewIncidentID()
 		// Record the mismatch in the audit trail.
 		if s.auditDB != nil {
 			details, _ := json.Marshal(map[string]string{
 				"expected":   stored.Value,
 				"computed":   computed,
 				"object_key": s3Key,
+				"incident":   incident,
 			})
 			_ = s.auditDB.Record(ctx, audit.Event{
 				EventType:  audit.EventCache,
@@ -699,7 +705,8 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 				Details:    string(details),
 			})
 		}
-		return fmt.Errorf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))
+		return &checksumMismatchError{incident: incident,
+			msg: fmt.Sprintf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))}
 	}
 
 	s.logger.Debug("checksum verified", "key", s3Key)
@@ -820,31 +827,20 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		if upstreamURL != "" {
 			blocked = append(blocked, "url", upstreamURL)
 		}
+		f := allowListRefusal(regType, policyCandidate, discoveryPkgName, versionFromKey(s3Key))
+		blocked = append(blocked, "incident", f.incident)
 		s.logger.Warn("upstream blocked by policy", blocked...)
-		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
-		refuseByPolicy(w, audit.CheckAllowList)
+		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL, f.incident)
+		f.write(w, r)
 		return decision, false
 	}
 	return decision, true
 }
 
-// refuseByPolicy answers a fetch an admission check refused. Every check
-// answers with the same status and the same plain-text form, so a client that
-// handles the allow-list's 403 handles an age or OSV refusal the same way;
-// only the check named in the body differs.
-func refuseByPolicy(w http.ResponseWriter, check string) {
-	msg := "upstream blocked by allow-list"
-	if check != audit.CheckAllowList {
-		msg = "upstream blocked by " + check + " policy"
-	}
-	http.Error(w, msg, http.StatusForbidden)
-}
-
 // fetchGatedTypes are the types whose proxy fill runs the age and OSV checks:
 // the ones the age gate can date, which are also the ones whose storage key
-// names the version being fetched. A freebsd key's version slot holds the ABI
-// and an apt pool key's the binary's version rather than the one an advisory
-// is filed against, and checking either would answer for the wrong thing.
+// names the version being fetched. A freebsd key's version slot holds the ABI,
+// and checking an advisory against that would answer for the wrong thing.
 var fetchGatedTypes = map[string]bool{
 	manifest.TypeNpm:   true,
 	manifest.TypePypi:  true,
@@ -924,11 +920,34 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		s.logger.Warn("upstream fetch admitted with a policy warning", "type", fill.typ, "package", fill.name,
 			"version", fill.version, "check", warn.Check, "reason", warn.Reason)
 	}
+	s.recordFillPolicyEvent(r, fill, res)
 	if res.Block == nil {
 		return fill, true
 	}
+	f := admitRefusal(fill.typ, fill.name, admitBlock{check: res.Block.Check, version: fill.version,
+		incident: res.Incident, details: res.Block.Details})
 	s.logger.Warn("upstream fetch blocked by policy", "type", fill.typ, "package", fill.name,
-		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason)
+		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
+	f.write(w, r)
+	return fill, false
+}
+
+// recordFillPolicyEvent writes the policy_warn or policy_violation cache event
+// a fill's warn or block leaves beside its admission row, in the form import's
+// create event takes, so the event log reads the same whichever path admitted
+// the version. A refusal stands whether or not the row lands.
+func (s *Server) recordFillPolicyEvent(r *http.Request, fill fillAdmission, res admit.FetchResult) {
+	if res.AuditDetails == nil {
+		return
+	}
+	status := "policy_warn"
+	if res.Block != nil {
+		status = audit.CachePolicyViolation
+	}
+	details, err := json.Marshal(res.AuditDetails)
+	if err != nil {
+		details = []byte("{}")
+	}
 	ctx, cancel := auditContext(r)
 	defer cancel()
 	if err := s.auditDB.Record(ctx, audit.Event{
@@ -936,15 +955,14 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		PkgType:    fill.typ,
 		PkgName:    fill.name,
 		PkgVersion: fill.version,
-		Status:     audit.CachePolicyViolation,
-		Details:    truncateField(res.Block.Check+": "+res.Block.Reason, maxDetailField),
+		Status:     status,
+		Details:    string(details),
+		ClientIP:   ClientIP(r),
 		Identity:   Identity(r),
 	}); err != nil {
-		s.logger.Error("audit write failed, denial not recorded — still refusing",
-			"type", fill.typ, "package", fill.name, "version", fill.version, "error", err)
+		s.logger.Error("audit write failed, fill policy event not recorded",
+			"type", fill.typ, "package", fill.name, "version", fill.version, "status", status, "error", err)
 	}
-	refuseByPolicy(w, res.Block.Check)
-	return fill, false
 }
 
 // recordFillRefusal writes the admission row for an immutable fetch the
@@ -989,6 +1007,102 @@ func (s *Server) pinAdmission(ctx context.Context, typ, name, version, key strin
 	}
 }
 
+// proxyMalwareGate refuses a cache fill for a version OSV records as malware,
+// under the ecosystem's malware action, and returns false once it has written
+// the response. It runs where the allow-list does, before the resolver, so a
+// refused version costs no upstream read.
+//
+// It runs ahead of versionPolicyGate and answers to the malware action alone,
+// because that gate skips itself when no audit database is open and a known
+// malicious package must be refused either way. A miss is the one moment
+// bodega decides to take a version in,
+// so a cache hit is not re-checked: a version already cached when its record
+// was published is what 'bodega policy osv rescan' is for. Only the language
+// ecosystems are checked, because they are the ones OSV publishes malware
+// records for, and the version comes off the object key, so an artifact whose
+// key names none (an index, a packument) passes through.
+//
+// A refusal writes the fill's admission row here, since versionPolicyGate
+// never runs to write it.
+func (s *Server) proxyMalwareGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, discoveryPkgName, s3Key, decision string, immutable bool) bool {
+	if policy.OSVEcosystemFor(regType) == "" {
+		return true
+	}
+	_, keyName, version := manifest.ParseKey(s3Key)
+	name := discoveryPkgName
+	if name == "" {
+		name = keyName
+	}
+	if name == "" || version == "" {
+		return true
+	}
+	res := admit.OSVChecker(s.cfg, s.auditDB).CheckMalware(r.Context(),
+		&manifest.PackageManifest{Name: name, Type: regType},
+		&manifest.VersionEntry{Version: version})
+	switch res.Action {
+	case policy.ActionBlock:
+		f := osvRefusal(regType, name, version, res.Details)
+		s.logger.Warn("upstream blocked by OSV malware policy", "type", regType, "package", name, "version", version,
+			"reason", res.Reason, "incident", f.incident)
+		s.recordMalwareRefusal(r, regType, name, version, s3Key, res, f.incident)
+		if s.auditDB != nil && immutable {
+			ctx, cancel := auditContext(r)
+			fill := fillIdentity(regType, discoveryPkgName, s3Key)
+			admit.Fetch(ctx, s.auditDB, []policy.VersionChecker{verdict{res}}, fill.typ, fill.name,
+				manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy},
+				allowListVerdict(decision, policyCandidate), admit.Who{Identity: Identity(r)}, "")
+			cancel()
+		}
+		f.write(w, r)
+		return false
+	case policy.ActionWarn:
+		s.logger.Warn("OSV malware check could not clear the fill", "type", regType, "package", name, "version", version, "reason", res.Reason)
+	}
+	return true
+}
+
+// verdict is a check already run, replayed as a VersionChecker so admit.Fetch
+// records it rather than running the check a second time.
+type verdict struct{ res policy.Result }
+
+func (v verdict) Check(context.Context, *manifest.PackageManifest, *manifest.VersionEntry) policy.Result {
+	return v.res
+}
+
+// recordMalwareRefusal writes the audit row for one fill the malware action
+// refused. The refusal stands whether or not the row lands, for the reason
+// recordPolicyViolation gives.
+func (s *Server) recordMalwareRefusal(r *http.Request, regType, name, version, s3Key string, res policy.Result, incident string) {
+	if s.auditDB == nil {
+		return
+	}
+	details, err := json.Marshal(map[string]any{
+		"key":      truncateField(s3Key, maxDetailField),
+		"incident": incident,
+		"malware":  res.Details["malware"],
+		"reason":   truncateField(res.Reason, maxDetailField),
+	})
+	if err != nil {
+		details = []byte("{}")
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType:  audit.EventCache,
+		PkgType:    regType,
+		PkgName:    name,
+		PkgVersion: version,
+		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
+		Status:     audit.CacheMalwareBlocked,
+		Details:    string(details),
+	}); err != nil {
+		s.logger.Error("audit write failed, malware refusal not recorded — still refusing",
+			"event_type", audit.EventCache, "status", audit.CacheMalwareBlocked,
+			"type", regType, "package", name, "version", version, "error", err)
+	}
+}
+
 // recordUpstreamAttempt writes the discovery row for one permitted upstream
 // attempt, so operators can review what the fleet reached for and later promote
 // a captured host or package to an allow-list rule.
@@ -1014,7 +1128,7 @@ func (s *Server) recordUpstreamAttempt(r *http.Request, regType, upstreamURL, po
 // cannot be written is not a reason to let a blocked upstream through. It is a
 // reason to say so loudly, naming the event, so a reconstruction from the log
 // is possible when the table is missing the row.
-func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL string) {
+func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL, incident string) {
 	if s.auditDB == nil {
 		return
 	}
@@ -1025,12 +1139,12 @@ func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate
 		PkgType:   regType,
 		PkgName:   policyCandidate,
 		Status:    audit.CachePolicyViolation,
-		Details:   fmt.Sprintf("url=%s", upstreamURL),
+		Details:   fmt.Sprintf("url=%s incident=%s", upstreamURL, incident),
 	}); err != nil {
 		s.logger.Error("audit write failed, denial not recorded — still refusing",
 			"event_type", audit.EventCache, "status", audit.CachePolicyViolation,
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL,
-			"error", err)
+			"incident", incident, "error", err)
 	}
 }
 

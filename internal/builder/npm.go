@@ -257,6 +257,12 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					cfg.StampNpmEntry(store, name, ve)
 					stampFetchRecord(context.Background(), store, manifest.TypeNpm, name, ve, dest, computed, pj.Dependencies)
 					stampNpmBin(context.Background(), store, name, ve, pj.Bin)
+					// A dist-tag entry stays floating, so a time read for the
+					// version it resolved to today would date tomorrow's too.
+					if distTag == "" && ve.PublishedAt == "" {
+						published, pErr := cfg.upstreamPublishedAt(ctx, manifest.TypeNpm, pm.Name, fetchVe.Version, registry)
+						stampPublishedAt(ctx, out, store, manifest.TypeNpm, name, pm.Name+"@"+fetchVe.Version, ve, published, pErr)
+					}
 				}
 			}
 

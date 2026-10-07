@@ -34,6 +34,15 @@ CREATE_BODY='{"config_version":1,"name":"e2e-acl-probe","type":"binary","version
 E2E_HOST=server
 e2e_bodega server "pkg delete binary e2e-acl-probe" >/dev/null 2>&1 || true
 
+# ACC-10 creates the probe, so from here on leaving by any road deletes it.
+# cleanup is run.sh's own exit trap, which this one wraps rather than replaces.
+acc_probe_on_exit() {
+	e2e_bodega server "pkg delete binary e2e-acl-probe" >/dev/null 2>&1 || true
+	cleanup
+}
+trap acc_probe_on_exit EXIT
+trap 'exit 130' INT TERM
+
 # Every token an earlier suite or an earlier run left behind is revoked first.
 # ACC-05 asserts that widening the admin list is refused while no token exists,
 # and one surviving token makes that widening legal: the check then reports a
@@ -193,13 +202,18 @@ e2e_reload server || true
 # and one that never lands both read as "still accepted" on a single request,
 # and those are a documentation note and an incident respectively. The loop
 # records which of the two it is, and how long it took.
+#
+# The poll deletes a package no run ever creates. The bearer gate answers
+# before the handler, so a revoked token is 401 and a live one reaches the
+# handler and gets 404 with nothing written. Polling with the create re-made
+# e2e-acl-probe on every accepted request inside the refresh window.
 E2E_HOST=client
 revoked_after=""
 for waited in 0 5 10 15 20 25 30 35; do
 	[ "$waited" -gt 0 ] && sleep 5
-	e2e_on client "curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+	e2e_on client "curl -s -o /dev/null -w '%{http_code}' -X DELETE \
 		-H 'Authorization: Bearer $E2E_TOKEN' \
-		-d '$CREATE_BODY' '$E2E_BASE_URL/api/v1/packages/binary'" || true
+		'$E2E_BASE_URL/api/v1/packages/binary/e2e-acl-never-created'" || true
 	if [ "$E2E_OUT" = "401" ]; then
 		revoked_after="$waited"
 		break
@@ -207,7 +221,7 @@ for waited in 0 5 10 15 20 25 30 35; do
 done
 check_matches ACC-13 "a revoked token stops working within the ACL refresh window" \
 	'^[0-9]+$' "${revoked_after:-still accepted after 35s: $E2E_OUT}" \
-	"internal/server/middleware.go:776" "POST with the revoked token, polled to 35s"
+	"internal/server/middleware.go:776" "DELETE with the revoked token, polled to 35s"
 
 # ---- the deny list ---------------------------------------------------------
 #
@@ -254,5 +268,13 @@ e2e_reload server || true
 e2e_bodega server "acl admin list" || true
 check_lacks ACC-20 "the admin list is back to loopback" "$E2E_CLIENT_CIDR" "$E2E_OUT" \
 	"cmd/bodega/cmd_acl.go:246" "bodega acl admin list"
+
+e2e_bodega server "pkg delete binary e2e-acl-probe" >/dev/null 2>&1 || true
+trap cleanup EXIT
+trap - INT TERM
+e2e_on server "curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+	http://127.0.0.1:8080/api/v1/packages/binary/e2e-acl-probe" || true
+check_eq ACC-21 "the suite leaves no probe package behind" "404" "$E2E_OUT" \
+	"internal/server/server.go:1000" "GET /api/v1/packages/binary/e2e-acl-probe"
 
 unset CREATE_BODY client_status pepper_state pepper_readable revoked_after waited
