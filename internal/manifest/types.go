@@ -769,6 +769,19 @@ func ValidatePackageName(name string) error {
 	return nil
 }
 
+// ValidateDepPolicy rejects a dep_policy outside "", "none", "direct" and
+// "transitive". Readers compare the field against exact strings, so a
+// misspelling or a capital letter falls through to whichever branch the reader
+// checks last and imports a set nobody asked for while reporting success.
+// typ and name only label the error.
+func ValidateDepPolicy(typ, name, policy string) error {
+	switch policy {
+	case "", "none", "direct", "transitive":
+		return nil
+	}
+	return fmt.Errorf("%s/%s: unknown dep_policy %q; accepted values are \"none\" (the default when unset), \"direct\" and \"transitive\"", typ, name, policy)
+}
+
 // ValidateBinaryFilename rejects a binary entry's filename override unless it
 // is a clean relative path. Empty is allowed and means the URL's basename.
 //

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -55,6 +56,8 @@ func TestFetchGitHonorsDepPolicy(t *testing.T) {
 		{policy: "direct", wantImport: true},
 		{policy: "transitive", wantImport: true},
 		{policy: "drect", wantErr: true},
+		{policy: "trasnitive", wantErr: true},
+		{policy: "Direct", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run("policy="+tt.policy, func(t *testing.T) {
@@ -86,7 +89,7 @@ func TestFetchGitHonorsDepPolicy(t *testing.T) {
 					t.Fatalf("unknown dep_policy fetched: failures=%d results=%+v\n%s", sum.Failures, sum.Results, log.String())
 				}
 				msg := sum.Results[0].Err.Error()
-				for _, want := range []string{"git/demo", `"drect"`, `"none"`, `"direct"`, `"transitive"`} {
+				for _, want := range []string{"git/demo", strconv.Quote(tt.policy), `"none"`, `"direct"`, `"transitive"`} {
 					if !strings.Contains(msg, want) {
 						t.Errorf("error %q does not name %s", msg, want)
 					}

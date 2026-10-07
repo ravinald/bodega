@@ -300,6 +300,13 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if err := manifest.ValidateBinaryFilenames(pm); err != nil {
 		return err
 	}
+	// Only apt and git read dep_policy. Other types ignore it, so refusing a
+	// stray value there would reject a manifest whose behavior it cannot change.
+	if pm.Type == manifest.TypeApt || pm.Type == manifest.TypeGit {
+		if err := manifest.ValidateDepPolicy(pm.Type, pm.Name, pm.DepPolicy); err != nil {
+			return err
+		}
+	}
 	// A storage_policy naming nothing fails at the next upload, long after the
 	// edit that introduced it and with no obvious connection back to it.
 	if err := CheckBackendName(cfg, pm.StoragePolicy); err != nil {
