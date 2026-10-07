@@ -12,9 +12,13 @@ package admit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -292,6 +296,73 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb)}
 }
 
+// RecordPublished dates every version of pm that arrives without a
+// published_at, reading the registry its url names: the read a fetch makes, so
+// an imported version reaches the hosted indexes with a time a client's
+// release-age cooldown can evaluate. It runs whatever the age policy says,
+// because the indexes publish the time whether or not this server gates on it.
+//
+// It writes only what upstream answered. A version it cannot date stays
+// undated and is named in res.Warnings, and the import goes ahead: the
+// manifest is good either way. A published_at the caller supplied is kept, so
+// an exported manifest imported elsewhere is not re-read, and a version
+// existing already holds is skipped, because MergeVersions keeps that entry
+// over the incoming one. existing may be nil.
+//
+// A registry that cannot be reached is tried once per manifest, so an offline
+// import of a long version list costs one timeout rather than one per version.
+func RecordPublished(ctx context.Context, pm, existing *manifest.PackageManifest, res *Result) {
+	if !slices.Contains(policy.AgeEcosystems(), pm.Type) {
+		return
+	}
+	recordPublished(ctx, NewPublishReader(), pm, existing, res)
+}
+
+// NewPublishReader builds the reader RecordPublished dates versions with. A
+// test binary that imports manifests replaces it, so the suite reads a local
+// stub rather than the public registries.
+var NewPublishReader = func() *policy.AgeChecker { return policy.NewAgeChecker(nil) }
+
+func recordPublished(ctx context.Context, ac *policy.AgeChecker, pm, existing *manifest.PackageManifest, res *Result) {
+	warns := &versionWarnings{}
+	defer warns.flush(res)
+	unreachable := map[string]error{}
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		if ve.PublishedAt != "" || policy.UndatableVersion(pm.Type, ve.Version) || holdsVersion(existing, ve.Version) {
+			continue
+		}
+		upstream := strings.TrimRight(strings.TrimSpace(ve.URL), "/")
+		err, skip := unreachable[upstream]
+		if !skip {
+			var t time.Time
+			t, err = ac.AtUpstream(pm.Type, upstream).PublishedAt(ctx, pm.Type, pm.Name, strings.TrimSpace(ve.Version))
+			if err == nil {
+				ve.PublishedAt = t.UTC().Format(time.RFC3339)
+				continue
+			}
+			var transport *url.Error
+			if errors.As(err, &transport) {
+				unreachable[upstream] = err
+			}
+		}
+		warns.add(ve.Version, []policy.Result{{Check: "published_at",
+			Reason: "no publish time recorded, so a client's release-age cooldown cannot evaluate this version: " + err.Error()}})
+	}
+}
+
+func holdsVersion(pm *manifest.PackageManifest, version string) bool {
+	if pm == nil {
+		return false
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return true
+		}
+	}
+	return false
+}
+
 // versionWarnings collects the per-version warns of one manifest into the
 // lines a caller prints. A degraded gate gives every version of a package the
 // same reason, so the versions are gathered under it: a 40-version import
@@ -350,7 +421,14 @@ func describeVersions(versions []string) string {
 // these four keys is how a rescan starts reporting on data admission never
 // read.
 func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
-	ck := policy.NewOSVChecker(adb)
+	// A nil *audit.DB inside the interface is not a nil interface, and the
+	// checker reads a nil store as "no rows", which is what a rescan with no
+	// audit database has.
+	var store policy.OSVStore
+	if adb != nil {
+		store = adb
+	}
+	ck := policy.NewOSVChecker(store)
 	if cfg == nil {
 		return ck
 	}

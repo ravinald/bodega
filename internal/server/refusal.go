@@ -327,6 +327,11 @@ func osvRefusal(typ, name, version string, d map[string]any) *refusal {
 			ids = append(ids, fmt.Sprint(x))
 		}
 	}
+	if malware := anyStrings(d["malware"]); len(malware) > 0 {
+		f.reason = "OSV records this version as malicious: " + strings.Join(malware, ", ") + "."
+		f.next = "do not install this version; remove it from any lockfile that names it and pick another release."
+		return f
+	}
 	if len(ids) == 0 {
 		f.reason = "this version has a known vulnerability record."
 	} else {
@@ -334,6 +339,20 @@ func osvRefusal(typ, name, version string, d map[string]any) *refusal {
 	}
 	f.next = "pick a version without those records, or ask an operator to review `bodega policy osv list`."
 	return f
+}
+
+func anyStrings(v any) []string {
+	switch x := v.(type) {
+	case []string:
+		return x
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, e := range x {
+			out = append(out, fmt.Sprint(e))
+		}
+		return out
+	}
+	return nil
 }
 
 func anyInt64(v any) int64 {

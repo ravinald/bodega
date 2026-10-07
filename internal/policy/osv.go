@@ -19,6 +19,7 @@ import (
 // OSVStore is the subset of audit.DB the OSV checker needs.
 type OSVStore interface {
 	GetOSVPolicy(ctx context.Context, ecosystem string) (audit.OSVPolicy, error)
+	GetOSVMalwarePolicy(ctx context.Context, ecosystem string) (audit.OSVMalwarePolicy, error)
 }
 
 // osvEcosystemFor maps bodega's registry types to OSV's ecosystem identifiers.
@@ -113,7 +114,23 @@ func NewOSVChecker(store OSVStore) *OSVChecker {
 	}
 }
 
+// Check evaluates one version under two actions. An advisory is a version
+// with a known flaw and answers to the osv_policy row, which is off until an
+// operator sets it. A malware record is a package someone published to do
+// harm and answers to the malware action, which is block until an operator
+// says otherwise; that default is why a fresh install looks anything up.
 func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Result {
+	return c.check(ctx, pm, ve, false)
+}
+
+// CheckMalware evaluates the malware action alone. It is the proxy fill's
+// question: that path does not run the advisory gate, and a client fetching
+// through the proxy still must not receive a package OSV says is malicious.
+func (c *OSVChecker) CheckMalware(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Result {
+	return c.check(ctx, pm, ve, true)
+}
+
+func (c *OSVChecker) check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, malwareOnly bool) Result {
 	if pm == nil || ve == nil {
 		return Result{Check: "osv", Action: ActionPass}
 	}
@@ -122,48 +139,61 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	}
 	// An apt entry with no version is a stub whose .deb nothing has resolved
 	// yet, and a stub is exactly what the gate must not wave through: see the
-	// warn below, once the policy row says the gate is on at all.
+	// warn below, once the actions say the gate is on at all.
 	if ve.Version == "" && pm.Type != manifest.TypeApt {
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
-	policy, err := c.store.GetOSVPolicy(ctx, pm.Type)
-	if errors.Is(err, audit.ErrOSVPolicyNotFound) {
-		return Result{Check: "osv", Action: ActionPass}
+	acts := c.actions(ctx, pm.Type)
+	if malwareOnly {
+		acts.advisory = ActionIgnore
 	}
-	if err != nil {
-		return Result{Check: "osv", Action: ActionWarn, Reason: "load osv policy: " + err.Error()}
-	}
-	if policy.Action == ActionIgnore {
-		return Result{Check: "osv", Action: ActionPass}
+	if acts.advisory == ActionIgnore && acts.malware == ActionIgnore {
+		return acts.pass()
 	}
 	if ve.Version == "" {
 		return Result{Check: "osv", Action: ActionWarn,
-			Reason: fmt.Sprintf("apt entry %s carries no version, so no advisory can be evaluated against it", pm.Name)}
+			Reason: acts.qualify(fmt.Sprintf("apt entry %s carries no version, so no advisory can be evaluated against it", pm.Name))}
 	}
 	lk := osvLookupFor(pm, ve, c.DefaultAptSuite, c.ServedAptSuites)
 	if lk.reason != "" {
-		return Result{Check: "osv", Action: ActionWarn, Reason: lk.reason}
+		return Result{Check: "osv", Action: ActionWarn, Reason: acts.qualify(lk.reason)}
 	}
 
 	ans := c.answerFor(ctx, lk, ve)
 	if ans.err != nil {
-		return Result{Check: "osv", Action: ActionWarn,
-			Reason: fmt.Sprintf("osv lookup failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, ans.err)}
-	}
-	vulns := ans.vulns
-	if len(vulns) == 0 {
-		// A gate that could not answer must not report a clean result.
-		if !ans.conclusive() {
-			return Result{Check: "osv", Action: ActionWarn, Reason: ans.degraded}
+		reason := fmt.Sprintf("osv lookup failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, ans.err)
+		if r, ok := priorMalware(pm, ve, acts.malware, reason); ok {
+			return r
 		}
-		if reason := lk.emptyAnswerReason(vulns); reason != "" {
-			return Result{Check: "osv", Action: ActionWarn, Reason: reason}
+		return Result{Check: "osv", Action: ActionWarn, Reason: acts.qualify(reason)}
+	}
+	malware, advisories := splitMalware(ans.vulns)
+	if acts.malware == ActionIgnore {
+		malware = nil
+	}
+	if acts.advisory == ActionIgnore {
+		advisories = nil
+	}
+	if len(malware) == 0 && len(advisories) == 0 {
+		// A gate that could not answer must not report a clean result, and
+		// one that could not answer today still knows what an earlier answer
+		// found.
+		if !ans.conclusive() {
+			if r, ok := priorMalware(pm, ve, acts.malware, ans.degraded); ok {
+				return r
+			}
+			return Result{Check: "osv", Action: ActionWarn, Reason: acts.qualify(ans.degraded)}
+		}
+		if reason := lk.emptyAnswerReason(ans.vulns); reason != "" {
+			return Result{Check: "osv", Action: ActionWarn, Reason: acts.qualify(reason)}
 		}
 		// Dating a clean result is what stops it reading, a year later, like
-		// a version nobody ever looked at.
-		stampOSV(ve, nil, c.now(), lk.queried)
-		return Result{Check: "osv", Action: ActionPass}
+		// a version nobody ever looked at. Records under an ignored action
+		// are stamped too: whether a version carries them is the same fact
+		// whatever the gate does about it.
+		stampOSV(ve, ans.vulns, c.now(), lk.queried)
+		return acts.pass()
 	}
 
 	// Stamp onto VersionEntry.Metadata so the knowledge follows the version.
@@ -173,22 +203,37 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	if ans.conclusive() {
 		checkedAt = c.now()
 	}
-	stampOSV(ve, vulns, checkedAt, lk.queried)
+	stampOSV(ve, ans.vulns, checkedAt, lk.queried)
 
-	ids := vulnIDs(vulns)
-	details := map[string]any{
-		"vulns": ids,
-		"count": len(vulns),
-	}
-	if sev := vulnSeverities(vulns); len(sev) > 0 {
+	details := map[string]any{}
+	if sev := vulnSeverities(ans.vulns); len(sev) > 0 {
 		details["severity"] = sev
 	}
 	if lk.queried != "" {
 		details["queried"] = lk.queried
 	}
 
-	reason := fmt.Sprintf("%s@%s has %d OSV record(s): %s",
-		pm.Name, ve.Version, len(vulns), strings.Join(ids, ", "))
+	// Malware is named record by record and never counted with the
+	// advisories: "3 OSV record(s)" reads as three CVEs to triage, and one of
+	// them being a package built to steal credentials is not a triage item.
+	action := ActionPass
+	var parts []string
+	if len(malware) > 0 {
+		action = acts.malware
+		details["malware"] = vulnIDs(malware)
+		parts = append(parts, fmt.Sprintf("%s@%s is known malware: %s",
+			pm.Name, ve.Version, describeMalware(malware)))
+	}
+	if len(advisories) > 0 {
+		action = stricter(action, acts.advisory)
+		ids := vulnIDs(advisories)
+		details["vulns"] = ids
+		details["count"] = len(advisories)
+		parts = append(parts, fmt.Sprintf("%s@%s has %d OSV record(s): %s",
+			pm.Name, ve.Version, len(advisories), strings.Join(ids, ", ")))
+	}
+
+	reason := strings.Join(parts, "; ")
 	if lk.queried != "" {
 		reason += ", queried as " + lk.queried
 	}
@@ -197,10 +242,107 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	}
 	return Result{
 		Check:   "osv",
-		Action:  policy.Action,
-		Reason:  reason,
+		Action:  action,
+		Reason:  acts.qualify(reason),
 		Details: details,
 	}
+}
+
+// osvActions is what the gate does with each kind of record for one
+// ecosystem, plus anything that went wrong reading those settings.
+type osvActions struct {
+	advisory string
+	malware  string
+	notes    []string
+}
+
+// actions reads both settings. An unreadable advisory row warns, as it always
+// has; an unreadable malware row blocks, because the alternative is that a
+// database fault turns off the one check that runs with no configuration.
+// Neither stops the lookup: a malware hit is still worth refusing while the
+// advisory row is unreadable.
+func (c *OSVChecker) actions(ctx context.Context, registryType string) osvActions {
+	out := osvActions{advisory: ActionIgnore}
+	if c.store == nil {
+		out.malware = ActionBlock
+		return out
+	}
+	switch p, err := c.store.GetOSVPolicy(ctx, registryType); {
+	case errors.Is(err, audit.ErrOSVPolicyNotFound):
+	case err != nil:
+		out.advisory = ActionWarn
+		out.notes = append(out.notes, "load osv policy: "+err.Error())
+	default:
+		out.advisory = p.Action
+	}
+	var err error
+	out.malware, err = c.MalwareAction(ctx, registryType)
+	if err != nil {
+		out.notes = append(out.notes, "load osv malware policy: "+err.Error())
+	}
+	return out
+}
+
+// pass is the clean verdict, which a settings read that failed turns into a
+// warn: the operator has to learn that the gate ran on a default it did not
+// choose.
+func (a osvActions) pass() Result {
+	if len(a.notes) > 0 {
+		return Result{Check: "osv", Action: ActionWarn, Reason: strings.Join(a.notes, "; ")}
+	}
+	return Result{Check: "osv", Action: ActionPass}
+}
+
+func (a osvActions) qualify(reason string) string {
+	if len(a.notes) == 0 {
+		return reason
+	}
+	return reason + "; " + strings.Join(a.notes, "; ")
+}
+
+// MalwareAction is the action for malware records in one registry type: the
+// stored row, or block when there is none. An unreadable row also answers
+// block, with the error beside it for the caller to report.
+func (c *OSVChecker) MalwareAction(ctx context.Context, registryType string) (string, error) {
+	if c.store == nil {
+		return ActionBlock, nil
+	}
+	p, err := c.store.GetOSVMalwarePolicy(ctx, registryType)
+	switch {
+	case errors.Is(err, audit.ErrOSVMalwarePolicyNotFound):
+		return ActionBlock, nil
+	case err != nil:
+		return ActionBlock, err
+	}
+	return p.Action, nil
+}
+
+// priorMalware applies the malware action to what an earlier lookup stamped,
+// for a lookup that could not answer today. A version with no such stamp is
+// the caller's to warn on: refusing every version while OSV is unreachable
+// would stop every install over an outage, which is the wrong trade for a
+// list that only holds malware someone has already reported.
+func priorMalware(pm *manifest.PackageManifest, ve *manifest.VersionEntry, action, degraded string) (Result, bool) {
+	if action == ActionIgnore || ve.Metadata[OSVMetaMalware] == "" {
+		return Result{}, false
+	}
+	ids := splitIDs(ve.Metadata[OSVMetaMalware])
+	return Result{
+		Check:  "osv",
+		Action: action,
+		Reason: fmt.Sprintf("%s@%s is known malware: %s, found by an earlier check; this one could not confirm it (%s)",
+			pm.Name, ve.Version, strings.Join(ids, ", "), degraded),
+		Details: map[string]any{"malware": ids},
+	}, true
+}
+
+// stricter returns the more restrictive of two actions.
+func stricter(a, b string) string {
+	rank := map[string]int{ActionPass: 0, ActionIgnore: 0, ActionWarn: 1, ActionBlock: 2}
+	if rank[b] > rank[a] {
+		return b
+	}
+	return a
 }
 
 // osvAnswer is one lookup's evidence. degraded names why the answer cannot be
@@ -419,6 +561,66 @@ type osvVuln struct {
 	ID       string        `json:"id"`
 	Summary  string        `json:"summary"`
 	Severity []OSVSeverity `json:"severity"`
+	// Malicious is what database_specific said, decoded at sync or at query
+	// time; see osvDatabaseSpecific.
+	Malicious bool `json:"-"`
+}
+
+// isMalware reports whether the record describes a malicious package rather
+// than a vulnerable one. OpenSSF's malicious-packages feed publishes under
+// MAL- ids; a record from another database that describes malware says so in
+// database_specific instead.
+func (v osvVuln) isMalware() bool {
+	return strings.HasPrefix(v.ID, "MAL-") || v.Malicious
+}
+
+// osvDatabaseSpecific is the part of a record's database_specific block that
+// marks malware. The OpenSSF feed carries malicious-packages-origins on every
+// record it exports, whatever id the record goes by downstream, and GitHub
+// files a malware advisory under CWE-506, "Embedded Malicious Code".
+type osvDatabaseSpecific struct {
+	MaliciousOrigins json.RawMessage `json:"malicious-packages-origins"`
+	CWEIDs           []string        `json:"cwe_ids"`
+}
+
+func (d osvDatabaseSpecific) malicious() bool {
+	if len(d.MaliciousOrigins) > 0 && string(d.MaliciousOrigins) != "null" {
+		return true
+	}
+	for _, id := range d.CWEIDs {
+		if id == "CWE-506" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitMalware(vs []osvVuln) (malware, advisories []osvVuln) {
+	for _, v := range vs {
+		if v.isMalware() {
+			malware = append(malware, v)
+		} else {
+			advisories = append(advisories, v)
+		}
+	}
+	return malware, advisories
+}
+
+// describeMalware names each record with its summary, sorted by id. The
+// summary is what tells an operator what the package did, and the id is what
+// they search for.
+func describeMalware(vs []osvVuln) string {
+	sorted := append([]osvVuln(nil), vs...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	parts := make([]string, 0, len(sorted))
+	for _, v := range sorted {
+		if v.Summary == "" {
+			parts = append(parts, v.ID)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", v.ID, v.Summary))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // osvAPIBodyLimit caps what one api.osv.dev response may cost in memory. A
@@ -462,12 +664,20 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 			ecosystem, name, version, limit>>20)
 	}
 	var out struct {
-		Vulns []osvVuln `json:"vulns"`
+		Vulns []struct {
+			osvVuln
+			DatabaseSpecific osvDatabaseSpecific `json:"database_specific"`
+		} `json:"vulns"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("parse osv response: %w", err)
 	}
-	return out.Vulns, nil
+	vulns := make([]osvVuln, 0, len(out.Vulns))
+	for _, v := range out.Vulns {
+		v.Malicious = v.DatabaseSpecific.malicious()
+		vulns = append(vulns, v.osvVuln)
+	}
+	return vulns, nil
 }
 
 // vulnSeverities keys each record's severity entries by its OSV id. A version

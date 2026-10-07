@@ -301,7 +301,7 @@ What it does not cover:
 
 - **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git`, `helm`, `freebsd`, and `distfiles` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
 - **`warn`, not `block`.** A version inside the window is admitted and recorded as `policy_warn`. Hardening it is `bodega policy age set <ecosystem> 7d block`.
-- **Nothing else is on.** The upstream allow-list is empty, which accepts every candidate, and the OSV gate has no rows. Add them with `bodega policy add <type> <pattern>` and `bodega policy osv set npm warn`.
+- **Nothing else is on, bar malware.** The upstream allow-list is empty, which accepts every candidate, and the OSV gate checks no advisory until you add a row. Add them with `bodega policy add <type> <pattern>` and `bodega policy osv set npm warn`. The one OSV check that runs unconfigured blocks versions OSV records as known malware; see [Malware records](usage.md#malware-records).
 - **Upgrades gain nothing.** An install created before this default keeps enforcing exactly what it enforced. bodega records the seed as a one-time decision, so it also never returns after `bodega policy age remove`.
 
 `bodega doctor` reports an install with no allow-list rule and no age gate, and one whose gates are all set to `ignore`, at exit 2. See [threat-model.md](threat-model.md) for what the chokepoint does and does not defend.

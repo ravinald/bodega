@@ -197,7 +197,7 @@ func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
 	}
 	// An ecosystem `policy age set` refuses must also be one publishedAt
 	// cannot date, or the refusal and the gate disagree.
-	_, err := (&AgeChecker{}).publishedAt(context.Background(), manifest.TypeApt, "bash", "5.2")
+	_, err := (&AgeChecker{}).PublishedAt(context.Background(), manifest.TypeApt, "bash", "5.2")
 	if err == nil || !strings.Contains(err.Error(), "no upstream timestamp source") {
 		t.Errorf("apt has no timestamp source; got err=%v", err)
 	}

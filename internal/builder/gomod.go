@@ -159,6 +159,10 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				// Stamp artifact size from the .zip file.
 				zipPath := filepath.Join(dir, ve.Version+".zip")
 				stampArtifactSize(context.Background(), store, manifest.TypeGomod, name, ve, zipPath)
+				if ve.PublishedAt == "" {
+					published, pErr := gomodInfoPublishedAt(filepath.Join(dir, ve.Version+".info"))
+					stampPublishedAt(ctx, out, store, manifest.TypeGomod, name, pm.Name+"@"+ve.Version, ve, published, pErr)
+				}
 			}
 
 			result.Err = fetchErr

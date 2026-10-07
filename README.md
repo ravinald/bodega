@@ -39,6 +39,28 @@ The server runs on Linux and FreeBSD, and builds from source on both; FreeBSD ne
 
 Storage defaults to the local filesystem at `/var/lib/bodega`. For S3, set `storage_backend` to `"s3"` in the config file and run `bodega init` to create the bucket with encryption, versioning, lifecycle rules, and public access blocked. Credentials come from the AWS default chain. `bodega init --print-policy` prints the IAM policies for setup and for the running service, and `bodega init check` confirms the current credentials hold the runtime one. [S3 setup](docs/usage.md#s3-setup) has the details.
 
+### Verifying a release
+
+Every release publishes `checksums-sha256.txt`, which lists each archive, package and SBOM, along with a keyless cosign signature over it and a SLSA build provenance attestation covering every file it lists. Both are issued to `.github/workflows/release-build.yml`, the reusable workflow that builds the release, so a signature from any other workflow in the repository fails these checks:
+
+```bash
+VERSION=v0.2.0
+gh release download "$VERSION" --repo ravinald/bodega
+cosign verify-blob \
+  --certificate checksums-sha256.txt.pem \
+  --signature checksums-sha256.txt.sig \
+  --certificate-identity "https://github.com/ravinald/bodega/.github/workflows/release-build.yml@refs/tags/$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums-sha256.txt
+sha256sum --ignore-missing -c checksums-sha256.txt
+gh attestation verify "bodega_${VERSION#v}_linux_amd64.tar.gz" \
+  --repo ravinald/bodega \
+  --signer-workflow ravinald/bodega/.github/workflows/release-build.yml \
+  --source-ref "refs/tags/$VERSION"
+```
+
+Binaries, archives, packages and SBOMs take their timestamps from the commit rather than the clock. CI runs `goreleaser release --snapshot --clean --skip=sign` twice on every pull request and fails if the two `checksums-sha256.txt` files differ.
+
 ## Quick start
 
 Add a package, fetch it, and serve it to a client:
