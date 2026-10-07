@@ -121,6 +121,11 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 					if existing != nil && !merge {
 						return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
 					}
+					dated := admit.Result{}
+					admit.RecordPublished(ctx, pm, existing, &dated)
+					for _, w := range dated.Warnings {
+						fmt.Fprintf(os.Stderr, "%s/%s: WARNING: %s\n", pm.Type, pm.Name, w)
+					}
 
 					if existing != nil && merge {
 						admit.MergeVersions(existing, pm)

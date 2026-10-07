@@ -387,6 +387,9 @@ func TestFrozenDeleteDenialRecorded(t *testing.T) {
 	if details["pkg_name"] != "hello" || details["pkg_type"] != "apt" {
 		t.Errorf("details = %v, want the frozen entry named", details)
 	}
+	if inc := refusalIncident(t, rec.Header(), checkFrozen); details["incident"] != inc || bodyIncident(t, rec.Body.String(), checkFrozen) != inc {
+		t.Errorf("the refusal's incident %s is not the row's %q", inc, details["incident"])
+	}
 	if row := denials(t, s)[0]; row.PkgType != "apt" || row.PkgName != "hello" {
 		t.Errorf("pkg = %q/%q, want apt/hello", row.PkgType, row.PkgName)
 	}
@@ -431,6 +434,9 @@ func TestVersionConstraintDenialsRecorded(t *testing.T) {
 			details := wantOneDenial(t, s, audit.DenialVersionConstraint, "127.0.0.1")
 			if details["constraint"] != manifest.ConstraintExact || details["entry_version"] != tc.entryVer {
 				t.Errorf("details = %v, want the constraint and the entry version", details)
+			}
+			if inc := refusalIncident(t, rec.Header(), checkConstraint); details["incident"] != inc || bodyIncident(t, rec.Body.String(), checkConstraint) != inc {
+				t.Errorf("the refusal's incident %s is not the row's %q", inc, details["incident"])
 			}
 			row := denials(t, s)[0]
 			if row.PkgType != tc.pkgType || row.PkgName != tc.pkgName {

@@ -4,37 +4,61 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write       # create releases
-  id-token: write       # cosign keyless signing via OIDC
-  attestations: write   # SLSA provenance via actions/attest-build-provenance
+# Each job asks for what it uses. The write scopes and the OIDC token reach the
+# build job alone, never the gate check that runs ahead of it.
+permissions: {}
 
 jobs:
-  release:
+  # ci.yml does not run on a tag, so this asks its gate about the tagged
+  # commit instead. event=push and branch=main are what tie the answer to
+  # main: ci.yml runs on push for main alone, and a pull_request run reports a
+  # branch commit that may never have merged. The commit and its tag can land
+  # minutes apart, so a run still in progress is waited on, not failed.
+  ci-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0    # GoReleaser needs full history for changelog
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - uses: anchore/sbom-action/download-syft@v0
-      - uses: sigstore/cosign-installer@v3
-
-      - uses: goreleaser/goreleaser-action@v7
-        with:
-          # This job signs and attests what people install, so the tool that
-          # builds it is a version somebody chose rather than whatever shipped
-          # the morning of the tag.
-          version: v2.18.2
-          args: release --clean
+      - name: Wait for ci.yml's gate to pass on the tagged commit
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          deadline=$(( $(date +%s) + 55 * 60 ))
+          while :; do
+            run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+            state=
+            if [ -n "$run" ]; then
+              state=$(gh api "repos/$REPO/actions/runs/$run/jobs" \
+                --jq '.jobs[] | select(.name == "gate") | .status + " " + (.conclusion // "")')
+            fi
+            case "$state" in
+              "completed success")
+                echo "ci.yml gate passed for $SHA (run $run)"
+                exit 0 ;;
+              completed*)
+                echo "::error::ci.yml gate concluded '${state#completed }' for $SHA (run $run); fix main and tag a commit whose gate passed"
+                exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              if [ -z "$run" ]; then
+                echo "::error::no ci.yml push run on main for $SHA; a release tag must name a commit on main"
+              else
+                echo "::error::ci.yml gate for $SHA (run $run) did not finish in time: '${state:-not started}'"
+              fi
+              exit 1
+            fi
+            echo "waiting on ci.yml gate for $SHA: ${run:-no run yet} ${state:-pending}"
+            sleep 30
+          done
 
-      - name: Attest binaries
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: 'dist/bodega_*'
+  build:
+    needs: ci-gate
+    permissions:
+      contents: write       # create the GitHub release
+      id-token: write       # cosign keyless signing and attestation via OIDC
+      attestations: write   # store the build provenance
+    uses: ./.github/workflows/release-build.yml

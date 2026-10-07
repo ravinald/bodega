@@ -362,7 +362,7 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		if strings.Contains(r.Header.Get("Accept"), pypiJSONSimple) || r.URL.RawQuery == "format="+pypiJSONSimple {
+		if strings.Contains(r.Header.Get("Accept"), pypiSimpleJSON) || r.URL.RawQuery == "format="+pypiSimpleJSON {
 			var out []map[string]any
 			var versions []string
 			for _, f := range files {
@@ -376,7 +376,7 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 					versions = append(versions, v)
 				}
 			}
-			w.Header().Set("Content-Type", pypiJSONSimple)
+			w.Header().Set("Content-Type", pypiSimpleJSON)
 			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]string{"api-version": "1.1"},
 				"name": dist, "files": out, "versions": versions})
 			return
@@ -470,7 +470,7 @@ func TestIndexFilterPypi(t *testing.T) {
 // pipAccept is the Accept header pip 24 sends to a simple index.
 const pipAccept = "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01"
 
-type pypiJSONPage struct {
+type pypiJSONPageView struct {
 	Files []struct {
 		Filename     string            `json:"filename"`
 		URL          string            `json:"url"`
@@ -491,13 +491,13 @@ func TestIndexFilterPypiJSON(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("JSON simple page status = %d, body %s", rec.Code, rec.Body)
 	}
-	if got := rec.Header().Get("Content-Type"); got != pypiJSONSimple {
-		t.Fatalf("Content-Type = %q, want %s (body %s)", got, pypiJSONSimple, rec.Body)
+	if got := rec.Header().Get("Content-Type"); got != pypiSimpleJSON {
+		t.Fatalf("Content-Type = %q, want %s (body %s)", got, pypiSimpleJSON, rec.Body)
 	}
 	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Accept") {
 		t.Errorf("Vary = %q, want Accept", got)
 	}
-	var page pypiJSONPage
+	var page pypiJSONPageView
 	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func TestIndexFilterPypiJSON(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 so pip reports no matching distribution itself", rec.Code)
 		}
-		var page pypiJSONPage
+		var page pypiJSONPageView
 		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 			t.Fatal(err)
 		}
@@ -595,7 +595,12 @@ func TestPypiWantsJSON(t *testing.T) {
 		"text/html": false,
 		"*/*":       false,
 		"":          false,
-		"application/vnd.pypi.simple.v1+json;q=0": false,
+		"application/vnd.pypi.simple.v1+json;q=0":               false,
+		"application/vnd.pypi.simple.latest+json":               true,
+		"application/vnd.pypi.simple.v1+json; q=0, text/html":   false,
+		"text/html, application/vnd.pypi.simple.v1+json; q=0.5": false,
+		// A tie goes to HTML, the form this route served before it spoke JSON.
+		"application/vnd.pypi.simple.v1+json, text/html": false,
 	} {
 		if got := pypiWantsJSON(accept); got != want {
 			t.Errorf("pypiWantsJSON(%q) = %v, want %v", accept, got, want)

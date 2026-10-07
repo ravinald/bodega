@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -511,5 +512,173 @@ func TestRescanRow_FlaggedRowsCarryTheirReason(t *testing.T) {
 		Answered: true, Flagged: true, Vulns: []string{"GHSA-hit"},
 	}); detail != "GHSA-hit" {
 		t.Errorf("a clean flagged row is the ids alone, got %q", detail)
+	}
+}
+
+func malAdvisory(id string) map[string]any {
+	rec := advisory(id, "minimist", "1.0.0", "9.9.9")
+	rec["summary"] = "Malicious code in minimist"
+	return rec
+}
+
+func reloadVersion(t *testing.T, root, version string) manifest.VersionEntry {
+	t.Helper()
+	pm, err := manifest.NewLocalStore(filepath.Join(root, "manifests")).GetPackage(context.Background(), manifest.TypeNpm, "minimist")
+	if err != nil || pm == nil {
+		t.Fatalf("reload minimist: %v", err)
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return ve
+		}
+	}
+	t.Fatalf("version %s not in the reloaded manifest", version)
+	return manifest.VersionEntry{}
+}
+
+func auditEvents(t *testing.T, root string, f audit.Filter) []audit.StoredEvent {
+	t.Helper()
+	adb, err := audit.Open(filepath.Join(root, "logs", "audit.db"))
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer adb.Close()
+	evs, err := adb.Query(context.Background(), f)
+	if err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	return evs
+}
+
+// TestRescanCommand_HidesNewlyPublishedMalware is the composed path for a MAL-
+// record published after admission: no policy row, the version hidden on
+// disk, the hide audited under osv-malware, and a second run leaving alone
+// the version an operator then unhid.
+func TestRescanCommand_HidesNewlyPublishedMalware(t *testing.T) {
+	root := rescanInstall(t,
+		manifest.VersionEntry{Version: "1.2.5"},
+		manifest.VersionEntry{Version: "0.0.1"})
+	syncInto(t, root, malAdvisory("MAL-2026-77"))
+
+	stdout, stderr, err := runRescan(t)
+	if err != nil {
+		t.Fatalf("rescan: %v\n%s", err, stderr)
+	}
+	if !reloadVersion(t, root, "1.2.5").Hidden {
+		t.Fatal("a version matching a newly published MAL- record was left served")
+	}
+	if reloadVersion(t, root, "0.0.1").Hidden {
+		t.Error("a version outside the record's range was hidden")
+	}
+	if !strings.Contains(stdout, "hidden (malware)") || !strings.Contains(stderr, "MAL-2026-77") {
+		t.Errorf("the run must say what it hid:\n%s\n%s", stdout, stderr)
+	}
+	evs := auditEvents(t, root, audit.Filter{EventType: audit.EventHide, Actor: "osv-malware"})
+	if len(evs) != 1 || evs[0].PkgVersion != "1.2.5" || !strings.Contains(evs[0].Details, "MAL-2026-77") {
+		t.Fatalf("hide audit events = %+v", evs)
+	}
+
+	// The operator looks, decides, and unhides. The next run must not overrule them.
+	store := manifest.NewLocalStore(filepath.Join(root, "manifests"))
+	pm, _ := store.GetPackage(context.Background(), manifest.TypeNpm, "minimist")
+	for i := range pm.Versions {
+		pm.Versions[i].Hidden = false
+	}
+	if err := store.SavePackage(context.Background(), pm); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err := runRescan(t); err != nil {
+		t.Fatalf("second rescan: %v\n%s", err, stderr)
+	}
+	if reloadVersion(t, root, "1.2.5").Hidden {
+		t.Error("a record already stamped was treated as new and re-hid the version")
+	}
+}
+
+// TestRescanCommand_FrozenMalwareIsAnError: frozen is not hidden, so the
+// version stays served and the run says so at ERROR and exits non-zero.
+func TestRescanCommand_FrozenMalwareIsAnError(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "1.2.5", Frozen: true})
+	syncInto(t, root, malAdvisory("MAL-2026-78"))
+
+	_, stderr, err := runRescan(t)
+	if err == nil || !strings.Contains(err.Error(), "frozen") {
+		t.Fatalf("a frozen malware version must fail the run, got %v", err)
+	}
+	if !strings.Contains(stderr, "ERROR:") || !strings.Contains(stderr, "MAL-2026-78") {
+		t.Errorf("stderr must report it at ERROR: %q", stderr)
+	}
+	if reloadVersion(t, root, "1.2.5").Hidden {
+		t.Error("a frozen version was hidden")
+	}
+}
+
+// TestRescanCommand_MalwareWarnDoesNotHide: under warn the version is listed
+// and left served.
+func TestRescanCommand_MalwareWarnDoesNotHide(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "1.2.5"})
+	syncInto(t, root, malAdvisory("MAL-2026-79"))
+	adb, err := audit.Open(filepath.Join(root, "logs", "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adb.SetOSVMalwarePolicy(context.Background(), audit.OSVMalwarePolicy{Ecosystem: "npm", Action: "warn"}); err != nil {
+		t.Fatal(err)
+	}
+	adb.Close()
+
+	stdout, stderr, err := runRescan(t)
+	if err != nil {
+		t.Fatalf("rescan: %v\n%s", err, stderr)
+	}
+	if reloadVersion(t, root, "1.2.5").Hidden {
+		t.Error("warn hid the version")
+	}
+	if !strings.Contains(stdout, "malware (new)") {
+		t.Errorf("warn must still list the version: %q", stdout)
+	}
+}
+
+// TestPolicyOSVMalwareSet_IgnoreRequiresReason: turning the default off takes
+// a reason, and the change is audited with who made it.
+func TestPolicyOSVMalwareSet_IgnoreRequiresReason(t *testing.T) {
+	root := rescanInstall(t)
+	run := func(args ...string) error {
+		cmd := newPolicyOSVMalwareSetCmd(&globalFlags{})
+		cmd.SetArgs(args)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		return cmd.Execute()
+	}
+
+	if err := run("npm", "ignore"); err == nil || !strings.Contains(err.Error(), "--reason") {
+		t.Fatalf("ignore without --reason must be refused, got %v", err)
+	}
+	if err := run("npm", "ignore", "--reason", "   "); err == nil {
+		t.Fatal("a blank reason is no reason")
+	}
+	if evs := auditEvents(t, root, audit.Filter{EventType: audit.EventPolicy}); len(evs) != 0 {
+		t.Fatalf("a refused set wrote %d audit event(s)", len(evs))
+	}
+
+	t.Setenv("SUDO_USER", "alice")
+	if err := run("npm", "ignore", "--reason", "internal fork, vetted"); err != nil {
+		t.Fatalf("ignore with a reason: %v", err)
+	}
+	evs := auditEvents(t, root, audit.Filter{EventType: audit.EventPolicy})
+	if len(evs) != 1 || evs[0].Actor != "alice" || evs[0].PkgType != "npm" ||
+		!strings.Contains(evs[0].Details, "internal fork, vetted") || !strings.Contains(evs[0].Details, "ignore") {
+		t.Fatalf("policy audit events = %+v", evs)
+	}
+
+	adb, err := audit.Open(filepath.Join(root, "logs", "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adb.Close()
+	p, err := adb.GetOSVMalwarePolicy(context.Background(), "npm")
+	if err != nil || p.Action != "ignore" || p.Actor != "alice" {
+		t.Errorf("stored row = %+v, %v", p, err)
 	}
 }

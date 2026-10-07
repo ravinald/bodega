@@ -454,10 +454,6 @@ func (s *Server) npmPublishTimes(ctx context.Context, name string) {
 	}
 }
 
-// pypiJSONSimple is the PEP 691 media type, which carries PEP 700 upload-time
-// per file where the HTML page carries none.
-const pypiJSONSimple = "application/vnd.pypi.simple.v1+json"
-
 // pypiPublishTimes caches the earliest upload-time of each version on the
 // upstream's JSON simple page. Earliest because that is the moment the
 // version became installable, which is the same reading the age gate takes
@@ -469,7 +465,7 @@ func (s *Server) pypiPublishTimes(ctx context.Context, name string) {
 			UploadTime string `json:"upload-time"`
 		} `json:"files"`
 	}
-	if err := s.upstreamJSON(ctx, s.pypiSimpleURL(manifest.CanonicalPypiName(name)), pypiJSONSimple, &doc); err != nil {
+	if err := s.upstreamJSON(ctx, s.pypiSimpleURL(manifest.CanonicalPypiName(name)), pypiSimpleJSON, &doc); err != nil {
 		s.logger.Debug("pypi JSON simple page unavailable", "package", name, "error", err)
 		return
 	}

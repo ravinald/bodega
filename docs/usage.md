@@ -62,6 +62,13 @@ bodega build fetch git             # fetch git sources only
 bodega build fetch git widget      # fetch only widget
 ```
 
+`--backfill-published` fetches nothing. It records `published_at` on every npm, pypi, gomod and cargo version that has none, reading each from upstream at most once every 250ms, and prints how many it filled and how many it could not. A gomod version whose `.info` is already in the build root is read from that file without a request. Each version it could not date is named with its reason, and the command exits non-zero when there is at least one. A type with no publish time to read (`apt`, `binary` and the rest) is refused when named and skipped when not. Run it once on a store fetched before bodega recorded publish times; a fetch dates every version it downloads from then on.
+
+```bash
+bodega build fetch --backfill-published         # every type that has a publish time
+bodega build fetch npm --backfill-published     # npm only
+```
+
 #### How a pypi version is resolved
 
 A pypi fetch resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against. The fetch then downloads the closure that file resolves to into `<build-root>/wheelhouse/` and writes `<build-root>/resolved-requirements.txt`, which pins every distribution in it with a SHA-256. See [What reaches pip](#what-reaches-pip).
@@ -380,7 +387,7 @@ bodega show pkg pypi django 5.2.12    # specific version detail
 bodega show pkg pypi django json      # JSON output
 ```
 
-The version list carries an `OSV` and a `CHECKED` column per version, and names the flagged ids underneath. See [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescan) for what `unchecked` means and how the date gets written.
+The version list carries an `OSV` and a `CHECKED` column per version, and names the flagged ids underneath. See [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescanmalware) for what `unchecked` means and how the date gets written.
 
 ### `bodega pkg hide TYPE NAME [VERSION]`
 
@@ -1484,13 +1491,14 @@ TIMESTAMP            EVENT   TYPE   NAME                   STATUS               
 
 #### What each client shows when it is refused
 
-The message differs per ecosystem, and three of the seven print bodega's own body verbatim. That is why the refusal names the repair:
+A profile refusal answers through the same format as every other check, so what each client prints is in [What a refused client sees](#what-a-refused-client-sees). Its reason names the rule and its next step names the repair, because the two rules call for opposite fixes:
 
 ```text
-membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
-  Add it:      bodega profile add web gomod example.com/mod
-  Or open it:  bodega profile set web gomod --membership open
+bodega refused gomod/example.com/mod@v1.0.0 (profile, incident 3f9c0a1b2d4e): membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
+Next step: ask an operator to add it with `bodega profile add web gomod example.com/mod`, or to open the type with `bodega profile set web gomod --membership open`.
 ```
+
+Four cases are particular to profiles.
 
 **pypi.** A filtered index reads to `pip` as a distribution that publishes nothing, so it resolves against what is left rather than failing on what is gone:
 
@@ -1501,56 +1509,7 @@ ERROR: Could not find a version that satisfies the requirement django (from vers
 ERROR: No matching distribution found for django
 ```
 
-A refused wheel, which is a client that already knew the URL, names the file and the status:
-
-```text
-$ pip install ok
-Collecting ok
-  ERROR: HTTP error 403 while getting http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl (from http://bodega:8080/pypi/simple/ok/)
-ERROR: Could not install requirement ok from http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl because of HTTP error 403 Client Error: Forbidden for url: http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl
-```
-
-A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel:
-
-```text
-membership: profile "web" does not list pypi/msgpack-python-0.3.0.win-amd64-py2.7.exe.
-  Add it:      bodega profile add web pypi msgpack-python-0.3.0.win-amd64-py2.7.exe
-  Or open it:  bodega profile set web pypi --membership open
-```
-
-Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
-
-**npm.** The same text for a packument and for a tarball, with the URL as the only thing that tells them apart. It does not print bodega's body:
-
-```text
-$ npm install ok
-npm error code E403
-npm error 403 403 Forbidden - GET http://bodega:8080/npm/ok/-/ok-1.0.0.tgz
-npm error 403 In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy, or on a server you do not have access to.
-```
-
-**gomod.** `go` prints the whole response body under `server response:`, so the operator reading the failure gets the repair without opening the audit log:
-
-```text
-$ go get example.com/mod@v1.0.0
-go: example.com/mod@v1.0.0: reading http://bodega:8080/go/example.com/mod/@v/v1.0.0.info: 403 Forbidden
- server response:
- membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
-   Add it:      bodega profile add web gomod example.com/mod
-   Or open it:  bodega profile set web gomod --membership open
-```
-
-**cargo.** Also prints the body, under `body:`, and names the sparse-index URL rather than the crate:
-
-```text
-$ cargo fetch
-Caused by:
-  failed to get successful HTTP response from `http://bodega:8080/cargo/se/rd/serde` (10.0.0.4), got 403
-  body:
-  membership: profile "web" does not list cargo/serde.
-    Add it:      bodega profile add web cargo serde
-    Or open it:  bodega profile set web cargo --membership open
-```
+A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel. Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
 
 **helm.** `helm repo add` succeeds and the charts are simply not there. The index answers 200 with the refused charts filtered out of it, because a 403 on `index.yaml` fails the repository rather than the install, so the first thing an operator sees is an empty search:
 
@@ -1561,21 +1520,15 @@ $ helm search repo bodega
 No results found
 ```
 
-The refusal arrives at the pull, and helm prints neither the chart name nor bodega's body. This is the ecosystem where the audit row is the only place the reason lives:
+The refusal arrives at the pull.
 
-```text
-$ helm pull bodega/cert-manager --version 1.14.0
-Error: failed to fetch http://bodega:8080/helm/charts/cert-manager-1.14.0.tgz : 403 Forbidden
-```
-
-**git.** `git` relays the body as `remote:` lines before its own error:
+**git.** `git` relays a text body as `remote:` lines before its own error:
 
 ```text
 $ git clone http://bodega:8080/git/github/foo/bar.git
 Cloning into 'bar'...
-remote: membership: profile "web" does not list git/github.
-remote:   Add it:      bodega profile add web git github
-remote:   Or open it:  bodega profile set web git --membership open
+remote: bodega refused git/github (profile, incident 4d5e6f708192): membership: profile "web" does not list git/github.
+remote: Next step: ask an operator to add it with `bodega profile add web git github`, or to open the type with `bodega profile set web git --membership open`.
 fatal: unable to access 'http://bodega:8080/git/github/foo/bar.git/': The requested URL returned error: 403
 ```
 
@@ -1590,7 +1543,7 @@ HTTP request sent, awaiting response... 403 Forbidden
 2026-09-10 16:43:44 ERROR 403: Forbidden.
 ```
 
-`-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both.
+`-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both. The `X-Bodega-Refusal` header survives `-f`: `curl -fsS -D - -o /dev/null` prints it.
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
 
@@ -1671,9 +1624,8 @@ Three limits, stated rather than left to be found:
 - **The `sources.list` is a scoping boundary, not an authorization one.** The host can edit it and read the unfiltered mirrored codename; the codename's name is not a secret either. What refuses the artifacts behind it is the request predicate at `/apt/pool/`, which runs on identity:
 
   ```text
-  membership: profile "web" does not list apt/demo-extra at 1.0.
-    Add it:      bodega profile add web apt demo-extra
-    Or open it:  bodega profile set web apt --membership open
+  bodega refused apt/demo-extra@1.0 (profile, incident 7c1d2e3f4a5b): membership: profile "web" does not list apt/demo-extra at 1.0.
+  Next step: ask an operator to add it with `bodega profile add web apt demo-extra`, or to open the type with `bodega profile set web apt --membership open`.
   ```
 
 - **bodega re-signs an index it did not verify a signature on.** It checks the archive's TLS certificate and the SHA256 the archive's own `Release` publishes for the `Packages` beside it, and it holds no distro keyring to check `InRelease` against. A mirrored codename forwards the archive's signature intact; a filtered one does not. See [Threat model](threat-model.md).
@@ -1719,9 +1671,8 @@ A `.pkg` fetched by hand is refused with 403 in the vocabulary every other type 
 
 ```text
 $ curl 'https://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-9.2~2$3mdm1utt.pkg'
-membership: profile "web" does not list freebsd/nano at 9.2.
-  Add it:      bodega profile add web freebsd nano
-  Or open it:  bodega profile set web freebsd --membership open
+bodega refused freebsd/nano@9.2 (profile, incident 9e8d7c6b5a40): membership: profile "web" does not list freebsd/nano at 9.2.
+Next step: ask an operator to add it with `bodega profile add web freebsd nano`, or to open the type with `bodega profile set web freebsd --membership open`.
 ```
 
 An object no record names is refused to a bound host whatever its filename says, since nothing states which package it holds. That includes `Latest/pkg.pkg` and its `.sig`, which alias a `pkg` package without naming its version, so `pkg bootstrap` does not work through a profile: bootstrap the host before binding it. A catalogue bodega cannot read answers 503 for every package under it, to a bound host alone, rather than serving objects nothing decided on.
@@ -1828,6 +1779,135 @@ is inside admin_permit_cidr can POST and DELETE against this bodega.
 
 `bodega token generate` takes a label and nothing else: a token is a token. The mutation gate accepts any unexpired one of them once `admin_permit_cidr` reaches past loopback, so the credential in a build host's `~/.netrc` is also the credential that authorizes `POST /api/v1/...` from that host. Keeping `admin_permit_cidr` at loopback makes the gate ignore tokens entirely and is the remedy that costs nothing; otherwise every host you write a credential to is admin-capable and should be treated that way. Scoped tokens would sever the two and do not exist yet. See [Threat model](threat-model.md).
 
+### What a refused client sees
+
+Every refusal answers the same five things, in the form the refused client prints: which check refused, the package and version, a one-sentence reason, the next step, and an incident ID. The status is the one the check has always answered; only the body and two headers are bodega's.
+
+```text
+bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" is not on this server's upstream allow-list.
+Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
+```
+
+| Check        | Status | Where it refuses                                                                     |
+| ------------ | ------ | ------------------------------------------------------------------------------------ |
+| `allow-list` | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                         |
+| `age`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
+| `osv`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
+| `profile`    | 403    | any package route on a host whose profile governs the type                           |
+| `constraint` | 403    | an npm or gomod version outside the entry's `version_constraint`                     |
+| `hidden`     | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it |
+| `frozen`     | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                            |
+| `checksum`   | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest           |
+
+Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
+
+The body never carries a credential, an upstream URL, an internal hostname, a storage key or a bucket name, because it goes to whoever can reach the route. For the types whose allow-list rule is a host or a URL prefix (apt, git, helm, binary, freebsd, distfiles), that means the body cannot name the upstream to admit, and the next step points the operator at the audit row instead.
+
+**Finding the incident.** The incident is written into the details of the audit row the refusal recorded, beside the URL, the key and the digests the body leaves out. `bodega audit events` prints the row but not its details, so read them from the API on the server's loopback:
+
+```bash
+curl -s 'http://127.0.0.1:8080/api/v1/audit?name=left-pad&limit=200' | grep 650285e650d5
+```
+
+| Check                                  | Audit row                                               |
+| -------------------------------------- | ------------------------------------------------------- |
+| `allow-list`, `age`, `osv` on a fetch  | `cache` / `policy_violation`                            |
+| `allow-list`, `age`, `osv` on a create | `create` / `policy_violation`                           |
+| `profile`                              | `denied` / `profile_membership` or `profile_constraint` |
+| `constraint`                           | `denied` / `version_constraint`                         |
+| `hidden`                               | `denied` / `hidden`                                     |
+| `frozen`                               | `denied` / `entry_frozen`                               |
+| `checksum`                             | `cache` / `checksum_mismatch`                           |
+
+A `checksum` refusal whose digest could not be read at all writes no row, because the database that would hold it is what failed; its incident is in the server log line instead.
+
+#### Per client
+
+Each of these was captured from the real client against an allow-list refusal. Hostnames and addresses are replaced; incidents are as captured.
+
+**npm** prints the `error` field of a JSON body on its own `403` line:
+
+```text
+$ npm install left-pad@1.3.0
+npm ERR! code E403
+npm ERR! 403 403 Forbidden - GET http://bodega.example.com:8080/npm/left-pad - bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" is not on this server's upstream allow-list. Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
+npm ERR! 403 In most cases, you or one of your dependencies are requesting
+npm ERR! 403 a package version that is forbidden by your security policy, or
+npm ERR! 403 on a server you do not have access to.
+```
+
+**pip** never prints a body, so a pypi refusal puts its first line into the HTTP reason phrase. A refused file download shows it at any verbosity:
+
+```text
+$ pip install http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+Collecting toml==0.10.2
+  ERROR: HTTP error 403 while getting http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+ERROR: Could not install requirement toml==0.10.2 from http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl because of HTTP error 403 Client Error: Forbidden - bodega refused pypi/toml@0.10.2 (allow-list, incident bb3e3adbe3b9): pypi "toml" is not on this server's upstream allow-list. for url: http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+```
+
+A refused index page is the common case, and pip reports it only at `-vv`. Without it the output is `No matching distribution found`, which reads as a package that does not exist:
+
+```text
+$ pip install -vv toml==0.10.2
+...
+Could not fetch URL http://bodega.example.com:8080/pypi/simple/toml/: 403 Client Error: Forbidden - bodega refused pypi/toml (allow-list, incident ece4bf0530d8): pypi "toml" is not on this server's upstream allow-list. for url: http://bodega.example.com:8080/pypi/simple/toml/ - skipping
+...
+ERROR: No matching distribution found for toml==0.10.2
+```
+
+**go** prints a text body under `server response:`:
+
+```text
+$ go mod download github.com/kr/pretty@v0.3.1
+go: github.com/kr/pretty@v0.3.1: reading http://bodega.example.com:8080/go/github.com/kr/pretty/@v/v0.3.1.info: 403 Forbidden
+    server response:
+    bodega refused gomod/github.com/kr/pretty@v0.3.1 (allow-list, incident 0c8fe7cd094c): gomod "github.com/kr/pretty" is not on this server's upstream allow-list.
+    Next step: ask an operator to run `bodega policy add gomod github.com/kr/pretty` if it should be.
+```
+
+**cargo** prints the body under `body:`, in the `{"errors":[{"detail":...}]}` form its registry API uses:
+
+```text
+$ cargo fetch
+    Updating `bodega` index
+error: failed to get `itoa` as a dependency of package `e2e v0.1.0 (/src/e2e)`
+
+Caused by:
+  failed to query replaced source registry `crates-io`
+
+Caused by:
+  download of it/oa/itoa failed
+
+Caused by:
+  failed to get successful HTTP response from `http://bodega.example.com:8080/cargo/it/oa/itoa` (192.0.2.10), got 403
+  body:
+  {"errors":[{"detail":"bodega refused cargo/itoa (allow-list, incident 567d03969769): cargo \"itoa\" is not on this server's upstream allow-list. Next step: ask an operator to run `bodega policy add cargo itoa` if it should be."}]}
+```
+
+**helm** prints the status line and nothing else, so it gets the reason phrase pip does. The upstream it needed is not named, for the reason given above:
+
+```text
+$ helm pull http://bodega.example.com:8080/helm/charts/e2e-ref-chart-1.0.0.tgz
+Error: failed to fetch http://bodega.example.com:8080/helm/charts/e2e-ref-chart-1.0.0.tgz : 403 Forbidden - bodega refused helm/e2e-ref-chart@1.0.0 (allow-list, incident 2b5017fdb05a): the upstream this helm request needs is not on this server's upstream allow-list.
+```
+
+**apt** likewise, on the `Err:` line and again on `E: Failed to fetch`:
+
+```text
+$ apt-get download tree
+Err:1 http://bodega.example.com:8080/apt resolute/universe arm64 tree arm64 2.3.1-1
+  403  Forbidden - bodega refused apt/tree@2.3.1-1 (allow-list, incident bfcfa1a2d8d4): the upstream this apt request needs is not on this server's upstream allow-list. [IP: 192.0.2.10 8080]
+E: Failed to fetch http://bodega.example.com:8080/apt/pool/universe/t/tree/tree_2.3.1-1_arm64.deb  403  Forbidden - bodega refused apt/tree@2.3.1-1 (allow-list, incident bfcfa1a2d8d4): the upstream this apt request needs is not on this server's upstream allow-list. [IP: 192.0.2.10 8080]
+```
+
+The mutation API answers its own JSON, `{"error": "<summary> Next step: <next step>"}`, for a create the allow-list, age or OSV gate blocks and for a delete of a frozen entry.
+
+#### Limits
+
+- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod or cargo version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. Proxied apt, helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
+- **The reason phrase is HTTP/1.1's.** HTTP/2 has none, so a pip, helm or apt client that negotiates HTTP/2 with bodega's TLS listener, or a reverse proxy that rewrites the status line, shows the bare `403 Forbidden`. The header and body still carry the refusal.
+- **Other refusals keep their own text.** The middleware gates (deny list, admin network, tokens), the `/client/` routes, a git push, the spool bounds and the distfiles license and environment refusals are not package checks and answer as they did.
+
 ### `bodega policy list [--type TYPE]`
 
 Lists configured upstream allow-list rules. Without `--type`, shows every rule grouped by registry type.
@@ -1865,9 +1945,9 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
-### `bodega policy osv <sync|set|list|remove|rescan>`
+### `bodega policy osv <sync|set|list|remove|rescan|malware>`
 
-Matches every `(ecosystem, name, version)` an import carries against a local copy of the OSV database and warns or blocks on the per-ecosystem policy.
+Matches every `(ecosystem, name, version)` an import carries against a local copy of the OSV database and warns or blocks on the per-ecosystem policy. Malware records answer to a separate action that blocks with no configuration; see [Malware records](#malware-records).
 
 ```bash
 bodega policy osv sync
@@ -1876,6 +1956,8 @@ bodega policy osv set npm warn
 bodega policy osv list
 bodega policy osv rescan --type npm
 bodega policy osv remove npm
+bodega policy osv malware list
+bodega policy osv malware set pypi ignore --reason "internal index, vetted by sec-team"
 ```
 
 `sync` is the only OSV subcommand that reaches the network. Admission reads the synced directory and nothing else, unless `osv_api_fallback` is on.
@@ -1887,6 +1969,44 @@ bodega policy osv remove npm
 | `osv_db_max_age`   | `168h`               | How old a synced ecosystem may be before a clean answer warns instead of passing |
 
 The fallback is off by default because the deployment this gate exists for cannot reach `api.osv.dev`: with it on, every version stalls for the 15-second client timeout against a host that never answers, once per version, which a 635-package import pays 635 times.
+
+#### Malware records
+
+OSV carries two kinds of record. An advisory says a version has a flaw. A malware record says the package was published to do harm: OpenSSF's [malicious-packages](https://github.com/ossf/malicious-packages) project publishes them through OSV under `MAL-` ids, the same feed GitHub Dependabot alerts on. The gate treats a record as malware when its id begins `MAL-`, or when its `database_specific` block carries `malicious-packages-origins` or the CWE `CWE-506` (Embedded Malicious Code), which is how GitHub files a malware advisory under a `GHSA-` id.
+
+Malware records are evaluated under their own action per ecosystem, and **that action is `block` for every OSV-covered ecosystem until someone sets it otherwise**. It does not depend on an `osv_policy` row: with no rows at all the lookup still runs, a malware hit is refused, and every other advisory is ignored as before. `bodega policy osv set` governs only the advisories.
+
+```bash
+$ bodega policy osv malware list
+ECOSYSTEM  ACTION           SET BY  UPDATED     REASON
+apt        block (default)  -       -           -
+cargo      block (default)  -       -           -
+gomod      block (default)  -       -           -
+npm        warn             alice   2026-10-06  -
+pypi       ignore           bob     2026-10-06  internal index, vetted by sec-team
+
+$ bodega policy osv malware set npm ignore
+Error: ignore serves known malware for npm without a word in the log; pass --reason saying why
+```
+
+`set` takes `block`, `warn` or `ignore`. `ignore` requires `--reason`. Every change writes an audit event of type `policy` naming the actor, the action and the reason, and the row keeps the reason and actor beside the action.
+
+A malware hit names each record and its summary, and is never counted with the advisories:
+
+```bash
+$ bodega pkg import evil.json
+Error: policy blocked evil-pkg@1.0.0: osv: evil-pkg@1.0.0 is known malware: MAL-2025-1234 (Malicious code in evil-pkg (npm)); evil-pkg@1.0.0 has 1 OSV record(s): CVE-2025-0001
+```
+
+The advisory clause appears only when the ecosystem has an `osv_policy` row that is not `ignore`. The audit detail carries the malware ids under `malware`, apart from `vulns` and `count`, which now hold the advisories alone.
+
+**An outage does not stop installs.** When the gate cannot answer (no synced database, one older than `osv_db_max_age`, or a failed `api.osv.dev` query), a version with no prior malware verdict is admitted under `warn` with the degraded reason, exactly as [a stale database](#staleness-and-the-missing-database) is handled for advisories. A version an earlier check already found malware against keeps that verdict: the ids live in the `vetting.osv.malware` stamp, and the malware action applies to them while the source is down. This is also what a fresh install with nothing synced sees: every import warns until `bodega policy osv sync` has run.
+
+The proxy applies the malware action on a cache miss for `npm`, `pypi`, `gomod` and `cargo`, before it contacts the upstream. A refused fill answers `403` with the reason in the body and writes a `cache` audit row with status `malware_blocked`. The proxy does not run the advisory gate, and it does not re-check a cache hit; a version cached before its record was published is what [rescan](#rescan) is for. Only artifacts whose object key names a version are checked, so an npm packument, a cargo index entry or a pypi sdist passes through.
+
+**Only reported malware is caught.** The gate matches against a list of packages someone has already identified and reported to the feed. A package published an hour ago that nobody has looked at yet is not on it, and nothing here inspects what a package does. Pair this with the publish-age cooldown in [`bodega policy age`](#bodega-policy-age-setlistremove), which buys the reporting time to happen.
+
+An archive synced before this gate existed recognizes malware by its `MAL-` id alone. Re-run `bodega policy osv sync` to pick up `database_specific` marks.
 
 #### Sync
 
@@ -2123,7 +2243,20 @@ Admission and rescan part company on what they write for such an entry, on purpo
 
 The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. Whatever qualified an answer is on the row that answer produced, after the ids: a caveat that reached only the reason counts on stderr leaves one line claiming a verdict the run never had. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
 
-**Rescan records and decides nothing.** It never blocks, hides, freezes or deletes. An OSV data refresh that flags the base image half a fleet runs on would otherwise take that fleet offline with no operator in the loop, on the strength of a third-party data push. What to do about a version that has become vulnerable is a decision, and it stays with the person reading the report.
+**Rescan records advisories and decides nothing about them.** It never blocks, freezes or deletes over an advisory. An OSV data refresh that flags the base image half a fleet runs on would otherwise take that fleet offline with no operator in the loop, on the strength of a third-party data push. What to do about a version that has become vulnerable is a decision, and it stays with the person reading the report.
+
+**Malware is the exception.** A malware record no earlier stamp on the version named, in an ecosystem whose malware action is `block`, hides the version as `bodega pkg hide` does. The hide is written to the audit trail as a `hide` event with actor `osv-malware`, and the row reads `hidden (malware)`. A frozen version is not hidden: it is reported on stderr as an `ERROR`, its row reads `ERROR: frozen malware`, and the run exits 1 because the version is still served. Under `warn` the row reads `malware (new)` and the version is left alone; under `ignore` the record is stamped and nothing else happens.
+
+```bash
+$ bodega policy osv rescan --type npm
+TYPE  PACKAGE   VERSION  STATE             DETAIL
+npm   minimist  1.2.5    hidden (malware)  MAL-2026-77
+Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
+Hid 1 version(s) matching newly published malware records (actor osv-malware).
+  npm/minimist@1.2.5: MAL-2026-77
+```
+
+"Newly" is measured against the version's own stamp. Once a run has stamped a record, later runs do not treat it as new, so a version an operator unhides after reviewing it stays served. A malware record matched in data too stale to stamp is still acted on, and because nothing was stamped, the next run will act on it again.
 
 **A run that could not read the database does not look like a clean run.** Both print zero newly flagged, so the summary carries an unanswered count and the reason behind it, and the command exits 1 when it answered for nothing:
 
@@ -2140,7 +2273,7 @@ Error: nothing was re-checked: none of 2 version(s) could be answered for; the r
 
 Every unanswered version earns its own row. An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.
 
-Unlike `set`, `list` and the gate itself, `rescan` reads no policy row. Whether a version is vulnerable today is the same fact under `warn`, `block` and `ignore`; the row decides what admission does with a finding, not whether the finding is recorded. So an install that has configured no OSV policy still gets the report.
+`rescan` reads no `osv_policy` row. Whether a version is vulnerable today is the same fact under `warn`, `block` and `ignore`; the row decides what admission does with a finding, not whether the finding is recorded. So an install that has configured no OSV policy still gets the report. It does read the malware action, because that action decides whether a new malware record hides the version.
 
 A rescan that wrote anything signals a running `bodega serve`, so the API reflects the new stamps without a restart. `manifest.Store` answers a package request from its cache once it has served that package, so without the signal a long-running server would keep calling a freshly flagged version clean for the life of the process. A walk that saved nothing sends nothing, and a walk that saved some packages before failing on others signals anyway before it exits 1.
 
@@ -2162,7 +2295,7 @@ Flagged by OSV:
 
 The `OSV` cell reads `n/a` on `binary`, `git` and `helm`. Those three have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
-`GET /api/v1/packages/{type}/{name}/{version}` carries the same four keys on the version's `metadata`.
+`GET /api/v1/packages/{type}/{name}/{version}` carries the same keys on the version's `metadata`, plus `vetting.osv.malware`, which lists the stamped ids that are malware records.
 
 ### `bodega policy age <set|list|remove>`
 
@@ -2217,6 +2350,32 @@ Nothing else counts such a row as enforcement. The `bodega serve` startup banner
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
+The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod or cargo artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from; a registry bodega cannot reach makes every miss warn rather than block. A cache hit is not checked again. The OSV gate runs at the same points.
+
+#### Publish times in the hosted indexes
+
+The age gate runs on the bodega host, at admission and on a proxy cache miss. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
+
+A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
+
+| Type  | Route                            | Where the time appears                                                                                       |
+| ----- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| npm   | `/npm/<package>`                 | `time.<version>` per dated version, with `time.created` and `time.modified` the earliest and latest of those |
+| pypi  | `/pypi/simple/<dist>/`           | `data-upload-time` on each wheel's anchor in HTML; `upload-time` per file in PEP 691 JSON                    |
+| gomod | `/go/<module>/@v/<version>.info` | `Time`, set to the recorded value; every other field of the stored `.info` is kept                           |
+| cargo | none                             | The sparse index format has no publish time, so cargo clients have nothing to read                           |
+
+The pypi page answers PEP 691 JSON (`application/vnd.pypi.simple.v1+json`, `api-version` 1.0) to a client whose `Accept` header ranks it above HTML, which pip and uv both do, and HTML to everything else. The JSON carries an empty `hashes` object, as the HTML never carried a digest.
+
+A version with no `published_at` is left out rather than given an invented time: it has no `time` key in the packument, no `data-upload-time` or `upload-time` on its files, and its `.info` is served as stored. npm and pip treat an undated version as old enough, so an undated version passes every client-side cooldown. A version ends up undated when:
+
+- it was fetched before bodega recorded publish times: run `bodega build fetch --backfill-published` once;
+- the upstream had no time for it, or could not be reached: the fetch prints `WARNING: no publish time recorded` with the reason and stores the artifact anyway, and an import stores the entry with a `published_at` warning naming the version (printed by `pkg import`, logged at WARN and returned in `warnings` by the API). An import that cannot reach a registry tries it once per package rather than once per version;
+- it is a pypi distribution that arrives only as another entry's dependency, or under an entry that pins no version: the closure is resolved as a whole and there is no entry naming that version to record the time on;
+- it is an npm dist-tag entry such as `latest`, which names no single release.
+
+Proxy-mode packages are untouched: their index is upstream's own, times included.
+
 A blocking age gate refuses a too-new version; it does not steer a client away from one. To have the resolver pick the newest version that passes instead, turn on [`bodega policy filter`](#bodega-policy-filter-setlist) for the ecosystem.
 
 ### `bodega policy filter <set|list>`
@@ -2240,7 +2399,7 @@ pypi       on      age < 3d                  2026-10-06
 
 `WITHHOLDS` is computed from the age and OSV policies in force and is shown for an ecosystem that is off too, so you can read what turning it on would do first. The filter is off by default, and the server reads the setting on every index request, so `set` takes effect without a restart.
 
-**What it withholds.** Only a gate whose action is `block`. A version younger than the age gate's minimum, and a version the local OSV database (`osv_db_dir`) has a record for. A gate on `warn` or `ignore` withholds nothing, because the artifact route would serve that version and hiding it would refuse at the index what nobody refuses at the fetch. The filter never queries `api.osv.dev`, `osv_api_fallback` or not: one index read would be a query per listed version. A version the local database cannot answer for stays.
+**What it withholds.** Only a gate whose action is `block`. A version OSV records as malicious is withheld whenever the malware action is `block`, which it is with no row set, whatever the advisory gate says: the artifact route refuses it either way. A version younger than the age gate's minimum, and a version the local OSV database (`osv_db_dir`) has a record for. A gate on `warn` or `ignore` withholds nothing, because the artifact route would serve that version and hiding it would refuse at the index what nobody refuses at the fetch. The filter never queries `api.osv.dev`, `osv_api_fallback` or not: one index read would be a query per listed version. A version the local database cannot answer for stays.
 
 **Which indexes.** The three bodega proxies from upstream:
 
@@ -2264,7 +2423,7 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 
 - **It does not rewrite a lockfile.** `npm ci`, `pip install -r` with pinned versions and `go mod download` against an existing `go.sum` name the version without reading the index, so a pinned version that the gate blocks fails on the artifact, as it would without the filter.
 - **It never replaces the artifact-level gate.** With the filter on, the tarball, wheel or `.zip`/`.info`/`.mod` route refuses a withheld version requested directly with a `403` naming the gate, and writes a `denied` row with status `withheld_version`. The index is advice to a resolver; the artifact route is where the decision is enforced.
-- With the filter off, a proxied artifact is not checked against the age or OSV gate at fetch time. Both gates run at admission (`bodega pkg import`, `pkg create`, `POST /api/v1/packages`).
+- With the filter off, the proxied index lists every version upstream does, and the age and OSV gates refuse a too-new or flagged version when the client fetches its artifact (see the age gate above).
 - The gomod `@latest` document and the npm version route `/npm/<pkg>/<version>` are not filtered. `go` reads `@latest` only when the list is empty, and both lead to an artifact the route refuses.
 
 ### `bodega discover ...`
@@ -2577,7 +2736,7 @@ A default config is created on first run. All fields are optional.
 }
 ```
 
-`server_url` and `token` are read only on a host that pushes to a bodega server rather than running one; keep the token in `BODEGA_TOKEN` where you can, so it is never written to disk. The OSV keys are described under [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescan), `storage_by_group` under [Named backends](#named-backends-and-per-type-placement), and `apt_signing_name` and `apt_signing_email` under [Signing the apt repository](#signing-the-apt-repository).
+`server_url` and `token` are read only on a host that pushes to a bodega server rather than running one; keep the token in `BODEGA_TOKEN` where you can, so it is never written to disk. The OSV keys are described under [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescanmalware), `storage_by_group` under [Named backends](#named-backends-and-per-type-placement), and `apt_signing_name` and `apt_signing_email` under [Signing the apt repository](#signing-the-apt-repository).
 
 `deny_list`, `admin_permit_cidr` and `trusted_proxies` are bootstrap values. bodega copies each one into the audit database the first time it starts against a database that does not hold it, logging `acl source list=<name> source=database detail="copied from config file on this start"`. From then on the database decides and the file's entry is inert; a start where the two disagree logs a `WARN` naming both values and the `bodega acl` command that shows the live one. Edit them with `bodega acl`, not with the file.
 
@@ -3272,6 +3431,7 @@ All version entries support:
 | `checksum`           | object | `{"algorithm": "sha256", "value": "hex..."}`                                                                                          |
 | `checksum_verified`  | bool   | Whether checksum matches upstream publisher                                                                                           |
 | `artifact_size`      | int64  | Size in bytes (set at fetch time)                                                                                                     |
+| `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |
@@ -4001,6 +4161,75 @@ gpg --show-keys --with-fingerprint /etc/apt/keyrings/bodega-archive-keyring.gpg 
 ```
 
 Or skip the network entirely: `bodega apt key export --keyring` writes the same bytes to stdout for delivery through whatever channel you already trust with the rest of the host's configuration.
+
+### Attestation signing key
+
+bodega holds a third key, separate from the apt and pkg keys, whose only job is signing attestations about what it admitted. Keeping it separate means a stolen attestation key cannot sign an `InRelease` or a pkg catalogue, and a stolen apt or pkg key cannot vouch for a dependency. The server loads the key and publishes its public half; no route emits a signed attestation yet.
+
+As with the other two keys, the server only ever **loads** it. Generation is a CLI operation. The search order, first hit wins:
+
+| Order | Path                                        | Notes                                                     |
+| ----- | ------------------------------------------- | --------------------------------------------------------- |
+| 1     | `$CREDENTIALS_DIRECTORY/attest-signing.key` | systemd `LoadCredential=`; a per-service tmpfs, mode 0400 |
+| 2     | `/etc/bodega/attest-signing.key`            | packaged location                                         |
+| 3     | `<storage_path>/attest-signing.key`         | beside the artifacts                                      |
+
+The permission rules are the apt key's: a file readable beyond its owner is refused with the `chmod` that fixes it, the group bit alone is allowed inside `$CREDENTIALS_DIRECTORY`, and the key carries no passphrase. `docs/bodega.service` ships no `LoadCredential=` line for this key, so add `LoadCredential=attest-signing.key:/etc/bodega/attest-signing.key` beside the apt one, or have the service user own `/etc/bodega/attest-signing.key`, mode 0600.
+
+```bash
+bodega attest key generate             # Ed25519, mode 0600, at the first writable path above
+bodega attest key generate --force     # add a new key to an existing file; it becomes the signer
+bodega attest key show                 # every key: key ID, created, state, PEM public key
+bodega attest key retire <keyid>       # erase one key's private half; its public half stays published
+```
+
+The file is one or more PEM blocks, each below a `Created:` line. A signing key is an unencrypted PKCS#8 `PRIVATE KEY`, which is what `openssl genpkey -algorithm ed25519` writes, so a key made with openssl loads as-is (with no creation time). A retired key is its `PUBLIC KEY` alone, below a `Retired:` line.
+
+The key ID is the lowercase hex SHA-256 of the key's DER `SubjectPublicKeyInfo`. Anyone holding the PEM public key can recompute it:
+
+```bash
+openssl pkey -pubin -in key.pem -outform DER | sha256sum
+```
+
+`GET /api/v1/attestation/keys` lists every key in the file, unauthenticated, like the apt keyring routes:
+
+```json
+[
+  {
+    "keyid": "3db5a03ef0a8f221f36781ab6541e4e9b395599d53cdc848c580b9545b6e7c09",
+    "alg": "ed25519",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA58nTg5w3a7ruwPmNtvv+beALVqYLiCeKiwosSLQGpHk=\n-----END PUBLIC KEY-----\n",
+    "created_at": "2026-10-07T00:48:53Z",
+    "retired": false
+  }
+]
+```
+
+An empty array means no key is installed. Serving without one is allowed, and the server logs it once at `WARN` when it starts.
+
+A new key, or a retirement, takes effect on `systemctl reload bodega` (`SIGHUP`). A reload never takes the key away: if the file has become unreadable or unparseable, or has gone missing, the loaded key keeps signing and publishing, and the journal names the file and the reason. Dropping the key is a restart.
+
+#### Rotation
+
+Several keys may sit in the file. The newest one that is not retired signs, and every key's public half is published, so a verifier holding both key IDs accepts attestations from either side of the switch.
+
+```bash
+bodega attest key generate --force     # the new key joins the old one
+# ... publish the new key ID to verifiers, beside the old one ...
+systemctl reload bodega                # the new key signs; both are published
+bodega attest key retire <old-keyid>   # the old key's secret is erased from the file
+systemctl reload bodega                # the old key is published as retired
+```
+
+Unlike apt, where both keys sign during the window, only one key signs an attestation. A verifier pinned only to the old key ID rejects every attestation signed after the reload, so the new key ID has to reach verifiers **before** the reload.
+
+`retire` keeps the public half because an attestation outlives the rotation: one signed last month still has to verify. It takes the full 64-character key ID or a prefix of at least 16 characters, refuses a prefix matching more than one key, and refuses the last key that can sign. Retiring erases the private half from the file and nowhere else, so a backup or an earlier copy of the file can still sign. Retirement tells a verifier bodega has stopped using the key; it revokes nothing. To stop trusting a key, a verifier drops its key ID.
+
+#### Pinning the key ID
+
+The keys route is authenticated by TLS and by nothing else. A verifier that takes its key ID from that route trusts whoever controls the server's certificate, not the key.
+
+So a consumer pins a key ID it learned through a separate channel: `bodega attest key show` on the server, copied into a CI configuration repository, an onboarding doc, or a policy file a reviewer signs off. At verification time the consumer fetches `/api/v1/attestation/keys`, takes the entry whose `keyid` matches the pinned value, recomputes the SHA-256 of that entry's public key and checks that it matches, then verifies the signature with that key. A key the route lists but the consumer has not pinned is ignored. During a rotation the consumer pins both key IDs and drops the old one once it no longer needs to verify attestations the old key signed.
 
 ### Mirroring an upstream archive
 
@@ -4899,6 +5128,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
 | GET    | `/api/v1/status`                           | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
 | GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
+| GET    | `/api/v1/attestation/keys`                 | Every published attestation signing key, unauthenticated. See [Attestation signing key](#attestation-signing-key)                                                                       |
 | GET    | `/api/v1/audit`                            | Query audit events (supports filters)                                                                                                                                                   |
 | GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET    | `/client/plan`, `/client/plan.txt`         | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
@@ -5100,7 +5330,7 @@ curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
 - `401 Unauthorized` — missing or invalid Bearer token
-- `403 Forbidden` — IP not in `admin_permit_cidr`, or entry is frozen (delete)
+- `403 Forbidden` — IP not in `admin_permit_cidr`; the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
 - `409 Conflict` — entry already exists
 - `413 Request Entity Too Large` — request body exceeds 1 MiB
 
@@ -5286,7 +5516,7 @@ Both paths write the same row, keyed by the object key, so a version pinned by t
 
 Two artifacts have no per-version object key to pin against. **pypi** wheels upload as a directory holding a resolved dependency closure rather than one object per version. **Clone-mode git** ships a bundle generated locally at package time, so there are no upstream bytes to attest to and `git bundle create` is not reproducible byte-for-byte; a git entry fetched as a release tarball pins normally. Neither is an error: the fetch records the digest on the manifest entry and skips the cache row.
 
-When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from their object key once, on the first open after upgrade; the log line names the row count.
+When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with a `checksum` refusal whose incident names the audit row holding both digests. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from their object key once, on the first open after upgrade; the log line names the row count.
 
 **Management:**
 
@@ -5377,15 +5607,16 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 
 **Event types:**
 
-| Type                                                              | Trigger                                                                                                                    |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `serve_fetch`                                                     | Client downloaded a package over HTTP                                                                                      |
-| `fetch`, `build`, `package`, `upload`, `sync`                     | Build pipeline stage completed for an entry                                                                                |
-| `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API)                                                                                        |
-| `init`, `reset`, `status`, `show`                                 | Operator command                                                                                                           |
-| `cache`                                                           | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the two refusals decided on the way |
-| `denied`                                                          | A request the server refused                                                                                               |
-| `serve_start`, `serve_stop`                                       | `bodega serve` bound its listener / shut down                                                                              |
+| Type                                                              | Trigger                                                                                                                |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `serve_fetch`                                                     | Client downloaded a package over HTTP                                                                                  |
+| `fetch`, `build`, `package`, `upload`, `sync`                     | Build pipeline stage completed for an entry                                                                            |
+| `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API)                                                                                    |
+| `init`, `reset`, `status`, `show`                                 | Operator command                                                                                                       |
+| `policy`                                                          | A gate's action changed; today `bodega policy osv malware set`, with the action and reason in `details`                |
+| `cache`                                                           | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the refusals decided on the way |
+| `denied`                                                          | A request the server refused                                                                                           |
+| `serve_start`, `serve_stop`                                       | `bodega serve` bound its listener / shut down                                                                          |
 
 That table is the whole set. A type absent from a trail is a gap to chase rather than a type the server was never going to write: `cache` was defined and reachable only through its two refusals for several releases, so an install proxying npm and cargo all day recorded nothing saying which artifacts had come from upstream, and nothing in the trail read as missing.
 
@@ -5397,6 +5628,7 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
 | `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record                              |
+| `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
 | `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
 
 One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.

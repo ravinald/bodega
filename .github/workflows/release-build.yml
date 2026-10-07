@@ -1,0 +1,48 @@
+name: Release build
+
+# Called from release.yml and nothing else. Build, sign and attest live in this
+# reusable workflow because the OIDC token behind every signature names it as
+# the signer, so a verifier can require this file rather than any workflow in
+# the repository. Changing what a release runs means changing this file, and
+# `gh attestation verify --signer-workflow` refuses anything else.
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0    # GoReleaser needs full history for changelog
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          # This job signs and attests what people install, so the tool that
+          # builds it is a version somebody chose rather than whatever shipped
+          # the morning of the tag.
+          version: v2.18.2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The checksum file lists every archive, package and SBOM GoReleaser
+      # publishes, so one provenance statement covers them all and a new
+      # artifact type is covered the day GoReleaser starts checksumming it.
+      - name: Attest every checksummed artifact
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/checksums-sha256.txt

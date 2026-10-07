@@ -116,7 +116,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	pkgName := r.PathValue("package")
 	pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
 	if pkg != nil && isPackageHidden(pkg) {
-		http.NotFound(w, r)
+		s.refuseHidden(w, r, manifest.TypePypi, pkgName, "")
 		return
 	}
 	if !s.entitleGate(w, r, manifest.TypePypi, pkgName, "") {
@@ -152,7 +152,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		fetch, key := upstream, "pypi/simple/"+normalized+"/index.html"
 		wantJSON := pypiWantsJSON(r.Header.Get("Accept"))
 		if wantJSON {
-			fetch, key = upstream+"?format="+pypiJSONSimple, "pypi/simple/"+normalized+"/index.json"
+			fetch, key = upstream+"?format="+pypiSimpleJSON, "pypi/simple/"+normalized+"/index.json"
 		}
 		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit, wantJSON: wantJSON,
 			withhold: s.indexWithholdFor(r, manifest.TypePypi, normalized)}
@@ -194,8 +194,9 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// Collect matching wheel paths. We keep the path relative to "pypi/wheels/"
 	// so links work with versioned subdirs (e.g. "0.4.6/examplesdk-1.35.0-py3-none-any.whl").
 	type wheelEntry struct {
-		relPath  string // relative to pypi/wheels/, e.g. "0.4.6/examplesdk-1.35.0.whl"
-		filename string // base filename for display
+		relPath    string // relative to pypi/wheels/, e.g. "0.4.6/examplesdk-1.35.0.whl"
+		filename   string // base filename for display
+		uploadTime string // PEP 700 upload-time; empty when no fetch recorded one
 	}
 	named := pypiEntryVersionFilter(pkg)
 	var wheels []wheelEntry
@@ -217,11 +218,39 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		relPath := strings.TrimPrefix(key, manifest.PypiWheelPrefix)
-		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename})
+		_, version := wheelIdentity(filename)
+		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename, uploadTime: pypiUploadTime(pkg, version)})
 	}
 
 	if len(wheels) == 0 {
 		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Add("Vary", "Accept")
+	if pypiWantsJSON(r.Header.Get("Accept")) {
+		files := make([]pypiJSONFile, 0, len(wheels))
+		for _, whl := range wheels {
+			files = append(files, pypiJSONFile{
+				Filename:   whl.filename,
+				URL:        "/pypi/wheels/" + whl.relPath,
+				Hashes:     map[string]string{},
+				UploadTime: whl.uploadTime,
+			})
+		}
+		body, err := json.Marshal(pypiJSONPage{
+			Meta:  pypiJSONMeta{APIVersion: "1.0"},
+			Name:  normalized,
+			Files: files,
+		})
+		if err != nil {
+			s.logger.Error("pypi json index generation failed", "package", pkgName, "error", err)
+			http.Error(w, "index generation failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", pypiSimpleJSON)
+		//nolint:gosec // G705: body is generated JSON; Content-Type is set above.
+		_, _ = w.Write(body)
 		return
 	}
 
@@ -230,9 +259,71 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Links for %s</title></head>\n  <body>\n", escapedName)
 	_, _ = fmt.Fprintf(w, "    <h1>Links for %s</h1>\n", escapedName)
 	for _, whl := range wheels {
-		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/wheels/%s\">%s</a>\n", html.EscapeString(whl.relPath), html.EscapeString(whl.filename))
+		attr := ""
+		if whl.uploadTime != "" {
+			attr = ` data-upload-time="` + html.EscapeString(whl.uploadTime) + `"`
+		}
+		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/wheels/%s\"%s>%s</a>\n", html.EscapeString(whl.relPath), attr, html.EscapeString(whl.filename))
 	}
 	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
+}
+
+// pypiSimpleJSON is the PEP 691 media type for the JSON form of a simple page.
+const pypiSimpleJSON = "application/vnd.pypi.simple.v1+json"
+
+// pypiJSONPage is a PEP 691 project page.
+//
+// api-version stays 1.0. PEP 700's 1.1 makes size and a versions list
+// mandatory, and the page is built from a storage listing that carries
+// neither. upload-time is read by pip and uv whatever version a page
+// declares, and a 1.0 client ignores a key it does not know.
+type pypiJSONPage struct {
+	Meta  pypiJSONMeta   `json:"meta"`
+	Name  string         `json:"name"`
+	Files []pypiJSONFile `json:"files"`
+}
+
+type pypiJSONMeta struct {
+	APIVersion string `json:"api-version"`
+}
+
+// pypiJSONFile is one file on a PEP 691 page. hashes is required and may be
+// empty, which it is: the storage listing the page is built from carries no
+// digest, and the HTML form never published one either.
+type pypiJSONFile struct {
+	Filename   string            `json:"filename"`
+	URL        string            `json:"url"`
+	Hashes     map[string]string `json:"hashes"`
+	UploadTime string            `json:"upload-time,omitempty"`
+}
+
+// pypiUploadTime is the PEP 700 upload-time for a file of version, from the
+// manifest entry naming that version. Every file of a version carries the
+// version's time, which the fetch reads as the earliest upload among them.
+func pypiUploadTime(pm *manifest.PackageManifest, version string) string {
+	if pm == nil || version == "" {
+		return ""
+	}
+	for _, ve := range pm.Versions {
+		if !pypiSameVersion(ve.Version, version) {
+			continue
+		}
+		if t, ok := publishedTime(ve); ok {
+			return t.Format(time.RFC3339)
+		}
+	}
+	return ""
+}
+
+// pypiSameVersion compares a manifest version with one read off a wheel
+// filename, which PEP 427 writes normalized.
+func pypiSameVersion(a, b string) bool {
+	if a == b {
+		return true
+	}
+	av, aOK := builder.ParsePyVersion(a)
+	bv, bOK := builder.ParsePyVersion(b)
+	return aOK && bOK && av.Equal(bv)
 }
 
 // handlePypiWheel proxies /pypi/wheels/{path...} → S3 pypi/wheels/{path...}
@@ -377,7 +468,16 @@ type pypiIndexWriter struct {
 	// all on the cache-hit path where proxyS3 streams a stored object straight
 	// in.
 	tooBig bool
+	// hijacked records that a refusal answered on the raw connection, past
+	// this buffer, and flush has nothing left to write.
+	hijacked bool
 }
+
+// Unwrap lets the allow-list refusal on this route reach the connection to
+// write its own status line; see refusal.writeWithReasonPhrase.
+func (p *pypiIndexWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+func (p *pypiIndexWriter) observeHijack(int) { p.hijacked = true }
 
 func (p *pypiIndexWriter) WriteHeader(code int) {
 	if p.status == 0 {
@@ -404,6 +504,9 @@ func (p *pypiIndexWriter) Write(b []byte) (int, error) {
 // A refusal or an error passes untouched: those bodies carry no links, and a
 // 403 from the allow-list must reach the client as the handler wrote it.
 func (p *pypiIndexWriter) flush() error {
+	if p.hijacked {
+		return nil
+	}
 	body := p.body.Bytes()
 	if p.status == 0 {
 		p.status = http.StatusOK
@@ -421,7 +524,7 @@ func (p *pypiIndexWriter) flush() error {
 				return err
 			}
 			body = out
-			p.Header().Set("Content-Type", pypiJSONSimple)
+			p.Header().Set("Content-Type", pypiSimpleJSON)
 		} else {
 			filtered := filterPypiSimplePage(body, p.pkg, p.permit)
 			if p.withhold != nil {
@@ -523,7 +626,7 @@ func pypiWantsJSON(accept string) bool {
 			}
 		}
 		switch mt {
-		case pypiJSONSimple, "application/vnd.pypi.simple.latest+json":
+		case pypiSimpleJSON, "application/vnd.pypi.simple.latest+json":
 			qJSON = max(qJSON, q)
 		case "application/vnd.pypi.simple.v1+html", "application/vnd.pypi.simple.latest+html", "text/html", "text/*", "*/*":
 			qHTML = max(qHTML, q)

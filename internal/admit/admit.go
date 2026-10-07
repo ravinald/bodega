@@ -12,9 +12,13 @@ package admit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -57,6 +61,16 @@ type Result struct {
 	Decision Decision
 	Reason   string
 	Warnings []string
+
+	// The rest is set on PolicyBlocked only, for a caller that has to tell
+	// the person refused which gate said no and how to find the row it wrote.
+	// Check is "allow-list", "age" or "osv"; Version is the version refused;
+	// Incident is the ID the refusal's audit row carries in its details;
+	// Details is the refusing check's structured payload.
+	Check    string
+	Version  string
+	Incident string
+	Details  map[string]any
 }
 
 // OK reports whether the caller may proceed to write.
@@ -83,11 +97,13 @@ func Admit(
 	if err := validate(cfg, pm, &res); err != nil {
 		return Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
 	}
-	if err := checkAllowList(ctx, checker, adb, pm, actor); err != nil {
-		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	if blocked := checkAllowList(ctx, checker, adb, pm, actor); blocked != nil {
+		blocked.Warnings = res.Warnings
+		return *blocked
 	}
-	if err := checkVersions(ctx, adb, cfg, pm, actor, &res); err != nil {
-		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	if blocked := checkVersions(ctx, adb, pm, actor, audit.EventCreate, &res, VersionCheckers(cfg, adb)); blocked != nil {
+		blocked.Warnings = res.Warnings
+		return *blocked
 	}
 	return res
 }
@@ -182,7 +198,8 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 
 // checkAllowList runs the URL-level allow-list over every version. It is
 // cheap and fails fast, so it runs before the checks that reach the network.
-func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) error {
+// It returns nil when every version passes.
+func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) *Result {
 	if checker == nil {
 		return nil
 	}
@@ -192,6 +209,7 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 			continue
 		}
 		if err := checker.Check(ctx, pm.Type, candidate); err != nil {
+			incident := audit.NewIncidentID()
 			if adb != nil {
 				_ = adb.Record(ctx, audit.Event{
 					EventType:  audit.EventCreate,
@@ -200,10 +218,11 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 					PkgVersion: ve.Version,
 					Actor:      actor,
 					Status:     "policy_violation",
-					Details:    fmt.Sprintf("candidate=%s", candidate),
+					Details:    fmt.Sprintf("candidate=%s incident=%s", candidate, incident),
 				})
 			}
-			return err
+			return &Result{Decision: PolicyBlocked, Reason: err.Error(),
+				Check: "allow-list", Version: ve.Version, Incident: incident}
 		}
 	}
 	return nil
@@ -216,13 +235,9 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 // looking. Recording alone leaves an OSV gate with no synced database printing
 // a clean import and filing the warning somewhere nobody reads until after the
 // package is in the store.
-func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) error {
+func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string, eventType audit.EventType, res *Result, checkers []policy.VersionChecker) *Result {
 	if adb == nil {
 		return nil
-	}
-	checkers := []policy.VersionChecker{
-		policy.NewAgeChecker(adb),
-		OSVChecker(cfg, adb),
 	}
 	warns := &versionWarnings{}
 	defer warns.flush(res)
@@ -230,14 +245,19 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 		ve := &pm.Versions[i]
 		combined := policy.RunChecks(ctx, pm, ve, checkers...)
 		warns.add(ve.Version, combined.Warns)
+		var incident string
 		if details := combined.AuditDetails(); details != nil {
+			if combined.Blocked() {
+				incident = audit.NewIncidentID()
+				details["incident"] = incident
+			}
 			blob, _ := json.Marshal(details)
 			status := "policy_warn"
 			if combined.Blocked() {
 				status = "policy_violation"
 			}
 			_ = adb.Record(ctx, audit.Event{
-				EventType:  audit.EventCreate,
+				EventType:  eventType,
 				PkgType:    pm.Type,
 				PkgName:    pm.Name,
 				PkgVersion: ve.Version,
@@ -247,10 +267,100 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 			})
 		}
 		if combined.Blocked() {
-			return fmt.Errorf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())
+			first := combined.Blocks[0]
+			return &Result{Decision: PolicyBlocked,
+				Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons()),
+				Check:  first.Check, Version: ve.Version, Incident: incident, Details: first.Details}
 		}
 	}
 	return nil
+}
+
+// CheckFetch runs the per-version checks import runs on one version a proxy
+// fill is about to fetch, so a version no manifest names is not admitted under
+// a weaker policy than one that arrived through import. The row is a cache
+// event because nothing was created. A nil result means the fetch may go
+// ahead; a warn is recorded rather than returned, since the client fetching
+// has nowhere to read one.
+//
+// checkers is VersionCheckers outside a test.
+func CheckFetch(ctx context.Context, adb *audit.DB, checkers []policy.VersionChecker, typ, name, version string) *Result {
+	pm := &manifest.PackageManifest{Type: typ, Name: name,
+		Versions: []manifest.VersionEntry{{Version: version, Mode: manifest.ModeProxy}}}
+	return checkVersions(ctx, adb, pm, "", audit.EventCache, nil, checkers)
+}
+
+// VersionCheckers are the per-version checks every admission runs, import
+// and proxy fill alike.
+func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
+	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb)}
+}
+
+// RecordPublished dates every version of pm that arrives without a
+// published_at, reading the registry its url names: the read a fetch makes, so
+// an imported version reaches the hosted indexes with a time a client's
+// release-age cooldown can evaluate. It runs whatever the age policy says,
+// because the indexes publish the time whether or not this server gates on it.
+//
+// It writes only what upstream answered. A version it cannot date stays
+// undated and is named in res.Warnings, and the import goes ahead: the
+// manifest is good either way. A published_at the caller supplied is kept, so
+// an exported manifest imported elsewhere is not re-read, and a version
+// existing already holds is skipped, because MergeVersions keeps that entry
+// over the incoming one. existing may be nil.
+//
+// A registry that cannot be reached is tried once per manifest, so an offline
+// import of a long version list costs one timeout rather than one per version.
+func RecordPublished(ctx context.Context, pm, existing *manifest.PackageManifest, res *Result) {
+	if !slices.Contains(policy.AgeEcosystems(), pm.Type) {
+		return
+	}
+	recordPublished(ctx, NewPublishReader(), pm, existing, res)
+}
+
+// NewPublishReader builds the reader RecordPublished dates versions with. A
+// test binary that imports manifests replaces it, so the suite reads a local
+// stub rather than the public registries.
+var NewPublishReader = func() *policy.AgeChecker { return policy.NewAgeChecker(nil) }
+
+func recordPublished(ctx context.Context, ac *policy.AgeChecker, pm, existing *manifest.PackageManifest, res *Result) {
+	warns := &versionWarnings{}
+	defer warns.flush(res)
+	unreachable := map[string]error{}
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		if ve.PublishedAt != "" || policy.UndatableVersion(pm.Type, ve.Version) || holdsVersion(existing, ve.Version) {
+			continue
+		}
+		upstream := strings.TrimRight(strings.TrimSpace(ve.URL), "/")
+		err, skip := unreachable[upstream]
+		if !skip {
+			var t time.Time
+			t, err = ac.AtUpstream(pm.Type, upstream).PublishedAt(ctx, pm.Type, pm.Name, strings.TrimSpace(ve.Version))
+			if err == nil {
+				ve.PublishedAt = t.UTC().Format(time.RFC3339)
+				continue
+			}
+			var transport *url.Error
+			if errors.As(err, &transport) {
+				unreachable[upstream] = err
+			}
+		}
+		warns.add(ve.Version, []policy.Result{{Check: "published_at",
+			Reason: "no publish time recorded, so a client's release-age cooldown cannot evaluate this version: " + err.Error()}})
+	}
+}
+
+func holdsVersion(pm *manifest.PackageManifest, version string) bool {
+	if pm == nil {
+		return false
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return true
+		}
+	}
+	return false
 }
 
 // versionWarnings collects the per-version warns of one manifest into the
@@ -311,7 +421,14 @@ func describeVersions(versions []string) string {
 // these four keys is how a rescan starts reporting on data admission never
 // read.
 func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
-	ck := policy.NewOSVChecker(adb)
+	// A nil *audit.DB inside the interface is not a nil interface, and the
+	// checker reads a nil store as "no rows", which is what a rescan with no
+	// audit database has.
+	var store policy.OSVStore
+	if adb != nil {
+		store = adb
+	}
+	ck := policy.NewOSVChecker(store)
 	if cfg == nil {
 		return ck
 	}

@@ -1,16 +1,23 @@
 package server
 
 import (
+	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // TestMain points the host-wide search paths at a scratch directory before any
-// test builds a Server.
+// test builds a Server, and stops the import path's publish-time reads at the
+// loopback interface, so an import test never reaches a public registry.
 //
 // New() reads the apt signing key from /etc/bodega/apt-signing.key and the
 // token pepper from /etc/bodega/pepper or the user's config directory, none of
@@ -30,8 +37,30 @@ func TestMain(m *testing.M) {
 	// Unset rather than redirected: a test that wants a key installed at
 	// position 1 sets this itself, and t.Setenv restores it to unset.
 	_ = os.Unsetenv(aptsign.CredentialsEnv)
+	// A fresh audit database seeds an npm and pypi age gate, which dates every
+	// proxied version against the public registry. No check here may depend on
+	// reaching it; the tests of the gate itself install their own.
+	fetchCheckers = func(*config.Config, *audit.DB) []policy.VersionChecker { return nil }
+
+	admit.NewPublishReader = func() *policy.AgeChecker {
+		ac := policy.NewAgeChecker(nil)
+		ac.HTTP = &http.Client{Transport: loopbackOnly{}}
+		return ac
+	}
 
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// loopbackOnly refuses every host but this one. Swapping the reader's
+// endpoints is not enough: an entry's url overrides them, and the catalogs
+// these tests import name the public registries.
+type loopbackOnly struct{}
+
+func (loopbackOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	if ip := net.ParseIP(r.URL.Hostname()); ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("test binary refuses %s: only a loopback stub may be read", r.URL.Host)
+	}
+	return http.DefaultTransport.RoundTrip(r)
 }

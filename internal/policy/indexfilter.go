@@ -72,20 +72,36 @@ func (f *IndexFilter) Gate(ctx context.Context, ecosystem string) (*IndexGate, e
 		g.MinAge = time.Duration(age.MinAgeSeconds) * time.Second
 	}
 
+	fixed := fixedOSVPolicy{malware: audit.OSVMalwarePolicy{Action: ActionBlock}}
 	osv, err := f.store.GetOSVPolicy(ctx, ecosystem)
 	switch {
 	case errors.Is(err, audit.ErrOSVPolicyNotFound):
 	case err != nil:
 		return nil, err
-	case osv.Action == ActionBlock && f.osv != nil:
-		// A copy answering from the row already read, so a packument of two
-		// thousand versions is one policy query rather than two thousand. The
-		// live API is off for the same reason: one index read would be a
+	case osv.Action == ActionBlock:
+		fixed.advisory = &osv
+	}
+	// Malware blocks with no row at all, so the filter withholds a version
+	// OSV records as malicious whether or not the advisory gate is on: the
+	// artifact route refuses it either way, and an index still listing it
+	// hands the resolver a version it can never install.
+	mal, err := f.store.GetOSVMalwarePolicy(ctx, ecosystem)
+	switch {
+	case errors.Is(err, audit.ErrOSVMalwarePolicyNotFound):
+	case err != nil:
+		return nil, err
+	default:
+		fixed.malware = mal
+	}
+	if f.osv != nil && (fixed.advisory != nil || fixed.malware.Action == ActionBlock) {
+		// A copy answering from the rows already read, so a packument of two
+		// thousand versions is two policy queries rather than four thousand.
+		// The live API is off for the same reason: one index read would be a
 		// query per version against a host the admission path only reaches
 		// when the operator asked it to. A version the local database cannot
 		// answer comes back as a warn, and a warn keeps it.
 		ck := *f.osv
-		ck.store = fixedOSVPolicy(osv)
+		ck.store = fixed
 		ck.AllowAPIFallback = false
 		g.osv = &ck
 	}
@@ -133,8 +149,21 @@ func (g *IndexGate) Withhold(ctx context.Context, name, version string, publishe
 	return ""
 }
 
-type fixedOSVPolicy audit.OSVPolicy
+// fixedOSVPolicy answers an OSVChecker from rows already read. advisory is
+// nil when the advisory gate does not block, which reads as no row: the
+// checker then applies the malware action alone.
+type fixedOSVPolicy struct {
+	advisory *audit.OSVPolicy
+	malware  audit.OSVMalwarePolicy
+}
 
 func (p fixedOSVPolicy) GetOSVPolicy(context.Context, string) (audit.OSVPolicy, error) {
-	return audit.OSVPolicy(p), nil
+	if p.advisory == nil {
+		return audit.OSVPolicy{}, audit.ErrOSVPolicyNotFound
+	}
+	return *p.advisory, nil
+}
+
+func (p fixedOSVPolicy) GetOSVMalwarePolicy(context.Context, string) (audit.OSVMalwarePolicy, error) {
+	return p.malware, nil
 }

@@ -103,7 +103,11 @@ func (s *Server) serveFreeBSD(w http.ResponseWriter, r *http.Request, abi, repo,
 		// Before the cache read and before any upstream contact. hide is the
 		// quarantine control, and an ABI that still answers from the store or
 		// still warms a proxy cache is not quarantined.
-		http.NotFound(w, r)
+		hiddenVersion := ""
+		if !isPackageHidden(pm) {
+			hiddenVersion = ve.Version
+		}
+		s.refuseHidden(w, r, manifest.TypeFreeBSD, repo, hiddenVersion)
 		return
 	}
 

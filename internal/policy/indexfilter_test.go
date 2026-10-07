@@ -12,6 +12,8 @@ type fakeIndexFilterStore struct {
 	on  bool
 	age *audit.AgePolicy
 	osv *audit.OSVPolicy
+	// malware nil means no row, which the malware action reads as block.
+	malware *audit.OSVMalwarePolicy
 }
 
 func (f fakeIndexFilterStore) IndexFilterEnabled(context.Context, string) (bool, error) {
@@ -23,6 +25,13 @@ func (f fakeIndexFilterStore) GetAgePolicy(context.Context, string) (audit.AgePo
 		return audit.AgePolicy{}, audit.ErrAgePolicyNotFound
 	}
 	return *f.age, nil
+}
+
+func (f fakeIndexFilterStore) GetOSVMalwarePolicy(context.Context, string) (audit.OSVMalwarePolicy, error) {
+	if f.malware == nil {
+		return audit.OSVMalwarePolicy{}, audit.ErrOSVMalwarePolicyNotFound
+	}
+	return *f.malware, nil
 }
 
 func (f fakeIndexFilterStore) GetOSVPolicy(context.Context, string) (audit.OSVPolicy, error) {
@@ -48,9 +57,16 @@ func TestIndexFilterGate(t *testing.T) {
 	})
 	t.Run("a warn gate withholds nothing", func(t *testing.T) {
 		warn := &audit.AgePolicy{MinAgeSeconds: 7 * 24 * 3600, Action: ActionWarn}
-		g, err := NewIndexFilter(fakeIndexFilterStore{on: true, age: warn, osv: &audit.OSVPolicy{Action: ActionWarn}}, ck).Gate(ctx, "npm")
+		ignore := &audit.OSVMalwarePolicy{Action: ActionIgnore}
+		g, err := NewIndexFilter(fakeIndexFilterStore{on: true, age: warn, osv: &audit.OSVPolicy{Action: ActionWarn}, malware: ignore}, ck).Gate(ctx, "npm")
 		if err != nil || g != nil {
-			t.Errorf("gate = %+v, %v; want nil when neither gate blocks", g, err)
+			t.Errorf("gate = %+v, %v; want nil when no gate blocks", g, err)
+		}
+		// With no malware row the malware action blocks, so the filter still
+		// withholds what OSV records as malicious.
+		g, err = NewIndexFilter(fakeIndexFilterStore{on: true, age: warn, osv: &audit.OSVPolicy{Action: ActionWarn}}, ck).Gate(ctx, "npm")
+		if err != nil || g == nil || g.osv == nil || g.MinAge != 0 {
+			t.Errorf("gate = %+v, %v; want an OSV gate for malware alone", g, err)
 		}
 	})
 

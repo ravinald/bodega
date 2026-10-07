@@ -18,7 +18,8 @@ builds:
       - -s -w
       - -X main.version={{.Version}}
       - -X main.commit={{.FullCommit}}
-      - -X main.buildDate={{.Date}}
+      - -X main.buildDate={{.CommitDate}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
     # Windows is intentionally omitted: cmd/bodega/cmd_reset.go imports
     # log/syslog (Unix-only). Add windows/amd64 once that usage is guarded
     # behind build tags.
@@ -30,13 +31,29 @@ archives:
     formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    # The commit's time rather than the checkout's, so an archive rebuilt
+    # from a fresh clone matches the published one byte for byte.
+    builds_info:
+      mtime: '{{ .CommitDate }}'
     files:
-      - LICENSE
-      - README.md
-      - docs/quickstart.md
-      - docs/usage.md
-      - docs/bodega.service
-      - docs/bodega.rc
+      - src: LICENSE
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: README.md
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: docs/quickstart.md
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: docs/usage.md
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: docs/bodega.service
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: docs/bodega.rc
+        info:
+          mtime: '{{ .CommitDate }}'
 
 nfpms:
   - id: linux-packages
@@ -47,6 +64,7 @@ nfpms:
     description: Self-hosted package repository manager
     license: Apache-2.0
     formats: [deb, rpm]
+    mtime: '{{ .CommitDate }}'
     bindir: /usr/local/bin
     contents:
       - src: docs/bodega.service
@@ -61,6 +79,22 @@ checksum:
 sboms:
   - id: binary
     artifacts: binary
+    # syft stamps every SPDX document with the wall clock and a random
+    # namespace UUID and has no switch to turn either off, so two builds of one
+    # commit would never agree on the SBOM's checksum. The rest of its output
+    # is stable, so both fields are rewritten from the commit and the
+    # document's own versioned name. pipefail keeps a syft failure from
+    # becoming an empty SBOM that jq exits 0 on.
+    cmd: bash
+    args:
+      - -o
+      - pipefail
+      - -c
+      - >-
+        syft "$artifact" --output spdx-json --enrich all
+        | jq -c '.creationInfo.created = "{{ .CommitDate }}"
+        | .documentNamespace = "https://github.com/ravinald/bodega/spdx/$document"'
+        > "$document"
 
 signs:
   - cmd: cosign
