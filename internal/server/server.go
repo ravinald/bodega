@@ -142,6 +142,13 @@ type Server struct {
 	// and bodega adds none.
 	pkgSign atomic.Pointer[pkgSigning]
 
+	// attestSign is the key attestations are signed with and the public set
+	// GET /api/v1/attestation/keys serves. nil when no key is installed.
+	// Swapped whole on SIGHUP for the reason aptSign is.
+	attestSign atomic.Pointer[attestSigning]
+	// attestNoKeyWarned keeps the no-key WARN to one line per process.
+	attestNoKeyWarned atomic.Bool
+
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
 	// repository to digest it, and a fleet's `pkg update` cron would
@@ -394,6 +401,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 
 	s.loadAptSigner()
 	s.loadPkgSigner()
+	s.loadAttestSigner()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -755,10 +763,11 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt and pkg signing keys, the CIDR access lists, the identity bindings and the profile bindings")
+	s.logger.Info("reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
 	s.loadPkgSigner()
+	s.loadAttestSigner()
 	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
 	s.refreshIdentities(ctx)
@@ -886,6 +895,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}", s.handleAPIPackage)
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}", s.handleAPIPackageVersion)
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}/attestation", s.handleAttestation)
+	m.HandleFunc("GET /api/v1/attestation/keys", s.handleAttestationKeys)
 	m.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
 	m.HandleFunc("GET /api/v1/config", s.handleAPIConfig)
 	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)

@@ -4037,6 +4037,75 @@ gpg --show-keys --with-fingerprint /etc/apt/keyrings/bodega-archive-keyring.gpg 
 
 Or skip the network entirely: `bodega apt key export --keyring` writes the same bytes to stdout for delivery through whatever channel you already trust with the rest of the host's configuration.
 
+### Attestation signing key
+
+bodega holds a third key, separate from the apt and pkg keys, whose only job is signing attestations about what it admitted. Keeping it separate means a stolen attestation key cannot sign an `InRelease` or a pkg catalogue, and a stolen apt or pkg key cannot vouch for a dependency. The server loads the key and publishes its public half; no route emits a signed attestation yet.
+
+As with the other two keys, the server only ever **loads** it. Generation is a CLI operation. The search order, first hit wins:
+
+| Order | Path                                        | Notes                                                     |
+| ----- | ------------------------------------------- | --------------------------------------------------------- |
+| 1     | `$CREDENTIALS_DIRECTORY/attest-signing.key` | systemd `LoadCredential=`; a per-service tmpfs, mode 0400 |
+| 2     | `/etc/bodega/attest-signing.key`            | packaged location                                         |
+| 3     | `<storage_path>/attest-signing.key`         | beside the artifacts                                      |
+
+The permission rules are the apt key's: a file readable beyond its owner is refused with the `chmod` that fixes it, the group bit alone is allowed inside `$CREDENTIALS_DIRECTORY`, and the key carries no passphrase. `docs/bodega.service` ships no `LoadCredential=` line for this key, so add `LoadCredential=attest-signing.key:/etc/bodega/attest-signing.key` beside the apt one, or have the service user own `/etc/bodega/attest-signing.key`, mode 0600.
+
+```bash
+bodega attest key generate             # Ed25519, mode 0600, at the first writable path above
+bodega attest key generate --force     # add a new key to an existing file; it becomes the signer
+bodega attest key show                 # every key: key ID, created, state, PEM public key
+bodega attest key retire <keyid>       # erase one key's private half; its public half stays published
+```
+
+The file is one or more PEM blocks, each below a `Created:` line. A signing key is an unencrypted PKCS#8 `PRIVATE KEY`, which is what `openssl genpkey -algorithm ed25519` writes, so a key made with openssl loads as-is (with no creation time). A retired key is its `PUBLIC KEY` alone, below a `Retired:` line.
+
+The key ID is the lowercase hex SHA-256 of the key's DER `SubjectPublicKeyInfo`. Anyone holding the PEM public key can recompute it:
+
+```bash
+openssl pkey -pubin -in key.pem -outform DER | sha256sum
+```
+
+`GET /api/v1/attestation/keys` lists every key in the file, unauthenticated, like the apt keyring routes:
+
+```json
+[
+  {
+    "keyid": "3db5a03ef0a8f221f36781ab6541e4e9b395599d53cdc848c580b9545b6e7c09",
+    "alg": "ed25519",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA58nTg5w3a7ruwPmNtvv+beALVqYLiCeKiwosSLQGpHk=\n-----END PUBLIC KEY-----\n",
+    "created_at": "2026-10-07T00:48:53Z",
+    "retired": false
+  }
+]
+```
+
+An empty array means no key is installed. Serving without one is allowed, and the server logs it once at `WARN` when it starts.
+
+A new key, or a retirement, takes effect on `systemctl reload bodega` (`SIGHUP`). A reload never takes the key away: if the file has become unreadable or unparseable, or has gone missing, the loaded key keeps signing and publishing, and the journal names the file and the reason. Dropping the key is a restart.
+
+#### Rotation
+
+Several keys may sit in the file. The newest one that is not retired signs, and every key's public half is published, so a verifier holding both key IDs accepts attestations from either side of the switch.
+
+```bash
+bodega attest key generate --force     # the new key joins the old one
+# ... publish the new key ID to verifiers, beside the old one ...
+systemctl reload bodega                # the new key signs; both are published
+bodega attest key retire <old-keyid>   # the old key's secret is erased from the file
+systemctl reload bodega                # the old key is published as retired
+```
+
+Unlike apt, where both keys sign during the window, only one key signs an attestation. A verifier pinned only to the old key ID rejects every attestation signed after the reload, so the new key ID has to reach verifiers **before** the reload.
+
+`retire` keeps the public half because an attestation outlives the rotation: one signed last month still has to verify. It takes the full 64-character key ID or a prefix of at least 16 characters, refuses a prefix matching more than one key, and refuses the last key that can sign. Retiring erases the private half from the file and nowhere else, so a backup or an earlier copy of the file can still sign. Retirement tells a verifier bodega has stopped using the key; it revokes nothing. To stop trusting a key, a verifier drops its key ID.
+
+#### Pinning the key ID
+
+The keys route is authenticated by TLS and by nothing else. A verifier that takes its key ID from that route trusts whoever controls the server's certificate, not the key.
+
+So a consumer pins a key ID it learned through a separate channel: `bodega attest key show` on the server, copied into a CI configuration repository, an onboarding doc, or a policy file a reviewer signs off. At verification time the consumer fetches `/api/v1/attestation/keys`, takes the entry whose `keyid` matches the pinned value, recomputes the SHA-256 of that entry's public key and checks that it matches, then verifies the signature with that key. A key the route lists but the consumer has not pinned is ignored. During a rotation the consumer pins both key IDs and drops the old one once it no longer needs to verify attestations the old key signed.
+
 ### Mirroring an upstream archive
 
 A codename listed in `apt_upstreams` is a **mirrored codename**: served from upstream rather than generated, the other of the two modes a codename can take. A codename in `apt_suites` is a **generated suite**, built from bodega's own manifest entries and signed by bodega. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
@@ -4934,6 +5003,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
 | GET    | `/api/v1/status`                           | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
 | GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
+| GET    | `/api/v1/attestation/keys`                 | Every published attestation signing key, unauthenticated. See [Attestation signing key](#attestation-signing-key)                                                                       |
 | GET    | `/api/v1/audit`                            | Query audit events (supports filters)                                                                                                                                                   |
 | GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET    | `/client/plan`, `/client/plan.txt`         | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
