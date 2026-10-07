@@ -311,7 +311,14 @@ func describeVersions(versions []string) string {
 // these four keys is how a rescan starts reporting on data admission never
 // read.
 func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
-	ck := policy.NewOSVChecker(adb)
+	// A nil *audit.DB inside the interface is not a nil interface, and the
+	// checker reads a nil store as "no rows", which is what a rescan with no
+	// audit database has.
+	var store policy.OSVStore
+	if adb != nil {
+		store = adb
+	}
+	ck := policy.NewOSVChecker(store)
 	if cfg == nil {
 		return ck
 	}

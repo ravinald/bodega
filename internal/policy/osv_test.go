@@ -15,6 +15,15 @@ import (
 
 type fakeOSVStore struct {
 	policies map[string]audit.OSVPolicy
+	malware  map[string]audit.OSVMalwarePolicy
+}
+
+func (f *fakeOSVStore) GetOSVMalwarePolicy(_ context.Context, ecosystem string) (audit.OSVMalwarePolicy, error) {
+	p, ok := f.malware[ecosystem]
+	if !ok {
+		return audit.OSVMalwarePolicy{}, audit.ErrOSVMalwarePolicyNotFound
+	}
+	return p, nil
 }
 
 func (f *fakeOSVStore) GetOSVPolicy(_ context.Context, ecosystem string) (audit.OSVPolicy, error) {
@@ -47,13 +56,163 @@ func stubOSV(t *testing.T, vulnIDs ...string) *httptest.Server {
 	}))
 }
 
+// TestOSVPolicy_NoPolicy is a fresh install: no rows and nothing synced. The
+// malware action still runs its lookup, finds nothing to answer from, and
+// admits under warn with the reason rather than refusing every version.
 func TestOSVPolicy_NoPolicy(t *testing.T) {
 	ck := NewOSVChecker(&fakeOSVStore{})
 	r := ck.Check(context.Background(),
 		&manifest.PackageManifest{Name: "anything", Type: manifest.TypeNpm},
 		&manifest.VersionEntry{Version: "1.0.0"})
+	if r.Action != ActionWarn || !strings.Contains(r.Reason, "policy osv sync") {
+		t.Errorf("no policy and no database = warn naming the sync, got %+v", r)
+	}
+}
+
+// TestOSVPolicy_BothActionsIgnoredSkipsTheLookup is the only configuration
+// that still answers before any lookup.
+func TestOSVPolicy_BothActionsIgnoredSkipsTheLookup(t *testing.T) {
+	ck := NewOSVChecker(&fakeOSVStore{malware: map[string]audit.OSVMalwarePolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionIgnore, Reason: "vetted"},
+	}})
+	r := ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "anything", Type: manifest.TypeNpm},
+		&manifest.VersionEntry{Version: "1.0.0"})
 	if r.Action != ActionPass {
-		t.Errorf("no policy = pass, got %+v", r)
+		t.Errorf("advisory unset and malware ignored = pass, got %+v", r)
+	}
+}
+
+func malRecord(id, summary string) map[string]any {
+	return map[string]any{"id": id, "summary": summary}
+}
+
+// TestOSVMalware_BlocksWithNoPolicyRow is the default the item exists for: no
+// osv_policy row, no malware row, and a MAL- record against the version.
+func TestOSVMalware_BlocksWithNoPolicyRow(t *testing.T) {
+	var eco string
+	srv := stubOSVRecords(t, &eco,
+		malRecord("MAL-2025-1234", "Malicious code in evil-pkg (npm)"),
+		map[string]any{"id": "CVE-2025-0001"})
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+
+	ve := &manifest.VersionEntry{Version: "1.0.0"}
+	r := ck.Check(context.Background(), &manifest.PackageManifest{Name: "evil-pkg", Type: manifest.TypeNpm}, ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("MAL- record with no policy row = block, got %+v", r)
+	}
+	if !strings.Contains(r.Reason, "MAL-2025-1234") || !strings.Contains(r.Reason, "Malicious code in evil-pkg") {
+		t.Errorf("the reason must name the record and its summary: %q", r.Reason)
+	}
+	// The CVE answers to the advisory gate, which nobody turned on.
+	if strings.Contains(r.Reason, "OSV record(s)") || strings.Contains(r.Reason, "CVE-2025-0001") {
+		t.Errorf("an ignored advisory leaked into the malware verdict: %q", r.Reason)
+	}
+	if ve.Metadata[OSVMetaMalware] != "MAL-2025-1234" {
+		t.Errorf("malware stamp = %q", ve.Metadata[OSVMetaMalware])
+	}
+}
+
+// TestOSVMalware_CVEOnlyUnderWarn keeps an ordinary advisory on the advisory
+// action: a block-by-default malware gate must not turn a CVE into a block.
+func TestOSVMalware_CVEOnlyUnderWarn(t *testing.T) {
+	var eco string
+	srv := stubOSVRecords(t, &eco, map[string]any{"id": "CVE-2025-0002", "summary": "prototype pollution"})
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionWarn},
+	}})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+
+	ve := &manifest.VersionEntry{Version: "1.0.0"}
+	r := ck.Check(context.Background(), &manifest.PackageManifest{Name: "pkg", Type: manifest.TypeNpm}, ve)
+	if r.Action != ActionWarn {
+		t.Fatalf("CVE under warn = warn, got %+v", r)
+	}
+	if !strings.Contains(r.Reason, "1 OSV record(s): CVE-2025-0002") || strings.Contains(r.Reason, "malware") {
+		t.Errorf("reason = %q", r.Reason)
+	}
+	if _, ok := r.Details["malware"]; ok {
+		t.Errorf("a CVE was reported as malware: %v", r.Details)
+	}
+	if ve.Metadata[OSVMetaMalware] != "" {
+		t.Errorf("a CVE was stamped as malware: %q", ve.Metadata[OSVMetaMalware])
+	}
+}
+
+// TestOSVMalware_NeverCountedWithAdvisories: one malware record beside two
+// CVEs reads as known malware plus two advisories, never as three records.
+func TestOSVMalware_NeverCountedWithAdvisories(t *testing.T) {
+	var eco string
+	srv := stubOSVRecords(t, &eco,
+		map[string]any{"id": "GHSA-mal0-0000-0000", "summary": "Malware in pkg",
+			"database_specific": map[string]any{"cwe_ids": []string{"CWE-506"}}},
+		map[string]any{"id": "CVE-2025-0003"},
+		map[string]any{"id": "CVE-2025-0004"})
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionWarn},
+	}})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+
+	r := ck.Check(context.Background(), &manifest.PackageManifest{Name: "pkg", Type: manifest.TypeNpm},
+		&manifest.VersionEntry{Version: "1.0.0"})
+	if r.Action != ActionBlock {
+		t.Fatalf("database_specific-marked malware = block, got %+v", r)
+	}
+	if !strings.Contains(r.Reason, "GHSA-mal0-0000-0000 (Malware in pkg)") {
+		t.Errorf("reason does not name the malware record: %q", r.Reason)
+	}
+	if !strings.Contains(r.Reason, "2 OSV record(s)") || strings.Contains(r.Reason, "3 OSV record(s)") {
+		t.Errorf("malware was folded into the advisory count: %q", r.Reason)
+	}
+}
+
+// TestOSVMalware_IgnoreAdmits: an operator who set ignore gets the version.
+func TestOSVMalware_IgnoreAdmits(t *testing.T) {
+	var eco string
+	srv := stubOSVRecords(t, &eco, malRecord("MAL-2025-9", "bad"))
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{
+		policies: map[string]audit.OSVPolicy{manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionBlock}},
+		malware:  map[string]audit.OSVMalwarePolicy{manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionIgnore, Reason: "x"}},
+	})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+	r := ck.Check(context.Background(), &manifest.PackageManifest{Name: "pkg", Type: manifest.TypeNpm},
+		&manifest.VersionEntry{Version: "1.0.0"})
+	if r.Action != ActionPass {
+		t.Errorf("malware under ignore, no advisories = pass, got %+v", r)
+	}
+}
+
+// TestOSVMalware_OutageWarnsUnlessAVerdictExists: an unreachable source admits
+// a version nobody has a verdict on, and keeps refusing one an earlier check
+// found malware against.
+func TestOSVMalware_OutageWarnsUnlessAVerdictExists(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+	pm := &manifest.PackageManifest{Name: "pkg", Type: manifest.TypeNpm}
+
+	r := ck.Check(context.Background(), pm, &manifest.VersionEntry{Version: "1.0.0"})
+	if r.Action != ActionWarn || !strings.Contains(r.Reason, "HTTP 503") {
+		t.Errorf("no prior verdict during an outage = warn with the reason, got %+v", r)
+	}
+
+	ve := &manifest.VersionEntry{Version: "1.0.1", Metadata: map[string]string{OSVMetaMalware: "MAL-2025-7"}}
+	r = ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionBlock || !strings.Contains(r.Reason, "MAL-2025-7") {
+		t.Errorf("a prior malware verdict outlives an outage, got %+v", r)
 	}
 }
 

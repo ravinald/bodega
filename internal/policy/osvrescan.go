@@ -26,6 +26,12 @@ const (
 	// operator cannot trace back to the package they installed is a finding
 	// they will not act on.
 	OSVMetaQueried = "vetting.osv.queried"
+	// OSVMetaMalware lists the stamped ids that are malware records. It is
+	// what admission falls back on when OSV cannot answer, and what a rescan
+	// compares against to tell a newly published record from one an operator
+	// already saw. The ids alone cannot say it: a record GitHub marks as
+	// malware goes by a GHSA- id like any advisory.
+	OSVMetaMalware = "vetting.osv.malware"
 )
 
 // stampOSV records one conclusive lookup on the version. A zero checkedAt
@@ -57,6 +63,11 @@ func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time, q
 	} else {
 		ve.Metadata[OSVMetaCheckedAt] = checkedAt.UTC().Format(time.RFC3339)
 	}
+	if malware, _ := splitMalware(vulns); len(malware) > 0 {
+		ve.Metadata[OSVMetaMalware] = strings.Join(vulnIDs(malware), ",")
+	} else {
+		delete(ve.Metadata, OSVMetaMalware)
+	}
 	ids := vulnIDs(vulns)
 	if len(ids) == 0 {
 		delete(ve.Metadata, OSVMetaVulns)
@@ -77,7 +88,9 @@ func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time, q
 // Answered false means the stamp was left exactly as it was found. Rescan
 // records and never decides: nothing here hides, freezes, blocks or deletes a
 // version, because an OSV data refresh that flags a base image would otherwise
-// take a fleet offline without an operator in the loop.
+// take a fleet offline without an operator in the loop. NewMalware is the one
+// finding the caller acts on, under the malware action; see
+// OSVChecker.MalwareAction.
 type OSVRescanChange struct {
 	Answered bool
 	// Vulns are the ids the lookup matched, reported whether or not the run
@@ -90,6 +103,12 @@ type OSVRescanChange struct {
 	// withdrawal looks like from here.
 	Flagged bool
 	Cleared bool
+	// Malware are the ids among Vulns that are malware records, and
+	// NewMalware the ones no earlier stamp on this version named. Both are
+	// set whether or not the run could answer: a MAL- record matched in
+	// stale data is still a package built to do harm.
+	Malware    []string
+	NewMalware []string
 	// Reason names why nothing was learned, or what limits what was. Empty on
 	// an unqualified answer.
 	Reason string
@@ -97,7 +116,7 @@ type OSVRescanChange struct {
 
 // Rescan re-runs the OSV lookup for one stored version and re-stamps it.
 //
-// It reads no policy row. The per-ecosystem action decides what admission does
+// It reads no policy row; the caller applies the malware action to NewMalware. The per-ecosystem action decides what admission does
 // with a finding; whether a version is vulnerable today is the same fact under
 // warn, block and ignore, and an operator who has not configured the gate
 // still gets the report.
@@ -125,19 +144,51 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 		// stands for was never queried, but dropping the ids would leave the
 		// verb built for the late-published advisory silent on the case it
 		// exists for.
-		return OSVRescanChange{Vulns: vulnIDs(ans.vulns), Reason: reason}
+		ch := OSVRescanChange{Vulns: vulnIDs(ans.vulns), Reason: reason}
+		ch.Malware, ch.NewMalware = malwareSince(ve, ans.vulns)
+		return ch
 	}
 
 	ids := vulnIDs(ans.vulns)
 	had := ve.Metadata[OSVMetaVulns] != ""
-	stampOSV(ve, ans.vulns, c.now(), lk.queried)
-	return OSVRescanChange{
+	ch := OSVRescanChange{
 		Answered: true,
 		Vulns:    ids,
 		Flagged:  len(ids) > 0 && !had,
 		Cleared:  len(ids) == 0 && had,
 		Reason:   ans.degraded,
 	}
+	ch.Malware, ch.NewMalware = malwareSince(ve, ans.vulns)
+	stampOSV(ve, ans.vulns, c.now(), lk.queried)
+	return ch
+}
+
+// malwareSince splits the malware records in vulns into all of them and the
+// ones the version's current stamp does not name. Read before the re-stamp:
+// after it, every record is one the stamp already names.
+//
+// Any stamped id counts as seen, not only the malware list, because a stamp
+// written before that list existed carries a MAL- id among the advisories. A
+// record an operator already looked at and left served is theirs to decide,
+// and hiding it again on every rescan would overrule them.
+func malwareSince(ve *manifest.VersionEntry, vulns []osvVuln) (all, fresh []string) {
+	malware, _ := splitMalware(vulns)
+	if len(malware) == 0 {
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	for _, key := range []string{OSVMetaVulns, OSVMetaMalware} {
+		for _, id := range splitIDs(ve.Metadata[key]) {
+			seen[id] = true
+		}
+	}
+	all = vulnIDs(malware)
+	for _, id := range all {
+		if !seen[id] {
+			fresh = append(fresh, id)
+		}
+	}
+	return all, fresh
 }
 
 // OSVRescanSummary accumulates one rescan run. Report is the only reader; the
@@ -228,14 +279,7 @@ func (s OSVStamp) State() string {
 // reads as unchecked, which is the honest answer for a value nothing can date.
 func OSVStampOf(ve manifest.VersionEntry) OSVStamp {
 	var st OSVStamp
-	if raw := ve.Metadata[OSVMetaVulns]; raw != "" {
-		for _, id := range strings.Split(raw, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				st.Vulns = append(st.Vulns, id)
-			}
-		}
-		sort.Strings(st.Vulns)
-	}
+	st.Vulns = splitIDs(ve.Metadata[OSVMetaVulns])
 	if raw := ve.Metadata[OSVMetaSeverity]; raw != "" {
 		// A blob that does not parse is dropped rather than reported. The ids
 		// beside it are the finding; a score bodega could not read is a
@@ -252,4 +296,16 @@ func OSVStampOf(ve manifest.VersionEntry) OSVStamp {
 		}
 	}
 	return st
+}
+
+// splitIDs reads a stamped id list back, sorted, with blanks dropped.
+func splitIDs(raw string) []string {
+	var ids []string
+	for _, id := range strings.Split(raw, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }

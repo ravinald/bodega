@@ -83,6 +83,7 @@ const (
 	EventFreeze  EventType = "freeze"  // bodega freeze
 	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
 	EventShow    EventType = "show"    // bodega show
+	EventPolicy  EventType = "policy"  // a gate's action changed, e.g. bodega policy osv malware set
 
 	// Server lifecycle events.
 	EventServeStart EventType = "serve_start" // bodega serve started
@@ -113,6 +114,7 @@ const (
 	CacheMiss             = "cache_miss"        // fetched from upstream and cached
 	CacheChecksumMismatch = "checksum_mismatch" // upstream bytes disagreed with the pinned digest
 	CachePolicyViolation  = "policy_violation"  // upstream allow-list refused the candidate
+	CacheMalwareBlocked   = "malware_blocked"   // OSV records the version as malware and the malware action is block
 )
 
 // Status values for EventDenied. They name the gate that refused, so an
