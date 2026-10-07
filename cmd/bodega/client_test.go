@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
 )
 
@@ -202,5 +204,49 @@ func TestRemoteImportFailsWhenNothingLands(t *testing.T) {
 	}
 	if err := importToServer(srv.URL, "", true, false, "", []string{catalog}); err == nil {
 		t.Fatal("a push where every package was refused reported success")
+	}
+}
+
+// TestLocalImportRecordsUpstreamPublishTimes is the CLI half of the import
+// dating: with no audit database there is no age policy, and the version is
+// still dated from the registry its url names.
+func TestLocalImportRecordsUpstreamPublishTimes(t *testing.T) {
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/left-pad" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"time":{"1.3.0":"2018-04-09T01:22:46.500Z"}}`))
+	}))
+	defer registry.Close()
+
+	dir := t.TempDir()
+	catalog := filepath.Join(dir, "catalog.json")
+	if err := os.WriteFile(catalog, []byte(fmt.Sprintf(
+		`{"name":"left-pad","type":"npm","versions":[{"version":"1.3.0","url":%q}]}`, registry.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifests := filepath.Join(dir, "manifests")
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(
+		`{"manifest_dir":%q,"storage_path":%q}`, manifests, filepath.Join(dir, "storage"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BODEGA_CONFIG_FILE", cfgPath)
+
+	cmd := newImportCmd(&globalFlags{})
+	cmd.SetArgs([]string{catalog})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("pkg import: %v", err)
+	}
+
+	pm, err := manifest.NewLocalStore(manifests).GetPackage(t.Context(), manifest.TypeNpm, "left-pad")
+	if err != nil || pm == nil {
+		t.Fatalf("left-pad not stored: %v", err)
+	}
+	if got := pm.Versions[0].PublishedAt; got != "2018-04-09T01:22:46Z" {
+		t.Errorf("published_at = %q, want 2018-04-09T01:22:46Z", got)
 	}
 }

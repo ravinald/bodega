@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/json"
 	"strings"
+	"time"
 
 	"net/http"
 
@@ -107,7 +109,58 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 	if pm == nil {
 		s.recordNoManifest(ctx, r, manifest.TypeGomod, module, gomodVersionFromFile(file), upstream)
 	}
+	if published, ok := gomodRecordedTime(pm, file); ok {
+		rw := &indexFilterWriter{
+			ResponseWriter: w,
+			subject:        module + "/@v/" + file,
+			filter:         func(b []byte) []byte { return gomodInfoWithTime(b, published) },
+		}
+		s.proxyVersion(rw, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
+		if err := rw.flush(); err != nil {
+			s.logger.Error("gomod info response failed", "module", module, "error", err)
+		}
+		return
+	}
 	s.proxyVersion(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
+}
+
+// gomodRecordedTime returns the publish time recorded for the version a .info
+// request names. Any other file, or a version with none recorded, is served
+// as stored.
+func gomodRecordedTime(pm *manifest.PackageManifest, file string) (time.Time, bool) {
+	if pm == nil || !strings.HasSuffix(file, ".info") {
+		return time.Time{}, false
+	}
+	version := strings.TrimSuffix(file, ".info")
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return publishedTime(ve)
+		}
+	}
+	return time.Time{}, false
+}
+
+// gomodInfoWithTime sets Time in a stored .info document to the recorded
+// publish time, keeping every other field. The stored document is upstream's
+// own, so the two normally agree; the manifest is what every hosted index
+// answers from, and a .info disagreeing with the packument and the simple page
+// would give one module two ages. A document that does not parse is passed
+// through as it is, since the go command reports that better than this can.
+func gomodInfoWithTime(body []byte, published time.Time) []byte {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
+		return body
+	}
+	ts, err := json.Marshal(published.Format(time.RFC3339))
+	if err != nil {
+		return body
+	}
+	doc["Time"] = ts
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // gomodVersionFromFile recovers the manifest version from a proxy filename.

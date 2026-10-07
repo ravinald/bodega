@@ -62,6 +62,13 @@ bodega build fetch git             # fetch git sources only
 bodega build fetch git widget      # fetch only widget
 ```
 
+`--backfill-published` fetches nothing. It records `published_at` on every npm, pypi, gomod and cargo version that has none, reading each from upstream at most once every 250ms, and prints how many it filled and how many it could not. A gomod version whose `.info` is already in the build root is read from that file without a request. Each version it could not date is named with its reason, and the command exits non-zero when there is at least one. A type with no publish time to read (`apt`, `binary` and the rest) is refused when named and skipped when not. Run it once on a store fetched before bodega recorded publish times; a fetch dates every version it downloads from then on.
+
+```bash
+bodega build fetch --backfill-published         # every type that has a publish time
+bodega build fetch npm --backfill-published     # npm only
+```
+
 #### How a pypi version is resolved
 
 A pypi fetch resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against. The fetch then downloads the closure that file resolves to into `<build-root>/wheelhouse/` and writes `<build-root>/resolved-requirements.txt`, which pins every distribution in it with a SHA-256. See [What reaches pip](#what-reaches-pip).
@@ -2270,6 +2277,30 @@ Nothing else counts such a row as enforcement. The `bodega serve` startup banner
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
+#### Publish times in the hosted indexes
+
+The age gate runs at admission, on the bodega host. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
+
+A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
+
+| Type  | Route                            | Where the time appears                                                                                       |
+| ----- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| npm   | `/npm/<package>`                 | `time.<version>` per dated version, with `time.created` and `time.modified` the earliest and latest of those |
+| pypi  | `/pypi/simple/<dist>/`           | `data-upload-time` on each wheel's anchor in HTML; `upload-time` per file in PEP 691 JSON                    |
+| gomod | `/go/<module>/@v/<version>.info` | `Time`, set to the recorded value; every other field of the stored `.info` is kept                           |
+| cargo | none                             | The sparse index format has no publish time, so cargo clients have nothing to read                           |
+
+The pypi page answers PEP 691 JSON (`application/vnd.pypi.simple.v1+json`, `api-version` 1.0) to a client whose `Accept` header ranks it above HTML, which pip and uv both do, and HTML to everything else. The JSON carries an empty `hashes` object, as the HTML never carried a digest.
+
+A version with no `published_at` is left out rather than given an invented time: it has no `time` key in the packument, no `data-upload-time` or `upload-time` on its files, and its `.info` is served as stored. npm and pip treat an undated version as old enough, so an undated version passes every client-side cooldown. A version ends up undated when:
+
+- it was fetched before bodega recorded publish times: run `bodega build fetch --backfill-published` once;
+- the upstream had no time for it, or could not be reached: the fetch prints `WARNING: no publish time recorded` with the reason and stores the artifact anyway, and an import stores the entry with a `published_at` warning naming the version (printed by `pkg import`, logged at WARN and returned in `warnings` by the API). An import that cannot reach a registry tries it once per package rather than once per version;
+- it is a pypi distribution that arrives only as another entry's dependency, or under an entry that pins no version: the closure is resolved as a whole and there is no entry naming that version to record the time on;
+- it is an npm dist-tag entry such as `latest`, which names no single release.
+
+Proxy-mode packages are untouched: their index is upstream's own, times included.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
@@ -3275,6 +3306,7 @@ All version entries support:
 | `checksum`           | object | `{"algorithm": "sha256", "value": "hex..."}`                                                                                          |
 | `checksum_verified`  | bool   | Whether checksum matches upstream publisher                                                                                           |
 | `artifact_size`      | int64  | Size in bytes (set at fetch time)                                                                                                     |
+| `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |
