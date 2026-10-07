@@ -14,6 +14,35 @@ be provided.
 The latest tagged release on `main`. Older releases receive fixes only for
 critical (CVSS 9.0+) issues.
 
+## Verifying a release
+
+Each release signs `checksums-sha256.txt` with cosign keyless and attests
+every file it lists (archives, packages and SBOMs) with SLSA build
+provenance. Both are issued to the reusable workflow
+`.github/workflows/release-build.yml`, which `release.yml` calls only after
+`ci.yml`'s gate has passed on the tagged commit. Check the signature, then the
+checksums, then the provenance:
+
+```bash
+VERSION=v0.2.0
+gh release download "$VERSION" --repo ravinald/bodega
+cosign verify-blob \
+  --certificate checksums-sha256.txt.pem \
+  --signature checksums-sha256.txt.sig \
+  --certificate-identity "https://github.com/ravinald/bodega/.github/workflows/release-build.yml@refs/tags/$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums-sha256.txt
+sha256sum --ignore-missing -c checksums-sha256.txt
+gh attestation verify "bodega_${VERSION#v}_linux_amd64.tar.gz" \
+  --repo ravinald/bodega \
+  --signer-workflow ravinald/bodega/.github/workflows/release-build.yml \
+  --source-ref "refs/tags/$VERSION"
+```
+
+A failure from any of the three means the file did not come from this
+repository's release workflow at that tag. Do not install it, and report it
+as above.
+
 ## Scope
 
 In scope:
