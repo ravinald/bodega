@@ -257,6 +257,8 @@ The `dep_policy` on a PackageManifest controls automatic dependency creation:
 
 Every git fetch scans the source for dependency files (requirements.txt, go.mod, package.json). Under `"none"` it prints how many dependencies it found and which `dep_policy` would import them, and creates no entries. Under `"direct"` or `"transitive"` it creates a manifest entry for each immediate dependency, with `required_by` naming the git entry. git has no recursive discovery: neither value follows a dependency's own dependencies. Any other value fails that entry's fetch before it clones, naming the entry and the accepted values.
 
+The match is exact and case-sensitive: `"Direct"` is not `"direct"`. Admission (`pkg import`, `pkg edit` and `POST /api/v1/packages/{type}`) refuses any other value on an apt or git manifest, and `pkg create` asks again. An apt or git entry already in the store with any other value fails its fetch with an ERROR naming the entry and the value, and discovers nothing. Other types do not read the field and accept whatever it holds.
+
 ## Serve modes
 
 Every gomod, helm, and npm entry has a `mode` field:

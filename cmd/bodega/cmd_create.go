@@ -172,12 +172,16 @@ Examples:
 				}
 
 				depChoice, err := prompt(r, "Include dependencies? (none / direct / transitive)", "none")
-				if err == nil && depChoice != "none" && depChoice != "" {
-					depth := "direct"
-					if depChoice == "transitive" {
-						depth = "transitive"
+				for err == nil {
+					verr := manifest.ValidateDepPolicy(t, name, depChoice)
+					if verr == nil {
+						break
 					}
-					deps := builder.DiscoverAptDeps(store, ve.SourceName, depth, os.Stdout)
+					fmt.Println(verr)
+					depChoice, err = prompt(r, "Include dependencies? (none / direct / transitive)", "none")
+				}
+				if err == nil && depChoice != "none" && depChoice != "" {
+					deps := builder.DiscoverAptDeps(store, ve.SourceName, depChoice, os.Stdout)
 					if len(deps) > 0 {
 						added := builder.ImportAptDeps(ctx, store, name, deps, os.Stdout)
 						fmt.Printf("Discovered %d deps, added %d new entries\n", len(deps), added)

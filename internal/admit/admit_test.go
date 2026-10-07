@@ -533,3 +533,51 @@ func TestAdmitRefusesACredentialInAnAptIdentityField(t *testing.T) {
 		t.Errorf("an ordinary apt entry was refused: %s", res.Reason)
 	}
 }
+
+// TestAdmitRefusesAnUnknownDepPolicy keeps a misspelled dep_policy out of the
+// store on the two types that read it. Every reader compares exact strings,
+// so "Direct" or "trasnitive" would otherwise fall through to whatever branch
+// it checks last. A type that ignores the field is not refused for carrying it.
+func TestAdmitRefusesAnUnknownDepPolicy(t *testing.T) {
+	git := func(policy string) *manifest.PackageManifest {
+		return &manifest.PackageManifest{
+			Name: "demo", Type: manifest.TypeGit, DepPolicy: policy,
+			Versions: []manifest.VersionEntry{{URL: "https://example.com/demo.git", Ref: "v1.0.0"}},
+		}
+	}
+	apt := func(policy string) *manifest.PackageManifest {
+		pm := aptPkg("hello", "*")
+		pm.DepPolicy = policy
+		return pm
+	}
+	for _, mk := range []struct {
+		label string
+		pm    func(string) *manifest.PackageManifest
+	}{{"apt/hello", apt}, {"git/demo", git}} {
+		for _, bad := range []string{"trasnitive", "Direct"} {
+			res := Admit(t.Context(), nil, nil, &config.Config{}, mk.pm(bad), "")
+			if res.OK() || res.Decision != Invalid {
+				t.Errorf("%s: admitted dep_policy %q (decision %s)", mk.label, bad, res.Decision)
+				continue
+			}
+			for _, want := range []string{mk.label, `"` + bad + `"`, `"none"`, `"direct"`, `"transitive"`} {
+				if !strings.Contains(res.Reason, want) {
+					t.Errorf("%s: reason %q does not name %s", mk.label, res.Reason, want)
+				}
+			}
+		}
+		for _, good := range []string{"", "none", "direct", "transitive"} {
+			if res := Admit(t.Context(), nil, nil, &config.Config{}, mk.pm(good), ""); !res.OK() {
+				t.Errorf("%s: refused dep_policy %q: %s", mk.label, good, res.Reason)
+			}
+		}
+	}
+
+	pypi := &manifest.PackageManifest{
+		Name: "requests", Type: manifest.TypePypi, DepPolicy: "Direct",
+		Versions: []manifest.VersionEntry{{Version: "2.32.3"}},
+	}
+	if res := Admit(t.Context(), nil, nil, &config.Config{}, pypi, ""); !res.OK() {
+		t.Errorf("refused a dep_policy on a type that never reads it: %s", res.Reason)
+	}
+}
