@@ -259,3 +259,56 @@ func TestRecordInventoryPollKeepsLastSuccess(t *testing.T) {
 		t.Errorf("stats = %+v", st)
 	}
 }
+
+// A reader verifying the chain has only the stored rows, so every row has to
+// recompute to its own sha256 from what InventoryReports returns, whatever
+// precision the writer's clock had and whatever the strings carry.
+func TestInventoryReportChainRecomputesFromStoredRows(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 123456789, time.FixedZone("x", 5*3600))
+
+	reps := []InventoryReport{
+		{Source: "cdx", ExternalID: "h", ObservedAt: now, ReceivedAt: now.Add(987654 * time.Nanosecond),
+			Components: []InventoryComponent{{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0"}}},
+		{Source: "cdx", ExternalID: "h", ObservedAt: now.Add(time.Second), ReceivedAt: now.Add(time.Second),
+			Components: []InventoryComponent{}},
+		{Source: "cdx", ExternalID: "h", ReceivedAt: now.Add(2 * time.Second),
+			Components: []InventoryComponent{
+				{Ecosystem: "other", Name: "bad\xffutf8\x00nul", Path: "/opt/<a>&b", PURL: "pkg:generic/x"},
+				{Ecosystem: "npm", Name: "a"},
+			}},
+	}
+	var returned []InventoryReport
+	for _, r := range reps {
+		got, err := db.AppendInventoryReport(ctx, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		returned = append(returned, got)
+	}
+	stored, err := db.InventoryReports(ctx, "cdx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != len(reps) {
+		t.Fatalf("stored %d reports, want %d", len(stored), len(reps))
+	}
+	prev := ""
+	for i, s := range stored {
+		sum, err := reportDigest(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum != s.SHA256 {
+			t.Errorf("report %d: stored sha256 %s, recomputed %s", i, s.SHA256, sum)
+		}
+		if s.PrevSHA256 != prev {
+			t.Errorf("report %d: prev_sha256 %q, want recomputed predecessor %q", i, s.PrevSHA256, prev)
+		}
+		prev = sum
+		if returned[i].SHA256 != s.SHA256 || !returned[i].ObservedAt.Equal(s.ObservedAt) || !returned[i].ReceivedAt.Equal(s.ReceivedAt) {
+			t.Errorf("report %d: returned %+v differs from stored %+v", i, returned[i], s)
+		}
+	}
+}

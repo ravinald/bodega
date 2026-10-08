@@ -222,11 +222,27 @@ ORDER BY r.source, r.external_id`)
 	return out, rows.Err()
 }
 
-// reportDigest is the SHA-256 a report is chained by. It covers prev_sha256,
-// so each row commits to the one before it under the same chain key.
+// storedForm reduces a report to what its row and component rows can hold:
+// times in UTC at millisecond precision, and no components as nil, because
+// InventoryReports reads an empty report back with nil Components.
+func storedForm(r InventoryReport) InventoryReport {
+	r.ObservedAt = r.ObservedAt.UTC().Truncate(time.Millisecond)
+	r.ReceivedAt = r.ReceivedAt.UTC().Truncate(time.Millisecond)
+	if len(r.Components) == 0 {
+		r.Components = nil
+	}
+	return r
+}
+
+// reportDigest is the SHA-256 a report is chained by: the hex sha256 of the
+// JSON encoding of InventoryReport, with ID and SHA256 zeroed, times in UTC at
+// millisecond precision, and Components null when there are none. It covers
+// PrevSHA256, so each row commits to the one before it under the same chain
+// key, and it covers only what the rows hold, so a report read back with
+// InventoryReports recomputes to its own SHA256.
 func reportDigest(r InventoryReport) (string, error) {
+	r = storedForm(r)
 	r.ID, r.SHA256 = 0, ""
-	r.ObservedAt, r.ReceivedAt = r.ObservedAt.UTC(), r.ReceivedAt.UTC()
 	b, err := json.Marshal(r)
 	if err != nil {
 		return "", err
@@ -237,8 +253,9 @@ func reportDigest(r InventoryReport) (string, error) {
 
 // AppendInventoryReport stores one report and its components in a single
 // transaction, assigning its sequence number and chaining it to the previous
-// report from the same host under the same source. The returned report
-// carries the assigned ID, Seq, PrevSHA256 and SHA256.
+// report from the same host under the same source. The returned report is
+// the stored form (see reportDigest) and carries the assigned ID, Seq,
+// PrevSHA256 and SHA256.
 //
 // A report for a mapped host also moves that mapping's last_seen. That is
 // the only write this path makes outside the append-only tables.
@@ -249,6 +266,7 @@ func (a *DB) AppendInventoryReport(ctx context.Context, r InventoryReport) (Inve
 	if r.Source == "" || r.ExternalID == "" {
 		return r, errors.New("an inventory report needs a source and an external id")
 	}
+	r = storedForm(r)
 	tx, err := a.writer().BeginTx(ctx, nil)
 	if err != nil {
 		return r, err

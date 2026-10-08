@@ -5935,6 +5935,8 @@ No code path updates or deletes a row in the three append-only tables except `re
 
 Reports are chained. Each carries a sequence number and the sha256 of the previous report from the same host under the same source instance (keyed on the identity, or on the external id while the host is unbound), so a missing or substituted row shows as a gap in the chain. Retention cuts the chain at its boundary: the oldest surviving report names a predecessor that is gone.
 
+A report's `sha256` is the hex SHA-256 of the JSON encoding of `audit.InventoryReport` (`internal/audit/inventory.go`) with `id` set to `0` and `sha256` set to `""`, both times in UTC at millisecond precision (the precision the row stores), and `components` encoded as `null` when there are none, in the order they were stored. It covers `prev_sha256`, so each report commits to its predecessor. Every field it covers is a column, so a reader verifies the chain from the stored rows alone: recompute each report's hash, compare it with its `sha256`, and compare it with the next report's `prev_sha256`.
+
 ### Writing a source
 
 A source type is one package implementing `inventory.Source` from `internal/inventory`:
