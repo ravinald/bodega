@@ -179,6 +179,10 @@ lib/remote.sh           ssh/scp; e2e_on runs one command string on "server" or "
 lib/bodega.sh           bodega CLI, config, restart, HTTP helpers
 lib/fixtures.sh         the shared package set: one hosted PackageManifest per
                         type, plus npm-proxy/cargo-proxy/gomod-proxy in proxy mode
+lib/freebsd.sh          a one-package pkg repository the freebsd guest builds, in both layouts
+lib/pkgconf.sh          suite 47 ships it to the freebsd guest and runs it there under
+                        sudo: saves and restores the guest's pkg configuration. POSIX sh,
+                        and executed rather than sourced
 lib/report.sh           findings.jsonl -> report.md, and issue filing
 lib/selftest.sh         the harness's own tests. Runs with no guest reachable
 suites/*.sh             sourced in filename order

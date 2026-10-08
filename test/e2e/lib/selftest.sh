@@ -296,6 +296,57 @@ t_ok "empty zfs output names no dataset" "1|zfs list named no single dataset for
 t_ok "a leading slash names no dataset" 1 "$(zfs_of "$work/s" "/bodega" | awk -F"|" 'NR == 1 {print $1}')"
 t_ok "two lines name no dataset" 1 "$(zfs_of "$work/t" "$(printf 'a\nb')" | awk -F"|" 'NR == 1 {print $1}')"
 
+# ---- suite 47's pkg-configuration helper ----------------------------------
+#
+# Driven against scratch roots on this host. `state` stays out: its `stat -f`
+# is BSD-only, and the Linux CI runner would fail it for reasons of its own.
+
+pkgconf() { FBSD_PKGCONF_ROOT="$1" sh "$E2E_DIR/lib/pkgconf.sh" "${@:2}"; }
+# pkgconf_ls <root> — every path under usr/local/etc/pkg, or "absent".
+pkgconf_ls() {
+	if [ -e "$1/usr/local/etc/pkg" ]; then
+		(cd "$1" && find usr/local/etc/pkg | sort | tr '\n' ' ')
+	else
+		echo absent
+	fi
+}
+repos=usr/local/etc/pkg/repos
+
+pre="$work/pkgconf-present"
+mkdir -p "$pre/$repos"
+printf 'stanza as found\n' >"$pre/$repos/bodega.conf"
+printf 'backup as found\n' >"$pre/$repos/bodega.conf.bodega-20250101T000000Z"
+pre_found="$(pkgconf_ls "$pre")"
+pkgconf "$pre" save found
+printf 'stanza doctor wrote\n' >"$pre/$repos/bodega.conf"
+printf 'stanza as found\n' >"$pre/$repos/bodega.conf.bodega-20260101T000000Z"
+pkgconf "$pre" restore found
+t_ok "pkgconf: a present stanza restores to the listing it was saved with" "$pre_found" "$(pkgconf_ls "$pre")"
+t_ok "pkgconf: a backup written after the save is gone" gone \
+	"$([ -e "$pre/$repos/bodega.conf.bodega-20260101T000000Z" ] && echo kept || echo gone)"
+t_ok "pkgconf: the saved stanza comes back byte for byte" "stanza as found" "$(cat "$pre/$repos/bodega.conf")"
+t_ok "pkgconf: a backup that predates the save comes back" "backup as found" \
+	"$(cat "$pre/$repos/bodega.conf.bodega-20250101T000000Z")"
+
+abs="$work/pkgconf-absent"
+mkdir -p "$abs"
+pkgconf "$abs" save found
+pkgconf "$abs" seed
+pkgconf "$abs" save seeded
+abs_seeded="$(pkgconf_ls "$abs")"
+printf 'stanza doctor wrote\n' >"$abs/$repos/bodega.conf"
+printf 'seeded stanza\n' >"$abs/$repos/bodega.conf.bodega-20260101T000000Z"
+pkgconf "$abs" restore seeded
+t_ok "pkgconf: the seeded state restores without the backup written after it" "$abs_seeded" "$(pkgconf_ls "$abs")"
+t_ok "pkgconf: the seeded listing carries no backup" none \
+	"$(case "$abs_seeded" in *bodega.conf.bodega-*) echo present ;; *) echo none ;; esac)"
+printf 'stanza doctor wrote\n' >"$abs/$repos/bodega.conf.bodega-20260101T000000Z"
+pkgconf "$abs" restore found
+t_ok "pkgconf: an absent stanza restores as absence" absent "$(pkgconf_ls "$abs")"
+pkgconf "$abs" drop
+t_ok "pkgconf: drop removes the saved copies" gone \
+	"$([ -e "$abs/var/tmp/bodega-e2e-pkgconf" ] && echo kept || echo gone)"
+
 # ---- counters --------------------------------------------------------------
 
 t_ok "PASS counter agrees with the file" \
