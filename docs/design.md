@@ -783,7 +783,15 @@ Only public, unauthenticated upstreams are supported. No credential is read from
 
 `/binaries/<namespace>/<rest>` composes `<url><rest>` and caches the result under `binaries/<namespace>/<rest>`. `open` fetches on a miss and enforces the allow-list; `catalog` looks `<namespace>/<rest>` up in the manifest store first and 404s a miss with a `no_manifest` row, without contacting the upstream. `bodega discover promote binary <namespace>/<rest> --as manifest` is what turns that row into the entry catalog mode is waiting for.
 
-The empty map is the migration path and the default: while `binary_upstreams` has no entries, `/binaries/{path...}` reads storage exactly as it always has. Once any entry exists, a first segment naming no key 404s with a `no_namespace` row rather than falling through to a storage read — **including a path that resolved before**. The alternative, falling through, was rejected: the storage read misses too, so the 404 arrives either way and the discovery log ends up holding nothing that names the key the operator meant to type. An install that serves local binaries and namespaced ones at once needs a namespace for each tree it still serves locally.
+The empty map is the migration path and the default: while `binary_upstreams` has no entries, `/binaries/{path...}` reads storage exactly as it always has. Once any entry exists, the first path segment is resolved in this order:
+
+1. **A `binary_upstreams` key.** The namespace serves the request, even when a hosted entry carries the same name. `bodega serve` logs one `WARN` at startup and on every reload naming each hosted entry a key shadows; rename one or the other to bring the entry back.
+2. **The package of a hosted binary manifest.** A path whose package (`<name>` in `<name>/<version>/<file>`, alias included) is exactly the name of a hosted entry reads storage as it would with the map empty, entitlement gate included.
+3. **Anything else** 404s with a `no_namespace` row, without touching storage.
+
+A plain fall-through to storage was rejected: the storage read misses too, so the 404 arrives either way and the discovery log ends up holding nothing that names the key the operator meant to type. Gating the fall-through on a manifest keeps that row, because a mistyped namespace matches no entry. Refusing to import or upload a hosted binary once namespaces exist was rejected as well: it leaves every existing hosted entry unreachable the day the first namespace is added, and no namespace can point back at the storage tree.
+
+The package API's `client_config` follows the same split. A hosted entry's URL is its storage-key alias, `/binaries/<name>/<version>/~/<tag>/<display>`; an entry whose name begins with `<namespace>/` for a configured key gets `/binaries/<name>`, the path the namespace serves it under.
 
 Authenticated upstreams are out of scope here as they are for git. A namespace pointing at a private release endpoint fails as a 404 with no credential prompt, which is indistinguishable from a typo in the path; check the upstream by hand before hunting the path.
 

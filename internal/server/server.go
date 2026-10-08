@@ -644,6 +644,8 @@ func (s *Server) Start(ctx context.Context) error {
 		s.logger.Info("bodega server listening", "addr", boundAddr)
 	}
 
+	s.warnShadowedBinaries()
+
 	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
 	sdNotifyReady()
 
@@ -771,6 +773,7 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 func (s *Server) reload(ctx context.Context) {
 	s.logger.Info("reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
+	s.warnShadowedBinaries()
 	s.loadAptSigner()
 	s.loadPkgSigner()
 	s.loadAttestSigner()
@@ -1071,7 +1074,11 @@ func (s *Server) clientFiles(r *http.Request, t string, pm *manifest.PackageMani
 			if ve.Hidden {
 				continue
 			}
-			if p, ok := pm.BinaryLinkName(key, typeBackend, i); ok {
+			p, ok := clientconf.NamespacedBinaryPath(pm.Name, s.cfg.BinaryUpstreams)
+			if !ok {
+				p, ok = pm.BinaryLinkName(key, typeBackend, i)
+			}
+			if ok {
 				in.Binary = append(in.Binary, clientconf.BinaryLink{Filename: public.Versions[i].Filename, Path: p})
 			}
 		}

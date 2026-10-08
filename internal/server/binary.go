@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -14,16 +15,19 @@ import (
 // namespaced upstream, or from the storage tree the uploader wrote.
 //
 // The namespaced form wins when the first path segment names a binary_upstreams
-// key. When it names none and binary_upstreams holds at least one entry, the
-// request 404s and is recorded as no_namespace rather than falling through to
-// the storage read.
+// key, even over a hosted entry of the same name (warnShadowedBinaries says so
+// at startup and reload). When it names none and binary_upstreams holds at
+// least one entry, the request reaches the storage read only if a hosted
+// manifest names exactly the package the path resolves to; anything else 404s
+// and is recorded as no_namespace.
 //
-// Plan 06 left that choice open and offered the fall-through as the
-// alternative. The fall-through is worse: an operator who opted into
+// A plain fall-through to storage was rejected: an operator who opted into
 // binary_upstreams and mistyped a namespace would get a storage read that also
 // misses, so the 404 arrives either way and the discovery log holds nothing
-// naming the key they meant to type. A loud miss costs the same status code
-// and answers the question.
+// naming the key they meant to type. A typo matches no manifest, so gating on
+// one keeps that row. Refusing hosted binaries once a namespace exists was
+// rejected too: it strands every existing hosted entry the day the first
+// namespace is added, and no namespace can point back at the storage tree.
 //
 // An install with no binary_upstreams block reaches the storage read on every
 // path, which is what every existing install does today.
@@ -36,7 +40,11 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 
 	if ns, rest, ok := splitNamespace(p); ok && len(s.cfg.BinaryUpstreams) > 0 {
 		bu, configured := s.cfg.BinaryUpstreams[ns]
-		if !configured {
+		if configured {
+			s.handleBinaryUpstream(w, r, ns, rest, bu)
+			return
+		}
+		if !s.hostsBinary(r, p) {
 			// pattern_hint and pkg_name are both the namespace, matching the
 			// git namespace miss: the actionable unit is the key an operator
 			// would add to binary_upstreams, and keying the row on the full
@@ -46,8 +54,6 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		s.handleBinaryUpstream(w, r, ns, rest, bu)
-		return
 	}
 
 	// Storage first, shape second. An install whose backend never came up owes
@@ -92,6 +98,36 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxyS3(w, r, store, key)
+}
+
+// hostsBinary reports whether a hosted binary manifest names exactly the
+// package p resolves to. The name is compared rather than trusting the lookup,
+// because GetPackage folds "/" to "--" and would answer for a different entry.
+func (s *Server) hostsBinary(r *http.Request, p string) bool {
+	pkg, _, _ := manifest.BinaryPathIdentity(p)
+	if pkg == "" {
+		return false
+	}
+	pm, _ := s.store.GetPackage(r.Context(), manifest.TypeBinary, pkg)
+	return pm != nil && pm.Name == pkg
+}
+
+// warnShadowedBinaries logs the hosted binary entries a binary_upstreams key of
+// the same name hides. The namespace wins the route, so those entries answer
+// with the upstream's bytes or a 404 while the package API still lists them.
+func (s *Server) warnShadowedBinaries() {
+	var shadowed []string
+	for _, name := range s.store.ListPackages(manifest.TypeBinary) {
+		if _, ok := s.cfg.BinaryUpstreams[name]; ok {
+			shadowed = append(shadowed, name)
+		}
+	}
+	if len(shadowed) == 0 {
+		return
+	}
+	sort.Strings(shadowed)
+	s.logger.Warn("binary_upstreams keys shadow hosted binary entries of the same name; /binaries/<name>/... routes to the namespace, so those entries are unreachable until the key or the entry is renamed",
+		"entries", shadowed, "namespaces", shadowed)
 }
 
 // handleBinaryUpstream serves one request against a configured namespace.
