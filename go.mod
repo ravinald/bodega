@@ -2,7 +2,7 @@ module github.com/ravinald/bodega
 
 go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.9
 
 require (
 	github.com/ProtonMail/go-crypto v1.5.2
