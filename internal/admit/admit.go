@@ -61,6 +61,9 @@ type Result struct {
 	Decision Decision
 	Reason   string
 	Warnings []string
+	// Admissions are the rows this decision wrote, one per version. Empty
+	// when there was no audit database to write them to.
+	Admissions []audit.Admission
 
 	// The rest is set on PolicyBlocked only, for a caller that has to tell
 	// the person refused which gate said no and how to find the row it wrote.
@@ -75,6 +78,13 @@ type Result struct {
 
 // OK reports whether the caller may proceed to write.
 func (r Result) OK() bool { return r.Decision == Admitted }
+
+// Who is the caller an admission row attributes its decision to: the OS user
+// for the CLI, the identity binding a request resolved to for the API.
+type Who struct {
+	Actor    string
+	Identity string
+}
 
 // Admit runs every check a manifest must pass before it is stored, in the
 // order the cheapest and most specific failure comes first: structure, then
@@ -92,20 +102,174 @@ func Admit(
 	pm *manifest.PackageManifest,
 	actor string,
 ) Result {
+	return AdmitAs(ctx, checker, adb, cfg, pm, Who{Actor: actor})
+}
+
+// AdmitAs is Admit with the caller's identity as well as its actor, for the
+// mutation API, whose caller is a host an identity binding named rather than
+// the process owner.
+//
+// With an audit database it writes one admission row per version for every
+// outcome, a clean pass included: a passed admission that leaves nothing
+// behind is a version no attestation can cite.
+func AdmitAs(
+	ctx context.Context,
+	checker *policy.Checker,
+	adb *audit.DB,
+	cfg *config.Config,
+	pm *manifest.PackageManifest,
+	who Who,
+) Result {
+	ev := newEvaluation(ctx, adb, pm)
 	res := Result{Decision: Admitted}
 
 	if err := validate(cfg, pm, &res); err != nil {
-		return Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
+		ev.notRun("not run: the manifest is invalid: " + err.Error())
+		res = Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
+		return ev.record(ctx, adb, pm, res, who)
 	}
-	if blocked := checkAllowList(ctx, checker, adb, pm, actor); blocked != nil {
+	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev, nil); blocked != nil {
 		blocked.Warnings = res.Warnings
-		return *blocked
+		return ev.record(ctx, adb, pm, *blocked, who)
 	}
-	if blocked := checkVersions(ctx, adb, pm, actor, audit.EventCreate, &res, VersionCheckers(cfg, adb)); blocked != nil {
+	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, VersionCheckers(cfg, adb), ev); blocked != nil {
 		blocked.Warnings = res.Warnings
-		return *blocked
+		return ev.record(ctx, adb, pm, *blocked, who)
 	}
-	return res
+	return ev.record(ctx, adb, pm, res, who)
+}
+
+// Confirm asks an operator whether to admit a version the allow-list refused.
+// It returns true to proceed; an error is a failure to ask, not a no.
+type Confirm func(version, candidate string) (bool, error)
+
+// Create runs the policy checks `bodega pkg create` answers to: the
+// allow-list, with confirm asked on a refusal, and the per-version checks.
+//
+// The structural checks Admit starts with are left out. create assembles an
+// entry from prompts and completes some of them after it is stored: an apt
+// entry named by package resolves its concrete version afterwards, and
+// validate refuses an apt entry with no version. What create shares with
+// every other surface is the policy, so that is what runs here.
+//
+// An override is recorded as its own check beside the allow-list's block,
+// attributed to who.Actor, so the row says the rule refused and who overrode
+// it rather than recording a pass.
+func Create(
+	ctx context.Context,
+	checker *policy.Checker,
+	adb *audit.DB,
+	cfg *config.Config,
+	pm *manifest.PackageManifest,
+	who Who,
+	confirm Confirm,
+) Result {
+	ev := newEvaluation(ctx, adb, pm)
+	res := Result{Decision: Admitted}
+	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev, confirm); blocked != nil {
+		return ev.record(ctx, adb, pm, *blocked, who)
+	}
+	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, VersionCheckers(cfg, adb), ev); blocked != nil {
+		blocked.Warnings = res.Warnings
+		res = *blocked
+	}
+	return ev.record(ctx, adb, pm, res, who)
+}
+
+// FetchResult is the verdict on one version a fetch is about to bring in.
+type FetchResult struct {
+	Admission audit.Admission
+	// Block is the first per-version check that refused, nil when none did.
+	Block *policy.Result
+	// Warns are the warn-level results, for a caller that prints them.
+	Warns []policy.Result
+	// Incident is the ID a refusal hands the person refused, set with Block.
+	// The caller writes it into the audit row its refusal records.
+	Incident string
+	// AuditDetails is the warn and block payload import writes to its
+	// policy_warn and policy_violation event rows, incident included, for a
+	// caller that writes the same row. Nil on a clean pass.
+	AuditDetails map[string]any
+}
+
+// Fetch decides on one version a fetch is about to bring in, after the
+// caller's own allow-list gate has let it through, and writes the row.
+//
+// The builder and the proxy each run the allow-list themselves, because each
+// answers a refusal in its own way (a failed entry in a build summary, a 403
+// with a discovery row) and has already spent the lookup by the time it gets
+// here. allow is what that gate concluded, rendered by AllowListCheck.
+// An allow refused records age and OSV as not evaluated and the decision as
+// policy_blocked, so a refusal leaves a row like a pass does. checkers nil
+// records them as not evaluated with notRunDetail as the reason: the proxy
+// passes nil for a type whose request names no version the checks could date.
+func Fetch(
+	ctx context.Context,
+	adb *audit.DB,
+	checkers []policy.VersionChecker,
+	typ, name string,
+	ve manifest.VersionEntry,
+	allow audit.AdmissionCheck,
+	who Who,
+	notRunDetail string,
+) FetchResult {
+	if adb == nil {
+		return FetchResult{}
+	}
+	pm := &manifest.PackageManifest{Type: typ, Name: name, Versions: []manifest.VersionEntry{ve}}
+	ev := newEvaluation(ctx, adb, pm)
+	ev.set(0, allow)
+	var out FetchResult
+	decision := audit.AdmissionAdmitted
+	switch {
+	case allow.Status == audit.CheckBlock:
+		decision = audit.AdmissionPolicyBlocked
+		ev.notRunChecks(0, "not run: the allow-list refused this version", audit.CheckAge, audit.CheckOSV)
+	case checkers == nil:
+		if notRunDetail == "" {
+			notRunDetail = "not run"
+		}
+		ev.notRunChecks(0, notRunDetail, audit.CheckAge, audit.CheckOSV)
+	default:
+		results := ev.runVersion(ctx, pm, 0, checkers)
+		combined := policy.Combine(results)
+		out.Warns = combined.Warns
+		out.AuditDetails = combined.AuditDetails()
+		if combined.Blocked() {
+			b := combined.Blocks[0]
+			out.Block = &b
+			out.Incident = audit.NewIncidentID()
+			out.AuditDetails["incident"] = out.Incident
+			decision = audit.AdmissionPolicyBlocked
+		}
+	}
+	out.Admission = ev.row(pm, 0, decision, who)
+	_ = adb.RecordAdmission(ctx, out.Admission)
+	return out
+}
+
+// AllowListCheck renders an allow-list verdict as an admission check.
+// hasRules says whether the type has any rules, which is what decides between
+// "block" and "none" as the action; candidate is what was checked, empty when
+// the entry names nothing the allow-list can rule on; err is Check's answer.
+func AllowListCheck(hasRules bool, candidate string, err error) audit.AdmissionCheck {
+	c := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckPass}
+	if hasRules {
+		c.Action = policy.ActionBlock
+	}
+	switch {
+	case err != nil:
+		c.Status = audit.CheckBlock
+		c.Detail = err.Error()
+	case candidate == "":
+		c.Status = audit.CheckNotEvaluated
+		c.Detail = "the entry names no upstream the allow-list can rule on"
+	case hasRules:
+		c.Detail = "matched: " + candidate
+	default:
+		c.Detail = "no allow-list rules for this type: " + candidate
+	}
+	return c
 }
 
 // validate rejects a manifest the rest of bodega cannot act on, and records a
@@ -205,32 +369,64 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 
 // checkAllowList runs the URL-level allow-list over every version. It is
 // cheap and fails fast, so it runs before the checks that reach the network.
-// It returns nil when every version passes.
-func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) *Result {
+// It returns nil when every version passes. A version after the one refused
+// is never reached, and its row says so.
+//
+// confirm, when set, is asked about a refusal; a yes lets the manifest
+// through with the override recorded as its own check.
+func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string, ev *evaluation, confirm Confirm) *Result {
 	if checker == nil {
+		ev.notRunChecks(-1, "not run: no allow-list loaded", audit.CheckAllowList)
 		return nil
 	}
-	for _, ve := range pm.Versions {
+	hasRules, _ := checker.HasRules(ctx, pm.Type)
+	for i, ve := range pm.Versions {
 		candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
 		if candidate == "" {
+			ev.set(i, AllowListCheck(hasRules, "", nil))
 			continue
 		}
-		if err := checker.Check(ctx, pm.Type, candidate); err != nil {
-			incident := audit.NewIncidentID()
-			if adb != nil {
-				_ = adb.Record(ctx, audit.Event{
-					EventType:  audit.EventCreate,
-					PkgType:    pm.Type,
-					PkgName:    pm.Name,
-					PkgVersion: ve.Version,
-					Actor:      actor,
-					Status:     "policy_violation",
-					Details:    fmt.Sprintf("candidate=%s incident=%s", candidate, incident),
-				})
-			}
-			return &Result{Decision: PolicyBlocked, Reason: err.Error(),
+		err := checker.Check(ctx, pm.Type, candidate)
+		ev.set(i, AllowListCheck(hasRules, candidate, err))
+		if err == nil {
+			continue
+		}
+		incident := audit.NewIncidentID()
+		if adb != nil {
+			_ = adb.Record(ctx, audit.Event{
+				EventType:  audit.EventCreate,
+				PkgType:    pm.Type,
+				PkgName:    pm.Name,
+				PkgVersion: ve.Version,
+				Actor:      actor,
+				Status:     "policy_violation",
+				Details:    fmt.Sprintf("candidate=%s incident=%s", candidate, incident),
+			})
+		}
+		blocked := func(reason string) *Result {
+			return &Result{Decision: PolicyBlocked, Reason: reason,
 				Check: "allow-list", Version: ve.Version, Incident: incident}
 		}
+		if confirm != nil && policy.IsViolation(err) {
+			ok, cerr := confirm(admissionVersion(ve), candidate)
+			if cerr != nil {
+				ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckNotEvaluated,
+					Detail: "the prompt could not be read: " + cerr.Error()})
+				ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
+				return blocked(cerr.Error())
+			}
+			if ok {
+				ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckPass,
+					Detail: fmt.Sprintf("%s answered y to proceed past the allow-list refusal of %s", actor, candidate)})
+				continue
+			}
+			ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckBlock,
+				Detail: fmt.Sprintf("%s declined to proceed past the allow-list refusal of %s", actor, candidate)})
+			ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
+			return blocked("aborted: upstream violates policy")
+		}
+		ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
+		return blocked(err.Error())
 	}
 	return nil
 }
@@ -242,7 +438,7 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 // looking. Recording alone leaves an OSV gate with no synced database printing
 // a clean import and filing the warning somewhere nobody reads until after the
 // package is in the store.
-func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string, eventType audit.EventType, res *Result, checkers []policy.VersionChecker) *Result {
+func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string, eventType audit.EventType, res *Result, checkers []policy.VersionChecker, ev *evaluation) *Result {
 	if adb == nil {
 		return nil
 	}
@@ -250,7 +446,7 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	defer warns.flush(res)
 	for i := range pm.Versions {
 		ve := &pm.Versions[i]
-		combined := policy.RunChecks(ctx, pm, ve, checkers...)
+		combined := policy.Combine(ev.runVersion(ctx, pm, i, checkers))
 		warns.add(ve.Version, combined.Warns)
 		var incident string
 		if details := combined.AuditDetails(); details != nil {
@@ -274,6 +470,7 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 			})
 		}
 		if combined.Blocked() {
+			ev.notRunAfter(i, "not run: "+admissionVersion(*ve)+" was refused first")
 			first := combined.Blocks[0]
 			return &Result{Decision: PolicyBlocked,
 				Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons()),
@@ -283,22 +480,8 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	return nil
 }
 
-// CheckFetch runs the per-version checks import runs on one version a proxy
-// fill is about to fetch, so a version no manifest names is not admitted under
-// a weaker policy than one that arrived through import. The row is a cache
-// event because nothing was created. A nil result means the fetch may go
-// ahead; a warn is recorded rather than returned, since the client fetching
-// has nowhere to read one.
-//
-// checkers is VersionCheckers outside a test.
-func CheckFetch(ctx context.Context, adb *audit.DB, checkers []policy.VersionChecker, typ, name, version string) *Result {
-	pm := &manifest.PackageManifest{Type: typ, Name: name,
-		Versions: []manifest.VersionEntry{{Version: version, Mode: manifest.ModeProxy}}}
-	return checkVersions(ctx, adb, pm, "", audit.EventCache, nil, checkers)
-}
-
-// VersionCheckers are the per-version checks every admission runs, import
-// and proxy fill alike.
+// VersionCheckers are the per-version checks every admission runs: import,
+// create, the builder's fetch and the proxy's fill.
 func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
 	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb)}
 }

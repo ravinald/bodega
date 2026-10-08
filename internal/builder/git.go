@@ -143,7 +143,7 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGit, Name: name, Err: err})
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeGit, name, ve.Ref, ve.URL); err != nil {
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeGit, name, ve); err != nil {
 				cfg.logf("  [git] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGit, Name: name, Err: err})

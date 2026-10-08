@@ -1242,7 +1242,7 @@ func resolvePypiRequirements(cfg *Config, store *manifest.Store) *Summary {
 	reqLines = append(reqLines, "\n# Extra packages from manifest\n")
 	unresolved := false
 	for _, name := range pkgNames {
-		if err := cfg.EnforcePolicy(ctx, manifest.TypePypi, name, "", ""); err != nil {
+		if err := cfg.EnforcePolicy(ctx, manifest.TypePypi, name, manifest.VersionEntry{}); err != nil {
 			_, _ = fmt.Fprintf(out, "      %s — SKIPPED: %v\n", name, err)
 			summary.Failures++
 			continue

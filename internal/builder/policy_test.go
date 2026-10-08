@@ -17,7 +17,7 @@ func (s staticStore) GetPoliciesByType(_ context.Context, t string) ([]policy.Ru
 
 func TestEnforcePolicyAllowsWhenNoChecker(t *testing.T) {
 	c := &Config{}
-	if err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "django", "4.2", ""); err != nil {
+	if err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "django", manifest.VersionEntry{Version: "4.2"}); err != nil {
 		t.Errorf("nil checker should pass: %v", err)
 	}
 }
@@ -27,7 +27,7 @@ func TestEnforcePolicyAllowsWhenMatch(t *testing.T) {
 		manifest.TypePypi: {audit.PolicyInfo{RegistryType: manifest.TypePypi, RuleKind: policy.KindPackage, Pattern: "django"}},
 	}}
 	c := &Config{policyChecker: policy.NewChecker(store)}
-	if err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "django", "4.2", ""); err != nil {
+	if err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "django", manifest.VersionEntry{Version: "4.2"}); err != nil {
 		t.Errorf("django should match: %v", err)
 	}
 }
@@ -37,7 +37,7 @@ func TestEnforcePolicyBlocksWhenNoMatch(t *testing.T) {
 		manifest.TypePypi: {audit.PolicyInfo{RegistryType: manifest.TypePypi, RuleKind: policy.KindPackage, Pattern: "django"}},
 	}}
 	c := &Config{policyChecker: policy.NewChecker(store)}
-	err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "requests", "2.31", "")
+	err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "requests", manifest.VersionEntry{Version: "2.31"})
 	if !policy.IsViolation(err) {
 		t.Fatalf("requests should be blocked, got %v", err)
 	}

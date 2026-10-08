@@ -177,7 +177,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		src := cfg.DistfilesUpstream + manifest.DistfilesURLPath(name)
 		// A digest says the bytes are right; it does not say the operator
 		// agreed to contact the host that would supply them.
-		if err := cfg.EnforcePolicy(ctx, manifest.TypeDistfiles, name, "", src); err != nil {
+		if err := cfg.EnforcePolicy(ctx, manifest.TypeDistfiles, name, manifest.VersionEntry{URL: src}); err != nil {
 			fail(name, fmt.Errorf("%w; allow the host with 'bodega policy add distfiles <host>'", err), time.Since(start))
 			continue
 		}
@@ -186,6 +186,9 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 			fail(name, err, time.Since(start))
 			continue
 		}
+		// distinfo pinned the digest before the fetch; this is the moment
+		// bytes matching it exist under the key.
+		cfg.pinAdmission(ctx, manifest.TypeDistfiles, name, "", manifest.DistfilesKey(name))
 		elapsed := time.Since(start)
 		_, _ = fmt.Fprintf(out, "    SHA-256: %s (matches distinfo from %s)\n    Size: %s\n    Done (%s)\n",
 			entry.SHA256, strings.Join(entry.Ports, ", "), humanBytes(entry.Size), elapsed.Round(time.Millisecond))

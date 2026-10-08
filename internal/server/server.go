@@ -1327,8 +1327,9 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	pm.Type = t
 
 	// An HTTP caller is not the process owner, so the audit rows this writes
-	// carry no actor rather than the server's.
-	res := admit.Admit(ctx, s.policy, s.auditDB, s.cfg, &pm, "")
+	// carry no actor rather than the server's; the admission rows carry the
+	// identity the request resolved to instead.
+	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, &pm, admit.Who{Identity: Identity(r)})
 	for _, warning := range res.Warnings {
 		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
 	}

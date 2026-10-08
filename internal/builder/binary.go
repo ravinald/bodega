@@ -155,7 +155,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 				cfg.logf("  [binary] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeBinary, name, ve.Version, ve.URL); err != nil {
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeBinary, name, ve); err != nil {
 				cfg.logf("  [binary] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeBinary, Name: name, Err: err})

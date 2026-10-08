@@ -1,12 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newAuditEventsCmd(gf *globalFlags) *cobra.Command {
@@ -121,6 +125,114 @@ token_missing, token_invalid, token_expired, admin_only.`,
 	cmd.Flags().IntVar(&limit, "limit", 20, "Maximum number of events to show")
 
 	return cmd
+}
+
+func newAuditAdmissionsCmd(gf *globalFlags) *cobra.Command {
+	var (
+		asJSON bool
+		limit  int
+	)
+	cmd := &cobra.Command{
+		Use:   "admissions <type> <name> [version]",
+		Short: "Show the admission decisions recorded for a package",
+		Long: `admissions prints every admission decision recorded for a package, newest
+first: the verdict, each check's result, the digest of the policy it was
+decided under, and the object key once the artifact's digest was pinned.
+
+A decision is written by pkg import, pkg edit, pkg create, POST
+/api/v1/packages, POST /api/v1/packages/import, a build's fetch and a proxy
+fill. A row whose checks all say not_evaluated was written by a digest pin
+that found no decision for its version: those bytes reached the store with
+nothing evaluated, and the row says so rather than recording a pass.
+
+Under audit_sink "syslog" or "jsonl" it refuses: those sinks ship decisions
+out as "admission" and "admission_pin" records and keep nothing to read back.
+
+Examples:
+  bodega audit admissions npm lodash
+  bodega audit admissions npm lodash 4.17.21
+  bodega audit admissions gomod example.com/example-corp/widget-sdk v1.30.0 --json`,
+		Args: cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !isValidType(args[0]) {
+				return fmt.Errorf("unknown type %q — must be one of: %s", args[0], strings.Join(manifest.AllTypes, ", "))
+			}
+			db, err := openQueryableAuditDB(gf, "the admission decisions `audit admissions` queries")
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			f := audit.AdmissionFilter{PkgType: args[0], PkgName: args[1], Limit: limit}
+			if len(args) == 3 {
+				f.PkgVersion = args[2]
+			}
+			rows, err := db.Admissions(backgroundCtx(), f)
+			if err != nil {
+				return fmt.Errorf("query admissions: %w", err)
+			}
+			if asJSON {
+				if rows == nil {
+					rows = []audit.Admission{}
+				}
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rows)
+			}
+			if len(rows) == 0 {
+				fmt.Println("No admission decisions recorded.")
+				return nil
+			}
+			printAdmissions(rows)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the rows as a JSON array, with every check's detail")
+	cmd.Flags().IntVar(&limit, "limit", 50, "Maximum number of decisions to show")
+	return cmd
+}
+
+// printAdmissions renders one line per decision, then the detail of every
+// check that did not pass beneath it: the verdict an operator is looking for
+// is usually the one exception, and a column cannot hold its reason.
+func printAdmissions(rows []audit.Admission) {
+	fmt.Printf("%-20s %-16s %-15s %-44s %-22s %-14s %s\n",
+		"DECIDED", "VERSION", "DECISION", "CHECKS", "POLICY", "BY", "OBJECT KEY")
+	fmt.Println("---")
+	for _, a := range rows {
+		var checks []string
+		for _, c := range a.Checks {
+			checks = append(checks, c.Check+"="+c.Status)
+		}
+		by := a.Actor
+		if by == "" {
+			by = a.Identity
+		}
+		policyDigest := a.PolicyDigest
+		if policyDigest == "" {
+			policyDigest = "(none)"
+		}
+		key := a.ObjectKey
+		if key == "" {
+			key = "(not pinned)"
+		}
+		fmt.Printf("%-20s %-16s %-15s %-44s %-22s %-14s %s\n",
+			a.DecidedAt.Format("2006-01-02 15:04:05"),
+			truncate(a.PkgVersion, 16),
+			a.Decision,
+			strings.Join(checks, " "),
+			truncate(policyDigest, 22),
+			truncate(by, 14),
+			key,
+		)
+		for _, c := range a.Checks {
+			if c.Status == audit.CheckPass || c.Detail == "" {
+				continue
+			}
+			fmt.Printf("    %s (%s, action %s): %s\n", c.Check, c.Status, c.Action, c.Detail)
+		}
+	}
+	fmt.Printf("\n%d decision(s)\n", len(rows))
 }
 
 func truncate(s string, max int) string {

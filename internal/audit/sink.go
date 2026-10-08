@@ -51,6 +51,14 @@ type EventSink interface {
 	// between; one that writes row by row returns where it stopped.
 	RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) (applied int, err error)
 
+	// RecordAdmission writes one admission decision, and PinAdmission the
+	// object key its digest was later pinned under. A queryable sink attaches
+	// the pin to the decision's row through DB.PinAdmission instead; this
+	// method is the write-only sinks' half, which can only emit the pin as a
+	// record of its own.
+	RecordAdmission(ctx context.Context, row Admission) error
+	PinAdmission(ctx context.Context, p AdmissionPin) error
+
 	Close() error
 }
 
@@ -65,6 +73,7 @@ type EventReader interface {
 	AggregateDiscovery(ctx context.Context, registryType string) ([]DiscoveryAggregate, error)
 	ClearDiscovery(ctx context.Context, registryType string) (int64, error)
 	DiscoveryCount(ctx context.Context, registryType string) (int64, error)
+	QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error)
 }
 
 // SinkConfig selects and addresses a sink.

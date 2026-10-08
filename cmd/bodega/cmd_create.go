@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -149,7 +152,7 @@ Examples:
 				ve = manifest.VersionEntry{}
 			}
 
-			if err := confirmPolicyOverride(ctx, r, gf, t, name, ve); err != nil {
+			if err := confirmPolicyOverride(ctx, r, gf, cfg, t, name, ve); err != nil {
 				return err
 			}
 
@@ -240,55 +243,58 @@ func setStoragePolicy(ctx context.Context, store *manifest.Store, t, name, polic
 	return nil
 }
 
-// confirmPolicyOverride runs the upstream allow-list on the entry that was just
-// collected interactively. If a violation is found, the operator is warned and
-// given a y/N prompt to proceed anyway. Confirmation writes a policy_override
-// audit event. This is the ONLY policy enforcement path that allows override —
-// the server API, builder fetches, and bodega pkg import all hard-reject.
-func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, t, name string, ve manifest.VersionEntry) error {
+// confirmPolicyOverride runs admission on the entry that was just collected
+// interactively: the upstream allow-list, then the age and OSV checks every
+// other surface runs. On an allow-list violation the operator is warned and
+// given a y/N prompt to proceed anyway, and confirmation writes a
+// policy_override audit event. This is the ONLY policy enforcement path that
+// allows override — the server API, builder fetches, and bodega pkg import all
+// hard-reject. An age or OSV block has no override here either.
+//
+// The decision is written to the admissions table whatever it is, with the
+// operator's answer as its own check beside the allow-list's refusal.
+func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, cfg *config.Config, t, name string, ve manifest.VersionEntry) error {
 	adb := openAuditDB(gf)
 	if adb == nil {
 		return nil
 	}
 	defer adb.Close()
 
-	checker := policy.NewChecker(adb)
-	candidate := policy.CandidateFor(t, name, ve.URL)
-	if candidate == "" {
-		return nil
-	}
-	err := checker.Check(ctx, t, candidate)
-	if err == nil {
-		return nil
-	}
-	if !policy.IsViolation(err) {
-		return fmt.Errorf("policy check: %w", err)
-	}
+	actor := audit.CurrentActor()
+	pm := &manifest.PackageManifest{Type: t, Name: name, Versions: []manifest.VersionEntry{ve}}
+	confirm := func(version, candidate string) (bool, error) {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  WARNING: upstream not in allow-list\n")
+		fmt.Fprintf(os.Stderr, "    type:      %s\n", t)
+		fmt.Fprintf(os.Stderr, "    candidate: %s\n", candidate)
+		fmt.Fprintf(os.Stderr, "    fix:       bodega policy add %s %s\n", t, candidate)
+		fmt.Fprintln(os.Stderr)
 
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintf(os.Stderr, "  WARNING: upstream not in allow-list\n")
-	fmt.Fprintf(os.Stderr, "    type:      %s\n", t)
-	fmt.Fprintf(os.Stderr, "    candidate: %s\n", candidate)
-	fmt.Fprintf(os.Stderr, "    fix:       bodega policy add %s %s\n", t, candidate)
-	fmt.Fprintln(os.Stderr)
-
-	answer, pErr := prompt(r, "Proceed anyway? [y/N]", "N")
-	if pErr != nil {
-		return pErr
+		answer, err := prompt(r, "Proceed anyway? [y/N]", "N")
+		if err != nil {
+			return false, err
+		}
+		if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+			return false, nil
+		}
+		_ = adb.Record(ctx, audit.Event{
+			EventType:  audit.EventCreate,
+			PkgType:    t,
+			PkgName:    name,
+			PkgVersion: version,
+			Actor:      actor,
+			Status:     "policy_override",
+			Details:    fmt.Sprintf("candidate=%s", candidate),
+		})
+		return true, nil
 	}
-	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
-		return fmt.Errorf("aborted: upstream violates policy")
+	res := admit.Create(ctx, policy.NewChecker(adb), adb, cfg, pm, admit.Who{Actor: actor}, confirm)
+	for _, w := range res.Warnings {
+		fmt.Fprintf(os.Stderr, "%s/%s: %s\n", t, name, w)
 	}
-
-	_ = adb.Record(ctx, audit.Event{
-		EventType:  audit.EventCreate,
-		PkgType:    t,
-		PkgName:    name,
-		PkgVersion: ve.Version,
-		Actor:      audit.CurrentActor(),
-		Status:     "policy_override",
-		Details:    fmt.Sprintf("candidate=%s", candidate),
-	})
+	if !res.OK() {
+		return errors.New(res.Reason)
+	}
 	return nil
 }
 

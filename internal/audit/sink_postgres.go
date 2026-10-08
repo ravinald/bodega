@@ -370,3 +370,58 @@ func (s *postgresSink) DiscoveryCount(ctx context.Context, registryType string) 
 	}
 	return n, err
 }
+
+func (s *postgresSink) RecordAdmission(ctx context.Context, row Admission) error {
+	checks, err := encodeChecks(row.Checks)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO admissions (pkg_type, pkg_name, pkg_version, object_key, decision, checks, policy_digest, actor, identity, decided_at)
+		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)`,
+		row.PkgType, row.PkgName, row.PkgVersion, nullKey(row.ObjectKey), row.Decision,
+		checks, row.PolicyDigest, row.Actor, row.Identity, row.DecidedAt.UTC(),
+	)
+	return err
+}
+
+// PinAdmission is unreachable for a queryable sink, which DB.PinAdmission
+// routes through pinAdmission; it exists to satisfy EventSink.
+func (s *postgresSink) PinAdmission(ctx context.Context, p AdmissionPin) error {
+	_, err := s.pinAdmission(ctx, p)
+	return err
+}
+
+// pinAdmission locks the row it reads, so two hosts pinning the same version
+// at once attach one key each rather than both reading a NULL and the second
+// UPDATE overwriting the first.
+func (s *postgresSink) pinAdmission(ctx context.Context, p AdmissionPin) (admissionPinResult, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return admissionPinResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := pinTx(ctx, tx, p, pgPlaceholder, " FOR UPDATE", pgTime)
+	if err != nil {
+		return admissionPinResult{}, err
+	}
+	return res, tx.Commit()
+}
+
+func (s *postgresSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
+	q, args := buildAdmissionQuery(f, pgPlaceholder)
+	// checks is JSONB; the cast hands the driver text for scanAdmissions.
+	q = strings.Replace(q, " checks,", " checks::text,", 1)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanAdmissions(rows, pgTime)
+}
+
+func pgPlaceholder(n int) string { return fmt.Sprintf("$%d", n) }
+
+func pgTime(v any) time.Time {
+	t, _ := v.(time.Time)
+	return t
+}

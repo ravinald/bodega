@@ -317,3 +317,61 @@ func effectiveLimit(limit int) int {
 	}
 	return limit
 }
+
+func (s *sqliteSink) RecordAdmission(ctx context.Context, row Admission) error {
+	if s.readOnly {
+		return nil
+	}
+	checks, err := encodeChecks(row.Checks)
+	if err != nil {
+		return err
+	}
+	_, err = s.writer().ExecContext(ctx,
+		`INSERT INTO admissions (pkg_type, pkg_name, pkg_version, object_key, decision, checks, policy_digest, actor, identity, decided_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.PkgType, row.PkgName, row.PkgVersion, nullKey(row.ObjectKey), row.Decision,
+		checks, row.PolicyDigest, row.Actor, row.Identity, row.DecidedAt.UTC().Format(sqliteDecidedAt),
+	)
+	return err
+}
+
+// PinAdmission is unreachable for a queryable sink, which DB.PinAdmission
+// routes through pinAdmission; it exists to satisfy EventSink.
+func (s *sqliteSink) PinAdmission(ctx context.Context, p AdmissionPin) error {
+	_, err := s.pinAdmission(ctx, p)
+	return err
+}
+
+// pinAdmission runs on the write handle so the read and the write it decides
+// are one transaction on the one connection that writes.
+func (s *sqliteSink) pinAdmission(ctx context.Context, p AdmissionPin) (admissionPinResult, error) {
+	tx, err := s.writer().BeginTx(ctx, nil)
+	if err != nil {
+		return admissionPinResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := pinTx(ctx, tx, p, func(int) string { return "?" }, "", sqliteTime)
+	if err != nil {
+		return admissionPinResult{}, err
+	}
+	return res, tx.Commit()
+}
+
+func (s *sqliteSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
+	//nolint:gosec // G202: WHERE clause assembled from fixed column names; values are bound.
+	q, args := buildAdmissionQuery(f, func(int) string { return "?" })
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanAdmissions(rows, sqliteTime)
+}
+
+// sqliteTime parses a stored timestamp column. The driver returns the TEXT
+// as a string; a zero time stands for one that does not parse, as it does for
+// every other timestamp read in this package.
+func sqliteTime(v any) time.Time {
+	s, _ := v.(string)
+	t, _ := time.Parse(time.RFC3339Nano, s)
+	return t
+}
