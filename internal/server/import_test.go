@@ -380,6 +380,9 @@ func TestBulkImportHoldsABoundHostToItsOwnOrigin(t *testing.T) {
 				if !strings.Contains(reason, `"db02"`) || !strings.Contains(reason, `"db01"`) {
 					t.Errorf("reason %q does not name both the claimed origin and the identity", reason)
 				}
+				if !strings.Contains(reason, "re-run 'bodega pkg convert --origin db01'") {
+					t.Errorf("reason %q does not name the convert flag that fixes it", reason)
+				}
 				if pm != nil {
 					t.Errorf("a refused package was saved: %+v", pm)
 				}

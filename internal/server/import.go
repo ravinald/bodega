@@ -196,8 +196,9 @@ func holdToIdentity(pm *manifest.PackageManifest, identity string) error {
 	for _, ve := range pm.Versions {
 		for _, origin := range admit.Origins(ve) {
 			if origin != identity {
-				return fmt.Errorf("version %s claims origin %q, but the request is bound to identity %q; a bound host can push only its own rows",
-					ve.Version, origin, identity)
+				return fmt.Errorf("version %s claims origin %q, but the request is bound to identity %q; "+
+					"a bound host can push only its own rows (re-run 'bodega pkg convert --origin %s')",
+					ve.Version, origin, identity, identity)
 			}
 		}
 	}
