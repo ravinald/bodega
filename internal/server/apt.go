@@ -77,7 +77,7 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(s.cfg.AptUpstreams) == 0 || s.aptPoolIsLocal(poolPath) {
-		s.proxyS3(w, r, store, manifest.AptKey(poolPath))
+		s.serveArtifact(w, r, store, manifest.AptKey(poolPath), "")
 		return
 	}
 	s.handleAptMirrorPool(w, r, poolPath, store)

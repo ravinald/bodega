@@ -605,3 +605,47 @@ func TestConcurrentWritersKeepEveryRow(t *testing.T) {
 		len(events), writers, elapsed.Round(time.Millisecond),
 		float64(len(events))/elapsed.Seconds())
 }
+
+// object_key and digest are nullable and an empty value lands as NULL, so the
+// served-set query can tell "served no artifact" from any string, and the
+// identity index exists for it to read.
+func TestServedObjectColumns(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+	for _, col := range []string{"object_key", "digest"} {
+		var notNull int
+		if err := db.db.QueryRowContext(ctx,
+			`SELECT "notnull" FROM pragma_table_info('events') WHERE name = ?`, col).Scan(&notNull); err != nil {
+			t.Fatalf("column %s: %v", col, err)
+		}
+		if notNull != 0 {
+			t.Errorf("events.%s is NOT NULL, want nullable", col)
+		}
+	}
+	var cols string
+	if err := db.db.QueryRowContext(ctx,
+		`SELECT group_concat(name, ',') FROM pragma_index_info('idx_events_identity_type')`).Scan(&cols); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if cols != "identity,event_type" {
+		t.Errorf("idx_events_identity_type columns = %q, want identity,event_type", cols)
+	}
+
+	if err := db.Record(ctx, Event{EventType: EventServeFetch, PkgType: "npm", PkgName: "widget"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	var nulls int
+	if err := db.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE object_key IS NULL AND digest IS NULL`).Scan(&nulls); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if nulls != 1 {
+		t.Errorf("rows with NULL object_key and digest = %d, want 1", nulls)
+	}
+}
+
+func TestServedRefusesAnEmptyIdentity(t *testing.T) {
+	if _, err := tempDB(t).Served(context.Background(), "", time.Time{}); err == nil {
+		t.Error("Served with no identity returned no error; it would answer for every unbound request at once")
+	}
+}

@@ -192,6 +192,81 @@ Examples:
 	return cmd
 }
 
+func newAuditServedCmd(gf *globalFlags) *cobra.Command {
+	var (
+		identity string
+		since    string
+		asJSON   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "served",
+		Short: "List the distinct artifacts served to one identity",
+		Long: `served prints each distinct (type, name, version, digest) bodega served to
+one identity, read from its serve_fetch rows. Two builds of one version are
+two lines, told apart by the digest.
+
+Only rows naming the stored object they served count: a metadata response
+(an index, a packument, InRelease) hands over no artifact, and a row written
+before bodega recorded object keys cannot say which bytes it was. DIGEST is
+empty where bodega holds no sha256 for the object.
+
+Under audit_sink "syslog" or "jsonl" it refuses: those sinks keep nothing to
+read back.
+
+Examples:
+  bodega audit served --identity build-07
+  bodega audit served --identity build-07 --since 7d
+  bodega audit served --identity build-07 --since 24h --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if identity == "" {
+				return fmt.Errorf("--identity is required: the served set is per host (see 'bodega identity list')")
+			}
+			var from time.Time
+			if since != "" {
+				d, err := parseAgeDuration(since)
+				if err != nil || d <= 0 {
+					return fmt.Errorf("invalid --since %q (want a duration like 24h or 7d)", since)
+				}
+				from = time.Now().Add(-d)
+			}
+			db, err := openQueryableAuditDB(gf, "the serve_fetch rows `audit served` reads")
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			rows, err := db.Served(backgroundCtx(), identity, from)
+			if err != nil {
+				return fmt.Errorf("query served artifacts: %w", err)
+			}
+			if asJSON {
+				if rows == nil {
+					rows = []audit.ServedArtifact{}
+				}
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rows)
+			}
+			if len(rows) == 0 {
+				fmt.Printf("No artifacts served to %s.\n", identity)
+				return nil
+			}
+			fmt.Printf("%-8s %-40s %-24s %s\n", "TYPE", "NAME", "VERSION", "DIGEST")
+			fmt.Println("---")
+			for _, a := range rows {
+				fmt.Printf("%-8s %-40s %-24s %s\n", a.PkgType, truncate(a.PkgName, 40), truncate(a.PkgVersion, 24), a.Digest)
+			}
+			fmt.Printf("\n%d artifact(s)\n", len(rows))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&identity, "identity", "", "Identity whose served set to list (required)")
+	cmd.Flags().StringVar(&since, "since", "", "Only rows newer than this duration ago (e.g. 24h, 7d); default all time")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the rows as a JSON array")
+	return cmd
+}
+
 // printAdmissions renders one line per decision, then the detail of every
 // check that did not pass beneath it: the verdict an operator is looking for
 // is usually the one exception, and a column cannot hold its reason.
