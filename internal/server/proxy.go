@@ -106,7 +106,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// Before the body, not after: a client that hangs up mid-transfer
 			// still asked for the artifact, and the row is the record of the
 			// request rather than of the delivery.
-			s.serveCacheHit(w, r, store, s3Key, func(obj cachedObject) {
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
 			return
@@ -120,7 +120,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// Stale but no upstream — serve what we have. Recorded for the
 			// same reason the fresh hit is: the row counts requests, and a
 			// cache the request never left is still a request.
-			s.serveCacheHit(w, r, store, s3Key, func(obj cachedObject) {
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
 			return
@@ -172,7 +172,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// An outage is the window an operator reads these columns in.
 			// Left unrecorded, request_count and last_client go quiet exactly
 			// while the upstream is down and the cache is carrying the fleet.
-			s.serveCacheHit(w, r, store, s3Key, func(obj cachedObject) {
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
 			return
@@ -214,7 +214,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// other direction. The cache row has no such double: the response
 			// is cached bytes, and an outage is precisely the window an
 			// operator asks which artifacts the cache is carrying.
-			s.serveCacheHit(w, r, store, s3Key, func(obj cachedObject) {
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
 			return
@@ -249,7 +249,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 				// bytes the client got. Either one alone leaves a 200 response
 				// whose artifact came from the cache indistinguishable from a
 				// request that was simply refused.
-				s.serveCacheHit(w, r, store, s3Key, func(obj cachedObject) {
+				s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 					s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, obj)
 				})
 				return
@@ -298,6 +298,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// what discovery aggregates, and recordUpstreamAttempt above has already
 	// recorded it under both of those meanings.
 	s.recordCacheEvent(r, audit.CacheMiss, regType, up.url, policyCandidate, discoveryPkgName, s3Key)
+	if immutable {
+		noteServed(r, s3Key, spool.sha256)
+	}
 
 	ct := up.contentType
 	if ct == "" {
@@ -1421,13 +1424,19 @@ func identifyObject(ctx context.Context, store storage.ObjectStore, s3Key string
 // a hit names whatever sat at the key at decision time, and an upload landing
 // between that Head and this open is then served under the previous tenant's
 // attribution.
-func (s *Server) serveCacheHit(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, record func(cachedObject)) {
+//
+// immutable is the caller's artifact flag: a versioned object is an artifact
+// the serve_fetch row names by key, and a mutable index is not.
+func (s *Server) serveCacheHit(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, immutable bool, record func(cachedObject)) {
 	res, ok := s.openStored(w, r, store, s3Key)
 	if !ok {
 		return
 	}
 	defer func() { _ = res.Body.Close() }()
 	record(cachedObject{store: store, id: streamIdentity(store, res)})
+	if immutable {
+		noteServed(r, s3Key, "")
+	}
 	s.serveStored(w, s3Key, res)
 }
 

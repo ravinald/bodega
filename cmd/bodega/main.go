@@ -231,7 +231,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		signalsReload(newMoveCmd(gf)),
 	)
 
-	// Audit commands: bodega audit {events,check,admissions}
+	// Audit commands: bodega audit {events,check,admissions,served}
 	auditParent := &cobra.Command{
 		Use:   "audit",
 		Short: "Audit trail and dependency checking",
@@ -240,6 +240,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		newAuditEventsCmd(gf),
 		newAuditCheckCmd(gf),
 		newAuditAdmissionsCmd(gf),
+		newAuditServedCmd(gf),
 	)
 
 	// Top-level commands. A group classified here carries its whole subtree:

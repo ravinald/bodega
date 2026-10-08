@@ -200,6 +200,30 @@ type Event struct {
 	// replacing it: the deny list matched on the address, and one identity can
 	// hold several.
 	Identity string
+	// ObjectKey is the stored object a serve_fetch handed over, and Digest
+	// the lowercase hex sha256 bodega recorded for it. Both are empty on a
+	// response that served no stored artifact (an index, a packument), and
+	// Digest alone is empty where nothing recorded one for the key. Stored as
+	// NULL when empty.
+	ObjectKey string
+	Digest    string
+}
+
+// ServedArtifact is one distinct artifact bodega served to an identity.
+type ServedArtifact struct {
+	PkgType    string `json:"pkg_type"`
+	PkgName    string `json:"pkg_name"`
+	PkgVersion string `json:"pkg_version"`
+	Digest     string `json:"digest"`
+}
+
+// nullIfEmpty binds "" as NULL, for the columns where empty means "not
+// applicable" rather than a value.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // StoredEvent is an Event with its database ID and timestamp.
@@ -600,6 +624,22 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 		}
 	}
 	return events, nil
+}
+
+// Served returns the distinct (type, name, version, digest) bodega served to
+// identity since the given time (zero = all time), sorted. Only serve_fetch
+// rows carrying an object key count: a metadata response handed over no
+// artifact, and a row written before the key was recorded cannot say which
+// bytes it was.
+func (a *DB) Served(ctx context.Context, identity string, since time.Time) ([]ServedArtifact, error) {
+	if identity == "" {
+		return nil, errors.New("served set needs an identity")
+	}
+	r, err := a.reader("served artifacts")
+	if err != nil {
+		return nil, err
+	}
+	return r.QueryServed(ctx, identity, since)
 }
 
 // Count returns the total number of events matching the filter.

@@ -45,10 +45,11 @@ func (s *sqliteSink) Record(ctx context.Context, ev Event) error {
 		return nil
 	}
 	_, err := s.writer().ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity, object_key, digest)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
 		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor, ev.Identity,
+		nullIfEmpty(ev.ObjectKey), nullIfEmpty(ev.Digest),
 	)
 	return err
 }
@@ -112,7 +113,7 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
 	}
 
-	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity FROM events"
+	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity, COALESCE(object_key, ''), COALESCE(digest, '') FROM events"
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -135,7 +136,8 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 		err := rows.Scan(&se.ID, &ts, &et,
 			&se.PkgType, &se.PkgName, &se.PkgVersion,
 			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details, &se.Actor, &se.Identity)
+			&se.DurationMs, &se.Details, &se.Actor, &se.Identity,
+			&se.ObjectKey, &se.Digest)
 		if err != nil {
 			return nil, err
 		}
@@ -168,6 +170,34 @@ func (s *sqliteSink) CountEvents(ctx context.Context, f Filter) (int64, error) {
 	var count int64
 	err := s.rdb.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
+}
+
+func (s *sqliteSink) QueryServed(ctx context.Context, identity string, since time.Time) ([]ServedArtifact, error) {
+	q := `SELECT DISTINCT pkg_type, pkg_name, pkg_version, COALESCE(digest, '')
+	      FROM events
+	      WHERE identity = ? AND event_type = ? AND object_key IS NOT NULL`
+	args := []any{identity, string(EventServeFetch)}
+	if !since.IsZero() {
+		q += " AND timestamp >= ?"
+		args = append(args, since.UTC().Format(time.RFC3339Nano))
+	}
+	q += " ORDER BY 1, 2, 3, 4"
+
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ServedArtifact
+	for rows.Next() {
+		var sa ServedArtifact
+		if err := rows.Scan(&sa.PkgType, &sa.PkgName, &sa.PkgVersion, &sa.Digest); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
 }
 
 func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {

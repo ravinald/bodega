@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Sink kinds. The set is closed: each one answers a question the others
@@ -69,6 +70,7 @@ type EventSink interface {
 type EventReader interface {
 	QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, error)
 	CountEvents(ctx context.Context, f Filter) (int64, error)
+	QueryServed(ctx context.Context, identity string, since time.Time) ([]ServedArtifact, error)
 	ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error)
 	AggregateDiscovery(ctx context.Context, registryType string) ([]DiscoveryAggregate, error)
 	ClearDiscovery(ctx context.Context, registryType string) (int64, error)

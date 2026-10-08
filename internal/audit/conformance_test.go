@@ -87,6 +87,8 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		DurationMs: 4711,
 		Details:    `{"note":"a \"quoted\" detail"}`,
 		Actor:      "ravi",
+		ObjectKey:  "packages/apt/pool/main/h/hello/hello_2.10-3_amd64.deb",
+		Digest:     "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
 	}
 
 	fullRow := DiscoveryRow{
@@ -148,9 +150,72 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 				ClientIP: fullEvent.ClientIP, UserAgent: fullEvent.UserAgent,
 				Status: fullEvent.Status, DurationMs: fullEvent.DurationMs,
 				Details: fullEvent.Details, Actor: fullEvent.Actor,
+				ObjectKey: fullEvent.ObjectKey, Digest: fullEvent.Digest,
 			}
 			if got[0] != want {
 				t.Errorf("event round trip differs:\n got %+v\nwant %+v", got[0], want)
+			}
+		}},
+
+		// The served set is what F54 compares a host's inventory against, so
+		// the rows it must leave out are fixtures here: another identity's,
+		// a metadata response with no key, a non-fetch event carrying one, and
+		// a repeat of a row already counted. Two digests at one version are
+		// two builds and stay two rows.
+		{"served_set_is_distinct_per_identity", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
+			if !h.queryable {
+				t.Skip("write-only sinks answer no reads")
+			}
+			const d1, d2, d3 = "1111111111111111111111111111111111111111111111111111111111111111",
+				"2222222222222222222222222222222222222222222222222222222222222222",
+				"3333333333333333333333333333333333333333333333333333333333333333"
+			fetch := func(identity, typ, name, version, key, digest string) Event {
+				return Event{EventType: EventServeFetch, PkgType: typ, PkgName: name, PkgVersion: version,
+					Identity: identity, ObjectKey: key, Digest: digest, Status: "success"}
+			}
+			for _, ev := range []Event{
+				fetch("host-a", "npm", "widget", "1.0.0", "packages/npm/widget/widget-1.0.0.tgz", d1),
+				fetch("host-a", "npm", "widget", "1.0.0", "packages/npm/widget/widget-1.0.0.tgz", d1),
+				fetch("host-a", "npm", "widget", "1.0.0", "packages/npm/widget/widget-1.0.0.tgz", d2),
+				fetch("host-a", "npm", "widget", "", "", ""),
+				fetch("host-a", "apt", "hello", "2.10", "packages/apt/pool/main/h/hello/hello_2.10_amd64.deb", ""),
+				fetch("host-b", "npm", "other", "2.0.0", "packages/npm/other/other-2.0.0.tgz", d3),
+				{EventType: EventCache, PkgType: "npm", PkgName: "cached", PkgVersion: "9.9.9", Identity: "host-a",
+					ObjectKey: "packages/npm/cached/cached-9.9.9.tgz", Digest: d3},
+			} {
+				if err := h.sink.Record(ctx, ev); err != nil {
+					t.Fatalf("Record: %v", err)
+				}
+			}
+			r := h.sink.(EventReader) //nolint:forcetypeassert // gated on h.queryable above.
+
+			got, err := r.QueryServed(ctx, "host-a", time.Time{})
+			if err != nil {
+				t.Fatalf("QueryServed: %v", err)
+			}
+			want := []ServedArtifact{
+				{PkgType: "apt", PkgName: "hello", PkgVersion: "2.10", Digest: ""},
+				{PkgType: "npm", PkgName: "widget", PkgVersion: "1.0.0", Digest: d1},
+				{PkgType: "npm", PkgName: "widget", PkgVersion: "1.0.0", Digest: d2},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("host-a served set:\n got %+v\nwant %+v", got, want)
+			}
+
+			got, err = r.QueryServed(ctx, "host-b", time.Time{})
+			if err != nil {
+				t.Fatalf("QueryServed: %v", err)
+			}
+			if want := []ServedArtifact{{PkgType: "npm", PkgName: "other", PkgVersion: "2.0.0", Digest: d3}}; !reflect.DeepEqual(got, want) {
+				t.Errorf("host-b served set:\n got %+v\nwant %+v", got, want)
+			}
+
+			got, err = r.QueryServed(ctx, "host-a", time.Now().Add(time.Hour))
+			if err != nil {
+				t.Fatalf("QueryServed: %v", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("served set since an hour from now = %+v, want none", got)
 			}
 		}},
 
@@ -495,6 +560,7 @@ func sqlHarness(t *testing.T, sink EventSink) sinkHarness {
 					ClientIP: se.ClientIP, UserAgent: se.UserAgent,
 					Status: se.Status, DurationMs: se.DurationMs,
 					Details: se.Details, Actor: se.Actor,
+					ObjectKey: se.ObjectKey, Digest: se.Digest,
 				})
 			}
 			return out

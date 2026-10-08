@@ -634,6 +634,8 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 
 			start := time.Now()
 			rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+			served := &servedObject{}
+			r = r.WithContext(context.WithValue(r.Context(), servedObjectCtxKey{}, served))
 			next.ServeHTTP(rec, r)
 			duration := time.Since(start)
 
@@ -661,9 +663,77 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 				UserAgent:  r.UserAgent(),
 				Status:     "success",
 				DurationMs: duration.Milliseconds(),
+				ObjectKey:  served.key,
+				Digest:     servedDigest(r.Context(), db, served),
 			})
 		})
 	}
+}
+
+// servedObject is what an artifact serve path tells AuditMiddleware about the
+// bytes it handed over. The middleware writes the row but runs outside the
+// handler that resolved the object, so it puts an empty slot in the request
+// context and the handler fills it. A slot nobody filled is a response that
+// served no stored artifact, and the row carries no key.
+type servedObject struct {
+	key    string
+	digest string
+	// index is set by a route serving metadata through a path that otherwise
+	// records a key: apt's by-hash index files are immutable and cached like
+	// a .deb, and are still an index.
+	index bool
+}
+
+type servedObjectCtxKey struct{}
+
+// noteServed records the stored object this request served. digest is the
+// one the caller holds a record of, or "" to have the middleware read the
+// checksums row for key. A no-op outside AuditMiddleware.
+func noteServed(r *http.Request, key, digest string) {
+	if so, ok := r.Context().Value(servedObjectCtxKey{}).(*servedObject); ok && !so.index {
+		so.key, so.digest = key, digest
+	}
+}
+
+// markIndexResponse declares that this request serves an index, so no
+// noteServed further down attaches a key to it.
+func markIndexResponse(r *http.Request) {
+	if so, ok := r.Context().Value(servedObjectCtxKey{}).(*servedObject); ok {
+		so.index = true
+	}
+}
+
+// servedDigest is the digest the row carries: the handler's when it supplied
+// one, otherwise the sha256 the checksums table recorded for the key. It never
+// reads the object; a key nothing recorded a sha256 for gets "".
+func servedDigest(ctx context.Context, db *audit.DB, so *servedObject) string {
+	if so.key == "" {
+		return ""
+	}
+	if d := normalizeSHA256(so.digest); d != "" {
+		return d
+	}
+	cs, err := db.GetChecksum(ctx, so.key)
+	if err != nil || cs == nil || !strings.EqualFold(cs.Algorithm, "sha256") {
+		return ""
+	}
+	return normalizeSHA256(cs.Value)
+}
+
+// normalizeSHA256 returns d as lowercase hex, or "" when it is not a sha256
+// hex digest: a blanked checksums row, or a value under another encoding,
+// must not reach a column a host's report is compared against.
+func normalizeSHA256(d string) string {
+	d = strings.ToLower(d)
+	if len(d) != 64 {
+		return ""
+	}
+	for _, c := range d {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return d
 }
 
 // parsePackagePath extracts package type, name, and version from a request path.

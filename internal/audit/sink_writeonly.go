@@ -78,6 +78,8 @@ type wireEvent struct {
 	Details    string `json:"details"`
 	Actor      string `json:"actor"`
 	Identity   string `json:"identity"`
+	ObjectKey  string `json:"object_key,omitempty"`
+	Digest     string `json:"digest,omitempty"`
 }
 
 type wireDiscovery struct {
@@ -112,6 +114,8 @@ func encodeEvent(ev Event) ([]byte, error) {
 			Details:    ev.Details,
 			Actor:      ev.Actor,
 			Identity:   ev.Identity,
+			ObjectKey:  ev.ObjectKey,
+			Digest:     ev.Digest,
 		},
 	})
 }

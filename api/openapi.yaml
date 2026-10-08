@@ -1987,6 +1987,16 @@ components:
           description: >-
             Host an identity binding resolved the request to. Empty when nothing
             bound it; it sits beside ClientIP rather than replacing it.
+        ObjectKey:
+          type: string
+          description: >-
+            Storage key of the artifact a serve_fetch streamed. Empty on a
+            metadata response (an index, a packument) and on every other event.
+        Digest:
+          type: string
+          description: >-
+            Lowercase hex SHA-256 bodega recorded for ObjectKey. Empty when
+            ObjectKey is, or when nothing recorded a SHA-256 for the key.
 
     ClientPlan:
       type: object

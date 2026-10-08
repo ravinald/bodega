@@ -111,10 +111,11 @@ func runPostgresMigrations(db *sql.DB) error {
 
 func (s *postgresSink) Record(ctx context.Context, ev Event) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity, object_key, digest)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
 		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor, ev.Identity,
+		nullIfEmpty(ev.ObjectKey), nullIfEmpty(ev.Digest),
 	)
 	return err
 }
@@ -183,7 +184,7 @@ func (s *postgresSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent
 		where = append(where, "timestamp <= "+a.next(f.Until.UTC()))
 	}
 
-	q := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity FROM events"
+	q := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity, COALESCE(object_key, ''), COALESCE(digest, '') FROM events"
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via $N parameters.
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -206,7 +207,8 @@ func (s *postgresSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent
 		if err := rows.Scan(&se.ID, &ts, &et,
 			&se.PkgType, &se.PkgName, &se.PkgVersion,
 			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details, &se.Actor, &se.Identity); err != nil {
+			&se.DurationMs, &se.Details, &se.Actor, &se.Identity,
+			&se.ObjectKey, &se.Digest); err != nil {
 			return nil, err
 		}
 		se.EventType = EventType(et)
@@ -235,6 +237,34 @@ func (s *postgresSink) CountEvents(ctx context.Context, f Filter) (int64, error)
 	var count int64
 	err := s.db.QueryRowContext(ctx, q, a.vals...).Scan(&count)
 	return count, err
+}
+
+func (s *postgresSink) QueryServed(ctx context.Context, identity string, since time.Time) ([]ServedArtifact, error) {
+	q := `SELECT DISTINCT pkg_type, pkg_name, pkg_version, COALESCE(digest, '')
+	      FROM events
+	      WHERE identity = $1 AND event_type = $2 AND object_key IS NOT NULL`
+	args := []any{identity, string(EventServeFetch)}
+	if !since.IsZero() {
+		q += " AND timestamp >= $3"
+		args = append(args, since.UTC())
+	}
+	q += " ORDER BY 1, 2, 3, 4"
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ServedArtifact
+	for rows.Next() {
+		var sa ServedArtifact
+		if err := rows.Scan(&sa.PkgType, &sa.PkgName, &sa.PkgVersion, &sa.Digest); err != nil {
+			return nil, err
+		}
+		out = append(out, sa)
+	}
+	return out, rows.Err()
 }
 
 func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {

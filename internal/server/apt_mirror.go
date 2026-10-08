@@ -125,6 +125,7 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	upstream := upstreams[0].URL + "/dists/" + codename + "/" + rest
 	key := manifest.AptKey("dists/" + codename + "/" + rest)
 	immutable := aptDistsImmutable(rest)
+	markIndexResponse(r)
 
 	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 }
@@ -160,7 +161,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 		// so on a default install every mirrored .deb after the first was
 		// served with nothing in the trail saying the cache answered it.
 		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
-		s.serveCacheHit(w, r, store, key, func(obj cachedObject) {
+		s.serveCacheHit(w, r, store, key, true, func(obj cachedObject) {
 			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
 			s.recordAptPoolHit(r, poolPath, key)
 		})
