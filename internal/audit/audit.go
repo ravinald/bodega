@@ -133,6 +133,7 @@ const (
 	DenialTokenInvalid = "token_invalid"        // Bearer presented, matched no stored hash
 	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
 	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
+	DenialTokenScope   = "token_scope"          // token valid, but its scope does not reach this route
 
 	// Refusals decided inside a handler rather than by the middleware chain.
 	// They reach the same table because an operator asking "who was turned
@@ -853,11 +854,23 @@ func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName strin
 
 // ---- API Token Management ---------------------------------------------------
 
+// Token scopes. A full token may use every mutation route; an inventory
+// token reaches only the push routes inventory sources register, so the
+// credential a host holds to report its packages cannot edit the catalog.
+const (
+	ScopeFull      = "full"
+	ScopeInventory = "inventory"
+)
+
+// ValidTokenScope reports whether s is a scope api_tokens accepts.
+func ValidTokenScope(s string) bool { return s == ScopeFull || s == ScopeInventory }
+
 // TokenInfo holds non-sensitive metadata about an API token.
 type TokenInfo struct {
 	ID        string
 	Label     string
 	Comment   string
+	Scope     string
 	CreatedAt time.Time
 	ExpiresAt *time.Time // nil = never expires
 	LastUsed  *time.Time // nil = never used
@@ -868,17 +881,26 @@ type TokenHash struct {
 	ID        string
 	Hash      string
 	ExpiresAt *time.Time
+	Scope     string
 }
 
-// InsertToken stores a new hashed API token.
+// InsertToken stores a new hashed API token with full scope.
 func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, expiresAt *time.Time) error {
+	return a.InsertScopedToken(ctx, id, label, hash, comment, ScopeFull, expiresAt)
+}
+
+// InsertScopedToken stores a new hashed API token limited to scope.
+func (a *DB) InsertScopedToken(ctx context.Context, id, label, hash, comment, scope string, expiresAt *time.Time) error {
+	if !ValidTokenScope(scope) {
+		return fmt.Errorf("unknown token scope %q (want %s or %s)", scope, ScopeFull, ScopeInventory)
+	}
 	var exp sql.NullString
 	if expiresAt != nil {
 		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
 	}
 	_, err := a.writer().ExecContext(ctx,
-		"INSERT INTO api_tokens (id, label, hash, comment, expires_at) VALUES (?, ?, ?, ?, ?)",
-		id, label, hash, comment, exp,
+		"INSERT INTO api_tokens (id, label, hash, comment, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, label, hash, comment, scope, exp,
 	)
 	return err
 }
@@ -886,7 +908,7 @@ func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, e
 // ListTokens returns metadata for all tokens (never the hash).
 func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, label, comment, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+		"SELECT id, label, comment, scope, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
 	)
 	if err != nil {
 		return nil, err
@@ -897,7 +919,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	for rows.Next() {
 		var t TokenInfo
 		var created, expires, lastUsed sql.NullString
-		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &created, &expires, &lastUsed); err != nil {
+		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &t.Scope, &created, &expires, &lastUsed); err != nil {
 			return nil, err
 		}
 		if created.Valid {
@@ -923,7 +945,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 // GetTokenHashes returns all token hashes for auth verification.
 func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, hash, expires_at FROM api_tokens",
+		"SELECT id, hash, expires_at, scope FROM api_tokens",
 	)
 	if err != nil {
 		return nil, err
@@ -934,7 +956,7 @@ func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	for rows.Next() {
 		var h TokenHash
 		var expires sql.NullString
-		if err := rows.Scan(&h.ID, &h.Hash, &expires); err != nil {
+		if err := rows.Scan(&h.ID, &h.Hash, &expires, &h.Scope); err != nil {
 			return nil, err
 		}
 		if expires.Valid {

@@ -18,6 +18,7 @@ Comprehensive documentation for the bodega package repository manager.
 - [Proxy/Cache](#proxycache)
 - [Checksum Verification](#checksum-verification)
 - [Audit Trail](#audit-trail)
+- [Inventory](#inventory)
 - [TUI](#tui)
 - [Web Dashboard](#web-dashboard)
 - [Manifest Integrity](#manifest-integrity)
@@ -1032,13 +1033,16 @@ bodega token generate ci-pipeline expiry 2027-06-01      # expires on a specific
 bodega token generate ci-pipeline expiry never            # no expiry
 bodega token generate ci-pipeline "Jenkins deploy key"    # with a comment
 bodega token generate ci-pipeline expiry 90d "CI token"   # expiry + comment
+bodega token create web-01 --scope inventory              # a host's inventory push credential
 ```
+
+`create` is an alias for `generate`. `--scope` decides what the token may do: `full` (the default) reaches every mutation route, and `inventory` reaches only the push routes inventory sources register. See [Token scope](#token-scope).
 
 On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`), mode `0640` owned by root in the group the service runs in, or `0600` where the host names no service account. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
 
 ### `bodega token list`
 
-Lists all API tokens with their ID, label, creation date, expiry, last use, and comment. Expired tokens are marked.
+Lists all API tokens with their ID, label, scope, creation date, expiry, last use, and comment. Expired tokens are marked.
 
 ### `bodega token revoke <id|label>`
 
@@ -1089,6 +1093,17 @@ A server holding one skips it, serves the rest of the list, and names the entry 
 Every add and remove writes an audit row: a `create` or `delete` event with `pkg_type=acl`, the list name, the CIDR and the OS user who ran the command. `bodega audit events` shows the list in its `NAME` column; the CIDR is in the record's version field, which `GET /api/v1/audit` returns and the table view does not.
 
 The first write to a list copies the config file's value in and says so. After that the database owns the list and the file's entry is inert; see **Configuration** below.
+
+### `bodega inventory <sources|bind|unbind|unbound>`
+
+Lists the configured inventory sources and manages the mapping from each source's host ids to bodega identities. See [Inventory](#inventory).
+
+```bash
+bodega inventory sources [--json]
+bodega inventory unbound [--json]
+bodega inventory bind <source> <external-id> <identity>
+bodega inventory unbind <source> <external-id>
+```
 
 ### `bodega identity <bind|unbind|list>`
 
@@ -2805,6 +2820,8 @@ It is also consumed rather than displayed. Every `dist.tarball` bodega writes in
 `spool_dir`, `spool_max_artifact_bytes` and `spool_max_total_bytes` bound the disk the proxy spends copying upstream artifacts. An empty `spool_dir` means `{build_root}/tmp`, and `bodega serve` refuses to start when it cannot create that directory or write in it. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) for the two ceilings, what a refused client is told, and where the pressure is reported.
 
 `audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
+
+`inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory).
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -5773,6 +5790,177 @@ bodega audit admissions npm minimist 1.2.8 --json
 
 **Not yet covered.** The pypi build admits a package by name before pip resolves a version, so its wheels, and every transitive dependency in the closure, pin with a `not_evaluated` row and a WARN on first fetch. An apt or FreeBSD proxy fill records age and OSV as `not_evaluated` even where import would evaluate OSV for apt.
 ---
+
+## Inventory
+
+bodega can hold each host's installed packages, as reported by an inventory collector, beside its own record of what it served. This section describes how reports arrive and what is stored. Comparing the two is a separate step and is not described here.
+
+### Source model
+
+A **source** is a collector plugged into one frame. Every source type declares four things:
+
+| Declaration  | Values                  | Meaning                                                                                                       |
+| ------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Type name    | e.g. `cyclonedx`        | The `type` an `inventory_sources` entry names                                                                 |
+| Mode         | `push`, `pull`          | `push`: something sends reports to a route the source registers. `pull`: bodega polls a vendor API on a timer |
+| Capabilities | `inventory`, `attempts` | `inventory`: installed components. `attempts`: evidence a host reached a package registry directly            |
+| Normalizer   |                         | Maps the source's own format into the common model below                                                      |
+
+A pull source polls a vendor's management API, never a host. bodega holds no credential into any host.
+
+Every source normalizes into one model:
+
+| Record    | Fields                                                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Component | ecosystem (a bodega type name, or `other`), name, version, path, digest algorithm and value, origin, purl when known        |
+| Report    | source instance, external id, identity, observed time, received time, sequence number, previous report's sha256, components |
+| Attempt   | source instance, external id, identity, observed time, received time, destination host, ecosystem when inferable, detail    |
+
+A batch that breaks the source's own declaration is refused whole: reports from a source without the `inventory` capability, attempts from one without `attempts`, a component with no name or in an ecosystem outside the list above.
+
+One host may report through several source instances. Each instance's reports are stored separately, and nothing in this layer merges or ranks them.
+
+### Configuring sources
+
+`inventory_sources` maps an instance name to `{"type": ..., "enabled": ..., <type-specific keys>}`. The instance name, not the type, is what every stored row records, so several instances of one type (two vendor tenants, say) are separate sources with separate hosts.
+
+```json
+"inventory_sources": {
+  "hosts": {
+    "type": "cyclonedx",
+    "enabled": true,
+    "max_body_bytes": 33554432
+  }
+}
+```
+
+Keys every instance accepts:
+
+| Key         | Default  | Meaning                                                                                    |
+| ----------- | -------- | ------------------------------------------------------------------------------------------ |
+| `type`      | required | A registered source type                                                                   |
+| `enabled`   | `false`  | A disabled push instance registers no route; a disabled pull instance is never polled      |
+| `retention` | off      | A Go duration such as `"2160h"`. Rows of this instance received earlier are deleted hourly |
+| `interval`  | `"1h"`   | Pull instances only. Minimum `"5m"`                                                        |
+
+Instance names are lowercase letters, digits, `.`, `_` and `-`, because they appear in a URL path. An unknown type, an unknown key, or a value the type rejects stops the config load with an error naming the instance and the key:
+
+```text
+inventory_sources.hosts.max_body_size: unknown key for source type "cyclonedx"
+```
+
+#### The `cyclonedx` source
+
+The built-in source. A push source with the `inventory` capability, which accepts a CycloneDX 1.5 or 1.6 JSON document at:
+
+```text
+POST /api/v1/inventory/sources/<instance>/bom
+```
+
+| Key              | Default             | Meaning                             |
+| ---------------- | ------------------- | ----------------------------------- |
+| `max_body_bytes` | `33554432` (32 MiB) | A larger body is refused with `413` |
+
+The request must carry a token scoped `inventory` that has an identity binding. The bound identity is the host's external id, and since the binding already ties the credential to that host, the source writes the host mapping itself. A full-scope token is refused with `403`, so an admin credential never needs to be copied onto a host.
+
+```bash
+# On bodega, once per host:
+bodega token create web-01 --scope inventory
+bodega identity bind token <id> web-01
+
+# On the host, from any tool that emits CycloneDX:
+syft dir:/ -o cyclonedx-json > bom.json
+curl --fail -H "Authorization: Bearer $BODEGA_INVENTORY_TOKEN" \
+  --data-binary @bom.json https://bodega.example.com/api/v1/inventory/sources/hosts/bom
+```
+
+A component's ecosystem comes from its purl type (`deb` is `apt`, `golang` is `gomod`, `pypi`, `npm`, `cargo`, `helm`, `freebsd`); anything else is `other`. The digest is the strongest hash the component lists. The path is the first `evidence.occurrences` location, and the origin is the purl's `repository_url` or `download_url` qualifier, or a `distribution` external reference. `metadata.timestamp` is the observed time.
+
+| Status | Cause                                                                 |
+| ------ | --------------------------------------------------------------------- |
+| `202`  | Stored. The body counts reports, attempts, and reports stored unbound |
+| `400`  | Not CycloneDX JSON, or a `specVersion` other than 1.5 or 1.6          |
+| `401`  | No token, an unknown token, or an expired one                         |
+| `403`  | A token not scoped `inventory`, or one with no identity binding       |
+| `404`  | No enabled push instance serves that instance and route               |
+| `413`  | Body over `max_body_bytes`                                            |
+
+### Host mapping
+
+Each source names hosts its own way: a node key, a vendor host id, a token's identity. `inventory_hosts` maps `(source instance, external id)` to a bodega identity, and a report reaches an identity through that table and nothing else. Whatever identity a normalizer writes into a report is discarded.
+
+```bash
+bodega inventory unbound                       # ids that reported and that nothing maps
+bodega inventory bind hosts node-7f3a web-01   # map one
+bodega inventory unbind hosts node-7f3a
+```
+
+A report from an unmapped external id is stored with an empty identity, not dropped, and its id appears in `bodega inventory unbound` until it is bound. Binding does not rewrite the stored rows; reports from then on carry the identity. Binding an id already mapped to a different identity is refused: unbind first.
+
+A source that authenticates a host to an identity by its own means writes the mapping itself, as `cyclonedx` does from the token binding. If the table already maps that id to another identity, the table wins and the server logs a `WARN` naming both.
+
+`bodega inventory sources` lists each configured instance with its type, mode, capabilities, enabled state, last report time (and, for a pull source, last poll and whether it failed), and how many hosts it maps and how many unbound ids it has seen. `--json` adds `last_success` and `last_error` for pull sources.
+
+### Token scope
+
+`api_tokens` carries a `scope`: `full` or `inventory`. Tokens created before the column existed are `full`, and `full` is the default for new ones.
+
+An `inventory` token is refused with `403` on every mutation route except the push routes sources register, in both the localhost-only and the token-required posture. The refusal names the scope and the route and is recorded as a `denied` event with status `token_scope`:
+
+```text
+Forbidden: a token scoped "inventory" cannot POST /api/v1/packages/apt; it reaches only inventory push routes under /api/v1/inventory/sources/
+```
+
+### Push routes and the admin gate
+
+Every POST, PATCH and DELETE meets the `admin_permit_cidr` gate, with git's upload-pack as the one long-standing exemption. Hosts posting inventory sit outside that range, so the route a push source registers under `/api/v1/inventory/sources/<instance>/` is exempt as well, and is authenticated by the source instead. The exemption covers exactly the registered method and path of an enabled instance: a disabled instance, an unknown instance, an unregistered route below a real instance, and every other POST still meet the gate. The deny list still applies to push routes.
+
+### Pull scheduling
+
+Each enabled pull instance polls on its own `interval` (default 1h, minimum 5m), starting after a random delay within one interval so a restart does not send every instance to its vendor at once. A failed poll is logged at `ERROR` with the instance and the upstream's error and retried at the next interval, not sooner. The last attempt, last success and last error are recorded per instance.
+
+### What is stored
+
+All of it lives in the audit database (`audit_db`), whatever `audit_sink` is set to. Nothing here writes to the manifest store.
+
+| Table                    | Holds                                                    | Writes                        |
+| ------------------------ | -------------------------------------------------------- | ----------------------------- |
+| `inventory_reports`      | One row per report                                       | Append-only                   |
+| `inventory_components`   | The components of each report                            | Append-only                   |
+| `inventory_attempts`     | Attempt evidence                                         | Append-only                   |
+| `inventory_hosts`        | The host mapping, with first and last report time        | `bind`, `unbind`, `last_seen` |
+| `inventory_source_polls` | Last poll, last success and last error per pull instance | Updated per poll              |
+
+No code path updates or deletes a row in the three append-only tables except `retention`, which is off by default and deletes whole rows by age. A trigger on each table refuses `UPDATE` outright.
+
+Reports are chained. Each carries a sequence number and the sha256 of the previous report from the same host under the same source instance (keyed on the identity, or on the external id while the host is unbound), so a missing or substituted row shows as a gap in the chain. Retention cuts the chain at its boundary: the oldest surviving report names a predecessor that is gone.
+
+### Writing a source
+
+A source type is one package implementing `inventory.Source` from `internal/inventory`:
+
+```go
+type Source interface {
+	Type() string
+	Mode() Mode
+	Capabilities() []Capability
+	Normalize(doc []byte, externalID string) (Batch, error)
+}
+```
+
+A push source also implements `inventory.PushSource` (`Routes` and `Authenticate`); a pull source implements `inventory.PullSource` (`Poll`). The package registers a `Factory` from `init`, reading its type-specific keys through the `*inventory.Settings` it is handed; any key it does not read is refused as unknown:
+
+```go
+func init() { inventory.Register("mytool", newSource) }
+```
+
+The registration line is one blank import beside the existing ones in `internal/server/inventory.go`:
+
+```go
+_ "github.com/ravinald/bodega/internal/inventory/mytool"
+```
+
+`internal/inventory/cyclonedx` is the worked example.
 
 ## TUI
 

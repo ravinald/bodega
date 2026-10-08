@@ -26,6 +26,8 @@ tags:
     description: Configuration a client host reads to point its package systems at bodega
   - name: attestation
     description: Keys bodega signs attestations with
+  - name: inventory
+    description: Installed-package reports from inventory sources
 
 paths:
   /healthz:
@@ -490,6 +492,69 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/AuditEvent"
+
+  /api/v1/inventory/sources/{instance}/{route}:
+    post:
+      summary: Push an inventory report to a source
+      description: >
+        One route per push source route, under the instance name configured in
+        inventory_sources. Only routes an enabled push source registered exist;
+        anything else answers 404 from inside admin_permit_cidr and 403 from
+        outside it. These routes are exempt from the admin_permit_cidr gate and
+        are authenticated by the source. The built-in cyclonedx source takes a
+        CycloneDX 1.5 or 1.6 JSON document at route "bom" from a token scoped
+        "inventory" that carries an identity binding.
+      operationId: pushInventory
+      tags: [inventory]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: instance
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance name from inventory_sources
+        - name: route
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Route the source registered, e.g. "bom"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: The source's own document format
+      responses:
+        "202":
+          description: Report stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance:
+                    type: string
+                  reports:
+                    type: integer
+                  attempts:
+                    type: integer
+                  unbound:
+                    type: integer
+                    description: Reports stored without an identity because no host mapping names their external id
+        "400":
+          description: The document did not parse or normalize
+        "401":
+          description: Missing, unknown or expired token
+        "403":
+          description: Token scope does not reach this route, or the token is bound to no identity
+        "404":
+          description: No enabled push source serves this instance and route
+        "413":
+          description: Body over the source's max_body_bytes
 
   /api/v1/profiles/{name}/pins:
     get:
@@ -2053,6 +2118,10 @@ components:
           type: string
         Comment:
           type: string
+        Scope:
+          type: string
+          enum: [full, inventory]
+          description: full reaches every mutation route; inventory reaches only inventory push routes
         CreatedAt:
           type: string
           format: date-time

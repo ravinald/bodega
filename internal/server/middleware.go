@@ -12,9 +12,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -786,13 +788,25 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // send to attribute the request; what may be fetched is a separate question
 // this gate does not ask. The exceptions are the four admin reads, which
 // Server.requireAdmin gates with the same AdminPermits predicate this uses.
-func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
+//
+// pushRoute names the routes inventory push sources registered. Those, beside
+// git's upload-pack, skip the admin gate: hosts outside admin_permit_cidr post
+// to them, and each is authenticated by the source that registered it. A nil
+// pushRoute exempts nothing.
+//
+// A token scoped "inventory" is refused on every other route, in both the
+// localhost-only and the token-required posture, so a host's reporting
+// credential is never an admin credential.
+func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger, pushRoute func(*http.Request) bool) func(http.Handler) http.Handler {
 	// Cache token hashes to avoid per-request DB queries.
 	var cachedHashes []audit.TokenHash
 	var cacheTime time.Time
+	var cacheMu sync.Mutex
 	const cacheTTL = 30 * time.Second
 
 	loadHashes := func() []audit.TokenHash {
+		cacheMu.Lock()
+		defer cacheMu.Unlock()
 		if time.Since(cacheTime) < cacheTTL && cachedHashes != nil {
 			return cachedHashes
 		}
@@ -819,6 +833,10 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 				next.ServeHTTP(w, r)
 				return
 			}
+			if pushRoute != nil && pushRoute(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 
 			// Check IP against admin_permit_cidr.
 			clientIP := net.ParseIP(ClientIP(r))
@@ -838,7 +856,20 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 			}
 
 			// If the allow-list goes beyond localhost, require a valid Bearer token.
-			if !LocalhostOnly(adminNets) {
+			if LocalhostOnly(adminNets) {
+				// No token is required here, but one may still be presented,
+				// and an inventory token must not pass where it would be
+				// refused on a widened server.
+				if auth, ok := bearerOf(r); ok {
+					incoming := audit.HashToken(auth, pepper)
+					for _, h := range loadHashes() {
+						if h.Scope == audit.ScopeInventory && subtle.ConstantTimeCompare([]byte(incoming), []byte(h.Hash)) == 1 {
+							refuseScope(w, r, auditDB, logger, h)
+							return
+						}
+					}
+				}
+			} else {
 				hashes := loadHashes()
 				if len(hashes) == 0 {
 					logger.Warn("mutation blocked: no tokens configured for remote access",
@@ -894,6 +925,11 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 					return
 				}
 
+				if matched.Scope == audit.ScopeInventory {
+					refuseScope(w, r, auditDB, logger, *matched)
+					return
+				}
+
 				// Update last_used asynchronously.
 				if auditDB != nil {
 					go func(id string) {
@@ -905,6 +941,28 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// bearerOf returns the request's Bearer credential, read the way the
+// token-required branch reads it.
+func bearerOf(r *http.Request) (string, bool) {
+	h := r.Header.Get("Authorization")
+	auth := strings.TrimPrefix(h, "Bearer ")
+	if auth == "" || auth == h {
+		return "", false
+	}
+	return auth, true
+}
+
+// refuseScope answers a scoped token presented on a route its scope does not
+// reach, naming both so the operator knows which credential to swap.
+func refuseScope(w http.ResponseWriter, r *http.Request, auditDB *audit.DB, logger *slog.Logger, tok audit.TokenHash) {
+	logger.Warn("mutation blocked: token scope does not reach this route",
+		"token_id", tok.ID, "scope", tok.Scope, "method", r.Method, "path", r.URL.Path)
+	recordDenial(auditDB, r, audit.DenialTokenScope,
+		map[string]string{"token_id": tok.ID, "scope": tok.Scope})
+	http.Error(w, fmt.Sprintf("Forbidden: a token scoped %q cannot %s %s; it reaches only inventory push routes under %s",
+		tok.Scope, r.Method, r.URL.Path, inventory.RoutePrefix), http.StatusForbidden)
 }
 
 // SecurityHeadersMiddleware adds standard security headers to every response.

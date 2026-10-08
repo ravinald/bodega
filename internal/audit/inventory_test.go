@@ -1,0 +1,261 @@
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+const tokenScopeVersion = 25
+
+// A token minted before scopes existed was an admin credential, and the
+// migration must not quietly demote it: it migrates as full.
+func TestTokenScopeMigrationKeepsExistingTokensFull(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	m := migrator(t, raw)
+	if err := m.Migrate(tokenScopeVersion - 1); err != nil {
+		t.Fatalf("migrate to %d: %v", tokenScopeVersion-1, err)
+	}
+	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash) VALUES ('old', 'ci', 'h')`); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	if err := m.Migrate(tokenScopeVersion); err != nil {
+		t.Fatalf("migrate to %d: %v", tokenScopeVersion, err)
+	}
+	var scope string
+	if err := raw.QueryRow(`SELECT scope FROM api_tokens WHERE id = 'old'`).Scan(&scope); err != nil {
+		t.Fatalf("read scope: %v", err)
+	}
+	if scope != ScopeFull {
+		t.Errorf("pre-existing token scope = %q, want %q", scope, ScopeFull)
+	}
+	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope) VALUES ('x', 'x', 'x', 'admin')`); err == nil {
+		t.Error("a scope outside full/inventory was stored; the CHECK constraint is missing")
+	}
+}
+
+func TestScopedTokenRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	if err := db.InsertToken(ctx, "a", "admin", "ha", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertScopedToken(ctx, "b", "host", "hb", "", ScopeInventory, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertScopedToken(ctx, "c", "bad", "hc", "", "root", nil); err == nil {
+		t.Error("InsertScopedToken accepted an unknown scope")
+	}
+	hashes, err := db.GetTokenHashes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, h := range hashes {
+		got[h.ID] = h.Scope
+	}
+	if got["a"] != ScopeFull || got["b"] != ScopeInventory {
+		t.Errorf("scopes = %v, want a=full b=inventory", got)
+	}
+	infos, err := db.ListTokens(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range infos {
+		if i.Scope != got[i.ID] {
+			t.Errorf("ListTokens scope for %s = %q, GetTokenHashes says %q", i.ID, i.Scope, got[i.ID])
+		}
+	}
+}
+
+func TestInventoryHostMapping(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+
+	added, err := db.BindInventoryHost(ctx, "osq", "node-1", "web-01")
+	if err != nil || !added {
+		t.Fatalf("bind = %v, %v; want added", added, err)
+	}
+	if added, err := db.BindInventoryHost(ctx, "osq", "node-1", "web-01"); err != nil || added {
+		t.Errorf("rebinding to the same identity = %v, %v; want a no-op", added, err)
+	}
+	_, err = db.BindInventoryHost(ctx, "osq", "node-1", "web-02")
+	var conflict *InventoryHostConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("rebinding to another identity: err = %v, want *InventoryHostConflict", err)
+	}
+	// The same external id under another instance is another host.
+	if added, err := db.BindInventoryHost(ctx, "osq-b", "node-1", "web-02"); err != nil || !added {
+		t.Errorf("same id under a second instance = %v, %v; want added", added, err)
+	}
+	if id, _ := db.InventoryHostIdentity(ctx, "osq", "node-1"); id != "web-01" {
+		t.Errorf("identity = %q, want web-01", id)
+	}
+	if removed, err := db.UnbindInventoryHost(ctx, "osq", "node-1"); err != nil || !removed {
+		t.Errorf("unbind = %v, %v", removed, err)
+	}
+	if id, _ := db.InventoryHostIdentity(ctx, "osq", "node-1"); id != "" {
+		t.Errorf("identity after unbind = %q, want none", id)
+	}
+}
+
+func TestInventoryReportsChainAndStayUnbound(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+
+	rep := InventoryReport{Source: "cdx", ExternalID: "ghost", ObservedAt: now, ReceivedAt: now,
+		Components: []InventoryComponent{{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0"}}}
+	first, err := db.AppendInventoryReport(ctx, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.AppendInventoryReport(ctx, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Seq != 1 || second.Seq != 2 {
+		t.Errorf("seq = %d, %d; want 1, 2", first.Seq, second.Seq)
+	}
+	if first.PrevSHA256 != "" || second.PrevSHA256 != first.SHA256 || second.SHA256 == first.SHA256 {
+		t.Errorf("chain broken: first=%+v second=%+v", first, second)
+	}
+
+	unbound, err := db.ListUnboundInventoryHosts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unbound) != 1 || unbound[0].ExternalID != "ghost" || unbound[0].Reports != 2 {
+		t.Fatalf("unbound = %+v, want ghost with 2 reports", unbound)
+	}
+
+	// Binding takes the id off the unbound list and leaves the stored rows
+	// exactly as they were written.
+	if _, err := db.BindInventoryHost(ctx, "cdx", "ghost", "web-03"); err != nil {
+		t.Fatal(err)
+	}
+	if unbound, _ := db.ListUnboundInventoryHosts(ctx); len(unbound) != 0 {
+		t.Errorf("unbound after bind = %+v, want none", unbound)
+	}
+	stored, err := db.InventoryReports(ctx, "cdx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 || stored[0].Identity != "" || len(stored[0].Components) != 1 {
+		t.Errorf("stored = %+v, want two unbound reports with one component each", stored)
+	}
+	hosts, _ := db.ListInventoryHosts(ctx)
+	if len(hosts) != 1 || !hosts[0].FirstSeen.Equal(now) {
+		t.Errorf("hosts = %+v, want first_seen carried from the unbound reports", hosts)
+	}
+}
+
+// One host reporting through two instances keeps both histories, each
+// chained on its own.
+func TestInventoryReportsKeptPerSource(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	now := time.Now()
+	for _, src := range []string{"osq", "falcon-a"} {
+		if _, err := db.AppendInventoryReport(ctx, InventoryReport{
+			Source: src, ExternalID: "h", Identity: "web-01", ObservedAt: now, ReceivedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := db.InventoryReports(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].Seq != 1 || all[1].Seq != 1 {
+		t.Errorf("reports = %+v, want one per source, each starting its own chain", all)
+	}
+}
+
+func TestInventoryTablesRefuseUpdates(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	now := time.Now()
+	if _, err := db.AppendInventoryReport(ctx, InventoryReport{Source: "s", ExternalID: "h", ObservedAt: now, ReceivedAt: now,
+		Components: []InventoryComponent{{Ecosystem: "apt", Name: "curl"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AppendInventoryAttempts(ctx, []InventoryAttempt{{Source: "s", ExternalID: "h", Destination: "pypi.org",
+		ObservedAt: now, ReceivedAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`UPDATE inventory_reports SET identity = 'x'`,
+		`UPDATE inventory_components SET name = 'x'`,
+		`UPDATE inventory_attempts SET destination = 'x'`,
+	} {
+		_, err := db.writer().ExecContext(ctx, q)
+		if err == nil || !strings.Contains(err.Error(), "append-only") {
+			t.Errorf("%s: err = %v, want the append-only refusal", q, err)
+		}
+	}
+}
+
+func TestPruneInventoryRemovesOnlyOlderRowsOfOneSource(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	old := time.Now().Add(-48 * time.Hour)
+	recent := time.Now()
+	for _, r := range []InventoryReport{
+		{Source: "a", ExternalID: "h", ObservedAt: old, ReceivedAt: old, Components: []InventoryComponent{{Ecosystem: "apt", Name: "x"}}},
+		{Source: "a", ExternalID: "h", ObservedAt: recent, ReceivedAt: recent},
+		{Source: "b", ExternalID: "h", ObservedAt: old, ReceivedAt: old},
+	} {
+		if _, err := db.AppendInventoryReport(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.AppendInventoryAttempts(ctx, []InventoryAttempt{{Source: "a", ExternalID: "h", Destination: "d", ObservedAt: old, ReceivedAt: old}}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := db.PruneInventory(ctx, "a", time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("pruned %d rows, want the old report and the old attempt", n)
+	}
+	a, _ := db.InventoryReports(ctx, "a")
+	b, _ := db.InventoryReports(ctx, "b")
+	if len(a) != 1 || len(b) != 1 {
+		t.Errorf("after prune: a=%d b=%d reports, want 1 and 1", len(a), len(b))
+	}
+	var orphans int
+	_ = db.db.QueryRow(`SELECT COUNT(*) FROM inventory_components WHERE report_id NOT IN (SELECT id FROM inventory_reports)`).Scan(&orphans)
+	if orphans != 0 {
+		t.Errorf("%d components outlived their report", orphans)
+	}
+}
+
+func TestRecordInventoryPollKeepsLastSuccess(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	ok := time.Date(2026, 10, 8, 1, 0, 0, 0, time.UTC)
+	if err := db.RecordInventoryPoll(ctx, "falcon", ok, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordInventoryPoll(ctx, "falcon", ok.Add(time.Hour), errors.New("401 from upstream")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := db.InventorySourceStats(ctx, "falcon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LastSuccess.Equal(ok) || !st.LastAttempt.Equal(ok.Add(time.Hour)) || st.LastError != "401 from upstream" {
+		t.Errorf("stats = %+v", st)
+	}
+}
