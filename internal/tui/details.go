@@ -622,10 +622,16 @@ func clientFiles(cfg *config.Config, store *manifest.Store, entryType, name stri
 			key = []byte(pst.Pepper)
 		}
 		var typeBackend string
+		var upstreams map[string]config.BinaryUpstream
 		if cfg != nil {
 			typeBackend = cfg.StorageByType[manifest.TypeBinary]
+			upstreams = cfg.BinaryUpstreams
 		}
-		if p, ok := pm.BinaryLinkName(key, typeBackend, 0); ok {
+		p, ok := clientconf.NamespacedBinaryPath(pm.Name, upstreams)
+		if !ok {
+			p, ok = pm.BinaryLinkName(key, typeBackend, 0)
+		}
+		if ok {
 			in.Binary = []clientconf.BinaryLink{{Filename: pm.Public(key).Versions[0].Filename, Path: p}}
 		}
 	}

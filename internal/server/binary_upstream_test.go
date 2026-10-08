@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -407,5 +409,174 @@ func TestBinaryCatalogSafeNameCollision(t *testing.T) {
 	rows := waitForBinaryRows(t, s, audit.DecisionNoManifest, 1)
 	if rows[0].PkgName != collided {
 		t.Errorf("pkg_name = %q, want %q", rows[0].PkgName, collided)
+	}
+}
+
+// demoServer is the install B107 was found on: one catalog namespace beside
+// one hosted entry and one entry cataloged under that namespace, each with its
+// bytes where the route that serves it reads them.
+func demoServer(t *testing.T) (s *Server, hosted, namespaced *manifest.PackageManifest) {
+	t.Helper()
+	s = binaryServer(t, "observe")
+	s.cfg.BinaryUpstreams = map[string]config.BinaryUpstream{
+		"github": {URL: "https://github.example.invalid/", Mode: config.UpstreamModeCatalog},
+	}
+	hosted = &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "wifimgr", Versions: []manifest.VersionEntry{
+		{Version: "0.1.1", URL: "https://dl.example.invalid/wifimgr_0.1.1_linux_arm64.tar.gz"},
+	}}
+	nsName := "github/ravinald/wifimgr/releases/download/v0.1.1/wifimgr_0.1.1_linux_arm64.tar.gz"
+	namespaced = &manifest.PackageManifest{Type: manifest.TypeBinary, Name: nsName, Versions: []manifest.VersionEntry{
+		{Version: "0.1.1", URL: "https://github.example.invalid/ravinald/wifimgr/releases/download/v0.1.1/wifimgr_0.1.1_linux_arm64.tar.gz"},
+	}}
+	for _, pm := range []*manifest.PackageManifest{hosted, namespaced} {
+		if err := s.store.SavePackage(t.Context(), pm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// reload re-reads the persisted index, so an index held only in memory
+	// would empty the listing the shadow warning walks.
+	if err := s.store.SaveIndex(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := manifest.ArtifactKeys(hosted, hosted.Versions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), keys[0], []byte("HOSTED")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), manifest.BinaryPrefix+nsName, []byte("NAMESPACED")); err != nil {
+		t.Fatal(err)
+	}
+	return s, hosted, namespaced
+}
+
+// clientConfigURL returns the one Package URL the package API hands out for a
+// binary package, as a path under the server.
+func clientConfigURL(t *testing.T, s *Server, name string) string {
+	t.Helper()
+	code, body := getStatusAndBody(t, s, "/api/v1/packages/binary/"+manifest.SafeName(name))
+	if code != http.StatusOK {
+		t.Fatalf("package API for %s = %d: %s", name, code, body)
+	}
+	files, _ := decodeJSON(t, body)["client_config"].([]any)
+	if len(files) != 1 {
+		t.Fatalf("client_config for %s holds %d files, want 1: %s", name, len(files), body)
+	}
+	content, _ := files[0].(map[string]any)["content"].(string)
+	_, p, ok := strings.Cut(content, "/binaries/")
+	if !ok {
+		t.Fatalf("client_config for %s is not a /binaries/ URL: %q", name, content)
+	}
+	return "/binaries/" + p
+}
+
+// The server must serve every URL its own package API hands out. Before B107 a
+// namespace made the hosted entry's link 404, and the namespaced entry's link
+// was a storage-key path the namespace route never reads.
+func TestBinaryClientConfigServesBesideANamespace(t *testing.T) {
+	s, hosted, namespaced := demoServer(t)
+
+	for _, tc := range []struct {
+		pm   *manifest.PackageManifest
+		want string
+	}{{hosted, "HOSTED"}, {namespaced, "NAMESPACED"}} {
+		link := clientConfigURL(t, s, tc.pm.Name)
+		if code, got := getStatusAndBody(t, s, link); code != http.StatusOK || got != tc.want {
+			t.Errorf("%s's client_config %s = %d %q, want 200 %q", tc.pm.Name, link, code, got, tc.want)
+		}
+	}
+	if link := clientConfigURL(t, s, namespaced.Name); link != "/binaries/"+namespaced.Name {
+		t.Errorf("namespaced client_config = %s, want /binaries/%s", link, namespaced.Name)
+	}
+	if link := clientConfigURL(t, s, hosted.Name); !strings.HasPrefix(link, "/binaries/wifimgr/0.1.1/~/") {
+		t.Errorf("hosted client_config = %s, want its storage-key alias", link)
+	}
+
+	// A typo of the namespace matches no manifest, so it keeps the loud miss.
+	if code := getBinary(t, s, "/binaries/githbu/ravinald/wifimgr/releases/download/v0.1.1/wifimgr_0.1.1_linux_arm64.tar.gz"); code != http.StatusNotFound {
+		t.Errorf("mistyped namespace = %d, want 404", code)
+	}
+	rows := waitForBinaryRows(t, s, audit.DecisionNoNamespace, 1)
+	if rows[0].PatternHint != "githbu" {
+		t.Errorf("no_namespace row = %q, want the mistyped key %q", rows[0].PatternHint, "githbu")
+	}
+}
+
+// A hosted entry answers the same with or without a namespace configured,
+// across the paths a client can spell it under and the gates in front of them.
+func TestBinaryHostedServesTheSameBesideANamespace(t *testing.T) {
+	hostedVersion := func(t *testing.T, s *Server, hidden bool) string {
+		t.Helper()
+		pm, _ := s.store.GetPackage(t.Context(), manifest.TypeBinary, "wifimgr")
+		pm.Versions[0].Hidden = hidden
+		if err := s.store.SavePackage(t.Context(), pm); err != nil {
+			t.Fatal(err)
+		}
+		p, ok := pm.BinaryLinkName([]byte(s.pepper), "", 0)
+		if !ok {
+			t.Fatal("no link for the hosted entry")
+		}
+		return "/binaries/" + p
+	}
+	statuses := func(t *testing.T, withNamespace bool) []int {
+		t.Helper()
+		s, _, _ := demoServer(t)
+		if !withNamespace {
+			s.cfg.BinaryUpstreams = nil
+		}
+		var out []int
+		for _, hidden := range []bool{false, true} {
+			link := hostedVersion(t, s, hidden)
+			out = append(out, getBinary(t, s, link),
+				getBinary(t, s, "/binaries/wifimgr/0.1.1/~/"+strings.Repeat("f", 32)+"/wifimgr_0.1.1_linux_arm64.tar.gz"))
+		}
+		f := bindProfile(t, s, "locked", "locked01",
+			[]audit.ProfileTypeRule{closedRule(manifest.TypeBinary, audit.VersionFloating, audit.ExpansionBlock)}, nil)
+		code, _ := f.get(t, hostedVersion(t, s, false))
+		return append(out, code)
+	}
+
+	without, with := statuses(t, false), statuses(t, true)
+	want := []int{http.StatusOK, http.StatusNotFound, http.StatusOK, http.StatusNotFound, http.StatusForbidden}
+	for i := range want {
+		if without[i] != want[i] || with[i] != without[i] {
+			t.Errorf("case %d: without namespace %d, with namespace %d, want %d both", i, without[i], with[i], want[i])
+		}
+	}
+}
+
+// A namespace named like a hosted entry wins the route, and the server says so
+// at startup and on every reload rather than letting the entry go dark.
+func TestBinaryNamespaceShadowingHostedEntryWarns(t *testing.T) {
+	s, _, _ := demoServer(t)
+	s.cfg.BinaryUpstreams["wifimgr"] = config.BinaryUpstream{URL: "https://wifimgr.example.invalid/", Mode: config.UpstreamModeCatalog}
+	var buf syncBuffer
+	s.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	if code := getBinary(t, s, clientConfigURL(t, s, "wifimgr")); code != http.StatusNotFound {
+		t.Errorf("shadowed hosted link = %d, want the namespace's 404", code)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	waitFor(t, func() bool { return strings.Contains(buf.String(), "bodega server listening") })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	s.reload(t.Context())
+	warns := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "shadow") {
+			warns++
+			if !strings.Contains(line, "entries=[wifimgr]") || !strings.Contains(line, "namespaces=[wifimgr]") {
+				t.Errorf("warning does not name the entry and its key: %s", line)
+			}
+		}
+	}
+	if warns != 2 {
+		t.Errorf("shadow warnings = %d, want one at startup and one on reload:\n%s", warns, buf.String())
 	}
 }

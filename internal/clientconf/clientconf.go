@@ -250,6 +250,22 @@ type BinaryLink struct {
 	Path     string
 }
 
+// NamespacedBinaryPath returns the path under /binaries/ that serves a binary
+// entry named under a configured binary_upstreams key, and false for any other
+// entry. That path is the name itself: the route hands /binaries/<ns>/<rest> to
+// the namespace, which looks the entry up as "<ns>/<rest>", so the storage-key
+// spelling BinaryLinkName composes for a hosted entry never reaches it.
+func NamespacedBinaryPath(name string, upstreams map[string]config.BinaryUpstream) (string, bool) {
+	ns, rest, ok := strings.Cut(name, "/")
+	if !ok || rest == "" {
+		return "", false
+	}
+	if _, configured := upstreams[ns]; !configured {
+		return "", false
+	}
+	return name, true
+}
+
 // Binary renders a binary's download URL. A binary is fetched, not
 // configured, so its File carries no path.
 func Binary(base string, link BinaryLink) File {

@@ -324,3 +324,31 @@ func TestNoSurfaceComposesAClientLine(t *testing.T) {
 func routePattern(s string) bool {
 	return strings.HasPrefix(s, "GET /") || strings.HasPrefix(s, "POST /") || strings.HasPrefix(s, "HEAD /")
 }
+
+// A namespaced binary is served at /binaries/<its name>; anything else keeps
+// the storage-key link BinaryLinkName composes.
+func TestNamespacedBinaryPath(t *testing.T) {
+	upstreams := map[string]config.BinaryUpstream{"github": {URL: "https://github.com/"}}
+	for _, tc := range []struct {
+		name, want string
+		ok         bool
+	}{
+		{"github/ravinald/wifimgr/releases/download/v0.1.1/wifimgr.tar.gz", "github/ravinald/wifimgr/releases/download/v0.1.1/wifimgr.tar.gz", true},
+		{"wifimgr", "", false},
+		{"github", "", false},
+		{"github/", "", false},
+		{"githbu/ravinald/wifimgr.tar.gz", "", false},
+	} {
+		got, ok := NamespacedBinaryPath(tc.name, upstreams)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("NamespacedBinaryPath(%q) = %q, %v, want %q, %v", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	if _, ok := NamespacedBinaryPath("github/ravinald/wifimgr.tar.gz", nil); ok {
+		t.Error("a name is namespaced with no binary_upstreams configured")
+	}
+	f := Binary(testBase, BinaryLink{Filename: "wifimgr.tar.gz", Path: "github/ravinald/wifimgr.tar.gz"})
+	if want := testBase + "/binaries/github/ravinald/wifimgr.tar.gz"; f.Content != want {
+		t.Errorf("Binary content = %q, want %q", f.Content, want)
+	}
+}
