@@ -97,7 +97,7 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage backend error", http.StatusBadGateway)
 		return
 	}
-	s.proxyS3(w, r, store, key)
+	s.serveArtifact(w, r, store, key, "")
 }
 
 // hostsBinary reports whether a hosted binary manifest names exactly the

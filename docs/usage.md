@@ -925,6 +925,21 @@ bodega audit admissions npm lodash 4.17.21         # one version
 bodega audit admissions gomod example.com/example-corp/widget-sdk v1.30.0 --json
 ```
 
+### `bodega audit served --identity <name>`
+
+Prints each distinct (type, name, version, digest) bodega served to one identity, read from its `serve_fetch` rows, sorted. Two builds of one version are two lines, told apart by the digest. Only rows carrying an `object_key` count, so metadata responses and rows written before bodega recorded keys are left out; `DIGEST` is blank where bodega holds no SHA-256 for the object. Refuses by name under `audit_sink: "syslog"` or `"jsonl"`, like `audit events`. See [What a fetch served](#audit-trail).
+
+| Flag         | Default  | Purpose                                                            |
+| ------------ | -------- | ------------------------------------------------------------------ |
+| `--identity` | required | The bound host name whose served set to list                       |
+| `--since`    | all time | Only rows newer than this long ago: a Go duration, or `<N>d`       |
+| `--json`     | off      | Emit `[{pkg_type, pkg_name, pkg_version, digest}]` as a JSON array |
+
+```bash
+bodega audit served --identity build-07
+bodega audit served --identity build-07 --since 7d --json
+```
+
 ### `bodega audit check`
 
 Scans the manifest store and the dependency graph for four kinds of problem, and prints one line per finding:
@@ -5699,7 +5714,16 @@ bodega audit events --type denied --client 203.0.113.9
 bodega audit events --name lodash --since 2026-04-07
 ```
 
-Fields on every row: timestamp, event type, package type/name/version, client IP, user agent, status, duration, actor (the OS user, on CLI and TUI events), and the `details` blob.
+Fields on every row: timestamp, event type, package type/name/version, client IP, user agent, status, duration, actor (the OS user, on CLI and TUI events), identity, and the `details` blob.
+
+**What a fetch served.** A `serve_fetch` row also carries two fields naming the bytes it handed over, because the name and version come off the URL and cannot tell two builds of one version apart:
+
+| Field        | Holds                                                                                                                                                                                                                                              | Empty (NULL) when                                                                                                                                                                                                                                                                                                  |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `object_key` | The storage key of the artifact streamed: a `.deb`, an npm tarball, a wheel, a crate, a FreeBSD `.pkg`, a gomod `.zip`/`.info`/`.mod`, a helm chart, a git archive or a binary, whether hosted, served from the proxy cache or fetched on a miss   | The response was metadata rather than a stored artifact: an apt `Release`, `InRelease`, `Packages` or `by-hash` index, an npm packument, a pypi simple page, a cargo index line, a FreeBSD `meta.conf` or catalogue, a helm `index.yaml`, a gomod `list`. Every row written before this field existed is empty too |
+| `digest`     | Lowercase hex SHA-256 of that object as bodega recorded it: the digest computed while a proxy miss was spooled, the version entry's `artifact_digest` when that entry has the object as its only artifact, or else the `checksums` row for the key | `object_key` is empty, or nothing recorded a SHA-256 for the key: a hosted object never pinned, or a checksum row under another algorithm or cleared by an operator. The request never reads the object to compute one                                                                                             |
+
+`syslog` and `jsonl` emit both as `object_key` and `digest` on the event record, omitted where empty. `bodega audit served --identity <name>` reads them back as the distinct set of artifacts one host was handed; see [`bodega audit served`](#bodega-audit-served---identity-name).
 
 **Not recorded**, deliberately:
 

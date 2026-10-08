@@ -1885,7 +1885,34 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 		http.Error(w, "storage backend error", http.StatusBadGateway)
 		return
 	}
-	s.proxyS3(w, r, store, key)
+	s.serveArtifact(w, r, store, key, s.entryDigest(r.Context(), typ, pkg, version, key))
+}
+
+// entryDigest returns the ArtifactDigest a version entry recorded, when that
+// entry's single artifact key is key. A version holding several objects (a
+// pypi release's wheels, gomod's .zip beside .info and .mod) records a digest
+// naming none of them in particular, so it is not lent to any.
+func (s *Server) entryDigest(ctx context.Context, typ, pkg, version, key string) string {
+	if s.store == nil || pkg == "" {
+		return ""
+	}
+	pm, err := s.store.GetPackage(ctx, typ, pkg)
+	if err != nil || pm == nil {
+		return ""
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version != version && (version == "" || ve.Ref != version) {
+			continue
+		}
+		if ve.ArtifactDigest == "" {
+			return ""
+		}
+		if keys, err := manifest.ArtifactKeys(pm, ve); err == nil && len(keys) == 1 && keys[0] == key {
+			return ve.ArtifactDigest
+		}
+		return ""
+	}
+	return ""
 }
 
 // proxyVersionOrRefuse serves the artifact its manifest entry names, and
@@ -1925,7 +1952,7 @@ func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, ty
 		http.Error(w, reason, http.StatusNotFound)
 		return
 	}
-	s.proxyS3(w, r, store, key)
+	s.serveArtifact(w, r, store, key, s.entryDigest(r.Context(), typ, pkg, version, key))
 }
 
 // listFanout unions List across every backend a read of typ may reach.
@@ -2013,6 +2040,20 @@ func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.O
 	}
 	defer func() { _ = result.Body.Close() }()
 	s.serveStored(w, s3Key, result)
+}
+
+// serveArtifact is proxyS3 for a stored artifact: the serve_fetch row names
+// the key it streamed and digest, or the digest recorded for the key when
+// digest is "". Indexes and other regenerable documents go through proxyS3 and
+// carry no key.
+func (s *Server) serveArtifact(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, digest string) {
+	result, ok := s.openStored(w, r, store, key)
+	if !ok {
+		return
+	}
+	defer func() { _ = result.Body.Close() }()
+	noteServed(r, key, digest)
+	s.serveStored(w, key, result)
 }
 
 // openStored opens s3Key for streaming and answers the client itself when the
