@@ -270,6 +270,64 @@ func moveFile(src, dst string) error {
 	return os.Remove(src)
 }
 
+// cloneAptSource checks out the source an apt entry builds from. The .deb is
+// published under the entry's version, so a ref that cannot be fetched fails
+// here rather than falling back to the default branch: the wrong commit would
+// otherwise be built, signed and served with every check passing. On failure
+// dir is removed, because CheckAptStage reads its existence as "fetched".
+func cloneAptSource(out io.Writer, name, url, ref, dir string) error {
+	if ref == "" {
+		_, _ = fmt.Fprintf(out, "    Cloning %s at its default branch: the entry names no ref\n", url)
+		if err := runCmd(out, "", "git", "clone", "--depth", "1", url, dir); err != nil {
+			return fmt.Errorf("git clone: %w", err)
+		}
+	} else {
+		_, _ = fmt.Fprintf(out, "    Cloning %s at %s...\n", url, ref)
+		if err := cloneAptRef(out, url, ref, dir); err != nil {
+			_ = os.RemoveAll(dir)
+			return fmt.Errorf("apt entry %s: fetch ref %q from %s: %w", name, ref, url, err)
+		}
+	}
+	head, err := runCmdCapture(dir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("apt entry %s: resolve HEAD of %s: %w: %s", name, dir, err, strings.TrimSpace(head))
+	}
+	_, _ = fmt.Fprintf(out, "    Commit: %s\n", strings.TrimSpace(head))
+	return nil
+}
+
+// cloneAptRef shallow-clones url at ref. A tag or branch goes through
+// "clone --branch", which keeps the tag and the origin remote a build script
+// may read; "--branch" cannot take a commit SHA, so a full SHA is fetched into
+// an empty repository instead.
+func cloneAptRef(out io.Writer, url, ref, dir string) error {
+	if !isFullCommitSHA(ref) {
+		return runCmd(out, "", "git", "clone", "--depth", "1", "--branch="+ref, url, dir)
+	}
+	steps := [][]string{
+		{"-c", "advice.defaultBranchName=false", "init", "-q", dir},
+		{"-C", dir, "remote", "add", "origin", url},
+		{"-C", dir, "fetch", "--depth", "1", "origin", ref},
+		{"-C", dir, "checkout", "-q", "--detach", "FETCH_HEAD"},
+	}
+	for _, args := range steps {
+		if err := runCmd(out, "", "git", args...); err != nil {
+			return fmt.Errorf("git %s: %w", args[2], err)
+		}
+	}
+	return nil
+}
+
+// isFullCommitSHA reports whether ref is a full SHA-1 or SHA-256 object name.
+func isFullCommitSHA(ref string) bool {
+	if len(ref) != 40 && len(ref) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(ref)
+	return err == nil
+}
+
 // CheckAptStage inspects the filesystem to determine which pipeline stages have
 // completed for the given apt package version. It does not run any commands.
 func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
@@ -443,14 +501,11 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cloneDir := aptSourceDir(d, name, ve)
 				if err := os.RemoveAll(cloneDir); err != nil {
 					fetchErr = fmt.Errorf("remove old source %s: %w", cloneDir, err)
+				} else if err := cloneAptSource(out, name, ve.URL, ve.Ref, cloneDir); err != nil {
+					fetchErr = err
 				} else {
-					_, _ = fmt.Fprintf(out, "    Cloning %s...\n", ve.URL)
-					if err := runCmd(out, "", "git", "clone", "--depth", "1", ve.URL, cloneDir); err != nil {
-						fetchErr = fmt.Errorf("git clone: %w", err)
-					} else {
-						artifactPath = cloneDir
-						_, _ = fmt.Fprintf(out, "    Source: %s\n", cloneDir)
-					}
+					artifactPath = cloneDir
+					_, _ = fmt.Fprintf(out, "    Source: %s\n", cloneDir)
 				}
 
 			case ve.URL != "":
