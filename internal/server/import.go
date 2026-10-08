@@ -101,7 +101,7 @@ func (s *Server) handleBulkImport(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, importDecodeStatus(err), map[string]string{"error": importDecodeMessage(err)})
 			return
 		}
-		resp.record(s.importOne(ctx, &pm, merge, Identity(r)))
+		resp.record(s.importOne(ctx, &pm, merge, Identity(r), ClientIP(r)))
 	}
 
 	if err := s.store.SaveIndex(ctx); err != nil {
@@ -118,11 +118,15 @@ func (s *Server) handleBulkImport(w http.ResponseWriter, r *http.Request) {
 
 // importOne runs the shared admit path and writes, mirroring what
 // 'bodega pkg import' does locally so the two surfaces cannot disagree.
-func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, merge bool, identity string) ImportResult {
+func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, merge bool, identity, clientIP string) ImportResult {
 	out := ImportResult{Type: pm.Type, Name: pm.Name}
 
 	if !manifest.IsKnownType(pm.Type) {
 		out.Outcome, out.Reason = ImportInvalid, fmt.Sprintf("unknown type %q", pm.Type)
+		return out
+	}
+	if err := holdToIdentity(pm, identity); err != nil {
+		out.Outcome, out.Reason = ImportFailed, err.Error()
 		return out
 	}
 	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, pm, admit.Who{Identity: identity})
@@ -170,12 +174,34 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 			EventType: audit.EventCreate,
 			PkgType:   pm.Type,
 			PkgName:   pm.Name,
+			ClientIP:  clientIP,
 			Status:    "success",
 			Details:   audit.FormatDiff(nil, blob),
+			Identity:  identity,
 		})
 	}
 	out.Outcome = outcome
 	return out
+}
+
+// holdToIdentity keeps a bound host to cataloging itself. The binding decides
+// who pushed, so every origin a row claims must be that identity, and a row
+// claiming none is stamped with it the way --origin would have on the client.
+// An unbound push (an operator cataloging a host from a workstation) has no
+// identity to compare against and keeps the origin it claims.
+func holdToIdentity(pm *manifest.PackageManifest, identity string) error {
+	if identity == "" {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		for _, origin := range admit.Origins(ve) {
+			if origin != identity {
+				return fmt.Errorf("version %s claims origin %q, but the request is bound to identity %q; a bound host can push only its own rows",
+					ve.Version, origin, identity)
+			}
+		}
+	}
+	return admit.ApplyOrigin(pm, identity)
 }
 
 func (resp *ImportResponse) record(res ImportResult) {

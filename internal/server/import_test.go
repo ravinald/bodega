@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -324,4 +325,105 @@ func TestImportRoutesRecordUpstreamPublishTimes(t *testing.T) {
 		}
 		check(t, s, nil)
 	})
+}
+
+// TestBulkImportHoldsABoundHostToItsOwnOrigin covers what an operator reading
+// _origin relies on: the row names the host that pushed it. A token bound to
+// one host cannot catalog rows under another's name, and an unbound push from
+// a workstation keeps the origin it claims because no identity says otherwise.
+func TestBulkImportHoldsABoundHostToItsOwnOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name, identity, body string
+		outcome              ImportOutcome
+		origin               string
+	}{
+		{"own origin", "db01", aptManifestFrom("curl", "8.5.0", "db01"), ImportImported, "db01"},
+		{"no origin", "db01", aptManifest("curl", "8.5.0"), ImportImported, "db01"},
+		{"unbound", "", aptManifestFrom("curl", "8.5.0", "db02"), ImportImported, "db02"},
+		{"another host", "db01", aptManifestFrom("curl", "8.5.0", "db02"), ImportFailed, ""},
+		{"another host among several", "db01", aptManifestFrom("curl", "8.5.0", "db01,db02"), ImportFailed, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDiscoveryServer(t)
+			body := "[" + tc.body + "," + aptManifest("wget", "1.21") + "]"
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/import", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			s.handleBulkImport(w, withIdentity(r, tc.identity))
+			var resp ImportResponse
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			if w.Code != http.StatusOK || len(resp.Results) != 2 {
+				t.Fatalf("status %d, results %+v", w.Code, resp.Results)
+			}
+			if got := resp.Results[0]; got.Outcome != tc.outcome {
+				t.Fatalf("curl: outcome = %q (%s), want %q", got.Outcome, got.Reason, tc.outcome)
+			}
+			if resp.Results[1].Outcome != ImportImported {
+				t.Errorf("wget beside it: outcome = %q (%s), want imported", resp.Results[1].Outcome, resp.Results[1].Reason)
+			}
+
+			all, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCreate, PkgName: "curl"})
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			// The admit path writes its own policy_warn row; the write is
+			// the success row.
+			var events []audit.StoredEvent
+			for _, e := range all {
+				if e.Status == "success" {
+					events = append(events, e)
+				}
+			}
+			pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, "curl")
+
+			if tc.outcome == ImportFailed {
+				reason := resp.Results[0].Reason
+				if !strings.Contains(reason, `"db02"`) || !strings.Contains(reason, `"db01"`) {
+					t.Errorf("reason %q does not name both the claimed origin and the identity", reason)
+				}
+				if pm != nil {
+					t.Errorf("a refused package was saved: %+v", pm)
+				}
+				if len(all) != 0 {
+					t.Errorf("a refused package wrote an audit row: %+v", all)
+				}
+				return
+			}
+
+			if pm == nil {
+				t.Fatal("curl reported imported but is not in the store")
+			}
+			if got := pm.Versions[0].Metadata[admit.MetaOrigin]; got != tc.origin {
+				t.Errorf("stored origin = %q, want %q", got, tc.origin)
+			}
+			if len(events) != 1 {
+				t.Fatalf("create rows for curl = %d, want 1: %+v", len(events), events)
+			}
+			if ev := events[0]; ev.Identity != tc.identity || ev.ClientIP != ClientIP(r) || ev.ClientIP == "" {
+				t.Errorf("audit row identity %q client %q, want %q and %q", ev.Identity, ev.ClientIP, tc.identity, ClientIP(r))
+			}
+		})
+	}
+}
+
+// TestBulkImportRefusesAnotherHostOnMerge pins that a refused package is not
+// merged either: a bound host adding its name to a row another host owns
+// would be the same false claim arriving through the merge path.
+func TestBulkImportRefusesAnotherHostOnMerge(t *testing.T) {
+	s := newDiscoveryServer(t)
+	seed := httptest.NewRequest(http.MethodPost, "/api/v1/packages/import", strings.NewReader("["+aptManifestFrom("curl", "8.5.0", "db02")+"]"))
+	s.handleBulkImport(httptest.NewRecorder(), withIdentity(seed, "db02"))
+
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/import?merge=true",
+		strings.NewReader("["+aptManifestFrom("curl", "8.6.0", "db03")+"]"))
+	w := httptest.NewRecorder()
+	s.handleBulkImport(w, withIdentity(r, "db01"))
+	var resp ImportResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Results) != 1 || resp.Results[0].Outcome != ImportFailed {
+		t.Fatalf("results = %+v, want one failed", resp.Results)
+	}
+	pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, "curl")
+	if pm == nil || len(pm.Versions) != 1 {
+		t.Fatalf("a refused merge changed the stored package: %+v", pm)
+	}
 }

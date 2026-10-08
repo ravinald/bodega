@@ -515,6 +515,14 @@ Plaintext `http` is refused. A bearer token on an unencrypted link is readable b
 
 A remote import lands package by package and reports each one. Anything already present, refused by policy, or malformed is named on stderr and the rest still land: one clashing package in a 635-package host catalog must not discard the other 634. The command fails only when nothing landed at all.
 
+A host whose request resolves to an identity binding, by token or by address, can push rows only for itself. Every `_origin` a pushed entry carries must be that identity, and an entry carrying none is stamped with it, the same way `--origin` stamps it on the client. A package naming any other host is refused whole, with nothing saved or merged for it, and the rest of the push carries on:
+
+```text
+apt/curl: failed: version 8.5.0 claims origin "db02", but the request is bound to identity "db01"; a bound host can push only its own rows
+```
+
+A push that resolves to no identity, such as an operator cataloging a host from a workstation under `admin_permit_cidr`, keeps the origin it claims. The `create` row each landed package writes to the audit log records the pushing identity and client IP either way.
+
 ### `bodega pkg convert <type> [file|-]`
 
 Converts a package manager's own report of what is installed into bodega manifests, on stdout.
