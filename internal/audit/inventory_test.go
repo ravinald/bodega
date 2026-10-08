@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const tokenScopeVersion = 25
+const tokenScopeVersion = 26
 
 // A token minted before scopes existed was an admin credential, and the
 // migration must not quietly demote it: it migrates as full.
