@@ -36,7 +36,9 @@ does not.
 Every version entry is stamped with the host the inventory came from, so a
 catalog holding several hosts can still say which one contributed a package.
 That defaults to this machine's hostname; --origin names another when the
-input was captured elsewhere.
+input was captured elsewhere, or when the catalog is pushed with a token bound
+to an identity other than the hostname. A bound push is refused unless every
+origin it carries is that identity.
 
 An apt inventory also records the release it was captured on, because Ubuntu
 and Debian backport a security fix without moving the upstream version, so the
@@ -203,8 +205,10 @@ const osReleasePath = hostpkg.OSReleasePath
 func osReleaseCodename(path string) string { return hostpkg.OSReleaseCodename(path) }
 
 // resolveOrigin names the host an inventory came from. Convert runs on the
-// machine being cataloged in the common case, so the hostname is right without
-// a flag; --origin is for a capture converted somewhere else.
+// machine being cataloged in the common case, so the hostname is the default;
+// --origin is for a capture converted somewhere else, or for a host whose
+// identity binding names something other than its hostname, since the server
+// holds a bound push to the binding's name.
 func resolveOrigin(flag string) (string, error) {
 	if flag != "" {
 		return flag, nil
