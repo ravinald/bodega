@@ -74,11 +74,11 @@ bodega serve --allow-plaintext   # HTTP server on :8080
 
 The client then points at the mirror instead of upstream, and nothing else about its workflow changes.
 
-To catalog a host that already exists rather than adding packages one at a time, read its installed set and push the result. Neither step needs a manifest store on the host:
+To catalog a host that already exists rather than adding packages one at a time, read its installed set and push the result. Neither step needs a manifest store on the host. `--origin` names the identity the host's token is bound to, because a bound host can push only rows carrying its own identity:
 
 ```bash
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' \
-  | bodega pkg convert apt > catalog.json
+  | bodega pkg convert apt --origin db01 > catalog.json
 bodega pkg import --server https://bodega.example.com catalog.json
 ```
 

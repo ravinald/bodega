@@ -515,6 +515,16 @@ Plaintext `http` is refused. A bearer token on an unencrypted link is readable b
 
 A remote import lands package by package and reports each one. Anything already present, refused by policy, or malformed is named on stderr and the rest still land: one clashing package in a 635-package host catalog must not discard the other 634. The command fails only when nothing landed at all.
 
+A host whose request resolves to an identity binding, by token or by address, can push rows only for itself. Every `_origin` a pushed entry carries must be that identity, and an entry carrying none is stamped with it, the same way `--origin` stamps it on the client. A package naming any other host is refused whole, with nothing saved or merged for it, and the rest of the push carries on:
+
+```text
+apt/curl: failed: version 8.5.0 claims origin "db02", but the request is bound to identity "db01"; a bound host can push only its own rows (re-run 'bodega pkg convert --origin db01')
+```
+
+A push that resolves to no identity, such as an operator cataloging a host from a workstation under `admin_permit_cidr`, keeps the origin it claims. The `create` row with status `success` that each landed package writes to the audit log records the pushing identity and client IP either way. The `policy_warn` row a warning check writes beside it does not carry them yet.
+
+The comparison is against the binding's name, not the hostname `pkg convert` stamps by default. A host whose binding names something else (a token bound as `build-07`, or a CIDR binding naming a group such as `devbox`) has every package refused until it converts with `--origin <binding name>`. `pkg import --origin` cannot repair a catalog already stamped with the hostname, because it refuses to overwrite an origin the payload carries.
+
 ### `bodega pkg convert <type> [file|-]`
 
 Converts a package manager's own report of what is installed into bodega manifests, on stdout.
@@ -578,10 +588,12 @@ Every skip and every gap is reported on stderr, so stdout stays a clean payload 
 
 ```bash
 # On the host being cataloged. Neither step needs a manifest store here.
-# Every entry is stamped with this machine's hostname, so the catalog can
-# still name the contributor once other hosts land in it.
+# Every entry is stamped with --origin, so the catalog can still name the
+# contributor once other hosts land in it. Pass the identity the push token
+# is bound to: the server compares _origin with the binding, not with the
+# hostname convert would stamp without the flag.
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
-  | bodega pkg convert apt > catalog.json
+  | bodega pkg convert apt --origin db01 > catalog.json
 
 # Read it. This is the review step, and it is the point of the two commands.
 $EDITOR catalog.json
@@ -594,7 +606,7 @@ Re-running later against the same host adds whatever moved on:
 
 ```bash
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
-  | bodega pkg convert apt \
+  | bodega pkg convert apt --origin db01 \
   | bodega pkg import --server https://bodega.example --merge -
 ```
 
