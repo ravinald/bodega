@@ -33,11 +33,19 @@ func newTokenCmd(gf *globalFlags) *cobra.Command {
 
 // bodega token generate <label> [expiry <days|date|never>] [comment]
 func newTokenGenerateCmd(gf *globalFlags) *cobra.Command {
-	return &cobra.Command{
-		Use:   "generate <label> [expiry <duration|date|never>] [comment]",
-		Short: "Generate a new API token",
+	var scope string
+	c := &cobra.Command{
+		Use:     "generate <label> [expiry <duration|date|never>] [comment]",
+		Aliases: []string{"create"},
+		Short:   "Generate a new API token",
 		Long: `Generate a cryptographically random API token. The raw token is displayed
 once and cannot be retrieved later. A SHA-256 hash (with pepper) is stored.
+
+--scope full (the default) reaches every mutation route. --scope inventory
+reaches only the push routes inventory sources register, which is what a host
+posting its installed packages needs and nothing more. An inventory token also
+needs an identity binding before a source accepts it:
+  bodega identity bind token <id> <identity>
 
 Examples:
   bodega token generate ci-pipeline
@@ -45,9 +53,13 @@ Examples:
   bodega token generate ci-pipeline expiry 2027-06-01
   bodega token generate ci-pipeline expiry never
   bodega token generate ci-pipeline expiry 90d "Jenkins deploy key"
-  bodega token generate ci-pipeline "Jenkins deploy key"`,
+  bodega token generate ci-pipeline "Jenkins deploy key"
+  bodega token create web-01 --scope inventory`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !audit.ValidTokenScope(scope) {
+				return fmt.Errorf("unknown --scope %q: want %s or %s", scope, audit.ScopeFull, audit.ScopeInventory)
+			}
 			label := args[0]
 			expiry, comment := parseExpiryAndComment(args[1:])
 
@@ -116,7 +128,7 @@ Examples:
 
 			// Store in DB.
 			ctx := context.Background()
-			if err := adb.InsertToken(ctx, id, label, hash, comment, expiresAt); err != nil {
+			if err := adb.InsertScopedToken(ctx, id, label, hash, comment, scope, expiresAt); err != nil {
 				return fmt.Errorf("store token: %w", err)
 			}
 
@@ -127,7 +139,7 @@ Examples:
 				PkgName:   label,
 				Actor:     audit.CurrentActor(),
 				Status:    "success",
-				Details:   fmt.Sprintf("id=%s", id),
+				Details:   fmt.Sprintf("id=%s scope=%s", id, scope),
 			})
 
 			// Display.
@@ -136,6 +148,7 @@ Examples:
 			fmt.Printf("  Token:   %s\n", token)
 			fmt.Printf("  ID:      %s\n", id)
 			fmt.Printf("  Label:   %s\n", label)
+			fmt.Printf("  Scope:   %s\n", scope)
 			if expiresAt != nil {
 				fmt.Printf("  Expires: %s\n", expiresAt.Format("2006-01-02"))
 			} else {
@@ -144,10 +157,15 @@ Examples:
 			if comment != "" {
 				fmt.Printf("  Comment: %s\n", comment)
 			}
+			if scope == audit.ScopeInventory {
+				fmt.Printf("\nBind it to the host it was minted for:\n  bodega identity bind token %s <identity>\n", id)
+			}
 
 			return nil
 		},
 	}
+	c.Flags().StringVar(&scope, "scope", audit.ScopeFull, "What the token may do: full, or inventory (inventory push routes only)")
+	return c
 }
 
 func newTokenListCmd(gf *globalFlags) *cobra.Command {
@@ -172,7 +190,7 @@ func newTokenListCmd(gf *globalFlags) *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tLABEL\tCREATED\tEXPIRES\tLAST USED\tCOMMENT")
+			fmt.Fprintln(w, "ID\tLABEL\tSCOPE\tCREATED\tEXPIRES\tLAST USED\tCOMMENT")
 			for _, t := range tokens {
 				created := t.CreatedAt.Format("2006-01-02")
 				expires := "never"
@@ -191,8 +209,8 @@ func newTokenListCmd(gf *globalFlags) *cobra.Command {
 				if len(comment) > 40 {
 					comment = comment[:37] + "..."
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-					t.ID, t.Label, created, expires, lastUsed, comment)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					t.ID, t.Label, t.Scope, created, expires, lastUsed, comment)
 			}
 			return w.Flush()
 		},

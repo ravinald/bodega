@@ -1,5 +1,6 @@
-// Package inventory answers "which object backs this manifest entry, and is it
-// there?" for every package type.
+// Package inventory answers two questions about what exists: which object
+// backs each manifest entry (this file), and which packages each host has
+// installed, as reported by pluggable inventory sources (source.go, frame.go).
 //
 // It lives outside internal/s3 because the answer is not S3-specific: it holds
 // for the local backend and for every named backend alike. Taking a concrete S3

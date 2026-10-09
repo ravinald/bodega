@@ -545,7 +545,7 @@ func mustParseCIDR(cidr string) *net.IPNet {
 func TestMutationAuthGETPassesThrough(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.0.0/16")}
-	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger, nil)(testHandler("ok"))
 
 	// GET from a non-permitted IP should still pass — only POST/DELETE are gated.
 	req := httptest.NewRequest("GET", "/api/v1/packages", nil)
@@ -561,7 +561,7 @@ func TestMutationAuthGETPassesThrough(t *testing.T) {
 func TestMutationAuthBlocksNonPermittedIP(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
-	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger, nil)(testHandler("ok"))
 
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
@@ -576,7 +576,7 @@ func TestMutationAuthBlocksNonPermittedIP(t *testing.T) {
 func TestMutationAuthLocalhostNoTokenRequired(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("127.0.0.0/8")}
-	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger, nil)(testHandler("ok"))
 
 	// POST from localhost should pass without any token.
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
@@ -607,7 +607,7 @@ func TestMutationAuthRemoteRequiresToken(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("10.0.0.0/8")}
-	handler := MutationAuthMiddleware(StaticNets(nets), adb, pepper, logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), adb, pepper, logger, nil)(testHandler("ok"))
 
 	// POST from permitted IP but no token — should be rejected.
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
@@ -645,7 +645,7 @@ func TestMutationAuthRemoteRequiresToken(t *testing.T) {
 func TestMutationAuthDELETEAlsoGated(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
-	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger, nil)(testHandler("ok"))
 
 	req := httptest.NewRequest("DELETE", "/api/v1/packages/apt/test", nil)
 	req.RemoteAddr = "10.0.0.1:12345"

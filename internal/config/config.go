@@ -251,6 +251,12 @@ type Config struct {
 	// file has no way to say which of them a later pool request came from.
 	AptUpstreams map[string][]AptUpstream `json:"apt_upstreams,omitempty"`
 
+	// InventorySources maps an inventory source instance name to its
+	// settings: "type", "enabled" and whatever keys that type takes. Several
+	// instances of one type are allowed, two Falcon tenants for example, so
+	// the instance name rather than the type is what a report records.
+	InventorySources map[string]InventorySource `json:"inventory_sources,omitempty"`
+
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
 
@@ -957,6 +963,15 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		return nil, err
 	}
 
+	if len(cfg.InventorySources) > 0 {
+		if ValidateInventorySources == nil {
+			return nil, errors.New("inventory_sources is set, but this binary links no inventory source registry to check it against")
+		}
+		if err := ValidateInventorySources(cfg.InventorySources); err != nil {
+			return nil, err
+		}
+	}
+
 	// Mutation allow-list: default to localhost only.
 	if len(cfg.AdminPermitCIDR) == 0 {
 		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
@@ -976,6 +991,16 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.MarkResolved()
 	return cfg, nil
 }
+
+// InventorySource is one inventory_sources entry as the file carries it.
+// internal/inventory owns what the keys mean.
+type InventorySource map[string]any
+
+// ValidateInventorySources checks inventory_sources during Load, and refuses
+// the load on an unknown type, an unknown key or a value the type rejects.
+// internal/inventory sets it: the registry of source types lives there, and
+// that package already imports this one.
+var ValidateInventorySources func(map[string]InventorySource) error
 
 // MarkResolved records the current values as the resolved baseline, so Save
 // treats them as supplied rather than chosen. Load calls it; a caller that

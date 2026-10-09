@@ -36,6 +36,7 @@ import (
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -89,6 +90,10 @@ type Server struct {
 	pepperErr    error        // set when the pepper in force is unreadable; Start refuses on it
 	spool        *spoolLimiter
 	spoolErr     error // set when spool_dir cannot be created or written; Start refuses on it
+	// inventory runs the configured inventory sources; inventoryErr is set
+	// when inventory_sources does not configure, and Start refuses on it.
+	inventory    *inventory.Frame
+	inventoryErr error
 	// fills holds a proxied key from the moment its bytes reach the store
 	// until its origin row does, so a hit arriving inside that window can
 	// still name the fetch it is reading. See internal/server/proxy.go.
@@ -392,6 +397,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.seedACLs(context.Background())
 	s.refreshACLs(context.Background())
 	s.refreshIdentities(context.Background())
+	s.setupInventory()
 
 	// Resolve the git toolchain before routes are registered: whether
 	// git-http-backend exists decides which routes exist.
@@ -481,7 +487,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
-	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.isInventoryPush)(h)
 	h = s.clientMiddleware(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
@@ -581,6 +587,10 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.spoolErr
 	}
 
+	if s.inventoryErr != nil {
+		return s.inventoryErr
+	}
+
 	if err := s.guardPlaintext(); err != nil {
 		return err
 	}
@@ -661,6 +671,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// does not move, so without this loop a long-running server eventually
 	// serves an expired Release and every client fails apt update at once.
 	go s.aptRefreshLoop(ctx)
+
+	// Inventory pull polls and the retention sweep.
+	go s.inventory.Run(ctx)
 
 	// Discovery worker — drains the recorder's queue until ctx is cancelled.
 	if s.discovery != nil {
@@ -928,6 +941,11 @@ func (s *Server) registerRoutes() {
 
 	// Host profiles
 	m.HandleFunc("GET /api/v1/profiles/{name}/pins", s.handleAPIProfilePins)
+
+	// Inventory push sources. One pattern for every instance; the frame
+	// matches the instance and route, and only a route a source registered is
+	// exempt from the admin gate.
+	m.HandleFunc("POST /api/v1/inventory/sources/{instance}/{route...}", s.handleInventoryPush)
 
 	// Upstream allow-list policies (mutation-gated)
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)

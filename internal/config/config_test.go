@@ -9,6 +9,9 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
+	// Registers the cyclonedx source type, which the inventory_sources
+	// override below names; Load refuses a type nothing registered.
+	_ "github.com/ravinald/bodega/internal/inventory/cyclonedx"
 )
 
 // isolateConfig points loadFileConfig at a path in t.TempDir() that does not
@@ -199,6 +202,12 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		// Load parses this one, so the string filler's "value-<key>" is
 		// refused before the round trip can measure anything.
 		"osv_db_max_age": "72h",
+		// Load runs every instance through the source registry, so the
+		// filled value has to be one a registered type accepts. Numbers are
+		// float64 because that is what a JSON object decodes them to.
+		"inventory_sources": map[string]config.InventorySource{
+			"hosts": {"type": "cyclonedx", "enabled": true, "max_body_bytes": float64(1 << 20)},
+		},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()
