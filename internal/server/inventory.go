@@ -133,7 +133,7 @@ func (s *Server) osqueryPlan(h *clientHost) []clientconf.OsqueryPlan {
 	return out
 }
 
-// planOsquery renders the osquery flags file for the one server-mode source a
+// planOsquery renders the osquery flag list for the one server-mode source a
 // host enrolls with. A shipper-mode source configures no osqueryd: something
 // else owns that host's osquery config.
 func (s *Server) planOsquery(h *clientHost, one func(clientconf.File) []planFile) []planFile {

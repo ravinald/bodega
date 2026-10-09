@@ -9,8 +9,8 @@
 # running it.
 #
 # Needs only sh, curl or fetch(1), sha256sum or sha256(1), awk, diff and cmp.
-# The osquery system also runs the host's own apt-get or pkg, and systemctl
-# or service(8).
+# The osquery system also asks dpkg-query or pkg(8) whether osquery is
+# installed, and runs systemctl or sysrc(8) and service(8).
 
 set -eu
 umask 022
@@ -32,10 +32,11 @@ usage: sh setup.sh --url <bodega base URL> [--apply] [--systems a,b] [--allow-pl
 A host identified by a token reads it from BODEGA_TOKEN, so the token never
 appears in a process listing. A host bound by address needs none.
 
-The osquery system runs only when --systems names it. It installs osquery
-from bodega through apt-get or pkg, writes its flags, writes the enroll secret
-from BODEGA_OSQUERY_SECRET to a file only root can read, and enables and
-restarts osqueryd. Mint the secret on the server with
+The osquery system runs only when --systems names it, on a host where osquery
+is already installed. It merges bodega's flags into the flagfile osqueryd
+reads, keeping every other line, writes the enroll secret from
+BODEGA_OSQUERY_SECRET to a file only root can read, and enables and restarts
+osqueryd. Mint the secret on the server with
 `bodega osquery secret create <instance> <identity>`.
 EOF
 }
@@ -47,8 +48,7 @@ die() {
 
 base=${BODEGA_URL:-}
 token=${BODEGA_TOKEN:-}
-# Kept in this shell only: nothing this script runs, apt-get and pkg
-# included, inherits it.
+# Kept in this shell only: nothing this script runs inherits it.
 osq_secret=${BODEGA_OSQUERY_SECRET:-}
 unset BODEGA_OSQUERY_SECRET
 apply=no
@@ -308,6 +308,93 @@ keep() {
 	esac
 }
 
+# osq_merge <existing> <plan> <out> writes the existing flags file with the
+# plan's flags merged in. The plan's lines are "<rule>\t<name>\t<value>": a
+# set flag replaces every line setting it and is appended when none does; a
+# default is appended only when no line sets it; an include adds its value,
+# last, to the comma-separated list a line already holds. Every other line,
+# comments and blank lines included, is kept as it was and where it was.
+# osqueryd reads both --name=value and --name value, so both are matched;
+# a line bodega rewrites is written in the first form.
+osq_merge() {
+	awk -F "$tab" '
+	function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+	FILENAME == ARGV[1] {
+		if ($1 == "set" || $1 == "default" || $1 == "include") {
+			order[++m] = $2
+			if ($1 == "include") inc[$2] = inc[$2] ? inc[$2] "," $3 : $3
+			else { rule[$2] = $1; val[$2] = $3 }
+		}
+		next
+	}
+	{
+		s = trim($0); name = ""
+		if (substr(s, 1, 2) == "--" && match(substr(s, 3), /^[A-Za-z0-9_]+/)) {
+			name = substr(s, 3, RLENGTH); rest = substr(s, 3 + RLENGTH)
+			if (rest != "" && rest !~ /^[= \t]/) name = ""
+		}
+		if (name == "" || !(name in rule || name in inc)) { print; next }
+		seen[name] = 1
+		if ((name in rule) && rule[name] == "set") { print "--" name "=" val[name]; next }
+		if (!(name in inc)) { print; next }
+		v = rest; sub(/^=/, "", v); v = trim(v)
+		n = split(inc[name], add, ","); changed = 0
+		for (i = 1; i <= n; i++) {
+			k = split(v, have, ","); found = 0
+			for (j = 1; j <= k; j++) if (trim(have[j]) == add[i]) found = 1
+			if (!found) { v = v == "" ? add[i] : v "," add[i]; changed = 1 }
+		}
+		if (changed) print "--" name "=" v
+		else print
+	}
+	END {
+		for (i = 1; i <= m; i++) {
+			name = order[i]
+			if (seen[name] || !(name in rule)) continue
+			print "--" name "=" val[name]
+			seen[name] = 1
+		}
+	}' "$2" "$1" >"$3" || die "could not read $1 to merge bodega's osquery flags into it; nothing was written"
+}
+
+# osq_flagfile <plan> <default> prints the flagfile osqueryd reads: the one
+# the host's package configuration names, else the plan's default. The plan's
+# "from" line says where to look: a variable in a shell-syntax file, as the
+# deb's /etc/default/osqueryd sets FLAG_FILE, or "sysrc" for rc.conf.
+osq_flagfile() {
+	from_var=$(awk -F "$tab" '$1 == "from" {print $2; exit}' "$1")
+	from_src=$(awk -F "$tab" '$1 == "from" {print $3; exit}' "$1")
+	case $from_var in
+	'' | *[!A-Za-z0-9_]*) die "the osquery plan names no variable for where osqueryd's flagfile is set; fetch the script again from $base/client/setup.sh. Nothing was written" ;;
+	esac
+	found=
+	case $from_src in
+	sysrc) found=$(sysrc -n "$from_var" 2>/dev/null || true) ;;
+	/*)
+		if [ -r "$from_src" ]; then
+			found=$(awk -v n="$from_var" '
+			{ sub(/^[ \t]*(export[ \t]+)?/, "") }
+			index($0, n "=") == 1 {
+				v = substr($0, length(n) + 2)
+				if (v ~ /^"/) { v = substr(v, 2); sub(/".*$/, "", v) }
+				else if (v ~ /^\047/) { v = substr(v, 2); sub(/\047.*$/, "", v) }
+				else sub(/[ \t#].*$/, "", v)
+			}
+			END { print v }' "$from_src")
+		fi
+		;;
+	*) die "the osquery plan says the flagfile is named in $from_src, which this script does not know how to read; fetch the script again from $base/client/setup.sh. Nothing was written" ;;
+	esac
+	if [ -z "$found" ]; then
+		printf '%s\n' "$2"
+		return
+	fi
+	case $found in
+	*[!A-Za-z0-9/._-]* | [!/]*) die "$from_var in $from_src names $found as osqueryd's flagfile, which is not an absolute path this script will write. Nothing was written" ;;
+	esac
+	printf '%s\n' "$found"
+}
+
 # redact <file> prints it with every secret replaced by <redacted>: the
 # whole userinfo of an http or https URL, user and password, empty or not, up
 # to the last @ before the path, since a token can sit in either half and a
@@ -399,8 +486,8 @@ if [ -n "$systems" ]; then
 		esac
 	done
 fi
-# osquery installs a package and starts a daemon, so a run that names no
-# systems leaves it out rather than doing either unasked.
+# osquery writes an enroll secret and restarts a daemon, so a run that names
+# no systems leaves it out rather than doing either unasked.
 selected() {
 	if [ -z "$want" ]; then
 		[ "$1" != osquery ]
@@ -435,7 +522,7 @@ if [ -n "$blocked" ]; then
 fi
 if [ -z "$want" ]; then
 	case " $all " in
-	*" osquery "*) printf '%-8s %-10s %s\n' skip osquery "installs a package, writes an enroll secret and starts osqueryd, so it runs only when named: --systems osquery" ;;
+	*" osquery "*) printf '%-8s %-10s %s\n' skip osquery "writes an enroll secret and restarts osqueryd, so it runs only when named: --systems osquery" ;;
 	esac
 fi
 
@@ -463,6 +550,19 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
 	/*) target=$path ;;
 	*) die "the plan puts $system at $path, which is not an absolute path; refusing to write it" ;;
 	esac
+	if [ "$system" = osquery ]; then
+		case $os in
+		linux)
+			# shellcheck disable=SC2016 # ${Status} is dpkg-query's field, not sh's
+			[ "$(dpkg-query -W -f='${Status}' osquery 2>/dev/null || true)" = "install ok installed" ] ||
+				die "osquery is not installed on this host, and bodega does not install it. Install it from osquery's own apt repository as https://osquery.io/downloads describes, then re-run. Nothing was written"
+			;;
+		freebsd)
+			pkg info -e osquery 2>/dev/null ||
+				die "osquery is not installed on this host, and bodega does not install it. Install it with \`pkg install osquery\` (sysutils/osquery), then re-run. Nothing was written"
+			;;
+		esac
+	fi
 	get "$url" "$work/$n"
 	got=$(sha256_of "$work/$n")
 	if [ "$got" != "$sha" ]; then
@@ -472,11 +572,12 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
   The file changed between the plan and the fetch, or something between this host and $base rewrote it.
   Re-run to rule out the first. If it repeats, fetch $url from another host and compare before trusting this path"
 	fi
-	printf '%s\t%s\t%s\n' "$n" "$system" "$target" >>"$work/changes"
 	if [ "$system" = osquery ]; then
+		target=$(osq_flagfile "$work/$n" "$target")
 		osq_n=$n
 		osq_target=$target
 	fi
+	printf '%s\t%s\t%s\n' "$n" "$system" "$target" >>"$work/changes"
 done 3<"$work/plan.txt"
 
 # ---- compare ---------------------------------------------------------------
@@ -489,7 +590,11 @@ while IFS=$tab read -r n system target <&3; do
 	fi
 	old=/dev/null
 	[ ! -f "$target" ] || old=$target
-	keep "$system" "$old" "$work/$n" "$work/$n.new"
+	if [ "$system" = osquery ]; then
+		osq_merge "$old" "$work/$n" "$work/$n.new"
+	else
+		keep "$system" "$old" "$work/$n" "$work/$n.new"
+	fi
 	if [ -f "$target" ] && cmp -s "$target" "$work/$n.new"; then
 		printf 'unchanged  %-10s %s\n' "$system" "$target"
 		continue
@@ -513,27 +618,18 @@ done 3<"$work/changes"
 # ---- osquery ---------------------------------------------------------------
 #
 # The flags file went through the compare above like any other. What is left
-# is the package, the enroll secret and the daemon. The secret is compared
-# with cmp and never printed: the dry run says it will be written, not what
-# it is.
+# is the enroll secret and the daemon. The secret is compared with cmp and
+# never printed: the dry run says it will be written, not what it is.
 
 osq_steps=0
-osq_pkg=no
 osq_secret_write=no
 osq_secret_missing=no
-osq_rcflag=no
+osq_enable=no
 osq_restart=no
 if [ -n "$osq_n" ]; then
-	osq_secret_path=$(sed -n 's/^--enroll_secret_path=//p' "$work/$osq_n" | sed -n 1p)
+	osq_secret_path=$(awk -F "$tab" '$1 == "set" && $2 == "enroll_secret_path" {print $3; exit}' "$work/$osq_n")
 	case $osq_secret_path in
-	*[!A-Za-z0-9/._-]* | '' | [!/]*) die "the osquery flags name no absolute --enroll_secret_path, so there is nowhere to write the enroll secret. Nothing was written" ;;
-	esac
-	case $os in
-	linux)
-		# shellcheck disable=SC2016 # ${Status} is dpkg-query's field, not sh's
-		[ "$(dpkg-query -W -f='${Status}' osquery 2>/dev/null || true)" = "install ok installed" ] || osq_pkg=yes
-		;;
-	freebsd) pkg info -e osquery 2>/dev/null || osq_pkg=yes ;;
+	*[!A-Za-z0-9/._-]* | '' | [!/]*) die "the osquery plan names no absolute enroll_secret_path, so there is nowhere to write the enroll secret. Nothing was written" ;;
 	esac
 	if [ -n "$osq_secret" ]; then
 		if [ -f "$osq_secret_path" ] && printf '%s' "$osq_secret" | cmp -s - "$osq_secret_path" 2>/dev/null; then
@@ -546,40 +642,24 @@ if [ -n "$osq_n" ]; then
 	fi
 	case $os in
 	linux) systemctl is-enabled --quiet osqueryd 2>/dev/null && systemctl is-active --quiet osqueryd 2>/dev/null || osq_restart=yes ;;
-	freebsd) [ "$(sysrc -n osqueryd_enable 2>/dev/null || true)" = YES ] && service osqueryd status >/dev/null 2>&1 || osq_restart=yes ;;
+	freebsd)
+		# rc.conf is written only when osqueryd is not enabled yet, so a host
+		# that already runs it keeps its rc.conf as it was.
+		[ "$(sysrc -n osqueryd_enable 2>/dev/null || true)" = YES ] || osq_enable=yes
+		[ "$osq_enable" = no ] && service osqueryd status >/dev/null 2>&1 || osq_restart=yes
+		;;
 	esac
-	# The plan's FreeBSD flags path is not the rc script's default, and the
-	# rc script drops a flagfile it cannot read without a word, so rc.conf
-	# has to name it.
-	if [ "$os" = freebsd ] && [ "$(sysrc -n osqueryd_flagfile 2>/dev/null || true)" != "$osq_target" ]; then
-		case $osq_target in
-		*[!A-Za-z0-9/._-]* | [!/]*) die "the plan puts the osquery flags at $osq_target, which is not a path rc.conf can name. Nothing was written" ;;
-		esac
-		osq_rcflag=yes
-		osq_restart=yes
-	fi
-	if [ "$osq_pkg" = yes ] || [ "$osq_secret_write" = yes ] || awk -F "$tab" -v t="$osq_target" '$3 == t {f = 1} END {exit !f}' "$work/writes"; then
+	if [ "$osq_secret_write" = yes ] || awk -F "$tab" -v t="$osq_target" '$3 == t {f = 1} END {exit !f}' "$work/writes"; then
 		osq_restart=yes
 	fi
 
 	printf '\n'
-	if [ "$osq_pkg" = yes ]; then
-		osq_steps=$((osq_steps + 1))
-		case $os in
-		linux) printf 'install    %-10s the osquery package, through apt-get from bodega'"'"'s apt suite\n' osquery ;;
-		freebsd) printf 'install    %-10s the osquery package, through pkg from bodega'"'"'s repository\n' osquery ;;
-		esac
-	fi
 	if [ "$osq_secret_write" = yes ]; then
 		osq_steps=$((osq_steps + 1))
 		printf 'secret     %-10s %s: the enroll secret in BODEGA_OSQUERY_SECRET will be written, mode 0600, owner root (not shown)\n' osquery "$osq_secret_path"
 	fi
 	if [ "$osq_secret_missing" = yes ]; then
 		printf 'secret     %-10s %s: absent, and BODEGA_OSQUERY_SECRET is unset, so --apply will refuse\n' osquery "$osq_secret_path"
-	fi
-	if [ "$osq_rcflag" = yes ]; then
-		osq_steps=$((osq_steps + 1))
-		printf 'rc.conf    %-10s osqueryd_flagfile=%s, so the rc script reads the flags above\n' osquery "$osq_target"
 	fi
 	if [ "$osq_restart" = yes ]; then
 		osq_steps=$((osq_steps + 1))
@@ -601,7 +681,7 @@ if [ "$osq_secret_missing" = yes ]; then
 	die "BODEGA_OSQUERY_SECRET is unset and $osq_secret_path holds no enroll secret, so osqueryd could not enroll. Mint one on the server with \`bodega osquery secret create <instance> <identity>\` and pass it in BODEGA_OSQUERY_SECRET. Nothing was written"
 fi
 if [ "$osq_steps" -gt 0 ] && [ "$(id -u)" != 0 ]; then
-	die "the osquery steps install a package, write a root-only secret and start a daemon, so they need root. Re-run as root. Nothing was written"
+	die "the osquery steps write a root-only secret and restart a daemon, so they need root. Re-run as root. Nothing was written"
 fi
 
 # ---- apply -----------------------------------------------------------------
@@ -637,22 +717,6 @@ done 3<"$work/order"
 [ "$changed" -eq 0 ] ||
 	printf '\nApplied %s file(s). Each replaced file sits beside its backup, suffixed .bodega-%s.\n' "$changed" "$stamp"
 
-# The files land first: on a host taking --systems apt,osquery in one run,
-# apt-get can only find osquery once bodega's stanza is in place, and the deb
-# ships no flags file of its own to overwrite ours.
-if [ "$osq_pkg" = yes ]; then
-	case $os in
-	linux)
-		apt-get update || die "apt-get update failed, so osquery was not installed. The files above are written"
-		DEBIAN_FRONTEND=noninteractive apt-get install -y osquery ||
-			die "apt-get could not install osquery. It installs from bodega's apt suite: point this host at it with --systems apt, and serve osquery from the server as docs/usage.md describes under \"Serving osquery\". The files above are written"
-		;;
-	freebsd)
-		pkg install -y osquery ||
-			die "pkg could not install osquery. It installs from bodega's pkg repository: point this host at it with --systems freebsd. The files above are written"
-		;;
-	esac
-fi
 if [ "$osq_secret_write" = yes ]; then
 	osq_dir=$(dirname "$osq_secret_path")
 	mkdir -p "$osq_dir" || die "could not create $osq_dir for the enroll secret"
@@ -673,10 +737,9 @@ if [ "$osq_restart" = yes ]; then
 		systemctl restart osqueryd || die "osqueryd did not start; \`journalctl -u osqueryd\` says why"
 		;;
 	freebsd)
-		if [ "$osq_rcflag" = yes ]; then
-			sysrc osqueryd_flagfile="$osq_target" >/dev/null || die "sysrc could not set osqueryd_flagfile=$osq_target in /etc/rc.conf"
+		if [ "$osq_enable" = yes ]; then
+			sysrc osqueryd_enable=YES >/dev/null || die "sysrc could not set osqueryd_enable=YES in /etc/rc.conf"
 		fi
-		sysrc osqueryd_enable=YES >/dev/null || die "sysrc could not set osqueryd_enable=YES in /etc/rc.conf"
 		service osqueryd restart || die "osqueryd did not start; /var/log/osquery says why"
 		;;
 	esac

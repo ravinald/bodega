@@ -192,9 +192,10 @@ func TestOsqueryShipScriptDigestIsPublished(t *testing.T) {
 	}
 }
 
-// F55: the osquery system's record is the flags file for the one server-mode
+// The osquery system's record is the flag list for the one server-mode
 // source, rendered for the host's OS from public_url, and served at the URL
-// the record names with the digest it carries.
+// the record names with the digest it carries. The path is the package's
+// default flagfile, which setup.sh uses when the host names no other.
 func TestOsquerySystemFlagsFile(t *testing.T) {
 	s := hostedServer(t)
 	f := clientProfile(t, s)
@@ -205,9 +206,9 @@ func TestOsquerySystemFlagsFile(t *testing.T) {
 		t.Fatal(s.inventoryErr)
 	}
 
-	cases := []struct{ os, query, path, secret, ca string }{
-		{"linux", "os=linux&codename=noble", "/etc/osquery/osquery.flags", "/etc/osquery/bodega.secret", "/etc/ssl/certs/ca-certificates.crt"},
-		{"freebsd", "os=freebsd&abi=FreeBSD:15:aarch64", "/usr/local/etc/osquery.flags", "/usr/local/etc/osquery/bodega.secret", "/etc/ssl/cert.pem"},
+	cases := []struct{ os, query, path, from, secret, ca string }{
+		{"linux", "os=linux&codename=noble", "/etc/osquery/osquery.flags", "FLAG_FILE\t/etc/default/osqueryd", "/etc/osquery/bodega.secret", "/etc/ssl/certs/ca-certificates.crt"},
+		{"freebsd", "os=freebsd&abi=FreeBSD:15:aarch64", "/usr/local/etc/osquery/osquery.flags", "osqueryd_flagfile\tsysrc", "/usr/local/etc/osquery/bodega.secret", "/etc/ssl/cert.pem"},
 	}
 	for _, c := range cases {
 		var rec planRecord
@@ -219,15 +220,18 @@ func TestOsquerySystemFlagsFile(t *testing.T) {
 		if rec.Action != planInstall || rec.Path != c.path {
 			t.Fatalf("%s: osquery record = %+v, want an install at %s", c.os, rec, c.path)
 		}
-		want := "--tls_hostname=bodega.example.com:8443\n" +
-			"--tls_server_certs=" + c.ca + "\n" +
-			"--enroll_secret_path=" + c.secret + "\n" +
-			"--enroll_tls_endpoint=/b/api/v1/inventory/sources/osq/enroll\n" +
-			"--config_plugin=tls\n" +
-			"--config_tls_endpoint=/b/api/v1/inventory/sources/osq/config\n" +
-			"--config_refresh=1800\n" +
-			"--logger_plugin=tls\n" +
-			"--logger_tls_endpoint=/b/api/v1/inventory/sources/osq/log\n"
+		want := "from\t" + c.from + "\n" +
+			"set\ttls_hostname\tbodega.example.com:8443\n" +
+			"set\ttls_server_certs\t" + c.ca + "\n" +
+			"set\tenroll_secret_path\t" + c.secret + "\n" +
+			"set\tenroll_tls_endpoint\t/b/api/v1/inventory/sources/osq/enroll\n" +
+			"set\tconfig_plugin\ttls\n" +
+			"set\tconfig_tls_endpoint\t/b/api/v1/inventory/sources/osq/config\n" +
+			"set\tconfig_refresh\t1800\n" +
+			"default\thost_identifier\tuuid\n" +
+			"default\tlogger_plugin\tfilesystem,tls\n" +
+			"include\tlogger_plugin\ttls\n" +
+			"set\tlogger_tls_endpoint\t/b/api/v1/inventory/sources/osq/log\n"
 		code, body := clientGet(t, s, f.token, rec.URL[strings.Index(rec.URL, "/client/"):])
 		if code != http.StatusOK || body != want {
 			t.Errorf("%s: GET %s = %d\n%s\nwant\n%s", c.os, rec.URL, code, body, want)
