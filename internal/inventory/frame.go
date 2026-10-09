@@ -37,6 +37,11 @@ type Frame struct {
 	// refused, so the refusal lands in the same audit table as every other.
 	OnRefusal func(r *http.Request, reason string, details map[string]string)
 
+	// HashSecret, when set, is the peppered hash bodega keys its stored
+	// credentials on. A route handler that checks a secret of its own (an
+	// osquery enroll secret) hashes with it, so one pepper covers both.
+	HashSecret func(secret string) (string, error)
+
 	now    func() time.Time
 	jitter func(time.Duration) time.Duration
 
@@ -98,8 +103,11 @@ func (f *Frame) PushRoute(r *http.Request) (*Instance, Route, bool) {
 	return nil, Route{}, false
 }
 
-// ServeHTTP answers a push route. Authentication comes before the body is
-// read, so an unauthenticated caller cannot make bodega read 32 MiB.
+// ServeHTTP answers a push route. On the sequence the frame serves itself,
+// authentication comes before the body is read, so an unauthenticated caller
+// cannot make bodega read 32 MiB. A route with Handler set is handed the
+// request unauthenticated, and one whose credential travels in the body (an
+// osquery node_key) reads up to its route's MaxBody before it authenticates.
 func (f *Frame) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	inst, rt, ok := f.PushRoute(r)
 	if !ok {
@@ -108,6 +116,10 @@ func (f *Frame) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.db == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured; inventory reports have nowhere to go"})
+		return
+	}
+	if rt.Handler != nil {
+		rt.Handler(w, r, &RouteEnv{f: f, Instance: inst, Route: rt})
 		return
 	}
 	push := inst.Source.(PushSource)
@@ -124,27 +136,11 @@ func (f *Frame) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, ae.Status, map[string]string{"error": ae.Message})
 		return
 	}
-	if principal.ExternalID == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "source authenticated the request to no host"})
-		return
-	}
+	// An empty ExternalID is a source whose documents name their own hosts;
+	// Ingest refuses any report that then names none.
 
-	if rt.MaxBody > 0 && r.ContentLength > rt.MaxBody {
-		writeTooLarge(w, rt.MaxBody)
-		return
-	}
-	body := r.Body
-	if rt.MaxBody > 0 {
-		body = http.MaxBytesReader(w, r.Body, rt.MaxBody)
-	}
-	doc, err := io.ReadAll(body)
-	if err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			writeTooLarge(w, rt.MaxBody)
-			return
-		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body: " + err.Error()})
+	doc, ok := readCapped(w, r, rt.MaxBody)
+	if !ok {
 		return
 	}
 	batch, err := inst.Source.Normalize(doc, principal.ExternalID)
@@ -154,16 +150,101 @@ func (f *Frame) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := f.Ingest(r.Context(), inst, principal, batch)
 	if err != nil {
-		var bad *ContractError
-		if errors.As(err, &bad) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		f.logger.Error("inventory ingest failed", "instance", inst.Name, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		f.writeIngestError(w, inst, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, res)
+}
+
+func (f *Frame) writeIngestError(w http.ResponseWriter, inst *Instance, err error) {
+	var bad *ContractError
+	if errors.As(err, &bad) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	f.logger.Error("inventory ingest failed", "instance", inst.Name, "error", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+}
+
+// readCapped reads a request body under limit, answering 413 itself for a
+// larger one whether or not the request declared its length. Zero is no cap.
+func readCapped(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	if limit > 0 && r.ContentLength > limit {
+		writeTooLarge(w, limit)
+		return nil, false
+	}
+	body := r.Body
+	if limit > 0 {
+		body = http.MaxBytesReader(w, r.Body, limit)
+	}
+	doc, err := io.ReadAll(body)
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeTooLarge(w, limit)
+			return nil, false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body: " + err.Error()})
+		return nil, false
+	}
+	return doc, true
+}
+
+// RouteEnv is what the frame lends a Route.Handler: the instance it serves,
+// the store, and the frame's own body cap, ingest and refusal paths, so a
+// source answering its own protocol still stores and audits like every other.
+type RouteEnv struct {
+	f        *Frame
+	Instance *Instance
+	Route    Route
+}
+
+// DB is the report store, which also holds whatever credentials a source
+// keeps for its hosts.
+func (e *RouteEnv) DB() *audit.DB { return e.f.db }
+
+// Logger is the frame's logger.
+func (e *RouteEnv) Logger() *slog.Logger { return e.f.logger }
+
+// Now is the frame's clock.
+func (e *RouteEnv) Now() time.Time { return e.f.now() }
+
+// ReadBody reads the request body under the route's MaxBody. On false it has
+// already answered the request.
+func (e *RouteEnv) ReadBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	return readCapped(w, r, e.Route.MaxBody)
+}
+
+// Ingest stores a batch the way a frame-served route would.
+func (e *RouteEnv) Ingest(ctx context.Context, p Principal, b Batch) (IngestResult, error) {
+	return e.f.Ingest(ctx, e.Instance, p, b)
+}
+
+// WriteIngestError answers a failed Ingest: 400 for a batch the source
+// should not have produced, 500 for anything else.
+func (e *RouteEnv) WriteIngestError(w http.ResponseWriter, err error) {
+	e.f.writeIngestError(w, e.Instance, err)
+}
+
+// Refuse records a refused request in the audit table under reason. details
+// may say which check failed even where the response must not.
+func (e *RouteEnv) Refuse(r *http.Request, reason string, details map[string]string) {
+	if details == nil {
+		details = map[string]string{}
+	}
+	details["instance"] = e.Instance.Name
+	if e.f.OnRefusal != nil {
+		e.f.OnRefusal(r, reason, details)
+	}
+}
+
+// HashSecret hashes a secret the way bodega stores its tokens. It fails when
+// the server holds no pepper to key the hash on.
+func (e *RouteEnv) HashSecret(secret string) (string, error) {
+	if e.f.HashSecret == nil {
+		return "", errors.New("no pepper is loaded to verify secrets against")
+	}
+	return e.f.HashSecret(secret)
 }
 
 func writeTooLarge(w http.ResponseWriter, limit int64) {

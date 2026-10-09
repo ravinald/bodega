@@ -257,6 +257,12 @@ type Config struct {
 	// the instance name rather than the type is what a report records.
 	InventorySources map[string]InventorySource `json:"inventory_sources,omitempty"`
 
+	// OsqueryScanDirs names the trees an osquery source scans for language
+	// packages on each host, by profile. osquery's python_packages and
+	// npm_packages tables read only the directories a query names, so this
+	// is the declared extent of what bodega can see of pip and npm installs.
+	OsqueryScanDirs OsqueryScanDirs `json:"osquery_scan_dirs,omitzero"`
+
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
 
@@ -972,6 +978,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		}
 	}
 
+	if err := cfg.OsqueryScanDirs.validate(); err != nil {
+		return nil, err
+	}
+
 	// Mutation allow-list: default to localhost only.
 	if len(cfg.AdminPermitCIDR) == 0 {
 		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
@@ -990,6 +1000,62 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.snapshot = snap
 	cfg.MarkResolved()
 	return cfg, nil
+}
+
+// OsqueryDirs is one set of language-package trees.
+type OsqueryDirs struct {
+	Python []string `json:"python,omitempty"`
+	NPM    []string `json:"npm,omitempty"`
+}
+
+// OsqueryScanDirs is osquery_scan_dirs: the trees for a host whose profile
+// has no entry, and per-profile replacements. A profile's entry replaces the
+// default rather than adding to it, so a profile can scan less than the rest
+// of the fleet. Both default to nothing, which scans no language trees.
+type OsqueryScanDirs struct {
+	Default  OsqueryDirs            `json:"default,omitzero"`
+	Profiles map[string]OsqueryDirs `json:"profiles,omitempty"`
+}
+
+// For returns the trees a host bound to profile scans; "" is a host with no
+// profile.
+func (o OsqueryScanDirs) For(profile string) OsqueryDirs {
+	if d, ok := o.Profiles[profile]; ok && profile != "" {
+		return d
+	}
+	return o.Default
+}
+
+// validate refuses a directory that is not absolute or that carries a quote
+// or control character. Each one is written into an osquery SQL string
+// literal, so a quote would end the literal and a relative path would scan
+// wherever osqueryd happens to run.
+func (o OsqueryScanDirs) validate() error {
+	check := func(where string, d OsqueryDirs) error {
+		for kind, dirs := range map[string][]string{"python": d.Python, "npm": d.NPM} {
+			for _, dir := range dirs {
+				if !strings.HasPrefix(dir, "/") {
+					return fmt.Errorf("osquery_scan_dirs.%s.%s: %q is not an absolute path", where, kind, dir)
+				}
+				if strings.ContainsAny(dir, "'\"\\") || strings.ContainsFunc(dir, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+					return fmt.Errorf("osquery_scan_dirs.%s.%s: %q holds a quote, backslash or control character, which an osquery query cannot carry safely", where, kind, dir)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("default", o.Default); err != nil {
+		return err
+	}
+	for name, d := range o.Profiles {
+		if name == "" {
+			return errors.New("osquery_scan_dirs.profiles: a profile name is empty; the default entry is where a host with no profile is configured")
+		}
+		if err := check("profiles."+name, d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // InventorySource is one inventory_sources entry as the file carries it.

@@ -1120,6 +1120,18 @@ bodega inventory bind <source> <external-id> <identity>
 bodega inventory unbind <source> <external-id>
 ```
 
+### `bodega osquery secret <create|list|revoke>`
+
+Manages the enroll secrets an [`osquery` source](#the-osquery-source) in `server` mode accepts. A host presenting one gets a `node_key`, and the secret's identity becomes the identity of every report under that key.
+
+```bash
+bodega osquery secret create <instance> <identity> [--expires <duration>] [--label <name>]
+bodega osquery secret list [--json]
+bodega osquery secret revoke <id>
+```
+
+`create` prints the secret once and stores only its peppered hash, keyed on the same pepper as API tokens. `--expires` takes a Go duration (`12h`), `30d`, `1y`, a date, or `never` (the default), and stops new enrollments after that time. It refuses an instance that is not an `osquery` source in `server` mode. `list` shows each secret's id, source, label, identity, creation and expiry, and how many nodes enrolled with it, never the secret. `revoke` deletes the secret and every `node_key` enrolled with it. `create` and `revoke` each write a `create` or `delete` audit row with `pkg_type=osquery-secret`.
+
 ### `bodega identity <bind|unbind|list>`
 
 Maps something the serve path can observe about a request to a host name, so the audit and discovery tables say which host asked rather than only which address did.
@@ -2836,7 +2848,7 @@ It is also consumed rather than displayed. Every `dist.tarball` bodega writes in
 
 `audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
-`inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory).
+`inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory). `osquery_scan_dirs` names, per profile, the language-package trees an osquery source scans; see [The `osquery` source](#the-osquery-source).
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -4051,6 +4063,8 @@ web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_
 
 `\u0026` is `&`, escaped by the JSON encoder; any JSON parser returns the plain URL.
 
+When an [`osquery` source](#the-osquery-source) is enabled, the JSON plan also carries an `osquery` array, one entry per enabled osquery instance, with `instance`, `mode`, `endpoint`, `interval` (seconds) and the `python_dirs` and `npm_dirs` this host's profile declares. `plan.txt` has no osquery record: it lists only files `setup.sh` writes.
+
 **Refusals.** Every error body is plain text naming the next step. The deny list answers first, before any identity is resolved. The identity check comes next, ahead of the mutation gate and the router: a host no binding names gets the `403` below on every `/client/` path and method whatever else is wrong with the request, including a path the router would redirect or not find and a method it would refuse, so an unknown address learns the command that admits it and not which `os` values, system names or methods this server takes.
 
 | Status | When                                                                                                        | Body                                                                                                                                                                  |
@@ -5193,6 +5207,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET    | `/client/plan`, `/client/plan.txt`         | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
 | GET    | `/client/{system}`                         | One system's client file, rendered for the requesting host                                                                                                                              |
+| GET    | `/client/osquery-ship.sh`                  | The osquery result-log shipper. See [Mode B: the result-log shipper](#mode-b-the-result-log-shipper)                                                                                    |
 | GET    | `/healthz`                                 | Health probe (returns `ok`)                                                                                                                                                             |
 
 #### `version` on `/api/v1/status`
@@ -5909,6 +5924,127 @@ A component's ecosystem comes from its purl type (`deb` is `apt`, `golang` is `g
 | `404`  | No enabled push instance serves that instance and route               |
 | `413`  | Body over `max_body_bytes`                                            |
 
+#### The `osquery` source
+
+A push source with the `inventory` capability for hosts running [osquery](https://osquery.io/), with no agent of bodega's own on the host. osquery's [remote API](https://osquery.readthedocs.io/en/stable/deployment/remote/) lets a host take its config from exactly one server, so each instance runs in one of two modes, set by its `mode` key:
+
+| Mode      | Use it when                                                                            | Routes under `/api/v1/inventory/sources/<instance>/` |
+| --------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `server`  | bodega is the host's osquery server (mode A). No fleet manager owns the host's osquery | `enroll`, `config`, `log`                            |
+| `shipper` | something else owns the host's osquery config (mode B), and a shipper forwards its log | `results`                                            |
+
+A fleet can run one instance of each. A host belongs to one: a `server` instance accepts no shipped results, and a `shipper` instance answers no enroll.
+
+```json
+"inventory_sources": {
+  "osq":   { "type": "osquery", "enabled": true, "mode": "server", "interval": "1h" },
+  "osq-b": { "type": "osquery", "enabled": true, "mode": "shipper" }
+},
+"osquery_scan_dirs": {
+  "default":  { "python": ["/usr/lib/python3/dist-packages"] },
+  "profiles": { "web": { "python": ["/usr/lib/python3/dist-packages"], "npm": ["/srv/app"] } }
+}
+```
+
+| Key              | Default             | Meaning                                                                                                                                                             |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`           | required            | `server` or `shipper`                                                                                                                                               |
+| `interval`       | `"1h"`              | How often the schedule's snapshot queries run, in whole seconds. Minimum `"1m"`. In `shipper` mode it is advisory: the plan states it, and the config owner decides |
+| `max_body_bytes` | `16777216` (16 MiB) | Cap on a `log` or `results` post; a larger body is refused with `413`. `enroll` and `config` are capped at 64 KiB                                                   |
+
+##### Tables and ecosystems
+
+bodega's schedule is one snapshot query per platform, unioning every table that platform has, so one run yields one report holding the host's whole installed set:
+
+| osquery table     | Platform       | Ecosystem recorded                            | Scanned                                    |
+| ----------------- | -------------- | --------------------------------------------- | ------------------------------------------ |
+| `deb_packages`    | Linux          | `apt`                                         | always                                     |
+| `rpm_packages`    | Linux          | `other`, with purl `pkg:rpm/<name>@<version>` | always                                     |
+| `pkg_packages`    | FreeBSD        | `freebsd`                                     | always                                     |
+| `python_packages` | Linux, FreeBSD | `pypi`, with the package's path               | only `directory IN (...)` the python trees |
+| `npm_packages`    | Linux, FreeBSD | `npm`, with the package's path                | only `directory IN (...)` the npm trees    |
+
+The queries are named `bodega_packages_linux` and `bodega_packages_freebsd`. The normalizer reads only snapshot events of a query whose name contains `bodega_packages`, which still matches when a fleet manager prefixes it (osquery packs write `pack_<pack>_<query>`), and skips every other line. Nothing here covers gomod, cargo, helm, git, binaries or distfiles, and a macOS host is scheduled no query.
+
+`osquery_scan_dirs` declares the language trees. `default` applies to a host with no profile or a profile with no entry; a profile's entry replaces the default rather than adding to it. Both are empty out of the box, which leaves `python_packages` and `npm_packages` out of the query entirely: unfiltered, they read only the interpreter's default paths and global modules, which would look like a scan that found nothing. A python tree is a `site-packages` or `dist-packages` directory; an npm tree is a project directory holding `node_modules`. Every entry must be an absolute path with no quote, backslash or control character, or the config load stops. The schedule lists the trees sorted and deduplicated, so it changes only when the plan does.
+
+Each host's [plan](#client-plan-and-per-system-files) carries an `osquery` section with one entry per enabled osquery instance: the instance, its mode, the `endpoint` base its routes sit under, the `interval` in seconds, and the `python_dirs` and `npm_dirs` for that host's profile.
+
+##### Mode A: bodega as the osquery server
+
+Mint an enroll secret per host (or per group of hosts that should share one identity). The secret is printed once and only its peppered hash is stored:
+
+```bash
+bodega osquery secret create osq web-01 --expires 30d
+```
+
+On the host, write the secret to a file only root can read and start `osqueryd` with:
+
+```text
+--tls_hostname=bodega.example.com:8443
+--tls_server_certs=/etc/osquery/bodega-ca.pem
+--enroll_secret_path=/etc/osquery/bodega.secret
+--enroll_tls_endpoint=/api/v1/inventory/sources/osq/enroll
+--config_plugin=tls
+--config_tls_endpoint=/api/v1/inventory/sources/osq/config
+--logger_plugin=tls
+--logger_tls_endpoint=/api/v1/inventory/sources/osq/log
+```
+
+osquery speaks only HTTPS to a tls plugin, so bodega must answer TLS at `--tls_hostname`, directly or behind a proxy. `--tls_server_certs` is the CA bundle that signed that certificate. `--logger_plugin` takes a list, so `filesystem,tls` keeps a local log as well. The three routes are exempt from `admin_permit_cidr` like every registered push route.
+
+| Endpoint | Request                                            | Answer                                                                                                               |
+| -------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `enroll` | `enroll_secret`, `host_identifier`, `host_details` | `{"node_key": "...", "node_invalid": false}` for a valid, unexpired secret of this instance                          |
+| `config` | `node_key`                                         | `{"schedule": {...}}` for the node's identity                                                                        |
+| `log`    | `node_key`, `log_type`, `data`                     | `{}`. A `result` batch is stored as one report per snapshot run; `status` lines are logged at `DEBUG` and not stored |
+
+A successful enroll hands out a fresh random `node_key` and maps the key's sha256 to the secret's identity in the [host mapping](#host-mapping), so reports carry that identity from the first one. bodega keeps only the sha256. Every failed check (an unknown, revoked or expired secret, another instance's secret, an unknown or revoked `node_key`, a malformed body) gets the same `200 {"node_invalid": true}`, which tells osquery to re-enroll. The response never says which check failed; the server's `WARN` line and a `denied` audit row do, with the check in `details`. A body over the cap is `413`, and an unknown `log_type` is `400`.
+
+`--expires` stops new enrollments after that time; node keys already handed out keep working. `bodega osquery secret revoke <id>` deletes the secret and every node key enrolled with it, so each of those hosts gets `node_invalid` on its next request. Reports already stored keep their identity, and the mapping rows stay. A host that re-enrolls gets a new key and a new external id.
+
+##### Mode B: the result-log shipper
+
+Where a fleet manager or a SIEM pipeline owns osquery's config, add bodega's queries to that config (copy them from a `server` instance's `config` answer, or write the SQL above with your trees) as snapshot queries, and have the host write the filesystem log (`--logger_plugin=filesystem`, alone or in a list). The filesystem logger writes snapshot results to `osqueryd.snapshots.log`, not `osqueryd.results.log`.
+
+`POST .../results` takes that log as NDJSON from a token scoped `inventory`, which needs no identity binding: one shipper may forward many hosts. Each line's `hostIdentifier` is its external id, mapped through the [host mapping](#host-mapping), so a host nothing maps yet lands as unbound until `bodega inventory bind osq-b <hostIdentifier> <identity>`. Set `--host_identifier` on the hosts to something stable (`uuid`, or `hostname` where names do not change). The token vouches for no host: anyone holding it can post lines naming any `hostIdentifier`, and a mapped one lands under its identity. A full-scope token is refused with `403`.
+
+| Status | Cause                                                                                  |
+| ------ | -------------------------------------------------------------------------------------- |
+| `202`  | Stored. The body counts reports and reports stored unbound                             |
+| `400`  | A line that is not JSON, or a `bodega_packages` snapshot line with no `hostIdentifier` |
+| `401`  | No token, an unknown token, or an expired one                                          |
+| `403`  | A token not scoped `inventory`                                                         |
+| `413`  | Body over `max_body_bytes`                                                             |
+
+bodega serves the shipper at `GET /client/osquery-ship.sh`: a POSIX `sh` script, the same bytes for every host, behind the same host admission as the [setup script](#setup-script). Its source is [`internal/server/osquery_ship.sh`](../internal/server/osquery_ship.sh). This release serves SHA-256 `3a15fb22885d9740c3c2f1e9302e9e79c7695a8af9fb23b7974fdbe3afa71c9b`, and the running server reports the one it serves as `osquery_ship_sha256` in `GET /api/v1/status`, beside `client_setup_sha256`.
+
+```sh
+curl -fsS -o /usr/local/libexec/osquery-ship.sh https://bodega.example.com:8443/client/osquery-ship.sh
+sha256sum /usr/local/libexec/osquery-ship.sh    # FreeBSD: sha256
+install -d -o osqship -m 0700 /var/db/bodega
+install -o osqship -m 0600 /dev/null /var/db/bodega/token   # then write the inventory token into it
+```
+
+Run it from cron as a user that can read the osquery log and write its state directory, and nothing more:
+
+```text
+* * * * * osqship sh /usr/local/libexec/osquery-ship.sh --endpoint https://bodega.example.com:8443/api/v1/inventory/sources/osq-b --token-file /var/db/bodega/token
+```
+
+| Option              | Default                                   | Meaning                                                        |
+| ------------------- | ----------------------------------------- | -------------------------------------------------------------- |
+| `--endpoint`        | required (or `BODEGA_OSQUERY_ENDPOINT`)   | The plan's `endpoint` for the instance; `/results` is appended |
+| `--token-file`      | required                                  | Refused unless mode `0600` or `0400`                           |
+| `--log`             | `/var/log/osquery/osqueryd.snapshots.log` | The log to read                                                |
+| `--state`           | `/var/db/bodega/osquery-ship.offset`      | The inode and byte offset already posted                       |
+| `--max-bytes`       | `8388608`                                 | Most bytes one post carries, in whole lines                    |
+| `--allow-plaintext` | off                                       | Permit an `http://` endpoint                                   |
+
+Each run reads from the recorded offset, posts the new complete lines (a line osqueryd is still writing waits for the next run), and advances the offset only when bodega answers `2xx`; a failed post exits `1` and the same lines go again next run. A log that shrank (copytruncate) or was replaced (a new inode) is read from its first byte. Lines still unread in a log rotated away by rename are not posted. The token reaches `curl` on stdin, never on its command line, and a `mkdir` lock keeps two runs from posting the same lines. It needs `sh`, `curl`, `awk`, `wc`, `ls` and `mkdir`.
+
+A single line larger than `--max-bytes` is posted alone, and one larger than `max_body_bytes` is refused with `413` on every run, which stops the shipper at that line. Raise `max_body_bytes` on the instance if a host's snapshot outgrows it.
+
 ### Host mapping
 
 Each source names hosts its own way: a node key, a vendor host id, a token's identity. `inventory_hosts` maps `(source instance, external id)` to a bodega identity, and a report reaches an identity through that table and nothing else. Whatever identity a normalizer writes into a report is discarded.
@@ -5947,13 +6083,15 @@ Each enabled pull instance polls on its own `interval` (default 1h, minimum 5m),
 
 All of it lives in the audit database (`audit_db`), whatever `audit_sink` is set to. Nothing here writes to the manifest store.
 
-| Table                    | Holds                                                    | Writes                        |
-| ------------------------ | -------------------------------------------------------- | ----------------------------- |
-| `inventory_reports`      | One row per report                                       | Append-only                   |
-| `inventory_components`   | The components of each report                            | Append-only                   |
-| `inventory_attempts`     | Attempt evidence                                         | Append-only                   |
-| `inventory_hosts`        | The host mapping, with first and last report time        | `bind`, `unbind`, `last_seen` |
-| `inventory_source_polls` | Last poll, last success and last error per pull instance | Updated per poll              |
+| Table                    | Holds                                                      | Writes                           |
+| ------------------------ | ---------------------------------------------------------- | -------------------------------- |
+| `inventory_reports`      | One row per report                                         | Append-only                      |
+| `inventory_components`   | The components of each report                              | Append-only                      |
+| `inventory_attempts`     | Attempt evidence                                           | Append-only                      |
+| `inventory_hosts`        | The host mapping, with first and last report time          | `bind`, `unbind`, `last_seen`    |
+| `inventory_source_polls` | Last poll, last success and last error per pull instance   | Updated per poll                 |
+| `osquery_enroll_secrets` | Enroll secrets, by peppered hash, with identity and expiry | `secret create`, `secret revoke` |
+| `osquery_nodes`          | Each `node_key` handed out, by sha256, with its secret     | enroll, `secret revoke`          |
 
 No code path updates or deletes a row in the three append-only tables except `retention`, which is off by default and deletes whole rows by age. A trigger on each table refuses `UPDATE` outright.
 
@@ -5974,7 +6112,7 @@ type Source interface {
 }
 ```
 
-A push source also implements `inventory.PushSource` (`Routes` and `Authenticate`); a pull source implements `inventory.PullSource` (`Poll`). The package registers a `Factory` from `init`, reading its type-specific keys through the `*inventory.Settings` it is handed; any key it does not read is refused as unknown:
+A push source also implements `inventory.PushSource` (`Routes` and `Authenticate`); a pull source implements `inventory.PullSource` (`Poll`). A route whose protocol answers with more than an ingest count sets `Route.Handler`, which answers the request itself in place of the frame's authenticate, normalize and ingest steps, and reaches the body cap, the store, `Ingest` and the audit refusal path through the `*inventory.RouteEnv` it is handed; `internal/inventory/osquery` does this for enroll, config and log. The package registers a `Factory` from `init`, reading its type-specific keys through the `*inventory.Settings` it is handed; any key it does not read is refused as unknown:
 
 ```go
 func init() { inventory.Register("mytool", newSource) }

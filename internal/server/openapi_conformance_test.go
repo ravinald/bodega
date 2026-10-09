@@ -234,6 +234,7 @@ var schemaStructs = map[string]any{
 	"ClientConfigFile":   clientconf.File{},
 	"ClientPlan":         clientPlan{},
 	"ClientPlanRecord":   planRecord{},
+	"ClientOsqueryPlan":  clientconf.OsqueryPlan{},
 	"VersionEntry":       manifest.VersionEntry{},
 	"BuildEnv":           manifest.BuildEnv{},
 	"Dependency":         manifest.Dependency{},

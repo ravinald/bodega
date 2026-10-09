@@ -78,25 +78,9 @@ Examples:
 			}
 			defer adb.Close()
 
-			// Load or create pepper.
-			pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+			pepper, err := mintPepper("token")
 			if err != nil {
-				return fmt.Errorf("pepper: %w", err)
-			}
-			// The mint aborts rather than keying a token on a pepper the
-			// server cannot open. A pepper written before this check existed
-			// reaches here readable by root alone, and root is not who
-			// validates the token.
-			if err := audit.VerifyPepperHandoff(pst.Path); err != nil {
 				return err
-			}
-			pepper := pst.Pepper
-			for _, c := range pst.Shadowed {
-				fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This token is keyed on %s, "+
-					"and a server reading %s will refuse it.\n", c.Path, pst.Path, c.Path)
-				if c.Err != nil {
-					fmt.Fprintf(os.Stderr, "warning: %s cannot be read either: %v\n", c.Path, c.Err)
-				}
 			}
 
 			// Generate random token.
@@ -166,6 +150,30 @@ Examples:
 	}
 	c.Flags().StringVar(&scope, "scope", audit.ScopeFull, "What the token may do: full, or inventory (inventory push routes only)")
 	return c
+}
+
+// mintPepper loads or creates the pepper a new credential is keyed on, and
+// warns about any second pepper a server might read instead. what names the
+// credential in the warning.
+func mintPepper(what string) (string, error) {
+	pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+	if err != nil {
+		return "", fmt.Errorf("pepper: %w", err)
+	}
+	// The mint aborts rather than keying a credential on a pepper the server
+	// cannot open. A pepper written before this check existed reaches here
+	// readable by root alone, and root is not who validates the credential.
+	if err := audit.VerifyPepperHandoff(pst.Path); err != nil {
+		return "", err
+	}
+	for _, c := range pst.Shadowed {
+		fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This %s is keyed on %s, "+
+			"and a server reading %s will refuse it.\n", c.Path, what, pst.Path, c.Path)
+		if c.Err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s cannot be read either: %v\n", c.Path, c.Err)
+		}
+	}
+	return pst.Pepper, nil
 }
 
 func newTokenListCmd(gf *globalFlags) *cobra.Command {

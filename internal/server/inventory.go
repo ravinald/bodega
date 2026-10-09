@@ -3,11 +3,15 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
+	"github.com/ravinald/bodega/internal/inventory/osquery"
 
 	// Inventory source types. One import per type is its registration.
 	_ "github.com/ravinald/bodega/internal/inventory/cyclonedx"
@@ -26,7 +30,16 @@ func (s *Server) setupInventory() {
 	s.inventory.OnRefusal = func(r *http.Request, reason string, details map[string]string) {
 		recordDenial(s.auditDB, r, reason, details)
 	}
+	s.inventory.HashSecret = func(secret string) (string, error) {
+		if s.pepper == "" {
+			return "", errors.New("this server loaded no pepper, so it cannot check a secret minted against one")
+		}
+		return audit.HashToken(secret, s.pepper), nil
+	}
 	for _, inst := range instances {
+		if src, ok := inst.Source.(*osquery.Source); ok {
+			src.SetScanDirs(s.osqueryDirsForIdentity)
+		}
 		s.logger.Info("inventory source configured", "instance", inst.Name,
 			"type", inst.Source.Type(), "mode", inst.Source.Mode(), "enabled", inst.Enabled)
 	}
@@ -84,4 +97,36 @@ func (c inventoryCredentials) Token(r *http.Request) (inventory.Token, error) {
 	}
 	return inventory.Token{}, &inventory.AuthError{Status: http.StatusUnauthorized,
 		Reason: audit.DenialTokenInvalid, Message: "token not recognized"}
+}
+
+// osqueryDirsForIdentity is the language trees a host scans, by the profile
+// bound to its identity: what its plan's osquery section declares and what
+// the config endpoint schedules, from one lookup.
+func (s *Server) osqueryDirsForIdentity(identity string) config.OsqueryDirs {
+	return s.cfg.OsqueryScanDirs.For(s.profileNow().profileFor(identity).Name())
+}
+
+// osqueryPlan is the plan's osquery section: one entry per enabled osquery
+// instance, with the trees this host's profile declares.
+func (s *Server) osqueryPlan(h *clientHost) []clientconf.OsqueryPlan {
+	if s.inventory == nil {
+		return nil
+	}
+	dirs := s.cfg.OsqueryScanDirs.For(h.profile.Name())
+	var out []clientconf.OsqueryPlan
+	for _, inst := range s.inventory.Instances() {
+		src, ok := inst.Source.(*osquery.Source)
+		if !ok || !inst.Enabled {
+			continue
+		}
+		out = append(out, clientconf.OsqueryPlan{
+			Instance:   inst.Name,
+			Mode:       src.OsqueryMode(),
+			Endpoint:   h.base + inventory.RoutePrefix + inst.Name,
+			Interval:   int64(src.Interval() / time.Second),
+			PythonDirs: osquery.CleanDirs(dirs.Python),
+			NPMDirs:    osquery.CleanDirs(dirs.NPM),
+		})
+	}
+	return out
 }
