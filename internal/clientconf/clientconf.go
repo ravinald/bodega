@@ -310,12 +310,14 @@ func GitBundleURL(base string, b GitBundle) File {
 // that package installs.
 const SystemOsquery = "osquery"
 
-// OsqueryFlagsPaths is where osqueryd reads its flags on each OS. FreeBSD's is
-// the sysutils/osquery rc script's osqueryd_flagfile default: `service
-// osqueryd start` reads nothing else unless rc.conf names it.
+// OsqueryFlagsPaths is where osqueryd reads its flags on each OS. FreeBSD's
+// is not the sysutils/osquery rc script's default
+// (/usr/local/etc/osquery/osquery.flags), so setup.sh names it in rc.conf as
+// osqueryd_flagfile. The rc script skips a flagfile it cannot read without a
+// word, and osqueryd then starts with no server to enroll with.
 var OsqueryFlagsPaths = map[string]string{
 	OSLinux:   "/etc/osquery/osquery.flags",
-	OSFreeBSD: "/usr/local/etc/osquery/osquery.flags",
+	OSFreeBSD: "/usr/local/etc/osquery.flags",
 }
 
 // osquerySecretPaths sit beside the flags file. setup.sh reads the path back

@@ -523,16 +523,17 @@ printf 'web-01\t-\tcidr:127.0.0.1/32\tosquery\tinstall\t%s\t%s/client/osquery?os
 }
 chmod +x "$osq/bin/"*
 
-# osq_run <secret or -> <args...> runs setup.sh, writing combined output to
-# $osq/out and echoing its exit status.
+# osq_run <secret or -> <args...> runs setup.sh with the stubs in $osq_bin,
+# writing combined output to $osq/out and echoing its exit status.
+osq_bin="$osq/bin"
 osq_run() {
 	local secret="$1" rc=0
 	shift
 	if [ "$secret" = - ]; then
-		env -u BODEGA_OSQUERY_SECRET -u BODEGA_TOKEN PATH="$osq/bin:$PATH" \
+		env -u BODEGA_OSQUERY_SECRET -u BODEGA_TOKEN PATH="$osq_bin:$PATH" \
 			sh "$E2E_DIR/../../internal/server/client_setup.sh" --url "$osq_url" "$@" >"$osq/out" 2>&1 || rc=$?
 	else
-		env -u BODEGA_TOKEN BODEGA_OSQUERY_SECRET="$secret" PATH="$osq/bin:$PATH" \
+		env -u BODEGA_TOKEN BODEGA_OSQUERY_SECRET="$secret" PATH="$osq_bin:$PATH" \
 			sh "$E2E_DIR/../../internal/server/client_setup.sh" --url "$osq_url" "$@" >"$osq/out" 2>&1 || rc=$?
 	fi
 	echo "$rc"
@@ -584,6 +585,52 @@ t_ok "setup osquery: a second apply installs and restarts nothing" "" \
 rm -f "$osq_secret_file"
 t_ok "setup osquery: a lost secret with none supplied is refused, not reported as unchanged" "1 yes no" \
 	"$(osq_run - --systems osquery --allow-plaintext --apply) $(osq_has "BODEGA_OSQUERY_SECRET is unset") $(osq_has "Nothing to change")"
+
+# FreeBSD: the plan's flags path is not the rc script's default, so the run
+# has to name it in rc.conf through sysrc. sysrc and service keep their state
+# in $osq/fstate the way dpkg-query and systemctl do above.
+osq_bin="$osq/fbin"
+mkdir -p "$osq_bin" "$osq/fstate"
+osq_flags="$osq/root/usr/local/etc/osquery.flags"
+osq_secret_file="$osq/root/usr/local/etc/osquery/bodega.secret"
+printf -- '--tls_hostname=bodega.example.com\n--enroll_secret_path=%s\n--config_plugin=tls\n--logger_plugin=tls\n' \
+	"$osq_secret_file" >"$osq/srv/client/osquery"
+osq_sum="$(sha256sum "$osq/srv/client/osquery" 2>/dev/null || shasum -a 256 "$osq/srv/client/osquery")"
+printf 'web-01\t-\tcidr:127.0.0.1/32\tosquery\tinstall\t%s\t%s/client/osquery?os=freebsd\t%s\t-\n' \
+	"$osq_flags" "$osq_url" "${osq_sum%% *}" >"$osq/srv/client/plan.txt"
+# shellcheck disable=SC2016  # every $ here expands in the stub, not here
+{
+	printf '#!/bin/sh\necho FreeBSD\n' >"$osq_bin/uname"
+	cp "$osq/bin/id" "$osq/bin/chown" "$osq_bin/"
+	printf '#!/bin/sh\ncase "$1 $2" in\n"config abi") echo FreeBSD:15:aarch64 ;;\n"info -e") [ -e "%s/installed" ] ;;\n"install -y") echo "pkg $*" >>"%s/calls"; : >"%s/installed" ;;\nesac\n' \
+		"$osq/fstate" "$osq" "$osq/fstate" >"$osq_bin/pkg"
+	printf '#!/bin/sh\nif [ "$1" = -n ]; then cat "%s/$2" 2>/dev/null || exit 1; exit 0; fi\necho "sysrc $*" >>"%s/calls"\nprintf "%%s" "${1#*=}" >"%s/${1%%%%=*}"\n' \
+		"$osq/fstate" "$osq" "$osq/fstate" >"$osq_bin/sysrc"
+	printf '#!/bin/sh\ncase $2 in\nstatus) [ -e "%s/running" ] ;;\nrestart) echo "service $*" >>"%s/calls"; : >"%s/running" ;;\nesac\n' \
+		"$osq/fstate" "$osq" "$osq/fstate" >"$osq_bin/service"
+}
+chmod +x "$osq_bin/"*
+: >"$osq/calls"
+
+t_ok "setup osquery freebsd: the dry run exits 0" 0 "$(osq_run "$osq_secret" --systems osquery --allow-plaintext)"
+t_ok "setup osquery freebsd: the dry run lists the rc.conf step" yes \
+	"$(osq_has "rc.conf    osquery    osqueryd_flagfile=$osq_flags, so the rc script reads the flags above")"
+t_ok "setup osquery freebsd: the dry run prints no secret and runs nothing" "no " "$(osq_has "$osq_secret") $(osq_calls)"
+t_ok "setup osquery freebsd: apply exits 0" 0 "$(osq_run "$osq_secret" --systems osquery --allow-plaintext --apply)"
+t_ok "setup osquery freebsd: apply names the flags in rc.conf before enabling and restarting" \
+	"pkg install -y osquery;chown 0:0 SECRET;sysrc osqueryd_flagfile=$osq_flags;sysrc osqueryd_enable=YES;service osqueryd restart;" \
+	"$(osq_calls | sed "s#$osq/root/usr/local/etc/osquery/\.bodega-secret\.[A-Za-z0-9]*#SECRET#")"
+t_ok "setup osquery freebsd: the flags land at the planned path" yes \
+	"$(cmp -s "$osq_flags" "$osq/srv/client/osquery" && echo yes || echo no)"
+t_ok "setup osquery freebsd: the secret file is mode 0600 and nothing printed it" "$osq_secret_file no" \
+	"$(find "$osq_secret_file" -type f -perm 600) $(osq_has "$osq_secret")"
+: >"$osq/calls"
+t_ok "setup osquery freebsd: a second apply sets nothing in rc.conf" "0 yes " \
+	"$(osq_run "$osq_secret" --systems osquery --allow-plaintext --apply) $(osq_has "Nothing to change") $(osq_calls)"
+printf '/usr/local/etc/osquery/osquery.flags' >"$osq/fstate/osqueryd_flagfile"
+t_ok "setup osquery freebsd: rc.conf naming another flagfile is set back and restarted" \
+	"0 sysrc osqueryd_flagfile=$osq_flags;sysrc osqueryd_enable=YES;service osqueryd restart;" \
+	"$(osq_run "$osq_secret" --systems osquery --allow-plaintext --apply) $(osq_calls)"
 
 # ---- counters --------------------------------------------------------------
 

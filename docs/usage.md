@@ -3687,7 +3687,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `b41231ef431c2da114e373967b3cc808b895308eb56502ac33c0420e30114171`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `409311b6350d79c8235821cd66156597f712c586b4352ccfb0a865092a141be1`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -3714,10 +3714,10 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
 
 **osquery.** The `osquery` system runs only when `--systems` names it, because it does more than write a file. It points the host at an [`osquery` source](#the-osquery-source) in `server` mode:
 
-1. Writes the flags file the plan renders: `/etc/osquery/osquery.flags` on Linux, `/usr/local/etc/osquery/osquery.flags` on FreeBSD, which is the path the `sysutils/osquery` rc script reads.
+1. Writes the flags file the plan renders: `/etc/osquery/osquery.flags` on Linux, `/usr/local/etc/osquery.flags` on FreeBSD. The `sysutils/osquery` rc script reads `/usr/local/etc/osquery/osquery.flags` by default and skips a flagfile it cannot read without saying so, so on FreeBSD the script also sets `osqueryd_flagfile` to the plan's path with `sysrc`.
 2. Installs osquery through the host's own package manager from bodega: `apt-get install osquery` from bodega's suite, or `pkg install osquery` from bodega's repository. Neither downloads from the internet, so bodega has to [serve osquery](#serving-osquery) first, and the host's apt or pkg has to point at bodega already or in the same run (`--systems apt,osquery`, `--systems freebsd,osquery`).
 3. Writes the enroll secret from `BODEGA_OSQUERY_SECRET`, never an argument, to the path the flags name in `--enroll_secret_path`, mode 0600, owned by root. Nothing the script runs inherits the variable.
-4. Enables `osqueryd` (`systemctl enable`, or `osqueryd_enable=YES` through `sysrc`) and restarts it.
+4. Enables `osqueryd` (`systemctl enable`, or `osqueryd_flagfile` and `osqueryd_enable=YES` through `sysrc`) and restarts it.
 
 The dry run lists each step it would take, shows the flags diff, and says a secret will be written without printing it. A step already done is skipped, so a second run with nothing changed restarts nothing. Once the secret file exists the variable may be left unset, and the file is kept; with neither, `--apply` refuses before writing anything. Mint the secret on the server with `bodega osquery secret create <instance> <identity>`, then on the host, as root:
 
@@ -5970,13 +5970,13 @@ A fleet can run one instance of each. A host belongs to one: a `server` instance
 
 bodega's schedule is one snapshot query per platform, unioning every table that platform has, so one run yields one report holding the host's whole installed set:
 
-| osquery table     | Platform       | Ecosystem recorded                            | Scanned                                    |
-| ----------------- | -------------- | --------------------------------------------- | ------------------------------------------ |
-| `deb_packages`    | Linux          | `apt`                                         | always                                     |
-| `rpm_packages`    | Linux          | `other`, with purl `pkg:rpm/<name>@<version>` | always                                     |
-| `pkg_packages`    | FreeBSD        | `freebsd`                                     | always                                     |
-| `python_packages` | Linux, FreeBSD | `pypi`, with the package's path               | only `directory IN (...)` the python trees |
-| `npm_packages`    | Linux, FreeBSD | `npm`, with the package's path                | only `directory IN (...)` the npm trees    |
+| osquery table         | Platform       | Ecosystem recorded                            | Scanned                                    |
+| --------------------- | -------------- | --------------------------------------------- | ------------------------------------------ |
+| `deb_packages`        | Linux          | `apt`                                         | always                                     |
+| `rpm_packages`        | Linux          | `other`, with purl `pkg:rpm/<name>@<version>` | always                                     |
+| `bodega_pkg_packages` | FreeBSD        | `freebsd`                                     | always                                     |
+| `python_packages`     | Linux, FreeBSD | `pypi`, with the package's path               | only `directory IN (...)` the python trees |
+| `npm_packages`        | Linux, FreeBSD | `npm`, with the package's path                | only `directory IN (...)` the npm trees    |
 
 The queries are named `bodega_packages_linux` and `bodega_packages_freebsd`. The normalizer reads only snapshot events of a query whose name contains `bodega_packages`, which still matches when a fleet manager prefixes it (osquery packs write `pack_<pack>_<query>`), and skips every other line. Nothing here covers gomod, cargo, helm, git, binaries or distfiles, and a macOS host is scheduled no query.
 
@@ -6017,7 +6017,7 @@ A `.deb` whose bytes do not match its `checksum` is refused at fetch and never r
 
 FreeBSD packages osquery as `sysutils/osquery`, so a pkg repository bodega proxies from upstream serves it with nothing added, provided upstream built it for that ABI and branch. Measured 2026-10-09 for `FreeBSD:15:aarch64`: `quarterly` carries `osquery-5.23.0_1` and `latest` carries none, so a host on `latest` gets `No packages available to install matching 'osquery'` from `setup.sh`.
 
-A FreeBSD host enrolls and runs bodega's schedule, but it stores no report yet: the osquery FreeBSD build registers no `pkg_packages` table, so the FreeBSD query fails on every run ([#100](https://github.com/ravinald/bodega/issues/100)).
+osquery's FreeBSD build registers no `pkg_packages` table. pkg keeps its database in SQLite, so the config bodega serves mounts `/var/db/pkg/local.sqlite` as the table `bodega_pkg_packages` through osquery's [auto table construction](https://osquery.readthedocs.io/en/stable/deployment/configuration/#automatic-table-construction), and the FreeBSD query reads that. A Linux host skips the entry, which is marked `"platform": "freebsd"`.
 
 ##### Mode A: bodega as the osquery server
 
@@ -6041,17 +6041,17 @@ On the host, [`setup.sh --systems osquery`](#setup-script) does the rest: it ins
 --logger_tls_endpoint=/api/v1/inventory/sources/osq/log
 ```
 
-| OS      | Flags file                             | Enroll secret                          | `--tls_server_certs`                 |
-| ------- | -------------------------------------- | -------------------------------------- | ------------------------------------ |
-| Linux   | `/etc/osquery/osquery.flags`           | `/etc/osquery/bodega.secret`           | `/etc/ssl/certs/ca-certificates.crt` |
-| FreeBSD | `/usr/local/etc/osquery/osquery.flags` | `/usr/local/etc/osquery/bodega.secret` | `/etc/ssl/cert.pem`                  |
+| OS      | Flags file                     | Enroll secret                          | `--tls_server_certs`                 |
+| ------- | ------------------------------ | -------------------------------------- | ------------------------------------ |
+| Linux   | `/etc/osquery/osquery.flags`   | `/etc/osquery/bodega.secret`           | `/etc/ssl/certs/ca-certificates.crt` |
+| FreeBSD | `/usr/local/etc/osquery.flags` | `/usr/local/etc/osquery/bodega.secret` | `/etc/ssl/cert.pem`                  |
 
 osquery speaks only HTTPS to a tls plugin, so bodega must answer TLS at `--tls_hostname`, directly or behind a proxy, and `--tls_hostname` and the endpoints come from `public_url`, host and port and path. The plan skips osquery when `public_url` is `http://`. `--tls_server_certs` names the host's system trust store rather than the bundle osquery's package carries, so a private CA that signed bodega's certificate is trusted once it is added the usual way: `update-ca-certificates` on Debian and Ubuntu, or a copy in `/usr/local/share/certs` and `certctl rehash` on FreeBSD (`certctl trust` alone does not survive the next rehash). `--config_refresh` is the source's `interval`, so a schedule change reaches the host without a restart. `--logger_plugin` takes a list, so `filesystem,tls` keeps a local log as well; set it by hand and the next `setup.sh` run shows the diff that would undo it. The three routes are exempt from `admin_permit_cidr` like every registered push route.
 
 | Endpoint | Request                                            | Answer                                                                                                               |
 | -------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `enroll` | `enroll_secret`, `host_identifier`, `host_details` | `{"node_key": "...", "node_invalid": false}` for a valid, unexpired secret of this instance                          |
-| `config` | `node_key`                                         | `{"schedule": {...}}` for the node's identity                                                                        |
+| `config` | `node_key`                                         | `{"schedule": {...}, "auto_table_construction": {...}}` for the node's identity                                      |
 | `log`    | `node_key`, `log_type`, `data`                     | `{}`. A `result` batch is stored as one report per snapshot run; `status` lines are logged at `DEBUG` and not stored |
 
 A successful enroll hands out a fresh random `node_key` and maps the key's sha256 to the secret's identity in the [host mapping](#host-mapping), so reports carry that identity from the first one. bodega keeps only the sha256. Every failed check (an unknown, revoked or expired secret, another instance's secret, an unknown or revoked `node_key`, a malformed body) gets the same `200 {"node_invalid": true}`, which tells osquery to re-enroll. The response never says which check failed; the server's `WARN` line and a `denied` audit row do, with the check in `details`. A body over the cap is `413`, and an unknown `log_type` is `400`.
@@ -6060,7 +6060,7 @@ A successful enroll hands out a fresh random `node_key` and maps the key's sha25
 
 ##### Mode B: the result-log shipper
 
-Where a fleet manager or a SIEM pipeline owns osquery's config, add bodega's queries to that config (copy them from a `server` instance's `config` answer, or write the SQL above with your trees) as snapshot queries, and have the host write the filesystem log (`--logger_plugin=filesystem`, alone or in a list). The filesystem logger writes snapshot results to `osqueryd.snapshots.log`, not `osqueryd.results.log`.
+Where a fleet manager or a SIEM pipeline owns osquery's config, add bodega's queries to that config (copy them from a `server` instance's `config` answer, or write the SQL above with your trees) as snapshot queries, with the `auto_table_construction` entry from the same answer if any host runs FreeBSD, and have the host write the filesystem log (`--logger_plugin=filesystem`, alone or in a list). The filesystem logger writes snapshot results to `osqueryd.snapshots.log`, not `osqueryd.results.log`.
 
 `POST .../results` takes that log as NDJSON from a token scoped `inventory`, which needs no identity binding: one shipper may forward many hosts. Each line's `hostIdentifier` is its external id, mapped through the [host mapping](#host-mapping), so a host nothing maps yet lands as unbound until `bodega inventory bind osq-b <hostIdentifier> <identity>`. Set `--host_identifier` on the hosts to something stable (`uuid`, or `hostname` where names do not change). The token vouches for no host: anyone holding it can post lines naming any `hostIdentifier`, and a mapped one lands under its identity. A full-scope token is refused with `403`.
 

@@ -521,6 +521,7 @@ osq_steps=0
 osq_pkg=no
 osq_secret_write=no
 osq_secret_missing=no
+osq_rcflag=no
 osq_restart=no
 if [ -n "$osq_n" ]; then
 	osq_secret_path=$(sed -n 's/^--enroll_secret_path=//p' "$work/$osq_n" | sed -n 1p)
@@ -547,6 +548,16 @@ if [ -n "$osq_n" ]; then
 	linux) systemctl is-enabled --quiet osqueryd 2>/dev/null && systemctl is-active --quiet osqueryd 2>/dev/null || osq_restart=yes ;;
 	freebsd) [ "$(sysrc -n osqueryd_enable 2>/dev/null || true)" = YES ] && service osqueryd status >/dev/null 2>&1 || osq_restart=yes ;;
 	esac
+	# The plan's FreeBSD flags path is not the rc script's default, and the
+	# rc script drops a flagfile it cannot read without a word, so rc.conf
+	# has to name it.
+	if [ "$os" = freebsd ] && [ "$(sysrc -n osqueryd_flagfile 2>/dev/null || true)" != "$osq_target" ]; then
+		case $osq_target in
+		*[!A-Za-z0-9/._-]* | [!/]*) die "the plan puts the osquery flags at $osq_target, which is not a path rc.conf can name. Nothing was written" ;;
+		esac
+		osq_rcflag=yes
+		osq_restart=yes
+	fi
 	if [ "$osq_pkg" = yes ] || [ "$osq_secret_write" = yes ] || awk -F "$tab" -v t="$osq_target" '$3 == t {f = 1} END {exit !f}' "$work/writes"; then
 		osq_restart=yes
 	fi
@@ -565,6 +576,10 @@ if [ -n "$osq_n" ]; then
 	fi
 	if [ "$osq_secret_missing" = yes ]; then
 		printf 'secret     %-10s %s: absent, and BODEGA_OSQUERY_SECRET is unset, so --apply will refuse\n' osquery "$osq_secret_path"
+	fi
+	if [ "$osq_rcflag" = yes ]; then
+		osq_steps=$((osq_steps + 1))
+		printf 'rc.conf    %-10s osqueryd_flagfile=%s, so the rc script reads the flags above\n' osquery "$osq_target"
 	fi
 	if [ "$osq_restart" = yes ]; then
 		osq_steps=$((osq_steps + 1))
@@ -658,6 +673,9 @@ if [ "$osq_restart" = yes ]; then
 		systemctl restart osqueryd || die "osqueryd did not start; \`journalctl -u osqueryd\` says why"
 		;;
 	freebsd)
+		if [ "$osq_rcflag" = yes ]; then
+			sysrc osqueryd_flagfile="$osq_target" >/dev/null || die "sysrc could not set osqueryd_flagfile=$osq_target in /etc/rc.conf"
+		fi
 		sysrc osqueryd_enable=YES >/dev/null || die "sysrc could not set osqueryd_enable=YES in /etc/rc.conf"
 		service osqueryd restart || die "osqueryd did not start; /var/log/osquery says why"
 		;;

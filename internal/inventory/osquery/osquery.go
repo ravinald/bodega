@@ -311,7 +311,10 @@ func (s *Source) serveConfig(w http.ResponseWriter, r *http.Request, env *invent
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"schedule": Schedule(s.dirsFor(n.Identity), s.interval)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"schedule":                Schedule(s.dirsFor(n.Identity), s.interval),
+		"auto_table_construction": AutoTables(),
+	})
 }
 
 func (s *Source) dirsFor(identity string) config.OsqueryDirs {

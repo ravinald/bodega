@@ -207,7 +207,7 @@ func TestOsquerySystemFlagsFile(t *testing.T) {
 
 	cases := []struct{ os, query, path, secret, ca string }{
 		{"linux", "os=linux&codename=noble", "/etc/osquery/osquery.flags", "/etc/osquery/bodega.secret", "/etc/ssl/certs/ca-certificates.crt"},
-		{"freebsd", "os=freebsd&abi=FreeBSD:15:aarch64", "/usr/local/etc/osquery/osquery.flags", "/usr/local/etc/osquery/bodega.secret", "/etc/ssl/cert.pem"},
+		{"freebsd", "os=freebsd&abi=FreeBSD:15:aarch64", "/usr/local/etc/osquery.flags", "/usr/local/etc/osquery/bodega.secret", "/etc/ssl/cert.pem"},
 	}
 	for _, c := range cases {
 		var rec planRecord

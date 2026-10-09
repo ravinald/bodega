@@ -270,16 +270,19 @@ func TestConfigSchedule(t *testing.T) {
 		t.Errorf("forged node_key: %s, refusal %+v", rec.Body.String(), h.lastRefusal())
 	}
 
+	var atc map[string]AutoTable
 	schedule := func() map[string]Query {
 		t.Helper()
 		rec := h.post(RouteConfig, `{"node_key":"`+key+`"}`)
 		var out struct {
-			Schedule    map[string]Query `json:"schedule"`
-			NodeInvalid *bool            `json:"node_invalid"`
+			Schedule    map[string]Query     `json:"schedule"`
+			ATC         map[string]AutoTable `json:"auto_table_construction"`
+			NodeInvalid *bool                `json:"node_invalid"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != http.StatusOK {
 			t.Fatalf("config = %d %s", rec.Code, rec.Body.String())
 		}
+		atc = out.ATC
 		return out.Schedule
 	}
 	first := schedule()
@@ -292,8 +295,15 @@ func TestConfigSchedule(t *testing.T) {
 			t.Errorf("linux query lacks %s: %s", table, lin.Query)
 		}
 	}
-	if !strings.Contains(fbsd.Query, "pkg_packages") {
-		t.Errorf("freebsd query lacks pkg_packages: %s", fbsd.Query)
+	// osquery's FreeBSD build registers no pkg_packages table (#100): the
+	// query reads the table the config mounts over pkg's own database.
+	pkg := atc[TableFreeBSDPkg]
+	if pkg.Path != "/var/db/pkg/local.sqlite" || pkg.Platform != "freebsd" || !strings.Contains(pkg.Query, "FROM packages") ||
+		!reflect.DeepEqual(pkg.Columns, []string{"name", "version"}) {
+		t.Errorf("config's auto_table_construction = %+v, want %s over pkg's local.sqlite on freebsd", atc, TableFreeBSDPkg)
+	}
+	if !strings.Contains(fbsd.Query, "FROM "+TableFreeBSDPkg) || strings.Contains(fbsd.Query, "FROM pkg_packages") {
+		t.Errorf("freebsd query does not read %s: %s", TableFreeBSDPkg, fbsd.Query)
 	}
 	if strings.Contains(lin.Query, "python_packages") || strings.Contains(lin.Query, "npm_packages") {
 		t.Errorf("with no declared trees the schedule still scans language packages: %s", lin.Query)
