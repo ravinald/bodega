@@ -54,7 +54,7 @@ CHECK_LEGS := ci-drift pin-check fmt-check tidy-check harness vet build lint tes
 # linted. test/e2e/results is gitignored run output, and a run or a review may
 # leave a script there that sources files relative to where it was written.
 E2E_SHELL := $(filter-out test/e2e/results/%,$(shell shfmt -f test/e2e 2>/dev/null))
-SETUP_SHELL := internal/server/client_setup.sh
+SETUP_SHELL := internal/server/client_setup.sh internal/server/osquery_ship.sh
 
 # ---- Install paths ---------------------------------------------------------
 # `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected
@@ -218,9 +218,10 @@ test-apt:
 
 ## harness: Lint the e2e harness and run its own tests (no VM needed)
 #
-# The e2e suites and the served setup script are the only shell in the tree,
-# so without a leg here they are the one thing `make check` does not read. The
-# script is held to -s sh because hosts run it under dash and FreeBSD's sh.
+# The e2e suites and the served scripts (setup.sh and the osquery shipper) are
+# the only shell in the tree, so without a leg here they are the one thing
+# `make check` does not read. The served scripts are held to -s sh because
+# hosts run them under dash and FreeBSD's sh.
 # shellcheck runs with -x so it follows the sourced libraries; without it
 # every suite reports its shared globals as unassigned and the real findings
 # hide among them.

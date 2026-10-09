@@ -117,6 +117,12 @@ type Route struct {
 	Path   string
 	// MaxBody caps the request body; a larger one is refused with 413.
 	MaxBody int64
+	// Handler, when set, answers the route itself in place of the frame's
+	// authenticate, normalize and ingest sequence. It is for a protocol
+	// whose responses carry more than an ingest count, such as osquery's
+	// enroll and config, and it authenticates the request on its own:
+	// Authenticate is not called first.
+	Handler func(w http.ResponseWriter, r *http.Request, env *RouteEnv)
 }
 
 // Principal is who a push request speaks for. Identity is set only when the

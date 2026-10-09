@@ -513,7 +513,7 @@ func (s *Server) serveClientPlan(w http.ResponseWriter, r *http.Request, subject
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(planTSV(records)))
 	} else {
-		writeJSON(w, http.StatusOK, clientPlan{Records: records})
+		writeJSON(w, http.StatusOK, clientPlan{Records: records, Osquery: s.osqueryPlan(h)})
 	}
 	noteClient(r, subject, h, "", "")
 }
@@ -545,6 +545,33 @@ func (s *Server) handleClientSetup(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(clientSetupScript)
 	noteClient(r, "setup.sh", nil, "", "")
+}
+
+// osqueryShipScript is GET /client/osquery-ship.sh: the POSIX sh shipper
+// that forwards osqueryd's results log to an osquery source in shipper mode.
+// It is the same bytes for every host and takes its endpoint and token as
+// arguments, so one digest covers it.
+//
+//go:embed osquery_ship.sh
+var osqueryShipScript []byte
+
+// osqueryShipSHA256 is the digest /api/v1/status publishes for the shipper.
+var osqueryShipSHA256 = func() string {
+	sum := sha256.Sum256(osqueryShipScript)
+	return hex.EncodeToString(sum[:])
+}()
+
+// handleOsqueryShip serves GET /client/osquery-ship.sh behind the same
+// admission as setup.sh.
+func (s *Server) handleOsqueryShip(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.admitClient(w, r, "osquery-ship.sh"); !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(osqueryShipScript)
+	noteClient(r, "osquery-ship.sh", nil, "", "")
 }
 
 // handleClientSystem serves GET /client/{system}: that system's file,
@@ -679,7 +706,7 @@ func (s *Server) clientMiddleware(next http.Handler) http.Handler {
 }
 
 // maxClientSubject bounds a /client/ row's name. The longest name a served
-// response carries is plan.txt; anything longer is a caller's path.
+// response carries is osquery-ship.sh; anything longer is a caller's path.
 const maxClientSubject = 64
 
 // recordClient writes the audit row for one /client/ response. A served plan

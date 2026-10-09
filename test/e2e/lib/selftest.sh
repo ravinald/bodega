@@ -347,6 +347,125 @@ pkgconf "$abs" drop
 t_ok "pkgconf: drop removes the saved copies" gone \
 	"$([ -e "$abs/var/tmp/bodega-e2e-pkgconf" ] && echo kept || echo gone)"
 
+# ---- osquery shipper -------------------------------------------------------
+#
+# The served shipper against a stub HTTP server: the server records each
+# post's body and answers whatever status the test last wrote. What matters
+# is the offset, because a shipper that advanced it on a failed post would
+# drop those lines for good with nothing on the host to say so.
+
+ship="$work/ship"
+mkdir -p "$ship/posts" "$ship/state"
+printf '202\n' >"$ship/status"
+cat >"$ship/stub.py" <<'EOF'
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        n = len(os.listdir(os.path.join(d, "posts")))
+        with open(os.path.join(d, "posts", "%03d" % n), "wb") as f:
+            f.write(body)
+        with open(os.path.join(d, "auth"), "w") as f:
+            f.write(self.headers.get("Authorization", "") + " " + self.path)
+        code = int(open(os.path.join(d, "status")).read())
+        self.send_response(code)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *a):
+        pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+with open(os.path.join(d, "port.tmp"), "w") as f:
+    f.write(str(s.server_address[1]))
+os.rename(os.path.join(d, "port.tmp"), os.path.join(d, "port"))
+s.serve_forever()
+EOF
+python3 -I "$ship/stub.py" "$ship" &
+stub_pid=$!
+trap 'kill "$stub_pid" 2>/dev/null || true; rm -rf "$work"' EXIT
+for _ in $(seq 1 50); do
+	[ -s "$ship/port" ] && break
+	sleep 0.1
+done
+[ -s "$ship/port" ] || {
+	echo "FAIL osquery shipper stub server did not start"
+	exit 1
+}
+ship_url="http://127.0.0.1:$(cat "$ship/port")/api/v1/inventory/sources/osq-b"
+printf 'bodega_ak_shiptest\n' >"$ship/token"
+chmod 600 "$ship/token"
+ship_log="$ship/results.log"
+ship_state="$ship/state/offset"
+
+ship_run() {
+	sh "$E2E_DIR/../../internal/server/osquery_ship.sh" --endpoint "$ship_url" --allow-plaintext \
+		--token-file "$ship/token" --log "$ship_log" --state "$ship_state" "$@" >"$ship/out" 2>&1
+}
+ship_posts() { find "$ship/posts" -type f | wc -l | tr -d ' '; }
+ship_last() { cat "$(find "$ship/posts" -type f | sort | tail -1)"; }
+ship_offset() { awk '{print $2}' "$ship_state"; }
+size_of() { wc -c <"$1" | tr -d ' '; }
+
+printf '{"n":1}\n{"n":2}\n{"n":3' >"$ship_log"
+ship_run
+t_ok "ship: new complete lines are posted" "$(printf '{"n":1}\n{"n":2}')" "$(ship_last)"
+t_ok "ship: the partial line osqueryd is still writing stays behind" 16 "$(ship_offset)"
+t_ok "ship: the token goes in a Bearer header to the results route" \
+	"Bearer bodega_ak_shiptest /api/v1/inventory/sources/osq-b/results" "$(cat "$ship/auth")"
+
+printf '}\n{"n":4}\n' >>"$ship_log"
+ship_run
+t_ok "ship: the next run starts at the recorded offset" "$(printf '{"n":3}\n{"n":4}')" "$(ship_last)"
+t_ok "ship: the offset reaches the end of the log" "$(size_of "$ship_log")" "$(ship_offset)"
+
+before="$(ship_posts)"
+ship_run
+t_ok "ship: nothing new posts nothing" "$before" "$(ship_posts)"
+
+printf '500\n' >"$ship/status"
+printf '{"n":5}\n' >>"$ship_log"
+held="$(ship_offset)"
+ship_exit=0
+ship_run || ship_exit=$?
+t_ok "ship: a failed post exits non-zero" 1 "$ship_exit"
+t_ok "ship: a failed post does not advance the offset" "$held" "$(ship_offset)"
+printf '202\n' >"$ship/status"
+ship_run
+t_ok "ship: the retry posts the lines the failure held back" '{"n":5}' "$(ship_last)"
+
+# copytruncate: same inode, shorter file.
+: >"$ship_log"
+printf '{"r":1}\n' >>"$ship_log"
+ship_run
+t_ok "ship: a log that shrank is read from its start" '{"r":1}' "$(ship_last)"
+t_ok "ship: the offset restarts with it" 8 "$(ship_offset)"
+
+# A rename rotation: a new inode longer than the old offset still restarts.
+mv "$ship_log" "$ship_log.1"
+printf '{"rot":"aaaaaaaaaaaaaaaa"}\n{"rot":2}\n' >"$ship_log"
+ship_run
+t_ok "ship: a replaced log is read from its start" "$(printf '{"rot":"aaaaaaaaaaaaaaaa"}\n{"rot":2}')" "$(ship_last)"
+
+printf '{"big":1}\n{"big":2}\n{"big":3}\n' >>"$ship_log"
+ship_run --max-bytes 20
+t_ok "ship: --max-bytes caps one post at whole lines" "$(printf '{"big":1}\n{"big":2}')" "$(ship_last)"
+ship_run --max-bytes 20
+t_ok "ship: the rest goes on the next run" '{"big":3}' "$(ship_last)"
+
+chmod 644 "$ship/token"
+before="$(ship_posts)"
+printf '{"n":6}\n' >>"$ship_log"
+ship_exit=0
+ship_run || ship_exit=$?
+t_ok "ship: a token file others can read is refused" "1 $before" "$ship_exit $(ship_posts)"
+chmod 600 "$ship/token"
+
+ship_exit=0
+sh "$E2E_DIR/../../internal/server/osquery_ship.sh" --endpoint "${ship_url#http://}" \
+	--token-file "$ship/token" --log "$ship_log" --state "$ship_state" >/dev/null 2>&1 || ship_exit=$?
+t_ok "ship: an endpoint that is not a URL is refused" 1 "$ship_exit"
+
 # ---- counters --------------------------------------------------------------
 
 t_ok "PASS counter agrees with the file" \

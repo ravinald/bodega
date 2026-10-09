@@ -503,7 +503,12 @@ paths:
         outside it. These routes are exempt from the admin_permit_cidr gate and
         are authenticated by the source. The built-in cyclonedx source takes a
         CycloneDX 1.5 or 1.6 JSON document at route "bom" from a token scoped
-        "inventory" that carries an identity binding.
+        "inventory" that carries an identity binding. An osquery source in
+        server mode answers osquery's remote API at "enroll", "config" and
+        "log", authenticated by enroll secret and node_key in the body and
+        answering {"node_invalid": true} with 200 for every failed check; in
+        shipper mode it takes osquery result-log NDJSON at "results" from a
+        token scoped "inventory".
       operationId: pushInventory
       tags: [inventory]
       security:
@@ -681,6 +686,28 @@ paths:
         is client_setup_sha256 in GET /api/v1/status. An unidentified host gets
         403, as on every /client/ route.
       operationId: getClientSetupScript
+      tags: [client]
+      responses:
+        "200":
+          description: The script
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          $ref: "#/components/responses/ClientError"
+
+  /client/osquery-ship.sh:
+    get:
+      summary: The POSIX sh shipper that forwards osquery's log to bodega
+      description: >
+        The same bytes for every host, embedded in the binary. Run from cron, it
+        reads osqueryd's filesystem log from a recorded byte offset and posts
+        new complete lines to an osquery source's results route, advancing the
+        offset only on a 2xx. Its digest is osquery_ship_sha256 in GET
+        /api/v1/status. An unidentified host gets 403, as on every /client/
+        route.
+      operationId: getOsqueryShipScript
       tags: [client]
       responses:
         "200":
@@ -1486,6 +1513,11 @@ components:
           description: >-
             SHA-256 of GET /client/setup.sh. Compare it with the script's own
             digest before running the script.
+        osquery_ship_sha256:
+          type: string
+          description: >-
+            SHA-256 of GET /client/osquery-ship.sh. Compare it with the script's
+            own digest before running the script.
 
     SpoolStats:
       type: object
@@ -2005,6 +2037,41 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ClientPlanRecord"
+        osquery:
+          type: array
+          description: >-
+            One entry per enabled osquery inventory source. Absent when none is
+            enabled. plan.txt carries no form of it.
+          items:
+            $ref: "#/components/schemas/ClientOsqueryPlan"
+
+    ClientOsqueryPlan:
+      type: object
+      properties:
+        instance:
+          type: string
+          description: The inventory_sources instance name
+        mode:
+          type: string
+          enum: [server, shipper]
+        endpoint:
+          type: string
+          description: >-
+            Base URL the instance's routes sit under: enroll, config and log in
+            server mode, results in shipper mode
+        interval:
+          type: integer
+          description: Seconds between runs of the schedule's snapshot queries
+        python_dirs:
+          type: array
+          items:
+            type: string
+          description: Trees python_packages reads on this host, from its profile's osquery_scan_dirs entry
+        npm_dirs:
+          type: array
+          items:
+            type: string
+          description: Trees npm_packages reads on this host, from its profile's osquery_scan_dirs entry
 
     ClientPlanRecord:
       type: object

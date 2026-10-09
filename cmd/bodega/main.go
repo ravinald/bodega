@@ -258,6 +258,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		noReloadSignal(newACLCmd(gf)),
 		noReloadSignal(newIdentityCmd(gf)),
 		noReloadSignal(newInventoryCmd(gf)),
+		noReloadSignal(newOsqueryCmd(gf)),
 		noReloadSignal(newProfileCmd(gf)),
 		noReloadSignal(newPolicyCmd(gf)),
 		noReloadSignal(newDiscoverCmd(gf)),

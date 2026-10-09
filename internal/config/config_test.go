@@ -208,6 +208,12 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"inventory_sources": map[string]config.InventorySource{
 			"hosts": {"type": "cyclonedx", "enabled": true, "max_body_bytes": float64(1 << 20)},
 		},
+		// Load refuses a relative directory, so the filler's strings cannot
+		// stand in.
+		"osquery_scan_dirs": config.OsqueryScanDirs{
+			Default:  config.OsqueryDirs{Python: []string{"/usr/lib/python3/dist-packages"}},
+			Profiles: map[string]config.OsqueryDirs{"web": {NPM: []string{"/srv/app"}}},
+		},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

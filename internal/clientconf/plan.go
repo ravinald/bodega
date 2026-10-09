@@ -46,8 +46,25 @@ func (p PlanRecord) Fields() []string {
 
 // Plan is GET /client/plan. The records are plan.txt's lines, field for
 // field, so a tool can switch encodings without reinterpreting anything.
+// Osquery has no plan.txt form: it configures no file setup.sh writes.
 type Plan struct {
-	Records []PlanRecord `json:"records"`
+	Records []PlanRecord  `json:"records"`
+	Osquery []OsqueryPlan `json:"osquery,omitempty"`
+}
+
+// OsqueryPlan is one enabled osquery inventory source as a host sees it:
+// where to reach it and what its schedule scans. Endpoint is the base the
+// source's routes sit under (enroll, config and log in server mode, results
+// in shipper mode). Interval is in seconds, osquery's unit. PythonDirs and
+// NPMDirs are the trees python_packages and npm_packages read on this host,
+// from its profile's osquery_scan_dirs entry.
+type OsqueryPlan struct {
+	Instance   string   `json:"instance"`
+	Mode       string   `json:"mode"`
+	Endpoint   string   `json:"endpoint"`
+	Interval   int64    `json:"interval"`
+	PythonDirs []string `json:"python_dirs"`
+	NPMDirs    []string `json:"npm_dirs"`
 }
 
 // Systems names each system the plan lists, once, in plan order.
