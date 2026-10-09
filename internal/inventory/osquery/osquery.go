@@ -264,7 +264,10 @@ func (s *Source) serveEnroll(w http.ResponseWriter, r *http.Request, env *invent
 	digest := KeyDigest(key)
 	if err := env.DB().EnrollOsqueryNode(ctx, audit.OsqueryNode{
 		Source: s.instance, KeySHA256: digest, SecretID: sec.ID, Identity: sec.Identity, HostIdentifier: host,
-	}); err != nil {
+	}); errors.Is(err, audit.ErrNoOsquerySecret) {
+		s.deny(w, r, env, audit.DenialTokenInvalid, "enroll_secret", "unknown or revoked secret", map[string]string{"host_identifier": host})
+		return
+	} else if err != nil {
 		s.internalError(w, env, "record enrolled node", err)
 		return
 	}

@@ -147,6 +147,12 @@ func (a *DB) RevokeOsquerySecret(ctx context.Context, id string) (OsquerySecret,
 // EnrollOsqueryNode records a node_key by its sha256 and maps that sha256 to
 // the secret's identity in inventory_hosts, in one transaction, so a node
 // that exists always resolves to the identity it enrolled as.
+//
+// The secret's existence is checked by the insert itself rather than by the
+// caller's earlier lookup. A revoke committing between that lookup and this
+// insert would otherwise leave a node naming a deleted secret, which no
+// revoke can reach again. A secret that is gone, or holds another source or
+// identity, returns ErrNoOsquerySecret and writes neither row.
 func (a *DB) EnrollOsqueryNode(ctx context.Context, n OsqueryNode) error {
 	if a.readOnly {
 		return errors.New("audit db is read-only")
@@ -159,10 +165,21 @@ func (a *DB) EnrollOsqueryNode(ctx context.Context, n OsqueryNode) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO osquery_nodes (source, key_sha256, secret_id, identity, host_identifier) VALUES (?, ?, ?, ?, ?)`,
-		n.Source, n.KeySHA256, n.SecretID, n.Identity, n.HostIdentifier); err != nil {
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO osquery_nodes (source, key_sha256, secret_id, identity, host_identifier)
+SELECT ?, ?, ?, ?, ?
+WHERE EXISTS (SELECT 1 FROM osquery_enroll_secrets WHERE id = ? AND source = ? AND identity = ?)`,
+		n.Source, n.KeySHA256, n.SecretID, n.Identity, n.HostIdentifier,
+		n.SecretID, n.Source, n.Identity)
+	if err != nil {
 		return err
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if inserted == 0 {
+		return ErrNoOsquerySecret
 	}
 	now := invTime(time.Now())
 	if _, err := tx.ExecContext(ctx,

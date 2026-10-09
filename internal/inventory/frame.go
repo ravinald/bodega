@@ -103,8 +103,11 @@ func (f *Frame) PushRoute(r *http.Request) (*Instance, Route, bool) {
 	return nil, Route{}, false
 }
 
-// ServeHTTP answers a push route. Authentication comes before the body is
-// read, so an unauthenticated caller cannot make bodega read 32 MiB.
+// ServeHTTP answers a push route. On the sequence the frame serves itself,
+// authentication comes before the body is read, so an unauthenticated caller
+// cannot make bodega read 32 MiB. A route with Handler set is handed the
+// request unauthenticated, and one whose credential travels in the body (an
+// osquery node_key) reads up to its route's MaxBody before it authenticates.
 func (f *Frame) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	inst, rt, ok := f.PushRoute(r)
 	if !ok {
