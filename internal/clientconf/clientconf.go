@@ -13,7 +13,9 @@ package clientconf
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/aptsources"
@@ -302,6 +304,80 @@ func GitBundleURL(base string, b GitBundle) File {
 	}
 }
 
+// SystemOsquery is the plan system that points osqueryd at an osquery source
+// in server mode. It is no package type: osquery's own package reaches a host
+// through apt or pkg like any other, and this system configures the daemon
+// that package installs.
+const SystemOsquery = "osquery"
+
+// OsqueryFlagsPaths is where osqueryd reads its flags on each OS. FreeBSD's
+// is not the sysutils/osquery rc script's default
+// (/usr/local/etc/osquery/osquery.flags), so setup.sh names it in rc.conf as
+// osqueryd_flagfile. The rc script skips a flagfile it cannot read without a
+// word, and osqueryd then starts with no server to enroll with.
+var OsqueryFlagsPaths = map[string]string{
+	OSLinux:   "/etc/osquery/osquery.flags",
+	OSFreeBSD: "/usr/local/etc/osquery.flags",
+}
+
+// osquerySecretPaths sit beside the flags file. setup.sh reads the path back
+// out of --enroll_secret_path rather than holding a copy of this table.
+var osquerySecretPaths = map[string]string{
+	OSLinux:   "/etc/osquery/bodega.secret",
+	OSFreeBSD: "/usr/local/etc/osquery/bodega.secret",
+}
+
+// osqueryCABundles are each OS's system trust store, so a private CA added
+// with update-ca-certificates or certctl reaches osqueryd too. Left unset,
+// osqueryd on Linux reads the Mozilla bundle frozen into its own package,
+// which trusts no private CA and never changes with the host's.
+var osqueryCABundles = map[string]string{
+	OSLinux:   "/etc/ssl/certs/ca-certificates.crt",
+	OSFreeBSD: "/etc/ssl/cert.pem",
+}
+
+// Osquery renders osqueryd's flags file for one server-mode source, one File
+// per OS because the secret and the CA bundle live at different paths on
+// each. osqueryd builds every URL as https://<tls_hostname><endpoint>, so the
+// hostname carries public_url's port and the endpoints carry its path.
+// Content is empty when base or the endpoint does not parse.
+func Osquery(base string, src OsqueryPlan) []File {
+	b, err := url.Parse(base)
+	if err != nil || b.Host == "" {
+		return nil
+	}
+	ep, err := url.Parse(src.Endpoint)
+	if err != nil || ep.Path == "" {
+		return nil
+	}
+	path := strings.TrimRight(ep.Path, "/")
+	var out []File
+	for _, goos := range []string{OSLinux, OSFreeBSD} {
+		var sb strings.Builder
+		sb.WriteString("--tls_hostname=" + b.Host + "\n")
+		if b.Scheme == "https" {
+			sb.WriteString("--tls_server_certs=" + osqueryCABundles[goos] + "\n")
+		}
+		sb.WriteString("--enroll_secret_path=" + osquerySecretPaths[goos] + "\n")
+		sb.WriteString("--enroll_tls_endpoint=" + path + "/enroll\n")
+		sb.WriteString("--config_plugin=tls\n")
+		sb.WriteString("--config_tls_endpoint=" + path + "/config\n")
+		if src.Interval > 0 {
+			sb.WriteString("--config_refresh=" + strconv.FormatInt(src.Interval, 10) + "\n")
+		}
+		sb.WriteString("--logger_plugin=tls\n")
+		sb.WriteString("--logger_tls_endpoint=" + path + "/log\n")
+		out = append(out, File{
+			System:  SystemOsquery,
+			Label:   "osquery.flags",
+			Scope:   src.Instance + " (" + goos + ")",
+			Paths:   map[string]string{goos: OsqueryFlagsPaths[goos]},
+			Content: sb.String(),
+		})
+	}
+	return out
+}
+
 // Inputs are the facts a type's rendering needs beyond the base URL. Apt and
 // FreeBSD arrive rendered, because their state differs between the running
 // server and the TUI's view of the key files, and each resolves its own.
@@ -312,6 +388,9 @@ type Inputs struct {
 	Apt          []aptsources.Sources
 	FreeBSD      []pkgrepos.Repo
 	Binary       []BinaryLink
+	// Osquery is the one server-mode source a host enrolls with: osqueryd
+	// takes its config from exactly one server.
+	Osquery *OsqueryPlan
 }
 
 // ForType renders every file a client of entryType installs. It is the one
@@ -349,6 +428,10 @@ func ForType(entryType string, in Inputs) []File {
 	case manifest.TypeBinary:
 		for _, l := range in.Binary {
 			out = append(out, Binary(in.Base, l))
+		}
+	case SystemOsquery:
+		if in.Osquery != nil {
+			out = append(out, Osquery(in.Base, *in.Osquery)...)
 		}
 	}
 	kept := out[:0]

@@ -24,6 +24,35 @@ type Query struct {
 	Platform string `json:"platform"`
 }
 
+// AutoTable is one entry in osquery's auto_table_construction config: a
+// table osquery builds at config load by running query against the SQLite
+// file at path.
+type AutoTable struct {
+	Query    string   `json:"query"`
+	Path     string   `json:"path"`
+	Columns  []string `json:"columns"`
+	Platform string   `json:"platform"`
+}
+
+// TableFreeBSDPkg is the table the FreeBSD query reads. osquery's FreeBSD
+// build registers no pkg_packages table, and pkg's own database is SQLite, so
+// the config mounts that database as this table instead.
+const TableFreeBSDPkg = "bodega_pkg_packages"
+
+// AutoTables is the auto_table_construction block every config carries
+// beside the schedule. platform keeps a Linux host from mounting a path it
+// does not have.
+func AutoTables() map[string]AutoTable {
+	return map[string]AutoTable{
+		TableFreeBSDPkg: {
+			Query:    "SELECT name, version FROM packages",
+			Path:     "/var/db/pkg/local.sqlite",
+			Columns:  []string{"name", "version"},
+			Platform: "freebsd",
+		},
+	}
+}
+
 // The schedule's query names, one per platform. A result line is read as
 // inventory when its query name contains QueryMarker, which covers both and
 // any name a fleet manager builds around them (osquery packs prefix
@@ -55,7 +84,7 @@ func Schedule(dirs config.OsqueryDirs, interval time.Duration) map[string]Query 
 		},
 		QueryFreeBSD: {
 			Query: unionAll(append([]string{
-				"SELECT 'freebsd' AS ecosystem, name, version, '' AS path FROM pkg_packages",
+				"SELECT 'freebsd' AS ecosystem, name, version, '' AS path FROM " + TableFreeBSDPkg,
 			}, lang...)),
 			Interval: secs, Snapshot: true, Platform: "freebsd",
 		},

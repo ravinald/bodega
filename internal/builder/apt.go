@@ -116,29 +116,19 @@ func stampAptPoolPath(ctx context.Context, store *manifest.Store, name string, t
 	if err != nil || pm == nil {
 		return err
 	}
-	targetKey := targetVE.Version
-	if targetKey == "" {
-		targetKey = targetVE.Ref
+	i := entryIndex(pm.Versions, targetVE)
+	if i < 0 {
+		return nil
 	}
-	for i := range pm.Versions {
-		ve := &pm.Versions[i]
-		veKey := ve.Version
-		if veKey == "" {
-			veKey = ve.Ref
-		}
-		if veKey != targetKey {
-			continue
-		}
-		if ve.Metadata == nil {
-			ve.Metadata = make(map[string]string)
-		}
-		if ve.Metadata["_pool_path"] == rel {
-			return nil
-		}
-		ve.Metadata["_pool_path"] = rel
-		return store.SavePackage(ctx, pm)
+	ve := &pm.Versions[i]
+	if ve.Metadata == nil {
+		ve.Metadata = make(map[string]string)
 	}
-	return nil
+	if ve.Metadata["_pool_path"] == rel {
+		return nil
+	}
+	ve.Metadata["_pool_path"] = rel
+	return store.SavePackage(ctx, pm)
 }
 
 // aptPinOnOffer fails when the local cache knows the package but not the
@@ -855,11 +845,8 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				ve.ArtifactSize = fi.Size()
 				// Persist the updated metadata back to the store.
 				if updated, err := store.GetPackage(ctx, manifest.TypeApt, name); err == nil && updated != nil {
-					for i := range updated.Versions {
-						if updated.Versions[i].Version == ve.Version {
-							updated.Versions[i] = ve
-							break
-						}
+					if i := entryIndex(updated.Versions, ve); i >= 0 {
+						updated.Versions[i] = ve
 					}
 					if err := store.SavePackage(ctx, updated); err != nil {
 						_, _ = fmt.Fprintf(out, "    WARNING: could not save metadata: %v\n", err)

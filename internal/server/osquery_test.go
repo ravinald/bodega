@@ -80,8 +80,8 @@ func TestOsqueryPlanSection(t *testing.T) {
 	if !reflect.DeepEqual(a.NPMDirs, []string{"/srv/a", "/srv/b"}) || len(a.PythonDirs) != 0 || a.PythonDirs == nil {
 		t.Errorf("dirs = python %v npm %v; want the profile's entry, sorted, replacing the default", a.PythonDirs, a.NPMDirs)
 	}
-	if _, txt := clientGet(t, s, f.token, "/client/plan.txt?os=linux&codename=noble"); strings.Contains(txt, "osquery") {
-		t.Errorf("plan.txt grew an osquery record:\n%s", txt)
+	if _, txt := clientGet(t, s, f.token, "/client/plan.txt?os=linux&codename=noble"); !strings.Contains(txt, "\tosquery\tskip\t-\t-\t-\tosqueryd speaks only https") {
+		t.Errorf("plan.txt over a plain-http base does not skip osquery for the reason osqueryd cannot reach it:\n%s", txt)
 	}
 
 	secret := addEnrollSecret(t, s, "osq", "web-host")
@@ -189,5 +189,73 @@ func TestOsqueryShipScriptDigestIsPublished(t *testing.T) {
 	}
 	if code, _ := clientGet(t, s, "", "/client/osquery-ship.sh"); code != http.StatusForbidden {
 		t.Errorf("unidentified host got the shipper: %d", code)
+	}
+}
+
+// F55: the osquery system's record is the flags file for the one server-mode
+// source, rendered for the host's OS from public_url, and served at the URL
+// the record names with the digest it carries.
+func TestOsquerySystemFlagsFile(t *testing.T) {
+	s := hostedServer(t)
+	f := clientProfile(t, s)
+	s.cfg.PublicURL = "https://bodega.example.com:8443/b"
+	s.cfg.InventorySources = osquerySources
+	s.setupInventory()
+	if s.inventoryErr != nil {
+		t.Fatal(s.inventoryErr)
+	}
+
+	cases := []struct{ os, query, path, secret, ca string }{
+		{"linux", "os=linux&codename=noble", "/etc/osquery/osquery.flags", "/etc/osquery/bodega.secret", "/etc/ssl/certs/ca-certificates.crt"},
+		{"freebsd", "os=freebsd&abi=FreeBSD:15:aarch64", "/usr/local/etc/osquery.flags", "/usr/local/etc/osquery/bodega.secret", "/etc/ssl/cert.pem"},
+	}
+	for _, c := range cases {
+		var rec planRecord
+		for _, r := range planJSON(t, s, f.token, c.query) {
+			if r.System == "osquery" {
+				rec = r
+			}
+		}
+		if rec.Action != planInstall || rec.Path != c.path {
+			t.Fatalf("%s: osquery record = %+v, want an install at %s", c.os, rec, c.path)
+		}
+		want := "--tls_hostname=bodega.example.com:8443\n" +
+			"--tls_server_certs=" + c.ca + "\n" +
+			"--enroll_secret_path=" + c.secret + "\n" +
+			"--enroll_tls_endpoint=/b/api/v1/inventory/sources/osq/enroll\n" +
+			"--config_plugin=tls\n" +
+			"--config_tls_endpoint=/b/api/v1/inventory/sources/osq/config\n" +
+			"--config_refresh=1800\n" +
+			"--logger_plugin=tls\n" +
+			"--logger_tls_endpoint=/b/api/v1/inventory/sources/osq/log\n"
+		code, body := clientGet(t, s, f.token, rec.URL[strings.Index(rec.URL, "/client/"):])
+		if code != http.StatusOK || body != want {
+			t.Errorf("%s: GET %s = %d\n%s\nwant\n%s", c.os, rec.URL, code, body, want)
+		}
+		sum := sha256.Sum256([]byte(body))
+		if hex.EncodeToString(sum[:]) != rec.SHA256 {
+			t.Errorf("%s: the served flags do not match the record's digest", c.os)
+		}
+	}
+
+	// osqueryd takes its config from one server, so a second server-mode
+	// source leaves the choice to the operator.
+	s.cfg.InventorySources = map[string]config.InventorySource{
+		"osq":  osquerySources["osq"],
+		"osq2": {"type": "osquery", "enabled": true, "mode": "server"},
+	}
+	s.setupInventory()
+	for _, r := range planJSON(t, s, f.token, "os=linux&codename=noble") {
+		if r.System == "osquery" && (r.Action != planSkip || !strings.Contains(r.Reason, "osq, osq2")) {
+			t.Errorf("two server-mode sources: %+v, want a skip naming both", r)
+		}
+	}
+
+	s.cfg.InventorySources = map[string]config.InventorySource{"osq-b": osquerySources["osq-b"]}
+	s.setupInventory()
+	for _, r := range planJSON(t, s, f.token, "os=linux&codename=noble") {
+		if r.System == "osquery" && (r.Action != planSkip || !strings.Contains(r.Reason, "no osquery source in server mode")) {
+			t.Errorf("shipper mode only: %+v, want a skip", r)
+		}
 	}
 }

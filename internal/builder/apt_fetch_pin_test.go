@@ -134,3 +134,49 @@ func TestVerifyFetchedCatchesAnEditedDeb(t *testing.T) {
 		t.Fatal("a .deb edited in the build root passed the skip path")
 	}
 }
+
+// TestFetchAptKeepsEachArchitectureOnItsOwnEntry covers one version published
+// as one .deb per architecture, two entries that differ only by URL. Matching
+// the stored entry by version alone stamped the second download's digest and
+// pool path onto the first entry, so the next fetch refused the first .deb.
+func TestFetchAptKeepsEachArchitectureOnItsOwnEntry(t *testing.T) {
+	const pkg, amdDeb, armDeb = "osquery", "osquery_5.23.1-1.linux_amd64.deb", "osquery_5.23.1-1.linux_arm64.deb"
+	amdBody, armBody := "amd64 deb bytes", "arm64 deb bytes"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/"+amdDeb, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(amdBody)) })
+	mux.HandleFunc("/"+armDeb, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(armBody)) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	amdSum, armSum := ComputeBytesSHA256([]byte(amdBody)), ComputeBytesSHA256([]byte(armBody))
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeApt,
+		Name: pkg,
+		Versions: []manifest.VersionEntry{
+			{Version: "5.23.1-1", URL: srv.URL + "/" + amdDeb, Checksum: newSHA256Checksum(amdSum)},
+			{Version: "5.23.1-1", URL: srv.URL + "/" + armDeb, Checksum: newSHA256Checksum(armSum)},
+		},
+	}
+	cfg, store, _ := pinEnv(t, pm)
+
+	if s := FetchApt(cfg, store, pkg); s.Failures != 0 {
+		t.Fatalf("first fetch reported %d failures: %+v", s.Failures, s.Results)
+	}
+	stored, err := store.GetPackage(t.Context(), manifest.TypeApt, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []struct{ sum, deb string }{{amdSum, amdDeb}, {armSum, armDeb}} {
+		ve := stored.Versions[i]
+		if ve.Checksum == nil || ve.Checksum.Value != want.sum {
+			t.Errorf("entry %d (%s) carries checksum %+v, want %s", i, want.deb, ve.Checksum, want.sum)
+		}
+		if got, wantPath := ve.Metadata["_pool_path"], aptPoolRelPath(pkg, want.deb); got != wantPath {
+			t.Errorf("entry %d carries _pool_path %q, want %q", i, got, wantPath)
+		}
+	}
+
+	if s := FetchApt(cfg, store, pkg); s.Failures != 0 {
+		t.Fatalf("a re-fetch of both architectures was refused: %+v", s.Results)
+	}
+}

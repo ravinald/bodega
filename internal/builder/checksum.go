@@ -66,8 +66,41 @@ func newSHA256Checksum(hexDigest string) *manifest.Checksum {
 // withdraw the packages the build just produced.
 const checksumSourceBuild = "manifest"
 
+// entryKey is the field a version entry is addressed by: its version, or its
+// ref when it has none.
+func entryKey(ve manifest.VersionEntry) string {
+	if ve.Version != "" {
+		return ve.Version
+	}
+	return ve.Ref
+}
+
+// entryIndex finds target among versions after a fetch or package stage has
+// reloaded the manifest: the entry with target's key and URL, or failing that
+// the first with its key, or -1.
+//
+// One version can be several entries that differ by URL, one .deb per
+// architecture. Matching on the key alone wrote the second architecture's
+// digest and pool path onto the first entry, which then failed its own next
+// fetch against bytes that were never its own.
+func entryIndex(versions []manifest.VersionEntry, target manifest.VersionEntry) int {
+	key, first := entryKey(target), -1
+	for i, ve := range versions {
+		if entryKey(ve) != key {
+			continue
+		}
+		if ve.URL == target.URL {
+			return i
+		}
+		if first < 0 {
+			first = i
+		}
+	}
+	return first
+}
+
 // updateVersionChecksum finds the VersionEntry in pm that matches targetVE
-// (by Version or Ref), updates its Checksum and ChecksumVerified fields,
+// (see entryIndex), updates its Checksum and ChecksumVerified fields,
 // saves the manifest, and pins the digest in the audit cache.
 //
 // Every per-type fetch funnels its digest through here, so the cache write
@@ -83,30 +116,14 @@ func (c *Config) updateVersionChecksum(ctx context.Context, store *manifest.Stor
 		return fmt.Errorf("%s entry %q not found", typ, name)
 	}
 
-	targetKey := targetVE.Version
-	if targetKey == "" {
-		targetKey = targetVE.Ref
+	i := entryIndex(pm.Versions, targetVE)
+	if i < 0 {
+		return fmt.Errorf("version %q not found in %s/%s", entryKey(targetVE), typ, name)
 	}
-
-	found := false
-	var saved manifest.VersionEntry
-	for i := range pm.Versions {
-		ve := &pm.Versions[i]
-		veKey := ve.Version
-		if veKey == "" {
-			veKey = ve.Ref
-		}
-		if veKey == targetKey {
-			ve.Checksum = cs
-			ve.ChecksumVerified = verified
-			found = true
-			saved = *ve
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("version %q not found in %s/%s", targetKey, typ, name)
-	}
+	ve := &pm.Versions[i]
+	ve.Checksum = cs
+	ve.ChecksumVerified = verified
+	saved := *ve
 	if err := store.SavePackage(ctx, pm); err != nil {
 		return err
 	}
