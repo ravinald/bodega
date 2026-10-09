@@ -50,31 +50,19 @@ func readOSRelease() string {
 }
 
 // stampVersion updates BuildEnv and Platform on a specific VersionEntry within
-// a PackageManifest and saves the manifest. It matches the entry by Version or
-// Ref field.
+// a PackageManifest and saves the manifest. It matches the entry by
+// entryIndex.
 func stampVersion(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry, env *manifest.BuildEnv, defaultPlatform string) {
 	pm, err := store.GetPackage(ctx, typ, name)
 	if err != nil || pm == nil {
 		return
 	}
 
-	targetKey := targetVE.Version
-	if targetKey == "" {
-		targetKey = targetVE.Ref
-	}
-
-	for i := range pm.Versions {
+	if i := entryIndex(pm.Versions, targetVE); i >= 0 {
 		ve := &pm.Versions[i]
-		veKey := ve.Version
-		if veKey == "" {
-			veKey = ve.Ref
-		}
-		if veKey == targetKey {
-			ve.BuildEnv = env
-			if ve.Platform == "" {
-				ve.Platform = defaultPlatform
-			}
-			break
+		ve.BuildEnv = env
+		if ve.Platform == "" {
+			ve.Platform = defaultPlatform
 		}
 	}
 	_ = store.SavePackage(ctx, pm)
@@ -159,20 +147,8 @@ func updateVersionEntry(ctx context.Context, store *manifest.Store, typ, name st
 	if err != nil || pm == nil {
 		return
 	}
-	targetKey := targetVE.Version
-	if targetKey == "" {
-		targetKey = targetVE.Ref
-	}
-	for i := range pm.Versions {
-		ve := &pm.Versions[i]
-		veKey := ve.Version
-		if veKey == "" {
-			veKey = ve.Ref
-		}
-		if veKey == targetKey {
-			mutate(ve)
-			break
-		}
+	if i := entryIndex(pm.Versions, targetVE); i >= 0 {
+		mutate(&pm.Versions[i])
 	}
 	_ = store.SavePackage(ctx, pm)
 }

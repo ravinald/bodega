@@ -9,6 +9,8 @@
 # running it.
 #
 # Needs only sh, curl or fetch(1), sha256sum or sha256(1), awk, diff and cmp.
+# The osquery system also runs the host's own apt-get or pkg, and systemctl
+# or service(8).
 
 set -eu
 umask 022
@@ -29,6 +31,12 @@ usage: sh setup.sh --url <bodega base URL> [--apply] [--systems a,b] [--allow-pl
 
 A host identified by a token reads it from BODEGA_TOKEN, so the token never
 appears in a process listing. A host bound by address needs none.
+
+The osquery system runs only when --systems names it. It installs osquery
+from bodega through apt-get or pkg, writes its flags, writes the enroll secret
+from BODEGA_OSQUERY_SECRET to a file only root can read, and enables and
+restarts osqueryd. Mint the secret on the server with
+`bodega osquery secret create <instance> <identity>`.
 EOF
 }
 
@@ -39,6 +47,10 @@ die() {
 
 base=${BODEGA_URL:-}
 token=${BODEGA_TOKEN:-}
+# Kept in this shell only: nothing this script runs, apt-get and pkg
+# included, inherits it.
+osq_secret=${BODEGA_OSQUERY_SECRET:-}
+unset BODEGA_OSQUERY_SECRET
 apply=no
 plaintext=no
 systems=
@@ -74,6 +86,9 @@ base=${base%/}
 case $token in
 *[!A-Za-z0-9_.-]*) die "BODEGA_TOKEN holds characters no bodega token has; check what was pasted into it" ;;
 esac
+case $osq_secret in
+*[!A-Za-z0-9_.-]*) die "BODEGA_OSQUERY_SECRET holds characters no bodega enroll secret has; check what was pasted into it" ;;
+esac
 
 # The same rule `bodega serve` applies: plain http only when asked for, and a
 # token never over it unless asked for.
@@ -81,6 +96,11 @@ case $base in
 https://*) ;;
 http://*)
 	if [ "$plaintext" != yes ]; then
+		case ",$systems," in
+		*,osquery,*)
+			die "refusing osquery over plain http to $base: the flags file names the server osqueryd hands its enroll secret to, and anything on the path could rewrite it, so the enroll secret would cross the network in clear to whoever did. Use https, or pass --allow-plaintext on a link you trust"
+			;;
+		esac
 		if [ -n "$token" ]; then
 			die "refusing to send BODEGA_TOKEN to $base over plain http: anything on the path can read it. Use https, or pass --allow-plaintext on a link you trust"
 		fi
@@ -379,8 +399,13 @@ if [ -n "$systems" ]; then
 		esac
 	done
 fi
+# osquery installs a package and starts a daemon, so a run that names no
+# systems leaves it out rather than doing either unasked.
 selected() {
-	[ -z "$want" ] && return 0
+	if [ -z "$want" ]; then
+		[ "$1" != osquery ]
+		return
+	fi
 	case "$want " in
 	*" $1 "*) return 0 ;;
 	esac
@@ -408,10 +433,17 @@ done 3<"$work/plan.txt"
 if [ -n "$blocked" ]; then
 	die "the plan installs nothing for a system you named, so nothing was written:$blocked"
 fi
+if [ -z "$want" ]; then
+	case " $all " in
+	*" osquery "*) printf '%-8s %-10s %s\n' skip osquery "installs a package, writes an enroll secret and starts osqueryd, so it runs only when named: --systems osquery" ;;
+	esac
+fi
 
 # Every file is fetched and checked before any is compared or written, so a
 # mismatch anywhere leaves the host as it was.
 n=0
+osq_n=
+osq_target=
 : >"$work/changes"
 while IFS=$tab read -r identity profile match system action path url sha reason <&3; do
 	selected "$system" || continue
@@ -441,6 +473,10 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
   Re-run to rule out the first. If it repeats, fetch $url from another host and compare before trusting this path"
 	fi
 	printf '%s\t%s\t%s\n' "$n" "$system" "$target" >>"$work/changes"
+	if [ "$system" = osquery ]; then
+		osq_n=$n
+		osq_target=$target
+	fi
 done 3<"$work/plan.txt"
 
 # ---- compare ---------------------------------------------------------------
@@ -474,13 +510,83 @@ while IFS=$tab read -r n system target <&3; do
 	printf '%s\t%s\t%s\n' "$n" "$system" "$target" >>"$work/writes"
 done 3<"$work/changes"
 
-if [ "$changed" -eq 0 ]; then
+# ---- osquery ---------------------------------------------------------------
+#
+# The flags file went through the compare above like any other. What is left
+# is the package, the enroll secret and the daemon. The secret is compared
+# with cmp and never printed: the dry run says it will be written, not what
+# it is.
+
+osq_steps=0
+osq_pkg=no
+osq_secret_write=no
+osq_secret_missing=no
+osq_restart=no
+if [ -n "$osq_n" ]; then
+	osq_secret_path=$(sed -n 's/^--enroll_secret_path=//p' "$work/$osq_n" | sed -n 1p)
+	case $osq_secret_path in
+	*[!A-Za-z0-9/._-]* | '' | [!/]*) die "the osquery flags name no absolute --enroll_secret_path, so there is nowhere to write the enroll secret. Nothing was written" ;;
+	esac
+	case $os in
+	linux)
+		# shellcheck disable=SC2016 # ${Status} is dpkg-query's field, not sh's
+		[ "$(dpkg-query -W -f='${Status}' osquery 2>/dev/null || true)" = "install ok installed" ] || osq_pkg=yes
+		;;
+	freebsd) pkg info -e osquery 2>/dev/null || osq_pkg=yes ;;
+	esac
+	if [ -n "$osq_secret" ]; then
+		if [ -f "$osq_secret_path" ] && printf '%s' "$osq_secret" | cmp -s - "$osq_secret_path" 2>/dev/null; then
+			printf 'unchanged  %-10s %s (enroll secret)\n' osquery "$osq_secret_path"
+		else
+			osq_secret_write=yes
+		fi
+	elif [ ! -e "$osq_secret_path" ]; then
+		osq_secret_missing=yes
+	fi
+	case $os in
+	linux) systemctl is-enabled --quiet osqueryd 2>/dev/null && systemctl is-active --quiet osqueryd 2>/dev/null || osq_restart=yes ;;
+	freebsd) [ "$(sysrc -n osqueryd_enable 2>/dev/null || true)" = YES ] && service osqueryd status >/dev/null 2>&1 || osq_restart=yes ;;
+	esac
+	if [ "$osq_pkg" = yes ] || [ "$osq_secret_write" = yes ] || awk -F "$tab" -v t="$osq_target" '$3 == t {f = 1} END {exit !f}' "$work/writes"; then
+		osq_restart=yes
+	fi
+
+	printf '\n'
+	if [ "$osq_pkg" = yes ]; then
+		osq_steps=$((osq_steps + 1))
+		case $os in
+		linux) printf 'install    %-10s the osquery package, through apt-get from bodega'"'"'s apt suite\n' osquery ;;
+		freebsd) printf 'install    %-10s the osquery package, through pkg from bodega'"'"'s repository\n' osquery ;;
+		esac
+	fi
+	if [ "$osq_secret_write" = yes ]; then
+		osq_steps=$((osq_steps + 1))
+		printf 'secret     %-10s %s: the enroll secret in BODEGA_OSQUERY_SECRET will be written, mode 0600, owner root (not shown)\n' osquery "$osq_secret_path"
+	fi
+	if [ "$osq_secret_missing" = yes ]; then
+		printf 'secret     %-10s %s: absent, and BODEGA_OSQUERY_SECRET is unset, so --apply will refuse\n' osquery "$osq_secret_path"
+	fi
+	if [ "$osq_restart" = yes ]; then
+		osq_steps=$((osq_steps + 1))
+		printf 'service    %-10s enable osqueryd and restart it\n' osquery
+	fi
+fi
+
+if [ "$changed" -eq 0 ] && [ "$osq_steps" -eq 0 ] && [ "$osq_secret_missing" = no ]; then
 	printf '\nNothing to change: every file already matches the plan.\n'
 	exit 0
 fi
 if [ "$apply" != yes ]; then
-	printf '\nDry run: nothing was written. Re-run with --apply to back up and write the %s file(s) above.\n' "$changed"
+	printf '\nDry run: nothing was written. Re-run with --apply to back up and write the %s file(s) above' "$changed"
+	[ "$osq_steps" -eq 0 ] || printf ' and take the %s osquery step(s)' "$osq_steps"
+	printf '.\n'
 	exit 0
+fi
+if [ "$osq_secret_missing" = yes ]; then
+	die "BODEGA_OSQUERY_SECRET is unset and $osq_secret_path holds no enroll secret, so osqueryd could not enroll. Mint one on the server with \`bodega osquery secret create <instance> <identity>\` and pass it in BODEGA_OSQUERY_SECRET. Nothing was written"
+fi
+if [ "$osq_steps" -gt 0 ] && [ "$(id -u)" != 0 ]; then
+	die "the osquery steps install a package, write a root-only secret and start a daemon, so they need root. Re-run as root. Nothing was written"
 fi
 
 # ---- apply -----------------------------------------------------------------
@@ -513,4 +619,48 @@ while IFS=$tab read -r n system target <&3; do
 	written="$written $target"
 done 3<"$work/order"
 
-printf '\nApplied %s file(s). Each replaced file sits beside its backup, suffixed .bodega-%s.\n' "$changed" "$stamp"
+[ "$changed" -eq 0 ] ||
+	printf '\nApplied %s file(s). Each replaced file sits beside its backup, suffixed .bodega-%s.\n' "$changed" "$stamp"
+
+# The files land first: on a host taking --systems apt,osquery in one run,
+# apt-get can only find osquery once bodega's stanza is in place, and the deb
+# ships no flags file of its own to overwrite ours.
+if [ "$osq_pkg" = yes ]; then
+	case $os in
+	linux)
+		apt-get update || die "apt-get update failed, so osquery was not installed. The files above are written"
+		DEBIAN_FRONTEND=noninteractive apt-get install -y osquery ||
+			die "apt-get could not install osquery. It installs from bodega's apt suite: point this host at it with --systems apt, and serve osquery from the server as docs/usage.md describes under \"Serving osquery\". The files above are written"
+		;;
+	freebsd)
+		pkg install -y osquery ||
+			die "pkg could not install osquery. It installs from bodega's pkg repository: point this host at it with --systems freebsd. The files above are written"
+		;;
+	esac
+fi
+if [ "$osq_secret_write" = yes ]; then
+	osq_dir=$(dirname "$osq_secret_path")
+	mkdir -p "$osq_dir" || die "could not create $osq_dir for the enroll secret"
+	# mktemp creates the file 0600, and chown runs before a byte is written,
+	# so no window exists where the secret sits in a file anyone else can read.
+	osq_tmp=$(mktemp "$osq_dir/.bodega-secret.XXXXXX") || die "could not create a file in $osq_dir for the enroll secret"
+	if chmod 600 "$osq_tmp" && chown 0:0 "$osq_tmp" && printf '%s' "$osq_secret" >"$osq_tmp" && mv -f "$osq_tmp" "$osq_secret_path"; then
+		printf 'wrote      %s (enroll secret, mode 0600, owner root)\n' "$osq_secret_path"
+	else
+		rm -f "$osq_tmp"
+		die "writing the enroll secret to $osq_secret_path failed; the files above are written"
+	fi
+fi
+if [ "$osq_restart" = yes ]; then
+	case $os in
+	linux)
+		systemctl enable osqueryd || die "systemctl could not enable osqueryd"
+		systemctl restart osqueryd || die "osqueryd did not start; \`journalctl -u osqueryd\` says why"
+		;;
+	freebsd)
+		sysrc osqueryd_enable=YES >/dev/null || die "sysrc could not set osqueryd_enable=YES in /etc/rc.conf"
+		service osqueryd restart || die "osqueryd did not start; /var/log/osquery says why"
+		;;
+	esac
+	printf 'started    osqueryd\n'
+fi

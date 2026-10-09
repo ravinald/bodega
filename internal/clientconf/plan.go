@@ -46,7 +46,8 @@ func (p PlanRecord) Fields() []string {
 
 // Plan is GET /client/plan. The records are plan.txt's lines, field for
 // field, so a tool can switch encodings without reinterpreting anything.
-// Osquery has no plan.txt form: it configures no file setup.sh writes.
+// Osquery describes every enabled osquery source; the osquery system's record
+// is the flags file for the one server-mode source a host enrolls with.
 type Plan struct {
 	Records []PlanRecord  `json:"records"`
 	Osquery []OsqueryPlan `json:"osquery,omitempty"`
@@ -82,9 +83,23 @@ func (p Plan) Systems() []string {
 // name the plan does not list is an error naming the ones it does, and so is
 // a named system the plan refuses or skips: the operator asked for it, and a
 // run that quietly configures the rest reads as one that configured it.
+//
+// The osquery system is left out of an empty selection and refused by name:
+// its flags file alone names a secret nothing wrote and a daemon nothing
+// installed, and only setup.sh does the rest.
 func (p Plan) Select(systems []string) ([]PlanRecord, error) {
+	if slices.Contains(systems, SystemOsquery) {
+		return nil, fmt.Errorf("the osquery system installs a package, writes an enroll secret and starts osqueryd, and this command writes files only.\n" +
+			"  Run the served setup script instead: BODEGA_OSQUERY_SECRET=<secret> sh setup.sh --url <base> --systems osquery --apply")
+	}
 	if len(systems) == 0 {
-		return p.Records, nil
+		var out []PlanRecord
+		for _, r := range p.Records {
+			if r.System != SystemOsquery {
+				out = append(out, r)
+			}
+		}
+		return out, nil
 	}
 	listed := p.Systems()
 	for _, s := range systems {

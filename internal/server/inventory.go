@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -129,4 +131,36 @@ func (s *Server) osqueryPlan(h *clientHost) []clientconf.OsqueryPlan {
 		})
 	}
 	return out
+}
+
+// planOsquery renders the osquery flags file for the one server-mode source a
+// host enrolls with. A shipper-mode source configures no osqueryd: something
+// else owns that host's osquery config.
+func (s *Server) planOsquery(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	skip := func(reason string) []planFile {
+		return []planFile{{system: clientconf.SystemOsquery, action: planSkip, reason: reason}}
+	}
+	var servers []clientconf.OsqueryPlan
+	var names []string
+	for _, p := range s.osqueryPlan(h) {
+		if p.Mode == osquery.ModeServer {
+			servers = append(servers, p)
+			names = append(names, p.Instance)
+		}
+	}
+	switch {
+	case len(servers) == 0:
+		return skip("this server runs no osquery source in server mode, so there is nothing for osqueryd to enroll with")
+	case len(servers) > 1:
+		return skip(fmt.Sprintf("this server runs %d osquery sources in server mode (%s), and osqueryd takes its config from one; disable the others or configure this host by hand",
+			len(servers), strings.Join(names, ", ")))
+	case !strings.HasPrefix(h.base, "https://"):
+		return skip(fmt.Sprintf("osqueryd speaks only https to its server, and this server is reached at %s; set public_url to the https address bodega or the proxy in front of it answers on", h.base))
+	}
+	for _, f := range clientconf.ForType(clientconf.SystemOsquery, clientconf.Inputs{Base: h.base, Osquery: &servers[0]}) {
+		if f.Path(h.q.OS) != "" {
+			return one(f)
+		}
+	}
+	return skip("public_url " + h.base + " names no host for osqueryd's --tls_hostname")
 }

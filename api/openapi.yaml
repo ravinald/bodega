@@ -734,7 +734,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles]
+            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles, osquery]
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
@@ -2088,7 +2088,7 @@ components:
           description: The binding that resolved it, "token:<id>" or "cidr:<prefix>"
         system:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles, osquery]
         action:
           type: string
           enum: [install, refuse, skip]

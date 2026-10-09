@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -233,8 +234,11 @@ func hostPrefix(ip string) string {
 }
 
 // clientSystems is the order a plan lists systems in: every type bodega
-// serves, in the build order the rest of the tree uses.
-func clientSystems() []string { return manifest.AllTypes }
+// serves, in the build order the rest of the tree uses, then osquery, which
+// configures a daemon rather than a package client.
+func clientSystems() []string {
+	return append(slices.Clone(manifest.AllTypes), clientconf.SystemOsquery)
+}
 
 // planFor renders every system's outcome for h.
 func (s *Server) planFor(r *http.Request, h *clientHost) []planFile {
@@ -275,6 +279,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 	case manifest.TypeBinary:
 		return []planFile{{system: sys, action: planSkip,
 			reason: "binary entries are downloaded by URL, not configured, so there is no client file"}}
+	case clientconf.SystemOsquery:
+		return s.planOsquery(h, one)
 	}
 	return []planFile{{system: sys, action: planSkip, reason: "no client file is rendered for " + sys}}
 }

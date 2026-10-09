@@ -257,3 +257,35 @@ func TestDiffPrintsNoCredential(t *testing.T) {
 		}
 	}
 }
+
+// The osquery system needs a package, a secret and a running daemon, none of
+// which a file-only apply provides, so it is left out of an empty selection
+// and refused by name.
+func TestSelectKeepsOsqueryOutOfAFileOnlyApply(t *testing.T) {
+	p := Plan{Records: []PlanRecord{
+		{System: "pypi", Action: PlanInstall, Path: "/etc/pip.conf"},
+		{System: SystemOsquery, Action: PlanInstall, Path: OsqueryFlagsPaths[OSLinux]},
+	}}
+	got, err := p.Select(nil)
+	if err != nil || len(got) != 1 || got[0].System != "pypi" {
+		t.Errorf("Select(nil) = %+v, %v; want pypi alone", got, err)
+	}
+	if _, err := p.Select([]string{SystemOsquery}); err == nil || !strings.Contains(err.Error(), "setup.sh") {
+		t.Errorf("Select(osquery) = %v, want a refusal naming setup.sh", err)
+	}
+}
+
+// --tls_server_certs names a CA bundle, which only a TLS server needs.
+func TestOsqueryFlagsNameCertsOnlyOverTLS(t *testing.T) {
+	src := OsqueryPlan{Instance: "osq", Mode: "server", Endpoint: "http://b.example:8080/api/v1/inventory/sources/osq"}
+	for _, f := range Osquery("http://b.example:8080", src) {
+		if strings.Contains(f.Content, "--tls_server_certs") || !strings.Contains(f.Content, "--tls_hostname=b.example:8080\n") {
+			t.Errorf("%s over http:\n%s", f.Scope, f.Content)
+		}
+	}
+	for _, f := range Osquery("https://b.example", src) {
+		if !strings.Contains(f.Content, "--tls_server_certs=") {
+			t.Errorf("%s over https names no CA bundle:\n%s", f.Scope, f.Content)
+		}
+	}
+}

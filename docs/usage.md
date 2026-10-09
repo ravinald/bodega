@@ -1782,7 +1782,7 @@ Both checks certify the configuration doctor ran under, and each detail line say
 
 The pip check reads `/usr/local/etc/pip.conf`, `/usr/local/pip.conf` and `/etc/xdg/pip/pip.conf` on FreeBSD beside the paths it reads everywhere, and the npm check reads `/usr/local/etc/npmrc`. pip itself ignores the first of those; doctor reads it because the ports convention puts a file there, and a warning about a file pip never reads costs less than an `OK` over one an operator believes is in force.
 
-`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason.
+`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is refused by name and left out otherwise: its flags file alone points at a secret nothing wrote and a daemon nothing installed, so only the setup script configures it.
 
 ```bash
 bodega doctor --configure apt,pypi --url https://bodega.internal
@@ -3687,7 +3687,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `c6ccbb001582a9dc78221ab07bd8aad413cea8370068e89eacb4fe357e767f0c`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `b41231ef431c2da114e373967b3cc808b895308eb56502ac33c0420e30114171`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -3710,7 +3710,21 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
 
    Each file that differs is copied beside the original as `<file>.bodega-<UTC timestamp>`, then written. A file that already matches is left alone, so a second run writes nothing and makes no backup. Every target is checked writable before the first write, so a run lacking root stops before it has changed anything. apt reads every file in `sources.list.d/` and prints a notice for the backup's unknown extension on each `apt update` until you delete it.
 
-`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest.
+`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest, except `osquery`.
+
+**osquery.** The `osquery` system runs only when `--systems` names it, because it does more than write a file. It points the host at an [`osquery` source](#the-osquery-source) in `server` mode:
+
+1. Writes the flags file the plan renders: `/etc/osquery/osquery.flags` on Linux, `/usr/local/etc/osquery/osquery.flags` on FreeBSD, which is the path the `sysutils/osquery` rc script reads.
+2. Installs osquery through the host's own package manager from bodega: `apt-get install osquery` from bodega's suite, or `pkg install osquery` from bodega's repository. Neither downloads from the internet, so bodega has to [serve osquery](#serving-osquery) first, and the host's apt or pkg has to point at bodega already or in the same run (`--systems apt,osquery`, `--systems freebsd,osquery`).
+3. Writes the enroll secret from `BODEGA_OSQUERY_SECRET`, never an argument, to the path the flags name in `--enroll_secret_path`, mode 0600, owned by root. Nothing the script runs inherits the variable.
+4. Enables `osqueryd` (`systemctl enable`, or `osqueryd_enable=YES` through `sysrc`) and restarts it.
+
+The dry run lists each step it would take, shows the flags diff, and says a secret will be written without printing it. A step already done is skipped, so a second run with nothing changed restarts nothing. Once the secret file exists the variable may be left unset, and the file is kept; with neither, `--apply` refuses before writing anything. Mint the secret on the server with `bodega osquery secret create <instance> <identity>`, then on the host, as root:
+
+```sh
+read -r BODEGA_OSQUERY_SECRET && export BODEGA_OSQUERY_SECRET   # paste it; it never reaches a process listing
+sh setup.sh --url https://bodega-host:8443 --systems apt,osquery --apply
+```
 
 The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first.
 
@@ -3727,7 +3741,7 @@ The files themselves are written unredacted, and a backup of a file that held a 
 
 What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` from `VERSION_CODENAME` in `/etc/os-release` on Linux, since `lsb_release` is absent from minimal images. On an instance serving no apt suite by the host's codename, the plan skips apt and names the suites it does serve, and `bodega doctor --configure apt --suite <suite>` is the way through.
 
-An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
+An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. With `--systems osquery` the refusal says so for the secret: a rewritten flags file sends osqueryd's enroll secret, in clear, to whoever rewrote it. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
 
 A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
 
@@ -3967,16 +3981,16 @@ Every route takes the same query parameters:
 | `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it |
 | `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite   |
 
-The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types: `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`.
+The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
-**Records.** The plan lists all ten systems, one record per file, in this column order:
+**Records.** The plan lists all eleven systems, one record per file, in this column order:
 
 | Column     | Value                                                                                                 |
 | ---------- | ----------------------------------------------------------------------------------------------------- |
 | `identity` | the name the host resolved to                                                                         |
 | `profile`  | the profile bound to that name, empty when none is                                                    |
 | `match`    | the binding that resolved it: `token:<token-id>` or `cidr:<prefix>`                                   |
-| `system`   | the package type                                                                                      |
+| `system`   | the package type, or `osquery`                                                                        |
 | `action`   | `install`, `refuse` or `skip`                                                                         |
 | `path`     | where the file goes on this `os`. A leading `~` is the home directory of the user the file configures |
 | `url`      | where to fetch it                                                                                     |
@@ -3985,7 +3999,7 @@ The host resolves the way a package route resolves it: a bound token, then the l
 
 - **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together.
 - **`refuse`** is a system the host's profile excludes: closed, listing nothing of that type, and blocking the rest. It also covers a profile that scopes apt to a codename other than the one the host states, and a git profile covering none of the served namespaces. A refusal is a record rather than an absence, so a host can tell "not for you" from "not configured".
-- **`skip`** is a system with nothing to install here for a reason that is not the profile's: the wrong operating system (apt on FreeBSD, pkg and distfiles on Linux), nothing configured on the server, a fact the host did not state, or a choice only the operator can make, such as two pkg repositories serving the same ABI. `binary` is always a skip: a binary is downloaded by URL, not configured.
+- **`skip`** is a system with nothing to install here for a reason that is not the profile's: the wrong operating system (apt on FreeBSD, pkg and distfiles on Linux), nothing configured on the server, a fact the host did not state, or a choice only the operator can make, such as two pkg repositories serving the same ABI. `binary` is always a skip: a binary is downloaded by URL, not configured. `osquery` is a skip when no enabled `osquery` source runs in `server` mode, when more than one does (osqueryd takes its config from one server), and when the host reaches bodega over `http://`, since osqueryd speaks only https to its server.
 
 bodega's pkg fingerprint is not in the plan. The FreeBSD stanza names it and says to deliver it out of band, because a fingerprint fetched from the server it authenticates proves nothing.
 
@@ -4063,7 +4077,7 @@ web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_
 
 `\u0026` is `&`, escaped by the JSON encoder; any JSON parser returns the plain URL.
 
-When an [`osquery` source](#the-osquery-source) is enabled, the JSON plan also carries an `osquery` array, one entry per enabled osquery instance, with `instance`, `mode`, `endpoint`, `interval` (seconds) and the `python_dirs` and `npm_dirs` this host's profile declares. `plan.txt` has no osquery record: it lists only files `setup.sh` writes.
+When an [`osquery` source](#the-osquery-source) is enabled, the JSON plan also carries an `osquery` array, one entry per enabled osquery instance, with `instance`, `mode`, `endpoint`, `interval` (seconds) and the `python_dirs` and `npm_dirs` this host's profile declares. The `osquery` record in both encodings is the flags file for the one `server` instance, described under [Mode A](#mode-a-bodega-as-the-osquery-server).
 
 **Refusals.** Every error body is plain text naming the next step. The deny list answers first, before any identity is resolved. The identity check comes next, ahead of the mutation gate and the router: a host no binding names gets the `403` below on every `/client/` path and method whatever else is wrong with the request, including a path the router would redirect or not find and a method it would refuse, so an unknown address learns the command that admits it and not which `os` values, system names or methods this server takes.
 
@@ -4073,7 +4087,7 @@ When an [`osquery` source](#the-osquery-source) is enabled, the JSON plan also c
 | `403`  | the host's address is on the deny list (`bodega acl deny`), on every `/client/` path                        | the deny entry that matched, `bodega acl deny remove <cidr>`, and the `bodega identity bind` command for the address                                                  |
 | `403`  | no identity binding names the host, on every `/client/` path and method, before any check but the deny list | the `bodega identity bind` command for its address, and `bodega acl proxies add` first when the address came from a forwarded header this server does not yet believe |
 | `403`  | `GET /client/{system}` for a system the host's profile excludes                                             | the profile's reason, the same text as the plan's `refuse` record                                                                                                     |
-| `404`  | `GET /client/{system}` for a system that is a `skip` here, or a name that is not one of the ten             | the skip's reason, or the ten names                                                                                                                                   |
+| `404`  | `GET /client/{system}` for a system that is a `skip` here, or a name that is not one of the eleven          | the skip's reason, or the eleven names                                                                                                                                |
 
 ```text
 $ curl -s "https://bodega-host:8080/client/plan?os=linux"
@@ -5970,6 +5984,41 @@ The queries are named `bodega_packages_linux` and `bodega_packages_freebsd`. The
 
 Each host's [plan](#client-plan-and-per-system-files) carries an `osquery` section with one entry per enabled osquery instance: the instance, its mode, the `endpoint` base its routes sit under, the `interval` in seconds, and the `python_dirs` and `npm_dirs` for that host's profile.
 
+##### Serving osquery
+
+Hosts install osquery from bodega rather than from the internet. On Linux it is a hosted apt package built from osquery's own release debs, fetched by URL and checked against a pinned SHA-256. One version is two entries, one `.deb` per architecture; apt tells them apart by the `Architecture` each `.deb`'s control data carries, and each entry keeps its own digest and pool path. The version is the one that control data carries, `5.23.1-1.linux`, not the `5.23.1-1` in the filename: it is what the index publishes and what `deb_packages` reports back from the host. No osquery binary lives in this repository.
+
+```json
+{
+  "name": "osquery",
+  "type": "apt",
+  "description": "osquery daemon and interactive shell",
+  "versions": [
+    {
+      "version": "5.23.1-1.linux",
+      "url": "https://github.com/osquery/osquery/releases/download/5.23.1/osquery_5.23.1-1.linux_amd64.deb",
+      "checksum": { "algorithm": "sha256", "value": "1431a9a6394657eba3cdd3476a462a6fe9721fc3664a70f23efcf7e37816787a" }
+    },
+    {
+      "version": "5.23.1-1.linux",
+      "url": "https://github.com/osquery/osquery/releases/download/5.23.1/osquery_5.23.1-1.linux_arm64.deb",
+      "checksum": { "algorithm": "sha256", "value": "062df9b6432ca1b374e80b24b54f027e224f1300d8bf6338182ec40f41b7975d" }
+    }
+  ]
+}
+```
+
+```bash
+bodega pkg import osquery.json
+bodega build upload apt osquery       # fetch, check each digest, package, upload
+```
+
+A `.deb` whose bytes do not match its `checksum` is refused at fetch and never reaches the suite. The digests above are the ones GitHub publishes for the 5.23.1 assets; for another release, read them from the release page or `gh api repos/osquery/osquery/releases/tags/<version>` and check one download against them. The entry names no suite, so it is served under `apt_codename`, and the OSV gate warns that it names no release, which is expected for a package no distribution publishes.
+
+FreeBSD packages osquery as `sysutils/osquery`, so a pkg repository bodega proxies from upstream serves it with nothing added, provided upstream built it for that ABI and branch. Measured 2026-10-09 for `FreeBSD:15:aarch64`: `quarterly` carries `osquery-5.23.0_1` and `latest` carries none, so a host on `latest` gets `No packages available to install matching 'osquery'` from `setup.sh`.
+
+A FreeBSD host enrolls and runs bodega's schedule, but it stores no report yet: the osquery FreeBSD build registers no `pkg_packages` table, so the FreeBSD query fails on every run ([#100](https://github.com/ravinald/bodega/issues/100)).
+
 ##### Mode A: bodega as the osquery server
 
 Mint an enroll secret per host (or per group of hosts that should share one identity). The secret is printed once and only its peppered hash is stored:
@@ -5978,20 +6027,26 @@ Mint an enroll secret per host (or per group of hosts that should share one iden
 bodega osquery secret create osq web-01 --expires 30d
 ```
 
-On the host, write the secret to a file only root can read and start `osqueryd` with:
+On the host, [`setup.sh --systems osquery`](#setup-script) does the rest: it installs osquery from bodega, writes the secret and the flags below, and enables and restarts `osqueryd`. The flags are the plan's `osquery` record, served at `GET /client/osquery`, and look like this for a Linux host with `public_url` set to `https://bodega.example.com:8443` and `interval` at `1h`:
 
 ```text
 --tls_hostname=bodega.example.com:8443
---tls_server_certs=/etc/osquery/bodega-ca.pem
+--tls_server_certs=/etc/ssl/certs/ca-certificates.crt
 --enroll_secret_path=/etc/osquery/bodega.secret
 --enroll_tls_endpoint=/api/v1/inventory/sources/osq/enroll
 --config_plugin=tls
 --config_tls_endpoint=/api/v1/inventory/sources/osq/config
+--config_refresh=3600
 --logger_plugin=tls
 --logger_tls_endpoint=/api/v1/inventory/sources/osq/log
 ```
 
-osquery speaks only HTTPS to a tls plugin, so bodega must answer TLS at `--tls_hostname`, directly or behind a proxy. `--tls_server_certs` is the CA bundle that signed that certificate. `--logger_plugin` takes a list, so `filesystem,tls` keeps a local log as well. The three routes are exempt from `admin_permit_cidr` like every registered push route.
+| OS      | Flags file                             | Enroll secret                          | `--tls_server_certs`                 |
+| ------- | -------------------------------------- | -------------------------------------- | ------------------------------------ |
+| Linux   | `/etc/osquery/osquery.flags`           | `/etc/osquery/bodega.secret`           | `/etc/ssl/certs/ca-certificates.crt` |
+| FreeBSD | `/usr/local/etc/osquery/osquery.flags` | `/usr/local/etc/osquery/bodega.secret` | `/etc/ssl/cert.pem`                  |
+
+osquery speaks only HTTPS to a tls plugin, so bodega must answer TLS at `--tls_hostname`, directly or behind a proxy, and `--tls_hostname` and the endpoints come from `public_url`, host and port and path. The plan skips osquery when `public_url` is `http://`. `--tls_server_certs` names the host's system trust store rather than the bundle osquery's package carries, so a private CA that signed bodega's certificate is trusted once it is added the usual way: `update-ca-certificates` on Debian and Ubuntu, or a copy in `/usr/local/share/certs` and `certctl rehash` on FreeBSD (`certctl trust` alone does not survive the next rehash). `--config_refresh` is the source's `interval`, so a schedule change reaches the host without a restart. `--logger_plugin` takes a list, so `filesystem,tls` keeps a local log as well; set it by hand and the next `setup.sh` run shows the diff that would undo it. The three routes are exempt from `admin_permit_cidr` like every registered push route.
 
 | Endpoint | Request                                            | Answer                                                                                                               |
 | -------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
