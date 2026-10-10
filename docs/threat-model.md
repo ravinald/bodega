@@ -257,7 +257,7 @@ risk:
     `//host`) goes through the same cut as `url`, whatever its key, except
     the five apt keys below, which are refused rather than cut. The test is
     on the whole value: a URL inside longer text (`see
-    https://user:secret@host/`), a schemeless `user:secret@host/x` and a
+https://user:secret@host/`), a schemeless `user:secret@host/x` and a
     secret that is not part of a URL are published as written.
   - **`metadata.attestation_uri` takes no credential.** Its endpoint answers
     an `http(s)` uri with a 302 whose `Location` the client follows, so the
@@ -292,6 +292,7 @@ risk:
   from the body, and a test of a redirect asserts it on the `Location`
   header separately, since that is a different code path carrying the same
   string.
+
 - **A secret an operator writes into configuration.** `gomod_upstream`,
   `npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream`
   and each `apt_upstreams` `url` accept userinfo, so a private index can be
@@ -371,6 +372,7 @@ risk:
 
   A manifest read from the API and pushed back through an import arrives
   without the userinfo, query and fragment of its `url`.
+
 - **A replacement read while it is being written.** On a `local` backend a
   replacement is written to a staging file inside a directory of its own, and
   both are reduced to their mode bits before the first byte lands: every ACL
@@ -663,6 +665,70 @@ defence against:
   An operator who wants a mirror no client request can make phone home sets
   `proxy_cache_enabled: false` and accepts that a package the mirror lacks is
   a 404.
+
+## Host inventory reconciliation
+
+Everything above protects the path through bodega. A host that reaches a
+public registry directly never touches that path, and `bodega doctor` only
+reads the configuration that should prevent it. [Inventory
+reconciliation](usage.md#reconciliation) looks at the result instead: each
+host's installed packages, as a collector reports them, compared against
+bodega's own record of what it served that host, served to someone else,
+cataloged, and refused. A component bodega never served or cataloged is
+`unknown`, the likely mark of a bypass; one bodega refused is `refused`
+however it arrived.
+
+What it proves is narrower than the name suggests:
+
+- **A host reports on itself.** osquery, a CycloneDX generator or a shipper
+  runs on the host it describes, under that host's trust. bodega never
+  connects to a host to look, so every report is the host's own word.
+- **Root on the host can omit or forge components.** Whoever holds root can
+  remove a package from the report, rewrite its version, stop the collector,
+  or post a fabricated report with the host's credential. The control catches
+  drift and process bypass (a developer who pointed pip at PyPI, an image
+  built from the wrong mirror), not an attacker who already owns the host. A
+  collector that goes quiet is reported as [stale](usage.md#staleness), so
+  silence is a finding, but a forged report that arrives on time is not.
+- **It is detective and after the fact.** A report arrives after the install,
+  and classification happens when it arrives. Nothing here stops a package
+  from being fetched, installed or run, and a package installed and removed
+  between two reports is never seen.
+- **apt and pip components match on name and version only.** Neither dpkg
+  nor pip records where a package came from, so a host that installed the
+  same name and version from a public mirror looks like one bodega served.
+  The digest check catches different bytes only where both sides record a
+  sha256, which an apt or pip inventory usually does not carry.
+
+A second source on the same host helps at the edges. Where two collectors
+cover one ecosystem and one omits a component the other reports, bodega
+records a [source disagreement](usage.md#source-disagreement). Both
+collectors still run under the host's root, so a disagreement is evidence of
+a broken or misconfigured collector, and evidence of tampering only once one
+of the two reads the host from outside its trust boundary (a scanner over a
+disk snapshot, say), which bodega does not yet distinguish.
+
+### Not SLSA Dependency L3
+
+This control is not a path to SLSA Dependency L3 and does not compensate for
+its absence. The [Dependency track
+draft](https://slsa.dev/spec/draft/dependency-track#dep-enforce-curated-feed)
+requires at L3 that build and developer environments "MUST NOT be able to
+resolve dependencies outside the platform", and that "Network policy or
+equivalent access controls MUST prevent it, not just detect it after the
+fact." Reconciliation is detection after the fact by construction.
+
+The L3 path is **egress control: hosts may reach only bodega.** That is
+infrastructure, not bodega code: default-deny outbound on a network firewall,
+a cloud security group, or a host firewall managed from off the host, with
+bodega the one permitted package destination. Public registries sit behind
+CDNs whose addresses change, so allow-listing the registries you mean to
+block does not work; denying everything and allowing bodega does. A blocked
+flow also leaves evidence the host cannot erase, which no self-report can.
+
+Reconciliation sits beside egress control rather than instead of it: it
+reports what got through a gap in the egress policy, or what arrived before
+the policy existed.
 
 ## Out-of-scope distribution formats
 

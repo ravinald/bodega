@@ -3287,7 +3287,7 @@ bodega treats Linux and FreeBSD as peers. Both run the server, both are clients 
 | Client of the server                            | apt, and every language client                       | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
 | Client configuration written by `bodega doctor` | apt sources and keyring, credentials                 | `pkg` repository configuration, credentials                                                                                     |
 | Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, GOPROXY | pkg repositories, `make.conf`, pip, npm, cargo, GOPROXY                                                                         |
-| Profile rules                                   | per package; apt hosts read a filtered codename      | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))         |
+| Profile rules                                   | per package; apt hosts read a filtered codename      | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))           |
 | Release archive                                 | amd64, arm64                                         | amd64, arm64                                                                                                                    |
 | Distribution package                            | `.deb` and `.rpm`, with the systemd unit             | not yet                                                                                                                         |
 | Service definition                              | [bodega.service](bodega.service) (systemd)           | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
@@ -3407,16 +3407,16 @@ sudo chmod 0600 /etc/bodega/apt-signing.key
 
 The script reads these from `/etc/rc.conf`; set them with `sysrc`:
 
-| Variable               | Default                      | Meaning                                                                                       |
-| ---------------------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
-| `bodega_enable`        | `NO`                         | Start at boot. `service bodega enable` sets it.                                               |
-| `bodega_user`          | `bodega`                     | The account the server runs as. Name it in `BODEGA_SERVICE_USER` when minting tokens.         |
-| `bodega_config`        | `/etc/bodega/config.json`    | Exported to the server as `BODEGA_CONFIG_FILE`.                                               |
-| `bodega_flags`         | empty                        | Appended to `bodega serve`, for example `--allow-plaintext=false`.                            |
-| `bodega_chdir`         | `/var/lib/bodega`            | Working directory. A relative `manifest_dir` resolves against it.                             |
-| `bodega_logfile`       | `/var/log/bodega.log`        | Where the server's stdout and stderr go. Every directory above it must be root's alone.       |
-| `bodega_restart_delay` | `5`                          | Seconds `daemon(8)` waits before restarting a server that exited.                             |
-| `bodega_env_file`      | unset                        | A file of `VAR=value` lines for the server's environment, such as S3 credentials.             |
+| Variable               | Default                   | Meaning                                                                                 |
+| ---------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
+| `bodega_enable`        | `NO`                      | Start at boot. `service bodega enable` sets it.                                         |
+| `bodega_user`          | `bodega`                  | The account the server runs as. Name it in `BODEGA_SERVICE_USER` when minting tokens.   |
+| `bodega_config`        | `/etc/bodega/config.json` | Exported to the server as `BODEGA_CONFIG_FILE`.                                         |
+| `bodega_flags`         | empty                     | Appended to `bodega serve`, for example `--allow-plaintext=false`.                      |
+| `bodega_chdir`         | `/var/lib/bodega`         | Working directory. A relative `manifest_dir` resolves against it.                       |
+| `bodega_logfile`       | `/var/log/bodega.log`     | Where the server's stdout and stderr go. Every directory above it must be root's alone. |
+| `bodega_restart_delay` | `5`                       | Seconds `daemon(8)` waits before restarting a server that exited.                       |
+| `bodega_env_file`      | unset                     | A file of `VAR=value` lines for the server's environment, such as S3 credentials.       |
 
 `bodega_flags` reaches `bodega serve`, not `daemon(8)`. The server's temporary files go to `tmp/` under `bodega_chdir`, which the account itself creates mode 0700 on every start; the script never runs as root on a path the account can write.
 
@@ -3761,12 +3761,12 @@ An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bode
 
 A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
 
-| Client                         | What bodega composes                                                                                                                                 |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| apt                            | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                                                    |
-| FreeBSD `pkg`                  | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                                                |
-| pip, npm, cargo, Go, helm, git | each file below; `doctor --write-credentials` places the token each one reads, and for helm also registers the repository                            |
-| FreeBSD ports (`make.conf`)    | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                         |
+| Client                         | What bodega composes                                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| apt                            | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                            |
+| FreeBSD `pkg`                  | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                        |
+| pip, npm, cargo, Go, helm, git | each file below; `doctor --write-credentials` places the token each one reads, and for helm also registers the repository    |
+| FreeBSD ports (`make.conf`)    | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles) |
 
 **APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 
@@ -3830,8 +3830,8 @@ That is the file `go env -w GOPROXY=https://bodega-host:8080/go` writes, and the
 apiVersion: ""
 generated: "0001-01-01T00:00:00Z"
 repositories:
-- name: bodega
-  url: https://bodega-host:8080/helm
+  - name: bodega
+    url: https://bodega-host:8080/helm
 ```
 
 helm unmarshals the whole file, so the list item alone is not something to install: `helm repo list` over a file holding only the `- name: bodega` entry answers `Error: no repositories to show`. On a host that already has the file, `helm repo add bodega https://bodega-host:8080/helm` adds the same entry to it. `bodega doctor --write-credentials` writes this document with the credential added to the entry. The paths are helm's defaults and move with `HELM_REPOSITORY_CONFIG` or `XDG_CONFIG_HOME`.
@@ -3874,7 +3874,7 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 
 ```ini
 [url "https://bodega-host:8080/git/github/"]
-	insteadOf = https://github.com/
+    insteadOf = https://github.com/
 ```
 
 git rewrites any URL starting with the `insteadOf` value onto the `url` before it connects, so `git clone https://github.com/octocat/Hello-World.git` clones from `https://bodega-host:8080/git/github/octocat/Hello-World.git` with nothing else changed. `git config --global url.https://bodega-host:8080/git/github/.insteadOf https://github.com/` writes the same entry. bodega renders one section per namespace, sorted by name, and none when `git_upstreams` is empty. The clone URL still has to end in `.git`, as it does against a forge. See [Git smart-HTTP](#git-smart-http) for what bodega does with that request.
@@ -4796,13 +4796,13 @@ It needs a ports tree on the server to read `distinfo` from. Keep it at the revi
 "distfiles_root": ""
 ```
 
-| Key                               | Default                                         | What it does                                                                                                                                                                                                                                                                                                                                                                                                       |
-| --------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Key                               | Default                                         | What it does                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `distfiles_ports_tree`            | unset                                           | Root of the ports tree whose `distinfo` files decide what is admitted. Unset, `/distfiles/` answers every request 404 and `build fetch distfiles` refuses every entry. Any absolute path; the tree need not sit at `/usr/ports`. The shipped systemd unit hides `/tmp`, `/var/tmp` and `/home` from the server, so a tree under or reached through one of them needs the override in [Running under systemd](#running-under-systemd). |
-| `distfiles_upstream`              | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                                                                                                                                                                                                                                               |
-| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIRs `build fetch distfiles` writes, one per declared environment at `<distfiles_root>/distfiles/@<environment digest>/`, with the client check beside them. See [The client check](#the-client-check).                                                                                                                                                                                            |
-| `distfiles_environment_variables` | empty                                           | The supported client environment's make variables: each name maps to every value it may hold where a port reads it. `[]` declares it undefined on every client. See [The client environment](#the-client-environment).                                                                                                                                                                                             |
-| `distfiles_environment_files`     | empty                                           | The supported client environment's files outside the ports tree: each absolute client-host path maps to its alternatives, `"absent"` or the absolute path of a snapshot on the bodega host. See [The client environment](#the-client-environment).                                                                                                                                                                 |
+| `distfiles_upstream`              | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                                                                                                                                                                                                                                                                  |
+| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIRs `build fetch distfiles` writes, one per declared environment at `<distfiles_root>/distfiles/@<environment digest>/`, with the client check beside them. See [The client check](#the-client-check).                                                                                                                                                                                                               |
+| `distfiles_environment_variables` | empty                                           | The supported client environment's make variables: each name maps to every value it may hold where a port reads it. `[]` declares it undefined on every client. See [The client environment](#the-client-environment).                                                                                                                                                                                                                |
+| `distfiles_environment_files`     | empty                                           | The supported client environment's files outside the ports tree: each absolute client-host path maps to its alternatives, `"absent"` or the absolute path of a snapshot on the bodega host. See [The client environment](#the-client-environment).                                                                                                                                                                                    |
 
 `distfiles` is host-scoped in the upstream allow-list, the same as `apt` and `freebsd`: `bodega policy add distfiles distcache.FreeBSD.org` names the host. A digest establishes that the bytes are right, not that the operator agreed to contact the host, so both the route and `build fetch distfiles` check the allow-list before any upstream request. A denied miss answers `403` and records a `policy_violation` row.
 
@@ -5228,7 +5228,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | ------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET    | `/api/v1/packages`                         | All entries across all types                                                                                                                                                            |
 | GET    | `/api/v1/packages/{type}`                  | Entries for one type                                                                                                                                                                    |
-| GET    | `/api/v1/packages/{type}/{name}`           | Single entry details, with `client_config`: what a client of the package installs. See [`client_config`](#client_config-on-get-apiv1packagestypename)                               |
+| GET    | `/api/v1/packages/{type}/{name}`           | Single entry details, with `client_config`: what a client of the package installs. See [`client_config`](#client_config-on-get-apiv1packagestypename)                                   |
 | GET    | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
 | GET    | `/api/v1/status`                           | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
 | GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
@@ -5821,7 +5821,6 @@ An allow-list refusal is a `cache` event with `status=policy_violation` rather t
 
 A read-only audit database used to be the quieter version of the same loss: `Record` no-oped, `Query` kept answering, so `/api/v1/audit` responded and simply stopped growing. `bodega serve` now refuses to start on it, naming the file and the uid. Read commands still work against a database they cannot write, which is what keeps `bodega audit events` usable as a non-root user against a root-owned file.
 
-
 ### Admission decisions
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
@@ -5859,6 +5858,7 @@ bodega audit admissions npm minimist 1.2.8 --json
 ```
 
 **Not yet covered.** The pypi build admits a package by name before pip resolves a version, so its wheels, and every transitive dependency in the closure, pin with a `not_evaluated` row and a WARN on first fetch. An apt or FreeBSD proxy fill records age and OSV as `not_evaluated` even where import would evaluate OSV for apt.
+
 ---
 
 ## Inventory
@@ -6170,10 +6170,10 @@ A source type is one package implementing `inventory.Source` from `internal/inve
 
 ```go
 type Source interface {
-	Type() string
-	Mode() Mode
-	Capabilities() []Capability
-	Normalize(doc []byte, externalID string) (Batch, error)
+    Type() string
+    Mode() Mode
+    Capabilities() []Capability
+    Normalize(doc []byte, externalID string) (Batch, error)
 }
 ```
 
@@ -6242,7 +6242,7 @@ An instance mapped to a host is stale on it when the host has no report through 
 
 #### Baselines
 
-A stock host's first report lists its whole image as `unknown`. Accept a baseline at provisioning, before anything else is installed:
+Accepting a baseline is a required step of bringing a host under reconciliation, not an option. A stock host's first report lists its whole image as `unknown`, because the distribution installed it and bodega served none of it: 705 apt packages on the first stock guest measured. Until a baseline covers them, every report from that host exits 1 on hundreds of components nobody needs to act on, and an alert that always fires is one people learn to ignore. Accept a baseline at provisioning, before anything else is installed, so the image is accepted and only what arrives afterwards is judged:
 
 ```bash
 bodega inventory accept web-01                     # the host's current set
@@ -6259,6 +6259,16 @@ Each arriving report with at least one `refused` or `unknown` component writes o
 #### Limits
 
 Classification reads the served set through the audit sink. With `audit_sink` set to `syslog` or `jsonl` there is no table to read, so reports are stored unclassified and read `unclassified`, the server logs an `ERROR` per report, and `bodega inventory report` exits 1 for every host they cover. No `inventory` audit event is written for them. Each arriving report reads every distinct object bodega has served to anyone, which on a large `sqlite` event table is a scan per report.
+
+What reconciliation can and cannot prove about a host, and why it is not SLSA Dependency L3, is in the [threat model](threat-model.md#host-inventory-reconciliation).
+
+### Mapping
+
+| Framework | Control                                                                                                                                                                                                     | What bodega supplies                                                                                             |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| S2C2F     | [AUD-2](https://github.com/ossf/s2c2f/blob/main/specification/framework.md#secure-supply-chain-consumption-framework-requirements): audit that developers consume OSS through the approved ingestion method | `unknown` and `refused` components, against what bodega served and refused                                       |
+| CIS v8    | Control 2, Safeguard [2.3](https://cas.docs.cisecurity.org/en/latest/source/Controls2/#23-address-unauthorized-software): unauthorized software is removed or receives a documented exception               | `inventory report` names it; `accept --comment` records the exception, `discover promote` brings it under bodega |
+| CIS v8    | Control 2, Safeguard [2.4](https://cas.docs.cisecurity.org/en/latest/source/Controls2/#24-utilize-automated-software-inventory-tools): automated software inventory tools                                   | The collectors inventory; bodega stores their reports and compares them against what it served                   |
 
 ## TUI
 
