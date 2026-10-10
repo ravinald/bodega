@@ -730,6 +730,48 @@ Reconciliation sits beside egress control rather than instead of it: it
 reports what got through a gap in the egress policy, or what arrived before
 the policy existed.
 
+## What an attestation proves
+
+Every artifact bodega admits gets a signed statement (see
+[design.md](design.md#attestations) for its format and
+[usage.md](usage.md#attestations) for fetching and verifying one). A statement
+that verifies against a key ID you pinned says one thing: **this bodega's
+policy admitted these bytes at this time.** Spelled out:
+
+- **These bytes.** The subject is a purl and a SHA-256. `bodega attest
+  verify` checks that digest against the artifact you hold, so the statement
+  is about that file and no other.
+- **This bodega.** `ingestionPlatform.id` names the instance, and the key ID
+  names the key it signed with. Nothing else in the statement authenticates
+  where it came from.
+- **This policy.** `policyEvaluations` carries the admission row as
+  recorded: the decision, every check's action and status, and the digest of
+  the allow-list, age and OSV policy in force. A check that did not run says
+  `not_evaluated`, and an object pinned with no decision behind it carries
+  nothing else. `verify` fails a statement whose decision is not `admitted`
+  or whose checks include a `block`; it passes `not_evaluated`, so a consumer
+  that needs every check to have run has to read the evaluations itself.
+- **At this time.** `decidedAt` and `ingestedAt` are the bodega host's
+  clock. No timestamp authority or transparency log witnesses them.
+
+It does not prove that the artifact is safe, that its publisher is who the
+registry says (`upstreamProvenance` and `publisherSignature` say
+`unavailable` until bodega verifies those), or that the policy was a good
+one. It also proves nothing about a statement signed after the **bodega host
+is compromised**. The key that signs is loaded by the serving process and
+read by `bodega attest backfill` and `bodega build fetch` on the same host,
+so anyone who controls that host can sign a statement admitting anything, at
+any time, under any policy digest, and it verifies like every honest one.
+Statements signed before the compromise stay meaningful only if the
+compromise could not reach them: on S3, keep `attestations/` under Object
+Lock (see [design.md](design.md#storage-layout)), so that an attacker who
+can sign new envelopes cannot also rewrite the old ones. Without it, a
+versioned bucket keeps the overwritten version as noncurrent, because
+`bodega init` sets no noncurrent expiry on `attestations/` and the runtime
+policy cannot delete versions; an auditor has to go looking for it. Rotating
+the key does not repair this. A verifier has to drop the stolen key ID, and from then
+on it rejects every statement that key signed, honest ones included.
+
 ## Out-of-scope distribution formats
 
 Three properties make a distribution format incompatible with bodega's

@@ -10,6 +10,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Object keys — the one derivation of where an artifact's bytes live.
@@ -73,6 +74,10 @@ const (
 	// ManifestsPrefix roots the manifest tree on an object store backend.
 	ManifestsPrefix = "manifests/"
 
+	// AttestationPrefix roots the signed envelopes bodega emits for what it
+	// admitted: see AttestationKey.
+	AttestationPrefix = "attestations/"
+
 	gomodPrefix      = "gomod/"
 	helmPrefix       = "charts/"
 	npmPrefix        = "npm/"
@@ -87,6 +92,7 @@ const (
 // drifting.
 func StoragePrefixes() []string {
 	return []string{
+		AttestationPrefix,
 		BinaryPrefix,
 		cargoCratePrefix,
 		cargoIndexPrefix,
@@ -623,6 +629,31 @@ func GitKey(name, ref string, release bool) string {
 func PypiWheelKey(filename string) string {
 	return PypiWheelPrefix + filename
 }
+
+// AttestationDir returns the prefix every envelope signed for objectKey sits
+// under. The object key goes in whole, so an envelope lives beside nothing but
+// its own artifact's history and a listing of this prefix is that history.
+func AttestationDir(objectKey string) string {
+	return AttestationPrefix + objectKey + "/"
+}
+
+// AttestationKey returns the key of the envelope signed for objectKey under
+// the admission decided at decidedAt.
+//
+// Named by the decision rather than by the moment of signing, for two
+// reasons. A re-admission is a new decision and so a new key, which keeps
+// every earlier envelope in place. A repeat pin under the same decision lands
+// on the key already written, so re-verifying a cached object never stacks up
+// copies of one statement. The fixed-width UTC form sorts lexically in time
+// order, which is how the newest is found without reading any envelope.
+func AttestationKey(objectKey string, decidedAt time.Time) string {
+	return AttestationDir(objectKey) + decidedAt.UTC().Format(attestationStamp) + AttestationExt
+}
+
+// AttestationExt is the suffix of every envelope key.
+const AttestationExt = ".dsse.json"
+
+const attestationStamp = "20060102T150405.000000000Z"
 
 // AptKey returns the key for a .deb at poolPath, which is relative to
 // AptPrefix and is the same string the Packages index publishes as Filename.

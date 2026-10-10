@@ -119,7 +119,7 @@ func TestEnforcePolicyRecordsTheAdmission(t *testing.T) {
 			}
 			key := manifest.NpmTarballKey("minimist", tc.version)
 			cs := &manifest.Checksum{Algorithm: "sha256", Value: strings.Repeat("a", 64)}
-			if err := c.pinArtifactDigest(t.Context(), key, manifest.TypeNpm, "minimist", tc.version, cs); err != nil {
+			if err := c.pinArtifactDigest(t.Context(), key, manifest.TypeNpm, "minimist", tc.version, cs, nil); err != nil {
 				t.Fatalf("pinArtifactDigest: %v", err)
 			}
 			if got := onlyAdmission(t, c, manifest.TypeNpm, "minimist", tc.version).ObjectKey; got != key {
@@ -139,7 +139,7 @@ func TestPinWithNoAdmissionWarns(t *testing.T) {
 	c, out := admissionConfig(t, true)
 	key := "pypi/wheels/idna-3.7-py3-none-any.whl"
 	cs := &manifest.Checksum{Algorithm: "sha256", Value: strings.Repeat("b", 64)}
-	if err := c.pinArtifactDigest(t.Context(), key, manifest.TypePypi, "idna", "3.7", cs); err != nil {
+	if err := c.pinArtifactDigest(t.Context(), key, manifest.TypePypi, "idna", "3.7", cs, nil); err != nil {
 		t.Fatalf("pinArtifactDigest: %v", err)
 	}
 	row := onlyAdmission(t, c, manifest.TypePypi, "idna", "3.7")
@@ -151,7 +151,7 @@ func TestPinWithNoAdmissionWarns(t *testing.T) {
 	}
 	// The next build verifies against the pin, finds that row and stays quiet.
 	out.Reset()
-	if err := c.pinArtifactDigest(t.Context(), key, manifest.TypePypi, "idna", "3.7", cs); err != nil {
+	if err := c.pinArtifactDigest(t.Context(), key, manifest.TypePypi, "idna", "3.7", cs, nil); err != nil {
 		t.Fatalf("second pin: %v", err)
 	}
 	if out.Len() != 0 {

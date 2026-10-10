@@ -188,7 +188,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		}
 		// distinfo pinned the digest before the fetch; this is the moment
 		// bytes matching it exist under the key.
-		cfg.pinAdmission(ctx, manifest.TypeDistfiles, name, "", manifest.DistfilesKey(name))
+		cfg.pinAdmission(ctx, manifest.TypeDistfiles, name, "", manifest.DistfilesKey(name), entry.SHA256, nil)
 		elapsed := time.Since(start)
 		_, _ = fmt.Fprintf(out, "    SHA-256: %s (matches distinfo from %s)\n    Size: %s\n    Done (%s)\n",
 			entry.SHA256, strings.Join(entry.Ports, ", "), humanBytes(entry.Size), elapsed.Round(time.Millisecond))

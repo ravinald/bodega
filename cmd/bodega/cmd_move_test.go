@@ -559,3 +559,24 @@ func assertSpooledAt(t *testing.T, spoolDir, buildRoot string) {
 		t.Errorf("the copy spooled under %s, ignoring the configured spool_dir", fallback)
 	}
 }
+
+// The envelopes signed for an artifact move with it, and --delete-source
+// removes them from the source with the artifact.
+func TestMoveCarriesAttestations(t *testing.T) {
+	src := storage.NewMemory()
+	src.Seed(exampleToolKey, "payload")
+	envelope := manifest.AttestationDir(exampleToolKey) + "20261010T000000.000000000Z" + manifest.AttestationExt
+	src.Seed(envelope, `{"payloadType":"application/vnd.in-toto+json"}`)
+	dst := storage.NewMemory()
+
+	m, _, pm, out := moveFixture(t, src, dst, true)
+	if err := m.moveVersion(t.Context(), pm, 0); err != nil {
+		t.Fatalf("moveVersion: %v\n%s", err, out)
+	}
+	if got, _ := dst.Get(t.Context(), envelope); string(got) != `{"payloadType":"application/vnd.in-toto+json"}` {
+		t.Errorf("envelope on the destination = %q", got)
+	}
+	if info, _ := src.Head(t.Context(), envelope); info != nil && info.Exists {
+		t.Error("--delete-source left the envelope on the source")
+	}
+}

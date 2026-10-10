@@ -1129,7 +1129,7 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	if summary.HasFailures() {
 		return summary
 	}
-	return fetchPypiClosure(cfg, summary)
+	return fetchPypiClosure(cfg, store, summary)
 }
 
 // resolvePypiRequirements writes combined-requirements.txt and, when the
@@ -1332,7 +1332,7 @@ func resolvePypiRequirements(cfg *Config, store *manifest.Store) *Summary {
 
 // fetchPypiClosure downloads everything the resolved requirements imply, pins a
 // digest per file, and writes the lock the build reads instead of an index.
-func fetchPypiClosure(cfg *Config, summary *Summary) *Summary {
+func fetchPypiClosure(cfg *Config, store *manifest.Store, summary *Summary) *Summary {
 	ctx := context.Background()
 	out := cfg.stdout()
 	root := cfg.rootFor(manifest.TypePypi)
@@ -1378,7 +1378,7 @@ func fetchPypiClosure(cfg *Config, summary *Summary) *Summary {
 		return fail(fmt.Errorf("clear the wheelhouse at %s: %w", house, err))
 	}
 
-	if err := cfg.pinPypiClosure(ctx, arts, house); err != nil {
+	if err := cfg.pinPypiClosure(ctx, store, arts, house); err != nil {
 		return fail(err)
 	}
 	lock := pypiLockPath(root)

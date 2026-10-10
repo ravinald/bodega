@@ -17,6 +17,7 @@ Comprehensive documentation for the bodega package repository manager.
 - [Supply Chain Management](#supply-chain-management)
 - [Proxy/Cache](#proxycache)
 - [Checksum Verification](#checksum-verification)
+- [Attestations](#attestations)
 - [Audit Trail](#audit-trail)
 - [Inventory](#inventory)
 - [TUI](#tui)
@@ -39,7 +40,7 @@ Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default
   public acl: CONFIGURED (all blocked)
   versioning: ENABLED
   encryption: CONFIGURED (AES-256)
-  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ kept)
+  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ and attestations/ kept)
   binaries/              CREATED
   ...
 ```
@@ -2782,6 +2783,8 @@ A default config is created on first run. All fields are optional.
   "allow_plaintext": false,
   "listen_addr": ":8080",
   "public_url": "",
+  "attestation_platform_id": "",
+  "attestation_keyids": [],
   "server_url": "",
   "token": "",
   "proxy_cache_enabled": false,
@@ -2857,6 +2860,8 @@ Both suites are then served by one instance and apt resolves dependencies across
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
 It is also consumed rather than displayed. Every `dist.tarball` bodega writes into an npm packument is built from it (see [Client configuration](#client-configuration)), so a `public_url` naming a host or scheme clients cannot reach fails `npm install` at the tarball fetch rather than at the packument, and npm reports a URL this key composed without naming the key or the packument it came in. Check it first when npm resolves a version and then 404s or times out fetching the `.tgz`.
+
+`attestation_platform_id` is the `ingestionPlatform.id` every attestation this instance signs carries. Empty means `public_url` (resolved the same way, so `--public-url` and `$BODEGA_PUBLIC_URL` count), and with that empty too, `bodega://<hostname>`. Set it when a verifier needs a stable name for the instance that does not change with its URL. `attestation_keyids` is the list of attestation key IDs `bodega attest verify` trusts when no `--key` is given; see [Verifying](#verifying).
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
@@ -3013,12 +3018,12 @@ Two things make a correct policy look broken. A policy attached in the last few 
 
 **Lifecycle.** `bodega init` keeps two kinds of rule on the bucket, each with an ID starting `bodega-`:
 
-| Rule                               | Scope                                                                                     | Retention                           |
-| ---------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
-| Abort incomplete multipart uploads | the whole bucket                                                                          | 7 days after the upload began       |
-| Expire noncurrent versions         | each prefix in [Storage Layout](#storage-layout) except `manifests/`, one rule per prefix | 30 days after a version is replaced |
+| Rule                               | Scope                                                                                                         | Retention                           |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Abort incomplete multipart uploads | the whole bucket                                                                                              | 7 days after the upload began       |
+| Expire noncurrent versions         | each prefix in [Storage Layout](#storage-layout) except `manifests/` and `attestations/`, one rule per prefix | 30 days after a version is replaced |
 
-A multipart upload that dies partway leaves parts that are billed, appear in no listing and serve nothing; the first rule clears them. The second bounds what versioning costs where history is worth nothing: under an artifact prefix, a noncurrent version is a byte-identical replacement or a catalogue upstream has since replaced. `manifests/` keeps every version, for the reason the runtime policy withholds `s3:DeleteObjectVersion`. S3 lifecycle filters take a prefix and no wildcard, so "everything except `manifests/`" is one rule per prefix.
+A multipart upload that dies partway leaves parts that are billed, appear in no listing and serve nothing; the first rule clears them. The second bounds what versioning costs where history is worth nothing: under an artifact prefix, a noncurrent version is a byte-identical replacement or a catalogue upstream has since replaced. `manifests/` and `attestations/` keep every version, for the reason the runtime policy withholds `s3:DeleteObjectVersion`: when a compromised service overwrites or deletes a manifest or a signed envelope, the honest version stays behind as noncurrent, and an expiry rule would remove it 30 days later. S3 lifecycle filters take a prefix and no wildcard, so "everything except `manifests/` and `attestations/`" is one rule per prefix. A bucket that already carries a `bodega-expire-noncurrent-attestations` rule loses it on the next `bodega init`, which treats it as drift.
 
 Rules whose ID does not start with `bodega-` are yours, and `bodega init` writes them back unchanged. A `bodega-` rule edited on the bucket is drift, and the next `bodega init` rewrites it; the retention periods are `AbortIncompleteMultipartDays` and `NoncurrentVersionDays` in `internal/s3/init.go`. A named backend with a `prefix` gets its rules and markers at the bucket root, not under the prefix, so its noncurrent versions do not expire.
 
@@ -3183,7 +3188,7 @@ Pass --replace-placement to repoint the manifest at "bulk" and re-upload; the ol
 
 #### What is not placed
 
-Generated indexes, proxy-cache entries and attestation blobs have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable.
+Generated indexes, proxy-cache entries and envelopes an `s3://` `attestation_uri` names have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable. Envelopes bodega signs itself are placed with their artifact instead; see [Attestations](#where-envelopes-live).
 
 Every route that does hold a version entry for an uploaded artifact resolves by record: `binary`, `helm`, `npm`, `cargo`, `gomod`, `pypi` and `git` read the recorded name, and the apt pool reads the reverse `pool/` mapping the snapshot carries, because a `.deb` is addressed by path with no package and version in the request to look an entry up by. Nothing serving an uploaded artifact is left on the type rule.
 
@@ -3191,7 +3196,9 @@ One read holds an entry and stays on the type rule anyway: a package in `proxy` 
 
 #### Attestation envelopes resolve by the bucket in their URI
 
-An attestation envelope is written by an external sync service rather than by bodega, so `storage` on the version entry says where the artifact went and nothing about where the envelope stayed. `pkg move` does not carry it either, so after a move the two are on different backends by construction.
+This is about an envelope somebody other than bodega wrote and named in `attestation_uri`. Bodega's own envelopes sit beside their artifact and `pkg move` carries them; see [Attestations](#where-envelopes-live).
+
+An `attestation_uri` envelope is written outside bodega, so `storage` on the version entry says where the artifact went and nothing about where the envelope stayed. `pkg move` does not carry it either, so after a move the two are on different backends by construction.
 
 An `s3://<bucket>/<key>` `attestation_uri` is therefore resolved by its own bucket. `handleAttestation` matches `<bucket>` against every configured backend's label — `s3://<bucket>`, or `s3://<bucket>/<prefix>` for a backend rooted at a key prefix, in which case the URI's key must sit under that prefix — and reads from the one that answers. The URI is already in the manifest, so this needs no new field and nothing has to be migrated. An `http(s)` `attestation_uri` is redirected to rather than read, so it may not carry a credential; see [Credentials in a manifest](#credentials-in-a-manifest).
 
@@ -4268,7 +4275,7 @@ Or skip the network entirely: `bodega apt key export --keyring` writes the same 
 
 ### Attestation signing key
 
-bodega holds a third key, separate from the apt and pkg keys, whose only job is signing attestations about what it admitted. Keeping it separate means a stolen attestation key cannot sign an `InRelease` or a pkg catalogue, and a stolen apt or pkg key cannot vouch for a dependency. The server loads the key and publishes its public half; no route emits a signed attestation yet.
+bodega holds a third key, separate from the apt and pkg keys, whose only job is signing attestations about what it admitted (see [Attestations](#attestations)). Keeping it separate means a stolen attestation key cannot sign an `InRelease` or a pkg catalogue, and a stolen apt or pkg key cannot vouch for a dependency. The server loads the key, signs with it and publishes its public half; `bodega build fetch` and `bodega attest backfill` read the same file.
 
 As with the other two keys, the server only ever **loads** it. Generation is a CLI operation. The search order, first hit wins:
 
@@ -5224,21 +5231,22 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 
 ### Read endpoints
 
-| Method | Path                                       | Description                                                                                                                                                                             |
-| ------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/api/v1/packages`                         | All entries across all types                                                                                                                                                            |
-| GET    | `/api/v1/packages/{type}`                  | Entries for one type                                                                                                                                                                    |
-| GET    | `/api/v1/packages/{type}/{name}`           | Single entry details, with `client_config`: what a client of the package installs. See [`client_config`](#client_config-on-get-apiv1packagestypename)                                   |
-| GET    | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
-| GET    | `/api/v1/status`                           | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
-| GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
-| GET    | `/api/v1/attestation/keys`                 | Every published attestation signing key, unauthenticated. See [Attestation signing key](#attestation-signing-key)                                                                       |
-| GET    | `/api/v1/audit`                            | Query audit events (supports filters)                                                                                                                                                   |
-| GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
-| GET    | `/client/plan`, `/client/plan.txt`         | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
-| GET    | `/client/{system}`                         | One system's client file, rendered for the requesting host                                                                                                                              |
-| GET    | `/client/osquery-ship.sh`                  | The osquery result-log shipper. See [Mode B: the result-log shipper](#mode-b-the-result-log-shipper)                                                                                    |
-| GET    | `/healthz`                                 | Health probe (returns `ok`)                                                                                                                                                             |
+| Method | Path                                                   | Description                                                                                                                                                                             |
+| ------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/v1/packages`                                     | All entries across all types                                                                                                                                                            |
+| GET    | `/api/v1/packages/{type}`                              | Entries for one type                                                                                                                                                                    |
+| GET    | `/api/v1/packages/{type}/{name}`                       | Single entry details, with `client_config`: what a client of the package installs. See [`client_config`](#client_config-on-get-apiv1packagestypename)                                   |
+| GET    | `/api/v1/packages/{type}/{name}/{version}`             | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
+| GET    | `/api/v1/status`                                       | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
+| GET    | `/api/v1/config`                                       | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
+| GET    | `/api/v1/packages/{type}/{name}/{version}/attestation` | The newest attestation bodega signed for the version, else the `attestation_uri` passthrough; `?source=upstream` forces the passthrough. See [Attestations](#fetching)                  |
+| GET    | `/api/v1/attestation/keys`                             | Every published attestation signing key, unauthenticated. See [Attestation signing key](#attestation-signing-key)                                                                       |
+| GET    | `/api/v1/audit`                                        | Query audit events (supports filters)                                                                                                                                                   |
+| GET    | `/api/v1/profiles/{name}/pins`                         | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
+| GET    | `/client/plan`, `/client/plan.txt`                     | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
+| GET    | `/client/{system}`                                     | One system's client file, rendered for the requesting host                                                                                                                              |
+| GET    | `/client/osquery-ship.sh`                              | The osquery result-log shipper. See [Mode B: the result-log shipper](#mode-b-the-result-log-shipper)                                                                                    |
+| GET    | `/healthz`                                             | Health probe (returns `ok`)                                                                                                                                                             |
 
 #### `version` on `/api/v1/status`
 
@@ -5630,6 +5638,84 @@ bodega pkg checksum list                        # view all cached checksums
 bodega pkg checksum list --type gomod           # filter by type
 bodega pkg checksum clear gomod github.com/foo  # clear, next fetch recomputes
 ```
+
+---
+
+## Attestations
+
+When an [attestation signing key](#attestation-signing-key) is installed, bodega signs a statement for every artifact it admits, at the moment the artifact's digest is pinned: on a hosted fetch and on a proxy fill. Each is an in-toto Statement v1 with the SLSA Dependency track's `https://slsa.dev/dependency/v1` predicate, in a DSSE envelope. The statement names the artifact by purl and SHA-256 and carries the admission decision behind it: every check as the audit trail recorded it, and the policy digest. [design.md](design.md#attestations) describes the fields, and [threat-model.md](threat-model.md#what-an-attestation-proves) what a verified statement does and does not prove.
+
+Nothing is signed when:
+
+- no key is installed. The server logs that once at `WARN` when it starts, and a fetch prints nothing.
+- `audit_sink` is `syslog` or `jsonl`, or the audit store is read-only. The signer re-reads the admission table before every signature, and those keep no table to read. The server logs `attestations are off` once at `WARN` when it starts, naming the sink.
+- the admission on record does not support the statement: the version has no admission row, its newest decision is not `admitted`, or that decision names a different object. The signer refuses and logs `attestation not signed` at `ERROR` (a hosted fetch prints `ERROR: ... no attestation signed for <key>`) with the reason. The artifact is still served.
+
+A pin with no decision behind it, such as a wheel pip pulled in transitively, is signed with the checks its admission row records, which are all `not_evaluated`. It is never signed as a pass.
+
+### Where envelopes live
+
+Each envelope is stored under `attestations/<artifact key>/<decided_at>.dsse.json`, on the backend the artifact lives on. A hosted fetch writes it into the build tree at `<type root>/attestations/...` and `bodega build upload` sends it to wherever its artifact went. A proxy fill writes it into the backend it cached the artifact into. `bodega pkg move` copies a version's envelopes with it and, under `--delete-source`, deletes them from the source with it. pypi wheels upload as a directory, so their envelopes do too, from `<pypi root>/attestations/pypi/wheels/`.
+
+A re-admission writes a new envelope beside the earlier ones, so a version's directory is its history. A repeat pin under the same decision, such as a re-fetch that matches the pinned digest, lands on the envelope already written. On S3, keep the `attestations/` prefix under Object Lock; see [design.md](design.md#storage-layout).
+
+### Fetching
+
+```bash
+curl -s https://bodega.example/api/v1/packages/npm/lodash/4.17.21/attestation
+curl -s 'https://bodega.example/api/v1/packages/npm/lodash/4.17.21/attestation?source=upstream'
+```
+
+The route serves the newest envelope bodega signed for the version. With none, it falls back to the envelope the version's `metadata.attestation_uri` names, written by somebody else; `?source=upstream` goes to that directly. It answers 404 when neither exists. For pypi the newest envelope across the release's wheels is served, and its subject's `file_name` qualifier names the wheel it covers. The payload is base64 in the envelope's `payload` field:
+
+```bash
+curl -s https://bodega.example/api/v1/packages/npm/lodash/4.17.21/attestation | jq -r .payload | base64 -d | jq .predicate
+```
+
+### Verifying
+
+```bash
+bodega attest verify npm/lodash/4.17.21 --key 3db5a03ef0a8f221f36781ab6541e4e9b395599d53cdc848c580b9545b6e7c09
+bodega attest verify pypi/requests/2.31.0 --artifact requests-2.31.0-py3-none-any.whl
+bodega attest verify ./lodash.dsse.json --package npm/lodash/4.17.21 --artifact lodash-4.17.21.tgz --public-key attest.pub
+```
+
+`verify` runs five checks and prints each one; any failure prints what it expected and what it observed, and the command exits non-zero:
+
+| Check            | Passes when                                                                                     |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| `signature`      | the envelope carries a valid Ed25519 signature by a key ID you trust                            |
+| `predicate-type` | the statement is in-toto v1 with the `https://slsa.dev/dependency/v1` predicate                 |
+| `subject-digest` | the subject's sha256 matches the artifact bytes                                                 |
+| `subject-name`   | the subject's purl, qualifiers aside, names the package and version you asked about             |
+| `policy`         | the decision was `admitted` and no evaluation is a `block`; `not_evaluated` passes and is named |
+
+```text
+ok    signature       valid signature by 3db5a03e...
+ok    predicate-type  https://in-toto.io/Statement/v1 / https://slsa.dev/dependency/v1
+FAIL  subject-digest  expected sha256:9f86d081...
+                      observed sha256:2c26b46b...
+ok    subject-name    pkg:npm/lodash@4.17.21
+ok    policy          no block
+Error: attestation for npm/lodash@4.17.21 failed 1 of 5 checks
+```
+
+The trusted key IDs come from `--key` (repeatable) or `attestation_keyids` in the config file, and verify refuses to run with neither. Learn them the way [Pinning the key ID](#pinning-the-key-id) describes, not from the server being checked: verify fetches the public keys from `/api/v1/attestation/keys`, or reads them from `--public-key`, and accepts a key only when it hashes to an ID you pinned.
+
+Given `type/name/version`, verify fetches the envelope from the server (`--server`, `$BODEGA_SERVER`, `server_url`, then `public_url`) and the artifact bytes from the route a client would download them from, unless `--artifact` names a local copy. Given an envelope file, it needs `--package type/name/version`, because nothing else says which package the envelope should be about. distfiles are not fetched; pass `--artifact`.
+
+`cosign verify-attestation` and other in-toto tooling read the same envelope; the key is the PEM from `bodega attest key show`.
+
+### Backfilling
+
+```bash
+bodega attest backfill
+bodega attest backfill --type npm
+```
+
+`backfill` signs an envelope for every pinned object that has none: each object whose sha256 the checksum table holds and that is present on the backend its version records. It pins each one's admission first, as a fetch would, so an object with no admission on record gets a row whose checks all say `not_evaluated` and is signed that way, and a row written before a check existed carries that check as `not_evaluated`. The refusals above apply, and an object already attested is skipped, so a second run signs nothing.
+
+Run it on the server host, as the user the server runs as: it reads the signing key and writes to the artifact backends. It prints one line per object signed or refused and exits non-zero when any was refused. distfiles are not covered, because their digest lives in the ports tree's distinfo rather than in the checksum table.
 
 ---
 
@@ -6413,23 +6499,24 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 
 `freebsd` keeps everything literal as well, for a different reason: the key is the path the upstream repository serves the object at, so an ABI's colons and a hashed filename's `~` and `$` all survive into it. S3 accepts all three in a key and every POSIX filesystem accepts them in a path, and encoding them would buy nothing while costing a decoder at four call sites — where a wrong decode serves the wrong bytes under a signature that still verifies.
 
-| Type      | S3 prefix       | Example key                                                                     |
-| --------- | --------------- | ------------------------------------------------------------------------------- |
-| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                   |
-| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                             |
-| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                |
-| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`            |
-| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                             |
-| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                               |
-| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                 |
-| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                              |
-| cargo     | `cargo/index/`  | `cargo/index/se/rd/serde`                                                       |
-| distfiles | `distfiles/`    | `distfiles/zsh-5.9.2.tar.xz`                                                    |
-| freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg` |
-| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                           |
-| index     | `index.json`    | Fast startup without loading every manifest                                     |
-| graph     | `graph.json`    | Dependency graph with typed edges                                               |
-| metrics   | `metrics.json`  | Dashboard metrics                                                               |
+| Type      | S3 prefix       | Example key                                                                       |
+| --------- | --------------- | --------------------------------------------------------------------------------- |
+| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                     |
+| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                               |
+| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                  |
+| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`              |
+| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                               |
+| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                                 |
+| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                   |
+| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                                |
+| cargo     | `cargo/index/`  | `cargo/index/se/rd/serde`                                                         |
+| distfiles | `distfiles/`    | `distfiles/zsh-5.9.2.tar.xz`                                                      |
+| freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`   |
+| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                             |
+| attest    | `attestations/` | `attestations/npm/lodash/lodash-4.17.21.tgz/20261010T120000.000000000Z.dsse.json` |
+| index     | `index.json`    | Fast startup without loading every manifest                                       |
+| graph     | `graph.json`    | Dependency graph with typed edges                                                 |
+| metrics   | `metrics.json`  | Dashboard metrics                                                                 |
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

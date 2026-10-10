@@ -31,6 +31,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/clientconf"
@@ -160,6 +161,9 @@ type Server struct {
 	attestSign atomic.Pointer[attestSigning]
 	// attestNoKeyWarned keeps the no-key WARN to one line per process.
 	attestNoKeyWarned atomic.Bool
+	// attest signs the envelope for each proxy pin; nil when the audit store
+	// keeps no admissions table to re-read, which setupAttestation says once.
+	attest *attest.Emitter
 
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
@@ -416,6 +420,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.loadAptSigner()
 	s.loadPkgSigner()
 	s.loadAttestSigner()
+	s.setupAttestation()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can

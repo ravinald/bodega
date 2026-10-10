@@ -196,7 +196,7 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 				stampFetchRecord(ctx, store, manifest.TypeFreeBSD, repo, ve, freeBSDCatalogPath(d, repo, ve), digest, nil)
 				// The catalogue is the object the digest is over, and the one
 				// whose records name every package the repository holds.
-				cfg.pinAdmission(ctx, manifest.TypeFreeBSD, repo, ve.Version, manifest.FreeBSDKey(ve.Version, repo, manifest.FreeBSDCatalogFile))
+				cfg.pinAdmission(ctx, manifest.TypeFreeBSD, repo, ve.Version, manifest.FreeBSDKey(ve.Version, repo, manifest.FreeBSDCatalogFile), digest, ve.RequiredBy)
 			}
 			summary.Results = append(summary.Results, result)
 			summary.Total++

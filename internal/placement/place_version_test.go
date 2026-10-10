@@ -3,6 +3,8 @@ package placement
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -216,5 +218,34 @@ func TestGroupPlacesTheNextWriteAndIsRecorded(t *testing.T) {
 	// it chose — which is what keeps the read path off the hierarchy.
 	if got := recordedStorage(t, store); got != "bulk" {
 		t.Errorf("recorded storage = %q, want bulk from the group rule", got)
+	}
+}
+
+// An artifact's envelopes are written to the backend the artifact went to,
+// under the attestation prefix for its key.
+func TestUploadCarriesAttestationsWithTheArtifact(t *testing.T) {
+	pl, _ := placerFixture(t, "bulk")
+	dir := t.TempDir()
+	art := filepath.Join(dir, "example-tool.zip")
+	env := filepath.Join(dir, "20261010T000000.000000000Z"+manifest.AttestationExt)
+	for _, f := range []string{art, env} {
+		if err := os.WriteFile(f, []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := manifest.BinaryKey("example-tool-v2", "2.15.0", "example-tool.zip")
+	n, err := pl.UploadPaths(t.Context(), manifest.TypeBinary, []builder.ArtifactPath{{
+		Local: art, ObjectKey: key, Package: "example-tool-v2", Version: "2.15.0", Attestations: []string{env},
+	}})
+	if err != nil || n != 2 {
+		t.Fatalf("UploadPaths = %d, %v; want 2 objects", n, err)
+	}
+	bulk, _ := pl.Stores().ByName("bulk")
+	want := manifest.AttestationDir(key) + filepath.Base(env)
+	if info, _ := bulk.Head(t.Context(), want); info == nil || !info.Exists {
+		t.Errorf("%s not on the artifact's backend", want)
+	}
+	if info, _ := pl.Stores().Default().Head(t.Context(), want); info != nil && info.Exists {
+		t.Errorf("%s also landed on the default backend", want)
 	}
 }

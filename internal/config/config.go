@@ -88,23 +88,30 @@ var (
 // added here is read, resolved and written back with no other edit, and the
 // two runtime-only fields opt out with `json:"-"`.
 type Config struct {
-	Bucket            string   `json:"bucket"`
-	Region            string   `json:"region"`
-	BuildRoot         string   `json:"build_root"`
-	ManifestDir       string   `json:"manifest_dir,omitempty"` // unset means {storage_path}/manifests, so clearing it drops the key rather than pinning "" as a setting
-	LogDir            string   `json:"log_dir"`
-	LogWindowHeight   int      `json:"logwindow_height"`
-	LogLevel          int      `json:"log_level"` // --log-level and $BODEGA_LOG_LEVEL are resolved by the caller, not by Load
-	AptRoot           string   `json:"apt_root,omitempty"`
-	GitRoot           string   `json:"git_root,omitempty"`
-	PypiRoot          string   `json:"pypi_root,omitempty"`
-	BinaryRoot        string   `json:"binary_root,omitempty"`
-	TLSCert           string   `json:"tls_cert,omitempty"`
-	TLSKey            string   `json:"tls_key,omitempty"`
-	ListenAddr        string   `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
-	PublicURL         string   `json:"public_url,omitempty"`  // external base URL clients reach the server at; see ResolvePublicURL
-	ServerURL         string   `json:"server_url,omitempty"`  // bodega server this host pushes catalogs to; see ResolveServerURL
-	Token             string   `json:"token,omitempty"`       // bearer token for that server; $BODEGA_TOKEN wins
+	Bucket          string `json:"bucket"`
+	Region          string `json:"region"`
+	BuildRoot       string `json:"build_root"`
+	ManifestDir     string `json:"manifest_dir,omitempty"` // unset means {storage_path}/manifests, so clearing it drops the key rather than pinning "" as a setting
+	LogDir          string `json:"log_dir"`
+	LogWindowHeight int    `json:"logwindow_height"`
+	LogLevel        int    `json:"log_level"` // --log-level and $BODEGA_LOG_LEVEL are resolved by the caller, not by Load
+	AptRoot         string `json:"apt_root,omitempty"`
+	GitRoot         string `json:"git_root,omitempty"`
+	PypiRoot        string `json:"pypi_root,omitempty"`
+	BinaryRoot      string `json:"binary_root,omitempty"`
+	TLSCert         string `json:"tls_cert,omitempty"`
+	TLSKey          string `json:"tls_key,omitempty"`
+	ListenAddr      string `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
+	PublicURL       string `json:"public_url,omitempty"`  // external base URL clients reach the server at; see ResolvePublicURL
+	// AttestationPlatformID is ingestionPlatform.id in every attestation this
+	// instance signs; see ResolveAttestationPlatformID.
+	AttestationPlatformID string `json:"attestation_platform_id,omitempty"`
+	// AttestationKeyIDs are the attestation key IDs 'bodega attest verify'
+	// trusts when no --key is given. Learned through a channel other than the
+	// server whose statements they check.
+	AttestationKeyIDs []string `json:"attestation_keyids,omitempty"`
+	ServerURL         string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token             string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -1851,6 +1858,22 @@ func (c *Config) ResolveListenAddr(flagAddr string) string {
 // answer from the request; callers without one render a placeholder.
 func (c *Config) ResolvePublicURL(flagURL string) string {
 	return strings.TrimRight(firstNonEmpty(flagURL, os.Getenv(EnvPublicURL), c.PublicURL), "/")
+}
+
+// ResolveAttestationPlatformID returns the ingestionPlatform.id this instance
+// signs under: attestation_platform_id, then the public URL, then
+// "bodega://<hostname>". The last is a placeholder a verifier can still tell
+// apart per host, for an install that has neither key set; a statement
+// naming no platform at all would say nothing about where it was admitted.
+func (c *Config) ResolveAttestationPlatformID() string {
+	if id := firstNonEmpty(c.AttestationPlatformID, c.ResolvePublicURL("")); id != "" {
+		return id
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "localhost"
+	}
+	return "bodega://" + host
 }
 
 // loadFileConfig reads the config file in force into a Config, plus the legacy

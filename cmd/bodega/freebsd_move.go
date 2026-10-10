@@ -123,7 +123,12 @@ func (m *mover) moveFreeBSDRepo(ctx context.Context, pm *manifest.PackageManifes
 	// package out of a live catalogue and then cannot fetch it.
 	removal := slices.Clone(roots)
 	slices.Reverse(removal)
-	return m.commit(ctx, pm, i, label, srcName, src, append(removal, objects...))
+	// The catalogue is the object a mirror fetch pins and attests.
+	envelopes, err := m.carryAttestations(ctx, src, srcName, label, manifest.FreeBSDKey(ve.Version, pm.Name, manifest.FreeBSDCatalogFile))
+	if err != nil {
+		return err
+	}
+	return m.commit(ctx, pm, i, label, srcName, src, append(append(removal, objects...), envelopes...))
 }
 
 // pinFreeBSDRoots copies the three repository-root files out of the source

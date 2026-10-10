@@ -311,9 +311,9 @@ func TestParsePypiArtifactName(t *testing.T) {
 		{"MANIFEST.sha256", "", "", false},
 		{"six.tar.gz", "", "", false},
 	} {
-		dist, version, ok := parsePypiArtifactName(tc.base)
+		dist, version, ok := ParsePypiArtifactName(tc.base)
 		if ok != tc.ok || dist != tc.dist || version != tc.version {
-			t.Errorf("parsePypiArtifactName(%q) = %q, %q, %v; want %q, %q, %v",
+			t.Errorf("ParsePypiArtifactName(%q) = %q, %q, %v; want %q, %q, %v",
 				tc.base, dist, version, ok, tc.dist, tc.version, tc.ok)
 		}
 	}

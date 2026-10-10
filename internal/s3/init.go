@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -200,17 +201,24 @@ const (
 // operator's and is written back unchanged.
 const lifecycleRulePrefix = "bodega-"
 
+// historyPrefixes keep every noncurrent version. RuntimePolicy withholds
+// s3:DeleteObjectVersion, so an overwrite or delete by a compromised service
+// leaves the honest version behind as noncurrent; an expiry rule here would
+// finish that deletion for it. Under manifests/ that version is what a
+// manifest has against whoever can already write it. Under attestations/ it
+// is the signed record of what was admitted, which a compromise must not be
+// able to age out.
+var historyPrefixes = []string{manifest.ManifestsPrefix, manifest.AttestationPrefix}
+
 // LifecycleRules are the rules InitBucket keeps on the bucket.
 //
 // Abandoned multipart parts are billed, appear in no listing and serve
 // nothing, so the abort rule covers the bucket root unconditionally.
 //
-// Noncurrent versions expire under every artifact prefix and never under
-// manifests/: versioning is what a manifest has against whoever can already
-// write it, and RuntimePolicy withholds s3:DeleteObjectVersion so that history
-// outlives a compromised service. Elsewhere a noncurrent version is a
-// byte-identical replacement or a catalogue upstream has since replaced. S3
-// filters take a prefix and no wildcard, hence one rule per prefix.
+// Noncurrent versions expire under every artifact prefix and never under the
+// prefixes in historyPrefixes. Under an artifact prefix a noncurrent version
+// is a byte-identical replacement or a catalogue upstream has since replaced.
+// S3 filters take a prefix and no wildcard, hence one rule per prefix.
 func LifecycleRules() []types.LifecycleRule {
 	rules := []types.LifecycleRule{{
 		ID:     aws.String(lifecycleRulePrefix + "abort-incomplete-multipart"),
@@ -221,7 +229,7 @@ func LifecycleRules() []types.LifecycleRule {
 		},
 	}}
 	for _, prefix := range expectedPrefixes {
-		if prefix == manifest.ManifestsPrefix {
+		if slices.Contains(historyPrefixes, prefix) {
 			continue
 		}
 		rules = append(rules, types.LifecycleRule{
@@ -273,7 +281,7 @@ func ensureLifecycle(ctx context.Context, client BucketAPI, out io.Writer, bucke
 	if err != nil {
 		return fmt.Errorf("put lifecycle configuration on %s: %w", bucket, err)
 	}
-	fmt.Fprintf(out, "  lifecycle:  CONFIGURED (abort multipart after %dd, noncurrent versions after %dd, manifests/ kept)\n",
+	fmt.Fprintf(out, "  lifecycle:  CONFIGURED (abort multipart after %dd, noncurrent versions after %dd, manifests/ and attestations/ kept)\n",
 		AbortIncompleteMultipartDays, NoncurrentVersionDays)
 	return nil
 }

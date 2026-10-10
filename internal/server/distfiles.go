@@ -437,7 +437,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// distinfo pinned the digest before the fetch, so matching it is the pin.
-	s.pinFill(ctx, fill, key, true)
+	s.pinFill(ctx, store, fill, key, spool.sha256, true)
 	s.fillCache(ctx, store, key, spool.path(), up.url, spool.sha256, spool.size)
 	s.recordCacheEvent(r, audit.CacheMiss, manifest.TypeDistfiles, up.url, name, name, key)
 
