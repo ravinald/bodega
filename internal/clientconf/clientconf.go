@@ -305,23 +305,33 @@ func GitBundleURL(base string, b GitBundle) File {
 }
 
 // SystemOsquery is the plan system that points osqueryd at an osquery source
-// in server mode. It is no package type: osquery's own package reaches a host
-// through apt or pkg like any other, and this system configures the daemon
-// that package installs.
+// in server mode. It is no package type: the host installs osquery the way
+// osquery's own guide says, and this system adds bodega's flags to the
+// daemon that package installs.
 const SystemOsquery = "osquery"
 
-// OsqueryFlagsPaths is where osqueryd reads its flags on each OS. FreeBSD's
-// is not the sysutils/osquery rc script's default
-// (/usr/local/etc/osquery/osquery.flags), so setup.sh names it in rc.conf as
-// osqueryd_flagfile. The rc script skips a flagfile it cannot read without a
-// word, and osqueryd then starts with no server to enroll with.
+// OsqueryFlagsPaths is where each OS's osquery package reads its flags when
+// nothing overrides it: the deb's /etc/default/osqueryd FLAG_FILE, and the
+// sysutils/osquery rc script's osqueryd_flagfile default. setup.sh writes
+// here only when the host names no other path; see osqueryFlagSources.
 var OsqueryFlagsPaths = map[string]string{
 	OSLinux:   "/etc/osquery/osquery.flags",
-	OSFreeBSD: "/usr/local/etc/osquery.flags",
+	OSFreeBSD: "/usr/local/etc/osquery/osquery.flags",
 }
 
-// osquerySecretPaths sit beside the flags file. setup.sh reads the path back
-// out of --enroll_secret_path rather than holding a copy of this table.
+// osqueryFlagSources is where each OS's package names the flagfile its
+// daemon reads, as the variable and either the file holding it or "sysrc"
+// for rc.conf. Following it rather than OsqueryFlagsPaths alone means a host
+// whose operator moved the flags gets bodega's flags where osqueryd reads
+// them, not in a file nothing opens.
+var osqueryFlagSources = map[string][2]string{
+	OSLinux:   {"FLAG_FILE", "/etc/default/osqueryd"},
+	OSFreeBSD: {"osqueryd_flagfile", "sysrc"},
+}
+
+// osquerySecretPaths sit beside the default flags file. setup.sh reads the
+// path back out of the enroll_secret_path flag rather than holding a copy of
+// this table.
 var osquerySecretPaths = map[string]string{
 	OSLinux:   "/etc/osquery/bodega.secret",
 	OSFreeBSD: "/usr/local/etc/osquery/bodega.secret",
@@ -336,12 +346,39 @@ var osqueryCABundles = map[string]string{
 	OSFreeBSD: "/etc/ssl/cert.pem",
 }
 
-// Osquery renders osqueryd's flags file for one server-mode source, one File
-// per OS because the secret and the CA bundle live at different paths on
-// each. osqueryd builds every URL as https://<tls_hostname><endpoint>, so the
-// hostname carries public_url's port and the endpoints carry its path.
-// Content is empty when base or the endpoint does not parse.
-func Osquery(base string, src OsqueryPlan) []File {
+// How setup.sh merges one OsqueryFlag into the host's flags file.
+const (
+	// OsqueryFlagSet is a flag bodega needs to work: every line setting it
+	// is replaced by bodega's, and it is appended when absent.
+	OsqueryFlagSet = "set"
+	// OsqueryFlagDefault is the operator's flag: a line setting it is kept,
+	// and bodega's value is appended only when none does.
+	OsqueryFlagDefault = "default"
+	// OsqueryFlagInclude adds Value to the comma-separated list a line
+	// setting the flag already holds, last, when it is not there. It writes
+	// nothing for an absent flag; a default for the same name does that.
+	OsqueryFlagInclude = "include"
+)
+
+// OsqueryFlag is one flag bodega manages in osqueryd's flags file. Name has
+// no leading dashes.
+type OsqueryFlag struct {
+	Rule  string
+	Name  string
+	Value string
+}
+
+// OsqueryFlags is the flag list for one server-mode source on goos, in the
+// order setup.sh appends the ones a host's file lacks. osqueryd builds every
+// URL as https://<tls_hostname><endpoint>, so the hostname carries
+// public_url's port and the endpoints carry its path. It is nil when base or
+// the endpoint does not parse.
+//
+// logger_plugin is merged rather than set because a deployed host may feed
+// its filesystem log, osquery's default, to something else. host_identifier
+// defaults to uuid because osquery's own default, hostname, changes when a
+// host is renamed, and a shipper's mapping keys on it.
+func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	b, err := url.Parse(base)
 	if err != nil || b.Host == "" {
 		return nil
@@ -351,25 +388,50 @@ func Osquery(base string, src OsqueryPlan) []File {
 		return nil
 	}
 	path := strings.TrimRight(ep.Path, "/")
+	set := func(name, value string) OsqueryFlag { return OsqueryFlag{OsqueryFlagSet, name, value} }
+	out := []OsqueryFlag{set("tls_hostname", b.Host)}
+	if b.Scheme == "https" {
+		out = append(out, set("tls_server_certs", osqueryCABundles[goos]))
+	}
+	out = append(out,
+		set("enroll_secret_path", osquerySecretPaths[goos]),
+		set("enroll_tls_endpoint", path+"/enroll"),
+		set("config_plugin", "tls"),
+		set("config_tls_endpoint", path+"/config"),
+	)
+	if src.Interval > 0 {
+		out = append(out, set("config_refresh", strconv.FormatInt(src.Interval, 10)))
+	}
+	return append(out,
+		OsqueryFlag{OsqueryFlagDefault, "host_identifier", "uuid"},
+		OsqueryFlag{OsqueryFlagDefault, "logger_plugin", "filesystem,tls"},
+		OsqueryFlag{OsqueryFlagInclude, "logger_plugin", "tls"},
+		set("logger_tls_endpoint", path+"/log"),
+	)
+}
+
+// Osquery renders the osquery system's plan file for one server-mode
+// source, one File per OS. It is no flags file but the instructions
+// setup.sh merges into the host's, one tab-separated line each: first
+// "from", the variable naming the flagfile and where it is set, then one
+// "<rule> <name> <value>" per OsqueryFlag. Content is empty when base or the
+// endpoint does not parse.
+func Osquery(base string, src OsqueryPlan) []File {
 	var out []File
 	for _, goos := range []string{OSLinux, OSFreeBSD} {
+		flags := OsqueryFlags(base, src, goos)
+		if flags == nil {
+			return nil
+		}
+		from := osqueryFlagSources[goos]
 		var sb strings.Builder
-		sb.WriteString("--tls_hostname=" + b.Host + "\n")
-		if b.Scheme == "https" {
-			sb.WriteString("--tls_server_certs=" + osqueryCABundles[goos] + "\n")
+		sb.WriteString("from\t" + from[0] + "\t" + from[1] + "\n")
+		for _, f := range flags {
+			sb.WriteString(f.Rule + "\t" + f.Name + "\t" + f.Value + "\n")
 		}
-		sb.WriteString("--enroll_secret_path=" + osquerySecretPaths[goos] + "\n")
-		sb.WriteString("--enroll_tls_endpoint=" + path + "/enroll\n")
-		sb.WriteString("--config_plugin=tls\n")
-		sb.WriteString("--config_tls_endpoint=" + path + "/config\n")
-		if src.Interval > 0 {
-			sb.WriteString("--config_refresh=" + strconv.FormatInt(src.Interval, 10) + "\n")
-		}
-		sb.WriteString("--logger_plugin=tls\n")
-		sb.WriteString("--logger_tls_endpoint=" + path + "/log\n")
 		out = append(out, File{
 			System:  SystemOsquery,
-			Label:   "osquery.flags",
+			Label:   "osquery flags",
 			Scope:   src.Instance + " (" + goos + ")",
 			Paths:   map[string]string{goos: OsqueryFlagsPaths[goos]},
 			Content: sb.String(),

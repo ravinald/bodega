@@ -295,6 +295,12 @@ func TestConfigSchedule(t *testing.T) {
 			t.Errorf("linux query lacks %s: %s", table, lin.Query)
 		}
 	}
+	// The filter rides on the schedule a host fetches every config_refresh,
+	// so a host enrolled before it existed gets it on its next fetch with the
+	// key it already holds: no re-enrollment.
+	if !strings.Contains(lin.Query, "FROM deb_packages WHERE status = 'install ok installed'") {
+		t.Errorf("linux query reads removed packages too: %s", lin.Query)
+	}
 	// osquery's FreeBSD build registers no pkg_packages table (#100): the
 	// query reads the table the config mounts over pkg's own database.
 	pkg := atc[TableFreeBSDPkg]

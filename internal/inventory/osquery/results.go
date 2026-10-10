@@ -69,6 +69,10 @@ const (
 // per-table queries would each fire on their own timer, and a report holding
 // only the python packages would read as a host whose debs were removed.
 //
+// deb_packages lists every package dpkg remembers, so the Linux select keeps
+// only installed ones: a package removed with its config left behind reads
+// "deinstall ok config-files" and is not on the host.
+//
 // The output depends on dirs and interval alone, with directories sorted and
 // deduplicated, so the schedule changes only when the plan does.
 func Schedule(dirs config.OsqueryDirs, interval time.Duration) map[string]Query {
@@ -77,7 +81,7 @@ func Schedule(dirs config.OsqueryDirs, interval time.Duration) map[string]Query 
 	return map[string]Query{
 		QueryLinux: {
 			Query: unionAll(append([]string{
-				"SELECT 'apt' AS ecosystem, name, version, '' AS path FROM deb_packages",
+				"SELECT 'apt' AS ecosystem, name, version, '' AS path FROM deb_packages WHERE status = 'install ok installed'",
 				"SELECT 'rpm', name, version || '-' || release, '' FROM rpm_packages",
 			}, lang...)),
 			Interval: secs, Snapshot: true, Platform: "linux",

@@ -85,11 +85,11 @@ func (p Plan) Systems() []string {
 // run that quietly configures the rest reads as one that configured it.
 //
 // The osquery system is left out of an empty selection and refused by name:
-// its flags file alone names a secret nothing wrote and a daemon nothing
-// installed, and only setup.sh does the rest.
+// its flags name a secret nothing wrote, they merge into a file rather than
+// replacing it, and only setup.sh does both and restarts osqueryd.
 func (p Plan) Select(systems []string) ([]PlanRecord, error) {
 	if slices.Contains(systems, SystemOsquery) {
-		return nil, fmt.Errorf("the osquery system installs a package, writes an enroll secret and starts osqueryd, and this command writes files only.\n" +
+		return nil, fmt.Errorf("the osquery system merges flags into osqueryd's, writes an enroll secret and restarts osqueryd, and this command writes whole files only.\n" +
 			"  Run the served setup script instead: BODEGA_OSQUERY_SECRET=<secret> sh setup.sh --url <base> --systems osquery --apply")
 	}
 	if len(systems) == 0 {

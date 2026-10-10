@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -275,17 +276,59 @@ func TestSelectKeepsOsqueryOutOfAFileOnlyApply(t *testing.T) {
 	}
 }
 
-// --tls_server_certs names a CA bundle, which only a TLS server needs.
+// The plan lists the flags bodega owns as set, the two that stay the
+// operator's as default, and adds tls to logger_plugin rather than writing it
+// alone. --tls_server_certs names a CA bundle, which only a TLS server needs.
 func TestOsqueryFlagsNameCertsOnlyOverTLS(t *testing.T) {
-	src := OsqueryPlan{Instance: "osq", Mode: "server", Endpoint: "http://b.example:8080/api/v1/inventory/sources/osq"}
-	for _, f := range Osquery("http://b.example:8080", src) {
-		if strings.Contains(f.Content, "--tls_server_certs") || !strings.Contains(f.Content, "--tls_hostname=b.example:8080\n") {
-			t.Errorf("%s over http:\n%s", f.Scope, f.Content)
+	src := OsqueryPlan{Instance: "osq", Mode: "server", Endpoint: "https://b.example:8443/api/v1/inventory/sources/osq", Interval: 600}
+	ep := "/api/v1/inventory/sources/osq"
+	cases := []struct {
+		base, goos string
+		certs      string
+		secret     string
+	}{
+		{"http://b.example:8443", OSLinux, "", "/etc/osquery/bodega.secret"},
+		{"http://b.example:8443", OSFreeBSD, "", "/usr/local/etc/osquery/bodega.secret"},
+		{"https://b.example:8443", OSLinux, "/etc/ssl/certs/ca-certificates.crt", "/etc/osquery/bodega.secret"},
+		{"https://b.example:8443", OSFreeBSD, "/etc/ssl/cert.pem", "/usr/local/etc/osquery/bodega.secret"},
+	}
+	for _, c := range cases {
+		want := []OsqueryFlag{{OsqueryFlagSet, "tls_hostname", "b.example:8443"}}
+		if c.certs != "" {
+			want = append(want, OsqueryFlag{OsqueryFlagSet, "tls_server_certs", c.certs})
+		}
+		want = append(want,
+			OsqueryFlag{OsqueryFlagSet, "enroll_secret_path", c.secret},
+			OsqueryFlag{OsqueryFlagSet, "enroll_tls_endpoint", ep + "/enroll"},
+			OsqueryFlag{OsqueryFlagSet, "config_plugin", "tls"},
+			OsqueryFlag{OsqueryFlagSet, "config_tls_endpoint", ep + "/config"},
+			OsqueryFlag{OsqueryFlagSet, "config_refresh", "600"},
+			OsqueryFlag{OsqueryFlagDefault, "host_identifier", "uuid"},
+			OsqueryFlag{OsqueryFlagDefault, "logger_plugin", "filesystem,tls"},
+			OsqueryFlag{OsqueryFlagInclude, "logger_plugin", "tls"},
+			OsqueryFlag{OsqueryFlagSet, "logger_tls_endpoint", ep + "/log"},
+		)
+		if got := OsqueryFlags(c.base, src, c.goos); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s on %s:\n got  %+v\n want %+v", c.base, c.goos, got, want)
 		}
 	}
-	for _, f := range Osquery("https://b.example", src) {
-		if !strings.Contains(f.Content, "--tls_server_certs=") {
-			t.Errorf("%s over https names no CA bundle:\n%s", f.Scope, f.Content)
+
+	files := Osquery("https://b.example:8443", src)
+	if len(files) != 2 {
+		t.Fatalf("Osquery = %d files, want one per OS", len(files))
+	}
+	for _, f := range files {
+		goos := OSLinux
+		if f.Path(OSLinux) == "" {
+			goos = OSFreeBSD
 		}
+		from := map[string]string{OSLinux: "from\tFLAG_FILE\t/etc/default/osqueryd\n", OSFreeBSD: "from\tosqueryd_flagfile\tsysrc\n"}[goos]
+		if f.Path(goos) != OsqueryFlagsPaths[goos] || !strings.HasPrefix(f.Content, from) ||
+			!strings.Contains(f.Content, "\ninclude\tlogger_plugin\ttls\n") || strings.Contains(f.Content, "--") {
+			t.Errorf("%s plan file at %s:\n%s", goos, f.Path(goos), f.Content)
+		}
+	}
+	if OsqueryFlagsPaths[OSFreeBSD] != "/usr/local/etc/osquery/osquery.flags" {
+		t.Errorf("FreeBSD flags path = %s, want the sysutils/osquery rc script's default", OsqueryFlagsPaths[OSFreeBSD])
 	}
 }
