@@ -301,7 +301,7 @@ func TestEnsureEncryption(t *testing.T) {
 }
 
 func TestEnsureLifecycle(t *testing.T) {
-	const changed = "  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ kept)\n"
+	const changed = "  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ and attestations/ kept)\n"
 	operatorRule := types.LifecycleRule{
 		ID:         aws.String("operator-tmp"),
 		Status:     types.ExpirationStatusEnabled,
@@ -313,6 +313,11 @@ func TestEnsureLifecycle(t *testing.T) {
 	stale := append(LifecycleRules(), types.LifecycleRule{
 		ID: aws.String("bodega-expire-noncurrent-services"), Status: types.ExpirationStatusEnabled,
 		Filter:                      &types.LifecycleRuleFilter{Prefix: aws.String("services/")},
+		NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{NoncurrentDays: aws.Int32(30)},
+	})
+	attestationExpiry := append(LifecycleRules(), types.LifecycleRule{
+		ID: aws.String("bodega-expire-noncurrent-attestations"), Status: types.ExpirationStatusEnabled,
+		Filter:                      &types.LifecycleRuleFilter{Prefix: aws.String("attestations/")},
 		NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{NoncurrentDays: aws.Int32(30)},
 	})
 	cases := []struct {
@@ -331,6 +336,7 @@ func TestEnsureLifecycle(t *testing.T) {
 		{name: "operator rule survives the rewrite", mutate: func(f *fakeBucket) { f.lifecycle = []types.LifecycleRule{operatorRule} }, wantOut: changed, wantPut: true, wantKept: true},
 		{name: "a hand-edited bodega rule is drift", mutate: func(f *fakeBucket) { f.lifecycle = edited }, wantOut: changed, wantPut: true},
 		{name: "a rule for a retired prefix is drift", mutate: func(f *fakeBucket) { f.lifecycle = stale }, wantOut: changed, wantPut: true},
+		{name: "an expiry rule on attestations/ is drift", mutate: func(f *fakeBucket) { f.lifecycle = attestationExpiry }, wantOut: changed, wantPut: true},
 		{name: "read fails refuses rather than overwrite unseen rules", mutate: func(f *fakeBucket) { f.lifecycleGetErr = errBoom }, wantErr: "read lifecycle configuration on b"},
 		{name: "write fails", mutate: func(f *fakeBucket) { f.lifecycle = nil; f.lifecyclePutErr = errBoom }, wantPut: true, wantErr: "put lifecycle configuration on b"},
 	}
@@ -358,10 +364,10 @@ func TestEnsureLifecycle(t *testing.T) {
 	}
 }
 
-// TestLifecycleKeepsManifestHistory pins the split: every artifact prefix
-// expires its noncurrent versions and manifests/ never does, because that
-// history is what survives whoever can rewrite a manifest.
-func TestLifecycleKeepsManifestHistory(t *testing.T) {
+// TestLifecycleKeepsHistory pins the split: every artifact prefix expires its
+// noncurrent versions and manifests/ and attestations/ never do, because that
+// history is what survives whoever can rewrite a manifest or an envelope.
+func TestLifecycleKeepsHistory(t *testing.T) {
 	var abort int
 	expiring := map[string]bool{}
 	for _, r := range LifecycleRules() {
@@ -382,11 +388,19 @@ func TestLifecycleKeepsManifestHistory(t *testing.T) {
 	if abort != 1 {
 		t.Errorf("%d abort-multipart rules, want 1", abort)
 	}
-	if expiring["manifests/"] || expiring[""] {
-		t.Errorf("noncurrent versions expire under manifests/ (or the whole bucket): %v", expiring)
+	if expiring[""] {
+		t.Errorf("noncurrent versions expire across the whole bucket: %v", expiring)
+	}
+	for _, p := range []string{"manifests/", "attestations/"} {
+		if expiring[p] {
+			t.Errorf("noncurrent versions expire under %s", p)
+		}
+		if !slices.Contains(manifest.StoragePrefixes(), p) {
+			t.Errorf("%s is not a storage prefix, so init writes no marker for it", p)
+		}
 	}
 	for _, p := range manifest.StoragePrefixes() {
-		if p != manifest.ManifestsPrefix && !expiring[p] {
+		if p != manifest.ManifestsPrefix && p != manifest.AttestationPrefix && !expiring[p] {
 			t.Errorf("artifact prefix %s keeps noncurrent versions forever", p)
 		}
 	}

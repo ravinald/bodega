@@ -765,8 +765,11 @@ any time, under any policy digest, and it verifies like every honest one.
 Statements signed before the compromise stay meaningful only if the
 compromise could not reach them: on S3, keep `attestations/` under Object
 Lock (see [design.md](design.md#storage-layout)), so that an attacker who
-can sign new envelopes cannot also rewrite the old ones. Rotating the key
-does not repair this. A verifier has to drop the stolen key ID, and from then
+can sign new envelopes cannot also rewrite the old ones. Without it, a
+versioned bucket keeps the overwritten version as noncurrent, because
+`bodega init` sets no noncurrent expiry on `attestations/` and the runtime
+policy cannot delete versions; an auditor has to go looking for it. Rotating
+the key does not repair this. A verifier has to drop the stolen key ID, and from then
 on it rejects every statement that key signed, honest ones included.
 
 ## Out-of-scope distribution formats

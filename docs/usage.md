@@ -40,7 +40,7 @@ Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default
   public acl: CONFIGURED (all blocked)
   versioning: ENABLED
   encryption: CONFIGURED (AES-256)
-  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ kept)
+  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ and attestations/ kept)
   binaries/              CREATED
   ...
 ```
@@ -3018,12 +3018,12 @@ Two things make a correct policy look broken. A policy attached in the last few 
 
 **Lifecycle.** `bodega init` keeps two kinds of rule on the bucket, each with an ID starting `bodega-`:
 
-| Rule                               | Scope                                                                                     | Retention                           |
-| ---------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
-| Abort incomplete multipart uploads | the whole bucket                                                                          | 7 days after the upload began       |
-| Expire noncurrent versions         | each prefix in [Storage Layout](#storage-layout) except `manifests/`, one rule per prefix | 30 days after a version is replaced |
+| Rule                               | Scope                                                                                                         | Retention                           |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Abort incomplete multipart uploads | the whole bucket                                                                                              | 7 days after the upload began       |
+| Expire noncurrent versions         | each prefix in [Storage Layout](#storage-layout) except `manifests/` and `attestations/`, one rule per prefix | 30 days after a version is replaced |
 
-A multipart upload that dies partway leaves parts that are billed, appear in no listing and serve nothing; the first rule clears them. The second bounds what versioning costs where history is worth nothing: under an artifact prefix, a noncurrent version is a byte-identical replacement or a catalogue upstream has since replaced. `manifests/` keeps every version, for the reason the runtime policy withholds `s3:DeleteObjectVersion`. S3 lifecycle filters take a prefix and no wildcard, so "everything except `manifests/`" is one rule per prefix.
+A multipart upload that dies partway leaves parts that are billed, appear in no listing and serve nothing; the first rule clears them. The second bounds what versioning costs where history is worth nothing: under an artifact prefix, a noncurrent version is a byte-identical replacement or a catalogue upstream has since replaced. `manifests/` and `attestations/` keep every version, for the reason the runtime policy withholds `s3:DeleteObjectVersion`: when a compromised service overwrites or deletes a manifest or a signed envelope, the honest version stays behind as noncurrent, and an expiry rule would remove it 30 days later. S3 lifecycle filters take a prefix and no wildcard, so "everything except `manifests/` and `attestations/`" is one rule per prefix. A bucket that already carries a `bodega-expire-noncurrent-attestations` rule loses it on the next `bodega init`, which treats it as drift.
 
 Rules whose ID does not start with `bodega-` are yours, and `bodega init` writes them back unchanged. A `bodega-` rule edited on the bucket is drift, and the next `bodega init` rewrites it; the retention periods are `AbortIncompleteMultipartDays` and `NoncurrentVersionDays` in `internal/s3/init.go`. A named backend with a `prefix` gets its rules and markers at the bucket root, not under the prefix, so its noncurrent versions do not expire.
 
