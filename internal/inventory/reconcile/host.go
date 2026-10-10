@@ -38,8 +38,9 @@ type Component struct {
 }
 
 // HostReport is a host's current installed set, classified. Alert is set when
-// a component is refused or unknown or two sources disagree, which is when
-// `bodega inventory report` exits 1.
+// a component is refused, unknown or unclassified, or two sources disagree,
+// which is when `bodega inventory report` exits 1. An unclassified component
+// has not been shown to be anything but unknown, so it alerts too.
 type HostReport struct {
 	Identity      string                     `json:"identity"`
 	GeneratedAt   time.Time                  `json:"generated_at"`
@@ -108,11 +109,8 @@ func (r *Reconciler) host(ctx context.Context, identity string, mapped map[strin
 	for _, c := range out.Components {
 		out.Counts[c.Class]++
 	}
-	out.Disagreements = newestDisagreements(latest, classes)
-	if out.Disagreements == nil {
-		out.Disagreements = []audit.SourceDisagreement{}
-	}
-	out.Alert = out.Counts[ClassRefused]+out.Counts[ClassUnknown] > 0 || len(out.Disagreements) > 0
+	out.Disagreements = currentDisagreements(latest, classes)
+	out.Alert = out.Counts[ClassRefused]+out.Counts[ClassUnknown]+out.Counts[ClassUnclassified] > 0 || len(out.Disagreements) > 0
 	return out, nil
 }
 
@@ -224,21 +222,44 @@ func betterRecord(class, current string) bool {
 	return rank(class) < rank(current)
 }
 
-// newestDisagreements returns the findings recorded with the newest classified
-// report among the latest. Each ingest compares its report with every other
-// source's latest, so the newest one holds the host's disagreements as they
-// stand now.
-func newestDisagreements(latest []audit.InventoryReport, classes map[int64]audit.InventoryClassification) []audit.SourceDisagreement {
-	var newest int64
+// currentDisagreements returns the findings that still stand between the
+// latest reports. Each ingest records only the pairs that include its own
+// source, so a host's findings are spread over every latest report; a finding
+// stands while both reports it names are still their sources' latest, and is
+// retired once either source reports again, because that report recorded the
+// pair afresh. Two reports ingested together can both compare against each
+// other, so findings are de-duplicated.
+func currentDisagreements(latest []audit.InventoryReport, classes map[int64]audit.InventoryClassification) []audit.SourceDisagreement {
+	latestID := map[string]int64{}
 	for _, rep := range latest {
-		if _, ok := classes[rep.ID]; ok && rep.ID > newest {
-			newest = rep.ID
+		latestID[rep.Source] = rep.ID
+	}
+	out := []audit.SourceDisagreement{}
+	seen := map[string]bool{}
+	for _, rep := range latest {
+		for _, d := range classes[rep.ID].Disagreements {
+			if latestID[d.ReportedBy] != d.ReportedIn || latestID[d.AbsentFrom] != d.AbsentIn {
+				continue
+			}
+			k := Key(d.Ecosystem, d.Name, d.Version) + "\x00" + d.ReportedBy + "\x00" + d.AbsentFrom
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, d)
 		}
 	}
-	if newest == 0 {
-		return nil
-	}
-	return classes[newest].Disagreements
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.ReportedBy != b.ReportedBy {
+			return a.ReportedBy < b.ReportedBy
+		}
+		if a.AbsentFrom != b.AbsentFrom {
+			return a.AbsentFrom < b.AbsentFrom
+		}
+		return Key(a.Ecosystem, a.Name, a.Version) < Key(b.Ecosystem, b.Name, b.Version)
+	})
+	return out
 }
 
 // HostSummary is one identity's line in `bodega inventory hosts`.

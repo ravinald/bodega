@@ -1125,7 +1125,7 @@ bodega inventory accept --profile <name> [--comment <text>]
 bodega inventory baseline <identity> [--json]
 ```
 
-`report` exits 1 when a component of the host's current set is `refused` or `unknown`, or two sources disagree, whatever `--class` narrows the output to; 0 otherwise. `accept` writes a `create` audit row with `pkg_type=inventory-baseline`.
+`report` exits 1 when a component of the host's current set is `refused`, `unknown` or `unclassified`, or two sources disagree, whatever `--class` narrows the output to; 0 otherwise. `accept` writes a `create` audit row with `pkg_type=inventory-baseline`.
 
 ### `bodega osquery secret <create|list|revoke>`
 
@@ -6220,7 +6220,7 @@ Worst first. A component gets the first class whose rule holds:
 | `unattributed` | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                        |
 | `stale`        | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                 |
 
-Classes are displayed worst first: `refused`, `unknown`, `unattributed`, `served`, `baseline`. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`.
+Classes are displayed worst first: `refused`, `unknown`, `unattributed`, `served`, `baseline`. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
 
 Names compare the way bodega's types canonicalize them: `Django` installed and `django` served are one pypi package, while npm names stay case-sensitive. A version compares exactly, except that an apt epoch is dropped on both sides, since dpkg reports `1:2.38.1-5` and the pool file is `util-linux_2.38.1-5_amd64.deb`. An apt or FreeBSD `serve_fetch` row names a pool path or a repository, so the object key's filename says which package was served. A catalog entry counts only at its exact version: a range or open entry records nothing about a version bodega never served under it, so a host holding one got it elsewhere.
 
@@ -6234,7 +6234,7 @@ A host's current set is the union of the latest report from each source instance
 
 #### Source disagreement
 
-When a report arrives, every component it holds is compared with the latest report of each other enabled instance mapped to the same host, and the other way round. A component one reports and the other omits is a `source-disagreement` finding naming both instances and both reports, unless the omitting instance does not cover that ecosystem on that host (an `osquery` source sees pip and npm trees only where the host's profile declares a directory to scan, and claims nothing in `other`). The findings are stored with the arriving report, so the newest report on a host holds that host's disagreements as they stand. With a collector outside the host's trust boundary as the second source, a disagreement is the tamper signal described in the design notes.
+When a report arrives, every component it holds is compared with the latest report of each other enabled instance mapped to the same host, and the other way round. A component one reports and the other omits is a `source-disagreement` finding naming both instances and both reports, unless the omitting instance does not cover that ecosystem on that host (an `osquery` source sees pip and npm trees only where the host's profile declares a directory to scan, and claims nothing in `other`). The findings are stored with the arriving report, which compares only the pairs that include its own instance. A host's disagreements are the union of the findings stored with each instance's latest report, keeping a finding only while both reports it names are still their instances' latest: when either instance reports again, its new report has recorded that pair afresh. With a collector outside the host's trust boundary as the second source, a disagreement is the tamper signal described in the design notes.
 
 #### Staleness
 
@@ -6258,7 +6258,7 @@ Each arriving report with at least one `refused` or `unknown` component writes o
 
 #### Limits
 
-Classification reads the served set through the audit sink. With `audit_sink` set to `syslog` or `jsonl` there is no table to read, so reports are stored unclassified and read `unclassified`, and the server logs an `ERROR` per report. Each arriving report reads every distinct object bodega has served to anyone, which on a large `sqlite` event table is a scan per report.
+Classification reads the served set through the audit sink. With `audit_sink` set to `syslog` or `jsonl` there is no table to read, so reports are stored unclassified and read `unclassified`, the server logs an `ERROR` per report, and `bodega inventory report` exits 1 for every host they cover. No `inventory` audit event is written for them. Each arriving report reads every distinct object bodega has served to anyone, which on a large `sqlite` event table is a scan per report.
 
 ## TUI
 
