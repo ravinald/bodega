@@ -37,6 +37,12 @@ type Frame struct {
 	// refused, so the refusal lands in the same audit table as every other.
 	OnRefusal func(r *http.Request, reason string, details map[string]string)
 
+	// OnReport, when set, is handed each report once it is stored, with the
+	// ID, Seq and chain fields the store assigned. Reconciliation hangs off
+	// it. It runs inside Ingest, after the report is committed, so its
+	// failure is its own to log: the report stays stored either way.
+	OnReport func(ctx context.Context, inst *Instance, stored audit.InventoryReport)
+
 	// HashSecret, when set, is the peppered hash bodega keys its stored
 	// credentials on. A route handler that checks a secret of its own (an
 	// osquery enroll secret) hashes with it, so one pepper covers both.
@@ -321,8 +327,12 @@ func (f *Frame) Ingest(ctx context.Context, inst *Instance, p Principal, b Batch
 		for i, c := range r.Components {
 			row.Components[i] = audit.InventoryComponent(c)
 		}
-		if _, err := f.db.AppendInventoryReport(ctx, row); err != nil {
+		stored, err := f.db.AppendInventoryReport(ctx, row)
+		if err != nil {
 			return res, err
+		}
+		if f.OnReport != nil {
+			f.OnReport(ctx, inst, stored)
 		}
 		res.Reports++
 		if id == "" {

@@ -71,6 +71,7 @@ type EventReader interface {
 	QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, error)
 	CountEvents(ctx context.Context, f Filter) (int64, error)
 	QueryServed(ctx context.Context, identity string, since time.Time) ([]ServedArtifact, error)
+	QueryServedObjects(ctx context.Context, identity string) ([]ServedObject, error)
 	ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error)
 	AggregateDiscovery(ctx context.Context, registryType string) ([]DiscoveryAggregate, error)
 	ClearDiscovery(ctx context.Context, registryType string) (int64, error)

@@ -476,9 +476,10 @@ WHERE r.source = ? AND NOT EXISTS (SELECT 1 FROM inventory_hosts h WHERE h.sourc
 	return st, nil
 }
 
-// PruneInventory deletes one source's reports, components and attempts
-// received before cutoff. It is the only path that removes a row from the
-// three append-only tables, and only the retention setting calls it.
+// PruneInventory deletes one source's reports, their components and
+// classifications, and its attempts received before cutoff. It is the only
+// path that removes a row from the append-only tables, and only the retention
+// setting calls it.
 func (a *DB) PruneInventory(ctx context.Context, source string, cutoff time.Time) (int64, error) {
 	if a.readOnly {
 		return 0, errors.New("audit db is read-only")
@@ -489,6 +490,11 @@ func (a *DB) PruneInventory(ctx context.Context, source string, cutoff time.Time
 	}
 	defer func() { _ = tx.Rollback() }()
 	ts := invTime(cutoff)
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM inventory_classifications WHERE report_id IN
+    (SELECT id FROM inventory_reports WHERE source = ? AND received_at < ?)`, source, ts); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM inventory_components WHERE report_id IN
     (SELECT id FROM inventory_reports WHERE source = ? AND received_at < ?)`, source, ts); err != nil {

@@ -267,6 +267,19 @@ func (s *postgresSink) QueryServed(ctx context.Context, identity string, since t
 	return out, rows.Err()
 }
 
+func (s *postgresSink) QueryServedObjects(ctx context.Context, identity string) ([]ServedObject, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT pkg_type, pkg_name, pkg_version, object_key, COALESCE(digest, '')
+	      FROM events
+	      WHERE event_type = $1 AND object_key IS NOT NULL AND ($2::text = '' OR identity = $2::text)
+	      ORDER BY 1, 2, 3, 4, 5`,
+		string(EventServeFetch), identity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanServedObjects(rows)
+}
+
 func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
 	var where []string
 	a := &pgArgs{}

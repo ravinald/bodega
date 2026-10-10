@@ -1109,16 +1109,23 @@ Every add and remove writes an audit row: a `create` or `delete` event with `pkg
 
 The first write to a list copies the config file's value in and says so. After that the database owns the list and the file's entry is inert; see **Configuration** below.
 
-### `bodega inventory <sources|bind|unbind|unbound>`
+### `bodega inventory <sources|bind|unbind|unbound|report|hosts|accept|baseline>`
 
-Lists the configured inventory sources and manages the mapping from each source's host ids to bodega identities. See [Inventory](#inventory).
+Lists the configured inventory sources, manages the mapping from each source's host ids to bodega identities, and reads and steers reconciliation. See [Inventory](#inventory) and [Reconciliation](#reconciliation).
 
 ```bash
 bodega inventory sources [--json]
 bodega inventory unbound [--json]
 bodega inventory bind <source> <external-id> <identity>
 bodega inventory unbind <source> <external-id>
+bodega inventory report <identity> [--class <c,...>] [--json]
+bodega inventory hosts [--json]
+bodega inventory accept <identity> [--report <id>] [--comment <text>]
+bodega inventory accept --profile <name> [--comment <text>]
+bodega inventory baseline <identity> [--json]
 ```
+
+`report` exits 1 when a component of the host's current set is `refused` or `unknown`, or two sources disagree, whatever `--class` narrows the output to; 0 otherwise. `accept` writes a `create` audit row with `pkg_type=inventory-baseline`.
 
 ### `bodega osquery secret <create|list|revoke>`
 
@@ -2577,6 +2584,15 @@ A row with no version becomes one entry with `version_constraint: "any"`, but on
 The URL written is the one the manifest field means for the type, which is not always the one `discover show` prints. For gomod and npm the field is a registry root (`https://proxy.golang.org`, `https://registry.npmjs.org`) that the builder appends a module or package path to, so the recorded artifact URL is narrowed to it. Every other type records a URL that already means what the field means.
 
 It never rewrites what is already there. A version already in the manifest is skipped, so a `hosted` entry is never downgraded to `proxy` and re-running the command adds nothing. Rows with an empty upstream URL are named on stderr and skipped: a `proxy` entry with no URL would 404 as the miss it came from did, so those packages need a URL supplied by hand.
+
+`--inventory <identity>` takes the source from a host's inventory instead of the discovery log. The pattern is then a package name, and every version of it that the host's current set holds as `unknown` (see [Reconciliation](#reconciliation)) becomes a manifest entry:
+
+```bash
+bodega discover promote pypi requests --inventory web-01
+bodega discover promote apt htop --inventory web-01
+```
+
+A `pypi`, `npm`, `gomod` or `cargo` entry is written the way a `no_manifest` row is, in `proxy` mode with the configured `pypi_upstream`, `npm_upstream`, `gomod_upstream` or `cargo_upstream` as the URL. An `apt` entry carries no URL and resolves through `apt-get download`, the form `bodega pkg convert apt` writes. Other types have no single upstream to proxy and are refused with the `bodega pkg create` command to run instead. A name the host holds in another class (already `served`, or `refused`) is refused, and the error names the class. `--inventory` writes manifest entries only, so `--as policy` beside it is refused.
 
 #### `bodega discover promote-all <type> [--as policy|manifest]`
 
@@ -5696,16 +5712,17 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 
 **Event types:**
 
-| Type                                                              | Trigger                                                                                                                |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `serve_fetch`                                                     | Client downloaded a package over HTTP                                                                                  |
-| `fetch`, `build`, `package`, `upload`, `sync`                     | Build pipeline stage completed for an entry                                                                            |
-| `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API)                                                                                    |
-| `init`, `reset`, `status`, `show`                                 | Operator command                                                                                                       |
-| `policy`                                                          | A gate's action changed; today `bodega policy osv malware set`, with the action and reason in `details`                |
-| `cache`                                                           | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the refusals decided on the way |
-| `denied`                                                          | A request the server refused                                                                                           |
-| `serve_start`, `serve_stop`                                       | `bodega serve` bound its listener / shut down                                                                          |
+| Type                                                              | Trigger                                                                                                                                                      |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `serve_fetch`                                                     | Client downloaded a package over HTTP                                                                                                                        |
+| `fetch`, `build`, `package`, `upload`, `sync`                     | Build pipeline stage completed for an entry                                                                                                                  |
+| `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API)                                                                                                                          |
+| `init`, `reset`, `status`, `show`                                 | Operator command                                                                                                                                             |
+| `policy`                                                          | A gate's action changed; today `bodega policy osv malware set`, with the action and reason in `details`                                                      |
+| `cache`                                                           | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the refusals decided on the way                                       |
+| `denied`                                                          | A request the server refused                                                                                                                                 |
+| `serve_start`, `serve_stop`                                       | `bodega serve` bound its listener / shut down                                                                                                                |
+| `inventory`                                                       | An inventory report holding a refused or unknown component (`bypass`), or two sources disagreeing (`source_disagreement`); see [Audit events](#audit-events) |
 
 That table is the whole set. A type absent from a trail is a gap to chase rather than a type the server was never going to write: `cache` was defined and reachable only through its two refusals for several releases, so an install proxying npm and cargo all day recorded nothing saying which artifacts had come from upstream, and nothing in the trail read as missing.
 
@@ -5846,7 +5863,7 @@ bodega audit admissions npm minimist 1.2.8 --json
 
 ## Inventory
 
-bodega can hold each host's installed packages, as reported by an inventory collector, beside its own record of what it served. This section describes how reports arrive and what is stored. Comparing the two is a separate step and is not described here.
+bodega can hold each host's installed packages, as reported by an inventory collector, beside its own record of what it served and what it refused, and say which installed package falls in which class. The sections below describe how reports arrive, what is stored, and how [Reconciliation](#reconciliation) compares the two.
 
 ### Source model
 
@@ -5889,12 +5906,14 @@ One host may report through several source instances. Each instance's reports ar
 
 Keys every instance accepts:
 
-| Key         | Default  | Meaning                                                                                    |
-| ----------- | -------- | ------------------------------------------------------------------------------------------ |
-| `type`      | required | A registered source type                                                                   |
-| `enabled`   | `false`  | A disabled push instance registers no route; a disabled pull instance is never polled      |
-| `retention` | off      | A Go duration such as `"2160h"`. Rows of this instance received earlier are deleted hourly |
-| `interval`  | `"1h"`   | Pull instances only. Minimum `"5m"`                                                        |
+| Key         | Default  | Meaning                                                                                                                |
+| ----------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `type`      | required | A registered source type                                                                                               |
+| `enabled`   | `false`  | A disabled push instance registers no route; a disabled pull instance is never polled                                  |
+| `retention` | off      | A Go duration such as `"2160h"`. Rows of this instance received earlier are deleted hourly                             |
+| `interval`  | see text | Pull: how often to poll, default `"1h"`, minimum `"5m"`. Push: how often hosts are expected to report, default `"24h"` |
+
+A push instance's `interval` only decides when [reconciliation](#staleness) calls a host stale; nothing is scheduled from it. A source type that schedules its hosts itself takes its own: an `osquery` instance's interval is its snapshot interval.
 
 Instance names are lowercase letters, digits, `.`, `_` and `-`, because they appear in a URL path. An unknown type, an unknown key, or a value the type rejects stops the config load with an error naming the instance and the key:
 
@@ -6126,17 +6145,20 @@ Each enabled pull instance polls on its own `interval` (default 1h, minimum 5m),
 
 All of it lives in the audit database (`audit_db`), whatever `audit_sink` is set to. Nothing here writes to the manifest store.
 
-| Table                    | Holds                                                      | Writes                           |
-| ------------------------ | ---------------------------------------------------------- | -------------------------------- |
-| `inventory_reports`      | One row per report                                         | Append-only                      |
-| `inventory_components`   | The components of each report                              | Append-only                      |
-| `inventory_attempts`     | Attempt evidence                                           | Append-only                      |
-| `inventory_hosts`        | The host mapping, with first and last report time          | `bind`, `unbind`, `last_seen`    |
-| `inventory_source_polls` | Last poll, last success and last error per pull instance   | Updated per poll                 |
-| `osquery_enroll_secrets` | Enroll secrets, by peppered hash, with identity and expiry | `secret create`, `secret revoke` |
-| `osquery_nodes`          | Each `node_key` handed out, by sha256, with its secret     | enroll, `secret revoke`          |
+| Table                           | Holds                                                      | Writes                           |
+| ------------------------------- | ---------------------------------------------------------- | -------------------------------- |
+| `inventory_reports`             | One row per report                                         | Append-only                      |
+| `inventory_components`          | The components of each report                              | Append-only                      |
+| `inventory_attempts`            | Attempt evidence                                           | Append-only                      |
+| `inventory_hosts`               | The host mapping, with first and last report time          | `bind`, `unbind`, `last_seen`    |
+| `inventory_source_polls`        | Last poll, last success and last error per pull instance   | Updated per poll                 |
+| `osquery_enroll_secrets`        | Enroll secrets, by peppered hash, with identity and expiry | `secret create`, `secret revoke` |
+| `osquery_nodes`                 | Each `node_key` handed out, by sha256, with its secret     | enroll, `secret revoke`          |
+| `inventory_classifications`     | Each report's classes and source-disagreement findings     | Once per report, on arrival      |
+| `inventory_baselines`           | Accepted baselines, with actor, time and comment           | `inventory accept`               |
+| `inventory_baseline_components` | The components each baseline covers                        | `inventory accept`               |
 
-No code path updates or deletes a row in the three append-only tables except `retention`, which is off by default and deletes whole rows by age. A trigger on each table refuses `UPDATE` outright.
+No code path updates or deletes a row in the three append-only tables, or in `inventory_classifications`, except `retention`, which is off by default and deletes whole rows by age (a report's classification goes with the report). A trigger on each table refuses `UPDATE` outright.
 
 Reports are chained. Each carries a sequence number and the sha256 of the previous report from the same host under the same source instance (keyed on the identity, or on the external id while the host is unbound), so a missing or substituted row shows as a gap in the chain. Retention cuts the chain at its boundary: the oldest surviving report names a predecessor that is gone.
 
@@ -6168,6 +6190,75 @@ _ "github.com/ravinald/bodega/internal/inventory/mytool"
 ```
 
 `internal/inventory/cyclonedx` is the worked example.
+
+Two optional interfaces feed [reconciliation](#reconciliation). A push source implementing `inventory.Intervaler` (`Interval() time.Duration`) sets its instances' expected reporting interval itself, in place of the `interval` key. A source implementing `inventory.CoverageDeclarer` (`Covers(identity, ecosystem string) bool`) says which ecosystems it sees on a host; one that does not is taken to see every ecosystem, and so can disagree about any of them.
+
+### Reconciliation
+
+Each report from a mapped host is classified as it arrives, against what bodega served, refused and cataloged at that moment and the baselines in force, and the result is stored with the report. Reconciliation reads only the common model, so a new source type needs nothing here. A report from an unbound id is not classified; binding the id later does not classify it either.
+
+```bash
+bodega inventory report web-01                 # the host's current set, worst first
+bodega inventory report web-01 --class refused,unknown
+bodega inventory hosts                         # every mapped host, staleness and counts
+bodega inventory accept web-01 --comment "golden image 2026-10"
+bodega inventory baseline web-01
+```
+
+`GET /api/v1/inventory/<identity>` returns what `report --json` prints, and is admin-gated like `GET /api/v1/audit`.
+
+#### Classes
+
+Worst first. A component gets the first class whose rule holds:
+
+| Class          | Rule                                                                                                                                                                                                |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refused`      | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                              |
+| `baseline`     | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                            |
+| `unknown`      | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row |
+| `served`       | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                             |
+| `unattributed` | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                        |
+| `stale`        | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                 |
+
+Classes are displayed worst first: `refused`, `unknown`, `unattributed`, `served`, `baseline`. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`.
+
+Names compare the way bodega's types canonicalize them: `Django` installed and `django` served are one pypi package, while npm names stay case-sensitive. A version compares exactly, except that an apt epoch is dropped on both sides, since dpkg reports `1:2.38.1-5` and the pool file is `util-linux_2.38.1-5_amd64.deb`. An apt or FreeBSD `serve_fetch` row names a pool path or a repository, so the object key's filename says which package was served. A catalog entry counts only at its exact version: a range or open entry records nothing about a version bodega never served under it, so a host holding one got it elsewhere.
+
+Classes are recorded, not recomputed. Hiding a version, serving a package, or accepting a baseline changes the class of components in reports that arrive afterwards, never of those already stored.
+
+`foreign-origin` (the package manager itself names a non-bodega source) is reserved and not emitted.
+
+#### The current set
+
+A host's current set is the union of the latest report from each source instance mapped to it. A component two instances report is one entry naming both, with the worse of their recorded classes. `report` shows each component's ecosystem, name, version, the paths reported for it, the instances that reported it and the reason for its class, then each mapped instance with its last report and whether it is stale, then any source disagreements.
+
+#### Source disagreement
+
+When a report arrives, every component it holds is compared with the latest report of each other enabled instance mapped to the same host, and the other way round. A component one reports and the other omits is a `source-disagreement` finding naming both instances and both reports, unless the omitting instance does not cover that ecosystem on that host (an `osquery` source sees pip and npm trees only where the host's profile declares a directory to scan, and claims nothing in `other`). The findings are stored with the arriving report, so the newest report on a host holds that host's disagreements as they stand. With a collector outside the host's trust boundary as the second source, a disagreement is the tamper signal described in the design notes.
+
+#### Staleness
+
+An instance mapped to a host is stale on it when the host has no report through it within twice the instance's `interval`. For a pull instance a report exists only where a poll succeeded and returned the host, so its last report is its last successful poll covering the host. A host mapped and never reported through an instance is stale on it, and so is a mapping naming an instance `inventory_sources` no longer configures. Staleness does not change `report`'s exit status.
+
+#### Baselines
+
+A stock host's first report lists its whole image as `unknown`. Accept a baseline at provisioning, before anything else is installed:
+
+```bash
+bodega inventory accept web-01                     # the host's current set
+bodega inventory accept web-01 --report 412        # one stored report
+bodega inventory accept --profile web-tier         # every identity bound to the profile
+```
+
+An identity baseline copies the components of the accepted reports, with name, version and digest. A profile baseline copies the profile's entries: a pinned entry covers its version, an unpinned one every version of the name. Both are copies, so retention removing the report, or an edit to the profile, leaves the baseline as accepted; accept again to take the change. The newest baseline for an identity, and the newest for its bound profile, are in force together; earlier ones stay on record. `bodega inventory baseline <identity>` shows both, with who accepted each, when, the comment and the components.
+
+#### Audit events
+
+Each arriving report with at least one `refused` or `unknown` component writes one `inventory` event with status `bypass`, the identity, the source instance as its name, and `details` holding the report id and the counts per class. A report that produces source-disagreement findings writes one `inventory` event with status `source_disagreement`, with the report id, the number of findings and the instances involved. Both go to the configured `audit_sink` and obey `audit_events`.
+
+#### Limits
+
+Classification reads the served set through the audit sink. With `audit_sink` set to `syslog` or `jsonl` there is no table to read, so reports are stored unclassified and read `unclassified`, and the server logs an `ERROR` per report. Each arriving report reads every distinct object bodega has served to anyone, which on a large `sqlite` event table is a scan per report.
 
 ## TUI
 

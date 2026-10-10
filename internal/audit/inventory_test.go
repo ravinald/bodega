@@ -312,3 +312,64 @@ func TestInventoryReportChainRecomputesFromStoredRows(t *testing.T) {
 		}
 	}
 }
+
+// A report is classified once. The record of what bodega knew when it
+// arrived can be neither replaced nor edited, and retention removes it with
+// the report it belongs to.
+func TestInventoryClassificationIsWriteOnceAndPrunedWithItsReport(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	rep, err := db.AppendInventoryReport(ctx, InventoryReport{Source: "cdx", ExternalID: "web-01", Identity: "web-01",
+		ObservedAt: old, ReceivedAt: old, Components: []InventoryComponent{{Ecosystem: "npm", Name: "x", Version: "1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := InventoryClassification{ReportID: rep.ID, Source: "cdx", Identity: "web-01", ClassifiedAt: old,
+		Components: []ClassifiedComponent{{Ecosystem: "npm", Name: "x", Version: "1", Class: "unknown", Reason: "r"}}}
+	if err := db.RecordInventoryClassification(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	c.Components[0].Class = "served"
+	if err := db.RecordInventoryClassification(ctx, c); err == nil {
+		t.Error("a second classification of one report was stored")
+	}
+	if _, err := db.writer().ExecContext(ctx, `UPDATE inventory_classifications SET components = '[]'`); err == nil {
+		t.Error("UPDATE on inventory_classifications succeeded; the append-only trigger is missing")
+	}
+	got, err := db.InventoryClassifications(ctx, []int64{rep.ID})
+	if err != nil || got[rep.ID].Components[0].Class != "unknown" || got[rep.ID].Disagreements == nil {
+		t.Errorf("stored classification = %+v, %v; want the first one, with an empty (not null) disagreement list", got, err)
+	}
+	if _, err := db.PruneInventory(ctx, "cdx", old.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := db.InventoryClassifications(ctx, []int64{rep.ID}); len(got) != 0 {
+		t.Errorf("classification of a pruned report survived: %+v", got)
+	}
+}
+
+func TestInventoryBaselineNamesOneSubject(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	for _, b := range []InventoryBaseline{{}, {Identity: "a", Profile: "p"}} {
+		if _, err := db.AcceptInventoryBaseline(ctx, b); err == nil {
+			t.Errorf("baseline %+v was accepted", b)
+		}
+	}
+	first, err := db.AcceptInventoryBaseline(ctx, InventoryBaseline{Identity: "a", ReportIDs: []int64{3, 4}, Actor: "ops",
+		Components: []BaselineComponent{{Ecosystem: "apt", Name: "bash", Version: "5"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptInventoryBaseline(ctx, InventoryBaseline{Identity: "a", Comment: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := db.CurrentInventoryBaseline(ctx, "a", "")
+	if err != nil || cur == nil || cur.Comment != "second" || cur.ID == first.ID {
+		t.Errorf("current = %+v, %v; want the newer baseline in force", cur, err)
+	}
+	if none, err := db.CurrentInventoryBaseline(ctx, "", "a"); err != nil || none != nil {
+		t.Errorf("an identity's baseline answered as a profile's: %+v, %v", none, err)
+	}
+}

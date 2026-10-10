@@ -20,25 +20,36 @@ import (
 // through, and reports on the configured sources.
 func newInventoryCmd(gf *globalFlags) *cobra.Command {
 	parent := &cobra.Command{
-		Use:   "inventory <sources|bind|unbind|unbound>",
-		Short: "Inspect inventory sources and map their hosts to identities",
+		Use:   "inventory <sources|bind|unbind|unbound|report|hosts|accept|baseline>",
+		Short: "Inspect inventory sources, map their hosts, and reconcile what hosts installed",
 		Long: `Inventory sources deliver each host's installed packages to bodega, either
 pushed to a route the source registers or polled from a vendor API. Each
 source names hosts its own way (a node key, a vendor host id, a token's
 identity), and a report reaches an identity only through the host mapping
 these commands manage. A report from an id nothing maps is kept as unbound.
 
+Each report is classified against what bodega served, refused and cataloged
+as it arrives. report, hosts, accept and baseline read and steer that.
+
 Examples:
   bodega inventory sources
   bodega inventory unbound --json
   bodega inventory bind osquery-a 5f1c0e... web-01
-  bodega inventory unbind osquery-a 5f1c0e...`,
+  bodega inventory unbind osquery-a 5f1c0e...
+  bodega inventory report web-01
+  bodega inventory hosts
+  bodega inventory accept web-01 --comment "golden image"
+  bodega inventory baseline web-01`,
 	}
 	parent.AddCommand(
 		newInventorySourcesCmd(gf),
 		newInventoryBindCmd(gf),
 		newInventoryUnbindCmd(gf),
 		newInventoryUnboundCmd(gf),
+		newInventoryReportCmd(gf),
+		newInventoryHostsCmd(gf),
+		newInventoryAcceptCmd(gf),
+		newInventoryBaselineCmd(gf),
 	)
 	return parent
 }

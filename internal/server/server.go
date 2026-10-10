@@ -37,6 +37,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/inventory"
+	"github.com/ravinald/bodega/internal/inventory/reconcile"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -93,6 +94,7 @@ type Server struct {
 	// inventory runs the configured inventory sources; inventoryErr is set
 	// when inventory_sources does not configure, and Start refuses on it.
 	inventory    *inventory.Frame
+	reconciler   *reconcile.Reconciler
 	inventoryErr error
 	// fills holds a proxied key from the moment its bytes reach the store
 	// until its origin row does, so a hit arriving inside that window can
@@ -947,6 +949,9 @@ func (s *Server) registerRoutes() {
 	// matches the instance and route, and only a route a source registered is
 	// exempt from the admin gate.
 	m.HandleFunc("POST /api/v1/inventory/sources/{instance}/{route...}", s.handleInventoryPush)
+
+	// One host's installed set, classified against what bodega served it.
+	m.HandleFunc("GET /api/v1/inventory/{identity}", s.handleAPIInventory)
 
 	// Upstream allow-list policies (mutation-gated)
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)

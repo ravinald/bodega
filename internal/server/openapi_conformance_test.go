@@ -14,6 +14,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory/reconcile"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
 	"github.com/ravinald/bodega/internal/pkgrepos"
@@ -244,6 +245,11 @@ var schemaStructs = map[string]any{
 	"TokenInfo":          audit.TokenInfo{},
 	"ProfilePin":         pins.Pin{},
 	"ProfilePinOSV":      pins.OSVState{},
+
+	"InventoryHostReport":         reconcile.HostReport{},
+	"InventorySourceState":        reconcile.SourceState{},
+	"InventoryComponent":          reconcile.Component{},
+	"InventorySourceDisagreement": audit.SourceDisagreement{},
 }
 
 var schemasWithoutStruct = map[string]string{
