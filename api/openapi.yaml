@@ -568,13 +568,14 @@ paths:
         The union of the latest report from each inventory source instance
         mapped to the identity. Each component carries the class recorded when
         its report arrived (refused, unknown, unattributed, served, baseline,
-        or unclassified for a report that arrived before reconciliation ran),
+        or unclassified for a report nothing classified: it arrived before
+        reconciliation ran, or while the audit sink could not answer),
         the reason, and the instances that reported it. Each mapped instance is
         listed with its last report and whether it is stale: no report within
         twice its interval. Disagreements list components one instance reports
         and another enabled instance covering that ecosystem omits. alert is
-        true when a component is refused or unknown or there is a
-        disagreement, which is when `bodega inventory report` exits 1.
+        true when a component is refused, unknown or unclassified, or there is
+        a disagreement, which is when `bodega inventory report` exits 1.
         Admin-gated like the other /api/v1 reads.
       operationId: getInventoryHost
       tags: [inventory]
@@ -2158,7 +2159,7 @@ components:
           format: date-time
         alert:
           type: boolean
-          description: A component is refused or unknown, or two sources disagree
+          description: A component is refused, unknown or unclassified, or two sources disagree
         counts:
           type: object
           description: Components per class, and stale instances under "stale"
