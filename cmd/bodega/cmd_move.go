@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -316,7 +317,47 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 		moved = append(moved, key)
 	}
 
-	return m.commit(ctx, pm, i, label, srcName, src, moved)
+	var envelopes []string
+	for _, key := range moved {
+		carried, err := m.carryAttestations(ctx, src, srcName, label, key)
+		if err != nil {
+			return err
+		}
+		envelopes = append(envelopes, carried...)
+	}
+	return m.commit(ctx, pm, i, label, srcName, src, append(moved, envelopes...))
+}
+
+// carryAttestations copies every envelope bodega signed for key to the
+// destination and returns their keys. An attestation names the bytes it is
+// about, not a backend, so it moves with them: left behind, the route would
+// look for it beside the artifact and find nothing, and --delete-source would
+// strand it on a backend no reader consults.
+//
+// The copy is checked byte for byte. Nothing records an envelope's digest, and
+// a changed byte fails signature verification later with nothing pointing at
+// the move that changed it.
+func (m *mover) carryAttestations(ctx context.Context, src storage.ObjectStore, srcName, label, key string) ([]string, error) {
+	listed, err := src.List(ctx, manifest.AttestationDir(key))
+	if err != nil {
+		return nil, fmt.Errorf("%s: list the attestations for %s on %q: %w", label, key, srcName, err)
+	}
+	var carried []string
+	for _, ek := range listed {
+		if obj, ok := attest.ObjectKeyOf(ek); !ok || obj != key {
+			continue
+		}
+		fmt.Fprintf(m.out, "  %s: %s -> %s (%s)\n", label, srcName, m.dstName, ek)
+		_, sum, err := m.copyObject(ctx, src, ek)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", label, err)
+		}
+		if err := m.verifyBytes(ctx, ek, sum); err != nil {
+			return nil, fmt.Errorf("%s: %w", label, err)
+		}
+		carried = append(carried, ek)
+	}
+	return carried, nil
 }
 
 // commit records the destination on the version entry and then, and only then,

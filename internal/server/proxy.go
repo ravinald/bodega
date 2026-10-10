@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -278,7 +279,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		f.write(w, r)
 		return
 	}
-	s.pinFill(ctx, fill, s3Key, immutable)
+	s.pinFill(ctx, store, fill, s3Key, spool.sha256, immutable)
 
 	// Cache to storage (best-effort — don't fail the response if caching fails).
 	// The read above and this write take the same store parameter: resolving
@@ -986,28 +987,37 @@ func (s *Server) recordFillRefusal(r *http.Request, regType, policyCandidate, na
 // database at the gate, or a route that bypassed it) falls through to the
 // not_evaluated row and the WARN, which is the honest record of bytes cached
 // with no decision behind them.
-func (s *Server) pinFill(ctx context.Context, fill fillAdmission, s3Key string, immutable bool) {
+//
+// The attestation is written to store, the backend the fill caches into, so
+// the envelope sits beside the bytes it describes.
+func (s *Server) pinFill(ctx context.Context, store storage.ObjectStore, fill fillAdmission, s3Key, sha256 string, immutable bool) {
 	if s.auditDB == nil || !immutable {
 		return
 	}
 	if fill.typ == "" {
 		fill = fillIdentity("", "", s3Key)
 	}
-	s.pinAdmission(ctx, fill.typ, fill.name, fill.version, s3Key)
+	s.pinAdmission(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256)
 }
 
 // pinAdmission attaches key to the newest admitted decision for the version,
-// and says so at WARN when there was none to attach to.
-func (s *Server) pinAdmission(ctx context.Context, typ, name, version, key string) {
+// and says so at WARN when there was none to attach to, then signs the
+// attestation for the pin.
+func (s *Server) pinAdmission(ctx context.Context, store storage.ObjectStore, typ, name, version, key, sha256 string) {
 	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
 	switch {
 	case err != nil:
 		s.logger.Error("admission row not updated with its object key", "type", typ, "package", name,
 			"version", version, "key", key, "error", err)
+		return
 	case outcome == audit.PinUnadmitted:
 		s.logger.Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
 			"type", typ, "package", name, "version", version, "key", key)
 	}
+	s.emitAttestation(ctx, store, attest.Pin{
+		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256,
+		RequiredBy: s.requiredBy(ctx, typ, name, version), Outcome: outcome,
+	})
 }
 
 // proxyMalwareGate refuses a cache fill for a version OSV records as malware,

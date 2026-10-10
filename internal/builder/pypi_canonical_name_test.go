@@ -33,8 +33,8 @@ func TestBuilderNamesADistributionTheSameWayTheStoreDoes(t *testing.T) {
 		if got, _, ok := parseWheelName(in + "-1.0.0-py3-none-any.whl"); !ok || got != want {
 			t.Errorf("parseWheelName(%q wheel) = %q (ok %v), want %q", in, got, ok, want)
 		}
-		if got, _, ok := parsePypiArtifactName(in + "-1.0.0.tar.gz"); !ok || got != want {
-			t.Errorf("parsePypiArtifactName(%q sdist) = %q (ok %v), want %q", in, got, ok, want)
+		if got, _, ok := ParsePypiArtifactName(in + "-1.0.0.tar.gz"); !ok || got != want {
+			t.Errorf("ParsePypiArtifactName(%q sdist) = %q (ok %v), want %q", in, got, ok, want)
 		}
 	}
 }

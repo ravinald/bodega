@@ -279,22 +279,33 @@ paths:
 
   /api/v1/packages/{type}/{name}/{version}/attestation:
     get:
-      summary: Fetch a version's provenance attestation
+      summary: Fetch a version's attestation
       description: |
-        Resolves the `attestation_uri` recorded on the version entry and answers
-        with the envelope. Nothing in bodega writes that blob: an external
-        authority puts it somewhere and the manifest records where, so this
-        route reads rather than generates.
+        Answers with the newest DSSE envelope bodega signed for the version: an
+        in-toto Statement v1 with the `https://slsa.dev/dependency/v1`
+        predicate, naming the artifact by purl and SHA-256 and carrying the
+        admission decision behind it. Envelopes are signed when the digest is
+        pinned, on a hosted fetch or a proxy fill, and verify against the keys
+        `/api/v1/attestation/keys` publishes. For pypi the newest envelope
+        across the release's wheels is served; its subject's `file_name`
+        qualifier names the wheel.
 
-        An `https://` URI answers 302 to it. An `s3://` URI is proxied from the
-        backend whose bucket matches, falling back to the type rule when no
-        configured backend claims that bucket — the fallback is what answered
-        before named backends existed, and a WARN in the journal says which of
-        the two resolved it.
+        With no envelope of its own, the route falls back to the
+        `attestation_uri` recorded on the version entry, which names an
+        envelope somebody other than bodega wrote. `?source=upstream` skips
+        bodega's own and goes to that directly. An `https://` URI answers 302
+        to it. An `s3://` URI is proxied from the backend whose bucket matches,
+        falling back to the type rule when no configured backend claims that
+        bucket — the fallback is what answered before named backends existed,
+        and a WARN in the journal says which of the two resolved it.
 
         Not gated by the host profile. A profile refuses artifacts; this is
         metadata about one, and the decision to leave it ungated is recorded
-        against issue #300.
+        against issue #300. Bodega's own envelope names the artifact's purl,
+        digest and the admission checks it passed, so a host whose profile
+        refuses a package can still learn that bodega admitted it and under
+        which policy digest. For a cataloged version the package read
+        routes, which are not profile-gated either, already say as much.
       operationId: getAttestation
       tags: [packages]
       parameters:
@@ -305,10 +316,38 @@ paths:
           required: true
           schema:
             type: string
+        - name: source
+          in: query
+          required: false
+          description: "`upstream` serves the `attestation_uri` passthrough even when bodega holds its own envelope"
+          schema:
+            type: string
+            enum: [upstream]
       responses:
         "200":
-          description: The attestation envelope, proxied from object storage
+          description: The newest envelope bodega signed, or an `s3://` attestation_uri envelope proxied from object storage
           content:
+            application/json:
+              schema:
+                type: object
+                description: DSSE envelope; `payload` is the base64 of the in-toto statement
+                required: [payloadType, payload, signatures]
+                properties:
+                  payloadType:
+                    type: string
+                    example: application/vnd.in-toto+json
+                  payload:
+                    type: string
+                  signatures:
+                    type: array
+                    items:
+                      type: object
+                      required: [keyid, sig]
+                      properties:
+                        keyid:
+                          type: string
+                        sig:
+                          type: string
             application/octet-stream:
               schema:
                 type: string
@@ -316,9 +355,9 @@ paths:
         "302":
           description: Redirect to the http(s) attestation_uri the entry records
         "404":
-          description: Unknown type, package or version, or no attestation_uri recorded
+          description: Unknown type, package or version, or neither an envelope of bodega's own nor an attestation_uri
         "502":
-          description: attestation_uri is malformed or names an unsupported scheme
+          description: Bodega's own envelope could not be read from storage, or attestation_uri is malformed or names an unsupported scheme
 
   /api/v1/attestation/keys:
     get:

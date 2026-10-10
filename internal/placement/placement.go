@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -383,6 +384,17 @@ func (p *Placer) UploadPaths(ctx context.Context, typ string, paths []builder.Ar
 			return n, fmt.Errorf("upload %s %s: %w", typ, ap.Local, err)
 		}
 		n++
+		// The envelope goes where its artifact just went rather than being
+		// placed on its own, so a placement edit between the two cannot
+		// separate them.
+		for _, local := range ap.Attestations {
+			key := manifest.AttestationDir(ap.ObjectKey) + filepath.Base(local)
+			fmt.Fprintf(p.out, "    upload: %s/%s\n", st.Label(), key)
+			if err := st.PutFile(ctx, local, key); err != nil {
+				return n, fmt.Errorf("upload %s attestation %s: %w", typ, local, err)
+			}
+			n++
+		}
 	}
 	return n, nil
 }
@@ -471,7 +483,16 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 			return n, fmt.Errorf("upload pypi: %w", err)
 		}
 		fmt.Fprintf(p.out, "    Uploaded %d file(s) to %s/%s\n", n, st.Label(), keyPrefix)
-		return n, nil
+		attDir, attPrefix := builder.PypiAttestationDir(bcfg)
+		if _, err := os.Stat(attDir); err != nil {
+			return n, nil //nolint:nilerr // no fetch signed anything, which is not an upload failure
+		}
+		m, err := st.SyncDir(ctx, p.out, attDir, attPrefix)
+		if err != nil {
+			return n + m, fmt.Errorf("upload pypi attestations: %w", err)
+		}
+		fmt.Fprintf(p.out, "    Uploaded %d attestation(s) to %s/%s\n", m, st.Label(), attPrefix)
+		return n + m, nil
 	}
 
 	paths, release, err := ArtifactPaths(bcfg, p.store, typ, p.only)
@@ -479,6 +500,7 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 		return 0, err
 	}
 	defer release()
+	builder.AttachAttestations(bcfg, typ, paths)
 	if len(paths) == 0 {
 		// Naming the directory is what separates "nothing was built" from
 		// "this command resolved a different root than the build did".

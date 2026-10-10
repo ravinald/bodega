@@ -5,22 +5,27 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/attest"
+	"github.com/ravinald/bodega/internal/attestsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // Config holds the parameters shared by all builders.
@@ -87,6 +92,9 @@ type Config struct {
 	// run in that state say so on its own output.
 	policyChecker *policy.Checker
 	policyNotice  sync.Once
+	// attester signs the attestation for each pin; see attestEmitter.
+	attester   *attest.Emitter
+	attestOnce sync.Once
 	// app is the configuration NewConfig was built from, kept for the OSV
 	// gate's database and fallback settings. Nil on a Config built by hand,
 	// which leaves the gate with no database: it warns rather than passing.
@@ -194,10 +202,11 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 var fetchCheckers = admit.VersionCheckers
 
 // pinAdmission attaches an object key to the admission decision for the
-// version whose digest was just pinned, or verified against the pin. A pin no
-// decision preceded is said out loud: those bytes reached the store with no
-// admission behind them, and the row written for them says not_evaluated.
-func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key string) {
+// version whose digest was just pinned, or verified against the pin, and signs
+// the attestation for it. A pin no decision preceded is said out loud: those
+// bytes reached the store with no admission behind them, and the row written
+// for them says not_evaluated, which is what the attestation then carries.
+func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha256 string, requiredBy []string) {
 	if c.AuditDB == nil || key == "" {
 		return
 	}
@@ -205,9 +214,85 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key strin
 	switch {
 	case err != nil:
 		c.logf("  WARNING: %s/%s@%s: admission row not updated with object key %s: %v", typ, name, version, key, err)
+		return
 	case outcome == audit.PinUnadmitted:
 		c.logf("  WARNING: %s/%s@%s: pinned %s with no admission decision on record; recorded it as not_evaluated", typ, name, version, key)
 	}
+	e := c.attestEmitter()
+	if e == nil {
+		return
+	}
+	// The envelope is written into the build tree under the key it is stored
+	// at, and travels with its artifact on upload: the fetch runs before any
+	// backend is chosen for the bytes, so there is nowhere else it could go
+	// that stays beside them.
+	ek, err := e.Emit(ctx, storage.NewLocal(c.rootFor(typ)), attest.Pin{
+		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256, RequiredBy: requiredBy, Outcome: outcome,
+	})
+	switch {
+	case err != nil:
+		c.logf("  ERROR: %s/%s@%s: no attestation signed for %s: %v", typ, name, version, key, err)
+	case ek != "" && c.Verbose:
+		c.logf("    Attestation: %s", ek)
+	}
+}
+
+// attestEmitter is the signer this Config's pins attest with, loaded on the
+// first pin. nil means this run signs nothing: no key installed (a supported
+// configuration, and silent), a key that will not load, or an audit sink with
+// no admissions table to re-read before signing. The last two say so once.
+func (c *Config) attestEmitter() *attest.Emitter {
+	c.attestOnce.Do(func() {
+		if c.app == nil || c.AuditDB == nil {
+			return
+		}
+		kr, err := attestsign.Load(attestsign.DefaultKeyPaths(c.app.StoragePath))
+		switch {
+		case errors.Is(err, attestsign.ErrNoKey):
+			return
+		case err != nil:
+			c.logf("  WARNING: this run signs no attestations: %v", err)
+			return
+		}
+		if c.AuditDB.ReadOnly() || !c.AuditDB.EventsQueryable() {
+			c.logf("  attest: audit_sink %s keeps no admissions table to re-read before signing, so this run signs no attestations", c.AuditDB.SinkName())
+			return
+		}
+		signer := kr.Signer()
+		c.attester = &attest.Emitter{
+			Signer:     func() attestsign.Signer { return signer },
+			Admissions: c.AuditDB,
+			PlatformID: c.app.ResolveAttestationPlatformID(),
+		}
+	})
+	return c.attester
+}
+
+// AttachAttestations sets each path's Attestations to the envelopes a fetch
+// left for its object, so the upload writes them to the backend the artifact
+// went to.
+func AttachAttestations(cfg *Config, typ string, paths []ArtifactPath) {
+	tree := attestationTree(cfg.rootFor(typ))
+	for i := range paths {
+		rel := strings.TrimPrefix(manifest.AttestationDir(paths[i].ObjectKey), manifest.AttestationPrefix)
+		matches, _ := filepath.Glob(filepath.Join(tree, filepath.FromSlash(rel), "*"+manifest.AttestationExt))
+		paths[i].Attestations = matches
+	}
+}
+
+// PypiAttestationDir is PypiArtifactDir for the envelopes: pypi's wheels sync
+// as a directory, so their envelopes do too.
+func PypiAttestationDir(cfg *Config) (localDir, keyPrefix string) {
+	tree := attestationTree(cfg.rootFor(manifest.TypePypi))
+	return filepath.Join(tree, filepath.FromSlash(manifest.PypiWheelPrefix)), manifest.AttestationPrefix + manifest.PypiWheelPrefix
+}
+
+// attestationTree is where a fetch leaves envelopes under a type's root: the
+// directory manifest.AttestationPrefix names, laid out as the keys they upload
+// to, since pinAdmission writes them through a storage.Local rooted at the
+// type's root. A literal so reset's source scan can see what it clears.
+func attestationTree(root string) string {
+	return filepath.Join(root, "attestations")
 }
 
 // RootFor returns the root a type's fetch writes under: its *_root override
@@ -412,7 +497,7 @@ type ResetPath struct {
 func ResetPaths(cfg *Config) []ResetPath {
 	byPath := map[string]*ResetPath{}
 	for _, typ := range manifest.AllTypes {
-		for _, p := range typeResetPaths(cfg, typ) {
+		for _, p := range append(typeResetPaths(cfg, typ), attestationTree(cfg.rootFor(typ))) {
 			p = filepath.Clean(p)
 			if rp, ok := byPath[p]; ok {
 				rp.Types = append(rp.Types, typ)
@@ -643,6 +728,9 @@ type ArtifactPath struct {
 	// routed by its type instead.
 	Package string
 	Version string
+	// Attestations are the local envelopes signed for this object, uploaded
+	// to whichever backend the object itself goes to.
+	Attestations []string
 }
 
 // MergeSummaries merges an arbitrary slice of Summary pointers into one.

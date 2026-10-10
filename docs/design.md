@@ -81,6 +81,8 @@ Every backend, local or S3, carries the same key layout:
                              #   version segment. The ports tree itself has no
                              #   type: ports.txz is a binary entry at
                              #   binaries/freebsd-ports/15.1-RELEASE/ports.txz
+  attestations/              # signed envelopes, one directory per artifact key:
+                             #   attestations/<artifact key>/<decided_at>.dsse.json
 ```
 
 Every key is derived in one place: `manifest.ArtifactKeys` and its per-type helpers in `internal/manifest/keys.go`. The uploader, every server handler, `bodega build status`, `bodega pkg move` and the delete path all resolve through it. Three independent derivations existed before, and they disagreed.
@@ -88,6 +90,8 @@ Every key is derived in one place: `manifest.ArtifactKeys` and its per-type help
 A name containing a slash encodes to `--` for every type except gomod, which keeps its slashes. A Go client requests `GET /<module>/@v/<version>.zip` with the module path verbatim and nothing on the wire can re-encode it, so the uploader is the side that has to write the wire form. Any install that uploaded a Go module before that landed has bytes at the old encoded key; `bodega repair keys` moves them.
 
 Each package gets its own manifest file at `manifests/{type}/{safeName}/manifest.json`. This replaces the old monolithic per-type JSON files and enables parallel operations without lock contention.
+
+`attestations/` holds the DSSE envelopes bodega signs for what it admits (see [Attestations](#attestations)). An envelope is keyed by its artifact's own key and the time of the admission it cites, so a re-admission adds a file beside the earlier ones and never replaces one. It lives on the backend its artifact lives on: the hosted path writes it into the build tree and `bodega build upload` sends it wherever its artifact went, the proxy writes it into the backend the fill cached into, and `bodega pkg move` carries it. On S3, put the bucket holding this prefix under S3 Object Lock in compliance mode, with a retention at least as long as you keep the artifacts: an envelope nothing can delete or overwrite is a record a later compromise of the bodega host cannot rewrite. `bodega init` does not configure it. Under it, `bodega pkg move --delete-source` removes nothing from the source in practice: on a versioned bucket the delete adds a delete marker and the locked version of the envelope stays where it was.
 
 On S3, `bodega init` configures the bucket with versioning enabled, because a rewritten manifest's previous version is the only copy an attacker who can write the manifest cannot also rewrite. It sets SSE-S3 (AES-256) encryption, with no KMS option (a bucket policy that requires KMS refuses every write bodega makes), and blocks public access.
 
@@ -105,7 +109,7 @@ Placement and resolution are separate questions and share no code path. The conf
 
 An absent `storage` is `default`, not "recompute from config" — that is the answer for every artifact uploaded before named backends existed. A name nothing answers to fails the read rather than searching the other backends: serving bytes from one store under a digest recorded against another is the signature the checksum machinery exists to catch.
 
-Objects with no version entry — generated indexes, proxy-cache entries, attestation blobs — follow the type rule at both ends, which is safe because every one of them is regenerable. Manifests stay on `default`: they are what records placement.
+Objects with no version entry — generated indexes, proxy-cache entries, an envelope an `s3://` `attestation_uri` names — follow the type rule at both ends, which is safe because every one of them is regenerable. Bodega's own attestation envelopes are not in that set: each one travels with its artifact (see [Storage layout](#storage-layout)). Manifests stay on `default`: they are what records placement.
 
 Moving an artifact between backends is `bodega pkg move`, which copies, verifies at the destination, writes the manifest, and only then considers the source. Deleting first would be unrecoverable: both backends answer a missing object with "not found" rather than an error, so an artifact lost mid-move is indistinguishable from one that was never uploaded.
 
@@ -637,6 +641,18 @@ Both halves of the retirement report rather than vanish, and neither is silent. 
 ### Manifest integrity
 
 Every manifest JSON file has a companion `.md5` file. On load, the MD5 is verified. On save, it's recomputed. This catches accidental corruption and makes S3 sync conflicts visible.
+
+### Attestations
+
+bodega signs one statement for every artifact it admits: an [in-toto Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md) whose predicate is the SLSA [Dependency track](https://slsa.dev/spec/draft/dependency-track) draft's `https://slsa.dev/dependency/v1`, in a [DSSE](https://github.com/secure-systems-lab/dsse/blob/master/protocol.md) envelope, signed with the attestation key (see `docs/usage.md`, "Attestation signing key"). `internal/attest` builds the statement, the pre-authentication encoding and the envelope with the standard library and signs through `attestsign.Signer`; the predicate type is one constant there, because the draft may still rename it.
+
+The subject is the artifact's [purl](https://github.com/package-url/purl-spec) with its SHA-256, plus a `bodega.objectKey` annotation naming the storage key. npm, pypi (with a `file_name` qualifier naming the wheel), gomod and cargo use their registered purl types; the rest are `pkg:generic/<bodega type>/<name>`, because a `deb` purl needs a distribution vendor an apt entry does not record. The predicate carries `ingestionPlatform.id` (`attestation_platform_id`, defaulting to the public URL), `ingestedAt`, `policyEvaluations` (the admission row's decision, `policyDigest`, actor, identity and every check as recorded, with any of `allowlist`, `age` and `osv` the row lacks listed as `not_evaluated`), `resolvedFrom` (the version's `required_by`) and `upstreamProvenance` and `publisherSignature`, which say `{"status": "unavailable"}` until bodega verifies a publisher's own signatures.
+
+**An envelope is signed when a digest is pinned**, at the two `PinAdmission` call sites: the builder's `pinAdmission`, which every hosted fetch's pin passes through, and the proxy's `pinFill`. Before signing, the emitter re-reads the admission table rather than trusting its caller. It refuses, at ERROR, when the version has no row, when its newest decision is not `admitted`, or when that decision names a different object. A pin no decision preceded (`PinUnadmitted`) is signed with the `not_evaluated` checks its row records, never as a pass. Under a `syslog` or `jsonl` sink, or a read-only store, there is no table to re-read, so nothing is signed and the server says why once, at WARN, when it starts. With no key loaded nothing is signed and nothing is logged beyond the no-key WARN. The envelope is named after the decision's `decided_at`, so a repeat pin under one decision lands on the file already written and a re-admission writes a new one.
+
+Envelopes are stored under `attestations/<artifact key>/` on the artifact's own backend. That prefix is the record an auditor reads after the fact, so on S3 keep it under Object Lock as [Storage layout](#storage-layout) describes: without it, whoever compromises the bodega host can rewrite or delete the envelopes already written as well as sign new ones.
+
+`GET /api/v1/packages/{type}/{name}/{version}/attestation` serves the newest of the version's envelopes, falls back to an `attestation_uri` written by somebody else, and takes `?source=upstream` to skip straight to that. `bodega attest verify` checks an envelope against a pinned key ID and the artifact's bytes, and `bodega attest backfill` signs objects pinned before any of this existed. What a statement does and does not prove is in [threat-model.md](threat-model.md#what-an-attestation-proves).
 
 ## Audit trail
 

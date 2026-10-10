@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -163,13 +164,13 @@ func (c *Config) pinChecksum(ctx context.Context, pm *manifest.PackageManifest, 
 	if version == "" {
 		version = ve.Ref
 	}
-	return c.pinArtifactDigest(ctx, keys[0], pm.Type, pm.Name, version, cs)
+	return c.pinArtifactDigest(ctx, keys[0], pm.Type, pm.Name, version, cs, ve.RequiredBy)
 }
 
 // pinArtifactDigest records one object key's digest and enforces an earlier
 // one. It is the rule described above, reached either from a manifest entry via
 // pinChecksum or from a key a caller derived itself.
-func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version string, cs *manifest.Checksum) error {
+func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version string, cs *manifest.Checksum, requiredBy []string) error {
 	if c.AuditDB == nil || key == "" || cs == nil || cs.Value == "" {
 		return nil
 	}
@@ -184,14 +185,24 @@ func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version 
 		}
 		// Bytes that match the pin are the pinned object, so the decision
 		// this fetch was admitted under names it as well.
-		c.pinAdmission(ctx, typ, name, version, key)
+		c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy)
 		return nil
 	}
 	if err := c.AuditDB.StoreChecksum(ctx, key, typ, name, version, cs.Algorithm, cs.Value, checksumSourceBuild); err != nil {
 		return err
 	}
-	c.pinAdmission(ctx, typ, name, version, key)
+	c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy)
 	return nil
+}
+
+// sha256Of is the digest an attestation names, which is SHA-256 only: a pin
+// under another algorithm has nothing a verifier holding the bytes could
+// compare, and Emit refuses an empty one.
+func sha256Of(cs *manifest.Checksum) string {
+	if cs == nil || !strings.EqualFold(cs.Algorithm, "sha256") {
+		return ""
+	}
+	return cs.Value
 }
 
 // findAndUpdateGitChecksum updates Checksum and ChecksumVerified on a git VersionEntry and saves.

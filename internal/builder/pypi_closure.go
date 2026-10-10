@@ -54,10 +54,10 @@ func pypiWheelhouseDir(root string) string { return filepath.Join(root, "wheelho
 // applications' requirements as read, and this one is what they resolved to.
 func pypiLockPath(root string) string { return filepath.Join(root, "resolved-requirements.txt") }
 
-// parsePypiArtifactName splits a downloaded filename into its distribution and
+// ParsePypiArtifactName splits a downloaded filename into its distribution and
 // version. A wheel carries both in fixed positions; an sdist puts the version
 // after the last hyphen, which is the only split PEP 625 guarantees.
-func parsePypiArtifactName(base string) (dist, version string, ok bool) {
+func ParsePypiArtifactName(base string) (dist, version string, ok bool) {
 	if strings.HasSuffix(base, ".whl") {
 		return parseWheelName(base)
 	}
@@ -91,7 +91,7 @@ func scanPypiWheelhouse(dir string) ([]pypiArtifact, error) {
 			continue
 		}
 		base := ent.Name()
-		dist, version, ok := parsePypiArtifactName(base)
+		dist, version, ok := ParsePypiArtifactName(base)
 		if !ok {
 			return nil, fmt.Errorf("%s: %s is not a distribution filename this can name, so nothing pins it", dir, base)
 		}
@@ -328,14 +328,34 @@ func downloadPypiClosure(out io.Writer, pipBin, indexURL, combinedReq, house str
 // reads: same table, same source word, keyed by the object key the wheel is
 // served under. What differs is only where the key comes from, because a pypi
 // manifest entry covers a closure rather than a file.
-func (c *Config) pinPypiClosure(ctx context.Context, arts []pypiArtifact, house string) error {
+//
+// store supplies each artifact's RequiredBy for its attestation, when a pypi
+// entry for that version exists; a wheel pip pulled in transitively has none.
+func (c *Config) pinPypiClosure(ctx context.Context, store *manifest.Store, arts []pypiArtifact, house string) error {
 	for _, a := range arts {
 		cs := newSHA256Checksum(a.Digest)
-		if err := c.pinArtifactDigest(ctx, a.Key(), manifest.TypePypi, a.Dist, a.Version, cs); err != nil {
+		if err := c.pinArtifactDigest(ctx, a.Key(), manifest.TypePypi, a.Dist, a.Version, cs, pypiRequiredBy(ctx, store, a)); err != nil {
 			// Refused rather than stored: the bytes go before the error does,
 			// so a later build cannot reach them through --find-links.
 			_ = os.Remove(filepath.Join(house, a.File))
 			return err
+		}
+	}
+	return nil
+}
+
+// pypiRequiredBy is the RequiredBy of the pypi entry for a's version, or nil.
+func pypiRequiredBy(ctx context.Context, store *manifest.Store, a pypiArtifact) []string {
+	if store == nil {
+		return nil
+	}
+	pm, err := store.GetPackage(ctx, manifest.TypePypi, a.Dist)
+	if err != nil || pm == nil {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == a.Version {
+			return ve.RequiredBy
 		}
 	}
 	return nil
