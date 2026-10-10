@@ -217,6 +217,27 @@ type ServedArtifact struct {
 	Digest     string `json:"digest"`
 }
 
+// ServedObject is one distinct stored object bodega served.
+type ServedObject struct {
+	PkgType    string `json:"pkg_type"`
+	PkgName    string `json:"pkg_name"`
+	PkgVersion string `json:"pkg_version"`
+	ObjectKey  string `json:"object_key"`
+	Digest     string `json:"digest"`
+}
+
+func scanServedObjects(rows *sql.Rows) ([]ServedObject, error) {
+	var out []ServedObject
+	for rows.Next() {
+		var so ServedObject
+		if err := rows.Scan(&so.PkgType, &so.PkgName, &so.PkgVersion, &so.ObjectKey, &so.Digest); err != nil {
+			return nil, err
+		}
+		out = append(out, so)
+	}
+	return out, rows.Err()
+}
+
 // nullIfEmpty binds "" as NULL, for the columns where empty means "not
 // applicable" rather than a value.
 func nullIfEmpty(s string) any {
@@ -640,6 +661,19 @@ func (a *DB) Served(ctx context.Context, identity string, since time.Time) ([]Se
 		return nil, err
 	}
 	return r.QueryServed(ctx, identity, since)
+}
+
+// ServedObjects returns the distinct stored objects bodega served to
+// identity, or to anyone when identity is empty, each with the type, name and
+// version the serve_fetch row recorded. Unlike Served it keeps the object key,
+// because apt and FreeBSD rows name a pool path or a repository there and only
+// the key says which package the bytes were.
+func (a *DB) ServedObjects(ctx context.Context, identity string) ([]ServedObject, error) {
+	r, err := a.reader("served objects")
+	if err != nil {
+		return nil, err
+	}
+	return r.QueryServedObjects(ctx, identity)
 }
 
 // Count returns the total number of events matching the filter.

@@ -226,11 +226,44 @@ const (
 	MinPullInterval     = 5 * time.Minute
 )
 
+// DefaultPushInterval is how often a push instance is expected to report when
+// neither its type nor its configuration says. A host posting a CycloneDX
+// document from a daily job is the case it is sized for.
+const DefaultPushInterval = 24 * time.Hour
+
+// Intervaler is a push source that knows how often its hosts report, because
+// it schedules them itself (osquery's snapshot interval). Its interval is the
+// instance's, in place of the interval key.
+type Intervaler interface {
+	Interval() time.Duration
+}
+
+// CoverageDeclarer is a source that sees only some ecosystems on a host, and
+// can say which. A source that does not implement it is taken to see every
+// ecosystem it could report. Reconciliation reads it so a source that cannot
+// see pip trees is never said to disagree about one.
+type CoverageDeclarer interface {
+	Covers(identity, ecosystem string) bool
+}
+
+// Covers reports whether src sees ecosystem on identity's host.
+func Covers(src Source, identity, ecosystem string) bool {
+	if !HasCapability(src, CapInventory) {
+		return false
+	}
+	if c, ok := src.(CoverageDeclarer); ok {
+		return c.Covers(identity, ecosystem)
+	}
+	return true
+}
+
 // Instance is one configured source.
 type Instance struct {
 	Name    string
 	Enabled bool
-	// Interval is the poll interval of a pull source; zero for push.
+	// Interval is the poll interval of a pull source, and for a push source
+	// how often its hosts are expected to report. A host silent for twice
+	// this long is stale.
 	Interval time.Duration
 	// Retention is how long stored rows are kept; zero keeps them forever.
 	Retention time.Duration
@@ -293,6 +326,14 @@ func configureOne(name string, raw config.InventorySource) (*Instance, error) {
 	case ModePush:
 		if _, ok := src.(PushSource); !ok {
 			return nil, fmt.Errorf("inventory_sources.%s: source type %q declares push mode and registers no routes", name, typeName)
+		}
+		if iv, ok := src.(Intervaler); ok {
+			inst.Interval = iv.Interval()
+		} else if inst.Interval, err = s.Duration("interval", DefaultPushInterval); err != nil {
+			return nil, err
+		}
+		if inst.Interval <= 0 {
+			return nil, fmt.Errorf("inventory_sources.%s.interval: want a positive duration", name)
 		}
 	case ModePull:
 		if _, ok := src.(PullSource); !ok {

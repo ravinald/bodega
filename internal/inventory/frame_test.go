@@ -130,8 +130,8 @@ func TestRegisteredFakesConfigureAsPushAndPull(t *testing.T) {
 	for _, i := range insts {
 		byName[i.Name] = i
 	}
-	if byName["edge"].Source.Mode() != ModePush || byName["edge"].Interval != 0 {
-		t.Errorf("edge = %+v, want push with no interval", byName["edge"])
+	if byName["edge"].Source.Mode() != ModePush || byName["edge"].Interval != DefaultPushInterval {
+		t.Errorf("edge = %+v, want push at the 24h expected-report default", byName["edge"])
 	}
 	if byName["tenant"].Source.Mode() != ModePull || byName["tenant"].Interval != DefaultPullInterval {
 		t.Errorf("tenant = %+v, want pull at the 1h default", byName["tenant"])
@@ -150,7 +150,7 @@ func TestConfigureErrorsNameInstanceAndKey(t *testing.T) {
 		{"unknown type", config.InventorySource{"type": "nope"}, "inventory_sources.x.type"},
 		{"missing type", config.InventorySource{"enabled": true}, "inventory_sources.x.type"},
 		{"unknown key", config.InventorySource{"type": "fake-push", "colour": "red"}, "inventory_sources.x.colour"},
-		{"interval on push", config.InventorySource{"type": "fake-push", "interval": "1h"}, "inventory_sources.x.interval"},
+		{"push interval not a duration", config.InventorySource{"type": "fake-push", "interval": "daily"}, "inventory_sources.x.interval"},
 		{"type validation", config.InventorySource{"type": "fake-pull"}, "inventory_sources.x.tenant"},
 		{"interval too short", config.InventorySource{"type": "fake-pull", "tenant": "a", "interval": "4m"}, "inventory_sources.x.interval"},
 		{"interval not a duration", config.InventorySource{"type": "fake-pull", "tenant": "a", "interval": "hourly"}, "inventory_sources.x.interval"},

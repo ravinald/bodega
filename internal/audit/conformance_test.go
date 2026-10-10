@@ -210,6 +210,21 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 				t.Errorf("host-b served set:\n got %+v\nwant %+v", got, want)
 			}
 
+			objs, err := r.QueryServedObjects(ctx, "host-b")
+			if err != nil {
+				t.Fatalf("QueryServedObjects: %v", err)
+			}
+			if want := []ServedObject{{PkgType: "npm", PkgName: "other", PkgVersion: "2.0.0", ObjectKey: "packages/npm/other/other-2.0.0.tgz", Digest: d3}}; !reflect.DeepEqual(objs, want) {
+				t.Errorf("host-b served objects:\n got %+v\nwant %+v", objs, want)
+			}
+			objs, err = r.QueryServedObjects(ctx, "")
+			if err != nil {
+				t.Fatalf("QueryServedObjects: %v", err)
+			}
+			if len(objs) != 4 {
+				t.Errorf("served objects for every identity = %d rows, want 4 (hello, widget at two digests, other): %+v", len(objs), objs)
+			}
+
 			got, err = r.QueryServed(ctx, "host-a", time.Now().Add(time.Hour))
 			if err != nil {
 				t.Fatalf("QueryServed: %v", err)

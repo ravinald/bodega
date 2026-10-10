@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -215,5 +216,46 @@ func TestInventoryConfigErrorRefusesStart(t *testing.T) {
 	err := s.Start(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "inventory_sources.x.type") {
 		t.Errorf("Start = %v, want the inventory_sources error", err)
+	}
+}
+
+// A pushed report is classified on arrival, and GET /api/v1/inventory/{identity}
+// returns the host's classified set to an admin address and refuses any other.
+func TestInventoryReportRouteServesTheClassifiedHost(t *testing.T) {
+	s := newInventoryServer(t, []string{"10.0.0.0/8"})
+	if err := s.auditDB.Record(context.Background(), audit.Event{EventType: audit.EventServeFetch, PkgType: "apt",
+		PkgName: "pool/main/c/curl/curl_8.5.0-2ubuntu10_amd64.deb", Identity: "web-01",
+		ObjectKey: "packages/apt/pool/main/c/curl/curl_8.5.0-2ubuntu10_amd64.deb", Status: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := send(s, http.MethodPost, "/api/v1/inventory/sources/hosts/bom", outsideAddr, invToken, cdxDoc); rec.Code != http.StatusAccepted {
+		t.Fatalf("push status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	if rec := send(s, http.MethodGet, "/api/v1/inventory/web-01", outsideAddr, "", ""); rec.Code != http.StatusForbidden {
+		t.Errorf("from outside admin_permit_cidr: status = %d, want 403", rec.Code)
+	}
+	rec := send(s, http.MethodGet, "/api/v1/inventory/web-01", adminAddr, "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s; want 200", rec.Code, rec.Body)
+	}
+	var got struct {
+		Identity   string `json:"identity"`
+		Alert      bool   `json:"alert"`
+		Components []struct {
+			Name    string   `json:"name"`
+			Class   string   `json:"class"`
+			Sources []string `json:"sources"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Identity != "web-01" || got.Alert || len(got.Components) != 1 ||
+		got.Components[0].Class != "served" || got.Components[0].Sources[0] != "hosts" {
+		t.Errorf("report = %s, want curl served through hosts and no alert", rec.Body)
+	}
+	if rec := send(s, http.MethodGet, "/api/v1/inventory/nobody", adminAddr, "", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("unmapped identity: status = %d, want 404", rec.Code)
 	}
 }

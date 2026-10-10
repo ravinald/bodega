@@ -200,6 +200,19 @@ func (s *sqliteSink) QueryServed(ctx context.Context, identity string, since tim
 	return out, rows.Err()
 }
 
+func (s *sqliteSink) QueryServedObjects(ctx context.Context, identity string) ([]ServedObject, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT pkg_type, pkg_name, pkg_version, object_key, COALESCE(digest, '')
+	      FROM events
+	      WHERE event_type = ? AND object_key IS NOT NULL AND (? = '' OR identity = ?)
+	      ORDER BY 1, 2, 3, 4, 5`,
+		string(EventServeFetch), identity, identity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanServedObjects(rows)
+}
+
 func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
 	var where []string
 	var args []any

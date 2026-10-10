@@ -28,6 +28,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // TypeName is the inventory_sources "type" this package registers.
@@ -315,6 +316,22 @@ func (s *Source) serveConfig(w http.ResponseWriter, r *http.Request, env *invent
 		"schedule":                Schedule(s.dirsFor(n.Identity), s.interval),
 		"auto_table_construction": AutoTables(),
 	})
+}
+
+// Covers is what the schedule reads on identity's host: the system package
+// tables always, and pip or npm trees only where the host's profile declares
+// a directory to scan. rpm lands in "other", but so does everything a
+// CycloneDX document cannot type, so osquery claims no coverage of it.
+func (s *Source) Covers(identity, ecosystem string) bool {
+	switch ecosystem {
+	case manifest.TypeApt, manifest.TypeFreeBSD:
+		return true
+	case manifest.TypePypi:
+		return len(CleanDirs(s.dirsFor(identity).Python)) > 0
+	case manifest.TypeNpm:
+		return len(CleanDirs(s.dirsFor(identity).NPM)) > 0
+	}
+	return false
 }
 
 func (s *Source) dirsFor(identity string) config.OsqueryDirs {

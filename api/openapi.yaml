@@ -561,6 +561,47 @@ paths:
         "413":
           description: Body over the source's max_body_bytes
 
+  /api/v1/inventory/{identity}:
+    get:
+      summary: A host's installed set, classified against what bodega served it
+      description: >
+        The union of the latest report from each inventory source instance
+        mapped to the identity. Each component carries the class recorded when
+        its report arrived (refused, unknown, unattributed, served, baseline,
+        or unclassified for a report nothing classified: it arrived before
+        reconciliation ran, or while the audit sink could not answer),
+        the reason, and the instances that reported it. Each mapped instance is
+        listed with its last report and whether it is stale: no report within
+        twice its interval. Disagreements list components one instance reports
+        and another enabled instance covering that ecosystem omits. alert is
+        true when a component is refused, unknown or unclassified, or there is
+        a disagreement, which is when `bodega inventory report` exits 1.
+        Admin-gated like the other /api/v1 reads.
+      operationId: getInventoryHost
+      tags: [inventory]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: identity
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Identity the host mapping binds the host to
+      responses:
+        "200":
+          description: The host's classified installed set
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryHostReport"
+        "403":
+          description: Caller is not in admin_permit_cidr
+        "404":
+          description: No inventory source maps this identity
+        "503":
+          description: Audit database not configured
+
   /api/v1/profiles/{name}/pins:
     get:
       summary: List a profile's version pins
@@ -2107,6 +2148,112 @@ components:
         reason:
           type: string
           description: Why a refuse or skip record has no file
+
+    InventoryHostReport:
+      type: object
+      properties:
+        identity:
+          type: string
+        generated_at:
+          type: string
+          format: date-time
+        alert:
+          type: boolean
+          description: A component is refused, unknown or unclassified, or two sources disagree
+        counts:
+          type: object
+          description: Components per class, and stale instances under "stale"
+          additionalProperties:
+            type: integer
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/InventorySourceState"
+        components:
+          type: array
+          description: Worst class first
+          items:
+            $ref: "#/components/schemas/InventoryComponent"
+        disagreements:
+          type: array
+          items:
+            $ref: "#/components/schemas/InventorySourceDisagreement"
+
+    InventorySourceState:
+      type: object
+      properties:
+        instance:
+          type: string
+        type:
+          type: string
+        mode:
+          type: string
+          enum: [push, pull]
+        enabled:
+          type: boolean
+        interval:
+          type: string
+          description: Go duration; stale after twice this with no report
+        report_id:
+          type: integer
+          description: The latest report from this instance for the host
+        last_report:
+          type: string
+          format: date-time
+          nullable: true
+        last_poll:
+          type: string
+          format: date-time
+          description: Pull instances only, the last successful poll
+        stale:
+          type: boolean
+        reason:
+          type: string
+          description: Why the instance is stale
+
+    InventoryComponent:
+      type: object
+      properties:
+        ecosystem:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        paths:
+          type: array
+          items:
+            type: string
+        sources:
+          type: array
+          items:
+            type: string
+          description: Instances whose latest report holds this component
+        class:
+          type: string
+          enum: [refused, unknown, unattributed, unclassified, served, baseline]
+        reason:
+          type: string
+
+    InventorySourceDisagreement:
+      type: object
+      properties:
+        ecosystem:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        reported_by:
+          type: string
+        reported_in:
+          type: integer
+          description: Report id
+        absent_from:
+          type: string
+        absent_in:
+          type: integer
+          description: Report id
 
     ProfilePin:
       type: object

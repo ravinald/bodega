@@ -14,6 +14,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/inventory/osquery"
+	"github.com/ravinald/bodega/internal/inventory/reconcile"
 
 	// Inventory source types. One import per type is its registration.
 	_ "github.com/ravinald/bodega/internal/inventory/cyclonedx"
@@ -32,6 +33,8 @@ func (s *Server) setupInventory() {
 	s.inventory.OnRefusal = func(r *http.Request, reason string, details map[string]string) {
 		recordDenial(s.auditDB, r, reason, details)
 	}
+	s.reconciler = s.newReconciler(instances)
+	s.inventory.OnReport = s.reconciler.Ingested
 	s.inventory.HashSecret = func(secret string) (string, error) {
 		if s.pepper == "" {
 			return "", errors.New("this server loaded no pepper, so it cannot check a secret minted against one")
@@ -45,6 +48,40 @@ func (s *Server) setupInventory() {
 		s.logger.Info("inventory source configured", "instance", inst.Name,
 			"type", inst.Source.Type(), "mode", inst.Source.Mode(), "enabled", inst.Enabled)
 	}
+}
+
+// newReconciler reads the same store and instances the frame was built with,
+// so a report is classified against the catalog this server serves.
+func (s *Server) newReconciler(instances []*inventory.Instance) *reconcile.Reconciler {
+	rc := &reconcile.Reconciler{DB: s.auditDB, Instances: instances, Logger: s.logger}
+	if s.store != nil {
+		rc.Catalog = s.store
+	}
+	return rc
+}
+
+// handleAPIInventory answers GET /api/v1/inventory/{identity}: the host's
+// current installed set, classified, as `bodega inventory report --json`
+// prints it.
+func (s *Server) handleAPIInventory(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil || s.reconciler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	rep, err := s.reconciler.Host(r.Context(), r.PathValue("identity"))
+	if errors.Is(err, reconcile.ErrUnknownIdentity) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		s.logger.Error("could not assemble a host's inventory", "identity", r.PathValue("identity"), "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read the host's inventory"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 // isInventoryPush is the exemption MutationAuthMiddleware asks about.

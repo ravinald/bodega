@@ -97,9 +97,16 @@ func TestSettings(t *testing.T) {
 	if rt := push.Routes(); len(rt) != 1 || rt[0].Path != RoutePath || rt[0].MaxBody != 32<<20 {
 		t.Errorf("routes = %+v, want POST bom capped at 32 MiB", rt)
 	}
+	if insts[0].Interval != inventory.DefaultPushInterval {
+		t.Errorf("interval = %s, want the push default %s", insts[0].Interval, inventory.DefaultPushInterval)
+	}
+	weekly, err := inventory.Configure(map[string]config.InventorySource{"h": {"type": TypeName, "interval": "168h"}})
+	if err != nil || weekly[0].Interval != 168*time.Hour {
+		t.Errorf("interval 168h: err = %v, instance = %+v; a push host's expected cadence is configurable", err, weekly)
+	}
 	for raw, want := range map[string]config.InventorySource{
 		"inventory_sources.h.max_body_bytes": {"type": TypeName, "max_body_bytes": float64(-1)},
-		"inventory_sources.h.interval":       {"type": TypeName, "interval": "1h"},
+		"inventory_sources.h.interval":       {"type": TypeName, "interval": "soon"},
 		"inventory_sources.h.url":            {"type": TypeName, "url": "https://x"},
 	} {
 		if _, err := inventory.Configure(map[string]config.InventorySource{"h": want}); err == nil || !strings.Contains(err.Error(), raw) {

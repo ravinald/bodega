@@ -19,6 +19,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory/reconcile"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -151,7 +152,7 @@ func newDiscoverShowCmd(gf *globalFlags) *cobra.Command {
 }
 
 func newDiscoverPromoteCmd(gf *globalFlags) *cobra.Command {
-	var as string
+	var as, fromInventory string
 	cmd := &cobra.Command{
 		Use:   "promote <type> <pattern> [comment]",
 		Short: "Promote one discovered pattern to an allow-list rule or manifest entries",
@@ -163,10 +164,18 @@ observation in the bucket, in proxy mode with the upstream URL the handler
 would have fetched. Same write path as 'bodega pkg create'. Existing entries
 are never rewritten: a version already in the manifest is left alone.
 
+--inventory <identity> takes the source from a host's inventory instead: the
+pattern is a package name, and every version of it the host holds as unknown
+('bodega inventory report <identity> --class unknown') becomes a manifest
+entry, the way a no_manifest row does. pypi, npm, gomod and cargo entries
+proxy the configured upstream; an apt entry is fetched with apt-get download,
+as 'bodega pkg convert apt' writes it.
+
 Examples:
   bodega discover promote gomod example.com/example-corp/
   bodega discover promote npm @example-cloud/* "example-cloud SDK packages"
-  bodega discover promote gomod example.com/example-corp/ --as manifest`,
+  bodega discover promote gomod example.com/example-corp/ --as manifest
+  bodega discover promote pypi requests --inventory web-01`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			regType := args[0]
@@ -174,6 +183,12 @@ Examples:
 			comment := ""
 			if len(args) > 2 {
 				comment = strings.Join(args[2:], " ")
+			}
+			if fromInventory != "" {
+				if cmd.Flags().Changed("as") && as != promoteAsManifest {
+					return fmt.Errorf("--inventory writes manifest entries; it cannot write --as %s", as)
+				}
+				return promoteInventory(gf, os.Stdout, regType, pattern, fromInventory)
 			}
 			switch as {
 			case promoteAsPolicy:
@@ -185,6 +200,8 @@ Examples:
 		},
 	}
 	addPromoteAsFlag(cmd, &as)
+	cmd.Flags().StringVar(&fromInventory, "inventory", "",
+		"promote the unknown components this identity's inventory holds under <pattern>, a package name")
 	return cmd
 }
 
@@ -1112,4 +1129,115 @@ func writeGenerateSummary(w io.Writer, s generateSummary, opts generateOpts) {
 			fmt.Fprintf(w, "  %s\n", line.text)
 		}
 	}
+}
+
+// ---- Inventory promotion ---------------------------------------------------
+
+// promoteInventory writes a manifest entry for each version of one package a
+// host's inventory holds as unknown, so a package a host legitimately needs
+// comes under bodega in one step. It refuses rather than writes when the host
+// holds no unknown version of the name: an entry for a package bodega already
+// served, or one it refused, is not what the operator is asking for.
+func promoteInventory(gf *globalFlags, out io.Writer, regType, name, identity string) error {
+	if err := policy.ValidateType(regType); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if err := ensureMutable(cfg); err != nil {
+		return err
+	}
+	rc, done, err := openReconciler(gf)
+	if err != nil {
+		return err
+	}
+	defer done()
+	ctx := context.Background()
+	rep, err := rc.Host(ctx, identity)
+	if err != nil {
+		return err
+	}
+	entries, err := inventoryManifestEntries(cfg, rep, regType, name)
+	if err != nil {
+		return err
+	}
+	store, err := loadStore(gf)
+	if err != nil {
+		return fmt.Errorf("load manifests: %w", err)
+	}
+	added, present, err := applyManifestEntries(ctx, store, out, regType, entries)
+	if err != nil {
+		return err
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		return fmt.Errorf("save manifest index to %s: %w — the %d entries above were written but will not be listed until the index saves; make the store writable and re-run",
+			store.Label(), err, added)
+	}
+	fmt.Fprintf(out, "\nPromoted %d manifest %s from %s's inventory, skipped %d already present.\n",
+		added, plural(added, "entry", "entries"), identity, present)
+	return nil
+}
+
+// inventoryManifestEntries maps the unknown components of rep named name onto
+// manifest entries. A pypi, npm, gomod or cargo entry goes through the same
+// mapping as a no_manifest row, with the configured upstream as the URL the
+// handler would have used. An apt entry carries no URL, which the apt builder
+// resolves through 'apt-get download', the shape the apt host importer writes.
+func inventoryManifestEntries(cfg *config.Config, rep *reconcile.HostReport, regType, name string) ([]manifestEntry, error) {
+	want := manifest.CanonicalName(regType, name)
+	var rows []audit.DiscoveryRow
+	var entries []manifestEntry
+	var otherClasses []string
+	for _, c := range rep.Components {
+		if c.Ecosystem != regType || manifest.CanonicalName(regType, c.Name) != want {
+			continue
+		}
+		if c.Class != reconcile.ClassUnknown {
+			otherClasses = append(otherClasses, fmt.Sprintf("%s is %s", dash(c.Version), c.Class))
+			continue
+		}
+		switch regType {
+		case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo:
+			rows = append(rows, audit.DiscoveryRow{
+				RegistryType: regType, PkgName: c.Name, PkgVersion: c.Version,
+				Decision: audit.DecisionNoManifest, UpstreamURL: inventoryUpstream(cfg, regType),
+			})
+		case manifest.TypeApt:
+			entries = append(entries, manifestEntry{PkgName: want, Entry: manifest.VersionEntry{Version: c.Version, SourceName: want}})
+		default:
+			return nil, fmt.Errorf("%s has no single upstream a promoted entry could proxy, so an inventory component cannot become one here; catalog it with 'bodega pkg create %s %s'",
+				regType, regType, want)
+		}
+	}
+	built, _, noVersion := buildManifestEntries(rows)
+	entries = append(entries, built...)
+	if len(noVersion) > 0 {
+		fmt.Fprintf(os.Stderr, "skipped a versionless component of (%s, %s): %s composes the version into the fetch URL, so an open entry would 404\n",
+			regType, want, regType)
+	}
+	if len(entries) == 0 {
+		if len(otherClasses) > 0 {
+			return nil, fmt.Errorf("%s holds %s %s, but no version of it is unknown (%s); only an unknown component promotes",
+				rep.Identity, regType, want, strings.Join(otherClasses, ", "))
+		}
+		return nil, fmt.Errorf("%s's current inventory holds no %s package named %s; 'bodega inventory report %s --class unknown' lists what can be promoted",
+			rep.Identity, regType, want, rep.Identity)
+	}
+	return entries, nil
+}
+
+func inventoryUpstream(cfg *config.Config, regType string) string {
+	switch regType {
+	case manifest.TypePypi:
+		return cfg.PypiUpstream
+	case manifest.TypeNpm:
+		return cfg.NpmUpstream
+	case manifest.TypeGomod:
+		return cfg.GomodUpstream
+	case manifest.TypeCargo:
+		return cfg.CargoUpstream
+	}
+	return ""
 }
