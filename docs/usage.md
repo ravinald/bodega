@@ -2291,10 +2291,7 @@ Versions imported before this key existed cannot be backfilled. Nothing on disk 
 ```json
 {
   "GHSA-xxxx-yyyy-zzzz": [
-    {
-      "type": "CVSS_V3",
-      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-    }
+    { "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
   ]
 }
 ```
@@ -2982,12 +2979,7 @@ The runtime policy is for the service:
     {
       "Sid": "Objects",
       "Effect": "Allow",
-      "Action": [
-        "s3:AbortMultipartUpload",
-        "s3:DeleteObject",
-        "s3:GetObject",
-        "s3:PutObject"
-      ],
+      "Action": ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::example-bodega-artifacts/*"
     }
   ]
