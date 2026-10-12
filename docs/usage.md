@@ -1040,7 +1040,7 @@ No cached checksums matched apt/ngnix; nothing was cleared. Run `bodega pkg chec
 
 ### `bodega pkg trust <show|reset> <type> <name>`
 
-Shows or clears the source repository and builder a package's upstream provenance is pinned to. The first version of a package whose provenance verifies pins both, trust-on-first-use, the same model as checksum pinning; a later version verified from a different repository or builder records `mismatch`. See [`bodega policy provenance`](#bodega-policy-provenance-setlist) for the check itself.
+Shows or clears the source repository and builder a package's upstream provenance is pinned to. The first version of a package whose provenance verifies pins both, trust-on-first-use, the same model as checksum pinning; a later version verified from a different repository or builder records `mismatch`. So does an npm version with no provenance that the packument's `time` map dates after the pinned version; one dated before it stays `unavailable`, and one either time is missing for records `invalid`. See [`bodega policy provenance`](#bodega-policy-provenance-setlist) for the check itself.
 
 ```console
 $ bodega pkg trust show npm sigstore
@@ -1057,7 +1057,7 @@ Cleared the pin for npm/sigstore (was https://github.com/actions/runner/github-h
 
 The builder is pinned with any `@<ref>` suffix removed. A GitHub Actions builder ID names the workflow at the ref that ran it (`.../release.yml@refs/tags/v1.2.3`), and a release workflow runs at a new tag every time, so pinning the ref would make every version after the first a mismatch. `workflow` keeps the full value for the person reading it.
 
-`reset` deletes the pin so the next verified version pins afresh. Run it when a project moved repositories or CI systems on purpose, after confirming the move somewhere other than the package itself. It writes a `policy` audit event naming the OS user who ran it and what the pin held (`source_repository_uri`, `builder_id`, `pinned_version`), and it refuses on a read-only install like every other write. Resetting a package with no pin is not an error.
+`reset` deletes the pin so the next verified version pins afresh. Run it when a project moved repositories or CI systems on purpose, or stopped publishing npm releases from CI, after confirming the change somewhere other than the package itself. It writes a `policy` audit event naming the OS user who ran it and what the pin held (`source_repository_uri`, `builder_id`, `pinned_version`), and it refuses on a read-only install like every other write. Resetting a package with no pin is not an error.
 
 ### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
 
@@ -2502,12 +2502,12 @@ From a verified bundle the row records the certificate's source repository URI, 
 
 **Outcomes.** Every version gets one:
 
-| Outcome       | Means                                                                                                                                                                                   |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `verified`    | a provenance bundle verified, and its repository and builder match the package's pin (or this version took the pin)                                                                     |
-| `unavailable` | the registry answered that the package publishes no provenance, or its ecosystem has no mechanism bodega reads                                                                          |
-| `invalid`     | published provenance did not verify, could not be fetched or had no trusted root to check it against, or the lookup that says whether any is published failed                           |
-| `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name)                     |
+| Outcome       | Means                                                                                                                                                                                                                                         |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `verified`    | a provenance bundle verified, and its repository and builder match the package's pin (or this version took the pin)                                                                                                                           |
+| `unavailable` | the registry answered that the package publishes no provenance, or its ecosystem has no mechanism bodega reads                                                                                                                                |
+| `invalid`     | published provenance did not verify, could not be fetched or had no trusted root to check it against, or the lookup that says whether any is published failed                                                                                 |
+| `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; or an npm version with no provenance, published after the pinned version; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name) |
 
 `unavailable` is the registry's answer, not the absence of one: a packument read and parsed with no `dist.attestations` for the version, a 404 from GitHub's attestation lookup or an empty attestation list, a release asset with no recorded digest, or a release with no `SHA256SUMS`. A lookup that gets no answer is `invalid`: a transport error, a status other than 200 or 404 (a rate limit's 403 included), a body that does not parse, or one larger than its cap, which is refused rather than truncated. So is every failure once the packument says a version publishes provenance. Nothing that publishes provenance passes because verification was skipped. An npm entry that names no single release (`*`, `latest`) records `not_evaluated`; the fetch that resolves a version checks it.
 

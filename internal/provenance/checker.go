@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -59,6 +60,9 @@ type judgement struct {
 	pm     *manifest.PackageManifest
 	ev     Evidence
 	action string
+	// unpinned is a version without provenance checked before this
+	// admission had any pin to hold it to, judged only once Commit knows one.
+	unpinned bool
 }
 
 // Action returns the configured action for an ecosystem: warn when none is
@@ -98,7 +102,7 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 	}
 
 	ev := c.evaluate(ctx, pm, ve)
-	if ev.Outcome == audit.ProvenanceVerified {
+	if ev.Outcome == audit.ProvenanceVerified || (ev.Outcome == audit.ProvenanceUnavailable && pm.Type == manifest.TypeNpm) {
 		ev = c.compare(ctx, pm, ve, ev, action)
 	}
 	return verdict(ev, action)
@@ -113,30 +117,40 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 // called, so it writes nothing.
 func (c *Checker) Commit(ctx context.Context) map[*manifest.VersionEntry]policy.Result {
 	if c.pending == nil || c.Store == nil {
+		c.judged = nil
 		return nil
 	}
 	want := *c.pending
 	judged := c.judged
 	c.pending, c.judged = nil, nil
 	held, created, err := c.Store.PinProvenance(ctx, want)
-	if err == nil && (created || samePin(held, want)) {
-		return nil
-	}
-	out := make(map[*manifest.VersionEntry]policy.Result, len(judged))
+	settled := err == nil && (created || samePin(held, want))
+	var out map[*manifest.VersionEntry]policy.Result
 	for _, j := range judged {
+		if settled && !j.unpinned {
+			continue
+		}
 		ev := j.ev
 		if err != nil {
 			ev = pinFailed(ev, "written", err)
 		} else {
-			ev = against(j.pm, ev, held)
+			ev = judge(j.pm, ev, held)
+		}
+		if j.unpinned && ev.Outcome == j.ev.Outcome {
+			continue
+		}
+		if out == nil {
+			out = make(map[*manifest.VersionEntry]policy.Result, len(judged))
 		}
 		out[j.ve] = verdict(ev, j.action)
 	}
 	return out
 }
 
-// compare judges a verified version against the package's stored pin, or,
-// when it holds none, against the pin this admission would take.
+// compare judges a verified version, or an npm version without provenance,
+// against the package's stored pin, or, when it holds none, against the pin
+// this admission would take. A verified version with neither becomes that
+// pin; one without provenance and with neither stays unavailable.
 func (c *Checker) compare(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, ev Evidence, action string) Evidence {
 	if c.Store == nil {
 		return ev
@@ -144,13 +158,17 @@ func (c *Checker) compare(ctx context.Context, pm *manifest.PackageManifest, ve 
 	held, err := c.Store.GetProvenancePin(ctx, pm.Type, pm.Name)
 	switch {
 	case err == nil:
-		return against(pm, ev, held)
+		return judge(pm, ev, held)
 	case !errors.Is(err, audit.ErrProvenancePinNotFound):
 		return pinFailed(ev, "read", err)
 	}
-	c.judged = append(c.judged, judgement{ve: ve, pm: pm, ev: ev, action: action})
+	unpinned := c.pending == nil && ev.Outcome != audit.ProvenanceVerified
+	c.judged = append(c.judged, judgement{ve: ve, pm: pm, ev: ev, action: action, unpinned: unpinned})
 	if c.pending != nil {
-		return against(pm, ev, *c.pending)
+		return judge(pm, ev, *c.pending)
+	}
+	if unpinned {
+		return ev
 	}
 	version := strings.TrimSpace(ve.Version)
 	if version == "" {
@@ -167,6 +185,49 @@ func (c *Checker) compare(ctx context.Context, pm *manifest.PackageManifest, ve 
 	return ev
 }
 
+// judge holds ev against held: a verified version by who built it, one
+// without provenance by when it was published.
+func judge(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) Evidence {
+	if ev.Outcome == audit.ProvenanceUnavailable {
+		return stopped(pm, ev, held)
+	}
+	return against(pm, ev, held)
+}
+
+// stopped is an npm version without provenance judged against held. A
+// version published after the pinned one is a mismatch: the project
+// published provenance and then a version arrived without it, which is what
+// a publish from a stolen token on a machine other than the project's CI
+// looks like. One published before the pinned version predates the
+// project's adoption of provenance and stays unavailable. With either time
+// unknown no comparison ran, and saying unavailable would pass it under warn.
+func stopped(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) Evidence {
+	pinnedAt, ok := ev.Published[held.PinnedVersion]
+	var missing []string
+	if ev.PublishedAt == nil {
+		missing = append(missing, "this version's")
+	}
+	if !ok {
+		missing = append(missing, "pinned version "+held.PinnedVersion+"'s")
+	}
+	if len(missing) > 0 {
+		ev.Outcome = audit.ProvenanceInvalid
+		ev.Detail = fmt.Sprintf("%s; %s/%s is pinned to %s from %s, and the packument's time map has no publish time for %s, so whether this version came after the pin is unknown",
+			ev.Detail, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, strings.Join(missing, " or "))
+		return ev
+	}
+	at := ev.PublishedAt.UTC().Format(time.RFC3339)
+	pinned := pinnedAt.UTC().Format(time.RFC3339)
+	if ev.PublishedAt.Before(pinnedAt) {
+		ev.Detail = fmt.Sprintf("%s; published %s, before pinned version %s (%s), so it predates the pin", ev.Detail, at, held.PinnedVersion, pinned)
+		return ev
+	}
+	ev.Outcome = audit.ProvenanceMismatch
+	ev.Detail = fmt.Sprintf("published %s with no provenance, but %s/%s is pinned to %s from %s since version %s (published %s); 'bodega pkg trust reset %s %s' clears the pin if the project stopped publishing from CI on purpose",
+		at, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, held.PinnedVersion, pinned, pm.Type, pm.Name)
+	return ev
+}
+
 // against is a verified version judged against held: unchanged when it was
 // built by the pinned builder from the pinned repository, a mismatch when not.
 func against(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) Evidence {
@@ -180,12 +241,17 @@ func against(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin
 	return ev
 }
 
-// pinFailed is a verified version whose pin could not be read or written.
-// The signature verified; what is unknown is whether it matches an earlier
-// version, and reporting verified would claim a comparison that never ran.
+// pinFailed is a version whose pin could not be read or written. Whether a
+// verified version matches an earlier one, or whether one without provenance
+// came after a version that had it, is unknown, and reporting the outcome
+// verification reached would claim a comparison that never ran.
 func pinFailed(ev Evidence, verb string, err error) Evidence {
+	was := "verified"
+	if ev.Outcome == audit.ProvenanceUnavailable {
+		was = "no provenance published"
+	}
 	ev.Outcome = audit.ProvenanceInvalid
-	ev.Detail = "verified, but the trust-on-first-use pin could not be " + verb + ": " + err.Error()
+	ev.Detail = was + ", but the trust-on-first-use pin could not be " + verb + ": " + err.Error()
 	return ev
 }
 

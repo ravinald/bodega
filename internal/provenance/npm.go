@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 )
@@ -37,22 +38,42 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 	if err != nil {
 		return invalid("the packument lookup for %s failed, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
-	var doc struct {
-		Versions map[string]struct {
-			Dist struct {
-				Integrity    string `json:"integrity"`
-				Attestations *struct {
-					URL        string `json:"url"`
-					Provenance *struct {
-						PredicateType string `json:"predicateType"`
-					} `json:"provenance"`
-				} `json:"attestations"`
-			} `json:"dist"`
-		} `json:"versions"`
-	}
+	var doc packument
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return invalid("the packument lookup for %s failed: the answer is not JSON, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
+	ev := v.npmVersion(ctx, registry, name, version, &doc)
+	ev.Published = make(map[string]time.Time, len(doc.Time))
+	for ver, at := range doc.Time {
+		if t, err := time.Parse(time.RFC3339Nano, at); err == nil {
+			ev.Published[ver] = t
+		}
+	}
+	if t, ok := ev.Published[version]; ok {
+		ev.PublishedAt = &t
+	}
+	return ev
+}
+
+// packument is the part of an npm packument the check reads. Time maps each
+// version to when it was published, beside the "created" and "modified" keys,
+// and keeps a version's time after the version itself is unpublished.
+type packument struct {
+	Versions map[string]struct {
+		Dist struct {
+			Integrity    string `json:"integrity"`
+			Attestations *struct {
+				URL        string `json:"url"`
+				Provenance *struct {
+					PredicateType string `json:"predicateType"`
+				} `json:"provenance"`
+			} `json:"attestations"`
+		} `json:"dist"`
+	} `json:"versions"`
+	Time map[string]string `json:"time"`
+}
+
+func (v *Verifier) npmVersion(ctx context.Context, registry, name, version string, doc *packument) Evidence {
 	ver, ok := doc.Versions[version]
 	if !ok {
 		return invalid("the packument for %s lists no version %s, so whether it publishes provenance is unknown", name, version)
@@ -68,7 +89,7 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 	if strings.HasPrefix(att.URL, "/") {
 		att.URL = registry + att.URL
 	}
-	body, err = v.get(ctx, att.URL, nil, 8<<20)
+	body, err := v.get(ctx, att.URL, nil, 8<<20)
 	if err != nil {
 		return invalid("%s@%s publishes provenance, but its bundles could not be read: %v", name, version, err)
 	}
