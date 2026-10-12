@@ -262,12 +262,13 @@ func TestPypiCanonicalFormIsTheSameThroughEveryPolicyCaller(t *testing.T) {
 	}
 }
 
-// digestStore is the four listings Digest reads, held in memory.
+// digestStore is the five listings Digest reads, held in memory.
 type digestStore struct {
-	rules   []audit.PolicyInfo
-	ages    []audit.AgePolicy
-	osvs    []audit.OSVPolicy
-	malware []audit.OSVMalwarePolicy
+	rules      []audit.PolicyInfo
+	ages       []audit.AgePolicy
+	osvs       []audit.OSVPolicy
+	malware    []audit.OSVMalwarePolicy
+	provenance []audit.ProvenancePolicy
 }
 
 func (d *digestStore) ListPolicies(context.Context) ([]audit.PolicyInfo, error) { return d.rules, nil }
@@ -280,6 +281,9 @@ func (d *digestStore) ListOSVPolicies(context.Context) ([]audit.OSVPolicy, error
 func (d *digestStore) ListOSVMalwarePolicies(context.Context) ([]audit.OSVMalwarePolicy, error) {
 	return d.malware, nil
 }
+func (d *digestStore) ListProvenancePolicies(context.Context) ([]audit.ProvenancePolicy, error) {
+	return d.provenance, nil
+}
 
 // TestDigestTracksPolicyContent pins the two properties an admission row's
 // policy_digest is cited for: decisions under unchanged policy share it, and
@@ -291,9 +295,10 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 				{ID: "1", RegistryType: "npm", RuleKind: KindPackage, Pattern: "lodash", Comment: "c", CreatedBy: "ravi"},
 				{ID: "2", RegistryType: "apt", RuleKind: KindHost, Pattern: "archive.ubuntu.com"},
 			},
-			ages:    []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: ActionBlock}},
-			osvs:    []audit.OSVPolicy{{Ecosystem: "pypi", Action: ActionWarn}},
-			malware: []audit.OSVMalwarePolicy{{Ecosystem: "npm", Action: ActionWarn, Reason: "r"}},
+			ages:       []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: ActionBlock}},
+			osvs:       []audit.OSVPolicy{{Ecosystem: "pypi", Action: ActionWarn}},
+			malware:    []audit.OSVMalwarePolicy{{Ecosystem: "npm", Action: ActionWarn, Reason: "r"}},
+			provenance: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: ActionBlock, Actor: "ravi"}},
 		}
 	}
 	digest := func(s *digestStore) string {
@@ -318,6 +323,7 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 		},
 		"policy_row_touched_without_change": func(s *digestStore) { s.ages[0].UpdatedAt = time.Now() },
 		"malware_reason_reworded":           func(s *digestStore) { s.malware[0].Reason = "other" },
+		"provenance_set_by_someone_else":    func(s *digestStore) { s.provenance[0].Actor = "other" },
 	}
 	for name, edit := range same {
 		s := base()
@@ -332,14 +338,16 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 		"rule_added": func(s *digestStore) {
 			s.rules = append(s.rules, audit.PolicyInfo{RegistryType: "npm", RuleKind: KindPackage, Pattern: "left-pad"})
 		},
-		"rule_removed":           func(s *digestStore) { s.rules = s.rules[:1] },
-		"rule_moved_to_a_type":   func(s *digestStore) { s.rules[0].RegistryType = "cargo" },
-		"age_minimum_edited":     func(s *digestStore) { s.ages[0].MinAgeSeconds = 86400 },
-		"age_action_edited":      func(s *digestStore) { s.ages[0].Action = ActionWarn },
-		"age_policy_removed":     func(s *digestStore) { s.ages = nil },
-		"osv_action_edited":      func(s *digestStore) { s.osvs[0].Action = ActionBlock },
-		"malware_action_edited":  func(s *digestStore) { s.malware[0].Action = ActionIgnore },
-		"malware_policy_removed": func(s *digestStore) { s.malware = nil },
+		"rule_removed":              func(s *digestStore) { s.rules = s.rules[:1] },
+		"rule_moved_to_a_type":      func(s *digestStore) { s.rules[0].RegistryType = "cargo" },
+		"age_minimum_edited":        func(s *digestStore) { s.ages[0].MinAgeSeconds = 86400 },
+		"age_action_edited":         func(s *digestStore) { s.ages[0].Action = ActionWarn },
+		"age_policy_removed":        func(s *digestStore) { s.ages = nil },
+		"osv_action_edited":         func(s *digestStore) { s.osvs[0].Action = ActionBlock },
+		"malware_action_edited":     func(s *digestStore) { s.malware[0].Action = ActionIgnore },
+		"malware_policy_removed":    func(s *digestStore) { s.malware = nil },
+		"provenance_action_edited":  func(s *digestStore) { s.provenance[0].Action = ActionWarn },
+		"provenance_policy_removed": func(s *digestStore) { s.provenance = nil },
 		"osv_policy_added": func(s *digestStore) {
 			s.osvs = append(s.osvs, audit.OSVPolicy{Ecosystem: "npm", Action: ActionBlock})
 		},

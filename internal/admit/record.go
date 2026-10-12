@@ -8,7 +8,15 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
+
+// versionChecks are the checks VersionCheckers run, in row order, for the
+// bookkeeping that marks them not run.
+var versionChecks = []string{audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance}
+
+// allChecks is every check an admission row names.
+var allChecks = append([]string{audit.CheckAllowList}, versionChecks...)
 
 // evaluation accumulates the per-check verdicts of one admission, one list
 // per version, and turns them into the rows it writes. The policy digest and
@@ -23,11 +31,17 @@ type evaluation struct {
 
 func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest) *evaluation {
 	ev := &evaluation{
-		checks:  make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
-		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone},
+		checks: make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
+		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone,
+			audit.CheckUpstreamProvenance: policy.ActionWarn},
 	}
 	if adb == nil {
 		return ev
+	}
+	if a, err := provenance.Action(ctx, adb, pm.Type); err == nil {
+		ev.actions[audit.CheckUpstreamProvenance] = a
+	} else {
+		ev.actions[audit.CheckUpstreamProvenance] = "unknown"
 	}
 	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
 	if p, err := adb.GetAgePolicy(ctx, pm.Type); err == nil {
@@ -70,16 +84,16 @@ func (ev *evaluation) notRunChecks(i int, detail string, names ...string) {
 
 // notRun marks every check without a verdict not evaluated, on every version.
 func (ev *evaluation) notRun(detail string) {
-	ev.notRunChecks(-1, detail, audit.CheckAllowList, audit.CheckAge, audit.CheckOSV)
+	ev.notRunChecks(-1, detail, allChecks...)
 }
 
 // notRunAfter is the bookkeeping for a refusal at version i: the checks that
 // would have followed on i, and every check on the versions after it, never
 // ran.
 func (ev *evaluation) notRunAfter(i int, detail string) {
-	ev.notRunChecks(i, detail, audit.CheckAge, audit.CheckOSV)
+	ev.notRunChecks(i, detail, versionChecks...)
 	for j := i + 1; j < len(ev.checks); j++ {
-		ev.notRunChecks(j, detail, audit.CheckAllowList, audit.CheckAge, audit.CheckOSV)
+		ev.notRunChecks(j, detail, allChecks...)
 	}
 }
 
@@ -104,26 +118,28 @@ func (ev *evaluation) runVersion(ctx context.Context, pm *manifest.PackageManife
 			status = audit.CheckWarn
 		case policy.ActionBlock:
 			status = audit.CheckBlock
+		case policy.ActionNotEvaluated:
+			status = audit.CheckNotEvaluated
 		}
 		action := ev.actions[r.Check]
 		if action == "" {
 			action = audit.ActionNone
 		}
-		ev.set(i, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason})
+		ev.set(i, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance})
 	}
 	return results
 }
 
 // row renders version i as an admission row. Every row names the allow-list,
-// age and OSV checks, so a consumer never has to read a missing entry as a
-// pass.
+// age, OSV and upstream provenance checks, so a consumer never has to read a
+// missing entry as a pass.
 func (ev *evaluation) row(pm *manifest.PackageManifest, i int, decision string, who Who) audit.Admission {
 	checks := append([]audit.AdmissionCheck(nil), ev.checks[i]...)
 	fill := "not run"
 	if len(pm.Versions) == 0 {
 		fill = "not run: the manifest names no version"
 	}
-	for _, name := range []string{audit.CheckAllowList, audit.CheckAge, audit.CheckOSV} {
+	for _, name := range allChecks {
 		checks = upsertCheck(checks, ev.notRunCheck(name, fill), true)
 	}
 	sort.SliceStable(checks, func(a, b int) bool { return checkRank(checks[a].Check) < checkRank(checks[b].Check) })
@@ -205,8 +221,10 @@ func checkRank(name string) int {
 		return 2
 	case audit.CheckOSV:
 		return 3
+	case audit.CheckUpstreamProvenance:
+		return 4
 	}
-	return 4
+	return 5
 }
 
 // admissionVersion is the version an admission row is keyed by, and it is

@@ -24,6 +24,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // Decision is the verdict on one manifest. Conflict with an existing package
@@ -224,12 +225,12 @@ func Fetch(
 	switch {
 	case allow.Status == audit.CheckBlock:
 		decision = audit.AdmissionPolicyBlocked
-		ev.notRunChecks(0, "not run: the allow-list refused this version", audit.CheckAge, audit.CheckOSV)
+		ev.notRunChecks(0, "not run: the allow-list refused this version", versionChecks...)
 	case checkers == nil:
 		if notRunDetail == "" {
 			notRunDetail = "not run"
 		}
-		ev.notRunChecks(0, notRunDetail, audit.CheckAge, audit.CheckOSV)
+		ev.notRunChecks(0, notRunDetail, versionChecks...)
 	default:
 		results := ev.runVersion(ctx, pm, 0, checkers)
 		combined := policy.Combine(results)
@@ -483,7 +484,34 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 // VersionCheckers are the per-version checks every admission runs: import,
 // create, the builder's fetch and the proxy's fill.
 func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
-	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb)}
+	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb)}
+}
+
+// ProvenanceChecker builds the upstream provenance check: npm read from the
+// configured npm upstream when an entry names no registry, and the Sigstore
+// trusted root from sigstore_trusted_root, or TUF when that is unset.
+func ProvenanceChecker(cfg *config.Config, adb *audit.DB) *provenance.Checker {
+	v := NewProvenanceVerifier(cfg)
+	if cfg != nil && cfg.NpmUpstream != "" {
+		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
+	}
+	// A nil *audit.DB inside the interface is not a nil interface.
+	var store provenance.Store
+	if adb != nil {
+		store = adb
+	}
+	return &provenance.Checker{Store: store, Verifier: v}
+}
+
+// NewProvenanceVerifier builds the verifier the provenance check fetches
+// through. A test binary replaces it, so the suite never reads a public
+// registry, GitHub or Sigstore's TUF repository.
+var NewProvenanceVerifier = func(cfg *config.Config) *provenance.Verifier {
+	path := ""
+	if cfg != nil {
+		path = cfg.SigstoreTrustedRoot
+	}
+	return provenance.NewVerifier(path)
 }
 
 // RecordPublished dates every version of pm that arrives without a

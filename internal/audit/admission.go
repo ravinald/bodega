@@ -23,6 +23,10 @@ const (
 	CheckAllowList = "allowlist"
 	CheckAge       = "age"
 	CheckOSV       = "osv"
+	// CheckUpstreamProvenance is the publisher's own signed provenance,
+	// verified against the Sigstore trusted root. Its entry carries the
+	// outcome and the identity verified in Provenance.
+	CheckUpstreamProvenance = "upstream_provenance"
 	// CheckOverride is the operator answering y to `bodega pkg create`'s
 	// allow-list prompt. It is its own entry so the allow-list entry beside it
 	// can still say block: the row records that the rule refused and who
@@ -53,6 +57,36 @@ type AdmissionCheck struct {
 	Action string `json:"action"`
 	Status string `json:"status"`
 	Detail string `json:"detail"`
+	// Provenance is set on the upstream_provenance entry when the check
+	// ran, and nil everywhere else.
+	Provenance *UpstreamProvenance `json:"provenance,omitempty"`
+}
+
+// Upstream provenance outcomes: what verifying a publisher's signed
+// provenance concluded, as distinct from what the policy then did about it.
+const (
+	ProvenanceVerified = "verified"
+	// ProvenanceUnavailable means the package publishes no provenance, or
+	// its ecosystem has no mechanism bodega reads.
+	ProvenanceUnavailable = "unavailable"
+	// ProvenanceInvalid means provenance was published and did not verify:
+	// a signature, a certificate chain or a subject digest failed, or there
+	// was no trusted root to verify it against.
+	ProvenanceInvalid = "invalid"
+	// ProvenanceMismatch means the provenance verified, but from a source
+	// repository or builder other than the one the package is pinned to.
+	ProvenanceMismatch = "mismatch"
+)
+
+// UpstreamProvenance is what the upstream_provenance check verified. The
+// identity fields are empty unless a signature verified.
+type UpstreamProvenance struct {
+	Outcome             string `json:"outcome"`
+	SourceRepositoryURI string `json:"source_repository_uri,omitempty"`
+	WorkflowRef         string `json:"workflow_ref,omitempty"`
+	BuilderID           string `json:"builder_id,omitempty"`
+	// BundleDigest is "sha256:<hex>" over the Sigstore bundle as fetched.
+	BundleDigest string `json:"bundle_digest,omitempty"`
 }
 
 // Admission is one decision on one version.
@@ -201,6 +235,7 @@ func NotEvaluatedChecks(detail string) []AdmissionCheck {
 		{Check: CheckAllowList, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 		{Check: CheckAge, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 		{Check: CheckOSV, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
+		{Check: CheckUpstreamProvenance, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 	}
 }
 

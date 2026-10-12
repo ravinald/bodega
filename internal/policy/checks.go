@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -13,6 +14,10 @@ const (
 	ActionWarn   = "warn"
 	ActionBlock  = "block"
 	ActionIgnore = "ignore"
+	// ActionNotEvaluated is a check declining to judge a version it cannot
+	// evaluate, such as an unpinned "*". It neither passes nor fails: the
+	// admission row records the check as not_evaluated.
+	ActionNotEvaluated = "not_evaluated"
 )
 
 // Result is a single check's verdict on a single VersionEntry.
@@ -21,6 +26,9 @@ type Result struct {
 	Action  string         // pass | warn | block
 	Reason  string         // human-readable; empty on pass
 	Details map[string]any // structured payload for audit
+	// Provenance is what the upstream provenance check verified, carried
+	// into the admission row's entry for it. Nil for every other check.
+	Provenance *audit.UpstreamProvenance
 }
 
 // VersionChecker runs a policy check against a specific version. Unlike the
@@ -50,7 +58,7 @@ func Combine(results []Result) Combined {
 	var out Combined
 	for _, r := range results {
 		switch r.Action {
-		case "", ActionPass, ActionIgnore:
+		case "", ActionPass, ActionIgnore, ActionNotEvaluated:
 			continue
 		case ActionWarn:
 			out.Warns = append(out.Warns, r)

@@ -1038,6 +1038,27 @@ apt: the digest goes, the row stays. Cached upstream .debs stay out of the index
 No cached checksums matched apt/ngnix; nothing was cleared. Run `bodega pkg checksum list --type apt` for the names this instance recorded.
 ```
 
+### `bodega pkg trust <show|reset> <type> <name>`
+
+Shows or clears the source repository and builder a package's upstream provenance is pinned to. The first version of a package whose provenance verifies pins both, trust-on-first-use, the same model as checksum pinning; a later version verified from a different repository or builder records `mismatch`. See [`bodega policy provenance`](#bodega-policy-provenance-setlist) for the check itself.
+
+```console
+$ bodega pkg trust show npm sigstore
+package            npm/sigstore
+source repository  https://github.com/sigstore/sigstore-js
+builder            https://github.com/actions/runner/github-hosted
+workflow           https://github.com/sigstore/sigstore-js/.github/workflows/release.yml@refs/heads/main
+pinned by version  3.0.0
+pinned at          2026-10-11T21:40:02Z
+
+$ bodega pkg trust reset npm sigstore
+Cleared the pin for npm/sigstore (was https://github.com/actions/runner/github-hosted from https://github.com/sigstore/sigstore-js); the next verified version pins afresh.
+```
+
+The builder is pinned with any `@<ref>` suffix removed. A GitHub Actions builder ID names the workflow at the ref that ran it (`.../release.yml@refs/tags/v1.2.3`), and a release workflow runs at a new tag every time, so pinning the ref would make every version after the first a mismatch. `workflow` keeps the full value for the person reading it.
+
+`reset` deletes the pin so the next verified version pins afresh. Run it when a project moved repositories or CI systems on purpose, after confirming the move somewhere other than the package itself. It writes a `policy` audit event naming the OS user who ran it and what the pin held (`source_repository_uri`, `builder_id`, `pinned_version`), and it refuses on a read-only install like every other write. Resetting a package with no pin is not an error.
+
 ### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
 
 Generates a cryptographically random API token. The raw token is displayed once and cannot be retrieved later. A SHA-256 hash (with a server-side pepper) is stored in the audit database.
@@ -2455,6 +2476,69 @@ Proxy-mode packages are untouched: their index is upstream's own, times included
 
 A blocking age gate refuses a too-new version; it does not steer a client away from one. To have the resolver pick the newest version that passes instead, turn on [`bodega policy filter`](#bodega-policy-filter-setlist) for the ecosystem.
 
+### `bodega policy provenance <set|list>`
+
+Checks who built and published a version, not only which bytes it was. npm serves a Sigstore bundle beside a version built in CI (`dist.attestations` in the packument): a SLSA provenance statement naming the source repository and workflow, signed by a short-lived certificate bound to that CI identity. A GitHub release asset built with `actions/attest` carries the same as a GitHub artifact attestation. bodega verifies these at admission, so a version published with a stolen maintainer token from a laptop stops looking like one published by the project's CI.
+
+```bash
+bodega policy provenance set npm block
+bodega policy provenance set binary warn
+bodega policy provenance list
+```
+
+The check runs at the same points as the age and OSV gates: import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`), a build's fetch, and every proxy cache miss for a versioned npm artifact. It does not run on a version the proxy caches with no admission decision behind it; those rows say `not_evaluated`.
+
+**What is verified, per type.**
+
+| Type                                        | Read                                                                                                                          | Verified                                                                                                                                                                                                    |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm`                                       | the packument from the entry's `url`, or `npm_upstream`; then the bundles `dist.attestations.url` names                       | every SLSA provenance bundle against the Sigstore trusted root, issued to GitHub Actions or GitLab CI, with a subject named `pkg:npm/<name>@<version>` whose sha512 equals the packument's `dist.integrity` |
+| `binary` with a GitHub release download URL | the asset's sha256 from the entry (`sha256` or `checksum`), else the release API; then GitHub's attestations for that digest  | every `https://slsa.dev/provenance/v1` attestation against the trusted root, issued to GitHub Actions, with a subject carrying that sha256                                                                  |
+| `git` fetched as a release archive          | the archive's sha256 from the entry's `checksum`, else the release's `SHA256SUMS`; then GitHub's attestations for that digest | as for `binary`                                                                                                                                                                                             |
+
+npm's own publish attestation, which sits in the same document and is signed by the registry's key rather than by a CI identity, is not verified: it says the registry accepted an upload, not who built it. GitHub's release attestation, signed by GitHub to say a release is immutable, is filtered out the same way. GitHub's API is read without a token, so it answers 60 requests an hour per address; past that, a lookup cannot tell and records `unavailable`.
+
+From a verified bundle the row records the certificate's source repository URI, its build signer URI as the workflow ref, the provenance's builder ID, and the sha256 of the bundle as fetched.
+
+**Outcomes.** Every version gets one:
+
+| Outcome       | Means                                                                                                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `verified`    | a provenance bundle verified, and its repository and builder match the package's pin (or this version took the pin)                                                                     |
+| `unavailable` | the package publishes no provenance, its ecosystem has no mechanism bodega reads, or the registry could not be read to find out                                                         |
+| `invalid`     | provenance was published and did not verify: a signature, certificate chain or subject digest failed, the bundle could not be fetched, or there was no trusted root to check it against |
+| `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name)                     |
+
+Once the packument says a version publishes provenance, every failure after that is `invalid`, never `unavailable`: nothing that publishes provenance passes because verification was skipped. An npm entry that names no single release (`*`, `latest`) records `not_evaluated`; the fetch that resolves a version checks it.
+
+**Actions.** One row per ecosystem in `upstream_provenance_policy`; `set` overwrites, and `list` prints every type, with the unset ones at their default:
+
+| Action           | `verified` | `unavailable` | `invalid` | `mismatch` |
+| ---------------- | ---------- | ------------- | --------- | ---------- |
+| `warn` (default) | pass       | pass          | warn      | warn       |
+| `block`          | pass       | block         | block     | block      |
+| `ignore`         | pass       | pass          | pass      | pass       |
+
+`ignore` still verifies and records the outcome, and still takes the pin. A block answers the importer, the build or the proxied client the way an age or OSV block does (see [What a refused client sees](#what-a-refused-client-sees)), with `upstream_provenance` as the check. Every `set` writes a `policy` audit event naming who ran it.
+
+**Ecosystems not covered.** `pypi`, `gomod`, `cargo`, `helm`, `apt`, `freebsd` and `distfiles` record `unavailable` on every version, with the reason in the row's detail: PyPI's PEP 740 attestations and helm's `.prov` files are not verified yet, and the rest publish no per-package statement of who built them. A `binary` or `git` entry not fetched from a GitHub release records `unavailable` too. `set` accepts `block` for these and says what it does: every version is refused.
+
+**The trust-on-first-use pin.** The first version of a package whose provenance verifies pins its source repository and builder in `upstream_provenance_pins`; [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name) shows and clears it. The pin is only as good as that first version: a package whose first admitted version was built by an attacker's CI pins the attacker.
+
+#### Air-gapped hosts
+
+The trusted root, which holds the Fulcio certificate authorities, the Rekor transparency-log keys and the CT log keys bundles chain to, comes from Sigstore's TUF repository. A host that cannot reach it names a copy in `sigstore_trusted_root`:
+
+```bash
+# On a host that can reach TUF, any client built on sigstore-go's default TUF
+# options verifies the chain from its embedded root and caches the target here:
+cp ~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json sigstore-trusted-root.json
+# Copy it across, then in config.json:
+#   "sigstore_trusted_root": "/etc/bodega/sigstore-trusted-root.json"
+```
+
+`bodega serve` refuses to start when the file is missing or does not parse, naming it. Sigstore rotates these keys rarely, but it does: a bundle signed under a key the copy predates fails as `invalid`, so refresh the copy when a run of `invalid` outcomes names a certificate chain or log key. Verification itself reaches no network: the transparency-log inclusion proof and timestamps travel inside the bundle.
+
 ### `bodega policy filter <set|list>`
 
 Hides the versions the age and OSV gates block from the proxied indexes, so a client's resolver settles on the newest version that passes and fails only when nothing in its range does. Without it, `npm install widget@^4.1.0` is shown a 4.3.0 published yesterday, picks it, and is refused on the tarball with nothing it can do about it. With it, the packument lists 4.1.0 and 4.2.0, and the same install resolves 4.2.0. Sonatype's and JFrog's curation products and the client-side `pmg` work the same way.
@@ -2785,6 +2869,7 @@ A default config is created on first run. All fields are optional.
   "public_url": "",
   "attestation_platform_id": "",
   "attestation_keyids": [],
+  "sigstore_trusted_root": "",
   "server_url": "",
   "token": "",
   "proxy_cache_enabled": false,
@@ -2862,6 +2947,8 @@ Set it whenever a reverse proxy terminates TLS or publishes a different hostname
 It is also consumed rather than displayed. Every `dist.tarball` bodega writes into an npm packument is built from it (see [Client configuration](#client-configuration)), so a `public_url` naming a host or scheme clients cannot reach fails `npm install` at the tarball fetch rather than at the packument, and npm reports a URL this key composed without naming the key or the packument it came in. Check it first when npm resolves a version and then 404s or times out fetching the `.tgz`.
 
 `attestation_platform_id` is the `ingestionPlatform.id` every attestation this instance signs carries. Empty means `public_url` (resolved the same way, so `--public-url` and `$BODEGA_PUBLIC_URL` count), and with that empty too, `bodega://<hostname>`. Set it when a verifier needs a stable name for the instance that does not change with its URL. `attestation_keyids` is the list of attestation key IDs `bodega attest verify` trusts when no `--key` is given; see [Verifying](#verifying).
+
+`sigstore_trusted_root` names a Sigstore `trusted_root.json` the [upstream provenance check](#bodega-policy-provenance-setlist) verifies bundles against. Empty means bodega fetches the trusted root through Sigstore's TUF repository (`tuf-repo-cdn.sigstore.dev`) the first time a version that publishes provenance is admitted, and again a day later. The TUF metadata is held in memory, so nothing is written under the home directory of the user bodega runs as; a fetch that fails is retried after five minutes, and a root fetched earlier keeps being used meanwhile. Set it on a host that cannot reach TUF; see [Air-gapped hosts](#air-gapped-hosts). When it names a file that is missing or does not parse as a trusted root, `bodega serve` refuses to start and names the file and the reason. A CLI admission (`bodega pkg import`, `bodega build fetch`) reads the file each time it verifies a bundle, and records a version that publishes provenance as `invalid` when the file cannot be read.
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
@@ -5704,6 +5791,17 @@ The trusted key IDs come from `--key` (repeatable) or `attestation_keyids` in th
 
 Given `type/name/version`, verify fetches the envelope from the server (`--server`, `$BODEGA_SERVER`, `server_url`, then `public_url`) and the artifact bytes from the route a client would download them from, unless `--artifact` names a local copy. Given an envelope file, it needs `--package type/name/version`, because nothing else says which package the envelope should be about. distfiles are not fetched; pass `--artifact`.
 
+After the checks, verify prints what the statement says about the publisher's own provenance: `upstream-provenance` and `publisher-signature`, each with its status (`verified`, `unavailable`, `invalid` or `mismatch`, as the [upstream provenance check](#bodega-policy-provenance-setlist) recorded it at admission) and, when a signature verified, the source repository, workflow, builder and bundle digest. Neither line fails verify. An envelope signed before bodega verified provenance carries `unavailable` and nothing else, and verifies as it always did.
+
+```text
+info  upstream-provenance verified
+                      source https://github.com/sigstore/sigstore-js
+                      workflow https://github.com/sigstore/sigstore-js/.github/workflows/release.yml@refs/heads/main
+                      builder https://github.com/actions/runner/github-hosted
+                      bundle sha256:5b0c...
+info  publisher-signature verified
+```
+
 `cosign verify-attestation` and other in-toto tooling read the same envelope; the key is the PEM from `bodega attest key show`.
 
 ### Backfilling
@@ -5911,24 +6009,24 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
 
-| Column          | Holds                                                                                                                         |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `pkg_type`      | The package type                                                                                                              |
-| `pkg_name`      | The package name as the manifest or the request names it                                                                      |
-| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none              |
-| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                           |
-| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                     |
-| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age` and `osv`, plus `override`           |
-| `policy_digest` | `sha256:` over the allow-list rules and the `age_policy`, `osv_policy` and `osv_malware_policy` rows in force at the decision |
-| `actor`         | The OS user, for a CLI decision                                                                                               |
-| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                     |
-| `decided_at`    | When the decision was made                                                                                                    |
+| Column          | Holds                                                                                                                                                                                                                                                                                                         |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                              |
+| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                      |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                              |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                           |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                     |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv` and `upstream_provenance`, plus `override`; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran |
+| `policy_digest` | `sha256:` over the allow-list rules and the `age_policy`, `osv_policy`, `osv_malware_policy` and `upstream_provenance_policy` rows in force at the decision                                                                                                                                                   |
+| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                               |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                     |
+| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                    |
 
-In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
+In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` records `warn` when none is set, because that is its default) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
 The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
 
-**The policy digest** is computed by `policy.Digest` over the rule type, kind and pattern of every allow-list rule, the ecosystem, minimum age and action of every age policy, and the ecosystem and action of every OSV policy and every OSV malware policy, sorted. The malware rows are in it because the OSV check refuses on them as well, under a default of `block` that no `osv_policy` row turns off. A rule's id, comment, author and timestamp are left out, so removing a rule and adding it back is the same policy, while any edit that can change a verdict changes the digest. Two decisions under unchanged policy carry the same digest.
+**The policy digest** is computed by `policy.Digest` over the rule type, kind and pattern of every allow-list rule, the ecosystem, minimum age and action of every age policy, and the ecosystem and action of every OSV policy, every OSV malware policy and every upstream provenance policy, sorted. The malware rows are in it because the OSV check refuses on them as well, under a default of `block` that no `osv_policy` row turns off. A rule's id, comment, author and timestamp are left out, so removing a rule and adding it back is the same policy, while any edit that can change a verdict changes the digest. Two decisions under unchanged policy carry the same digest.
 
 **Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
 
