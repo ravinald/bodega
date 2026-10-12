@@ -112,22 +112,59 @@ func (ev *evaluation) runVersion(ctx context.Context, pm *manifest.PackageManife
 	for _, c := range checkers {
 		r := c.Check(ctx, pm, &pm.Versions[i])
 		results = append(results, r)
-		status := audit.CheckPass
-		switch r.Action {
-		case policy.ActionWarn:
-			status = audit.CheckWarn
-		case policy.ActionBlock:
-			status = audit.CheckBlock
-		case policy.ActionNotEvaluated:
-			status = audit.CheckNotEvaluated
-		}
-		action := ev.actions[r.Check]
-		if action == "" {
-			action = audit.ActionNone
-		}
-		ev.set(i, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance})
+		ev.setResult(i, r)
 	}
 	return results
+}
+
+// setResult records r as version i's verdict for its check.
+func (ev *evaluation) setResult(i int, r policy.Result) {
+	status := audit.CheckPass
+	switch r.Action {
+	case policy.ActionWarn:
+		status = audit.CheckWarn
+	case policy.ActionBlock:
+		status = audit.CheckBlock
+	case policy.ActionNotEvaluated:
+		status = audit.CheckNotEvaluated
+	}
+	action := ev.actions[r.Check]
+	if action == "" {
+		action = audit.ActionNone
+	}
+	ev.set(i, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance})
+}
+
+// committer is a checker that holds a write back until the admission it
+// judged is decided: the upstream provenance check's trust-on-first-use pin.
+type committer interface {
+	Commit(ctx context.Context) map[*manifest.VersionEntry]policy.Result
+}
+
+// commit runs every committer among checkers once an admission of pm is
+// decided admitted, records any verdict that changed, and returns the changed
+// verdicts per version index.
+func (ev *evaluation) commit(ctx context.Context, pm *manifest.PackageManifest, checkers []policy.VersionChecker) [][]policy.Result {
+	var out [][]policy.Result
+	for _, c := range checkers {
+		cm, ok := c.(committer)
+		if !ok {
+			continue
+		}
+		for ve, r := range cm.Commit(ctx) {
+			for i := range pm.Versions {
+				if &pm.Versions[i] != ve {
+					continue
+				}
+				if out == nil {
+					out = make([][]policy.Result, len(pm.Versions))
+				}
+				out[i] = append(out[i], r)
+				ev.setResult(i, r)
+			}
+		}
+	}
+	return out
 }
 
 // row renders version i as an admission row. Every row names the allow-list,

@@ -244,7 +244,7 @@ func setStoragePolicy(ctx context.Context, store *manifest.Store, t, name, polic
 }
 
 // confirmPolicyOverride runs admission on the entry that was just collected
-// interactively: the upstream allow-list, then the age and OSV checks every
+// interactively: the upstream allow-list, then the version checks every
 // other surface runs. On an allow-list violation the operator is warned and
 // given a y/N prompt to proceed anyway, and confirmation writes a
 // policy_override audit event. This is the ONLY policy enforcement path that

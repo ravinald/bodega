@@ -291,7 +291,8 @@ func (v *Verifier) client() *http.Client {
 // published" rather than "could not tell".
 var errNotFound = errors.New("not found")
 
-// get reads url, up to limit bytes.
+// get reads url, refusing a body over limit bytes rather than returning a
+// truncated one, which would parse as a document that is not there.
 func (v *Verifier) get(ctx context.Context, url string, header http.Header, limit int64) ([]byte, error) {
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
 		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", url)
@@ -315,5 +316,12 @@ func (v *Verifier) get(ctx context.Context, url string, header http.Header, limi
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, limit))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
+	}
+	return body, nil
 }

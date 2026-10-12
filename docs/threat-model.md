@@ -207,13 +207,15 @@ risk:
   the GitHub artifact attestation of a binary or git release asset. The
   bundle is verified against Sigstore's trusted root, and its subject must be
   the tarball's published sha512 (npm) or the asset's sha256 (GitHub). The
-  first verified version of a package pins its source repository and builder;
+  first admitted version to verify pins its source repository and builder;
   a later version verified from anything else is a `mismatch`, and one with
   no provenance is `unavailable`. Under `bodega policy provenance set <type>
   block`, both are refused, so the laptop publish gets no further than the
-  admission row that names it. Under the default `warn`, a `mismatch` or an
-  `invalid` bundle is a warning and an `unavailable` passes: the outcome is
-  recorded in every admission row and attestation, but nothing is refused.
+  admission row that names it. Under the default `warn`, a `mismatch`, an
+  `invalid` bundle or a lookup that got no answer (a rate limit, an outage)
+  is a warning, and only a registry's answer that the version publishes
+  nothing (`unavailable`) passes: the outcome is recorded in every admission
+  row and attestation, but nothing is refused.
   See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
 - **Transitive dependency poisoning.** When a top-level package (e.g. a git
   repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega

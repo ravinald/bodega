@@ -234,6 +234,12 @@ func Fetch(
 	default:
 		results := ev.runVersion(ctx, pm, 0, checkers)
 		combined := policy.Combine(results)
+		if !combined.Blocked() {
+			if changed := ev.commit(ctx, pm, checkers); changed != nil {
+				results = replaceResults(results, changed[0])
+				combined = policy.Combine(results)
+			}
+		}
 		out.Warns = combined.Warns
 		out.AuditDetails = combined.AuditDetails()
 		if combined.Blocked() {
@@ -246,6 +252,20 @@ func Fetch(
 	}
 	out.Admission = ev.row(pm, 0, decision, who)
 	_ = adb.RecordAdmission(ctx, out.Admission)
+	return out
+}
+
+// replaceResults is results with each entry of changed in place of the one
+// for the same check.
+func replaceResults(results, changed []policy.Result) []policy.Result {
+	out := append([]policy.Result(nil), results...)
+	for _, c := range changed {
+		for k := range out {
+			if out[k].Check == c.Check {
+				out[k] = c
+			}
+		}
+	}
 	return out
 }
 
@@ -432,8 +452,9 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 	return nil
 }
 
-// checkVersions runs the per-version checks (age, OSV). They live in the audit
-// database, so with no database there is nothing to check against. Warn-level
+// checkVersions runs the per-version checks (age, OSV, upstream provenance).
+// They live in the audit database, so with no database there is nothing to
+// check against. Warn-level
 // results do not block; they are recorded and reported on res, because a gate
 // that answered "I could not tell" has to say so where the operator is
 // looking. Recording alone leaves an OSV gate with no synced database printing
@@ -445,9 +466,9 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	}
 	warns := &versionWarnings{}
 	defer warns.flush(res)
-	for i := range pm.Versions {
+	decide := func(i int, results []policy.Result) *Result {
 		ve := &pm.Versions[i]
-		combined := policy.Combine(ev.runVersion(ctx, pm, i, checkers))
+		combined := policy.Combine(results)
 		warns.add(ve.Version, combined.Warns)
 		var incident string
 		if details := combined.AuditDetails(); details != nil {
@@ -476,6 +497,23 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 			return &Result{Decision: PolicyBlocked,
 				Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons()),
 				Check:  first.Check, Version: ve.Version, Incident: incident, Details: first.Details}
+		}
+		return nil
+	}
+	for i := range pm.Versions {
+		if blocked := decide(i, ev.runVersion(ctx, pm, i, checkers)); blocked != nil {
+			return blocked
+		}
+	}
+	// Only now is the manifest admitted, so only now may a check write what
+	// an admission leaves behind. A verdict the write changes is decided like
+	// any other: a pin another admission took first can still refuse this one.
+	for i, changed := range ev.commit(ctx, pm, checkers) {
+		if changed == nil {
+			continue
+		}
+		if blocked := decide(i, changed); blocked != nil {
+			return blocked
 		}
 	}
 	return nil

@@ -24,6 +24,7 @@ type fakePosture struct {
 	rules []audit.PolicyInfo
 	ages  []audit.AgePolicy
 	osvs  []audit.OSVPolicy
+	provs []audit.ProvenancePolicy
 }
 
 func (f fakePosture) ListPolicies(context.Context) ([]audit.PolicyInfo, error) {
@@ -31,6 +32,9 @@ func (f fakePosture) ListPolicies(context.Context) ([]audit.PolicyInfo, error) {
 }
 func (f fakePosture) ListAgePolicies(context.Context) ([]audit.AgePolicy, error) { return f.ages, nil }
 func (f fakePosture) ListOSVPolicies(context.Context) ([]audit.OSVPolicy, error) { return f.osvs, nil }
+func (f fakePosture) ListProvenancePolicies(context.Context) ([]audit.ProvenancePolicy, error) {
+	return f.provs, nil
+}
 
 func findingFor(t *testing.T, findings []host.Finding, check string) host.Finding {
 	t.Helper()
@@ -64,6 +68,34 @@ func TestDoctorAcceptsAnyPolicyCoverage(t *testing.T) {
 	store := fakePosture{ages: []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"}}}
 	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); f.IsFinding() {
 		t.Errorf("an install with a seeded age gate reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// An upstream provenance block refuses fetches on its own; a warn row refuses
+// nothing, because warn is what the check runs at with no row.
+func TestDoctorCountsAProvenanceBlockAsCoverage(t *testing.T) {
+	store := fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "block"}}}
+	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); f.IsFinding() {
+		t.Errorf("an install with an npm provenance block reported %s: %s", f.Status, f.Detail)
+	}
+	store = fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "warn"}}}
+	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); !f.IsFinding() {
+		t.Errorf("an install whose only policy is a provenance warn reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// Provenance runs at warn on an ecosystem with no row, so it is silenced only
+// once every ecosystem it covers is on ignore.
+func TestDoctorReportsProvenanceSilencedEverywhere(t *testing.T) {
+	some := fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "ignore"}}}
+	if f := findingFor(t, serverPosture(context.Background(), some), "policy-ignored"); f.IsFinding() {
+		t.Errorf("npm alone on ignore reported %s: %s", f.Status, f.Detail)
+	}
+	all := fakePosture{provs: []audit.ProvenancePolicy{
+		{Ecosystem: "npm", Action: "ignore"}, {Ecosystem: "git", Action: "ignore"}, {Ecosystem: "binary", Action: "ignore"}}}
+	f := findingFor(t, serverPosture(context.Background(), all), "policy-ignored")
+	if !f.IsFinding() || !strings.Contains(f.Detail, "upstream provenance") || !strings.Contains(f.Remediation, "bodega policy provenance set") {
+		t.Errorf("every covered ecosystem on ignore reported %s: %s / %s", f.Status, f.Detail, f.Remediation)
 	}
 }
 

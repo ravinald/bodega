@@ -3,10 +3,12 @@ package admit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sigstore/sigstore-go/pkg/root"
@@ -125,5 +127,80 @@ func TestFetchRecordsUpstreamProvenance(t *testing.T) {
 		manifest.VersionEntry{Version: "3.0.0"}, AllowListCheck(false, "sigstore", nil), Who{}, "not run: no version")
 	if c := checkOf(t, res.Admission, audit.CheckUpstreamProvenance); c.Status != audit.CheckNotEvaluated {
 		t.Errorf("a fill with no checkers recorded %+v", c)
+	}
+}
+
+// A version another check refuses does not become the trust-on-first-use
+// pin, through import or through a fetch, and neither does a version whose
+// sibling in the same manifest is refused: nothing of a refused manifest is
+// stored. The first version actually admitted takes the pin.
+func TestRefusedVersionTakesNoProvenancePin(t *testing.T) {
+	f := newAdmissionFixture(t)
+	registry := npmWithProvenance(t)
+	dir := t.TempDir()
+	db := policy.NewOSVDatabase(dir)
+	db.ExportBase = osvExport(t, map[string]any{
+		"id": "GHSA-test-0002",
+		"affected": []map[string]any{{
+			"package":  map[string]string{"name": "sigstore", "ecosystem": "npm"},
+			"versions": []string{"3.0.0", "2.0.0"},
+		}},
+	}).URL
+	if _, err := db.Sync(t.Context(), "npm"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{StoragePath: t.TempDir(), OSVDBDir: dir, NpmUpstream: registry}
+	noPin := func(when string) {
+		t.Helper()
+		if pin, err := f.adb.GetProvenancePin(t.Context(), manifest.TypeNpm, "sigstore"); !errors.Is(err, audit.ErrProvenancePinNotFound) {
+			t.Fatalf("%s: pin = %+v, %v; want none", when, pin, err)
+		}
+	}
+
+	res := Admit(t.Context(), policy.NewChecker(f.adb), f.adb, cfg, &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore",
+		Versions: []manifest.VersionEntry{{Version: "3.0.0", URL: registry}}}, "ravi")
+	if res.Decision != PolicyBlocked || res.Check != audit.CheckOSV {
+		t.Fatalf("Decision = %v %q (%s)", res.Decision, res.Check, res.Reason)
+	}
+	c := checkOf(t, f.rows(t, "sigstore")[0], audit.CheckUpstreamProvenance)
+	if c.Provenance == nil || c.Provenance.Outcome != audit.ProvenanceVerified || !strings.Contains(c.Detail, "pinned once admitted") {
+		t.Errorf("a refused version's row = %+v", c)
+	}
+	noPin("after an import OSV refused")
+
+	fr := Fetch(t.Context(), f.adb, VersionCheckers(cfg, f.adb), manifest.TypeNpm, "sigstore",
+		manifest.VersionEntry{Version: "3.0.0", Mode: manifest.ModeProxy}, AllowListCheck(false, "sigstore", nil), Who{Identity: "host-a"}, "")
+	if fr.Block == nil || fr.Block.Check != audit.CheckOSV {
+		t.Fatalf("fetch block = %+v", fr.Block)
+	}
+	noPin("after a fetch OSV refused")
+
+	// 3.0.0 passes its own checks; its sibling 2.0.0 is refused, so the
+	// manifest is refused whole.
+	db.ExportBase = osvExport(t, map[string]any{
+		"id": "GHSA-test-0003",
+		"affected": []map[string]any{{
+			"package":  map[string]string{"name": "sigstore", "ecosystem": "npm"},
+			"versions": []string{"2.0.0"},
+		}},
+	}).URL
+	if _, err := db.Sync(t.Context(), "npm"); err != nil {
+		t.Fatal(err)
+	}
+	res = Admit(t.Context(), policy.NewChecker(f.adb), f.adb, cfg, &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore",
+		Versions: []manifest.VersionEntry{{Version: "3.0.0", URL: registry}, {Version: "2.0.0", URL: registry}}}, "ravi")
+	if res.Decision != PolicyBlocked || res.Version != "2.0.0" {
+		t.Fatalf("Decision = %v at %q (%s)", res.Decision, res.Version, res.Reason)
+	}
+	noPin("after a sibling was refused")
+
+	res = Admit(t.Context(), policy.NewChecker(f.adb), f.adb, cfg, &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore",
+		Versions: []manifest.VersionEntry{{Version: "3.0.0", URL: registry}}}, "ravi")
+	if res.Decision != Admitted {
+		t.Fatalf("Decision = %v (%s)", res.Decision, res.Reason)
+	}
+	pin, err := f.adb.GetProvenancePin(t.Context(), manifest.TypeNpm, "sigstore")
+	if err != nil || pin.PinnedVersion != "3.0.0" || pin.SourceRepositoryURI != "https://github.com/sigstore/sigstore-js" {
+		t.Fatalf("pin after an admitted version = %+v, %v", pin, err)
 	}
 }

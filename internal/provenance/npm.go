@@ -18,10 +18,12 @@ var npmIssuers = "^(" + strings.ReplaceAll(issuerGitHubActions, ".", `\.`) + "|"
 // registry root registry (the verifier's own when empty).
 //
 // The packument says whether provenance exists (dist.attestations) and what
-// the tarball's sha512 is (dist.integrity). Once it says provenance exists,
-// every failure after that point is invalid rather than unavailable: a
-// version that publishes provenance never passes because the bundle could not
-// be fetched or there was no trusted root to check it against.
+// the tarball's sha512 is (dist.integrity). Only a packument that was read,
+// parsed and lists the version without dist.attestations is unavailable.
+// Every other failure is invalid: a packument that could not be read cannot
+// say provenance is absent, and a version that publishes provenance never
+// passes because the bundle could not be fetched or there was no trusted root
+// to check it against.
 //
 // The attestations document also carries npm's own publish attestation,
 // signed by the registry's key rather than a CI identity. It says the
@@ -33,7 +35,7 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 	}
 	body, err := v.get(ctx, registry+"/"+name, nil, 32<<20)
 	if err != nil {
-		return unavailable("could not read the packument, so whether %s@%s publishes provenance is unknown: %v", name, version, err)
+		return invalid("the packument lookup for %s failed, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
 	var doc struct {
 		Versions map[string]struct {
@@ -49,11 +51,11 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 		} `json:"versions"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return unavailable("the packument for %s is not JSON: %v", name, err)
+		return invalid("the packument lookup for %s failed: the answer is not JSON, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
 	ver, ok := doc.Versions[version]
 	if !ok {
-		return unavailable("the packument for %s lists no version %s", name, version)
+		return invalid("the packument for %s lists no version %s, so whether it publishes provenance is unknown", name, version)
 	}
 	att := ver.Dist.Attestations
 	if att == nil || att.Provenance == nil {

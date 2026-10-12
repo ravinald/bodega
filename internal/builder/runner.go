@@ -138,7 +138,7 @@ func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) err
 }
 
 // EnforcePolicy is the builder's admission of one manifest entry at fetch
-// time: the upstream allow-list, then the age and OSV checks import runs, with
+// time: the upstream allow-list, then the version checks import runs, with
 // the decision written to the admissions table. On a refusal it records an
 // audit event and returns the error so the calling Fetch* function can log,
 // bump Summary.Failures, and continue to the next entry. Returns nil when the

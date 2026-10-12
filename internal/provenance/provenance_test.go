@@ -275,6 +275,13 @@ func (f *fakeStore) GetProvenancePolicy(_ context.Context, eco string) (audit.Pr
 	return audit.ProvenancePolicy{Ecosystem: eco, Action: a}, nil
 }
 
+func (f *fakeStore) GetProvenancePin(_ context.Context, typ, name string) (audit.ProvenancePin, error) {
+	if got, ok := f.pins[typ+"/"+name]; ok {
+		return got, nil
+	}
+	return audit.ProvenancePin{}, audit.ErrProvenancePinNotFound
+}
+
 func (f *fakeStore) PinProvenance(_ context.Context, p audit.ProvenancePin) (audit.ProvenancePin, bool, error) {
 	if f.pins == nil {
 		f.pins = map[string]audit.ProvenancePin{}
@@ -287,8 +294,9 @@ func (f *fakeStore) PinProvenance(_ context.Context, p audit.ProvenancePin) (aud
 	return p, true, nil
 }
 
-// The first verified version pins; a later one verified from another
-// repository is a mismatch, and the pin is left as it was.
+// The first verified version pins once its admission commits, and not
+// before; a later one verified from another repository is a mismatch, and
+// the pin is left as it was.
 func TestFirstVerifiedVersionPinsAndAnotherRepositoryMismatches(t *testing.T) {
 	r := newRegistry(t)
 	r.packument(t, "sigstore", "3.0.0", sigstoreIntegrity, "/att/sigstore@3.0.0")
@@ -301,6 +309,12 @@ func TestFirstVerifiedVersionPinsAndAnotherRepositoryMismatches(t *testing.T) {
 	first := c.Check(context.Background(), pm, ve)
 	if first.Provenance.Outcome != audit.ProvenanceVerified || first.Action != policy.ActionPass {
 		t.Fatalf("first check %+v, want a verified pass", first)
+	}
+	if _, ok := store.pins["npm/sigstore"]; ok {
+		t.Fatal("Check wrote the pin before the admission was decided")
+	}
+	if changed := c.Commit(context.Background()); changed != nil {
+		t.Fatalf("an uncontested commit changed verdicts: %+v", changed)
 	}
 	pin := store.pins["npm/sigstore"]
 	if pin.SourceRepositoryURI != sigstoreRepo || pin.BuilderID != npmRunnerBuilder || pin.PinnedVersion != "3.0.0" {
@@ -356,6 +370,122 @@ func TestOutcomeAgainstAction(t *testing.T) {
 				t.Errorf("%s under %q: action %s (%s), want %s", name, action, got.Action, got.Reason, wantAction)
 			}
 		}
+	}
+}
+
+// Another admission pinned a different repository between this one's Check
+// and its Commit: the version Check passed against its own pending pin is
+// judged again against the pin that won.
+func TestCommitJudgesAgainstThePinThatWon(t *testing.T) {
+	r := newRegistry(t)
+	r.packument(t, "sigstore", "3.0.0", sigstoreIntegrity, "/att/sigstore@3.0.0")
+	r.put("/att/sigstore@3.0.0", fixture(t, "npm-sigstore-3.0.0.attestations.json"))
+	store := &fakeStore{actions: map[string]string{"npm": policy.ActionBlock}}
+	c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+	pm := &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore"}
+	ve := &manifest.VersionEntry{Version: "3.0.0"}
+	if got := c.Check(context.Background(), pm, ve); got.Action != policy.ActionPass {
+		t.Fatalf("check %+v", got)
+	}
+	store.pins = map[string]audit.ProvenancePin{"npm/sigstore": {PkgType: "npm", PkgName: "sigstore",
+		SourceRepositoryURI: "https://github.com/example/sigstore-js", BuilderID: npmRunnerBuilder, PinnedVersion: "2.9.0"}}
+	changed := c.Commit(context.Background())
+	got, ok := changed[ve]
+	if !ok || got.Provenance.Outcome != audit.ProvenanceMismatch || got.Action != policy.ActionBlock {
+		t.Fatalf("commit after a lost race = %+v", changed)
+	}
+	if store.pins["npm/sigstore"].SourceRepositoryURI != "https://github.com/example/sigstore-js" {
+		t.Error("commit overwrote the pin that won")
+	}
+}
+
+// An oracle that did not answer is not an oracle saying "none": a rate limit,
+// an outage or a truncated body is invalid, so it warns under the default
+// action and provenance a package publishes is never skipped into a pass. A
+// 404 on the attestation lookup is GitHub's answer that there is none.
+func TestFailedLookupIsInvalidNotUnavailable(t *testing.T) {
+	status := func(code int) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) })
+	}
+	failing := func(t *testing.T, h http.Handler) *Verifier {
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		return &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}, NpmRegistry: srv.URL,
+			GitHubWeb: srv.URL, GitHubAPI: srv.URL + "/api", Root: recordedRoot(t)}
+	}
+	check := func(t *testing.T, v *Verifier, pm *manifest.PackageManifest, ve *manifest.VersionEntry) policy.Result {
+		c := &Checker{Store: &fakeStore{}, Verifier: v}
+		return c.Check(context.Background(), pm, ve)
+	}
+	gh := &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "gh"}
+	ghEntry := func(v *Verifier) *manifest.VersionEntry {
+		return &manifest.VersionEntry{Version: "2.102.0", SHA256: ghAssetSHA256,
+			URL: v.GitHubWeb + "/cli/cli/releases/download/v2.102.0/" + ghAsset}
+	}
+	npm := &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore"}
+
+	cases := []struct {
+		name        string
+		handler     http.Handler
+		pm          *manifest.PackageManifest
+		ve          func(*Verifier) *manifest.VersionEntry
+		wantOutcome string
+		wantAction  string
+	}{
+		{"github attestations 403", status(http.StatusForbidden), gh, ghEntry, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"github attestations 404", status(http.StatusNotFound), gh, ghEntry, audit.ProvenanceUnavailable, policy.ActionPass},
+		{"github attestations not JSON", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("<html>")) }),
+			gh, ghEntry, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"github release digest 403", status(http.StatusForbidden), gh, func(v *Verifier) *manifest.VersionEntry {
+			ve := ghEntry(v)
+			ve.SHA256 = ""
+			return ve
+		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"git SHA256SUMS 503", status(http.StatusServiceUnavailable), &manifest.PackageManifest{Type: manifest.TypeGit, Name: "cli"},
+			func(v *Verifier) *manifest.VersionEntry {
+				return &manifest.VersionEntry{URL: v.GitHubWeb + "/cli/cli", Ref: "v2.102.0", Source: "release"}
+			}, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"git SHA256SUMS 404", status(http.StatusNotFound), &manifest.PackageManifest{Type: manifest.TypeGit, Name: "cli"},
+			func(v *Verifier) *manifest.VersionEntry {
+				return &manifest.VersionEntry{URL: v.GitHubWeb + "/cli/cli", Ref: "v2.102.0", Source: "release"}
+			}, audit.ProvenanceUnavailable, policy.ActionPass},
+		{"npm packument 503", status(http.StatusServiceUnavailable), npm, func(*Verifier) *manifest.VersionEntry {
+			return &manifest.VersionEntry{Version: "3.0.0"}
+		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"npm packument 403", status(http.StatusForbidden), npm, func(*Verifier) *manifest.VersionEntry {
+			return &manifest.VersionEntry{Version: "3.0.0"}
+		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"npm packument not JSON", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{")) }),
+			npm, func(*Verifier) *manifest.VersionEntry { return &manifest.VersionEntry{Version: "3.0.0"} },
+			audit.ProvenanceInvalid, policy.ActionWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := failing(t, tc.handler)
+			got := check(t, v, tc.pm, tc.ve(v))
+			if got.Provenance == nil || got.Provenance.Outcome != tc.wantOutcome || got.Action != tc.wantAction {
+				t.Fatalf("%+v (%s), want %s and %s", got, got.Reason, tc.wantOutcome, tc.wantAction)
+			}
+			if tc.wantOutcome == audit.ProvenanceInvalid && !strings.Contains(got.Reason, "failed") {
+				t.Errorf("reason %q does not say the lookup failed", got.Reason)
+			}
+		})
+	}
+}
+
+// A body past the cap is refused rather than truncated into a document that
+// does not parse, or worse, one that does.
+func TestOversizedBodyIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", 2<<20+1)))
+	}))
+	t.Cleanup(srv.Close)
+	v := &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}}
+	if _, err := v.get(context.Background(), srv.URL, nil, 2<<20); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("err = %v, want a size refusal", err)
+	}
+	if body, err := v.get(context.Background(), srv.URL, nil, 4<<20); err != nil || len(body) != 2<<20+1 {
+		t.Fatalf("under the cap: %d bytes, %v", len(body), err)
 	}
 }
 

@@ -32,13 +32,33 @@ var uncoveredReason = map[string]string{
 // Store is what the check reads and writes in the audit database.
 type Store interface {
 	GetProvenancePolicy(ctx context.Context, ecosystem string) (audit.ProvenancePolicy, error)
+	GetProvenancePin(ctx context.Context, pkgType, pkgName string) (audit.ProvenancePin, error)
 	PinProvenance(ctx context.Context, p audit.ProvenancePin) (audit.ProvenancePin, bool, error)
 }
 
-// Checker is the upstream_provenance admission check.
+// Checker is the upstream_provenance admission check. One Checker judges one
+// admission: Check compares each verified version with the package's pin and
+// writes nothing, and Commit takes the pin once the admission is decided, so
+// a version another check refuses never becomes the anchor every later
+// version is held to.
 type Checker struct {
 	Store    Store
 	Verifier *Verifier
+
+	// pending is the pin this admission takes if it is admitted: the first
+	// verified version's identity, when the package holds no pin yet. Later
+	// versions of the same admission are compared with it.
+	pending *audit.ProvenancePin
+	// judged is every version compared with pending, for Commit to judge
+	// again should the stored pin turn out to be another one.
+	judged []judgement
+}
+
+type judgement struct {
+	ve     *manifest.VersionEntry
+	pm     *manifest.PackageManifest
+	ev     Evidence
+	action string
 }
 
 // Action returns the configured action for an ecosystem: warn when none is
@@ -79,11 +99,105 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 
 	ev := c.evaluate(ctx, pm, ve)
 	if ev.Outcome == audit.ProvenanceVerified {
-		ev = c.pin(ctx, pm, ve, ev)
+		ev = c.compare(ctx, pm, ve, ev, action)
 	}
+	return verdict(ev, action)
+}
+
+// Commit takes the pending pin, once the admission Check judged has been
+// decided admitted, and returns a fresh verdict for every version whose
+// verdict the stored pin changes. That is none, unless another admission
+// pinned a different identity between Check and Commit, or the write failed:
+// a version is then judged against what the package actually holds, which is
+// what the pin's read-back exists for. Commit on a refused admission is never
+// called, so it writes nothing.
+func (c *Checker) Commit(ctx context.Context) map[*manifest.VersionEntry]policy.Result {
+	if c.pending == nil || c.Store == nil {
+		return nil
+	}
+	want := *c.pending
+	judged := c.judged
+	c.pending, c.judged = nil, nil
+	held, created, err := c.Store.PinProvenance(ctx, want)
+	if err == nil && (created || samePin(held, want)) {
+		return nil
+	}
+	out := make(map[*manifest.VersionEntry]policy.Result, len(judged))
+	for _, j := range judged {
+		ev := j.ev
+		if err != nil {
+			ev = pinFailed(ev, "written", err)
+		} else {
+			ev = against(j.pm, ev, held)
+		}
+		out[j.ve] = verdict(ev, j.action)
+	}
+	return out
+}
+
+// compare judges a verified version against the package's stored pin, or,
+// when it holds none, against the pin this admission would take.
+func (c *Checker) compare(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, ev Evidence, action string) Evidence {
+	if c.Store == nil {
+		return ev
+	}
+	held, err := c.Store.GetProvenancePin(ctx, pm.Type, pm.Name)
+	switch {
+	case err == nil:
+		return against(pm, ev, held)
+	case !errors.Is(err, audit.ErrProvenancePinNotFound):
+		return pinFailed(ev, "read", err)
+	}
+	c.judged = append(c.judged, judgement{ve: ve, pm: pm, ev: ev, action: action})
+	if c.pending != nil {
+		return against(pm, ev, *c.pending)
+	}
+	version := strings.TrimSpace(ve.Version)
+	if version == "" {
+		version = ve.Ref
+	}
+	c.pending = &audit.ProvenancePin{
+		PkgType: pm.Type, PkgName: pm.Name,
+		SourceRepositoryURI: ev.SourceRepositoryURI,
+		BuilderID:           PinnedBuilder(ev.BuilderID),
+		WorkflowRef:         ev.WorkflowRef,
+		PinnedVersion:       version,
+	}
+	ev.Detail += "; the package's first verified version, pinned once admitted"
+	return ev
+}
+
+// against is a verified version judged against held: unchanged when it was
+// built by the pinned builder from the pinned repository, a mismatch when not.
+func against(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) Evidence {
+	builder := PinnedBuilder(ev.BuilderID)
+	if held.SourceRepositoryURI == ev.SourceRepositoryURI && held.BuilderID == builder {
+		return ev
+	}
+	ev.Outcome = audit.ProvenanceMismatch
+	ev.Detail = fmt.Sprintf("built by %s from %s, but %s/%s is pinned to %s from %s (first verified at %s); 'bodega pkg trust reset %s %s' clears the pin if the move is legitimate",
+		builder, ev.SourceRepositoryURI, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, held.PinnedVersion, pm.Type, pm.Name)
+	return ev
+}
+
+// pinFailed is a verified version whose pin could not be read or written.
+// The signature verified; what is unknown is whether it matches an earlier
+// version, and reporting verified would claim a comparison that never ran.
+func pinFailed(ev Evidence, verb string, err error) Evidence {
+	ev.Outcome = audit.ProvenanceInvalid
+	ev.Detail = "verified, but the trust-on-first-use pin could not be " + verb + ": " + err.Error()
+	return ev
+}
+
+func samePin(a, b audit.ProvenancePin) bool {
+	return a.SourceRepositoryURI == b.SourceRepositoryURI && a.BuilderID == b.BuilderID
+}
+
+// verdict turns an outcome into the check's result under action.
+func verdict(ev Evidence, action string) policy.Result {
 	prov := ev.UpstreamProvenance
-	r.Provenance = &prov
-	r.Reason = ev.Outcome + ": " + ev.Detail
+	r := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionPass,
+		Provenance: &prov, Reason: ev.Outcome + ": " + ev.Detail}
 	failed := false
 	switch ev.Outcome {
 	case audit.ProvenanceInvalid, audit.ProvenanceMismatch:
@@ -116,7 +230,7 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 		if digest == "" {
 			var err error
 			if digest, err = v.ReleaseAssetDigest(ctx, rel); err != nil {
-				return unavailable("could not read release %s/%s@%s for %s's digest, so its attestations cannot be looked up: %v", rel.Owner, rel.Repo, rel.Tag, rel.Asset, err)
+				return invalid("the release lookup for %s/%s@%s failed, so %s's digest and its attestations are unknown: %v", rel.Owner, rel.Repo, rel.Tag, rel.Asset, err)
 			}
 		}
 		if digest == "" {
@@ -134,7 +248,10 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 		asset := ve.Ref + ".tar.gz"
 		digest := entrySHA256(ve)
 		if digest == "" {
-			digest = v.PublishedSHA256(ctx, owner, repo, ve.Ref, asset)
+			var err error
+			if digest, err = v.PublishedSHA256(ctx, owner, repo, ve.Ref, asset); err != nil {
+				return invalid("reading the SHA256SUMS release %s/%s@%s publishes failed, so %s's digest and its attestations are unknown: %v", owner, repo, ve.Ref, asset, err)
+			}
 		}
 		if digest == "" {
 			return unavailable("release %s/%s@%s publishes no sha256 for %s, so no attestation can be looked up before the fetch", owner, repo, ve.Ref, asset)
@@ -145,45 +262,6 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 		return unavailable("%s", why)
 	}
 	return unavailable("%s has no provenance mechanism bodega reads", pm.Type)
-}
-
-// pin compares a verified identity with the package's pin, taking the pin
-// when there is none.
-func (c *Checker) pin(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, ev Evidence) Evidence {
-	if c.Store == nil {
-		return ev
-	}
-	version := strings.TrimSpace(ve.Version)
-	if version == "" {
-		version = ve.Ref
-	}
-	want := audit.ProvenancePin{
-		PkgType: pm.Type, PkgName: pm.Name,
-		SourceRepositoryURI: ev.SourceRepositoryURI,
-		BuilderID:           PinnedBuilder(ev.BuilderID),
-		WorkflowRef:         ev.WorkflowRef,
-		PinnedVersion:       version,
-	}
-	got, created, err := c.Store.PinProvenance(ctx, want)
-	if err != nil {
-		// The signature verified; what is unknown is whether it matches an
-		// earlier version. Reporting verified would claim a comparison that
-		// never ran.
-		ev.Outcome = audit.ProvenanceInvalid
-		ev.Detail = "verified, but the trust-on-first-use pin could not be read or written: " + err.Error()
-		return ev
-	}
-	if created {
-		ev.Detail += "; pinned as this package's first verified version"
-		return ev
-	}
-	if got.SourceRepositoryURI == want.SourceRepositoryURI && got.BuilderID == want.BuilderID {
-		return ev
-	}
-	ev.Outcome = audit.ProvenanceMismatch
-	ev.Detail = fmt.Sprintf("built by %s from %s, but %s/%s is pinned to %s from %s (first verified at %s); 'bodega pkg trust reset %s %s' clears the pin if the move is legitimate",
-		want.BuilderID, want.SourceRepositoryURI, pm.Type, pm.Name, got.BuilderID, got.SourceRepositoryURI, got.PinnedVersion, pm.Type, pm.Name)
-	return ev
 }
 
 // entrySHA256 is the sha256 the manifest entry already pins, if any.

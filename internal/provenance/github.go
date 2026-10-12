@@ -70,8 +70,11 @@ func (v *Verifier) underGitHub(raw string) (string, bool) {
 }
 
 // ReleaseAssetDigest asks the release API for the sha256 GitHub recorded for
-// an asset. Empty when the release names none: assets uploaded before GitHub
-// began recording digests have none.
+// an asset. Empty when the release lists the asset with no digest, as assets
+// uploaded before GitHub began recording them are, or does not list it. An
+// error is a lookup that failed, a missing release included: the asset's
+// download comes from the same release, so a 404 here says the API could not
+// be asked, not that the asset carries nothing.
 func (v *Verifier) ReleaseAssetDigest(ctx context.Context, rel GitHubRelease) (string, error) {
 	body, err := v.get(ctx, v.apiURL("repos", rel.Owner, rel.Repo, "releases", "tags", rel.Tag), githubHeaders(), 4<<20)
 	if err != nil {
@@ -96,27 +99,34 @@ func (v *Verifier) ReleaseAssetDigest(ctx context.Context, rel GitHubRelease) (s
 }
 
 // PublishedSHA256 reads the SHA256SUMS a release publishes beside its assets
-// and returns the line naming asset, or "" when none does.
-func (v *Verifier) PublishedSHA256(ctx context.Context, owner, repo, tag, asset string) string {
+// and returns the line naming asset, or "" when the release publishes no such
+// file (a 404) or none of its lines names asset. Any other failure to read
+// one is an error, because "" would claim the release publishes nothing.
+func (v *Verifier) PublishedSHA256(ctx context.Context, owner, repo, tag, asset string) (string, error) {
 	for _, name := range []string{"SHA256SUMS", "sha256sums.txt"} {
 		body, err := v.get(ctx, strings.TrimRight(v.GitHubWeb, "/")+"/"+owner+"/"+repo+"/releases/download/"+url.PathEscape(tag)+"/"+name, nil, 1<<20)
-		if err != nil {
+		if errors.Is(err, errNotFound) {
 			continue
+		}
+		if err != nil {
+			return "", err
 		}
 		for _, line := range strings.Split(string(body), "\n") {
 			f := strings.Fields(line)
 			if len(f) >= 2 && len(f[0]) == 64 && path.Base(strings.TrimPrefix(f[1], "*")) == asset {
-				return strings.ToLower(f[0])
+				return strings.ToLower(f[0]), nil
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // GitHubAttestations verifies the SLSA provenance GitHub holds for an asset
-// digest in owner/repo: what actions/attest records. A digest GitHub holds no
-// provenance for is unavailable; one whose provenance does not verify is
-// invalid.
+// digest in owner/repo: what actions/attest records. A digest GitHub answers
+// it holds no provenance for is unavailable. One whose provenance does not
+// verify is invalid, and so is a lookup that got no answer: a rate limit, an
+// outage or a body that does not parse says nothing about whether the asset
+// publishes provenance.
 //
 // GitHub's own release attestation (initiator "github") is a statement that
 // the release is immutable, signed by GitHub rather than by the workflow that
@@ -125,7 +135,7 @@ func (v *Verifier) PublishedSHA256(ctx context.Context, owner, repo, tag, asset 
 func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256hex string) Evidence {
 	digest, err := hex.DecodeString(sha256hex)
 	if err != nil || len(digest) != 32 {
-		return unavailable("%q is not a sha256 digest an attestation could name", sha256hex)
+		return invalid("%q is not a sha256 digest, so the attestation lookup for %s/%s could not be made", sha256hex, owner, repo)
 	}
 	q := v.apiURL("repos", owner, repo, "attestations", "sha256:"+strings.ToLower(sha256hex)) + "?predicate_type=provenance"
 	body, err := v.get(ctx, q, githubHeaders(), 8<<20)
@@ -133,7 +143,7 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 		return unavailable("%s/%s publishes no attestation for sha256:%s", owner, repo, sha256hex)
 	}
 	if err != nil {
-		return unavailable("could not read GitHub's attestations, so whether sha256:%s in %s/%s carries provenance is unknown: %v", sha256hex, owner, repo, err)
+		return invalid("the attestation lookup for sha256:%s in %s/%s failed, so whether it carries provenance is unknown: %v", sha256hex, owner, repo, err)
 	}
 	var doc struct {
 		Attestations []struct {
@@ -142,7 +152,7 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 		} `json:"attestations"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return unavailable("GitHub's attestations answer for %s/%s is not JSON: %v", owner, repo, err)
+		return invalid("the attestation lookup for sha256:%s in %s/%s failed: the answer is not JSON: %v", sha256hex, owner, repo, err)
 	}
 	var raws [][]byte
 	for i, a := range doc.Attestations {
