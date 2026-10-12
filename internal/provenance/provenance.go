@@ -48,6 +48,12 @@ type Evidence struct {
 	audit.UpstreamProvenance
 	// Detail says why, in words an operator acts on.
 	Detail string
+	// PublishedAt is when the registry says the version checked was
+	// published, nil when it does not say. Published is the same for every
+	// version it lists; a version absent from it has an unknown time. Only
+	// npm fills either.
+	PublishedAt *time.Time
+	Published   map[string]time.Time
 }
 
 func unavailable(format string, a ...any) Evidence {

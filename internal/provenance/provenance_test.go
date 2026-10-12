@@ -538,3 +538,207 @@ func TestPinnedBuilderDropsTheRef(t *testing.T) {
 		}
 	}
 }
+
+// sigstorePackument serves the recorded packument npm-sigstore.packument.json:
+// registry.npmjs.org/sigstore fetched on 2026-10-12, cut to 0.1.1 (published
+// before sigstore-js adopted provenance), 3.0.0 and 3.1.0, with 3.0.0's
+// attestations URL made relative so it resolves on the loopback registry, and
+// 3.1.0's dist.attestations removed so it reads as a publish from outside CI.
+// edit changes the decoded document before it is served.
+func sigstorePackument(t *testing.T, r *registry, edit func(doc map[string]any)) {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(fixture(t, "npm-sigstore.packument.json"), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if edit != nil {
+		edit(doc)
+	}
+	r.putJSON(t, "/sigstore", doc)
+	r.put("/-/npm/v1/attestations/sigstore@3.0.0", fixture(t, "npm-sigstore-3.0.0.attestations.json"))
+}
+
+func sigstorePin() audit.ProvenancePin {
+	return audit.ProvenancePin{PkgType: "npm", PkgName: "sigstore",
+		SourceRepositoryURI: sigstoreRepo, BuilderID: npmRunnerBuilder, PinnedVersion: "3.0.0"}
+}
+
+func TestNpmPublishTimesComeFromThePackument(t *testing.T) {
+	r := newRegistry(t)
+	sigstorePackument(t, r, func(doc map[string]any) { delete(doc["time"].(map[string]any), "3.1.0") })
+	v := newTestVerifier(t, r)
+
+	ev := v.Npm(context.Background(), "", "sigstore", "3.0.0")
+	if ev.PublishedAt == nil || ev.PublishedAt.Format("2006-01-02T15:04:05.000Z07:00") != "2024-10-14T16:13:47.295Z" {
+		t.Errorf("3.0.0 published at %v", ev.PublishedAt)
+	}
+	if got := ev.Published["0.1.1"]; got.IsZero() {
+		t.Error("0.1.1's publish time is missing from Published")
+	}
+	ev = v.Npm(context.Background(), "", "sigstore", "3.1.0")
+	if ev.Outcome != audit.ProvenanceUnavailable {
+		t.Fatalf("3.1.0 is %s (%s)", ev.Outcome, ev.Detail)
+	}
+	if ev.PublishedAt != nil {
+		t.Errorf("a version missing from time reads as published at %v, want unknown", ev.PublishedAt)
+	}
+	if _, ok := ev.Published["3.1.0"]; ok {
+		t.Error("a version missing from time is in Published")
+	}
+}
+
+// A package pinned to a CI identity that then publishes a version with no
+// provenance at all reads mismatch: the stolen-token publish from a laptop.
+// A version from before the pin, and any version of an unpinned package,
+// stay unavailable.
+func TestNpmWithoutProvenanceAgainstThePin(t *testing.T) {
+	cases := []struct {
+		name, version string
+		pinned        bool
+		wantOutcome   string
+		wantByAction  map[string]string
+		wantIn        []string
+	}{
+		{"after the pin", "3.1.0", true, audit.ProvenanceMismatch,
+			map[string]string{"": policy.ActionWarn, "warn": policy.ActionWarn, "block": policy.ActionBlock, "ignore": policy.ActionPass},
+			[]string{sigstoreRepo, npmRunnerBuilder, "version 3.0.0", "2024-10-14T16:13:47Z", "2025-02-04T20:35:48Z", "bodega pkg trust reset npm sigstore"}},
+		{"before the pin", "0.1.1", true, audit.ProvenanceUnavailable,
+			map[string]string{"": policy.ActionPass, "warn": policy.ActionPass, "block": policy.ActionBlock, "ignore": policy.ActionPass},
+			[]string{"predates the pin", "2022-12-01T17:15:22Z"}},
+		{"unpinned", "3.1.0", false, audit.ProvenanceUnavailable,
+			map[string]string{"": policy.ActionPass, "warn": policy.ActionPass, "block": policy.ActionBlock, "ignore": policy.ActionPass},
+			[]string{"publishes no provenance"}},
+	}
+	r := newRegistry(t)
+	sigstorePackument(t, r, nil)
+	for _, tc := range cases {
+		for action, wantAction := range tc.wantByAction {
+			t.Run(tc.name+"/"+action, func(t *testing.T) {
+				store := &fakeStore{actions: map[string]string{}}
+				if action != "" {
+					store.actions["npm"] = action
+				}
+				if tc.pinned {
+					store.pins = map[string]audit.ProvenancePin{"npm/sigstore": sigstorePin()}
+				}
+				c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+				got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: tc.version})
+				if got.Provenance == nil || got.Provenance.Outcome != tc.wantOutcome || got.Action != wantAction {
+					t.Fatalf("%+v (%s), want %s and %s", got, got.Reason, tc.wantOutcome, wantAction)
+				}
+				for _, w := range tc.wantIn {
+					if !strings.Contains(got.Reason, w) {
+						t.Errorf("reason %q does not name %q", got.Reason, w)
+					}
+				}
+				if changed := c.Commit(context.Background()); changed != nil {
+					t.Errorf("commit changed verdicts: %+v", changed)
+				}
+				if !tc.pinned && store.pins != nil {
+					t.Errorf("a version without provenance took a pin: %+v", store.pins)
+				}
+			})
+		}
+	}
+}
+
+// With a pin held, a publish time the packument does not give means the
+// comparison could not run, so the version is invalid rather than passing
+// as unavailable. A pin that cannot be read is invalid too.
+func TestNpmWithoutProvenanceUnknownTimeIsInvalid(t *testing.T) {
+	cases := []struct{ name, drop, want string }{
+		{"version's time missing", "3.1.0", "this version's"},
+		{"pinned version's time missing", "3.0.0", "pinned version 3.0.0's"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRegistry(t)
+			sigstorePackument(t, r, func(doc map[string]any) { delete(doc["time"].(map[string]any), tc.drop) })
+			store := &fakeStore{pins: map[string]audit.ProvenancePin{"npm/sigstore": sigstorePin()}}
+			c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+			got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: "3.1.0"})
+			if got.Provenance.Outcome != audit.ProvenanceInvalid || got.Action != policy.ActionWarn {
+				t.Fatalf("%+v (%s), want invalid and warn", got, got.Reason)
+			}
+			if !strings.Contains(got.Reason, tc.want) || !strings.Contains(got.Reason, "no publish time") {
+				t.Errorf("reason %q does not say %s time is missing", got.Reason, tc.want)
+			}
+		})
+	}
+	t.Run("pin unreadable", func(t *testing.T) {
+		r := newRegistry(t)
+		sigstorePackument(t, r, nil)
+		c := &Checker{Store: brokenPins{&fakeStore{}}, Verifier: newTestVerifier(t, r)}
+		got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: "3.1.0"})
+		if got.Provenance.Outcome != audit.ProvenanceInvalid || !strings.Contains(got.Reason, "could not be read") {
+			t.Fatalf("%+v (%s), want invalid naming the read", got, got.Reason)
+		}
+	})
+}
+
+type brokenPins struct{ *fakeStore }
+
+func (brokenPins) GetProvenancePin(context.Context, string, string) (audit.ProvenancePin, error) {
+	return audit.ProvenancePin{}, errors.New("database is locked")
+}
+
+// One admission imports 3.0.0 with provenance and 3.1.0 without, the package
+// holding no pin yet: 3.1.0 is held to the pin 3.0.0 is about to take, in
+// whichever order the manifest lists them.
+func TestNpmBatchJudgesAgainstThePendingPin(t *testing.T) {
+	for _, order := range [][]string{{"3.0.0", "3.1.0"}, {"3.1.0", "3.0.0"}} {
+		t.Run(strings.Join(order, ","), func(t *testing.T) {
+			r := newRegistry(t)
+			sigstorePackument(t, r, nil)
+			store := &fakeStore{actions: map[string]string{"npm": policy.ActionWarn}}
+			c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+			pm := &manifest.PackageManifest{Type: "npm", Name: "sigstore"}
+			got := map[string]policy.Result{}
+			entries := map[string]*manifest.VersionEntry{}
+			for _, v := range order {
+				entries[v] = &manifest.VersionEntry{Version: v}
+				got[v] = c.Check(context.Background(), pm, entries[v])
+			}
+			for ve, res := range c.Commit(context.Background()) {
+				got[ve.Version] = res
+			}
+			if got["3.0.0"].Provenance.Outcome != audit.ProvenanceVerified {
+				t.Errorf("3.0.0: %s (%s)", got["3.0.0"].Provenance.Outcome, got["3.0.0"].Reason)
+			}
+			if res := got["3.1.0"]; res.Provenance.Outcome != audit.ProvenanceMismatch || res.Action != policy.ActionWarn {
+				t.Errorf("3.1.0: %s/%s (%s), want mismatch and warn", res.Provenance.Outcome, res.Action, res.Reason)
+			}
+			if store.pins["npm/sigstore"].PinnedVersion != "3.0.0" {
+				t.Errorf("pin %+v", store.pins["npm/sigstore"])
+			}
+		})
+	}
+}
+
+// Another admission pinned a different identity between Check and Commit: a
+// version without provenance judged against this admission's pending pin is
+// judged again against the pin that won, here one whose version the
+// packument gives no time for.
+func TestCommitJudgesUnavailableAgainstThePinThatWon(t *testing.T) {
+	r := newRegistry(t)
+	sigstorePackument(t, r, nil)
+	store := &fakeStore{}
+	c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+	pm := &manifest.PackageManifest{Type: "npm", Name: "sigstore"}
+	c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "3.0.0"})
+	old := &manifest.VersionEntry{Version: "0.1.1"}
+	if got := c.Check(context.Background(), pm, old); got.Provenance.Outcome != audit.ProvenanceUnavailable {
+		t.Fatalf("0.1.1 against the pending pin: %s (%s)", got.Provenance.Outcome, got.Reason)
+	}
+	won := sigstorePin()
+	won.SourceRepositoryURI, won.PinnedVersion = "https://github.com/example/sigstore-js", "0.0.0"
+	store.pins = map[string]audit.ProvenancePin{"npm/sigstore": won}
+	changed := c.Commit(context.Background())
+	got, ok := changed[old]
+	if !ok {
+		t.Fatalf("commit did not judge 0.1.1 again: %+v", changed)
+	}
+	if got.Provenance.Outcome != audit.ProvenanceInvalid || !strings.Contains(got.Reason, "pinned version 0.0.0's") {
+		t.Errorf("0.1.1 against a pin whose time the packument lacks: %s (%s), want invalid", got.Provenance.Outcome, got.Reason)
+	}
+}

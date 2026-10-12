@@ -1,0 +1,73 @@
+{
+  "_id": "sigstore",
+  "name": "sigstore",
+  "dist-tags": {
+    "latest": "3.1.0"
+  },
+  "versions": {
+    "0.1.1": {
+      "name": "sigstore",
+      "version": "0.1.1",
+      "dist": {
+        "shasum": "4c1181d676395bfa478a54d0d51f1650b094e23f",
+        "tarball": "https://registry.npmjs.org/sigstore/-/sigstore-0.1.1.tgz",
+        "fileCount": 109,
+        "integrity": "sha512-H33B4+E6DQKYdst5MscF6zm/vYvhq2OV1raloghvU+SpJQQ6TW3y9uQWjK1rjouOu0Y8vVrHa6iGuSufRG1Zng==",
+        "signatures": [
+          {
+            "sig": "MEUCIFKxB2dvh0aQX1DPXE2qkVe4InAC49tO+s2qIcVdZKd2AiEAkI7sRAwhoHNKjDEy+FIVbj5fF2PHEhpXqnQ2gt+jTzk=",
+            "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+          }
+        ],
+        "unpackedSize": 195167
+      }
+    },
+    "3.0.0": {
+      "name": "sigstore",
+      "version": "3.0.0",
+      "dist": {
+        "shasum": "d6eadcc6590185a7f1c16184078ce8a9ef6db937",
+        "tarball": "https://registry.npmjs.org/sigstore/-/sigstore-3.0.0.tgz",
+        "fileCount": 9,
+        "integrity": "sha512-PHMifhh3EN4loMcHCz6l3v/luzgT3za+9f8subGgeMNjbJjzH4Ij/YoX3Gvu+kaouJRIlVdTHHCREADYf+ZteA==",
+        "signatures": [
+          {
+            "sig": "MEUCIFFWJhn8uYavdTFhFBe51TdFVm2BWZTpNU8XXDyKqjHEAiEA6ueK9t6wUnn5DqL9LA+25JRseNOfzRPsCWLULd2m3Fs=",
+            "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+          }
+        ],
+        "attestations": {
+          "url": "/-/npm/v1/attestations/sigstore@3.0.0",
+          "provenance": {
+            "predicateType": "https://slsa.dev/provenance/v1"
+          }
+        },
+        "unpackedSize": 36880
+      }
+    },
+    "3.1.0": {
+      "name": "sigstore",
+      "version": "3.1.0",
+      "dist": {
+        "shasum": "08dc6c0c425263e9fdab85ffdb6477550e2c511d",
+        "tarball": "https://registry.npmjs.org/sigstore/-/sigstore-3.1.0.tgz",
+        "fileCount": 9,
+        "integrity": "sha512-ZpzWAFHIFqyFE56dXqgX/DkDRZdz+rRcjoIk/RQU4IX0wiCv1l8S7ZrXDHcCc+uaf+6o7w3h2l3g6GYG5TKN9Q==",
+        "signatures": [
+          {
+            "sig": "MEUCIQCCs7f3ZfBv/GAQbS2bwYKkP7qA+YhEXPVcTlRrP88JHAIgaWJxIIvEupPr1wB3i15BqqC768dquUTCaFcnxxMfK+I=",
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+          }
+        ],
+        "unpackedSize": 37213
+      }
+    }
+  },
+  "time": {
+    "created": "2022-08-08T20:42:14.283Z",
+    "modified": "2026-06-01T21:02:52.569Z",
+    "0.1.1": "2022-12-01T17:15:22.640Z",
+    "3.0.0": "2024-10-14T16:13:47.295Z",
+    "3.1.0": "2025-02-04T20:35:48.753Z"
+  }
+}

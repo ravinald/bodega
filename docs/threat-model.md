@@ -208,14 +208,20 @@ risk:
   bundle is verified against Sigstore's trusted root, and its subject must be
   the tarball's published sha512 (npm) or the asset's sha256 (GitHub). The
   first admitted version to verify pins its source repository and builder;
-  a later version verified from anything else is a `mismatch`, and one with
-  no provenance is `unavailable`. Under `bodega policy provenance set <type>
-  block`, both are refused, so the laptop publish gets no further than the
-  admission row that names it. Under the default `warn`, a `mismatch`, an
-  `invalid` bundle or a lookup that got no answer (a rate limit, an outage)
-  is a warning, and only a registry's answer that the version publishes
-  nothing (`unavailable`) passes: the outcome is recorded in every admission
-  row and attestation, but nothing is refused.
+  a later version verified from anything else is a `mismatch`. So is an npm
+  version with no provenance at all, published after the pinned version by
+  the packument's `time` map: that is the laptop publish, which carries no
+  CI provenance to compare. An npm version published before the pinned one
+  predates the project's adoption of provenance and stays `unavailable`, and
+  one the packument gives no publish time for, or whose pinned version it
+  gives none for, is `invalid`. Under `bodega policy provenance set <type>
+block`, `mismatch`, `invalid` and `unavailable` are all refused, so the
+  laptop publish gets no further than the admission row that names it. Under
+  the default `warn`, a `mismatch`, an `invalid` bundle or a lookup that got
+  no answer (a rate limit, an outage) is a warning, and only a registry's
+  answer that the version publishes nothing (`unavailable`) passes: the
+  outcome is recorded in every admission row and attestation, but nothing is
+  refused.
   See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
 - **Transitive dependency poisoning.** When a top-level package (e.g. a git
   repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega
@@ -453,8 +459,15 @@ defence against:
   rest publish no per-package statement of who built them. A binary or git
   entry not fetched from a GitHub release, a git entry cloned rather than
   fetched as a release archive, and a release asset with no recorded digest
-  are `unavailable` too. Within npm and GitHub releases the check still
-  stops short of four things. It trusts the first verified version: a package
+  are `unavailable` too. So is a GitHub release asset whose attestation
+  lookup finds none, even when earlier releases of the same package verified
+  and pinned. The check reads no publish time for a release (an entry that
+  records its sha256 never calls the release API, and a git archive's digest
+  comes from `SHA256SUMS`), so it cannot tell a release after the pin from
+  one before the repository adopted attestations, and an asset uploaded from
+  a laptop with a stolen GitHub token passes under `warn`. An npm package that never published provenance holds no pin
+  and passes under `warn` the same way. Within npm and GitHub releases the
+  check still stops short of four things. It trusts the first verified version: a package
   whose first admitted version was already built by an attacker's CI pins the
   attacker. It cannot tell a compromised CI workflow or source repository from
   an honest one, because the signature is that workflow's. It does not verify
@@ -773,7 +786,7 @@ that verifies against a key ID you pinned says one thing: **this bodega's
 policy admitted these bytes at this time.** Spelled out:
 
 - **These bytes.** The subject is a purl and a SHA-256. `bodega attest
-  verify` checks that digest against the artifact you hold, so the statement
+verify` checks that digest against the artifact you hold, so the statement
   is about that file and no other.
 - **This bodega.** `ingestionPlatform.id` names the instance, and the key ID
   names the key it signed with. Nothing else in the statement authenticates
