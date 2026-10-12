@@ -22,7 +22,7 @@ var ErrRefused = errors.New("refused to sign")
 // StandardChecks are the checks every admission runs. A statement lists each
 // one, so a row written before a check existed reads as not_evaluated for it
 // rather than leaving the check out, which a consumer could read as a pass.
-var StandardChecks = []string{audit.CheckAllowList, audit.CheckAge, audit.CheckOSV}
+var StandardChecks = []string{audit.CheckAllowList, audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance}
 
 // AdmissionReader is the audit trail's read surface for decisions.
 type AdmissionReader interface {
@@ -152,6 +152,7 @@ func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time
 	if alg, hex, ok := strings.Cut(row.PolicyDigest, ":"); ok && hex != "" {
 		pe.PolicyDigest[alg] = hex
 	}
+	upstream := AvailabilityOf(row.Checks)
 	var from []ResourceDescriptor
 	for _, r := range p.RequiredBy {
 		from = append(from, ResourceDescriptor{Name: r})
@@ -169,10 +170,31 @@ func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time
 			IngestedAt:         ingestedAt.UTC(),
 			PolicyEvaluations:  pe,
 			ResolvedFrom:       from,
-			UpstreamProvenance: Availability{Status: StatusUnavailable},
-			PublisherSignature: Availability{Status: StatusUnavailable},
+			UpstreamProvenance: upstream,
+			PublisherSignature: upstream,
 		},
 	}
+}
+
+// AvailabilityOf reads the upstream_provenance check of a row. A row without
+// one, or whose check did not run, says unavailable: an outcome nobody
+// evaluated is never reported as verified.
+func AvailabilityOf(checks []audit.AdmissionCheck) Availability {
+	for _, c := range checks {
+		if c.Check != audit.CheckUpstreamProvenance || c.Status == audit.CheckNotEvaluated || c.Provenance == nil || c.Provenance.Outcome == "" {
+			continue
+		}
+		p := c.Provenance
+		a := Availability{Status: p.Outcome}
+		if p.Outcome == audit.ProvenanceVerified || p.Outcome == audit.ProvenanceMismatch {
+			a.SourceRepositoryURI, a.WorkflowRef, a.BuilderID = p.SourceRepositoryURI, p.WorkflowRef, p.BuilderID
+			if alg, hex, ok := strings.Cut(p.BundleDigest, ":"); ok && hex != "" {
+				a.BundleDigest = map[string]string{alg: hex}
+			}
+		}
+		return a
+	}
+	return Availability{Status: StatusUnavailable}
 }
 
 // Evaluations copies a row's checks as recorded and appends each standard

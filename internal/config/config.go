@@ -110,35 +110,40 @@ type Config struct {
 	// trusts when no --key is given. Learned through a channel other than the
 	// server whose statements they check.
 	AttestationKeyIDs []string `json:"attestation_keyids,omitempty"`
-	ServerURL         string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
-	Token             string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
-	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
-	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
-	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
-	NpmUpstream       string   `json:"npm_upstream,omitempty"`
-	PypiUpstream      string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
-	CargoUpstream     string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
-	CargoDLUpstream   string   `json:"cargo_dl_upstream,omitempty"`
-	DiscoverMode      string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
-	GomodRoot         string   `json:"gomod_root,omitempty"`
-	HelmRoot          string   `json:"helm_root,omitempty"`
-	NpmRoot           string   `json:"npm_root,omitempty"`
-	CargoRoot         string   `json:"cargo_root,omitempty"`
-	FreeBSDRoot       string   `json:"freebsd_root,omitempty"`
-	DistfilesRoot     string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
-	AuditDB           string   `json:"audit_db,omitempty"`
-	DenyList          []string `json:"deny_list,omitempty"`
-	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
-	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
-	AuditSink         string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
-	AuditSinkDSN      string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
-	StorageBackend    string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
-	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
-	AptCodename       string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
-	AptSuites         []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
-	AptSigningName    string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
-	AptSigningEmail   string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
-	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+	// SigstoreTrustedRoot names a Sigstore trusted_root.json that upstream
+	// provenance is verified against, for a host that cannot reach Sigstore's
+	// TUF repository. Empty means fetch it through TUF. serve refuses to
+	// start when it names a file that is missing or does not parse.
+	SigstoreTrustedRoot string   `json:"sigstore_trusted_root,omitempty"`
+	ServerURL           string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token               string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
+	ProxyCacheEnabled   bool     `json:"proxy_cache_enabled"`
+	MetadataTTL         string   `json:"metadata_ttl,omitempty"`
+	GomodUpstream       string   `json:"gomod_upstream,omitempty"`
+	NpmUpstream         string   `json:"npm_upstream,omitempty"`
+	PypiUpstream        string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
+	CargoUpstream       string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
+	CargoDLUpstream     string   `json:"cargo_dl_upstream,omitempty"`
+	DiscoverMode        string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
+	GomodRoot           string   `json:"gomod_root,omitempty"`
+	HelmRoot            string   `json:"helm_root,omitempty"`
+	NpmRoot             string   `json:"npm_root,omitempty"`
+	CargoRoot           string   `json:"cargo_root,omitempty"`
+	FreeBSDRoot         string   `json:"freebsd_root,omitempty"`
+	DistfilesRoot       string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
+	AuditDB             string   `json:"audit_db,omitempty"`
+	DenyList            []string `json:"deny_list,omitempty"`
+	Timezone            string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
+	AuditEvents         []string `json:"audit_events,omitempty"`      // event types to record; empty = all
+	AuditSink           string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
+	AuditSinkDSN        string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
+	StorageBackend      string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
+	StoragePath         string   `json:"storage_path,omitempty"`      // root directory for local backend
+	AptCodename         string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
+	AptSuites           []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
+	AptSigningName      string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
+	AptSigningEmail     string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
+	AdminPermitCIDR     []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 
 	// OSV gate. osv_db_dir holds the per-ecosystem archives `bodega policy osv
 	// sync` writes and defaults to {storage_path}/osv, so a connected host

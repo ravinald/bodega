@@ -290,18 +290,20 @@ func firstSegment(p string) string {
 	return p
 }
 
-// DigestStore is what Digest reads: every row of the four tables an
+// DigestStore is what Digest reads: every row of the five tables an
 // admission decision is judged against. *audit.DB satisfies it.
 type DigestStore interface {
 	ListPolicies(ctx context.Context) ([]audit.PolicyInfo, error)
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
 	ListOSVMalwarePolicies(ctx context.Context) ([]audit.OSVMalwarePolicy, error)
+	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
 }
 
 // Digest returns "sha256:<hex>" over a canonical serialization of the
-// allow-list rules and the age_policy, osv_policy and osv_malware_policy rows,
-// which is what an admission row cites as the policy it was decided under.
+// allow-list rules and the age_policy, osv_policy, osv_malware_policy and
+// upstream_provenance_policy rows, which is what an admission row cites as
+// the policy it was decided under.
 // The malware rows are in it because the OSV check refuses on them too, with
 // a default of block that an absent osv_policy row does not turn off.
 //
@@ -327,6 +329,10 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("policy digest: list osv malware policies: %w", err)
 	}
+	provenance, err := store.ListProvenancePolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list upstream provenance policies: %w", err)
+	}
 
 	type rule struct {
 		Type    string `json:"type"`
@@ -348,7 +354,9 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 		Age       []age  `json:"age"`
 		OSV       []osv  `json:"osv"`
 		Malware   []osv  `json:"osv_malware"`
-	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}}
+		// Provenance reuses osv's two fields: an ecosystem and an action.
+		Provenance []osv `json:"upstream_provenance"`
+	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}, Provenance: []osv{}}
 	for _, r := range rules {
 		canon.AllowList = append(canon.AllowList, rule{r.RegistryType, r.RuleKind, r.Pattern})
 	}
@@ -361,12 +369,16 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	for _, m := range malware {
 		canon.Malware = append(canon.Malware, osv{m.Ecosystem, m.Action})
 	}
+	for _, p := range provenance {
+		canon.Provenance = append(canon.Provenance, osv{p.Ecosystem, p.Action})
+	}
 	slices.SortFunc(canon.AllowList, func(a, b rule) int {
 		return strings.Compare(a.Type+"\x00"+a.Kind+"\x00"+a.Pattern, b.Type+"\x00"+b.Kind+"\x00"+b.Pattern)
 	})
 	slices.SortFunc(canon.Age, func(a, b age) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 	slices.SortFunc(canon.OSV, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 	slices.SortFunc(canon.Malware, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
+	slices.SortFunc(canon.Provenance, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 
 	blob, err := json.Marshal(canon)
 	if err != nil {

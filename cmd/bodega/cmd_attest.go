@@ -249,6 +249,12 @@ what it observed:
 
 Any failed check exits non-zero.
 
+It then prints upstream-provenance and publisher-signature: whether the
+publisher's own signed provenance was verified at admission (verified,
+unavailable, invalid or mismatch), and the source repository, workflow,
+builder and bundle digest it named. Neither fails verify; the admission's
+upstream_provenance evaluation is what the policy check reads.
+
 The trusted key IDs come from --key, or from attestation_keyids in the config
 file. Learn them somewhere other than the server being checked: the public key
 for each ID is fetched from /api/v1/attestation/keys (or read from
@@ -293,7 +299,7 @@ server. distfiles bytes are not fetched: pass --artifact.`,
 					return fmt.Errorf("%s is neither a readable file nor type/name/version: %w", args[0], err)
 				}
 			}
-			results, err := req.run()
+			results, st, err := req.run()
 			if err != nil {
 				return err
 			}
@@ -306,6 +312,8 @@ server. distfiles bytes are not fetched: pass --artifact.`,
 				failed++
 				fmt.Fprintf(cmd.OutOrStdout(), "FAIL  %-15s expected %s\n      %-15s observed %s\n", r.Check, r.Expected, "", r.Observed)
 			}
+			printAvailability(cmd.OutOrStdout(), "upstream-provenance", st.Predicate.UpstreamProvenance)
+			printAvailability(cmd.OutOrStdout(), "publisher-signature", st.Predicate.PublisherSignature)
 			if failed > 0 {
 				return fmt.Errorf("attestation for %s/%s@%s failed %d of %d checks", req.typ, req.name, req.version, failed, len(results))
 			}
@@ -333,32 +341,54 @@ func splitPackageSpec(spec string) (typ, name, version string, err error) {
 	return typ, rest[:i], rest[i+1:], nil
 }
 
+// printAvailability reports what the statement says about the publisher's
+// own provenance. It is information, not a check: what an unavailable or a
+// mismatch means for a consumer is that consumer's policy, and the admission
+// row already applied bodega's.
+func printAvailability(w io.Writer, label string, a attest.Availability) {
+	status := a.Status
+	if status == "" {
+		status = "(absent)"
+	}
+	fmt.Fprintf(w, "info  %-15s %s\n", label, status)
+	for _, f := range []struct{ k, v string }{
+		{"source", a.SourceRepositoryURI}, {"workflow", a.WorkflowRef}, {"builder", a.BuilderID},
+	} {
+		if f.v != "" {
+			fmt.Fprintf(w, "      %-15s %s %s\n", "", f.k, f.v)
+		}
+	}
+	for alg, d := range a.BundleDigest {
+		fmt.Fprintf(w, "      %-15s bundle %s:%s\n", "", alg, d)
+	}
+}
+
 // run gathers the envelope, the keys and the bytes, then checks.
-func (v *verifyRequest) run() ([]attest.Result, error) {
+func (v *verifyRequest) run() ([]attest.Result, *attest.Statement, error) {
 	if v.envelope == nil {
 		body, err := v.fetch("/api/v1/packages/" + url.PathEscape(v.typ) + "/" + url.PathEscape(v.name) + "/" + url.PathEscape(v.version) + "/attestation")
 		if err != nil {
-			return nil, fmt.Errorf("fetch the attestation: %w", err)
+			return nil, nil, fmt.Errorf("fetch the attestation: %w", err)
 		}
 		v.envelope = body
 	}
 	env, st, err := attest.ParseEnvelope(v.envelope)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	trusted, err := v.trustedKeys()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sum, err := v.artifactDigest(st)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return attest.Verify(env, st, attest.VerifyInput{
 		Trusted:        trusted,
 		ArtifactSHA256: sum,
 		WantPURL:       attest.PURLBase(attest.PURL(v.typ, v.name, v.version, "")),
-	}), nil
+	}), st, nil
 }
 
 // trustedKeys returns the public key for each pinned ID it can find. A key is

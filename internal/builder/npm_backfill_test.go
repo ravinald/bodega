@@ -26,9 +26,15 @@ func TestFetchNpmBackfillsARecordThatWasResetUnderItsTarball(t *testing.T) {
 	body := npmPackageTGZ(t, `{"name":"color-convert","version":"2.0.1",
 		"dependencies":{"color-name":"~1.1.4"}}`)
 
-	// No upstream: reaching one would mean the stage check did not
-	// short-circuit, which is the behavior under test.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// No tarball upstream: downloading one would mean the stage check did
+	// not short-circuit, which is the behavior under test. The packument is
+	// another matter: admission runs before the stage check, and the upstream
+	// provenance check reads it there, so it answers 404 (no provenance).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/-/") {
+			http.NotFound(w, r)
+			return
+		}
 		t.Error("the fetch reached upstream for a tarball already on disk")
 		w.WriteHeader(http.StatusInternalServerError)
 	}))

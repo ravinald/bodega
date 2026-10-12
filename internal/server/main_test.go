@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -8,16 +10,20 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/sigstore/sigstore-go/pkg/root"
+
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // TestMain points the host-wide search paths at a scratch directory before any
 // test builds a Server, and stops the import path's publish-time reads at the
-// loopback interface, so an import test never reaches a public registry.
+// loopback interface, so an import test never reaches a public registry, GitHub
+// or Sigstore.
 //
 // New() reads the apt signing key from /etc/bodega/apt-signing.key and the
 // token pepper from /etc/bodega/pepper or the user's config directory, none of
@@ -46,6 +52,14 @@ func TestMain(m *testing.M) {
 		ac := policy.NewAgeChecker(nil)
 		ac.HTTP = &http.Client{Transport: loopbackOnly{}}
 		return ac
+	}
+	admit.NewProvenanceVerifier = func(*config.Config) *provenance.Verifier {
+		v := provenance.NewVerifier("")
+		v.HTTP = &http.Client{Transport: loopbackOnly{}}
+		v.Root = func(context.Context) (root.TrustedMaterial, error) {
+			return nil, errors.New("a test binary fetches no Sigstore trusted root")
+		}
+		return v
 	}
 
 	code := m.Run()

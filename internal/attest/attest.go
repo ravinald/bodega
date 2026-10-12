@@ -74,8 +74,11 @@ type Predicate struct {
 	IngestedAt        time.Time            `json:"ingestedAt"`
 	PolicyEvaluations PolicyEvaluations    `json:"policyEvaluations"`
 	ResolvedFrom      []ResourceDescriptor `json:"resolvedFrom,omitempty"`
-	// UpstreamProvenance and PublisherSignature say unavailable until bodega
-	// verifies a publisher's own statements; see StatusUnavailable.
+	// UpstreamProvenance and PublisherSignature are what the admission row's
+	// upstream_provenance check concluded about the publisher's own signed
+	// provenance. Both carry the same status and identity: the provenance and
+	// the signature over it are one Sigstore bundle, verified together. A row
+	// whose check did not run says unavailable; see AvailabilityOf.
 	UpstreamProvenance Availability `json:"upstreamProvenance"`
 	PublisherSignature Availability `json:"publisherSignature"`
 }
@@ -85,9 +88,19 @@ type Platform struct {
 	ID string `json:"id"`
 }
 
-// Availability is a field's status when it carries no evidence of its own.
+// Availability is the outcome of verifying a publisher's provenance:
+// verified, unavailable, invalid or mismatch. The identity fields are what
+// the signing certificate and the provenance named, set when a signature
+// verified (verified and mismatch) and omitted otherwise, which is also how
+// an envelope signed before they existed reads.
 type Availability struct {
-	Status string `json:"status"`
+	Status              string `json:"status"`
+	SourceRepositoryURI string `json:"sourceRepositoryUri,omitempty"`
+	WorkflowRef         string `json:"workflowRef,omitempty"`
+	BuilderID           string `json:"builderId,omitempty"`
+	// BundleDigest is the digest of the Sigstore bundle that was verified,
+	// as an in-toto digest set.
+	BundleDigest map[string]string `json:"bundleDigest,omitempty"`
 }
 
 // PolicyEvaluations is the admission decision the statement rests on: the

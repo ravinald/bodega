@@ -26,6 +26,7 @@ import (
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // newDoctorCmd reports host-level configuration that would silently bypass
@@ -709,6 +710,7 @@ type postureStore interface {
 	ListPolicies(ctx context.Context) ([]audit.PolicyInfo, error)
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
+	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
 }
 
 // serverPostureFindings resolves this machine's install and reports on it,
@@ -795,9 +797,16 @@ func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 	if err != nil {
 		return postureSkipped("read osv policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
+	provs, err := store.ListProvenancePolicies(ctx)
+	// doctor opens the store read-only and so never migrates it: a store
+	// that predates the table cannot hold a row, which is the same posture
+	// as an empty one.
+	if err != nil && !strings.Contains(err.Error(), "no such table") {
+		return postureSkipped("read upstream provenance policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
+	}
 	return []host.Finding{
-		policyCoverage(rules, ages, osvs),
-		policyIgnored(ages, osvs),
+		policyCoverage(rules, ages, osvs, provs),
+		policyIgnored(ages, osvs, provs),
 		policyEcosystem(ages, osvs),
 	}
 }
@@ -840,17 +849,25 @@ func enforcing(rows []gateRow, covered []string) []gateRow {
 // policyCoverage is the zero-policy install: a caching proxy with an audit
 // trail. Every upstream fetch is admitted, and nothing in the request path
 // would have refused the compromised release the audit trail then records.
-// It reads every gate admit.checkVersions runs, age and OSV both: an install
-// carrying one of them refuses fetches, so reporting it as wide open is a
-// false statement the operator can disprove from their own logs.
-func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy, osvs []audit.OSVPolicy) host.Finding {
+// It reads every gate admit.checkVersions runs, age, OSV and upstream
+// provenance: an install carrying one of them refuses fetches, so reporting
+// it as wide open is a false statement the operator can disprove from their
+// own logs. A provenance row counts only at block, because the check runs at
+// warn on every ecosystem with no row at all, and warn refuses nothing.
+func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy, osvs []audit.OSVPolicy, provs []audit.ProvenancePolicy) host.Finding {
 	f := host.Finding{Check: "policy-coverage", Status: host.StatusOK}
 	aged := enforcing(ageRows(ages), policy.AgeEcosystems())
 	scanned := enforcing(osvRows(osvs), policy.OSVEcosystems())
 	gates := slices.Concat(aged, scanned)
-	if len(rules) > 0 || len(gates) > 0 {
-		f.Detail = fmt.Sprintf("%d allow-list rule(s), %d ecosystem(s) with a publish-age gate, %d with an OSV gate",
-			len(rules), len(aged), len(scanned))
+	provenanceBlocks := 0
+	for _, p := range provs {
+		if p.Action == policy.ActionBlock {
+			provenanceBlocks++
+		}
+	}
+	if len(rules) > 0 || len(gates) > 0 || provenanceBlocks > 0 {
+		f.Detail = fmt.Sprintf("%d allow-list rule(s), %d ecosystem(s) with a publish-age gate, %d with an OSV gate, %d with an upstream provenance block",
+			len(rules), len(aged), len(scanned), provenanceBlocks)
 		// This check asks whether anybody ever configured a policy; whether it
 		// runs is policy-ignored's question. Counting a silenced row as a gate
 		// is the right answer to the first question and a false statement on
@@ -861,7 +878,7 @@ func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy, osvs []aud
 		return f
 	}
 	f.Status = host.StatusWarn
-	f.Detail = "no allow-list rule and no publish-age or OSV gate: every upstream fetch is admitted"
+	f.Detail = "no allow-list rule, no publish-age or OSV gate and no upstream provenance block: every upstream fetch is admitted"
 	f.Remediation = "bodega policy add npm <package> to constrain what may be fetched; " +
 		"bodega policy age set npm 7d warn for a publish-age cooldown"
 	return f
@@ -880,7 +897,7 @@ func ignoredCount(rows []gateRow) int {
 // policyIgnored is the install that had a gate and lost it. Silencing one
 // ecosystem during an incident is routine; leaving every ecosystem on ignore
 // is a gate that reports as configured and has never run since.
-func policyIgnored(ages []audit.AgePolicy, osvs []audit.OSVPolicy) host.Finding {
+func policyIgnored(ages []audit.AgePolicy, osvs []audit.OSVPolicy, provs []audit.ProvenancePolicy) host.Finding {
 	f := host.Finding{Check: "policy-ignored", Status: host.StatusOK}
 	var silenced, fixes []string
 	if ecos := silencedEcosystems(ageRows(ages), policy.AgeEcosystems()); len(ecos) > 0 {
@@ -890,6 +907,10 @@ func policyIgnored(ages []audit.AgePolicy, osvs []audit.OSVPolicy) host.Finding 
 	if ecos := silencedEcosystems(osvRows(osvs), policy.OSVEcosystems()); len(ecos) > 0 {
 		silenced = append(silenced, "osv ("+strings.Join(ecos, ", ")+")")
 		fixes = append(fixes, "bodega policy osv set "+ecos[0]+" warn")
+	}
+	if ecos := provenanceSilenced(provs); len(ecos) > 0 {
+		silenced = append(silenced, "upstream provenance ("+strings.Join(ecos, ", ")+")")
+		fixes = append(fixes, "bodega policy provenance set "+ecos[0]+" warn")
 	}
 	if len(silenced) == 0 {
 		f.Detail = "no gate is set to ignore on every ecosystem it covers"
@@ -914,6 +935,25 @@ func silencedEcosystems(rows []gateRow, covered []string) []string {
 		ecos = append(ecos, r.ecosystem)
 	}
 	return ecos
+}
+
+// provenanceSilenced names the ecosystems the upstream provenance check
+// verifies anything for when every one of them is on ignore. Unlike age and
+// OSV, an ecosystem with no row is not off: it runs at warn, so the check is
+// silenced only once each covered ecosystem has an ignore row.
+func provenanceSilenced(provs []audit.ProvenancePolicy) []string {
+	ignored := map[string]bool{}
+	for _, p := range provs {
+		if p.Action == policy.ActionIgnore {
+			ignored[p.Ecosystem] = true
+		}
+	}
+	for _, eco := range provenance.Covered {
+		if !ignored[eco] {
+			return nil
+		}
+	}
+	return slices.Clone(provenance.Covered)
 }
 
 // policyEcosystem is the row the gate cannot read. `policy set` refuses one

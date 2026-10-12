@@ -2,8 +2,12 @@ package attest
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -145,10 +149,18 @@ func TestEmitSignsWhatTheRowSaysAndVerifies(t *testing.T) {
 		pr.UpstreamProvenance.Status != StatusUnavailable || pr.PublisherSignature.Status != StatusUnavailable {
 		t.Errorf("predicate = %+v", pr)
 	}
-	// The row lacks an OSV entry, so the statement says so rather than
-	// leaving it out.
-	if last := pr.PolicyEvaluations.Evaluations[len(pr.PolicyEvaluations.Evaluations)-1]; last.Check != audit.CheckOSV || last.Status != audit.CheckNotEvaluated {
-		t.Errorf("missing check rendered as %+v", last)
+	// The row lacks OSV and upstream provenance entries, so the statement
+	// says so rather than leaving them out.
+	for _, name := range []string{audit.CheckOSV, audit.CheckUpstreamProvenance} {
+		var found *Evaluation
+		for i, e := range pr.PolicyEvaluations.Evaluations {
+			if e.Check == name {
+				found = &pr.PolicyEvaluations.Evaluations[i]
+			}
+		}
+		if found == nil || found.Status != audit.CheckNotEvaluated {
+			t.Errorf("missing %s check rendered as %+v", name, found)
+		}
 	}
 
 	in := VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}
@@ -307,5 +319,85 @@ func TestEmitNothingWithoutAKeyOrATable(t *testing.T) {
 	}
 	if keys := store.Keys(); len(keys) != 0 {
 		t.Errorf("wrote %v", keys)
+	}
+}
+
+// The emitter fills upstreamProvenance and publisherSignature from the row's
+// upstream_provenance check, and a check that never ran says unavailable
+// whatever its entry holds.
+func TestEmitCarriesTheUpstreamProvenanceOfTheRow(t *testing.T) {
+	ctx := context.Background()
+	verified := audit.UpstreamProvenance{
+		Outcome:             audit.ProvenanceVerified,
+		SourceRepositoryURI: "https://github.com/lodash/lodash",
+		WorkflowRef:         "https://github.com/lodash/lodash/.github/workflows/release.yml@refs/tags/4.17.21",
+		BuilderID:           "https://github.com/actions/runner/github-hosted",
+		BundleDigest:        "sha256:" + strings.Repeat("cd", 32),
+	}
+	cases := []struct {
+		name  string
+		check audit.AdmissionCheck
+		want  Availability
+	}{
+		{"verified", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckPass, Provenance: &verified},
+			Availability{Status: audit.ProvenanceVerified, SourceRepositoryURI: verified.SourceRepositoryURI, WorkflowRef: verified.WorkflowRef,
+				BuilderID: verified.BuilderID, BundleDigest: map[string]string{"sha256": strings.Repeat("cd", 32)}}},
+		{"invalid", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckWarn,
+			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}},
+			Availability{Status: audit.ProvenanceInvalid}},
+		{"not evaluated", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckNotEvaluated, Provenance: &verified},
+			Availability{Status: StatusUnavailable}},
+	}
+	for i, tc := range cases {
+		db := openAudit(t)
+		store := storage.NewMemory()
+		version := "4.17." + string(rune('0'+i))
+		key := manifest.NpmTarballKey("lodash", version)
+		admit(t, db, version, audit.AdmissionAdmitted, append(append([]audit.AdmissionCheck(nil), passing...), tc.check))
+		ek, err := emitter(db, newSigner(t)).Emit(ctx, store, pin(t, db, version, key))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		data, _ := store.Get(ctx, ek)
+		_, st, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for field, got := range map[string]Availability{"upstreamProvenance": st.Predicate.UpstreamProvenance, "publisherSignature": st.Predicate.PublisherSignature} {
+			if got.Status != tc.want.Status || got.SourceRepositoryURI != tc.want.SourceRepositoryURI || got.WorkflowRef != tc.want.WorkflowRef ||
+				got.BuilderID != tc.want.BuilderID || got.BundleDigest["sha256"] != tc.want.BundleDigest["sha256"] {
+				t.Errorf("%s: %s = %+v, want %+v", tc.name, field, got, tc.want)
+			}
+		}
+	}
+}
+
+// An envelope signed before upstreamProvenance carried anything but a status
+// still parses and passes every check.
+func TestPreF38EnvelopeStillVerifies(t *testing.T) {
+	s := newSigner(t)
+	payload := `{"_type":"` + StatementType + `","subject":[{"name":"pkg:npm/lodash@4.17.21","digest":{"sha256":"` + digest + `"}}],` +
+		`"predicateType":"` + PredicateType + `","predicate":{"ingestionPlatform":{"id":"https://bodega.example"},` +
+		`"ingestedAt":"2026-10-10T12:00:00Z","policyEvaluations":{"policyDigest":{},"decision":"admitted","decidedAt":"2026-10-10T12:00:00Z",` +
+		`"evaluations":[{"check":"allowlist","action":"none","status":"pass"}]},` +
+		`"upstreamProvenance":{"status":"unavailable"},"publisherSignature":{"status":"unavailable"}}}`
+	sig, err := s.Sign(rand.Reader, PAE(PayloadType, []byte(payload)), crypto.Hash(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload)),
+		Signatures: []Signature{{KeyID: s.KeyID(), Sig: base64.StdEncoding.EncodeToString(sig)}}}
+	data, _ := json.Marshal(env)
+	pe, st, err := ParseEnvelope(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Predicate.UpstreamProvenance.Status != StatusUnavailable || st.Predicate.UpstreamProvenance.SourceRepositoryURI != "" {
+		t.Errorf("upstreamProvenance = %+v", st.Predicate.UpstreamProvenance)
+	}
+	for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+		if !r.OK {
+			t.Errorf("%s failed: expected %s, observed %s", r.Check, r.Expected, r.Observed)
+		}
 	}
 }

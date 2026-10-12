@@ -76,8 +76,8 @@ paths:
         lands in memory whole. Types may be mixed in one push.
 
         Every manifest passes the same admission checks as the single-package
-        route: structural validation, the upstream allow-list, then the age and
-        OSV version checks.
+        route: structural validation, the upstream allow-list, then the age,
+        OSV and upstream provenance version checks.
 
         Restricted to IPs in `admin_permit_cidr`. When the allow-list extends
         beyond localhost, a valid Bearer token is required.

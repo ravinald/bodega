@@ -16,6 +16,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/provenance"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -78,6 +79,9 @@ apt update succeeds. One that cannot be created or opened stops the start: a
 server that publishes an empty Release over a manifest root nothing can read is
 indistinguishable from a healthy one that holds no packages.
 
+When sigstore_trusted_root names a file, serve reads it before binding and
+refuses to start if it is missing or is not a Sigstore trusted root.
+
 Use --quiet to suppress the startup banner for scripted use; log-level
 output continues to respect log_level in the config.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -90,6 +94,15 @@ output continues to respect log_level in the config.`,
 			// healthy doing it.
 			if err := ensureManifestRoot(cfg); err != nil {
 				return err
+			}
+			// A trusted root named and unreadable would turn every version
+			// that publishes provenance into invalid at admission, which on
+			// a block policy refuses all of them for a reason the operator
+			// only learns from the rows.
+			if cfg.SigstoreTrustedRoot != "" {
+				if _, err := provenance.LoadTrustedRootFile(cfg.SigstoreTrustedRoot); err != nil {
+					return err
+				}
 			}
 			// Clean up stale PID file from a previous server instance.
 			server.CleanStalePID(cfg.LogDir)

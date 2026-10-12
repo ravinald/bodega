@@ -199,6 +199,24 @@ risk:
   let an operator quarantine the bad version and pin a known-good replacement
   in seconds. The walkthroughs under `docs/quarantine/` cover one such
   compromise end to end.
+- **A compromised maintainer account publishing outside CI, for npm and
+  GitHub releases.** A maintainer token stolen and used from a laptop
+  publishes a version whose checksum bodega would pin as readily as any other.
+  The upstream provenance check reads what the publisher signed about who
+  built it: the Sigstore bundle npm serves beside a version built in CI, and
+  the GitHub artifact attestation of a binary or git release asset. The
+  bundle is verified against Sigstore's trusted root, and its subject must be
+  the tarball's published sha512 (npm) or the asset's sha256 (GitHub). The
+  first admitted version to verify pins its source repository and builder;
+  a later version verified from anything else is a `mismatch`, and one with
+  no provenance is `unavailable`. Under `bodega policy provenance set <type>
+  block`, both are refused, so the laptop publish gets no further than the
+  admission row that names it. Under the default `warn`, a `mismatch`, an
+  `invalid` bundle or a lookup that got no answer (a rate limit, an outage)
+  is a warning, and only a registry's answer that the version publishes
+  nothing (`unavailable`) passes: the outcome is recorded in every admission
+  row and attestation, but nothing is refused.
+  See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
 - **Transitive dependency poisoning.** When a top-level package (e.g. a git
   repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega
   records every dependency it discovers and creates manifest entries for
@@ -428,6 +446,22 @@ defence against:
   `bodega attest key retire` erases the private half from the file and nowhere
   else, so a copy taken earlier keeps signing. Retiring is not revocation:
   verifiers stop trusting a stolen key only when they drop its key ID.
+- **A compromised maintainer account publishing outside CI, everywhere
+  else.** pypi, gomod, cargo, helm, apt, freebsd and distfiles record
+  `unavailable` on every version, with the reason in the admission row:
+  PEP 740 attestations and helm `.prov` files are not verified yet, and the
+  rest publish no per-package statement of who built them. A binary or git
+  entry not fetched from a GitHub release, a git entry cloned rather than
+  fetched as a release archive, and a release asset with no recorded digest
+  are `unavailable` too. Within npm and GitHub releases the check still
+  stops short of four things. It trusts the first verified version: a package
+  whose first admitted version was already built by an attacker's CI pins the
+  attacker. It cannot tell a compromised CI workflow or source repository from
+  an honest one, because the signature is that workflow's. It does not verify
+  npm's own publish attestation, which is signed by the registry's key rather
+  than by a CI identity. And it does not run on versions the proxy caches with
+  no admission decision behind them (`PinUnadmitted`), such as a dependency a
+  client pulls through an npm proxy route bodega never admitted.
 - **Anything inside an opaque distribution bundle.** When a package format
   bundles its own dependencies in a way bodega cannot inspect (see below),
   the contents of that bundle are outside bodega's allow-list. Bodega may
@@ -746,18 +780,22 @@ policy admitted these bytes at this time.** Spelled out:
   where it came from.
 - **This policy.** `policyEvaluations` carries the admission row as
   recorded: the decision, every check's action and status, and the digest of
-  the allow-list, age and OSV policy in force. A check that did not run says
-  `not_evaluated`, and an object pinned with no decision behind it carries
-  nothing else. `verify` fails a statement whose decision is not `admitted`
+  the allow-list, age, OSV and upstream provenance policy in force. A check
+  that did not run says `not_evaluated`, and an object pinned with no
+  decision behind it carries nothing else. `verify` fails a statement whose decision is not `admitted`
   or whose checks include a `block`; it passes `not_evaluated`, so a consumer
   that needs every check to have run has to read the evaluations itself.
 - **At this time.** `decidedAt` and `ingestedAt` are the bodega host's
   clock. No timestamp authority or transparency log witnesses them.
 
-It does not prove that the artifact is safe, that its publisher is who the
-registry says (`upstreamProvenance` and `publisherSignature` say
-`unavailable` until bodega verifies those), or that the policy was a good
-one. It also proves nothing about a statement signed after the **bodega host
+It does not prove that the artifact is safe, or that the policy was a good
+one. `upstreamProvenance` and `publisherSignature` say what the admission's
+upstream provenance check concluded about the publisher's own signed
+provenance (`verified`, `unavailable`, `invalid` or `mismatch`, with the
+source repository and builder when a signature verified); they are bodega's
+report of that check, not the publisher's bundle, so a consumer who wants to
+verify the publisher independently fetches the bundle from the registry
+itself. It also proves nothing about a statement signed after the **bodega host
 is compromised**. The key that signs is loaded by the serving process and
 read by `bodega attest backfill` and `bodega build fetch` on the same host,
 so anyone who controls that host can sign a statement admitting anything, at
