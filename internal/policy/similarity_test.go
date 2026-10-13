@@ -70,6 +70,8 @@ func TestNearHitsAndMisses(t *testing.T) {
 		{"npm scope typo", npm, "@typse/node", "@types/node", 1},
 		{"npm scoped name typo", npm, "@types/nodee", "@types/node", 1},
 		{"npm scope and name", npm, "@type/nod", "@types/node", 2},
+		{"npm one-letter scope on an unscoped name", npm, "@a/lodash", "lodash", 1},
+		{"npm two-letter scope on an unscoped name", npm, "@ab/lodash", "lodash", 2},
 		{"cargo separator is not an edit", cargo, "Serde-Jsno", "serde_json", 1},
 		{"cargo", cargo, "tokioo", "tokio", 1},
 	}
@@ -91,8 +93,8 @@ func TestNearHitsAndMisses(t *testing.T) {
 		{"far", pypi, "bodega-internal-widget"},
 		{"three edits", pypi, "rekwestz"},
 		{"npm equal scoped", npm, "@Types/Node"},
-		// The scope is its own field: moving a package under a scope nobody
-		// popular uses is not one edit from the unscoped name.
+		// The scope distances add to the name's: `@evil` against no scope is
+		// 4, so `@evil/lodash` is 4 from `lodash`, while `@a/lodash` is 1.
 		{"npm foreign scope", npm, "@evil/lodash"},
 		{"npm unscoped against scoped", npm, "types-node"},
 		{"cargo equal after separator", cargo, "serde-json"},
@@ -100,6 +102,58 @@ func TestNearHitsAndMisses(t *testing.T) {
 	for _, c := range misses {
 		if popular, dist, ok := c.list.Near(c.cand); ok {
 			t.Errorf("%s: Near(%q) = %q at %d, want no hit", c.name, c.cand, popular, dist)
+		}
+	}
+}
+
+// A scope is compared with the other name's scope, so one the popular name
+// lacks costs its length and no more: the `@` and `/` are not edits.
+func TestNearScopedAgainstUnscopedEmbedded(t *testing.T) {
+	npm, _ := EmbeddedPopularNames(manifest.TypeNpm)
+	if popular, dist, ok := npm.Near("@a/yaml"); !ok || popular != "yaml" || dist != 1 {
+		t.Errorf("Near(%q) = %q, %d, %v; want %q, 1, true", "@a/yaml", popular, dist, ok, "yaml")
+	}
+}
+
+// Nearest skips names it can prove are no closer than the best so far; the
+// skip must never change the answer. Every candidate gets the name and the
+// distance a scan of the whole list returns, ties going to the more popular.
+// The scan is quadratic in the list, so a sample of names seeds candidates,
+// denser for npm, whose floor splits the scope and so is not the textbook
+// length bound pypi and cargo use.
+func TestNearestMatchesBruteForce(t *testing.T) {
+	for _, eco := range SimilarityEcosystems() {
+		p, _ := EmbeddedPopularNames(eco)
+		stride := 50
+		if eco == manifest.TypeNpm {
+			stride = 17
+		}
+		var cands []string
+		for i, n := range p.Names {
+			if i%stride != 0 {
+				continue
+			}
+			cands = append(cands, n, n+"x", n[1:])
+			if eco != manifest.TypeNpm {
+				continue
+			}
+			if scope, bare := splitNpmScope(n); scope == "" {
+				cands = append(cands, "@a/"+n, "@ab/"+n)
+			} else {
+				cands = append(cands, bare, "@"+scope[1:]+"/"+bare)
+			}
+		}
+		for _, c := range cands {
+			key := NormalizeName(eco, c)
+			want, wantD := "", -1
+			for i, k := range p.keys {
+				if d := nameDistance(eco, key, k); wantD < 0 || d < wantD {
+					want, wantD = p.Names[i], d
+				}
+			}
+			if got, gotD, _ := p.Nearest(c); got != want || gotD != wantD {
+				t.Errorf("%s: Nearest(%q) = %q at %d; the whole list says %q at %d", eco, c, got, gotD, want, wantD)
+			}
 		}
 	}
 }

@@ -146,7 +146,7 @@ func (p PopularNames) Nearest(name string) (popular string, distance int, ok boo
 	key := NormalizeName(p.Ecosystem, name)
 	best := -1
 	for i, k := range p.keys {
-		if best >= 0 && lengthGap(key, k) >= best {
+		if best >= 0 && distanceFloor(p.Ecosystem, key, k) >= best {
 			continue
 		}
 		d := nameDistance(p.Ecosystem, key, k)
@@ -208,8 +208,22 @@ func splitNpmScope(name string) (scope, bare string) {
 	return "", name
 }
 
-// lengthGap is a lower bound on the distance between a and b, for skipping a
-// name that cannot beat the best found so far.
+// distanceFloor is a lower bound on nameDistance, for skipping a name that
+// cannot beat the best found so far. It splits an npm name the way
+// nameDistance does: the gap between the whole strings counts the `@` and
+// `/` of a scope the other name lacks, so it can exceed the summed distance
+// and prune the true nearest name.
+func distanceFloor(ecosystem, a, b string) int {
+	if ecosystem == manifest.TypeNpm {
+		as, an := splitNpmScope(a)
+		bs, bn := splitNpmScope(b)
+		return lengthGap(as, bs) + lengthGap(an, bn)
+	}
+	return lengthGap(a, b)
+}
+
+// lengthGap is a lower bound on the Damerau-Levenshtein distance between a
+// and b: every edit changes the length by at most one.
 func lengthGap(a, b string) int {
 	d := len([]rune(a)) - len([]rune(b))
 	if d < 0 {

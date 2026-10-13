@@ -29,7 +29,9 @@ compared separately; cargo treats - and _ as one character.
 
 Exempt, so turning the check on breaks nothing already in use:
   - a name an exact allow-list rule names (not an npm @scope/* wildcard)
-  - a name the manifest store held when the check first ran here
+  - a name in use when the check first ran here: one the manifest store
+    held, or one with an admitted row in the admissions table (the only
+    record a pass-through proxy fill leaves)
 
 The action says what a near name does to the admission:
 

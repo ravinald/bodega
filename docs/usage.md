@@ -2578,7 +2578,7 @@ A distance of 1 or 2 to a popular name the candidate is not equal to fails, and 
 reqeusts is distance 1 from the popular pypi name requests (embedded list of 1000, 2026-10-01)
 ```
 
-A name equal to a popular one after normalization passes, as does one three or more edits from all of them. Splitting the npm scope means `@typse/node` is 1 from `@types/node`, while `@evil/lodash` is not near `lodash`: a scope nobody popular uses is its own name, not one edit. gomod, git, helm, binary, apt, freebsd and distfiles record `not_evaluated`, because no list ships for them and `set` and `load` refuse them.
+A name equal to a popular one after normalization passes, as does one three or more edits from all of them. Splitting the npm scope means `@typse/node` is 1 from `@types/node`. A scope the popular name lacks costs its length and the `@` and `/` cost nothing, so `@a/lodash` is 1 from `lodash` and fails, while `@evil/lodash` is 4 and passes. gomod, git, helm, binary, apt, freebsd and distfiles record `not_evaluated`, because no list ships for them and `set` and `load` refuse them.
 
 **Exemptions.** So that turning the check on refuses nothing already in use, a near name passes, with the reason in the detail, when:
 
