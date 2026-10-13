@@ -86,6 +86,7 @@ const (
 	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
 	EventShow    EventType = "show"    // bodega show
 	EventPolicy  EventType = "policy"  // a gate's action changed, e.g. bodega policy osv malware set
+	EventRevet   EventType = "revet"   // a re-vet refused a cataloged version, or the webhook requested one
 
 	// Server lifecycle events.
 	EventServeStart EventType = "serve_start" // bodega serve started
@@ -134,6 +135,7 @@ const (
 	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
 	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
 	DenialTokenScope   = "token_scope"          // token valid, but its scope does not reach this route
+	DenialSignature    = "signature_invalid"    // re-vet webhook body unsigned, mis-signed, stale or replayed
 
 	// Refusals decided inside a handler rather than by the middleware chain.
 	// They reach the same table because an operator asking "who was turned

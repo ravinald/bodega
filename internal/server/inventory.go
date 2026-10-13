@@ -84,7 +84,7 @@ func (s *Server) handleAPIInventory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rep)
 }
 
-// isInventoryPush is the exemption MutationAuthMiddleware asks about.
+// isInventoryPush is one of the exemptions MutationAuthMiddleware asks about.
 func (s *Server) isInventoryPush(r *http.Request) bool {
 	if s.inventory == nil {
 		return false

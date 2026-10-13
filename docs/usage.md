@@ -2377,7 +2377,7 @@ Every unanswered version earns its own row. An unanswered version keeps the stam
 
 A rescan that wrote anything signals a running `bodega serve`, so the API reflects the new stamps without a restart. `manifest.Store` answers a package request from its cache once it has served that package, so without the signal a long-running server would keep calling a freshly flagged version clean for the life of the process. A walk that saved nothing sends nothing, and a walk that saved some packages before failing on others signals anyway before it exits 1.
 
-Nothing schedules a rescan. Pair it with `sync` in the same cron entry: refreshing the mirror and never re-reading it against what is stored leaves the gate current for imports that have not happened yet and stale for everything already served.
+Nothing schedules a rescan. Pair it with `sync` in the same cron entry: refreshing the mirror and never re-reading it against what is stored leaves the gate current for imports that have not happened yet and stale for everything already served. To act on what a refreshed mirror says rather than only record it, [`bodega policy revet`](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) re-runs admission and applies `revet_on_block`, and `revet_interval` schedules it inside `bodega serve`.
 
 Results surface where an operator already looks. `bodega show pkg <type> <name>` carries an `OSV` and a `CHECKED` column per version and names the flagged ids underneath:
 
@@ -2597,6 +2597,139 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 - **It never replaces the artifact-level gate.** With the filter on, the tarball, wheel or `.zip`/`.info`/`.mod` route refuses a withheld version requested directly with a `403` naming the gate, and writes a `denied` row with status `withheld_version`. The index is advice to a resolver; the artifact route is where the decision is enforced.
 - With the filter off, the proxied index lists every version upstream does, and the age and OSV gates refuse a too-new or flagged version when the client fetches its artifact (see the age gate above).
 - The gomod `@latest` document and the npm version route `/npm/<pkg>/<version>` are not filtered. `go` reads `@latest` only when the list is empty, and both lead to an artifact the route refuses.
+
+### `bodega policy revet [--type TYPE] [--name NAME] [--version VERSION] [--older-than DURATION]`
+
+Admission decides once. A version that passed OSV a month ago may have an advisory today, and `bodega policy osv rescan` records that advisory without changing what is served. `revet` re-runs admission itself over versions already in the catalog and acts on the answer.
+
+It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware) and [upstream provenance](#bodega-policy-provenance-setlist). The publish-age gate is skipped, because a version only gets older. The age verdict the last decision recorded is carried into the new row, labeled `not re-run, carried from the decision of <time>`; a version with no earlier age verdict records `not_evaluated`.
+
+Each version gets a **new** admission row beside the old one, with actor `revet` and the trigger as its identity: the operator's name for this command, `schedule` for the [scheduled re-vet](#scheduled-re-vet), `webhook` for the [webhook](#re-vet-webhook). The old row is kept, so `bodega audit admissions <type> <name> <version>` reads as the history of what bodega concluded and when. The new row carries the object key the previous decision was pinned under, one row per key for a pypi release with several wheels.
+
+```console
+$ bodega policy revet --type npm --name minimist
+TYPE  PACKAGE   VERSION  PREVIOUS  DECISION        ACTION    DETAIL
+npm   minimist  1.2.5    admitted  policy_blocked  reported  osv: GHSA-late-0001 ...
+npm   minimist  1.2.8    admitted  admitted        none
+Re-vetted 2 version(s): 1 admitted, 1 refused (0 hidden, 0 frozen), 0 error(s).
+WARN: npm/minimist@1.2.5 is refused and still served (reported)
+```
+
+| Flag           | Effect                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------- |
+| `--type`       | One registry type                                                                           |
+| `--name`       | One package, spelled as anywhere else (`@types/node`, `github.com/spf13/cobra`)             |
+| `--version`    | One version, or a git entry's ref                                                           |
+| `--older-than` | Only versions whose newest decision is older than this (`7d`, `72h`); none on record counts |
+| `--json`       | One object per version: the decisions, the failing checks, signed envelopes and notes       |
+
+A `--name` or `--version` that matches nothing exits 1. The table goes to stdout and the summary and WARN lines to stderr. The run exits 1 when a version could not be re-vetted, and when a refused version is frozen, because that version is still served.
+
+#### `revet_on_block`
+
+What a refusal does is set by `revet_on_block` in `config.json`:
+
+| Value              | Effect                                                                                                                                                                |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `report` (default) | A `revet` audit event (status `policy_violation`, details naming the failing checks) and a WARN. The version stays served.                                            |
+| `hide`             | The same event, then the version is hidden as `bodega pkg hide` does: saved to the manifest and recorded as a `hide` event with actor `revet` and the failing checks. |
+
+**A frozen version is never hidden**, whatever the setting. Freezing says the version must not change under the fleet pinned to it. The refusal is reported with action `frozen`, and the command exits 1 so a cron job sees it. A version already hidden is recorded with action `already_hidden` and left alone.
+
+A refused version stays refused only as long as the checks say so. When the advisory is withdrawn, the next re-vet writes an `admitted` row. A version `hide` hid stays hidden until an operator unhides it: un-hiding automatically would undo a hide somebody else may have made by hand for their own reasons.
+
+Find every version bodega refused on its own:
+
+```bash
+bodega audit events --type revet
+bodega audit events --type hide --actor revet
+```
+
+#### Revocation envelopes
+
+With an [attestation key](#attestation-signing-key) installed, a refusal of a pinned object signs a new envelope beside the earlier ones. Its `policyEvaluations.decision` is `policy_blocked` and its evaluations carry the failing check with status `block`. Envelope keys sort by decision time, so the [attestation route](#attestations) and anything reading the newest envelope see the refusal, not the admission it overturned. Every refusal signs one, so the newest envelope always carries the newest refusal. A pass signs a new envelope only when it overturns a refusal; a clean re-vet of a clean version signs nothing.
+
+The CLI signs only when it can read the key, so run it as the user the server runs as. Without the key, the row and the action still happen and a note on stderr says no envelope was signed. A version with no pinned sha256 gets no envelope, and its row says so.
+
+#### Scheduled re-vet
+
+`bodega serve` runs the re-vet itself when `revet_interval` is set:
+
+```json
+"revet_interval": "24h",
+"revet_rate": 1,
+"revet_on_block": "report"
+```
+
+| Key              | Default     | Effect                                                                                       |
+| ---------------- | ----------- | -------------------------------------------------------------------------------------------- |
+| `revet_interval` | unset (off) | How often the whole catalog is re-vetted. A Go duration; the first sweep waits one interval. |
+| `revet_rate`     | `1`         | Versions per second. The sweep re-vets one version at a time, `1/revet_rate` apart.          |
+| `revet_on_block` | `report`    | `report` or `hide`; see [`revet_on_block`](#revet_on_block)                                  |
+
+Each sweep logs `scheduled re-vet started` with the version count, and `scheduled re-vet finished` with `walked`, `admitted`, `refused`, `hidden`, `frozen`, `errors` and `duration`. Two sweeps never run at once: a tick that arrives while a sweep is still walking logs `scheduled re-vet skipped: the previous sweep is still running` and does nothing. A catalog of 3,000 versions at the default rate takes about 50 minutes, so an interval shorter than that skips ticks rather than queueing them.
+
+The rate is there for the provenance check, which reads the upstream registry, GitHub and Sigstore for every npm version. OSV answers from the local database and costs nothing.
+
+`bodega serve` reads the three keys at startup, so changing them takes a restart. A typo in any of them fails the load: `revet_interval` must be a positive Go duration, `revet_rate` above 0, and `revet_on_block` `report` or `hide`. With no audit store open, the schedule logs a WARN and stays off.
+
+#### Re-vet webhook
+
+`POST /api/v1/policy/revet` re-vets the cataloged versions a threat feed names, at once, and answers with their new decisions. A webhook call and a running sweep never re-vet two versions at the same time: the call waits for the version the sweep is on, then runs.
+
+The route is exempt from `admin_permit_cidr` and takes no bearer token. It is authenticated by an HMAC-SHA256 over the raw body, keyed by `revet_webhook_secret`, sent as `X-Bodega-Signature: sha256=<hex>`. The body carries a `timestamp` in Unix seconds, inside the signature, and the server refuses a body more than 5 minutes from its own clock in either direction. A body is accepted once; sending the same body again inside the window is refused.
+
+```json
+{
+  "type": "npm",
+  "name": "minimist",
+  "version": "1.2.5",
+  "reason": "GHSA-late-0001",
+  "timestamp": 1791900000
+}
+```
+
+`version` is optional; without it every cataloged version of the package is re-vetted. `reason` is free text, truncated to 512 bytes, written to the journal and to a `revet` audit event with status `requested`.
+
+Compute the signature over the exact bytes you send:
+
+```bash
+SECRET='the value of revet_webhook_secret'
+body=$(printf '{"type":"npm","name":"minimist","version":"1.2.5","reason":"GHSA-late-0001","timestamp":%d}' "$(date +%s)")
+sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+curl -sS -X POST https://bodega.example.com/api/v1/policy/revet \
+  -H 'Content-Type: application/json' \
+  -H "X-Bodega-Signature: sha256=$sig" \
+  --data-binary "$body"
+```
+
+```json
+{
+  "results": [
+    {
+      "type": "npm",
+      "name": "minimist",
+      "version": "1.2.5",
+      "previous_decision": "admitted",
+      "decision": "policy_blocked",
+      "action": "hidden",
+      "failing": [{ "check": "osv", "action": "block", "status": "block", "detail": "..." }]
+    }
+  ]
+}
+```
+
+| Status | Meaning                                                                                                  |
+| ------ | -------------------------------------------------------------------------------------------------------- |
+| 200    | Re-vetted; `results` holds one outcome per version                                                       |
+| 400    | `type` or `name` missing, or the type is unknown                                                         |
+| 401    | Unauthorized: no or malformed header, wrong signature, timestamp out of window, replay, or no secret set |
+| 404    | No cataloged version matches                                                                             |
+| 503    | No audit store is open                                                                                   |
+
+Every 401 has the same body, `Unauthorized`, so a caller without the secret learns nothing about which part failed. The journal names it (`re-vet webhook refused reason=...`), and the audit trail records a `denied` event with status `signature_invalid` and the same reason. With `revet_webhook_secret` unset every call is a 401.
+
+Use `--data-binary`, not `-d`: `-d` strips newlines from a file argument, and the server verifies the bytes it received. The secret sits in `config.json`, which bodega writes `0600`. Generate it with `openssl rand -hex 32`.
 
 ### `bodega discover ...`
 
@@ -2904,6 +3037,10 @@ A default config is created on first run. All fields are optional.
   "osv_db_dir": "",
   "osv_api_fallback": false,
   "osv_db_max_age": "168h",
+  "revet_interval": "",
+  "revet_rate": 1,
+  "revet_on_block": "report",
+  "revet_webhook_secret": "",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
   "apt_signing_name": "",
@@ -2920,7 +3057,7 @@ A default config is created on first run. All fields are optional.
 }
 ```
 
-`server_url` and `token` are read only on a host that pushes to a bodega server rather than running one; keep the token in `BODEGA_TOKEN` where you can, so it is never written to disk. The OSV keys are described under [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescanmalware), `storage_by_group` under [Named backends](#named-backends-and-per-type-placement), and `apt_signing_name` and `apt_signing_email` under [Signing the apt repository](#signing-the-apt-repository).
+`server_url` and `token` are read only on a host that pushes to a bodega server rather than running one; keep the token in `BODEGA_TOKEN` where you can, so it is never written to disk. The OSV keys are described under [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescanmalware), the `revet_*` keys under [`bodega policy revet`](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration), `storage_by_group` under [Named backends](#named-backends-and-per-type-placement), and `apt_signing_name` and `apt_signing_email` under [Signing the apt repository](#signing-the-apt-repository).
 
 `deny_list`, `admin_permit_cidr` and `trusted_proxies` are bootstrap values. bodega copies each one into the audit database the first time it starts against a database that does not hold it, logging `acl source list=<name> source=database detail="copied from config file on this start"`. From then on the database decides and the file's entry is inert; a start where the two disagree logs a `WARN` naming both values and the `bodega acl` command that shows the live one. Edit them with `bodega acl`, not with the file.
 
@@ -5510,6 +5647,8 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 | DELETE | `/api/v1/policies/{id}`        | Remove a rule by ID                                            |
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
+
+`POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 
 Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
 

@@ -39,6 +39,8 @@ least one rule for a registry type to switch enforcement on for that type.`,
 		newPolicyCheckCmd(gf),
 		newPolicyAgeCmd(gf),
 		newPolicyOSVCmd(gf),
+		// A hide rewrites a manifest the server serves from its cache.
+		signalsReload(newPolicyRevetCmd(gf)),
 		newPolicyProvenanceCmd(gf),
 		newPolicyFilterCmd(gf),
 	)

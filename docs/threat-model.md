@@ -502,6 +502,21 @@ defence against:
   a new one, because serving a package already reported as malware is not a
   posture anyone chose, and an install with nothing synced warns on every
   import until `bodega policy osv sync` runs.
+- **An advisory published after admission, until the next re-vet.** Admission
+  checks a version once. An advisory or malware record published later changes
+  nothing until a re-vet reads it: the schedule `revet_interval` sets in
+  `bodega serve`, `bodega policy revet` run by hand, or a signed call to the
+  re-vet webhook. Until then the version is served as admitted and its newest
+  attestation says `admitted`. On the schedule alone, the window is OSV's own
+  publication lag, plus the wait for the next `bodega policy osv sync`, plus
+  up to one `revet_interval`, plus the walk to that version at `revet_rate`.
+  `revet_interval` is off by default, so on a new install the window has no
+  bound. Under `revet_on_block: report` the re-vet does not close it either:
+  the version is reported and stays served until an operator hides it, and a
+  frozen version is never hidden under either setting. The webhook narrows the
+  window to the feed's own latency, and only for the packages the feed names.
+  See
+  [`bodega policy revet`](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
 - **A ports build reaching the internet through `MASTER_SITE_OVERRIDE`.**
   Serving distfiles over HTTP preempts a port's own sites; it does not replace
   them. `do-fetch.sh` falls through to the port's `MASTER_SITES` on any answer
@@ -863,6 +878,13 @@ verify` checks that digest against the artifact you hold, so the statement
   that needs every check to have run has to read the evaluations itself.
 - **At this time.** `decidedAt` and `ingestedAt` are the bodega host's
   clock. No timestamp authority or transparency log witnesses them.
+
+A statement is not withdrawn when a later re-vet refuses the version. The
+re-vet signs a newer envelope whose decision is `policy_blocked`, and the
+attestation route serves the newest, so a consumer that verifies the newest
+envelope sees the revocation, and `verify` fails it. A consumer that verified
+an envelope earlier and kept it is not told: the old statement still verifies,
+because it is still true of the moment it describes.
 
 It does not prove that the artifact is safe, or that the policy was a good
 one. `upstreamProvenance` and `publisherSignature` say what the admission's

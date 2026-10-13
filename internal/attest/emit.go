@@ -62,6 +62,21 @@ type Emitter struct {
 // moment earlier. A missing row, a newest decision that is not admitted, or one
 // that names another object is refused with ErrRefused.
 func (e *Emitter) Emit(ctx context.Context, store storage.ObjectStore, p Pin) (string, error) {
+	return e.emit(ctx, store, p, audit.AdmissionAdmitted)
+}
+
+// Revoke signs the envelope for a re-vet that refused p: the same statement
+// Emit signs, over a newest decision of policy_blocked. Its key sorts after
+// every envelope signed for an earlier decision, so the attestation route and
+// a consumer reading the newest envelope see the refusal rather than the
+// admission it overturned. The refusals Emit applies apply here with the
+// decision reversed: a newest decision that is not policy_blocked, or one
+// naming another object, is refused with ErrRefused.
+func (e *Emitter) Revoke(ctx context.Context, store storage.ObjectStore, p Pin) (string, error) {
+	return e.emit(ctx, store, p, audit.AdmissionPolicyBlocked)
+}
+
+func (e *Emitter) emit(ctx context.Context, store storage.ObjectStore, p Pin, decision string) (string, error) {
 	if e == nil || e.Signer == nil || p.Outcome == audit.PinUnverified {
 		return "", nil
 	}
@@ -75,7 +90,7 @@ func (e *Emitter) Emit(ctx context.Context, store storage.ObjectStore, p Pin) (s
 	if p.SHA256 == "" {
 		return "", fmt.Errorf("%w: %s has no sha256 digest pinned", ErrRefused, p.ObjectKey)
 	}
-	row, err := e.admission(ctx, p)
+	row, err := e.admission(ctx, p, decision)
 	if err != nil {
 		return "", err
 	}
@@ -99,9 +114,9 @@ func (e *Emitter) Emit(ctx context.Context, store storage.ObjectStore, p Pin) (s
 
 // admission is the row an envelope for p may cite. Copies of one decision
 // share its decided_at (a second wheel of a pypi release is a copy carrying
-// the second key), so "the newest decision" is every admitted row at the
-// newest timestamp, and one of them has to name this object.
-func (e *Emitter) admission(ctx context.Context, p Pin) (audit.Admission, error) {
+// the second key), so "the newest decision" is every row of that decision at
+// the newest timestamp, and one of them has to name this object.
+func (e *Emitter) admission(ctx context.Context, p Pin, decision string) (audit.Admission, error) {
 	if e.Admissions == nil {
 		return audit.Admission{}, fmt.Errorf("%w: no audit trail to read the admission from", ErrRefused)
 	}
@@ -121,13 +136,13 @@ func (e *Emitter) admission(ctx context.Context, p Pin) (audit.Admission, error)
 		return audit.Admission{}, fmt.Errorf("%w: no admission row for %s/%s@%s", ErrRefused, p.Type, p.Name, p.Version)
 	}
 	newest := mine[0]
-	if newest.Decision != audit.AdmissionAdmitted {
+	if newest.Decision != decision {
 		return audit.Admission{}, fmt.Errorf("%w: the newest decision for %s/%s@%s is %s, not %s",
-			ErrRefused, p.Type, p.Name, p.Version, newest.Decision, audit.AdmissionAdmitted)
+			ErrRefused, p.Type, p.Name, p.Version, newest.Decision, decision)
 	}
 	var named []string
 	for _, r := range mine {
-		if !r.DecidedAt.Equal(newest.DecidedAt) || r.Decision != audit.AdmissionAdmitted {
+		if !r.DecidedAt.Equal(newest.DecidedAt) || r.Decision != decision {
 			break
 		}
 		if r.ObjectKey == p.ObjectKey {
