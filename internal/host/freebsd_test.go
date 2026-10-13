@@ -465,6 +465,11 @@ func TestRunToolReportsWhatFailed(t *testing.T) {
 	}
 }
 
+// testWaitDelay stands in for toolWaitDelay in the runTool timing tests. A
+// case that waits out the delay and one that does not differ by 10s, which
+// a slow process start on a shared CI VM cannot close.
+const testWaitDelay = 10 * time.Second
+
 // A makefile's != assignment runs under sh, whose children hold make's
 // pipes. The timeout has to end the whole tree and return on time, and a
 // child left running after a clean exit is ended too.
@@ -490,8 +495,10 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		start := time.Now()
-		_, err := runToolWithin(time.Second, "", "sh", "-c", `sleep 40 & echo $! >"$1"; sleep 40; true`, "sh", pidfile)
-		if elapsed := time.Since(start); elapsed > time.Second+toolWaitDelay+time.Second {
+		_, err := runToolWaiting(time.Second, testWaitDelay, "", "sh", "-c", `sleep 40 & echo $! >"$1"; sleep 40; true`, "sh", pidfile)
+		// Expected: the 1s timeout, then the end of the group closes the
+		// pipes. The bound allows the whole wait delay as well, plus 5s.
+		if elapsed := time.Since(start); elapsed > time.Second+testWaitDelay+5*time.Second {
 			t.Errorf("returned after %s", elapsed)
 		}
 		if err == nil || !strings.Contains(err.Error(), "sh did not answer within 1s") {
@@ -501,9 +508,11 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 	})
 	t.Run("clean exit", func(t *testing.T) {
 		start := time.Now()
-		out, _ := runToolWithin(time.Minute, "", "sh", "-c", `echo answer; sleep 40 & echo $! >"$1"`, "sh", pidfile)
-		if elapsed := time.Since(start); elapsed > toolWaitDelay+time.Second {
-			t.Errorf("returned after %s", elapsed)
+		out, _ := runToolWaiting(time.Minute, testWaitDelay, "", "sh", "-c", `echo answer; sleep 40 & echo $! >"$1"`, "sh", pidfile)
+		// Expected: the wait delay, since the background sleep holds
+		// stdout. The upper bound leaves 5s of headroom over it.
+		if elapsed := time.Since(start); elapsed < testWaitDelay || elapsed > testWaitDelay+5*time.Second {
+			t.Errorf("returned after %s, want between %s and %s", elapsed, testWaitDelay, testWaitDelay+5*time.Second)
 		}
 		if string(out) != "answer\n" {
 			t.Errorf("stdout = %q", out)
@@ -555,23 +564,29 @@ func TestRunToolEndsDetachedDescendants(t *testing.T) {
 	t.Cleanup(func() { _ = bystander.Process.Kill(); _ = bystander.Wait() })
 
 	for _, c := range []struct {
-		mode    string
-		timeout time.Duration
-		bound   time.Duration
-		timeOut bool
+		mode     string
+		timeout  time.Duration
+		min, max time.Duration
+		timeOut  bool
 	}{
-		{"wait", time.Second, time.Second + toolWaitDelay + time.Second, true},
-		{"hold", time.Minute, toolWaitDelay + time.Second, false},
-		{"closed", time.Minute, time.Second, false},
+		// Expected: the 1s timeout, then ending the subtree closes the
+		// pipes. The bound allows the whole wait delay as well, plus 5s.
+		{"wait", time.Second, 0, time.Second + testWaitDelay + 5*time.Second, true},
+		// Expected: the wait delay, since the detached sleep holds stdout.
+		// The upper bound leaves 5s of headroom over it.
+		{"hold", time.Minute, testWaitDelay, testWaitDelay + 5*time.Second, false},
+		// Expected: near zero, since nothing holds the pipes. Half the wait
+		// delay leaves 5s of headroom and still fails a run that waits it out.
+		{"closed", time.Minute, 0, testWaitDelay / 2, false},
 	} {
 		t.Run(c.mode, func(t *testing.T) {
 			pidfile := filepath.Join(t.TempDir(), "pid")
 			t.Setenv(detachEnv, c.mode)
 			t.Setenv(detachEnv+"_PID", pidfile)
 			start := time.Now()
-			_, err := runToolWithin(c.timeout, "", os.Args[0], "-test.run=^TestDetachHelper$")
-			if elapsed := time.Since(start); elapsed > c.bound {
-				t.Errorf("returned after %s, bound %s", elapsed, c.bound)
+			_, err := runToolWaiting(c.timeout, testWaitDelay, "", os.Args[0], "-test.run=^TestDetachHelper$")
+			if elapsed := time.Since(start); elapsed < c.min || elapsed > c.max {
+				t.Errorf("returned after %s, want between %s and %s", elapsed, c.min, c.max)
 			}
 			if timedOut := err != nil && strings.Contains(err.Error(), "did not answer within"); timedOut != c.timeOut {
 				t.Errorf("err = %v", err)

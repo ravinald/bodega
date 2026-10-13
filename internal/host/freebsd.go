@@ -48,6 +48,13 @@ func runTool(stdin, name string, args ...string) ([]byte, error) {
 // read of those pipes waiting on them. ownDescendants says which processes
 // count as the tool's.
 func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([]byte, error) {
+	return runToolWaiting(timeout, toolWaitDelay, stdin, name, args...)
+}
+
+// runToolWaiting is runToolWithin with the wait for held pipes as a
+// parameter, so a test can tell waiting out the delay from not waiting by a
+// margin no slow process start can close.
+func runToolWaiting(timeout, waitDelay time.Duration, stdin, name string, args ...string) ([]byte, error) {
 	end, release, err := ownDescendants()
 	if err != nil {
 		return nil, fmt.Errorf("doctor did not run %s: %w", name, err)
@@ -61,7 +68,7 @@ func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([
 	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return end(cmd.Process.Pid) }
-	cmd.WaitDelay = toolWaitDelay
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.Output()
 	if cmd.Process != nil {
 		if endErr := end(cmd.Process.Pid); endErr != nil && err == nil {
