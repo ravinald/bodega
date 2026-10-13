@@ -47,8 +47,9 @@ type RevetFilter struct {
 	OlderThan           time.Duration
 }
 
-// RevetTarget is one cataloged version. Version is the label admission rows
-// key it by: the version, or a git entry's ref.
+// RevetTarget is one admitted version, cataloged or served only from the
+// proxy cache. Version is the label admission rows key it by: the version, or
+// a git entry's ref.
 type RevetTarget struct {
 	Type, Name, Version string
 }
@@ -98,7 +99,8 @@ func (s *RevetSummary) Add(o RevetOutcome) {
 	}
 }
 
-// Revetter re-runs admission over versions already in the catalog: the
+// Revetter re-runs admission over versions already admitted, whether into the
+// catalog or into the proxy cache: the
 // allow-list, OSV and upstream provenance, everything but the publish-age
 // gate, whose verdict only improves as a version gets older. Each version
 // gets a new admission row beside the old one, so the table reads as the
@@ -140,9 +142,16 @@ func RevetCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
 }
 
 // ErrNoRevetTargets is Targets finding nothing the filter names.
-var ErrNoRevetTargets = errors.New("no cataloged version matches")
+var ErrNoRevetTargets = errors.New("no admitted version matches")
 
-// Targets lists the cataloged versions f selects, in catalog order.
+// noCatalogEntry qualifies a refusal of a version served only from the proxy
+// cache: hiding is a manifest flag, and such a version has no manifest.
+const noCatalogEntry = "not hidden: no catalog entry exists to hide; the version is served from the proxy cache"
+
+// Targets lists the versions f selects: the cataloged ones in catalog order,
+// then, sorted, every version the admissions table holds an admitted or
+// pinned decision for that has no catalog entry, which is what a proxy fill
+// leaves behind.
 func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, error) {
 	if r.DB == nil {
 		return nil, errors.New("no audit store is open; a re-vet writes admission rows and has nowhere to write them")
@@ -165,6 +174,19 @@ func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, e
 		want = manifest.SafeName(f.Name)
 	}
 	cutoff := r.now().Add(-f.OlderThan)
+	old := func(t, name, v string) (bool, error) {
+		if f.OlderThan <= 0 {
+			return true, nil
+		}
+		prev, err := r.previous(ctx, t, name, v)
+		if err != nil {
+			return false, err
+		}
+		return len(prev) == 0 || !prev[0].DecidedAt.After(cutoff), nil
+	}
+	// cataloged holds every version the walk saw, filtered out or not, so
+	// the admissions pass below cannot add back one the filter dropped.
+	cataloged := map[RevetTarget]bool{}
 	var out []RevetTarget
 	for _, t := range types {
 		for _, name := range r.Store.ListPackages(t) {
@@ -180,21 +202,38 @@ func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, e
 			}
 			for _, ve := range pm.Versions {
 				v := admissionVersion(ve)
+				cataloged[RevetTarget{Type: t, Name: name, Version: v}] = true
 				if f.Version != "" && v != f.Version {
 					continue
 				}
-				if f.OlderThan > 0 {
-					prev, err := r.previous(ctx, t, pm.Name, v)
-					if err != nil {
-						return nil, err
-					}
-					if len(prev) > 0 && prev[0].DecidedAt.After(cutoff) {
-						continue
-					}
+				if ok, err := old(t, pm.Name, v); err != nil {
+					return nil, err
+				} else if !ok {
+					continue
 				}
 				out = append(out, RevetTarget{Type: t, Name: pm.Name, Version: v})
 			}
 		}
+	}
+	admitted, err := r.DB.AdmittedVersions(ctx, audit.AdmissionFilter{PkgType: f.Type, PkgVersion: f.Version})
+	if err != nil {
+		// A jsonl or syslog sink keeps no table to enumerate, so only the
+		// catalog can be walked; the WARN keeps that from passing unseen.
+		r.logger().Warn("re-vet walked the catalog only: versions served from the proxy cache cannot be listed",
+			"error", err)
+		admitted = nil
+	}
+	for _, a := range admitted {
+		safe := manifest.SafeName(a.PkgName)
+		if (want != "" && safe != want) || cataloged[RevetTarget{Type: a.PkgType, Name: safe, Version: a.PkgVersion}] {
+			continue
+		}
+		if ok, err := old(a.PkgType, a.PkgName, a.PkgVersion); err != nil {
+			return nil, err
+		} else if !ok {
+			continue
+		}
+		out = append(out, RevetTarget{Type: a.PkgType, Name: a.PkgName, Version: a.PkgVersion})
 	}
 	if len(out) == 0 && (f.Name != "" || f.Version != "") {
 		return nil, ErrNoRevetTargets
@@ -226,7 +265,7 @@ func (r *Revetter) Sweep(ctx context.Context, targets []RevetTarget, trigger str
 	return sum
 }
 
-// One re-vets a single cataloged version. trigger names what asked for it
+// One re-vets a single admitted version. trigger names what asked for it
 // ("schedule", "webhook", or the operator's name) and is recorded as the
 // row's identity.
 func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) RevetOutcome {
@@ -238,7 +277,7 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 		out.Error = "no audit store is open"
 		return out
 	}
-	pm, ve, err := r.lookup(ctx, tg)
+	pm, ve, cataloged, err := r.lookup(ctx, tg)
 	if err != nil {
 		out.Error = err.Error()
 		return out
@@ -291,32 +330,43 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 
 	out.Action = RevetNone
 	if blocked {
-		out.Action = r.onBlock(ctx, &out, ve, trigger)
+		out.Action = r.onBlock(ctx, &out, ve, cataloged, trigger)
 	}
 	// A refusal is signed every time, so the newest envelope always carries
 	// the newest refusal. A pass is signed only when it overturns one:
 	// re-signing every clean re-vet would add an envelope per version per
 	// interval and say nothing the admission's envelope did not.
 	if blocked || out.Previous == audit.AdmissionPolicyBlocked {
-		r.sign(ctx, &out, ve, rows)
+		r.sign(ctx, &out, ve, cataloged, rows)
 	}
 	return out
 }
 
-// lookup returns the manifest and the version tg names.
-func (r *Revetter) lookup(ctx context.Context, tg RevetTarget) (*manifest.PackageManifest, manifest.VersionEntry, error) {
+// lookup returns the manifest and the version tg names, and whether the
+// catalog holds it. A version the catalog lacks is re-vetted when the
+// admissions table holds an admitted or pinned decision for it, against a
+// manifest built from type and name alone, as the proxy fill's gate built it.
+func (r *Revetter) lookup(ctx context.Context, tg RevetTarget) (*manifest.PackageManifest, manifest.VersionEntry, bool, error) {
 	pm, err := r.Store.GetPackage(ctx, tg.Type, tg.Name)
 	if err != nil {
-		return nil, manifest.VersionEntry{}, err
+		return nil, manifest.VersionEntry{}, false, err
 	}
 	if pm != nil {
 		for _, ve := range pm.Versions {
 			if admissionVersion(ve) == tg.Version {
-				return pm, ve, nil
+				return pm, ve, true, nil
 			}
 		}
 	}
-	return nil, manifest.VersionEntry{}, fmt.Errorf("%s/%s@%s is no longer in the catalog", tg.Type, tg.Name, tg.Version)
+	admitted, err := r.DB.AdmittedVersions(ctx, audit.AdmissionFilter{PkgType: tg.Type, PkgName: tg.Name, PkgVersion: tg.Version})
+	if err != nil {
+		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s/%s@%s is not in the catalog, and the admissions table could not be read: %w", tg.Type, tg.Name, tg.Version, err)
+	}
+	if len(admitted) == 0 {
+		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s/%s@%s is neither in the catalog nor admitted to the proxy cache", tg.Type, tg.Name, tg.Version)
+	}
+	ve := manifest.VersionEntry{Version: tg.Version, Mode: manifest.ModeProxy}
+	return &manifest.PackageManifest{Type: tg.Type, Name: tg.Name, Versions: []manifest.VersionEntry{ve}}, ve, false, nil
 }
 
 // previous is the newest decision on record for the version: every row
@@ -412,9 +462,11 @@ func (r *Revetter) record(ctx context.Context, out *RevetOutcome, ev *evaluation
 
 // onBlock applies revet_on_block to a refused version and records what it
 // did.
-func (r *Revetter) onBlock(ctx context.Context, out *RevetOutcome, ve manifest.VersionEntry, trigger string) string {
+func (r *Revetter) onBlock(ctx context.Context, out *RevetOutcome, ve manifest.VersionEntry, cataloged bool, trigger string) string {
 	action := RevetReported
 	switch {
+	case !cataloged:
+		out.Notes = append(out.Notes, noCatalogEntry)
 	case ve.Frozen:
 		action = RevetFrozen
 	case ve.Hidden:
@@ -436,7 +488,7 @@ func (r *Revetter) onBlock(ctx context.Context, out *RevetOutcome, ve manifest.V
 	}); err != nil {
 		out.Notes = append(out.Notes, "audit event not written: "+err.Error())
 	}
-	r.logger().Warn("re-vet refused a cataloged version",
+	r.logger().Warn("re-vet refused an admitted version", "cataloged", cataloged,
 		"type", out.Type, "package", out.Name, "version", out.Version, "action", action,
 		"previous", out.Previous, "failing", failingSummary(out.Failing))
 	return action
@@ -489,15 +541,21 @@ func (r *Revetter) hide(ctx context.Context, out *RevetOutcome) error {
 	return nil
 }
 
-// sign writes the envelope for each row that names an object.
-func (r *Revetter) sign(ctx context.Context, out *RevetOutcome, ve manifest.VersionEntry, rows []audit.Admission) {
+// sign writes the envelope for each row that names an object, beside the
+// object: in the backend the manifest records for a cataloged version, and
+// for a proxy-cache entry in the one its key's type resolves to, which is
+// where the fill cached it and signed its first envelope.
+func (r *Revetter) sign(ctx context.Context, out *RevetOutcome, ve manifest.VersionEntry, cataloged bool, rows []audit.Admission) {
 	if r.Emitter == nil || r.Stores == nil {
 		return
 	}
-	store, err := r.Stores.ByName(ve.Storage)
-	if err != nil {
-		out.Notes = append(out.Notes, "no envelope signed: "+err.Error())
-		return
+	var store storage.ObjectStore
+	if cataloged {
+		var err error
+		if store, err = r.Stores.ByName(ve.Storage); err != nil {
+			out.Notes = append(out.Notes, "no envelope signed: "+err.Error())
+			return
+		}
 	}
 	for _, row := range rows {
 		if row.ObjectKey == "" {
@@ -509,13 +567,21 @@ func (r *Revetter) sign(ctx context.Context, out *RevetOutcome, ve manifest.Vers
 			out.Notes = append(out.Notes, "no envelope signed for "+row.ObjectKey+": no sha256 pinned for it")
 			continue
 		}
+		into := store
+		if !cataloged {
+			typ, _, _ := manifest.ParseKey(row.ObjectKey)
+			if typ == "" {
+				typ = row.PkgType
+			}
+			into = r.Stores.ForType(typ)
+		}
 		p := attest.Pin{Type: row.PkgType, Name: row.PkgName, Version: row.PkgVersion, ObjectKey: row.ObjectKey,
 			SHA256: sum.Value, RequiredBy: ve.RequiredBy}
 		emit := r.Emitter.Emit
 		if row.Decision == audit.AdmissionPolicyBlocked {
 			emit = r.Emitter.Revoke
 		}
-		key, err := emit(ctx, store, p)
+		key, err := emit(ctx, into, p)
 		switch {
 		case err != nil:
 			out.Notes = append(out.Notes, "no envelope signed for "+row.ObjectKey+": "+err.Error())

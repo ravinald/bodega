@@ -2600,7 +2600,7 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 
 ### `bodega policy revet [--type TYPE] [--name NAME] [--version VERSION] [--older-than DURATION]`
 
-Admission decides once. A version that passed OSV a month ago may have an advisory today, and `bodega policy osv rescan` records that advisory without changing what is served. `revet` re-runs admission itself over versions already in the catalog and acts on the answer.
+Admission decides once. A version that passed OSV a month ago may have an advisory today, and `bodega policy osv rescan` records that advisory without changing what is served. `revet` re-runs admission itself over versions already admitted and acts on the answer: every cataloged version, and every version the proxy cache admitted on a fill, which has an admission row and no catalog entry.
 
 It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware) and [upstream provenance](#bodega-policy-provenance-setlist). The publish-age gate is skipped, because a version only gets older. The age verdict the last decision recorded is carried into the new row, labeled `not re-run, carried from the decision of <time>`; a version with no earlier age verdict records `not_evaluated`.
 
@@ -2623,7 +2623,7 @@ WARN: npm/minimist@1.2.5 is refused and still served (reported)
 | `--older-than` | Only versions whose newest decision is older than this (`7d`, `72h`); none on record counts |
 | `--json`       | One object per version: the decisions, the failing checks, signed envelopes and notes       |
 
-A `--name` or `--version` that matches nothing exits 1. The table goes to stdout and the summary and WARN lines to stderr. The run exits 1 when a version could not be re-vetted, and when a refused version is frozen, because that version is still served.
+Proxy-cached versions are found in the admissions table, so with `audit_sink` set to `jsonl` or `syslog`, which keep none this process can read, only the catalog is walked and a WARN says so. A `--name` or `--version` that matches nothing exits 1. The table goes to stdout and the summary and WARN lines to stderr. The run exits 1 when a version could not be re-vetted, and when a refused version is frozen, because that version is still served.
 
 #### `revet_on_block`
 
@@ -2633,6 +2633,8 @@ What a refusal does is set by `revet_on_block` in `config.json`:
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `report` (default) | A `revet` audit event (status `policy_violation`, details naming the failing checks) and a WARN. The version stays served.                                            |
 | `hide`             | The same event, then the version is hidden as `bodega pkg hide` does: saved to the manifest and recorded as a `hide` event with actor `revet` and the failing checks. |
+
+**A version served only from the proxy cache is never hidden**, whatever the setting. Hiding is a flag on a catalog entry, and a proxy fill leaves none, so the refusal is recorded as `reported` with the note `not hidden: no catalog entry exists to hide`, and its [revocation envelope](#revocation-envelopes) is still signed. To stop serving it, import the version and hide it, or refuse the package in the allow-list.
 
 **A frozen version is never hidden**, whatever the setting. Freezing says the version must not change under the fleet pinned to it. The refusal is reported with action `frozen`, and the command exits 1 so a cron job sees it. A version already hidden is recorded with action `already_hidden` and left alone.
 
@@ -2661,11 +2663,11 @@ The CLI signs only when it can read the key, so run it as the user the server ru
 "revet_on_block": "report"
 ```
 
-| Key              | Default     | Effect                                                                                       |
-| ---------------- | ----------- | -------------------------------------------------------------------------------------------- |
-| `revet_interval` | unset (off) | How often the whole catalog is re-vetted. A Go duration; the first sweep waits one interval. |
-| `revet_rate`     | `1`         | Versions per second. The sweep re-vets one version at a time, `1/revet_rate` apart.          |
-| `revet_on_block` | `report`    | `report` or `hide`; see [`revet_on_block`](#revet_on_block)                                  |
+| Key              | Default     | Effect                                                                                            |
+| ---------------- | ----------- | ------------------------------------------------------------------------------------------------- |
+| `revet_interval` | unset (off) | How often every admitted version is re-vetted. A Go duration; the first sweep waits one interval. |
+| `revet_rate`     | `1`         | Versions per second. The sweep re-vets one version at a time, `1/revet_rate` apart.               |
+| `revet_on_block` | `report`    | `report` or `hide`; see [`revet_on_block`](#revet_on_block)                                       |
 
 Each sweep logs `scheduled re-vet started` with the version count, and `scheduled re-vet finished` with `walked`, `admitted`, `refused`, `hidden`, `frozen`, `errors` and `duration`. Two sweeps never run at once: a tick that arrives while a sweep is still walking logs `scheduled re-vet skipped: the previous sweep is still running` and does nothing. A catalog of 3,000 versions at the default rate takes about 50 minutes, so an interval shorter than that skips ticks rather than queueing them.
 
@@ -2675,7 +2677,7 @@ The rate is there for the provenance check, which reads the upstream registry, G
 
 #### Re-vet webhook
 
-`POST /api/v1/policy/revet` re-vets the cataloged versions a threat feed names, at once, and answers with their new decisions. A webhook call and a running sweep never re-vet two versions at the same time: the call waits for the version the sweep is on, then runs.
+`POST /api/v1/policy/revet` re-vets the admitted versions a threat feed names, cataloged or proxy-cached, at once, and answers with their new decisions. A webhook call and a running sweep never re-vet two versions at the same time: the call waits for the version the sweep is on, then runs.
 
 The route is exempt from `admin_permit_cidr` and takes no bearer token. It is authenticated by an HMAC-SHA256 over the raw body, keyed by `revet_webhook_secret`, sent as `X-Bodega-Signature: sha256=<hex>`. The body carries a `timestamp` in Unix seconds, inside the signature, and the server refuses a body more than 5 minutes from its own clock in either direction. A body is accepted once; sending the same body again inside the window is refused.
 
@@ -2689,7 +2691,7 @@ The route is exempt from `admin_permit_cidr` and takes no bearer token. It is au
 }
 ```
 
-`version` is optional; without it every cataloged version of the package is re-vetted. `reason` is free text, truncated to 512 bytes, written to the journal and to a `revet` audit event with status `requested`.
+`version` is optional; without it every admitted version of the package is re-vetted. `reason` is free text, truncated to 512 bytes, written to the journal and to a `revet` audit event with status `requested`.
 
 Compute the signature over the exact bytes you send:
 
@@ -2724,7 +2726,7 @@ curl -sS -X POST https://bodega.example.com/api/v1/policy/revet \
 | 200    | Re-vetted; `results` holds one outcome per version                                                       |
 | 400    | `type` or `name` missing, or the type is unknown                                                         |
 | 401    | Unauthorized: no or malformed header, wrong signature, timestamp out of window, replay, or no secret set |
-| 404    | No cataloged version matches                                                                             |
+| 404    | No admitted version matches: none in the catalog, and no admitted or pinned row from a proxy fill        |
 | 503    | No audit store is open                                                                                   |
 
 Every 401 has the same body, `Unauthorized`, so a caller without the secret learns nothing about which part failed. The journal names it (`re-vet webhook refused reason=...`), and the audit trail records a `denied` event with status `signature_invalid` and the same reason. With `revet_webhook_secret` unset every call is a 401.

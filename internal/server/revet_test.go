@@ -108,6 +108,46 @@ func TestRevetWebhookReVetsAndAnswers(t *testing.T) {
 	}
 }
 
+// A threat feed naming a package the server only ever proxied gets its
+// decision back rather than a 404, and under hide the refusal is reported:
+// the version has no catalog entry to hide, and none is created.
+func TestRevetWebhookReVetsAProxyOnlyVersion(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.RevetWebhookSecret = revetSecret
+	gateNpmOSV(t, s, true)
+	if err := s.auditDB.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0", ObjectKey: "npm/minimist/-/minimist-1.2.0.tgz",
+		Decision: audit.AdmissionAdmitted, Checks: audit.NotEvaluatedChecks("seeded"),
+		DecidedAt: time.Now().Add(-30 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.revet.rv.OnBlock = config.RevetHide
+	body := revetBody(t, time.Now(), "")
+	rec := postRevet(s, body, sign(revetSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Results []admit.RevetOutcome `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("results = %+v, want one", resp.Results)
+	}
+	if o := resp.Results[0]; o.Version != "1.2.0" || o.Decision != audit.AdmissionPolicyBlocked || o.Action != admit.RevetReported {
+		t.Errorf("outcome = %+v, want 1.2.0 policy_blocked, reported", o)
+	}
+	if pm, err := s.store.GetPackage(t.Context(), manifest.TypeNpm, "minimist"); err != nil || pm != nil {
+		t.Errorf("re-vet wrote a catalog entry: %+v (%v)", pm, err)
+	}
+	if rows := admissionsOf(t, s); len(rows) != 2 || rows[0].Actor != admit.RevetActor {
+		t.Errorf("rows = %+v, want the webhook's row beside the fill's", rows)
+	}
+}
+
 // Every authentication failure is the same bare 401, and nothing is re-vetted.
 func TestRevetWebhookRefusesBadSignatures(t *testing.T) {
 	s := revetServer(t)

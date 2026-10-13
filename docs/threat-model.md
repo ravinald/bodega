@@ -513,7 +513,10 @@ defence against:
   `revet_interval` is off by default, so on a new install the window has no
   bound. Under `revet_on_block: report` the re-vet does not close it either:
   the version is reported and stays served until an operator hides it, and a
-  frozen version is never hidden under either setting. The webhook narrows the
+  frozen version is never hidden under either setting. Neither is a version
+  served only from the proxy cache: it is re-vetted, reported and revoked on
+  the same schedule, but has no catalog entry to hide, so it stays served
+  until an operator imports and hides it or refuses the package. The webhook narrows the
   window to the feed's own latency, and only for the packages the feed names.
   See
   [`bodega policy revet`](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).

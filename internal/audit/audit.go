@@ -86,7 +86,7 @@ const (
 	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
 	EventShow    EventType = "show"    // bodega show
 	EventPolicy  EventType = "policy"  // a gate's action changed, e.g. bodega policy osv malware set
-	EventRevet   EventType = "revet"   // a re-vet refused a cataloged version, or the webhook requested one
+	EventRevet   EventType = "revet"   // a re-vet refused an admitted version, or the webhook requested one
 
 	// Server lifecycle events.
 	EventServeStart EventType = "serve_start" // bodega serve started

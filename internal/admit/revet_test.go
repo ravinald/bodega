@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -213,7 +214,7 @@ func TestRevetSignsTheRevocation(t *testing.T) {
 	if len(o.Envelopes) != 1 {
 		t.Fatalf("envelopes = %v (%v), want one", o.Envelopes, o.Notes)
 	}
-	st := newestStatement(t, f.objects)
+	st := newestStatement(t, f.objects, revetKey)
 	pe := st.Predicate.PolicyEvaluations
 	if pe.Decision != audit.AdmissionPolicyBlocked {
 		t.Errorf("newest envelope decision = %s, want policy_blocked", pe.Decision)
@@ -232,7 +233,7 @@ func TestRevetSignsTheRevocation(t *testing.T) {
 	if o.Decision != audit.AdmissionAdmitted || len(o.Envelopes) != 1 {
 		t.Fatalf("outcome = %+v, want admitted with one envelope", o)
 	}
-	if d := newestStatement(t, f.objects).Predicate.PolicyEvaluations.Decision; d != audit.AdmissionAdmitted {
+	if d := newestStatement(t, f.objects, revetKey).Predicate.PolicyEvaluations.Decision; d != audit.AdmissionAdmitted {
 		t.Errorf("newest envelope after the withdrawal = %s, want admitted", d)
 	}
 }
@@ -271,6 +272,137 @@ func TestRevetTargetsOlderThan(t *testing.T) {
 	}
 }
 
+const proxyKey = "npm/left-pad/-/left-pad-1.3.0.tgz"
+
+// admitProxyFill records what a proxy fill of left-pad 1.3.0 leaves behind:
+// an admitted row pinned to the cached object and its sha256, and no catalog
+// entry. is-odd 3.0.1 was refused at the fill, so it was never cached.
+func (f revetFixture) admitProxyFill(t *testing.T) {
+	t.Helper()
+	for _, row := range []audit.Admission{
+		{PkgType: manifest.TypeNpm, PkgName: "left-pad", PkgVersion: "1.3.0", ObjectKey: proxyKey,
+			Decision: audit.AdmissionAdmitted, DecidedAt: time.Now().Add(-20 * 24 * time.Hour),
+			Checks: []audit.AdmissionCheck{{Check: audit.CheckOSV, Action: policy.ActionBlock, Status: audit.CheckPass}}},
+		{PkgType: manifest.TypeNpm, PkgName: "is-odd", PkgVersion: "3.0.1",
+			Decision: audit.AdmissionPolicyBlocked, DecidedAt: time.Now().Add(-20 * 24 * time.Hour),
+			Checks: []audit.AdmissionCheck{{Check: audit.CheckOSV, Action: policy.ActionBlock, Status: audit.CheckBlock}}},
+	} {
+		if err := f.adb.RecordAdmission(t.Context(), row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.adb.StoreChecksum(t.Context(), proxyKey, manifest.TypeNpm, "left-pad", "1.3.0", "sha256",
+		strings.Repeat("cd", 32), "computed"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func proxyTarget() RevetTarget {
+	return RevetTarget{Type: manifest.TypeNpm, Name: "left-pad", Version: "1.3.0"}
+}
+
+// A version admitted by a proxy fill has no catalog entry and is still a
+// target, under every filter that names it; a cataloged version is listed
+// once, and a filter that drops it does not let the admissions table add it
+// back; a version only ever refused is not a target.
+func TestRevetTargetsIncludeProxyOnlyVersions(t *testing.T) {
+	f := newRevetFixture(t, manifest.VersionEntry{})
+	f.admitProxyFill(t)
+	rv := f.revetter(config.RevetReport)
+	cases := []struct {
+		name string
+		f    RevetFilter
+		want []RevetTarget
+	}{
+		{"unfiltered", RevetFilter{}, []RevetTarget{target(), proxyTarget()}},
+		{"type", RevetFilter{Type: manifest.TypeNpm}, []RevetTarget{target(), proxyTarget()}},
+		{"name", RevetFilter{Name: "left-pad"}, []RevetTarget{proxyTarget()}},
+		{"version", RevetFilter{Name: "left-pad", Version: "1.3.0"}, []RevetTarget{proxyTarget()}},
+		{"version drops the cataloged one", RevetFilter{Version: "1.3.0"}, []RevetTarget{proxyTarget()}},
+		{"older than both", RevetFilter{OlderThan: 7 * 24 * time.Hour}, []RevetTarget{target(), proxyTarget()}},
+		{"older than the proxy fill", RevetFilter{OlderThan: 25 * 24 * time.Hour}, []RevetTarget{target()}},
+		{"other type", RevetFilter{Type: manifest.TypePypi}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := rv.Targets(t.Context(), c.f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, c.want) {
+				t.Errorf("targets = %+v, want %+v", got, c.want)
+			}
+		})
+	}
+	if _, err := rv.Targets(t.Context(), RevetFilter{Name: "is-odd"}); err != ErrNoRevetTargets {
+		t.Errorf("refused-only version = %v, want ErrNoRevetTargets", err)
+	}
+	if o := rv.One(t.Context(), RevetTarget{Type: manifest.TypeNpm, Name: "is-odd", Version: "3.0.1"}, "schedule"); o.Error == "" {
+		t.Errorf("re-vet of a version never admitted = %+v, want an error", o)
+	}
+}
+
+// A proxy-served version flipped to block gets a policy_blocked row beside
+// the fill's, pinned to the cached object, and an envelope revoking it in
+// the store the proxy caches into. There is no catalog entry to hide, so
+// under either setting it is reported, the outcome says why, no hide event
+// is written and no catalog entry appears.
+func TestRevetProxyOnlyVersionIsReportedAndRevoked(t *testing.T) {
+	for _, onBlock := range []string{config.RevetReport, config.RevetHide} {
+		t.Run(onBlock, func(t *testing.T) {
+			f := newRevetFixture(t, manifest.VersionEntry{})
+			f.admitProxyFill(t)
+			ring, err := attestsign.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer := ring.Signer()
+			rv := f.revetter(onBlock)
+			rv.Stores = storage.NewSingle(f.objects)
+			rv.Emitter = &attest.Emitter{Signer: func() attestsign.Signer { return signer }, Admissions: f.adb, PlatformID: "bodega://test"}
+
+			o := rv.One(t.Context(), proxyTarget(), "webhook")
+			if o.Error != "" {
+				t.Fatalf("re-vet error: %s", o.Error)
+			}
+			if o.Previous != audit.AdmissionAdmitted || o.Decision != audit.AdmissionPolicyBlocked || o.Action != RevetReported {
+				t.Fatalf("outcome = %+v, want admitted -> policy_blocked, reported", o)
+			}
+			if !slices.ContainsFunc(o.Notes, func(n string) bool { return strings.Contains(n, "no catalog entry exists to hide") }) {
+				t.Errorf("notes = %v, want the reason it was not hidden", o.Notes)
+			}
+
+			rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "left-pad", PkgVersion: "1.3.0"})
+			if err != nil || len(rows) != 2 {
+				t.Fatalf("rows = %+v (%v), want the fill's kept and the re-vet beside it", rows, err)
+			}
+			if r := rows[0]; r.Decision != audit.AdmissionPolicyBlocked || r.Actor != RevetActor || r.Identity != "webhook" || r.ObjectKey != proxyKey {
+				t.Errorf("new row = %+v", r)
+			}
+			if rows[1].Decision != audit.AdmissionAdmitted || rows[1].Actor == RevetActor {
+				t.Errorf("fill's row rewritten: %+v", rows[1])
+			}
+
+			if len(o.Envelopes) != 1 {
+				t.Fatalf("envelopes = %v (%v), want one", o.Envelopes, o.Notes)
+			}
+			if d := newestStatement(t, f.objects, proxyKey).Predicate.PolicyEvaluations.Decision; d != audit.AdmissionPolicyBlocked {
+				t.Errorf("newest envelope decision = %s, want policy_blocked", d)
+			}
+
+			for et, want := range map[audit.EventType]int{audit.EventHide: 0, audit.EventRevet: 1} {
+				evs, err := f.adb.Query(t.Context(), audit.Filter{EventType: et, PkgName: "left-pad"})
+				if err != nil || len(evs) != want {
+					t.Errorf("%s events = %+v (%v), want %d", et, evs, err, want)
+				}
+			}
+			if pm, err := f.store.GetPackage(t.Context(), manifest.TypeNpm, "left-pad"); err != nil || pm != nil {
+				t.Errorf("re-vet wrote a catalog entry: %+v (%v)", pm, err)
+			}
+		})
+	}
+}
+
 func minimistRows(t *testing.T, adb *audit.DB) []audit.Admission {
 	t.Helper()
 	rows, err := adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0"})
@@ -280,9 +412,9 @@ func minimistRows(t *testing.T, adb *audit.DB) []audit.Admission {
 	return rows
 }
 
-func newestStatement(t *testing.T, objects storage.ObjectStore) attest.Statement {
+func newestStatement(t *testing.T, objects storage.ObjectStore, object string) attest.Statement {
 	t.Helper()
-	key, err := attest.Newest(t.Context(), objects, []string{revetKey})
+	key, err := attest.Newest(t.Context(), objects, []string{object})
 	if err != nil || key == "" {
 		t.Fatalf("newest envelope: %q, %v", key, err)
 	}
@@ -294,8 +426,8 @@ func newestStatement(t *testing.T, objects storage.ObjectStore) attest.Statement
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Dir(key)+"/" != manifest.AttestationDir(revetKey) {
-		t.Errorf("envelope %s filed outside %s", key, manifest.AttestationDir(revetKey))
+	if filepath.Dir(key)+"/" != manifest.AttestationDir(object) {
+		t.Errorf("envelope %s filed outside %s", key, manifest.AttestationDir(object))
 	}
 	return *st
 }

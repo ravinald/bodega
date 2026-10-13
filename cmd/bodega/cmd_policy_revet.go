@@ -25,9 +25,10 @@ func newPolicyRevetCmd(gf *globalFlags) *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "revet [--type TYPE] [--name NAME] [--version VERSION] [--older-than DURATION]",
-		Short: "Re-run admission over versions already in the catalog",
-		Long: `revet re-runs every per-version check against cataloged versions: the
-upstream allow-list, OSV and upstream provenance. The publish-age gate is
+		Short: "Re-run admission over versions already admitted",
+		Long: `revet re-runs every per-version check against admitted versions, those in
+the catalog and those the proxy cache admitted on a fill: the upstream
+allow-list, OSV and upstream provenance. The publish-age gate is
 not re-run, because a version only gets older; its last recorded verdict
 is carried into the new row with its date.
 
@@ -41,6 +42,8 @@ writes a revet audit event and prints a WARN; the version stays served.
 hide hides it as 'bodega pkg hide' does, recorded under the actor revet
 with the failing checks in the event. A frozen version is never hidden:
 it is reported, and the run exits non-zero because it is still served.
+Neither is a version served only from the proxy cache, which has no
+catalog entry to hide: it is reported, and its envelope still revokes it.
 
 With an attestation key installed, each refusal of a pinned object signs
 a new envelope whose policy evaluations record the block, and a pass that

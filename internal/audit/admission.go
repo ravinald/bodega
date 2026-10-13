@@ -228,6 +228,60 @@ func (a *DB) Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, er
 	return rows, nil
 }
 
+// AdmittedVersions lists, once each and sorted, every version f selects that
+// the table holds an admitted or pinned decision for. A version whose only
+// rows are refusals with no object behind them was never served, and is left
+// out. f.Limit is ignored: the list is the set of versions, not of rows.
+func (a *DB) AdmittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
+	r, err := a.reader("admission decisions")
+	if err != nil {
+		return nil, err
+	}
+	l, ok := r.(admittedVersionLister)
+	if !ok {
+		return nil, &UnqueryableSinkError{Sink: a.sink.Name(), Op: "admitted versions"}
+	}
+	return l.admittedVersions(ctx, f)
+}
+
+// admittedVersionLister is the half of a queryable sink that answers
+// AdmittedVersions. It sits outside EventReader so a reader that keeps no
+// admissions table need not grow a method to say so.
+type admittedVersionLister interface {
+	admittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error)
+}
+
+// buildAdmittedVersionsQuery renders AdmittedVersions' read. ph renders the
+// nth bind placeholder, as in pinTx.
+func buildAdmittedVersionsQuery(f AdmissionFilter, ph func(int) string) (string, []any) {
+	where := []string{"pkg_version <> ''", "(decision = 'admitted' OR object_key IS NOT NULL)"}
+	var args []any
+	for _, c := range []struct{ col, val string }{
+		{"pkg_type", f.PkgType}, {"pkg_name", f.PkgName}, {"pkg_version", f.PkgVersion},
+	} {
+		if c.val == "" {
+			continue
+		}
+		args = append(args, c.val)
+		where = append(where, c.col+" = "+ph(len(args)))
+	}
+	return `SELECT pkg_type, pkg_name, pkg_version FROM admissions WHERE ` + strings.Join(where, " AND ") +
+		` GROUP BY pkg_type, pkg_name, pkg_version ORDER BY pkg_type, pkg_name, pkg_version`, args
+}
+
+func scanAdmittedVersions(rows *sql.Rows) ([]AdmissionPin, error) {
+	defer rows.Close()
+	var out []AdmissionPin
+	for rows.Next() {
+		var p AdmissionPin
+		if err := rows.Scan(&p.PkgType, &p.PkgName, &p.PkgVersion); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // NotEvaluatedChecks is the check list of a decision that evaluated nothing,
 // every entry carrying the same reason.
 func NotEvaluatedChecks(detail string) []AdmissionCheck {

@@ -98,7 +98,7 @@ func (s *Server) revetLoop(ctx context.Context) {
 	}
 }
 
-// revetSweep re-vets the whole catalog, one version at a time at
+// revetSweep re-vets every admitted version, one at a time at
 // revet_rate, and reports whether it ran. A tick that arrives while the
 // previous sweep is still walking is skipped rather than queued: a catalog
 // that takes longer than the interval to walk would otherwise grow a backlog
@@ -112,7 +112,7 @@ func (s *Server) revetSweep(ctx context.Context) bool {
 	start := time.Now()
 	targets, err := s.revet.rv.Targets(ctx, admit.RevetFilter{})
 	if err != nil {
-		s.logger.Error("scheduled re-vet could not list the catalog", "error", err)
+		s.logger.Error("scheduled re-vet could not list admitted versions", "error", err)
 		return true
 	}
 	s.logger.Info("scheduled re-vet started", "versions", len(targets))
@@ -176,10 +176,10 @@ func (s *Server) handleRevetWebhook(w http.ResponseWriter, r *http.Request) {
 	targets, err := s.revet.rv.Targets(ctx, admit.RevetFilter{Type: req.Type, Name: req.Name, Version: req.Version})
 	switch {
 	case errors.Is(err, admit.ErrNoRevetTargets):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no cataloged version matches"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no admitted version matches"})
 		return
 	case err != nil:
-		s.logger.Error("re-vet webhook could not list the catalog", "error", err)
+		s.logger.Error("re-vet webhook could not list admitted versions", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}

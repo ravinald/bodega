@@ -159,7 +159,8 @@ type Config struct {
 	OSVDBMaxAge    string `json:"osv_db_max_age,omitempty"`
 
 	// Re-vet. revet_interval is how often `bodega serve` re-runs the
-	// per-version checks over every cataloged version; unset is off.
+	// per-version checks over every admitted version, cataloged or proxy
+	// cached; unset is off.
 	// revet_rate caps that sweep in versions per second (default 1), so a
 	// catalog of thousands does not turn into a burst against the registries
 	// the provenance check reads. revet_on_block is "report" (default) or
