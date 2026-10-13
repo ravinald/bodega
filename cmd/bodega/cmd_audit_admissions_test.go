@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,10 +15,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sigstore/sigstore-go/pkg/root"
+
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // admissionInstall writes a config whose npm OSV gate blocks and reads a
@@ -159,6 +164,108 @@ func TestImportRecordsTheAdmission(t *testing.T) {
 				t.Errorf("no osv check with status %s: %+v", tc.osv, r.Checks)
 			}
 		})
+	}
+}
+
+// npmSigstoreStub serves sigstore@3.0.0 with the bundle npm recorded for it
+// and points the provenance check at the recorded Sigstore trusted root, so
+// that version verifies the way it does in internal/provenance. It returns the
+// stub's URL.
+func npmSigstoreStub(t *testing.T) string {
+	t.Helper()
+	td := filepath.Join("..", "..", "internal", "provenance", "testdata")
+	bundles, err := os.ReadFile(filepath.Join(td, "npm-sigstore-3.0.0.attestations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sigstore":
+			dist := map[string]any{
+				"integrity": "sha512-PHMifhh3EN4loMcHCz6l3v/luzgT3za+9f8subGgeMNjbJjzH4Ij/YoX3Gvu+kaouJRIlVdTHHCREADYf+ZteA==",
+				"attestations": map[string]any{"url": srv.URL + "/att/sigstore@3.0.0",
+					"provenance": map[string]any{"predicateType": provenance.SLSAProvenanceV1}},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"versions": map[string]any{"3.0.0": map[string]any{"dist": dist}}})
+		case "/att/sigstore@3.0.0":
+			_, _ = w.Write(bundles)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	tr, err := provenance.LoadTrustedRootFile(filepath.Join(td, "trusted_root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := admit.NewProvenanceVerifier
+	admit.NewProvenanceVerifier = func(cfg *config.Config) *provenance.Verifier {
+		v := prev(cfg)
+		v.Root = func(context.Context) (root.TrustedMaterial, error) { return tr, nil }
+		return v
+	}
+	t.Cleanup(func() { admit.NewProvenanceVerifier = prev })
+	return srv.URL
+}
+
+// TestImportConflictRecordsNoAdmission pins that `pkg import` refuses an
+// existing package before admission. Admission records "admitted" and takes
+// the provenance pin on first verify, so a refusal decided after it left an
+// admitted row for a version never stored, and could make that version the pin
+// every later one is held to. The --merge import is the control: the same
+// version, admitted and stored, does take the pin, so the stub verifies.
+func TestImportConflictRecordsNoAdmission(t *testing.T) {
+	adbPath := admissionInstall(t, true)
+	registry := npmSigstoreStub(t)
+
+	// Seeded through the store, not import, so the seed writes no admission
+	// row and takes no pin of its own.
+	store, err := loadStore(&globalFlags{})
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	seed := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "sigstore", Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{{Version: "2.0.0", URL: registry}}}
+	if err := store.SavePackage(t.Context(), seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("seed index: %v", err)
+	}
+
+	trail := func() ([]audit.Admission, bool) {
+		t.Helper()
+		adb, err := audit.Open(adbPath)
+		if err != nil {
+			t.Fatalf("open audit db: %v", err)
+		}
+		defer adb.Close()
+		rows, err := adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "sigstore"})
+		if err != nil {
+			t.Fatalf("admissions: %v", err)
+		}
+		_, err = adb.GetProvenancePin(t.Context(), manifest.TypeNpm, "sigstore")
+		if err != nil && !errors.Is(err, audit.ErrProvenancePinNotFound) {
+			t.Fatalf("provenance pin: %v", err)
+		}
+		return rows, err == nil
+	}
+
+	file := writeTemp(t, "sigstore.json", fmt.Sprintf(`{"name":"sigstore","type":"npm","versions":[{"version":"3.0.0","url":%q}]}`, registry))
+	err = runImport(t, file)
+	if err == nil || err.Error() != "npm/sigstore already exists (use --merge to add versions)" {
+		t.Fatalf("pkg import = %v, want the existing-package refusal", err)
+	}
+	if rows, pinned := trail(); len(rows) != 0 || pinned {
+		t.Fatalf("a refused import left %d admission row(s) and pinned = %v: %+v", len(rows), pinned, rows)
+	}
+
+	if err := runImport(t, "--merge", file); err != nil {
+		t.Fatalf("control merge: %v", err)
+	}
+	if rows, pinned := trail(); len(rows) != 1 || rows[0].Decision != audit.AdmissionAdmitted || !pinned {
+		t.Fatalf("control merge left %d row(s), pinned = %v; the stub does not verify and the test above proves nothing", len(rows), pinned)
 	}
 }
 

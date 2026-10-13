@@ -129,6 +129,14 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 		out.Outcome, out.Reason = ImportFailed, err.Error()
 		return out
 	}
+	// Before admission, which records its decision and can take the
+	// provenance pin: a conflict stores nothing, so neither may outlive it.
+	existing, _ := s.store.GetPackage(ctx, pm.Type, pm.Name)
+	if existing != nil && !merge {
+		out.Outcome, out.Reason = ImportConflict, "package already exists (retry with merge=true to add versions)"
+		return out
+	}
+
 	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, pm, admit.Who{Identity: identity})
 	out.Warnings = res.Warnings
 	switch res.Decision {
@@ -137,12 +145,6 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 		return out
 	case admit.PolicyBlocked:
 		out.Outcome, out.Reason = ImportPolicyBlocked, res.Reason
-		return out
-	}
-
-	existing, _ := s.store.GetPackage(ctx, pm.Type, pm.Name)
-	if existing != nil && !merge {
-		out.Outcome, out.Reason = ImportConflict, "package already exists (retry with merge=true to add versions)"
 		return out
 	}
 
