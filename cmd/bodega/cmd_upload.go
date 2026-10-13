@@ -67,6 +67,7 @@ one NAME@VERSION, and pypi cannot take it.`,
 			if auditDB != nil {
 				defer auditDB.Close()
 			}
+			takeNameBaseline(cmd.Context(), auditDB, store)
 
 			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			// upload is the only advertised command that reaches a hosted

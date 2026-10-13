@@ -22,7 +22,7 @@ var ErrRefused = errors.New("refused to sign")
 // StandardChecks are the checks every admission runs. A statement lists each
 // one, so a row written before a check existed reads as not_evaluated for it
 // rather than leaving the check out, which a consumer could read as a pass.
-var StandardChecks = []string{audit.CheckAllowList, audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance}
+var StandardChecks = []string{audit.CheckAllowList, audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance, audit.CheckNameSimilarity}
 
 // AdmissionReader is the audit trail's read surface for decisions.
 type AdmissionReader interface {

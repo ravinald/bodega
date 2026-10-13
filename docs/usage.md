@@ -2035,6 +2035,19 @@ bodega policy add npm @example-cloud/*
 
 An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
 
+An exact npm, pypi or cargo name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
+
+```text
+$ bodega policy add pypi reqeusts
+
+  WARNING: pypi "reqeusts" is distance 1 from the popular package "requests"
+    An exact rule exempts "reqeusts" from the name similarity check, so a typo here admits the squat.
+
+Add the rule for "reqeusts", not "requests"? [y/N]:
+```
+
+Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin that ends before an answer, so a script has to pipe the `y` in on purpose. A confirmed rule's `create` audit event records `near_popular` and `distance`. An npm `@scope/*` wildcard is not compared: it names no package.
+
 ### `bodega policy remove <id|pattern> [--type TYPE]`
 
 Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to `--type` when provided.
@@ -2538,6 +2551,67 @@ cp ~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json sigstore
 ```
 
 `bodega serve` refuses to start when the file is missing or does not parse, naming it. Sigstore rotates these keys rarely, but it does: a bundle signed under a key the copy predates fails as `invalid`, so refresh the copy when a run of `invalid` outcomes names a certificate chain or log key. Verification itself reaches no network: the transparency-log inclusion proof and timestamps travel inside the bundle.
+
+### `bodega policy similarity <set|list|load>`
+
+Catches a typosquat the allow-list lets through. An exact allow-list rule refuses `reqeusts` while the operator typed `requests`; it admits `reqeusts` once the operator allow-lists the typo, and a broad rule (a gomod or git prefix, an npm `@scope/*`, a type with no rules at all) admits names nobody reviewed. This check compares every admitted npm, pypi and cargo name with that ecosystem's most-downloaded names instead.
+
+```bash
+bodega policy similarity set pypi block
+bodega policy similarity list
+bodega policy similarity load npm ./top-npm.txt
+```
+
+The check runs at the same points as the age, OSV and upstream provenance checks: import (`bodega pkg import`, `bodega pkg edit`, `bodega pkg create`, `POST /api/v1/packages`), a build's fetch, and every proxy cache miss for a versioned npm, pypi or cargo artifact. Its verdict is the admission row's `name_similarity` check.
+
+**The comparison.** Damerau-Levenshtein distance (insert, delete, substitute, or swap two adjacent characters, each one edit) between the candidate and each popular name, after normalization:
+
+| Type    | Normalization                                                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `pypi`  | PEP 503: lowercase, and any run of `-`, `_` and `.` is one `-`, so `Python_DateUtil` equals `python-dateutil`                  |
+| `npm`   | lowercase; the scope is compared with the other name's scope and the bare name with its bare name, and the two distances added |
+| `cargo` | lowercase, and `_` equals `-`, because crates.io refuses a crate that differs from an existing one only in those ways          |
+
+A distance of 1 or 2 to a popular name the candidate is not equal to fails, and the detail names the nearest popular name and the distance:
+
+```text
+reqeusts is distance 1 from the popular pypi name requests (embedded list of 1000, 2026-10-01)
+```
+
+A name equal to a popular one after normalization passes, as does one three or more edits from all of them. Splitting the npm scope means `@typse/node` is 1 from `@types/node`, while `@evil/lodash` is not near `lodash`: a scope nobody popular uses is its own name, not one edit. gomod, git, helm, binary, apt, freebsd and distfiles record `not_evaluated`, because no list ships for them and `set` and `load` refuse them.
+
+**Exemptions.** So that turning the check on refuses nothing already in use, a near name passes, with the reason in the detail, when:
+
+- an exact allow-list rule names it (a pypi or cargo rule, or an npm rule that is not `@scope/*`), compared under the same normalization; or
+- the manifest store held it when the name baseline was taken.
+
+The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload` and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists, and `list` prints how many and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
+
+**Actions.** One row per ecosystem in `name_similarity_policy`; `set` overwrites, and `list` prints all three, with the unset ones at their default:
+
+| Action           | A near name                                         |
+| ---------------- | --------------------------------------------------- |
+| `warn` (default) | admitted; the row's check says `warn`               |
+| `block`          | refused, naming `name_similarity` as the check      |
+| `ignore`         | admitted; the row records the near name as a `pass` |
+
+A block answers the importer, the build or the proxied client the way an age or OSV block does (see [What a refused client sees](#what-a-refused-client-sees)). A failure to read the policy, the list or the exemptions warns under any action. Every `set` and `load` writes a `policy` audit event naming who ran it.
+
+**Popular lists.** bodega embeds one list per ecosystem, the top 1000 by downloads, each file recording N, the source and the date it was taken in its header:
+
+| Type    | Source                                                                   | Window  |
+| ------- | ------------------------------------------------------------------------ | ------- |
+| `npm`   | [ecosyste.ms](https://packages.ecosyste.ms/), sorted by downloads        | 30 days |
+| `pypi`  | [top-pypi-packages](https://hugovk.github.io/top-pypi-packages/)         | 30 days |
+| `cargo` | [crates.io](https://crates.io/crates?sort=recent-downloads), recent sort | 90 days |
+
+`load` replaces one ecosystem's list whole with a file in the same format: one name per line, most popular first, `#` comments, and optional `# source:` and `# date:` header lines that `list` shows. Load a longer list, or one built from your own registry's traffic, when the defaults miss what your builds pull. The SHA-256 of each list in force is part of the [policy digest](#audit-trail), so a load changes the digest every later admission row cites.
+
+**Limits.**
+
+- **A squat of an unpopular name is not caught.** The check knows only the names on its list. `internal-widgett` is not near anything on it, and neither is a squat of the 1001st most-downloaded package.
+- **Short names collide.** Two edits is most of a three-letter name. Run against pypi's 1001st to 3000th most-downloaded projects, 208 of the 2000 (10%) were near a top-1000 name, nearly all of them short: `ray` is 2 from `rsa`, `pox` 1 from `tox`. Read a few weeks of `warn` rows before choosing `block`, and allow-list the legitimate near names exactly.
+- **It compares names, not intent.** A dependency-confusion attack that publishes your internal name to the public registry is not a near name; the allow-list and `pkg freeze` are what stop that.
 
 ### `bodega policy filter <set|list>`
 
@@ -6009,20 +6083,20 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
 
-| Column          | Holds                                                                                                                                                                                                                                                                                                         |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                              |
-| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                      |
-| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                              |
-| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                           |
-| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                     |
-| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv` and `upstream_provenance`, plus `override`; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran |
-| `policy_digest` | `sha256:` over the allow-list rules and the `age_policy`, `osv_policy`, `osv_malware_policy` and `upstream_provenance_policy` rows in force at the decision                                                                                                                                                   |
-| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                               |
-| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                     |
-| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                    |
+| Column          | Holds                                                                                                                                                                                                                                                                                                                            |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                 |
+| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                         |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                 |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                              |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                        |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, plus `override`; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran |
+| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy` and `name_similarity_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                   |
+| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                  |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                        |
+| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                       |
 
-In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` records `warn` when none is set, because that is its default) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
+In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
 The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
 
@@ -6030,7 +6104,7 @@ The decision is the manifest's. A version whose own checks all passed still reco
 
 **Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
 
-**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV and upstream provenance checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv` or `upstream_provenance`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
+**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV, upstream provenance and name similarity checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv`, `upstream_provenance` or `name_similarity`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
 
 **The builder runs them too.** A build's fetch admits each entry under the allow-list and the age, OSV and upstream provenance checks, and a block fails that entry the way an allow-list refusal does. Import may be months old by the time bytes are fetched, so the row a pin attaches to is the decision made when the bytes arrived.
 

@@ -17,6 +17,22 @@ risk:
   by registry type (package name for pypi/npm/cargo, prefix for gomod/git,
   hostname for apt). A request for `reqeusts` does not match an allow rule for
   `requests`, and the fetch is rejected before any bytes leave the network.
+  That holds while the operator types the rule correctly. It fails when the
+  operator allow-lists the typo, and a broad rule (a gomod or git prefix, an
+  npm `@scope/*`, a type with no rules at all) admits names nobody reviewed.
+  The `name_similarity` check covers that gap for npm, pypi and cargo: every
+  admission compares the name with the ecosystem's top 1000 by downloads, and
+  a name one or two Damerau-Levenshtein edits from a popular name it is not
+  equal to warns, or refuses under `bodega policy similarity set <eco> block`.
+  pypi is compared after PEP 503 normalization, npm with the scope and the
+  bare name compared separately. A name an exact allow-list rule names, or
+  one the manifest store held when the check first ran, is exempt, and
+  `bodega policy add` asks before writing an exact rule near a popular name.
+  The check knows only the names on its list: a squat of an unpopular
+  package is not caught, nor is a squat of a gomod, git, helm or binary name,
+  and short legitimate names collide often enough that `block` wants a few
+  weeks of `warn` rows read first. See
+  [`bodega policy similarity`](usage.md#bodega-policy-similarity-setlistload).
 - **Silent version drift.** Manifest entries pin a concrete version, an npm
   dist-tag being the exception named below. The first
   fetch records that version's SHA-256 in the audit database, keyed by the

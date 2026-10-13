@@ -452,10 +452,9 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 	return nil
 }
 
-// checkVersions runs the per-version checks (age, OSV, upstream provenance).
-// They live in the audit database, so with no database there is nothing to
-// check against. Warn-level
-// results do not block; they are recorded and reported on res, because a gate
+// checkVersions runs the per-version checks (age, OSV, upstream provenance,
+// name similarity). They live in the audit database, so with no database
+// there is nothing to check against. Warn-level results do not block; they are recorded and reported on res, because a gate
 // that answered "I could not tell" has to say so where the operator is
 // looking. Recording alone leaves an OSV gate with no synced database printing
 // a clean import and filing the warning somewhere nobody reads until after the
@@ -522,7 +521,13 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 // VersionCheckers are the per-version checks every admission runs: import,
 // create, the builder's fetch and the proxy's fill.
 func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
-	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb)}
+	// A nil *audit.DB inside the interface is not a nil interface.
+	var similarity policy.SimilarityStore
+	if adb != nil {
+		similarity = adb
+	}
+	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
+		policy.NewNameSimilarityChecker(similarity)}
 }
 
 // ProvenanceChecker builds the upstream provenance check: npm read from the

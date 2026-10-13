@@ -177,6 +177,7 @@ re-run with --editor cat to inspect, or copy and retry.`,
 			if adb != nil {
 				checker = policy.NewChecker(adb)
 			}
+			takeNameBaseline(ctx, adb, store)
 			// Before admit, because a relabel that strands the artifact is
 			// not a validation failure admit can see: CheckBackendName
 			// confirms the new name resolves to a configured backend, and a

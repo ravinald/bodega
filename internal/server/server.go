@@ -602,6 +602,16 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Before the listener, so no proxy fill or API admission runs before the
+	// names already served are exempt from the name similarity check.
+	if s.auditDB != nil && s.store != nil {
+		if took, err := policy.TakeNameBaseline(ctx, s.auditDB, s.store.AllPackages()); err != nil {
+			s.logger.Warn("name similarity baseline not recorded; packages already in the store are not exempt until it is", "error", err)
+		} else if took {
+			s.logger.Info("recorded the manifest store's package names as exempt from the name similarity check")
+		}
+	}
+
 	// Configure TLS if cert/key are provided.
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
