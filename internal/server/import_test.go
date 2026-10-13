@@ -1,16 +1,26 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/sigstore/sigstore-go/pkg/root"
+
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 func postImport(t *testing.T, s *Server, body, query string) (*httptest.ResponseRecorder, ImportResponse) {
@@ -428,5 +438,110 @@ func TestBulkImportRefusesAnotherHostOnMerge(t *testing.T) {
 	pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, "curl")
 	if pm == nil || len(pm.Versions) != 1 {
 		t.Fatalf("a refused merge changed the stored package: %+v", pm)
+	}
+}
+
+// admittingServer is a server with an audit database, so admission writes its
+// rows and the provenance check can pin, and an npm stub serving
+// sigstore@3.0.0 with the bundle npm recorded for it. The provenance check
+// reads that stub against the recorded Sigstore trusted root, so 3.0.0
+// verifies the way it does in internal/provenance. It returns the stub's URL
+// and seeds npm/sigstore at 2.0.0 straight into the store, so the seed itself
+// writes no admission row and takes no pin.
+func admittingServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	td := filepath.Join("..", "provenance", "testdata")
+	bundles, err := os.ReadFile(filepath.Join(td, "npm-sigstore-3.0.0.attestations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sigstore":
+			dist := map[string]any{
+				"integrity": "sha512-PHMifhh3EN4loMcHCz6l3v/luzgT3za+9f8subGgeMNjbJjzH4Ij/YoX3Gvu+kaouJRIlVdTHHCREADYf+ZteA==",
+				"attestations": map[string]any{"url": srv.URL + "/att/sigstore@3.0.0",
+					"provenance": map[string]any{"predicateType": provenance.SLSAProvenanceV1}},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"versions": map[string]any{"3.0.0": map[string]any{"dist": dist}}})
+		case "/att/sigstore@3.0.0":
+			_, _ = w.Write(bundles)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	tr, err := provenance.LoadTrustedRootFile(filepath.Join(td, "trusted_root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := admit.NewProvenanceVerifier
+	admit.NewProvenanceVerifier = func(cfg *config.Config) *provenance.Verifier {
+		v := prev(cfg)
+		v.Root = func(context.Context) (root.TrustedMaterial, error) { return tr, nil }
+		return v
+	}
+	t.Cleanup(func() { admit.NewProvenanceVerifier = prev })
+
+	dir := t.TempDir()
+	cfg := &config.Config{AptCodename: "noble", LogDir: dir, StoragePath: dir, AuditDB: filepath.Join(dir, "audit.db")}
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if s.auditDB == nil {
+		t.Fatal("audit DB not opened; the test would assert nothing")
+	}
+	t.Cleanup(func() { _ = s.auditDB.Close() })
+	// The seeded npm age gate dates versions against the public registry.
+	if _, err := s.auditDB.DeleteAgePolicy(t.Context(), manifest.TypeNpm); err != nil {
+		t.Fatal(err)
+	}
+	seed := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "sigstore", Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{{Version: "2.0.0", URL: srv.URL}}}
+	if err := s.store.SavePackage(t.Context(), seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	return s, srv.URL
+}
+
+// admissionTrail reports what admission left behind for npm/sigstore: its
+// admission rows and whether it holds a provenance pin.
+func admissionTrail(t *testing.T, s *Server) ([]audit.Admission, bool) {
+	t.Helper()
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "sigstore"})
+	if err != nil {
+		t.Fatalf("admissions: %v", err)
+	}
+	_, err = s.auditDB.GetProvenancePin(t.Context(), manifest.TypeNpm, "sigstore")
+	if err != nil && !errors.Is(err, audit.ErrProvenancePinNotFound) {
+		t.Fatalf("provenance pin: %v", err)
+	}
+	return rows, err == nil
+}
+
+// TestBulkImportConflictRecordsNoAdmission pins that a conflict is decided
+// before admission. Admission records "admitted" and takes the provenance pin
+// on first verify, so a conflict decided after it left an admitted row for a
+// version never stored, and could make that version the pin every later one
+// is held to. The merge import is the control: the same version, admitted and
+// stored, does take the pin, so the stub verifies.
+func TestBulkImportConflictRecordsNoAdmission(t *testing.T) {
+	s, registry := admittingServer(t)
+	body := fmt.Sprintf(`[{"name":"sigstore","type":"npm","versions":[{"version":"3.0.0","url":%q}]}]`, registry)
+
+	_, resp := postImport(t, s, body, "")
+	if len(resp.Results) != 1 || resp.Results[0].Outcome != ImportConflict ||
+		resp.Results[0].Reason != "package already exists (retry with merge=true to add versions)" {
+		t.Fatalf("results = %+v, want one conflict", resp.Results)
+	}
+	if rows, pinned := admissionTrail(t, s); len(rows) != 0 || pinned {
+		t.Fatalf("a conflict left %d admission row(s) and pinned = %v: %+v", len(rows), pinned, rows)
+	}
+
+	if _, resp := postImport(t, s, body, "merge=true"); resp.Merged != 1 {
+		t.Fatalf("control merge: %+v", resp.Results)
+	}
+	if rows, pinned := admissionTrail(t, s); len(rows) != 1 || rows[0].Decision != audit.AdmissionAdmitted || !pinned {
+		t.Fatalf("control merge left %d row(s), pinned = %v; the stub does not verify and the test above proves nothing", len(rows), pinned)
 	}
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -68,37 +67,24 @@ func TestAdmitAndMutationAPIAgreeOnTypes(t *testing.T) {
 	}
 }
 
-// TestMutationAPIReportsPolicyBeforeConflict pins the ordering the shared
-// admit path settled. A manifest that is both refused and already present
-// reports the refusal, because that is the answer the caller can act on;
-// reporting "already exists" hides a policy violation behind a name clash.
-func TestMutationAPIReportsPolicyBeforeConflict(t *testing.T) {
-	s, _, _ := refreshTestServer(t)
-	// An apt entry with no version fails admission. Store a package under the
-	// same name first so both conditions hold at once.
-	seed := &manifest.PackageManifest{
-		ConfigVersion: manifest.CurrentConfigVersion,
-		Name:          "clash",
-		Type:          manifest.TypeApt,
-		Versions:      []manifest.VersionEntry{{Version: "1.0.0"}},
-	}
-	if err := s.store.SavePackage(t.Context(), seed); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	body := `{"name":"clash","type":"apt","versions":[{"metadata":{"Architecture":"amd64"}}]}`
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/apt", strings.NewReader(body))
-	r.SetPathValue("type", manifest.TypeApt)
+// TestMutationAPIConflictRecordsNoAdmission pins that the mutation API decides
+// a name clash before admission, the same order both import paths keep. A 409
+// stores nothing, so it must leave no admitted row and take no provenance pin.
+// The cost is that a manifest both malformed and already present reports the
+// clash rather than the malformation.
+func TestMutationAPIConflictRecordsNoAdmission(t *testing.T) {
+	s, registry := admittingServer(t)
+	body := fmt.Sprintf(`{"name":"sigstore","versions":[{"version":"3.0.0","url":%q}]}`, registry)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/npm", strings.NewReader(body))
+	r.SetPathValue("type", manifest.TypeNpm)
 	w := httptest.NewRecorder()
 
 	s.handleCreateEntry(w, r)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: the admission failure outranks the name clash", w.Code)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	var got map[string]string
-	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if !strings.Contains(got["error"], "version") {
-		t.Errorf("error names the clash rather than the real problem: %q", got["error"])
+	if rows, pinned := admissionTrail(t, s); len(rows) != 0 || pinned {
+		t.Fatalf("a conflict left %d admission row(s) and pinned = %v: %+v", len(rows), pinned, rows)
 	}
 }

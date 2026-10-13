@@ -1365,6 +1365,16 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	pm.Type = t
 
+	// Conflict is checked before admission, which records its decision and
+	// can take the provenance pin: a 409 stores nothing, so neither may
+	// outlive it. A manifest both malformed and already present therefore
+	// reports the clash.
+	existing, _ := s.store.GetPackage(ctx, t, pm.Name)
+	if existing != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
+		return
+	}
+
 	// An HTTP caller is not the process owner, so the audit rows this writes
 	// carry no actor rather than the server's; the admission rows carry the
 	// identity the request resolved to instead.
@@ -1381,15 +1391,6 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		f := admitRefusal(t, pm.Name, admitBlock{check: res.Check, version: res.Version, incident: res.Incident, details: res.Details})
 		f.client = refusalClientAPI
 		f.write(w, r)
-		return
-	}
-
-	// Conflict is checked after admission so a manifest that is both refused
-	// and already present reports the refusal, which is the answer the caller
-	// can act on.
-	existing, _ := s.store.GetPackage(ctx, t, pm.Name)
-	if existing != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
 		return
 	}
 

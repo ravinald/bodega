@@ -109,6 +109,14 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 					if err := admit.ApplyOrigin(pm, origin); err != nil {
 						return fmt.Errorf("%s: %w", path, err)
 					}
+					// Before admission, which records its decision and can take
+					// the provenance pin: a refusal here stores nothing, so
+					// neither may outlive it.
+					existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
+					if existing != nil && !merge {
+						return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
+					}
+
 					res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 					for _, w := range res.Warnings {
 						fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
@@ -117,10 +125,6 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 						return fmt.Errorf("%s [%s/%s]: %s", path, pm.Type, pm.Name, res.Reason)
 					}
 
-					existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
-					if existing != nil && !merge {
-						return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
-					}
 					dated := admit.Result{}
 					admit.RecordPublished(ctx, pm, existing, &dated)
 					for _, w := range dated.Warnings {
