@@ -112,13 +112,13 @@ func newPolicySimilarityListCmd(gf *globalFlags) *cobra.Command {
 			if err := w.Flush(); err != nil {
 				return err
 			}
-			taken, at, count, err := adb.NameBaseline(ctx)
+			baseline, err := adb.NameBaseline(ctx)
 			if err != nil {
 				return err
 			}
-			if taken {
-				fmt.Fprintf(cmd.OutOrStdout(), "\nExempt as in use before the check: %d package names, recorded %s.\n",
-					count, at.UTC().Format("2006-01-02"))
+			if baseline.Taken {
+				fmt.Fprintf(cmd.OutOrStdout(), "\nExempt as in use before the check: %d package names from the manifest store and %d more with an admitted row, recorded %s.\n",
+					baseline.Packages, baseline.Admitted, baseline.TakenAt.UTC().Format("2006-01-02"))
 			}
 			return nil
 		},
@@ -203,25 +203,23 @@ func openSimilarityDB(ctx context.Context, gf *globalFlags) (*audit.DB, func(), 
 	return adb, func() { _ = adb.Close() }, nil
 }
 
-// takeNameBaseline records the store's packages as exempt from the name
-// similarity check, the first time any command holding both the store and the
+// takeNameBaseline records the store's packages and the admitted names as
+// exempt from the name similarity check, the first time any command holding both the store and the
 // audit database runs. A failure is a warning: the check still runs, and the
 // next command tries again.
 func takeNameBaseline(ctx context.Context, adb *audit.DB, store *manifest.Store) {
 	if adb == nil || store == nil {
 		return
 	}
-	all := store.AllPackages()
-	took, err := policy.TakeNameBaseline(ctx, adb, all)
+	took, err := policy.TakeNameBaseline(ctx, adb, store.AllPackages())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: the name similarity baseline was not recorded: %v\n", err)
 		return
 	}
 	if took {
-		n := 0
-		for _, names := range all {
-			n += len(names)
+		if b, err := adb.NameBaseline(ctx); err == nil {
+			fmt.Fprintf(os.Stderr, "Recorded %d package names from the manifest store and %d more with an admitted row as exempt from the name similarity check.\n",
+				b.Packages, b.Admitted)
 		}
-		fmt.Fprintf(os.Stderr, "Recorded %d existing package names as exempt from the name similarity check.\n", n)
 	}
 }

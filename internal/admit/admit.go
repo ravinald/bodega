@@ -454,11 +454,12 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 
 // checkVersions runs the per-version checks (age, OSV, upstream provenance,
 // name similarity). They live in the audit database, so with no database
-// there is nothing to check against. Warn-level results do not block; they are recorded and reported on res, because a gate
-// that answered "I could not tell" has to say so where the operator is
-// looking. Recording alone leaves an OSV gate with no synced database printing
-// a clean import and filing the warning somewhere nobody reads until after the
-// package is in the store.
+// there is nothing to check against. Warn-level results do not block; they
+// are recorded and reported on res, because a gate that answered "I could
+// not tell" has to say so where the operator is looking. Recording alone
+// leaves an OSV gate with no synced database printing a clean import and
+// filing the warning somewhere nobody reads until after the package is in
+// the store.
 func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string, eventType audit.EventType, res *Result, checkers []policy.VersionChecker, ev *evaluation) *Result {
 	if adb == nil {
 		return nil

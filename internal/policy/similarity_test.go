@@ -187,8 +187,8 @@ func (s *similarityStore) GetPopularList(context.Context, string) (audit.Popular
 func (s *similarityStore) GetPoliciesByType(context.Context, string) ([]Rule, error) {
 	return s.rules, nil
 }
-func (s *similarityStore) NameBaseline(context.Context) (bool, time.Time, int, error) {
-	return s.taken, time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC), len(s.baseline), nil
+func (s *similarityStore) NameBaseline(context.Context) (audit.NameBaselineState, error) {
+	return audit.NameBaselineState{Taken: s.taken, TakenAt: time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC), Packages: len(s.baseline)}, nil
 }
 func (s *similarityStore) InNameBaseline(_ context.Context, typ, key string) (bool, error) {
 	return s.baseline[typ+"/"+key], nil
@@ -305,7 +305,7 @@ func TestTakeNameBaselineOnce(t *testing.T) {
 	if r := checkName(t, adb, manifest.TypePypi, "reqests"); r.Action != ActionWarn {
 		t.Errorf("name offered to the second take = %+v, want a warn", r)
 	}
-	if taken, _, count, _ := adb.NameBaseline(ctx); !taken || count != 2 {
-		t.Errorf("NameBaseline = %v, %d", taken, count)
+	if st, _ := adb.NameBaseline(ctx); !st.Taken || st.Packages != 2 || st.Admitted != 0 {
+		t.Errorf("NameBaseline = %+v", st)
 	}
 }

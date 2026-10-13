@@ -606,9 +606,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// names already served are exempt from the name similarity check.
 	if s.auditDB != nil && s.store != nil {
 		if took, err := policy.TakeNameBaseline(ctx, s.auditDB, s.store.AllPackages()); err != nil {
-			s.logger.Warn("name similarity baseline not recorded; packages already in the store are not exempt until it is", "error", err)
+			s.logger.Warn("name similarity baseline not recorded; names already in use are not exempt until it is", "error", err)
 		} else if took {
-			s.logger.Info("recorded the manifest store's package names as exempt from the name similarity check")
+			s.logger.Info("recorded the manifest store's package names and the admitted names as exempt from the name similarity check")
 		}
 	}
 

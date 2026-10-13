@@ -1,6 +1,6 @@
 -- The name-similarity check (F39): the action per ecosystem, the popular-name
--- lists an operator loaded over the embedded ones, and the package names the
--- manifest store held when the check first ran here.
+-- lists an operator loaded over the embedded ones, and the package names in
+-- use when the check first ran here.
 --
 -- An absent policy row means warn, the same default upstream provenance has:
 -- a fresh install reports a near-miss name without refusing anything.
@@ -26,14 +26,16 @@ CREATE TABLE IF NOT EXISTS name_similarity_lists (
 );
 
 -- Names already in use are exempt, so turning the check on refuses nothing an
--- install already serves. The baseline is taken once, from the manifest store,
--- by the first process that holds both the store and this database; the
--- single row in name_similarity_baseline_taken says it has been, so a store
--- that happens to be empty at that moment is still a baseline rather than a
--- reason to take another one later, after a squat was admitted.
+-- install already serves. The baseline is taken once, from the manifest store
+-- and from the names with an admitted row in admissions (a pass-through proxy
+-- fill writes no manifest, so the admission is its only record), by the first
+-- process that holds both the store and this database. The single row in
+-- name_similarity_baseline_taken says it has been, so an install with nothing
+-- in use at that moment still has a baseline rather than a reason to take
+-- another one later, after a squat was admitted.
 --
--- pkg_key is the store's safe name under the check's normalization for the
--- type, which is what a lookup computes from the candidate.
+-- pkg_key is the safe name under the check's normalization for the type,
+-- which is what a lookup computes from the candidate.
 CREATE TABLE IF NOT EXISTS name_similarity_baseline (
     pkg_type TEXT NOT NULL,
     pkg_key  TEXT NOT NULL,
@@ -41,7 +43,8 @@ CREATE TABLE IF NOT EXISTS name_similarity_baseline (
 );
 
 CREATE TABLE IF NOT EXISTS name_similarity_baseline_taken (
-    id            INTEGER PRIMARY KEY CHECK(id = 1),
-    package_count INTEGER NOT NULL,
-    taken_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    id              INTEGER PRIMARY KEY CHECK(id = 1),
+    package_count   INTEGER NOT NULL,
+    admission_count INTEGER NOT NULL DEFAULT 0,
+    taken_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

@@ -2583,9 +2583,11 @@ A name equal to a popular one after normalization passes, as does one three or m
 **Exemptions.** So that turning the check on refuses nothing already in use, a near name passes, with the reason in the detail, when:
 
 - an exact allow-list rule names it (a pypi or cargo rule, or an npm rule that is not `@scope/*`), compared under the same normalization; or
-- the manifest store held it when the name baseline was taken.
+- it was in use when the name baseline was taken: the manifest store held it, or the `admissions` table held an `admitted` row for it.
 
-The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload` and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists, and `list` prints how many and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
+The admissions source covers the pass-through proxy, whose fills write an admission row and no manifest, so a name clients have been pulling through the proxy is in use even though the store has never listed it. A name whose only rows are refusals is not in use, and neither is one whose admitted rows all carry a `name_similarity` warning: the check had already run and flagged it.
+
+The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload` and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists and every name with an admitted row, and `list` prints how many came from each source and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
 
 **Actions.** One row per ecosystem in `name_similarity_policy`; `set` overwrites, and `list` prints all three, with the unset ones at their default:
 

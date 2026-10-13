@@ -104,3 +104,59 @@ func TestFetchRecordsNameSimilarity(t *testing.T) {
 		t.Errorf("after an allow-list refusal = %+v, want not_evaluated", c)
 	}
 }
+
+// A pass-through proxy fill writes an admission row and no manifest, so a
+// name clients pulled that way before the baseline is in use and exempt. A
+// pre-baseline refusal, or an admission the check already warned on, is not.
+func TestNameBaselineExemptsProxyAdmissions(t *testing.T) {
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	proxy := func(name, version string, checkers []policy.VersionChecker, allow audit.AdmissionCheck) FetchResult {
+		return Fetch(ctx, f.adb, checkers, manifest.TypeCargo, name,
+			manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy}, allow, Who{Actor: "client"}, "")
+	}
+
+	if res := proxy("serde_jsno", "1.0.0", nil, AllowListCheck(false, "serde_jsno", nil)); res.Admission.Decision != audit.AdmissionAdmitted {
+		t.Fatalf("pre-check fill = %s", res.Admission.Decision)
+	}
+	if res := proxy("tokioo", "1.0.0", nil, AllowListCheck(true, "tokioo", &policy.ViolationError{})); res.Admission.Decision != audit.AdmissionPolicyBlocked {
+		t.Fatalf("pre-check refusal = %s", res.Admission.Decision)
+	}
+	if res := proxy("randd", "1.0.0", VersionCheckers(f.unsynced, f.adb), AllowListCheck(false, "randd", nil)); res.Block != nil ||
+		checkOf(t, res.Admission, audit.CheckNameSimilarity).Status != audit.CheckWarn {
+		t.Fatalf("warned fill = %+v, %+v", res.Block, res.Admission.Checks)
+	}
+	if res := Fetch(ctx, f.adb, nil, manifest.TypeNpm, "@typse/node", manifest.VersionEntry{Version: "1.0.0", Mode: manifest.ModeProxy},
+		AllowListCheck(false, "@typse/node", nil), Who{Actor: "client"}, ""); res.Admission.Decision != audit.AdmissionAdmitted {
+		t.Fatalf("pre-check npm fill = %s", res.Admission.Decision)
+	}
+
+	if took, err := policy.TakeNameBaseline(ctx, f.adb, map[string][]string{}); err != nil || !took {
+		t.Fatalf("TakeNameBaseline = %v, %v", took, err)
+	}
+	if st, err := f.adb.NameBaseline(ctx); err != nil || st.Packages != 0 || st.Admitted != 2 {
+		t.Errorf("NameBaseline = %+v, %v; want 0 from the store and 2 admitted", st, err)
+	}
+	if err := f.adb.SetSimilarityPolicy(ctx, audit.SimilarityPolicy{Ecosystem: manifest.TypeCargo, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := proxy("serde_jsno", "1.0.1", VersionCheckers(f.unsynced, f.adb), AllowListCheck(false, "serde_jsno", nil))
+	if res.Block != nil {
+		t.Fatalf("name in use through the proxy refused under block: %s", res.Block.Reason)
+	}
+	if c := checkOf(t, res.Admission, audit.CheckNameSimilarity); c.Status != audit.CheckPass || !strings.Contains(c.Detail, "exempt") {
+		t.Errorf("in-use check = %+v", c)
+	}
+	for _, name := range []string{"tokioo", "randd"} {
+		res := proxy(name, "1.0.1", VersionCheckers(f.unsynced, f.adb), AllowListCheck(false, name, nil))
+		if res.Block == nil || res.Block.Check != audit.CheckNameSimilarity {
+			t.Errorf("%s under block = %+v, want refused by name_similarity", name, res.Block)
+		}
+	}
+
+	pm := &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "@typse/node", Versions: []manifest.VersionEntry{{Version: "1.0.1"}}}
+	if r := policy.NewNameSimilarityChecker(f.adb).Check(ctx, pm, &pm.Versions[0]); r.Action != policy.ActionPass || !strings.Contains(r.Reason, "exempt") {
+		t.Errorf("scoped npm name admitted before the baseline = %+v", r)
+	}
+}

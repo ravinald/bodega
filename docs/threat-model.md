@@ -26,7 +26,8 @@ risk:
   equal to warns, or refuses under `bodega policy similarity set <eco> block`.
   pypi is compared after PEP 503 normalization, npm with the scope and the
   bare name compared separately. A name an exact allow-list rule names, or
-  one the manifest store held when the check first ran, is exempt, and
+  one in use when the check first ran (in the manifest store, or admitted,
+  which is the only record a pass-through proxy fill leaves), is exempt, and
   `bodega policy add` asks before writing an exact rule near a popular name.
   The check knows only the names on its list: a squat of an unpopular
   package is not caught, nor is a squat of a gomod, git, helm or binary name,

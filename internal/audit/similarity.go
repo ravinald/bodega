@@ -149,11 +149,33 @@ type NameBaselineKey struct {
 	PkgKey  string
 }
 
-// TakeNameBaseline records keys as the names in use before the check, unless
-// a baseline was already taken here, and reports whether this call took it.
-// The marker and the names land in one transaction, so a crash between them
-// cannot leave a marker with half a baseline behind it.
-func (a *DB) TakeNameBaseline(ctx context.Context, keys []NameBaselineKey) (bool, error) {
+// NameBaselineState is the baseline's marker: whether it has been taken,
+// when, and how many names each source contributed.
+type NameBaselineState struct {
+	Taken   bool
+	TakenAt time.Time
+	// Packages counts the manifest store's names; Admitted counts the names
+	// with an admitted row that no earlier source had already contributed.
+	Packages int
+	Admitted int
+}
+
+// TakeNameBaseline records the names in use before the check, unless a
+// baseline was already taken here, and reports whether this call took it.
+// Two sources are in use: keys, the manifest store's names, and every name
+// the admissions table holds an admitted row for, which is the only record a
+// pass-through proxy fill leaves. normalize maps an admission row's type and
+// name to the key a lookup computes from the candidate.
+//
+// An admitted row whose name_similarity entry says warn does not count: the
+// check had already run and flagged that name, so it was not in use before
+// the check. Rows from before the check carry no such entry.
+//
+// The marker and both sources land in one transaction, which holds the write
+// lock from the marker insert on: a crash cannot leave a marker with half a
+// baseline behind it, and an admission committed by another process after
+// the read is after the baseline, judged like any other.
+func (a *DB) TakeNameBaseline(ctx context.Context, keys []NameBaselineKey, normalize func(pkgType, name string) string) (bool, error) {
 	tx, err := a.writer().BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -173,29 +195,82 @@ func (a *DB) TakeNameBaseline(ctx context.Context, keys []NameBaselineKey) (bool
 			return false, err
 		}
 	}
+	admitted, err := admittedBeforeCheck(ctx, tx, normalize)
+	if err != nil {
+		return false, err
+	}
+	added := 0
+	for _, k := range admitted {
+		res, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO name_similarity_baseline (pkg_type, pkg_key) VALUES (?, ?)`, k.PkgType, k.PkgKey)
+		if err != nil {
+			return false, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return false, err
+		} else if n > 0 {
+			added++
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE name_similarity_baseline_taken SET admission_count = ? WHERE id = 1`, added); err != nil {
+		return false, err
+	}
 	return true, tx.Commit()
 }
 
-// NameBaseline reports whether the baseline has been taken, and when.
-func (a *DB) NameBaseline(ctx context.Context) (taken bool, at time.Time, count int, err error) {
+// admittedBeforeCheck returns the normalized names with an admitted row the
+// name_similarity check did not warn on, read whole before any insert so no
+// result set is open on the transaction's connection while it writes.
+func admittedBeforeCheck(ctx context.Context, tx *sql.Tx, normalize func(pkgType, name string) string) ([]NameBaselineKey, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT pkg_type, pkg_name FROM admissions
+		WHERE decision = ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM json_each(admissions.checks) c
+			WHERE json_extract(c.value, '$.check') = ?
+			  AND json_extract(c.value, '$.status') IN (?, ?)
+		  )`,
+		AdmissionAdmitted, CheckNameSimilarity, CheckWarn, CheckBlock)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NameBaselineKey
+	for rows.Next() {
+		var typ, name string
+		if err := rows.Scan(&typ, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, NameBaselineKey{PkgType: typ, PkgKey: normalize(typ, name)})
+	}
+	return out, rows.Err()
+}
+
+// NameBaseline reports whether the baseline has been taken, when, and from
+// how many names.
+func (a *DB) NameBaseline(ctx context.Context) (NameBaselineState, error) {
+	var st NameBaselineState
 	var ts string
 	// The writer, not the read pool: a command takes the baseline and then
 	// admits in the same process, and the read pool can lag the write
 	// connection.
-	err = a.writer().QueryRowContext(ctx,
-		`SELECT package_count, taken_at FROM name_similarity_baseline_taken WHERE id = 1`).Scan(&count, &ts)
+	err := a.writer().QueryRowContext(ctx,
+		`SELECT package_count, admission_count, taken_at FROM name_similarity_baseline_taken WHERE id = 1`).
+		Scan(&st.Packages, &st.Admitted, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, time.Time{}, 0, nil
+		return NameBaselineState{}, nil
 	}
 	if err != nil {
-		return false, time.Time{}, 0, err
+		return NameBaselineState{}, err
 	}
-	at, _ = time.Parse(time.RFC3339Nano, ts)
-	return true, at, count, nil
+	st.Taken = true
+	st.TakenAt, _ = time.Parse(time.RFC3339Nano, ts)
+	return st, nil
 }
 
-// InNameBaseline reports whether key was in the manifest store when the
-// baseline was taken.
+// InNameBaseline reports whether key was in use, in the manifest store or
+// admitted, when the baseline was taken.
 func (a *DB) InNameBaseline(ctx context.Context, pkgType, key string) (bool, error) {
 	var n int
 	err := a.writer().QueryRowContext(ctx,

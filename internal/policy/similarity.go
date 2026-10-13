@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -268,7 +267,7 @@ type SimilarityStore interface {
 	GetSimilarityPolicy(ctx context.Context, ecosystem string) (audit.SimilarityPolicy, error)
 	GetPopularList(ctx context.Context, ecosystem string) (audit.PopularList, error)
 	GetPoliciesByType(ctx context.Context, registryType string) ([]Rule, error)
-	NameBaseline(ctx context.Context) (taken bool, at time.Time, count int, err error)
+	NameBaseline(ctx context.Context) (audit.NameBaselineState, error)
 	InNameBaseline(ctx context.Context, pkgType, key string) (bool, error)
 }
 
@@ -323,9 +322,10 @@ func ExactRule(typ, pattern string) bool {
 	return false
 }
 
-// TakeNameBaseline records every package the manifest store holds as a name
-// in use before the check, the first time it is called against a database,
-// and reports whether this call took it. all is manifest.Store.AllPackages.
+// TakeNameBaseline records every package the manifest store holds, and every
+// name with an admitted row in the audit database, as a name in use before
+// the check, the first time it is called against a database, and reports
+// whether this call took it. all is manifest.Store.AllPackages.
 func TakeNameBaseline(ctx context.Context, adb *audit.DB, all map[string][]string) (bool, error) {
 	if adb == nil {
 		return false, nil
@@ -339,7 +339,9 @@ func TakeNameBaseline(ctx context.Context, adb *audit.DB, all map[string][]strin
 	slices.SortFunc(keys, func(a, b audit.NameBaselineKey) int {
 		return strings.Compare(a.PkgType+"\x00"+a.PkgKey, b.PkgType+"\x00"+b.PkgKey)
 	})
-	return adb.TakeNameBaseline(ctx, keys)
+	return adb.TakeNameBaseline(ctx, keys, func(typ, name string) string {
+		return NormalizeName(typ, manifest.SafeName(name))
+	})
 }
 
 // NameSimilarityChecker is the name_similarity admission check. Every
@@ -449,11 +451,11 @@ func (c *NameSimilarityChecker) exemption(ctx context.Context, typ, name string)
 			return "allow-listed by an exact rule", nil
 		}
 	}
-	taken, at, _, err := c.Store.NameBaseline(ctx)
+	baseline, err := c.Store.NameBaseline(ctx)
 	if err != nil {
 		return "", err
 	}
-	if !taken {
+	if !baseline.Taken {
 		return "", nil
 	}
 	in, err := c.Store.InNameBaseline(ctx, typ, NormalizeName(typ, manifest.SafeName(name)))
@@ -461,7 +463,7 @@ func (c *NameSimilarityChecker) exemption(ctx context.Context, typ, name string)
 		return "", err
 	}
 	if in {
-		return "in the manifest store when the name baseline was taken on " + at.UTC().Format("2006-01-02"), nil
+		return "in use (in the manifest store or admitted) when the name baseline was taken on " + baseline.TakenAt.UTC().Format("2006-01-02"), nil
 	}
 	return "", nil
 }
