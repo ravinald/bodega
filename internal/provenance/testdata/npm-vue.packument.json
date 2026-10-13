@@ -1,0 +1,43 @@
+{
+  "_id": "vue",
+  "name": "vue",
+  "versions": {
+    "3.5.35": {
+      "name": "vue",
+      "version": "3.5.35",
+      "_npmUser": {
+        "name": "GitHub Actions",
+        "trustedPublisher": {
+          "id": "github"
+        }
+      },
+      "dist": {
+        "integrity": "sha512-cx89fnr+0kVGHiNFG6y6s0bdjypJRFNZn6x3WPstNdQR1bi1mbB7h4v5IBGTsPJU3nK1+0Iqj3Zf+hZWMieR4Q==",
+        "tarball": "https://registry.npmjs.org/vue/-/vue-3.5.35.tgz",
+        "attestations": {
+          "url": "https://registry.npmjs.org/-/npm/v1/attestations/vue@3.5.35",
+          "provenance": {
+            "predicateType": "https://slsa.dev/provenance/v1"
+          }
+        }
+      }
+    },
+    "3.5.36": {
+      "name": "vue",
+      "version": "3.5.36",
+      "_npmUser": {
+        "name": "daiwei1105"
+      },
+      "dist": {
+        "integrity": "sha512-6hrCB+O4R6UipvOSR19tuRlhx43lwlqb8dbb6DW0EKotcb7wGho6TXLYvuStZGSmKWs43OjaCjwYk5DniiPkLA==",
+        "tarball": "https://registry.npmjs.org/vue/-/vue-3.5.36.tgz"
+      }
+    }
+  },
+  "time": {
+    "created": "2013-12-07T06:09:46.299Z",
+    "modified": "2026-10-13T07:45:34.519Z",
+    "3.5.35": "2026-05-27T09:04:53.705Z",
+    "3.5.36": "2026-06-11T03:56:09.809Z"
+  }
+}

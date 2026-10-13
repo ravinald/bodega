@@ -52,14 +52,31 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 	if t, ok := ev.Published[version]; ok {
 		ev.PublishedAt = &t
 	}
+	ev.Publishers = make(map[string]Publisher, len(doc.Versions))
+	for ver, d := range doc.Versions {
+		if u := d.NpmUser; u != nil && strings.TrimSpace(u.Name) != "" {
+			ev.Publishers[ver] = Publisher{Name: strings.TrimSpace(u.Name), Trusted: u.TrustedPublisher != nil}
+		}
+	}
+	if p, ok := ev.Publishers[version]; ok {
+		ev.Publisher = &p
+	}
 	return ev
 }
 
 // packument is the part of an npm packument the check reads. Time maps each
 // version to when it was published, beside the "created" and "modified" keys,
 // and keeps a version's time after the version itself is unpublished.
+// NpmUser is who published the version; npm sets trustedPublisher when the
+// publish came through trusted publishing rather than an account's token.
 type packument struct {
 	Versions map[string]struct {
+		NpmUser *struct {
+			Name             string `json:"name"`
+			TrustedPublisher *struct {
+				ID string `json:"id"`
+			} `json:"trustedPublisher"`
+		} `json:"_npmUser"`
 		Dist struct {
 			Integrity    string `json:"integrity"`
 			Attestations *struct {
