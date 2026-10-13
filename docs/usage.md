@@ -1059,6 +1059,8 @@ The builder is pinned with any `@<ref>` suffix removed. A GitHub Actions builder
 
 `reset` deletes the pin so the next verified version pins afresh. Run it when a project moved repositories or CI systems on purpose, or stopped publishing npm releases from CI, after confirming the change somewhere other than the package itself. It writes a `policy` audit event naming the OS user who ran it and what the pin held (`source_repository_uri`, `builder_id`, `pinned_version`), and it refuses on a read-only install like every other write. Resetting a package with no pin is not an error.
 
+A `mismatch` on an npm version with no provenance is common, and most of the time it is a maintainer publishing by hand rather than a stolen token. On 2026-10-12, 11 of 29 popular npm packages had a release (no prerelease tag) without provenance published after their first version that had it, so roughly a third of active npm packages will raise one. The detail and the row's `publisher` and `pinned_publisher` name who published each version, read from the packument's `_npmUser`, for example `npm user daiwei1105` against `GitHub Actions` on vue 3.5.36. Ask the project before resetting; see [npm releases without provenance](#bodega-policy-provenance-setlist) for the measurement and what it means under `block`.
+
 ### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
 
 Generates a cryptographically random API token. The raw token is displayed once and cannot be retrieved later. A SHA-256 hash (with a server-side pepper) is stored in the audit database.
@@ -2521,6 +2523,15 @@ From a verified bundle the row records the certificate's source repository URI, 
 | `unavailable` | the registry answered that the package publishes no provenance, or its ecosystem has no mechanism bodega reads                                                                                                                                |
 | `invalid`     | published provenance did not verify, could not be fetched or had no trusted root to check it against, or the lookup that says whether any is published failed                                                                                 |
 | `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; or an npm version with no provenance, published after the pinned version; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name) |
+
+**npm releases without provenance.** A version with no provenance published after the pinned one is the trace a publish from a stolen token leaves, and it is also what a maintainer publishing by hand leaves. The two look the same from the registry, so bodega records `mismatch` for both and names who published each version: the detail reads `published 2026-06-11T03:56:09Z by npm user daiwei1105 with no provenance; pinned version 3.5.35 was published by GitHub Actions ...`, and a warn or block row's details carry `publisher` and `pinned_publisher` (JSON `null` when the packument's `_npmUser` names nobody). Telling the two apart is the operator's call, made with the project.
+
+It happens often. On 2026-10-12 a scan of 29 popular npm packages, reading each packument's `versions`, `time` and `dist.attestations`, found 11 with a release version (no prerelease tag) without provenance published after their first version that had it:
+
+- Backport lines: next 12.3.5 after 13.x, axios 0.29.0 after 1.6.1, vite 4.4.10 after the 5.0 beta, nuxt 2.17.4, svelte 4.2.19, rollup 2.80.0.
+- Mainline releases: pnpm 10.34.0 through 10.34.2, undici 6.19.0, vitest 3.1.0, vue 3.5.36 and 3.5.37.
+
+So roughly a third of active npm packages raise this outcome. Under `warn` that is a warning to read; under `block` it refuses those maintainer publishes along with any stolen-token one. Keep npm at `warn` unless you vet each package's release process and know which of them always publish from CI.
 
 `unavailable` is the registry's answer, not the absence of one: a packument read and parsed with no `dist.attestations` for the version, a 404 from GitHub's attestation lookup or an empty attestation list, a release asset with no recorded digest, or a release with no `SHA256SUMS`. A lookup that gets no answer is `invalid`: a transport error, a status other than 200 or 404 (a rate limit's 403 included), a body that does not parse, or one larger than its cap, which is refused rather than truncated. So is every failure once the packument says a version publishes provenance. Nothing that publishes provenance passes because verification was skipped. An npm entry that names no single release (`*`, `latest`) records `not_evaluated`; the fetch that resolves a version checks it.
 
