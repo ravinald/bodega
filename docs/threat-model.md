@@ -222,6 +222,15 @@ block`, `mismatch`, `invalid` and `unavailable` are all refused, so the
   answer that the version publishes nothing (`unavailable`) passes: the
   outcome is recorded in every admission row and attestation, but nothing is
   refused.
+  A maintainer publishing by hand leaves the same trace as the laptop
+  publish, and the registry cannot tell the two apart, so the `mismatch`
+  names who published the version and the pinned one (npm's `_npmUser`) and
+  leaves the call to the operator. It is common: on 2026-10-12, reading the
+  packuments of 29 popular npm packages, 11 had a release version (no
+  prerelease tag) without provenance published after their first version
+  that had it, mostly backport lines and some mainline releases. Under
+  `block` this outcome refuses those maintainer publishes; keep npm at
+  `warn` unless you vet each package's release process.
   See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
 - **Transitive dependency poisoning.** When a top-level package (e.g. a git
   repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega
@@ -776,6 +785,60 @@ flow also leaves evidence the host cannot erase, which no self-report can.
 Reconciliation sits beside egress control rather than instead of it: it
 reports what got through a gap in the egress policy, or what arrived before
 the policy existed.
+
+#### Registry names in DNS
+
+A resolver policy that refuses the public registries' names to server
+subnets is a cheap layer beside the firewall. These are the hosts bodega's
+built-in upstreams fetch from: the defaults of `gomod_upstream`,
+`npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream` and
+`distfiles_upstream`, plus `files.pythonhosted.org`, where PyPI's index sends
+every file download. `crates.io` publishes its index and its tarballs on
+separate subdomains, so it takes a wildcard. As an RPZ zone, where `CNAME .`
+answers NXDOMAIN:
+
+```zone
+proxy.golang.org         CNAME .
+registry.npmjs.org       CNAME .
+pypi.org                 CNAME .
+files.pythonhosted.org   CNAME .
+crates.io                CNAME .
+*.crates.io              CNAME .
+distcache.FreeBSD.org    CNAME .
+```
+
+The same names as a plain list, for a resolver without RPZ (Route 53
+Resolver DNS Firewall domain lists, Windows DNS query resolution policies,
+dnsmasq's `address=/<name>/`, which covers subdomains without the `*.`):
+
+```text
+proxy.golang.org
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+crates.io
+*.crates.io
+distcache.FreeBSD.org
+```
+
+Apply it to the client subnets and exempt bodega's own address, which still
+has to resolve every one of them. Go clients also query `sum.golang.org`
+directly unless `GOSUMDB` names something else; bodega does not proxy the
+checksum database, so blocking that name breaks `go get` rather than
+forcing it through bodega.
+
+Upstreams an operator adds are not on the list: `apt_upstreams`, `helm`
+repositories, FreeBSD `pkg` repositories, and any of the defaults above
+pointed at a mirror. Add their hosts by hand. Neither are the GitHub hosts
+git and binary entries fetch from (`github.com`,
+`objects.githubusercontent.com`, `api.github.com`). `github.com` cannot be
+blocked by name, because developers and CI on the same subnets push code and
+read issues on the same host that serves release assets and clones.
+
+DNS filtering enforces nothing: a client that dials an IP literal or resolves
+over DoH never asks the resolver. A resolver query for one of these names
+from a server subnet is still a bypass attempt and is worth a SIEM alert. The
+egress firewall blocks a bypass, and reconciliation proves one happened.
 
 ## What an attestation proves
 

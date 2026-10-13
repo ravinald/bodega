@@ -201,6 +201,9 @@ func judge(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) 
 // looks like. One published before the pinned version predates the
 // project's adoption of provenance and stays unavailable. With either time
 // unknown no comparison ran, and saying unavailable would pass it under warn.
+// A maintainer publishing by hand leaves the same trace, so a mismatch names
+// who published each version for the operator to take to the project; it
+// does not decide between the two.
 func stopped(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin) Evidence {
 	pinnedAt, ok := ev.Published[held.PinnedVersion]
 	var missing []string
@@ -223,8 +226,11 @@ func stopped(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin
 		return ev
 	}
 	ev.Outcome = audit.ProvenanceMismatch
-	ev.Detail = fmt.Sprintf("published %s with no provenance, but %s/%s is pinned to %s from %s since version %s (published %s); 'bodega pkg trust reset %s %s' clears the pin if the project stopped publishing from CI on purpose",
-		at, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, held.PinnedVersion, pinned, pm.Type, pm.Name)
+	if p, ok := ev.Publishers[held.PinnedVersion]; ok {
+		ev.PinnedPublisher = &p
+	}
+	ev.Detail = fmt.Sprintf("published %s by %s with no provenance; pinned version %s was published by %s (%s), and %s/%s is pinned to %s from %s since then. A maintainer publishing by hand and a publish from a stolen token look the same from the registry; if the project confirms this release, 'bodega pkg trust reset %s %s' clears the pin",
+		at, ev.Publisher, held.PinnedVersion, ev.PinnedPublisher, pinned, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, pm.Type, pm.Name)
 	return ev
 }
 
@@ -278,8 +284,22 @@ func verdict(ev Evidence, action string) policy.Result {
 			r.Details["source_repository_uri"] = prov.SourceRepositoryURI
 			r.Details["builder_id"] = prov.BuilderID
 		}
+		if ev.Outcome == audit.ProvenanceMismatch && prov.SourceRepositoryURI == "" {
+			r.Details["publisher"] = publisherName(ev.Publisher)
+			r.Details["pinned_publisher"] = publisherName(ev.PinnedPublisher)
+		}
 	}
 	return r
+}
+
+// publisherName is a publisher for Details: its name, or nil (JSON null)
+// when the registry did not name one, so a reader never mistakes an
+// unnamed publisher for one called "".
+func publisherName(p *Publisher) any {
+	if p == nil {
+		return nil
+	}
+	return p.Name
 }
 
 func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Evidence {

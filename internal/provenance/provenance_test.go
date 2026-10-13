@@ -29,6 +29,13 @@ import (
 //	npm-sigstore-3.0.0-tampered-subject.attestations.json
 //	                   the same, with the SLSA statement's sha512 subject
 //	                   digest altered by one hex digit
+//	npm-vue.packument.json
+//	                   registry.npmjs.org/vue fetched on 2026-10-13, cut
+//	                   to 3.5.35 (published by GitHub Actions through
+//	                   trusted publishing, with provenance) and 3.5.36
+//	                   (published by hand by npm user daiwei1105, without),
+//	                   each version cut to _npmUser.name, the
+//	                   trustedPublisher marker and dist
 //	github-cli-2.102.0-provenance.json.sn
 //	                   the actions/attest provenance GitHub serves for
 //	                   cli/cli v2.102.0's gh_2.102.0_linux_386.tar.gz,
@@ -740,5 +747,77 @@ func TestCommitJudgesUnavailableAgainstThePinThatWon(t *testing.T) {
 	}
 	if got.Provenance.Outcome != audit.ProvenanceInvalid || !strings.Contains(got.Reason, "pinned version 0.0.0's") {
 		t.Errorf("0.1.1 against a pin whose time the packument lacks: %s (%s), want invalid", got.Provenance.Outcome, got.Reason)
+	}
+}
+
+func vuePin() audit.ProvenancePin {
+	return audit.ProvenancePin{PkgType: "npm", PkgName: "vue",
+		SourceRepositoryURI: "https://github.com/vuejs/core", BuilderID: npmRunnerBuilder, PinnedVersion: "3.5.35"}
+}
+
+// A version without provenance after the pin names who published it and who
+// published the pinned version, in the reason and in Details, and the
+// outcome stays what E14 decided: a hand publish and a stolen token look the
+// same from the registry. A packument with no _npmUser says the publisher is
+// not named rather than leaving it blank.
+func TestNpmMismatchNamesThePublishers(t *testing.T) {
+	cases := []struct {
+		name, pkg, version   string
+		serve                func(*testing.T, *registry)
+		pin                  audit.ProvenancePin
+		wantIn               []string
+		publisher, pinnedPub any
+	}{
+		{"named", "vue", "3.5.36",
+			func(t *testing.T, r *registry) { r.put("/vue", fixture(t, "npm-vue.packument.json")) },
+			vuePin(),
+			[]string{"published 2026-06-11T03:56:09Z by npm user daiwei1105 with no provenance", "pinned version 3.5.35 was published by GitHub Actions (2026-05-27T09:04:53Z)", "bodega pkg trust reset npm vue"},
+			"daiwei1105", "GitHub Actions"},
+		{"not named", "sigstore", "3.1.0",
+			func(t *testing.T, r *registry) { sigstorePackument(t, r, nil) },
+			sigstorePin(),
+			[]string{"by a publisher the packument has not named with no provenance", "pinned version 3.0.0 was published by a publisher the packument has not named"},
+			nil, nil},
+	}
+	for _, tc := range cases {
+		for action, wantAction := range map[string]string{"warn": policy.ActionWarn, "block": policy.ActionBlock, "ignore": policy.ActionPass} {
+			t.Run(tc.name+"/"+action, func(t *testing.T) {
+				r := newRegistry(t)
+				tc.serve(t, r)
+				store := &fakeStore{actions: map[string]string{"npm": action},
+					pins: map[string]audit.ProvenancePin{"npm/" + tc.pkg: tc.pin}}
+				c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
+				got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: tc.pkg}, &manifest.VersionEntry{Version: tc.version})
+				if got.Provenance == nil || got.Provenance.Outcome != audit.ProvenanceMismatch || got.Action != wantAction {
+					t.Fatalf("%+v (%s), want mismatch and %s", got, got.Reason, wantAction)
+				}
+				for _, w := range tc.wantIn {
+					if !strings.Contains(got.Reason, w) {
+						t.Errorf("reason %q does not say %q", got.Reason, w)
+					}
+				}
+				if action == "ignore" {
+					return
+				}
+				for key, want := range map[string]any{"publisher": tc.publisher, "pinned_publisher": tc.pinnedPub} {
+					v, ok := got.Details[key]
+					if !ok || v != want {
+						t.Errorf("Details[%s] = %v (present %v), want %v", key, v, ok, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestNpmPublisherComesFromThePackument(t *testing.T) {
+	r := newRegistry(t)
+	r.put("/vue", fixture(t, "npm-vue.packument.json"))
+	ev := newTestVerifier(t, r).Npm(context.Background(), "", "vue", "3.5.36")
+	if ev.Publisher == nil || *ev.Publisher != (Publisher{Name: "daiwei1105"}) {
+		t.Errorf("3.5.36 publisher %+v, want npm user daiwei1105", ev.Publisher)
+	}
+	if p := ev.Publishers["3.5.35"]; p != (Publisher{Name: "GitHub Actions", Trusted: true}) {
+		t.Errorf("3.5.35 publisher %+v, want GitHub Actions through trusted publishing", p)
 	}
 }

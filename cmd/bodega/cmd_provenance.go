@@ -25,7 +25,11 @@ Sigstore bundles npm serves beside a version built in CI, and the GitHub
 artifact attestations of a binary or git release asset. A verified bundle
 names the source repository and builder; the first verified version of a
 package pins both, and a later version verified from anything else is a
-mismatch. 'bodega pkg trust' shows and clears the pin.
+mismatch. So is an npm version with no provenance published after the
+pinned version: the trace a publish from a stolen token leaves, and also
+the one a maintainer publishing by hand leaves. The result names who
+published each version; deciding which it was is the operator's call.
+'bodega pkg trust' shows and clears the pin.
 
 Each version gets one outcome:
 
@@ -34,7 +38,9 @@ Each version gets one outcome:
                mechanism bodega reads (pypi, gomod, cargo, helm, apt, freebsd,
                distfiles)
   invalid      provenance was published and did not verify
-  mismatch     it verified, from a repository or builder other than the pin
+  mismatch     it verified, from a repository or builder other than the pin;
+               or, on npm, it has no provenance and was published after the
+               pinned version
 
 The action says what each outcome does to the admission:
 

@@ -54,6 +54,33 @@ type Evidence struct {
 	// npm fills either.
 	PublishedAt *time.Time
 	Published   map[string]time.Time
+	// Publisher is who the registry says published the version checked, nil
+	// when it does not say; Publishers is the same for every version it
+	// names. PinnedPublisher is Publishers' entry for the pinned version,
+	// set when a version without provenance is judged against a pin. Only
+	// npm fills any of them.
+	Publisher       *Publisher
+	Publishers      map[string]Publisher
+	PinnedPublisher *Publisher
+}
+
+// Publisher is the account a registry says published a version: npm's
+// _npmUser. A trusted-publishing release is published by the CI system's
+// OIDC identity rather than an npm account, and npm names that identity
+// ("GitHub Actions") in the same field.
+type Publisher struct {
+	Name    string
+	Trusted bool
+}
+
+func (p *Publisher) String() string {
+	switch {
+	case p == nil:
+		return "a publisher the packument has not named"
+	case p.Trusted:
+		return p.Name
+	}
+	return "npm user " + p.Name
 }
 
 func unavailable(format string, a ...any) Evidence {
