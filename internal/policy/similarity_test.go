@@ -1,0 +1,365 @@
+package policy
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+func TestDamerauLevenshtein(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"requests", "requests", 0},
+		{"requests", "reqeusts", 1}, // adjacent swap
+		{"requests", "request", 1},  // deletion
+		{"requests", "rrequests", 1},
+		{"requests", "requezts", 1},
+		{"lodash", "lodahs", 1},
+		{"ca", "abc", 2}, // unrestricted: the restricted form says 3
+		{"colorama", "colourama", 1},
+		{"abc", "", 3},
+		{"kitten", "sitting", 3},
+	}
+	for _, c := range cases {
+		if got := damerauLevenshtein(c.a, c.b); got != c.want {
+			t.Errorf("damerauLevenshtein(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+		if got := damerauLevenshtein(c.b, c.a); got != c.want {
+			t.Errorf("damerauLevenshtein(%q, %q) = %d, want %d (not symmetric)", c.b, c.a, got, c.want)
+		}
+	}
+}
+
+func list(t *testing.T, eco string, names ...string) PopularNames {
+	t.Helper()
+	p, err := ParsePopularNames(eco, []byte("# source: test\n# date: 2026-10-13\n"+strings.Join(names, "\n")+"\n"))
+	if err != nil {
+		t.Fatalf("ParsePopularNames: %v", err)
+	}
+	return p
+}
+
+// A hit names the nearest popular name and the distance; a name equal to a
+// popular one after normalization, or further than two edits, is not one.
+func TestNearHitsAndMisses(t *testing.T) {
+	pypi := list(t, manifest.TypePypi, "requests", "python-dateutil", "numpy")
+	npm := list(t, manifest.TypeNpm, "lodash", "@types/node", "express")
+	cargo := list(t, manifest.TypeCargo, "serde_json", "tokio")
+	cases := []struct {
+		name    string
+		list    PopularNames
+		cand    string
+		popular string
+		dist    int
+	}{
+		{"pypi swap", pypi, "reqeusts", "requests", 1},
+		{"pypi missing letter", pypi, "reqests", "requests", 1},
+		{"pypi two edits", pypi, "reqeust", "requests", 2},
+		{"pep503 case and separators", pypi, "Python_DateUtill", "python-dateutil", 1},
+		{"pep503 dot run", pypi, "python..dateutl", "python-dateutil", 1},
+		{"npm uppercase", npm, "Lodahs", "lodash", 1},
+		{"npm scope typo", npm, "@typse/node", "@types/node", 1},
+		{"npm scoped name typo", npm, "@types/nodee", "@types/node", 1},
+		{"npm scope and name", npm, "@type/nod", "@types/node", 2},
+		{"npm one-letter scope on an unscoped name", npm, "@a/lodash", "lodash", 1},
+		{"npm two-letter scope on an unscoped name", npm, "@ab/lodash", "lodash", 2},
+		{"cargo separator is not an edit", cargo, "Serde-Jsno", "serde_json", 1},
+		{"cargo", cargo, "tokioo", "tokio", 1},
+	}
+	for _, c := range cases {
+		popular, dist, ok := c.list.Near(c.cand)
+		if !ok || popular != c.popular || dist != c.dist {
+			t.Errorf("%s: Near(%q) = %q, %d, %v; want %q, %d, true", c.name, c.cand, popular, dist, ok, c.popular, c.dist)
+		}
+	}
+
+	misses := []struct {
+		name string
+		list PopularNames
+		cand string
+	}{
+		{"pypi equal", pypi, "requests"},
+		{"pep503 equal", pypi, "Python_DateUtil"},
+		{"pep503 dots equal", pypi, "python.dateutil"},
+		{"far", pypi, "bodega-internal-widget"},
+		{"three edits", pypi, "rekwestz"},
+		{"npm equal scoped", npm, "@Types/Node"},
+		// The scope distances add to the name's: `@evil` against no scope is
+		// 4, so `@evil/lodash` is 4 from `lodash`, while `@a/lodash` is 1.
+		{"npm foreign scope", npm, "@evil/lodash"},
+		{"npm unscoped against scoped", npm, "types-node"},
+		{"cargo equal after separator", cargo, "serde-json"},
+	}
+	for _, c := range misses {
+		if popular, dist, ok := c.list.Near(c.cand); ok {
+			t.Errorf("%s: Near(%q) = %q at %d, want no hit", c.name, c.cand, popular, dist)
+		}
+	}
+}
+
+// A scope is compared with the other name's scope, so one the popular name
+// lacks costs its length and no more: the `@` and `/` are not edits.
+func TestNearScopedAgainstUnscopedEmbedded(t *testing.T) {
+	npm, _ := EmbeddedPopularNames(manifest.TypeNpm)
+	if popular, dist, ok := npm.Near("@a/yaml"); !ok || popular != "yaml" || dist != 1 {
+		t.Errorf("Near(%q) = %q, %d, %v; want %q, 1, true", "@a/yaml", popular, dist, ok, "yaml")
+	}
+}
+
+// Nearest skips names it can prove are no closer than the best so far; the
+// skip must never change the answer. Every candidate gets the name and the
+// distance a scan of the whole list returns, ties going to the more popular.
+// The scan is quadratic in the list, so a sample of names seeds candidates,
+// denser for npm, whose floor splits the scope and so is not the textbook
+// length bound pypi and cargo use.
+func TestNearestMatchesBruteForce(t *testing.T) {
+	for _, eco := range SimilarityEcosystems() {
+		p, _ := EmbeddedPopularNames(eco)
+		stride := 50
+		if eco == manifest.TypeNpm {
+			stride = 17
+		}
+		var cands []string
+		for i, n := range p.Names {
+			if i%stride != 0 {
+				continue
+			}
+			cands = append(cands, n, n+"x", n[1:])
+			if eco != manifest.TypeNpm {
+				continue
+			}
+			if scope, bare := splitNpmScope(n); scope == "" {
+				cands = append(cands, "@a/"+n, "@ab/"+n)
+			} else {
+				cands = append(cands, bare, "@"+scope[1:]+"/"+bare)
+			}
+		}
+		for _, c := range cands {
+			key := NormalizeName(eco, c)
+			want, wantD := "", -1
+			for i, k := range p.keys {
+				if d := nameDistance(eco, key, k); wantD < 0 || d < wantD {
+					want, wantD = p.Names[i], d
+				}
+			}
+			if got, gotD, _ := p.Nearest(c); got != want || gotD != wantD {
+				t.Errorf("%s: Nearest(%q) = %q at %d; the whole list says %q at %d", eco, c, got, gotD, want, wantD)
+			}
+		}
+	}
+}
+
+func TestParsePopularNames(t *testing.T) {
+	p, err := ParsePopularNames(manifest.TypePypi, []byte("# Top things\n# source: https://example.test/top.json\n# n: 3\n# date: 2026-10-01\nrequests\n\nRequests\nnumpy\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Source != "https://example.test/top.json" || p.Date != "2026-10-01" {
+		t.Errorf("header = %q, %q", p.Source, p.Date)
+	}
+	if strings.Join(p.Names, ",") != "requests,numpy" {
+		t.Errorf("Names = %v, want the duplicate dropped after normalization", p.Names)
+	}
+	if !strings.HasPrefix(p.SHA256, "sha256:") {
+		t.Errorf("SHA256 = %q", p.SHA256)
+	}
+	if _, err := ParsePopularNames(manifest.TypePypi, []byte("# only a header\n")); err == nil {
+		t.Error("an empty list parsed")
+	}
+	if _, err := ParsePopularNames(manifest.TypePypi, []byte("requests 2.0\n")); err == nil {
+		t.Error("a line with a space parsed as a name")
+	}
+}
+
+// Every shipped list records N and the source date in its header, and N is
+// what it holds.
+func TestEmbeddedListsRecordTheirHeader(t *testing.T) {
+	for _, eco := range SimilarityEcosystems() {
+		data, err := popularFS.ReadFile("popular/" + eco + ".txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		for _, line := range strings.Split(string(data), "\n") {
+			if v, ok := strings.CutPrefix(line, "# n: "); ok {
+				n, _ = strconv.Atoi(v)
+			}
+		}
+		p, ok := EmbeddedPopularNames(eco)
+		if !ok {
+			t.Fatalf("%s: no embedded list", eco)
+		}
+		if n == 0 || len(p.Names) != n {
+			t.Errorf("%s: header n=%d, list holds %d", eco, n, len(p.Names))
+		}
+		if _, err := time.Parse("2006-01-02", p.Date); err != nil || p.Source == "" {
+			t.Errorf("%s: header date %q source %q", eco, p.Date, p.Source)
+		}
+	}
+	if _, ok := EmbeddedPopularNames(manifest.TypeGomod); ok {
+		t.Error("gomod has an embedded list")
+	}
+	if p, _ := EmbeddedPopularNames(manifest.TypePypi); !p.Contains("requests") {
+		t.Error("the pypi list does not hold requests")
+	}
+}
+
+// similarityStore is the check's reads, held in memory.
+type similarityStore struct {
+	action   string
+	loaded   *audit.PopularList
+	rules    []Rule
+	taken    bool
+	baseline map[string]bool
+	err      error
+}
+
+func (s *similarityStore) GetSimilarityPolicy(_ context.Context, eco string) (audit.SimilarityPolicy, error) {
+	if s.err != nil {
+		return audit.SimilarityPolicy{}, s.err
+	}
+	if s.action == "" {
+		return audit.SimilarityPolicy{}, audit.ErrSimilarityPolicyNotFound
+	}
+	return audit.SimilarityPolicy{Ecosystem: eco, Action: s.action}, nil
+}
+func (s *similarityStore) GetPopularList(context.Context, string) (audit.PopularList, error) {
+	if s.loaded == nil {
+		return audit.PopularList{}, audit.ErrPopularListNotFound
+	}
+	return *s.loaded, nil
+}
+func (s *similarityStore) GetPoliciesByType(context.Context, string) ([]Rule, error) {
+	return s.rules, nil
+}
+func (s *similarityStore) NameBaseline(context.Context) (audit.NameBaselineState, error) {
+	return audit.NameBaselineState{Taken: s.taken, TakenAt: time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC), Packages: len(s.baseline)}, nil
+}
+func (s *similarityStore) InNameBaseline(_ context.Context, typ, key string) (bool, error) {
+	return s.baseline[typ+"/"+key], nil
+}
+
+func checkName(t *testing.T, store SimilarityStore, typ, name string) Result {
+	t.Helper()
+	pm := &manifest.PackageManifest{Type: typ, Name: name, Versions: []manifest.VersionEntry{{Version: "1.0.0"}}}
+	return NewNameSimilarityChecker(store).Check(t.Context(), pm, &pm.Versions[0])
+}
+
+func TestNameSimilarityCheckerActions(t *testing.T) {
+	r := checkName(t, &similarityStore{}, manifest.TypePypi, "reqeusts")
+	if r.Check != audit.CheckNameSimilarity || r.Action != ActionWarn {
+		t.Fatalf("default = %+v, want a warn", r)
+	}
+	if !strings.Contains(r.Reason, "requests") || !strings.Contains(r.Reason, "distance 1") {
+		t.Errorf("reason %q does not name the popular name and the distance", r.Reason)
+	}
+	if r.Details["nearest"] != "requests" || r.Details["distance"] != 1 {
+		t.Errorf("details = %v", r.Details)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypePypi, "reqeusts"); r.Action != ActionBlock {
+		t.Errorf("block = %+v", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionIgnore}, manifest.TypePypi, "reqeusts"); r.Action != ActionIgnore || !strings.Contains(r.Reason, "requests") {
+		t.Errorf("ignore = %+v, want ignore still naming the near name", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypePypi, "requests"); r.Action != ActionPass {
+		t.Errorf("a popular name = %+v, want a pass", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypePypi, "bodega-internal-widget"); r.Action != ActionPass {
+		t.Errorf("a far name = %+v, want a pass", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeGomod, "github.com/gorila/mux"); r.Action != ActionNotEvaluated {
+		t.Errorf("gomod = %+v, want not_evaluated", r)
+	}
+	if r := checkName(t, nil, manifest.TypePypi, "reqeusts"); r.Action != ActionNotEvaluated {
+		t.Errorf("no store = %+v, want not_evaluated", r)
+	}
+	if r := checkName(t, &similarityStore{err: errors.New("disk")}, manifest.TypePypi, "reqeusts"); r.Action != ActionWarn {
+		t.Errorf("policy read failure = %+v, want a warn", r)
+	}
+}
+
+// Names an exact rule names, or that the store held when the baseline was
+// taken, pass under block; a wildcard rule exempts nothing.
+func TestNameSimilarityExemptions(t *testing.T) {
+	exact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypePypi, Pattern: "Reqeusts"}}}
+	if r := checkName(t, exact, manifest.TypePypi, "reqeusts"); r.Action != ActionPass || !strings.Contains(r.Reason, "exact rule") {
+		t.Errorf("exact rule = %+v, want an exempt pass", r)
+	}
+	wildcard := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeNpm, Pattern: "@typse/*"}}}
+	if r := checkName(t, wildcard, manifest.TypeNpm, "@typse/node"); r.Action != ActionBlock {
+		t.Errorf("wildcard rule = %+v, want a block", r)
+	}
+	scopedExact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeNpm, Pattern: "@typse/node"}}}
+	if r := checkName(t, scopedExact, manifest.TypeNpm, "@typse/node"); r.Action != ActionPass {
+		t.Errorf("scoped exact rule = %+v, want a pass", r)
+	}
+
+	// The baseline is keyed by the store's safe name, so a scoped npm name
+	// is found the way the store lists it.
+	inUse := &similarityStore{action: ActionBlock, taken: true, baseline: map[string]bool{
+		"npm/" + NormalizeName(manifest.TypeNpm, manifest.SafeName("@typse/node")): true,
+		"pypi/reqeusts": true,
+	}}
+	if r := checkName(t, inUse, manifest.TypeNpm, "@Typse/Node"); r.Action != ActionPass || !strings.Contains(r.Reason, "baseline") {
+		t.Errorf("baseline npm = %+v, want an exempt pass", r)
+	}
+	if r := checkName(t, inUse, manifest.TypePypi, "Reqeusts"); r.Action != ActionPass {
+		t.Errorf("baseline pypi under PEP 503 = %+v, want a pass", r)
+	}
+	if r := checkName(t, inUse, manifest.TypePypi, "reqests"); r.Action != ActionBlock {
+		t.Errorf("a name outside the baseline = %+v, want a block", r)
+	}
+}
+
+// A loaded list replaces the embedded one whole.
+func TestLoadedListReplacesEmbedded(t *testing.T) {
+	text := "# source: internal mirror\nacme-core\n"
+	p, _ := ParsePopularNames(manifest.TypePypi, []byte(text))
+	store := &similarityStore{action: ActionBlock, loaded: &audit.PopularList{Ecosystem: manifest.TypePypi, Names: text, SHA256: p.SHA256}}
+	if r := checkName(t, store, manifest.TypePypi, "acme-cor"); r.Action != ActionBlock || !strings.Contains(r.Reason, "loaded list") {
+		t.Errorf("near a loaded name = %+v", r)
+	}
+	if r := checkName(t, store, manifest.TypePypi, "reqeusts"); r.Action != ActionPass {
+		t.Errorf("near an embedded name after a load = %+v, want a pass", r)
+	}
+}
+
+func TestTakeNameBaselineOnce(t *testing.T) {
+	adb, err := audit.Open(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	ctx := t.Context()
+	took, err := TakeNameBaseline(ctx, adb, map[string][]string{manifest.TypePypi: {"Reqeusts"}, manifest.TypeNpm: {"@typse--node"}})
+	if err != nil || !took {
+		t.Fatalf("first take = %v, %v", took, err)
+	}
+	took, err = TakeNameBaseline(ctx, adb, map[string][]string{manifest.TypePypi: {"reqests"}})
+	if err != nil || took {
+		t.Fatalf("second take = %v, %v, want no second baseline", took, err)
+	}
+	r := checkName(t, adb, manifest.TypePypi, "reqeusts")
+	if r.Action != ActionPass {
+		t.Errorf("baseline name = %+v", r)
+	}
+	if r := checkName(t, adb, manifest.TypeNpm, "@typse/node"); r.Action != ActionPass {
+		t.Errorf("baseline scoped name = %+v", r)
+	}
+	if r := checkName(t, adb, manifest.TypePypi, "reqests"); r.Action != ActionWarn {
+		t.Errorf("name offered to the second take = %+v, want a warn", r)
+	}
+	if st, _ := adb.NameBaseline(ctx); !st.Taken || st.Packages != 2 || st.Admitted != 0 {
+		t.Errorf("NameBaseline = %+v", st)
+	}
+}

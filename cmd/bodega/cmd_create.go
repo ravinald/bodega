@@ -152,7 +152,7 @@ Examples:
 				ve = manifest.VersionEntry{}
 			}
 
-			if err := confirmPolicyOverride(ctx, r, gf, cfg, t, name, ve); err != nil {
+			if err := confirmPolicyOverride(ctx, r, gf, cfg, store, t, name, ve); err != nil {
 				return err
 			}
 
@@ -253,12 +253,13 @@ func setStoragePolicy(ctx context.Context, store *manifest.Store, t, name, polic
 //
 // The decision is written to the admissions table whatever it is, with the
 // operator's answer as its own check beside the allow-list's refusal.
-func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, cfg *config.Config, t, name string, ve manifest.VersionEntry) error {
+func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, cfg *config.Config, store *manifest.Store, t, name string, ve manifest.VersionEntry) error {
 	adb := openAuditDB(gf)
 	if adb == nil {
 		return nil
 	}
 	defer adb.Close()
+	takeNameBaseline(ctx, adb, store)
 
 	actor := audit.CurrentActor()
 	pm := &manifest.PackageManifest{Type: t, Name: name, Versions: []manifest.VersionEntry{ve}}

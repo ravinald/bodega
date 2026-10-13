@@ -93,6 +93,7 @@ it once before a hosted index can date them.`,
 			if auditDB != nil {
 				defer auditDB.Close()
 			}
+			takeNameBaseline(cmd.Context(), auditDB, store)
 
 			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Force = force

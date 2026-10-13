@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -40,6 +41,7 @@ least one rule for a registry type to switch enforcement on for that type.`,
 		newPolicyAgeCmd(gf),
 		newPolicyOSVCmd(gf),
 		newPolicyProvenanceCmd(gf),
+		newPolicySimilarityCmd(gf),
 		newPolicyFilterCmd(gf),
 	)
 	return parent
@@ -107,7 +109,11 @@ Examples:
   bodega policy add pypi django
   bodega policy add npm @example-cloud/*
   bodega policy add gomod example.com/example-corp/
-  bodega policy add binary https://downloads.example.com/`,
+  bodega policy add binary https://downloads.example.com/
+
+An exact npm, pypi or cargo name within two edits of a popular package it is
+not equal to is a likely typo, and an exact rule exempts the name from the
+name similarity check, so add names both and asks before writing the rule.`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			regType := args[0]
@@ -146,6 +152,21 @@ Examples:
 			id := hex.EncodeToString(idBytes)
 
 			ctx := context.Background()
+			details := fmt.Sprintf("id=%s kind=%s", id, kind)
+			popular, distance, near, err := policy.NearPopularName(ctx, adb, regType, pattern)
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s was not compared with the popular %s names: %v\n", pattern, regType, err)
+			}
+			if near {
+				ok, err := confirmNearPopular(cmd, regType, pattern, popular, distance)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("not added: %s %q is distance %d from the popular package %q", regType, pattern, distance, popular)
+				}
+				details += fmt.Sprintf(" near_popular=%s distance=%d confirmed=yes", popular, distance)
+			}
 			rule := audit.PolicyInfo{
 				ID:           id,
 				RegistryType: regType,
@@ -164,13 +185,32 @@ Examples:
 				PkgName:   regType + ":" + pattern,
 				Actor:     audit.CurrentActor(),
 				Status:    "success",
-				Details:   fmt.Sprintf("id=%s kind=%s", id, kind),
+				Details:   details,
 			})
 
 			fmt.Printf("Added %s %s %q (id=%s)\n", regType, kind, pattern, id)
 			return nil
 		},
 	}
+}
+
+// confirmNearPopular asks whether to add an exact rule for a name near a
+// popular one. Anything but y or yes is a no, and so is a stdin that ends
+// before an answer: a script piping nothing in must not add the rule.
+func confirmNearPopular(cmd *cobra.Command, regType, pattern, popular string, distance int) (bool, error) {
+	errw := cmd.ErrOrStderr()
+	fmt.Fprintln(errw)
+	fmt.Fprintf(errw, "  WARNING: %s %q is distance %d from the popular package %q\n", regType, pattern, distance, popular)
+	fmt.Fprintf(errw, "    An exact rule exempts %q from the name similarity check, so a typo here admits the squat.\n", pattern)
+	fmt.Fprintln(errw)
+	fmt.Fprintf(errw, "Add the rule for %q, not %q? [y/N]: ", pattern, popular)
+	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Fprintln(errw)
+		return false, nil
+	}
+	answer := strings.TrimSpace(line)
+	return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes"), nil
 }
 
 func newPolicyRemoveCmd(gf *globalFlags) *cobra.Command {

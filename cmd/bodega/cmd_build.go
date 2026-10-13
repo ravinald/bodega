@@ -74,6 +74,7 @@ When a name is given after the type, only that entry is built.`,
 			if auditDB != nil {
 				defer auditDB.Close()
 			}
+			takeNameBaseline(cmd.Context(), auditDB, store)
 
 			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Stdout = buildOut

@@ -262,13 +262,15 @@ func TestPypiCanonicalFormIsTheSameThroughEveryPolicyCaller(t *testing.T) {
 	}
 }
 
-// digestStore is the five listings Digest reads, held in memory.
+// digestStore is the listings Digest reads, held in memory.
 type digestStore struct {
 	rules      []audit.PolicyInfo
 	ages       []audit.AgePolicy
 	osvs       []audit.OSVPolicy
 	malware    []audit.OSVMalwarePolicy
 	provenance []audit.ProvenancePolicy
+	similarity []audit.SimilarityPolicy
+	lists      []audit.PopularList
 }
 
 func (d *digestStore) ListPolicies(context.Context) ([]audit.PolicyInfo, error) { return d.rules, nil }
@@ -283,6 +285,12 @@ func (d *digestStore) ListOSVMalwarePolicies(context.Context) ([]audit.OSVMalwar
 }
 func (d *digestStore) ListProvenancePolicies(context.Context) ([]audit.ProvenancePolicy, error) {
 	return d.provenance, nil
+}
+func (d *digestStore) ListSimilarityPolicies(context.Context) ([]audit.SimilarityPolicy, error) {
+	return d.similarity, nil
+}
+func (d *digestStore) ListPopularLists(context.Context) ([]audit.PopularList, error) {
+	return d.lists, nil
 }
 
 // TestDigestTracksPolicyContent pins the two properties an admission row's
@@ -299,6 +307,8 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 			osvs:       []audit.OSVPolicy{{Ecosystem: "pypi", Action: ActionWarn}},
 			malware:    []audit.OSVMalwarePolicy{{Ecosystem: "npm", Action: ActionWarn, Reason: "r"}},
 			provenance: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: ActionBlock, Actor: "ravi"}},
+			similarity: []audit.SimilarityPolicy{{Ecosystem: "pypi", Action: ActionBlock, Actor: "ravi"}},
+			lists:      []audit.PopularList{{Ecosystem: "cargo", SHA256: "sha256:aa", Source: "a.txt"}},
 		}
 	}
 	digest := func(s *digestStore) string {
@@ -324,6 +334,8 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 		"policy_row_touched_without_change": func(s *digestStore) { s.ages[0].UpdatedAt = time.Now() },
 		"malware_reason_reworded":           func(s *digestStore) { s.malware[0].Reason = "other" },
 		"provenance_set_by_someone_else":    func(s *digestStore) { s.provenance[0].Actor = "other" },
+		"similarity_set_by_someone_else":    func(s *digestStore) { s.similarity[0].Actor = "other" },
+		"same_list_loaded_from_elsewhere":   func(s *digestStore) { s.lists[0].Source, s.lists[0].Actor = "b.txt", "other" },
 	}
 	for name, edit := range same {
 		s := base()
@@ -348,6 +360,13 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 		"malware_policy_removed":    func(s *digestStore) { s.malware = nil },
 		"provenance_action_edited":  func(s *digestStore) { s.provenance[0].Action = ActionWarn },
 		"provenance_policy_removed": func(s *digestStore) { s.provenance = nil },
+		"similarity_action_edited":  func(s *digestStore) { s.similarity[0].Action = ActionWarn },
+		"similarity_policy_removed": func(s *digestStore) { s.similarity = nil },
+		"popular_list_replaced":     func(s *digestStore) { s.lists[0].SHA256 = "sha256:bb" },
+		"popular_list_loaded": func(s *digestStore) {
+			s.lists = append(s.lists, audit.PopularList{Ecosystem: "npm", SHA256: "sha256:cc"})
+		},
+		"popular_list_unloaded": func(s *digestStore) { s.lists = nil },
 		"osv_policy_added": func(s *digestStore) {
 			s.osvs = append(s.osvs, audit.OSVPolicy{Ecosystem: "npm", Action: ActionBlock})
 		},

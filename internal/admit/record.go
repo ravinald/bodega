@@ -13,7 +13,7 @@ import (
 
 // versionChecks are the checks VersionCheckers run, in row order, for the
 // bookkeeping that marks them not run.
-var versionChecks = []string{audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance}
+var versionChecks = []string{audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance, audit.CheckNameSimilarity}
 
 // allChecks is every check an admission row names.
 var allChecks = append([]string{audit.CheckAllowList}, versionChecks...)
@@ -33,7 +33,7 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	ev := &evaluation{
 		checks: make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
 		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone,
-			audit.CheckUpstreamProvenance: policy.ActionWarn},
+			audit.CheckUpstreamProvenance: policy.ActionWarn, audit.CheckNameSimilarity: policy.ActionWarn},
 	}
 	if adb == nil {
 		return ev
@@ -42,6 +42,11 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		ev.actions[audit.CheckUpstreamProvenance] = a
 	} else {
 		ev.actions[audit.CheckUpstreamProvenance] = "unknown"
+	}
+	if a, err := policy.SimilarityAction(ctx, adb, pm.Type); err == nil {
+		ev.actions[audit.CheckNameSimilarity] = a
+	} else {
+		ev.actions[audit.CheckNameSimilarity] = "unknown"
 	}
 	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
 	if p, err := adb.GetAgePolicy(ctx, pm.Type); err == nil {
@@ -168,7 +173,7 @@ func (ev *evaluation) commit(ctx context.Context, pm *manifest.PackageManifest, 
 }
 
 // row renders version i as an admission row. Every row names the allow-list,
-// age, OSV and upstream provenance checks, so a consumer never has to read a
+// age, OSV, upstream provenance and name similarity checks, so a consumer never has to read a
 // missing entry as a pass.
 func (ev *evaluation) row(pm *manifest.PackageManifest, i int, decision string, who Who) audit.Admission {
 	checks := append([]audit.AdmissionCheck(nil), ev.checks[i]...)
@@ -260,8 +265,10 @@ func checkRank(name string) int {
 		return 3
 	case audit.CheckUpstreamProvenance:
 		return 4
+	case audit.CheckNameSimilarity:
+		return 5
 	}
-	return 5
+	return 6
 }
 
 // admissionVersion is the version an admission row is keyed by, and it is

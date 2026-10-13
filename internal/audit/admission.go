@@ -236,6 +236,7 @@ func NotEvaluatedChecks(detail string) []AdmissionCheck {
 		{Check: CheckAge, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 		{Check: CheckOSV, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 		{Check: CheckUpstreamProvenance, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
+		{Check: CheckNameSimilarity, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 	}
 }
 

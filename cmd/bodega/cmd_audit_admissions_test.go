@@ -288,7 +288,7 @@ func TestCreateRecordsTheOperatorsOverride(t *testing.T) {
 	ve := manifest.VersionEntry{Version: "1.2.8"}
 	r := bufio.NewReader(strings.NewReader("y\n"))
 	captureStdout(t, func() {
-		if err := confirmPolicyOverride(context.Background(), r, &globalFlags{}, cfg, manifest.TypeNpm, "minimist", ve); err != nil {
+		if err := confirmPolicyOverride(context.Background(), r, &globalFlags{}, cfg, nil, manifest.TypeNpm, "minimist", ve); err != nil {
 			t.Errorf("confirmPolicyOverride: %v", err)
 		}
 	})
