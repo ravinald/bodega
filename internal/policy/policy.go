@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -299,22 +300,26 @@ func firstSegment(p string) string {
 	return p
 }
 
-// DigestStore is what Digest reads: every row of the five tables an
-// admission decision is judged against. *audit.DB satisfies it.
+// DigestStore is what Digest reads: every row of the tables an admission
+// decision is judged against. *audit.DB satisfies it.
 type DigestStore interface {
 	ListPolicies(ctx context.Context) ([]audit.PolicyInfo, error)
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
 	ListOSVMalwarePolicies(ctx context.Context) ([]audit.OSVMalwarePolicy, error)
 	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
+	ListSimilarityPolicies(ctx context.Context) ([]audit.SimilarityPolicy, error)
+	ListPopularLists(ctx context.Context) ([]audit.PopularList, error)
 }
 
 // Digest returns "sha256:<hex>" over a canonical serialization of the
-// allow-list rules and the age_policy, osv_policy, osv_malware_policy and
-// upstream_provenance_policy rows, which is what an admission row cites as
-// the policy it was decided under.
+// allow-list rules, the age_policy, osv_policy, osv_malware_policy,
+// upstream_provenance_policy and name_similarity_policy rows, and the SHA-256
+// of the popular-name list in force for each ecosystem, which is what an
+// admission row cites as the policy it was decided under.
 // The malware rows are in it because the OSV check refuses on them too, with
-// a default of block that an absent osv_policy row does not turn off.
+// a default of block that an absent osv_policy row does not turn off. The
+// popular lists are in it because loading one changes which names fail.
 //
 // Only the fields that change a verdict are hashed. A rule's id, comment,
 // author and timestamp are left out, so removing a rule and adding it back is
@@ -342,6 +347,14 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("policy digest: list upstream provenance policies: %w", err)
 	}
+	similarity, err := store.ListSimilarityPolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list name similarity policies: %w", err)
+	}
+	loaded, err := store.ListPopularLists(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list popular-name lists: %w", err)
+	}
 
 	type rule struct {
 		Type    string `json:"type"`
@@ -365,7 +378,10 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 		Malware   []osv  `json:"osv_malware"`
 		// Provenance reuses osv's two fields: an ecosystem and an action.
 		Provenance []osv `json:"upstream_provenance"`
-	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}, Provenance: []osv{}}
+		Similarity []osv `json:"name_similarity"`
+		// Popular reuses osv's fields too: an ecosystem and the list's hash.
+		Popular []osv `json:"popular_lists"`
+	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}, Provenance: []osv{}, Similarity: []osv{}}
 	for _, r := range rules {
 		canon.AllowList = append(canon.AllowList, rule{r.RegistryType, r.RuleKind, r.Pattern})
 	}
@@ -381,6 +397,21 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	for _, p := range provenance {
 		canon.Provenance = append(canon.Provenance, osv{p.Ecosystem, p.Action})
 	}
+	for _, p := range similarity {
+		canon.Similarity = append(canon.Similarity, osv{p.Ecosystem, p.Action})
+	}
+	lists := map[string]string{}
+	for _, eco := range SimilarityEcosystems() {
+		if p, ok := EmbeddedPopularNames(eco); ok {
+			lists[eco] = p.SHA256
+		}
+	}
+	for _, l := range loaded {
+		lists[l.Ecosystem] = l.SHA256
+	}
+	for _, eco := range slices.Sorted(maps.Keys(lists)) {
+		canon.Popular = append(canon.Popular, osv{eco, lists[eco]})
+	}
 	slices.SortFunc(canon.AllowList, func(a, b rule) int {
 		return strings.Compare(a.Type+"\x00"+a.Kind+"\x00"+a.Pattern, b.Type+"\x00"+b.Kind+"\x00"+b.Pattern)
 	})
@@ -388,6 +419,7 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	slices.SortFunc(canon.OSV, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 	slices.SortFunc(canon.Malware, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 	slices.SortFunc(canon.Provenance, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
+	slices.SortFunc(canon.Similarity, func(a, b osv) int { return strings.Compare(a.Ecosystem, b.Ecosystem) })
 
 	blob, err := json.Marshal(canon)
 	if err != nil {

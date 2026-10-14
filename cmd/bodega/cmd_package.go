@@ -67,6 +67,7 @@ When a name is given after the type, only that entry is packaged.`,
 			if auditDB != nil {
 				defer auditDB.Close()
 			}
+			takeNameBaseline(cmd.Context(), auditDB, store)
 
 			// The cargo arm cascades into ensureFetchedCargo, so this command
 			// reaches a fetcher and needs the allow-list the fetch commands

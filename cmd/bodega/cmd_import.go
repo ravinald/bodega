@@ -91,6 +91,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 			if adb != nil {
 				checker = policy.NewChecker(adb)
 			}
+			takeNameBaseline(ctx, adb, store)
 
 			var imported int
 			for _, path := range args {
