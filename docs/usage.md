@@ -750,7 +750,7 @@ web-01: 414 installed, 409 served to it, 1 never_served, 1 served_elsewhere, 1 p
 | `--all`, `--inventory-dir` | off     | Compare every `<host>.json` in the directory and print one summary line per host           |
 | `--json`                   | off     | One report object, or an array of them under `--all`, with the counts, limits and findings |
 
-The exit code is for a scheduled job: 0 when no host has a `never_served` or `served_elsewhere` finding, 2 when any does, 1 when bodega could not answer (no audit store, a `syslog` or `jsonl` sink that keeps nothing to read, an unreadable inventory). Under `--all` an unreadable `<host>.json` is named on stderr and its line reads `error`; 2 still wins over it, so one broken file does not hide another host's bypass.
+The exit code is for a scheduled job: 0 when no host has a `never_served` or `served_elsewhere` finding, 2 when any does, 1 when bodega could not answer (no audit store, a `syslog` or `jsonl` sink that keeps nothing to read, an audit store with no events or no `serve_fetch` row naming a stored object, an unreadable inventory). An `audit_db` path that does not exist yet opens as an empty store, so a typo or a fresh deploy exits 1 with "the audit store holds no events; there is no serve record to compare <host> against" before any inventory is read, rather than reporting every host as a bypass. Under `--all` an unreadable `<host>.json` is named on stderr and its line reads `error`; 2 still wins over it, so one broken file does not hide another host's bypass.
 
 #### Inventories
 

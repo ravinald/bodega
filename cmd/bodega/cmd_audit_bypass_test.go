@@ -337,6 +337,51 @@ func TestAuditBypassExitCodes(t *testing.T) {
 		})
 	}
 
+	// A fresh audit_db, as a typo or a new deploy leaves it, opens empty and
+	// holds no serve record: the run cannot answer, whatever the inventory
+	// carries, and says so before reading it.
+	emptyCfg := filepath.Join(dir, "empty.json")
+	emptyBody := fmt.Sprintf(`{"storage_backend":"local","storage_path":%q,"manifest_dir":%q,"audit_db":%q,"log_dir":%q,"allow_plaintext":true,"apt_codename":"noble"}`,
+		filepath.Join(dir, "storage"), filepath.Join(dir, "manifests"), filepath.Join(dir, "fresh", "audit.db"), dir)
+	if err := os.WriteFile(emptyCfg, []byte(emptyBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "fresh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	five := filepath.Join(dir, "five.txt")
+	six := filepath.Join(dir, "six.txt")
+	if err := os.WriteFile(five, []byte("curl\t8.5.0\tamd64\tinstall ok installed\tcurl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(six, []byte("curl\t8.5.0\tamd64\tinstall ok installed\tcurl\t978307200\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fleet := filepath.Join(dir, "fleet")
+	if err := os.Mkdir(fleet, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	npmInventory(t, filepath.Join(fleet, "web-01.json"), []string{"nowhere"}, nil)
+	npmInventory(t, filepath.Join(fleet, "web-02.json"), []string{"old"}, map[string]string{"old": "2001-01-01T00:00:00Z"})
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"empty store, five-column dpkg", []string{"web-01", "--inventory", five, "--type", "apt"}},
+		{"empty store, six-column dpkg", []string{"web-01", "--inventory", six, "--type", "apt"}},
+		{"empty store, --all", []string{"--all", "--inventory-dir", fleet}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runBypassChild(t, emptyCfg, tc.args)
+			if code != 1 || !strings.Contains(out, "holds no events; there is no serve record to compare") {
+				t.Errorf("exit %d, want 1 naming the empty store; output:\n%s", code, out)
+			}
+			if strings.Contains(out, "never_served") || strings.Contains(out, "predates_audit") {
+				t.Errorf("an empty store produced findings beside its error:\n%s", out)
+			}
+		})
+	}
+
 	// An audit sink that keeps nothing to read cannot answer.
 	cfg := filepath.Join(dir, "jsonl.json")
 	body := fmt.Sprintf(`{"storage_backend":"local","storage_path":%q,"manifest_dir":%q,"log_dir":%q,"audit_sink":"jsonl","audit_sink_dsn":%q,"apt_codename":"noble"}`,
@@ -344,13 +389,55 @@ func TestAuditBypassExitCodes(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	args, _ := json.Marshal([]string{"audit", "bypass", "web-01", "--inventory", clean})
+	if out, code := runBypassChild(t, cfg, []string{"web-01", "--inventory", clean}); code != 1 {
+		t.Errorf("jsonl sink: exit %d, want 1; output:\n%s", code, out)
+	}
+}
+
+func runBypassChild(t *testing.T, cfg string, args []string) (string, int) {
+	t.Helper()
+	argv, _ := json.Marshal(append([]string{"audit", "bypass"}, args...))
 	cmd := exec.Command(os.Args[0], "-test.run=^TestAuditBypassExitHelper$")
-	cmd.Env = append(os.Environ(), auditChildArgvEnv+"="+string(args), config.EnvConfigFile+"="+cfg)
+	cmd.Env = append(os.Environ(), auditChildArgvEnv+"="+string(argv), config.EnvConfigFile+"="+cfg)
 	out, err := cmd.CombinedOutput()
 	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
-		t.Errorf("jsonl sink: err %v, want exit 1; output:\n%s", err, out)
+	if errors.As(err, &exit) {
+		return string(out), exit.ExitCode()
+	}
+	if err != nil {
+		t.Fatalf("run child: %v", err)
+	}
+	return string(out), 0
+}
+
+// TestAuditBypassRefusesAStoreWithNoServeRecord covers the store that holds
+// events but never a serve of an object: CLI writes landed, the server's did
+// not. Against it every host reads as a bypass.
+func TestAuditBypassRefusesAStoreWithNoServeRecord(t *testing.T) {
+	dir := t.TempDir()
+	db, err := audit.Open(filepath.Join(dir, "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Record(t.Context(), audit.Event{EventType: audit.EventServeFetch, PkgType: "npm", PkgName: "packument-only", Identity: "web-01"}); err != nil {
+		t.Fatal(err)
+	}
+	inv := filepath.Join(dir, "web-01.json")
+	npmInventory(t, inv, []string{"nowhere"}, nil)
+
+	var out bytes.Buffer
+	code, err := runAuditBypass(t.Context(), &out, db, bypassRequest{Host: "web-01", Inventory: inv}, false)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "no serve_fetch row naming a stored object") || out.Len() != 0 {
+		t.Errorf("code %d err %v output %q; want 1, an error naming the missing serve record, and no report", code, err, out.String())
+	}
+
+	// The store is refused before any inventory is read, so a missing one
+	// does not take the blame.
+	_, err = runAuditBypass(t.Context(), &out, db, bypassRequest{Host: "web-01", Inventory: filepath.Join(dir, "missing.json"),
+		ExcludeImage: filepath.Join(dir, "missing-image.json")}, false)
+	if err == nil || !strings.Contains(err.Error(), "no serve record to compare web-01 against") {
+		t.Errorf("err = %v, want the store named ahead of the unreadable inventories", err)
 	}
 }
 

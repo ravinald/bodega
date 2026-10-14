@@ -135,7 +135,8 @@ another name, and every serve at all when no binding names the host.
 
 Exits 0 when no host has a never_served or served_elsewhere finding, 2 when
 any does, and 1 when bodega could not answer, so a scheduled job can alert on
-it. Under --all, a host that cannot be read is named on stderr and does not
+it. An audit store holding no serve_fetch row is one that cannot answer: it
+is refused before any inventory is read. Under --all, a host that cannot be read is named on stderr and does not
 hide another host's findings: 2 wins over 1.
 
 Examples:
@@ -225,6 +226,18 @@ func runAuditBypass(ctx context.Context, w io.Writer, db *audit.DB, req bypassRe
 			return 1, err
 		}
 	}
+	hist, err := db.ServeHistory(ctx)
+	if err != nil {
+		return 1, fmt.Errorf("read what bodega served: %w", err)
+	}
+	if err := checkServeRecord(hist, req); err != nil {
+		return 1, err
+	}
+	bindings, err := db.ListIdentityBindings(ctx)
+	if err != nil {
+		return 1, fmt.Errorf("read identity bindings: %w", err)
+	}
+
 	var image map[string]bool
 	if req.ExcludeImage != "" {
 		pkgs, _, err := readBypassInventory(req.ExcludeImage, req.Type, req.Stderr)
@@ -237,14 +250,6 @@ func runAuditBypass(ctx context.Context, w io.Writer, db *audit.DB, req bypassRe
 		}
 	}
 
-	hist, err := db.ServeHistory(ctx)
-	if err != nil {
-		return 1, fmt.Errorf("read what bodega served: %w", err)
-	}
-	bindings, err := db.ListIdentityBindings(ctx)
-	if err != nil {
-		return 1, fmt.Errorf("read identity bindings: %w", err)
-	}
 	served := indexServeHistory(hist.Records)
 
 	if req.Dir == "" {
@@ -305,6 +310,27 @@ func runAuditBypass(ctx context.Context, w io.Writer, db *audit.DB, req bypassRe
 		return 1, fmt.Errorf("%d of %d inventories could not be read; see the lines above", failed, len(paths))
 	}
 	return 0, nil
+}
+
+// checkServeRecord refuses a store with no serve_fetch row naming an object.
+// Against it every installed version reads never_served, or predates_audit
+// when the window is empty, so the exit code would report on the store rather
+// than the host: an audit_db path with a typo opens as a fresh, empty store,
+// and a scheduled --all would page for the whole fleet.
+func checkServeRecord(hist audit.ServeHistory, req bypassRequest) error {
+	if len(hist.Records) > 0 {
+		return nil
+	}
+	subject := req.Host
+	if req.Dir != "" {
+		subject = "the hosts in " + req.Dir
+	}
+	if hist.Since.IsZero() {
+		return fmt.Errorf("the audit store holds no events; there is no serve record to compare %s against "+
+			"(check audit_db names the store the server writes)", subject)
+	}
+	return fmt.Errorf("the audit store holds no serve_fetch row naming a stored object since %s; there is no serve record to compare %s against "+
+		"(check audit_db names the store the server writes)", hist.Since.UTC().Format(time.RFC3339), subject)
 }
 
 func freeBSDBypassError() error {
@@ -545,7 +571,7 @@ func classifyBypass(host string, pkgs []installedPkg, image map[string]bool, ser
 			rep.Counts[class]++
 			rep.Findings = append(rep.Findings, f)
 		}
-		if !p.InstalledAt.IsZero() && (since.IsZero() || p.InstalledAt.Before(since)) {
+		if !p.InstalledAt.IsZero() && p.InstalledAt.Before(since) {
 			finding(bypassPredatesAudit, fmt.Sprintf("installed %s, before the audit store's oldest event", p.InstalledAt.Format(time.RFC3339)))
 			continue
 		}
@@ -663,9 +689,7 @@ func classCounts(rep bypassReport) string {
 // the reader of a scheduled job's output never sees this command's help.
 func bypassLimits(rep bypassReport) []string {
 	var out []string
-	if rep.AuditSince == nil {
-		out = append(out, "limit: the audit store holds no events, so nothing installed can be traced to bodega")
-	} else {
+	if rep.AuditSince != nil {
 		out = append(out, fmt.Sprintf("limit: the audit window starts %s; only serve_fetch rows naming a stored object count",
 			rep.AuditSince.Format(time.RFC3339)))
 	}
@@ -715,11 +739,7 @@ func printBypassSummary(w io.Writer, reps []bypassReport, since time.Time, anyHo
 		}
 		fmt.Fprintf(w, "%s: %d installed, %d served to it, %s\n", rep.Host, rep.Installed, rep.Served, classCounts(rep))
 	}
-	if since.IsZero() {
-		fmt.Fprintln(w, "limit: the audit store holds no events, so nothing installed can be traced to bodega")
-	} else {
-		fmt.Fprintf(w, "limit: the audit window starts %s; only serve_fetch rows naming a stored object count\n", since.UTC().Format(time.RFC3339))
-	}
+	fmt.Fprintf(w, "limit: the audit window starts %s; only serve_fetch rows naming a stored object count\n", since.UTC().Format(time.RFC3339))
 	fmt.Fprintln(w, "limit: unattributable packages (no identity on the request, or a binding that changed) are counted, not reported as bypass; run 'bodega audit bypass <host> --inventory <file>' for one host's reasons")
 	if anyHost {
 		fmt.Fprintln(w, "limit: --any-host counts a serve to any identity as served; attribution is not checked")
