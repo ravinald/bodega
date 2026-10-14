@@ -271,6 +271,7 @@ type digestStore struct {
 	provenance []audit.ProvenancePolicy
 	similarity []audit.SimilarityPolicy
 	lists      []audit.PopularList
+	integ      []audit.IntegrationPolicy
 }
 
 func (d *digestStore) ListPolicies(context.Context) ([]audit.PolicyInfo, error) { return d.rules, nil }
@@ -291,6 +292,9 @@ func (d *digestStore) ListSimilarityPolicies(context.Context) ([]audit.Similarit
 }
 func (d *digestStore) ListPopularLists(context.Context) ([]audit.PopularList, error) {
 	return d.lists, nil
+}
+func (d *digestStore) ListIntegrationPolicies(context.Context) ([]audit.IntegrationPolicy, error) {
+	return d.integ, nil
 }
 
 // TestDigestTracksPolicyContent pins the two properties an admission row's
@@ -369,6 +373,12 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 		"popular_list_unloaded": func(s *digestStore) { s.lists = nil },
 		"osv_policy_added": func(s *digestStore) {
 			s.osvs = append(s.osvs, audit.OSVPolicy{Ecosystem: "npm", Action: ActionBlock})
+		},
+		"integration_policy_added": func(s *digestStore) {
+			s.integ = []audit.IntegrationPolicy{{Instance: "aikido", Ecosystem: "npm", Action: ActionBlock}}
+		},
+		"integration_policy_on_another_instance": func(s *digestStore) {
+			s.integ = []audit.IntegrationPolicy{{Instance: "other", Ecosystem: "npm", Action: ActionBlock}}
 		},
 	}
 	seen := map[string]string{want: "base"}
