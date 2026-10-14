@@ -130,6 +130,17 @@ type identitySet struct {
 	tokens  []audit.TokenHash
 }
 
+// token returns the token with id, or nil when this generation of the set
+// does not hold it: revoked, or no longer keyed by any binding.
+func (s *identitySet) token(id string) *audit.TokenHash {
+	for i := range s.tokens {
+		if s.tokens[i].ID == id {
+			return &s.tokens[i]
+		}
+	}
+	return nil
+}
+
 // newIdentitySet parses the table into the shape the read path matches
 // against. An unparseable CIDR row is skipped rather than emptying the set: a
 // binding table that loses every row on one bad entry would attribute the

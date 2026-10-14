@@ -1091,7 +1091,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	)
 	if err != nil && strings.Contains(err.Error(), "no such column") {
 		// A store opened read-only is never migrated, and bodega doctor reads
-		// one that predates migration 032 to report on the tokens in it.
+		// one that predates migration 035 to report on the tokens in it.
 		rows, err = a.db.QueryContext(ctx,
 			"SELECT id, label, comment, scope, '', '', created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
 		)

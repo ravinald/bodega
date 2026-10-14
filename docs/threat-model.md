@@ -963,6 +963,11 @@ and that the request, every vote and the admission it changed are recorded:
 the `overrides` and `override_votes` tables, an `override` event per action,
 and an admission row whose check says `overridden` with the override's id.
 
+Scopes keep the two acts apart on the API. Requesting needs `write` and
+approving or rejecting needs `admin`, so a CI job's exchanged `write` token can
+ask for an override and cannot vote on one. That limits what a leaked write
+token does; it does nothing about a person who holds two admin tokens.
+
 **An identity is only as strong as bodega's token issuance.** The quorum
 counts distinct identity strings and nothing behind them. On the API an
 identity is whatever name `bodega identity bind` gave a token, so whoever can

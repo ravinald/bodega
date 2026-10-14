@@ -7,9 +7,27 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
-const tokenScopesVersion = 32
+const tokenScopesVersion = 35
+
+// migrationBefore is the version the source holds immediately below v. The
+// numbering has gaps where another branch reserved a version, so v-1 can
+// name no migration at all.
+func migrationBefore(t *testing.T, v uint) uint {
+	t.Helper()
+	src, err := iofs.New(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("iofs source: %v", err)
+	}
+	prev, err := src.Prev(v)
+	if err != nil {
+		t.Fatalf("no migration before %d: %v", v, err)
+	}
+	return prev
+}
 
 func TestParseScopes(t *testing.T) {
 	cases := []struct{ in, want, err string }{
@@ -83,7 +101,8 @@ func TestTokenScopesMigration(t *testing.T) {
 	}
 	defer func() { _ = raw.Close() }()
 	m := migrator(t, raw)
-	if err := m.Migrate(tokenScopesVersion - 1); err != nil {
+	before := migrationBefore(t, tokenScopesVersion)
+	if err := m.Migrate(before); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope) VALUES ('old', 'ci', 'h1', 'full'), ('inv', 'web', 'h2', 'inventory')`); err != nil {
@@ -117,7 +136,7 @@ func TestTokenScopesMigration(t *testing.T) {
 	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope, subject, issuer) VALUES ('e', 'e', 'h5', 'read,write,admin', 's', 'https://i')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Migrate(tokenScopesVersion - 1); err != nil {
+	if err := m.Migrate(before); err != nil {
 		t.Fatalf("down: %v", err)
 	}
 	var ids []string

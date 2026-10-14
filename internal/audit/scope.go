@@ -26,7 +26,7 @@ const (
 	// before scopes existed migrated to.
 	ScopeFull = "read,write,admin"
 
-	// scopeLegacyFull is the stored value migration 032 rewrote. A store
+	// scopeLegacyFull is the stored value migration 035 rewrote. A store
 	// opened read-only is never migrated, so the parser still reads it.
 	scopeLegacyFull = "full"
 )

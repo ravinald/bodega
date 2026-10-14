@@ -19,19 +19,26 @@ import (
 //
 // A CIDR binding is not accepted. It names a network, and every host on it
 // would vote as one identity, or every person on one host as the same one.
+//
+// The bound token is held to the route's scope here as well as at the gate:
+// requesting needs write, approving or rejecting needs admin. The gate checks
+// only a Bearer credential on a localhost-only server, while the identity
+// resolves from any form credentialFrom reads, so a write token sent as Basic
+// would otherwise cast an admin's vote.
 func (s *Server) overrideCaller(w http.ResponseWriter, r *http.Request) (string, bool) {
 	m := identityMatchOf(r)
-	if m.Kind != audit.BindToken || m.Identity == "" {
+	var tok *audit.TokenHash
+	if m.Kind == audit.BindToken && m.Identity != "" {
+		tok = s.identityNow().token(m.Key)
+	}
+	if tok == nil {
 		recordDenial(s.auditDB, r, audit.DenialTokenMissing, map[string]string{"route": "overrides"})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the override routes require a token bound to an identity: " +
 			"bodega token generate, then bodega identity bind token <id> <identity>, and send it as Authorization: Bearer <token>"})
 		return "", false
 	}
-	for _, t := range s.identityNow().tokens {
-		if t.ID == m.Key && t.Scope == audit.ScopeInventory {
-			refuseScope(w, r, s.auditDB, s.logger, t)
-			return "", false
-		}
+	if !authorizeScope(w, r, s.auditDB, s.logger, *tok) {
+		return "", false
 	}
 	return m.Identity, true
 }

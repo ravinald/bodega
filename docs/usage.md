@@ -6110,14 +6110,15 @@ Policy mutations invalidate the in-memory cache, so changes take effect on the n
 
 ### Override endpoints
 
-| Method | Path                                | Description                                                              |
-| ------ | ----------------------------------- | ------------------------------------------------------------------------ |
-| GET    | `/api/v1/overrides[?status=STATUS]` | List overrides; `status` is `pending`, `active`, `expired` or `rejected` |
-| POST   | `/api/v1/overrides`                 | Request one (JSON body: `{type, name, version, check, reason, expires}`) |
-| POST   | `/api/v1/overrides/{id}/approve`    | Approve (optional JSON body: `{comment}`)                                |
-| POST   | `/api/v1/overrides/{id}/reject`     | Reject (optional JSON body: `{comment}`)                                 |
+| Method | Path                                | Scope   | Description                                                              |
+| ------ | ----------------------------------- | ------- | ------------------------------------------------------------------------ |
+| GET    | `/api/v1/overrides[?status=STATUS]` | `read`  | List overrides; `status` is `pending`, `active`, `expired` or `rejected` |
+| POST   | `/api/v1/overrides`                 | `write` | Request one (JSON body: `{type, name, version, check, reason, expires}`) |
+| POST   | `/api/v1/overrides/{id}/approve`    | `admin` | Approve (optional JSON body: `{comment}`)                                |
+| POST   | `/api/v1/overrides/{id}/reject`     | `admin` | Reject (optional JSON body: `{comment}`)                                 |
 
-These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to is the requester or the voter. A request with no token, or with a token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. An `inventory`-scoped token gets `403`. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
+These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to is the requester or the voter. A request with no token, or with a token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. The bound token must also hold the scope in the table, whichever header form carries it: a token without it gets `403` naming the missing scope. Requesting is a write and voting is the second person's act, so a CI token minted with `write` can ask for an override and cannot approve one, and an `inventory` token can do neither. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
+
 `POST /api/v1/auth/exchange` and `GET /api/v1/auth/providers` are the OIDC routes; the exchange sits outside `admin_permit_cidr` because the ID token is the credential. See [Authentication](#authentication).
 
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).

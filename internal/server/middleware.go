@@ -1057,11 +1057,16 @@ func bearerOf(r *http.Request) (string, bool) {
 }
 
 // adminPrefixes are the routes the admin scope reaches: tokens, policies,
-// the audit trail, the resolved configuration, and the per-host inventory and
-// profile views. Every route here is also behind admin_permit_cidr.
+// the audit trail, the resolved configuration, the per-host inventory and
+// profile views, and the votes on a two-person override. Every route here is
+// also behind admin_permit_cidr.
+//
+// Only the votes under /api/v1/overrides/ are admin. Requesting an override
+// is a write and listing them a read: the second person approving is the act
+// the admin scope separates from the first.
 var adminPrefixes = []string{
 	"/api/v1/tokens", "/api/v1/policies", "/api/v1/audit", "/api/v1/config",
-	"/api/v1/inventory/", "/api/v1/profiles/",
+	"/api/v1/inventory/", "/api/v1/profiles/", "/api/v1/overrides/",
 }
 
 // routeScope names the scope a request needs and the package type it is
