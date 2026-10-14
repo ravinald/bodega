@@ -495,6 +495,12 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_, cmd := m.popup.HandleAuditTableKey(msg)
 		return m, cmd
 
+	case popupQueue:
+		if m.popup.queue.handleKey(msg) {
+			m.popup.dismiss()
+		}
+		return m, nil
+
 	case popupTokenManager:
 		dismissed := m.popup.HandleTokenManagerKey(key)
 		if dismissed {
@@ -689,6 +695,10 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "?":
 		m.popup.kind = popupHelp
+
+	case "Q":
+		m.popup = popupModel{kind: popupQueue, queue: newQueueView(m.auditDB, m.cfg)}
+		return m, nil
 
 	case "T":
 		// Open token manager popup.

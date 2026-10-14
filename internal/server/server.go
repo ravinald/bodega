@@ -986,6 +986,13 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)
 	m.HandleFunc("POST /api/v1/overrides/{id}/reject", s.handleRejectOverride)
 
+	// The refusal review queue (F50). The list is an admin read like the
+	// audit trail; the two resolutions are mutations and pass the mutation
+	// gate before the handler requires an identity-bound token.
+	m.HandleFunc("GET /api/v1/queue", s.handleListQueue)
+	m.HandleFunc("POST /api/v1/queue/{id}/approve", s.handleApproveQueue)
+	m.HandleFunc("POST /api/v1/queue/{id}/dismiss", s.handleDismissQueue)
+
 	// Threat-feed re-vet: exempt from the admin gate, authenticated by an
 	// HMAC over the body (see selfAuthenticated).
 	m.HandleFunc("POST "+RevetWebhookPath, s.handleRevetWebhook)

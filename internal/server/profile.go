@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -287,6 +288,8 @@ func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, 
 	}
 	f := profileRefusal(p, typ, name, version, d)
 	s.recordProfileRefusal(r, p, typ, name, version, d, f.incident)
+	s.queueRefusal(r, audit.QueueRefusal{PkgType: typ, PkgName: name, PkgVersion: version, Check: admit.QueueProfile,
+		Profile: p.Name(), Detail: f.reason, Incident: f.incident})
 	f.write(w, r)
 	return false
 }

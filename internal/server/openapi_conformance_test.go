@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/clientconf"
@@ -243,6 +244,9 @@ var schemaStructs = map[string]any{
 	"PolicyRule":         audit.PolicyInfo{},
 	"Override":           audit.Override{},
 	"OverrideVote":       audit.OverrideVote{},
+	"QueueRow":           audit.QueueRow{},
+	"QueueRequester":     audit.QueueRequester{},
+	"QueueResolution":    admit.QueueResolution{},
 	"AuditEvent":         audit.StoredEvent{},
 	"TokenInfo":          audit.TokenInfo{},
 	"ProfilePin":         pins.Pin{},

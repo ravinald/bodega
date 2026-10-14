@@ -835,6 +835,16 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		blocked = append(blocked, "incident", f.incident)
 		s.logger.Warn("upstream blocked by policy", blocked...)
 		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL, f.incident)
+		name := discoveryPkgName
+		if name == "" {
+			_, name, _ = manifest.ParseKey(s3Key)
+		}
+		if name == "" {
+			name = policyCandidate
+		}
+		s.queueRefusal(r, audit.QueueRefusal{PkgType: regType, PkgName: name, PkgVersion: f.version,
+			Check: admit.QueueAllowList, Pattern: queuePattern(regType, upstreamURL, policyCandidate, name),
+			Detail: f.reason, Incident: f.incident})
 		f.write(w, r)
 		return decision, false
 	}
@@ -932,6 +942,7 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		incident: res.Incident, details: res.Block.Details})
 	s.logger.Warn("upstream fetch blocked by policy", "type", fill.typ, "package", fill.name,
 		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
+	s.queueResult(r, fill.typ, fill.name, fill.version, *res.Block, f)
 	f.write(w, r)
 	return fill, false
 }
@@ -1058,6 +1069,7 @@ func (s *Server) proxyMalwareGate(w http.ResponseWriter, r *http.Request, regTyp
 		s.logger.Warn("upstream blocked by OSV malware policy", "type", regType, "package", name, "version", version,
 			"reason", res.Reason, "incident", f.incident)
 		s.recordMalwareRefusal(r, regType, name, version, s3Key, res, f.incident)
+		s.queueResult(r, regType, name, version, res, f)
 		if s.auditDB != nil && immutable {
 			ctx, cancel := auditContext(r)
 			fill := fillIdentity(regType, discoveryPkgName, s3Key)
