@@ -3093,7 +3093,7 @@ An override request goes through [`bodega override`](#bodega-override-requestapp
 
 **Running server.** A rule added by `approve` reaches a running server within the allow-list cache's 30 seconds, a profile pin within the profile cache's, and an override at the next admission. Through the API the server applies the rule and the pin at once.
 
-**Audit.** Each resolution writes a `queue` event (`bodega audit events --type queue`) with status `approved` or `dismissed`, and the rule, override or profile write it made records its own event as the matching command would. The rows live in the `refusal_queue` and `refusal_queue_requesters` tables of the embedded SQLite store (migration 033).
+**Audit.** Each resolution writes a `queue` event (`bodega audit events --type queue`) with status `approved` or `dismissed`, and the rule, override or profile write it made records its own event as the matching command would. The rows live in the `refusal_queue` and `refusal_queue_requesters` tables of the embedded SQLite store (migration 035).
 
 The TUI's `Q` key and [`/api/v1/queue`](#queue-endpoints) do the same, and the web UI dashboard shows the open rows read-only.
 
