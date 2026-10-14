@@ -3117,7 +3117,7 @@ The change uses the words the policy commands use, as `ecosystem=value`, and eac
 | `--osv npm=remove`         | `bodega policy osv remove npm`; also `--age`, `--provenance` and `--similarity` |
 | `--allow-file rules.json`  | replaces the allow-list of every type the file names                            |
 
-An ecosystem or action the matching `set` refuses is refused here too. The allow-file is a JSON object from type to the complete list of patterns that type would have, in `bodega policy add` syntax; an empty list proposes no rules, which turns enforcement off for that type:
+An ecosystem or action the matching `set` refuses is refused here too. The allow-file is a JSON object from type to the complete list of patterns that type would have, in `bodega policy add` syntax; an empty list proposes no rules for that type. The simulation reads the mode on record from [`bodega policy mode`](#bodega-policy-mode-setlist), so an empty list admits every name only in an ecosystem that is `open` or has no mode set, and refuses every name in one set to `listed`:
 
 ```json
 { "npm": ["lodash", "@example/*"], "pypi": [] }

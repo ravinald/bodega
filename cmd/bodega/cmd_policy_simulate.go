@@ -78,6 +78,18 @@ func (o *policyOverlay) GetPoliciesByType(ctx context.Context, t string) ([]audi
 	return o.DB.GetPoliciesByType(ctx, t)
 }
 
+// GetAdmissionMode reads the mode on record. policy.Checker finds it by type
+// assertion, so without it every type simulates in the mode its rules imply:
+// an empty proposed list under listed mode would read as open.
+func (o *policyOverlay) GetAdmissionMode(ctx context.Context, eco string) (audit.AdmissionMode, error) {
+	return o.DB.GetAdmissionMode(ctx, eco)
+}
+
+var (
+	_ policy.ModeStore  = (*policyOverlay)(nil)
+	_ admit.PolicyStore = (*policyOverlay)(nil)
+)
+
 func (o *policyOverlay) GetAgePolicy(ctx context.Context, eco string) (audit.AgePolicy, error) {
 	if p, ok := o.age[eco]; ok {
 		if p == nil {
@@ -222,7 +234,9 @@ The change uses the words the policy commands use, as ecosystem=value:
 The allow-file is a JSON object from type to the complete list of patterns
 that type would have, in 'bodega policy add' syntax:
   {"npm": ["lodash", "@example/*"], "pypi": []}
-An empty list proposes no rules for the type, which switches enforcement off.
+An empty list proposes no rules for the type. The mode set with 'bodega
+policy mode' still applies: an empty list admits every name in a type that is
+open or has no mode set, and refuses every name in a type set to listed.
 
 The age gate and the upstream provenance check read their registries, so a
 simulation over many versions makes as many reads.`,

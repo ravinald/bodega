@@ -140,3 +140,34 @@ func TestPolicySimulateRefusesWhatSetRefuses(t *testing.T) {
 		}
 	}
 }
+
+func TestPolicySimulateEmptyListUnderListedMode(t *testing.T) {
+	f := simulateFixture(t, policy.ActionWarn)
+	adb := f.open(t)
+	for i, name := range []string{"lodash", "minimist", "left-pad"} {
+		if err := adb.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "r" + strings.Repeat("x", i), RegistryType: manifest.TypeNpm,
+			RuleKind: policy.RuleKindForType(manifest.TypeNpm), Pattern: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := adb.SetAdmissionMode(t.Context(), audit.AdmissionMode{Ecosystem: manifest.TypeNpm, Mode: audit.ModeListed, Actor: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	adb.Close()
+	rules := f.write(t, "rules.json", `{"npm": []}`)
+	before := policyState(t, f)
+
+	sim := runSimulate(t, "--allow-file", rules)
+	if len(sim.Changes) != 3 {
+		t.Fatalf("changes = %+v; want every admitted npm version, since listed mode with no rules refuses every name", sim.Changes)
+	}
+	for _, c := range sim.Changes {
+		if c.Before != audit.AdmissionAdmitted || c.After != audit.AdmissionPolicyBlocked ||
+			len(c.Checks) == 0 || c.Checks[0].Check != audit.CheckAllowList || c.Checks[0].After != audit.CheckBlock {
+			t.Errorf("%s change = %+v; want newly blocked by the allow-list", c.Name, c)
+		}
+	}
+	if after := policyState(t, f); after != before {
+		t.Fatalf("simulate wrote something:\nbefore %s\nafter  %s", before, after)
+	}
+}
