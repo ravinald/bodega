@@ -988,8 +988,9 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
 
-	// Two-person overrides. Every route requires a token bound to an
-	// identity, which is what the quorum counts; see overrideCaller.
+	// Two-person overrides. Every route requires a token that names an
+	// identity, by a binding or by its OIDC principal, which is what the
+	// quorum counts; see overrideCaller.
 	m.HandleFunc("GET /api/v1/overrides", s.handleListOverrides)
 	m.HandleFunc("POST /api/v1/overrides", s.handleRequestOverride)
 	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)

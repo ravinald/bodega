@@ -1203,9 +1203,12 @@ paths:
       description: |
         Every override, newest request first, each with its votes and its
         status as of the request. Restricted to IPs in `admin_permit_cidr`,
-        and like every override route it requires a token bound to an
-        identity (`bodega identity bind token`), even on a server whose
-        mutation gate takes no token.
+        and like every override route it requires a token that names an
+        identity, even on a server whose mutation gate takes no token: one
+        bound with `bodega identity bind token`, or one minted by
+        `POST /api/v1/auth/exchange` or `bodega login`, which acts as
+        `<issuer>#<subject>`. A binding wins when a token has both. Listing
+        needs `read`, requesting `write`, and approving or rejecting `admin`.
       operationId: listOverrides
       tags: [status]
       security:
@@ -1230,9 +1233,9 @@ paths:
         "400":
           description: Unknown status
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not in admin_permit_cidr, or the token is scoped to inventory
+          description: Client IP is not in admin_permit_cidr, or the token lacks `read`
         "503":
           description: Audit database not configured
     post:
@@ -1278,9 +1281,9 @@ paths:
         "400":
           description: A field is missing or invalid, or the expiry is past override_max_ttl
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `write`
         "503":
           description: Audit database not configured
 
@@ -1310,9 +1313,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The caller requested this override, or the token is scoped to inventory
+          description: The caller requested this override, or the token lacks `admin`
         "404":
           description: No override with that id
         "409":
@@ -1347,9 +1350,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The token is scoped to inventory
+          description: The token lacks `admin`
         "404":
           description: No override with that id
         "409":
