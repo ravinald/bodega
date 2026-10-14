@@ -297,8 +297,11 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	// store serves from.
 	cp := *pm
 	cp.Versions = []manifest.VersionEntry{ve}
-	ev := newEvaluation(ctx, r.DB, &cp)
+	ev := newEvaluation(ctx, r.DB, &cp, r.now())
 	allow := r.allowList(ctx, &out, &cp, cataloged, prev)
+	if c, ok := ev.overrideCheck(&cp, 0, allow); ok {
+		allow = c
+	}
 	ev.set(0, allow)
 	ev.set(0, carriedAge(prev, ev.actions[audit.CheckAge]))
 
@@ -551,6 +554,9 @@ func (r *Revetter) record(ctx context.Context, out *RevetOutcome, ev *evaluation
 	}
 	if ev.digestErr != nil {
 		out.Notes = append(out.Notes, "recorded with no policy digest: "+ev.digestErr.Error())
+	}
+	if ev.overrideErr != nil {
+		out.Notes = append(out.Notes, "overrides not read, so none applied: "+ev.overrideErr.Error())
 	}
 	now := r.now().UTC()
 	rows := make([]audit.Admission, 0, len(keys))

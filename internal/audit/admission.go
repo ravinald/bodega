@@ -27,10 +27,9 @@ const (
 	// verified against the Sigstore trusted root. Its entry carries the
 	// outcome and the identity verified in Provenance.
 	CheckUpstreamProvenance = "upstream_provenance"
-	// CheckOverride is the operator answering y to `bodega pkg create`'s
-	// allow-list prompt. It is its own entry so the allow-list entry beside it
-	// can still say block: the row records that the rule refused and who
-	// overrode it, not a pass nobody evaluated.
+	// CheckOverride is the operator answering y to the allow-list prompt
+	// `bodega pkg create` carried before two-person overrides replaced it.
+	// Nothing writes it now; rows decided under the prompt still carry it.
 	CheckOverride = "override"
 )
 
@@ -60,6 +59,9 @@ type AdmissionCheck struct {
 	// Provenance is set on the upstream_provenance entry when the check
 	// ran, and nil everywhere else.
 	Provenance *UpstreamProvenance `json:"provenance,omitempty"`
+	// Override is the ID of the override that admitted past this check's
+	// failure, set when Status is CheckOverridden.
+	Override string `json:"override,omitempty"`
 }
 
 // Upstream provenance outcomes: what verifying a publisher's signed

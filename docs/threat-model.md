@@ -928,6 +928,51 @@ policy cannot delete versions; an auditor has to go looking for it. Rotating
 the key does not repair this. A verifier has to drop the stolen key ID, and from then
 on it rejects every statement that key signed, honest ones included.
 
+## Two-person overrides
+
+An override admits one version past one failed check once identities other
+than the requester approve it, until it expires (see
+[usage.md](usage.md#bodega-override-requestapproverejectlist)). It replaces a
+y/N prompt that let one operator at a terminal admit past the allow-list with
+a row indistinguishable from any other create. What it adds is that one
+identity cannot do it alone, that every request names a reason and an expiry,
+and that the request, every vote and the admission it changed are recorded:
+the `overrides` and `override_votes` tables, an `override` event per action,
+and an admission row whose check says `overridden` with the override's id.
+
+**An identity is only as strong as bodega's token issuance.** The quorum
+counts distinct identity strings and nothing behind them. On the API an
+identity is whatever name `bodega identity bind` gave a token, so whoever can
+run `bodega token generate` and `bodega identity bind` can mint a second
+identity and approve their own request with it, and so can anyone holding two
+bound tokens. On the CLI the identity is the OS user, or `SUDO_USER` under
+sudo, which the caller sets: anyone who can run `bodega override` against the
+audit database can vote under any name. There is no MFA claim to check, no
+signature over a vote, and no link between a token identity and a person. One
+person with a shell account and a differently named token counts as two.
+
+So the control is against one operator acting alone through the interfaces
+they were given, and against an exception nobody wrote down. It is not a
+control against the bodega host's administrators, who can also edit the audit
+database directly, and it is not a control against an attacker holding admin
+tokens. Keep token issuance and identity binding with fewer people than the
+quorum, bind each person their own token, and read `bodega audit events --type
+override` the way you read token creation.
+
+**Two verdicts are never overridden:** an OSV malware record and upstream
+provenance that fails to verify. Both say the bytes are hostile, and a vote
+does not change what the bytes are. Every other check, the allow-list
+included, can be overridden for one version at a time, so an approved override
+of `osv` admits a version with a known advisory exactly as written.
+
+An attestation of an overridden admission says `overridden` in that check's
+evaluation, with the override's id in its detail, and `bodega attest verify`
+passes it, because it is not a `block`. A consumer that refuses overridden
+admissions has to read the evaluations itself. Expiry is enforced by whatever
+admits or re-vets next: an expired override changes nothing already admitted
+until a re-vet runs, so without `revet_interval` an overridden version stays
+served after its override expires.
+
 ## Out-of-scope distribution formats
 
 Three properties make a distribution format incompatible with bodega's
