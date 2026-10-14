@@ -714,6 +714,67 @@ Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `pub
 - **Coverage decays from the moment it is measured.** A version that leaves the archive while pinned turns into an apt error at the next `update`, not a warning now. Re-run this after every upgrade window and re-read the counts.
 - **Nothing is installed and nothing is written to the manifest store.** The output is a file to review, then copy. Pinning a host is separate from cataloging it: see [Cataloging a host end to end](#cataloging-a-host-end-to-end).
 
+### `bodega audit bypass <host> --inventory <file>`
+
+Lists every package a host has installed that bodega has no record of serving to it. `bodega pin apt` holds a host to bodega once it is moved there; this is how you find out whether it stayed. It reads the inventory `bodega pkg convert` reads (or the JSON it writes), and the `serve_fetch` rows the [audit store](#bodega-audit-served---identity-name) keeps under the host's identity, and needs nothing on the host beyond the capture.
+
+```bash
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\t${db-fsys:Last-Modified}\n' > web-01.txt
+bodega audit bypass web-01 --inventory web-01.txt --type apt --exclude-image ubuntu-24.04.txt
+```
+
+```text
+CLASS              TYPE     NAME                                     VERSION                  REASON
+---
+never_served       apt      htop                                     3.3.0-4build1            no serve_fetch row names htop@3.3.0-4build1 for any identity
+served_elsewhere   apt      jq                                       1.7.1-3build1            bodega served jq@1.7.1-3build1 to web-02, never to web-01
+predates_audit     apt      cron                                     3.0pl1-184ubuntu2        installed 2026-03-02T11:40:12Z, before the audit store's oldest event
+
+web-01: 414 installed, 409 served to it, 1 never_served, 1 served_elsewhere, 1 predates_audit, 2 unattributable, 223 excluded as image
+  limit: the audit window starts 2026-04-01T00:00:00Z; only serve_fetch rows naming a stored object count
+  limit: 2 package(s) cannot be attributed and are not counted as bypass: 2 served to a request no identity binding resolved
+```
+
+| Class              | Meaning                                                                                    | Bypass |
+| ------------------ | ------------------------------------------------------------------------------------------ | ------ |
+| `never_served`     | bodega never served that version to anyone                                                 | yes    |
+| `served_elsewhere` | bodega served it, but never to this host                                                   | yes    |
+| `predates_audit`   | the inventory's install time is before the audit store's oldest event, so it cannot answer | no     |
+
+| Flag                       | Default | What it does                                                                               |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `--inventory`              | none    | The host's installed list. `-` reads stdin                                                 |
+| `--type`                   | none    | The parser for raw manager output; on converted JSON, the one ecosystem to keep            |
+| `--exclude-image`          | none    | An inventory of the base OS image. A (type, name, version) it lists is not a finding       |
+| `--any-host`               | off     | A serve to any identity counts as served, so only `never_served` remains                   |
+| `--all`, `--inventory-dir` | off     | Compare every `<host>.json` in the directory and print one summary line per host           |
+| `--json`                   | off     | One report object, or an array of them under `--all`, with the counts, limits and findings |
+
+The exit code is for a scheduled job: 0 when no host has a `never_served` or `served_elsewhere` finding, 2 when any does, 1 when bodega could not answer (no audit store, a `syslog` or `jsonl` sink that keeps nothing to read, an audit store with no events or no `serve_fetch` row naming a stored object, an unreadable inventory). An `audit_db` path that does not exist yet opens as an empty store, so a typo or a fresh deploy exits 1 with "the audit store holds no events; there is no serve record to compare <host> against" before any inventory is read, rather than reporting every host as a bypass. Under `--all` an unreadable `<host>.json` is named on stderr and its line reads `error`; 2 still wins over it, so one broken file does not hide another host's bypass.
+
+#### Inventories
+
+Raw manager output takes `--type`, and the parsers are the ones `pkg convert` uses. `pkg convert`'s own JSON is recognized by every entry naming a bodega type, so `--type` is optional there and only filters. `freebsd` is refused: its capture (`pkg query '%R\t%q'`) names the repository each package came from and not the package, so there is no installed version to look for.
+
+An install time is what tells `predates_audit` apart from the other two. dpkg writes one where you ask for it: `${db-fsys:Last-Modified}` as the sixth column (dpkg 1.19.3 and later), which `pkg convert` reads past and does not carry onto a catalog entry. A JSON inventory carries one as `metadata.installed_at` on a version, in RFC 3339 or Unix seconds. No other manager records an install time, so a pip, npm, Go, cargo or helm inventory never reads `predates_audit`, and the report counts how many packages it judged without one.
+
+`--exclude-image` takes the same formats. Capture it from a freshly booted instance of the image and keep it beside the image's build: a package the host was imaged with was never fetched by the host. It matches on version, so a package the host upgraded past the image's version is still compared.
+
+#### Attribution
+
+A serve counts for the host only under its own identity, which an [identity binding](#bodega-identity-bindunbindlist) assigns per request. Three cases leave a version neither served to the host nor provably served elsewhere, and the report counts them, by reason, rather than listing them as bypass:
+
+- **No identity on the request.** A `serve_fetch` row with an empty identity could be this host before it was bound, or any other unbound client.
+- **The binding changed.** A serve before the host's earliest current binding was written, or one from an address the host's CIDR binding now covers but recorded under another identity, could be this host under its old name.
+- **No binding names the host.** Every request it made carried no identity, so only `never_served` is evidence for it, and the report says so in a `limit:` line.
+
+#### Gaps
+
+- **Only the current binding table is known.** bodega keeps no history of bindings, so a token binding moved from one host to another reads as a serve to the new holder. The `binding_changed` test catches a rename only where an address or the binding's creation time gives it away.
+- **Name and version only.** Neither dpkg nor pip records where a package came from or its digest, so a host that installed the same version from a public mirror reads as served when bodega also served it that version. [Inventory reconciliation](#reconciliation) compares digests where the collector reports one.
+- **A row with no object key serves nothing.** A `serve_fetch` written before bodega recorded object keys, or one that answered an index, names no artifact, so a version served only then reads `never_served`.
+- **The window is the store's oldest event.** Retention that prunes the audit store moves the window forward, and a package installed before it reads `predates_audit` only where the inventory records an install time.
+
 ### `bodega pkg export [type] [name] [version]`
 
 Exports package manifests as JSON to stdout. Useful for backups, migrations, and inspecting manifest state.

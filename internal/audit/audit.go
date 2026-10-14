@@ -243,6 +243,20 @@ func scanServedObjects(rows *sql.Rows) ([]ServedObject, error) {
 	return out, rows.Err()
 }
 
+func scanServeRecords(rows *sql.Rows, parseTime func(any) time.Time) ([]ServeRecord, error) {
+	var out []ServeRecord
+	for rows.Next() {
+		var r ServeRecord
+		var first any
+		if err := rows.Scan(&r.PkgType, &r.PkgName, &r.PkgVersion, &r.ObjectKey, &r.Digest, &r.Identity, &r.ClientIP, &first); err != nil {
+			return nil, err
+		}
+		r.First = parseTime(first).UTC()
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // nullIfEmpty binds "" as NULL, for the columns where empty means "not
 // applicable" rather than a value.
 func nullIfEmpty(s string) any {
@@ -679,6 +693,39 @@ func (a *DB) ServedObjects(ctx context.Context, identity string) ([]ServedObject
 		return nil, err
 	}
 	return r.QueryServedObjects(ctx, identity)
+}
+
+// ServeRecord is one stored object bodega served to one (identity, address)
+// pair, with the first time it did. Identity is empty for a request no binding
+// resolved.
+type ServeRecord struct {
+	ServedObject
+	Identity string    `json:"identity"`
+	ClientIP string    `json:"client_ip"`
+	First    time.Time `json:"first"`
+}
+
+// ServeHistory is every serve_fetch that handed over a stored object, grouped
+// by object, identity and address, and the time the oldest event of any type
+// still in the store was written.
+//
+// Since is the start of what the store can testify to. A host that installed a
+// package before it holds no row either way, whether bodega served it or not.
+type ServeHistory struct {
+	Since   time.Time
+	Records []ServeRecord
+}
+
+// ServeHistory returns the store's serve record and the start of its window.
+// It keeps the identity and the client address that Served and ServedObjects
+// fold away, because attributing a serve to a host means asking which binding
+// the address belonged to.
+func (a *DB) ServeHistory(ctx context.Context) (ServeHistory, error) {
+	r, err := a.reader("serve history")
+	if err != nil {
+		return ServeHistory{}, err
+	}
+	return r.QueryServeHistory(ctx)
 }
 
 // Count returns the total number of events matching the filter.

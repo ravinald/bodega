@@ -213,6 +213,28 @@ func (s *sqliteSink) QueryServedObjects(ctx context.Context, identity string) ([
 	return scanServedObjects(rows)
 }
 
+func (s *sqliteSink) QueryServeHistory(ctx context.Context) (ServeHistory, error) {
+	var out ServeHistory
+	var since sql.NullString
+	if err := s.rdb.QueryRowContext(ctx, `SELECT MIN(timestamp) FROM events`).Scan(&since); err != nil {
+		return out, err
+	}
+	out.Since = sqliteTime(since.String)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT pkg_type, pkg_name, pkg_version, object_key, COALESCE(digest, ''),
+	             COALESCE(identity, ''), COALESCE(client_ip, ''), MIN(timestamp)
+	      FROM events
+	      WHERE event_type = ? AND object_key IS NOT NULL
+	      GROUP BY 1, 2, 3, 4, 5, 6, 7
+	      ORDER BY 1, 2, 3, 4, 5, 6, 7`,
+		string(EventServeFetch))
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	out.Records, err = scanServeRecords(rows, sqliteTime)
+	return out, err
+}
+
 func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
 	var where []string
 	var args []any

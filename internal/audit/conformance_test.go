@@ -235,6 +235,57 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			}
 		}},
 
+		// A host's bypass report attributes a serve through the identity and the
+		// address together, so a repeat collapses only when both match, the
+		// earliest time survives the grouping, and the window starts at the
+		// oldest event of any type rather than the oldest serve.
+		{"serve_history_keeps_identity_and_address", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
+			if !h.queryable {
+				t.Skip("write-only sinks answer no reads")
+			}
+			r := h.sink.(EventReader) //nolint:forcetypeassert // gated on h.queryable above.
+			empty, err := r.QueryServeHistory(ctx)
+			if err != nil {
+				t.Fatalf("QueryServeHistory on an empty store: %v", err)
+			}
+			if !empty.Since.IsZero() || len(empty.Records) != 0 {
+				t.Errorf("empty store history = %+v, want a zero window and no records", empty)
+			}
+			const key = "packages/npm/widget/widget-1.0.0.tgz"
+			fetch := func(identity, ip string) Event {
+				return Event{EventType: EventServeFetch, PkgType: "npm", PkgName: "widget", PkgVersion: "1.0.0",
+					Identity: identity, ClientIP: ip, ObjectKey: key, Status: "success"}
+			}
+			before := time.Now().Add(-time.Second)
+			for _, ev := range []Event{
+				{EventType: EventServeStart, Status: "success"},
+				fetch("host-a", "10.0.0.5"),
+				fetch("host-a", "10.0.0.5"),
+				fetch("", "10.0.0.9"),
+				{EventType: EventServeFetch, PkgType: "npm", PkgName: "widget", Identity: "host-a"},
+			} {
+				if err := h.sink.Record(ctx, ev); err != nil {
+					t.Fatalf("Record: %v", err)
+				}
+			}
+			got, err := r.QueryServeHistory(ctx)
+			if err != nil {
+				t.Fatalf("QueryServeHistory: %v", err)
+			}
+			if got.Since.Before(before) || got.Since.After(time.Now().Add(time.Second)) {
+				t.Errorf("Since = %v, want the time the first event was written", got.Since)
+			}
+			if len(got.Records) != 2 {
+				t.Fatalf("records = %+v, want one per (identity, address)", got.Records)
+			}
+			for i, want := range [][2]string{{"", "10.0.0.9"}, {"host-a", "10.0.0.5"}} {
+				rec := got.Records[i]
+				if rec.Identity != want[0] || rec.ClientIP != want[1] || rec.ObjectKey != key || rec.First.Before(before) {
+					t.Errorf("record %d = %+v, want identity %q from %s first seen after %v", i, rec, want[0], want[1], before)
+				}
+			}
+		}},
+
 		{"every_discovery_field_survives", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if _, err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
 				t.Fatalf("RecordDiscovery: %v", err)
