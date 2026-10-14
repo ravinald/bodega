@@ -965,8 +965,9 @@ and an admission row whose check says `overridden` with the override's id.
 
 Scopes keep the two acts apart on the API. Requesting needs `write` and
 approving or rejecting needs `admin`, so a CI job's exchanged `write` token can
-ask for an override and cannot vote on one. That limits what a leaked write
-token does; it does nothing about a person who holds two admin tokens.
+ask for an override and gets `403` naming `admin` when it tries to vote on
+one. That limits what a leaked write token does; it does nothing about a person
+who holds two admin tokens.
 
 **An identity is only as strong as bodega's token issuance.** The quorum
 counts distinct identity strings and nothing behind them. On the API an
@@ -978,6 +979,18 @@ sudo, which the caller sets: anyone who can run `bodega override` against the
 audit database can vote under any name. There is no MFA claim to check, no
 signature over a vote, and no link between a token identity and a person. One
 person with a shell account and a differently named token counts as two.
+
+A token from `POST /api/v1/auth/exchange` or `bodega login` needs no binding:
+it votes as `<issuer>#<subject>`, the issuer URL and the ID token's `sub`
+claim. Two exchanges by one subject are one voter. That identity proves what
+the provider's `sub` claim proves and what the mapping rule granted, and no
+more. A GitHub Actions subject names a repository and a ref, not a person, so
+two rules that grant `admin` to different workflows in one repository make
+two voters, and whoever can push to both refs casts both votes. Grant `admin`
+through a mapping rule only to subjects a single person cannot act as twice:
+a device-flow provider whose `sub` is the person, or one protected ref. A
+token that is also bound with `bodega identity bind token` votes under the
+binding instead.
 
 So the control is against one operator acting alone through the interfaces
 they were given, and against an exception nobody wrote down. It is not a

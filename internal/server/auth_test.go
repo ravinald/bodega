@@ -28,6 +28,13 @@ const oidcAudience = "https://bodega.example"
 //	acme/publisher        -> write:pypi (no read)
 func newOIDCServer(t *testing.T) (*Server, *idptest.Issuer) {
 	t.Helper()
+	return newOIDCServerAt(t, "10.0.0.0/8", nil)
+}
+
+// newOIDCServerAt is newOIDCServer with admin_permit_cidr set to adminCIDR,
+// and edit applied to the config before the server is built.
+func newOIDCServerAt(t *testing.T, adminCIDR string, edit func(*config.Config)) (*Server, *idptest.Issuer) {
+	t.Helper()
 	is := idptest.New(t)
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -35,7 +42,7 @@ func newOIDCServer(t *testing.T) (*Server, *idptest.Issuer) {
 		LogDir:          dir,
 		StoragePath:     dir,
 		AuditDB:         filepath.Join(dir, "audit.db"),
-		AdminPermitCIDR: []string{"10.0.0.0/8"},
+		AdminPermitCIDR: []string{adminCIDR},
 		AllowPlaintext:  true,
 		OIDCTokenTTL:    "10m",
 		OIDCProviders: []config.OIDCProvider{{
@@ -46,6 +53,9 @@ func newOIDCServer(t *testing.T) (*Server, *idptest.Issuer) {
 				{Claims: map[string]string{"repository": "acme/publisher"}, Scopes: "write:pypi"},
 			},
 		}},
+	}
+	if edit != nil {
+		edit(cfg)
 	}
 	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -322,5 +332,89 @@ func TestMintedTokenScopes(t *testing.T) {
 	rec = send(s, http.MethodPost, "/api/v1/tokens", adminAddr, fullToken, `{"label":"ci","scope":"write:npm, read"}`)
 	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"read,write:npm"`) {
 		t.Errorf("scoped mint: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// An exchanged token requests and votes on overrides under its principal's
+// identity, held to the route's scope, in both postures: on a localhost-only
+// server the gate asks for no token and checks only a Bearer credential, so
+// overrideCaller is the only scope check a Basic credential meets.
+func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
+	for _, posture := range []struct {
+		name, cidr, addr string
+		basic            bool
+	}{
+		{"token required", "10.0.0.0/8", adminAddr, false},
+		{"localhost only", "127.0.0.1/32", localAddr, true},
+	} {
+		t.Run(posture.name, func(t *testing.T) {
+			s, is := newOIDCServerAt(t, posture.cidr, func(c *config.Config) { c.OverrideQuorum = 3 })
+			app, _, _ := exchange(t, s, ciToken(t, is, "acme/app", nil))
+			ops, _, _ := exchange(t, s, ciToken(t, is, "acme/ops", nil))
+			opsAgain, _, _ := exchange(t, s, ciToken(t, is, "acme/ops", nil))
+			if app == nil || ops == nil || opsAgain == nil {
+				t.Fatal("exchange failed")
+			}
+			appID := is.URL + "#repo:acme/app:ref:refs/heads/main"
+			opsID := is.URL + "#repo:acme/ops:ref:refs/heads/main"
+
+			rec := send(s, http.MethodPost, "/api/v1/overrides", posture.addr, app.Token, overrideBody)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("write token requesting = %d %s, want 201", rec.Code, rec.Body)
+			}
+			o := decodeOverride(t, rec.Body.Bytes())
+			if o.RequestedBy != appID {
+				t.Errorf("requested_by = %q, want %q", o.RequestedBy, appID)
+			}
+			approve := "/api/v1/overrides/" + o.ID + "/approve"
+
+			basic := func(token string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, approve, nil)
+				req.RemoteAddr = posture.addr
+				req.SetBasicAuth("ci", token)
+				rec := httptest.NewRecorder()
+				s.handler().ServeHTTP(rec, req)
+				return rec
+			}
+			tries := map[string]*httptest.ResponseRecorder{"Bearer": send(s, http.MethodPost, approve, posture.addr, app.Token, "")}
+			if posture.basic {
+				tries["Basic"] = basic(app.Token)
+			}
+			for name, rec := range tries {
+				if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `lacks scope "admin"`) {
+					t.Errorf("write token approving over %s = %d %s, want 403 naming admin", name, rec.Code, rec.Body)
+				}
+			}
+
+			rec = send(s, http.MethodPost, approve, posture.addr, ops.Token, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("admin token approving = %d %s, want 200", rec.Code, rec.Body)
+			}
+			got := decodeOverride(t, rec.Body.Bytes())
+			if len(got.Votes) != 1 || got.Votes[0].Identity != opsID {
+				t.Errorf("votes = %+v, want one under %q", got.Votes, opsID)
+			}
+			// A second exchange for the same subject is the same voter.
+			if rec := send(s, http.MethodPost, approve, posture.addr, opsAgain.Token, ""); rec.Code != http.StatusConflict {
+				t.Errorf("second exchange approving = %d %s, want 409", rec.Code, rec.Body)
+			}
+			if rec := send(s, http.MethodGet, "/api/v1/overrides", posture.addr, ops.Token, ""); rec.Code != http.StatusOK {
+				t.Errorf("admin token listing = %d %s, want 200", rec.Code, rec.Body)
+			}
+
+			// A binding on the exchanged token wins over its principal.
+			if _, err := s.auditDB.AddIdentityBinding(context.Background(),
+				audit.IdentityBinding{Kind: audit.BindToken, Key: opsAgain.ID, Identity: "erin"}); err != nil {
+				t.Fatal(err)
+			}
+			s.refreshIdentities(context.Background())
+			rec = send(s, http.MethodPost, approve, posture.addr, opsAgain.Token, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("bound exchanged token approving = %d %s, want 200", rec.Code, rec.Body)
+			}
+			if got := decodeOverride(t, rec.Body.Bytes()); got.Status != audit.OverrideStatusActive || len(got.Votes) != 2 || got.Votes[1].Identity != "erin" {
+				t.Errorf("after the bound vote = %+v", got)
+			}
+		})
 	}
 }

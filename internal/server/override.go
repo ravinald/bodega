@@ -11,36 +11,52 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 )
 
-// overrideCaller returns the identity the request's token is bound to,
+// overrideCaller returns the identity the request votes or requests under,
 // writing the refusal when there is none. Every override route requires one,
 // in the localhost-only posture too, where the mutation gate asks for no
 // token: a quorum of identities means nothing when a vote can arrive with
 // nobody named on it.
 //
+// The identity is the one the token is bound to with bodega identity bind
+// token, or, for a token an OIDC exchange or bodega login minted, the
+// principal's Identity. A binding wins when a token has both: the operator
+// named that token on purpose.
+//
 // A CIDR binding is not accepted. It names a network, and every host on it
 // would vote as one identity, or every person on one host as the same one.
 //
-// The bound token is held to the route's scope here as well as at the gate:
+// The token is held to the route's scope here as well as at the gate:
 // requesting needs write, approving or rejecting needs admin. The gate checks
 // only a Bearer credential on a localhost-only server, while the identity
 // resolves from any form credentialFrom reads, so a write token sent as Basic
 // would otherwise cast an admin's vote.
 func (s *Server) overrideCaller(w http.ResponseWriter, r *http.Request) (string, bool) {
-	m := identityMatchOf(r)
-	var tok *audit.TokenHash
-	if m.Kind == audit.BindToken && m.Identity != "" {
-		tok = s.identityNow().token(m.Key)
-	}
+	identity, tok := s.overrideIdentity(r)
 	if tok == nil {
 		recordDenial(s.auditDB, r, audit.DenialTokenMissing, map[string]string{"route": "overrides"})
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the override routes require a token bound to an identity: " +
-			"bodega token generate, then bodega identity bind token <id> <identity>, and send it as Authorization: Bearer <token>"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the override routes require a token bound to an identity " +
+			"(bodega token generate, then bodega identity bind token <id> <identity>) or one from bodega login or POST /api/v1/auth/exchange, " +
+			"sent as Authorization: Bearer <token>"})
 		return "", false
 	}
 	if !authorizeScope(w, r, s.auditDB, s.logger, *tok) {
 		return "", false
 	}
-	return m.Identity, true
+	return identity, true
+}
+
+func (s *Server) overrideIdentity(r *http.Request) (string, *audit.TokenHash) {
+	if m := identityMatchOf(r); m.Kind == audit.BindToken && m.Identity != "" {
+		if tok := s.identityNow().token(m.Key); tok != nil {
+			return m.Identity, tok
+		}
+	}
+	if tok, ok := principalTokenOf(r); ok {
+		if p, ok := tok.Principal(); ok {
+			return p.Identity(), &tok
+		}
+	}
+	return "", nil
 }
 
 func (s *Server) handleListOverrides(w http.ResponseWriter, r *http.Request) {

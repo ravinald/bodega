@@ -1166,6 +1166,9 @@ func withToken(r *http.Request, tok audit.TokenHash) *http.Request {
 // those rows are anonymous for a request whose token names a workflow or a
 // person. It attaches the principal alone; scopes are the gate's to grant.
 //
+// It also keeps the matched token, for overrideCaller to hold to the route's
+// scope: an exchanged token has no identity binding to look it up through.
+//
 // It runs inside DenyListMiddleware, so a deny-listed peer costs no hash, and
 // it shares the gate's cache, so a token is loaded once per refresh.
 func principalMiddleware(tokens *tokenCache, pepper string) func(http.Handler) http.Handler {
@@ -1174,13 +1177,23 @@ func principalMiddleware(tokens *tokenCache, pepper string) func(http.Handler) h
 			if cred, _ := credentialFrom(r); cred != "" {
 				if tok := tokens.match(cred, pepper, time.Now()); tok != nil {
 					if p, ok := tok.Principal(); ok {
-						r = r.WithContext(audit.WithPrincipal(r.Context(), p))
+						ctx := audit.WithPrincipal(r.Context(), p)
+						r = r.WithContext(context.WithValue(ctx, principalTokenKey{}, *tok))
 					}
 				}
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+type principalTokenKey struct{}
+
+// principalTokenOf returns the exchanged token principalMiddleware matched
+// on r, and false when r carried none.
+func principalTokenOf(r *http.Request) (audit.TokenHash, bool) {
+	tok, ok := r.Context().Value(principalTokenKey{}).(audit.TokenHash)
+	return tok, ok
 }
 
 type tokenScopesKey struct{}

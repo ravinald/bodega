@@ -189,6 +189,15 @@ type Principal struct {
 	Issuer  string
 }
 
+// Identity is the name the override quorum counts this principal under:
+// the issuer, "#", then the subject. It is distinct per (issuer, subject),
+// so every workflow one provider vouches for is its own voter, and stable
+// across exchanges, so a subject exchanging twice is still one voter. An
+// OIDC issuer is a URL with no fragment, so the first "#" splits the two.
+func (p Principal) Identity() string {
+	return p.Issuer + "#" + p.Subject
+}
+
 type principalKey struct{}
 
 // WithPrincipal returns ctx carrying p, for Record to stamp on every row
