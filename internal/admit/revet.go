@@ -298,7 +298,7 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	cp := *pm
 	cp.Versions = []manifest.VersionEntry{ve}
 	ev := newEvaluation(ctx, r.DB, &cp)
-	allow := r.allowList(ctx, &cp)
+	allow := r.allowList(ctx, &out, &cp, cataloged, prev)
 	ev.set(0, allow)
 	ev.set(0, carriedAge(prev, ev.actions[audit.CheckAge]))
 
@@ -394,17 +394,123 @@ func (r *Revetter) previous(ctx context.Context, typ, name, version string) ([]a
 	return out, nil
 }
 
-func (r *Revetter) allowList(ctx context.Context, pm *manifest.PackageManifest) audit.AdmissionCheck {
+// allowList rules on what admission ruled on: the name for a type the list
+// keys by name, the upstream URL for every other. A URL-keyed version whose
+// entry names no URL, which is every version a helm, binary or apt proxy
+// fill admitted, is ruled on by the upstream each of its pinned objects was
+// cached from, and refused if any of them is outside the list. Without that
+// the re-vet of such a version re-runs nothing, and a narrowed allow-list
+// never reaches what the cache already serves.
+func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifest.PackageManifest, cataloged bool, prev []audit.Admission) audit.AdmissionCheck {
 	if r.Allow == nil {
 		return audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckNotEvaluated,
 			Detail: "not run: no allow-list loaded"}
 	}
 	hasRules, _ := r.Allow.HasRules(ctx, pm.Type)
-	candidate := policy.CandidateFor(pm.Type, pm.Name, pm.Versions[0].URL)
-	if candidate == "" {
+	ve := pm.Versions[0]
+	candidates := []string{policy.CandidateFor(pm.Type, pm.Name, ve.URL)}
+	if candidates[0] == "" && !policy.KeysByName(pm.Type) {
+		var unknown []string
+		candidates, unknown = r.cacheOrigins(ctx, ve, cataloged, prev)
+		for _, why := range unknown {
+			out.Notes = append(out.Notes, "allow-list not re-run: the upstream of the cached object is unknown: "+why)
+		}
+	}
+	if len(candidates) == 0 || candidates[0] == "" {
 		return AllowListCheck(hasRules, "", nil)
 	}
-	return AllowListCheck(hasRules, candidate, r.Allow.Check(ctx, pm.Type, candidate))
+	var check audit.AdmissionCheck
+	for i, c := range candidates {
+		got := AllowListCheck(hasRules, c, r.Allow.Check(ctx, pm.Type, c))
+		if i == 0 || got.Status == audit.CheckBlock {
+			check = got
+		}
+		if got.Status == audit.CheckBlock {
+			break
+		}
+	}
+	return check
+}
+
+// cacheOrigins returns the distinct upstreams recorded for the objects the
+// previous decision was pinned under, and for each object whose upstream
+// cannot be established, why not. An origin is read only against the
+// identity of the object at the key now, so bytes written over since by a
+// path that fetched nothing are not credited with the fill's upstream.
+func (r *Revetter) cacheOrigins(ctx context.Context, ve manifest.VersionEntry, cataloged bool, prev []audit.Admission) (origins, unknown []string) {
+	var keys []string
+	for _, p := range prev {
+		if p.ObjectKey != "" && !slices.Contains(keys, p.ObjectKey) {
+			keys = append(keys, p.ObjectKey)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, []string{"no cached object of this version is on record"}
+	}
+	if r.Stores == nil {
+		return nil, []string{"no object store is open to identify the cached object"}
+	}
+	for _, k := range keys {
+		u, err := r.cacheOrigin(ctx, ve, cataloged, prev[0].PkgType, k)
+		switch {
+		case err != nil:
+			unknown = append(unknown, k+": "+err.Error())
+		case u == "":
+			unknown = append(unknown, k+": no upstream is recorded for the object now at that key")
+		case !slices.Contains(origins, u):
+			origins = append(origins, u)
+		}
+	}
+	return origins, unknown
+}
+
+func (r *Revetter) cacheOrigin(ctx context.Context, ve manifest.VersionEntry, cataloged bool, typ, key string) (string, error) {
+	store, err := r.objectStore(ve, cataloged, typ, key)
+	if err != nil {
+		return "", err
+	}
+	res, err := store.GetStream(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", errors.New("the object is no longer in the store")
+	}
+	_ = res.Body.Close()
+	return r.DB.CacheOrigin(ctx, key, StreamIdentity(store, res))
+}
+
+// objectStore is the backend an object of the version lives in: the one the
+// manifest records for a cataloged version, and for a proxy-cache entry the
+// one its key's type resolves to, which is where the fill cached it.
+func (r *Revetter) objectStore(ve manifest.VersionEntry, cataloged bool, typ, key string) (storage.ObjectStore, error) {
+	if cataloged {
+		return r.Stores.ByName(ve.Storage)
+	}
+	if t, _, _ := manifest.ParseKey(key); t != "" {
+		typ = t
+	}
+	return r.Stores.ForType(typ), nil
+}
+
+// StreamIdentity is what the store said about the object an open handle is
+// on, in the form the audit store compares. A fill records its origin under
+// this identity and a re-vet reads it back under this identity, so the two
+// cannot drift apart. The zero value is what a caller with no metadata in
+// hand produces, and it matches no recorded origin.
+func StreamIdentity(store storage.ObjectStore, res *storage.StreamResult) audit.ObjectIdentity {
+	if store == nil || res == nil {
+		return audit.ObjectIdentity{}
+	}
+	obj := audit.ObjectIdentity{
+		Backend: store.Label(),
+		Size:    res.ContentLength,
+		ETag:    res.ETag,
+	}
+	if !res.LastModified.IsZero() {
+		obj.Modified = res.LastModified.UTC().Format(time.RFC3339Nano)
+	}
+	return obj
 }
 
 // carriedAge is the age entry of a re-vet row. The gate is not re-run,
@@ -549,14 +655,6 @@ func (r *Revetter) sign(ctx context.Context, out *RevetOutcome, ve manifest.Vers
 	if r.Emitter == nil || r.Stores == nil {
 		return
 	}
-	var store storage.ObjectStore
-	if cataloged {
-		var err error
-		if store, err = r.Stores.ByName(ve.Storage); err != nil {
-			out.Notes = append(out.Notes, "no envelope signed: "+err.Error())
-			return
-		}
-	}
 	for _, row := range rows {
 		if row.ObjectKey == "" {
 			out.Notes = append(out.Notes, "no envelope signed: no object of this version is pinned")
@@ -567,13 +665,10 @@ func (r *Revetter) sign(ctx context.Context, out *RevetOutcome, ve manifest.Vers
 			out.Notes = append(out.Notes, "no envelope signed for "+row.ObjectKey+": no sha256 pinned for it")
 			continue
 		}
-		into := store
-		if !cataloged {
-			typ, _, _ := manifest.ParseKey(row.ObjectKey)
-			if typ == "" {
-				typ = row.PkgType
-			}
-			into = r.Stores.ForType(typ)
+		into, err := r.objectStore(ve, cataloged, row.PkgType, row.ObjectKey)
+		if err != nil {
+			out.Notes = append(out.Notes, "no envelope signed: "+err.Error())
+			return
 		}
 		p := attest.Pin{Type: row.PkgType, Name: row.PkgName, Version: row.PkgVersion, ObjectKey: row.ObjectKey,
 			SHA256: sum.Value, RequiredBy: ve.RequiredBy}

@@ -44,6 +44,13 @@ with the failing checks in the event. A frozen version is never hidden:
 it is reported, and the run exits non-zero because it is still served.
 Neither is a version served only from the proxy cache, which has no
 catalog entry to hide: it is reported, and its envelope still revokes it.
+Under hide, such a version, or one whose hide failed, also makes the run
+exit non-zero, since it is still served; under report none does.
+
+For a helm, binary or apt version the proxy cached, whose catalog entry
+names no upstream, the allow-list is re-run against the upstream recorded
+when the object was cached. With none recorded, the allow-list entry is
+not_evaluated and the outcome notes that the upstream is unknown.
 
 With an attestation key installed, each refusal of a pinned object signs
 a new envelope whose policy evaluations record the block, and a pass that
@@ -86,7 +93,14 @@ user the server runs as so it can read the key.
 				Cfg: cfg, DB: adb, Store: store, Allow: policy.NewChecker(adb),
 				OnBlock: cfg.ResolveRevetOnBlock(),
 			}
-			if note := revetSigner(cmd, cfg, adb, rv); note != "" {
+			// The stores are opened whether or not this process can sign: the
+			// allow-list of a proxy-cached helm, binary or apt version is
+			// re-run against the upstream recorded for the object they hold.
+			if rv.Stores, err = storage.NewResolver(ctx, cfg); err != nil {
+				rv.Stores = nil
+				fmt.Fprintf(os.Stderr, "note: object stores not opened, so no envelope is signed and a proxy-cached URL-keyed version's allow-list is not re-run: %v\n", err)
+			}
+			if note := revetSigner(cfg, adb, rv); note != "" {
 				fmt.Fprintf(os.Stderr, "note: %s\n", note)
 			}
 			targets, err := rv.Targets(ctx, f)
@@ -128,6 +142,10 @@ user the server runs as so it can read the key.
 				signalReloadNow(cmd, gf)
 				return fmt.Errorf("%d frozen version(s) are refused and still served; unfreeze and hide them with 'bodega pkg freeze' and 'bodega pkg hide'", sum.Frozen)
 			}
+			if n := unhidden(rv.OnBlock, outcomes); n > 0 {
+				signalReloadNow(cmd, gf)
+				return fmt.Errorf("revet_on_block is hide and %d refused version(s) are still served; see the table for why each was not hidden", n)
+			}
 			return nil
 		},
 	}
@@ -143,7 +161,7 @@ user the server runs as so it can read the key.
 // sign, and otherwise returns why it cannot. Not signing is a note rather
 // than a failure: the refusal is still recorded and still acted on, and an
 // operator without the key is the common case for a CLI run.
-func revetSigner(cmd *cobra.Command, cfg *config.Config, adb *audit.DB, rv *admit.Revetter) string {
+func revetSigner(cfg *config.Config, adb *audit.DB, rv *admit.Revetter) string {
 	if adb.ReadOnly() || !adb.EventsQueryable() {
 		return "audit_sink " + adb.SinkName() + " keeps no admissions table to re-read before signing; refusals are recorded and no envelope is signed"
 	}
@@ -151,18 +169,32 @@ func revetSigner(cmd *cobra.Command, cfg *config.Config, adb *audit.DB, rv *admi
 	if err != nil {
 		return "no envelope is signed for a refusal: " + err.Error()
 	}
-	stores, err := storage.NewResolver(cmd.Context(), cfg)
-	if err != nil {
-		return "no envelope is signed for a refusal: " + err.Error()
+	if rv.Stores == nil {
+		return "no envelope is signed for a refusal: no object store is open"
 	}
 	signer := kr.Signer()
-	rv.Stores = stores
 	rv.Emitter = &attest.Emitter{
 		Signer:     func() attestsign.Signer { return signer },
 		Admissions: adb,
 		PlatformID: cfg.ResolveAttestationPlatformID(),
 	}
 	return ""
+}
+
+// unhidden counts the refusals revet_on_block: hide left served: a version
+// only the proxy cache holds, or one whose hide failed. Under report every
+// refusal is left served by design and none is counted.
+func unhidden(onBlock string, outcomes []admit.RevetOutcome) int {
+	if onBlock != config.RevetHide {
+		return 0
+	}
+	n := 0
+	for _, o := range outcomes {
+		if o.Blocked() && o.Action == admit.RevetReported {
+			n++
+		}
+	}
+	return n
 }
 
 func printRevet(outcomes []admit.RevetOutcome) error {

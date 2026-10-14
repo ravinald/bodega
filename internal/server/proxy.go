@@ -1387,18 +1387,7 @@ type cachedObject struct {
 // in the form the audit store compares. The zero value is what a caller with
 // no metadata in hand produces, and it matches no recorded origin.
 func streamIdentity(store storage.ObjectStore, res *storage.StreamResult) audit.ObjectIdentity {
-	if store == nil || res == nil {
-		return audit.ObjectIdentity{}
-	}
-	obj := audit.ObjectIdentity{
-		Backend: store.Label(),
-		Size:    res.ContentLength,
-		ETag:    res.ETag,
-	}
-	if !res.LastModified.IsZero() {
-		obj.Modified = res.LastModified.UTC().Format(time.RFC3339Nano)
-	}
-	return obj
+	return admit.StreamIdentity(store, res)
 }
 
 // identifyObject reads the object at s3Key and reports both what the store

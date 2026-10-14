@@ -2604,6 +2604,8 @@ Admission decides once. A version that passed OSV a month ago may have an adviso
 
 It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware) and [upstream provenance](#bodega-policy-provenance-setlist). The publish-age gate is skipped, because a version only gets older. The age verdict the last decision recorded is carried into the new row, labeled `not re-run, carried from the decision of <time>`; a version with no earlier age verdict records `not_evaluated`.
 
+The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary or apt version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`.
+
 Each version gets a **new** admission row beside the old one, with actor `revet` and the trigger as its identity: the operator's name for this command, `schedule` for the [scheduled re-vet](#scheduled-re-vet), `webhook` for the [webhook](#re-vet-webhook). The old row is kept, so `bodega audit admissions <type> <name> <version>` reads as the history of what bodega concluded and when. The new row carries the object key the previous decision was pinned under, one row per key for a pypi release with several wheels.
 
 ```console
@@ -2623,7 +2625,7 @@ WARN: npm/minimist@1.2.5 is refused and still served (reported)
 | `--older-than` | Only versions whose newest decision is older than this (`7d`, `72h`); none on record counts |
 | `--json`       | One object per version: the decisions, the failing checks, signed envelopes and notes       |
 
-Proxy-cached versions are found in the admissions table, so with `audit_sink` set to `jsonl` or `syslog`, which keep none this process can read, only the catalog is walked and a WARN says so. A `--name` or `--version` that matches nothing exits 1. The table goes to stdout and the summary and WARN lines to stderr. The run exits 1 when a version could not be re-vetted, and when a refused version is frozen, because that version is still served.
+Proxy-cached versions are found in the admissions table, so with `audit_sink` set to `jsonl` or `syslog`, which keep none this process can read, only the catalog is walked and a WARN says so. A `--name` or `--version` that matches nothing exits 1. The table goes to stdout and the summary and WARN lines to stderr. The run exits 1 when a version could not be re-vetted, when a refused version is frozen, and, under `revet_on_block: hide`, when a refused version was not hidden (a proxy-cached version, or one whose hide failed), because each of those is still served. Under `report` every refusal stays served by design, so refusals alone exit 0.
 
 #### `revet_on_block`
 
@@ -2634,7 +2636,7 @@ What a refusal does is set by `revet_on_block` in `config.json`:
 | `report` (default) | A `revet` audit event (status `policy_violation`, details naming the failing checks) and a WARN. The version stays served.                                            |
 | `hide`             | The same event, then the version is hidden as `bodega pkg hide` does: saved to the manifest and recorded as a `hide` event with actor `revet` and the failing checks. |
 
-**A version served only from the proxy cache is never hidden**, whatever the setting. Hiding is a flag on a catalog entry, and a proxy fill leaves none, so the refusal is recorded as `reported` with the note `not hidden: no catalog entry exists to hide`, and its [revocation envelope](#revocation-envelopes) is still signed. To stop serving it, import the version and hide it, or refuse the package in the allow-list.
+**A version served only from the proxy cache is never hidden**, whatever the setting. Hiding is a flag on a catalog entry, and a proxy fill leaves none, so the refusal is recorded as `reported` with the note `not hidden: no catalog entry exists to hide`, and its [revocation envelope](#revocation-envelopes) is still signed. To stop serving it, import the version and hide it, or refuse the package in the allow-list. Under `hide` the command exits 1 for it, as for a frozen version, since the setting asked for something the run could not do.
 
 **A frozen version is never hidden**, whatever the setting. Freezing says the version must not change under the fleet pinned to it. The refusal is reported with action `frozen`, and the command exits 1 so a cron job sees it. A version already hidden is recorded with action `already_hidden` and left alone.
 

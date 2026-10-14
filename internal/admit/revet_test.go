@@ -431,3 +431,126 @@ func newestStatement(t *testing.T, objects storage.ObjectStore, object string) a
 	}
 	return *st
 }
+
+const binaryKey = "binaries/tool/1.0.0/tool.tgz"
+
+// cacheBinaryFill records what a binary proxy fill leaves behind: the object
+// in the proxy store, its sha256, and an admitted row whose allow-list entry
+// matched the upstream it was fetched from. With origin set, the cache origin
+// is recorded under the identity of the stored object, as the fill does.
+func (f revetFixture) cacheBinaryFill(t *testing.T, origin string) {
+	t.Helper()
+	ctx := t.Context()
+	if err := f.objects.Put(ctx, binaryKey, []byte("tool bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.RecordAdmission(ctx, audit.Admission{
+		PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0", ObjectKey: binaryKey,
+		Decision: audit.AdmissionAdmitted, DecidedAt: time.Now().Add(-20 * 24 * time.Hour),
+		Checks: []audit.AdmissionCheck{AllowListCheck(true, "https://evil.example.com/tool.tgz", nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.StoreChecksum(ctx, binaryKey, manifest.TypeBinary, "tool", "1.0.0", "sha256",
+		strings.Repeat("ef", 32), "computed"); err != nil {
+		t.Fatal(err)
+	}
+	if origin == "" {
+		return
+	}
+	res, err := f.objects.GetStream(ctx, binaryKey)
+	if err != nil || res == nil {
+		t.Fatalf("open cached object: %v", err)
+	}
+	_ = res.Body.Close()
+	if err := f.adb.StoreCacheOrigin(ctx, binaryKey, origin, StreamIdentity(f.objects, res)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A binary, helm or apt version the proxy cached has no catalog entry and so
+// no URL to rule on; its allow-list is re-run against the upstream recorded
+// for the cached object. Outside the list it is refused and revoked, inside
+// it passes, and with no origin on record the allow-list is not_evaluated,
+// the decision follows the other checks and the outcome says why.
+func TestRevetProxyOnlyURLTypeRerunsAllowListOnCacheOrigin(t *testing.T) {
+	cases := []struct {
+		name, origin, decision, action, allow string
+		envelopes                             int
+		note                                  string
+	}{
+		{"outside the list", "https://evil.example.com/tool.tgz", audit.AdmissionPolicyBlocked, RevetReported, audit.CheckBlock, 1, "no catalog entry exists to hide"},
+		{"inside the list", "https://good.example.com/tool.tgz", audit.AdmissionAdmitted, RevetNone, audit.CheckPass, 0, ""},
+		{"no origin recorded", "", audit.AdmissionAdmitted, RevetNone, audit.CheckNotEvaluated, 0, "upstream of the cached object is unknown"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRevetFixture(t, manifest.VersionEntry{})
+			f.osv.action = policy.ActionPass
+			f.cacheBinaryFill(t, c.origin)
+			if err := f.adb.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "r1", RegistryType: manifest.TypeBinary,
+				RuleKind: policy.RuleKindForType(manifest.TypeBinary), Pattern: "https://good.example.com/"}); err != nil {
+				t.Fatal(err)
+			}
+			ring, err := attestsign.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer := ring.Signer()
+			rv := f.revetter(config.RevetHide)
+			rv.Allow = policy.NewChecker(f.adb)
+			rv.Stores = storage.NewSingle(f.objects)
+			rv.Emitter = &attest.Emitter{Signer: func() attestsign.Signer { return signer }, Admissions: f.adb, PlatformID: "bodega://test"}
+
+			targets, err := rv.Targets(t.Context(), RevetFilter{Type: manifest.TypeBinary})
+			want := []RevetTarget{{Type: manifest.TypeBinary, Name: "tool", Version: "1.0.0"}}
+			if err != nil || !slices.Equal(targets, want) {
+				t.Fatalf("targets = %+v (%v), want %+v", targets, err, want)
+			}
+			o := rv.One(t.Context(), targets[0], "schedule")
+			if o.Error != "" || o.Decision != c.decision || o.Action != c.action {
+				t.Fatalf("outcome = %+v, want %s, %s", o, c.decision, c.action)
+			}
+			if c.note != "" && !slices.ContainsFunc(o.Notes, func(n string) bool { return strings.Contains(n, c.note) }) {
+				t.Errorf("notes = %v, want one containing %q", o.Notes, c.note)
+			}
+			if c.note == "" && len(o.Notes) != 0 {
+				t.Errorf("notes = %v, want none", o.Notes)
+			}
+			if len(o.Envelopes) != c.envelopes {
+				t.Errorf("envelopes = %v (%v), want %d", o.Envelopes, o.Notes, c.envelopes)
+			}
+
+			rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0"})
+			if err != nil || len(rows) != 2 || rows[0].Actor != RevetActor || rows[0].ObjectKey != binaryKey {
+				t.Fatalf("rows = %+v (%v), want the re-vet's beside the fill's", rows, err)
+			}
+			allow := rows[0].Checks[slices.IndexFunc(rows[0].Checks, func(ch audit.AdmissionCheck) bool { return ch.Check == audit.CheckAllowList })]
+			if allow.Status != c.allow || (c.origin != "" && !strings.Contains(allow.Detail, c.origin)) {
+				t.Errorf("allow-list entry = %+v, want %s naming %q", allow, c.allow, c.origin)
+			}
+		})
+	}
+}
+
+// An origin is credited only to the object it was recorded for: bytes
+// written over the key since, by a path that fetched nothing, leave the
+// upstream unknown rather than inheriting the fill's.
+func TestRevetIgnoresAnOriginRecordedForOtherBytes(t *testing.T) {
+	f := newRevetFixture(t, manifest.VersionEntry{})
+	f.osv.action = policy.ActionPass
+	f.cacheBinaryFill(t, "https://good.example.com/tool.tgz")
+	if err := f.objects.Put(t.Context(), binaryKey, []byte("uploaded over the fill")); err != nil {
+		t.Fatal(err)
+	}
+	rv := f.revetter(config.RevetReport)
+	rv.Allow = policy.NewChecker(f.adb)
+	rv.Stores = storage.NewSingle(f.objects)
+	o := rv.One(t.Context(), RevetTarget{Type: manifest.TypeBinary, Name: "tool", Version: "1.0.0"}, "schedule")
+	if o.Error != "" || o.Decision != audit.AdmissionAdmitted {
+		t.Fatalf("outcome = %+v", o)
+	}
+	if !slices.ContainsFunc(o.Notes, func(n string) bool { return strings.Contains(n, "upstream of the cached object is unknown") }) {
+		t.Errorf("notes = %v, want the upstream reported unknown", o.Notes)
+	}
+}

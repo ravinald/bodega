@@ -144,3 +144,43 @@ func TestRevetCommandRejectsABadOlderThan(t *testing.T) {
 		t.Error("--older-than soon was accepted")
 	}
 }
+
+// A refused version only the proxy cache holds has no catalog entry to hide.
+// Under hide that leaves it served against the setting, and the run fails as
+// it does for a frozen one; under report leaving it served is the setting,
+// and the run succeeds.
+func TestRevetCommandProxyOnlyRefusalExitCode(t *testing.T) {
+	for _, c := range []struct {
+		onBlock string
+		fails   bool
+	}{{"hide", true}, {"report", false}} {
+		t.Run(c.onBlock, func(t *testing.T) {
+			root := revetInstall(t, c.onBlock)
+			adb, err := audit.Open(filepath.Join(root, "logs", "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = adb.RecordAdmission(context.Background(), audit.Admission{
+				PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.5",
+				Decision: audit.AdmissionAdmitted, Checks: audit.NotEvaluatedChecks("proxy fill"),
+				DecidedAt: time.Now().Add(-30 * 24 * time.Hour),
+			})
+			_ = adb.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			syncInto(t, root, advisory("GHSA-late", "minimist", "1.2.4", "1.2.6"))
+
+			_, stderr, err := runRevet(t)
+			if !strings.Contains(stderr, "1 refused (0 hidden, 0 frozen)") {
+				t.Fatalf("summary = %q (%v)", stderr, err)
+			}
+			if c.fails && (err == nil || !strings.Contains(err.Error(), "still served")) {
+				t.Errorf("err = %v, want the unhidden refusal to fail the run", err)
+			}
+			if !c.fails && err != nil {
+				t.Errorf("err = %v, want success under report", err)
+			}
+		})
+	}
+}
