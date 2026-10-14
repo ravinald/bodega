@@ -1970,16 +1970,20 @@ bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" 
 Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
 ```
 
-| Check        | Status | Where it refuses                                                                     |
-| ------------ | ------ | ------------------------------------------------------------------------------------ |
-| `allow-list` | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                         |
-| `age`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
-| `osv`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
-| `profile`    | 403    | any package route on a host whose profile governs the type                           |
-| `constraint` | 403    | an npm or gomod version outside the entry's `version_constraint`                     |
-| `hidden`     | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it |
-| `frozen`     | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                            |
-| `checksum`   | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest           |
+| Check         | Status | Where it refuses                                                                                                         |
+| ------------- | ------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `allow-list`  | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                                                             |
+| `age`         | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`                                                |
+| `osv`         | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`                                                |
+| `provenance`  | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks   |
+| `similarity`  | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when the `name_similarity` check blocks       |
+| `integration` | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
+| `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                         |
+| `profile`     | 403    | any package route on a host whose profile governs the type                                                               |
+| `constraint`  | 403    | an npm or gomod version outside the entry's `version_constraint`                                                         |
+| `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                     |
+| `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                |
+| `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest                                               |
 
 Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
 
@@ -1991,15 +1995,15 @@ The body never carries a credential, an upstream URL, an internal hostname, a st
 curl -s 'http://127.0.0.1:8080/api/v1/audit?name=left-pad&limit=200' | grep 650285e650d5
 ```
 
-| Check                                  | Audit row                                               |
-| -------------------------------------- | ------------------------------------------------------- |
-| `allow-list`, `age`, `osv` on a fetch  | `cache` / `policy_violation`                            |
-| `allow-list`, `age`, `osv` on a create | `create` / `policy_violation`                           |
-| `profile`                              | `denied` / `profile_membership` or `profile_constraint` |
-| `constraint`                           | `denied` / `version_constraint`                         |
-| `hidden`                               | `denied` / `hidden`                                     |
-| `frozen`                               | `denied` / `entry_frozen`                               |
-| `checksum`                             | `cache` / `checksum_mismatch`                           |
+| Check                                                                                       | Audit row                                               |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration`, `policy` on a fetch  | `cache` / `policy_violation`                            |
+| `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration`, `policy` on a create | `create` / `policy_violation`                           |
+| `profile`                                                                                   | `denied` / `profile_membership` or `profile_constraint` |
+| `constraint`                                                                                | `denied` / `version_constraint`                         |
+| `hidden`                                                                                    | `denied` / `hidden`                                     |
+| `frozen`                                                                                    | `denied` / `entry_frozen`                               |
+| `checksum`                                                                                  | `cache` / `checksum_mismatch`                           |
 
 A `checksum` refusal whose digest could not be read at all writes no row, because the database that would hold it is what failed; its incident is in the server log line instead.
 
@@ -3057,9 +3061,56 @@ The quorum is recorded with each request when it is made, so changing `override_
 
 **Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
 
+### `bodega queue <list|approve|dismiss>`
+
+The queue is one place to see every client request bodega refused and to resolve each refusal in one step. It holds one row per type, package, version and check, with when it was first and last refused, how many requests it took, and the identities and client addresses that asked.
+
+```bash
+bodega queue list
+bodega queue list --check age --json
+bodega queue approve 12 --reason "INC-4411: vendor needs 1.3.0 today"
+bodega queue dismiss 14 --reason "typo of lodash"
+```
+
+| Command                                                   | Effect                                                                                                                                       |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list [--type <type>] [--check <check>] [--all] [--json]` | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row. |
+| `approve <id> --reason <text> [--expires <duration>]`     | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only. |
+| `dismiss <id> --reason <text>`                            | Closes the row without admitting anything.                                                                                                   |
+
+**Which refusals write a row.** A row is written on every refusal of a client fetch by one of these checks, whatever `discover_mode` says:
+
+| Check                 | Written by                                                                                      | `approve` does                                                                                                                                                                                  |
+| --------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allow-list`          | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest.               |
+| `age`                 | The proxy fill's age gate                                                                       | Requests an override (below)                                                                                                                                                                    |
+| `osv`                 | The proxy fill's OSV gate, for an advisory                                                      | Requests an override                                                                                                                                                                            |
+| `malware`             | The proxy's malware gate, and the OSV gate when the record is `MAL-`                            | Refused; dismiss it                                                                                                                                                                             |
+| `upstream_provenance` | The proxy fill's provenance gate                                                                | Requests an override, or is refused when the provenance was `invalid`                                                                                                                           |
+| `name_similarity`     | The proxy fill's name similarity gate                                                           | Requests an override                                                                                                                                                                            |
+| `profile`             | A host profile refusing a package or version                                                    | Pins the version in every profile that refused it, as `bodega profile pin` does, with the reason on the entry and the operator as `pinned_by`. A row with no version lists the package instead. |
+
+An override request goes through [`bodega override`](#bodega-override-requestapproverejectlist): the operator who approves the row is the requester, and the version is admitted once `override_quorum` identities have approved it, so with the default quorum a second person runs `bodega override approve <id>`, which `approve` prints. `--expires` defaults to `override_max_ttl`. Approving a row whose version already has a pending or active override for that check resolves it into that override rather than filing a second request. A profile has no two-person flow, so a profile row is a single-operator exception recorded with its reason.
+
+`approve` refuses a `malware` row, and an `upstream_provenance` row whose outcome was `invalid`, naming the check: these say the version is hostile, and an override never admits them either. The row stays open until it is dismissed.
+
+**Reopening.** A row that is refused again after it was approved or dismissed reopens and keeps its last resolution, which `list` shows as `open (was: ...)`. An approval into an override that still waits for its second approver reopens on the next refused request; that is the queue showing the version is still refused.
+
+**Not queued.** `bodega pkg create` and `POST /api/v1/packages/{type}` refusals (an operator's own create, answered with the override command), the hidden, frozen, constraint and checksum refusals (each already names its own repair), and the FreeBSD catalogue refusals that name a repository path rather than a package.
+
+**How it relates to discovery.** [Discovery](#bodega-discover-) records what the fleet reached for upstream, allowed or denied, and only while `discover_mode` is `observe`; its rows aggregate by allow-list pattern and feed `discover promote`. The queue records only refusals, from every check, always, keyed by the version and the check that refused it, and resolves each one. An allow-list refusal with discovery on writes both a `denied` discovery row and a queue row; approving either one adds a rule, and the queue row reopens if the rule did not cover the request.
+
+**Running server.** A rule added by `approve` reaches a running server within the allow-list cache's 30 seconds, a profile pin within the profile cache's, and an override at the next admission. Through the API the server applies the rule and the pin at once.
+
+**Audit.** Each resolution writes a `queue` event (`bodega audit events --type queue`) with status `approved` or `dismissed`, and the rule, override or profile write it made records its own event as the matching command would. The rows live in the `refusal_queue` and `refusal_queue_requesters` tables of the embedded SQLite store (migration 035).
+
+The TUI's `Q` key and [`/api/v1/queue`](#queue-endpoints) do the same, and the web UI dashboard shows the open rows read-only.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
+
+For refusals alone, from every check and whatever `discover_mode` says, resolved one row at a time, see [`bodega queue`](#bodega-queue-listapprovedismiss).
 
 **It is a record of upstream reaches, not of installs.** A row means bodega went to an upstream, would have, or once did and is now answering from the copy it kept — a proxy cache hit bumps the row the fetch that filled it wrote, so a proxied artifact keeps counting long after the last upstream request for it. What writes nothing is a **hosted** entry: bodega built or fetched those on its own schedule and serves them out of storage with no upstream in the request at all. So the discovery log never answers "what did this host install", and it gets quieter as the catalog gets better. The answer to that question is the audit trail: `bodega audit events --client <ip> --type serve_fetch` carries one row per artifact bodega handed that client, hosted and proxied alike, which is the complete record discovery is not.
 
@@ -6154,6 +6205,16 @@ These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and
 
 `POST /api/v1/auth/exchange` and `GET /api/v1/auth/providers` are the OIDC routes; the exchange sits outside `admin_permit_cidr` because the ID token is the credential. See [Authentication](#authentication).
 
+### Queue endpoints
+
+| Method | Path                                  | Description                                                              |
+| ------ | ------------------------------------- | ------------------------------------------------------------------------ |
+| GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open` |
+| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires}`); answers what the approval did  |
+| POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
+
+These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
+
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 
 Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
@@ -6186,7 +6247,7 @@ curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
 - `401 Unauthorized` — missing or invalid Bearer token
-- `403 Forbidden` — IP not in `admin_permit_cidr`; the token lacks the scope the route needs (the body names it); the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
+- `403 Forbidden` — IP not in `admin_permit_cidr`; the token lacks the scope the route needs (the body names it); the entry is frozen (delete); or the allow-list or a version check blocked it (create), answered as `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration` or `policy`. The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
 - `409 Conflict` — entry already exists
 - `413 Request Entity Too Large` — request body exceeds 1 MiB
 
@@ -6717,7 +6778,7 @@ The decision is the manifest's. A version whose own checks all passed still reco
 
 **Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
 
-**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV, upstream provenance and name similarity checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv`, `upstream_provenance` or `name_similarity`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
+**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV, upstream provenance and name similarity checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv`, `provenance`, `similarity` or `integration`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
 
 **The builder runs them too.** A build's fetch admits each entry under the allow-list and the age, OSV and upstream provenance checks, and a block fails that entry the way an allow-list refusal does. Import may be months old by the time bytes are fetched, so the row a pin attaches to is the decision made when the bytes arrived.
 
@@ -7318,6 +7379,7 @@ With the Sources pane focused:
 | `R`                     | Remove the marked entries' stored artifacts, after a confirmation                                                                                                                                                                           |
 | `I`                     | Initialize an s3 backend's bucket, as `bodega init` does, after a confirmation naming the backend, bucket and region. It acts on s3 backends only, and asks which one when several are configured. Esc cancels while it reaches the backend |
 | `L`                     | Query the audit log                                                                                                                                                                                                                         |
+| `Q`                     | Open the refusal queue: `a` approves and `x` dismisses the row under the cursor, each after prompting for a reason; see [`bodega queue`](#bodega-queue-listapprovedismiss)                                                                  |
 | `G`                     | Configure an [integration](#integrations-view): pick a type, then fill in the form generated from its descriptor                                                                                                                            |
 | `T`                     | Open the token manager                                                                                                                                                                                                                      |
 | `Ctrl+R`                | Reload the manifests (any pane)                                                                                                                                                                                                             |

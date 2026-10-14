@@ -773,3 +773,91 @@ func TestBaselineIndexPassesTheAllowList(t *testing.T) {
 		t.Errorf("unmarked module list: status %d, want 403 (%s)", rec.Code, rec.Body.String())
 	}
 }
+
+// Every check admission can block on answers its own refusal word, a reason
+// naming the check, and an override request only where an override applies.
+// The details carry URLs, as a real provenance or integration result does, so
+// a body that copied them would show it.
+func TestAdmitRefusalPerCheck(t *testing.T) {
+	pinIncident(t)
+	leak := "https://github.com/evil/repo"
+	for _, tc := range []struct {
+		name, check, word, names string
+		details                  map[string]any
+		override                 bool
+		also                     string
+	}{
+		{"allowlist", audit.CheckAllowList, checkAllowList, "allow-list", nil, false, "bodega policy add"},
+		{"age", audit.CheckAge, checkAge, "minimum publish age", nil, false, ""},
+		{"osv", audit.CheckOSV, checkOSV, "vulnerability record", map[string]any{"vulns": []string{"GHSA-1"}}, false, ""},
+		{"osv malware", audit.CheckOSV, checkOSV, "malicious", map[string]any{"malware": []string{"MAL-2024-1"}}, false, "override does not apply"},
+		{"provenance mismatch", audit.CheckUpstreamProvenance, checkProvenance, "upstream_provenance",
+			map[string]any{"outcome": audit.ProvenanceMismatch, "source_repository_uri": leak}, true, "bodega pkg trust reset npm left-pad"},
+		{"provenance invalid", audit.CheckUpstreamProvenance, checkProvenance, "upstream_provenance",
+			map[string]any{"outcome": audit.ProvenanceInvalid, "source_repository_uri": leak}, false, "override does not apply"},
+		{"similarity", audit.CheckNameSimilarity, checkSimilarity, "name_similarity", nil, true, ""},
+		{"integration", "integration:aikido", checkIntegrate, `integration "aikido"`,
+			map[string]any{"instance": "aikido", "outcome": "flagged", "purl": "pkg:npm/left-pad@1.3.0"}, true, ""},
+		{"unknown", "tea_leaves", checkPolicy, "tea_leaves", map[string]any{"url": leak}, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := admitRefusal(manifest.TypeNpm, "left-pad", admitBlock{check: tc.check, version: "1.3.0", incident: "fedcba987654", details: tc.details})
+			f.client = refusalClientAPI
+			rec := httptest.NewRecorder()
+			f.write(rec, httptest.NewRequest(http.MethodPost, "/api/v1/packages/npm", nil))
+			body := rec.Body.String()
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", rec.Code)
+			}
+			if got, want := rec.Header().Get(refusalHeader), tc.word+"; incident=fedcba987654"; got != want {
+				t.Errorf("%s = %q, want %q", refusalHeader, got, want)
+			}
+			if !strings.Contains(f.reason, tc.names) {
+				t.Errorf("reason %q does not name %q", f.reason, tc.names)
+			}
+			cmd := "bodega override request npm left-pad 1.3.0 --check " + tc.check
+			if strings.Contains(f.next, cmd) != tc.override || (!tc.override && strings.Contains(f.next, "bodega override request")) {
+				t.Errorf("next %q: names %q = %v, want %v", f.next, cmd, !tc.override, tc.override)
+			}
+			if tc.override && !strings.Contains(f.next, "fedcba987654") {
+				t.Errorf("next %q does not name the incident", f.next)
+			}
+			if tc.also != "" && !strings.Contains(f.next, tc.also) {
+				t.Errorf("next %q does not name %q", f.next, tc.also)
+			}
+			if strings.Contains(body, "http://") || strings.Contains(body, "https://") {
+				t.Errorf("body carries a URL: %s", body)
+			}
+		})
+	}
+}
+
+// A provenance block on a proxy fill reaches the client as a provenance
+// refusal, not an allow-list one, through the real fill path.
+func TestProxyFillProvenanceRefusal(t *testing.T) {
+	prev := fetchCheckers
+	fetchCheckers = func(*config.Config, *audit.DB) []policy.VersionChecker {
+		return []policy.VersionChecker{verdict{policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock,
+			Reason:  "mismatch: built from https://github.com/evil/repo",
+			Details: map[string]any{"outcome": audit.ProvenanceMismatch, "source_repository_uri": "https://github.com/evil/repo"}}}}
+	}
+	t.Cleanup(func() { fetchCheckers = prev })
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	s.cfg.NpmUpstream = up.ts.URL
+
+	rec := doRequest(s, http.MethodGet, "/npm/minimist/-/minimist-1.2.8.tgz", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d %q, want 403", rec.Code, rec.Body.String())
+	}
+	inc := refusalIncident(t, rec.Header(), checkProvenance)
+	body := rec.Body.String()
+	for _, want := range []string{"upstream_provenance", "bodega override request npm minimist 1.2.8 --check upstream_provenance", inc} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body does not name %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "https://") || strings.Contains(body, "allow-list") {
+		t.Errorf("body carries a URL or the allow-list: %s", body)
+	}
+}

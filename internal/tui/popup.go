@@ -24,6 +24,7 @@ const (
 	popupAuditTable             // results table for an audit-log query
 	popupChoice                 // pick one of several named options
 	popupInitPending            // I key — waiting on a backend's dial
+	popupQueue                  // Q key — the refusal review queue
 )
 
 // choicePurpose names what a choice popup is choosing.
@@ -112,6 +113,9 @@ type popupModel struct {
 	jsonTitle    string         // title shown at the top of the JSON overlay
 	jsonTextarea textarea.Model // bubbles textarea for JSON editing
 	jsonError    string         // validation error shown at the bottom of the overlay
+
+	// --- refusal queue ---
+	queue *queueView
 
 	// --- audit results table ---
 	auditTable table.Model
@@ -230,6 +234,7 @@ Storage operations:
 
 Audit:
   L          Query audit log (with filters)
+  Q          Refusal queue: a=approve  x=dismiss
 
 Integrations:
   G          Pick an external check type and configure it
@@ -394,6 +399,9 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 
 	case popupTokenManager:
 		content = p.renderTokenManager()
+
+	case popupQueue:
+		content = p.queue.render()
 	}
 
 	box := popupStyle.Render(content)

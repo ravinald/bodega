@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/integration"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -27,6 +28,10 @@ const (
 	checkFrozen     = "frozen"
 	checkChecksum   = "checksum"
 	checkConstraint = "constraint"
+	checkProvenance = "provenance"
+	checkSimilarity = "similarity"
+	checkIntegrate  = "integration"
+	checkPolicy     = "policy"
 )
 
 // refusalHeader carries the check and the incident on every refusal, so a
@@ -266,25 +271,110 @@ func allowListRefusal(regType, candidate, name, version string) *refusal {
 	return f
 }
 
-// admitRefusal is the refusal for a manifest admission blocked by the
-// allow-list, the age gate or the OSV gate. Its incident is the one admit
-// wrote into the row it recorded.
+// admitRefusal is the refusal for a manifest admission blocked by one of its
+// checks. Its incident is the one admit wrote into the row it recorded.
 func admitRefusal(typ, name string, res admitBlock) *refusal {
-	var f *refusal
-	switch res.check {
-	case checkAge:
-		f = ageRefusal(typ, name, res.version, res.details)
-	case checkOSV:
-		f = osvRefusal(typ, name, res.version, res.details)
-	default:
-		f = newRefusal(checkAllowList, typ, name, res.version, http.StatusForbidden)
-		f.reason = fmt.Sprintf("%s %q is not on this server's upstream allow-list.", typ, name)
-		f.next = fmt.Sprintf("`bodega policy add %s <%s>` admits it, then retry.", typ, policy.RuleKindForType(typ))
-	}
+	f := newRefusal(admitRefusalWord(res.check), typ, name, res.version, http.StatusForbidden)
 	if res.incident != "" {
 		f.incident = res.incident
 	}
+	switch f.check {
+	case checkAllowList:
+		f.reason = fmt.Sprintf("%s %q is not on this server's upstream allow-list.", typ, name)
+		f.next = fmt.Sprintf("`bodega policy add %s <%s>` admits it, then retry.", typ, policy.RuleKindForType(typ))
+	case checkAge:
+		ageReason(f, res.details)
+	case checkOSV:
+		osvReason(f, res.details)
+	case checkProvenance:
+		provenanceReason(f, res.details)
+	case checkSimilarity:
+		f.reason = fmt.Sprintf("the %s check refused %s: its name is close to a package this server's similarity list names.",
+			res.check, f.subjectPhrase())
+		f.next = overrideNext(f, res.check)
+	case checkIntegrate:
+		what := "flagged it"
+		if fmt.Sprint(res.details["outcome"]) == "error" {
+			what = "could not be asked about it, and this server blocks when it cannot"
+		}
+		f.reason = fmt.Sprintf("the %s check refused %s: integration %q %s.",
+			res.check, f.subjectPhrase(), strings.TrimPrefix(res.check, integration.CheckPrefix), what)
+		f.next = overrideNext(f, res.check)
+	default:
+		f.reason = fmt.Sprintf("the %s check refused %s.", res.check, f.subjectPhrase())
+		f.next = fmt.Sprintf("give an operator incident %s; its audit row names what the check found.", f.incident)
+	}
 	return f
+}
+
+// admitRefusalWord maps an admission check to the word its refusal carries.
+// The allow-list arrives as audit.CheckAllowList from a proxy fill and as the
+// refusal word itself from admit's create path. Anything unlisted answers
+// checkPolicy, so a check added later is never reported as the allow-list.
+func admitRefusalWord(check string) string {
+	switch {
+	case check == audit.CheckAllowList || check == checkAllowList:
+		return checkAllowList
+	case check == audit.CheckAge:
+		return checkAge
+	case check == audit.CheckOSV:
+		return checkOSV
+	case check == audit.CheckUpstreamProvenance:
+		return checkProvenance
+	case check == audit.CheckNameSimilarity:
+		return checkSimilarity
+	case strings.HasPrefix(check, integration.CheckPrefix):
+		return checkIntegrate
+	}
+	return checkPolicy
+}
+
+// provenanceReason says what the upstream_provenance check concluded from its
+// outcome alone: the check's detail can name the source repository and the
+// builder by URL, and the body goes to whoever can reach the route.
+func provenanceReason(f *refusal, d map[string]any) {
+	outcome := fmt.Sprint(d["outcome"])
+	var what string
+	switch outcome {
+	case audit.ProvenanceInvalid:
+		what = "its publisher's signed provenance does not verify"
+	case audit.ProvenanceMismatch:
+		what = "its provenance names a different publisher than the one this server pinned"
+	case audit.ProvenanceUnavailable:
+		what = "it publishes no provenance and this server requires it"
+	default:
+		what = fmt.Sprintf("its provenance outcome is %q", outcome)
+	}
+	f.reason = fmt.Sprintf("the %s check refused %s: %s.", audit.CheckUpstreamProvenance, f.subjectPhrase(), what)
+	switch outcome {
+	case audit.ProvenanceInvalid:
+		f.next = fmt.Sprintf("an override does not apply to invalid upstream provenance; give an operator incident %s.", f.incident)
+	case audit.ProvenanceMismatch:
+		f.next = overrideNext(f, audit.CheckUpstreamProvenance) +
+			fmt.Sprintf(" If the publisher changed on purpose, `bodega pkg trust reset %s %s` re-pins it instead.", f.pkgType, f.name)
+	default:
+		f.next = overrideNext(f, audit.CheckUpstreamProvenance)
+	}
+}
+
+// overrideNext names the override request that admits this one version past
+// check, spelled the way `bodega override request --check` accepts it.
+func overrideNext(f *refusal, check string) string {
+	version := f.version
+	if version == "" {
+		version = "<version>"
+	}
+	return fmt.Sprintf("give an operator incident %s; `bodega override request %s %s %s --check %s` admits this version once approved.",
+		f.incident, f.pkgType, f.name, version, check)
+}
+
+// subjectPhrase is the package and version as a reason sentence names them.
+func (f *refusal) subjectPhrase() string {
+	s := fmt.Sprintf("%s %q", f.pkgType, f.name)
+	if f.version != "" {
+		s += " " + f.version
+	}
+	return s
 }
 
 // admitBlock is the part of an admission verdict a refusal is built from.
@@ -299,18 +389,22 @@ type admitBlock struct {
 // the person refused can plan around. d is the age check's own details.
 func ageRefusal(typ, name, version string, d map[string]any) *refusal {
 	f := newRefusal(checkAge, typ, name, version, http.StatusForbidden)
+	ageReason(f, d)
+	return f
+}
+
+func ageReason(f *refusal, d map[string]any) {
 	published, _ := time.Parse(time.RFC3339, fmt.Sprint(d["published_at"]))
 	minAge := time.Duration(anyInt64(d["min_age_seconds"])) * time.Second
 	if published.IsZero() || minAge <= 0 {
 		f.reason = "this version was published too recently for this server's minimum publish age."
 		f.next = "pin an older version, or ask an operator about `bodega policy age list`."
-		return f
+		return
 	}
 	f.reason = fmt.Sprintf("this version was published %s and this server holds new versions back for %s.",
 		published.UTC().Format(time.DateOnly), policy.ShortDuration(minAge))
 	f.next = fmt.Sprintf("the version becomes available on %s; pin an older version until then.",
 		published.Add(minAge).UTC().Format(time.DateOnly))
-	return f
 }
 
 // osvRefusal names the advisories by ID and nothing else from the check's
@@ -318,6 +412,11 @@ func ageRefusal(typ, name, version string, d map[string]any) *refusal {
 // about the local database, neither of which the client needs.
 func osvRefusal(typ, name, version string, d map[string]any) *refusal {
 	f := newRefusal(checkOSV, typ, name, version, http.StatusForbidden)
+	osvReason(f, d)
+	return f
+}
+
+func osvReason(f *refusal, d map[string]any) {
 	var ids []string
 	switch v := d["vulns"].(type) {
 	case []string:
@@ -329,8 +428,8 @@ func osvRefusal(typ, name, version string, d map[string]any) *refusal {
 	}
 	if malware := anyStrings(d["malware"]); len(malware) > 0 {
 		f.reason = "OSV records this version as malicious: " + strings.Join(malware, ", ") + "."
-		f.next = "do not install this version; remove it from any lockfile that names it and pick another release."
-		return f
+		f.next = "do not install this version; remove it from any lockfile that names it and pick another release. An override does not apply to known malware; give an operator incident " + f.incident + " if this is wrong."
+		return
 	}
 	if len(ids) == 0 {
 		f.reason = "this version has a known vulnerability record."
@@ -338,7 +437,6 @@ func osvRefusal(typ, name, version string, d map[string]any) *refusal {
 		f.reason = "this version has known vulnerability records: " + strings.Join(ids, ", ") + "."
 	}
 	f.next = "pick a version without those records, or ask an operator to review `bodega policy osv list`."
-	return f
 }
 
 func anyStrings(v any) []string {
