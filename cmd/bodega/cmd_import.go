@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -24,6 +26,7 @@ func newImportCmd(gf *globalFlags) *cobra.Command {
 	var origin string
 	var serverURL string
 	var allowPlaintext bool
+	var baseline bool
 
 	cmd := &cobra.Command{
 		Use:   "import <file> [file...]",
@@ -55,7 +58,19 @@ host's package manager, this pushes the result, and neither step needs a
 manifest store on the host. The server URL also comes from $BODEGA_SERVER or
 server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 
-  bodega pkg convert apt < installed.txt | bodega pkg import --server https://bodega.example -`,
+  bodega pkg convert apt < installed.txt | bodega pkg import --server https://bodega.example -
+
+--baseline marks every imported version as what hosts already run: a gate
+that fails on one records the finding and admits it rather than refusing,
+and 'bodega policy report' lists it as baseline debt until 'bodega policy
+baseline clear' removes the mark. Only this flag sets the mark. A version
+imported later without it is never baseline, and a mark carried in a file
+imported without it is dropped. --baseline writes the local store, so it is
+refused with --server: a host pushing its own catalog cannot exempt it from
+the gates.
+
+  bodega pkg convert npm < installed.txt > baseline.json
+  bodega pkg import --baseline --merge baseline.json`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
@@ -68,6 +83,9 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 			// directory and no audit database, and requiring them there is
 			// exactly what this flag exists to avoid.
 			if target := cfg.ResolveServerURL(serverURL); target != "" {
+				if baseline {
+					return fmt.Errorf("--baseline writes the local manifest store and cannot be sent to %s; copy the file to the bodega host and run 'bodega pkg import --baseline' there", target)
+				}
 				suppressReload(cmd)
 				return importToServer(target, cfg.ResolveToken(), allowPlaintext, merge, origin, args)
 			}
@@ -93,6 +111,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 			}
 			takeNameBaseline(ctx, adb, store)
 
+			now := time.Now()
 			var imported int
 			for _, path := range args {
 				data, err := readInput(path)
@@ -118,6 +137,12 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 						return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
 					}
 
+					if baseline {
+						admit.MarkBaseline(pm, now)
+					} else if dropped := admit.CarryBaseline(pm, existing); len(dropped) > 0 {
+						fmt.Fprintf(os.Stderr, "%s/%s: baseline mark ignored on %s: only --baseline sets it\n",
+							pm.Type, pm.Name, strings.Join(dropped, ", "))
+					}
 					res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 					for _, w := range res.Warnings {
 						fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
@@ -134,6 +159,9 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 
 					if existing != nil && merge {
 						admit.MergeVersions(existing, pm)
+						if baseline {
+							admit.MarkHeld(existing, pm)
+						}
 						if err := store.SavePackage(ctx, existing); err != nil {
 							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
 						}
@@ -177,6 +205,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 	cmd.Flags().StringVar(&origin, "origin", "", "Host these manifests were cataloged from; refused when the payload already names a different one")
 	cmd.Flags().StringVar(&serverURL, "server", "", "Push to this bodega server instead of writing the local manifest store")
 	cmd.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false, "Permit --server over http; refused by default because a bearer token would travel in the clear")
+	cmd.Flags().BoolVar(&baseline, "baseline", false, "Mark every imported version as baseline: admitted past a failing gate, with the finding recorded")
 	return cmd
 }
 

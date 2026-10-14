@@ -90,11 +90,14 @@ func ValidateOrigin(origin string) error {
 // The origins are the exception: a second host reporting the same version is
 // new information, and replacing rather than adding would lose the fact that
 // both machines have it.
+//
+// A ref-only entry (git) is matched by its Ref: matched by Version, every one
+// of them reads as "" and an incoming ref merges into whichever ref came first.
 func MergeVersions(existing, incoming *manifest.PackageManifest) {
 	for _, ve := range incoming.Versions {
 		found := false
 		for i := range existing.Versions {
-			if existing.Versions[i].Version == ve.Version {
+			if admissionVersion(existing.Versions[i]) == admissionVersion(ve) {
 				addOrigins(&existing.Versions[i], Origins(ve))
 				found = true
 				break

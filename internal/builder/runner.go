@@ -154,6 +154,13 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 		version = ve.Ref
 	}
 	err := c.checkPolicy(ctx, regType, candidate)
+	// A baseline version was already running somewhere when the list was
+	// written, so its refusal is recorded on the admission row and the build
+	// the mark exists to keep working goes on.
+	var baselined error
+	if ve.Baseline && policy.IsViolation(err) {
+		baselined, err = err, nil
+	}
 	if err != nil && c.AuditDB != nil {
 		_ = c.AuditDB.Record(ctx, audit.Event{
 			EventType:  audit.EventFetch,
@@ -171,8 +178,11 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone,
 		Status: audit.CheckNotEvaluated, Detail: "not run: no allow-list loaded"}
 	if c.policyChecker != nil {
-		hasRules, _ := c.policyChecker.HasRules(ctx, regType)
-		allow = admit.AllowListCheck(hasRules, candidate, err)
+		listed, _ := c.policyChecker.Listed(ctx, regType)
+		allow = admit.AllowListCheck(listed, candidate, err)
+		if baselined != nil {
+			allow, _ = admit.BaselineCheck(ve, admit.AllowListCheck(listed, candidate, baselined))
+		}
 	}
 	res := admit.Fetch(ctx, c.AuditDB, fetchCheckers(c.app, c.AuditDB), regType, name, ve, allow,
 		admit.Who{Actor: audit.CurrentActor()}, "")

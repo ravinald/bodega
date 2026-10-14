@@ -97,3 +97,24 @@ func TestIndexFilterGate(t *testing.T) {
 		}
 	}
 }
+
+// Malicious separates a MAL- record from an ordinary advisory, because a
+// baseline version is withheld for the first and kept for the second.
+func TestIndexGateMalicious(t *testing.T) {
+	ctx := context.Background()
+	mal := npmAdvisory("MAL-2026-1", "evil-pkg", "0", "9.9.9")
+	delete(mal, "severity")
+	db := dbWithNpm(t, t.TempDir(), npmAdvisory("GHSA-x", "minimist", "1.0.0", "1.2.6"), mal)
+	ck := NewOSVChecker(nil)
+	ck.LocalDB = db
+	g, err := NewIndexFilter(fakeIndexFilterStore{on: true, osv: &audit.OSVPolicy{Action: ActionBlock}}, ck).Gate(ctx, "npm")
+	if err != nil || g == nil {
+		t.Fatalf("gate = %v, %v", g, err)
+	}
+	if g.Withhold(ctx, "minimist", "1.2.5", time.Time{}) != WithheldOSV || g.Malicious(ctx, "minimist", "1.2.5") {
+		t.Error("an advisory must be withheld but not read as malware")
+	}
+	if !g.Malicious(ctx, "evil-pkg", "1.0.0") {
+		t.Error("a MAL- record must read as malware")
+	}
+}

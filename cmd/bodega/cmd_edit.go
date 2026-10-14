@@ -189,6 +189,12 @@ re-run with --editor cat to inspect, or copy and retry.`,
 				return keep("%v", err)
 			}
 
+			var before manifest.PackageManifest
+			_ = json.Unmarshal(beforeJSON, &before)
+			if dropped := admit.CarryBaseline(pm, &before); len(dropped) > 0 {
+				fmt.Fprintf(os.Stderr, "%s/%s: baseline mark ignored on %s: only `bodega pkg import --baseline` sets it\n",
+					pm.Type, pm.Name, strings.Join(dropped, ", "))
+			}
 			res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 			for _, w := range res.Warnings {
 				fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)

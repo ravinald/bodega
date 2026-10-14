@@ -712,3 +712,25 @@ func TestIndexFilterGomod(t *testing.T) {
 		}
 	})
 }
+
+// A proxy-mode version marked baseline stays in the filtered packument and its
+// tarball is served, though the age gate withholds it from an unmarked entry.
+func TestIndexFilterKeepsABaselineVersion(t *testing.T) {
+	s := filteringServer(t, manifest.TypeNpm)
+	s.cfg.NpmUpstream = npmFilterUpstream(t).URL
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "widget", Type: manifest.TypeNpm}
+	for _, v := range []string{"4.2.0", "4.3.0"} {
+		pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: v, Mode: manifest.ModeProxy})
+	}
+	pm.Versions[1].Baseline, pm.Versions[1].BaselineAt = true, "2026-01-01T00:00:00Z"
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	rec := get(t, s, "/npm/widget")
+	if !strings.Contains(rec.Body.String(), `"4.3.0"`) || rec.Header().Get(filteredHeader) != "" {
+		t.Errorf("baseline 4.3.0 withheld; header %q, body %s", rec.Header().Get(filteredHeader), rec.Body)
+	}
+	if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code != http.StatusOK {
+		t.Errorf("baseline tarball status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+}

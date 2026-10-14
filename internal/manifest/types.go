@@ -336,6 +336,17 @@ type VersionEntry struct {
 	// Frozen prevents this version from being built, edited, or deleted.
 	Frozen bool `json:"frozen,omitempty"`
 
+	// Baseline marks a version `bodega pkg import --baseline` brought in from
+	// what hosts already ran. A gate that fails on it records the finding and
+	// admits it rather than refusing, so turning a gate on breaks nothing that
+	// was already deployed. Only that import writes the mark: every other
+	// write path drops one it did not already hold (admit.CarryBaseline), and
+	// `bodega policy baseline clear` removes it.
+	Baseline bool `json:"baseline,omitempty"`
+	// BaselineAt is when the baseline import marked this version, RFC 3339
+	// in UTC.
+	BaselineAt string `json:"baseline_at,omitempty"`
+
 	// Storage names the backend holding this version's artifact bytes.
 	//
 	// EMPTY MEANS "default" — NOT "resolve via the config hierarchy". Every

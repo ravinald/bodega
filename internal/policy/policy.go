@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -69,6 +70,24 @@ type Store interface {
 	GetPoliciesByType(ctx context.Context, registryType string) ([]Rule, error)
 }
 
+// ModeStore is the store half that holds the admission mode an operator set.
+// *audit.DB satisfies it. A Store without it has no set modes, so every type
+// takes the mode its rules imply.
+type ModeStore interface {
+	GetAdmissionMode(ctx context.Context, ecosystem string) (audit.AdmissionMode, error)
+}
+
+// Mode is how a type decides which names it admits, and whether an operator
+// set that or the allow-list implied it.
+type Mode struct {
+	Mode string // audit.ModeListed or audit.ModeOpen
+	// Set is true when an operator chose Mode with `policy mode set`. False
+	// means it follows the rules: listed with any, open with none.
+	Set bool
+	// Rules is how many allow-list rules the type has.
+	Rules int
+}
+
 // DefaultCacheTTL is the in-memory cache duration for loaded rules. Mirrors
 // the token-hash cache in server/middleware.go.
 const DefaultCacheTTL = 30 * time.Second
@@ -82,6 +101,7 @@ type Checker struct {
 
 	mu     sync.RWMutex
 	cache  map[string][]Rule
+	modes  map[string]string
 	loaded map[string]time.Time
 }
 
@@ -102,6 +122,7 @@ func NewChecker(store Store) *Checker {
 		store:    store,
 		cacheTTL: DefaultCacheTTL,
 		cache:    make(map[string][]Rule),
+		modes:    make(map[string]string),
 		loaded:   make(map[string]time.Time),
 	}
 }
@@ -111,14 +132,16 @@ func NewChecker(store Store) *Checker {
 func (c *Checker) Invalidate() {
 	c.mu.Lock()
 	c.cache = make(map[string][]Rule)
+	c.modes = make(map[string]string)
 	c.loaded = make(map[string]time.Time)
 	c.mu.Unlock()
 }
 
 // Check returns nil if candidate is permitted under the current allow-list for
-// registryType. Empty rule set for a type means "allow" (opt-in feature).
-// Non-matching candidate returns a *ViolationError suitable for
-// errors.As / IsViolation.
+// registryType. A type in open mode admits every name, which is what a type
+// with no rules and no mode set is; a type in listed mode admits only a name
+// a rule matches, none at all when it has no rules. A non-matching candidate
+// returns a *ViolationError suitable for errors.As / IsViolation.
 //
 // What to pass as `candidate` per type:
 //   - apt:    upstream URL (hostname is extracted internally)
@@ -133,11 +156,11 @@ func (c *Checker) Check(ctx context.Context, registryType, candidate string) err
 	if c == nil {
 		return nil // nil checker = policy disabled entirely (test/dev convenience)
 	}
-	rules, err := c.rulesFor(ctx, registryType)
+	rules, mode, err := c.load(ctx, registryType)
 	if err != nil {
 		return fmt.Errorf("load policies: %w", err)
 	}
-	if len(rules) == 0 {
+	if mode.Mode == audit.ModeOpen {
 		return nil
 	}
 	for _, r := range rules {
@@ -151,12 +174,13 @@ func (c *Checker) Check(ctx context.Context, registryType, candidate string) err
 	}
 }
 
-func (c *Checker) rulesFor(ctx context.Context, registryType string) ([]Rule, error) {
+// load returns the type's rules and its mode, through the cache.
+func (c *Checker) load(ctx context.Context, registryType string) ([]Rule, Mode, error) {
 	c.mu.RLock()
 	if ts, ok := c.loaded[registryType]; ok && time.Since(ts) < c.cacheTTL {
-		rules := c.cache[registryType]
+		rules, set := c.cache[registryType], c.modes[registryType]
 		c.mu.RUnlock()
-		return rules, nil
+		return rules, modeOf(rules, set), nil
 	}
 	c.mu.RUnlock()
 
@@ -164,15 +188,64 @@ func (c *Checker) rulesFor(ctx context.Context, registryType string) ([]Rule, er
 	defer c.mu.Unlock()
 	// Re-check after acquiring write lock — another goroutine may have loaded.
 	if ts, ok := c.loaded[registryType]; ok && time.Since(ts) < c.cacheTTL {
-		return c.cache[registryType], nil
+		rules, set := c.cache[registryType], c.modes[registryType]
+		return rules, modeOf(rules, set), nil
 	}
 	rules, err := c.store.GetPoliciesByType(ctx, registryType)
 	if err != nil {
-		return nil, err
+		return nil, Mode{}, err
+	}
+	set := ""
+	if ms, ok := c.store.(ModeStore); ok {
+		m, err := ms.GetAdmissionMode(ctx, registryType)
+		switch {
+		case err == nil:
+			set = m.Mode
+		case !errors.Is(err, audit.ErrAdmissionModeNotFound):
+			return nil, Mode{}, fmt.Errorf("load admission mode: %w", err)
+		}
 	}
 	c.cache[registryType] = rules
+	c.modes[registryType] = set
 	c.loaded[registryType] = time.Now()
-	return rules, nil
+	return rules, modeOf(rules, set), nil
+}
+
+// modeOf resolves a type's mode from the mode set for it, empty when none
+// was, and its rules.
+func modeOf(rules []Rule, set string) Mode {
+	m := Mode{Mode: set, Set: set != "", Rules: len(rules)}
+	if !m.Set {
+		m.Mode = audit.ModeOpen
+		if len(rules) > 0 {
+			m.Mode = audit.ModeListed
+		}
+	}
+	return m
+}
+
+// ModeFor returns the admission mode registryType is in. A nil checker is
+// open: there is no allow-list to list anything.
+func (c *Checker) ModeFor(ctx context.Context, registryType string) (Mode, error) {
+	if c == nil {
+		return Mode{Mode: audit.ModeOpen}, nil
+	}
+	_, m, err := c.load(ctx, registryType)
+	return m, err
+}
+
+// Listed reports whether the allow-list decides which names registryType
+// admits: true in listed mode, false in open mode. It is what an admission
+// row's allow-list action and a discovery row's no_policy turn on.
+func (c *Checker) Listed(ctx context.Context, registryType string) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	m, err := c.ModeFor(ctx, registryType)
+	if err != nil {
+		return false, err
+	}
+	return m.Mode == audit.ModeListed, nil
 }
 
 func matchRule(registryType string, r Rule, candidate string) bool {
@@ -223,21 +296,6 @@ func matchNpm(candidate, pattern string) bool {
 		return strings.HasPrefix(candidate, strings.TrimSuffix(pattern, "*"))
 	}
 	return false
-}
-
-// HasRules reports whether any allow-list rules exist for registryType. The
-// discovery hook calls this to distinguish "allowed by an explicit rule" from
-// "no rules configured for this type" — both of which make Check return nil.
-// Result respects the same TTL cache as Check.
-func (c *Checker) HasRules(ctx context.Context, registryType string) (bool, error) {
-	if c == nil {
-		return false, nil
-	}
-	rules, err := c.rulesFor(ctx, registryType)
-	if err != nil {
-		return false, err
-	}
-	return len(rules) > 0, nil
 }
 
 // SuggestPattern returns the pattern a `policy add` call would use if an

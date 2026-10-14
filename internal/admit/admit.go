@@ -264,12 +264,13 @@ func replaceResults(results, changed []policy.Result) []policy.Result {
 }
 
 // AllowListCheck renders an allow-list verdict as an admission check.
-// hasRules says whether the type has any rules, which is what decides between
-// "block" and "none" as the action; candidate is what was checked, empty when
-// the entry names nothing the allow-list can rule on; err is Check's answer.
-func AllowListCheck(hasRules bool, candidate string, err error) audit.AdmissionCheck {
+// listed says whether the type is in listed mode, which is what decides
+// between "block" and "none" as the action; candidate is what was checked,
+// empty when the entry names nothing the allow-list can rule on; err is
+// Check's answer.
+func AllowListCheck(listed bool, candidate string, err error) audit.AdmissionCheck {
 	c := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckPass}
-	if hasRules {
+	if listed {
 		c.Action = policy.ActionBlock
 	}
 	switch {
@@ -279,10 +280,10 @@ func AllowListCheck(hasRules bool, candidate string, err error) audit.AdmissionC
 	case candidate == "":
 		c.Status = audit.CheckNotEvaluated
 		c.Detail = "the entry names no upstream the allow-list can rule on"
-	case hasRules:
+	case listed:
 		c.Detail = "matched: " + candidate
 	default:
-		c.Detail = "no allow-list rules for this type: " + candidate
+		c.Detail = "open admission mode, no allow-list rule required: " + candidate
 	}
 	return c
 }
@@ -386,23 +387,24 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 // cheap and fails fast, so it runs before the checks that reach the network.
 // It returns nil when every version passes. A version after the one refused
 // is never reached, and its row says so. A refusal an active override names
-// is recorded overridden and the version goes on to the version checks.
+// is recorded overridden, and one on a baseline version is recorded baseline;
+// either way the version goes on to the version checks.
 func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string, ev *evaluation) *Result {
 	if checker == nil {
 		ev.notRunChecks(-1, "not run: no allow-list loaded", audit.CheckAllowList)
 		return nil
 	}
-	hasRules, _ := checker.HasRules(ctx, pm.Type)
+	listed, _ := checker.Listed(ctx, pm.Type)
 	for i, ve := range pm.Versions {
 		candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
 		if candidate == "" {
-			ev.set(i, AllowListCheck(hasRules, "", nil))
+			ev.set(i, AllowListCheck(listed, "", nil))
 			continue
 		}
 		err := checker.Check(ctx, pm.Type, candidate)
-		check := AllowListCheck(hasRules, candidate, err)
+		check := AllowListCheck(listed, candidate, err)
 		if policy.IsViolation(err) {
-			if c, ok := ev.overrideCheck(pm, i, check); ok {
+			if c, ok := ev.admitPast(pm, i, check); ok {
 				ev.set(i, c)
 				continue
 			}

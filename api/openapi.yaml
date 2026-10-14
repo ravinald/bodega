@@ -1811,6 +1811,16 @@ components:
           type: boolean
         frozen:
           type: boolean
+        baseline:
+          type: boolean
+          description: >-
+            Imported with `bodega pkg import --baseline`. A gate that fails on
+            a baseline version records the finding and admits it. Only that
+            import sets it; every other write drops it.
+        baseline_at:
+          type: string
+          format: date-time
+          description: When the baseline import marked this version.
         description:
           type: string
         metadata:
