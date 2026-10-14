@@ -197,13 +197,22 @@ uninstall:
 # it runs serially and takes longer than every other package put together.
 # Split so CI runs the two beside each other instead of end to end; a local
 # `check` still runs both, in sequence.
+#
+# GO_TEST_TIMEOUT bounds a hang, not a normal run. internal/server took 308s to
+# 462s on CI with -race and -coverprofile in October 2026, and crossed go test's
+# 10m default once tests were added rather than any one of them hanging. ci.yml
+# runs both targets through make, so CI and a local run share this value.
+# TEST_FLAGS carries what only CI adds, such as -coverprofile.
+GO_TEST_TIMEOUT := 20m
+TEST_FLAGS ?=
+
 ## test: Run every package but internal/server, with the race detector
 test:
-	go list ./... | grep -v '/internal/server$$' | xargs go test -race -count=1
+	go list ./... | grep -v '/internal/server$$' | xargs go test -race -count=1 -timeout $(GO_TEST_TIMEOUT) $(TEST_FLAGS)
 
 ## test-server: Run internal/server with the race detector
 test-server:
-	go test -race -count=1 ./internal/server/...
+	go test -race -count=1 -timeout $(GO_TEST_TIMEOUT) $(TEST_FLAGS) ./internal/server/...
 
 ## test-verbose: Run all tests with verbose output
 test-verbose:
