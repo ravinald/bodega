@@ -155,7 +155,7 @@ func TestRefusedManifestNamesIntegrationsNotRun(t *testing.T) {
 	}
 }
 
-// An override may name an integration check, and admits past it.
+// An override request may name an integration check by its instance.
 func TestOverrideNamesIntegrationCheck(t *testing.T) {
 	if !isIntegrationCheck("integration:aikido") || isIntegrationCheck("integration:") || isIntegrationCheck("integration:Bad.Name") {
 		t.Error("isIntegrationCheck accepts or refuses the wrong names")
