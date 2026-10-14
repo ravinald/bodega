@@ -250,6 +250,41 @@ func TestExchangedTokenAttributesAuditRows(t *testing.T) {
 	}
 }
 
+// Rows written before the gate reads the token still name the subject: the
+// /client/ boundary's refusal, and the gate's own admin_permit_cidr refusal,
+// which it writes before it looks at any token.
+func TestExchangedTokenAttributesRowsWrittenBeforeTheGate(t *testing.T) {
+	s, is := newOIDCServer(t)
+	app, _, _ := exchange(t, s, ciToken(t, is, "acme/app", nil))
+	if app == nil {
+		t.Fatal("exchange failed")
+	}
+	cases := []struct {
+		name, method, path, remote, status string
+	}{
+		{"client refusal", http.MethodGet, "/client/plan", adminAddr, audit.DenialClientUnidentified},
+		{"cidr refusal", http.MethodPost, "/api/v1/packages/import", outsideAddr, audit.DenialIPNotPermitted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := send(s, tc.method, tc.path, tc.remote, app.Token, `{}`); rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+			rows, err := s.auditDB.Query(context.Background(), audit.Filter{})
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("query: %d rows, %v", len(rows), err)
+			}
+			r := rows[0]
+			if r.EventType != audit.EventDenied || r.Status != tc.status {
+				t.Fatalf("newest row = %s/%s, want denied/%s", r.EventType, r.Status, tc.status)
+			}
+			if r.Actor != app.Subject || r.Identity != is.URL {
+				t.Errorf("row actor=%q identity=%q, want %q and %q", r.Actor, r.Identity, app.Subject, is.URL)
+			}
+		})
+	}
+}
+
 // A narrowed token on bulk import lands the entries its types reach and
 // refuses the rest by name.
 func TestBulkImportHoldsEachEntryToTokenTypes(t *testing.T) {

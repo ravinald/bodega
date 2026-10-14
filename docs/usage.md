@@ -5624,7 +5624,7 @@ Write rules narrow. `repository_owner: acme` grants every repository in the orga
 
 ### CI token exchange
 
-`POST /api/v1/auth/exchange` takes `{"id_token": "<OIDC ID token>"}` and answers with a bodega token. It is reachable from outside `admin_permit_cidr`, because the ID token is the credential.
+`POST /api/v1/auth/exchange` takes `{"id_token": "<OIDC ID token>"}` and answers with a bodega token. The exchange itself is reachable from outside `admin_permit_cidr`, because the ID token is the credential. The token it returns is not exempt from that range: a read with it works from any address, but a write or admin request needs the caller's address inside `admin_permit_cidr` before its scopes are read, and from outside it is refused `403 Forbidden`.
 
 ```json
 {
@@ -5637,9 +5637,9 @@ Write rules narrow. `repository_owner: acme` grants every repository in the orga
 }
 ```
 
-The token lives for `oidc_token_ttl` and is then pruned from the database by the next exchange. Every audit row a request carrying it writes, and every admission decision, records the ID token's `sub` as the actor and its `iss` as the identity, so `bodega audit events --actor repo:acme/web:ref:refs/heads/main` or `--identity https://token.actions.githubusercontent.com` finds the workflow rather than a token id. `bodega token revoke <id>` ends one early.
+The token lives for `oidc_token_ttl` and is then pruned from the database by the next exchange. Every audit row a request carrying it writes, and every admission decision, records the ID token's `sub` as the actor and its `iss` as the identity, so `bodega audit events --actor repo:acme/web:ref:refs/heads/main` or `--identity https://token.actions.githubusercontent.com` finds the workflow rather than a token id. `bodega token revoke <id>` ends one early. The one row that does not name the subject is a deny-list refusal: `deny_list` refuses the address before any token is read, so that row names the address only.
 
-A GitHub Actions job requests an ID token for bodega's audience and exchanges it. The job needs `id-token: write`:
+A GitHub Actions job requests an ID token for bodega's audience and exchanges it. The job needs `id-token: write`. The import step below is a write, so it works from a self-hosted runner whose address is in `admin_permit_cidr`, or from a hosted runner only when its egress range is listed there; a job that only fetches packages needs no range:
 
 ```yaml
 permissions:

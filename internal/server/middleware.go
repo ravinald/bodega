@@ -871,8 +871,10 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // and threat feeds outside admin_permit_cidr post to them, and each handler
 // authenticates its caller itself. A nil pushRoute exempts nothing.
 func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger, pushRoute func(*http.Request) bool) func(http.Handler) http.Handler {
-	tokens := &tokenCache{db: auditDB, logger: logger}
+	return mutationAuth(admin, &tokenCache{db: auditDB, logger: logger}, auditDB, pepper, logger, pushRoute)
+}
 
+func mutationAuth(admin NetsFunc, tokens *tokenCache, auditDB *audit.DB, pepper string, logger *slog.Logger, pushRoute func(*http.Request) bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
@@ -1151,6 +1153,29 @@ func withToken(r *http.Request, tok audit.TokenHash) *http.Request {
 		ctx = audit.WithPrincipal(ctx, p)
 	}
 	return r.WithContext(ctx)
+}
+
+// principalMiddleware attaches the principal of an exchanged token to the
+// request before anything that writes an audit row on its own: the /client/
+// boundary and the gate's refusals that precede its token check. Without it
+// those rows are anonymous for a request whose token names a workflow or a
+// person. It attaches the principal alone; scopes are the gate's to grant.
+//
+// It runs inside DenyListMiddleware, so a deny-listed peer costs no hash, and
+// it shares the gate's cache, so a token is loaded once per refresh.
+func principalMiddleware(tokens *tokenCache, pepper string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if cred, _ := credentialFrom(r); cred != "" {
+				if tok := tokens.match(cred, pepper, time.Now()); tok != nil {
+					if p, ok := tok.Principal(); ok {
+						r = r.WithContext(audit.WithPrincipal(r.Context(), p))
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 type tokenScopesKey struct{}
