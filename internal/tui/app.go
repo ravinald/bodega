@@ -335,13 +335,22 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.popup.kind {
 	case popupChoice:
-		// I is the only action that offers a choice.
 		if m.popup.HandleChoiceKey(key) {
-			chosen := m.popup.chosen
+			chosen, purpose := m.popup.chosen, m.popup.choiceFor
 			m.popup.dismiss()
-			if chosen != "" {
-				return m.beginInit(chosen)
+			if chosen == "" {
+				return m, nil
 			}
+			if purpose == choiceIntegration {
+				p, err := m.openIntegrationForm(chosen)
+				if err != nil {
+					m.log.appendLog(errorStyle.Render("Integrations: " + err.Error()))
+					return m, nil
+				}
+				m.popup = p
+				return m, nil
+			}
+			return m.beginInit(chosen)
 		}
 		return m, nil
 
@@ -371,15 +380,20 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		if key == "ctrl+t" && m.popup.onTest != nil && !m.popup.selectOpen {
+			m.log.appendLog(dimStyle.Render("Testing integration with one real query..."))
+			return m, m.popup.onTest(m.popup.formFields)
+		}
+
 		// Open JSON overlay on "j" key (before printable-rune handling).
-		if key == "j" && !m.popup.selectOpen {
+		if key == "j" && !m.popup.selectOpen && !m.popup.integrationForm {
 			initialJSON := formFieldsToJSON(m.popup.formFields)
 			m.popup.OpenJSONOverlay(m.width, m.height, initialJSON, m.popup.formTitle)
 			return m, nil
 		}
 
 		// Ctrl+T: load defaults into form fields.
-		if key == "ctrl+t" && !m.popup.selectOpen {
+		if key == "ctrl+t" && !m.popup.selectOpen && !m.popup.integrationForm {
 			m.popup.formFields = configDefaultFields()
 			if m.popup.onChange != nil {
 				m.popup.onChange(&m.popup)
@@ -395,7 +409,7 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// the prompt and the report name the fields rather than the file. A
 		// line saying the config was reset left an admin_permit_cidr of
 		// 0.0.0.0/0 in place under a success message (#183, #227).
-		if key == "ctrl+r" && !m.popup.selectOpen {
+		if key == "ctrl+r" && !m.popup.selectOpen && !m.popup.integrationForm {
 			m.popup = popupModel{
 				kind:    popupConfirm,
 				message: "Reset this form's fields to their defaults and save?\nConfig keys the form does not edit are left as they are.",
@@ -802,6 +816,15 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "L":
 		m.popup = m.buildAuditPopup()
+		return m, nil
+
+	case "G":
+		p, err := buildIntegrationPicker()
+		if err != nil {
+			m.log.appendLog(errorStyle.Render("Integrations: " + err.Error()))
+			return m, nil
+		}
+		m.popup = p
 		return m, nil
 
 	case "v":
@@ -2569,7 +2592,7 @@ func configDefaultFields() []formField {
 func formFieldsToJSON(fields []formField) string {
 	m := make(map[string]string)
 	for _, f := range fields {
-		if f.Checkbox || f.Value == "" {
+		if f.Checkbox || f.Secret || f.Value == "" {
 			continue
 		}
 		m[f.Label] = f.Value

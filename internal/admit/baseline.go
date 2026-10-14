@@ -179,7 +179,9 @@ func failingChecks(ctx context.Context, checker *policy.Checker, adb *audit.DB, 
 		}
 	}
 	if adb != nil {
-		ev.runVersion(ctx, pm, 0, VersionCheckers(cfg, adb))
+		checkers := VersionCheckers(cfg, adb)
+		ev.include(ctx, pm, checkers)
+		ev.runVersion(ctx, pm, 0, checkers)
 	}
 	var failing []audit.AdmissionCheck
 	for _, c := range ev.checks[0] {

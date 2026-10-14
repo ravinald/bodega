@@ -26,6 +26,14 @@ const (
 	popupInitPending            // I key — waiting on a backend's dial
 )
 
+// choicePurpose names what a choice popup is choosing.
+type choicePurpose int
+
+const (
+	choiceInitBackend choicePurpose = iota // I: which s3 backend to initialize
+	choiceIntegration                      // G: which integration type to configure
+)
+
 // popupModel holds the state for the overlay popup.
 type popupModel struct {
 	kind    popupKind
@@ -54,6 +62,11 @@ type popupModel struct {
 	// chosen is the option Enter picked, left on the dismissed popup for the
 	// app to act on in the same Update, before any other key can open a popup.
 	chosen string
+	// choiceKeys, when set, is what chosen carries for each option in place
+	// of its display text.
+	choiceKeys []string
+	// choiceFor says which action the choice answers.
+	choiceFor choicePurpose
 
 	// --- init pending popup ---
 	// initSeq names the I request this popup is waiting on. A resolution
@@ -82,6 +95,13 @@ type popupModel struct {
 	validate func(fields []formField) string
 	// validationError is the last error returned by validate.
 	validationError string
+	// integrationForm marks a form generated from an integration
+	// descriptor. The config form's Ctrl+T, Ctrl+R and raw-JSON keys belong
+	// to that form alone, so they are off here and every rune is typed.
+	integrationForm bool
+	// onTest is the integration form's Ctrl+T: one real query, answered in
+	// the log pane.
+	onTest func(fields []formField) tea.Cmd
 
 	// --- inline select submenu ---
 	selectOpen   bool // is the inline submenu currently displayed?
@@ -143,7 +163,12 @@ type formField struct {
 	LabelSelectValue   string   // current value of the label-embedded dropdown
 	LabelSelectOptions []string // options for the label-embedded dropdown
 	LabelSelectOpen    bool     // is the label dropdown currently showing
-	cursor             int      // cursor position within Value (for text editing)
+	// Secret masks Value on screen and keeps it out of the raw-JSON view.
+	Secret bool
+	// key is the setting the field edits, for a form generated from a
+	// descriptor whose labels are display text.
+	key    string
+	cursor int // cursor position within Value (for text editing)
 
 	// edited records that a keystroke changed this field, which is not the
 	// same as its value differing from the prefill. A form seeded with a
@@ -205,6 +230,10 @@ Storage operations:
 
 Audit:
   L          Query audit log (with filters)
+
+Integrations:
+  G          Pick an external check type and configure it
+             (Ctrl+T in its form runs one real query)
 
 Log pane (Tab to focus):
   Tab        Return to Sources
@@ -538,8 +567,12 @@ func (p *popupModel) renderForm() string {
 			}
 
 		default:
+			shown := f.Value
+			if f.Secret {
+				shown = strings.Repeat("*", len([]rune(f.Value)))
+			}
 			if i == p.formCursor && !f.Disabled {
-				runes := []rune(f.Value)
+				runes := []rune(shown)
 				cur := f.cursor
 				if cur > len(runes) {
 					cur = len(runes)
@@ -555,9 +588,9 @@ func (p *popupModel) renderForm() string {
 					formCursorStyle.Render(cursorChar) +
 					formValueStyle.Render(after)
 			} else if f.Disabled {
-				value = dimStyle.Render(" " + f.Value)
+				value = dimStyle.Render(" " + shown)
 			} else {
-				value = formValueStyle.Render(" " + f.Value)
+				value = formValueStyle.Render(" " + shown)
 			}
 		}
 
@@ -566,7 +599,13 @@ func (p *popupModel) renderForm() string {
 		// Render hint below the field in dim text.
 		if f.Hint != "" {
 			hintPad := strings.Repeat(" ", maxLabel+4) // align under value
-			sb.WriteString(hintPad + dimStyle.Render(f.Hint) + "\n")
+			hint := dimStyle.Render(f.Hint)
+			if p.integrationForm {
+				// Descriptor help is prose, not a one-word hint, so it
+				// wraps and every line keeps the value column.
+				hint = strings.ReplaceAll(dimStyle.Width(72).Render(f.Hint), "\n", "\n"+hintPad)
+			}
+			sb.WriteString(hintPad + hint + "\n")
 		}
 
 		// Render inline submenu for Select fields or LabelSelect dropdown.
@@ -1101,10 +1140,13 @@ func (p *popupModel) HandleChoiceKey(key string) (dismiss bool) {
 		return true
 	case "enter":
 		var chosen string
-		if p.choiceCursor < len(p.choices) {
+		switch {
+		case p.choiceCursor < len(p.choiceKeys):
+			chosen = p.choiceKeys[p.choiceCursor]
+		case p.choiceCursor < len(p.choices):
 			chosen = p.choices[p.choiceCursor]
 		}
-		*p = popupModel{chosen: chosen}
+		*p = popupModel{chosen: chosen, choiceFor: p.choiceFor}
 		return true
 	}
 	return false

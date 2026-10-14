@@ -368,13 +368,14 @@ type DigestStore interface {
 	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
 	ListSimilarityPolicies(ctx context.Context) ([]audit.SimilarityPolicy, error)
 	ListPopularLists(ctx context.Context) ([]audit.PopularList, error)
+	ListIntegrationPolicies(ctx context.Context) ([]audit.IntegrationPolicy, error)
 }
 
 // Digest returns "sha256:<hex>" over a canonical serialization of the
 // allow-list rules, the age_policy, osv_policy, osv_malware_policy,
-// upstream_provenance_policy and name_similarity_policy rows, and the SHA-256
-// of the popular-name list in force for each ecosystem, which is what an
-// admission row cites as the policy it was decided under.
+// upstream_provenance_policy, name_similarity_policy and integration_policy
+// rows, and the SHA-256 of the popular-name list in force for each ecosystem,
+// which is what an admission row cites as the policy it was decided under.
 // The malware rows are in it because the OSV check refuses on them too, with
 // a default of block that an absent osv_policy row does not turn off. The
 // popular lists are in it because loading one changes which names fail.
@@ -413,6 +414,10 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("policy digest: list popular-name lists: %w", err)
 	}
+	integrations, err := store.ListIntegrationPolicies(ctx)
+	if err != nil {
+		return "", fmt.Errorf("policy digest: list integration policies: %w", err)
+	}
 
 	type rule struct {
 		Type    string `json:"type"`
@@ -428,6 +433,11 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 		Ecosystem string `json:"ecosystem"`
 		Action    string `json:"action"`
 	}
+	type integration struct {
+		Instance  string `json:"instance"`
+		Ecosystem string `json:"ecosystem"`
+		Action    string `json:"action"`
+	}
 	canon := struct {
 		Version   int    `json:"v"`
 		AllowList []rule `json:"allowlist"`
@@ -439,6 +449,10 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 		Similarity []osv `json:"name_similarity"`
 		// Popular reuses osv's fields too: an ecosystem and the list's hash.
 		Popular []osv `json:"popular_lists"`
+		// Integrations is omitted when empty, so an install with no
+		// integration_policy row cites the digest it cited before the table
+		// existed.
+		Integrations []integration `json:"integrations,omitempty"`
 	}{Version: 1, AllowList: []rule{}, Age: []age{}, OSV: []osv{}, Malware: []osv{}, Provenance: []osv{}, Similarity: []osv{}}
 	for _, r := range rules {
 		canon.AllowList = append(canon.AllowList, rule{r.RegistryType, r.RuleKind, r.Pattern})
@@ -458,6 +472,12 @@ func Digest(ctx context.Context, store DigestStore) (string, error) {
 	for _, p := range similarity {
 		canon.Similarity = append(canon.Similarity, osv{p.Ecosystem, p.Action})
 	}
+	for _, p := range integrations {
+		canon.Integrations = append(canon.Integrations, integration{p.Instance, p.Ecosystem, p.Action})
+	}
+	slices.SortFunc(canon.Integrations, func(a, b integration) int {
+		return strings.Compare(a.Instance+"\x00"+a.Ecosystem, b.Instance+"\x00"+b.Ecosystem)
+	})
 	lists := map[string]string{}
 	for _, eco := range SimilarityEcosystems() {
 		if p, ok := EmbeddedPopularNames(eco); ok {

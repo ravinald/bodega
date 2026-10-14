@@ -289,6 +289,11 @@ type Config struct {
 	// the instance name rather than the type is what a report records.
 	InventorySources map[string]InventorySource `json:"inventory_sources,omitempty"`
 
+	// Integrations maps an external check instance name to its settings:
+	// "type", "enabled" and whatever keys that type's descriptor declares.
+	// internal/integration owns what the keys mean.
+	Integrations map[string]Integration `json:"integrations,omitempty"`
+
 	// OsqueryScanDirs names the trees an osquery source scans for language
 	// packages on each host, by profile. osquery's python_packages and
 	// npm_packages tables read only the directories a query names, so this
@@ -1129,6 +1134,15 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		}
 	}
 
+	if len(cfg.Integrations) > 0 {
+		if ValidateIntegrations == nil {
+			return nil, errors.New("integrations is set, but this binary links no integration registry to check it against")
+		}
+		if err := ValidateIntegrations(cfg.Integrations); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := cfg.OsqueryScanDirs.validate(); err != nil {
 		return nil, err
 	}
@@ -1222,6 +1236,87 @@ type InventorySource map[string]any
 // internal/inventory sets it: the registry of source types lives there, and
 // that package already imports this one.
 var ValidateInventorySources func(map[string]InventorySource) error
+
+// Integration is one integrations entry as the file carries it.
+type Integration map[string]any
+
+// ValidateIntegrations checks integrations during Load. internal/integration
+// sets it, for the reason ValidateInventorySources is set from outside.
+var ValidateIntegrations func(map[string]Integration) error
+
+// FileKey returns one top-level key of the config file in force as the file
+// writes it. ok is false when the file or the key is absent.
+func FileKey(key string) (json.RawMessage, bool, error) {
+	data, err := os.ReadFile(ConfigPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, false, parseConfigError(ConfigPath(), err)
+	}
+	v, ok := raw[key]
+	return v, ok, nil
+}
+
+// SetFileKey writes one top-level key of the config file in force and
+// returns the path written. Every other key is re-emitted from the file's own
+// bytes in the file's own order, so a command that owns one key cannot
+// rewrite a setting it does not own. A nil value removes the key.
+//
+// It deliberately does not go through Load and Save. Save writes whatever
+// differs from what Load resolved, so a flag or environment variable in force
+// for the editing command could reach the file beside the key it meant to
+// change.
+func SetFileKey(key string, value any) (string, error) {
+	path := ConfigPath()
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		data = defaultConfigContent()
+	case err != nil:
+		return "", fmt.Errorf("read config %s: %w", path, err)
+	}
+	var check map[string]json.RawMessage
+	if err := json.Unmarshal(data, &check); err != nil {
+		return "", parseConfigError(path, err)
+	}
+	snap := newFileSnapshot(data)
+	if snap.raw == nil {
+		snap.raw = map[string]json.RawMessage{}
+	}
+	order := snap.order
+	if value == nil {
+		delete(snap.raw, key)
+	} else {
+		v, err := json.Marshal(value)
+		if err != nil {
+			return "", fmt.Errorf("marshal config key %q: %w", key, err)
+		}
+		indented, err := indentValue(v)
+		if err != nil {
+			return "", fmt.Errorf("marshal config key %q: %w", key, err)
+		}
+		if _, ok := snap.raw[key]; !ok {
+			order = append(order, key)
+		}
+		snap.raw[key] = indented
+	}
+	out, err := encodeOrdered(snap.raw, order, snap.spaced)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("create config dir %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return "", fmt.Errorf("write config %s: %w", path, err)
+	}
+	return path, nil
+}
 
 // MarkResolved records the current values as the resolved baseline, so Save
 // treats them as supplied rather than chosen. Load calls it; a caller that

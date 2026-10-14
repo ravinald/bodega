@@ -83,7 +83,7 @@ func newOverrideRequestCmd(gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&req.Check, "check", "", "the check to admit past: "+strings.Join(admit.OverrideChecks(), ", "))
+	c.Flags().StringVar(&req.Check, "check", "", "the check to admit past: "+strings.Join(admit.OverrideChecks(), ", ")+", or integration:<instance>")
 	c.Flags().StringVar(&req.Reason, "reason", "", "why, for the approvers and the audit trail")
 	c.Flags().StringVar(&req.Expires, "expires", "", "how long it applies once approved, e.g. 7d or 72h; at most override_max_ttl")
 	c.Flags().BoolVar(&asJSON, "json", false, "print the override as JSON")

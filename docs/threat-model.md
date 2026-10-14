@@ -1045,6 +1045,62 @@ so a report mode nobody switched back is visible in the audit trail, and
 `bodega policy report` lists every ecosystem's flagged checks with what each
 does once enforced.
 
+## External check integrations
+
+An integration sends something off the bodega host on every admission it
+runs, or on a timer, and lets a third party's answer refuse a version (see
+[usage.md](usage.md#integrations)). Each type's descriptor states what leaves
+the host in one sentence, which `bodega integration types`, `add`, `enable`
+and the TUI form print before an instance is turned on. That sentence is the
+contract; this section is what it exposes.
+
+**`malware-list`.** The list for each covered ecosystem (npm, pypi) is
+downloaded whole from the configured URL on the first lookup and again every
+`refresh_interval`. The list's host learns this server's address, that it runs
+bodega's default Go HTTP client, and when it refreshes. It never learns a
+package name, so it cannot build an inventory of what the organization uses.
+What it can do is decide verdicts: a list publisher, or anyone who can rewrite
+the response, can add an entry and refuse any version under `block`, or drop
+one and let a known-malicious version through. bodega refuses a list that is
+empty, not a JSON array or past 256 MiB, but it cannot tell a truthful list
+from a doctored one. Use an `https` URL; an `http` one, which the validator
+accepts for a mirror on a trusted network, hands both powers to anyone on the
+path.
+
+**A per-package API** (none ships yet) sends the purl of every version
+admitted, and usually an account token, so the vendor holds a dated record of
+what this organization pulls and when, tied to the account. That is a list of
+the dependencies an attacker would target, held by a third party. Its
+descriptor must say so, and an operator who cannot accept that should not
+enable it.
+
+**Outages refuse under `block`.** A network failure, a timeout, a 5xx, a rate
+limit or a list that cannot be read is recorded as an error under the
+instance's action, so no outage admits silently. The price is availability:
+under `block`, an unreachable vendor refuses every version of every covered
+ecosystem not already in the instance's answer cache. `malware-list` softens
+this by answering from its last list for three refresh intervals after a
+failed refresh. Under `warn` an outage admits with a warning on every version.
+
+**Answers are cached per purl for `cache_ttl`.** A version a vendor starts
+flagging after it answered is admitted again from the cache until the entry
+expires, and an admitted version is not asked again at all: integrations do
+not run on [re-vet](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
+
+**Secrets.** A vendor credential is never in the config file; a literal one
+there stops the load. It is read from `$CREDENTIALS_DIRECTORY`, then the
+environment, then a `0600` file. The environment is the weakest of the three:
+it is inherited by every child the server starts and readable by the same uid
+through `/proc`. No log line, error, `--json` output or TUI field prints a
+secret's value.
+
+**What the record shows.** Each admission row names every enabled instance as
+`integration:<instance>` with its action and the vendor's reason, and the
+policy digest covers the `integration_policy` rows. It does not cover the
+`integrations` config block: enabling, disabling or repointing an instance does
+not change the digest, so read which instances a row names, not the digest
+alone, to know which external checks a decision ran.
+
 ## Out-of-scope distribution formats
 
 Three properties make a distribution format incompatible with bodega's
