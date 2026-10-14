@@ -87,6 +87,39 @@ func TestAptRowsCarryTheArchitecture(t *testing.T) {
 	}
 }
 
+// TestAptRowsReadTheInstallTime covers the sixth column, and that a capture
+// whose sixth column is empty or not a number reads as no install time rather
+// than failing: an install time only refines a bypass report.
+func TestAptRowsReadTheInstallTime(t *testing.T) {
+	inv, err := ParseAptRows(strings.NewReader("curl\t8.5.0\tamd64\tinstall ok installed\tcurl\t978307200\n" +
+		"jq\t1.7.1\tamd64\tinstall ok installed\tjq\t\n" +
+		"zstd\t1.5.5\tamd64\tinstall ok installed\tlibzstd\tsoon\n"))
+	if err != nil {
+		t.Fatalf("ParseAptRows: %v", err)
+	}
+	if len(inv.Rows) != 3 {
+		t.Fatalf("rows = %+v, want 3", inv.Rows)
+	}
+	if got := inv.Rows[0].InstalledAt; got.Unix() != 978307200 || got.Location().String() != "UTC" {
+		t.Errorf("curl installed at %v, want 2001-01-01T00:00:00Z", got)
+	}
+	for _, row := range inv.Rows[1:] {
+		if !row.InstalledAt.IsZero() {
+			t.Errorf("%s installed at %v, want zero", row.Name, row.InstalledAt)
+		}
+	}
+	if inv.Rows[2].Source != "libzstd" {
+		t.Errorf("zstd source = %q: the sixth column moved the fifth", inv.Rows[2].Source)
+	}
+	res, err := ParseApt(strings.NewReader("curl\t8.5.0\tamd64\tinstall ok installed\tcurl\t978307200\n"))
+	if err != nil {
+		t.Fatalf("ParseApt: %v", err)
+	}
+	if md := res.Packages[0].Versions[0].Metadata; len(md) != 0 {
+		t.Errorf("convert carried the install time onto the manifest: %v", md)
+	}
+}
+
 // TestAptFormatsAgree cross-checks the two inventory formats against each
 // other. Both captures come from the same host at the same moment, so a
 // disagreement is a parser bug in one of them, and neither parser grades its

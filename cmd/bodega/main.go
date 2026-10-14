@@ -242,6 +242,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		newAuditCheckCmd(gf),
 		newAuditAdmissionsCmd(gf),
 		newAuditServedCmd(gf),
+		newAuditBypassCmd(gf),
 	)
 
 	// Top-level commands. A group classified here carries its whole subtree:
