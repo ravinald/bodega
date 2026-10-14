@@ -3052,9 +3052,56 @@ The quorum is recorded with each request when it is made, so changing `override_
 
 **Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
 
+### `bodega queue <list|approve|dismiss>`
+
+The queue is one place to see every client request bodega refused and to resolve each refusal in one step. It holds one row per type, package, version and check, with when it was first and last refused, how many requests it took, and the identities and client addresses that asked.
+
+```bash
+bodega queue list
+bodega queue list --check age --json
+bodega queue approve 12 --reason "INC-4411: vendor needs 1.3.0 today"
+bodega queue dismiss 14 --reason "typo of lodash"
+```
+
+| Command                                                   | Effect                                                                                                                                       |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list [--type <type>] [--check <check>] [--all] [--json]` | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row. |
+| `approve <id> --reason <text> [--expires <duration>]`     | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only. |
+| `dismiss <id> --reason <text>`                            | Closes the row without admitting anything.                                                                                                   |
+
+**Which refusals write a row.** A row is written on every refusal of a client fetch by one of these checks, whatever `discover_mode` says:
+
+| Check                 | Written by                                                                                      | `approve` does                                                                                                                                                                                  |
+| --------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allow-list`          | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest.               |
+| `age`                 | The proxy fill's age gate                                                                       | Requests an override (below)                                                                                                                                                                    |
+| `osv`                 | The proxy fill's OSV gate, for an advisory                                                      | Requests an override                                                                                                                                                                            |
+| `malware`             | The proxy's malware gate, and the OSV gate when the record is `MAL-`                            | Refused; dismiss it                                                                                                                                                                             |
+| `upstream_provenance` | The proxy fill's provenance gate                                                                | Requests an override, or is refused when the provenance was `invalid`                                                                                                                           |
+| `name_similarity`     | The proxy fill's name similarity gate                                                           | Requests an override                                                                                                                                                                            |
+| `profile`             | A host profile refusing a package or version                                                    | Pins the version in every profile that refused it, as `bodega profile pin` does, with the reason on the entry and the operator as `pinned_by`. A row with no version lists the package instead. |
+
+An override request goes through [`bodega override`](#bodega-override-requestapproverejectlist): the operator who approves the row is the requester, and the version is admitted once `override_quorum` identities have approved it, so with the default quorum a second person runs `bodega override approve <id>`, which `approve` prints. `--expires` defaults to `override_max_ttl`. Approving a row whose version already has a pending or active override for that check resolves it into that override rather than filing a second request. A profile has no two-person flow, so a profile row is a single-operator exception recorded with its reason.
+
+`approve` refuses a `malware` row, and an `upstream_provenance` row whose outcome was `invalid`, naming the check: these say the version is hostile, and an override never admits them either. The row stays open until it is dismissed.
+
+**Reopening.** A row that is refused again after it was approved or dismissed reopens and keeps its last resolution, which `list` shows as `open (was: ...)`. An approval into an override that still waits for its second approver reopens on the next refused request; that is the queue showing the version is still refused.
+
+**Not queued.** `bodega pkg create` and `POST /api/v1/packages/{type}` refusals (an operator's own create, answered with the override command), the hidden, frozen, constraint and checksum refusals (each already names its own repair), and the FreeBSD catalogue refusals that name a repository path rather than a package.
+
+**How it relates to discovery.** [Discovery](#bodega-discover-) records what the fleet reached for upstream, allowed or denied, and only while `discover_mode` is `observe`; its rows aggregate by allow-list pattern and feed `discover promote`. The queue records only refusals, from every check, always, keyed by the version and the check that refused it, and resolves each one. An allow-list refusal with discovery on writes both a `denied` discovery row and a queue row; approving either one adds a rule, and the queue row reopens if the rule did not cover the request.
+
+**Running server.** A rule added by `approve` reaches a running server within the allow-list cache's 30 seconds, a profile pin within the profile cache's, and an override at the next admission. Through the API the server applies the rule and the pin at once.
+
+**Audit.** Each resolution writes a `queue` event (`bodega audit events --type queue`) with status `approved` or `dismissed`, and the rule, override or profile write it made records its own event as the matching command would. The rows live in the `refusal_queue` and `refusal_queue_requesters` tables of the embedded SQLite store (migration 035).
+
+The TUI's `Q` key and [`/api/v1/queue`](#queue-endpoints) do the same, and the web UI dashboard shows the open rows read-only.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
+
+For refusals alone, from every check and whatever `discover_mode` says, resolved one row at a time, see [`bodega queue`](#bodega-queue-listapprovedismiss).
 
 **It is a record of upstream reaches, not of installs.** A row means bodega went to an upstream, would have, or once did and is now answering from the copy it kept — a proxy cache hit bumps the row the fetch that filled it wrote, so a proxied artifact keeps counting long after the last upstream request for it. What writes nothing is a **hosted** entry: bodega built or fetched those on its own schedule and serves them out of storage with no upstream in the request at all. So the discovery log never answers "what did this host install", and it gets quieter as the catalog gets better. The answer to that question is the audit trail: `bodega audit events --client <ip> --type serve_fetch` carries one row per artifact bodega handed that client, hosted and proxied alike, which is the complete record discovery is not.
 
@@ -5984,6 +6031,16 @@ Policy mutations invalidate the in-memory cache, so changes take effect on the n
 
 These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to is the requester or the voter. A request with no token, or with a token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. An `inventory`-scoped token gets `403`. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
 
+### Queue endpoints
+
+| Method | Path                                  | Description                                                              |
+| ------ | ------------------------------------- | ------------------------------------------------------------------------ |
+| GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open` |
+| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires}`); answers what the approval did  |
+| POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
+
+These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
+
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 
 Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
@@ -7148,6 +7205,7 @@ With the Sources pane focused:
 | `R`                     | Remove the marked entries' stored artifacts, after a confirmation                                                                                                                                                                           |
 | `I`                     | Initialize an s3 backend's bucket, as `bodega init` does, after a confirmation naming the backend, bucket and region. It acts on s3 backends only, and asks which one when several are configured. Esc cancels while it reaches the backend |
 | `L`                     | Query the audit log                                                                                                                                                                                                                         |
+| `Q`                     | Open the refusal queue: `a` approves and `x` dismisses the row under the cursor, each after prompting for a reason; see [`bodega queue`](#bodega-queue-listapprovedismiss)                                                                  |
 | `G`                     | Configure an [integration](#integrations-view): pick a type, then fill in the form generated from its descriptor                                                                                                                            |
 | `T`                     | Open the token manager                                                                                                                                                                                                                      |
 | `Ctrl+R`                | Reload the manifests (any pane)                                                                                                                                                                                                             |

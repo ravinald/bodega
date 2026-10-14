@@ -307,6 +307,9 @@ body {
 .dash-bar-count { width: 30px; font-size: 12px; color: var(--fg-dim); }
 .dash-section { margin-top: 16px; }
 .dash-section h3 { color: var(--fg-dim); font-size: 12px; margin-bottom: 8px; }
+.queue-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.queue-table th, .queue-table td { text-align: left; padding: 2px 8px 2px 0; vertical-align: top; }
+.queue-table th { color: var(--fg-dim); font-weight: normal; }
 
 /* Type colors */
 .type-apt { color: #ffaf00; }
@@ -799,10 +802,34 @@ async function showDashboard() {
     }
     html += '</div>';
 
+    html += await queueSection();
+
     d.innerHTML = html;
   } catch(e) {
     d.innerHTML = '<div class="detail-empty">Error loading metrics.</div>';
   }
+}
+
+// queueSection lists the open refusal queue, read-only: approving and
+// dismissing take an identity-bound token, which this page never holds, so
+// the rows name the command instead. /api/v1/queue is an admin read, and a
+// browser outside admin_permit_cidr gets the 403 and no section.
+async function queueSection() {
+  var resp;
+  try { resp = await fetch('/api/v1/queue'); } catch(e) { return ''; }
+  if (!resp.ok) return '';
+  var rows = await resp.json();
+  var html = '<div class="dash-section"><h3>Refused, awaiting review</h3>';
+  html += '<div class="dash-cards">' + dashCard(rows.length, 'Open') + '</div>';
+  if (rows.length === 0) return html + '</div>';
+  html += '<table class="queue-table"><tr><th>ID</th><th>Package</th><th>Check</th><th>Requests</th><th>Last seen</th><th>Detail</th></tr>';
+  for (var q of rows) {
+    var subject = q.pkg_type + '/' + q.pkg_name + (q.pkg_version ? '@' + q.pkg_version : '');
+    html += '<tr><td>' + q.id + '</td><td>' + escapeHtml(subject) + '</td><td>' + escapeHtml(q.check) +
+      '</td><td>' + q.request_count + '</td><td>' + escapeHtml(q.last_seen) + '</td><td>' + escapeHtml(q.detail) + '</td></tr>';
+  }
+  html += '</table><div style="color:var(--fg-dim);font-size:11px;margin-top:6px">Resolve with <code>bodega queue approve &lt;id&gt;</code> or <code>bodega queue dismiss &lt;id&gt;</code>.</div></div>';
+  return html;
 }
 
 async function showTypeMetrics(type) {
