@@ -140,13 +140,13 @@ func evaluateReadOnly(ctx context.Context, cfg *config.Config, checker *policy.C
 	}
 	ve := &pm.Versions[0]
 	candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
-	hasRules, _ := checker.HasRules(ctx, pm.Type)
+	listed, _ := checker.Listed(ctx, pm.Type)
 	var allowErr error
 	if candidate != "" {
 		allowErr = checker.Check(ctx, pm.Type, candidate)
 	}
 	v := readOnlyVerdict{Decision: audit.AdmissionAdmitted,
-		Checks: []audit.AdmissionCheck{admit.AllowListCheck(hasRules, candidate, allowErr)}}
+		Checks: []audit.AdmissionCheck{admit.AllowListCheck(listed, candidate, allowErr)}}
 	if allowErr != nil {
 		v.Decision, v.Reason = audit.AdmissionPolicyBlocked, allowErr.Error()
 		return v
