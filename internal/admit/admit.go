@@ -22,9 +22,14 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/integration"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/provenance"
+
+	// The integration types bodega ships register here, because every
+	// admission path reaches this package.
+	_ "github.com/ravinald/bodega/internal/integration/malwarelist"
 )
 
 // Decision is the verdict on one manifest. Conflict with an existing package
@@ -122,6 +127,8 @@ func AdmitAs(
 	who Who,
 ) Result {
 	ev := newEvaluation(ctx, adb, pm, time.Now())
+	checkers := VersionCheckers(cfg, adb)
+	ev.include(ctx, pm, checkers)
 	res := Result{Decision: Admitted}
 
 	if err := validate(cfg, pm, &res); err != nil {
@@ -133,7 +140,7 @@ func AdmitAs(
 		blocked.Warnings = res.Warnings
 		return ev.record(ctx, adb, pm, *blocked, who)
 	}
-	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, VersionCheckers(cfg, adb), ev); blocked != nil {
+	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, checkers, ev); blocked != nil {
 		blocked.Warnings = res.Warnings
 		return ev.record(ctx, adb, pm, *blocked, who)
 	}
@@ -158,11 +165,13 @@ func Create(
 	who Who,
 ) Result {
 	ev := newEvaluation(ctx, adb, pm, time.Now())
+	checkers := VersionCheckers(cfg, adb)
+	ev.include(ctx, pm, checkers)
 	res := Result{Decision: Admitted}
 	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev); blocked != nil {
 		return ev.record(ctx, adb, pm, *blocked, who)
 	}
-	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, VersionCheckers(cfg, adb), ev); blocked != nil {
+	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, checkers, ev); blocked != nil {
 		blocked.Warnings = res.Warnings
 		res = *blocked
 	}
@@ -213,18 +222,19 @@ func Fetch(
 	}
 	pm := &manifest.PackageManifest{Type: typ, Name: name, Versions: []manifest.VersionEntry{ve}}
 	ev := newEvaluation(ctx, adb, pm, time.Now())
+	ev.include(ctx, pm, checkers)
 	ev.set(0, allow)
 	var out FetchResult
 	decision := audit.AdmissionAdmitted
 	switch {
 	case allow.Status == audit.CheckBlock:
 		decision = audit.AdmissionPolicyBlocked
-		ev.notRunChecks(0, "not run: the allow-list refused this version", versionChecks...)
+		ev.notRunChecks(0, "not run: the allow-list refused this version", ev.versionChecks...)
 	case checkers == nil:
 		if notRunDetail == "" {
 			notRunDetail = "not run"
 		}
-		ev.notRunChecks(0, notRunDetail, versionChecks...)
+		ev.notRunChecks(0, notRunDetail, ev.versionChecks...)
 	default:
 		results := ev.runVersion(ctx, pm, 0, checkers)
 		combined := policy.Combine(results)
@@ -500,15 +510,24 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 }
 
 // VersionCheckers are the per-version checks every admission runs: import,
-// create, the builder's fetch and the proxy's fill.
+// create, the builder's fetch and the proxy's fill. Each enabled integration
+// instance follows the built-in checks, in instance name order.
 func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
 	// A nil *audit.DB inside the interface is not a nil interface.
 	var similarity policy.SimilarityStore
+	var store integration.Store
 	if adb != nil {
 		similarity = adb
+		store = adb
 	}
-	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
+	out := []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
 		policy.NewNameSimilarityChecker(similarity)}
+	if cfg != nil {
+		for _, c := range integration.Checks(cfg.Integrations, store) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // ProvenanceChecker builds the upstream provenance check: npm read from the

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/integration"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -53,8 +54,8 @@ func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req
 		return audit.Override{}, invalid("name is required")
 	case req.Version == "":
 		return audit.Override{}, invalid("version is required: an override names one version")
-	case !slices.Contains(allChecks, req.Check):
-		return audit.Override{}, invalid("unknown check %q (want one of %s)", req.Check, strings.Join(allChecks, ", "))
+	case !slices.Contains(allChecks, req.Check) && !isIntegrationCheck(req.Check):
+		return audit.Override{}, invalid("unknown check %q (want one of %s, or %s<instance>)", req.Check, strings.Join(allChecks, ", "), integration.CheckPrefix)
 	case req.Reason == "":
 		return audit.Override{}, invalid("a reason is required; it is what the approvers read")
 	case req.Expires == "":
@@ -141,6 +142,14 @@ func recordOverrideEvent(ctx context.Context, adb *audit.DB, o audit.Override, a
 	blob, _ := json.Marshal(details)
 	_ = adb.Record(ctx, audit.Event{EventType: audit.EventOverride, PkgType: o.PkgType, PkgName: o.PkgName,
 		PkgVersion: o.PkgVersion, Actor: actor, Status: status, Details: string(blob)})
+}
+
+// isIntegrationCheck reports whether check names an integration instance in
+// the form its admission rows carry. The instance need not be configured
+// now: an override outlives a config edit the way the row it answers does.
+func isIntegrationCheck(check string) bool {
+	name, ok := strings.CutPrefix(check, integration.CheckPrefix)
+	return ok && integration.ValidInstanceName(name)
 }
 
 // OverrideChecks are the check names an override may name: every check an

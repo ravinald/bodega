@@ -20,6 +20,7 @@ Comprehensive documentation for the bodega package repository manager.
 - [Attestations](#attestations)
 - [Audit Trail](#audit-trail)
 - [Inventory](#inventory)
+- [Integrations](#integrations)
 - [TUI](#tui)
 - [Web Dashboard](#web-dashboard)
 - [Manifest Integrity](#manifest-integrity)
@@ -2702,6 +2703,15 @@ A block answers the importer, the build or the proxied client the way an age or 
 - **Short names collide.** Two edits is most of a three-letter name. Run against pypi's 1001st to 3000th most-downloaded projects, 208 of the 2000 (10%) were near a top-1000 name, nearly all of them short: `ray` is 2 from `rsa`, `pox` 1 from `tox`. Read a few weeks of `warn` rows before choosing `block`, and allow-list the legitimate near names exactly.
 - **It compares names, not intent.** A dependency-confusion attack that publishes your internal name to the public registry is not a near name; the allow-list and `pkg freeze` are what stop that.
 
+### `bodega policy integration <set|list>`
+
+Sets what an external check instance does, per ecosystem, when it flags a version or cannot answer: `warn`, `block` or `ignore`. One `integration_policy` table holds every instance's rows; with no row the type's default applies. See [Integration policy](#integration-policy).
+
+```bash
+bodega policy integration set aikido npm block
+bodega policy integration list
+```
+
 ### `bodega policy filter <set|list>`
 
 Hides the versions the age and OSV gates block from the proxied indexes, so a client's resolver settles on the newest version that passes and fails only when nothing in its range does. Without it, `npm install widget@^4.1.0` is shown a 4.3.0 published yesterday, picks it, and is refused on the tarball with nothing it can do about it. With it, the packument lists 4.1.0 and 4.2.0, and the same install resolves 4.2.0. Sonatype's and JFrog's curation products and the client-side `pmg` work the same way.
@@ -2970,6 +2980,29 @@ Cleared the baseline mark from 212 npm version(s); 3 now fail a gate.
 
 The evaluation records nothing: no admission row and no provenance pin. The next build fetch or [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) of a failing version is the decision that refuses it, and with `revet_on_block: hide` the re-vet hides it. The clear itself writes one `policy` audit event with the counts. A mark whose time does not parse is cleared whatever `--older-than` says, since clearing is the direction that applies the gates.
 
+### `bodega integration <types|list|show|add|set|enable|disable|remove|secret|test>`
+
+Configures [integrations](#integrations), the external checks admission runs beside its own. Every edit goes through the validator `bodega serve` runs at load and rewrites only the `integrations` key of the config file.
+
+```bash
+bodega integration types
+bodega integration add aikido malware-list --set refresh_interval=12h
+bodega integration enable aikido
+bodega integration test aikido
+```
+
+| Command                                   | Effect                                                                                                                                                    |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types`                                   | Every registered type, with its cost, ecosystems, default action and what it sends off the host                                                           |
+| `list [--json]`                           | Configured instances, enabled state and last error; an instance that no longer validates says why                                                         |
+| `show <instance> [--json]`                | An instance's settings and where each came from (config file or default); secrets print `[redacted]` with the source they were found in                   |
+| `add <instance> <type> [--set key=value]` | Adds a disabled instance and prints what it sends off the host. `--set` repeats                                                                           |
+| `set <instance> key=value...`             | Changes settings and prints each old and new value. An empty value removes the key, so the default applies again                                          |
+| `enable <instance>`, `disable <instance>` | Turns an instance on or off, keeping its settings. `enable` refuses an instance whose required secret is not found                                        |
+| `remove <instance>`                       | Removes the instance. Its policy rows and credential file stay                                                                                            |
+| `secret <instance> <key>`                 | Reads a secret from standard input, never echoed, and stores it mode `0600`; see [Secrets](#secrets)                                                      |
+| `test <instance>`                         | One real query for the type's well-known package, cache bypassed, printing the answer, the latency and any quota the vendor reported. Exits 1 on an error |
+
 ### `bodega override <request|approve|reject|list>`
 
 An override admits one version past one check's failure. One identity requests it, a different identity approves it, and it applies only until it expires.
@@ -2996,7 +3029,7 @@ bodega pkg import left-pad.json
 | `reject <id> [--comment <text>]`                                                       | Records a rejection, which cancels the override for good, pending or approved. Anyone may reject, the requester included.                            |
 | `list [--pending\|--active\|--expired] [--json]`                                       | Lists overrides newest first, with their status, approvals so far against the quorum, requester, expiry and reason. The three filters are exclusive. |
 
-`--check` names one of the checks an admission row carries: `allowlist`, `age`, `osv`, `upstream_provenance` or `name_similarity`. The version is the one the admission row records: the version, or the ref for a git entry pinned by ref. A pypi name matches in its PEP 503 form, so `Foo_Bar` and `foo-bar` are the same request.
+`--check` names one of the checks an admission row carries: `allowlist`, `age`, `osv`, `upstream_provenance`, `name_similarity`, or `integration:<instance>` for an [integration](#integrations). The version is the one the admission row records: the version, or the ref for a git entry pinned by ref. A pypi name matches in its PEP 503 form, so `Foo_Bar` and `foo-bar` are the same request.
 
 `--expires` is a duration from the request, `7d` or `72h`. It is required, and capped by `override_max_ttl`:
 
@@ -3441,7 +3474,7 @@ It is also consumed rather than displayed. Every `dist.tarball` bodega writes in
 
 `audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
-`inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory). `osquery_scan_dirs` names, per profile, the language-package trees an osquery source scans; see [The `osquery` source](#the-osquery-source).
+`inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory). `integrations` configures the external checks admission runs; see [Integrations](#integrations). `osquery_scan_dirs` names, per profile, the language-package trees an osquery source scans; see [The `osquery` source](#the-osquery-source).
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -6548,24 +6581,24 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
 
-| Column          | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                                                                                                                                        |
-| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                                                                                                                                |
-| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                                                                                                                                             |
-| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, plus `override` on a row the retired `pkg create` prompt decided; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran, and an `overridden` entry adds `override`, the override's id |
-| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy` and `name_similarity_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                                                                                                                                  |
-| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                       |
-| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Column          | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, one `integration:<instance>` entry per enabled [integration](#integrations), plus `override` on a row the retired `pkg create` prompt decided; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran, and an `overridden` entry adds `override`, the override's id |
+| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy`, `name_similarity_policy` and `integration_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                                                                                                                                                                                         |
+| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block`, `overridden`, `baseline` or `not_evaluated`. `overridden` means the check failed and an approved, unexpired [override](#bodega-override-requestapproverejectlist) admitted the version anyway. `baseline` means the check failed on a version imported with [`--baseline`](#--baseline), which admits it with the finding in the detail. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
 The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
 
-**The policy digest** is computed by `policy.Digest` over the rule type, kind and pattern of every allow-list rule, the ecosystem, minimum age and action of every age policy, and the ecosystem and action of every OSV policy, every OSV malware policy and every upstream provenance policy, sorted. The malware rows are in it because the OSV check refuses on them as well, under a default of `block` that no `osv_policy` row turns off. A rule's id, comment, author and timestamp are left out, so removing a rule and adding it back is the same policy, while any edit that can change a verdict changes the digest. Two decisions under unchanged policy carry the same digest.
+**The policy digest** is computed by `policy.Digest` over the rule type, kind and pattern of every allow-list rule, the ecosystem, minimum age and action of every age policy, and the ecosystem and action of every OSV policy, every OSV malware policy and every upstream provenance policy, and the instance, ecosystem and action of every integration policy, sorted. The integration rows are left out of the serialization when there are none, so an install that never sets one cites the digest it cited before the table existed. The malware rows are in it because the OSV check refuses on them as well, under a default of `block` that no `osv_policy` row turns off. A rule's id, comment, author and timestamp are left out, so removing a rule and adding it back is the same policy, while any edit that can change a verdict changes the digest. Two decisions under unchanged policy carry the same digest.
 
 **Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
 
@@ -6993,6 +7026,148 @@ What reconciliation can and cannot prove about a host, and why it is not SLSA De
 | CIS v8    | Control 2, Safeguard [2.3](https://cas.docs.cisecurity.org/en/latest/source/Controls2/#23-address-unauthorized-software): unauthorized software is removed or receives a documented exception               | `inventory report` names it; `accept --comment` records the exception, `discover promote` brings it under bodega |
 | CIS v8    | Control 2, Safeguard [2.4](https://cas.docs.cisecurity.org/en/latest/source/Controls2/#24-utilize-automated-software-inventory-tools): automated software inventory tools                                   | The collectors inventory; bodega stores their reports and compares them against what it served                   |
 
+## Integrations
+
+An integration is an external risk check that runs on every version admitted, beside the age, OSV, upstream provenance and name similarity checks. Each integration type is declared once, in a descriptor, and three surfaces are generated from it: the `integrations` key in the config file, the [`bodega integration`](#bodega-integration-typeslistshowaddsetenabledisableremovesecrettest) commands and the TUI's Integrations view. All three run the same validator, so a setting one accepts the other two accept.
+
+Integrations are optional. With none configured, admission runs exactly the checks it ran before.
+
+### Model
+
+A descriptor states:
+
+| Declaration          | Meaning                                                                                                                          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Type name            | The `type` an `integrations` entry names                                                                                         |
+| Display name and URL | What the TUI picker and `bodega integration types` show                                                                          |
+| Cost                 | `free`, `free-tier` or `paid`                                                                                                    |
+| Ecosystems           | The bodega package types it answers for. Every other type records the check `not_evaluated`                                      |
+| What leaves the host | One sentence, shown by `types`, `add`, `enable`, `show` and the TUI form before an instance is enabled                           |
+| Default action       | `warn`, `block` or `ignore`, for an ecosystem with no [policy](#integration-policy) row                                          |
+| Fields               | Each with a key, label, help text, kind (`string`, `int`, `duration`, `bool`, `enum`, `url`), default, bounds, and a secret flag |
+
+Every type also takes two fields the frame adds:
+
+| Key         | Default | Meaning                                                                                                                           |
+| ----------- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_ttl` | `1h`    | How long an answer for one purl is reused. From `1m` to `7d`. Errors are never cached, so an outage ends when the vendor recovers |
+| `timeout`   | `10s`   | How long one query may take before it is recorded as an error. From `1s` to `5m`                                                  |
+
+An instance is one configured use of a type. Its name is lowercase letters, digits, `_` and `-`, at most 63 characters, and it is part of the check name the admission row records: `integration:<instance>`. Several instances of one type (two mirrors of a list, say) are separate checks.
+
+### Configuring
+
+`integrations` maps an instance name to `{"type": ..., "enabled": ..., <the type's field keys>}`, the structure of `inventory_sources`. A complete instance:
+
+```json
+"integrations": {
+  "aikido": {
+    "type": "malware-list",
+    "enabled": true,
+    "url": "https://malware-list.aikido.dev/",
+    "refresh_interval": "6h",
+    "cache_ttl": "1h",
+    "timeout": "30s"
+  }
+}
+```
+
+A key left out takes its default. `enabled` defaults to `false`; a disabled instance is validated like an enabled one and runs nothing.
+
+There are three ways to write that block, and they meet in one validator:
+
+- **By hand**, under configuration management. `bodega serve`, and every command that loads the config, refuses to start on an unknown type, an unknown key, a value of the wrong kind or one out of range, naming the instance, the key and what it wanted:
+
+  ```text
+  integrations.aikido.refresh_interval: want a duration such as "30s", "6h" or "1d", from 15m to 7d, got "1m"
+  ```
+
+- **From the CLI**, with `bodega integration add`, `set`, `enable`, `disable` and `remove`. Each validates the instance it edits and rewrites only the `integrations` key: every other key in the file is written back from the file's own bytes, in the file's own order.
+
+- **From the TUI**, with `G`; see [Integrations view](#integrations-view).
+
+`bodega integration show <instance>` reads back what the file says, whichever way it got there, and marks which values are defaults.
+
+A running `bodega serve` reads `integrations` when it starts; a `SIGHUP` does not re-read it. A one-shot command (`pkg import`, `build fetch`) reads it every run.
+
+### Secrets
+
+A field marked secret is never in the config file. It is read, in order, from:
+
+1. `$CREDENTIALS_DIRECTORY/<instance>.<key>`, which systemd's `LoadCredential=` populates. A relative or root `CREDENTIALS_DIRECTORY` is ignored, the rule the attestation key follows.
+2. `BODEGA_<INSTANCE>_<KEY>` in the environment, upper-cased with `-` written as `_`: `BODEGA_SOCKET_PROD_API_TOKEN` for instance `socket-prod`, key `api_token`.
+3. The file the instance's `<key>_file` names. It must be an absolute path, and a file readable by anyone but its owner is refused.
+
+A literal secret value in the file stops the load and names the command that moves it:
+
+```text
+integrations.socket.api_token: a secret is never written in the config file; remove the key and run: bodega integration secret socket api_token
+```
+
+`bodega integration secret <instance> <key>` reads the value from standard input, without echo when stdin is a terminal, and writes it mode `0600` to the instance's `<key>_file`, or to `credentials/<instance>.<key>` beside the config file, recording that path as `<key>_file`. The TUI form's masked field saves through the same function.
+
+No surface prints a secret. `show` and `show --json` print `[redacted]` with the source the value was found in, a log line or error names the key and never the value, and the TUI masks the field as it is typed. A key whose type is not registered is redacted when it ends in `password`, `passwd`, `token`, `secret`, `_auth` or `_key`, or is `apikey`, the rule `client_setup.sh` applies.
+
+### Integration policy
+
+One table, `integration_policy(instance, ecosystem, action)`, in the embedded audit store (migration 034), holds every instance's action per ecosystem. With no row, the type's default action applies.
+
+```bash
+bodega policy integration set aikido npm block
+bodega policy integration set aikido pypi warn
+bodega policy integration list
+```
+
+`set` refuses an ecosystem the instance's type does not cover. `list` prints every configured instance's covered ecosystems with the action in force and whether it is a row or the default, and any row whose instance is no longer configured: removing an instance keeps its rows, so adding it back under the same name restores them. The rows are part of the [policy digest](#admission-decisions).
+
+| Outcome                                           | `warn`        | `block`       | `ignore`       |
+| ------------------------------------------------- | ------------- | ------------- | -------------- |
+| not flagged                                       | pass          | pass          | pass           |
+| flagged                                           | warn          | block         | pass, recorded |
+| error: network, timeout, 5xx, rate limit, no list | warn          | block         | pass, recorded |
+| ecosystem not covered, or no concrete version     | not_evaluated | not_evaluated | not_evaluated  |
+
+An error takes the action, so under `block` an unreachable vendor refuses the version rather than admitting it unchecked. Each error is also stored as the instance's last error, which `bodega integration list` shows.
+
+### Admission
+
+Every enabled instance runs as a per-version check on every path that admits a version: `pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, bulk import, a build's fetch and a proxy fill of a versioned artifact. Instances run after the built-in checks, in instance name order. Each records an `integration:<instance>` entry in the [admission row](#admission-decisions), with the action in force and the vendor's reason in `detail`, and an [attestation](#attestations) statement carries the entry as recorded. A refusal answers the importer, the build or the proxied client the way an OSV block does, naming `integration:<instance>` as the check, and an [override](#bodega-override-requestapproverejectlist) may name it.
+
+Each instance caches answers per purl (`pkg:npm/lodash@4.17.21`) for `cache_ttl`, in the process that asked. A changed entry starts with an empty cache.
+
+[Re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) does not run integrations yet: it re-checks OSV and upstream provenance only.
+
+### Shipped types
+
+Generated from the registry; a test fails when this table and the registry disagree.
+
+<!-- integration-types:begin -->
+
+| Type           | Name                                             | Cost | Ecosystems | Default action | What leaves the host                                                                                                                                                                                             |
+| -------------- | ------------------------------------------------ | ---- | ---------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `malware-list` | [Malware list](https://malware-list.aikido.dev/) | free | npm, pypi  | block          | Nothing per package: the whole list for each ecosystem is downloaded from the configured URL on the refresh interval, so the list's host sees this server's address and when it refreshes, never a package name. |
+
+<!-- integration-types:end -->
+
+#### The `malware-list` type
+
+Reads a bulk JSON list of `{package_name, version, reason}` per ecosystem and fails a version the list names. A row with an empty or `*` version names every version of the package. pypi names are matched in their PEP 503 form.
+
+| Key                | Default                            | Meaning                                                                          |
+| ------------------ | ---------------------------------- | -------------------------------------------------------------------------------- |
+| `url`              | `https://malware-list.aikido.dev/` | Base URL serving `malware_predictions.json` (npm) and `malware_pypi.json` (pypi) |
+| `refresh_interval` | `6h`                               | How often each list is downloaded again, from `15m` to `7d`                      |
+
+The default is [Aikido's public list](https://malware-list.aikido.dev/), which needs no account. A list is downloaded on the first lookup for its ecosystem and again once it is older than `refresh_interval`; one download serves every lookup waiting on it. When a refresh fails, the last list keeps answering for three intervals, then each lookup records an error under the action. A list larger than 256 MiB, one that is not a JSON array, and an empty one are refused as errors rather than read as "nothing is malicious".
+
+`bodega integration test` asks about `npm` `lodash@4.17.21` and prints the size and fetch time of the list it matched against. The list publisher reports no quota.
+
+### Integrations view
+
+`G` in the TUI opens a picker listing every registered type with its display name, cost, ecosystems, and each configured instance of it with its enabled state. `Enter` opens a form generated from the descriptor: a `bool` is a checkbox, an `enum` a choice list, a secret a masked field, and every other kind a text field, with the field's help text and default under it. The type's URL, cost, ecosystems and "what leaves the host" sentence sit under the title, so they are on screen before the first save.
+
+The form edits the first instance of the type, or a new one named after the type when there is none; edit further instances with `bodega integration set`. `Enter` runs the validator `bodega serve` runs and keeps the form open with its message when it fails. A save writes this one instance under `integrations` and nothing else: a key the form does not show, such as a `<key>_file` path, is kept, and a field left at a default the file never set stays unset. A secret typed into the masked field is stored through `bodega integration secret`'s path; left empty, the stored one is kept. `Ctrl+T` runs `bodega integration test` against the values on the form, and the answer lands in the Log pane. The config form's `Ctrl+T`, `Ctrl+R` and `j` keys do not apply here, so every character types.
+
 ## TUI
 
 `bodega shell` launches a full-screen terminal interface with three panes:
@@ -7031,6 +7206,7 @@ With the Sources pane focused:
 | `I`                     | Initialize an s3 backend's bucket, as `bodega init` does, after a confirmation naming the backend, bucket and region. It acts on s3 backends only, and asks which one when several are configured. Esc cancels while it reaches the backend |
 | `L`                     | Query the audit log                                                                                                                                                                                                                         |
 | `Q`                     | Open the refusal queue: `a` approves and `x` dismisses the row under the cursor, each after prompting for a reason; see [`bodega queue`](#bodega-queue-listapprovedismiss)                                                                  |
+| `G`                     | Configure an [integration](#integrations-view): pick a type, then fill in the form generated from its descriptor                                                                                                                            |
 | `T`                     | Open the token manager                                                                                                                                                                                                                      |
 | `Ctrl+R`                | Reload the manifests (any pane)                                                                                                                                                                                                             |
 

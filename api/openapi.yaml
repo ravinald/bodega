@@ -1150,7 +1150,11 @@ paths:
                   type: string
                 check:
                   type: string
-                  enum: [allowlist, age, osv, upstream_provenance, name_similarity]
+                  description: |
+                    One of `allowlist`, `age`, `osv`, `upstream_provenance`
+                    and `name_similarity`, or `integration:<instance>` for a
+                    configured external check.
+                  pattern: "^(allowlist|age|osv|upstream_provenance|name_similarity|integration:[a-z0-9][a-z0-9_-]{0,62})$"
                 reason:
                   type: string
                 expires:
