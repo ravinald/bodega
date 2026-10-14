@@ -45,29 +45,34 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	if adb == nil {
 		return ev
 	}
-	if a, err := provenance.Action(ctx, adb, pm.Type); err == nil {
+	ev.readActions(ctx, adb, pm.Type)
+	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
+	ev.loadOverrides(ctx, adb, pm, now)
+	return ev
+}
+
+// readActions reads the action each version check is configured with for typ.
+func (ev *evaluation) readActions(ctx context.Context, store PolicyStore, typ string) {
+	if a, err := provenance.Action(ctx, store, typ); err == nil {
 		ev.actions[audit.CheckUpstreamProvenance] = a
 	} else {
 		ev.actions[audit.CheckUpstreamProvenance] = "unknown"
 	}
-	if a, err := policy.SimilarityAction(ctx, adb, pm.Type); err == nil {
+	if a, err := policy.SimilarityAction(ctx, store, typ); err == nil {
 		ev.actions[audit.CheckNameSimilarity] = a
 	} else {
 		ev.actions[audit.CheckNameSimilarity] = "unknown"
 	}
-	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
-	ev.loadOverrides(ctx, adb, pm, now)
-	if p, err := adb.GetAgePolicy(ctx, pm.Type); err == nil {
+	if p, err := store.GetAgePolicy(ctx, typ); err == nil {
 		ev.actions[audit.CheckAge] = p.Action
 	} else if !errors.Is(err, audit.ErrAgePolicyNotFound) {
 		ev.actions[audit.CheckAge] = "unknown"
 	}
-	if p, err := adb.GetOSVPolicy(ctx, pm.Type); err == nil {
+	if p, err := store.GetOSVPolicy(ctx, typ); err == nil {
 		ev.actions[audit.CheckOSV] = p.Action
 	} else if !errors.Is(err, audit.ErrOSVPolicyNotFound) {
 		ev.actions[audit.CheckOSV] = "unknown"
 	}
-	return ev
 }
 
 // set records c for version i, replacing an earlier verdict of the same

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/sumdb/dirhash"
@@ -212,12 +213,17 @@ func runPrefetch(ctx context.Context, gf *globalFlags, paths []string, format st
 			}
 			pm := prefetchManifest(cfg, e)
 			r.pm = pm
-			if dryRun {
-				v := evaluateReadOnly(ctx, cfg, checker, admit.VersionCheckersFrom(cfg, adb), pm)
-				r.Decision, r.Reason, r.Failing = v.Decision, v.Reason, failingChecks(v.Checks)
+			existing, err := carryStored(ctx, store, pm)
+			if err != nil {
+				r.Decision, r.Reason = prefetchError, err.Error()
 				continue
 			}
-			admitPrefetched(ctx, cfg, checker, adb, store, pm, r)
+			if dryRun {
+				v := admit.Evaluate(ctx, cfg, checker, adb, nil, pm, time.Now())
+				r.Decision, r.Reason, r.Failing = v.Decision.String(), v.Reason, failingChecks(v.Checks)
+				continue
+			}
+			admitPrefetched(ctx, cfg, checker, adb, store, pm, existing, r)
 		}
 	}
 
@@ -264,17 +270,33 @@ func prefetchManifest(cfg *config.Config, e lockfile.Entry) *manifest.PackageMan
 	return &manifest.PackageManifest{Type: e.Type, Name: manifest.CanonicalName(e.Type, e.Name), Versions: []manifest.VersionEntry{ve}}
 }
 
-// admitPrefetched is `bodega pkg import --merge` for one entry: admission,
-// publish time, then the write. A version the package already holds is
-// admitted again, so the row cites today's policy, and written nowhere.
-func admitPrefetched(ctx context.Context, cfg *config.Config, checker *policy.Checker, adb *audit.DB,
-	store *manifest.Store, pm *manifest.PackageManifest, r *prefetchResult) {
-	existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
+// carryStored gives pm what the stored package already settles for it, and
+// returns that package (nil when there is none). A dry run and a real one
+// both start here, so the two evaluate the same manifest. A store that cannot
+// be read is an entry bodega cannot answer for: guessing "not stored" would
+// drop a baseline mark the store holds, and the merge would then overwrite
+// the package with this one version.
+func carryStored(ctx context.Context, store *manifest.Store, pm *manifest.PackageManifest) (*manifest.PackageManifest, error) {
+	existing, err := store.GetPackage(ctx, pm.Type, pm.Name)
+	if err != nil {
+		return nil, err
+	}
 	if existing != nil && len(existing.Versions) > 0 {
 		// A package's mode is its first version's; a proxy entry appended to a
 		// hosted package would change nothing but would read as a contradiction.
 		pm.Versions[0].Mode = existing.Versions[0].Mode
 	}
+	// Only `pkg import --baseline` sets the mark; prefetch keeps the one the
+	// store holds, as every other write path does.
+	admit.CarryBaseline(pm, existing)
+	return existing, nil
+}
+
+// admitPrefetched is `bodega pkg import --merge` for one entry: admission,
+// publish time, then the write. A version the package already holds is
+// admitted again, so the row cites today's policy, and written nowhere.
+func admitPrefetched(ctx context.Context, cfg *config.Config, checker *policy.Checker, adb *audit.DB,
+	store *manifest.Store, pm, existing *manifest.PackageManifest, r *prefetchResult) {
 	res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 	for _, w := range res.Warnings {
 		fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
@@ -497,11 +519,14 @@ func fileDigest(path, algorithm string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// failingChecks keeps the checks that warned or blocked.
+// failingChecks keeps the checks that warned or blocked, and the ones a
+// baseline mark or an override admitted past: a CI reader seeing a known
+// vulnerable version go through needs to see why.
 func failingChecks(checks []audit.AdmissionCheck) []audit.AdmissionCheck {
 	var out []audit.AdmissionCheck
 	for _, c := range checks {
-		if c.Status == audit.CheckWarn || c.Status == audit.CheckBlock {
+		switch c.Status {
+		case audit.CheckWarn, audit.CheckBlock, audit.CheckBaseline, audit.CheckOverridden:
 			out = append(out, c)
 		}
 	}

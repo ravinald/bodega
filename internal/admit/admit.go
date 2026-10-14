@@ -140,6 +140,60 @@ func AdmitAs(
 	return ev.record(ctx, adb, pm, res, who)
 }
 
+// Verdict is what Evaluate concluded about one version.
+type Verdict struct {
+	Decision Decision
+	Reason   string
+	Checks   []audit.AdmissionCheck
+}
+
+// Evaluate decides on pm, which holds one version, the way Admit would and
+// writes nothing: no admission row, no audit event, and no provenance pin,
+// since no checker's Commit runs. The order, the active overrides and the
+// version's baseline mark all apply as they do in Admit, malware and invalid
+// provenance included, so a preview that goes through here cannot disagree
+// with the admission it previews. The mark it reads is the one pm carries,
+// so a manifest built outside the store wants CarryBaseline first, as every
+// write path does before Admit.
+//
+// store answers the policy reads, which is how a simulation evaluates a
+// policy nobody has written; nil reads adb. adb supplies the overrides, and a
+// nil adb runs structure and the allow-list alone, as Admit does.
+func Evaluate(ctx context.Context, cfg *config.Config, checker *policy.Checker, adb *audit.DB, store PolicyStore,
+	pm *manifest.PackageManifest, now time.Time) Verdict {
+	var res Result
+	if err := validate(cfg, pm, &res); err != nil {
+		return Verdict{Decision: Invalid, Reason: err.Error()}
+	}
+	if len(pm.Versions) != 1 {
+		return Verdict{Decision: Invalid, Reason: fmt.Sprintf("evaluate wants one version, got %d", len(pm.Versions))}
+	}
+	ev := newEvaluation(ctx, adb, pm, now)
+	if adb == nil {
+		store = nil
+	} else if store == nil {
+		store = adb
+	}
+	if store != nil {
+		ev.readActions(ctx, store, pm.Type)
+	}
+	// A nil database records nothing, which is what keeps the allow-list's
+	// refusal event out of a read-only evaluation.
+	if blocked := checkAllowList(ctx, checker, nil, pm, "", ev); blocked != nil {
+		return Verdict{Decision: PolicyBlocked, Reason: blocked.Reason, Checks: ev.checks[0]}
+	}
+	if store == nil {
+		return Verdict{Decision: Admitted, Checks: ev.checks[0]}
+	}
+	ve := &pm.Versions[0]
+	combined := policy.Combine(ev.runVersion(ctx, pm, 0, VersionCheckersFrom(cfg, store)))
+	if combined.Blocked() {
+		return Verdict{Decision: PolicyBlocked, Checks: ev.checks[0],
+			Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())}
+	}
+	return Verdict{Decision: Admitted, Checks: ev.checks[0]}
+}
+
 // Create runs the policy checks `bodega pkg create` answers to: the
 // allow-list and the per-version checks.
 //

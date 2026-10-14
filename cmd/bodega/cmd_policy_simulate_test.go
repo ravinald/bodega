@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -170,4 +171,77 @@ func TestPolicySimulateEmptyListUnderListedMode(t *testing.T) {
 	if after := policyState(t, f); after != before {
 		t.Fatalf("simulate wrote something:\nbefore %s\nafter  %s", before, after)
 	}
+}
+
+// simulateAgrees checks a simulation's verdict on minimist against what
+// admission decides once the change is made for real.
+func simulateAgrees(t *testing.T, f *prefetchFixture, sim simulation) {
+	t.Helper()
+	for _, c := range sim.Changes {
+		if c.Name == "minimist" {
+			t.Fatalf("changes = %+v; minimist stays admitted", sim.Changes)
+		}
+	}
+	adb := f.open(t)
+	defer adb.Close()
+	if err := adb.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeNpm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(&globalFlags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm, err := manifest.NewLocalStore(f.manifests).GetPackage(t.Context(), manifest.TypeNpm, "minimist")
+	if err != nil || pm == nil {
+		t.Fatalf("load minimist: %v", err)
+	}
+	if res := admit.Admit(t.Context(), policy.NewChecker(adb), adb, cfg, pm, "test"); !res.OK() {
+		t.Fatalf("admission under npm=block = %s (%s); the simulation said it would stay admitted", res.Decision, res.Reason)
+	}
+}
+
+func TestPolicySimulateHonorsBaseline(t *testing.T) {
+	f := simulateFixture(t, policy.ActionWarn)
+	storeBaseline(t, f, "minimist", "1.2.0")
+	sim := runSimulate(t, "--osv", "npm=block")
+	simulateAgrees(t, f, sim)
+}
+
+func TestPolicySimulateHonorsOverride(t *testing.T) {
+	f := simulateFixture(t, policy.ActionWarn)
+	adb := f.open(t)
+	now := time.Now()
+	o := audit.Override{ID: "o1", PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0", Check: audit.CheckOSV,
+		Reason: "patched in the vendored build", RequestedBy: "alice", RequestedAt: now, ExpiresAt: now.Add(24 * time.Hour), Quorum: 2}
+	if err := adb.InsertOverride(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := adb.VoteOverride(t.Context(), o.ID, "bob", audit.VoteApprove, "", now); err != nil || got.State != audit.OverrideApproved {
+		t.Fatalf("vote = %+v, %v; want the override approved", got, err)
+	}
+	adb.Close()
+	sim := runSimulate(t, "--osv", "npm=block")
+	simulateAgrees(t, f, sim)
+}
+
+func TestPolicySimulateBaselineDoesNotCoverMalware(t *testing.T) {
+	f := simulateFixture(t, policy.ActionWarn)
+	storeBaseline(t, f, "evil-pkg", "1.0.0")
+	adb := f.open(t)
+	if err := adb.SetOSVMalwarePolicy(t.Context(), audit.OSVMalwarePolicy{Ecosystem: manifest.TypeNpm, Action: policy.ActionWarn}); err != nil {
+		t.Fatal(err)
+	}
+	adb.Close()
+
+	sim := runSimulate(t, "--osv", "npm=block")
+	for _, c := range sim.Changes {
+		if c.Name == "evil-pkg" {
+			if c.Before != audit.AdmissionAdmitted || c.After != audit.AdmissionPolicyBlocked ||
+				len(c.Checks) != 1 || c.Checks[0].Check != audit.CheckOSV || !strings.Contains(c.Checks[0].Detail, "baseline mark does not apply") {
+				t.Fatalf("change = %+v; want evil-pkg newly blocked by osv, the mark refused for malware", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("changes = %+v; want evil-pkg newly blocked: a baseline mark never admits known malware", sim.Changes)
 }

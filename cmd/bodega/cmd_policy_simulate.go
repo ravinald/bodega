@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -132,54 +133,6 @@ func (o *policyOverlay) GetSimilarityPolicy(ctx context.Context, eco string) (au
 
 func (o *policyOverlay) PinProvenance(context.Context, audit.ProvenancePin) (audit.ProvenancePin, bool, error) {
 	return audit.ProvenancePin{}, false, errors.New("a policy simulation writes no provenance pin")
-}
-
-// readOnlyVerdict is what evaluateReadOnly concluded about one version.
-type readOnlyVerdict struct {
-	Decision string
-	Reason   string
-	Checks   []audit.AdmissionCheck
-}
-
-// evaluateReadOnly decides on pm's one version the way admission would, in the
-// same order, and writes nothing: no admission row, no audit event, no pin.
-// admit.Admit with no checker and no database is the structural half alone,
-// which writes nothing by construction; the policy half runs the checkers
-// here without ever calling Commit.
-func evaluateReadOnly(ctx context.Context, cfg *config.Config, checker *policy.Checker, checkers []policy.VersionChecker, pm *manifest.PackageManifest) readOnlyVerdict {
-	if res := admit.Admit(ctx, nil, nil, cfg, pm, ""); res.Decision == admit.Invalid {
-		return readOnlyVerdict{Decision: audit.AdmissionInvalid, Reason: res.Reason}
-	}
-	ve := &pm.Versions[0]
-	candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
-	listed, _ := checker.Listed(ctx, pm.Type)
-	var allowErr error
-	if candidate != "" {
-		allowErr = checker.Check(ctx, pm.Type, candidate)
-	}
-	v := readOnlyVerdict{Decision: audit.AdmissionAdmitted,
-		Checks: []audit.AdmissionCheck{admit.AllowListCheck(listed, candidate, allowErr)}}
-	if allowErr != nil {
-		v.Decision, v.Reason = audit.AdmissionPolicyBlocked, allowErr.Error()
-		return v
-	}
-	for _, c := range checkers {
-		r := c.Check(ctx, pm, ve)
-		status, action := audit.CheckPass, audit.ActionNone
-		switch r.Action {
-		case policy.ActionWarn:
-			status, action = audit.CheckWarn, policy.ActionWarn
-		case policy.ActionBlock:
-			status, action = audit.CheckBlock, policy.ActionBlock
-		case policy.ActionNotEvaluated:
-			status = audit.CheckNotEvaluated
-		}
-		v.Checks = append(v.Checks, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason})
-		if status == audit.CheckBlock && v.Decision == audit.AdmissionAdmitted {
-			v.Decision, v.Reason = audit.AdmissionPolicyBlocked, r.Check+": "+r.Reason
-		}
-	}
-	return v
 }
 
 type checkChange struct {
@@ -414,6 +367,7 @@ func simulatePolicy(ctx context.Context, cfg *config.Config, adb *audit.DB, stor
 	}
 	current := newPolicyOverlay(adb)
 	curChecker, newChecker := policy.NewChecker(current), policy.NewChecker(proposed)
+	now := time.Now()
 	sim := simulation{Types: proposed.types(), Changes: []simulatedChange{}}
 	for _, t := range sim.Types {
 		pms, err := admittedVersions(ctx, adb, store, t)
@@ -424,14 +378,14 @@ func simulatePolicy(ctx context.Context, cfg *config.Config, adb *audit.DB, stor
 			for _, ve := range pm.Versions {
 				one := *pm
 				one.Versions = []manifest.VersionEntry{ve}
-				before := evaluateReadOnly(ctx, cfg, curChecker, admit.VersionCheckersFrom(cfg, current), &one)
-				after := evaluateReadOnly(ctx, cfg, newChecker, admit.VersionCheckersFrom(cfg, proposed), &one)
+				before := admit.Evaluate(ctx, cfg, curChecker, adb, current, &one, now)
+				after := admit.Evaluate(ctx, cfg, newChecker, adb, proposed, &one, now)
 				sim.Evaluated++
 				if before.Decision == after.Decision {
 					continue
 				}
 				sim.Changes = append(sim.Changes, simulatedChange{Type: t, Name: pm.Name, Version: ve.Version,
-					Before: before.Decision, After: after.Decision, Checks: responsibleChecks(before.Checks, after.Checks)})
+					Before: before.Decision.String(), After: after.Decision.String(), Checks: responsibleChecks(before.Checks, after.Checks)})
 			}
 		}
 	}

@@ -28,8 +28,9 @@ import (
 )
 
 // prefetchFixture is an install whose upstreams are one loopback stub serving
-// lodash 4.17.21 for npm and example.com/mod v1.0.0 for gomod, and whose OSV
-// database names minimist 1.2.0 for npm.
+// lodash 4.17.21 and minimist 1.2.0 for npm and example.com/mod v1.0.0 for
+// gomod, and whose OSV database names minimist 1.2.0 in an advisory and
+// evil-pkg 1.0.0 in an advisory and a malware record.
 type prefetchFixture struct {
 	dir, adbPath, manifests string
 	tarball, modZip         []byte
@@ -44,6 +45,8 @@ func newPrefetchFixture(t *testing.T, osvAction string) *prefetchFixture {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lodash/-/lodash-4.17.21.tgz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(f.tarball) })
+	minimist := npmTarball(t, `{"name":"minimist","version":"1.2.0"}`)
+	mux.HandleFunc("/minimist/-/minimist-1.2.0.tgz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(minimist) })
 	mux.HandleFunc("/example.com/mod/@v/v1.0.0.info", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"2020-01-01T00:00:00Z"}`))
 	})
@@ -57,14 +60,20 @@ func newPrefetchFixture(t *testing.T, osvAction string) *prefetchFixture {
 	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var buf bytes.Buffer
 		zw := zip.NewWriter(&buf)
-		zf, _ := zw.Create("GHSA-test-0001.json")
-		_ = json.NewEncoder(zf).Encode(map[string]any{
-			"id": "GHSA-test-0001",
-			"affected": []map[string]any{{
-				"package":  map[string]string{"name": "minimist", "ecosystem": "npm"},
-				"versions": []string{"1.2.0"},
-			}},
-		})
+		for id, pkg := range map[string][2]string{
+			"GHSA-test-0001": {"minimist", "1.2.0"},
+			"GHSA-test-0002": {"evil-pkg", "1.0.0"},
+			"MAL-test-0001":  {"evil-pkg", "1.0.0"},
+		} {
+			zf, _ := zw.Create(id + ".json")
+			_ = json.NewEncoder(zf).Encode(map[string]any{
+				"id": id,
+				"affected": []map[string]any{{
+					"package":  map[string]string{"name": pkg[0], "ecosystem": "npm"},
+					"versions": []string{pkg[1]},
+				}},
+			})
+		}
 		_ = zw.Close()
 		_, _ = w.Write(buf.Bytes())
 	}))
@@ -375,4 +384,80 @@ func installState(t *testing.T, f *prefetchFixture) string {
 		t.Fatal(err)
 	}
 	return fmt.Sprintf("files=%v admissions=%d pins=%d events=%d", files, len(adm), len(pins), len(events))
+}
+
+// minimistLock is a v3 lockfile naming minimist 1.2.0, the version the OSV
+// database flags, with no integrity to compare.
+const minimistLock = `{"lockfileVersion": 3, "packages": {
+  "": {"name": "app"},
+  "node_modules/minimist": {"version": "1.2.0", "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.0.tgz"}
+}}`
+
+// storeBaseline stores npm name@version marked baseline, as `bodega pkg
+// import --baseline` leaves it.
+func storeBaseline(t *testing.T, f *prefetchFixture, name, version string) {
+	t.Helper()
+	store := manifest.NewLocalStore(f.manifests)
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Type: manifest.TypeNpm, Name: name,
+		Versions: []manifest.VersionEntry{{Version: version, Mode: manifest.ModeProxy, Baseline: true, BaselineAt: "2026-10-01T00:00:00Z"}}}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrefetchHonorsStoredBaseline(t *testing.T) {
+	f := newPrefetchFixture(t, policy.ActionBlock)
+	storeBaseline(t, f, "minimist", "1.2.0")
+	lock := f.write(t, "package-lock.json", minimistLock)
+
+	before := installState(t, f)
+	code, rows, err := f.prefetch(t, true, lock)
+	if err != nil || code != 0 || rows[0].Decision != audit.AdmissionAdmitted {
+		t.Fatalf("prefetch --dry-run = %d, %v, %+v; want minimist admitted as baseline", code, err, rows)
+	}
+	if c := failingCheck(rows[0], audit.CheckOSV); c.Status != audit.CheckBaseline {
+		t.Errorf("dry-run failing = %+v; want the osv check shown as admitted past by the baseline mark", rows[0].Failing)
+	}
+	if after := installState(t, f); after != before {
+		t.Fatalf("dry run changed the install:\nbefore %s\nafter  %s", before, after)
+	}
+
+	code, rows, err = f.prefetch(t, false, lock)
+	if err != nil || code != 0 || rows[0].Decision != audit.AdmissionAdmitted {
+		t.Fatalf("prefetch = %d, %v, %+v; want minimist admitted as baseline, as pkg import --merge admits it", code, err, rows)
+	}
+	if c := failingCheck(rows[0], audit.CheckOSV); c.Status != audit.CheckBaseline {
+		t.Errorf("failing = %+v; want the osv check shown as admitted past by the baseline mark", rows[0].Failing)
+	}
+	adb := f.open(t)
+	defer adb.Close()
+	adm, err := adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "minimist"})
+	if err != nil || len(adm) == 0 {
+		t.Fatalf("admissions = %+v, %v; want the prefetch's row", adm, err)
+	}
+	var osv string
+	for _, c := range adm[0].Checks {
+		if c.Check == audit.CheckOSV {
+			osv = c.Status
+		}
+	}
+	if adm[0].Decision != audit.AdmissionAdmitted || osv != audit.CheckBaseline {
+		t.Errorf("admission = %s with osv %q; want admitted with osv baseline", adm[0].Decision, osv)
+	}
+	pm, _ := manifest.NewLocalStore(f.manifests).GetPackage(t.Context(), manifest.TypeNpm, "minimist")
+	if pm == nil || len(pm.Versions) != 1 || !pm.Versions[0].Baseline {
+		t.Errorf("stored minimist = %+v; want the one version, still marked baseline", pm)
+	}
+}
+
+func failingCheck(r prefetchResult, check string) audit.AdmissionCheck {
+	for _, c := range r.Failing {
+		if c.Check == check {
+			return c
+		}
+	}
+	return audit.AdmissionCheck{}
 }
