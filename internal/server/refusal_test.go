@@ -650,3 +650,126 @@ func TestAgeWarnOnProxyFillServes(t *testing.T) {
 	}
 	t.Errorf("no policy_warn row for the served version: %+v", rows)
 }
+
+// baselineFillUpstream answers every proxy fill the baseline tests make: a
+// pypi simple page listing the wheel, and bytes for anything else.
+func baselineFillUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/simple/") {
+			_, _ = io.WriteString(w, `<a href="/files/six-1.2.0-py2.py3-none-any.whl">x</a>`+
+				`<a href="/files/attrs-1.2.0-py2.py3-none-any.whl">x</a>`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"Version":"v1.2.0"}`)
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// A version the stored manifest marks baseline is admitted on the proxy fill
+// past a failing age gate and past an allow-list in listed mode with no rule,
+// with the finding kept on the admission row under status baseline. The same
+// setup refuses an unmarked version, so the mark is what admits it.
+func TestBaselineProxyFillAdmitsPastAFailingGate(t *testing.T) {
+	type eco struct{ typ, marked, unmarked, version, markedPath, unmarkedPath string }
+	ecos := []eco{
+		{manifest.TypeNpm, "leftpad", "rightpad", "1.2.0", "/npm/leftpad/-/leftpad-1.2.0.tgz", "/npm/rightpad/-/rightpad-1.2.0.tgz"},
+		{manifest.TypeCargo, "itoa", "ryu", "1.2.0", "/cargo/itoa/1.2.0/download", "/cargo/ryu/1.2.0/download"},
+		{manifest.TypeGomod, "example.com/mod", "example.com/other", "v1.2.0", "/go/example.com/mod/@v/v1.2.0.zip", "/go/example.com/other/@v/v1.2.0.zip"},
+		{manifest.TypePypi, "six", "attrs", "1.2.0", "/pypi/wheels/six-1.2.0-py2.py3-none-any.whl", "/pypi/wheels/attrs-1.2.0-py2.py3-none-any.whl"},
+	}
+	gates := []struct {
+		name, check string
+		set         func(t *testing.T, s *Server, typ string)
+	}{
+		{"age block", audit.CheckAge, func(t *testing.T, s *Server, typ string) {
+			if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: typ, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"listed mode, no rules", audit.CheckAllowList, func(t *testing.T, s *Server, typ string) {
+			if err := s.auditDB.SetAdmissionMode(t.Context(), audit.AdmissionMode{Ecosystem: typ, Mode: audit.ModeListed}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, e := range ecos {
+		for _, g := range gates {
+			t.Run(e.typ+"/"+g.name, func(t *testing.T) {
+				stubAgeGate(t)
+				up := baselineFillUpstream(t)
+				s := newDiscoveryServer(t)
+				s.cfg.NpmUpstream, s.cfg.PypiUpstream, s.cfg.GomodUpstream, s.cfg.CargoDLUpstream = up.URL, up.URL, up.URL, up.URL
+				ctx := t.Context()
+				if err := s.store.AddVersion(ctx, e.typ, e.marked, manifest.VersionEntry{Version: e.version, Mode: manifest.ModeProxy,
+					Baseline: true, BaselineAt: "2026-01-01T00:00:00Z"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.store.AddVersion(ctx, e.typ, e.unmarked, manifest.VersionEntry{Version: e.version, Mode: manifest.ModeProxy}); err != nil {
+					t.Fatal(err)
+				}
+				g.set(t, s, e.typ)
+
+				rec := doRequest(s, http.MethodGet, e.markedPath, nil)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("baseline %s: status %d, %s=%q, want 200 (%s)", e.markedPath, rec.Code, refusalHeader, rec.Header().Get(refusalHeader), rec.Body.String())
+				}
+				rows, err := s.auditDB.Admissions(ctx, audit.AdmissionFilter{PkgType: e.typ, PkgName: e.marked})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(rows) != 1 {
+					t.Fatalf("got %d admission rows for the baseline fill, want 1: %+v", len(rows), rows)
+				}
+				found := false
+				for _, c := range rows[0].Checks {
+					if c.Check == g.check {
+						found = c.Status == audit.CheckBaseline
+						if !found {
+							t.Errorf("%s check = %+v, want status baseline", g.check, c)
+						}
+					}
+				}
+				if !found && !t.Failed() {
+					t.Errorf("row has no %s check: %+v", g.check, rows[0].Checks)
+				}
+				if rows[0].Decision != audit.AdmissionAdmitted {
+					t.Errorf("decision = %q, want admitted", rows[0].Decision)
+				}
+
+				if rec := doRequest(s, http.MethodGet, e.unmarkedPath, nil); rec.Code != http.StatusForbidden {
+					t.Errorf("unmarked %s: status %d, want 403 (%s)", e.unmarkedPath, rec.Code, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+// An index a host pinned to a baseline version reads before the artifact
+// passes the allow-list in listed mode too; a package with no mark does not.
+func TestBaselineIndexPassesTheAllowList(t *testing.T) {
+	up := baselineFillUpstream(t)
+	s := newDiscoveryServer(t)
+	s.cfg.GomodUpstream = up.URL
+	ctx := t.Context()
+	saved := upstreamGuard
+	upstreamGuard = func(string) error { return nil }
+	t.Cleanup(func() { upstreamGuard = saved })
+	if err := s.store.AddVersion(ctx, manifest.TypeGomod, "example.com/mod", manifest.VersionEntry{Version: "v1.2.0", Mode: manifest.ModeProxy,
+		Baseline: true, BaselineAt: "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.AddVersion(ctx, manifest.TypeGomod, "example.com/other", manifest.VersionEntry{Version: "v1.2.0", Mode: manifest.ModeProxy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.SetAdmissionMode(ctx, audit.AdmissionMode{Ecosystem: manifest.TypeGomod, Mode: audit.ModeListed}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doRequest(s, http.MethodGet, "/go/example.com/mod/@v/list", nil); rec.Code != http.StatusOK {
+		t.Errorf("baseline module list: status %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := doRequest(s, http.MethodGet, "/go/example.com/other/@v/list", nil); rec.Code != http.StatusForbidden {
+		t.Errorf("unmarked module list: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+}

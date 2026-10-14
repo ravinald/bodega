@@ -383,7 +383,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 
 	// A digest says the bytes are right; it does not say the operator agreed
 	// to contact the host that would supply them.
-	decision, ok := s.upstreamPolicyGate(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true)
+	decision, ok := s.upstreamPolicyGate(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true, nil)
 	if !ok {
 		if decision == audit.DecisionDenied {
 			s.recordFillRefusal(r, manifest.TypeDistfiles, upstream, name, key)
@@ -391,7 +391,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordUpstreamAttempt(r, manifest.TypeDistfiles, upstream, upstream, name, key, decision)
-	fill, ok := s.versionPolicyGate(w, r, manifest.TypeDistfiles, upstream, name, key, decision, true)
+	fill, ok := s.versionPolicyGate(w, r, manifest.TypeDistfiles, upstream, name, key, decision, true, nil)
 	if !ok {
 		return
 	}

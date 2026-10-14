@@ -86,6 +86,7 @@ const (
 	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
 	EventShow    EventType = "show"    // bodega show
 	EventPolicy  EventType = "policy"  // a gate's action changed, e.g. bodega policy osv malware set
+	EventRevet   EventType = "revet"   // a re-vet refused an admitted version, or the webhook requested one
 
 	// Server lifecycle events.
 	EventServeStart EventType = "serve_start" // bodega serve started
@@ -103,6 +104,9 @@ const (
 	// Status; see the Denial* constants.
 	EventDenied EventType = "denied"
 )
+
+// EventOverride is an override requested, approved or rejected.
+const EventOverride EventType = "override"
 
 // Status values for EventCache. They name the proxy outcome, so an operator
 // asking which artifacts came from upstream can tell that from an artifact the
@@ -134,6 +138,7 @@ const (
 	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
 	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
 	DenialTokenScope   = "token_scope"          // token valid, but its scope does not reach this route
+	DenialSignature    = "signature_invalid"    // re-vet webhook body unsigned, mis-signed, stale or replayed
 
 	// Refusals decided inside a handler rather than by the middleware chain.
 	// They reach the same table because an operator asking "who was turned
@@ -234,6 +239,20 @@ func scanServedObjects(rows *sql.Rows) ([]ServedObject, error) {
 			return nil, err
 		}
 		out = append(out, so)
+	}
+	return out, rows.Err()
+}
+
+func scanServeRecords(rows *sql.Rows, parseTime func(any) time.Time) ([]ServeRecord, error) {
+	var out []ServeRecord
+	for rows.Next() {
+		var r ServeRecord
+		var first any
+		if err := rows.Scan(&r.PkgType, &r.PkgName, &r.PkgVersion, &r.ObjectKey, &r.Digest, &r.Identity, &r.ClientIP, &first); err != nil {
+			return nil, err
+		}
+		r.First = parseTime(first).UTC()
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -674,6 +693,39 @@ func (a *DB) ServedObjects(ctx context.Context, identity string) ([]ServedObject
 		return nil, err
 	}
 	return r.QueryServedObjects(ctx, identity)
+}
+
+// ServeRecord is one stored object bodega served to one (identity, address)
+// pair, with the first time it did. Identity is empty for a request no binding
+// resolved.
+type ServeRecord struct {
+	ServedObject
+	Identity string    `json:"identity"`
+	ClientIP string    `json:"client_ip"`
+	First    time.Time `json:"first"`
+}
+
+// ServeHistory is every serve_fetch that handed over a stored object, grouped
+// by object, identity and address, and the time the oldest event of any type
+// still in the store was written.
+//
+// Since is the start of what the store can testify to. A host that installed a
+// package before it holds no row either way, whether bodega served it or not.
+type ServeHistory struct {
+	Since   time.Time
+	Records []ServeRecord
+}
+
+// ServeHistory returns the store's serve record and the start of its window.
+// It keeps the identity and the client address that Served and ServedObjects
+// fold away, because attributing a serve to a host means asking which binding
+// the address belonged to.
+func (a *DB) ServeHistory(ctx context.Context) (ServeHistory, error) {
+	r, err := a.reader("serve history")
+	if err != nil {
+		return ServeHistory{}, err
+	}
+	return r.QueryServeHistory(ctx)
 }
 
 // Count returns the total number of events matching the filter.

@@ -280,6 +280,28 @@ func (s *postgresSink) QueryServedObjects(ctx context.Context, identity string) 
 	return scanServedObjects(rows)
 }
 
+func (s *postgresSink) QueryServeHistory(ctx context.Context) (ServeHistory, error) {
+	var out ServeHistory
+	var since sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(timestamp) FROM events`).Scan(&since); err != nil {
+		return out, err
+	}
+	out.Since = since.Time
+	rows, err := s.db.QueryContext(ctx, `SELECT pkg_type, pkg_name, pkg_version, object_key, COALESCE(digest, ''),
+	             COALESCE(identity, ''), COALESCE(client_ip, ''), MIN(timestamp)
+	      FROM events
+	      WHERE event_type = $1 AND object_key IS NOT NULL
+	      GROUP BY 1, 2, 3, 4, 5, 6, 7
+	      ORDER BY 1, 2, 3, 4, 5, 6, 7`,
+		string(EventServeFetch))
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	out.Records, err = scanServeRecords(rows, pgTime)
+	return out, err
+}
+
 func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
 	var where []string
 	a := &pgArgs{}
@@ -452,7 +474,7 @@ func (s *postgresSink) pinAdmission(ctx context.Context, p AdmissionPin) (admiss
 }
 
 func (s *postgresSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
-	q, args := buildAdmissionQuery(f, pgPlaceholder)
+	q, args := buildAdmissionQuery(f, pgPlaceholder, func(t time.Time) any { return t })
 	// checks is JSONB; the cast hands the driver text for scanAdmissions.
 	q = strings.Replace(q, " checks,", " checks::text,", 1)
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -460,6 +482,15 @@ func (s *postgresSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) (
 		return nil, err
 	}
 	return scanAdmissions(rows, pgTime)
+}
+
+func (s *postgresSink) admittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
+	q, args := buildAdmittedVersionsQuery(f, pgPlaceholder)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanAdmittedVersions(rows)
 }
 
 func pgPlaceholder(n int) string { return fmt.Sprintf("$%d", n) }

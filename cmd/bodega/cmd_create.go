@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -152,7 +151,7 @@ Examples:
 				ve = manifest.VersionEntry{}
 			}
 
-			if err := confirmPolicyOverride(ctx, r, gf, cfg, store, t, name, ve); err != nil {
+			if err := admitCreate(ctx, gf, cfg, store, t, name, ve); err != nil {
 				return err
 			}
 
@@ -243,17 +242,14 @@ func setStoragePolicy(ctx context.Context, store *manifest.Store, t, name, polic
 	return nil
 }
 
-// confirmPolicyOverride runs admission on the entry that was just collected
-// interactively: the upstream allow-list, then the version checks every
-// other surface runs. On an allow-list violation the operator is warned and
-// given a y/N prompt to proceed anyway, and confirmation writes a
-// policy_override audit event. This is the ONLY policy enforcement path that
-// allows override — the server API, builder fetches, and bodega pkg import all
-// hard-reject. An age or OSV block has no override here either.
+// admitCreate runs admission on the entry that was just collected
+// interactively: the upstream allow-list, then the version checks every other
+// surface runs, with any approved override applied. A refusal is final here:
+// one operator at a terminal cannot admit past it, and the error names the
+// command that requests an override for a second identity to approve.
 //
-// The decision is written to the admissions table whatever it is, with the
-// operator's answer as its own check beside the allow-list's refusal.
-func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, cfg *config.Config, store *manifest.Store, t, name string, ve manifest.VersionEntry) error {
+// The decision is written to the admissions table whatever it is.
+func admitCreate(ctx context.Context, gf *globalFlags, cfg *config.Config, store *manifest.Store, t, name string, ve manifest.VersionEntry) error {
 	adb := openAuditDB(gf)
 	if adb == nil {
 		return nil
@@ -261,42 +257,30 @@ func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags
 	defer adb.Close()
 	takeNameBaseline(ctx, adb, store)
 
-	actor := audit.CurrentActor()
 	pm := &manifest.PackageManifest{Type: t, Name: name, Versions: []manifest.VersionEntry{ve}}
-	confirm := func(version, candidate string) (bool, error) {
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintf(os.Stderr, "  WARNING: upstream not in allow-list\n")
-		fmt.Fprintf(os.Stderr, "    type:      %s\n", t)
-		fmt.Fprintf(os.Stderr, "    candidate: %s\n", candidate)
-		fmt.Fprintf(os.Stderr, "    fix:       bodega policy add %s %s\n", t, candidate)
-		fmt.Fprintln(os.Stderr)
-
-		answer, err := prompt(r, "Proceed anyway? [y/N]", "N")
-		if err != nil {
-			return false, err
-		}
-		if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
-			return false, nil
-		}
-		_ = adb.Record(ctx, audit.Event{
-			EventType:  audit.EventCreate,
-			PkgType:    t,
-			PkgName:    name,
-			PkgVersion: version,
-			Actor:      actor,
-			Status:     "policy_override",
-			Details:    fmt.Sprintf("candidate=%s", candidate),
-		})
-		return true, nil
-	}
-	res := admit.Create(ctx, policy.NewChecker(adb), adb, cfg, pm, admit.Who{Actor: actor}, confirm)
+	res := admit.Create(ctx, policy.NewChecker(adb), adb, cfg, pm, admit.Who{Actor: audit.CurrentActor()})
 	for _, w := range res.Warnings {
 		fmt.Fprintf(os.Stderr, "%s/%s: %s\n", t, name, w)
 	}
 	if !res.OK() {
-		return errors.New(res.Reason)
+		return fmt.Errorf("%s\n%s", res.Reason, overrideHint(t, name, res))
 	}
 	return nil
+}
+
+// overrideHint names the command that requests an override for the check
+// that refused res.
+func overrideHint(t, name string, res admit.Result) string {
+	check := res.Check
+	if check == "allow-list" {
+		check = audit.CheckAllowList
+	}
+	version := res.Version
+	if version == "" {
+		version = "<version>"
+	}
+	return fmt.Sprintf("To admit it anyway, request an override for a second identity to approve:\n"+
+		"  bodega override request %s %s %s --check %s --reason \"<why>\" --expires 7d", t, name, version, check)
 }
 
 // prompt asks the user for a value, using defVal as the default.

@@ -164,6 +164,8 @@ type Server struct {
 	// attest signs the envelope for each proxy pin; nil when the audit store
 	// keeps no admissions table to re-read, which setupAttestation says once.
 	attest *attest.Emitter
+	// revet is the re-vet schedule and webhook; nil with no audit store.
+	revet *revetState
 
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
@@ -421,6 +423,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.loadPkgSigner()
 	s.loadAttestSigner()
 	s.setupAttestation()
+	s.setupRevet()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -494,7 +497,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
-	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.isInventoryPush)(h)
+	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.selfAuthenticated)(h)
 	h = s.clientMiddleware(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
@@ -691,6 +694,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Inventory pull polls and the retention sweep.
 	go s.inventory.Run(ctx)
+
+	// Scheduled re-vet; returns at once when revet_interval is unset.
+	go s.revetLoop(ctx)
 
 	// Discovery worker — drains the recorder's queue until ctx is cancelled.
 	if s.discovery != nil {
@@ -972,6 +978,17 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
+
+	// Two-person overrides. Every route requires a token bound to an
+	// identity, which is what the quorum counts; see overrideCaller.
+	m.HandleFunc("GET /api/v1/overrides", s.handleListOverrides)
+	m.HandleFunc("POST /api/v1/overrides", s.handleRequestOverride)
+	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)
+	m.HandleFunc("POST /api/v1/overrides/{id}/reject", s.handleRejectOverride)
+
+	// Threat-feed re-vet: exempt from the admin gate, authenticated by an
+	// HMAC over the body (see selfAuthenticated).
+	m.HandleFunc("POST "+RevetWebhookPath, s.handleRevetWebhook)
 }
 
 // requireAdmin gates the sensitive read endpoints, writing the 403 and the
@@ -1388,8 +1405,9 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	// An HTTP caller is not the process owner, so the audit rows this writes
 	// carry no actor rather than the server's; the admission rows carry the
 	// identity the request resolved to instead.
+	dropped := admit.CarryBaseline(&pm, nil)
 	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, &pm, admit.Who{Identity: Identity(r)})
-	for _, warning := range res.Warnings {
+	for _, warning := range append(baselineDropped(dropped), res.Warnings...) {
 		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
 	}
 	switch res.Decision {

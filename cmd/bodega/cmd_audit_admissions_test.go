@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -269,9 +268,11 @@ func TestImportConflictRecordsNoAdmission(t *testing.T) {
 	}
 }
 
-// TestCreateRecordsTheOperatorsOverride is the y/N prompt's row: the
-// allow-list's refusal kept, the answer beside it, the operator as actor.
-func TestCreateRecordsTheOperatorsOverride(t *testing.T) {
+// pkg create has no prompt: an allow-list refusal is final and names the
+// override request command. Requested by one operator and approved by
+// another through the CLI, the override admits the version, the row records
+// the allow-list overridden, and the requester's own approval never counts.
+func TestCreateTakesATwoPersonOverride(t *testing.T) {
 	adbPath := admissionInstall(t, true)
 	adb, err := audit.Open(adbPath)
 	if err != nil {
@@ -286,26 +287,66 @@ func TestCreateRecordsTheOperatorsOverride(t *testing.T) {
 		t.Fatalf("loadConfig: %v", err)
 	}
 	ve := manifest.VersionEntry{Version: "1.2.8"}
-	r := bufio.NewReader(strings.NewReader("y\n"))
-	captureStdout(t, func() {
-		if err := confirmPolicyOverride(context.Background(), r, &globalFlags{}, cfg, nil, manifest.TypeNpm, "minimist", ve); err != nil {
-			t.Errorf("confirmPolicyOverride: %v", err)
-		}
-	})
+	t.Setenv("SUDO_USER", "alice")
+
+	err = admitCreate(context.Background(), &globalFlags{}, cfg, nil, manifest.TypeNpm, "minimist", ve)
+	if err == nil || !strings.Contains(err.Error(), "bodega override request npm minimist 1.2.8 --check allowlist") {
+		t.Fatalf("create without an override = %v, want the refusal naming override request", err)
+	}
+
+	override := func(args ...string) (string, error) {
+		var runErr error
+		out := captureStdout(t, func() {
+			cmd := newOverrideCmd(&globalFlags{})
+			cmd.SetArgs(args)
+			cmd.SilenceUsage, cmd.SilenceErrors = true, true
+			runErr = cmd.Execute()
+		})
+		return out, runErr
+	}
+	out, err := override("request", "npm", "minimist", "1.2.8", "--check", "allowlist",
+		"--reason", "vendored until lodash ships the fix", "--expires", "7d", "--json")
+	if err != nil {
+		t.Fatalf("override request: %v", err)
+	}
+	var o audit.Override
+	if err := json.Unmarshal([]byte(out), &o); err != nil || o.RequestedBy != "alice" || o.Status != audit.OverrideStatusPending {
+		t.Fatalf("request = %+v (%v) from %q", o, err, out)
+	}
+	if _, err := override("approve", o.ID); err == nil || !errors.Is(err, audit.ErrSelfApproval) {
+		t.Fatalf("alice approving her own request = %v, want ErrSelfApproval", err)
+	}
+	if err := admitCreate(context.Background(), &globalFlags{}, cfg, nil, manifest.TypeNpm, "minimist", ve); err == nil {
+		t.Fatal("a pending override admitted the version")
+	}
+
+	t.Setenv("SUDO_USER", "bob")
+	if _, err := override("approve", o.ID); err != nil {
+		t.Fatalf("bob approving: %v", err)
+	}
+	if err := admitCreate(context.Background(), &globalFlags{}, cfg, nil, manifest.TypeNpm, "minimist", ve); err != nil {
+		t.Fatalf("create under an approved override: %v", err)
+	}
 	rows := admissionsJSON(t, "npm", "minimist")
-	if len(rows) != 1 {
-		t.Fatalf("want one row, got %+v", rows)
+	if len(rows) != 3 {
+		t.Fatalf("want three rows (two refusals, one admission), got %+v", rows)
 	}
-	got := map[string]string{}
+	got := map[string]audit.AdmissionCheck{}
 	for _, c := range rows[0].Checks {
-		got[c.Check] = c.Status
+		got[c.Check] = c
 	}
-	if rows[0].Decision != audit.AdmissionAdmitted || got[audit.CheckAllowList] != audit.CheckBlock ||
-		got[audit.CheckOverride] != audit.CheckPass || got[audit.CheckOSV] != audit.CheckPass {
+	if rows[0].Decision != audit.AdmissionAdmitted || got[audit.CheckAllowList].Status != audit.CheckOverridden ||
+		got[audit.CheckAllowList].Override != o.ID || got[audit.CheckOSV].Status != audit.CheckPass {
 		t.Errorf("override row = %+v", rows[0])
 	}
-	if rows[0].Actor != audit.CurrentActor() {
-		t.Errorf("actor = %q, want the operator %q", rows[0].Actor, audit.CurrentActor())
+	if _, ok := got[audit.CheckOverride]; ok {
+		t.Errorf("the row carries the retired prompt's %q check: %+v", audit.CheckOverride, rows[0])
+	}
+
+	out, err = override("list", "--active", "--json")
+	var active []audit.Override
+	if err != nil || json.Unmarshal([]byte(out), &active) != nil || len(active) != 1 || active[0].ID != o.ID {
+		t.Errorf("list --active = %q, %v", out, err)
 	}
 }
 

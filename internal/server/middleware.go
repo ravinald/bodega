@@ -859,10 +859,10 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // this gate does not ask. The exceptions are the four admin reads, which
 // Server.requireAdmin gates with the same AdminPermits predicate this uses.
 //
-// pushRoute names the routes inventory push sources registered. Those, beside
-// git's upload-pack, skip the admin gate: hosts outside admin_permit_cidr post
-// to them, and each is authenticated by the source that registered it. A nil
-// pushRoute exempts nothing.
+// pushRoute names the routes inventory push sources registered, and the
+// re-vet webhook. Those, beside git's upload-pack, skip the admin gate: hosts
+// and threat feeds outside admin_permit_cidr post to them, and each handler
+// authenticates its caller itself. A nil pushRoute exempts nothing.
 //
 // A token scoped "inventory" is refused on every other route, in both the
 // localhost-only and the token-required posture, so a host's reporting

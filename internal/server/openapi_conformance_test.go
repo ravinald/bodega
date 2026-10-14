@@ -241,6 +241,8 @@ var schemaStructs = map[string]any{
 	"Dependency":         manifest.Dependency{},
 	"Checksum":           manifest.Checksum{},
 	"PolicyRule":         audit.PolicyInfo{},
+	"Override":           audit.Override{},
+	"OverrideVote":       audit.OverrideVote{},
 	"AuditEvent":         audit.StoredEvent{},
 	"TokenInfo":          audit.TokenInfo{},
 	"ProfilePin":         pins.Pin{},
@@ -253,8 +255,9 @@ var schemaStructs = map[string]any{
 }
 
 var schemasWithoutStruct = map[string]string{
-	"Error":            "written as a map literal at each call site; no type carries it",
-	"PackagesResponse": "a map keyed by package type, held to manifest.AllTypes by TestOpenAPITypeListsMatchAllTypes",
+	"Error":               "written as a map literal at each call site; no type carries it",
+	"PackagesResponse":    "a map keyed by package type, held to manifest.AllTypes by TestOpenAPITypeListsMatchAllTypes",
+	"OverrideVoteRequest": "decoded into an anonymous struct in voteOverride",
 }
 
 func TestOpenAPISchemaTableCoversTheDocument(t *testing.T) {

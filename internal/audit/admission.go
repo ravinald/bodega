@@ -27,10 +27,9 @@ const (
 	// verified against the Sigstore trusted root. Its entry carries the
 	// outcome and the identity verified in Provenance.
 	CheckUpstreamProvenance = "upstream_provenance"
-	// CheckOverride is the operator answering y to `bodega pkg create`'s
-	// allow-list prompt. It is its own entry so the allow-list entry beside it
-	// can still say block: the row records that the rule refused and who
-	// overrode it, not a pass nobody evaluated.
+	// CheckOverride is the operator answering y to the allow-list prompt
+	// `bodega pkg create` carried before two-person overrides replaced it.
+	// Nothing writes it now; rows decided under the prompt still carry it.
 	CheckOverride = "override"
 )
 
@@ -60,6 +59,9 @@ type AdmissionCheck struct {
 	// Provenance is set on the upstream_provenance entry when the check
 	// ran, and nil everywhere else.
 	Provenance *UpstreamProvenance `json:"provenance,omitempty"`
+	// Override is the ID of the override that admitted past this check's
+	// failure, set when Status is CheckOverridden.
+	Override string `json:"override,omitempty"`
 }
 
 // Upstream provenance outcomes: what verifying a publisher's signed
@@ -123,7 +125,9 @@ type AdmissionFilter struct {
 	PkgType    string
 	PkgName    string
 	PkgVersion string
-	Limit      int // 0 = default (1000)
+	// Since keeps rows decided at or after it; zero keeps every row.
+	Since time.Time
+	Limit int // 0 = default (1000)
 }
 
 // AdmissionPin names the object a version's digest was pinned under.
@@ -226,6 +230,60 @@ func (a *DB) Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, er
 		}
 	}
 	return rows, nil
+}
+
+// AdmittedVersions lists, once each and sorted, every version f selects that
+// the table holds an admitted or pinned decision for. A version whose only
+// rows are refusals with no object behind them was never served, and is left
+// out. f.Limit is ignored: the list is the set of versions, not of rows.
+func (a *DB) AdmittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
+	r, err := a.reader("admission decisions")
+	if err != nil {
+		return nil, err
+	}
+	l, ok := r.(admittedVersionLister)
+	if !ok {
+		return nil, &UnqueryableSinkError{Sink: a.sink.Name(), Op: "admitted versions"}
+	}
+	return l.admittedVersions(ctx, f)
+}
+
+// admittedVersionLister is the half of a queryable sink that answers
+// AdmittedVersions. It sits outside EventReader so a reader that keeps no
+// admissions table need not grow a method to say so.
+type admittedVersionLister interface {
+	admittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error)
+}
+
+// buildAdmittedVersionsQuery renders AdmittedVersions' read. ph renders the
+// nth bind placeholder, as in pinTx.
+func buildAdmittedVersionsQuery(f AdmissionFilter, ph func(int) string) (string, []any) {
+	where := []string{"pkg_version <> ''", "(decision = 'admitted' OR object_key IS NOT NULL)"}
+	var args []any
+	for _, c := range []struct{ col, val string }{
+		{"pkg_type", f.PkgType}, {"pkg_name", f.PkgName}, {"pkg_version", f.PkgVersion},
+	} {
+		if c.val == "" {
+			continue
+		}
+		args = append(args, c.val)
+		where = append(where, c.col+" = "+ph(len(args)))
+	}
+	return `SELECT pkg_type, pkg_name, pkg_version FROM admissions WHERE ` + strings.Join(where, " AND ") +
+		` GROUP BY pkg_type, pkg_name, pkg_version ORDER BY pkg_type, pkg_name, pkg_version`, args
+}
+
+func scanAdmittedVersions(rows *sql.Rows) ([]AdmissionPin, error) {
+	defer rows.Close()
+	var out []AdmissionPin
+	for rows.Next() {
+		var p AdmissionPin
+		if err := rows.Scan(&p.PkgType, &p.PkgName, &p.PkgVersion); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // NotEvaluatedChecks is the check list of a decision that evaluated nothing,
@@ -347,8 +405,9 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 }
 
 // buildAdmissionQuery renders the newest-first read for f. ph renders the nth
-// bind placeholder, as in pinTx.
-func buildAdmissionQuery(f AdmissionFilter, ph func(int) string) (string, []any) {
+// bind placeholder, as in pinTx; since renders f.Since in the form the
+// dialect's decided_at column compares against.
+func buildAdmissionQuery(f AdmissionFilter, ph func(int) string, since func(time.Time) any) (string, []any) {
 	var (
 		where []string
 		args  []any
@@ -361,6 +420,10 @@ func buildAdmissionQuery(f AdmissionFilter, ph func(int) string) (string, []any)
 		}
 		args = append(args, c.val)
 		where = append(where, c.col+" = "+ph(len(args)))
+	}
+	if !f.Since.IsZero() {
+		args = append(args, since(f.Since.UTC()))
+		where = append(where, "decided_at >= "+ph(len(args)))
 	}
 	q := `SELECT id, pkg_type, pkg_name, pkg_version, object_key, decision, checks, policy_digest, actor, identity, decided_at FROM admissions`
 	if len(where) > 0 {
