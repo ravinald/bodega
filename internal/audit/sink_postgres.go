@@ -280,6 +280,28 @@ func (s *postgresSink) QueryServedObjects(ctx context.Context, identity string) 
 	return scanServedObjects(rows)
 }
 
+func (s *postgresSink) QueryServeHistory(ctx context.Context) (ServeHistory, error) {
+	var out ServeHistory
+	var since sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(timestamp) FROM events`).Scan(&since); err != nil {
+		return out, err
+	}
+	out.Since = since.Time
+	rows, err := s.db.QueryContext(ctx, `SELECT pkg_type, pkg_name, pkg_version, object_key, COALESCE(digest, ''),
+	             COALESCE(identity, ''), COALESCE(client_ip, ''), MIN(timestamp)
+	      FROM events
+	      WHERE event_type = $1 AND object_key IS NOT NULL
+	      GROUP BY 1, 2, 3, 4, 5, 6, 7
+	      ORDER BY 1, 2, 3, 4, 5, 6, 7`,
+		string(EventServeFetch))
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	out.Records, err = scanServeRecords(rows, pgTime)
+	return out, err
+}
+
 func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
 	var where []string
 	a := &pgArgs{}

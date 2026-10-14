@@ -1165,6 +1165,21 @@ instance, the recommended posture is:
   an account that cannot read `/etc/bodega/config.json` or `/var/lib/bodega`
   reads `SKIPPED` with the privilege it needs, rather than `N/A` beside the
   checks that genuinely passed.
+- **Run `bodega audit bypass` on a schedule** to detect a client routed
+  around bodega. It compares each host's installed packages, from the same
+  capture `bodega pkg convert` reads, with the `serve_fetch` rows bodega
+  wrote under that host's identity, and lists every version bodega never
+  served to anyone (`never_served`) or served only to other hosts
+  (`served_elsewhere`). `bodega audit bypass --all --inventory-dir <dir>`
+  covers a fleet, one line per host; pass `--exclude-image` with the base
+  image's inventory so the packages a host was built with are not findings.
+  Exit 2 is a bypass, exit 1 a run that could not answer. It is detection
+  after the fact, with the limits of [inventory
+  reconciliation](#host-inventory-reconciliation): the capture is the host's
+  own word, a match is on name and version, and a serve to a request no
+  identity binding resolved, or under a binding that has since changed, is
+  counted as unattributable rather than reported. Bind every host before
+  relying on it; an unbound host leaves only `never_served` as evidence.
 - **Declare the environment your ports clients build in** before serving
   distfiles from a stock tree; the empty declaration refuses all of them.
   Start from it, read the unplaced ports bodega logs, confirm each named value
