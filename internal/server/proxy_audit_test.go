@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
@@ -1193,5 +1195,14 @@ func TestProxyFillRefusesKnownMalware(t *testing.T) {
 	rows := cacheRows(t, s)
 	if len(rows) != 1 || rows[0].Status != audit.CacheMalwareBlocked || rows[0].PkgVersion != proxyAuditVersion {
 		t.Fatalf("cache rows = %+v, want one %s row", rows, audit.CacheMalwareBlocked)
+	}
+	// The refusal queues as malware, marked so no approval can admit it.
+	q := oneQueueRow(t, s)
+	if q.Check != admit.QueueMalware || q.PkgVersion != proxyAuditVersion || q.Unwaivable == "" {
+		t.Errorf("queue row = %+v, want an unwaivable malware row", q)
+	}
+	if _, err := admit.ApproveQueued(t.Context(), s.auditDB, s.cfg, q.ID, "alice",
+		admit.QueueApproval{Reason: "please"}, time.Now()); !errors.Is(err, admit.ErrQueueUnwaivable) {
+		t.Errorf("approving a malware row: %v, want ErrQueueUnwaivable", err)
 	}
 }

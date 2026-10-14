@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -328,6 +330,10 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	if len(refused) == len(candidates) && len(candidates) > 0 {
 		s.logger.Warn("apt pool path blocked: every configured archive is off the allow-list",
 			"pool_path", poolPath, "archives", strings.Join(refused, " "), "incident", f.incident)
+		first := candidates[0] + "/" + poolPath
+		s.queueRefusal(r, audit.QueueRefusal{PkgType: manifest.TypeApt, PkgName: name, PkgVersion: version,
+			Check: admit.QueueAllowList, Pattern: queuePattern(manifest.TypeApt, first, first, name),
+			Detail: f.reason, Incident: f.incident})
 		f.write(w, r)
 		return "", false
 	}

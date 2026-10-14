@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -26,10 +27,14 @@ var allChecks = append([]string{audit.CheckAllowList}, versionChecks...)
 // check runs, so every row of one decision cites the policy that decision
 // started under.
 type evaluation struct {
-	checks    [][]audit.AdmissionCheck
-	digest    string
-	digestErr error
-	actions   map[string]string
+	checks [][]audit.AdmissionCheck
+	// versionChecks are the per-version checks this admission runs: the
+	// built-in ones and each enabled integration instance. Every row names
+	// all of them.
+	versionChecks []string
+	digest        string
+	digestErr     error
+	actions       map[string]string
 	// overrides are the active overrides for the package, keyed by version
 	// and check; see loadOverrides.
 	overrides   map[string]audit.Override
@@ -38,7 +43,8 @@ type evaluation struct {
 
 func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, now time.Time) *evaluation {
 	ev := &evaluation{
-		checks: make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
+		checks:        make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
+		versionChecks: slices.Clone(versionChecks),
 		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone,
 			audit.CheckUpstreamProvenance: policy.ActionWarn, audit.CheckNameSimilarity: policy.ActionWarn},
 	}
@@ -75,6 +81,32 @@ func (ev *evaluation) readActions(ctx context.Context, store PolicyStore, typ st
 	}
 }
 
+// actionChecker is a per-version check whose name and action are not among
+// the built-in ones: an integration instance, whose name the config file
+// chooses and whose action is its integration_policy row.
+type actionChecker interface {
+	CheckName() string
+	ActionFor(ctx context.Context, ecosystem string) string
+}
+
+// include adds every checker among checkers that names itself to the checks
+// this admission's rows name, with the action each would take on pm's type.
+func (ev *evaluation) include(ctx context.Context, pm *manifest.PackageManifest, checkers []policy.VersionChecker) {
+	for _, c := range checkers {
+		ac, ok := c.(actionChecker)
+		if !ok || slices.Contains(ev.versionChecks, ac.CheckName()) {
+			continue
+		}
+		ev.versionChecks = append(ev.versionChecks, ac.CheckName())
+		ev.actions[ac.CheckName()] = ac.ActionFor(ctx, pm.Type)
+	}
+}
+
+// allChecks is every check this admission's rows name.
+func (ev *evaluation) allChecks() []string {
+	return append([]string{audit.CheckAllowList}, ev.versionChecks...)
+}
+
 // set records c for version i, replacing an earlier verdict of the same
 // check. i of -1 means every version.
 func (ev *evaluation) set(i int, c audit.AdmissionCheck) {
@@ -95,16 +127,16 @@ func (ev *evaluation) notRunChecks(i int, detail string, names ...string) {
 
 // notRun marks every check without a verdict not evaluated, on every version.
 func (ev *evaluation) notRun(detail string) {
-	ev.notRunChecks(-1, detail, allChecks...)
+	ev.notRunChecks(-1, detail, ev.allChecks()...)
 }
 
 // notRunAfter is the bookkeeping for a refusal at version i: the checks that
 // would have followed on i, and every check on the versions after it, never
 // ran.
 func (ev *evaluation) notRunAfter(i int, detail string) {
-	ev.notRunChecks(i, detail, versionChecks...)
+	ev.notRunChecks(i, detail, ev.versionChecks...)
 	for j := i + 1; j < len(ev.checks); j++ {
-		ev.notRunChecks(j, detail, allChecks...)
+		ev.notRunChecks(j, detail, ev.allChecks()...)
 	}
 }
 
@@ -203,7 +235,7 @@ func (ev *evaluation) row(pm *manifest.PackageManifest, i int, decision string, 
 	if len(pm.Versions) == 0 {
 		fill = "not run: the manifest names no version"
 	}
-	for _, name := range allChecks {
+	for _, name := range ev.allChecks() {
 		checks = upsertCheck(checks, ev.notRunCheck(name, fill), true)
 	}
 	sort.SliceStable(checks, func(a, b int) bool { return checkRank(checks[a].Check) < checkRank(checks[b].Check) })

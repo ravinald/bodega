@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
-	// Registers the cyclonedx source type, which the inventory_sources
-	// override below names; Load refuses a type nothing registered.
+	// Register the cyclonedx source type and the malware-list integration
+	// type, which the inventory_sources and integrations overrides below
+	// name; Load refuses a type nothing registered.
+	_ "github.com/ravinald/bodega/internal/integration/malwarelist"
 	_ "github.com/ravinald/bodega/internal/inventory/cyclonedx"
 )
 
@@ -215,6 +217,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		// float64 because that is what a JSON object decodes them to.
 		"inventory_sources": map[string]config.InventorySource{
 			"hosts": {"type": "cyclonedx", "enabled": true, "max_body_bytes": float64(1 << 20)},
+		},
+		"integrations": map[string]config.Integration{
+			"aikido": {"type": "malware-list", "enabled": true, "refresh_interval": "12h"},
 		},
 		// Load refuses a relative directory, so the filler's strings cannot
 		// stand in.

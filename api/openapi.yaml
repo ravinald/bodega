@@ -1150,7 +1150,11 @@ paths:
                   type: string
                 check:
                   type: string
-                  enum: [allowlist, age, osv, upstream_provenance, name_similarity]
+                  description: |
+                    One of `allowlist`, `age`, `osv`, `upstream_provenance`
+                    and `name_similarity`, or `integration:<instance>` for a
+                    configured external check.
+                  pattern: "^(allowlist|age|osv|upstream_provenance|name_similarity|integration:[a-z0-9][a-z0-9_-]{0,62})$"
                 reason:
                   type: string
                 expires:
@@ -1245,6 +1249,147 @@ paths:
         "503":
           description: Audit database not configured
 
+  /api/v1/queue:
+    get:
+      summary: List the refusal review queue
+      description: |
+        One row per (type, package, version, check) a client was refused,
+        most recently refused first, each with the identities and client
+        addresses that asked. Rows are written whatever `discover_mode` says.
+        Restricted to IPs in `admin_permit_cidr`.
+      operationId: listQueue
+      tags: [status]
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Keep only rows for this package type
+        - name: check
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [allow-list, age, osv, malware, profile, upstream_provenance, name_similarity]
+          description: Keep only rows refused by this check
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, approved, dismissed]
+            default: open
+          description: Keep only rows in this state
+      responses:
+        "200":
+          description: Queue rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/QueueRow"
+        "400":
+          description: Unknown type, check or state
+        "403":
+          description: Client IP is not in admin_permit_cidr
+        "503":
+          description: Audit database not configured
+
+  /api/v1/queue/{id}/approve:
+    post:
+      summary: Admit what one queue row refused
+      description: |
+        Resolves an open row by the action its check calls for: an allow-list
+        rule for `allow-list`, an exact pin in every profile that refused it
+        for `profile`, and a two-person override request for every other
+        check, or the override already pending or active for that version
+        and check. Like the override routes it requires a token bound to an
+        identity, which is recorded as the actor. A row refused as known
+        malware or for upstream provenance that failed to verify is refused
+        with 409 and stays open.
+      operationId: approveQueue
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/QueueID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                expires:
+                  type: string
+                  description: For a row approved into an override, a duration from now such as `7d`; defaults to `override_max_ttl`
+      responses:
+        "200":
+          description: Row approved; what the approval did
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueResolution"
+        "400":
+          description: No reason, or an invalid expiry
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: Client IP is not permitted, or the token is scoped to inventory
+        "404":
+          description: No queue row with that id
+        "409":
+          description: The row is not open, or its check cannot be waived
+        "503":
+          description: Audit database not configured
+
+  /api/v1/queue/{id}/dismiss:
+    post:
+      summary: Close one queue row without admitting anything
+      description: |
+        Records the token identity as the actor. The row reopens if the same
+        refusal happens again.
+      operationId: dismissQueue
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/QueueID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Row dismissed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueRow"
+        "400":
+          description: No reason
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: Client IP is not permitted, or the token is scoped to inventory
+        "404":
+          description: No queue row with that id
+        "409":
+          description: The row is not open
+        "503":
+          description: Audit database not configured
+
   /api/v1/tokens/{id}:
     delete:
       summary: Revoke a token
@@ -1335,6 +1480,13 @@ components:
       schema:
         type: string
       description: The override's id, as `bodega override list` prints it
+    QueueID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+      description: The queue row's id, as `bodega queue list` prints it
     PackageType:
       name: type
       in: path
@@ -1552,6 +1704,97 @@ components:
       type: object
       properties:
         comment:
+          type: string
+
+    QueueRow:
+      type: object
+      description: |
+        One (type, package, version, check) bodega refused a client, with who
+        asked. A row approved or dismissed and then refused again reopens and
+        keeps its last resolution, so a listing shows what did not take.
+      properties:
+        id:
+          type: integer
+        pkg_type:
+          type: string
+        pkg_name:
+          type: string
+        pkg_version:
+          type: string
+        check:
+          type: string
+          enum: [allow-list, age, osv, malware, profile, upstream_provenance, name_similarity]
+        pattern:
+          type: string
+          description: The allow-list rule approving an allow-list row adds
+        detail:
+          type: string
+          description: The reason the last refusal gave the client
+        unwaivable:
+          type: string
+          description: Why the row can never be approved; absent when it can
+        profiles:
+          type: array
+          items:
+            type: string
+          description: The profiles that refused a profile row
+        incident:
+          type: string
+          description: The incident id of the last refusal
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        request_count:
+          type: integer
+        requesters:
+          type: array
+          description: The most recent 20 identity and address pairs that asked
+          items:
+            $ref: "#/components/schemas/QueueRequester"
+        state:
+          type: string
+          enum: [open, approved, dismissed]
+        resolved_at:
+          type: string
+          format: date-time
+        resolved_by:
+          type: string
+        resolution:
+          type: string
+        resolution_reason:
+          type: string
+
+    QueueRequester:
+      type: object
+      properties:
+        identity:
+          type: string
+        client_ip:
+          type: string
+        request_count:
+          type: integer
+        last_seen:
+          type: string
+          format: date-time
+
+    QueueResolution:
+      type: object
+      description: What approving a row did. One of rule, override and profiles is set.
+      properties:
+        row:
+          $ref: "#/components/schemas/QueueRow"
+        rule:
+          $ref: "#/components/schemas/PolicyRule"
+        override:
+          $ref: "#/components/schemas/Override"
+        profiles:
+          type: array
+          items:
+            type: string
+        warning:
           type: string
 
     PolicyRule:

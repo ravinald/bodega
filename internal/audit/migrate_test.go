@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -88,6 +91,47 @@ func TestMigrationsRefusesNewerDB(t *testing.T) {
 	// Re-open should refuse with a clear error.
 	if _, err := Open(path); err == nil {
 		t.Fatal("expected error opening DB with schema version > binary max, got nil")
+	}
+}
+
+// TestMigrationVersionsAreContiguous holds every migration set to 1..N with no
+// hole. golang-migrate only walks upward from the version a database records,
+// so a branch that lands N+2 before another lands N+1 leaves every database
+// already at N+2 without N+1, and nothing reports the skip. A gap here is that
+// trap set in advance; a duplicate number already fails the open.
+func TestMigrationVersionsAreContiguous(t *testing.T) {
+	for _, set := range []struct {
+		fsys fs.FS
+		dir  string
+	}{
+		{migrationsFS, "migrations"},
+		{postgresMigrationsFS, "migrations_postgres"},
+	} {
+		entries, err := fs.ReadDir(set.fsys, set.dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", set.dir, err)
+		}
+		seen := map[uint64]bool{}
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".up.sql") {
+				continue
+			}
+			n, err := strconv.ParseUint(name[:strings.IndexByte(name, '_')], 10, 32)
+			if err != nil {
+				t.Fatalf("%s/%s: unparseable version: %v", set.dir, name, err)
+			}
+			seen[n] = true
+		}
+		maxV, err := maxMigrationVersion(set.fsys, set.dir)
+		if err != nil {
+			t.Fatalf("maxMigrationVersion %s: %v", set.dir, err)
+		}
+		for v := uint64(1); v <= uint64(maxV); v++ {
+			if !seen[v] {
+				t.Errorf("%s: no migration %03d below the highest, %03d; renumber the newest one into the hole", set.dir, v, maxV)
+			}
+		}
 	}
 }
 
