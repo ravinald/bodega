@@ -1965,16 +1965,20 @@ bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" 
 Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
 ```
 
-| Check        | Status | Where it refuses                                                                     |
-| ------------ | ------ | ------------------------------------------------------------------------------------ |
-| `allow-list` | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                         |
-| `age`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
-| `osv`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
-| `profile`    | 403    | any package route on a host whose profile governs the type                           |
-| `constraint` | 403    | an npm or gomod version outside the entry's `version_constraint`                     |
-| `hidden`     | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it |
-| `frozen`     | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                            |
-| `checksum`   | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest           |
+| Check         | Status | Where it refuses                                                                                                         |
+| ------------- | ------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `allow-list`  | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                                                             |
+| `age`         | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`                                                |
+| `osv`         | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`                                                |
+| `provenance`  | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks   |
+| `similarity`  | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when the `name_similarity` check blocks       |
+| `integration` | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
+| `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                         |
+| `profile`     | 403    | any package route on a host whose profile governs the type                                                               |
+| `constraint`  | 403    | an npm or gomod version outside the entry's `version_constraint`                                                         |
+| `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                     |
+| `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                |
+| `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest                                               |
 
 Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
 
@@ -1986,15 +1990,15 @@ The body never carries a credential, an upstream URL, an internal hostname, a st
 curl -s 'http://127.0.0.1:8080/api/v1/audit?name=left-pad&limit=200' | grep 650285e650d5
 ```
 
-| Check                                  | Audit row                                               |
-| -------------------------------------- | ------------------------------------------------------- |
-| `allow-list`, `age`, `osv` on a fetch  | `cache` / `policy_violation`                            |
-| `allow-list`, `age`, `osv` on a create | `create` / `policy_violation`                           |
-| `profile`                              | `denied` / `profile_membership` or `profile_constraint` |
-| `constraint`                           | `denied` / `version_constraint`                         |
-| `hidden`                               | `denied` / `hidden`                                     |
-| `frozen`                               | `denied` / `entry_frozen`                               |
-| `checksum`                             | `cache` / `checksum_mismatch`                           |
+| Check                                                                                       | Audit row                                               |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration`, `policy` on a fetch  | `cache` / `policy_violation`                            |
+| `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration`, `policy` on a create | `create` / `policy_violation`                           |
+| `profile`                                                                                   | `denied` / `profile_membership` or `profile_constraint` |
+| `constraint`                                                                                | `denied` / `version_constraint`                         |
+| `hidden`                                                                                    | `denied` / `hidden`                                     |
+| `frozen`                                                                                    | `denied` / `entry_frozen`                               |
+| `checksum`                                                                                  | `cache` / `checksum_mismatch`                           |
 
 A `checksum` refusal whose digest could not be read at all writes no row, because the database that would hold it is what failed; its incident is in the server log line instead.
 
@@ -6073,7 +6077,7 @@ curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
 - `401 Unauthorized` — missing or invalid Bearer token
-- `403 Forbidden` — IP not in `admin_permit_cidr`; the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
+- `403 Forbidden` — IP not in `admin_permit_cidr`; the entry is frozen (delete); or the allow-list or a version check blocked it (create), answered as `allow-list`, `age`, `osv`, `provenance`, `similarity`, `integration` or `policy`. The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
 - `409 Conflict` — entry already exists
 - `413 Request Entity Too Large` — request body exceeds 1 MiB
 
@@ -6602,7 +6606,7 @@ The decision is the manifest's. A version whose own checks all passed still reco
 
 **Pinning.** When a fetch pins an artifact's SHA-256 (the builder's checksum pin, the pypi per-wheel pin, a FreeBSD catalogue mirror, a distfile matching distinfo, or a proxy fill's first-fetch checksum) the newest admitted row for that version gains the object key. A fetch that verifies against an existing pin attaches the key the same way. A second object of one version, a second wheel of one pypi release for example, gets a copy of the decision carrying its own key. A pin that finds no admitted row for its version writes a row whose checks all say `not_evaluated`, with no policy digest, and logs a WARN naming the package and the object key: those bytes reached the store with nothing evaluated, and the row says so rather than recording a pass. Under `syslog` and `jsonl` there is no row to update, so a pin is emitted as a record of `kind: "admission_pin"` for the consumer to join to the newest admission for the same version.
 
-**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV, upstream provenance and name similarity checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv`, `upstream_provenance` or `name_similarity`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
+**The proxy runs import's checks.** A proxy fill of a versioned npm, pypi, gomod or cargo artifact runs the age, OSV, upstream provenance and name similarity checks before the upstream fetch, honoring each check's `warn`, `block` or `ignore` action. A block answers `403` through the same per-client refusal an allow-list refusal gets, naming the check (`age`, `osv`, `provenance`, `similarity` or `integration`) and an incident; the `policy_violation` cache event the refusal writes carries the same incident. A warn is logged, writes a `policy_warn` cache event, and the fetch goes ahead. A fill the OSV malware gate refuses writes its admission row too, with the `osv` check at `block`. A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks, because its storage key names no version an advisory is filed against. Metadata requests (a packument, an index, a version list) are not admissions and write no row.
 
 **The builder runs them too.** A build's fetch admits each entry under the allow-list and the age, OSV and upstream provenance checks, and a block fails that entry the way an allow-list refusal does. Import may be months old by the time bytes are fetched, so the row a pin attaches to is the decision made when the bytes arrived.
 
