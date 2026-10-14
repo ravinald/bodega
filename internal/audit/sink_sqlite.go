@@ -402,7 +402,7 @@ func (s *sqliteSink) pinAdmission(ctx context.Context, p AdmissionPin) (admissio
 
 func (s *sqliteSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
 	//nolint:gosec // G202: WHERE clause assembled from fixed column names; values are bound.
-	q, args := buildAdmissionQuery(f, func(int) string { return "?" })
+	q, args := buildAdmissionQuery(f, func(int) string { return "?" }, func(t time.Time) any { return t.Format(sqliteDecidedAt) })
 	rows, err := s.rdb.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err

@@ -734,9 +734,9 @@ func shortDigest(v string) string {
 // upstreamPolicyVerdict is the allow-list decision for one candidate, with no
 // response written and no discovery row. Decisions are:
 //
-//	no_policy : no rules configured for this type, so nothing was checked
+//	no_policy : the type is in open admission mode, so no rule was required
 //	allowed   : a rule matched
-//	denied    : a rule exists and none matched; the caller must refuse
+//	denied    : the type is in listed mode and no rule matched; the caller must refuse
 //
 // A non-nil error means the check itself could not run, which is a 500 rather
 // than a refusal — the caller decides. It is separate from
@@ -744,16 +744,16 @@ func shortDigest(v string) string {
 // to answer one request: recording a row per candidate would count one client
 // fetch as many, and the row is written once by the fetch that follows.
 func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandidate string) (string, bool, error) {
-	hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
-	if hasRulesErr != nil {
-		s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
+	listed, listedErr := s.policy.Listed(ctx, regType)
+	if listedErr != nil {
+		s.logger.Error("policy rules lookup failed", "error", listedErr)
 	}
 	err := s.policy.Check(ctx, regType, policyCandidate)
 	violation := err != nil && policy.IsViolation(err)
 	if err != nil && !violation {
 		return "", false, err
 	}
-	return classifyDecision(hasRules, violation), violation, nil
+	return classifyDecision(listed, violation), violation, nil
 }
 
 // enforceUpstreamPolicyRecording runs the allow-list check and writes the

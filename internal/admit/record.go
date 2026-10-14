@@ -141,12 +141,17 @@ func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Re
 	c := audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance}
 	if status == audit.CheckBlock {
 		if why := notOverridable(r); why == "" {
-			if oc, ok := ev.overrideCheck(pm, i, c); ok {
+			if oc, ok := ev.admitPast(pm, i, c); ok {
 				ev.set(i, oc)
 				return policy.Result{Check: r.Check, Action: policy.ActionPass, Provenance: r.Provenance}
 			}
-		} else if o, ok := ev.overrideFor(pm, i, r.Check); ok {
-			c.Detail += fmt.Sprintf("; override %s does not apply: %s", o.ID, why)
+		} else {
+			if o, ok := ev.overrideFor(pm, i, r.Check); ok {
+				c.Detail += fmt.Sprintf("; override %s does not apply: %s", o.ID, why)
+			}
+			if i < len(pm.Versions) && pm.Versions[i].Baseline {
+				c.Detail += "; the baseline mark does not apply: " + why
+			}
 		}
 	}
 	ev.set(i, c)

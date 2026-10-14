@@ -31,7 +31,8 @@ Registry types map to rule kinds as follows:
   gomod, helm, binary  prefix   — full URL/path prefix
 
 An empty allow-list means no enforcement — the feature is opt-in. Add at
-least one rule for a registry type to switch enforcement on for that type.`,
+least one rule for a registry type to switch enforcement on for that type,
+or set the type's admission mode with 'bodega policy mode set'.`,
 	}
 	parent.AddCommand(
 		newPolicyListCmd(gf),
@@ -45,6 +46,10 @@ least one rule for a registry type to switch enforcement on for that type.`,
 		newPolicyProvenanceCmd(gf),
 		newPolicySimilarityCmd(gf),
 		newPolicyFilterCmd(gf),
+		newPolicyModeCmd(gf),
+		newPolicyEnforceCmd(gf),
+		newPolicyReportCmd(gf),
+		newPolicyBaselineCmd(gf),
 	)
 	return parent
 }
@@ -77,7 +82,7 @@ func newPolicyListCmd(gf *globalFlags) *cobra.Command {
 			}
 			if len(rules) == 0 {
 				fmt.Println("No allow-list rules configured.")
-				fmt.Println("(Enforcement is disabled; all upstream sources are accepted.)")
+				fmt.Println("(A type in open admission mode accepts every upstream source; a type set listed accepts none. See 'bodega policy mode list'.)")
 				return nil
 			}
 

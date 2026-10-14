@@ -502,6 +502,19 @@ A flag naming a host the entry already lists passes. `--origin db01` over an ent
 
 `--origin` applies on the `--server` path too: the payload is stamped on the host before it is pushed, so `POST /api/v1/packages/import` receives the same field a local import would have written.
 
+#### `--baseline`
+
+`--baseline` marks every imported version as what your hosts already run. Each version gets `baseline: true` and `baseline_at`, the import time. A gate that fails on a baseline version records the finding and admits the version rather than refusing it, on every path that admits one: this import, a build's fetch and a [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration). The admission row records that check with status `baseline` and the original failure in its detail, so the finding is kept rather than read as a pass. [`bodega policy report`](#bodega-policy-report---since-duration---json) lists it under "Baseline debt" until [`bodega policy baseline clear`](#bodega-policy-baseline-clear-ecosystem---older-than-duration) removes the mark.
+
+```bash
+bodega pkg convert npm < installed.txt > baseline.json
+bodega pkg import --baseline --merge baseline.json
+```
+
+Two verdicts are never admitted by the mark, for the reason an [override](#bodega-override-requestapproverejectlist) cannot admit them: an OSV malware record and upstream provenance that fails to verify. The check stays `block` and its detail says the mark does not apply.
+
+Only this flag sets the mark. A version imported later without it is never baseline, and a mark carried in on a file, an API push or a `pkg edit` buffer is dropped with a warning unless the store already held it for that version. `--baseline` writes the local store, so it is refused with `--server`: a host pushing its own catalog cannot exempt it from the gates. With `--merge`, a version the store already holds gets the mark too, and one already marked keeps its earlier time.
+
 #### Importing to a remote server
 
 `--server` sends the manifests to a running bodega instead of writing the local manifest store. That is how a host catalogs itself: the package manager runs on the host and bodega usually does not, so the remote path opens no manifest directory, no bucket and no audit database.
@@ -2035,7 +2048,7 @@ bodega policy add git example.com/example-corp/ "widget maintainers"
 bodega policy add npm @example-cloud/*
 ```
 
-An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
+An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on, or set the type's [admission mode](#bodega-policy-mode-setlist) to `listed` or `open` explicitly. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
 
 An exact npm, pypi or cargo name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
 
@@ -2810,6 +2823,89 @@ curl -sS -X POST https://bodega.example.com/api/v1/policy/revet \
 Every 401 has the same body, `Unauthorized`, so a caller without the secret learns nothing about which part failed. The journal names it (`re-vet webhook refused reason=...`), and the audit trail records a `denied` event with status `signature_invalid` and the same reason. With `revet_webhook_secret` unset every call is a 401.
 
 Use `--data-binary`, not `-d`: `-d` strips newlines from a file argument, and the server verifies the bytes it received. The secret sits in `config.json`, which bodega writes `0600`. Generate it with `openssl rand -hex 32`.
+
+### `bodega policy mode <set|list>`
+
+Sets how an ecosystem decides which names it admits.
+
+| Mode     | Admits                                                                                         |
+| -------- | ---------------------------------------------------------------------------------------------- |
+| `listed` | Only a name an allow-list rule matches. With no rules, no name at all                          |
+| `open`   | Any name that passes every per-version gate: age, OSV, upstream provenance and name similarity |
+
+An ecosystem nobody set a mode for follows its allow-list: `listed` when it has rules, `open` when it has none, which is how every ecosystem behaved before modes existed. `open` is admission by criteria: no person approves each name, and the gates decide each version. `set` writes a `policy` audit event with the mode before and after, and warns when it sets `listed` on an ecosystem with no rules.
+
+```bash
+bodega policy mode set npm open
+bodega policy mode set pypi listed
+bodega policy mode list
+```
+
+```text
+ECOSYSTEM  MODE    RULES  SOURCE
+apt        open    0      default: no allow-list rules
+git        listed  2      default: has allow-list rules
+npm        open    0      set by ravi on 2026-10-13
+pypi       listed  0      set by ravi on 2026-10-13
+...
+```
+
+In `open` mode an admission row records the allow-list check with action `none` and a detail saying no rule was required, and a proxy discovery row records `no_policy`. `bodega doctor` names each ecosystem that is open because it has no rules rather than because someone set it, in its `policy-mode` row. The server's allow-list cache picks up a mode change within 30 seconds.
+
+### `bodega policy enforce <ecosystem> report|enforce`
+
+Switches every gate the ecosystem has a policy row for between its configured action and `warn` in one step.
+
+`report` sets the age, OSV, upstream provenance and name similarity rows to `warn` and saves the action each had. `enforce` writes each saved action back exactly, `ignore` included. A gate with no row is left without one: its default applies in both states. Each switch writes one `policy` audit event naming the actor and every gate's before and after:
+
+```console
+$ bodega policy enforce npm report
+npm: report
+  age                  block -> warn
+  osv                  block -> warn
+  upstream_provenance  block -> warn
+$ bodega policy enforce npm enforce
+npm: enforce
+  age                  warn -> block
+  osv                  warn -> block
+  upstream_provenance  warn -> block
+```
+
+`report` refuses an ecosystem already in report mode, because saving the warns it set would lose the actions `enforce` restores; `enforce` refuses one that is not. A gate somebody changed while the ecosystem was in report mode is still restored to the action it had before the switch, and the event's `before` says what it was changed to.
+
+Two things are left as they are. The [OSV malware action](#malware-records) keeps blocking: a known-malicious package is not one to admit while someone reads a report. The allow-list has no action to switch; [`bodega policy mode set <ecosystem> open`](#bodega-policy-mode-setlist) is how it stops deciding admission.
+
+### `bodega policy report [--since DURATION] [--json]`
+
+Lists what the gates flagged in the window (default `7d`), grouped by ecosystem, check and package, from the [admission rows](#admission-decisions). `REQUESTS` counts the rows, one per import, fetch or proxy fill; `HOSTS` names the identities that asked, and counts the rows that carried none (a CLI import, or a request no identity binding resolved). `ON ENFORCE` is the action the check takes once the ecosystem is enforced: the action `report` saved, or the one in force now. A `warn` row whose `ON ENFORCE` is `block` is what `bodega policy enforce <ecosystem> enforce` would start refusing.
+
+```console
+$ bodega policy report --since 7d
+Flagged since 2026-10-06T09:12:44Z
+ECOSYSTEM  CHECK  PACKAGE   STATUS  ON ENFORCE  REQUESTS  VERSIONS  HOSTS
+npm        age    left-pad  warn    block       14        1.3.0     ci-runner-1,ci-runner-2
+npm        osv    minimist  warn    block       3         1.2.0     ci-runner-1,(1 unidentified)
+
+Baseline debt
+ECOSYSTEM  CHECK  PACKAGE  VERSIONS  DETAIL
+npm        osv    lodash   4.17.20   GHSA-35jh-r3h4-6jhm ...; admitted as baseline (marked 2026-10-01T00:00:00Z)
+```
+
+Baseline debt is the versions still marked [baseline](#--baseline) whose newest admission row admitted past a failing check, whatever the window. It reads the manifest store, so a cleared mark drops off the list at once.
+
+The report reads at most 200,000 rows for the window and says so when it reaches that, since the counts are then a floor. It needs an audit sink with an admissions table; `syslog` and `jsonl` keep none. `--json` prints `{since, flagged, baseline_debt, truncated}`, each entry carrying `ecosystem`, `check`, `package`, `status`, `on_enforce`, `requests`, `versions`, `hosts`, `unidentified` and `detail`.
+
+### `bodega policy baseline clear <ecosystem> [--older-than DURATION]`
+
+Removes the [baseline](#--baseline) mark from every version of the ecosystem, or with `--older-than` only from versions marked at least that long ago, so the gates apply to them. It then evaluates each cleared version against the gates as they stand, overrides included, and reports how many now fail:
+
+```console
+$ bodega policy baseline clear npm --older-than 30d
+Cleared the baseline mark from 212 npm version(s); 3 now fail a gate.
+  lodash@4.17.20: osv: GHSA-35jh-r3h4-6jhm ...
+```
+
+The evaluation records nothing: no admission row and no provenance pin. The next build fetch or [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) of a failing version is the decision that refuses it, and with `revet_on_block: hide` the re-vet hides it. The clear itself writes one `policy` audit event with the counts. A mark whose time does not parse is cleared whatever `--older-than` says, since clearing is the direction that applies the gates.
 
 ### `bodega override <request|approve|reject|list>`
 
@@ -3894,6 +3990,8 @@ All version entries support:
 | `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
+| `baseline`           | bool   | Imported with [`pkg import --baseline`](#--baseline): a failing gate admits it and records the finding. Only that import sets it      |
+| `baseline_at`        | string | When the baseline import marked the version, RFC 3339 UTC                                                                             |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |
 | `metadata`           | object | Ecosystem-specific key-value pairs                                                                                                    |
 | `build_env`          | object | Build server's environment at artifact creation time                                                                                  |
@@ -5834,7 +5932,7 @@ When a dependency has a security issue, fails checksum verification, or is other
 
 ### Upstream allow-list
 
-The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior).
+The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior). An [admission mode](#bodega-policy-mode-setlist) set on a type overrides that default either way. [Rolling out enforcement](#rolling-out-enforcement) is the procedure for turning the gates on without breaking what already builds.
 
 Enforcement happens in four places:
 
@@ -5865,6 +5963,35 @@ Enforcement needs the audit database, which is where the rules live. An install 
 ```
 
 The allow-list is stored in SQLite (`upstream_policies` table in the audit DB) and is hot-mutable — server changes are picked up within 30 seconds, and policy mutations invalidate the cache immediately.
+
+### Rolling out enforcement
+
+A dependency gate that refuses on its first day breaks builds that were working, and the usual way out is somebody approving every name by hand. This procedure goes from observing to enforcing without either: nothing that already runs is refused, and no name needs a person to approve it.
+
+1. **Point clients at bodega.** Run the [setup script](#setup-script) or `bodega doctor --configure` on each host, so every fetch passes through the gates and leaves an admission row. `bodega doctor` on a client reports a package manager still reading another source.
+2. **Choose each ecosystem's admission mode.** `bodega policy mode list` shows each one. For admission by criteria, `bodega policy mode set <ecosystem> open`: any name is admitted if each version passes the gates. Keep `listed` where you maintain an allow-list.
+3. **Import a baseline.** Catalog what the hosts already run and import it with the mark, on the bodega host:
+
+   ```bash
+   bodega pkg convert npm < installed.txt > baseline.json
+   bodega pkg import --baseline --merge baseline.json
+   ```
+
+   A baseline version that fails a gate is admitted with the finding recorded, so legacy code that already depends on a flagged package keeps building.
+
+4. **Switch the gates to report.** Set the actions you mean to enforce, then switch them to `warn` in one step:
+
+   ```bash
+   bodega policy age set npm 7d block
+   bodega policy osv set npm block
+   bodega policy enforce npm report
+   ```
+
+5. **Read the report for a week.** `bodega policy report --since 7d` lists what each gate flagged, which hosts asked, and what each check does once enforced. A `warn` whose `ON ENFORCE` is `block` is a build that enforcing would break. Fix those first: upgrade, or for a CVE with no fix request a [two-person override](#bodega-override-requestapproverejectlist) with an expiry.
+6. **Enforce.** `bodega policy enforce npm enforce` restores every saved action. Baseline versions stay admitted and listed as baseline debt.
+7. **Pay down the debt.** `bodega policy baseline clear npm --older-than 90d` removes old marks and reports what now fails, which the next re-vet acts on.
+
+`bodega policy enforce` leaves the OSV malware action blocking throughout, and the baseline mark does not admit a malware record or upstream provenance that fails to verify.
 
 ### Scenario: Bad version of libssl3
 
@@ -6314,7 +6441,7 @@ Every decision on whether a version may enter bodega writes one row to the `admi
 | `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                       |
 | `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
-In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block`, `overridden` or `not_evaluated`. `overridden` means the check failed and an approved, unexpired [override](#bodega-override-requestapproverejectlist) admitted the version anyway. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
+In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block`, `overridden`, `baseline` or `not_evaluated`. `overridden` means the check failed and an approved, unexpired [override](#bodega-override-requestapproverejectlist) admitted the version anyway. `baseline` means the check failed on a version imported with [`--baseline`](#--baseline), which admits it with the finding in the detail. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
 The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
 

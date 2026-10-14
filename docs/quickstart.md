@@ -306,6 +306,8 @@ What it does not cover:
 
 `bodega doctor` reports an install with no allow-list rule and no age gate, and one whose gates are all set to `ignore`, at exit 2. See [threat-model.md](threat-model.md) for what the chokepoint does and does not defend.
 
+To turn the gates on without breaking builds that already work, or approving each package by hand, follow [Rolling out enforcement](usage.md#rolling-out-enforcement): import a baseline of what hosts already run, run the gates in report mode for a week, read `bodega policy report`, then enforce.
+
 ## Next steps
 
 - Run `bodega serve` as a service: [bodega.service](bodega.service) under systemd on Linux, [bodega.rc](bodega.rc) under rc.d on FreeBSD
