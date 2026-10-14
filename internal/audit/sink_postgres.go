@@ -462,6 +462,15 @@ func (s *postgresSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) (
 	return scanAdmissions(rows, pgTime)
 }
 
+func (s *postgresSink) admittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
+	q, args := buildAdmittedVersionsQuery(f, pgPlaceholder)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanAdmittedVersions(rows)
+}
+
 func pgPlaceholder(n int) string { return fmt.Sprintf("$%d", n) }
 
 func pgTime(v any) time.Time {

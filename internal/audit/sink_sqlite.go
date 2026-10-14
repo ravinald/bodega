@@ -410,6 +410,16 @@ func (s *sqliteSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]
 	return scanAdmissions(rows, sqliteTime)
 }
 
+func (s *sqliteSink) admittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
+	//nolint:gosec // G202: WHERE clause assembled from fixed column names; values are bound.
+	q, args := buildAdmittedVersionsQuery(f, func(int) string { return "?" })
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanAdmittedVersions(rows)
+}
+
 // sqliteTime parses a stored timestamp column. The driver returns the TEXT
 // as a string; a zero time stands for one that does not parse, as it does for
 // every other timestamp read in this package.

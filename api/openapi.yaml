@@ -28,6 +28,8 @@ tags:
     description: Keys bodega signs attestations with
   - name: inventory
     description: Installed-package reports from inventory sources
+  - name: policy
+    description: Re-running admission over admitted versions
 
 paths:
   /healthz:
@@ -892,6 +894,101 @@ paths:
                   expires_at:
                     type: string
                     format: date-time
+
+  /api/v1/policy/revet:
+    post:
+      summary: Re-vet admitted versions on a threat-feed call
+      description: >
+        Re-runs the allow-list, OSV and upstream provenance checks against the
+        admitted versions of one package (or one version of it) immediately,
+        cataloged or served only from the proxy cache, writes a new admission
+        row for each, applies revet_on_block to any refusal, and answers with
+        the new decisions. A proxy-cached version has no catalog entry to
+        hide, so its refusal is reported whatever revet_on_block says. Exempt from the
+        admin_permit_cidr gate and authenticated instead by
+        X-Bodega-Signature, "sha256=" followed by the hex HMAC-SHA256 of the
+        raw body under revet_webhook_secret. The body's timestamp must be
+        within 5 minutes of the server's clock, and a body is accepted once.
+        Every authentication failure, an unset secret included, is a bare 401.
+      operationId: revetWebhook
+      tags: [policy]
+      parameters:
+        - name: X-Bodega-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            example: "sha256=5d41402abc4b2a76b9719d911017c592"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, timestamp]
+              properties:
+                type:
+                  type: string
+                name:
+                  type: string
+                version:
+                  type: string
+                  description: One version or git ref; every admitted version when omitted
+                reason:
+                  type: string
+                  description: Free text for the journal and the audit trail, e.g. an advisory id
+                timestamp:
+                  type: integer
+                  description: Unix seconds when the body was signed
+      responses:
+        "200":
+          description: The versions were re-vetted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                        name:
+                          type: string
+                        version:
+                          type: string
+                        previous_decision:
+                          type: string
+                        decision:
+                          type: string
+                          enum: [admitted, policy_blocked]
+                        action:
+                          type: string
+                          enum: [none, reported, hidden, frozen, already_hidden]
+                        failing:
+                          type: array
+                          items:
+                            type: object
+                        envelopes:
+                          type: array
+                          items:
+                            type: string
+                        notes:
+                          type: array
+                          items:
+                            type: string
+                        error:
+                          type: string
+        "400":
+          description: type or name missing, or the type is unknown
+        "401":
+          description: Unauthorized
+        "404":
+          description: No admitted version matches, in the catalog or the proxy cache
+        "503":
+          description: No audit store is open
 
   /api/v1/policies:
     get:

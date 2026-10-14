@@ -158,6 +158,19 @@ type Config struct {
 	OSVAPIFallback bool   `json:"osv_api_fallback,omitempty"`
 	OSVDBMaxAge    string `json:"osv_db_max_age,omitempty"`
 
+	// Re-vet. revet_interval is how often `bodega serve` re-runs the
+	// per-version checks over every admitted version, cataloged or proxy
+	// cached; unset is off.
+	// revet_rate caps that sweep in versions per second (default 1), so a
+	// catalog of thousands does not turn into a burst against the registries
+	// the provenance check reads. revet_on_block is "report" (default) or
+	// "hide". revet_webhook_secret keys the HMAC that authenticates POST
+	// /api/v1/policy/revet; unset refuses every call.
+	RevetInterval      string  `json:"revet_interval,omitempty"`
+	RevetRate          float64 `json:"revet_rate,omitempty"`
+	RevetOnBlock       string  `json:"revet_on_block,omitempty"`
+	RevetWebhookSecret string  `json:"revet_webhook_secret,omitempty"`
+
 	// Proxy spool. spool_dir is where an upstream artifact is copied on its
 	// way to storage and the client; see ResolveSpoolDir for the default. The
 	// two ceilings are in bytes, and 0 in either means unbounded.
@@ -783,6 +796,46 @@ func (c *Config) ResolveOSVDBMaxAge() time.Duration {
 	return d
 }
 
+// Values of revet_on_block.
+const (
+	RevetReport = "report"
+	RevetHide   = "hide"
+)
+
+// DefaultRevetRate is revet_rate when unset, in versions per second.
+const DefaultRevetRate = 1.0
+
+// ResolveRevetInterval returns the scheduled re-vet interval, or zero when
+// the schedule is off. Load has already refused an unparseable value.
+func (c *Config) ResolveRevetInterval() time.Duration {
+	if c == nil || c.RevetInterval == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(c.RevetInterval)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// ResolveRevetPause is the wait between two versions of a scheduled sweep,
+// from revet_rate.
+func (c *Config) ResolveRevetPause() time.Duration {
+	rate := DefaultRevetRate
+	if c != nil && c.RevetRate > 0 {
+		rate = c.RevetRate
+	}
+	return time.Duration(float64(time.Second) / rate)
+}
+
+// ResolveRevetOnBlock returns revet_on_block, defaulting to report.
+func (c *Config) ResolveRevetOnBlock() string {
+	if c == nil || c.RevetOnBlock == "" {
+		return RevetReport
+	}
+	return c.RevetOnBlock
+}
+
 // spoolCeiling resolves one of the two spool byte ceilings against the file
 // that was actually read. An absent key takes the built-in default; a key
 // written as 0 is an operator turning the ceiling off, and json.Unmarshal
@@ -904,6 +957,23 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		if d, err := time.ParseDuration(cfg.OSVDBMaxAge); err != nil || d <= 0 {
 			return nil, fmt.Errorf("invalid osv_db_max_age %q (want a positive Go duration, e.g. \"168h\")", cfg.OSVDBMaxAge)
 		}
+	}
+
+	// A typo in any of the three would otherwise read as "off", "the default
+	// rate" or "report", and an operator who asked for hide would learn
+	// otherwise from a version still being served.
+	if cfg.RevetInterval != "" {
+		if d, err := time.ParseDuration(cfg.RevetInterval); err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid revet_interval %q (want a positive Go duration, e.g. \"24h\")", cfg.RevetInterval)
+		}
+	}
+	if cfg.RevetRate < 0 {
+		return nil, fmt.Errorf("invalid revet_rate %v (want versions per second above 0)", cfg.RevetRate)
+	}
+	switch cfg.RevetOnBlock {
+	case "", RevetReport, RevetHide:
+	default:
+		return nil, fmt.Errorf("invalid revet_on_block %q (want %q or %q)", cfg.RevetOnBlock, RevetReport, RevetHide)
 	}
 
 	// Discover mode: "" or "observe" — typo'd values fail loudly so operators

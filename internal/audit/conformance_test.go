@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -466,6 +467,41 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 				if !strings.Contains(err, want) {
 					t.Errorf("refusal text does not mention %q: %s", want, err)
 				}
+			}
+		}},
+
+		{"admitted_versions_lists_served_versions_once", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
+			if !h.queryable {
+				t.Skip("write-only sink: no table to enumerate")
+			}
+			at := time.Now().UTC()
+			for _, a := range []Admission{
+				{PkgType: "npm", PkgName: "left-pad", PkgVersion: "1.3.0", Decision: AdmissionAdmitted, DecidedAt: at},
+				{PkgType: "npm", PkgName: "left-pad", PkgVersion: "1.3.0", ObjectKey: "npm/left-pad/-/left-pad-1.3.0.tgz", Decision: AdmissionPolicyBlocked, DecidedAt: at},
+				{PkgType: "npm", PkgName: "is-odd", PkgVersion: "3.0.1", ObjectKey: "npm/is-odd/-/is-odd-3.0.1.tgz", Decision: AdmissionPolicyBlocked, DecidedAt: at},
+				{PkgType: "npm", PkgName: "is-even", PkgVersion: "1.0.0", Decision: AdmissionPolicyBlocked, DecidedAt: at},
+				{PkgType: "npm", PkgName: "unversioned", Decision: AdmissionAdmitted, DecidedAt: at},
+				{PkgType: "pypi", PkgName: "requests", PkgVersion: "2.31.0", Decision: AdmissionAdmitted, DecidedAt: at},
+			} {
+				if err := h.sink.RecordAdmission(ctx, a); err != nil {
+					t.Fatalf("RecordAdmission: %v", err)
+				}
+			}
+			l := h.sink.(admittedVersionLister)
+			got, err := l.admittedVersions(ctx, AdmissionFilter{PkgType: "npm"})
+			if err != nil {
+				t.Fatalf("admittedVersions: %v", err)
+			}
+			want := []AdmissionPin{
+				{PkgType: "npm", PkgName: "is-odd", PkgVersion: "3.0.1"},
+				{PkgType: "npm", PkgName: "left-pad", PkgVersion: "1.3.0"},
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("admittedVersions(npm) = %+v, want %+v", got, want)
+			}
+			got, err = l.admittedVersions(ctx, AdmissionFilter{PkgName: "requests", PkgVersion: "2.31.0"})
+			if err != nil || len(got) != 1 || got[0].PkgType != "pypi" {
+				t.Errorf("admittedVersions(requests@2.31.0) = %+v, %v", got, err)
 			}
 		}},
 

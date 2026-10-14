@@ -198,11 +198,20 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 // endpoint, not the thing being declared trusted); for everything else the
 // upstream URL is checked directly.
 func CandidateFor(registryType, packageName, entryURL string) string {
-	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo:
+	if KeysByName(registryType) {
 		return packageName
 	}
 	return entryURL
+}
+
+// KeysByName reports whether the allow-list for registryType rules on the
+// package name rather than on an upstream URL.
+func KeysByName(registryType string) bool {
+	switch registryType {
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo:
+		return true
+	}
+	return false
 }
 
 // matchNpm handles exact package names plus the `@scope/*` wildcard form.

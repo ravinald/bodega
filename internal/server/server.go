@@ -164,6 +164,8 @@ type Server struct {
 	// attest signs the envelope for each proxy pin; nil when the audit store
 	// keeps no admissions table to re-read, which setupAttestation says once.
 	attest *attest.Emitter
+	// revet is the re-vet schedule and webhook; nil with no audit store.
+	revet *revetState
 
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
@@ -421,6 +423,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.loadPkgSigner()
 	s.loadAttestSigner()
 	s.setupAttestation()
+	s.setupRevet()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -494,7 +497,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
-	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.isInventoryPush)(h)
+	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.selfAuthenticated)(h)
 	h = s.clientMiddleware(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
@@ -691,6 +694,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Inventory pull polls and the retention sweep.
 	go s.inventory.Run(ctx)
+
+	// Scheduled re-vet; returns at once when revet_interval is unset.
+	go s.revetLoop(ctx)
 
 	// Discovery worker — drains the recorder's queue until ctx is cancelled.
 	if s.discovery != nil {
@@ -972,6 +978,10 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
+
+	// Threat-feed re-vet: exempt from the admin gate, authenticated by an
+	// HMAC over the body (see selfAuthenticated).
+	m.HandleFunc("POST "+RevetWebhookPath, s.handleRevetWebhook)
 }
 
 // requireAdmin gates the sensitive read endpoints, writing the 403 and the
