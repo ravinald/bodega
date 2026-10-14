@@ -114,6 +114,11 @@ type indexWithhold struct {
 	gate    *policy.IndexGate
 	counts  map[string]int
 	undated int
+	// baseline holds the versions the stored manifest marks baseline. The
+	// artifact route admits them past age and OSV advisories, so the index
+	// keeps them too: withheld, the resolver of a host already pinned to one
+	// is told it does not exist.
+	baseline map[string]bool
 }
 
 // indexWithholdFor returns the filter pass for one proxied index, or nil when
@@ -134,7 +139,18 @@ func (s *Server) indexWithholdFor(r *http.Request, eco, name string) *indexWithh
 	if gate == nil {
 		return nil
 	}
-	return &indexWithhold{s: s, r: r, eco: eco, name: name, gate: gate, counts: map[string]int{}}
+	iw := &indexWithhold{s: s, r: r, eco: eco, name: name, gate: gate, counts: map[string]int{}}
+	if pm, _ := s.store.GetPackage(r.Context(), eco, name); pm != nil {
+		for _, ve := range pm.Versions {
+			if ve.Baseline && ve.Version != "" {
+				if iw.baseline == nil {
+					iw.baseline = map[string]bool{}
+				}
+				iw.baseline[ve.Version] = true
+			}
+		}
+	}
+	return iw
 }
 
 // decide returns the versions the gate withholds, each mapped to the gate
@@ -143,6 +159,13 @@ func (s *Server) indexWithholdFor(r *http.Request, eco, name string) *indexWithh
 func (iw *indexWithhold) decide(versions []string, times map[string]time.Time) map[string]string {
 	out := map[string]string{}
 	for _, v := range versions {
+		if iw.baseline[v] {
+			if iw.gate.Malicious(iw.r.Context(), iw.name, v) {
+				out[v] = policy.WithheldOSV
+				iw.counts[policy.WithheldOSV]++
+			}
+			continue
+		}
 		t, dated := times[v]
 		if !dated && iw.gate.Dates() {
 			iw.undated++

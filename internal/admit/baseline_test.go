@@ -155,3 +155,31 @@ func TestClearBaselineReportsWhatNowFails(t *testing.T) {
 		t.Fatalf("clear with no cutoff = %+v, %v; want the remaining 1.2.5", all, err)
 	}
 }
+
+// A `--baseline --merge` naming one ref of a git package marks that ref and no
+// other: ref-only entries all carry an empty Version, so a merge or a mark
+// keyed on it would reach every ref the package holds.
+func TestMarkHeldKeysRefOnlyVersionsByRef(t *testing.T) {
+	existing := &manifest.PackageManifest{Type: manifest.TypeGit, Name: "tool", Versions: []manifest.VersionEntry{
+		{Ref: "v1", URL: "https://example.com/tool.git"},
+		{Ref: "v2", URL: "https://example.com/tool.git"},
+	}}
+	imported := &manifest.PackageManifest{Type: manifest.TypeGit, Name: "tool", Versions: []manifest.VersionEntry{
+		{Ref: "v1", URL: "https://example.com/tool.git"},
+		{Ref: "v3", URL: "https://example.com/tool.git"},
+	}}
+	MarkBaseline(imported, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	MergeVersions(existing, imported)
+	MarkHeld(existing, imported)
+
+	marked := map[string]bool{}
+	for _, ve := range existing.Versions {
+		marked[ve.Ref] = ve.Baseline
+	}
+	if len(existing.Versions) != 3 {
+		t.Fatalf("versions = %+v, want v1, v2 and the new v3", existing.Versions)
+	}
+	if !marked["v1"] || marked["v2"] || !marked["v3"] {
+		t.Errorf("baseline marks = %v, want v1 and v3 marked and v2 left alone", marked)
+	}
+}

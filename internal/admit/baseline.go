@@ -53,6 +53,28 @@ func CarryBaseline(pm, existing *manifest.PackageManifest) []string {
 	return dropped
 }
 
+// MarkHeld copies the baseline mark from each version of imported onto the
+// version existing already held under the same key, which MergeVersions keeps
+// in place of the incoming entry. A version already marked keeps its earlier
+// time, so a second baseline import does not reset what `policy baseline
+// clear --older-than` measures. Keyed by Ref where Version is empty: keyed by
+// Version alone, one ref-only version in the import would mark every ref of
+// the package, including ones the import never named.
+func MarkHeld(existing, imported *manifest.PackageManifest) {
+	marks := map[string]string{}
+	for _, ve := range imported.Versions {
+		if ve.Baseline {
+			marks[admissionVersion(ve)] = ve.BaselineAt
+		}
+	}
+	for i := range existing.Versions {
+		ve := &existing.Versions[i]
+		if at, ok := marks[admissionVersion(*ve)]; ok && !ve.Baseline {
+			ve.Baseline, ve.BaselineAt = true, at
+		}
+	}
+}
+
 // BaselineCheck turns c, a failed check on ve, into a baseline one when ve
 // carries the baseline mark: admitted, with the failure kept in the detail.
 // It reports false for a check that did not fail or a version not marked.

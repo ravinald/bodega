@@ -983,7 +983,7 @@ enforce` admits whatever its gates would have refused (see
 to what hosts already run and to the time it takes to read a report.
 
 **The mark is set by the local CLI only.** It lives on the version entry in
-the manifest, where a build's fetch and a re-vet read it, so every other write
+the manifest, where a build's fetch, a proxy fill and a re-vet read it, so every other write
 path drops a mark the store did not already hold: a bulk import or
 `POST /api/v1/packages` from a host token, `pkg edit`, and `pkg import`
 without the flag. `--baseline` with `--server` is refused, so a host cannot
@@ -991,6 +991,12 @@ exempt its own catalog. Whoever can run `bodega pkg import` on the bodega host
 can baseline anything, which is the same person who can already write the
 manifest store and the policy tables directly. The TUI's entry editor writes
 the manifest without running admission and does not drop the mark either.
+
+**A proxy fill reads the mark from the store, never from the request.** In
+listed mode a package holding a marked version has its index served despite
+the allow-list, because a host pinned to that version reads the index first.
+The index still names the package's unmarked versions, and each of those is
+refused at the artifact, so the hole is the marked versions and nothing else.
 
 Report mode leaves the OSV malware action blocking and the allow-list as its
 admission mode says. Every switch is a `policy` audit event naming who made it,

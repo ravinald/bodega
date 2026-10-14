@@ -160,7 +160,7 @@ the gates.
 					if existing != nil && merge {
 						admit.MergeVersions(existing, pm)
 						if baseline {
-							markHeld(existing, pm)
+							admit.MarkHeld(existing, pm)
 						}
 						if err := store.SavePackage(ctx, existing); err != nil {
 							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
@@ -207,26 +207,6 @@ the gates.
 	cmd.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false, "Permit --server over http; refused by default because a bearer token would travel in the clear")
 	cmd.Flags().BoolVar(&baseline, "baseline", false, "Mark every imported version as baseline: admitted past a failing gate, with the finding recorded")
 	return cmd
-}
-
-// markHeld copies the baseline mark from each version of imported onto the
-// version existing already held under the same name, which MergeVersions
-// keeps in place of the incoming entry. A version already marked keeps its
-// earlier time, so a second baseline import does not reset what
-// `policy baseline clear --older-than` measures.
-func markHeld(existing, imported *manifest.PackageManifest) {
-	marks := map[string]string{}
-	for _, ve := range imported.Versions {
-		if ve.Baseline {
-			marks[ve.Version] = ve.BaselineAt
-		}
-	}
-	for i := range existing.Versions {
-		ve := &existing.Versions[i]
-		if at, ok := marks[ve.Version]; ok && !ve.Baseline {
-			ve.Baseline, ve.BaselineAt = true, at
-		}
-	}
 }
 
 func readInput(path string) ([]byte, error) {
