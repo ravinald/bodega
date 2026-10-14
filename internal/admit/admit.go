@@ -531,18 +531,40 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 		policy.NewNameSimilarityChecker(similarity)}
 }
 
+// PolicyStore is every read the per-version checks make of the policy tables.
+// *audit.DB is one; `bodega policy simulate` supplies another that answers
+// with a policy nobody has written.
+type PolicyStore interface {
+	policy.AgeStore
+	policy.OSVStore
+	policy.SimilarityStore
+	provenance.Store
+}
+
+// VersionCheckersFrom is VersionCheckers reading policy from store, in the
+// same order. A caller that must write nothing never calls Commit on the
+// provenance checker it returns, which is the only write any of them makes.
+func VersionCheckersFrom(cfg *config.Config, store PolicyStore) []policy.VersionChecker {
+	return []policy.VersionChecker{policy.NewAgeChecker(store), osvCheckerFrom(cfg, store),
+		provenanceCheckerFrom(cfg, store), policy.NewNameSimilarityChecker(store)}
+}
+
 // ProvenanceChecker builds the upstream provenance check: npm read from the
 // configured npm upstream when an entry names no registry, and the Sigstore
 // trusted root from sigstore_trusted_root, or TUF when that is unset.
 func ProvenanceChecker(cfg *config.Config, adb *audit.DB) *provenance.Checker {
-	v := NewProvenanceVerifier(cfg)
-	if cfg != nil && cfg.NpmUpstream != "" {
-		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
-	}
 	// A nil *audit.DB inside the interface is not a nil interface.
 	var store provenance.Store
 	if adb != nil {
 		store = adb
+	}
+	return provenanceCheckerFrom(cfg, store)
+}
+
+func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenance.Checker {
+	v := NewProvenanceVerifier(cfg)
+	if cfg != nil && cfg.NpmUpstream != "" {
+		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
 	}
 	return &provenance.Checker{Store: store, Verifier: v}
 }
@@ -690,6 +712,10 @@ func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	if adb != nil {
 		store = adb
 	}
+	return osvCheckerFrom(cfg, store)
+}
+
+func osvCheckerFrom(cfg *config.Config, store policy.OSVStore) *policy.OSVChecker {
 	ck := policy.NewOSVChecker(store)
 	if cfg == nil {
 		return ck

@@ -43,6 +43,7 @@ least one rule for a registry type to switch enforcement on for that type.`,
 		newPolicyProvenanceCmd(gf),
 		newPolicySimilarityCmd(gf),
 		newPolicyFilterCmd(gf),
+		newPolicySimulateCmd(gf),
 	)
 	return parent
 }

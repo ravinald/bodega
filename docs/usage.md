@@ -639,6 +639,82 @@ For apt specifically, `bodega build fetch apt` shells out to `apt-get download <
 
 Once the host installs from bodega, `bodega pin apt` closes the loop the other two rows leave open: it reads the same inventory this section converts, checks each installed version against the indices bodega actually serves, and writes the preferences file that holds the host where it is. That is a different question from the catalog, and it is the one asked on the day a host is moved behind bodega.
 
+### `bodega pkg prefetch <lockfile> [lockfile...]`
+
+Admits, records, fetches and pins every dependency a project's lockfile names, so a CI job learns about a block when the dependency is added rather than when a build asks for it.
+
+```bash
+bodega pkg prefetch package-lock.json
+bodega pkg prefetch go.sum Cargo.lock requirements.txt
+bodega pkg prefetch --format requirements deps/prod.lock
+bodega pkg prefetch --dry-run --json package-lock.json
+```
+
+| Format         | Detected from                              | Reads                                                                                                    |
+| -------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `package-lock` | `package-lock.json`, `npm-shrinkwrap.json` | the `packages` map of lockfileVersion 2 or 3; the project root, workspace links and bundled deps skipped |
+| `requirements` | `requirements*.txt`                        | every requirement pinned with `==`, its `--hash` values, extras and markers stripped                     |
+| `go.sum`       | `go.sum`                                   | every module zip line; a `/go.mod` line pins no download and is skipped                                  |
+| `cargo.lock`   | `Cargo.lock`                               | every `[[package]]` with a crates.io source; workspace members have none and are skipped                 |
+
+`--format` names the format for every file on the command line when a name says nothing. A lockfileVersion 1 `package-lock.json`, an unpinned requirement, and a `-r`, `-c` or `-e` line are refused: the first holds no flat list to read, and the other two would make a partial answer look like a complete one.
+
+**What each entry goes through.** Each (type, name, version) runs through `admit.Admit`, the admission `bodega pkg import` runs, and writes its admission row. An admitted version is then written to the manifest store, merged into the package when one exists, and fetched by the builder's own fetch for the type, which is where its digest is pinned (see [Checksum Verification](#checksum-verification)). A version the package already holds is admitted again, so the row cites the policy in force today, and is not written twice. A blocked version is written nowhere.
+
+A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
+
+An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io.
+
+**Digest comparison.** The digest a lockfile records is held against the one bodega pinned for the same version:
+
+| Lockfile records                         | Compared with                                                                                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| sha256 (`Cargo.lock`)                    | the pin itself, so `--dry-run` compares against a pin already on record                                                              |
+| sha512, sha384 or sha1 (npm `integrity`) | the same algorithm over the tarball in the build root, once its sha256 matches the pin                                               |
+| `h1:` (`go.sum`)                         | the Go dirhash over the module zip in the build root, once its sha256 matches the pin                                                |
+| sha256 list (`requirements.txt`)         | every file bodega pinned for the version; each must be one of the listed hashes, because pip refuses a file whose hash is not listed |
+
+A disagreement fails the entry as `mismatch`, naming the package, both digests and where each came from:
+
+```text
+npm  lodash@4.17.21  mismatch  lodash@4.17.21: lockfile sha512:6109…e3 (package-lock.json) disagrees with bodega sha512:c311…90 (/opt/bodega/npm/lodash/4.17.21/lodash-4.17.21.tgz, the fetched artifact pinned on npm/lodash/lodash-4.17.21.tgz)
+```
+
+A comparison bodega cannot make is `not_compared` with the reason, never a match: the lockfile records no digest, or bodega holds no artifact to compute the lockfile's algorithm over. Under `--dry-run` that is the usual answer for npm and gomod, whose lockfile algorithms are not the sha256 bodega pins.
+
+**Output.** One line per entry: type, name and version, the decision, then the checks that warned or blocked with their detail, or the mismatch, or why the digest was not compared. `--json` prints an array with `decision`, `failing_checks` (the admission row's entries), `fetch` and `digest` (`status`, `lockfile`, `lockfile_source`, `bodega`, `bodega_source`, `detail`). Fetch progress goes to stderr, so stdout carries the results alone.
+
+| Exit | Meaning                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------- |
+| `0`  | every entry admitted and no digest disagreed                                                         |
+| `2`  | any entry `policy_blocked`, `invalid` or `mismatch`                                                  |
+| `1`  | bodega could not answer: an `unsupported` entry, a failed fetch or write, or the run could not start |
+
+A definite no outranks an unanswered entry, so a run with both exits `2`.
+
+`--dry-run` runs the same structural, allow-list, age, OSV, upstream provenance and name similarity checks, compares against pins already on record, and writes nothing: no manifest, no admission row, no audit event, no fetch, no name baseline. prefetch refuses to run without the audit database, because without it only the allow-list would run and `admitted` would hide every other check.
+
+**In CI.** Run it when the lockfile changes, before the build, with the `bodega` binary pointed at the server's config and audit database (the job runs where the manifest store is, as `bodega pkg import` does):
+
+```yaml
+# .github/workflows/deps.yml
+on:
+  pull_request:
+    paths: [package-lock.json, go.sum, Cargo.lock, requirements.txt]
+jobs:
+  prefetch:
+    runs-on: [self-hosted, bodega]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Admit and pin the lockfiles through bodega
+        run: |
+          bodega pkg prefetch --json package-lock.json go.sum > prefetch.json
+      - if: failure()
+        run: jq -r '.[] | select(.decision != "admitted") | "\(.type) \(.name)@\(.version): \(.decision) \(.reason // "")"' prefetch.json
+```
+
+A job that only gates a pull request, and should leave nothing behind for a change nobody merged, runs `--dry-run` instead and prefetches on the merge.
+
 ### `bodega pin apt [file|-]`
 
 Turns a host's installed apt packages into a preferences file pinning each one to the version it runs, and a list of the packages that cannot be pinned.
@@ -2673,6 +2749,50 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 - **It never replaces the artifact-level gate.** With the filter on, the tarball, wheel or `.zip`/`.info`/`.mod` route refuses a withheld version requested directly with a `403` naming the gate, and writes a `denied` row with status `withheld_version`. The index is advice to a resolver; the artifact route is where the decision is enforced.
 - With the filter off, the proxied index lists every version upstream does, and the age and OSV gates refuse a too-new or flagged version when the client fetches its artifact (see the age gate above).
 - The gomod `@latest` document and the npm version route `/npm/<pkg>/<version>` are not filtered. `go` reads `@latest` only when the list is empty, and both lead to an artifact the route refuses.
+
+### `bodega policy simulate`
+
+Lists the admitted versions a proposed policy change would block or admit, with the check responsible, before anyone makes the change. It writes nothing: no policy row, no admission row, no audit event, no provenance pin.
+
+```bash
+bodega policy simulate --osv npm=block
+bodega policy simulate --age pypi=14d:block --json
+bodega policy simulate --similarity cargo=block --provenance npm=block
+bodega policy simulate --allow-file rules.json
+```
+
+The change uses the words the policy commands use, as `ecosystem=value`, and each flag repeats:
+
+| Flag                       | Same as                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------- |
+| `--osv npm=block`          | `bodega policy osv set npm block`                                               |
+| `--age pypi=14d:block`     | `bodega policy age set pypi 14d block`                                          |
+| `--provenance npm=block`   | `bodega policy provenance set npm block`                                        |
+| `--similarity cargo=block` | `bodega policy similarity set cargo block`                                      |
+| `--osv npm=remove`         | `bodega policy osv remove npm`; also `--age`, `--provenance` and `--similarity` |
+| `--allow-file rules.json`  | replaces the allow-list of every type the file names                            |
+
+An ecosystem or action the matching `set` refuses is refused here too. The allow-file is a JSON object from type to the complete list of patterns that type would have, in `bodega policy add` syntax; an empty list proposes no rules, which turns enforcement off for that type:
+
+```json
+{ "npm": ["lodash", "@example/*"], "pypi": [] }
+```
+
+**What is evaluated.** Every admitted version of each ecosystem the change touches, since a version of any other type reads the same policy rows either way: every version the manifest store lists, plus every version whose newest admission row is an evaluated `admitted` and which the store does not list, which is how a version the pass-through proxy admitted is found. Each is evaluated twice, against the policy on record and against it with the change applied, in admission's own order: structure, then the allow-list, then age, OSV, upstream provenance and name similarity. A version whose decision moves is listed with the checks whose verdict moved into or out of `block`:
+
+```text
+npm  minimist@1.2.0  admitted -> policy_blocked  osv pass->block: minimist@1.2.0 has 1 OSV record(s): GHSA-xvch-5gv4-984h
+1 version(s) of npm evaluated; 1 would change
+```
+
+`--json` prints `types`, `evaluated` and `changes`, each change carrying `before`, `after` and `checks` (`check`, `before`, `after`, `detail`).
+
+**Limits.**
+
+- The age gate and the upstream provenance check read their registries, so a simulation makes those reads for every version of the touched ecosystems, twice. Simulate one ecosystem at a time on a large store.
+- A check that warns rather than blocks moves no decision, so a change from `ignore` to `warn` lists nothing.
+- Name similarity exemptions come from the name baseline already taken; a simulation takes none.
+- The OSV malware action has no flag yet.
 
 ### `bodega discover ...`
 
