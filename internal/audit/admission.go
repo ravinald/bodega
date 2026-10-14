@@ -125,7 +125,9 @@ type AdmissionFilter struct {
 	PkgType    string
 	PkgName    string
 	PkgVersion string
-	Limit      int // 0 = default (1000)
+	// Since keeps rows decided at or after it; zero keeps every row.
+	Since time.Time
+	Limit int // 0 = default (1000)
 }
 
 // AdmissionPin names the object a version's digest was pinned under.
@@ -403,8 +405,9 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 }
 
 // buildAdmissionQuery renders the newest-first read for f. ph renders the nth
-// bind placeholder, as in pinTx.
-func buildAdmissionQuery(f AdmissionFilter, ph func(int) string) (string, []any) {
+// bind placeholder, as in pinTx; since renders f.Since in the form the
+// dialect's decided_at column compares against.
+func buildAdmissionQuery(f AdmissionFilter, ph func(int) string, since func(time.Time) any) (string, []any) {
 	var (
 		where []string
 		args  []any
@@ -417,6 +420,10 @@ func buildAdmissionQuery(f AdmissionFilter, ph func(int) string) (string, []any)
 		}
 		args = append(args, c.val)
 		where = append(where, c.col+" = "+ph(len(args)))
+	}
+	if !f.Since.IsZero() {
+		args = append(args, since(f.Since.UTC()))
+		where = append(where, "decided_at >= "+ph(len(args)))
 	}
 	q := `SELECT id, pkg_type, pkg_name, pkg_version, object_key, decision, checks, policy_digest, actor, identity, decided_at FROM admissions`
 	if len(where) > 0 {

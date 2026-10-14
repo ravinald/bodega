@@ -149,6 +149,19 @@ func (g *IndexGate) Withhold(ctx context.Context, name, version string, publishe
 	return ""
 }
 
+// Malicious reports whether OSV records the version as malware and the
+// malware action blocks. It is the one withholding a baseline version is still
+// subject to, since the mark says hosts already run the version, not that it
+// is safe to keep serving something published to do harm.
+func (g *IndexGate) Malicious(ctx context.Context, name, version string) bool {
+	if g.osv == nil {
+		return false
+	}
+	r := g.osv.Check(ctx, &manifest.PackageManifest{Type: g.Ecosystem, Name: name},
+		&manifest.VersionEntry{Version: version})
+	return r.Action == ActionBlock && r.Details["malware"] != nil
+}
+
 // fixedOSVPolicy answers an OSVChecker from rows already read. advisory is
 // nil when the advisory gate does not block, which reads as no row: the
 // checker then applies the malware action alone.

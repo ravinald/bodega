@@ -452,7 +452,7 @@ func (s *postgresSink) pinAdmission(ctx context.Context, p AdmissionPin) (admiss
 }
 
 func (s *postgresSink) QueryAdmissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
-	q, args := buildAdmissionQuery(f, pgPlaceholder)
+	q, args := buildAdmissionQuery(f, pgPlaceholder, func(t time.Time) any { return t })
 	// checks is JSONB; the cast hands the driver text for scanAdmissions.
 	q = strings.Replace(q, " checks,", " checks::text,", 1)
 	rows, err := s.db.QueryContext(ctx, q, args...)

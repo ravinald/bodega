@@ -973,6 +973,37 @@ admits or re-vets next: an expired override changes nothing already admitted
 until a re-vet runs, so without `revet_interval` an overridden version stays
 served after its override expires.
 
+## Baseline marks and report mode
+
+A version imported with `bodega pkg import --baseline` is admitted past any
+failing gate except an OSV malware record and upstream provenance that fails
+to verify, and an ecosystem switched to report mode with `bodega policy
+enforce` admits whatever its gates would have refused (see
+[usage.md](usage.md#rolling-out-enforcement)). Both are deliberate holes, sized
+to what hosts already run and to the time it takes to read a report.
+
+**The mark is set by the local CLI only.** It lives on the version entry in
+the manifest, where a build's fetch, a proxy fill and a re-vet read it, so every other write
+path drops a mark the store did not already hold: a bulk import or
+`POST /api/v1/packages` from a host token, `pkg edit`, and `pkg import`
+without the flag. `--baseline` with `--server` is refused, so a host cannot
+exempt its own catalog. Whoever can run `bodega pkg import` on the bodega host
+can baseline anything, which is the same person who can already write the
+manifest store and the policy tables directly. The TUI's entry editor writes
+the manifest without running admission and does not drop the mark either.
+
+**A proxy fill reads the mark from the store, never from the request.** In
+listed mode a package holding a marked version has its index served despite
+the allow-list, because a host pinned to that version reads the index first.
+The index still names the package's unmarked versions, and each of those is
+refused at the artifact, so the hole is the marked versions and nothing else.
+
+Report mode leaves the OSV malware action blocking and the allow-list as its
+admission mode says. Every switch is a `policy` audit event naming who made it,
+so a report mode nobody switched back is visible in the audit trail, and
+`bodega policy report` lists every ecosystem's flagged checks with what each
+does once enforced.
+
 ## Out-of-scope distribution formats
 
 Three properties make a distribution format incompatible with bodega's
@@ -1101,7 +1132,7 @@ set npm 7d block` turns the shipped `warn` into a refusal once you have
   clients: they are the install's own posture, and they take effect without a
   restart.
 
-On the bodega host itself, `doctor` adds three checks that read the audit
+On the bodega host itself, `doctor` adds four checks that read the audit
 database rather than the machine. They report `N/A` on a client host with no
 install, and `SKIPPED` where this account cannot read what they read:
 
@@ -1116,6 +1147,10 @@ install, and `SKIPPED` where this account cannot read what they read:
 - `policy-ecosystem`: a stored row whose gate cannot evaluate it, written
   before `policy set` learned to refuse one. It lists as active policy and is
   read by nothing.
+- `policy-mode`: the ecosystems in open admission mode because they have no
+  allow-list rules, not because anyone ran `policy mode set`. It reports OK and
+  names them: open is how a type without rules has always behaved, so it is a
+  decision to record rather than a defect.
 
 ## See also
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
@@ -137,8 +138,9 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 		return out
 	}
 
+	dropped := admit.CarryBaseline(pm, existing)
 	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, pm, admit.Who{Identity: identity})
-	out.Warnings = res.Warnings
+	out.Warnings = append(baselineDropped(dropped), res.Warnings...)
 	switch res.Decision {
 	case admit.Invalid:
 		out.Outcome, out.Reason = ImportInvalid, res.Reason
@@ -265,4 +267,13 @@ func peekNonSpace(br *bufio.Reader) (byte, error) {
 			return b[0], nil
 		}
 	}
+}
+
+// baselineDropped is the warning for the versions whose baseline mark
+// admit.CarryBaseline dropped, nil when it dropped none.
+func baselineDropped(versions []string) []string {
+	if len(versions) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("baseline mark ignored on %s: only `bodega pkg import --baseline` on the server sets it", strings.Join(versions, ", "))}
 }

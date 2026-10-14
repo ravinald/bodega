@@ -187,9 +187,9 @@ func (r *DiscoveryRecorder) flush(ctx context.Context, batch []audit.DiscoveryRo
 // classifyDecision maps the policy check result onto the discovery row's
 // `decision` column. discover_mode is not an input: it decides whether a row
 // is written, never what the row says. See proxy.go for the call site.
-func classifyDecision(hasRules, violation bool) string {
+func classifyDecision(listed, violation bool) string {
 	switch {
-	case !hasRules:
+	case !listed:
 		return audit.DecisionNoPolicy
 	case !violation:
 		return audit.DecisionAllowed
