@@ -11,7 +11,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
-const tokenScopesVersion = 35
+const tokenScopesVersion = 36
 
 // migrationBefore is the version the source holds immediately below v. The
 // numbering has gaps where another branch reserved a version, so v-1 can
