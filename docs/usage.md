@@ -503,6 +503,21 @@ A flag naming a host the entry already lists passes. `--origin db01` over an ent
 
 `--origin` applies on the `--server` path too: the payload is stamped on the host before it is pushed, so `POST /api/v1/packages/import` receives the same field a local import would have written.
 
+#### `--baseline`
+
+`--baseline` marks every imported version as what your hosts already run. Each version gets `baseline: true` and `baseline_at`, the import time. A gate that fails on a baseline version records the finding and admits the version rather than refusing it, on every path that admits one: this import, a build's fetch, a proxy fill of a `mode: proxy` entry (the form `pkg convert` writes) and a [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration). The admission row records that check with status `baseline` and the original failure in its detail, so the finding is kept rather than read as a pass. [`bodega policy report`](#bodega-policy-report---since-duration---json) lists it under "Baseline debt" until [`bodega policy baseline clear`](#bodega-policy-baseline-clear-ecosystem---older-than-duration) removes the mark.
+
+On the proxy path the [index filter](#bodega-policy-filter-setlist) keeps a marked version listed, and in `listed` [admission mode](#bodega-policy-mode-setlist) a package holding a marked version has its index served even with no allow-list rule, so a host pinned to that version can resolve it. The package's unmarked versions stay in that index and are refused at the artifact; add an allow-list rule to admit them.
+
+```bash
+bodega pkg convert npm < installed.txt > baseline.json
+bodega pkg import --baseline --merge baseline.json
+```
+
+Two verdicts are never admitted by the mark, for the reason an [override](#bodega-override-requestapproverejectlist) cannot admit them: an OSV malware record and upstream provenance that fails to verify. The check stays `block` and its detail says the mark does not apply.
+
+Only this flag sets the mark. A version imported later without it is never baseline, and a mark carried in on a file, an API push or a `pkg edit` buffer is dropped with a warning unless the store already held it for that version. `--baseline` writes the local store, so it is refused with `--server`: a host pushing its own catalog cannot exempt it from the gates. With `--merge`, a version the store already holds gets the mark too, and one already marked keeps its earlier time.
+
 #### Importing to a remote server
 
 `--server` sends the manifests to a running bodega instead of writing the local manifest store. That is how a host catalogs itself: the package manager runs on the host and bodega usually does not, so the remote path opens no manifest directory, no bucket and no audit database.
@@ -699,6 +714,67 @@ Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `pub
 - **`Packages.xz` is not read.** Go ships no xz decoder, and every archive publishing `.xz` publishes `.gz` beside it. An archive publishing only `.xz` is named in an error rather than counted as empty, since an index silently read as zero packages would turn every package in it into an unresolved one.
 - **Coverage decays from the moment it is measured.** A version that leaves the archive while pinned turns into an apt error at the next `update`, not a warning now. Re-run this after every upgrade window and re-read the counts.
 - **Nothing is installed and nothing is written to the manifest store.** The output is a file to review, then copy. Pinning a host is separate from cataloging it: see [Cataloging a host end to end](#cataloging-a-host-end-to-end).
+
+### `bodega audit bypass <host> --inventory <file>`
+
+Lists every package a host has installed that bodega has no record of serving to it. `bodega pin apt` holds a host to bodega once it is moved there; this is how you find out whether it stayed. It reads the inventory `bodega pkg convert` reads (or the JSON it writes), and the `serve_fetch` rows the [audit store](#bodega-audit-served---identity-name) keeps under the host's identity, and needs nothing on the host beyond the capture.
+
+```bash
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\t${db-fsys:Last-Modified}\n' > web-01.txt
+bodega audit bypass web-01 --inventory web-01.txt --type apt --exclude-image ubuntu-24.04.txt
+```
+
+```text
+CLASS              TYPE     NAME                                     VERSION                  REASON
+---
+never_served       apt      htop                                     3.3.0-4build1            no serve_fetch row names htop@3.3.0-4build1 for any identity
+served_elsewhere   apt      jq                                       1.7.1-3build1            bodega served jq@1.7.1-3build1 to web-02, never to web-01
+predates_audit     apt      cron                                     3.0pl1-184ubuntu2        installed 2026-03-02T11:40:12Z, before the audit store's oldest event
+
+web-01: 414 installed, 409 served to it, 1 never_served, 1 served_elsewhere, 1 predates_audit, 2 unattributable, 223 excluded as image
+  limit: the audit window starts 2026-04-01T00:00:00Z; only serve_fetch rows naming a stored object count
+  limit: 2 package(s) cannot be attributed and are not counted as bypass: 2 served to a request no identity binding resolved
+```
+
+| Class              | Meaning                                                                                    | Bypass |
+| ------------------ | ------------------------------------------------------------------------------------------ | ------ |
+| `never_served`     | bodega never served that version to anyone                                                 | yes    |
+| `served_elsewhere` | bodega served it, but never to this host                                                   | yes    |
+| `predates_audit`   | the inventory's install time is before the audit store's oldest event, so it cannot answer | no     |
+
+| Flag                       | Default | What it does                                                                               |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `--inventory`              | none    | The host's installed list. `-` reads stdin                                                 |
+| `--type`                   | none    | The parser for raw manager output; on converted JSON, the one ecosystem to keep            |
+| `--exclude-image`          | none    | An inventory of the base OS image. A (type, name, version) it lists is not a finding       |
+| `--any-host`               | off     | A serve to any identity counts as served, so only `never_served` remains                   |
+| `--all`, `--inventory-dir` | off     | Compare every `<host>.json` in the directory and print one summary line per host           |
+| `--json`                   | off     | One report object, or an array of them under `--all`, with the counts, limits and findings |
+
+The exit code is for a scheduled job: 0 when no host has a `never_served` or `served_elsewhere` finding, 2 when any does, 1 when bodega could not answer (no audit store, a `syslog` or `jsonl` sink that keeps nothing to read, an audit store with no events or no `serve_fetch` row naming a stored object, an unreadable inventory). An `audit_db` path that does not exist yet opens as an empty store, so a typo or a fresh deploy exits 1 with "the audit store holds no events; there is no serve record to compare <host> against" before any inventory is read, rather than reporting every host as a bypass. Under `--all` an unreadable `<host>.json` is named on stderr and its line reads `error`; 2 still wins over it, so one broken file does not hide another host's bypass.
+
+#### Inventories
+
+Raw manager output takes `--type`, and the parsers are the ones `pkg convert` uses. `pkg convert`'s own JSON is recognized by every entry naming a bodega type, so `--type` is optional there and only filters. `freebsd` is refused: its capture (`pkg query '%R\t%q'`) names the repository each package came from and not the package, so there is no installed version to look for.
+
+An install time is what tells `predates_audit` apart from the other two. dpkg writes one where you ask for it: `${db-fsys:Last-Modified}` as the sixth column (dpkg 1.19.3 and later), which `pkg convert` reads past and does not carry onto a catalog entry. A JSON inventory carries one as `metadata.installed_at` on a version, in RFC 3339 or Unix seconds. No other manager records an install time, so a pip, npm, Go, cargo or helm inventory never reads `predates_audit`, and the report counts how many packages it judged without one.
+
+`--exclude-image` takes the same formats. Capture it from a freshly booted instance of the image and keep it beside the image's build: a package the host was imaged with was never fetched by the host. It matches on version, so a package the host upgraded past the image's version is still compared.
+
+#### Attribution
+
+A serve counts for the host only under its own identity, which an [identity binding](#bodega-identity-bindunbindlist) assigns per request. Three cases leave a version neither served to the host nor provably served elsewhere, and the report counts them, by reason, rather than listing them as bypass:
+
+- **No identity on the request.** A `serve_fetch` row with an empty identity could be this host before it was bound, or any other unbound client.
+- **The binding changed.** A serve before the host's earliest current binding was written, or one from an address the host's CIDR binding now covers but recorded under another identity, could be this host under its old name.
+- **No binding names the host.** Every request it made carried no identity, so only `never_served` is evidence for it, and the report says so in a `limit:` line.
+
+#### Gaps
+
+- **Only the current binding table is known.** bodega keeps no history of bindings, so a token binding moved from one host to another reads as a serve to the new holder. The `binding_changed` test catches a rename only where an address or the binding's creation time gives it away.
+- **Name and version only.** Neither dpkg nor pip records where a package came from or its digest, so a host that installed the same version from a public mirror reads as served when bodega also served it that version. [Inventory reconciliation](#reconciliation) compares digests where the collector reports one.
+- **A row with no object key serves nothing.** A `serve_fetch` written before bodega recorded object keys, or one that answered an index, names no artifact, so a version served only then reads `never_served`.
+- **The window is the store's oldest event.** Retention that prunes the audit store moves the window forward, and a package installed before it reads `predates_audit` only where the inventory records an install time.
 
 ### `bodega pkg export [type] [name] [version]`
 
@@ -2040,7 +2116,7 @@ bodega policy add git example.com/example-corp/ "widget maintainers"
 bodega policy add npm @example-cloud/*
 ```
 
-An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
+An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on, or set the type's [admission mode](#bodega-policy-mode-setlist) to `listed` or `open` explicitly. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
 
 An exact npm, pypi or cargo name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
 
@@ -2816,6 +2892,138 @@ Every 401 has the same body, `Unauthorized`, so a caller without the secret lear
 
 Use `--data-binary`, not `-d`: `-d` strips newlines from a file argument, and the server verifies the bytes it received. The secret sits in `config.json`, which bodega writes `0600`. Generate it with `openssl rand -hex 32`.
 
+### `bodega policy mode <set|list>`
+
+Sets how an ecosystem decides which names it admits.
+
+| Mode     | Admits                                                                                         |
+| -------- | ---------------------------------------------------------------------------------------------- |
+| `listed` | Only a name an allow-list rule matches. With no rules, no name at all                          |
+| `open`   | Any name that passes every per-version gate: age, OSV, upstream provenance and name similarity |
+
+An ecosystem nobody set a mode for follows its allow-list: `listed` when it has rules, `open` when it has none, which is how every ecosystem behaved before modes existed. `open` is admission by criteria: no person approves each name, and the gates decide each version. `set` writes a `policy` audit event with the mode before and after, and warns when it sets `listed` on an ecosystem with no rules.
+
+```bash
+bodega policy mode set npm open
+bodega policy mode set pypi listed
+bodega policy mode list
+```
+
+```text
+ECOSYSTEM  MODE    RULES  SOURCE
+apt        open    0      default: no allow-list rules
+git        listed  2      default: has allow-list rules
+npm        open    0      set by ravi on 2026-10-13
+pypi       listed  0      set by ravi on 2026-10-13
+...
+```
+
+In `open` mode an admission row records the allow-list check with action `none` and a detail saying no rule was required, and a proxy discovery row records `no_policy`. `bodega doctor` names each ecosystem that is open because it has no rules rather than because someone set it, in its `policy-mode` row. The server's allow-list cache picks up a mode change within 30 seconds.
+
+### `bodega policy enforce <ecosystem> report|enforce`
+
+Switches every gate the ecosystem has a policy row for between its configured action and `warn` in one step.
+
+`report` sets the age, OSV, upstream provenance and name similarity rows to `warn` and saves the action each had. `enforce` writes each saved action back exactly, `ignore` included. A gate with no row is left without one: its default applies in both states. Each switch writes one `policy` audit event naming the actor and every gate's before and after:
+
+```console
+$ bodega policy enforce npm report
+npm: report
+  age                  block -> warn
+  osv                  block -> warn
+  upstream_provenance  block -> warn
+$ bodega policy enforce npm enforce
+npm: enforce
+  age                  warn -> block
+  osv                  warn -> block
+  upstream_provenance  warn -> block
+```
+
+`report` refuses an ecosystem already in report mode, because saving the warns it set would lose the actions `enforce` restores; `enforce` refuses one that is not. A gate somebody changed while the ecosystem was in report mode is still restored to the action it had before the switch, and the event's `before` says what it was changed to.
+
+Two things are left as they are. The [OSV malware action](#malware-records) keeps blocking: a known-malicious package is not one to admit while someone reads a report. The allow-list has no action to switch; [`bodega policy mode set <ecosystem> open`](#bodega-policy-mode-setlist) is how it stops deciding admission.
+
+### `bodega policy report [--since DURATION] [--json]`
+
+Lists what the gates flagged in the window (default `7d`), grouped by ecosystem, check and package, from the [admission rows](#admission-decisions). `REQUESTS` counts the rows, one per import, fetch or proxy fill; `HOSTS` names the identities that asked, and counts the rows that carried none (a CLI import, or a request no identity binding resolved). `ON ENFORCE` is the action the check takes once the ecosystem is enforced: the action `report` saved, or the one in force now. A `warn` row whose `ON ENFORCE` is `block` is what `bodega policy enforce <ecosystem> enforce` would start refusing.
+
+```console
+$ bodega policy report --since 7d
+Flagged since 2026-10-06T09:12:44Z
+ECOSYSTEM  CHECK  PACKAGE   STATUS  ON ENFORCE  REQUESTS  VERSIONS  HOSTS
+npm        age    left-pad  warn    block       14        1.3.0     ci-runner-1,ci-runner-2
+npm        osv    minimist  warn    block       3         1.2.0     ci-runner-1,(1 unidentified)
+
+Baseline debt
+ECOSYSTEM  CHECK  PACKAGE  VERSIONS  DETAIL
+npm        osv    lodash   4.17.20   GHSA-35jh-r3h4-6jhm ...; admitted as baseline (marked 2026-10-01T00:00:00Z)
+```
+
+Baseline debt is the versions still marked [baseline](#--baseline) whose newest admission row admitted past a failing check, whatever the window. It reads the manifest store, so a cleared mark drops off the list at once.
+
+The report reads at most 200,000 rows for the window and says so when it reaches that, since the counts are then a floor. It needs an audit sink with an admissions table; `syslog` and `jsonl` keep none. `--json` prints `{since, flagged, baseline_debt, truncated}`, each entry carrying `ecosystem`, `check`, `package`, `status`, `on_enforce`, `requests`, `versions`, `hosts`, `unidentified` and `detail`.
+
+### `bodega policy baseline clear <ecosystem> [--older-than DURATION]`
+
+Removes the [baseline](#--baseline) mark from every version of the ecosystem, or with `--older-than` only from versions marked at least that long ago, so the gates apply to them. It then evaluates each cleared version against the gates as they stand, overrides included, and reports how many now fail:
+
+```console
+$ bodega policy baseline clear npm --older-than 30d
+Cleared the baseline mark from 212 npm version(s); 3 now fail a gate.
+  lodash@4.17.20: osv: GHSA-35jh-r3h4-6jhm ...
+```
+
+The evaluation records nothing: no admission row and no provenance pin. The next build fetch or [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) of a failing version is the decision that refuses it, and with `revet_on_block: hide` the re-vet hides it. The clear itself writes one `policy` audit event with the counts. A mark whose time does not parse is cleared whatever `--older-than` says, since clearing is the direction that applies the gates.
+
+### `bodega override <request|approve|reject|list>`
+
+An override admits one version past one check's failure. One identity requests it, a different identity approves it, and it applies only until it expires.
+
+> **`bodega pkg create` no longer asks "Proceed anyway? [y/N]".** That prompt let the one operator at the terminal admit a version the allow-list refused, and the row it wrote looked like any other create. An allow-list refusal on `pkg create` is now final, like every other surface's, and the error prints the `bodega override request` command for that version and check. Older admission rows decided under the prompt keep their `override` check entry.
+
+```bash
+# alice, who needs the version
+bodega override request npm left-pad 1.3.0 --check allowlist \
+  --reason "vendor fork pending, INC-4411" --expires 7d
+
+# bob, who reviewed it
+bodega override list --pending
+bodega override approve 3f9a1c0e5b7d2a64 --comment "checked the diff against 1.2.9"
+
+# alice, now that it applies
+bodega pkg import left-pad.json
+```
+
+| Command                                                                                | Effect                                                                                                                                               |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `request <type> <name> <version> --check <check> --reason <text> --expires <duration>` | Records a pending override and prints its id. All three flags are required.                                                                          |
+| `approve <id> [--comment <text>]`                                                      | Records an approval. Refused for the requester, and for an identity that already voted.                                                              |
+| `reject <id> [--comment <text>]`                                                       | Records a rejection, which cancels the override for good, pending or approved. Anyone may reject, the requester included.                            |
+| `list [--pending\|--active\|--expired] [--json]`                                       | Lists overrides newest first, with their status, approvals so far against the quorum, requester, expiry and reason. The three filters are exclusive. |
+
+`--check` names one of the checks an admission row carries: `allowlist`, `age`, `osv`, `upstream_provenance` or `name_similarity`. The version is the one the admission row records: the version, or the ref for a git entry pinned by ref. A pypi name matches in its PEP 503 form, so `Foo_Bar` and `foo-bar` are the same request.
+
+`--expires` is a duration from the request, `7d` or `72h`. It is required, and capped by `override_max_ttl`:
+
+| Key                | Default | Effect                                                                                                                            |
+| ------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `override_max_ttl` | `30d`   | The longest `--expires` a request may ask for. `<N>d` or a Go duration.                                                           |
+| `override_quorum`  | `2`     | How many distinct identities, the requester included, must approve. Below 2 fails the config load: 1 is the prompt this replaced. |
+
+The quorum is recorded with each request when it is made, so changing `override_quorum` neither strands a request already half approved nor lets one through on fewer approvals than it was asked under.
+
+**Who is voting.** On the CLI the identity is the operator: `SUDO_USER` under sudo, otherwise the OS user. On the API it is the identity the request's token is bound to with `bodega identity bind token`. Identities are compared as plain strings across both surfaces, so `alice` at the shell and a token bound to `alice` are one identity, and two requests or votes from one identity never count twice. See [the threat model](threat-model.md#two-person-overrides) for what that does and does not prove.
+
+**What an override does.** Once approved, the next admission of that version records the named check with status `overridden`, the override's id in its `override` field, and a detail naming the original failure, the approvers and the expiry. The check's `action` still says `block`. The other checks run as they always do: an allow-list override does not skip OSV. It applies on every path that admits a version: `pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, bulk import, a build's fetch, a proxy fill, and a [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
+
+**What it never does.** An override does not apply to an OSV block that names a malware record (`MAL-`), or to upstream provenance whose outcome is `invalid`. Both say the version is hostile rather than that it misses a policy. The check stays `block` and its detail names the override it did not honor.
+
+**Expiry.** An override past its expiry stops applying with nobody acting and accepts no more votes. Nothing is rewritten: `list --expired` shows it, and the next re-vet of an admitted version refuses it again and acts under `revet_on_block`.
+
+**Audit.** Each request, approval and rejection writes an `override` event (`bodega audit events --type override`) with status `requested`, `approve` or `reject` and the id, check, state, approvers, quorum and expiry in its details. The requests and votes themselves live in the `overrides` and `override_votes` tables of the embedded SQLite store (migration 032), beside the allow-list.
+
+**Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
@@ -3126,6 +3334,8 @@ A default config is created on first run. All fields are optional.
   "revet_rate": 1,
   "revet_on_block": "report",
   "revet_webhook_secret": "",
+  "override_max_ttl": "30d",
+  "override_quorum": 2,
   "apt_codename": "noble",
   "apt_suites": ["noble"],
   "apt_signing_name": "",
@@ -3850,6 +4060,8 @@ All version entries support:
 | `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
+| `baseline`           | bool   | Imported with [`pkg import --baseline`](#--baseline): a failing gate admits it and records the finding. Only that import sets it      |
+| `baseline_at`        | string | When the baseline import marked the version, RFC 3339 UTC                                                                             |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |
 | `metadata`           | object | Ecosystem-specific key-value pairs                                                                                                    |
 | `build_env`          | object | Build server's environment at artifact creation time                                                                                  |
@@ -5896,6 +6108,16 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
 
+### Override endpoints
+
+| Method | Path                                | Description                                                              |
+| ------ | ----------------------------------- | ------------------------------------------------------------------------ |
+| GET    | `/api/v1/overrides[?status=STATUS]` | List overrides; `status` is `pending`, `active`, `expired` or `rejected` |
+| POST   | `/api/v1/overrides`                 | Request one (JSON body: `{type, name, version, check, reason, expires}`) |
+| POST   | `/api/v1/overrides/{id}/approve`    | Approve (optional JSON body: `{comment}`)                                |
+| POST   | `/api/v1/overrides/{id}/reject`     | Reject (optional JSON body: `{comment}`)                                 |
+
+These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to is the requester or the voter. A request with no token, or with a token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. An `inventory`-scoped token gets `403`. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
 `POST /api/v1/auth/exchange` and `GET /api/v1/auth/providers` are the OIDC routes; the exchange sits outside `admin_permit_cidr` because the ID token is the credential. See [Authentication](#authentication).
 
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
@@ -5942,14 +6164,14 @@ When a dependency has a security issue, fails checksum verification, or is other
 
 ### Upstream allow-list
 
-The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior).
+The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior). An [admission mode](#bodega-policy-mode-setlist) set on a type overrides that default either way. [Rolling out enforcement](#rolling-out-enforcement) is the procedure for turning the gates on without breaking what already builds.
 
 Enforcement happens in four places:
 
 - **Server proxy** (`bodega serve`) — cache-miss fetches check policy before leaving the box. Blocked fetches return 403.
 - **Builder** — each fetch stage validates entries before any network I/O, on every surface that runs one: `bodega build fetch`, `bodega build run`, `bodega build package`, `bodega build upload`, and the interactive `bodega shell`. A refusal prints against the entry and lands in the shell's log pane like any other stage output. `bodega build sync` and `bodega repair` reach no fetcher and check nothing.
 - **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
-- **Interactive create** (`bodega pkg create`) — warns the operator and asks y/N to proceed. The only path that allows override, and the override writes a `policy_override` audit event.
+- **Interactive create** (`bodega pkg create`): refuses like import does. The y/N prompt it once asked is gone; the way past a refusal is a [two-person override](#bodega-override-requestapproverejectlist).
 
 Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`.
 
@@ -5973,6 +6195,35 @@ Enforcement needs the audit database, which is where the rules live. An install 
 ```
 
 The allow-list is stored in SQLite (`upstream_policies` table in the audit DB) and is hot-mutable — server changes are picked up within 30 seconds, and policy mutations invalidate the cache immediately.
+
+### Rolling out enforcement
+
+A dependency gate that refuses on its first day breaks builds that were working, and the usual way out is somebody approving every name by hand. This procedure goes from observing to enforcing without either: nothing that already runs is refused, and no name needs a person to approve it.
+
+1. **Point clients at bodega.** Run the [setup script](#setup-script) or `bodega doctor --configure` on each host, so every fetch passes through the gates and leaves an admission row. `bodega doctor` on a client reports a package manager still reading another source.
+2. **Choose each ecosystem's admission mode.** `bodega policy mode list` shows each one. For admission by criteria, `bodega policy mode set <ecosystem> open`: any name is admitted if each version passes the gates. Keep `listed` where you maintain an allow-list.
+3. **Import a baseline.** Catalog what the hosts already run and import it with the mark, on the bodega host:
+
+   ```bash
+   bodega pkg convert npm < installed.txt > baseline.json
+   bodega pkg import --baseline --merge baseline.json
+   ```
+
+   A baseline version that fails a gate is admitted with the finding recorded, so legacy code that already depends on a flagged package keeps building.
+
+4. **Switch the gates to report.** Set the actions you mean to enforce, then switch them to `warn` in one step:
+
+   ```bash
+   bodega policy age set npm 7d block
+   bodega policy osv set npm block
+   bodega policy enforce npm report
+   ```
+
+5. **Read the report for a week.** `bodega policy report --since 7d` lists what each gate flagged, which hosts asked, and what each check does once enforced. A `warn` whose `ON ENFORCE` is `block` is a build that enforcing would break. Fix those first: upgrade, or for a CVE with no fix request a [two-person override](#bodega-override-requestapproverejectlist) with an expiry.
+6. **Enforce.** `bodega policy enforce npm enforce` restores every saved action. Baseline versions stay admitted and listed as baseline debt.
+7. **Pay down the debt.** `bodega policy baseline clear npm --older-than 90d` removes old marks and reports what now fails, which the next re-vet acts on.
+
+`bodega policy enforce` leaves the OSV malware action blocking throughout, and the baseline mark does not admit a malware record or upstream provenance that fails to verify.
 
 ### Scenario: Bad version of libssl3
 
@@ -6411,20 +6662,20 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
 
-| Column          | Holds                                                                                                                                                                                                                                                                                                                            |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                 |
-| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                         |
-| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                 |
-| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                              |
-| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                        |
-| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, plus `override`; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran |
-| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy` and `name_similarity_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                   |
-| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                  |
-| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                        |
-| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                       |
+| Column          | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                                                                                                                                        |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                                                                                                                                |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                                                                                                                                             |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, plus `override` on a row the retired `pkg create` prompt decided; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran, and an `overridden` entry adds `override`, the override's id |
+| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy` and `name_similarity_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                                                                                                                                  |
+| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                       |
+| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
-In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block` or `not_evaluated`. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
+In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block`, `overridden`, `baseline` or `not_evaluated`. `overridden` means the check failed and an approved, unexpired [override](#bodega-override-requestapproverejectlist) admitted the version anyway. `baseline` means the check failed on a version imported with [`--baseline`](#--baseline), which admits it with the finding in the detail. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
 The decision is the manifest's. A version whose own checks all passed still records `policy_blocked` when a sibling version in the same manifest was refused, because nothing in that manifest was written.
 

@@ -137,7 +137,8 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// URL offline, which is why the old ordering held until pypi grew a
 	// resolver. The row is written below, once there is a resolved URL to put
 	// in it.
-	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true)
+	baseline := s.baselineLookup(ctx, regType, discoveryPkgName, s3Key, immutable)
+	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true, baseline)
 	if !ok {
 		if decision == audit.DecisionDenied && immutable {
 			s.recordFillRefusal(r, regType, policyCandidate, discoveryPkgName, s3Key)
@@ -149,7 +150,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	}
 	// Before the resolve and the fetch, so a refused version's bytes never
 	// leave upstream; the allow-list above has already ruled on the name.
-	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable)
+	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable, baseline)
 	if !ok {
 		return
 	}
@@ -734,9 +735,9 @@ func shortDigest(v string) string {
 // upstreamPolicyVerdict is the allow-list decision for one candidate, with no
 // response written and no discovery row. Decisions are:
 //
-//	no_policy : no rules configured for this type, so nothing was checked
+//	no_policy : the type is in open admission mode, so no rule was required
 //	allowed   : a rule matched
-//	denied    : a rule exists and none matched; the caller must refuse
+//	denied    : the type is in listed mode and no rule matched; the caller must refuse
 //
 // A non-nil error means the check itself could not run, which is a 500 rather
 // than a refusal — the caller decides. It is separate from
@@ -744,16 +745,16 @@ func shortDigest(v string) string {
 // to answer one request: recording a row per candidate would count one client
 // fetch as many, and the row is written once by the fetch that follows.
 func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandidate string) (string, bool, error) {
-	hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
-	if hasRulesErr != nil {
-		s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
+	listed, listedErr := s.policy.Listed(ctx, regType)
+	if listedErr != nil {
+		s.logger.Error("policy rules lookup failed", "error", listedErr)
 	}
 	err := s.policy.Check(ctx, regType, policyCandidate)
 	violation := err != nil && policy.IsViolation(err)
 	if err != nil && !violation {
 		return "", false, err
 	}
-	return classifyDecision(hasRules, violation), violation, nil
+	return classifyDecision(listed, violation), violation, nil
 }
 
 // enforceUpstreamPolicyRecording runs the allow-list check and writes the
@@ -780,7 +781,7 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 // after the gate has run, so it drives upstreamPolicyGate and
 // recordUpstreamAttempt directly.
 func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
-	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record)
+	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record, nil)
 	if !ok {
 		return false
 	}
@@ -801,7 +802,12 @@ func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.R
 // needed the URL first would let the denied name reach the index host.
 // A refusal records what it knows, which on that path is no URL at all; the
 // allowed case records once the resolver has produced one.
-func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) (string, bool) {
+//
+// A violation on a request baseline answers for is let through with decision
+// denied, which is the allow-list's verdict and what the discovery row should
+// say; versionPolicyGate records it on the admission row as baseline. nil
+// means no request on that route can carry the mark.
+func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool, baseline baselineLookup) (string, bool) {
 	if s.policy == nil || regType == "" || policyCandidate == "" {
 		return "", true
 	}
@@ -818,6 +824,13 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		s.logger.Error("policy check failed", "error", err)
 		http.Error(w, "policy check failed", http.StatusInternalServerError)
 		return "", false
+	}
+	if violation && baseline != nil {
+		if _, marked := baseline(); marked {
+			s.logger.Warn("upstream admitted past the allow-list as baseline", "type", regType,
+				"candidate", policyCandidate, "key", s3Key)
+			return decision, true
+		}
 	}
 	if violation {
 		if record {
@@ -905,7 +918,7 @@ func allowListVerdict(decision, candidate string) audit.AdmissionCheck {
 // Mutable resources (a packument, an index, a version list) are not admitted:
 // they are not artifacts, nothing pins them, and a row per refresh would bury
 // the decisions an attestation cites.
-func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, name, s3Key, decision string, immutable bool) (fillAdmission, bool) {
+func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, name, s3Key, decision string, immutable bool, baseline baselineLookup) (fillAdmission, bool) {
 	if s.auditDB == nil || !immutable {
 		return fillAdmission{}, true
 	}
@@ -918,8 +931,17 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		notRun = "not run: a " + fill.typ + " proxy fill names no version the age and OSV checks can evaluate"
 	}
 	ve := manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy}
+	if baseline != nil {
+		if stored, ok := baseline(); ok {
+			ve.Baseline, ve.BaselineAt = true, stored.BaselineAt
+		}
+	}
+	allow := allowListVerdict(decision, policyCandidate)
+	if c, ok := admit.BaselineCheck(ve, allow); ok {
+		allow = c
+	}
 	res := admit.Fetch(r.Context(), s.auditDB, checkers, fill.typ, fill.name, ve,
-		allowListVerdict(decision, policyCandidate), admit.Who{Identity: Identity(r)}, notRun)
+		allow, admit.Who{Identity: Identity(r)}, notRun)
 	for _, warn := range res.Warns {
 		s.logger.Warn("upstream fetch admitted with a policy warning", "type", fill.typ, "package", fill.name,
 			"version", fill.version, "check", warn.Check, "reason", warn.Reason)
@@ -934,6 +956,50 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
 	f.write(w, r)
 	return fill, false
+}
+
+// baselineLookup answers whether the stored manifest marks what a proxy
+// request fetches as baseline, with the marked entry. For an artifact that is
+// the requested version; for an index it is any version of the package, since
+// a host pinned to a baseline version reads the index before the artifact.
+type baselineLookup func() (manifest.VersionEntry, bool)
+
+// baselineLookup reads the mark from the store, never from the request, and
+// at most once: the allow-list and the version gates share the answer, so a
+// `policy baseline clear` landing between them cannot leave the allow-list
+// passing a version the admission row then records as refused. Only the
+// copied mark is used, not the stored entry, so nothing else an operator wrote
+// on it changes how the fill is evaluated.
+func (s *Server) baselineLookup(ctx context.Context, regType, name, s3Key string, immutable bool) baselineLookup {
+	var (
+		done   bool
+		entry  manifest.VersionEntry
+		marked bool
+	)
+	return func() (manifest.VersionEntry, bool) {
+		if done {
+			return entry, marked
+		}
+		done = true
+		fill := fillIdentity(regType, name, s3Key)
+		if fill.typ == "" || fill.name == "" || (immutable && fill.version == "") {
+			return entry, marked
+		}
+		pm, err := s.store.GetPackage(ctx, fill.typ, fill.name)
+		if err != nil || pm == nil {
+			return entry, marked
+		}
+		for _, ve := range pm.Versions {
+			if !ve.Baseline {
+				continue
+			}
+			if !immutable || ve.Version == fill.version || (ve.Version == "" && ve.Ref == fill.version) {
+				entry, marked = ve, true
+				break
+			}
+		}
+		return entry, marked
+	}
 }
 
 // recordFillPolicyEvent writes the policy_warn or policy_violation cache event

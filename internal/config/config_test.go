@@ -207,6 +207,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"revet_interval": "24h",
 		"revet_rate":     2.5,
 		"revet_on_block": "hide",
+		// Load parses the first and holds the second to 2 or more.
+		"override_max_ttl": "14d",
+		"override_quorum":  3,
 		// Load runs every instance through the source registry, so the
 		// filled value has to be one a registered type accepts. Numbers are
 		// float64 because that is what a JSON object decodes them to.
@@ -751,5 +754,41 @@ func TestResolveSpoolDirDefault(t *testing.T) {
 				t.Errorf("ResolveSpoolDir() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// The override keys default to the requester plus one other identity for at
+// most 30 days. A quorum of 1 is refused rather than honored, and a TTL Load
+// cannot parse fails the load instead of reading as the default.
+func TestOverrideKeys(t *testing.T) {
+	isolateConfig(t)
+	writeConfig(t, `{}`)
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ResolveOverrideQuorum() != 2 || cfg.ResolveOverrideMaxTTL() != 30*24*time.Hour {
+		t.Errorf("defaults = quorum %d, ttl %s", cfg.ResolveOverrideQuorum(), cfg.ResolveOverrideMaxTTL())
+	}
+
+	writeConfig(t, `{"override_max_ttl": "72h", "override_quorum": 3}`)
+	if cfg, err = config.Load("", "", "", "", false, false); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ResolveOverrideQuorum() != 3 || cfg.ResolveOverrideMaxTTL() != 72*time.Hour {
+		t.Errorf("set = quorum %d, ttl %s", cfg.ResolveOverrideQuorum(), cfg.ResolveOverrideMaxTTL())
+	}
+
+	for body, want := range map[string]string{
+		`{"override_quorum": 1}`:      "invalid override_quorum 1",
+		`{"override_quorum": -2}`:     "invalid override_quorum -2",
+		`{"override_max_ttl": "30"}`:  `override_max_ttl: invalid duration "30"`,
+		`{"override_max_ttl": "0d"}`:  `override_max_ttl: invalid duration "0d"`,
+		`{"override_max_ttl": "-1h"}`: `override_max_ttl: invalid duration "-1h"`,
+	} {
+		writeConfig(t, body)
+		if _, err := config.Load("", "", "", "", false, false); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: Load = %v, want %q", body, err, want)
+		}
 	}
 }

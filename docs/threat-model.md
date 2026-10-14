@@ -951,6 +951,82 @@ policy cannot delete versions; an auditor has to go looking for it. Rotating
 the key does not repair this. A verifier has to drop the stolen key ID, and from then
 on it rejects every statement that key signed, honest ones included.
 
+## Two-person overrides
+
+An override admits one version past one failed check once identities other
+than the requester approve it, until it expires (see
+[usage.md](usage.md#bodega-override-requestapproverejectlist)). It replaces a
+y/N prompt that let one operator at a terminal admit past the allow-list with
+a row indistinguishable from any other create. What it adds is that one
+identity cannot do it alone, that every request names a reason and an expiry,
+and that the request, every vote and the admission it changed are recorded:
+the `overrides` and `override_votes` tables, an `override` event per action,
+and an admission row whose check says `overridden` with the override's id.
+
+**An identity is only as strong as bodega's token issuance.** The quorum
+counts distinct identity strings and nothing behind them. On the API an
+identity is whatever name `bodega identity bind` gave a token, so whoever can
+run `bodega token generate` and `bodega identity bind` can mint a second
+identity and approve their own request with it, and so can anyone holding two
+bound tokens. On the CLI the identity is the OS user, or `SUDO_USER` under
+sudo, which the caller sets: anyone who can run `bodega override` against the
+audit database can vote under any name. There is no MFA claim to check, no
+signature over a vote, and no link between a token identity and a person. One
+person with a shell account and a differently named token counts as two.
+
+So the control is against one operator acting alone through the interfaces
+they were given, and against an exception nobody wrote down. It is not a
+control against the bodega host's administrators, who can also edit the audit
+database directly, and it is not a control against an attacker holding admin
+tokens. Keep token issuance and identity binding with fewer people than the
+quorum, bind each person their own token, and read `bodega audit events --type
+override` the way you read token creation.
+
+**Two verdicts are never overridden:** an OSV malware record and upstream
+provenance that fails to verify. Both say the bytes are hostile, and a vote
+does not change what the bytes are. Every other check, the allow-list
+included, can be overridden for one version at a time, so an approved override
+of `osv` admits a version with a known advisory exactly as written.
+
+An attestation of an overridden admission says `overridden` in that check's
+evaluation, with the override's id in its detail, and `bodega attest verify`
+passes it, because it is not a `block`. A consumer that refuses overridden
+admissions has to read the evaluations itself. Expiry is enforced by whatever
+admits or re-vets next: an expired override changes nothing already admitted
+until a re-vet runs, so without `revet_interval` an overridden version stays
+served after its override expires.
+
+## Baseline marks and report mode
+
+A version imported with `bodega pkg import --baseline` is admitted past any
+failing gate except an OSV malware record and upstream provenance that fails
+to verify, and an ecosystem switched to report mode with `bodega policy
+enforce` admits whatever its gates would have refused (see
+[usage.md](usage.md#rolling-out-enforcement)). Both are deliberate holes, sized
+to what hosts already run and to the time it takes to read a report.
+
+**The mark is set by the local CLI only.** It lives on the version entry in
+the manifest, where a build's fetch, a proxy fill and a re-vet read it, so every other write
+path drops a mark the store did not already hold: a bulk import or
+`POST /api/v1/packages` from a host token, `pkg edit`, and `pkg import`
+without the flag. `--baseline` with `--server` is refused, so a host cannot
+exempt its own catalog. Whoever can run `bodega pkg import` on the bodega host
+can baseline anything, which is the same person who can already write the
+manifest store and the policy tables directly. The TUI's entry editor writes
+the manifest without running admission and does not drop the mark either.
+
+**A proxy fill reads the mark from the store, never from the request.** In
+listed mode a package holding a marked version has its index served despite
+the allow-list, because a host pinned to that version reads the index first.
+The index still names the package's unmarked versions, and each of those is
+refused at the artifact, so the hole is the marked versions and nothing else.
+
+Report mode leaves the OSV malware action blocking and the allow-list as its
+admission mode says. Every switch is a `policy` audit event naming who made it,
+so a report mode nobody switched back is visible in the audit trail, and
+`bodega policy report` lists every ecosystem's flagged checks with what each
+does once enforced.
+
 ## Out-of-scope distribution formats
 
 Three properties make a distribution format incompatible with bodega's
@@ -1056,6 +1132,21 @@ instance, the recommended posture is:
   an account that cannot read `/etc/bodega/config.json` or `/var/lib/bodega`
   reads `SKIPPED` with the privilege it needs, rather than `N/A` beside the
   checks that genuinely passed.
+- **Run `bodega audit bypass` on a schedule** to detect a client routed
+  around bodega. It compares each host's installed packages, from the same
+  capture `bodega pkg convert` reads, with the `serve_fetch` rows bodega
+  wrote under that host's identity, and lists every version bodega never
+  served to anyone (`never_served`) or served only to other hosts
+  (`served_elsewhere`). `bodega audit bypass --all --inventory-dir <dir>`
+  covers a fleet, one line per host; pass `--exclude-image` with the base
+  image's inventory so the packages a host was built with are not findings.
+  Exit 2 is a bypass, exit 1 a run that could not answer. It is detection
+  after the fact, with the limits of [inventory
+  reconciliation](#host-inventory-reconciliation): the capture is the host's
+  own word, a match is on name and version, and a serve to a request no
+  identity binding resolved, or under a binding that has since changed, is
+  counted as unattributable rather than reported. Bind every host before
+  relying on it; an unbound host leaves only `never_served` as evidence.
 - **Declare the environment your ports clients build in** before serving
   distfiles from a stock tree; the empty declaration refuses all of them.
   Start from it, read the unplaced ports bodega logs, confirm each named value
@@ -1079,7 +1170,7 @@ set npm 7d block` turns the shipped `warn` into a refusal once you have
   clients: they are the install's own posture, and they take effect without a
   restart.
 
-On the bodega host itself, `doctor` adds three checks that read the audit
+On the bodega host itself, `doctor` adds four checks that read the audit
 database rather than the machine. They report `N/A` on a client host with no
 install, and `SKIPPED` where this account cannot read what they read:
 
@@ -1094,6 +1185,10 @@ install, and `SKIPPED` where this account cannot read what they read:
 - `policy-ecosystem`: a stored row whose gate cannot evaluate it, written
   before `policy set` learned to refuse one. It lists as active policy and is
   read by nothing.
+- `policy-mode`: the ecosystems in open admission mode because they have no
+  allow-list rules, not because anyone ran `policy mode set`. It reports OK and
+  names them: open is how a type without rules has always behaved, so it is a
+  decision to record rather than a defect.
 
 ## See also
 

@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -34,6 +36,12 @@ type AptRow struct {
 	// Empty when the capture did not ask for it, which is every capture taken
 	// from 'apt list --installed' and every one taken before bodega asked.
 	Source string
+	// InstalledAt is when dpkg last wrote the package's file list, from
+	// ${db-fsys:Last-Modified} (dpkg 1.19.3 and later) as a sixth column. Zero
+	// when the capture did not ask for it. It is not carried onto a manifest:
+	// a catalog entry merges several hosts, and one host's install time is
+	// not a fact about the version.
+	InstalledAt time.Time
 }
 
 // AptInventory is one host's installed apt packages and what was dropped
@@ -110,7 +118,7 @@ func ParseAptRows(r io.Reader) (AptInventory, error) {
 
 // parseDpkgQuery reads the tab-separated form:
 //
-//	name<TAB>version<TAB>arch<TAB>status[<TAB>source]
+//	name<TAB>version<TAB>arch<TAB>status[<TAB>source[<TAB>installed]]
 //
 // The source package is last on purpose. dpkg's own field order would put
 // ${source:Package} second, and that capture parses with no error and drops
@@ -138,6 +146,12 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		if len(f) > 4 {
 			source = strings.TrimSpace(f[4])
 		}
+		var installed time.Time
+		if len(f) > 5 {
+			if secs, err := strconv.ParseInt(strings.TrimSpace(f[5]), 10, 64); err == nil && secs > 0 {
+				installed = time.Unix(secs, 0).UTC()
+			}
+		}
 		if status != dpkgInstalled {
 			skipped++
 			continue
@@ -145,7 +159,7 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		if name == "" || version == "" {
 			continue
 		}
-		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch, Source: source})
+		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch, Source: source, InstalledAt: installed})
 	}
 	if err := sc.Err(); err != nil {
 		return AptInventory{}, fmt.Errorf("scan dpkg-query output: %w", err)

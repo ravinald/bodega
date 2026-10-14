@@ -26,6 +26,7 @@ type fakePosture struct {
 	ages  []audit.AgePolicy
 	osvs  []audit.OSVPolicy
 	provs []audit.ProvenancePolicy
+	modes []audit.AdmissionMode
 	toks  []audit.TokenInfo
 }
 
@@ -36,6 +37,9 @@ func (f fakePosture) ListAgePolicies(context.Context) ([]audit.AgePolicy, error)
 func (f fakePosture) ListOSVPolicies(context.Context) ([]audit.OSVPolicy, error) { return f.osvs, nil }
 func (f fakePosture) ListProvenancePolicies(context.Context) ([]audit.ProvenancePolicy, error) {
 	return f.provs, nil
+}
+func (f fakePosture) ListAdmissionModes(context.Context) ([]audit.AdmissionMode, error) {
+	return f.modes, nil
 }
 func (f fakePosture) ListTokens(context.Context) ([]audit.TokenInfo, error) { return f.toks, nil }
 

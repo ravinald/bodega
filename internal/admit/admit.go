@@ -121,7 +121,7 @@ func AdmitAs(
 	pm *manifest.PackageManifest,
 	who Who,
 ) Result {
-	ev := newEvaluation(ctx, adb, pm)
+	ev := newEvaluation(ctx, adb, pm, time.Now())
 	res := Result{Decision: Admitted}
 
 	if err := validate(cfg, pm, &res); err != nil {
@@ -129,7 +129,7 @@ func AdmitAs(
 		res = Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
 		return ev.record(ctx, adb, pm, res, who)
 	}
-	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev, nil); blocked != nil {
+	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev); blocked != nil {
 		blocked.Warnings = res.Warnings
 		return ev.record(ctx, adb, pm, *blocked, who)
 	}
@@ -140,22 +140,15 @@ func AdmitAs(
 	return ev.record(ctx, adb, pm, res, who)
 }
 
-// Confirm asks an operator whether to admit a version the allow-list refused.
-// It returns true to proceed; an error is a failure to ask, not a no.
-type Confirm func(version, candidate string) (bool, error)
-
 // Create runs the policy checks `bodega pkg create` answers to: the
-// allow-list, with confirm asked on a refusal, and the per-version checks.
+// allow-list and the per-version checks.
 //
 // The structural checks Admit starts with are left out. create assembles an
 // entry from prompts and completes some of them after it is stored: an apt
 // entry named by package resolves its concrete version afterwards, and
 // validate refuses an apt entry with no version. What create shares with
-// every other surface is the policy, so that is what runs here.
-//
-// An override is recorded as its own check beside the allow-list's block,
-// attributed to who.Actor, so the row says the rule refused and who overrode
-// it rather than recording a pass.
+// every other surface is the policy, so that is what runs here, overrides
+// included.
 func Create(
 	ctx context.Context,
 	checker *policy.Checker,
@@ -163,11 +156,10 @@ func Create(
 	cfg *config.Config,
 	pm *manifest.PackageManifest,
 	who Who,
-	confirm Confirm,
 ) Result {
-	ev := newEvaluation(ctx, adb, pm)
+	ev := newEvaluation(ctx, adb, pm, time.Now())
 	res := Result{Decision: Admitted}
-	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev, confirm); blocked != nil {
+	if blocked := checkAllowList(ctx, checker, adb, pm, who.Actor, ev); blocked != nil {
 		return ev.record(ctx, adb, pm, *blocked, who)
 	}
 	if blocked := checkVersions(ctx, adb, pm, who.Actor, audit.EventCreate, &res, VersionCheckers(cfg, adb), ev); blocked != nil {
@@ -199,7 +191,9 @@ type FetchResult struct {
 // The builder and the proxy each run the allow-list themselves, because each
 // answers a refusal in its own way (a failed entry in a build summary, a 403
 // with a discovery row) and has already spent the lookup by the time it gets
-// here. allow is what that gate concluded, rendered by AllowListCheck.
+// here. allow is what that gate concluded, rendered by AllowListCheck, and an
+// override never turns it: the caller has already answered the refusal. The
+// per-version checks take overrides as every other admission does.
 // An allow refused records age and OSV as not evaluated and the decision as
 // policy_blocked, so a refusal leaves a row like a pass does. checkers nil
 // records them as not evaluated with notRunDetail as the reason: the proxy
@@ -218,7 +212,7 @@ func Fetch(
 		return FetchResult{}
 	}
 	pm := &manifest.PackageManifest{Type: typ, Name: name, Versions: []manifest.VersionEntry{ve}}
-	ev := newEvaluation(ctx, adb, pm)
+	ev := newEvaluation(ctx, adb, pm, time.Now())
 	ev.set(0, allow)
 	var out FetchResult
 	decision := audit.AdmissionAdmitted
@@ -270,12 +264,13 @@ func replaceResults(results, changed []policy.Result) []policy.Result {
 }
 
 // AllowListCheck renders an allow-list verdict as an admission check.
-// hasRules says whether the type has any rules, which is what decides between
-// "block" and "none" as the action; candidate is what was checked, empty when
-// the entry names nothing the allow-list can rule on; err is Check's answer.
-func AllowListCheck(hasRules bool, candidate string, err error) audit.AdmissionCheck {
+// listed says whether the type is in listed mode, which is what decides
+// between "block" and "none" as the action; candidate is what was checked,
+// empty when the entry names nothing the allow-list can rule on; err is
+// Check's answer.
+func AllowListCheck(listed bool, candidate string, err error) audit.AdmissionCheck {
 	c := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckPass}
-	if hasRules {
+	if listed {
 		c.Action = policy.ActionBlock
 	}
 	switch {
@@ -285,10 +280,10 @@ func AllowListCheck(hasRules bool, candidate string, err error) audit.AdmissionC
 	case candidate == "":
 		c.Status = audit.CheckNotEvaluated
 		c.Detail = "the entry names no upstream the allow-list can rule on"
-	case hasRules:
+	case listed:
 		c.Detail = "matched: " + candidate
 	default:
-		c.Detail = "no allow-list rules for this type: " + candidate
+		c.Detail = "open admission mode, no allow-list rule required: " + candidate
 	}
 	return c
 }
@@ -391,24 +386,30 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 // checkAllowList runs the URL-level allow-list over every version. It is
 // cheap and fails fast, so it runs before the checks that reach the network.
 // It returns nil when every version passes. A version after the one refused
-// is never reached, and its row says so.
-//
-// confirm, when set, is asked about a refusal; a yes lets the manifest
-// through with the override recorded as its own check.
-func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string, ev *evaluation, confirm Confirm) *Result {
+// is never reached, and its row says so. A refusal an active override names
+// is recorded overridden, and one on a baseline version is recorded baseline;
+// either way the version goes on to the version checks.
+func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string, ev *evaluation) *Result {
 	if checker == nil {
 		ev.notRunChecks(-1, "not run: no allow-list loaded", audit.CheckAllowList)
 		return nil
 	}
-	hasRules, _ := checker.HasRules(ctx, pm.Type)
+	listed, _ := checker.Listed(ctx, pm.Type)
 	for i, ve := range pm.Versions {
 		candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
 		if candidate == "" {
-			ev.set(i, AllowListCheck(hasRules, "", nil))
+			ev.set(i, AllowListCheck(listed, "", nil))
 			continue
 		}
 		err := checker.Check(ctx, pm.Type, candidate)
-		ev.set(i, AllowListCheck(hasRules, candidate, err))
+		check := AllowListCheck(listed, candidate, err)
+		if policy.IsViolation(err) {
+			if c, ok := ev.admitPast(pm, i, check); ok {
+				ev.set(i, c)
+				continue
+			}
+		}
+		ev.set(i, check)
 		if err == nil {
 			continue
 		}
@@ -424,30 +425,9 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 				Details:    fmt.Sprintf("candidate=%s incident=%s", candidate, incident),
 			})
 		}
-		blocked := func(reason string) *Result {
-			return &Result{Decision: PolicyBlocked, Reason: reason,
-				Check: "allow-list", Version: ve.Version, Incident: incident}
-		}
-		if confirm != nil && policy.IsViolation(err) {
-			ok, cerr := confirm(admissionVersion(ve), candidate)
-			if cerr != nil {
-				ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckNotEvaluated,
-					Detail: "the prompt could not be read: " + cerr.Error()})
-				ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
-				return blocked(cerr.Error())
-			}
-			if ok {
-				ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckPass,
-					Detail: fmt.Sprintf("%s answered y to proceed past the allow-list refusal of %s", actor, candidate)})
-				continue
-			}
-			ev.add(i, audit.AdmissionCheck{Check: audit.CheckOverride, Action: "confirm", Status: audit.CheckBlock,
-				Detail: fmt.Sprintf("%s declined to proceed past the allow-list refusal of %s", actor, candidate)})
-			ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
-			return blocked("aborted: upstream violates policy")
-		}
 		ev.notRunAfter(i, "not run: the allow-list refused "+admissionVersion(ve))
-		return blocked(err.Error())
+		return &Result{Decision: PolicyBlocked, Reason: err.Error(),
+			Check: "allow-list", Version: ve.Version, Incident: incident}
 	}
 	return nil
 }

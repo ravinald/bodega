@@ -702,7 +702,7 @@ func isZeroJSON(raw json.RawMessage) bool {
 // postureChecks names the server-posture rows in the order doctor prints them.
 // The set is fixed so the table has the same shape on a host with an install
 // and one without, which is what lets a pipeline diff the output.
-var postureChecks = []string{"policy-coverage", "policy-ignored", "policy-ecosystem", "token-scope"}
+var postureChecks = []string{"policy-coverage", "policy-ignored", "policy-ecosystem", "policy-mode", "token-scope"}
 
 // postureStore is the read surface the posture checks need. An interface so
 // they can be driven against a store built by hand, without a config file or
@@ -712,6 +712,7 @@ type postureStore interface {
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
 	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
+	ListAdmissionModes(ctx context.Context) ([]audit.AdmissionMode, error)
 	ListTokens(ctx context.Context) ([]audit.TokenInfo, error)
 }
 
@@ -806,10 +807,15 @@ func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 	if err != nil && !strings.Contains(err.Error(), "no such table") {
 		return postureSkipped("read upstream provenance policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
+	modes, err := store.ListAdmissionModes(ctx)
+	if err != nil && !strings.Contains(err.Error(), "no such table") {
+		return postureSkipped("read admission modes: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
+	}
 	findings := []host.Finding{
 		policyCoverage(rules, ages, osvs, provs),
 		policyIgnored(ages, osvs, provs),
 		policyEcosystem(ages, osvs),
+		policyMode(rules, modes),
 	}
 	tokens, err := store.ListTokens(ctx)
 	if err != nil {
@@ -848,6 +854,46 @@ func tokenScope(tokens []audit.TokenInfo, now time.Time) []host.Finding {
 			Detail: "no token holds read, write and admin unrestricted"})
 	}
 	return out
+}
+
+// policyMode names the ecosystems in open admission mode because they have no
+// allow-list rules and nobody set a mode: admission by criteria that nobody
+// chose. It is OK rather than WARN, since open is how every ecosystem without
+// rules has always behaved and turning it into a finding would change the
+// exit status of every install that runs doctor in CI. The row is where an
+// operator learns which open ecosystems were decided and which were not.
+func policyMode(rules []audit.PolicyInfo, modes []audit.AdmissionMode) host.Finding {
+	f := host.Finding{Check: "policy-mode", Status: host.StatusOK}
+	hasRules := map[string]bool{}
+	for _, r := range rules {
+		hasRules[r.RegistryType] = true
+	}
+	set := map[string]string{}
+	for _, m := range modes {
+		set[m.Ecosystem] = m.Mode
+	}
+	var byDefault, chosen []string
+	for _, eco := range manifest.AllTypes {
+		switch {
+		case set[eco] == audit.ModeOpen:
+			chosen = append(chosen, eco)
+		case set[eco] == "" && !hasRules[eco]:
+			byDefault = append(byDefault, eco)
+		}
+	}
+	if len(byDefault) == 0 {
+		f.Detail = "every open ecosystem was set open with `bodega policy mode set`"
+		if len(chosen) == 0 {
+			f.Detail = "no ecosystem is in open admission mode"
+		}
+		return f
+	}
+	f.Detail = "open because it has no allow-list rules, not because a mode was set: " + strings.Join(byDefault, ", ")
+	if len(chosen) > 0 {
+		f.Detail += "; set open: " + strings.Join(chosen, ", ")
+	}
+	f.Remediation = "bodega policy mode set " + byDefault[0] + " open to record the choice, or listed to admit only allow-listed names"
+	return f
 }
 
 // gateRow is a policy table flattened to what the posture checks read. Both

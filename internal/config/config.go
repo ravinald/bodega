@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,6 +171,12 @@ type Config struct {
 	RevetRate          float64 `json:"revet_rate,omitempty"`
 	RevetOnBlock       string  `json:"revet_on_block,omitempty"`
 	RevetWebhookSecret string  `json:"revet_webhook_secret,omitempty"`
+
+	// Overrides. override_max_ttl caps the --expires an override request may
+	// ask for (default 30d); override_quorum is how many distinct identities,
+	// the requester included, must agree before one applies (default 2).
+	OverrideMaxTTL string `json:"override_max_ttl,omitempty"`
+	OverrideQuorum int    `json:"override_quorum,omitempty"`
 
 	// Proxy spool. spool_dir is where an upstream artifact is copied on its
 	// way to storage and the client; see ResolveSpoolDir for the default. The
@@ -842,6 +849,51 @@ func (c *Config) ResolveRevetOnBlock() string {
 	return c.RevetOnBlock
 }
 
+// Defaults for the override keys.
+const (
+	DefaultOverrideMaxTTL = 30 * 24 * time.Hour
+	DefaultOverrideQuorum = 2
+)
+
+// ResolveOverrideMaxTTL returns override_max_ttl, defaulting to 30 days. Load
+// has already refused an unparseable value.
+func (c *Config) ResolveOverrideMaxTTL() time.Duration {
+	if c == nil || c.OverrideMaxTTL == "" {
+		return DefaultOverrideMaxTTL
+	}
+	d, err := ParseTTL(c.OverrideMaxTTL)
+	if err != nil {
+		return DefaultOverrideMaxTTL
+	}
+	return d
+}
+
+// ResolveOverrideQuorum returns override_quorum, defaulting to 2.
+func (c *Config) ResolveOverrideQuorum() int {
+	if c == nil || c.OverrideQuorum == 0 {
+		return DefaultOverrideQuorum
+	}
+	return c.OverrideQuorum
+}
+
+// ParseTTL reads a positive Go duration, or a whole number of days written
+// <N>d, which is how an expiry is usually said and which time.ParseDuration
+// does not accept.
+func ParseTTL(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		days, err := strconv.Atoi(n)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("invalid duration %q (want e.g. \"7d\" or \"72h\")", s)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid duration %q (want e.g. \"7d\" or \"72h\")", s)
+	}
+	return d, nil
+}
+
 // spoolCeiling resolves one of the two spool byte ceilings against the file
 // that was actually read. An absent key takes the built-in default; a key
 // written as 0 is an operator turning the ceiling off, and json.Unmarshal
@@ -980,6 +1032,17 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	case "", RevetReport, RevetHide:
 	default:
 		return nil, fmt.Errorf("invalid revet_on_block %q (want %q or %q)", cfg.RevetOnBlock, RevetReport, RevetHide)
+	}
+
+	// A quorum of one is the single-operator override this setting exists
+	// to replace, so it is refused rather than honored.
+	if cfg.OverrideMaxTTL != "" {
+		if _, err := ParseTTL(cfg.OverrideMaxTTL); err != nil {
+			return nil, fmt.Errorf("override_max_ttl: %w", err)
+		}
+	}
+	if cfg.OverrideQuorum != 0 && cfg.OverrideQuorum < 2 {
+		return nil, fmt.Errorf("invalid override_quorum %d (want 2 or more: the requester plus at least one other identity)", cfg.OverrideQuorum)
 	}
 
 	// Discover mode: "" or "observe" — typo'd values fail loudly so operators

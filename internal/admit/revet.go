@@ -297,8 +297,11 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	// store serves from.
 	cp := *pm
 	cp.Versions = []manifest.VersionEntry{ve}
-	ev := newEvaluation(ctx, r.DB, &cp)
+	ev := newEvaluation(ctx, r.DB, &cp, r.now())
 	allow := r.allowList(ctx, &out, &cp, cataloged, prev)
+	if c, ok := ev.admitPast(&cp, 0, allow); ok {
+		allow = c
+	}
 	ev.set(0, allow)
 	ev.set(0, carriedAge(prev, ev.actions[audit.CheckAge]))
 
@@ -406,7 +409,7 @@ func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifes
 		return audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckNotEvaluated,
 			Detail: "not run: no allow-list loaded"}
 	}
-	hasRules, _ := r.Allow.HasRules(ctx, pm.Type)
+	listed, _ := r.Allow.Listed(ctx, pm.Type)
 	ve := pm.Versions[0]
 	candidates := []string{policy.CandidateFor(pm.Type, pm.Name, ve.URL)}
 	if candidates[0] == "" && !policy.KeysByName(pm.Type) {
@@ -417,11 +420,11 @@ func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifes
 		}
 	}
 	if len(candidates) == 0 || candidates[0] == "" {
-		return AllowListCheck(hasRules, "", nil)
+		return AllowListCheck(listed, "", nil)
 	}
 	var check audit.AdmissionCheck
 	for i, c := range candidates {
-		got := AllowListCheck(hasRules, c, r.Allow.Check(ctx, pm.Type, c))
+		got := AllowListCheck(listed, c, r.Allow.Check(ctx, pm.Type, c))
 		if i == 0 || got.Status == audit.CheckBlock {
 			check = got
 		}
@@ -551,6 +554,9 @@ func (r *Revetter) record(ctx context.Context, out *RevetOutcome, ev *evaluation
 	}
 	if ev.digestErr != nil {
 		out.Notes = append(out.Notes, "recorded with no policy digest: "+ev.digestErr.Error())
+	}
+	if ev.overrideErr != nil {
+		out.Notes = append(out.Notes, "overrides not read, so none applied: "+ev.overrideErr.Error())
 	}
 	now := r.now().UTC()
 	rows := make([]audit.Admission, 0, len(keys))

@@ -1197,6 +1197,166 @@ paths:
         "503":
           description: Audit database not configured
 
+  /api/v1/overrides:
+    get:
+      summary: List two-person overrides
+      description: |
+        Every override, newest request first, each with its votes and its
+        status as of the request. Restricted to IPs in `admin_permit_cidr`,
+        and like every override route it requires a token bound to an
+        identity (`bodega identity bind token`), even on a server whose
+        mutation gate takes no token.
+      operationId: listOverrides
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, active, expired, rejected]
+          description: Keep only overrides with this status
+      responses:
+        "200":
+          description: Overrides
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Override"
+        "400":
+          description: Unknown status
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: Client IP is not in admin_permit_cidr, or the token is scoped to inventory
+        "503":
+          description: Audit database not configured
+    post:
+      summary: Request an override for one check on one version
+      description: |
+        Records a pending override requested by the token's identity. It
+        applies only once `override_quorum` distinct identities, the
+        requester included, have approved it, and only until it expires.
+        `expires` is required and at most `override_max_ttl`.
+      operationId: requestOverride
+      tags: [status]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, version, check, reason, expires]
+              properties:
+                type:
+                  type: string
+                name:
+                  type: string
+                version:
+                  type: string
+                check:
+                  type: string
+                  enum: [allowlist, age, osv, upstream_provenance, name_similarity]
+                reason:
+                  type: string
+                expires:
+                  type: string
+                  description: A duration from now, such as `7d` or `72h`
+      responses:
+        "201":
+          description: Override requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Override"
+        "400":
+          description: A field is missing or invalid, or the expiry is past override_max_ttl
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: Client IP is not permitted, or the token is scoped to inventory
+        "503":
+          description: Audit database not configured
+
+  /api/v1/overrides/{id}/approve:
+    post:
+      summary: Approve an override
+      description: |
+        Records the token identity's approval. The requester's own approval is
+        refused, and one identity votes once.
+      operationId: approveOverride
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/OverrideID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OverrideVoteRequest"
+      responses:
+        "200":
+          description: Vote recorded; the override as it now stands
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Override"
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: The caller requested this override, or the token is scoped to inventory
+        "404":
+          description: No override with that id
+        "409":
+          description: Already voted, already approved, rejected or expired
+        "503":
+          description: Audit database not configured
+
+  /api/v1/overrides/{id}/reject:
+    post:
+      summary: Reject an override
+      description: |
+        Records the token identity's rejection, which cancels the override for
+        good whether it was pending or approved. The requester may reject
+        their own request.
+      operationId: rejectOverride
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/OverrideID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OverrideVoteRequest"
+      responses:
+        "200":
+          description: Vote recorded; the override as it now stands
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Override"
+        "401":
+          description: No token, or a token bound to no identity
+        "403":
+          description: The token is scoped to inventory
+        "404":
+          description: No override with that id
+        "409":
+          description: Already voted, rejected or expired
+        "503":
+          description: Audit database not configured
+
   /api/v1/tokens/{id}:
     delete:
       summary: Revoke a token
@@ -1280,6 +1440,13 @@ components:
         POST and DELETE when the server accepts connections from non-localhost IPs.
 
   parameters:
+    OverrideID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: The override's id, as `bodega override list` prints it
     PackageType:
       name: type
       in: path
@@ -1432,6 +1599,72 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
+
+    Override:
+      type: object
+      description: |
+        A request to admit one version past one check's failure. Identities
+        are compared as plain strings: the CLI records the operator, the API
+        the identity a token is bound to.
+      properties:
+        id:
+          type: string
+        pkg_type:
+          type: string
+        pkg_name:
+          type: string
+        pkg_version:
+          type: string
+        check:
+          type: string
+        reason:
+          type: string
+        requested_by:
+          type: string
+        requested_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        quorum:
+          type: integer
+          description: Distinct identities, the requester included, that must approve
+        state:
+          type: string
+          enum: [pending, approved, rejected]
+          description: The stored state. Expiry is not a state; see status.
+        decided_at:
+          type: string
+          format: date-time
+        votes:
+          type: array
+          items:
+            $ref: "#/components/schemas/OverrideVote"
+        status:
+          type: string
+          enum: [pending, active, expired, rejected]
+          description: What the override amounts to when the response was written
+
+    OverrideVote:
+      type: object
+      properties:
+        identity:
+          type: string
+        vote:
+          type: string
+          enum: [approve, reject]
+        comment:
+          type: string
+        voted_at:
+          type: string
+          format: date-time
+
+    OverrideVoteRequest:
+      type: object
+      properties:
+        comment:
+          type: string
 
     PolicyRule:
       type: object
@@ -1690,6 +1923,16 @@ components:
           type: boolean
         frozen:
           type: boolean
+        baseline:
+          type: boolean
+          description: >-
+            Imported with `bodega pkg import --baseline`. A gate that fails on
+            a baseline version records the finding and admits it. Only that
+            import sets it; every other write drops it.
+        baseline_at:
+          type: string
+          format: date-time
+          description: When the baseline import marked this version.
         description:
           type: string
         metadata:

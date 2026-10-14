@@ -988,6 +988,13 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
 
+	// Two-person overrides. Every route requires a token bound to an
+	// identity, which is what the quorum counts; see overrideCaller.
+	m.HandleFunc("GET /api/v1/overrides", s.handleListOverrides)
+	m.HandleFunc("POST /api/v1/overrides", s.handleRequestOverride)
+	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)
+	m.HandleFunc("POST /api/v1/overrides/{id}/reject", s.handleRejectOverride)
+
 	// Threat-feed re-vet: exempt from the admin gate, authenticated by an
 	// HMAC over the body (see selfAuthenticated).
 	m.HandleFunc("POST "+RevetWebhookPath, s.handleRevetWebhook)
@@ -1414,8 +1421,9 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	// An HTTP caller is not the process owner, so the audit rows this writes
 	// carry no actor rather than the server's; the admission rows carry the
 	// identity the request resolved to instead.
+	dropped := admit.CarryBaseline(&pm, nil)
 	res := admit.AdmitAs(ctx, s.policy, s.auditDB, s.cfg, &pm, admit.Who{Identity: Identity(r)})
-	for _, warning := range res.Warnings {
+	for _, warning := range append(baselineDropped(dropped), res.Warnings...) {
 		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
 	}
 	switch res.Decision {
