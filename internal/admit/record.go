@@ -3,7 +3,9 @@ package admit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -19,17 +21,22 @@ var versionChecks = []string{audit.CheckAge, audit.CheckOSV, audit.CheckUpstream
 var allChecks = append([]string{audit.CheckAllowList}, versionChecks...)
 
 // evaluation accumulates the per-check verdicts of one admission, one list
-// per version, and turns them into the rows it writes. The policy digest and
-// the configured actions are read once, before any check runs, so every row
-// of one decision cites the policy that decision started under.
+// per version, and turns them into the rows it writes. The policy digest, the
+// configured actions and the overrides in effect are read once, before any
+// check runs, so every row of one decision cites the policy that decision
+// started under.
 type evaluation struct {
 	checks    [][]audit.AdmissionCheck
 	digest    string
 	digestErr error
 	actions   map[string]string
+	// overrides are the active overrides for the package, keyed by version
+	// and check; see loadOverrides.
+	overrides   map[string]audit.Override
+	overrideErr error
 }
 
-func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest) *evaluation {
+func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, now time.Time) *evaluation {
 	ev := &evaluation{
 		checks: make([][]audit.AdmissionCheck, max(len(pm.Versions), 1)),
 		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone,
@@ -49,6 +56,7 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		ev.actions[audit.CheckNameSimilarity] = "unknown"
 	}
 	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
+	ev.loadOverrides(ctx, adb, pm, now)
 	if p, err := adb.GetAgePolicy(ctx, pm.Type); err == nil {
 		ev.actions[audit.CheckAge] = p.Action
 	} else if !errors.Is(err, audit.ErrAgePolicyNotFound) {
@@ -67,13 +75,6 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 func (ev *evaluation) set(i int, c audit.AdmissionCheck) {
 	for _, j := range ev.indexes(i) {
 		ev.checks[j] = upsertCheck(ev.checks[j], c, false)
-	}
-}
-
-// add records c for version i beside whatever is there.
-func (ev *evaluation) add(i int, c audit.AdmissionCheck) {
-	for _, j := range ev.indexes(i) {
-		ev.checks[j] = append(ev.checks[j], c)
 	}
 }
 
@@ -115,15 +116,15 @@ func (ev *evaluation) notRunCheck(name, detail string) audit.AdmissionCheck {
 func (ev *evaluation) runVersion(ctx context.Context, pm *manifest.PackageManifest, i int, checkers []policy.VersionChecker) []policy.Result {
 	results := make([]policy.Result, 0, len(checkers))
 	for _, c := range checkers {
-		r := c.Check(ctx, pm, &pm.Versions[i])
-		results = append(results, r)
-		ev.setResult(i, r)
+		results = append(results, ev.setResult(pm, i, c.Check(ctx, pm, &pm.Versions[i])))
 	}
 	return results
 }
 
-// setResult records r as version i's verdict for its check.
-func (ev *evaluation) setResult(i int, r policy.Result) {
+// setResult records r as version i's verdict for its check, and returns the
+// verdict the caller decides on: r, or a pass when an active override
+// admitted past r's block.
+func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Result) policy.Result {
 	status := audit.CheckPass
 	switch r.Action {
 	case policy.ActionWarn:
@@ -137,7 +138,19 @@ func (ev *evaluation) setResult(i int, r policy.Result) {
 	if action == "" {
 		action = audit.ActionNone
 	}
-	ev.set(i, audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance})
+	c := audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance}
+	if status == audit.CheckBlock {
+		if why := notOverridable(r); why == "" {
+			if oc, ok := ev.overrideCheck(pm, i, c); ok {
+				ev.set(i, oc)
+				return policy.Result{Check: r.Check, Action: policy.ActionPass, Provenance: r.Provenance}
+			}
+		} else if o, ok := ev.overrideFor(pm, i, r.Check); ok {
+			c.Detail += fmt.Sprintf("; override %s does not apply: %s", o.ID, why)
+		}
+	}
+	ev.set(i, c)
+	return r
 }
 
 // committer is a checker that holds a write back until the admission it
@@ -164,8 +177,7 @@ func (ev *evaluation) commit(ctx context.Context, pm *manifest.PackageManifest, 
 				if out == nil {
 					out = make([][]policy.Result, len(pm.Versions))
 				}
-				out[i] = append(out[i], r)
-				ev.setResult(i, r)
+				out[i] = append(out[i], ev.setResult(pm, i, r))
 			}
 		}
 	}
@@ -215,6 +227,9 @@ func (ev *evaluation) record(ctx context.Context, adb *audit.DB, pm *manifest.Pa
 	}
 	if ev.digestErr != nil {
 		res.Warnings = append(res.Warnings, "admission recorded with no policy digest: "+ev.digestErr.Error())
+	}
+	if ev.overrideErr != nil {
+		res.Warnings = append(res.Warnings, "overrides not read, so none applied: "+ev.overrideErr.Error())
 	}
 	for i := range ev.checks {
 		row := ev.row(pm, i, res.Decision.String(), who)

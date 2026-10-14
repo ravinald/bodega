@@ -105,6 +105,9 @@ const (
 	EventDenied EventType = "denied"
 )
 
+// EventOverride is an override requested, approved or rejected.
+const EventOverride EventType = "override"
+
 // Status values for EventCache. They name the proxy outcome, so an operator
 // asking which artifacts came from upstream can tell that from an artifact the
 // cache answered and from the two refusals that write the same type.

@@ -2,7 +2,6 @@ package admit
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -190,60 +189,6 @@ func TestAdmitRecordsAllowListAndInvalidRefusals(t *testing.T) {
 	}
 	if res.Admissions[0].Decision != audit.AdmissionInvalid || res.Admissions[0].Evaluated() {
 		t.Errorf("invalid row = %+v, want decision invalid and nothing evaluated", res.Admissions[0])
-	}
-}
-
-// TestCreateRecordsTheOverride is the pkg create case: the allow-list's block
-// stays on the row and the operator's answer is its own check, attributed.
-func TestCreateRecordsTheOverride(t *testing.T) {
-	for _, tc := range []struct {
-		answer   bool
-		err      error
-		decision string
-		override string
-	}{
-		{true, nil, audit.AdmissionAdmitted, audit.CheckPass},
-		{false, nil, audit.AdmissionPolicyBlocked, audit.CheckBlock},
-		{false, errors.New("EOF"), audit.AdmissionPolicyBlocked, audit.CheckNotEvaluated},
-	} {
-		f := newAdmissionFixture(t)
-		if err := f.adb.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "r1", RegistryType: manifest.TypeNpm, RuleKind: policy.KindPackage, Pattern: "lodash"}); err != nil {
-			t.Fatalf("InsertPolicy: %v", err)
-		}
-		asked := 0
-		confirm := func(version, candidate string) (bool, error) {
-			asked++
-			if version != "1.2.8" || candidate != "minimist" {
-				t.Errorf("confirm asked about %s/%s", version, candidate)
-			}
-			return tc.answer, tc.err
-		}
-		res := Create(t.Context(), policy.NewChecker(f.adb), f.adb, f.synced, minimist("1.2.8"), Who{Actor: "ravi"}, confirm)
-		if asked != 1 {
-			t.Fatalf("confirm asked %d times, want 1", asked)
-		}
-		rows := f.rows(t, "minimist")
-		if len(rows) != 1 {
-			t.Fatalf("want one row, got %d", len(rows))
-		}
-		r := rows[0]
-		if r.Decision != tc.decision || res.OK() != (tc.decision == audit.AdmissionAdmitted) {
-			t.Errorf("answer %v: decision %q (OK=%v), want %q", tc.answer, r.Decision, res.OK(), tc.decision)
-		}
-		if al := checkOf(t, r, audit.CheckAllowList); al.Status != audit.CheckBlock {
-			t.Errorf("answer %v: allowlist = %+v, want the block kept", tc.answer, al)
-		}
-		if ov := checkOf(t, r, audit.CheckOverride); ov.Status != tc.override {
-			t.Errorf("answer %v: override = %+v, want %s", tc.answer, ov, tc.override)
-		}
-		if r.Actor != "ravi" || r.PolicyDigest != f.digest(t) {
-			t.Errorf("answer %v: actor %q digest %q", tc.answer, r.Actor, r.PolicyDigest)
-		}
-		if tc.answer {
-			if osv := checkOf(t, r, audit.CheckOSV); osv.Status != audit.CheckPass {
-				t.Errorf("an override skipped the OSV check: %+v", osv)
-			}
-		}
 	}
 }
 
