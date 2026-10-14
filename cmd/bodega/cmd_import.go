@@ -69,7 +69,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 			// exactly what this flag exists to avoid.
 			if target := cfg.ResolveServerURL(serverURL); target != "" {
 				suppressReload(cmd)
-				return importToServer(target, cfg.ResolveToken(), allowPlaintext, merge, origin, args)
+				return importToServer(target, cfg.ResolveTokenFor(target), allowPlaintext, merge, origin, args)
 			}
 
 			if err := ensureMutable(cfg); err != nil {

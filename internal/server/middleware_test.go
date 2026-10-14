@@ -661,7 +661,7 @@ func TestMutationAuthDELETEAlsoGated(t *testing.T) {
 // otherwise land. Before read-path identity the only Authorization headers
 // reaching this server were operator mutations; now every package GET can
 // carry one and `bodega doctor --write-credentials` writes one onto eight
-// client hosts. The tokens are unscoped, so a token in a log file is a write
+// client hosts. A token holding write or admin in a log file is a write
 // credential wherever admin_permit_cidr reaches past loopback.
 //
 // The header name has to survive: "did this client send a credential" is the

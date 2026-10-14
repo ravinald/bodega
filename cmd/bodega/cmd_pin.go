@@ -195,7 +195,7 @@ func pinClient(cfg *config.Config, flagURL string, allowPlaintext bool) (*Client
 	if err != nil {
 		return nil, pinTarget{}, err
 	}
-	client, err := NewClient(target.base, cfg.ResolveToken(), allowPlaintext || loopback)
+	client, err := NewClient(target.base, cfg.ResolveTokenFor(target.base), allowPlaintext || loopback)
 	if err != nil {
 		return nil, pinTarget{}, err
 	}

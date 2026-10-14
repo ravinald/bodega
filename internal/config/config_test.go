@@ -219,6 +219,12 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 			Default:  config.OsqueryDirs{Python: []string{"/usr/lib/python3/dist-packages"}},
 			Profiles: map[string]config.OsqueryDirs{"web": {NPM: []string{"/srv/app"}}},
 		},
+		// Load requires an https issuer and scopes that parse.
+		"oidc_providers": []config.OIDCProvider{{
+			Name: "github", Issuer: "https://token.actions.githubusercontent.com", Audience: "https://bodega.example",
+			Rules: []config.OIDCRule{{Claims: map[string]string{"repository": "acme/app"}, Scopes: "read,write:npm"}},
+		}},
+		"oidc_token_ttl": "10m",
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

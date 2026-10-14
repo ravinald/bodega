@@ -13,6 +13,7 @@ Comprehensive documentation for the bodega package repository manager.
 - [Manifest Structure](#manifest-structure)
 - [Pipeline](#pipeline)
 - [HTTP Server](#http-server)
+- [Authentication](#authentication)
 - [REST API](#rest-api)
 - [Supply Chain Management](#supply-chain-management)
 - [Proxy/Cache](#proxycache)
@@ -903,16 +904,16 @@ Launches the interactive TUI. See [TUI](#tui) section for keybindings.
 
 Queries the configured audit sink. Under `audit_sink: "syslog"` or `"jsonl"` it refuses by name: those sinks ship events out and keep nothing to read back. See [Audit Trail](#audit-trail).
 
-| Flag         | Default | Purpose                                                                    |
-| ------------ | ------- | -------------------------------------------------------------------------- |
-| `--type`     |         | Event type: fetch, build, create, delete, cache                            |
-| `--pkg-type` |         | Package type filter                                                        |
-| `--name`     |         | Package name filter                                                        |
-| `--client`   |         | Client IP filter                                                           |
-| `--identity` |         | Identity filter: the host name an identity binding resolved the request to |
-| `--actor`    |         | Actor filter (CLI and TUI events, matched against the OS user)             |
-| `--since`    |         | Show events after this time (RFC3339 or YYYY-MM-DD)                        |
-| `--limit`    | `20`    | Max events to show                                                         |
+| Flag         | Default | Purpose                                                                                                                               |
+| ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `--type`     |         | Event type: fetch, build, create, delete, cache                                                                                       |
+| `--pkg-type` |         | Package type filter                                                                                                                   |
+| `--name`     |         | Package name filter                                                                                                                   |
+| `--client`   |         | Client IP filter                                                                                                                      |
+| `--identity` |         | Identity filter: the host name an identity binding resolved the request to, or the issuer of an [exchanged token](#ci-token-exchange) |
+| `--actor`    |         | Actor filter: the OS user for CLI and TUI events, the ID token subject for a request carrying an exchanged token                      |
+| `--since`    |         | Show events after this time (RFC3339 or YYYY-MM-DD)                                                                                   |
+| `--limit`    | `20`    | Max events to show                                                                                                                    |
 
 ```bash
 bodega audit events                                    # last 20 events
@@ -920,6 +921,7 @@ bodega audit events --type fetch --limit 50            # last 50 fetches
 bodega audit events --pkg-type gomod --since 2026-04-07
 bodega audit events --client 10.0.0.5
 bodega audit events --identity build-07                # every request one host made
+bodega audit events --actor repo:acme/web:ref:refs/heads/main   # every request one workflow made
 ```
 
 The `CLIENT` and `IDENTITY` columns are printed together and neither substitutes for the other: the deny list matched on the address, and one identity holds several. `IDENTITY` is blank on a request no binding resolved, which is every request until `bodega identity bind` runs.
@@ -1061,27 +1063,30 @@ The builder is pinned with any `@<ref>` suffix removed. A GitHub Actions builder
 
 A `mismatch` on an npm version with no provenance is common, and most of the time it is a maintainer publishing by hand rather than a stolen token. On 2026-10-12, 11 of 29 popular npm packages had a release (no prerelease tag) without provenance published after their first version that had it, so roughly a third of active npm packages will raise one. The detail and the row's `publisher` and `pinned_publisher` name who published each version, read from the packument's `_npmUser`, for example `npm user daiwei1105` against `GitHub Actions` on vue 3.5.36. Ask the project before resetting; see [npm releases without provenance](#bodega-policy-provenance-setlist) for the measurement and what it means under `block`.
 
-### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
+### `bodega token generate <label> [expiry <duration|date|never>] [comment] --scope SCOPE`
 
 Generates a cryptographically random API token. The raw token is displayed once and cannot be retrieved later. A SHA-256 hash (with a server-side pepper) is stored in the audit database.
 
 ```bash
-bodega token generate ci-pipeline                        # expires in 365 days (default)
-bodega token generate ci-pipeline expiry 90d             # expires in 90 days
-bodega token generate ci-pipeline expiry 2027-06-01      # expires on a specific date
-bodega token generate ci-pipeline expiry never            # no expiry
-bodega token generate ci-pipeline "Jenkins deploy key"    # with a comment
-bodega token generate ci-pipeline expiry 90d "CI token"   # expiry + comment
-bodega token create web-01 --scope inventory              # a host's inventory push credential
+bodega token generate ci-pipeline --scope read,write:npm                 # expires in 365 days (default)
+bodega token generate ci-pipeline expiry 90d --scope write:pypi          # expires in 90 days
+bodega token generate ops expiry 2027-06-01 --scope admin                # expires on a specific date
+bodega token generate mirror-reader expiry never --scope read            # no expiry
+bodega token generate ci-pipeline "Jenkins deploy key" --scope write:npm # with a comment
+bodega token create web-01 --scope inventory                             # a host's inventory push credential
 ```
 
-`create` is an alias for `generate`. `--scope` decides what the token may do: `full` (the default) reaches every mutation route, and `inventory` reaches only the push routes inventory sources register. See [Token scope](#token-scope).
+`create` is an alias for `generate`. `--scope` is required and says what the token may do: one or more of `read`, `write` and `admin`, each optionally narrowed to package types (`write:npm,pypi`), or `inventory` alone. Repeat the flag or separate scopes with commas. There is no default, so no token is minted for everything because a flag was left off. See [Token scopes](#token-scopes) for what each one reaches.
 
 On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`), mode `0640` owned by root in the group the service runs in, or `0600` where the host names no service account. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
 
 ### `bodega token list`
 
-Lists all API tokens with their ID, label, scope, creation date, expiry, last use, and comment. Expired tokens are marked.
+Lists all API tokens with their ID, label, scope, creation date, expiry, last use, and comment. Expired tokens are marked, and a token an [OIDC exchange](#ci-token-exchange) minted shows the subject it acts for in the comment column. A closing line on stderr counts the tokens still holding `read`, `write` and `admin` unrestricted; `bodega doctor` names each one.
+
+### `bodega login --server <url> [--provider NAME]`
+
+Signs in through one of the server's `oidc_providers` with the OAuth device flow and stores the short-lived bodega token the server issues. See [Device sign-in](#device-sign-in).
 
 ### `bodega token revoke <id|label>`
 
@@ -1870,14 +1875,14 @@ helm's path is the one that is not the same everywhere: `doctor` resolves it the
 Writing a credential changes what an audit row says, never what the host may fetch. It does change what the host may **write**, which is why `doctor` prints this before it touches a file:
 
 ```text
-Before writing: bodega tokens carry no scope, so this same token is the
-credential half of the mutation gate. A host that holds it and whose address
-is inside admin_permit_cidr can POST and DELETE against this bodega.
-  Keep admin_permit_cidr at loopback (bodega acl admin list), or treat every
-  host you write a credential to as admin-capable.
+Before writing: this token is also checked on every write and admin route.
+Write a token minted with --scope read: it is refused with 403 anywhere but
+the read path, wherever this host sits. A token holding write or admin
+authorizes those from this host if its address is inside admin_permit_cidr.
+  bodega token generate <host> --scope read
 ```
 
-`bodega token generate` takes a label and nothing else: a token is a token. The mutation gate accepts any unexpired one of them once `admin_permit_cidr` reaches past loopback, so the credential in a build host's `~/.netrc` is also the credential that authorizes `POST /api/v1/...` from that host. Keeping `admin_permit_cidr` at loopback makes the gate ignore tokens entirely and is the remedy that costs nothing; otherwise every host you write a credential to is admin-capable and should be treated that way. Scoped tokens would sever the two and do not exist yet. See [Threat model](threat-model.md).
+`doctor` runs on the client host and cannot see the token's scopes, so it prints this rather than checking. A `read` token in a build host's `~/.netrc` attributes that host's fetches and authorizes nothing else; a token holding `write` or `admin` is the credential that authorizes `POST /api/v1/...` from that host once `admin_permit_cidr` reaches it. See [Token scopes](#token-scopes) and [Threat model](threat-model.md).
 
 ### What a refused client sees
 
@@ -3186,6 +3191,8 @@ It is also consumed rather than displayed. Every `dist.tarball` bodega writes in
 
 `inventory_sources` configures the collectors that report each host's installed packages; see [Inventory](#inventory). `osquery_scan_dirs` names, per profile, the language-package trees an osquery source scans; see [The `osquery` source](#the-osquery-source).
 
+`oidc_providers` names the identity providers whose ID tokens bodega exchanges for its own, and `oidc_token_ttl` (default `15m`) bounds the lifetime of the token an exchange mints; see [OIDC providers](#oidc-providers). Both are read at startup.
+
 Config files are written with mode `0600` (owner read/write only).
 
 **Resolution priority:** CLI flags > environment variables > config file > built-in defaults. Every flag in the table above is registered with an empty default so it cannot shadow the env var and config key beneath it; `--log-level` is the one exception, where `0` is both a valid level and the zero value, so bodega asks whether the flag was typed rather than reading its value.
@@ -3593,7 +3600,7 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 | `BODEGA_LISTEN_ADDR`                                                     | HTTP listen address for `bodega serve` (default `:8080`). Overridden by `--addr`.                                                                                                                                                                                           |
 | `BODEGA_PUBLIC_URL`                                                      | Base URL clients reach the server at. Overrides `public_url`; overridden by `bodega serve --public-url`                                                                                                                                                                     |
 | `BODEGA_SERVER`                                                          | The bodega server a host that is not the server pushes to (`pkg import`, `pin`). Overrides `server_url`; overridden by `--server`                                                                                                                                           |
-| `BODEGA_TOKEN`                                                           | Bearer token for that server. Read before `token` in the config file, so a token never has to be written to disk on a host being cataloged                                                                                                                                  |
+| `BODEGA_TOKEN`                                                           | Bearer token for that server. Read before a token `bodega login` stored and before `token` in the config file, so a token never has to be written to disk on a host being cataloged                                                                                         |
 | `BODEGA_SERVICE_USER`                                                    | The account the server runs as, for placing the token pepper where that account can read it. Overrides the `User=` read from the systemd unit, and is the only way to declare the account on a host with no unit                                                            |
 
 ---
@@ -5540,6 +5547,167 @@ with the same `"public_url": "https://bodega.example.com"` in `config.json`. Nei
 
 ---
 
+## Authentication
+
+A bodega token is a bearer credential with scopes. Operators mint long-lived ones with [`bodega token generate`](#bodega-token-generate-label-expiry-durationdatenever-comment---scope-scope); CI jobs and people get short-lived ones by exchanging an ID token from the organization's identity provider, so neither stores a bodega secret.
+
+### Token scopes
+
+Every token carries one or more scopes. Each of `read`, `write` and `admin` may be narrowed to package types with a colon.
+
+| Scope       | Reaches                                                                                                                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`      | Every `GET` and `HEAD` that is not an admin route: the package routes (`/apt/`, `/pypi/`, `/npm/`, `/go/` and the rest), the `/api/v1/packages` reads, `/client/`, status, metrics, git clone |
+| `write`     | `POST /api/v1/packages/{type}`, `POST /api/v1/packages/import`, `DELETE /api/v1/packages/{type}/{name}`, and the hide and freeze toggles                                                      |
+| `admin`     | `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/audit`, `/api/v1/config`, `/api/v1/inventory/{identity}` and `/api/v1/profiles/{name}/pins`, read or write                                     |
+| `inventory` | Reads, plus the push routes inventory sources register. Combines with no other scope; see [Inventory token scope](#inventory-token-scope)                                                     |
+
+`write:npm,pypi` reaches the write routes for npm and pypi only. A route tied to no single type (`GET /api/v1/packages`, `/client/plan`) is reached by any grant of its scope, narrowed or not. `POST /api/v1/packages/import` holds each entry in the body to the token's types and refuses the ones outside them in its per-entry results, because the body can name several types and the rest of the import still lands. `admin` takes no types. `/healthz` and the `/api/v1/auth/` routes need no scope.
+
+Scopes are written as one list, commas or spaces between grants: `read,write:npm,pypi,admin` is read, write narrowed to npm and pypi, and admin. That is unambiguous because no package type is named like a scope.
+
+A token presented on a route its scopes do not reach is refused with `403` naming the scope it lacks, on reads and mutations alike, whether or not `admin_permit_cidr` requires a token at all:
+
+```text
+Forbidden: token 3f9c... lacks scope "write:pypi", which POST /api/v1/packages/pypi needs; it holds "read,write:npm"
+```
+
+The refusal is a `denied` audit row with status `token_scope`, and its `details` name `token_id`, `scope` and `missing_scope`.
+
+**What scopes do not change.** They constrain a token that is presented. A request that presents none is decided as before: the read path is open, an admin read inside `admin_permit_cidr` needs no token, and a server whose `admin_permit_cidr` is loopback-only takes mutations from localhost with no token. A credential that matches no token on a read is treated as no credential. See [Threat model](threat-model.md).
+
+**Tokens minted before scopes.** Every existing token migrates to `read,write,admin`, so nothing in use stops working. `bodega doctor` warns once per unexpired token still holding all three unrestricted, under the check `token-scope`, with the command to mint a narrower one; `bodega token list` counts them. Downgrading to a release without scopes deletes every token narrower than `read,write,admin` and every exchanged token, rather than widening them.
+
+### OIDC providers
+
+`oidc_providers` names the issuers bodega trusts and maps each issuer's claims onto scopes:
+
+```json
+"oidc_providers": [
+  {
+    "name": "github",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "audience": "https://bodega.example.com",
+    "rules": [
+      {"claims": {"repository": "acme/web", "ref": "refs/heads/main"}, "scopes": "read,write:npm"},
+      {"claims": {"job_workflow_ref": "acme/release/.github/workflows/publish.yml@refs/heads/main"}, "scopes": "write:npm,pypi"},
+      {"claims": {"repository_owner": "acme"}, "scopes": "read"}
+    ]
+  },
+  {
+    "name": "okta",
+    "issuer": "https://acme.okta.com/oauth2/default",
+    "client_id": "0oa1bodegacli",
+    "rules": [
+      {"claims": {"groups": "bodega-admins"}, "scopes": "read,admin"},
+      {"claims": {"email": "*@acme.com"}, "scopes": "read"}
+    ]
+  }
+],
+"oidc_token_ttl": "15m"
+```
+
+| Key              | Meaning                                                                                                                                                                    |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`           | What `bodega login --provider` and the audit `details` call it. Defaults to the issuer's host                                                                              |
+| `issuer`         | The `iss` its tokens carry. Must be `https`; `http` is accepted for a loopback address only, for a test issuer                                                             |
+| `audience`       | The `aud` a CI job requests its token for                                                                                                                                  |
+| `client_id`      | The OAuth client `bodega login` signs in through; also accepted as `aud`, which is what a device-flow ID token carries. At least one of `audience` and `client_id` is set  |
+| `rules`          | Tried in order; the first whose every claim matches grants its `scopes`. A token matching none is refused                                                                  |
+| `rules[].claims` | Claim name to value. A value matches a string claim exactly, or as a glob where `*` spans any run of characters including `/`; against a list claim it matches any element |
+| `rules[].scopes` | The scopes the rule grants, in the [token scope](#token-scopes) syntax. `inventory` cannot be granted                                                                      |
+| `oidc_token_ttl` | Lifetime of every token an exchange mints. Default `15m`                                                                                                                   |
+
+`bodega serve` fetches each issuer's discovery document and signing keys at startup and caches the keys. A token naming a key the cache does not hold triggers a refetch, which is how a key rotation lands without a restart. An issuer that cannot be reached at startup is logged at `ERROR` and its tokens are refused; the server starts and serves everything else, and the next exchange naming that issuer tries discovery again, at most once a minute. Load refuses a provider list it could only misread: a rule with no claims, a claim value of `*`, an issuer listed twice, scopes that do not parse. Changing `oidc_providers` takes a restart.
+
+Write rules narrow. `repository_owner: acme` grants every repository in the organization, and a rule naming `repository` without `ref` grants every branch of it.
+
+### CI token exchange
+
+`POST /api/v1/auth/exchange` takes `{"id_token": "<OIDC ID token>"}` and answers with a bodega token. It is reachable from outside `admin_permit_cidr`, because the ID token is the credential.
+
+```json
+{
+  "token": "bodega_ak_9d1e...",
+  "id": "5b0c...",
+  "scopes": "read,write:npm",
+  "expires_at": "2026-10-13T19:42:08Z",
+  "subject": "repo:acme/web:ref:refs/heads/main",
+  "issuer": "https://token.actions.githubusercontent.com"
+}
+```
+
+The token lives for `oidc_token_ttl` and is then pruned from the database by the next exchange. Every audit row a request carrying it writes, and every admission decision, records the ID token's `sub` as the actor and its `iss` as the identity, so `bodega audit events --actor repo:acme/web:ref:refs/heads/main` or `--identity https://token.actions.githubusercontent.com` finds the workflow rather than a token id. `bodega token revoke <id>` ends one early.
+
+A GitHub Actions job requests an ID token for bodega's audience and exchanges it. The job needs `id-token: write`:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a bodega token
+        run: |
+          id_token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://bodega.example.com" | jq -r .value)
+          token=$(jq -n --arg t "$id_token" '{id_token: $t}' \
+            | curl -sSf -X POST https://bodega.example.com/api/v1/auth/exchange \
+                -H 'Content-Type: application/json' --data-binary @- | jq -r .token)
+          echo "::add-mask::$token"
+          echo "BODEGA_TOKEN=$token" >> "$GITHUB_ENV"
+      - run: bodega pkg import --server https://bodega.example.com catalog.json
+```
+
+GitLab CI issues the ID token through `id_tokens`, with the issuer `https://gitlab.com` (or your instance) and claims such as `project_path`, `ref` and `namespace_path`:
+
+```yaml
+publish:
+  id_tokens:
+    BODEGA_ID_TOKEN:
+      aud: https://bodega.example.com
+  script:
+    - >
+      export BODEGA_TOKEN=$(jq -n --arg t "$BODEGA_ID_TOKEN" '{id_token: $t}'
+      | curl -sSf -X POST https://bodega.example.com/api/v1/auth/exchange
+      -H 'Content-Type: application/json' --data-binary @- | jq -r .token)
+```
+
+A refusal is a `401` whose body names the issuer and why, and never echoes the token. One that matched no rule lists, per rule, each claim that failed and what the token carried:
+
+```json
+{
+  "error": "no rule for issuer https://token.actions.githubusercontent.com matched: rule 0: ref=\"refs/heads/feature\" (want \"refs/heads/main\"); rule 1: job_workflow_ref=\"acme/web/.github/workflows/ci.yml@refs/heads/feature\" (want \"acme/release/.github/workflows/publish.yml@refs/heads/main\"); rule 2: repository_owner=\"acme-forks\" (want \"acme\")"
+}
+```
+
+Expired tokens, a wrong audience, a bad signature and an unconfigured or unreachable issuer are refused the same way, each with its own reason. Every refusal is a `denied` audit row with status `oidc_refused`. A server with no `oidc_providers` answers `404`.
+
+### Device sign-in
+
+`bodega login` signs a person in through a provider with a `client_id`, using the OAuth device authorization flow, and stores the token bodega issues:
+
+```bash
+bodega login --server https://bodega.example.com
+```
+
+```text
+Open https://acme.okta.com/activate and enter code WDJB-MJHT
+Signed in to https://bodega.example.com as 00u1a2b3c4 (https://acme.okta.com/oauth2/default).
+  Scopes:  read,admin
+  Expires: Tue, 13 Oct 2026 19:42:08 PDT
+  Stored:  /home/alice/.config/bodega/credentials.json
+```
+
+It reads `GET /api/v1/auth/providers` for the providers that offer a device flow (a `client_id`, and an issuer whose discovery document names a `device_authorization_endpoint`), asks for `--provider` when there is more than one, runs the flow against the provider directly, and trades the ID token at `POST /api/v1/auth/exchange`. The provider's OAuth client must allow the device grant and the `openid` scope. Scopes come from the same rules a CI token's do, matched on the person's claims (`sub`, `email`, `groups`).
+
+The token is written to `credentials.json` in the user config directory (`$XDG_CONFIG_HOME/bodega`, `~/.config/bodega` on Linux, `~/Library/Application Support/bodega` on macOS), mode `0600` in a `0700` directory, keyed by server URL. `bodega pkg import --server` and `bodega pin` use it for that server until it expires. `$BODEGA_TOKEN` still wins over it, and it wins over `token` in the config file. Run `bodega login` again once it expires.
+
+---
+
 ## REST API
 
 All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](../api/openapi.yaml).
@@ -5712,11 +5880,11 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 ### Token endpoints
 
-| Method | Path                  | Description                                                |
-| ------ | --------------------- | ---------------------------------------------------------- |
-| GET    | `/api/v1/tokens`      | List all tokens                                            |
-| POST   | `/api/v1/tokens`      | Create a new token (JSON body: `{label, expiry, comment}`) |
-| DELETE | `/api/v1/tokens/{id}` | Revoke a token                                             |
+| Method | Path                  | Description                                                                            |
+| ------ | --------------------- | -------------------------------------------------------------------------------------- |
+| GET    | `/api/v1/tokens`      | List all tokens                                                                        |
+| POST   | `/api/v1/tokens`      | Create a new token (JSON body: `{label, scope, expiry, comment}`; `scope` is required) |
+| DELETE | `/api/v1/tokens/{id}` | Revoke a token                                                                         |
 
 ### Policy endpoints
 
@@ -5728,6 +5896,8 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
 
+`POST /api/v1/auth/exchange` and `GET /api/v1/auth/providers` are the OIDC routes; the exchange sits outside `admin_permit_cidr` because the ID token is the credential. See [Authentication](#authentication).
+
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 
 Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
@@ -5736,7 +5906,7 @@ That list lives in the audit database and is read per request, so `bodega acl ad
 
 The address compared against that list is the one `trusted_proxies` resolved, not the TCP peer. Behind a proxy the two differ by design; on a shared private network with the default trusted set they differ because a stranger said so.
 
-When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header. Widening the list is what turns that requirement on, which is why `bodega acl admin add` refuses to widen past localhost while no token exists.
+When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required, and it must hold the scope the route needs (`write` for the package routes, `admin` for tokens and policies). Generate tokens with `bodega token generate --scope ...` and pass them in the `Authorization` header. Widening the list is what turns that requirement on, which is why `bodega acl admin add` refuses to widen past localhost while no token exists.
 
 **Create example (from localhost):**
 
@@ -5760,7 +5930,7 @@ curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
 - `401 Unauthorized` — missing or invalid Bearer token
-- `403 Forbidden` — IP not in `admin_permit_cidr`; the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
+- `403 Forbidden` — IP not in `admin_permit_cidr`; the token lacks the scope the route needs (the body names it); the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
 - `409 Conflict` — entry already exists
 - `413 Request Entity Too Large` — request body exceeds 1 MiB
 
@@ -6174,6 +6344,8 @@ An object cached before bodega kept origins, filled by a path that fetches nothi
 | `token_missing`            | Mutation with no Bearer credential                                                                                                                                                                                                                                                                                 |
 | `token_invalid`            | Bearer presented, matched no stored hash                                                                                                                                                                                                                                                                           |
 | `token_expired`            | Bearer matched a token past its `expires_at`                                                                                                                                                                                                                                                                       |
+| `token_scope`              | A token presented on a route its scopes do not reach, read or mutation. `details` carries `token_id`, `scope` and `missing_scope`                                                                                                                                                                                  |
+| `oidc_refused`             | An ID token presented to `POST /api/v1/auth/exchange` failed verification or matched no rule. `details.reason` is the reason the caller was sent, never the token                                                                                                                                                  |
 | `admin_only`               | Admin-gated read (`/api/v1/config`, `/api/v1/audit`, tokens, policies) from outside `admin_permit_cidr`                                                                                                                                                                                                            |
 | `entry_frozen`             | `DELETE` on a package whose every version is frozen. The caller cleared the admin gate, which is what makes the attempt worth a row                                                                                                                                                                                |
 | `version_constraint`       | A gomod or npm request for a version outside the entry's `version_constraint`. `pkg_version` carries the version that was refused, `details` the constraint and the entry's own version                                                                                                                            |
@@ -6537,14 +6709,12 @@ A source that authenticates a host to an identity by its own means writes the ma
 
 `bodega inventory sources` lists each configured instance with its type, mode, capabilities, enabled state, last report time (and, for a pull source, last poll and whether it failed), and how many hosts it maps and how many unbound ids it has seen. `--json` adds `last_success` and `last_error` for pull sources.
 
-### Token scope
+### Inventory token scope
 
-`api_tokens` carries a `scope`: `full` or `inventory`. Tokens created before the column existed are `full`, and `full` is the default for new ones.
-
-An `inventory` token is refused with `403` on every mutation route except the push routes sources register, in both the localhost-only and the token-required posture. The refusal names the scope and the route and is recorded as a `denied` event with status `token_scope`:
+A push source accepts only a token scoped `inventory` (see [Token scopes](#token-scopes)). That scope combines with no other and reaches reads and the push routes sources register; it is refused with `403` on every other mutation route and on the admin routes, in both the localhost-only and the token-required posture. The refusal names the scope it lacks and is recorded as a `denied` event with status `token_scope`:
 
 ```text
-Forbidden: a token scoped "inventory" cannot POST /api/v1/packages/apt; it reaches only inventory push routes under /api/v1/inventory/sources/
+Forbidden: token 3f9c... lacks scope "write:apt", which POST /api/v1/packages/apt needs; it holds "inventory", which reaches only reads and the inventory push routes under /api/v1/inventory/sources/
 ```
 
 ### Push routes and the admin gate

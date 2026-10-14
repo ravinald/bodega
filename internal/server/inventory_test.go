@@ -164,7 +164,7 @@ func TestInventoryTokenRefusedOnOtherMutations(t *testing.T) {
 				t.Errorf("denials = %+v, want one %s", rows, audit.DenialTokenScope)
 			}
 			// A full token on the same route still works.
-			if rec := send(s, http.MethodPost, "/api/v1/tokens", tc.remote, fullToken, `{"label":"x"}`); rec.Code != http.StatusCreated {
+			if rec := send(s, http.MethodPost, "/api/v1/tokens", tc.remote, fullToken, `{"label":"x","scope":"read"}`); rec.Code != http.StatusCreated {
 				t.Errorf("full token: status = %d, want 201", rec.Code)
 			}
 		})

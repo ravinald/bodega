@@ -565,8 +565,8 @@ func (r *responseRecorder) Flush() {
 // Read-path identity is what makes this a leak rather than a curiosity. Before
 // it, the only Authorization headers arriving were operator mutations; now
 // every package GET can carry a token and `bodega doctor --write-credentials`
-// puts one on eight client hosts. The tokens are unscoped, so a token in a log
-// the journal group can read is a write credential (docs/threat-model.md).
+// puts one on eight client hosts. A token holding write or admin in a log the
+// journal group can read is a write credential (docs/threat-model.md).
 // recordDenial states the same position for audit rows: no header is copied
 // into one.
 //
@@ -842,9 +842,9 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 	return true
 }
 
-// MutationAuthMiddleware restricts POST and DELETE requests to clients in the
-// admin allow-list. When that list extends beyond localhost, a valid Bearer
-// token is required, verified via SHA-256(token + pepper) against the
+// MutationAuthMiddleware restricts POST, DELETE and PATCH requests to clients
+// in the admin allow-list. When that list extends beyond localhost, a valid
+// Bearer token is required, verified via SHA-256(token + pepper) against the
 // hashes stored in the audit DB.
 //
 // Both the allow-list and the localhost-only test are evaluated per request:
@@ -852,54 +852,38 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // captured at chain build time would leave a widened server still admitting
 // unauthenticated mutations until it restarted.
 //
-// GET/HEAD/OPTIONS requests pass through unconditionally: the read path is
-// open by design, not because a client could not authenticate. Every one of
-// the eight can (see credentialFrom), and IdentityMiddleware reads what they
-// send to attribute the request; what may be fetched is a separate question
-// this gate does not ask. The exceptions are the four admin reads, which
+// GET/HEAD/OPTIONS requests need no credential: the read path is open by
+// design, not because a client could not authenticate. Every one of the eight
+// can (see credentialFrom), and IdentityMiddleware reads what they send to
+// attribute the request. The exceptions are the admin reads, which
 // Server.requireAdmin gates with the same AdminPermits predicate this uses.
+//
+// A token that is presented is held to its scopes on every route, read or
+// mutation, in both the localhost-only and the token-required posture:
+// routeScope names what the route needs, and a token without it is refused
+// with a 403 naming the missing scope. A credential matching no token on a
+// read is no token at all, exactly as before scopes existed. A request whose
+// token an OIDC exchange minted carries its principal into the context, so
+// every audit row it writes names the subject and issuer.
 //
 // pushRoute names the routes inventory push sources registered, and the
 // re-vet webhook. Those, beside git's upload-pack, skip the admin gate: hosts
 // and threat feeds outside admin_permit_cidr post to them, and each handler
 // authenticates its caller itself. A nil pushRoute exempts nothing.
-//
-// A token scoped "inventory" is refused on every other route, in both the
-// localhost-only and the token-required posture, so a host's reporting
-// credential is never an admin credential.
 func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger, pushRoute func(*http.Request) bool) func(http.Handler) http.Handler {
-	// Cache token hashes to avoid per-request DB queries.
-	var cachedHashes []audit.TokenHash
-	var cacheTime time.Time
-	var cacheMu sync.Mutex
-	const cacheTTL = 30 * time.Second
-
-	loadHashes := func() []audit.TokenHash {
-		cacheMu.Lock()
-		defer cacheMu.Unlock()
-		if time.Since(cacheTime) < cacheTTL && cachedHashes != nil {
-			return cachedHashes
-		}
-		if auditDB == nil {
-			return nil
-		}
-		hashes, err := auditDB.GetTokenHashes(context.Background())
-		if err != nil {
-			logger.Error("failed to load token hashes", "error", err)
-			return cachedHashes // return stale cache on error
-		}
-		cachedHashes = hashes
-		cacheTime = time.Now()
-		return hashes
-	}
+	tokens := &tokenCache{db: auditDB, logger: logger}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch {
-				next.ServeHTTP(w, r)
-				return
-			}
-			if isGitUploadPack(r) {
+			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
+				if cred, _ := credentialFrom(r); cred != "" {
+					if tok := tokens.match(cred, pepper, time.Now()); tok != nil {
+						r = withToken(r, *tok)
+						if !authorizeScope(w, r, auditDB, logger, *tok) {
+							return
+						}
+					}
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -928,20 +912,18 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 			// If the allow-list goes beyond localhost, require a valid Bearer token.
 			if LocalhostOnly(adminNets) {
 				// No token is required here, but one may still be presented,
-				// and an inventory token must not pass where it would be
-				// refused on a widened server.
+				// and a token must not pass where its scopes would be refused
+				// on a widened server.
 				if auth, ok := bearerOf(r); ok {
-					incoming := audit.HashToken(auth, pepper)
-					for _, h := range loadHashes() {
-						if h.Scope == audit.ScopeInventory && subtle.ConstantTimeCompare([]byte(incoming), []byte(h.Hash)) == 1 {
-							refuseScope(w, r, auditDB, logger, h)
+					if tok := tokens.match(auth, pepper, time.Now()); tok != nil {
+						r = withToken(r, *tok)
+						if !authorizeScope(w, r, auditDB, logger, *tok) {
 							return
 						}
 					}
 				}
 			} else {
-				hashes := loadHashes()
-				if len(hashes) == 0 {
+				if len(tokens.all()) == 0 {
 					logger.Warn("mutation blocked: no tokens configured for remote access",
 						"client_ip", clientIP.String())
 					recordDenial(auditDB, r, audit.DenialNoTokens, nil)
@@ -949,9 +931,8 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 					return
 				}
 
-				auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-				if auth == "" || auth == r.Header.Get("Authorization") {
-					// No Bearer prefix or empty token.
+				auth, ok := bearerOf(r)
+				if !ok {
 					logger.Warn("mutation blocked: no bearer credential",
 						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
 					recordDenial(auditDB, r, audit.DenialTokenMissing, nil)
@@ -959,17 +940,7 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 					return
 				}
 
-				// Hash the incoming token with pepper and compare.
-				incoming := audit.HashToken(auth, pepper)
-
-				var matched *audit.TokenHash
-				for i := range hashes {
-					if subtle.ConstantTimeCompare([]byte(incoming), []byte(hashes[i].Hash)) == 1 {
-						matched = &hashes[i]
-						break
-					}
-				}
-
+				matched := tokens.lookup(auth, pepper)
 				if matched == nil {
 					logger.Warn("mutation blocked: invalid token",
 						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
@@ -977,12 +948,11 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 					// correlates a repeat caller across rows and is not
 					// replayable without the pepper.
 					recordDenial(auditDB, r, audit.DenialTokenInvalid,
-						map[string]string{"hash_prefix": hashPrefix(incoming)})
+						map[string]string{"hash_prefix": hashPrefix(audit.HashToken(auth, pepper))})
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
 				}
 
-				// Check expiry.
 				if matched.ExpiresAt != nil && matched.ExpiresAt.Before(time.Now()) {
 					logger.Warn("mutation blocked: token expired",
 						"token_id", matched.ID, "client_ip", clientIP.String())
@@ -995,8 +965,8 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 					return
 				}
 
-				if matched.Scope == audit.ScopeInventory {
-					refuseScope(w, r, auditDB, logger, *matched)
+				r = withToken(r, *matched)
+				if !authorizeScope(w, r, auditDB, logger, *matched) {
 					return
 				}
 
@@ -1013,6 +983,66 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 	}
 }
 
+// tokenCache holds the token hashes the gate compares against, reloaded on a
+// TTL so a request costs no query, and at once when this process wrote the
+// token table: a token an exchange minted is in use by the next request its
+// CI job makes, and making that job wait out the TTL would read as a token
+// that does not work.
+type tokenCache struct {
+	db     *audit.DB
+	logger *slog.Logger
+
+	mu     sync.Mutex
+	hashes []audit.TokenHash
+	at     time.Time
+	gen    uint64
+}
+
+const tokenCacheTTL = 30 * time.Second
+
+func (c *tokenCache) all() []audit.TokenHash {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return nil
+	}
+	gen := c.db.TokenGeneration()
+	if time.Since(c.at) < tokenCacheTTL && c.hashes != nil && gen == c.gen {
+		return c.hashes
+	}
+	hashes, err := c.db.GetTokenHashes(context.Background())
+	if err != nil {
+		c.logger.Error("failed to load token hashes", "error", err)
+		return c.hashes // stale cache on error
+	}
+	c.hashes, c.at, c.gen = hashes, time.Now(), gen
+	return hashes
+}
+
+// lookup returns the token cred hashes to, expired or not, or nil.
+func (c *tokenCache) lookup(cred, pepper string) *audit.TokenHash {
+	return findHash(c.all(), audit.HashToken(cred, pepper))
+}
+
+// match is lookup for a token still in force: an expired token is no token.
+func (c *tokenCache) match(cred, pepper string, now time.Time) *audit.TokenHash {
+	h := c.lookup(cred, pepper)
+	if h == nil || (h.ExpiresAt != nil && h.ExpiresAt.Before(now)) {
+		return nil
+	}
+	return h
+}
+
+func findHash(hashes []audit.TokenHash, incoming string) *audit.TokenHash {
+	for i := range hashes {
+		if subtle.ConstantTimeCompare([]byte(incoming), []byte(hashes[i].Hash)) == 1 {
+			h := hashes[i]
+			return &h
+		}
+	}
+	return nil
+}
+
 // bearerOf returns the request's Bearer credential, read the way the
 // token-required branch reads it.
 func bearerOf(r *http.Request) (string, bool) {
@@ -1024,15 +1054,112 @@ func bearerOf(r *http.Request) (string, bool) {
 	return auth, true
 }
 
-// refuseScope answers a scoped token presented on a route its scope does not
-// reach, naming both so the operator knows which credential to swap.
-func refuseScope(w http.ResponseWriter, r *http.Request, auditDB *audit.DB, logger *slog.Logger, tok audit.TokenHash) {
-	logger.Warn("mutation blocked: token scope does not reach this route",
-		"token_id", tok.ID, "scope", tok.Scope, "method", r.Method, "path", r.URL.Path)
+// adminPrefixes are the routes the admin scope reaches: tokens, policies,
+// the audit trail, the resolved configuration, and the per-host inventory and
+// profile views. Every route here is also behind admin_permit_cidr.
+var adminPrefixes = []string{
+	"/api/v1/tokens", "/api/v1/policies", "/api/v1/audit", "/api/v1/config",
+	"/api/v1/inventory/", "/api/v1/profiles/",
+}
+
+// routeScope names the scope a request needs and the package type it is
+// for, "" when the route is not tied to one type. An empty scope is a route
+// no token scope governs: the health probe and the token exchange itself.
+//
+// Bulk import is write with no type here, because its body can name several;
+// handleBulkImport holds each entry to the token's types.
+func routeScope(r *http.Request) (scope, pkgType string) {
+	p := r.URL.Path
+	if p == "/healthz" || strings.HasPrefix(p, authPathPrefix) {
+		return "", ""
+	}
+	for _, pre := range adminPrefixes {
+		if strings.HasPrefix(p, pre) {
+			return audit.ScopeAdmin, ""
+		}
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
+		return audit.ScopeRead, scopeTypeOf(p)
+	}
+	t, _ := parseAPIPackagePath(p)
+	if t == "import" {
+		t = ""
+	}
+	return audit.ScopeWrite, t
+}
+
+// scopeTypeOf is the package type a read path serves, or "".
+func scopeTypeOf(p string) string {
+	if t, _ := parseAPIPackagePath(p); t != "" {
+		return t
+	}
+	if strings.HasPrefix(p, "/distfiles/") {
+		return manifest.TypeDistfiles
+	}
+	t, _, _ := parsePackagePath(p)
+	return t
+}
+
+// authorizeScope answers whether tok's scopes reach this route, writing the
+// 403 and the audit row when they do not.
+func authorizeScope(w http.ResponseWriter, r *http.Request, auditDB *audit.DB, logger *slog.Logger, tok audit.TokenHash) bool {
+	need, typ := routeScope(r)
+	if need == "" {
+		return true
+	}
+	scopes, err := audit.ParseScopes(tok.Scope)
+	if err == nil && scopes.Allows(need, typ) {
+		return true
+	}
+	refuseScope(w, r, auditDB, logger, tok, missingScope(need, typ))
+	return false
+}
+
+func missingScope(need, typ string) string {
+	if typ == "" {
+		return need
+	}
+	return need + ":" + typ
+}
+
+// refuseScope answers a token presented on a route its scopes do not reach,
+// naming the scope it lacks and the scopes it holds, so the operator knows
+// which credential to mint.
+func refuseScope(w http.ResponseWriter, r *http.Request, auditDB *audit.DB, logger *slog.Logger, tok audit.TokenHash, missing string) {
+	logger.Warn("request blocked: token scope does not reach this route",
+		"token_id", tok.ID, "scope", tok.Scope, "missing", missing, "method", r.Method, "path", r.URL.Path)
 	recordDenial(auditDB, r, audit.DenialTokenScope,
-		map[string]string{"token_id": tok.ID, "scope": tok.Scope})
-	http.Error(w, fmt.Sprintf("Forbidden: a token scoped %q cannot %s %s; it reaches only inventory push routes under %s",
-		tok.Scope, r.Method, r.URL.Path, inventory.RoutePrefix), http.StatusForbidden)
+		map[string]string{"token_id": tok.ID, "scope": tok.Scope, "missing_scope": missing})
+	msg := fmt.Sprintf("Forbidden: token %s lacks scope %q, which %s %s needs; it holds %q",
+		tok.ID, missing, r.Method, r.URL.Path, tok.Scope)
+	if tok.Scope == audit.ScopeInventory {
+		msg += fmt.Sprintf(", which reaches only reads and the inventory push routes under %s", inventory.RoutePrefix)
+	}
+	http.Error(w, msg, http.StatusForbidden)
+}
+
+// withToken carries the authenticated token's scopes into the request
+// context for a handler that checks per item (bulk import), and an exchanged
+// token's subject and issuer, where audit.DB.Record and RecordAdmission read
+// them.
+func withToken(r *http.Request, tok audit.TokenHash) *http.Request {
+	ctx := r.Context()
+	if sc, err := audit.ParseScopes(tok.Scope); err == nil {
+		ctx = context.WithValue(ctx, tokenScopesKey{}, sc)
+	}
+	if p, ok := tok.Principal(); ok {
+		ctx = audit.WithPrincipal(ctx, p)
+	}
+	return r.WithContext(ctx)
+}
+
+type tokenScopesKey struct{}
+
+// tokenScopesOf returns the scopes of the token that authenticated r, and
+// false when no token did.
+func tokenScopesOf(r *http.Request) (audit.Scopes, bool) {
+	sc, ok := r.Context().Value(tokenScopesKey{}).(audit.Scopes)
+	return sc, ok
 }
 
 // SecurityHeadersMiddleware adds standard security headers to every response.
@@ -1155,6 +1282,7 @@ func isGitUploadPack(r *http.Request) bool {
 // travels with the value.
 var redactedBodyKeys = map[string]bool{
 	"token":         true,
+	"id_token":      true,
 	"access_token":  true,
 	"refresh_token": true,
 	"secret":        true,

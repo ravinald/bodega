@@ -33,7 +33,7 @@ func newTokenCmd(gf *globalFlags) *cobra.Command {
 
 // bodega token generate <label> [expiry <days|date|never>] [comment]
 func newTokenGenerateCmd(gf *globalFlags) *cobra.Command {
-	var scope string
+	var scopeArgs []string
 	c := &cobra.Command{
 		Use:     "generate <label> [expiry <duration|date|never>] [comment]",
 		Aliases: []string{"create"},
@@ -41,24 +41,37 @@ func newTokenGenerateCmd(gf *globalFlags) *cobra.Command {
 		Long: `Generate a cryptographically random API token. The raw token is displayed
 once and cannot be retrieved later. A SHA-256 hash (with pepper) is stored.
 
---scope full (the default) reaches every mutation route. --scope inventory
-reaches only the push routes inventory sources register, which is what a host
-posting its installed packages needs and nothing more. An inventory token also
-needs an identity binding before a source accepts it:
+--scope is required and says what the token may do. It is one or more of:
+
+  read    the package-serving routes (apt, pip, npm, go, cargo, ...)
+  write   the package mutation routes (create, import, delete, hide, freeze)
+  admin   tokens, policies, the audit trail and the configuration
+
+each optionally narrowed to package types with a colon: write:npm,pypi. A
+request outside the token's scopes is refused with 403 naming the scope it
+lacks. Repeat the flag or separate scopes with commas.
+
+--scope inventory reaches reads and the push routes inventory sources
+register, which is what a host posting its installed packages needs and
+nothing more. It combines with no other scope, and needs an identity binding
+before a source accepts it:
   bodega identity bind token <id> <identity>
 
 Examples:
-  bodega token generate ci-pipeline
-  bodega token generate ci-pipeline expiry 90d
-  bodega token generate ci-pipeline expiry 2027-06-01
-  bodega token generate ci-pipeline expiry never
-  bodega token generate ci-pipeline expiry 90d "Jenkins deploy key"
-  bodega token generate ci-pipeline "Jenkins deploy key"
+  bodega token generate ci-pipeline --scope read,write:npm
+  bodega token generate ci-pipeline expiry 90d --scope read --scope write:pypi
+  bodega token generate ops expiry 2027-06-01 --scope admin
+  bodega token generate mirror-reader expiry never --scope read
+  bodega token generate ci-pipeline expiry 90d "Jenkins deploy key" --scope write:npm
   bodega token create web-01 --scope inventory`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !audit.ValidTokenScope(scope) {
-				return fmt.Errorf("unknown --scope %q: want %s or %s", scope, audit.ScopeFull, audit.ScopeInventory)
+			if len(scopeArgs) == 0 {
+				return fmt.Errorf("--scope is required: name what the token may do, e.g. --scope read, --scope write:npm, or --scope read,write,admin")
+			}
+			scope, err := audit.CanonicalScopes(strings.Join(scopeArgs, ","))
+			if err != nil {
+				return fmt.Errorf("--scope: %w", err)
 			}
 			label := args[0]
 			expiry, comment := parseExpiryAndComment(args[1:])
@@ -148,7 +161,7 @@ Examples:
 			return nil
 		},
 	}
-	c.Flags().StringVar(&scope, "scope", audit.ScopeFull, "What the token may do: full, or inventory (inventory push routes only)")
+	c.Flags().StringArrayVar(&scopeArgs, "scope", nil, "What the token may do: read, write, admin, each optionally :<type>,... (e.g. write:npm,pypi); or inventory. Required")
 	return c
 }
 
@@ -199,6 +212,7 @@ func newTokenListCmd(gf *globalFlags) *cobra.Command {
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\tLABEL\tSCOPE\tCREATED\tEXPIRES\tLAST USED\tCOMMENT")
+			broad := 0
 			for _, t := range tokens {
 				created := t.CreatedAt.Format("2006-01-02")
 				expires := "never"
@@ -214,13 +228,25 @@ func newTokenListCmd(gf *globalFlags) *cobra.Command {
 					lastUsed = t.LastUsed.Format("2006-01-02 15:04")
 				}
 				comment := t.Comment
+				if t.Subject != "" {
+					comment = "exchanged for " + t.Subject
+				}
+				if sc, err := audit.ParseScopes(t.Scope); err == nil && sc.HoldsAll() {
+					broad++
+				}
 				if len(comment) > 40 {
 					comment = comment[:37] + "..."
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					t.ID, t.Label, t.Scope, created, expires, lastUsed, comment)
 			}
-			return w.Flush()
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			if broad > 0 {
+				fmt.Fprintf(os.Stderr, "\n%d token(s) hold read, write and admin unrestricted; mint narrower ones and revoke these (bodega doctor lists them)\n", broad)
+			}
+			return nil
 		},
 	}
 }

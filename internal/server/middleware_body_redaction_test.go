@@ -13,8 +13,8 @@ import (
 
 // The one moment a token can be read is the response to its own creation, so
 // handleCreateToken puts the plaintext in the body. At log_level 4 the trace
-// body capture wrote that into the journal, and the tokens carry no scope, so
-// a journal the journal group can read was a write credential. F11 closed the
+// body capture wrote that into the journal, and a token holding write or admin
+// in a journal the journal group can read is a write credential. F11 closed the
 // header channel; this is the sibling one function above it.
 func TestTraceBodyCaptureRedactsTheIssuedToken(t *testing.T) {
 	const token = "bodega_ak_22e74efc83a51511d1c51f615e6c32fe4daaeaf54d34701107ad82f4a5ac7824" //nolint:gosec // G101: the value under test is that this never reaches the log

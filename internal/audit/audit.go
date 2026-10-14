@@ -40,6 +40,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
@@ -136,6 +137,7 @@ const (
 	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
 	DenialTokenScope   = "token_scope"          // token valid, but its scope does not reach this route
 	DenialSignature    = "signature_invalid"    // re-vet webhook body unsigned, mis-signed, stale or replayed
+	DenialOIDCRefused  = "oidc_refused"         // ID token presented for exchange failed verification or matched no rule
 
 	// Refusals decided inside a handler rather than by the middleware chain.
 	// They reach the same table because an operator asking "who was turned
@@ -283,7 +285,18 @@ type DB struct {
 	filter   map[string]bool // nil = record all; otherwise only listed types
 	location *time.Location  // display timezone (storage is always UTC)
 	readOnly bool            // true when the backing file is not writable; Record becomes a no-op
+	// tokenGen counts writes to api_tokens through this handle, so a cache
+	// of token hashes in the same process can tell it is stale without
+	// waiting out its TTL. See TokenGeneration.
+	tokenGen atomic.Uint64
 }
+
+// TokenGeneration changes whenever this process inserts or deletes a token. A
+// token minted by an exchange is presented by the next request its CI job
+// makes, and a cache that waited out its TTL would refuse it. Another
+// process's writes (bodega token generate) are not counted; the TTL covers
+// those.
+func (a *DB) TokenGeneration() uint64 { return a.tokenGen.Load() }
 
 // writer is the handle every write goes through, and it is separate from the
 // read pool on purpose.
@@ -622,9 +635,16 @@ func (a *DB) Close() error {
 // Record writes one event to the configured sink. It is silent on filtered
 // events and on a read-only sqlite handle. Callers that need hard-fail
 // semantics should check ReadOnly() themselves.
+//
+// A request authenticated by an OIDC-exchanged token carries its principal in
+// ctx, and every row it writes names the subject as actor and the issuer as
+// identity whatever the caller filled in.
 func (a *DB) Record(ctx context.Context, ev Event) error {
 	if !a.ShouldRecord(ev.EventType) {
 		return nil
+	}
+	if p, ok := PrincipalFrom(ctx); ok {
+		ev.Actor, ev.Identity = p.Subject, p.Issuer
 	}
 	return a.sink.Record(ctx, ev)
 }
@@ -930,23 +950,14 @@ func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName strin
 
 // ---- API Token Management ---------------------------------------------------
 
-// Token scopes. A full token may use every mutation route; an inventory
-// token reaches only the push routes inventory sources register, so the
-// credential a host holds to report its packages cannot edit the catalog.
-const (
-	ScopeFull      = "full"
-	ScopeInventory = "inventory"
-)
-
-// ValidTokenScope reports whether s is a scope api_tokens accepts.
-func ValidTokenScope(s string) bool { return s == ScopeFull || s == ScopeInventory }
-
 // TokenInfo holds non-sensitive metadata about an API token.
 type TokenInfo struct {
 	ID        string
 	Label     string
 	Comment   string
 	Scope     string
+	Subject   string // set on a token an OIDC exchange minted
+	Issuer    string
 	CreatedAt time.Time
 	ExpiresAt *time.Time // nil = never expires
 	LastUsed  *time.Time // nil = never used
@@ -958,6 +969,17 @@ type TokenHash struct {
 	Hash      string
 	ExpiresAt *time.Time
 	Scope     string
+	Subject   string
+	Issuer    string
+}
+
+// Principal returns who an exchanged token acts for, and false for a token
+// minted by an operator.
+func (h TokenHash) Principal() (Principal, bool) {
+	if h.Subject == "" {
+		return Principal{}, false
+	}
+	return Principal{Subject: h.Subject, Issuer: h.Issuer}, true
 }
 
 // InsertToken stores a new hashed API token with full scope.
@@ -965,27 +987,65 @@ func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, e
 	return a.InsertScopedToken(ctx, id, label, hash, comment, ScopeFull, expiresAt)
 }
 
-// InsertScopedToken stores a new hashed API token limited to scope.
+// InsertScopedToken stores a new hashed API token limited to scope, which is
+// stored in canonical form.
 func (a *DB) InsertScopedToken(ctx context.Context, id, label, hash, comment, scope string, expiresAt *time.Time) error {
-	if !ValidTokenScope(scope) {
-		return fmt.Errorf("unknown token scope %q (want %s or %s)", scope, ScopeFull, ScopeInventory)
+	return a.insertToken(ctx, id, label, hash, comment, scope, expiresAt, Principal{})
+}
+
+// InsertExchangedToken stores a token an OIDC exchange minted, recording the
+// subject and issuer it acts for.
+func (a *DB) InsertExchangedToken(ctx context.Context, id, label, hash, scope string, expiresAt time.Time, p Principal) error {
+	if p.Subject == "" || p.Issuer == "" {
+		return fmt.Errorf("an exchanged token needs a subject and an issuer")
+	}
+	return a.insertToken(ctx, id, label, hash, "", scope, &expiresAt, p)
+}
+
+func (a *DB) insertToken(ctx context.Context, id, label, hash, comment, scope string, expiresAt *time.Time, p Principal) error {
+	canon, err := CanonicalScopes(scope)
+	if err != nil {
+		return err
 	}
 	var exp sql.NullString
 	if expiresAt != nil {
 		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
 	}
-	_, err := a.writer().ExecContext(ctx,
-		"INSERT INTO api_tokens (id, label, hash, comment, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-		id, label, hash, comment, scope, exp,
+	_, err = a.writer().ExecContext(ctx,
+		"INSERT INTO api_tokens (id, label, hash, comment, scope, expires_at, subject, issuer) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		id, label, hash, comment, canon, exp, p.Subject, p.Issuer,
 	)
+	a.tokenGen.Add(1)
 	return err
+}
+
+// DeleteExpiredExchangedTokens removes exchanged tokens past their expiry.
+// Each CI job mints one, so without this the table grows by one row per job
+// and every row costs a hash comparison on every authenticated request.
+// Operator-minted tokens are left for `bodega token list` to show as EXPIRED.
+func (a *DB) DeleteExpiredExchangedTokens(ctx context.Context, now time.Time) (int64, error) {
+	res, err := a.writer().ExecContext(ctx,
+		"DELETE FROM api_tokens WHERE issuer <> '' AND expires_at IS NOT NULL AND expires_at < ?",
+		now.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	a.tokenGen.Add(1)
+	return res.RowsAffected()
 }
 
 // ListTokens returns metadata for all tokens (never the hash).
 func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, label, comment, scope, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+		"SELECT id, label, comment, scope, subject, issuer, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
 	)
+	if err != nil && strings.Contains(err.Error(), "no such column") {
+		// A store opened read-only is never migrated, and bodega doctor reads
+		// one that predates migration 032 to report on the tokens in it.
+		rows, err = a.db.QueryContext(ctx,
+			"SELECT id, label, comment, scope, '', '', created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -995,7 +1055,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	for rows.Next() {
 		var t TokenInfo
 		var created, expires, lastUsed sql.NullString
-		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &t.Scope, &created, &expires, &lastUsed); err != nil {
+		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &t.Scope, &t.Subject, &t.Issuer, &created, &expires, &lastUsed); err != nil {
 			return nil, err
 		}
 		if created.Valid {
@@ -1021,7 +1081,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 // GetTokenHashes returns all token hashes for auth verification.
 func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, hash, expires_at, scope FROM api_tokens",
+		"SELECT id, hash, expires_at, scope, subject, issuer FROM api_tokens",
 	)
 	if err != nil {
 		return nil, err
@@ -1032,7 +1092,7 @@ func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	for rows.Next() {
 		var h TokenHash
 		var expires sql.NullString
-		if err := rows.Scan(&h.ID, &h.Hash, &expires, &h.Scope); err != nil {
+		if err := rows.Scan(&h.ID, &h.Hash, &expires, &h.Scope, &h.Subject, &h.Issuer); err != nil {
 			return nil, err
 		}
 		if expires.Valid {
@@ -1061,6 +1121,7 @@ func (a *DB) DeleteToken(ctx context.Context, id string) (bool, error) {
 		"DELETE FROM api_tokens WHERE id = ?",
 		id,
 	)
+	a.tokenGen.Add(1)
 	if err != nil {
 		return false, err
 	}
@@ -1074,6 +1135,7 @@ func (a *DB) DeleteTokenByLabel(ctx context.Context, label string) error {
 		"DELETE FROM api_tokens WHERE label = ?",
 		label,
 	)
+	a.tokenGen.Add(1)
 	return err
 }
 

@@ -119,8 +119,8 @@ token_missing, token_invalid, token_expired, admin_only.`,
 	cmd.Flags().StringVar(&pkgType, "pkg-type", "", "Package type filter (apt, git, pypi, binary, gomod, helm, npm)")
 	cmd.Flags().StringVar(&pkgName, "name", "", "Package name filter")
 	cmd.Flags().StringVar(&clientIP, "client", "", "Client IP filter (HTTP events)")
-	cmd.Flags().StringVar(&actor, "actor", "", "Actor filter (CLI/TUI events — matches the OS user)")
-	cmd.Flags().StringVar(&identity, "identity", "", "Identity filter (HTTP events — matches a bound host name)")
+	cmd.Flags().StringVar(&actor, "actor", "", "Actor filter: the OS user for CLI/TUI events, the ID token subject for requests with an exchanged token")
+	cmd.Flags().StringVar(&identity, "identity", "", "Identity filter: a bound host name, or the issuer of an exchanged token")
 	cmd.Flags().StringVar(&since, "since", "", "Show events after this time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().IntVar(&limit, "limit", 20, "Maximum number of events to show")
 

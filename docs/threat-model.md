@@ -389,9 +389,9 @@ https://user:secret@host/`), a schemeless `user:secret@host/x` and a
     credential on reads, not the token.
   - **Mutations: the existing CIDR and token rules.** Create and the hide and
     freeze toggles return the whole manifest as stored. A mutation needs an
-    address in `admin_permit_cidr`, and a bearer token only once that range
-    reaches past loopback; a loopback-only server takes mutations from
-    localhost with no token.
+    address in `admin_permit_cidr`, and a bearer token holding `write` for
+    the package's type only once that range reaches past loopback; a
+    loopback-only server takes mutations from localhost with no token.
   - **Operator host and backend.** `bodega show pkg`, `pkg export`,
     `pkg edit`, the TUI, the builder's output, repair and validation
     diagnostics and the server log print or serialize the manifest as
@@ -655,19 +655,42 @@ defence against:
   — all of these run with the build user's privileges and can do anything
   that user can. Bodega controls _which_ packages run; it does not sandbox
   what they do once they run.
-- **A read-path credential being read-only.** `bodega token generate` takes a
-  label and nothing else; the rows in `api_tokens` carry no scope. The
-  mutation gate accepts any unexpired one of them as its credential half
-  whenever `admin_permit_cidr` reaches past loopback, so a token written to a
-  client host by `bodega doctor --write-credentials` authorizes `POST` and
-  `DELETE` from that host too, if its address is inside `admin_permit_cidr`.
-  Read-path identity did not introduce this; it is what unscoped tokens have
-  always meant, and it matters now because the read path is the first place
-  those tokens live on machines other than an operator's. Two remedies exist
-  today, and `--write-credentials` prints them before it writes: keep
-  `admin_permit_cidr` at loopback, which makes the gate ignore tokens
-  entirely, or treat every host holding a written credential as
-  admin-capable. Scoped tokens would sever the two and are not shipped.
+- **What a token's scopes limit, and what they do not.** Every token carries
+  scopes: `read`, `write` and `admin`, each optionally narrowed to package
+  types, or `inventory`. A token presented on a route its scopes do not reach
+  is refused with `403` on reads and mutations alike, so a `read` token
+  written to a client host by `bodega doctor --write-credentials` cannot
+  `POST` or `DELETE` from that host even inside `admin_permit_cidr`. What
+  scopes do not limit:
+  - _A request that presents no token._ The read path stays open; an admin
+    read inside `admin_permit_cidr` needs no token; a loopback-only server
+    takes mutations from localhost with no token. A host inside the range
+    gets as much without its token as an `admin` token would give it, and
+    `admin_permit_cidr` stays the boundary for those. A credential that
+    matches no token on a read is no credential, as it was before.
+  - _Routes tied to no type._ `write:npm` reaches only npm's write routes,
+    but a narrowed `read` reaches every untyped read, such as the
+    `/api/v1/packages` listing, `/api/v1/status` and `/client/`, which name
+    packages of every type.
+  - _Tokens minted before scopes._ They migrated to `read,write,admin` so
+    nothing in use broke, and stay that broad until replaced. `bodega
+    doctor` names each one under `token-scope`.
+  - _The mapping an exchange applies._ An exchanged token is as narrow as
+    the rule that matched. A rule matching `repository_owner` grants every
+    repository in the organization, and one naming `repository` without
+    `ref` grants every branch, including one any contributor can push.
+  - _The identity provider after the exchange._ bodega verifies the ID token
+    once, at the exchange. A person removed from a group, or a workflow
+    whose access is pulled, keeps the bodega token until `oidc_token_ttl`
+    runs out or an operator runs `bodega token revoke`.
+  - _A captured ID token._ It is a bearer credential until its own `exp`,
+    and whoever holds it can exchange it. Its audience binds it to this
+    server (the `aud` must name the provider's `audience` or `client_id`),
+    not to the job that requested it.
+  - _The issuer itself._ An issuer, or anyone holding its signing key, mints
+    whatever claims it likes. Discovery and key fetches require `https`, so
+    the path to the issuer cannot substitute keys, but the issuer's own
+    compromise is outside this model.
 - **A profile's apt codename being an authorization boundary.** It is a
   scoping one. A profile that scopes apt is served a filtered `Packages` under
   a codename of its own, and the host reads that codename because its

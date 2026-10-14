@@ -93,10 +93,12 @@ no marker comment: Python's netrc module refuses a comment that follows a
 blank line, and refuses the whole file for it, so a marker there would cost
 pip every credential in the file. The machine <host> stanza is the anchor.
 
+  bodega token generate web-01 --scope read
   bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.internal
 
 The token names the host through bodega identity bind token <id> <name>. The
-write changes what an audit row says, never what the host may fetch.
+write changes what an audit row says, never what the host may fetch. Mint it
+with --scope read, so the credential on the host reaches nothing else.
 
 --configure is the other write. It applies the plan GET /client/plan returns
 for this host, the same plan the served setup script applies: which files
@@ -351,17 +353,16 @@ func writeClientCredentials(gf *globalFlags, token, baseURL string) error {
 // printCredentialPrecondition states what the token being written can do
 // beyond the read path, before the write rather than after it.
 //
-// api_tokens rows carry no scope, so the mutation gate accepts any unexpired
-// one of them as its credential half. Read-path attribution is the reason this
-// command exists, but the token it distributes is the same credential, and a
-// client host inside admin_permit_cidr gains write access the moment it holds
-// one. Nothing in the read path grants that; the absence of scopes does.
+// The mutation gate checks the same tokens the read path attributes with, and
+// this command runs on the client host, where the token's scopes cannot be
+// read. So it names the scope to mint rather than checking the one it holds:
+// a read token on a client host authorizes nothing but fetches.
 func printCredentialPrecondition() {
-	fmt.Println("Before writing: bodega tokens carry no scope, so this same token is the")
-	fmt.Println("credential half of the mutation gate. A host that holds it and whose address")
-	fmt.Println("is inside admin_permit_cidr can POST and DELETE against this bodega.")
-	fmt.Println("  Keep admin_permit_cidr at loopback (bodega acl admin list), or treat every")
-	fmt.Println("  host you write a credential to as admin-capable.")
+	fmt.Println("Before writing: this token is also checked on every write and admin route.")
+	fmt.Println("Write a token minted with --scope read: it is refused with 403 anywhere but")
+	fmt.Println("the read path, wherever this host sits. A token holding write or admin")
+	fmt.Println("authorizes those from this host if its address is inside admin_permit_cidr.")
+	fmt.Println("  bodega token generate <host> --scope read")
 	fmt.Println()
 }
 
@@ -701,7 +702,7 @@ func isZeroJSON(raw json.RawMessage) bool {
 // postureChecks names the server-posture rows in the order doctor prints them.
 // The set is fixed so the table has the same shape on a host with an install
 // and one without, which is what lets a pipeline diff the output.
-var postureChecks = []string{"policy-coverage", "policy-ignored", "policy-ecosystem"}
+var postureChecks = []string{"policy-coverage", "policy-ignored", "policy-ecosystem", "token-scope"}
 
 // postureStore is the read surface the posture checks need. An interface so
 // they can be driven against a store built by hand, without a config file or
@@ -711,6 +712,7 @@ type postureStore interface {
 	ListAgePolicies(ctx context.Context) ([]audit.AgePolicy, error)
 	ListOSVPolicies(ctx context.Context) ([]audit.OSVPolicy, error)
 	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
+	ListTokens(ctx context.Context) ([]audit.TokenInfo, error)
 }
 
 // serverPostureFindings resolves this machine's install and reports on it,
@@ -804,11 +806,48 @@ func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 	if err != nil && !strings.Contains(err.Error(), "no such table") {
 		return postureSkipped("read upstream provenance policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
-	return []host.Finding{
+	findings := []host.Finding{
 		policyCoverage(rules, ages, osvs, provs),
 		policyIgnored(ages, osvs, provs),
 		policyEcosystem(ages, osvs),
 	}
+	tokens, err := store.ListTokens(ctx)
+	if err != nil {
+		return append(findings, host.Finding{Check: "token-scope", Status: host.StatusSkip,
+			Detail: "read tokens: " + err.Error(), Remediation: "repair the audit store, then re-run `bodega doctor`"})
+	}
+	return append(findings, tokenScope(tokens, time.Now())...)
+}
+
+// tokenScope warns once for each unexpired token holding read, write and
+// admin with no type restriction. Every token minted before scopes existed
+// migrated to exactly that, so on an upgraded install this is the list of
+// credentials still as broad as they were before scopes could narrow them.
+// A store doctor opened read-only may predate the migration and still say
+// "full", which the parser reads as the same three.
+func tokenScope(tokens []audit.TokenInfo, now time.Time) []host.Finding {
+	var out []host.Finding
+	for _, t := range tokens {
+		if t.ExpiresAt != nil && t.ExpiresAt.Before(now) {
+			continue
+		}
+		sc, err := audit.ParseScopes(t.Scope)
+		if err != nil || !sc.HoldsAll() {
+			continue
+		}
+		out = append(out, host.Finding{
+			Check:  "token-scope",
+			Status: host.StatusWarn,
+			Detail: fmt.Sprintf("token %s (%s) holds read, write and admin on every package type", t.ID, t.Label),
+			Remediation: fmt.Sprintf("mint a token scoped to what %s does (bodega token generate %s --scope ...), move its holder to it, then bodega token revoke %s",
+				t.Label, t.Label, t.ID),
+		})
+	}
+	if len(out) == 0 {
+		out = append(out, host.Finding{Check: "token-scope", Status: host.StatusOK,
+			Detail: "no token holds read, write and admin unrestricted"})
+	}
+	return out
 }
 
 // gateRow is a policy table flattened to what the posture checks read. Both
