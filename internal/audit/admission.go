@@ -80,6 +80,12 @@ const (
 	// a signature, a certificate chain or a subject digest failed, or there
 	// was no trusted root to verify it against.
 	ProvenanceInvalid = "invalid"
+	// ProvenanceUnknown means the evidence could not be read: a registry or
+	// API lookup failed or answered something unparseable, the registry no
+	// longer lists the version, or the pin or publish times a comparison
+	// needed were missing. Nothing was concluded, so it says neither that
+	// provenance is absent nor that it failed, and an override may admit it.
+	ProvenanceUnknown = "unknown"
 	// ProvenanceMismatch means the provenance verified, but from a source
 	// repository or builder other than the one the package is pinned to.
 	ProvenanceMismatch = "mismatch"

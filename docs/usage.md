@@ -1197,7 +1197,7 @@ No cached checksums matched apt/ngnix; nothing was cleared. Run `bodega pkg chec
 
 ### `bodega pkg trust <show|reset> <type> <name>`
 
-Shows or clears the source repository and builder a package's upstream provenance is pinned to. The first version of a package whose provenance verifies pins both, trust-on-first-use, the same model as checksum pinning; a later version verified from a different repository or builder records `mismatch`. So does an npm version with no provenance that the packument's `time` map dates after the pinned version; one dated before it stays `unavailable`, and one either time is missing for records `invalid`. See [`bodega policy provenance`](#bodega-policy-provenance-setlist) for the check itself.
+Shows or clears the source repository and builder a package's upstream provenance is pinned to. The first version of a package whose provenance verifies pins both, trust-on-first-use, the same model as checksum pinning; a later version verified from a different repository or builder records `mismatch`. So does an npm version with no provenance that the packument's `time` map dates after the pinned version; one dated before it stays `unavailable`, and one either time is missing for records `unknown`. See [`bodega policy provenance`](#bodega-policy-provenance-setlist) for the check itself.
 
 ```console
 $ bodega pkg trust show npm sigstore
@@ -2492,7 +2492,10 @@ Versions imported before this key existed cannot be backfilled. Nothing on disk 
 ```json
 {
   "GHSA-xxxx-yyyy-zzzz": [
-    { "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    }
   ]
 }
 ```
@@ -2675,18 +2678,19 @@ The check runs at the same points as the age and OSV gates: import (`bodega pkg 
 | `binary` with a GitHub release download URL | the asset's sha256 from the entry (`sha256` or `checksum`), else the release API; then GitHub's attestations for that digest  | every `https://slsa.dev/provenance/v1` attestation against the trusted root, issued to GitHub Actions, with a subject carrying that sha256                                                                  |
 | `git` fetched as a release archive          | the archive's sha256 from the entry's `checksum`, else the release's `SHA256SUMS`; then GitHub's attestations for that digest | as for `binary`                                                                                                                                                                                             |
 
-npm's own publish attestation, which sits in the same document and is signed by the registry's key rather than by a CI identity, is not verified: it says the registry accepted an upload, not who built it. GitHub's release attestation, signed by GitHub to say a release is immutable, is filtered out the same way. GitHub's API is read without a token, so it answers 60 requests an hour per address; past that, a lookup fails and records `invalid`, which warns under the default action.
+npm's own publish attestation, which sits in the same document and is signed by the registry's key rather than by a CI identity, is not verified: it says the registry accepted an upload, not who built it. GitHub's release attestation, signed by GitHub to say a release is immutable, is filtered out the same way. GitHub's API is read without a token, so it answers 60 requests an hour per address; past that, a lookup fails and records `unknown`, which warns under the default action.
 
 From a verified bundle the row records the certificate's source repository URI, its build signer URI as the workflow ref, the provenance's builder ID, and the sha256 of the bundle as fetched.
 
 **Outcomes.** Every version gets one:
 
-| Outcome       | Means                                                                                                                                                                                                                                         |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `verified`    | a provenance bundle verified, and its repository and builder match the package's pin (or this version took the pin)                                                                                                                           |
-| `unavailable` | the registry answered that the package publishes no provenance, or its ecosystem has no mechanism bodega reads                                                                                                                                |
-| `invalid`     | published provenance did not verify, could not be fetched or had no trusted root to check it against, or the lookup that says whether any is published failed                                                                                 |
-| `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; or an npm version with no provenance, published after the pinned version; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name) |
+| Outcome       | Means                                                                                                                                                                                                                                                |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `verified`    | a provenance bundle verified, and its repository and builder match the package's pin (or this version took the pin)                                                                                                                                  |
+| `unavailable` | the registry answered that the package publishes no provenance, or its ecosystem has no mechanism bodega reads                                                                                                                                       |
+| `invalid`     | a provenance bundle was read and did not verify, named another subject, or had no trusted root to check it against; or the registry declared provenance and served a document holding no SLSA bundle                                                 |
+| `unknown`     | the evidence could not be read: a lookup failed or answered something that does not parse, the registry no longer lists the version, or the publish times or pin a comparison needs were missing. Nothing was verified, and an override may admit it |
+| `mismatch`    | a bundle verified, from a source repository or builder other than the one the package is pinned to; or an npm version with no provenance, published after the pinned version; see [`bodega pkg trust`](#bodega-pkg-trust-showreset-type-name)        |
 
 **npm releases without provenance.** A version with no provenance published after the pinned one is the trace a publish from a stolen token leaves, and it is also what a maintainer publishing by hand leaves. The two look the same from the registry, so bodega records `mismatch` for both and names who published each version: the detail reads `published 2026-06-11T03:56:09Z by npm user daiwei1105 with no provenance; pinned version 3.5.35 was published by GitHub Actions ...`, and a warn or block row's details carry `publisher` and `pinned_publisher` (JSON `null` when the packument's `_npmUser` names nobody). Telling the two apart is the operator's call, made with the project.
 
@@ -2697,15 +2701,15 @@ It happens often. On 2026-10-12 a scan of 29 popular npm packages, reading each 
 
 So roughly a third of active npm packages raise this outcome. Under `warn` that is a warning to read; under `block` it refuses those maintainer publishes along with any stolen-token one. Keep npm at `warn` unless you vet each package's release process and know which of them always publish from CI.
 
-`unavailable` is the registry's answer, not the absence of one: a packument read and parsed with no `dist.attestations` for the version, a 404 from GitHub's attestation lookup or an empty attestation list, a release asset with no recorded digest, or a release with no `SHA256SUMS`. A lookup that gets no answer is `invalid`: a transport error, a status other than 200 or 404 (a rate limit's 403 included), a body that does not parse, or one larger than its cap, which is refused rather than truncated. So is every failure once the packument says a version publishes provenance. Nothing that publishes provenance passes because verification was skipped. An npm entry that names no single release (`*`, `latest`) records `not_evaluated`; the fetch that resolves a version checks it.
+`unavailable` is the registry's answer, not the absence of one: a packument read and parsed with no `dist.attestations` for the version, a 404 from GitHub's attestation lookup or an empty attestation list, a release asset with no recorded digest, or a release with no `SHA256SUMS`. A lookup that gets no answer is `unknown`: a transport error, a status other than 200 or 404 (a rate limit's 403 included), a body that does not parse, or one larger than its cap, which is refused rather than truncated. So is a packument that no longer lists the version, which is what npm serves once a version is unpublished, and a bundle the packument names that could not be fetched. `unknown` claims neither that provenance is absent nor that it failed, so it never takes a pin or is compared with one, and unlike `invalid` an override may admit it. Nothing that publishes provenance passes because verification was skipped. An npm entry that names no single release (`*`, `latest`) records `not_evaluated`; the fetch that resolves a version checks it.
 
 **Actions.** One row per ecosystem in `upstream_provenance_policy`; `set` overwrites, and `list` prints every type, with the unset ones at their default:
 
-| Action           | `verified` | `unavailable` | `invalid` | `mismatch` |
-| ---------------- | ---------- | ------------- | --------- | ---------- |
-| `warn` (default) | pass       | pass          | warn      | warn       |
-| `block`          | pass       | block         | block     | block      |
-| `ignore`         | pass       | pass          | pass      | pass       |
+| Action           | `verified` | `unavailable` | `invalid` | `unknown` | `mismatch` |
+| ---------------- | ---------- | ------------- | --------- | --------- | ---------- |
+| `warn` (default) | pass       | pass          | warn      | warn      | warn       |
+| `block`          | pass       | block         | block     | block     | block      |
+| `ignore`         | pass       | pass          | pass      | pass      | pass       |
 
 `ignore` still verifies and records the outcome, and still takes the pin. A block answers the importer, the build or the proxied client the way an age or OSV block does (see [What a refused client sees](#what-a-refused-client-sees)), with `upstream_provenance` as the check. Every `set` writes a `policy` audit event naming who ran it.
 
@@ -2966,7 +2970,14 @@ curl -sS -X POST https://bodega.example.com/api/v1/policy/revet \
       "previous_decision": "admitted",
       "decision": "policy_blocked",
       "action": "hidden",
-      "failing": [{ "check": "osv", "action": "block", "status": "block", "detail": "..." }]
+      "failing": [
+        {
+          "check": "osv",
+          "action": "block",
+          "status": "block",
+          "detail": "..."
+        }
+      ]
     }
   ]
 }
@@ -3131,7 +3142,7 @@ The quorum is recorded with each request when it is made, so changing `override_
 
 **What an override does.** Once approved, the next admission of that version records the named check with status `overridden`, the override's id in its `override` field, and a detail naming the original failure, the approvers and the expiry. The check's `action` still says `block`. The other checks run as they always do: an allow-list override does not skip OSV. It applies on every path that admits a version: `pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, bulk import, a build's fetch, a proxy fill, and a [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
 
-**What it never does.** An override does not apply to an OSV block that names a malware record (`MAL-`), to a hit from an [integration](#integrations) whose type says a hit means malware (`malware-list`), or to upstream provenance whose outcome is `invalid`. Each says the version is hostile rather than that it misses a policy. The check stays `block` and its detail names the override it did not honor. The admission row records each such check as `unwaivable`, and `request` refuses an override naming a check the version's newest admission row recorded that way, naming the check; a request made before any admission is accepted and still never applies.
+**What it never does.** An override does not apply to an OSV block that names a malware record (`MAL-`), to a hit from an [integration](#integrations) whose type says a hit means malware (`malware-list`), or to upstream provenance whose outcome is `invalid`. Each says the version is hostile rather than that it misses a policy. The check stays `block` and its detail names the override it did not honor. The admission row records each such check as `unwaivable`, and `request` refuses an override naming a check the version's newest admission row recorded that way, naming the check; a request made before any admission is accepted and still never applies. Provenance whose outcome is `unknown` says only that the evidence could not be read, so an override admits it.
 
 **Expiry.** An override past its expiry stops applying with nobody acting and accepts no more votes. Nothing is rewritten: `list --expired` shows it, and the next re-vet of an admitted version refuses it again and acts under `revet_on_block`.
 
@@ -3724,7 +3735,12 @@ The runtime policy is for the service:
     {
       "Sid": "Objects",
       "Effect": "Allow",
-      "Action": ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
+      "Action": [
+        "s3:AbortMultipartUpload",
+        "s3:DeleteObject",
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
       "Resource": "arn:aws:s3:::example-bodega-artifacts/*"
     }
   ]
@@ -6661,7 +6677,7 @@ The trusted key IDs come from `--key` (repeatable) or `attestation_keyids` in th
 
 Given `type/name/version`, verify fetches the envelope from the server (`--server`, `$BODEGA_SERVER`, `server_url`, then `public_url`) and the artifact bytes from the route a client would download them from, unless `--artifact` names a local copy. Given an envelope file, it needs `--package type/name/version`, because nothing else says which package the envelope should be about. distfiles are not fetched; pass `--artifact`.
 
-After the checks, verify prints what the statement says about the publisher's own provenance: `upstream-provenance` and `publisher-signature`, each with its status (`verified`, `unavailable`, `invalid` or `mismatch`, as the [upstream provenance check](#bodega-policy-provenance-setlist) recorded it at admission) and, when a signature verified, the source repository, workflow, builder and bundle digest. Neither line fails verify. An envelope signed before bodega verified provenance carries `unavailable` and nothing else, and verifies as it always did.
+After the checks, verify prints what the statement says about the publisher's own provenance: `upstream-provenance` and `publisher-signature`, each with its status (`verified`, `unavailable`, `invalid`, `unknown` or `mismatch`, as the [upstream provenance check](#bodega-policy-provenance-setlist) recorded it at admission) and, when a signature verified, the source repository, workflow, builder and bundle digest. Neither line fails verify. An envelope signed before bodega verified provenance carries `unavailable` and nothing else, and verifies as it always did.
 
 ```text
 info  upstream-provenance verified

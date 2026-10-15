@@ -89,7 +89,7 @@ type Platform struct {
 }
 
 // Availability is the outcome of verifying a publisher's provenance:
-// verified, unavailable, invalid or mismatch. The identity fields are what
+// verified, unavailable, invalid, unknown or mismatch. The identity fields are what
 // the signing certificate and the provenance named, set when a signature
 // verified (verified and mismatch) and omitted otherwise, which is also how
 // an envelope signed before they existed reads.

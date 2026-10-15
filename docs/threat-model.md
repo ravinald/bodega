@@ -231,14 +231,18 @@ risk:
   CI provenance to compare. An npm version published before the pinned one
   predates the project's adoption of provenance and stays `unavailable`, and
   one the packument gives no publish time for, or whose pinned version it
-  gives none for, is `invalid`. Under `bodega policy provenance set <type>
-block`, `mismatch`, `invalid` and `unavailable` are all refused, so the
-  laptop publish gets no further than the admission row that names it. Under
-  the default `warn`, a `mismatch`, an `invalid` bundle or a lookup that got
-  no answer (a rate limit, an outage) is a warning, and only a registry's
-  answer that the version publishes nothing (`unavailable`) passes: the
-  outcome is recorded in every admission row and attestation, but nothing is
-  refused.
+  gives none for, is `unknown`. `unknown` means the evidence could not be
+  read: a lookup that got no answer (a rate limit, an outage), an answer
+  that does not parse, or a packument that no longer lists the version.
+  Nothing was verified, so it claims neither that provenance is absent nor
+  that it failed, and unlike `invalid` an override may admit it. Under
+  `bodega policy provenance set <type> block`, `mismatch`, `invalid`,
+  `unknown` and `unavailable` are all refused, so the laptop publish gets no
+  further than the admission row that names it. Under the default `warn`, a
+  `mismatch` or an `invalid` bundle is a warning, a lookup failure
+  (`unknown`) admits with a warning, and only a registry's answer that the
+  version publishes nothing (`unavailable`) passes silently: the outcome is
+  recorded in every admission row and attestation, but nothing is refused.
   A maintainer publishing by hand leaves the same trace as the laptop
   publish, and the registry cannot tell the two apart, so the `mismatch`
   names who published the version and the pinned one (npm's `_npmUser`) and
@@ -678,7 +682,7 @@ defence against:
     packages of every type.
   - _Tokens minted before scopes._ They migrated to `read,write,admin` so
     nothing in use broke, and stay that broad until replaced. `bodega
-    doctor` names each one under `token-scope`.
+doctor` names each one under `token-scope`.
   - _The mapping an exchange applies._ An exchanged token is as narrow as
     the rule that matched. A rule matching `repository_owner` grants every
     repository in the organization, and one naming `repository` without
@@ -936,11 +940,11 @@ because it is still true of the moment it describes.
 It does not prove that the artifact is safe, or that the policy was a good
 one. `upstreamProvenance` and `publisherSignature` say what the admission's
 upstream provenance check concluded about the publisher's own signed
-provenance (`verified`, `unavailable`, `invalid` or `mismatch`, with the
-source repository and builder when a signature verified); they are bodega's
-report of that check, not the publisher's bundle, so a consumer who wants to
-verify the publisher independently fetches the bundle from the registry
-itself. It also proves nothing about a statement signed after the **bodega host
+provenance (`verified`, `unavailable`, `invalid`, `unknown` or `mismatch`,
+with the source repository and builder when a signature verified); they are
+bodega's report of that check, not the publisher's bundle, so a consumer
+who wants to verify the publisher independently fetches the bundle from the
+registry itself. It also proves nothing about a statement signed after the **bodega host
 is compromised**. The key that signs is loaded by the serving process and
 read by `bodega attest backfill` and `bodega build fetch` on the same host,
 so anyone who controls that host can sign a statement admitting anything, at

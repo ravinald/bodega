@@ -211,14 +211,15 @@ func TestNpmWithoutProvenanceIsUnavailable(t *testing.T) {
 }
 
 // Published provenance is never skipped into a pass: a bundle that cannot be
-// read, or no trusted root to check it against, is invalid.
-func TestNpmPublishedButUnverifiableIsInvalid(t *testing.T) {
+// read is unknown, and one with no trusted root to check it against is
+// invalid.
+func TestNpmPublishedButUnverifiableIsNotAPass(t *testing.T) {
 	t.Run("bundle missing", func(t *testing.T) {
 		r := newRegistry(t)
 		r.packument(t, "sigstore", "3.0.0", sigstoreIntegrity, "/att/sigstore@3.0.0")
 		ev := newTestVerifier(t, r).Npm(context.Background(), "", "sigstore", "3.0.0")
-		if ev.Outcome != audit.ProvenanceInvalid {
-			t.Fatalf("outcome %s (%s), want invalid", ev.Outcome, ev.Detail)
+		if ev.Outcome != audit.ProvenanceUnknown {
+			t.Fatalf("outcome %s (%s), want unknown", ev.Outcome, ev.Detail)
 		}
 	})
 	t.Run("no trusted root", func(t *testing.T) {
@@ -407,10 +408,12 @@ func TestCommitJudgesAgainstThePinThatWon(t *testing.T) {
 }
 
 // An oracle that did not answer is not an oracle saying "none": a rate limit,
-// an outage or a truncated body is invalid, so it warns under the default
-// action and provenance a package publishes is never skipped into a pass. A
-// 404 on the attestation lookup is GitHub's answer that there is none.
-func TestFailedLookupIsInvalidNotUnavailable(t *testing.T) {
+// an outage, a truncated body or a packument that no longer lists the version
+// is unknown, so it warns under the default action and provenance a package
+// publishes is never skipped into a pass. Nor is it invalid: nothing was
+// verified, so nothing failed to. A 404 on the attestation lookup is GitHub's
+// answer that there is none.
+func TestFailedLookupIsUnknown(t *testing.T) {
 	status := func(code int) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) })
 	}
@@ -439,32 +442,37 @@ func TestFailedLookupIsInvalidNotUnavailable(t *testing.T) {
 		wantOutcome string
 		wantAction  string
 	}{
-		{"github attestations 403", status(http.StatusForbidden), gh, ghEntry, audit.ProvenanceInvalid, policy.ActionWarn},
+		{"npm packument lists no such version", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"versions":{"1.0.0":{}},"time":{"1.0.1":"2026-01-01T00:00:00Z"}}`))
+		}), &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "openai-pr-reviewer"},
+			func(*Verifier) *manifest.VersionEntry { return &manifest.VersionEntry{Version: "1.0.1"} },
+			audit.ProvenanceUnknown, policy.ActionWarn},
+		{"github attestations 403", status(http.StatusForbidden), gh, ghEntry, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"github attestations 404", status(http.StatusNotFound), gh, ghEntry, audit.ProvenanceUnavailable, policy.ActionPass},
 		{"github attestations not JSON", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("<html>")) }),
-			gh, ghEntry, audit.ProvenanceInvalid, policy.ActionWarn},
+			gh, ghEntry, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"github release digest 403", status(http.StatusForbidden), gh, func(v *Verifier) *manifest.VersionEntry {
 			ve := ghEntry(v)
 			ve.SHA256 = ""
 			return ve
-		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		}, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"git SHA256SUMS 503", status(http.StatusServiceUnavailable), &manifest.PackageManifest{Type: manifest.TypeGit, Name: "cli"},
 			func(v *Verifier) *manifest.VersionEntry {
 				return &manifest.VersionEntry{URL: v.GitHubWeb + "/cli/cli", Ref: "v2.102.0", Source: "release"}
-			}, audit.ProvenanceInvalid, policy.ActionWarn},
+			}, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"git SHA256SUMS 404", status(http.StatusNotFound), &manifest.PackageManifest{Type: manifest.TypeGit, Name: "cli"},
 			func(v *Verifier) *manifest.VersionEntry {
 				return &manifest.VersionEntry{URL: v.GitHubWeb + "/cli/cli", Ref: "v2.102.0", Source: "release"}
 			}, audit.ProvenanceUnavailable, policy.ActionPass},
 		{"npm packument 503", status(http.StatusServiceUnavailable), npm, func(*Verifier) *manifest.VersionEntry {
 			return &manifest.VersionEntry{Version: "3.0.0"}
-		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		}, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"npm packument 403", status(http.StatusForbidden), npm, func(*Verifier) *manifest.VersionEntry {
 			return &manifest.VersionEntry{Version: "3.0.0"}
-		}, audit.ProvenanceInvalid, policy.ActionWarn},
+		}, audit.ProvenanceUnknown, policy.ActionWarn},
 		{"npm packument not JSON", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{")) }),
 			npm, func(*Verifier) *manifest.VersionEntry { return &manifest.VersionEntry{Version: "3.0.0"} },
-			audit.ProvenanceInvalid, policy.ActionWarn},
+			audit.ProvenanceUnknown, policy.ActionWarn},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -473,10 +481,41 @@ func TestFailedLookupIsInvalidNotUnavailable(t *testing.T) {
 			if got.Provenance == nil || got.Provenance.Outcome != tc.wantOutcome || got.Action != tc.wantAction {
 				t.Fatalf("%+v (%s), want %s and %s", got, got.Reason, tc.wantOutcome, tc.wantAction)
 			}
-			if tc.wantOutcome == audit.ProvenanceInvalid && !strings.Contains(got.Reason, "failed") {
-				t.Errorf("reason %q does not say the lookup failed", got.Reason)
+			if tc.wantOutcome == audit.ProvenanceUnknown && !strings.Contains(got.Reason, "failed") && !strings.Contains(got.Reason, "lists no version") {
+				t.Errorf("reason %q does not say why the evidence could not be read", got.Reason)
 			}
 		})
+	}
+}
+
+// unknown warns under warn, refuses under block and is only recorded under
+// ignore. It never takes a pin, and a pin already held never turns it into a
+// mismatch, as it would an unavailable version published after the pin.
+func TestUnknownFollowsTheActionAndLeavesThePinAlone(t *testing.T) {
+	noVersion := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"versions":{"3.0.0":{}},"time":{"3.0.0":"2024-10-14T16:13:47Z","3.1.0":"2025-02-04T20:35:48Z"}}`))
+	})
+	srv := httptest.NewServer(noVersion)
+	t.Cleanup(srv.Close)
+	v := &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}, NpmRegistry: srv.URL, Root: recordedRoot(t)}
+	for _, pinned := range []bool{false, true} {
+		for action, want := range map[string]string{"warn": policy.ActionWarn, "block": policy.ActionBlock, "ignore": policy.ActionPass} {
+			store := &fakeStore{actions: map[string]string{"npm": action}}
+			if pinned {
+				store.pins = map[string]audit.ProvenancePin{"npm/sigstore": sigstorePin()}
+			}
+			c := &Checker{Store: store, Verifier: v}
+			got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: "3.1.0"})
+			if got.Provenance == nil || got.Provenance.Outcome != audit.ProvenanceUnknown || got.Action != want {
+				t.Errorf("pinned=%v %s: %+v (%s), want unknown and %s", pinned, action, got, got.Reason, want)
+			}
+			if changed := c.Commit(context.Background()); changed != nil {
+				t.Errorf("pinned=%v %s: commit changed verdicts: %+v", pinned, action, changed)
+			}
+			if !pinned && store.pins != nil {
+				t.Errorf("%s: an unknown version took a pin: %+v", action, store.pins)
+			}
+		}
 	}
 }
 
@@ -650,9 +689,9 @@ func TestNpmWithoutProvenanceAgainstThePin(t *testing.T) {
 }
 
 // With a pin held, a publish time the packument does not give means the
-// comparison could not run, so the version is invalid rather than passing
-// as unavailable. A pin that cannot be read is invalid too.
-func TestNpmWithoutProvenanceUnknownTimeIsInvalid(t *testing.T) {
+// comparison could not run, so the version is unknown rather than passing
+// as unavailable. A pin that cannot be read is unknown too.
+func TestNpmWithoutProvenanceUnknownTimeIsUnknown(t *testing.T) {
 	cases := []struct{ name, drop, want string }{
 		{"version's time missing", "3.1.0", "this version's"},
 		{"pinned version's time missing", "3.0.0", "pinned version 3.0.0's"},
@@ -664,8 +703,8 @@ func TestNpmWithoutProvenanceUnknownTimeIsInvalid(t *testing.T) {
 			store := &fakeStore{pins: map[string]audit.ProvenancePin{"npm/sigstore": sigstorePin()}}
 			c := &Checker{Store: store, Verifier: newTestVerifier(t, r)}
 			got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: "3.1.0"})
-			if got.Provenance.Outcome != audit.ProvenanceInvalid || got.Action != policy.ActionWarn {
-				t.Fatalf("%+v (%s), want invalid and warn", got, got.Reason)
+			if got.Provenance.Outcome != audit.ProvenanceUnknown || got.Action != policy.ActionWarn {
+				t.Fatalf("%+v (%s), want unknown and warn", got, got.Reason)
 			}
 			if !strings.Contains(got.Reason, tc.want) || !strings.Contains(got.Reason, "no publish time") {
 				t.Errorf("reason %q does not say %s time is missing", got.Reason, tc.want)
@@ -677,8 +716,8 @@ func TestNpmWithoutProvenanceUnknownTimeIsInvalid(t *testing.T) {
 		sigstorePackument(t, r, nil)
 		c := &Checker{Store: brokenPins{&fakeStore{}}, Verifier: newTestVerifier(t, r)}
 		got := c.Check(context.Background(), &manifest.PackageManifest{Type: "npm", Name: "sigstore"}, &manifest.VersionEntry{Version: "3.1.0"})
-		if got.Provenance.Outcome != audit.ProvenanceInvalid || !strings.Contains(got.Reason, "could not be read") {
-			t.Fatalf("%+v (%s), want invalid naming the read", got, got.Reason)
+		if got.Provenance.Outcome != audit.ProvenanceUnknown || !strings.Contains(got.Reason, "could not be read") {
+			t.Fatalf("%+v (%s), want unknown naming the read", got, got.Reason)
 		}
 	})
 }
@@ -745,8 +784,8 @@ func TestCommitJudgesUnavailableAgainstThePinThatWon(t *testing.T) {
 	if !ok {
 		t.Fatalf("commit did not judge 0.1.1 again: %+v", changed)
 	}
-	if got.Provenance.Outcome != audit.ProvenanceInvalid || !strings.Contains(got.Reason, "pinned version 0.0.0's") {
-		t.Errorf("0.1.1 against a pin whose time the packument lacks: %s (%s), want invalid", got.Provenance.Outcome, got.Reason)
+	if got.Provenance.Outcome != audit.ProvenanceUnknown || !strings.Contains(got.Reason, "pinned version 0.0.0's") {
+		t.Errorf("0.1.1 against a pin whose time the packument lacks: %s (%s), want unknown", got.Provenance.Outcome, got.Reason)
 	}
 }
 

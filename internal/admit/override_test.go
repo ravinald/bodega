@@ -189,6 +189,8 @@ func TestOverrideExpiry(t *testing.T) {
 // override says, and the row names the override it did not honor. An
 // advisory block on the same path is overridden, so the exclusion is the
 // verdict's and not the path's.
+// unknown provenance says the evidence could not be read, not that the version
+// is hostile, so an override admits it where it never admits invalid.
 func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 	f := newAdmissionFixture(t)
 	now := time.Now()
@@ -203,6 +205,8 @@ func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}}, false},
 		{"1.0.2", policy.Result{Check: audit.CheckOSV, Action: policy.ActionBlock, Reason: "GHSA-test-0002",
 			Details: map[string]any{"vulns": []string{"GHSA-test-0002"}}}, true},
+		{"1.0.3", policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no version 1.0.3",
+			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}, true},
 	} {
 		req := osvOverride(tc.version)
 		req.Check = tc.r.Check
@@ -224,6 +228,47 @@ func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 		if !strings.Contains(c.Detail, "override "+o.ID+" does not apply") {
 			t.Errorf("%s: detail %q does not name the override it refused", tc.version, c.Detail)
 		}
+	}
+}
+
+// A request is judged against the newest admission row: one that recorded
+// upstream provenance unknown takes an override request, one that recorded it
+// invalid refuses it, and a version whose newest row moved from unknown to
+// invalid refuses it too.
+func TestOverrideRequestAfterProvenanceRefusal(t *testing.T) {
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	unknown := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no version",
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}
+	invalid := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "signature did not verify",
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}}
+	refuse := func(version string, r policy.Result, unwaivable string) {
+		t.Helper()
+		got := Fetch(ctx, f.adb, []policy.VersionChecker{fixed{r}}, manifest.TypeNpm, "minimist",
+			manifest.VersionEntry{Version: version}, AllowListCheck(false, "minimist", nil), Who{}, "")
+		if c := checkOf(t, got.Admission, r.Check); got.Block == nil || c.Status != audit.CheckBlock || c.Unwaivable != unwaivable {
+			t.Fatalf("%s: row check = %+v, want blocked with unwaivable %q", version, c, unwaivable)
+		}
+	}
+	requestFor := func(version string) error {
+		req := osvOverride(version)
+		req.Check = audit.CheckUpstreamProvenance
+		_, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now())
+		return err
+	}
+	const never = "invalid upstream provenance is never overridden"
+
+	refuse("2.0.0", unknown, "")
+	if err := requestFor("2.0.0"); err != nil {
+		t.Errorf("override request for unknown provenance: %v", err)
+	}
+	refuse("2.0.1", invalid, never)
+	if err := requestFor("2.0.1"); !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), never) {
+		t.Errorf("override request for invalid provenance: %v", err)
+	}
+	refuse("2.0.0", invalid, never)
+	if err := requestFor("2.0.0"); !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), never) {
+		t.Errorf("override request after the newest row recorded invalid: %v", err)
 	}
 }
 

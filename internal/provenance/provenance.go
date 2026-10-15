@@ -87,6 +87,10 @@ func unavailable(format string, a ...any) Evidence {
 	return Evidence{UpstreamProvenance: audit.UpstreamProvenance{Outcome: audit.ProvenanceUnavailable}, Detail: fmt.Sprintf(format, a...)}
 }
 
+func unknown(format string, a ...any) Evidence {
+	return Evidence{UpstreamProvenance: audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}, Detail: fmt.Sprintf(format, a...)}
+}
+
 func invalid(format string, a ...any) Evidence {
 	return Evidence{UpstreamProvenance: audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}, Detail: fmt.Sprintf(format, a...)}
 }
