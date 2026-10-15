@@ -112,8 +112,9 @@ func TestOverrideRoutesRequireABoundToken(t *testing.T) {
 	}
 }
 
-// Requesting an override needs write, voting on one needs admin and listing
-// needs read, whichever header form carries the token. The Basic form matters
+// Requesting an override needs write, and voting on one or listing them needs
+// admin, because the list names every requester and voter, whichever header
+// form carries the token. The Basic form matters
 // on its own: the localhost-only gate scope-checks a Bearer credential only,
 // so overrideCaller is what refuses it.
 func TestOverrideRoutesCheckScope(t *testing.T) {
@@ -145,7 +146,8 @@ func TestOverrideRoutesCheckScope(t *testing.T) {
 		{"inventory token requesting over Basic", http.MethodPost, "/api/v1/overrides", scopedToken, "", true, http.StatusForbidden, "write"},
 		{"inventory token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", scopedToken, "", false, http.StatusForbidden, "admin"},
 		{"read token requesting", http.MethodPost, "/api/v1/overrides", readerToken, overrideBody, false, http.StatusForbidden, "write"},
-		{"read token listing", http.MethodGet, "/api/v1/overrides", readerToken, "", false, http.StatusOK, ""},
+		{"read token listing", http.MethodGet, "/api/v1/overrides", readerToken, "", false, http.StatusForbidden, "admin"},
+		{"write token listing over Basic", http.MethodGet, "/api/v1/overrides", writerToken, "", true, http.StatusForbidden, "admin"},
 	} {
 		var rec *httptest.ResponseRecorder
 		if tc.basic {
@@ -179,8 +181,8 @@ func TestOverrideRoutesCheckScope(t *testing.T) {
 			admin++
 		}
 	}
-	if admin != 4 {
-		t.Errorf("%d token_scope denials name missing_scope admin, want 4: %+v", admin, rows)
+	if admin != 6 {
+		t.Errorf("%d token_scope denials name missing_scope admin, want 6: %+v", admin, rows)
 	}
 }
 

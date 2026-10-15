@@ -1208,7 +1208,8 @@ paths:
         bound with `bodega identity bind token`, or one minted by
         `POST /api/v1/auth/exchange` or `bodega login`, which acts as
         `<issuer>#<subject>`. A binding wins when a token has both. Listing
-        needs `read`, requesting `write`, and approving or rejecting `admin`.
+        needs `admin`, because the list names every requester and voter;
+        requesting needs `write`, and approving or rejecting `admin`.
       operationId: listOverrides
       tags: [status]
       security:
@@ -1235,7 +1236,7 @@ paths:
         "401":
           description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not in admin_permit_cidr, or the token lacks `read`
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
         "503":
           description: Audit database not configured
     post:
@@ -1371,7 +1372,8 @@ paths:
         One row per (type, package, version, check) a client was refused,
         most recently refused first, each with the identities and client
         addresses that asked. Rows are written whatever `discover_mode` says.
-        Restricted to IPs in `admin_permit_cidr`.
+        Restricted to IPs in `admin_permit_cidr`, and a token presented must
+        hold `admin`.
       operationId: listQueue
       tags: [status]
       parameters:
@@ -1408,7 +1410,7 @@ paths:
         "400":
           description: Unknown type, check or state
         "403":
-          description: Client IP is not in admin_permit_cidr
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
         "503":
           description: Audit database not configured
 
@@ -1421,7 +1423,9 @@ paths:
         for `profile`, and a two-person override request for every other
         check, or the override already pending or active for that version
         and check. Like the override routes it requires a token bound to an
-        identity, which is recorded as the actor. A row refused as known
+        identity, which is recorded as the actor, and the token must hold
+        `admin`: approving writes an allow-list rule or a profile pin. A row
+        refused as known
         malware or for upstream provenance that failed to verify is refused
         with 409 and stays open.
       operationId: approveQueue
@@ -1455,7 +1459,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `admin`
         "404":
           description: No queue row with that id
         "409":
@@ -1467,8 +1471,8 @@ paths:
     post:
       summary: Close one queue row without admitting anything
       description: |
-        Records the token identity as the actor. The row reopens if the same
-        refusal happens again.
+        Records the token identity as the actor, and the token must hold
+        `admin`. The row reopens if the same refusal happens again.
       operationId: dismissQueue
       tags: [status]
       security:
@@ -1497,7 +1501,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `admin`
         "404":
           description: No queue row with that id
         "409":

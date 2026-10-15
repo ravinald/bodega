@@ -25,7 +25,7 @@ func (s *Server) queueRefusal(r *http.Request, q audit.QueueRefusal) {
 	if s.auditDB == nil || q.PkgType == "" || q.PkgName == "" {
 		return
 	}
-	q.Identity, q.ClientIP = Identity(r), ClientIP(r)
+	q.Identity, q.ClientIP = callerName(r), ClientIP(r)
 	ctx, cancel := auditContext(r)
 	defer cancel()
 	if err := s.auditDB.RecordRefusal(ctx, q, time.Now()); err != nil {

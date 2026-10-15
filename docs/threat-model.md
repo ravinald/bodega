@@ -660,8 +660,12 @@ defence against:
   types, or `inventory`. A token presented on a route its scopes do not reach
   is refused with `403` on reads and mutations alike, so a `read` token
   written to a client host by `bodega doctor --write-credentials` cannot
-  `POST` or `DELETE` from that host even inside `admin_permit_cidr`. What
-  scopes do not limit:
+  `POST` or `DELETE` from that host even inside `admin_permit_cidr`.
+  `admin` covers every route that writes policy, profiles, tokens or
+  override votes, or that returns requester identities or client
+  addresses: the review queue's list, approve and dismiss included, so a CI
+  token refused a package cannot approve its own queue row into an
+  allow-list rule. What scopes do not limit:
   - _A request that presents no token._ The read path stays open; an admin
     read inside `admin_permit_cidr` needs no token; a loopback-only server
     takes mutations from localhost with no token. A host inside the range

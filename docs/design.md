@@ -492,7 +492,7 @@ Package-serving read endpoints remain unauthenticated. That is a policy, not a l
 
 ### Token scopes and OIDC exchange
 
-A token's scopes are checked by the same middleware that checks its existence. `routeScope` names what a request needs from its method and path alone (admin by path prefix, then read for `GET`, `HEAD` and git's upload-pack, then write), and the package type comes from the path the way the audit row's subject does. One classifier serves reads and mutations, so a route cannot be gated as admin on one path through the code and as write on another. Bulk import is the one handler that checks again, per entry, because its body names the types and the path names none.
+A token's scopes are checked by the same middleware that checks its existence. `routeScope` names what a request needs from its method and path alone (admin by path prefix, then read for `GET`, `HEAD` and git's upload-pack, then write), and the package type comes from the path the way the audit row's subject does. One classifier serves reads and mutations, so a route cannot be gated as admin on one path through the code and as write on another. Bulk import is the one handler that checks again, per entry, because its body names the types and the path names none. The method fallback makes any route missing from `adminPrefixes` a write or a read, so `TestEveryAPIRouteHasAChosenScope` reads the routes `server.go` registers and fails on any `/api/v1/` route nobody assigned a scope.
 
 Scopes constrain only a token that is presented. The read path stays open and `admin_permit_cidr` stays the boundary for a request with no token; scopes were added to stop a credential minted for one job from being a credential for every job, not to put a token in front of the reads.
 

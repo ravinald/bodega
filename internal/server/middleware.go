@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1058,16 +1059,24 @@ func bearerOf(r *http.Request) (string, bool) {
 
 // adminPrefixes are the routes the admin scope reaches: tokens, policies,
 // the audit trail, the resolved configuration, the per-host inventory and
-// profile views, and the votes on a two-person override. Every route here is
-// also behind admin_permit_cidr.
+// profile views, the votes on a two-person override, and the refusal review
+// queue. Every route here is also behind admin_permit_cidr.
 //
-// Only the votes under /api/v1/overrides/ are admin. Requesting an override
-// is a write and listing them a read: the second person approving is the act
-// the admin scope separates from the first.
+// The queue is admin read and write alike: its list names each requester and
+// client address, and approving a row writes an allow-list rule or edits a
+// profile, which is what POST /api/v1/policies does.
+//
+// Only the votes under /api/v1/overrides/ are admin among the override
+// mutations. Requesting an override is a write: the second person approving
+// is the act the admin scope separates from the first.
 var adminPrefixes = []string{
 	"/api/v1/tokens", "/api/v1/policies", "/api/v1/audit", "/api/v1/config",
-	"/api/v1/inventory/", "/api/v1/profiles/", "/api/v1/overrides/",
+	"/api/v1/inventory/", "/api/v1/profiles/", "/api/v1/overrides/", "/api/v1/queue",
 }
+
+// adminReads are routes whose read is admin while a mutation on the same path
+// is not. The override list names every requester and voter.
+var adminReads = []string{"/api/v1/overrides"}
 
 // routeScope names the scope a request needs and the package type it is
 // for, "" when the route is not tied to one type. An empty scope is a route
@@ -1086,6 +1095,9 @@ func routeScope(r *http.Request) (scope, pkgType string) {
 		}
 	}
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
+		if slices.Contains(adminReads, p) {
+			return audit.ScopeAdmin, ""
+		}
 		return audit.ScopeRead, scopeTypeOf(p)
 	}
 	t, _ := parseAPIPackagePath(p)

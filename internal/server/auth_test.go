@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/idp/idptest"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 const oidcAudience = "https://bodega.example"
@@ -203,6 +206,10 @@ func TestScopeRefusalOnReadWriteAndAdminRoutes(t *testing.T) {
 		{"write without write", http.MethodDelete, "/api/v1/packages/npm/left-pad", ops.Token, "write:npm"},
 		{"admin read", http.MethodGet, "/api/v1/audit", app.Token, "admin"},
 		{"admin mutation", http.MethodPost, "/api/v1/tokens", app.Token, "admin"},
+		{"queue list", http.MethodGet, "/api/v1/queue", app.Token, "admin"},
+		{"queue approve", http.MethodPost, "/api/v1/queue/1/approve", app.Token, "admin"},
+		{"queue dismiss", http.MethodPost, "/api/v1/queue/1/dismiss", app.Token, "admin"},
+		{"override list", http.MethodGet, "/api/v1/overrides", app.Token, "admin"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -219,6 +226,10 @@ func TestScopeRefusalOnReadWriteAndAdminRoutes(t *testing.T) {
 	for _, ok := range []struct{ method, path, token string }{
 		{http.MethodGet, "/api/v1/packages/npm", app.Token},
 		{http.MethodGet, "/api/v1/audit", ops.Token},
+		{http.MethodGet, "/api/v1/queue", ops.Token},
+		{http.MethodPost, "/api/v1/queue/1/approve", ops.Token},
+		{http.MethodGet, "/api/v1/overrides", ops.Token},
+		{http.MethodPost, "/api/v1/overrides", app.Token},
 		{http.MethodGet, "/healthz", pub.Token},
 	} {
 		if rec := send(s, ok.method, ok.path, adminAddr, ok.token, ""); rec.Code == http.StatusForbidden || rec.Code == http.StatusUnauthorized {
@@ -414,6 +425,175 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 			}
 			if got := decodeOverride(t, rec.Body.Bytes()); got.Status != audit.OverrideStatusActive || len(got.Votes) != 2 || got.Votes[1].Identity != "erin" {
 				t.Errorf("after the bound vote = %+v", got)
+			}
+		})
+	}
+}
+
+// Every /api/v1/ route the mux registers has a scope somebody chose, and the
+// gate computes that scope. routeScope falls back on the method alone, so a
+// route merged in without an adminPrefixes entry reads as write or read and a
+// CI token reaches it. A route missing from want fails here until it is
+// classified.
+func TestEveryAPIRouteHasAChosenScope(t *testing.T) {
+	want := map[string]string{
+		"GET /api/v1/packages":                                     audit.ScopeRead,
+		"GET /api/v1/packages/{type}":                              audit.ScopeRead,
+		"GET /api/v1/packages/{type}/{name}":                       audit.ScopeRead,
+		"GET /api/v1/packages/{type}/{name}/{version}":             audit.ScopeRead,
+		"GET /api/v1/packages/{type}/{name}/{version}/attestation": audit.ScopeRead,
+		"GET /api/v1/attestation/keys":                             audit.ScopeRead,
+		"GET /api/v1/status":                                       audit.ScopeRead,
+		"GET /api/v1/config":                                       audit.ScopeAdmin,
+		"GET /api/v1/metrics":                                      audit.ScopeRead,
+		"POST /api/v1/packages/import":                             audit.ScopeWrite,
+		"POST /api/v1/packages/{type}":                             audit.ScopeWrite,
+		"DELETE /api/v1/packages/{type}/{name}":                    audit.ScopeWrite,
+		"PATCH /api/v1/packages/{type}/{name}/hide":                audit.ScopeWrite,
+		"PATCH /api/v1/packages/{type}/{name}/hide/{version}":      audit.ScopeWrite,
+		"PATCH /api/v1/packages/{type}/{name}/freeze":              audit.ScopeWrite,
+		"PATCH /api/v1/packages/{type}/{name}/freeze/{version}":    audit.ScopeWrite,
+		"GET /api/v1/audit":                                        audit.ScopeAdmin,
+		"GET /api/v1/tokens":                                       audit.ScopeAdmin,
+		"POST /api/v1/tokens":                                      audit.ScopeAdmin,
+		"DELETE /api/v1/tokens/{id}":                               audit.ScopeAdmin,
+		"GET /api/v1/profiles/{name}/pins":                         audit.ScopeAdmin,
+		"POST /api/v1/inventory/sources/{instance}/{route...}":     audit.ScopeAdmin,
+		"GET /api/v1/inventory/{identity}":                         audit.ScopeAdmin,
+		"GET /api/v1/policies":                                     audit.ScopeAdmin,
+		"POST /api/v1/policies":                                    audit.ScopeAdmin,
+		"DELETE /api/v1/policies/{id}":                             audit.ScopeAdmin,
+		"GET /api/v1/overrides":                                    audit.ScopeAdmin,
+		"POST /api/v1/overrides":                                   audit.ScopeWrite,
+		"POST /api/v1/overrides/{id}/approve":                      audit.ScopeAdmin,
+		"POST /api/v1/overrides/{id}/reject":                       audit.ScopeAdmin,
+		"GET /api/v1/queue":                                        audit.ScopeAdmin,
+		"POST /api/v1/queue/{id}/approve":                          audit.ScopeAdmin,
+		"POST /api/v1/queue/{id}/dismiss":                          audit.ScopeAdmin,
+		// HMAC over the body, not a token: the gate passes it as a push route.
+		"POST " + RevetWebhookPath:            audit.ScopeWrite,
+		"POST " + authExchangePath:            "",
+		"GET " + authPathPrefix + "providers": "",
+	}
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consts := map[string]string{"RevetWebhookPath": RevetWebhookPath, "authExchangePath": authExchangePath, "authPathPrefix": authPathPrefix}
+	re := regexp.MustCompile(`m\.HandleFunc\("([A-Z]+ [^"]*)"((?:\s*\+\s*(?:\w+|"[^"]*"))*)`)
+	sample := regexp.MustCompile(`\{type\}|\{[^}]*\}`)
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		pattern := m[1]
+		for _, part := range regexp.MustCompile(`\w+|"[^"]*"`).FindAllString(m[2], -1) {
+			if lit, ok := strings.CutPrefix(part, `"`); ok {
+				pattern += strings.TrimSuffix(lit, `"`)
+			} else if v, ok := consts[part]; ok {
+				pattern += v
+			} else {
+				t.Fatalf("route %q concatenates %s, which this test cannot resolve", m[0], part)
+			}
+		}
+		method, path, _ := strings.Cut(pattern, " ")
+		if !strings.HasPrefix(path, "/api/v1/") {
+			continue
+		}
+		seen[pattern] = true
+		scope, ok := want[pattern]
+		if !ok {
+			t.Errorf("%s is registered with no chosen scope; add it to want, and to adminPrefixes if it reaches admin surface", pattern)
+			continue
+		}
+		concrete := sample.ReplaceAllStringFunc(path, func(seg string) string {
+			if seg == "{type}" {
+				return manifest.TypeNpm
+			}
+			return "x"
+		})
+		if got, _ := routeScope(httptest.NewRequest(method, concrete, nil)); got != scope {
+			t.Errorf("%s: routeScope = %q, want %q", pattern, got, scope)
+		}
+	}
+	for pattern := range want {
+		if !seen[pattern] {
+			t.Errorf("%s is in want but server.go registers no such route", pattern)
+		}
+	}
+}
+
+// Every row naming who asked names an exchanged token's caller by its
+// principal: a refused fetch lands in the review queue and in discovery under
+// <issuer>#<subject>, the name the override quorum counts.
+func TestExchangedCallerNamedInQueueAndDiscovery(t *testing.T) {
+	s := newDiscoveryServer(t)
+	p := audit.Principal{Subject: "repo:acme/app:ref:refs/heads/main", Issuer: "https://token.actions.githubusercontent.com"}
+	if err := s.auditDB.InsertExchangedToken(t.Context(), "ex1", "ci", audit.HashToken("bodega_ex_1", s.pepper), "read",
+		time.Now().Add(10*time.Minute), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.AddVersion(t.Context(), manifest.TypeNpm, "leftpad", manifest.VersionEntry{
+		Version: "1.2.0", Mode: manifest.ModeProxy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+		ID: "npm-elsewhere", RegistryType: manifest.TypeNpm, RuleKind: policy.KindPackage, Pattern: "rightpad",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.policy.Invalidate()
+	rec := doRequest(s, http.MethodGet, "/npm/leftpad/-/leftpad-1.2.0.tgz", map[string]string{"Authorization": "Bearer bodega_ex_1"})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body)
+	}
+	q := oneQueueRow(t, s)
+	if len(q.Requesters) != 1 || q.Requesters[0].Identity != p.Identity() {
+		t.Errorf("queue requesters = %+v, want identity %q", q.Requesters, p.Identity())
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rows, _ := s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{RegistryType: manifest.TypeNpm})
+		if len(rows) > 0 {
+			if rows[0].LastIdentity != p.Identity() {
+				t.Errorf("discovery last_identity = %q, want %q", rows[0].LastIdentity, p.Identity())
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no discovery row recorded")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// callerName ranks a token binding over a principal and a principal over any
+// other binding, the order overrideIdentity votes in.
+func TestCallerNamePrecedence(t *testing.T) {
+	p := audit.Principal{Subject: "alice", Issuer: "https://idp.example"}
+	cases := []struct {
+		name      string
+		match     identityMatch
+		principal bool
+		want      string
+	}{
+		{"nothing", identityMatch{}, false, ""},
+		{"cidr binding alone", identityMatch{Identity: "rack-4", Kind: audit.BindCIDR}, false, "rack-4"},
+		{"principal over cidr binding", identityMatch{Identity: "rack-4", Kind: audit.BindCIDR}, true, p.Identity()},
+		{"token binding over principal", identityMatch{Identity: "build-07", Kind: audit.BindToken}, true, "build-07"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/npm/leftpad", nil)
+			ctx := context.WithValue(r.Context(), identityKey, tc.match)
+			if tc.principal {
+				ctx = audit.WithPrincipal(ctx, p)
+			}
+			r = r.WithContext(ctx)
+			if got := callerName(r); got != tc.want {
+				t.Errorf("callerName = %q, want %q", got, tc.want)
+			}
+			if Identity(r) != tc.match.Identity {
+				t.Errorf("Identity = %q, want the binding alone", Identity(r))
 			}
 		})
 	}
