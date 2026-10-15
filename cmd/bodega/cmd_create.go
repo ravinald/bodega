@@ -269,11 +269,15 @@ func admitCreate(ctx context.Context, gf *globalFlags, cfg *config.Config, store
 }
 
 // overrideHint names the command that requests an override for the check
-// that refused res.
+// that refused res, or, when the admission row records that check as one no
+// override may lift, why not and the incident to hand an operator instead.
 func overrideHint(t, name string, res admit.Result) string {
 	check := res.Check
 	if check == "allow-list" {
 		check = audit.CheckAllowList
+	}
+	if why := recordedUnwaivable(res, check); why != "" {
+		return fmt.Sprintf("No override can admit it: %s.\nGive an operator incident %s.", why, res.Incident)
 	}
 	version := res.Version
 	if version == "" {
@@ -281,6 +285,23 @@ func overrideHint(t, name string, res admit.Result) string {
 	}
 	return fmt.Sprintf("To admit it anyway, request an override for a second identity to approve:\n"+
 		"  bodega override request %s %s %s --check %s --reason \"<why>\" --expires 7d", t, name, version, check)
+}
+
+// recordedUnwaivable is why the admission row res wrote for its refused
+// version records check as unwaivable, or "" when it does not or no row was
+// written.
+func recordedUnwaivable(res admit.Result, check string) string {
+	for _, a := range res.Admissions {
+		if a.PkgVersion != res.Version {
+			continue
+		}
+		for _, c := range a.Checks {
+			if c.Check == check && c.Unwaivable != "" {
+				return c.Unwaivable
+			}
+		}
+	}
+	return ""
 }
 
 // prompt asks the user for a value, using defVal as the default.
