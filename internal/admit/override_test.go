@@ -231,6 +231,47 @@ func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 	}
 }
 
+// A request is judged against the newest admission row: one that recorded
+// upstream provenance unknown takes an override request, one that recorded it
+// invalid refuses it, and a version whose newest row moved from unknown to
+// invalid refuses it too.
+func TestOverrideRequestAfterProvenanceRefusal(t *testing.T) {
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	unknown := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no version",
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}
+	invalid := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "signature did not verify",
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}}
+	refuse := func(version string, r policy.Result, unwaivable string) {
+		t.Helper()
+		got := Fetch(ctx, f.adb, []policy.VersionChecker{fixed{r}}, manifest.TypeNpm, "minimist",
+			manifest.VersionEntry{Version: version}, AllowListCheck(false, "minimist", nil), Who{}, "")
+		if c := checkOf(t, got.Admission, r.Check); got.Block == nil || c.Status != audit.CheckBlock || c.Unwaivable != unwaivable {
+			t.Fatalf("%s: row check = %+v, want blocked with unwaivable %q", version, c, unwaivable)
+		}
+	}
+	requestFor := func(version string) error {
+		req := osvOverride(version)
+		req.Check = audit.CheckUpstreamProvenance
+		_, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now())
+		return err
+	}
+	const never = "invalid upstream provenance is never overridden"
+
+	refuse("2.0.0", unknown, "")
+	if err := requestFor("2.0.0"); err != nil {
+		t.Errorf("override request for unknown provenance: %v", err)
+	}
+	refuse("2.0.1", invalid, never)
+	if err := requestFor("2.0.1"); !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), never) {
+		t.Errorf("override request for invalid provenance: %v", err)
+	}
+	refuse("2.0.0", invalid, never)
+	if err := requestFor("2.0.0"); !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), never) {
+		t.Errorf("override request after the newest row recorded invalid: %v", err)
+	}
+}
+
 // An allow-list refusal on the import path takes an override like a version
 // check does, and the version checks still run after it.
 func TestOverrideAllowList(t *testing.T) {
