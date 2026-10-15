@@ -1068,23 +1068,29 @@ func startGitTestServer(t *testing.T, s *Server, writeTimeout time.Duration, htt
 	return ts
 }
 
+// gitTestStall is the backendStall for tests whose child must start before the
+// stall runs out. The stall clock starts before the CGI child does, so the
+// stall also bounds forking and execing /bin/sh and the script's first printf,
+// which a loaded -race run has stretched past one second.
+const gitTestStall = 10 * time.Second
+
 // A git response that keeps producing output outlives the server-wide write
 // timeout. A full clone of a large repository is minutes of pack, and the
 // route used to die at that bound with "curl 18 transfer closed with
 // outstanding read data remaining", naming neither bodega nor a timeout.
 //
-// The stall also bounds the child's start, so it leaves a loaded -race run
-// two seconds to fork a shell. Twelve 0.3s gaps run past the first deadline
-// (one stall and a quarter), so the response completes only if output moves it.
+// Sixteen 1s gaps run past the first deadline (one stall and a quarter, 12.5s),
+// so the response completes only if output moves it.
 func TestGitResponseOutlivesTheServerWriteTimeout(t *testing.T) {
 	sleep := lookPath(t, "sleep")
 	for _, h2 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("http2=%v", h2), func(t *testing.T) {
+			t.Parallel()
 			s := newGitServer(t, newGitUpstream(t))
-			s.gitTool.backendStall = 2 * time.Second
+			s.gitTool.backendStall = gitTestStall
 			s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\n'
 i=0
-while [ $i -lt 12 ]; do printf 'chunk%02d\n' $i; `+sleep+` 0.3; i=$((i+1)); done
+while [ $i -lt 16 ]; do printf 'chunk%02d\n' $i; `+sleep+` 1; i=$((i+1)); done
 `)
 			ts := startGitTestServer(t, s, 300*time.Millisecond, h2)
 
@@ -1100,8 +1106,8 @@ while [ $i -lt 12 ]; do printf 'chunk%02d\n' $i; `+sleep+` 0.3; i=$((i+1)); done
 			if err != nil {
 				t.Fatalf("read body after %d bytes: %v", len(body), err)
 			}
-			if resp.StatusCode != http.StatusOK || !strings.HasSuffix(string(body), "chunk11\n") {
-				t.Errorf("status %d, body %q; want 200 and all twelve chunks", resp.StatusCode, body)
+			if resp.StatusCode != http.StatusOK || !strings.HasSuffix(string(body), "chunk15\n") {
+				t.Errorf("status %d, body %q; want 200 and all sixteen chunks", resp.StatusCode, body)
 			}
 		})
 	}
@@ -1145,11 +1151,12 @@ printf 'finished\n'
 // both the ceiling and the server-wide bound. This is what keeps the per-route
 // hour from being an hour for a wedged child.
 func TestGitResponseStallKillsTheChild(t *testing.T) {
+	t.Parallel()
 	sleep := lookPath(t, "sleep")
 	s := newGitServer(t, newGitUpstream(t))
-	s.gitTool.backendStall = time.Second
+	s.gitTool.backendStall = gitTestStall
 	s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\nstarted\n'
-exec `+sleep+` 30
+exec `+sleep+` 60
 `)
 	ts := startGitTestServer(t, s, time.Minute, false)
 
@@ -1160,7 +1167,7 @@ exec `+sleep+` 30
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if elapsed := time.Since(start); elapsed > 2*gitTestStall {
 		t.Errorf("a silent child held the response %s; want it cut at the %s stall", elapsed, s.gitTool.backendStall)
 	}
 	if string(body) != "started\n" {
