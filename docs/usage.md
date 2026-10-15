@@ -515,7 +515,7 @@ bodega pkg convert npm < installed.txt > baseline.json
 bodega pkg import --baseline --merge baseline.json
 ```
 
-Two verdicts are never admitted by the mark, for the reason an [override](#bodega-override-requestapproverejectlist) cannot admit them: an OSV malware record and upstream provenance that fails to verify. The check stays `block` and its detail says the mark does not apply.
+Three verdicts are never admitted by the mark, for the reason an [override](#bodega-override-requestapproverejectlist) cannot admit them: an OSV malware record, a hit from an [integration](#integrations) whose type says a hit means malware (`malware-list`), and upstream provenance that fails to verify. The check stays `block` and its detail says the mark does not apply.
 
 Only this flag sets the mark. A version imported later without it is never baseline, and a mark carried in on a file, an API push or a `pkg edit` buffer is dropped with a warning unless the store already held it for that version. `--baseline` writes the local store, so it is refused with `--server`: a host pushing its own catalog cannot exempt it from the gates. With `--merge`, a version the store already holds gets the mark too, and one already marked keeps its earlier time.
 
