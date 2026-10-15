@@ -6,7 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -20,13 +22,16 @@ const (
 	bobToken     = "bodega_ak_bob"
 	unboundToken = "bodega_ak_unbound"
 	scopedToken  = "bodega_ak_scoped"
+	writerToken  = "bodega_ak_writer"
+	readerToken  = "bodega_ak_reader"
 	localAddr    = "127.0.0.1:40000"
 )
 
 // newOverrideServer is a localhost-only server, the posture in which the
 // mutation gate asks for no token at all, with tokens bound to alice and bob,
-// one bound to nothing, an inventory token bound to web-01, and a CIDR
-// binding that names every local caller "lab".
+// one bound to nothing, an inventory token bound to web-01, a write-only
+// token bound to carol, a read-only one bound to dave, and a CIDR binding that
+// names every local caller "lab".
 func newOverrideServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
@@ -45,13 +50,21 @@ func newOverrideServer(t *testing.T) *Server {
 			t.Fatal(err)
 		}
 	}
-	if err := s.auditDB.InsertScopedToken(ctx, "s1", "web-01", audit.HashToken(scopedToken, invPepper), "", audit.ScopeInventory, nil); err != nil {
-		t.Fatal(err)
+	for id, st := range map[string]struct{ tok, scope string }{
+		"s1": {scopedToken, audit.ScopeInventory},
+		"w1": {writerToken, audit.ScopeWrite},
+		"r1": {readerToken, audit.ScopeRead},
+	} {
+		if err := s.auditDB.InsertScopedToken(ctx, id, id, audit.HashToken(st.tok, invPepper), "", st.scope, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, b := range []audit.IdentityBinding{
 		{Kind: audit.BindToken, Key: "a1", Identity: "alice"},
 		{Kind: audit.BindToken, Key: "b1", Identity: "bob"},
 		{Kind: audit.BindToken, Key: "s1", Identity: "web-01"},
+		{Kind: audit.BindToken, Key: "w1", Identity: "carol"},
+		{Kind: audit.BindToken, Key: "r1", Identity: "dave"},
 		{Kind: audit.BindCIDR, Key: "127.0.0.0/8", Identity: "lab"},
 	} {
 		if _, err := s.auditDB.AddIdentityBinding(ctx, b); err != nil {
@@ -75,16 +88,12 @@ func decodeOverride(t *testing.T, body []byte) audit.Override {
 
 // Every override route takes a token bound to an identity, on a server whose
 // mutation gate would let an anonymous localhost POST through. A CIDR
-// binding does not count, and an inventory token is refused by scope.
+// binding does not count.
 func TestOverrideRoutesRequireABoundToken(t *testing.T) {
 	s := newOverrideServer(t)
-	for _, tc := range []struct {
-		name, token string
-		want        int
-	}{
-		{"no token", "", http.StatusUnauthorized},
-		{"token bound to nothing, address bound by CIDR", unboundToken, http.StatusUnauthorized},
-		{"inventory token", scopedToken, http.StatusForbidden},
+	for _, tc := range []struct{ name, token string }{
+		{"no token", ""},
+		{"token bound to nothing, address bound by CIDR", unboundToken},
 	} {
 		for _, r := range []struct{ method, path, body string }{
 			{http.MethodGet, "/api/v1/overrides", ""},
@@ -92,14 +101,88 @@ func TestOverrideRoutesRequireABoundToken(t *testing.T) {
 			{http.MethodPost, "/api/v1/overrides/abc/approve", ""},
 			{http.MethodPost, "/api/v1/overrides/abc/reject", ""},
 		} {
-			if rec := send(s, r.method, r.path, localAddr, tc.token, r.body); rec.Code != tc.want {
-				t.Errorf("%s: %s %s = %d (%s), want %d", tc.name, r.method, r.path, rec.Code, rec.Body, tc.want)
+			if rec := send(s, r.method, r.path, localAddr, tc.token, r.body); rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s: %s %s = %d (%s), want 401", tc.name, r.method, r.path, rec.Code, rec.Body)
 			}
 		}
 	}
 	list, err := s.auditDB.ListOverrides(context.Background(), audit.OverrideFilter{})
 	if err != nil || len(list) != 0 {
 		t.Errorf("refused requests left %d override(s): %v", len(list), err)
+	}
+}
+
+// Requesting an override needs write, and voting on one or listing them needs
+// admin, because the list names every requester and voter, whichever header
+// form carries the token. The Basic form matters
+// on its own: the localhost-only gate scope-checks a Bearer credential only,
+// so overrideCaller is what refuses it.
+func TestOverrideRoutesCheckScope(t *testing.T) {
+	s := newOverrideServer(t)
+	rec := send(s, http.MethodPost, "/api/v1/overrides", localAddr, writerToken, overrideBody)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("write token requesting = %d %s, want 201", rec.Code, rec.Body)
+	}
+	id := decodeOverride(t, rec.Body.Bytes()).ID
+
+	basic := func(method, path, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = localAddr
+		req.SetBasicAuth("ci", token)
+		rec := httptest.NewRecorder()
+		s.handler().ServeHTTP(rec, req)
+		return rec
+	}
+	for _, tc := range []struct {
+		name, method, path, token, body string
+		basic                           bool
+		want                            int
+		missing                         string
+	}{
+		{"write token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", false, http.StatusForbidden, "admin"},
+		{"write token rejecting", http.MethodPost, "/api/v1/overrides/" + id + "/reject", writerToken, "", false, http.StatusForbidden, "admin"},
+		{"write token approving over Basic", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", true, http.StatusForbidden, "admin"},
+		{"inventory token requesting", http.MethodPost, "/api/v1/overrides", scopedToken, overrideBody, false, http.StatusForbidden, "write"},
+		{"inventory token requesting over Basic", http.MethodPost, "/api/v1/overrides", scopedToken, "", true, http.StatusForbidden, "write"},
+		{"inventory token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", scopedToken, "", false, http.StatusForbidden, "admin"},
+		{"read token requesting", http.MethodPost, "/api/v1/overrides", readerToken, overrideBody, false, http.StatusForbidden, "write"},
+		{"read token listing", http.MethodGet, "/api/v1/overrides", readerToken, "", false, http.StatusForbidden, "admin"},
+		{"write token listing over Basic", http.MethodGet, "/api/v1/overrides", writerToken, "", true, http.StatusForbidden, "admin"},
+	} {
+		var rec *httptest.ResponseRecorder
+		if tc.basic {
+			rec = basic(tc.method, tc.path, tc.token)
+		} else {
+			rec = send(s, tc.method, tc.path, localAddr, tc.token, tc.body)
+		}
+		if rec.Code != tc.want {
+			t.Errorf("%s = %d (%s), want %d", tc.name, rec.Code, rec.Body, tc.want)
+			continue
+		}
+		if tc.missing != "" && !strings.Contains(rec.Body.String(), `lacks scope "`+tc.missing+`"`) {
+			t.Errorf("%s: body %q does not name the missing scope %q", tc.name, rec.Body, tc.missing)
+		}
+	}
+
+	o, err := s.auditDB.GetOverride(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.State != audit.OverrideStatusPending || len(o.Votes) != 0 {
+		t.Errorf("refused votes changed the override: %+v", o)
+	}
+	rows, err := s.auditDB.Query(context.Background(), audit.Filter{EventType: audit.EventDenied})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admin int
+	for _, r := range rows {
+		if r.Status == audit.DenialTokenScope && strings.Contains(r.Details, `"missing_scope":"admin"`) {
+			admin++
+		}
+	}
+	if admin != 6 {
+		t.Errorf("%d token_scope denials name missing_scope admin, want 6: %+v", admin, rows)
 	}
 }
 

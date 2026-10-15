@@ -38,8 +38,10 @@ one included.
 Once approved, the next admission of that version records the check as
 "overridden" with the override's id in its admission row. It stops applying
 at its expiry with nobody acting, so the next re-vet refuses the version
-again. An override never applies to known malware (an OSV MAL- record) or to
-upstream provenance that failed to verify.
+again. An override never applies to known malware (an OSV MAL- record or a
+malware-list integration hit) or to upstream provenance that failed to verify,
+and a request naming a check the version's newest admission recorded as one of
+those is refused.
 
 On the CLI the identity is the operator (SUDO_USER under sudo); on the API it
 is the identity the request's token is bound to (bodega identity bind token).

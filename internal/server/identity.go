@@ -21,6 +21,25 @@ func Identity(r *http.Request) string {
 	return identityMatchOf(r).Identity
 }
 
+// callerName is the name a row that records who asked carries: a token
+// binding's identity, else an exchanged or device-flow token's
+// <issuer>#<subject>, else whatever binding matched. That is the order the
+// override quorum counts a caller in, so the requester a queue or discovery
+// row names is the voter an override would name.
+//
+// It names and never decides. A profile, an identity hold and the client
+// binding checks read Identity, because a principal was never bound to any
+// of them and must not select one.
+func callerName(r *http.Request) string {
+	if m := identityMatchOf(r); m.Kind == audit.BindToken && m.Identity != "" {
+		return m.Identity
+	}
+	if p, ok := audit.PrincipalFrom(r.Context()); ok {
+		return p.Identity()
+	}
+	return Identity(r)
+}
+
 // identityMatchOf is the binding IdentityMiddleware resolved this request
 // through. A handler reporting which rule matched reads it here rather than
 // resolving again: a binding table reloaded in between would answer for a
@@ -128,6 +147,17 @@ type identitySet struct {
 	byToken map[string]string // token id -> identity
 	cidr    []cidrBinding
 	tokens  []audit.TokenHash
+}
+
+// token returns the token with id, or nil when this generation of the set
+// does not hold it: revoked, or no longer keyed by any binding.
+func (s *identitySet) token(id string) *audit.TokenHash {
+	for i := range s.tokens {
+		if s.tokens[i].ID == id {
+			return &s.tokens[i]
+		}
+	}
+	return nil
 }
 
 // newIdentitySet parses the table into the shape the read path matches

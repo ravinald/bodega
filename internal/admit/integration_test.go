@@ -31,7 +31,14 @@ func (d verdictDouble) Lookup(_ context.Context, q integration.Query) (integrati
 func init() {
 	integration.Register(integration.Descriptor{
 		Type: "admit-double", DisplayName: "Admit double", VendorURL: "https://example.test/", Cost: integration.CostFree,
-		Ecosystems: []string{manifest.TypeCargo}, DataSent: "Nothing.", DefaultAction: policy.ActionWarn,
+		Ecosystems: []string{manifest.TypeCargo}, DataSent: "Nothing.", DefaultAction: policy.ActionWarn, Flags: integration.FlagRisk,
+		Fields: []integration.Field{{Key: "verdict", Label: "Verdict", Kind: integration.KindEnum, Default: "clean",
+			Options: []string{"clean", "flagged", "error"}}},
+		New: func(inst *integration.Instance) (integration.Checker, error) { return verdictDouble{inst}, nil },
+	})
+	integration.Register(integration.Descriptor{
+		Type: "admit-malware-double", DisplayName: "Admit malware double", VendorURL: "https://example.test/", Cost: integration.CostFree,
+		Ecosystems: []string{manifest.TypeCargo}, DataSent: "Nothing.", DefaultAction: policy.ActionBlock, Flags: integration.FlagMalware,
 		Fields: []integration.Field{{Key: "verdict", Label: "Verdict", Kind: integration.KindEnum, Default: "clean",
 			Options: []string{"clean", "flagged", "error"}}},
 		New: func(inst *integration.Instance) (integration.Checker, error) { return verdictDouble{inst}, nil },
@@ -204,5 +211,43 @@ func TestEvaluateRunsIntegrationsLikeAdmit(t *testing.T) {
 				t.Errorf("Evaluate = %v under %s", v.Decision, action)
 			}
 		})
+	}
+}
+
+// A hit from a type whose flags mean malware is recorded unwaivable on the
+// admission row, and an override request naming it is refused with the check
+// named. A risk type's hit on the same version takes the request.
+func TestOverrideRequestRefusesMalwareListHit(t *testing.T) {
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	if err := f.adb.SetIntegrationPolicy(ctx, audit.IntegrationPolicy{Instance: "flagger", Ecosystem: manifest.TypeCargo, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := *f.unsynced
+	cfg.Integrations = map[string]config.Integration{
+		"aikido":  {"type": "admit-malware-double", "enabled": true, "verdict": "flagged"},
+		"flagger": {"type": "admit-double", "enabled": true, "verdict": "flagged"},
+	}
+	if res := Admit(ctx, policy.NewChecker(f.adb), f.adb, &cfg, crate("zq-malware-hit"), "ravi"); res.Decision != PolicyBlocked {
+		t.Fatalf("Decision = %v", res.Decision)
+	}
+	row := cargoRow(t, f, "zq-malware-hit")
+	if c := checkOf(t, row, "integration:aikido"); c.Status != audit.CheckBlock || c.Unwaivable != "known malware is never overridden" {
+		t.Errorf("malware-list check = %+v", c)
+	}
+	if c := checkOf(t, row, "integration:flagger"); c.Unwaivable != "" {
+		t.Errorf("risk check recorded unwaivable: %+v", c)
+	}
+
+	req := OverrideRequest{Type: manifest.TypeCargo, Name: "zq-malware-hit", Version: row.PkgVersion,
+		Check: "integration:aikido", Reason: "vendor says false positive", Expires: "1d"}
+	_, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now())
+	if !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), "integration:aikido") ||
+		!strings.Contains(err.Error(), "known malware is never overridden") {
+		t.Errorf("override request for a malware-list hit: %v", err)
+	}
+	req.Check = "integration:flagger"
+	if _, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now()); err != nil {
+		t.Errorf("override request for a risk hit: %v", err)
 	}
 }

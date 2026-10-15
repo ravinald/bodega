@@ -183,6 +183,7 @@ func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Re
 				return policy.Result{Check: r.Check, Action: policy.ActionPass, Provenance: r.Provenance}
 			}
 		} else {
+			c.Unwaivable = why
 			if o, ok := ev.overrideFor(pm, i, r.Check); ok {
 				c.Detail += fmt.Sprintf("; override %s does not apply: %s", o.ID, why)
 			}

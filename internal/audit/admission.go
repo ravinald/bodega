@@ -62,6 +62,11 @@ type AdmissionCheck struct {
 	// Override is the ID of the override that admitted past this check's
 	// failure, set when Status is CheckOverridden.
 	Override string `json:"override,omitempty"`
+	// Unwaivable is why no override or queue approval may admit past this
+	// check's block, set when the result named a version as hostile. An
+	// override request reads it here rather than re-deriving it from config
+	// that may have changed since.
+	Unwaivable string `json:"unwaivable,omitempty"`
 }
 
 // Upstream provenance outcomes: what verifying a publisher's signed
@@ -168,9 +173,13 @@ const (
 // subject to audit_events: that list selects which event types an operator
 // wants in the trail, and a decision missing from this table is a version no
 // attestation can cite, whatever the operator chose to keep of the events.
+// A principal in ctx names the actor and identity, as it does for Record.
 func (a *DB) RecordAdmission(ctx context.Context, row Admission) error {
 	if a.readOnly {
 		return nil
+	}
+	if p, ok := PrincipalFrom(ctx); ok {
+		row.Actor, row.Identity = p.Subject, p.Issuer
 	}
 	if !ValidAdmissionDecision(row.Decision) {
 		return fmt.Errorf("admission decision %q is outside the set (%s, %s, %s)", row.Decision, AdmissionAdmitted, AdmissionPolicyBlocked, AdmissionInvalid)

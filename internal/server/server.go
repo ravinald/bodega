@@ -37,6 +37,7 @@ import (
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
+	"github.com/ravinald/bodega/internal/idp"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/inventory/reconcile"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -166,6 +167,11 @@ type Server struct {
 	attest *attest.Emitter
 	// revet is the re-vet schedule and webhook; nil with no audit store.
 	revet *revetState
+	// oidc verifies the ID tokens POST /api/v1/auth/exchange trades for a
+	// bodega token; nil when oidc_providers is empty. oidcClient is the HTTP
+	// client discovery and key fetches use, nil for the default.
+	oidc       *idp.Registry
+	oidcClient *http.Client
 
 	// freeBSDCat holds each generated repository's three root files, keyed by
 	// ABI and repository. Building one reads every package object in the
@@ -424,6 +430,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.loadAttestSigner()
 	s.setupAttestation()
 	s.setupRevet()
+	s.setupOIDC()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -497,8 +504,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
-	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger, s.selfAuthenticated)(h)
+	tokens := &tokenCache{db: s.auditDB, logger: s.logger}
+	h = mutationAuth(s.adminNetsFunc(), tokens, s.auditDB, s.pepper, s.logger, s.selfAuthenticated)(h)
 	h = s.clientMiddleware(h)
+	h = principalMiddleware(tokens, s.pepper)(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
 	// purpose. Outside everything that writes an audit row, so every row
@@ -979,8 +988,9 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
 
-	// Two-person overrides. Every route requires a token bound to an
-	// identity, which is what the quorum counts; see overrideCaller.
+	// Two-person overrides. Every route requires a token that names an
+	// identity, by a binding or by its OIDC principal, which is what the
+	// quorum counts; see overrideCaller.
 	m.HandleFunc("GET /api/v1/overrides", s.handleListOverrides)
 	m.HandleFunc("POST /api/v1/overrides", s.handleRequestOverride)
 	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)
@@ -996,6 +1006,13 @@ func (s *Server) registerRoutes() {
 	// Threat-feed re-vet: exempt from the admin gate, authenticated by an
 	// HMAC over the body (see selfAuthenticated).
 	m.HandleFunc("POST "+RevetWebhookPath, s.handleRevetWebhook)
+
+	// OIDC: an ID token from a configured provider is exchanged for a scoped
+	// bodega token, and bodega login lists the providers it can sign in
+	// through. The exchange is exempt from the admin gate; the ID token is
+	// the credential.
+	m.HandleFunc("POST "+authExchangePath, s.handleAuthExchange)
+	m.HandleFunc("GET "+authPathPrefix+"providers", s.handleAuthProviders)
 }
 
 // requireAdmin gates the sensitive read endpoints, writing the 403 and the
@@ -1680,6 +1697,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		Label   string `json:"label"`
 		Expiry  string `json:"expiry"`
 		Comment string `json:"comment"`
+		Scope   string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -1689,22 +1707,20 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required"})
 		return
 	}
+	// No default scope: a token minted without saying what it is for would
+	// otherwise be minted for everything.
+	scope, err := audit.CanonicalScopes(req.Scope)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "scope: " + err.Error()})
+		return
+	}
 
-	// Generate token.
-	b := make([]byte, 32)
-	if _, err := cryptoRand.Read(b); err != nil {
+	token, id, err := mintToken()
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	token := "bodega_ak_" + hex.EncodeToString(b)
-
-	// Hash with pepper.
 	hash := audit.HashToken(token, s.pepper)
-
-	// Generate short ID.
-	idBytes := make([]byte, 16)
-	_, _ = cryptoRand.Read(idBytes)
-	id := hex.EncodeToString(idBytes)
 
 	// Parse expiry.
 	var expiresAt *time.Time
@@ -1722,7 +1738,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	if err := s.auditDB.InsertToken(ctx, id, req.Label, hash, req.Comment, expiresAt); err != nil {
+	if err := s.auditDB.InsertScopedToken(ctx, id, req.Label, hash, req.Comment, scope, expiresAt); err != nil {
 		s.logger.Error("insert token failed", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
@@ -1732,6 +1748,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"id":    id,
 		"label": req.Label,
+		"scope": scope,
 	}
 	if expiresAt != nil {
 		resp["expires_at"] = expiresAt.Format(time.RFC3339)

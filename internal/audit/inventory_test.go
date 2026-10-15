@@ -35,8 +35,8 @@ func TestTokenScopeMigrationKeepsExistingTokensFull(t *testing.T) {
 	if err := raw.QueryRow(`SELECT scope FROM api_tokens WHERE id = 'old'`).Scan(&scope); err != nil {
 		t.Fatalf("read scope: %v", err)
 	}
-	if scope != ScopeFull {
-		t.Errorf("pre-existing token scope = %q, want %q", scope, ScopeFull)
+	if scope != scopeLegacyFull {
+		t.Errorf("pre-existing token scope = %q, want %q", scope, scopeLegacyFull)
 	}
 	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope) VALUES ('x', 'x', 'x', 'admin')`); err == nil {
 		t.Error("a scope outside full/inventory was stored; the CHECK constraint is missing")
@@ -64,7 +64,7 @@ func TestScopedTokenRoundTrips(t *testing.T) {
 		got[h.ID] = h.Scope
 	}
 	if got["a"] != ScopeFull || got["b"] != ScopeInventory {
-		t.Errorf("scopes = %v, want a=full b=inventory", got)
+		t.Errorf("scopes = %v, want a=%s b=inventory", got, ScopeFull)
 	}
 	infos, err := db.ListTokens(ctx)
 	if err != nil {

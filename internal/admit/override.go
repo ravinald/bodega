@@ -64,6 +64,10 @@ func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req
 	if err := manifest.ValidatePackageName(req.Name); err != nil {
 		return audit.Override{}, invalid("%v", err)
 	}
+	if why := recordedUnwaivable(ctx, adb, req); why != "" {
+		return audit.Override{}, invalid("%s/%s@%s was refused by %s, and %s; an override cannot admit it",
+			req.Type, req.Name, req.Version, req.Check, why)
+	}
 	ttl, err := config.ParseTTL(req.Expires)
 	if err != nil {
 		return audit.Override{}, invalid("expires: %v", err)
@@ -142,6 +146,23 @@ func recordOverrideEvent(ctx context.Context, adb *audit.DB, o audit.Override, a
 	blob, _ := json.Marshal(details)
 	_ = adb.Record(ctx, audit.Event{EventType: audit.EventOverride, PkgType: o.PkgType, PkgName: o.PkgName,
 		PkgVersion: o.PkgVersion, Actor: actor, Status: status, Details: string(blob)})
+}
+
+// recordedUnwaivable is why the newest admission row for req's version
+// says its check admits no override, or "" when it does not say so or no row
+// can be read. Admission refuses such an override whatever is recorded here;
+// this only stops a request nobody could ever see applied.
+func recordedUnwaivable(ctx context.Context, adb *audit.DB, req OverrideRequest) string {
+	rows, err := adb.Admissions(ctx, audit.AdmissionFilter{PkgType: req.Type, PkgName: req.Name, PkgVersion: req.Version, Limit: 1})
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	for _, c := range rows[0].Checks {
+		if c.Check == req.Check {
+			return c.Unwaivable
+		}
+	}
+	return ""
 }
 
 // isIntegrationCheck reports whether check names an integration instance in
@@ -225,12 +246,13 @@ func (ev *evaluation) overrideCheck(pm *manifest.PackageManifest, i int, c audit
 
 // notOverridable says why a failed result admits no override, or "" when it
 // does. These are the verdicts that a version is hostile rather than that it
-// misses a policy: a MAL- record says it was published to do harm, and
-// provenance that fails to verify says someone signed something other than
-// what was served. Two people agreeing does not change either fact.
+// misses a policy: a MAL- record or a malware-list hit says it was published
+// to do harm, and provenance that fails to verify says someone signed
+// something other than what was served. Two people agreeing does not change
+// either fact.
 func notOverridable(r policy.Result) string {
 	switch {
-	case r.Check == audit.CheckOSV && r.Details["malware"] != nil:
+	case r.Details["malware"] != nil && (r.Check == audit.CheckOSV || isIntegrationCheck(r.Check)):
 		return "known malware is never overridden"
 	case r.Check == audit.CheckUpstreamProvenance && r.Provenance != nil && r.Provenance.Outcome == audit.ProvenanceInvalid:
 		return "invalid upstream provenance is never overridden"

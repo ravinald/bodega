@@ -30,6 +30,8 @@ tags:
     description: Installed-package reports from inventory sources
   - name: policy
     description: Re-running admission over admitted versions
+  - name: auth
+    description: Exchanging an OIDC ID token for a scoped bodega token
 
 paths:
   /healthz:
@@ -867,7 +869,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [label]
+              required: [label, scope]
               properties:
                 label:
                   type: string
@@ -876,6 +878,14 @@ paths:
                   description: "Duration (30d, 1y), date (2027-01-01), or 'never'. Default: 365d"
                 comment:
                   type: string
+                scope:
+                  type: string
+                  description: |
+                    What the token may do: one or more of read, write, admin, each
+                    optionally narrowed to package types (write:npm,pypi); or
+                    inventory. Required, so no token is minted for everything by
+                    default.
+                  example: "read,write:npm"
       responses:
         "201":
           description: Token created
@@ -890,6 +900,8 @@ paths:
                   id:
                     type: string
                   label:
+                    type: string
+                  scope:
                     type: string
                   expires_at:
                     type: string
@@ -989,6 +1001,106 @@ paths:
           description: No admitted version matches, in the catalog or the proxy cache
         "503":
           description: No audit store is open
+
+  /api/v1/auth/exchange:
+    post:
+      summary: Exchange an OIDC ID token for a scoped bodega token
+      description: |
+        Verifies an ID token from one of the server's oidc_providers (a GitHub
+        Actions or GitLab CI job token, or the ID token `bodega login` obtains
+        through the device flow) and answers with a bodega token carrying the
+        scopes of the provider's first rule whose claims all match, valid for
+        oidc_token_ttl (default 15 minutes). The token's aud must name the
+        provider's audience or client_id. Exempt from the admin_permit_cidr
+        gate: the ID token is the credential. Every audit row written by a
+        request carrying the minted token names the ID token's subject as the
+        actor and its issuer as the identity.
+
+        A refusal names the issuer and, when no rule matched, each rule's
+        unmatched claims with the values the token carried. It never echoes
+        the token.
+      operationId: authExchange
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token:
+                  type: string
+                  description: The OIDC ID token, a signed JWT
+      responses:
+        "200":
+          description: Token minted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Bearer token (only shown once)
+                  id:
+                    type: string
+                  scopes:
+                    type: string
+                    example: "read,write:npm"
+                  expires_at:
+                    type: string
+                    format: date-time
+                  subject:
+                    type: string
+                  issuer:
+                    type: string
+        "400":
+          description: The body is not {"id_token":"..."}
+        "401":
+          description: >
+            The ID token failed verification (signature, expiry, audience), its
+            issuer is not configured or could not be reached, or no rule matched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No oidc_providers are configured
+        "503":
+          description: The audit store or the pepper is not loaded
+
+  /api/v1/auth/providers:
+    get:
+      summary: List the providers bodega login can sign in through
+      description: |
+        Providers with a client_id whose issuer was reached and advertises a
+        device authorization endpoint. Public: an issuer and a client_id are
+        what any login prompt shows.
+      operationId: authProviders
+      tags: [auth]
+      security: []
+      responses:
+        "200":
+          description: Provider list, empty when none offers a device flow
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    issuer:
+                      type: string
+                    client_id:
+                      type: string
+                    device_authorization_endpoint:
+                      type: string
+                    token_endpoint:
+                      type: string
 
   /api/v1/policies:
     get:
@@ -1091,9 +1203,13 @@ paths:
       description: |
         Every override, newest request first, each with its votes and its
         status as of the request. Restricted to IPs in `admin_permit_cidr`,
-        and like every override route it requires a token bound to an
-        identity (`bodega identity bind token`), even on a server whose
-        mutation gate takes no token.
+        and like every override route it requires a token that names an
+        identity, even on a server whose mutation gate takes no token: one
+        bound with `bodega identity bind token`, or one minted by
+        `POST /api/v1/auth/exchange` or `bodega login`, which acts as
+        `<issuer>#<subject>`. A binding wins when a token has both. Listing
+        needs `admin`, because the list names every requester and voter;
+        requesting needs `write`, and approving or rejecting `admin`.
       operationId: listOverrides
       tags: [status]
       security:
@@ -1118,9 +1234,9 @@ paths:
         "400":
           description: Unknown status
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not in admin_permit_cidr, or the token is scoped to inventory
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
         "503":
           description: Audit database not configured
     post:
@@ -1170,9 +1286,9 @@ paths:
         "400":
           description: A field is missing or invalid, or the expiry is past override_max_ttl
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `write`
         "503":
           description: Audit database not configured
 
@@ -1202,9 +1318,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The caller requested this override, or the token is scoped to inventory
+          description: The caller requested this override, or the token lacks `admin`
         "404":
           description: No override with that id
         "409":
@@ -1239,9 +1355,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
-          description: No token, or a token bound to no identity
+          description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The token is scoped to inventory
+          description: The token lacks `admin`
         "404":
           description: No override with that id
         "409":
@@ -1256,7 +1372,8 @@ paths:
         One row per (type, package, version, check) a client was refused,
         most recently refused first, each with the identities and client
         addresses that asked. Rows are written whatever `discover_mode` says.
-        Restricted to IPs in `admin_permit_cidr`.
+        Restricted to IPs in `admin_permit_cidr`, and a token presented must
+        hold `admin`.
       operationId: listQueue
       tags: [status]
       parameters:
@@ -1293,7 +1410,7 @@ paths:
         "400":
           description: Unknown type, check or state
         "403":
-          description: Client IP is not in admin_permit_cidr
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
         "503":
           description: Audit database not configured
 
@@ -1306,7 +1423,9 @@ paths:
         for `profile`, and a two-person override request for every other
         check, or the override already pending or active for that version
         and check. Like the override routes it requires a token bound to an
-        identity, which is recorded as the actor. A row refused as known
+        identity, which is recorded as the actor, and the token must hold
+        `admin`: approving writes an allow-list rule or a profile pin. A row
+        refused as known
         malware or for upstream provenance that failed to verify is refused
         with 409 and stays open.
       operationId: approveQueue
@@ -1340,7 +1459,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `admin`
         "404":
           description: No queue row with that id
         "409":
@@ -1352,8 +1471,8 @@ paths:
     post:
       summary: Close one queue row without admitting anything
       description: |
-        Records the token identity as the actor. The row reopens if the same
-        refusal happens again.
+        Records the token identity as the actor, and the token must hold
+        `admin`. The row reopens if the same refusal happens again.
       operationId: dismissQueue
       tags: [status]
       security:
@@ -1382,7 +1501,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token is scoped to inventory
+          description: Client IP is not permitted, or the token lacks `admin`
         "404":
           description: No queue row with that id
         "409":
@@ -2966,8 +3085,16 @@ components:
           type: string
         Scope:
           type: string
-          enum: [full, inventory]
-          description: full reaches every mutation route; inventory reaches only inventory push routes
+          example: "read,write:npm,pypi"
+          description: |
+            read, write and admin, each optionally narrowed to package types;
+            or inventory, which reaches reads and the inventory push routes
+        Subject:
+          type: string
+          description: The ID token subject an exchanged token acts for; empty on a minted token
+        Issuer:
+          type: string
+          description: The issuer of that ID token; empty on a minted token
         CreatedAt:
           type: string
           format: date-time

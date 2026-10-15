@@ -26,7 +26,8 @@ func newQueueCmd(gf *globalFlags) *cobra.Command {
 		Long: `queue holds one row for every (type, package, version, check) a client was
 refused, with the identities and addresses that asked. A row is written whatever
 discover_mode says, for the allow-list, age, osv, malware, profile,
-upstream_provenance and name_similarity checks.
+upstream_provenance and name_similarity checks and for each integration
+(integration:<instance>).
 
   list    [--type <type>] [--check <check>] [--all] [--json]
   approve <id> --reason <text> [--expires <duration>]
@@ -42,8 +43,9 @@ approve does what the row's check calls for:
                override), which applies once override_quorum identities
                approve it; --expires defaults to override_max_ttl
 
-A row refused as known malware, or for upstream provenance that failed to
-verify, is never approved: dismiss it. A row that is refused again after it
+A row refused as known malware (an OSV MAL- record or a malware-list
+integration hit), or for upstream provenance that failed to verify, is never
+approved: dismiss it. A row that is refused again after it
 was approved or dismissed reopens.
 
 Examples:

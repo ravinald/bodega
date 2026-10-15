@@ -87,7 +87,7 @@ the gates.
 					return fmt.Errorf("--baseline writes the local manifest store and cannot be sent to %s; copy the file to the bodega host and run 'bodega pkg import --baseline' there", target)
 				}
 				suppressReload(cmd)
-				return importToServer(target, cfg.ResolveToken(), allowPlaintext, merge, origin, args)
+				return importToServer(target, cfg.ResolveTokenFor(target), allowPlaintext, merge, origin, args)
 			}
 
 			if err := ensureMutable(cfg); err != nil {

@@ -35,6 +35,18 @@ const (
 	CostPaid     Cost = "paid"
 )
 
+// Flag is what a flagged answer from a type says about the version.
+type Flag string
+
+const (
+	// FlagMalware means the version was published to do harm, the fact an
+	// OSV MAL- record states. No override or queue approval admits past it.
+	FlagMalware Flag = "malware"
+	// FlagRisk means the vendor judges the version risky against some
+	// threshold. An override may admit past it.
+	FlagRisk Flag = "risk"
+)
+
 // Kind is what a field's value is, and what input the TUI draws for it.
 type Kind string
 
@@ -125,7 +137,10 @@ type Descriptor struct {
 	// DefaultAction applies to an ecosystem with no integration_policy row:
 	// warn, block or ignore.
 	DefaultAction string
-	Fields        []Field
+	// Flags is what a flagged answer means. Register refuses a type that
+	// leaves it unset, so no type is overridable by omission.
+	Flags  Flag
+	Fields []Field
 	// Probe is the well-known package `bodega integration test` asks about.
 	Probe Query
 	New   func(inst *Instance) (Checker, error)
@@ -190,6 +205,11 @@ func Register(d Descriptor) {
 	case CostFree, CostFreeTier, CostPaid:
 	default:
 		panic(fmt.Sprintf("integration %s: cost %q is not free, free-tier or paid", d.Type, d.Cost))
+	}
+	switch d.Flags {
+	case FlagMalware, FlagRisk:
+	default:
+		panic(fmt.Sprintf("integration %s: flags %q is not malware or risk", d.Type, d.Flags))
 	}
 	if strings.TrimSpace(d.DataSent) == "" {
 		panic("integration " + d.Type + ": a descriptor must say what leaves the host")

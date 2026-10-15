@@ -96,9 +96,7 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - run: |
-          go list ./... | grep -v '/internal/server$' \
-            | xargs go test -race -count=1 -coverprofile=coverage.out
+      - run: make test TEST_FLAGS=-coverprofile=coverage.out
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -115,9 +113,17 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - run: go test -race -count=1 -coverprofile=coverage-server.out ./internal/server/...
+      # shell: bash is what turns on pipefail; the default shell lets tee's
+      # exit status stand in for a failed test run.
+      - shell: bash
+        run: make test-server TEST_FLAGS=-coverprofile=coverage-server.out | tee test-server.log
       - name: Coverage summary
         run: go tool cover -func=coverage-server.out | tail -1
+      # Repeats go test's own `ok ... <n>s` line (or FAIL, on a timeout) after
+      # the coverage step, so a slow run shows its elapsed time without the log.
+      - name: Elapsed
+        if: always()
+        run: grep -E '^(ok|FAIL)[[:space:]]' test-server.log
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-server

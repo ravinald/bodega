@@ -1072,15 +1072,19 @@ func startGitTestServer(t *testing.T, s *Server, writeTimeout time.Duration, htt
 // timeout. A full clone of a large repository is minutes of pack, and the
 // route used to die at that bound with "curl 18 transfer closed with
 // outstanding read data remaining", naming neither bodega nor a timeout.
+//
+// The stall also bounds the child's start, so it leaves a loaded -race run
+// two seconds to fork a shell. Twelve 0.3s gaps run past the first deadline
+// (one stall and a quarter), so the response completes only if output moves it.
 func TestGitResponseOutlivesTheServerWriteTimeout(t *testing.T) {
 	sleep := lookPath(t, "sleep")
 	for _, h2 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("http2=%v", h2), func(t *testing.T) {
 			s := newGitServer(t, newGitUpstream(t))
-			s.gitTool.backendStall = time.Second
+			s.gitTool.backendStall = 2 * time.Second
 			s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\n'
 i=0
-while [ $i -lt 12 ]; do printf 'chunk%02d\n' $i; `+sleep+` 0.1; i=$((i+1)); done
+while [ $i -lt 12 ]; do printf 'chunk%02d\n' $i; `+sleep+` 0.3; i=$((i+1)); done
 `)
 			ts := startGitTestServer(t, s, 300*time.Millisecond, h2)
 
