@@ -40,7 +40,7 @@ func init() {
 	Register(Descriptor{
 		Type: "every-kind", DisplayName: "Every kind", VendorURL: "https://example.test/", Cost: CostFreeTier,
 		Ecosystems: []string{manifest.TypeCargo}, DataSent: "The purl of every version asked about.",
-		DefaultAction: policy.ActionWarn,
+		DefaultAction: policy.ActionWarn, Flags: FlagRisk,
 		Fields: []Field{
 			{Key: "label", Label: "Label", Kind: KindString},
 			{Key: "limit", Label: "Limit", Kind: KindInt, Default: "10", Min: 1, Max: 100},
@@ -231,7 +231,7 @@ func TestRedact(t *testing.T) {
 func TestRegisterPanics(t *testing.T) {
 	base := func() Descriptor {
 		return Descriptor{Type: "panics", DisplayName: "p", Cost: CostFree, DataSent: "nothing",
-			DefaultAction: policy.ActionWarn, New: func(*Instance) (Checker, error) { return nil, nil }}
+			DefaultAction: policy.ActionWarn, Flags: FlagRisk, New: func(*Instance) (Checker, error) { return nil, nil }}
 	}
 	cases := map[string]func(*Descriptor){
 		"duplicate":        func(d *Descriptor) { d.Type = "every-kind" },
@@ -241,6 +241,7 @@ func TestRegisterPanics(t *testing.T) {
 		"bad_default":      func(d *Descriptor) { d.Fields = []Field{{Key: "x", Kind: KindInt, Default: "ten"}} },
 		"no_data_sentence": func(d *Descriptor) { d.DataSent = "" },
 		"bad_action":       func(d *Descriptor) { d.DefaultAction = "pass" },
+		"no_flags":         func(d *Descriptor) { d.Flags = "" },
 	}
 	for name, edit := range cases {
 		d := base()
