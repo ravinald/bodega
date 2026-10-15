@@ -801,7 +801,7 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 		{"similarity", audit.CheckNameSimilarity, checkSimilarity, "name_similarity", nil, true, ""},
 		{"integration", "integration:aikido", checkIntegrate, `integration "aikido"`,
 			map[string]any{"instance": "aikido", "outcome": "flagged", "purl": "pkg:npm/left-pad@1.3.0"}, true, ""},
-		{"integration malware", "integration:aikido", checkIntegrate, "lists this version as malware",
+		{"integration malware", "integration:aikido", checkIntegrate, `integration "aikido" lists this version as malware`,
 			map[string]any{"instance": "aikido", "outcome": "flagged", "malware": []string{"integration:aikido"}}, false, "override does not apply"},
 		{"unknown", "tea_leaves", checkPolicy, "tea_leaves", map[string]any{"url": leak}, false, ""},
 	} {
