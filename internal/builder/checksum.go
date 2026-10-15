@@ -235,6 +235,15 @@ func (c *Config) findAndUpdateCargoChecksum(store *manifest.Store, name string, 
 	return c.updateVersionChecksum(context.Background(), store, manifest.TypeCargo, name, ve, cs, verified)
 }
 
+// FetchedArtifact returns the file a completed fetch left in the build root for
+// this entry, or "" when there is none. name is the store's safe name.
+func (c *Config) FetchedArtifact(typ, name string, ve manifest.VersionEntry) string {
+	if path := c.fetchedArtifact(typ, name, ve); path != "" && fileExists(path) {
+		return path
+	}
+	return ""
+}
+
 // fetchedArtifact returns the path of the artifact a completed fetch left on
 // disk for this entry, or "" when the type has no single object to digest.
 //

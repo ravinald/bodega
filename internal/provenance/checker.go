@@ -101,7 +101,9 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 		return r
 	}
 
-	ev := c.evaluate(ctx, pm, ve)
+	key := strings.Join([]string{audit.CheckUpstreamProvenance, pm.Type, pm.Name, ve.Version, ve.URL, ve.Ref,
+		entrySHA256(ve), fmt.Sprint(ve.IsRelease())}, "\x00")
+	ev := policy.SharedLookup(ctx, key, func() Evidence { return c.evaluate(ctx, pm, ve) })
 	if ev.Outcome == audit.ProvenanceVerified || (ev.Outcome == audit.ProvenanceUnavailable && pm.Type == manifest.TypeNpm) {
 		ev = c.compare(ctx, pm, ve, ev, action)
 	}

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -390,5 +391,31 @@ func TestDigestTracksPolicyContent(t *testing.T) {
 			t.Errorf("%s: digest %s is the same as %s's", name, got, prior)
 		}
 		seen[got] = name
+	}
+}
+
+// Under ShareLookups a question is asked once and its first answer, a failure
+// included, is every later answer; without it every ask reaches look, which is
+// what admission depends on to retry a vendor that failed.
+func TestSharedLookup(t *testing.T) {
+	calls := 0
+	look := func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("503")
+		}
+		return nil
+	}
+	ctx := ShareLookups(t.Context())
+	if a, b := SharedLookup(ctx, "k", look), SharedLookup(ctx, "k", look); a == nil || b == nil || calls != 1 {
+		t.Fatalf("shared: %v, %v after %d call(s); want the first failure twice from one call", a, b, calls)
+	}
+	_ = SharedLookup(ctx, "other", look)
+	if calls != 2 {
+		t.Errorf("a second key reused the first answer (%d calls)", calls)
+	}
+	calls = 0
+	if a, b := SharedLookup(t.Context(), "k", look), SharedLookup(t.Context(), "k", look); a == nil || b != nil || calls != 2 {
+		t.Errorf("unshared: %v, %v after %d call(s); want each ask to reach look", a, b, calls)
 	}
 }

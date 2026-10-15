@@ -6,10 +6,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 
@@ -203,4 +207,52 @@ func TestRefusedVersionTakesNoProvenancePin(t *testing.T) {
 	if err != nil || pin.PinnedVersion != "3.0.0" || pin.SourceRepositoryURI != "https://github.com/sigstore/sigstore-js" {
 		t.Fatalf("pin after an admitted version = %+v, %v", pin, err)
 	}
+}
+
+// Two evaluations under one ShareLookups context see the same provenance
+// answer, so a registry that fails the first read and answers the second
+// cannot move a version between them. The control pair, evaluated without
+// the shared context, shows the registry double is flaky.
+func TestEvaluateSharesProvenanceLookups(t *testing.T) {
+	f := newAdmissionFixture(t)
+	registry := npmWithProvenance(t)
+	var failNext atomic.Bool
+	forward := httputil.NewSingleHostReverseProxy(mustURL(t, registry))
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sigstore" && failNext.Swap(false) {
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(flaky.Close)
+	if err := f.adb.SetProvenancePolicy(t.Context(), audit.ProvenancePolicy{Ecosystem: manifest.TypeNpm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	pm := &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "sigstore",
+		Versions: []manifest.VersionEntry{{Version: "3.0.0", URL: flaky.URL}}}
+	twice := func(ctx context.Context) (Verdict, Verdict) {
+		failNext.Store(true)
+		now := time.Now()
+		return Evaluate(ctx, f.synced, policy.NewChecker(f.adb), f.adb, nil, pm, now),
+			Evaluate(ctx, f.synced, policy.NewChecker(f.adb), f.adb, nil, pm, now)
+	}
+
+	if first, second := twice(t.Context()); first.Decision == second.Decision {
+		t.Fatalf("control: unshared evaluations agree (%v); the double is not flaky", first.Decision)
+	}
+	first, second := twice(policy.ShareLookups(t.Context()))
+	if first.Decision != second.Decision || first.Decision != PolicyBlocked {
+		t.Fatalf("shared evaluations = %v then %v (%s / %s); want the first answer, blocked, both times",
+			first.Decision, second.Decision, first.Reason, second.Reason)
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }

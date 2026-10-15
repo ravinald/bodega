@@ -51,6 +51,7 @@ or set the type's admission mode with 'bodega policy mode set'.`,
 		newPolicyEnforceCmd(gf),
 		newPolicyReportCmd(gf),
 		newPolicyBaselineCmd(gf),
+		newPolicySimulateCmd(gf),
 	)
 	return parent
 }
