@@ -399,7 +399,10 @@ func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.V
 		degraded = append(degraded, lk.note)
 	}
 	for _, t := range lk.targets {
-		ans := c.lookup(ctx, t.ecosystem, t.name, ve.Version)
+		eco, name := t.ecosystem, t.name
+		ans := SharedLookup(ctx, "osv\x00"+eco+"\x00"+name+"\x00"+ve.Version, func() osvAnswer {
+			return c.lookup(ctx, eco, name, ve.Version)
+		})
 		if ans.err != nil {
 			// Whole, not just the error: a caller reads the ids off an
 			// answer it could not act on, and lookup builds this one.

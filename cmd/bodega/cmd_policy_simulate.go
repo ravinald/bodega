@@ -378,8 +378,11 @@ func simulatePolicy(ctx context.Context, cfg *config.Config, adb *audit.DB, stor
 			for _, ve := range pm.Versions {
 				one := *pm
 				one.Versions = []manifest.VersionEntry{ve}
-				before := admit.Evaluate(ctx, cfg, curChecker, adb, current, &one, now)
-				after := admit.Evaluate(ctx, cfg, newChecker, adb, proposed, &one, now)
+				// Both evaluations share every upstream answer, so only a
+				// value the proposal changes can move the decision.
+				vctx := policy.ShareLookups(ctx)
+				before := admit.Evaluate(vctx, cfg, curChecker, adb, current, &one, now)
+				after := admit.Evaluate(vctx, cfg, newChecker, adb, proposed, &one, now)
 				sim.Evaluated++
 				if before.Decision == after.Decision {
 					continue

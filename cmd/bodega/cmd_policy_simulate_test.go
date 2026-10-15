@@ -3,12 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/integration/malwarelist"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -244,4 +249,49 @@ func TestPolicySimulateBaselineDoesNotCoverMalware(t *testing.T) {
 		}
 	}
 	t.Fatalf("changes = %+v; want evil-pkg newly blocked: a baseline mark never admits known malware", sim.Changes)
+}
+
+// A proposal equal to current policy moves nothing, even when an integration
+// under block fails its first lookup and answers the next: the malware list
+// below answers 503 to its first download and serves a list after that.
+func TestPolicySimulateIgnoresTransientIntegrationError(t *testing.T) {
+	var fetches atomic.Int32
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fetches.Add(1) == 1 {
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`[{"package_name":"evil-pkg","version":"1.0.0","reason":"test"}]`))
+	}))
+	t.Cleanup(list.Close)
+	f := simulateFixture(t, policy.ActionWarn)
+	adb := f.open(t)
+	defer adb.Close()
+	if err := adb.SetIntegrationPolicy(t.Context(), audit.IntegrationPolicy{Instance: "flaky", Ecosystem: manifest.TypeNpm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	gf := &globalFlags{}
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Integrations = map[string]config.Integration{"flaky": {"type": malwarelist.Type, "enabled": true, "url": list.URL}}
+	store, err := loadStore(gf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposed, err := parsePolicyChange(adb, []string{"npm=warn"}, nil, nil, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim, err := simulatePolicy(t.Context(), cfg, adb, store, proposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetches.Load() < 2 {
+		t.Fatalf("the list was fetched %d time(s); the test needs the failure and an answer", fetches.Load())
+	}
+	if sim.Evaluated != 3 || len(sim.Changes) != 0 {
+		t.Fatalf("evaluated=%d changes=%+v; a no-op proposal moves nothing", sim.Evaluated, sim.Changes)
+	}
 }

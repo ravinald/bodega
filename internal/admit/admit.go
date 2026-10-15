@@ -186,6 +186,13 @@ func Evaluate(ctx context.Context, cfg *config.Config, checker *policy.Checker, 
 	if store != nil {
 		ev.readActions(ctx, store, pm.Type)
 		checkers = VersionCheckersFrom(cfg, store, readOnlyIntegrations{adb})
+		// Age is judged at now, so two evaluations given one now agree on
+		// how old a version is.
+		for _, c := range checkers {
+			if age, ok := c.(*policy.AgeChecker); ok {
+				age.Now = func() time.Time { return now }
+			}
+		}
 		ev.include(ctx, pm, checkers)
 	}
 	// A nil database records nothing, which is what keeps the allow-list's

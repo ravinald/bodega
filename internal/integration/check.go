@@ -82,7 +82,15 @@ func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, 
 	}
 	q := Query{Ecosystem: pm.Type, Name: pm.Name, Version: version}
 	action := c.ActionFor(ctx, pm.Type)
-	a, err := c.lookup(ctx, q)
+	type answered struct {
+		a   Answer
+		err error
+	}
+	got := policy.SharedLookup(ctx, c.CheckName()+"\x00"+q.PURL(), func() answered {
+		a, err := c.lookup(ctx, q)
+		return answered{a, err}
+	})
+	a, err := got.a, got.err
 	switch {
 	case err != nil:
 		if c.store != nil {

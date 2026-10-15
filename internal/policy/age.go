@@ -104,7 +104,15 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			Reason: "version " + versionLabel(version) + " pins nothing; age gate is version-aware"}
 	}
 
-	publishedAt, err := c.PublishedAt(ctx, pm.Type, pm.Name, version)
+	type dated struct {
+		at  time.Time
+		err error
+	}
+	d := SharedLookup(ctx, "age\x00"+pm.Type+"\x00"+pm.Name+"\x00"+version, func() dated {
+		at, err := c.PublishedAt(ctx, pm.Type, pm.Name, version)
+		return dated{at, err}
+	})
+	publishedAt, err := d.at, d.err
 	if err != nil {
 		// Not having an upstream timestamp shouldn't fail-closed; short-circuit
 		// with a warn that shows up in the audit but doesn't block.

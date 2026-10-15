@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -117,4 +118,53 @@ func resultsAsList(rs []Result) []map[string]any {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// sharedLookups holds the answers to upstream lookups made under one
+// ShareLookups context, errors included, one per question.
+type sharedLookups struct {
+	mu      sync.Mutex
+	answers map[string]*sharedAnswer
+}
+
+type sharedAnswer struct {
+	once  sync.Once
+	value any
+}
+
+type sharedLookupsKey struct{}
+
+// ShareLookups returns a context under which each question a version check
+// asks outside bodega (a registry's publish time, an OSV query, a provenance
+// lookup, an integration vendor) is asked once, and every later check under
+// the same context that asks it gets that first answer, a failure included.
+// `bodega policy simulate` evaluates each version twice under one, so a
+// lookup that fails in one evaluation fails in both and a transient error
+// cannot read as a decision the proposal moved. A context without it asks
+// every time, which is what admission wants.
+func ShareLookups(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sharedLookupsKey{}, &sharedLookups{answers: map[string]*sharedAnswer{}})
+}
+
+// SharedLookup answers key with look, or with the answer look gave the first
+// time key was asked under ctx's ShareLookups. A key names the check and
+// every input its answer depends on; an error the caller wants shared
+// travels inside T.
+func SharedLookup[T any](ctx context.Context, key string, look func() T) T {
+	s, ok := ctx.Value(sharedLookupsKey{}).(*sharedLookups)
+	if !ok {
+		return look()
+	}
+	s.mu.Lock()
+	a := s.answers[key]
+	if a == nil {
+		a = &sharedAnswer{}
+		s.answers[key] = a
+	}
+	s.mu.Unlock()
+	a.once.Do(func() { a.value = look() })
+	// A nil interface answer is stored as a nil any, which only the
+	// comma-ok form converts back.
+	v, _ := a.value.(T)
+	return v
 }
