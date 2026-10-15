@@ -293,6 +293,11 @@ func admitRefusal(typ, name string, res admitBlock) *refusal {
 			res.check, f.subjectPhrase())
 		f.next = overrideNext(f, res.check)
 	case checkIntegrate:
+		if res.details["malware"] != nil {
+			f.reason = fmt.Sprintf("integration %q lists this version as malware.", strings.TrimPrefix(res.check, integration.CheckPrefix))
+			f.next = "do not install this version; remove it from any lockfile that names it and pick another release. An override does not apply to known malware; give an operator incident " + f.incident + " if this is wrong."
+			break
+		}
 		what := "flagged it"
 		if fmt.Sprint(res.details["outcome"]) == "error" {
 			what = "could not be asked about it, and this server blocks when it cannot"

@@ -258,8 +258,9 @@ func approveProfile(ctx context.Context, adb *audit.DB, row audit.QueueRow, acto
 // reopened while its override waited for a second approver does not file a
 // second request.
 func approveOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, row audit.QueueRow, actor string, a QueueApproval, now time.Time) (audit.Override, error) {
-	if !slices.Contains(allChecks, row.Check) {
-		return audit.Override{}, fmt.Errorf("%w: no approval is defined for check %q", ErrInvalidQueue, row.Check)
+	if !slices.Contains(allChecks, row.Check) && !isIntegrationCheck(row.Check) {
+		return audit.Override{}, fmt.Errorf("%w: no approval is defined for check %q; `bodega queue dismiss %d` closes the row",
+			ErrInvalidQueue, row.Check, row.ID)
 	}
 	existing, err := ListOverrides(ctx, adb, "", now)
 	if err != nil {

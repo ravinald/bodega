@@ -62,6 +62,11 @@ type AdmissionCheck struct {
 	// Override is the ID of the override that admitted past this check's
 	// failure, set when Status is CheckOverridden.
 	Override string `json:"override,omitempty"`
+	// Unwaivable is why no override or queue approval may admit past this
+	// check's block, set when the result named a version as hostile. An
+	// override request reads it here rather than re-deriving it from config
+	// that may have changed since.
+	Unwaivable string `json:"unwaivable,omitempty"`
 }
 
 // Upstream provenance outcomes: what verifying a publisher's signed
