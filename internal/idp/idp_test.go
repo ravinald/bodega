@@ -131,8 +131,19 @@ func TestExchangeHonorsKeyRotation(t *testing.T) {
 	if is.JWKSFetches() <= before {
 		t.Error("the rotated key verified without the JWKS being refetched")
 	}
-	if _, err := r.Exchange(context.Background(), old); err == nil {
-		t.Error("a token signed by the withdrawn key still verified")
+	// go-oidc v3.17.0 (RemoteKeySet.keysFromRemote) calls inflight.done before
+	// it locks and stores cachedKeys, so the rotated-key Exchange can return
+	// while the cache still holds the withdrawn key. Withdrawal is eventual by
+	// a few instructions; the assertion waits that out rather than racing it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := r.Exchange(context.Background(), old); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a token signed by the withdrawn key still verified after 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
