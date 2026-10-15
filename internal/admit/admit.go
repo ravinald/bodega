@@ -147,6 +147,71 @@ func AdmitAs(
 	return ev.record(ctx, adb, pm, res, who)
 }
 
+// Verdict is what Evaluate concluded about one version.
+type Verdict struct {
+	Decision Decision
+	Reason   string
+	Checks   []audit.AdmissionCheck
+}
+
+// Evaluate decides on pm, which holds one version, the way Admit would and
+// writes nothing: no admission row, no audit event, no provenance pin, since
+// no checker's Commit runs, and no integration's last error. The order, every
+// enabled integration under its action, the active overrides and the
+// version's baseline mark all apply as they do in Admit, malware and invalid
+// provenance included, so a preview that goes through here cannot disagree
+// with the admission it previews. The mark it reads is the one pm carries,
+// so a manifest built outside the store wants CarryBaseline first, as every
+// write path does before Admit.
+//
+// store answers the policy reads, which is how a simulation evaluates a
+// policy nobody has written; nil reads adb. adb supplies the overrides, and a
+// nil adb runs structure and the allow-list alone, as Admit does.
+func Evaluate(ctx context.Context, cfg *config.Config, checker *policy.Checker, adb *audit.DB, store PolicyStore,
+	pm *manifest.PackageManifest, now time.Time) Verdict {
+	var res Result
+	if err := validate(cfg, pm, &res); err != nil {
+		return Verdict{Decision: Invalid, Reason: err.Error()}
+	}
+	if len(pm.Versions) != 1 {
+		return Verdict{Decision: Invalid, Reason: fmt.Sprintf("evaluate wants one version, got %d", len(pm.Versions))}
+	}
+	ev := newEvaluation(ctx, adb, pm, now)
+	if adb == nil {
+		store = nil
+	} else if store == nil {
+		store = adb
+	}
+	var checkers []policy.VersionChecker
+	if store != nil {
+		ev.readActions(ctx, store, pm.Type)
+		checkers = VersionCheckersFrom(cfg, store, readOnlyIntegrations{adb})
+		// Age is judged at now, so two evaluations given one now agree on
+		// how old a version is.
+		for _, c := range checkers {
+			if age, ok := c.(*policy.AgeChecker); ok {
+				age.Now = func() time.Time { return now }
+			}
+		}
+		ev.include(ctx, pm, checkers)
+	}
+	// A nil database records nothing, which is what keeps the allow-list's
+	// refusal event out of a read-only evaluation.
+	if blocked := checkAllowList(ctx, checker, nil, pm, "", ev); blocked != nil {
+		return Verdict{Decision: PolicyBlocked, Reason: blocked.Reason, Checks: ev.checks[0]}
+	}
+	if store == nil {
+		return Verdict{Decision: Admitted, Checks: ev.checks[0]}
+	}
+	ve := &pm.Versions[0]
+	combined := policy.Combine(ev.runVersion(ctx, pm, 0, checkers))
+	if combined.Blocked() {
+		return Verdict{Decision: PolicyBlocked, Checks: ev.checks[0],
+			Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())}
+	}
+	return Verdict{Decision: Admitted, Checks: ev.checks[0]}
+}
+
 // Create runs the policy checks `bodega pkg create` answers to: the
 // allow-list and the per-version checks.
 //
@@ -522,6 +587,10 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 	}
 	out := []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
 		policy.NewNameSimilarityChecker(similarity)}
+	return appendIntegrations(out, cfg, store)
+}
+
+func appendIntegrations(out []policy.VersionChecker, cfg *config.Config, store integration.Store) []policy.VersionChecker {
 	if cfg != nil {
 		for _, c := range integration.Checks(cfg.Integrations, store) {
 			out = append(out, c)
@@ -530,18 +599,50 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 	return out
 }
 
+// PolicyStore is every read the per-version checks make of the policy tables.
+// *audit.DB is one; `bodega policy simulate` supplies another that answers
+// with a policy nobody has written.
+type PolicyStore interface {
+	policy.AgeStore
+	policy.OSVStore
+	policy.SimilarityStore
+	provenance.Store
+}
+
+// VersionCheckersFrom is VersionCheckers reading policy from store and each
+// integration's action from integrations, in the same order. A caller that
+// must write nothing never calls Commit on the provenance checker it returns,
+// and passes integrations through readOnlyIntegrations, since an integration
+// records its lookup errors as it checks.
+func VersionCheckersFrom(cfg *config.Config, store PolicyStore, integrations integration.Store) []policy.VersionChecker {
+	out := []policy.VersionChecker{policy.NewAgeChecker(store), osvCheckerFrom(cfg, store),
+		provenanceCheckerFrom(cfg, store), policy.NewNameSimilarityChecker(store)}
+	return appendIntegrations(out, cfg, integrations)
+}
+
+// readOnlyIntegrations reads integration policy from store and drops the
+// lookup errors an integration check would otherwise record.
+type readOnlyIntegrations struct{ integration.Store }
+
+// RecordIntegrationError records nothing.
+func (readOnlyIntegrations) RecordIntegrationError(context.Context, string, string) error { return nil }
+
 // ProvenanceChecker builds the upstream provenance check: npm read from the
 // configured npm upstream when an entry names no registry, and the Sigstore
 // trusted root from sigstore_trusted_root, or TUF when that is unset.
 func ProvenanceChecker(cfg *config.Config, adb *audit.DB) *provenance.Checker {
-	v := NewProvenanceVerifier(cfg)
-	if cfg != nil && cfg.NpmUpstream != "" {
-		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
-	}
 	// A nil *audit.DB inside the interface is not a nil interface.
 	var store provenance.Store
 	if adb != nil {
 		store = adb
+	}
+	return provenanceCheckerFrom(cfg, store)
+}
+
+func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenance.Checker {
+	v := NewProvenanceVerifier(cfg)
+	if cfg != nil && cfg.NpmUpstream != "" {
+		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
 	}
 	return &provenance.Checker{Store: store, Verifier: v}
 }
@@ -689,6 +790,10 @@ func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	if adb != nil {
 		store = adb
 	}
+	return osvCheckerFrom(cfg, store)
+}
+
+func osvCheckerFrom(cfg *config.Config, store policy.OSVStore) *policy.OSVChecker {
 	ck := policy.NewOSVChecker(store)
 	if cfg == nil {
 		return ck
