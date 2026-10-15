@@ -795,6 +795,8 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 			map[string]any{"outcome": audit.ProvenanceMismatch, "source_repository_uri": leak}, true, "bodega pkg trust reset npm left-pad"},
 		{"provenance invalid", audit.CheckUpstreamProvenance, checkProvenance, "upstream_provenance",
 			map[string]any{"outcome": audit.ProvenanceInvalid, "source_repository_uri": leak}, false, "override does not apply"},
+		{"provenance unknown", audit.CheckUpstreamProvenance, checkProvenance, "provenance could not be checked",
+			map[string]any{"outcome": audit.ProvenanceUnknown}, true, ""},
 		{"similarity", audit.CheckNameSimilarity, checkSimilarity, "name_similarity", nil, true, ""},
 		{"integration", "integration:aikido", checkIntegrate, `integration "aikido"`,
 			map[string]any{"instance": "aikido", "outcome": "flagged", "purl": "pkg:npm/left-pad@1.3.0"}, true, ""},
@@ -814,6 +816,9 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 			}
 			if !strings.Contains(f.reason, tc.names) {
 				t.Errorf("reason %q does not name %q", f.reason, tc.names)
+			}
+			if tc.details["outcome"] == audit.ProvenanceUnknown && strings.Contains(f.reason, "verify") {
+				t.Errorf("reason %q says provenance failed to verify when nothing was verified", f.reason)
 			}
 			cmd := "bodega override request npm left-pad 1.3.0 --check " + tc.check
 			if strings.Contains(f.next, cmd) != tc.override || (!tc.override && strings.Contains(f.next, "bodega override request")) {

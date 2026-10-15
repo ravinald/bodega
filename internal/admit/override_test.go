@@ -189,6 +189,8 @@ func TestOverrideExpiry(t *testing.T) {
 // override says, and the row names the override it did not honor. An
 // advisory block on the same path is overridden, so the exclusion is the
 // verdict's and not the path's.
+// unknown provenance says the evidence could not be read, not that the version
+// is hostile, so an override admits it where it never admits invalid.
 func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 	f := newAdmissionFixture(t)
 	now := time.Now()
@@ -203,6 +205,8 @@ func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}}, false},
 		{"1.0.2", policy.Result{Check: audit.CheckOSV, Action: policy.ActionBlock, Reason: "GHSA-test-0002",
 			Details: map[string]any{"vulns": []string{"GHSA-test-0002"}}}, true},
+		{"1.0.3", policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no version 1.0.3",
+			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}, true},
 	} {
 		req := osvOverride(tc.version)
 		req.Check = tc.r.Check

@@ -251,9 +251,9 @@ Any failed check exits non-zero.
 
 It then prints upstream-provenance and publisher-signature: whether the
 publisher's own signed provenance was verified at admission (verified,
-unavailable, invalid or mismatch), and the source repository, workflow,
-builder and bundle digest it named. Neither fails verify; the admission's
-upstream_provenance evaluation is what the policy check reads.
+unavailable, invalid, unknown or mismatch), and the source repository,
+workflow, builder and bundle digest it named. Neither fails verify; the
+admission's upstream_provenance evaluation is what the policy check reads.
 
 The trusted key IDs come from --key, or from attestation_keyids in the config
 file. Learn them somewhere other than the server being checked: the public key

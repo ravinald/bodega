@@ -342,6 +342,8 @@ func provenanceReason(f *refusal, d map[string]any) {
 		what = "its provenance names a different publisher than the one this server pinned"
 	case audit.ProvenanceUnavailable:
 		what = "it publishes no provenance and this server requires it"
+	case audit.ProvenanceUnknown:
+		what = "its publisher's provenance could not be checked, because the evidence could not be read"
 	default:
 		what = fmt.Sprintf("its provenance outcome is %q", outcome)
 	}

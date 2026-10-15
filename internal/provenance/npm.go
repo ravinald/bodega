@@ -21,10 +21,10 @@ var npmIssuers = "^(" + strings.ReplaceAll(issuerGitHubActions, ".", `\.`) + "|"
 // The packument says whether provenance exists (dist.attestations) and what
 // the tarball's sha512 is (dist.integrity). Only a packument that was read,
 // parsed and lists the version without dist.attestations is unavailable.
-// Every other failure is invalid: a packument that could not be read cannot
-// say provenance is absent, and a version that publishes provenance never
-// passes because the bundle could not be fetched or there was no trusted root
-// to check it against.
+// Evidence that could not be read is unknown: a packument that was not read,
+// or does not list the version, cannot say provenance is absent, and bundles
+// that were not fetched cannot say it failed. A bundle that was read and did
+// not verify, or had no trusted root to check it against, is invalid.
 //
 // The attestations document also carries npm's own publish attestation,
 // signed by the registry's key rather than a CI identity. It says the
@@ -36,11 +36,11 @@ func (v *Verifier) Npm(ctx context.Context, registry, name, version string) Evid
 	}
 	body, err := v.get(ctx, registry+"/"+name, nil, 32<<20)
 	if err != nil {
-		return invalid("the packument lookup for %s failed, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
+		return unknown("the packument lookup for %s failed, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
 	var doc packument
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return invalid("the packument lookup for %s failed: the answer is not JSON, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
+		return unknown("the packument lookup for %s failed: the answer is not JSON, so whether %s@%s publishes provenance is unknown: %v", name, name, version, err)
 	}
 	ev := v.npmVersion(ctx, registry, name, version, &doc)
 	ev.Published = make(map[string]time.Time, len(doc.Time))
@@ -93,7 +93,7 @@ type packument struct {
 func (v *Verifier) npmVersion(ctx context.Context, registry, name, version string, doc *packument) Evidence {
 	ver, ok := doc.Versions[version]
 	if !ok {
-		return invalid("the packument for %s lists no version %s, so whether it publishes provenance is unknown", name, version)
+		return unknown("the packument for %s lists no version %s, so whether it publishes provenance is unknown", name, version)
 	}
 	att := ver.Dist.Attestations
 	if att == nil || att.Provenance == nil {
@@ -101,14 +101,14 @@ func (v *Verifier) npmVersion(ctx context.Context, registry, name, version strin
 	}
 	integrity, err := sha512Integrity(ver.Dist.Integrity)
 	if err != nil {
-		return invalid("%s@%s publishes provenance, but %v, so its subject cannot be checked", name, version, err)
+		return unknown("%s@%s publishes provenance, but %v, so its subject cannot be checked", name, version, err)
 	}
 	if strings.HasPrefix(att.URL, "/") {
 		att.URL = registry + att.URL
 	}
 	body, err := v.get(ctx, att.URL, nil, 8<<20)
 	if err != nil {
-		return invalid("%s@%s publishes provenance, but its bundles could not be read: %v", name, version, err)
+		return unknown("%s@%s publishes provenance, but its bundles could not be read: %v", name, version, err)
 	}
 	var bundles struct {
 		Attestations []struct {
@@ -117,7 +117,7 @@ func (v *Verifier) npmVersion(ctx context.Context, registry, name, version strin
 		} `json:"attestations"`
 	}
 	if err := json.Unmarshal(body, &bundles); err != nil {
-		return invalid("%s@%s publishes provenance, but %s is not an attestations document: %v", name, version, att.URL, err)
+		return unknown("%s@%s publishes provenance, but %s is not an attestations document: %v", name, version, att.URL, err)
 	}
 	tm, err := v.Root(ctx)
 	if err != nil {

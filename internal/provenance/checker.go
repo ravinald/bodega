@@ -82,8 +82,9 @@ func Action(ctx context.Context, store Store, ecosystem string) (string, error) 
 }
 
 // Check verifies ve's upstream provenance and turns the outcome into a
-// verdict. invalid and mismatch fail under warn and block; unavailable fails
-// under block only; ignore records the outcome and fails nothing.
+// verdict. invalid, unknown and mismatch fail under warn and block;
+// unavailable fails under block only; ignore records the outcome and fails
+// nothing.
 func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) policy.Result {
 	r := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionPass}
 	if pm == nil || ve == nil {
@@ -214,7 +215,7 @@ func stopped(pm *manifest.PackageManifest, ev Evidence, held audit.ProvenancePin
 		missing = append(missing, "pinned version "+held.PinnedVersion+"'s")
 	}
 	if len(missing) > 0 {
-		ev.Outcome = audit.ProvenanceInvalid
+		ev.Outcome = audit.ProvenanceUnknown
 		ev.Detail = fmt.Sprintf("%s; %s/%s is pinned to %s from %s, and the packument's time map has no publish time for %s, so whether this version came after the pin is unknown",
 			ev.Detail, pm.Type, pm.Name, held.BuilderID, held.SourceRepositoryURI, strings.Join(missing, " or "))
 		return ev
@@ -256,7 +257,7 @@ func pinFailed(ev Evidence, verb string, err error) Evidence {
 	if ev.Outcome == audit.ProvenanceUnavailable {
 		was = "no provenance published"
 	}
-	ev.Outcome = audit.ProvenanceInvalid
+	ev.Outcome = audit.ProvenanceUnknown
 	ev.Detail = was + ", but the trust-on-first-use pin could not be " + verb + ": " + err.Error()
 	return ev
 }
@@ -272,7 +273,7 @@ func verdict(ev Evidence, action string) policy.Result {
 		Provenance: &prov, Reason: ev.Outcome + ": " + ev.Detail}
 	failed := false
 	switch ev.Outcome {
-	case audit.ProvenanceInvalid, audit.ProvenanceMismatch:
+	case audit.ProvenanceInvalid, audit.ProvenanceUnknown, audit.ProvenanceMismatch:
 		failed = action != policy.ActionIgnore
 	case audit.ProvenanceUnavailable:
 		failed = action == policy.ActionBlock
@@ -316,7 +317,7 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 		if digest == "" {
 			var err error
 			if digest, err = v.ReleaseAssetDigest(ctx, rel); err != nil {
-				return invalid("the release lookup for %s/%s@%s failed, so %s's digest and its attestations are unknown: %v", rel.Owner, rel.Repo, rel.Tag, rel.Asset, err)
+				return unknown("the release lookup for %s/%s@%s failed, so %s's digest and its attestations are unknown: %v", rel.Owner, rel.Repo, rel.Tag, rel.Asset, err)
 			}
 		}
 		if digest == "" {
@@ -336,7 +337,7 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 		if digest == "" {
 			var err error
 			if digest, err = v.PublishedSHA256(ctx, owner, repo, ve.Ref, asset); err != nil {
-				return invalid("reading the SHA256SUMS release %s/%s@%s publishes failed, so %s's digest and its attestations are unknown: %v", owner, repo, ve.Ref, asset, err)
+				return unknown("reading the SHA256SUMS release %s/%s@%s publishes failed, so %s's digest and its attestations are unknown: %v", owner, repo, ve.Ref, asset, err)
 			}
 		}
 		if digest == "" {

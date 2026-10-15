@@ -124,7 +124,7 @@ func (v *Verifier) PublishedSHA256(ctx context.Context, owner, repo, tag, asset 
 // GitHubAttestations verifies the SLSA provenance GitHub holds for an asset
 // digest in owner/repo: what actions/attest records. A digest GitHub answers
 // it holds no provenance for is unavailable. One whose provenance does not
-// verify is invalid, and so is a lookup that got no answer: a rate limit, an
+// verify is invalid. A lookup that got no answer is unknown: a rate limit, an
 // outage or a body that does not parse says nothing about whether the asset
 // publishes provenance.
 //
@@ -135,7 +135,7 @@ func (v *Verifier) PublishedSHA256(ctx context.Context, owner, repo, tag, asset 
 func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256hex string) Evidence {
 	digest, err := hex.DecodeString(sha256hex)
 	if err != nil || len(digest) != 32 {
-		return invalid("%q is not a sha256 digest, so the attestation lookup for %s/%s could not be made", sha256hex, owner, repo)
+		return unknown("%q is not a sha256 digest, so the attestation lookup for %s/%s could not be made", sha256hex, owner, repo)
 	}
 	q := v.apiURL("repos", owner, repo, "attestations", "sha256:"+strings.ToLower(sha256hex)) + "?predicate_type=provenance"
 	body, err := v.get(ctx, q, githubHeaders(), 8<<20)
@@ -143,7 +143,7 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 		return unavailable("%s/%s publishes no attestation for sha256:%s", owner, repo, sha256hex)
 	}
 	if err != nil {
-		return invalid("the attestation lookup for sha256:%s in %s/%s failed, so whether it carries provenance is unknown: %v", sha256hex, owner, repo, err)
+		return unknown("the attestation lookup for sha256:%s in %s/%s failed, so whether it carries provenance is unknown: %v", sha256hex, owner, repo, err)
 	}
 	var doc struct {
 		Attestations []struct {
@@ -152,13 +152,13 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 		} `json:"attestations"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return invalid("the attestation lookup for sha256:%s in %s/%s failed: the answer is not JSON: %v", sha256hex, owner, repo, err)
+		return unknown("the attestation lookup for sha256:%s in %s/%s failed: the answer is not JSON: %v", sha256hex, owner, repo, err)
 	}
 	var raws [][]byte
 	for i, a := range doc.Attestations {
 		raw, err := v.attestationBundle(ctx, a.Bundle, a.BundleURL)
 		if err != nil {
-			return invalid("%s/%s publishes attestation %d for sha256:%s, but it could not be read: %v", owner, repo, i, sha256hex, err)
+			return unknown("%s/%s publishes attestation %d for sha256:%s, but it could not be read: %v", owner, repo, i, sha256hex, err)
 		}
 		if predicateTypeOf(raw) == SLSAProvenanceV1 {
 			raws = append(raws, raw)
