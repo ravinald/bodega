@@ -25,7 +25,7 @@ func init() {
 	integration.Register(integration.Descriptor{
 		Type: "form-double", DisplayName: "Form double", VendorURL: "https://vendor.example.test/", Cost: integration.CostPaid,
 		Ecosystems: []string{manifest.TypeNpm, manifest.TypePypi}, DataSent: "The purl of every version, with the account token.",
-		DefaultAction: policy.ActionWarn,
+		DefaultAction: policy.ActionWarn, Flags: integration.FlagRisk,
 		Fields: []integration.Field{
 			{Key: "endpoint", Label: "Endpoint", Kind: integration.KindURL, Default: "https://api.vendor.example.test/", Help: "Where queries go."},
 			{Key: "max_batch", Label: "Max batch", Kind: integration.KindInt, Default: "5", Min: 1, Max: 5, Help: "Packages per request."},

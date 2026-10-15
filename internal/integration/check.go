@@ -95,6 +95,9 @@ func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, 
 		r.Action = action
 		r.Reason = a.Reason
 		r.Details = map[string]any{"instance": c.inst.Name, "outcome": "flagged", "purl": q.PURL()}
+		if d.Flags == FlagMalware {
+			r.Details["malware"] = []string{c.CheckName()}
+		}
 	default:
 		r.Reason = "not flagged by " + d.DisplayName
 	}

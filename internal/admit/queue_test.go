@@ -2,6 +2,7 @@ package admit
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,6 +63,9 @@ func TestQueueCheckForAndUnwaivable(t *testing.T) {
 		{"provenance invalid", policy.Result{Check: audit.CheckUpstreamProvenance,
 			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}}, QueueProvenance, true},
 		{"name similarity", policy.Result{Check: audit.CheckNameSimilarity}, QueueSimilarity, false},
+		{"integration risk", policy.Result{Check: "integration:socket", Details: map[string]any{"outcome": "flagged"}}, "integration:socket", false},
+		{"integration malware", policy.Result{Check: "integration:aikido",
+			Details: map[string]any{"outcome": "flagged", "malware": []string{"integration:aikido"}}}, "integration:aikido", true},
 	} {
 		if got := QueueCheckFor(tc.r); got != tc.check {
 			t.Errorf("%s: check %q, want %q", tc.name, got, tc.check)
@@ -101,7 +105,7 @@ func TestApproveAllowListAddsTheRule(t *testing.T) {
 // override for that version and check, requested by the approver. A row that
 // reopens while that override waits is approved into the same override.
 func TestApproveVersionChecksRequestsAnOverride(t *testing.T) {
-	for _, check := range []string{QueueAge, QueueOSV, QueueProvenance, QueueSimilarity} {
+	for _, check := range []string{QueueAge, QueueOSV, QueueProvenance, QueueSimilarity, "integration:socket"} {
 		t.Run(check, func(t *testing.T) {
 			adb := openQueueStore(t)
 			f := audit.QueueRefusal{PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0", Check: check}
@@ -163,6 +167,8 @@ func TestApproveRefusesUnwaivableChecks(t *testing.T) {
 		{PkgType: manifest.TypeNpm, PkgName: "evil2", PkgVersion: "1.0.0", Check: QueueMalware},
 		{PkgType: manifest.TypeNpm, PkgName: "forged", PkgVersion: "2.0.0", Check: QueueProvenance,
 			Unwaivable: "invalid upstream provenance is never overridden"},
+		{PkgType: manifest.TypeNpm, PkgName: "openai-pr-reviewer", PkgVersion: "1.0.1", Check: "integration:aikido",
+			Unwaivable: "known malware is never overridden"},
 	} {
 		row := queued(t, adb, f)
 		_, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice", QueueApproval{Reason: "please"}, queueT0)
@@ -178,6 +184,21 @@ func TestApproveRefusesUnwaivableChecks(t *testing.T) {
 	}
 	if list, _ := adb.ListOverrides(t.Context(), audit.OverrideFilter{}); len(list) != 0 {
 		t.Errorf("a refused approval filed overrides: %+v", list)
+	}
+}
+
+// A row whose check no approval is defined for says so, names the check and
+// says how to close it, and stays open.
+func TestApproveUnknownCheckNamesDismiss(t *testing.T) {
+	adb := openQueueStore(t)
+	row := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypeNpm, PkgName: "leftpad", PkgVersion: "1.0.0", Check: "tea_leaves"})
+	_, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice", QueueApproval{Reason: "please"}, queueT0)
+	want := fmt.Sprintf("bodega queue dismiss %d", row.ID)
+	if !errors.Is(err, ErrInvalidQueue) || !strings.Contains(err.Error(), `"tea_leaves"`) || !strings.Contains(err.Error(), want) {
+		t.Errorf("approve of an unknown check: %v, want it to name the check and %q", err, want)
+	}
+	if got, _ := adb.GetQueueRow(t.Context(), row.ID); got.State != audit.QueueOpen {
+		t.Errorf("row left %s", got.State)
 	}
 }
 
