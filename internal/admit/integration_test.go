@@ -216,7 +216,8 @@ func TestEvaluateRunsIntegrationsLikeAdmit(t *testing.T) {
 
 // A hit from a type whose flags mean malware is recorded unwaivable on the
 // admission row, and an override request naming it is refused with the check
-// named. A risk type's hit on the same version takes the request.
+// named. A risk type's hit on the same version is recorded waivable, but a
+// request naming it is refused too: the malware hit still refuses the version.
 func TestOverrideRequestRefusesMalwareListHit(t *testing.T) {
 	f := newAdmissionFixture(t)
 	ctx := t.Context()
@@ -247,7 +248,8 @@ func TestOverrideRequestRefusesMalwareListHit(t *testing.T) {
 		t.Errorf("override request for a malware-list hit: %v", err)
 	}
 	req.Check = "integration:flagger"
-	if _, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now()); err != nil {
-		t.Errorf("override request for a risk hit: %v", err)
+	if _, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now()); !errors.Is(err, ErrInvalidOverride) ||
+		!strings.Contains(err.Error(), "also refused by integration:aikido") {
+		t.Errorf("override request for a risk hit beside a malware-list hit: %v", err)
 	}
 }

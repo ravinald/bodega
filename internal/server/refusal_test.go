@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
@@ -866,5 +867,58 @@ func TestProxyFillProvenanceRefusal(t *testing.T) {
 	}
 	if strings.Contains(body, "https://") || strings.Contains(body, "allow-list") {
 		t.Errorf("body carries a URL or the allow-list: %s", body)
+	}
+}
+
+// A version that fails an overridable check and an unwaivable one is refused
+// for the unwaivable one through the real fill path: the client is told no
+// override applies, and its queue row refuses an approval. The unwaivable
+// check runs second, as integrations run after provenance and age.
+func TestProxyFillNamesTheUnwaivableBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name, word, names string
+		first, second     policy.Result
+	}{
+		{"provenance unknown and a malware list", checkIntegrate, "lists this version as malware",
+			policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no provenance",
+				Details: map[string]any{"outcome": audit.ProvenanceUnknown}, Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}},
+			policy.Result{Check: "integration:aikido", Action: policy.ActionBlock, Reason: "aikido lists minimist as malware",
+				Details: map[string]any{"instance": "aikido", "outcome": "flagged", "malware": []string{"integration:aikido"}}}},
+		{"age and an OSV MAL- record", checkOSV, "malicious",
+			policy.Result{Check: audit.CheckAge, Action: policy.ActionBlock, Reason: "published 2h ago"},
+			policy.Result{Check: audit.CheckOSV, Action: policy.ActionBlock, Reason: "known malware: MAL-2026-9",
+				Details: map[string]any{"malware": []string{"MAL-2026-9"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := fetchCheckers
+			fetchCheckers = func(*config.Config, *audit.DB) []policy.VersionChecker {
+				return []policy.VersionChecker{verdict{tc.first}, verdict{tc.second}}
+			}
+			t.Cleanup(func() { fetchCheckers = prev })
+			s := proxyingServer(t)
+			up := newRecordingUpstream(t)
+			s.cfg.NpmUpstream = up.ts.URL
+
+			rec := doRequest(s, http.MethodGet, "/npm/minimist/-/minimist-1.2.8.tgz", nil)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d %q, want 403", rec.Code, rec.Body.String())
+			}
+			refusalIncident(t, rec.Header(), tc.word)
+			body := rec.Body.String()
+			if !strings.Contains(body, tc.names) || !strings.Contains(strings.ToLower(body), "override does not apply") {
+				t.Errorf("body does not name the unwaivable block: %s", body)
+			}
+			if strings.Contains(body, "bodega override request") {
+				t.Errorf("body offers an override that cannot admit the version: %s", body)
+			}
+			q := oneQueueRow(t, s)
+			if q.Unwaivable == "" {
+				t.Errorf("queue row = %+v, want it unwaivable", q)
+			}
+			if _, err := admit.ApproveQueued(t.Context(), s.auditDB, s.cfg, q.ID, "alice",
+				admit.QueueApproval{Reason: "please"}, time.Now()); !errors.Is(err, admit.ErrQueueUnwaivable) {
+				t.Errorf("approving the row: %v, want ErrQueueUnwaivable", err)
+			}
+		})
 	}
 }

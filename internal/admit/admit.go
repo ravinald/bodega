@@ -312,7 +312,7 @@ func Fetch(
 		out.Warns = combined.Warns
 		out.AuditDetails = combined.AuditDetails()
 		if combined.Blocked() {
-			b := combined.Blocks[0]
+			b := reportedBlock(combined.Blocks)
 			out.Block = &b
 			out.Incident = audit.NewIncidentID()
 			out.AuditDetails["incident"] = out.Incident
@@ -548,10 +548,10 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		}
 		if combined.Blocked() {
 			ev.notRunAfter(i, "not run: "+admissionVersion(*ve)+" was refused first")
-			first := combined.Blocks[0]
+			block := reportedBlock(combined.Blocks)
 			return &Result{Decision: PolicyBlocked,
 				Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons()),
-				Check:  first.Check, Version: ve.Version, Incident: incident, Details: first.Details}
+				Check:  block.Check, Version: ve.Version, Incident: incident, Details: block.Details}
 		}
 		return nil
 	}

@@ -64,9 +64,12 @@ func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req
 	if err := manifest.ValidatePackageName(req.Name); err != nil {
 		return audit.Override{}, invalid("%v", err)
 	}
-	if why := recordedUnwaivable(ctx, adb, req); why != "" {
+	if check, why := recordedUnwaivable(ctx, adb, req); check == req.Check {
 		return audit.Override{}, invalid("%s/%s@%s was refused by %s, and %s; an override cannot admit it",
 			req.Type, req.Name, req.Version, req.Check, why)
+	} else if check != "" {
+		return audit.Override{}, invalid("%s/%s@%s was also refused by %s, and %s; an override of %s cannot admit it",
+			req.Type, req.Name, req.Version, check, why, req.Check)
 	}
 	ttl, err := config.ParseTTL(req.Expires)
 	if err != nil {
@@ -148,21 +151,24 @@ func recordOverrideEvent(ctx context.Context, adb *audit.DB, o audit.Override, a
 		PkgVersion: o.PkgVersion, Actor: actor, Status: status, Details: string(blob)})
 }
 
-// recordedUnwaivable is why the newest admission row for req's version
-// says its check admits no override, or "" when it does not say so or no row
-// can be read. Admission refuses such an override whatever is recorded here;
-// this only stops a request nobody could ever see applied.
-func recordedUnwaivable(ctx context.Context, adb *audit.DB, req OverrideRequest) string {
+// recordedUnwaivable names a check the newest admission row for req's
+// version records as admitting no override, with why, or "" when the row
+// records none or no row can be read. req's own check comes first. Any one
+// such check makes every override of the version moot, because an override
+// skips only the check it names and the unwaivable one still refuses.
+// Admission refuses such an override whatever is recorded here; this only
+// stops a request nobody could ever see applied.
+func recordedUnwaivable(ctx context.Context, adb *audit.DB, req OverrideRequest) (check, why string) {
 	rows, err := adb.Admissions(ctx, audit.AdmissionFilter{PkgType: req.Type, PkgName: req.Name, PkgVersion: req.Version, Limit: 1})
 	if err != nil || len(rows) == 0 {
-		return ""
+		return "", ""
 	}
 	for _, c := range rows[0].Checks {
-		if c.Check == req.Check {
-			return c.Unwaivable
+		if c.Unwaivable != "" && (check == "" || c.Check == req.Check) {
+			check, why = c.Check, c.Unwaivable
 		}
 	}
-	return ""
+	return check, why
 }
 
 // isIntegrationCheck reports whether check names an integration instance in
@@ -242,6 +248,19 @@ func (ev *evaluation) overrideCheck(pm *manifest.PackageManifest, i int, c audit
 	c.Detail = fmt.Sprintf("%s; overridden by %s (approved by %s; expires %s)",
 		c.Detail, o.ID, strings.Join(o.Approvers(), ", "), o.ExpiresAt.UTC().Format(time.RFC3339))
 	return c, true
+}
+
+// reportedBlock is the block a refusal names when a version fails several
+// checks: the first unwaivable one, else the first in check order. Naming an
+// overridable check while an unwaivable one stands would send the client to an
+// override that can never admit the version.
+func reportedBlock(blocks []policy.Result) policy.Result {
+	for _, b := range blocks {
+		if notOverridable(b) != "" {
+			return b
+		}
+	}
+	return blocks[0]
 }
 
 // notOverridable says why a failed result admits no override, or "" when it

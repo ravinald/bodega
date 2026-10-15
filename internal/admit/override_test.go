@@ -331,3 +331,56 @@ func TestRequestOverrideRefusals(t *testing.T) {
 		t.Errorf("60d under a 90d cap: %v", err)
 	}
 }
+
+// One unwaivable block on a version makes every override of it moot: the
+// refusal names it ahead of an overridable block that ran first, and a
+// request for the overridable check is refused naming both. With no
+// unwaivable block the refusal names the first in check order, and every
+// block is on the row either way.
+func TestUnwaivableBlockOutranksCheckOrder(t *testing.T) {
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	unknown := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock, Reason: "the packument lists no provenance",
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}
+	malware := policy.Result{Check: "integration:aikido", Action: policy.ActionBlock, Reason: "aikido lists minimist as malware",
+		Details: map[string]any{"malware": []string{"integration:aikido"}}}
+	similar := policy.Result{Check: audit.CheckNameSimilarity, Action: policy.ActionBlock, Reason: "one edit from minimal"}
+	fetch := func(version string, rs ...policy.Result) FetchResult {
+		t.Helper()
+		var checkers []policy.VersionChecker
+		for _, r := range rs {
+			checkers = append(checkers, fixed{r})
+		}
+		got := Fetch(ctx, f.adb, checkers, manifest.TypeNpm, "minimist", manifest.VersionEntry{Version: version},
+			AllowListCheck(false, "minimist", nil), Who{}, "")
+		for _, r := range rs {
+			if c := checkOf(t, got.Admission, r.Check); c.Status != audit.CheckBlock {
+				t.Errorf("%s: row check %s = %+v, want blocked", version, r.Check, c)
+			}
+		}
+		return got
+	}
+
+	if got := fetch("1.0.1", unknown, malware); got.Block == nil || got.Block.Check != malware.Check {
+		t.Errorf("reported block = %+v, want %s", got.Block, malware.Check)
+	}
+	req := osvOverride("1.0.1")
+	req.Check = audit.CheckUpstreamProvenance
+	_, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now())
+	want := "npm/minimist@1.0.1 was also refused by integration:aikido, and known malware is never overridden; an override of upstream_provenance cannot admit it"
+	if !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), want) {
+		t.Errorf("override request beside a malware block: %v, want %q", err, want)
+	}
+	req.Check = malware.Check
+	if _, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now()); err == nil ||
+		!strings.Contains(err.Error(), "was refused by integration:aikido") {
+		t.Errorf("override request for the malware check itself: %v", err)
+	}
+
+	if got := fetch("1.0.2", unknown, similar); got.Block == nil || got.Block.Check != unknown.Check {
+		t.Errorf("reported block = %+v, want the first in check order, %s", got.Block, unknown.Check)
+	}
+	req = osvOverride("1.0.2")
+	req.Check = audit.CheckNameSimilarity
+	request(t, f.adb, f.synced, req, time.Now())
+}
