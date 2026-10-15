@@ -300,6 +300,12 @@ type Config struct {
 	// is the declared extent of what bodega can see of pip and npm installs.
 	OsqueryScanDirs OsqueryScanDirs `json:"osquery_scan_dirs,omitzero"`
 
+	// OIDCProviders are the identity providers whose ID tokens POST
+	// /api/v1/auth/exchange trades for a bodega token, and oidc_token_ttl is
+	// that token's lifetime (default 15m). See OIDCProvider.
+	OIDCProviders []OIDCProvider `json:"oidc_providers,omitempty"`
+	OIDCTokenTTL  string         `json:"oidc_token_ttl,omitempty"`
+
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
 
@@ -1138,6 +1144,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	}
 
 	if err := cfg.OsqueryScanDirs.validate(); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validateOIDC(); err != nil {
 		return nil, err
 	}
 
@@ -2262,11 +2272,4 @@ func firstNonEmpty(vals ...string) string {
 // only the second one is set.
 func (c *Config) ResolveServerURL(flagURL string) string {
 	return strings.TrimRight(firstNonEmpty(flagURL, os.Getenv(EnvServerURL), c.ServerURL), "/")
-}
-
-// ResolveToken returns the bearer token a client authenticates with:
-// $BODEGA_TOKEN, then the config file. It is read from the environment first
-// so a token never has to be written to disk on a host being cataloged.
-func (c *Config) ResolveToken() string {
-	return firstNonEmpty(os.Getenv(EnvToken), c.Token)
 }

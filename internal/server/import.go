@@ -102,6 +102,14 @@ func (s *Server) handleBulkImport(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, importDecodeStatus(err), map[string]string{"error": importDecodeMessage(err)})
 			return
 		}
+		if sc, ok := tokenScopesOf(r); ok && !sc.Allows(audit.ScopeWrite, pm.Type) {
+			missing := missingScope(audit.ScopeWrite, pm.Type)
+			recordDenialFor(s.auditDB, r, pm.Type, pm.Name, "", audit.DenialTokenScope,
+				map[string]string{"missing_scope": missing})
+			resp.record(ImportResult{Type: pm.Type, Name: pm.Name, Outcome: ImportFailed,
+				Reason: fmt.Sprintf("the token lacks scope %q", missing)})
+			continue
+		}
 		resp.record(s.importOne(ctx, &pm, merge, Identity(r), ClientIP(r)))
 	}
 

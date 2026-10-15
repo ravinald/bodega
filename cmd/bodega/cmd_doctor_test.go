@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/host"
@@ -26,6 +27,7 @@ type fakePosture struct {
 	osvs  []audit.OSVPolicy
 	provs []audit.ProvenancePolicy
 	modes []audit.AdmissionMode
+	toks  []audit.TokenInfo
 }
 
 func (f fakePosture) ListPolicies(context.Context) ([]audit.PolicyInfo, error) {
@@ -39,6 +41,7 @@ func (f fakePosture) ListProvenancePolicies(context.Context) ([]audit.Provenance
 func (f fakePosture) ListAdmissionModes(context.Context) ([]audit.AdmissionMode, error) {
 	return f.modes, nil
 }
+func (f fakePosture) ListTokens(context.Context) ([]audit.TokenInfo, error) { return f.toks, nil }
 
 func findingFor(t *testing.T, findings []host.Finding, check string) host.Finding {
 	t.Helper()
@@ -793,5 +796,35 @@ func TestDoctorSummaryCountsWhatWasNotMeasured(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Each unexpired token still holding read, write and admin unrestricted is
+// warned about by id; a narrowed, expired or exchanged-and-narrow token is
+// not. "full" is what an unmigrated store still says.
+func TestDoctorWarnsOnUnscopedTokens(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	store := fakePosture{toks: []audit.TokenInfo{
+		{ID: "legacy", Label: "ci", Scope: audit.ScopeFull},
+		{ID: "old-store", Label: "ops", Scope: "full"},
+		{ID: "narrow", Label: "npm", Scope: "read,write:npm"},
+		{ID: "gone", Label: "x", Scope: audit.ScopeFull, ExpiresAt: &past},
+	}}
+	var warned []string
+	for _, f := range serverPosture(context.Background(), store) {
+		if f.Check != "token-scope" {
+			continue
+		}
+		if f.Status != host.StatusWarn {
+			t.Errorf("token-scope row %+v, want WARN", f)
+		}
+		warned = append(warned, f.Detail)
+	}
+	if len(warned) != 2 || !strings.Contains(warned[0], "legacy") || !strings.Contains(warned[1], "old-store") {
+		t.Errorf("warnings = %v, want one each for legacy and old-store", warned)
+	}
+	clean := findingFor(t, serverPosture(context.Background(), fakePosture{toks: store.toks[2:]}), "token-scope")
+	if clean.Status != host.StatusOK {
+		t.Errorf("no broad tokens: %+v, want OK", clean)
 	}
 }

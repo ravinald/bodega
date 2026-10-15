@@ -168,9 +168,13 @@ const (
 // subject to audit_events: that list selects which event types an operator
 // wants in the trail, and a decision missing from this table is a version no
 // attestation can cite, whatever the operator chose to keep of the events.
+// A principal in ctx names the actor and identity, as it does for Record.
 func (a *DB) RecordAdmission(ctx context.Context, row Admission) error {
 	if a.readOnly {
 		return nil
+	}
+	if p, ok := PrincipalFrom(ctx); ok {
+		row.Actor, row.Identity = p.Subject, p.Issuer
 	}
 	if !ValidAdmissionDecision(row.Decision) {
 		return fmt.Errorf("admission decision %q is outside the set (%s, %s, %s)", row.Decision, AdmissionAdmitted, AdmissionPolicyBlocked, AdmissionInvalid)

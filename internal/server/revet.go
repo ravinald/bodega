@@ -133,7 +133,7 @@ func (s *Server) isRevetWebhook(r *http.Request) bool {
 // selfAuthenticated is every route that skips the admin gate because the
 // handler authenticates the caller itself.
 func (s *Server) selfAuthenticated(r *http.Request) bool {
-	return s.isRevetWebhook(r) || s.isInventoryPush(r)
+	return s.isRevetWebhook(r) || s.isInventoryPush(r) || isAuthExchange(r)
 }
 
 // handleRevetWebhook re-vets the versions a threat feed names, immediately,
