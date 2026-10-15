@@ -155,8 +155,9 @@ type Verdict struct {
 }
 
 // Evaluate decides on pm, which holds one version, the way Admit would and
-// writes nothing: no admission row, no audit event, and no provenance pin,
-// since no checker's Commit runs. The order, the active overrides and the
+// writes nothing: no admission row, no audit event, no provenance pin, since
+// no checker's Commit runs, and no integration's last error. The order, every
+// enabled integration under its action, the active overrides and the
 // version's baseline mark all apply as they do in Admit, malware and invalid
 // provenance included, so a preview that goes through here cannot disagree
 // with the admission it previews. The mark it reads is the one pm carries,
@@ -181,8 +182,11 @@ func Evaluate(ctx context.Context, cfg *config.Config, checker *policy.Checker, 
 	} else if store == nil {
 		store = adb
 	}
+	var checkers []policy.VersionChecker
 	if store != nil {
 		ev.readActions(ctx, store, pm.Type)
+		checkers = VersionCheckersFrom(cfg, store, readOnlyIntegrations{adb})
+		ev.include(ctx, pm, checkers)
 	}
 	// A nil database records nothing, which is what keeps the allow-list's
 	// refusal event out of a read-only evaluation.
@@ -193,7 +197,7 @@ func Evaluate(ctx context.Context, cfg *config.Config, checker *policy.Checker, 
 		return Verdict{Decision: Admitted, Checks: ev.checks[0]}
 	}
 	ve := &pm.Versions[0]
-	combined := policy.Combine(ev.runVersion(ctx, pm, 0, VersionCheckersFrom(cfg, store)))
+	combined := policy.Combine(ev.runVersion(ctx, pm, 0, checkers))
 	if combined.Blocked() {
 		return Verdict{Decision: PolicyBlocked, Checks: ev.checks[0],
 			Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())}
@@ -576,6 +580,10 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 	}
 	out := []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
 		policy.NewNameSimilarityChecker(similarity)}
+	return appendIntegrations(out, cfg, store)
+}
+
+func appendIntegrations(out []policy.VersionChecker, cfg *config.Config, store integration.Store) []policy.VersionChecker {
 	if cfg != nil {
 		for _, c := range integration.Checks(cfg.Integrations, store) {
 			out = append(out, c)
@@ -594,13 +602,23 @@ type PolicyStore interface {
 	provenance.Store
 }
 
-// VersionCheckersFrom is VersionCheckers reading policy from store, in the
-// same order. A caller that must write nothing never calls Commit on the
-// provenance checker it returns, which is the only write any of them makes.
-func VersionCheckersFrom(cfg *config.Config, store PolicyStore) []policy.VersionChecker {
-	return []policy.VersionChecker{policy.NewAgeChecker(store), osvCheckerFrom(cfg, store),
+// VersionCheckersFrom is VersionCheckers reading policy from store and each
+// integration's action from integrations, in the same order. A caller that
+// must write nothing never calls Commit on the provenance checker it returns,
+// and passes integrations through readOnlyIntegrations, since an integration
+// records its lookup errors as it checks.
+func VersionCheckersFrom(cfg *config.Config, store PolicyStore, integrations integration.Store) []policy.VersionChecker {
+	out := []policy.VersionChecker{policy.NewAgeChecker(store), osvCheckerFrom(cfg, store),
 		provenanceCheckerFrom(cfg, store), policy.NewNameSimilarityChecker(store)}
+	return appendIntegrations(out, cfg, integrations)
 }
+
+// readOnlyIntegrations reads integration policy from store and drops the
+// lookup errors an integration check would otherwise record.
+type readOnlyIntegrations struct{ integration.Store }
+
+// RecordIntegrationError records nothing.
+func (readOnlyIntegrations) RecordIntegrationError(context.Context, string, string) error { return nil }
 
 // ProvenanceChecker builds the upstream provenance check: npm read from the
 // configured npm upstream when an entry names no registry, and the Sigstore

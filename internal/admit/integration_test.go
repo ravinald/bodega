@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
@@ -159,5 +160,49 @@ func TestRefusedManifestNamesIntegrationsNotRun(t *testing.T) {
 func TestOverrideNamesIntegrationCheck(t *testing.T) {
 	if !isIntegrationCheck("integration:aikido") || isIntegrationCheck("integration:") || isIntegrationCheck("integration:Bad.Name") {
 		t.Error("isIntegrationCheck accepts or refuses the wrong names")
+	}
+}
+
+// Evaluate runs the integrations Admit runs, under the same actions, and
+// leaves no last error behind: a preview that skipped them would admit what
+// the admission it previews refuses.
+func TestEvaluateRunsIntegrationsLikeAdmit(t *testing.T) {
+	for _, action := range []string{policy.ActionWarn, policy.ActionBlock, policy.ActionIgnore} {
+		t.Run("action="+action, func(t *testing.T) {
+			f := newAdmissionFixture(t)
+			ctx := t.Context()
+			for _, inst := range []string{"flagger", "outage"} {
+				if err := f.adb.SetIntegrationPolicy(ctx, audit.IntegrationPolicy{Instance: inst, Ecosystem: manifest.TypeCargo, Action: action}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := withIntegrations(f.unsynced)
+			name := "zq-evaluate-" + action
+			v := Evaluate(ctx, cfg, policy.NewChecker(f.adb), f.adb, nil, crate(name), time.Now())
+			if last, err := f.adb.IntegrationErrors(ctx); err != nil || len(last) != 0 {
+				t.Fatalf("Evaluate recorded integration errors: %+v, %v", last, err)
+			}
+			var flag, outage audit.AdmissionCheck
+			for _, c := range v.Checks {
+				switch c.Check {
+				case "integration:flagger":
+					flag = c
+				case "integration:outage":
+					outage = c
+				case "integration:off":
+					t.Errorf("the disabled instance ran: %+v", c)
+				}
+			}
+			if flag.Action != action || outage.Action != action {
+				t.Errorf("Evaluate actions %q, %q; want %s (%+v)", flag.Action, outage.Action, action, v.Checks)
+			}
+			res := Admit(ctx, policy.NewChecker(f.adb), f.adb, cfg, crate(name), "ravi")
+			if res.Decision != v.Decision {
+				t.Errorf("Evaluate = %v, Admit = %v (%s)", v.Decision, res.Decision, res.Reason)
+			}
+			if want := action == policy.ActionBlock; (v.Decision == PolicyBlocked) != want {
+				t.Errorf("Evaluate = %v under %s", v.Decision, action)
+			}
+		})
 	}
 }
