@@ -233,7 +233,11 @@ risk:
   one the packument gives no publish time for, or whose pinned version it
   gives none for, is `unknown`. `unknown` means the evidence could not be
   read: a lookup that got no answer (a rate limit, an outage), an answer
-  that does not parse, or a packument that no longer lists the version.
+  that does not parse, or a packument that no longer lists the version. It
+  is also `unknown` when bodega has no Sigstore trusted root to check a
+  bundle against (TUF unreachable, or a `sigstore_trusted_root` file that
+  cannot be read or parsed); only a bundle checked against a root and
+  failing is `invalid`.
   Nothing was verified, so it claims neither that provenance is absent nor
   that it failed, and unlike `invalid` an override may admit it. Under
   `bodega policy provenance set <type> block`, `mismatch`, `invalid`,

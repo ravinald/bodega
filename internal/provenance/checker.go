@@ -287,6 +287,9 @@ func verdict(ev Evidence, action string) policy.Result {
 			r.Details["source_repository_uri"] = prov.SourceRepositoryURI
 			r.Details["builder_id"] = prov.BuilderID
 		}
+		if ev.NoTrustedRoot {
+			r.Details[audit.DetailNoTrustedRoot] = true
+		}
 		if ev.Outcome == audit.ProvenanceMismatch && prov.SourceRepositoryURI == "" {
 			r.Details["publisher"] = publisherName(ev.Publisher)
 			r.Details["pinned_publisher"] = publisherName(ev.PinnedPublisher)

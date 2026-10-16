@@ -169,7 +169,7 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 	}
 	tm, err := v.Root(ctx)
 	if err != nil {
-		return invalid("%s/%s publishes provenance for sha256:%s, and it was not verified: %v", owner, repo, sha256hex, err)
+		return noRoot(err, "%s/%s publishes provenance for sha256:%s", owner, repo, sha256hex)
 	}
 	var verified *Evidence
 	for i, raw := range raws {

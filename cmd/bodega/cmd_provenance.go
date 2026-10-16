@@ -39,8 +39,9 @@ Each version gets one outcome:
                distfiles)
   invalid      provenance was published and did not verify
   unknown      the evidence could not be read: a lookup failed or did not
-               parse, or the registry no longer lists the version; nothing
-               was verified, and an override may admit it
+               parse, or the registry no longer lists the version; or this
+               server had no Sigstore trusted root to check a bundle against;
+               nothing was verified, and an override may admit it
   mismatch     it verified, from a repository or builder other than the pin;
                or, on npm, it has no provenance and was published after the
                pinned version

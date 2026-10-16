@@ -76,20 +76,27 @@ const (
 	// ProvenanceUnavailable means the package publishes no provenance, or
 	// its ecosystem has no mechanism bodega reads.
 	ProvenanceUnavailable = "unavailable"
-	// ProvenanceInvalid means provenance was published and did not verify:
-	// a signature, a certificate chain or a subject digest failed, or there
-	// was no trusted root to verify it against.
+	// ProvenanceInvalid means provenance was published, checked against a
+	// trusted root, and did not verify: a signature, a certificate chain or a
+	// subject digest failed.
 	ProvenanceInvalid = "invalid"
 	// ProvenanceUnknown means the evidence could not be read: a registry or
 	// API lookup failed or answered something unparseable, the registry no
-	// longer lists the version, or the pin or publish times a comparison
-	// needed were missing. Nothing was concluded, so it says neither that
-	// provenance is absent nor that it failed, and an override may admit it.
+	// longer lists the version, the pin or publish times a comparison needed
+	// were missing, or there was no Sigstore trusted root to check a bundle
+	// against. Nothing was concluded, so it says neither that provenance is
+	// absent nor that it failed, and an override may admit it.
 	ProvenanceUnknown = "unknown"
 	// ProvenanceMismatch means the provenance verified, but from a source
 	// repository or builder other than the one the package is pinned to.
 	ProvenanceMismatch = "mismatch"
 )
+
+// DetailNoTrustedRoot is the Details key, true, on an unknown upstream
+// provenance result reached because no Sigstore trusted root could be had.
+// The root error itself stays in the check's detail, which is not served to
+// clients.
+const DetailNoTrustedRoot = "no_trusted_root"
 
 // UpstreamProvenance is what the upstream_provenance check verified. The
 // identity fields are empty unless a signature verified.

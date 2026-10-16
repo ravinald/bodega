@@ -348,7 +348,11 @@ func provenanceReason(f *refusal, d map[string]any) {
 	case audit.ProvenanceUnavailable:
 		what = "it publishes no provenance and this server requires it"
 	case audit.ProvenanceUnknown:
-		what = "its publisher's provenance could not be checked, because the evidence could not be read"
+		if d[audit.DetailNoTrustedRoot] == true {
+			what = "its publisher's provenance could not be checked, because this server had no Sigstore trusted root to check it against"
+		} else {
+			what = "its publisher's provenance could not be checked, because the evidence could not be read"
+		}
 	default:
 		what = fmt.Sprintf("its provenance outcome is %q", outcome)
 	}
@@ -361,6 +365,9 @@ func provenanceReason(f *refusal, d map[string]any) {
 			fmt.Sprintf(" If the publisher changed on purpose, `bodega pkg trust reset %s %s` re-pins it instead.", f.pkgType, f.name)
 	default:
 		f.next = overrideNext(f, audit.CheckUpstreamProvenance)
+		if outcome == audit.ProvenanceUnknown && d[audit.DetailNoTrustedRoot] == true {
+			f.next += " To restore the trusted root, an operator checks that the host can reach Sigstore's TUF repository, or points `sigstore_trusted_root` at a readable trusted_root.json."
+		}
 	}
 }
 
