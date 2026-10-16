@@ -29,11 +29,14 @@ than the requester approve it, until it expires.
   reject  <id>
   list    [--pending|--active|--expired] [--json]
 
-An override counts the requester toward override_quorum (default 2), so the
-default is the requester plus one other identity. The requester can never
-approve their own request, and one identity voting twice counts once. A
-rejection by anyone, the requester included, cancels it for good, an approved
-one included.
+An override needs override_quorum (default 2) identities holding approve. The
+requester counts toward it only when they held approve at request time: on the
+CLI they always do, so the default is the requester plus one other identity,
+while a write-only API token (a CI pipeline) needs two approvers. The requester
+can never approve their own request, and one identity voting twice counts once.
+An approval from a token the requester minted, or through an identity binding
+the requester made, is recorded but does not count. A rejection by anyone, the
+requester included, cancels it for good, an approved one included.
 
 Once approved, the next admission of that version records the check as
 "overridden" with the override's id in its admission row. It stops applying
@@ -71,7 +74,7 @@ func newOverrideRequestCmd(gf *globalFlags) *cobra.Command {
 				return err
 			}
 			defer adb.Close()
-			o, err := admit.RequestOverride(backgroundCtx(), adb, cfg, req, audit.CurrentActor(), time.Now())
+			o, err := admit.RequestOverride(backgroundCtx(), adb, cfg, req, audit.LocalOverrideCaller(audit.CurrentActor()), time.Now())
 			if err != nil {
 				return err
 			}
@@ -80,8 +83,8 @@ func newOverrideRequestCmd(gf *globalFlags) *cobra.Command {
 			}
 			fmt.Printf("Requested override %s: %s/%s@%s past %s, expires %s.\n",
 				o.ID, o.PkgType, o.PkgName, o.PkgVersion, o.Check, o.ExpiresAt.Format(time.RFC3339))
-			fmt.Printf("It needs %d approval(s) from identities other than %s:\n  bodega override approve %s\n",
-				o.Quorum-len(o.Approvers()), o.RequestedBy, o.ID)
+			fmt.Printf("It needs %d more approval(s) from identities other than %s (%s):\n  bodega override approve %s\n",
+				o.ApprovalsNeeded, o.RequestedBy, requesterCounted(o), o.ID)
 			return nil
 		},
 	}
@@ -112,12 +115,16 @@ func newOverrideVoteCmd(gf *globalFlags, approve bool) *cobra.Command {
 				return err
 			}
 			defer adb.Close()
-			o, err := admit.VoteOverride(backgroundCtx(), adb, args[0], audit.CurrentActor(), approve, comment, time.Now())
+			voter := audit.LocalOverrideCaller(audit.CurrentActor())
+			o, err := admit.VoteOverride(backgroundCtx(), adb, args[0], voter, approve, comment, time.Now())
 			if err != nil {
 				return overrideVoteError(args[0], err)
 			}
 			if asJSON {
 				return printJSON(o)
+			}
+			if v, ok := admit.VoteBy(o, voter.Identity); ok && !v.Counted {
+				fmt.Printf("Your approval is recorded but does not count: %s.\n", v.NotCounted)
 			}
 			switch o.Status {
 			case audit.OverrideStatusActive:
@@ -126,8 +133,8 @@ func newOverrideVoteCmd(gf *globalFlags, approve bool) *cobra.Command {
 			case audit.OverrideStatusRejected:
 				fmt.Printf("Override %s is rejected and will never apply.\n", o.ID)
 			default:
-				fmt.Printf("Override %s has %d of %d approvals and does not apply yet.\n",
-					o.ID, len(o.Approvers()), o.Quorum)
+				fmt.Printf("Override %s has %d of %d approvals and needs %d more before it applies.\n",
+					o.ID, len(o.Approvers()), o.Quorum, o.ApprovalsNeeded)
 			}
 			return nil
 		},
@@ -135,6 +142,14 @@ func newOverrideVoteCmd(gf *globalFlags, approve bool) *cobra.Command {
 	c.Flags().StringVar(&comment, "comment", "", "a note recorded with the vote")
 	c.Flags().BoolVar(&asJSON, "json", false, "print the override as JSON")
 	return c
+}
+
+// requesterCounted says whether o's requester counts toward its quorum.
+func requesterCounted(o audit.Override) string {
+	if o.RequesterCounts {
+		return "counted"
+	}
+	return "not counted"
 }
 
 // overrideVoteError says what to do next about a refused vote.
@@ -184,7 +199,7 @@ func newOverrideListCmd(gf *globalFlags) *cobra.Command {
 			for _, o := range list {
 				fmt.Fprintf(tw, "%s\t%s\t%s/%s@%s\t%s\t%d/%d\t%s\t%s\t%s\n", o.ID, o.Status,
 					o.PkgType, o.PkgName, o.PkgVersion, o.Check, len(o.Approvers()), o.Quorum,
-					o.RequestedBy, o.ExpiresAt.Format(time.RFC3339), o.Reason)
+					o.RequestedBy+" ("+requesterCounted(o)+")", o.ExpiresAt.Format(time.RFC3339), o.Reason)
 			}
 			return tw.Flush()
 		},

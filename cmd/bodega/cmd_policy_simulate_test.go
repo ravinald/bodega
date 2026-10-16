@@ -217,11 +217,11 @@ func TestPolicySimulateHonorsOverride(t *testing.T) {
 	adb := f.open(t)
 	now := time.Now()
 	o := audit.Override{ID: "o1", PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0", Check: audit.CheckOSV,
-		Reason: "patched in the vendored build", RequestedBy: "alice", RequestedAt: now, ExpiresAt: now.Add(24 * time.Hour), Quorum: 2}
+		Reason: "patched in the vendored build", RequestedBy: "alice", RequestedAt: now, ExpiresAt: now.Add(24 * time.Hour), Quorum: 2, RequesterCounts: true}
 	if err := adb.InsertOverride(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := adb.VoteOverride(t.Context(), o.ID, "bob", audit.VoteApprove, "", now); err != nil || got.State != audit.OverrideApproved {
+	if got, err := adb.VoteOverride(t.Context(), o.ID, audit.LocalOverrideCaller("bob"), audit.VoteApprove, "", now); err != nil || got.State != audit.OverrideApproved {
 		t.Fatalf("vote = %+v, %v; want the override approved", got, err)
 	}
 	adb.Close()

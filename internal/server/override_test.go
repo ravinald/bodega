@@ -24,6 +24,8 @@ const (
 	scopedToken  = "bodega_ak_scoped"
 	writerToken  = "bodega_ak_writer"
 	readerToken  = "bodega_ak_reader"
+	mintedToken  = "bodega_ak_minted"
+	boundToken   = "bodega_ak_bound"
 	localAddr    = "127.0.0.1:40000"
 )
 
@@ -232,5 +234,85 @@ func TestOverrideAPIFlow(t *testing.T) {
 		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &list) != nil || len(list) != want {
 			t.Errorf("list status=%q = %d %s, want %d override(s)", status, rec.Code, rec.Body, want)
 		}
+	}
+}
+
+// The F46 live check: a write-only CI token requested and one admin approved.
+// Over the API the requester does not count, a vote from a token the
+// requester minted or through a binding the requester made is recorded but
+// does not count, and two other approvers are the quorum. The listing and the
+// requested event say the requester did not count.
+func TestOverrideAPIWriteRequesterNeedsTwoApprovers(t *testing.T) {
+	s := newOverrideServer(t)
+	ctx := context.Background()
+	for id, st := range map[string]struct{ tok, createdBy string }{
+		"m1": {mintedToken, "carol"},
+		"m2": {boundToken, "test-operator"},
+	} {
+		if err := s.auditDB.InsertScopedToken(ctx, id, id, audit.HashToken(st.tok, invPepper), "", "read,approve", st.createdBy, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, b := range []audit.IdentityBinding{
+		{Kind: audit.BindToken, Key: "m1", Identity: "sock-1", Actor: "test-operator"},
+		{Kind: audit.BindToken, Key: "m2", Identity: "sock-2", Actor: "carol"},
+	} {
+		if _, err := s.auditDB.AddIdentityBinding(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.refreshIdentities(ctx)
+
+	rec := send(s, http.MethodPost, "/api/v1/overrides", localAddr, writerToken, overrideBody)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("write token requesting = %d %s", rec.Code, rec.Body)
+	}
+	o := decodeOverride(t, rec.Body.Bytes())
+	if o.RequestedBy != "carol" || o.RequesterCounts || o.ApprovalsNeeded != 2 {
+		t.Fatalf("requested = %+v, want carol, not counted, 2 approvals needed", o)
+	}
+	approve := "/api/v1/overrides/" + o.ID + "/approve"
+	for _, voter := range []struct{ bearer, why string }{
+		{mintedToken, "minted by the requester"},
+		{boundToken, "binding was made by the requester"},
+	} {
+		why := voter.why
+		rec := send(s, http.MethodPost, approve, localAddr, voter.bearer, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s approving = %d %s", why, rec.Code, rec.Body)
+		}
+		got := decodeOverride(t, rec.Body.Bytes())
+		v := got.Votes[len(got.Votes)-1]
+		if v.Counted || !strings.Contains(v.NotCounted, why) || v.Scope != "read,approve" || got.ApprovalsNeeded != 2 {
+			t.Errorf("%s: vote %+v, needs %d; want recorded, not counted, still 2 needed", why, v, got.ApprovalsNeeded)
+		}
+	}
+	rec = send(s, http.MethodPost, approve, localAddr, aliceToken, "")
+	if got := decodeOverride(t, rec.Body.Bytes()); rec.Code != http.StatusOK || got.Status != audit.OverrideStatusPending || got.ApprovalsNeeded != 1 {
+		t.Fatalf("alice approving = %d %s, want pending with 1 needed", rec.Code, rec.Body)
+	}
+	rec = send(s, http.MethodPost, approve, localAddr, bobToken, "")
+	if got := decodeOverride(t, rec.Body.Bytes()); rec.Code != http.StatusOK || got.Status != audit.OverrideStatusActive ||
+		strings.Join(got.Approvers(), ",") != "alice,bob" {
+		t.Fatalf("bob approving = %d %s, want active, approved by alice and bob", rec.Code, rec.Body)
+	}
+
+	rec = send(s, http.MethodGet, "/api/v1/overrides", localAddr, bobToken, "")
+	var list []audit.Override
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &list) != nil || len(list) != 1 || list[0].RequesterCounts {
+		t.Errorf("list = %d %s, want one override with requester_counts false", rec.Code, rec.Body)
+	}
+	events, err := s.auditDB.Query(ctx, audit.Filter{EventType: audit.EventOverride})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requested bool
+	for _, e := range events {
+		if e.Status == "requested" {
+			requested = strings.Contains(e.Details, `"requester_counts":false`) && strings.Contains(e.Details, `"approvals_needed":2`)
+		}
+	}
+	if !requested {
+		t.Errorf("no requested event records the requester as not counted: %+v", events)
 	}
 }

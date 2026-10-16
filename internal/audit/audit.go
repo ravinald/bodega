@@ -1022,6 +1022,7 @@ type TokenHash struct {
 	Scope     string
 	Subject   string
 	Issuer    string
+	CreatedBy string
 }
 
 // Principal returns who an exchanged token acts for, and false for a token
@@ -1145,7 +1146,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 // GetTokenHashes returns all token hashes for auth verification.
 func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, hash, expires_at, scope, subject, issuer FROM api_tokens",
+		"SELECT id, hash, expires_at, scope, subject, issuer, created_by FROM api_tokens",
 	)
 	if err != nil {
 		return nil, err
@@ -1156,7 +1157,7 @@ func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 	for rows.Next() {
 		var h TokenHash
 		var expires sql.NullString
-		if err := rows.Scan(&h.ID, &h.Hash, &expires, &h.Scope, &h.Subject, &h.Issuer); err != nil {
+		if err := rows.Scan(&h.ID, &h.Hash, &expires, &h.Scope, &h.Subject, &h.Issuer, &h.CreatedBy); err != nil {
 			return nil, err
 		}
 		if expires.Valid {

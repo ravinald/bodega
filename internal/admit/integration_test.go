@@ -242,13 +242,13 @@ func TestOverrideRequestRefusesMalwareListHit(t *testing.T) {
 
 	req := OverrideRequest{Type: manifest.TypeCargo, Name: "zq-malware-hit", Version: row.PkgVersion,
 		Check: "integration:aikido", Reason: "vendor says false positive", Expires: "1d"}
-	_, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now())
+	_, err := RequestOverride(ctx, f.adb, &cfg, req, audit.LocalOverrideCaller("alice"), time.Now())
 	if !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), "integration:aikido") ||
 		!strings.Contains(err.Error(), "known malware is never overridden") {
 		t.Errorf("override request for a malware-list hit: %v", err)
 	}
 	req.Check = "integration:flagger"
-	if _, err := RequestOverride(ctx, f.adb, &cfg, req, "alice", time.Now()); !errors.Is(err, ErrInvalidOverride) ||
+	if _, err := RequestOverride(ctx, f.adb, &cfg, req, audit.LocalOverrideCaller("alice"), time.Now()); !errors.Is(err, ErrInvalidOverride) ||
 		!strings.Contains(err.Error(), "also refused by integration:aikido") {
 		t.Errorf("override request for a risk hit beside a malware-list hit: %v", err)
 	}

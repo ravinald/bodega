@@ -3103,7 +3103,7 @@ bodega integration test aikido
 
 ### `bodega override <request|approve|reject|list>`
 
-An override admits one version past one check's failure. One identity requests it, a different identity approves it, and it applies only until it expires.
+An override admits one version past one check's failure. One identity requests it, identities holding `approve` approve it, and it applies only until it expires.
 
 > **`bodega pkg create` no longer asks "Proceed anyway? [y/N]".** That prompt let the one operator at the terminal admit a version the allow-list refused, and the row it wrote looked like any other create. An allow-list refusal on `pkg create` is now final, like every other surface's, and the error prints the `bodega override request` command for that version and check. Older admission rows decided under the prompt keep their `override` check entry.
 
@@ -3123,7 +3123,7 @@ bodega pkg import left-pad.json
 | Command                                                                                | Effect                                                                                                                                               |
 | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `request <type> <name> <version> --check <check> --reason <text> --expires <duration>` | Records a pending override and prints its id. All three flags are required.                                                                          |
-| `approve <id> [--comment <text>]`                                                      | Records an approval. Refused for the requester, and for an identity that already voted.                                                              |
+| `approve <id> [--comment <text>]`                                                      | Records an approval. Refused for the requester, and for an identity that already voted. Says so when the approval is recorded but does not count.    |
 | `reject <id> [--comment <text>]`                                                       | Records a rejection, which cancels the override for good, pending or approved. Anyone may reject, the requester included.                            |
 | `list [--pending\|--active\|--expired] [--json]`                                       | Lists overrides newest first, with their status, approvals so far against the quorum, requester, expiry and reason. The three filters are exclusive. |
 
@@ -3131,12 +3131,20 @@ bodega pkg import left-pad.json
 
 `--expires` is a duration from the request, `7d` or `72h`. It is required, and capped by `override_max_ttl`:
 
-| Key                | Default | Effect                                                                                                                            |
-| ------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `override_max_ttl` | `30d`   | The longest `--expires` a request may ask for. `<N>d` or a Go duration.                                                           |
-| `override_quorum`  | `2`     | How many distinct identities, the requester included, must approve. Below 2 fails the config load: 1 is the prompt this replaced. |
+| Key                | Default | Effect                                                                                                                                                             |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `override_max_ttl` | `30d`   | The longest `--expires` a request may ask for. `<N>d` or a Go duration.                                                                                            |
+| `override_quorum`  | `2`     | How many distinct identities holding `approve` must approve, the requester included when they count. Below 2 fails the config load: 1 is the prompt this replaced. |
 
 The quorum is recorded with each request when it is made, so changing `override_quorum` neither strands a request already half approved nor lets one through on fewer approvals than it was asked under.
+
+**Who counts.** The quorum counts identities holding `approve`:
+
+- The requester counts only when their token held `approve` at request time. A request on the CLI always counts its requester, since root on the host holds every scope. A CI token holding `write` can request but does not count, so under the default quorum it needs two approvers. Whether the requester counts is recorded with the request (`requester_counts`), so narrowing or widening the token later does not change it. A request made before migration 038 counts its requester, the rule it was made under.
+- An approval counts only from a token holding `approve` when it voted. The vote records that scope, or `local` for the CLI.
+- An approval does not count when the requester minted the voter's token (its `created_by`) or made the identity binding it resolved through (the binding's `actor`). The vote is still recorded, with `counted: false` and the reason in `not_counted`, and `approve` prints that reason. This catches one person minting a second voter, not two people agreeing.
+
+`request` and `approve` print how many more approvals the override needs; the JSON carries it as `approvals_needed`. `list` marks the requester `(counted)` or `(not counted)`.
 
 **Who is voting.** On the CLI the identity is the operator: `SUDO_USER` under sudo, otherwise the OS user. On the API it is the identity the request's token is bound to with `bodega identity bind token`, or, for a token from [`POST /api/v1/auth/exchange`](#authentication) or `bodega login` that carries no binding, `<issuer>#<subject>`: the provider's issuer URL, `#`, then the ID token's `sub` claim, such as `https://token.actions.githubusercontent.com#repo:acme/app:ref:refs/heads/main`. Each exchange mints a new token, but the subject stays the same, so one workflow or person exchanging twice is one identity; a binding on the token wins over its subject. Identities are compared as plain strings across both surfaces, so `alice` at the shell and a token bound to `alice` are one identity, and two requests or votes from one identity never count twice. See [the threat model](threat-model.md#two-person-overrides) for what that does and does not prove.
 
@@ -3146,7 +3154,7 @@ The quorum is recorded with each request when it is made, so changing `override_
 
 **Expiry.** An override past its expiry stops applying with nobody acting and accepts no more votes. Nothing is rewritten: `list --expired` shows it, and the next re-vet of an admitted version refuses it again and acts under `revet_on_block`.
 
-**Audit.** Each request, approval and rejection writes an `override` event (`bodega audit events --type override`) with status `requested`, `approve` or `reject` and the id, check, state, approvers, quorum and expiry in its details. The requests and votes themselves live in the `overrides` and `override_votes` tables of the embedded SQLite store (migration 032), beside the allow-list.
+**Audit.** Each request, approval and rejection writes an `override` event (`bodega audit events --type override`) with status `requested`, `approve` or `reject` and the id, check, state, approvers, quorum and expiry in its details. A `requested` event also records `requester_counts` and `approvals_needed`; a vote event records the voter's `scope` and, for an approval that did not count, `not_counted`. The requests and votes themselves live in the `overrides` and `override_votes` tables of the embedded SQLite store (migrations 032 and 038), beside the allow-list.
 
 **Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
 
