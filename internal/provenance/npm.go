@@ -23,8 +23,9 @@ var npmIssuers = "^(" + strings.ReplaceAll(issuerGitHubActions, ".", `\.`) + "|"
 // parsed and lists the version without dist.attestations is unavailable.
 // Evidence that could not be read is unknown: a packument that was not read,
 // or does not list the version, cannot say provenance is absent, and bundles
-// that were not fetched cannot say it failed. A bundle that was read and did
-// not verify, or had no trusted root to check it against, is invalid.
+// that were not fetched cannot say it failed, and neither can bundles with no
+// trusted root to check them against. A bundle that was checked and did not
+// verify is invalid.
 //
 // The attestations document also carries npm's own publish attestation,
 // signed by the registry's key rather than a CI identity. It says the
@@ -121,7 +122,7 @@ func (v *Verifier) npmVersion(ctx context.Context, registry, name, version strin
 	}
 	tm, err := v.Root(ctx)
 	if err != nil {
-		return invalid("%s@%s publishes provenance, and it was not verified: %v", name, version, err)
+		return noRoot(err, "%s@%s publishes provenance", name, version)
 	}
 
 	var verified *Evidence

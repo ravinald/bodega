@@ -361,6 +361,9 @@ func provenanceReason(f *refusal, d map[string]any) {
 			fmt.Sprintf(" If the publisher changed on purpose, `bodega pkg trust reset %s %s` re-pins it instead.", f.pkgType, f.name)
 	default:
 		f.next = overrideNext(f, audit.CheckUpstreamProvenance)
+		if outcome == audit.ProvenanceUnknown && d[audit.DetailNoTrustedRoot] == true {
+			f.next += " This server had no Sigstore trusted root to check the provenance against; to fix that, an operator checks that the host can reach Sigstore's TUF repository, or points `sigstore_trusted_root` at a readable trusted_root.json."
+		}
 	}
 }
 

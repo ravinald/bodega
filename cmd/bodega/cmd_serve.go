@@ -95,10 +95,10 @@ output continues to respect log_level in the config.`,
 			if err := ensureManifestRoot(cfg); err != nil {
 				return err
 			}
-			// A trusted root named and unreadable would turn every version
-			// that publishes provenance into invalid at admission, which on
-			// a block policy refuses all of them for a reason the operator
-			// only learns from the rows.
+			// A trusted root named and unreadable would leave every version
+			// that publishes provenance unchecked and unknown at admission,
+			// which on a block policy refuses all of them until someone
+			// overrides each one or fixes the file.
 			if cfg.SigstoreTrustedRoot != "" {
 				if _, err := provenance.LoadTrustedRootFile(cfg.SigstoreTrustedRoot); err != nil {
 					return err

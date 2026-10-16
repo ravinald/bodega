@@ -232,7 +232,8 @@ func TestOverrideNeverAppliesToMalwareOrInvalidProvenance(t *testing.T) {
 }
 
 // A request is judged against the newest admission row: one that recorded
-// upstream provenance unknown takes an override request, one that recorded it
+// upstream provenance unknown takes an override request, whether the evidence
+// went unread or no trusted root was had to check it, one that recorded it
 // invalid refuses it, and a version whose newest row moved from unknown to
 // invalid refuses it too.
 func TestOverrideRequestAfterProvenanceRefusal(t *testing.T) {
@@ -256,7 +257,16 @@ func TestOverrideRequestAfterProvenanceRefusal(t *testing.T) {
 		_, err := RequestOverride(ctx, f.adb, f.synced, req, audit.LocalOverrideCaller("alice"), time.Now())
 		return err
 	}
+	noRoot := policy.Result{Check: audit.CheckUpstreamProvenance, Action: policy.ActionBlock,
+		Reason:     "unknown: minimist@2.0.2 publishes provenance, but it was not checked, because there is no Sigstore trusted root to check it against: TUF unreachable",
+		Details:    map[string]any{"outcome": audit.ProvenanceUnknown, audit.DetailNoTrustedRoot: true},
+		Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}}
 	const never = "invalid upstream provenance is never overridden"
+
+	refuse("2.0.2", noRoot, "")
+	if err := requestFor("2.0.2"); err != nil {
+		t.Errorf("override request for provenance left unchecked without a trusted root: %v", err)
+	}
 
 	refuse("2.0.0", unknown, "")
 	if err := requestFor("2.0.0"); err != nil {
