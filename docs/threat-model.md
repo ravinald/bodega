@@ -971,42 +971,58 @@ and that the request, every vote and the admission it changed are recorded:
 the `overrides` and `override_votes` tables, an `override` event per action,
 and an admission row whose check says `overridden` with the override's id.
 
-Scopes keep the two acts apart on the API. Requesting needs `write` and
-approving or rejecting needs `admin`, so a CI job's exchanged `write` token can
-ask for an override and gets `403` naming `admin` when it tries to vote on
-one. That limits what a leaked write token does; it does nothing about a person
-who holds two admin tokens.
+Scopes keep the acts apart on the API. Requesting needs `write`, approving
+or rejecting needs `approve`, and minting tokens needs `superadmin`. `admin`
+implies none of the other two, so the operator who sets policy does not
+approve exceptions to it. A CI job's exchanged `write` token can ask for an
+override and gets `403` naming `approve` when it tries to vote on one. The
+quorum counts identities holding `approve`: a requester counts only when its
+own token held `approve` at request time, so a write-only CI request needs
+two approvers under the default quorum of 2.
 
-**An identity is only as strong as bodega's token issuance.** The quorum
-counts distinct identity strings and nothing behind them. On the API an
-identity is whatever name `bodega identity bind` gave a token, so whoever can
-run `bodega token generate` and `bodega identity bind` can mint a second
-identity and approve their own request with it, and so can anyone holding two
-bound tokens. On the CLI the identity is the OS user, or `SUDO_USER` under
-sudo, which the caller sets: anyone who can run `bodega override` against the
-audit database can vote under any name. There is no MFA claim to check, no
-signature over a vote, and no link between a token identity and a person. One
-person with a shell account and a differently named token counts as two.
+**Whoever mints tokens can mint a voter.** Each token records the identity
+that minted it (`created_by`), and each identity binding the identity that
+made it. An approval through a token or binding the requester made is recorded
+and does not count. That catches one person voting twice. It does not catch
+two people agreeing: a `superadmin` can still mint an `approve` token for a
+colluding second person, whose vote counts. Give `superadmin` to one or two
+named people who do not hold `approve`; `bodega doctor` names every token
+holding both.
+
+**The quorum counts identities, not people.** It compares identity strings
+and nothing behind them. On the API an identity is whatever name
+`bodega identity bind` gave a token. There is no MFA claim to check, no
+signature over a vote, and no link between an identity and a person. One
+person with two accounts in an identity-provider group that a rule grants
+`approve` counts twice, and preventing that is the provider's job, not
+bodega's.
 
 A token from `POST /api/v1/auth/exchange` or `bodega login` needs no binding:
 it votes as `<issuer>#<subject>`, the issuer URL and the ID token's `sub`
 claim. Two exchanges by one subject are one voter. That identity proves what
 the provider's `sub` claim proves and what the mapping rule granted, and no
 more. A GitHub Actions subject names a repository and a ref, not a person, so
-two rules that grant `admin` to different workflows in one repository make
-two voters, and whoever can push to both refs casts both votes. Grant `admin`
-through a mapping rule only to subjects a single person cannot act as twice:
-a device-flow provider whose `sub` is the person, or one protected ref. A
-token that is also bound with `bodega identity bind token` votes under the
-binding instead.
+two rules that grant `approve` to different workflows in one repository make
+two voters, and whoever can push to both refs casts both votes. Grant
+`approve` through a mapping rule only to subjects a single person cannot act
+as twice: a device-flow provider whose `sub` is the person, or one protected
+ref. A token that is also bound with `bodega identity bind token` votes under
+the binding instead.
 
-So the control is against one operator acting alone through the interfaces
-they were given, and against an exception nobody wrote down. It is not a
-control against the bodega host's administrators, who can also edit the audit
-database directly, and it is not a control against an attacker holding admin
-tokens. Keep token issuance and identity binding with fewer people than the
-quorum, bind each person their own token, and read `bodega audit events --type
-override` the way you read token creation.
+**The local CLI is attributable by convention only.** `bodega override` run
+on the host acts with every scope, and its identity is the OS user, or
+`SUDO_USER` under sudo, which the caller sets: anyone who can run it against
+the audit database can vote under any name. Treat a CLI vote as a record of
+who claimed to cast it.
+
+**Root on the bodega host is outside the model.** Root can write the audit
+database directly, edit `oidc_providers`, and bind any token to any name. The
+two-person rule is a control against one identity acting alone through the
+API, and against an exception nobody wrote down. It is not a control against
+the host's administrators or an attacker holding root. Keep `superadmin` and
+host access with fewer people than the quorum, bind each person their own
+token, and read `bodega audit events --type override` the way you read token
+creation.
 
 **Two verdicts are never overridden:** an OSV malware record and upstream
 provenance that fails to verify. Both say the bytes are hostile, and a vote

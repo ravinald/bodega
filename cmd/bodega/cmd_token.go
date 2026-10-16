@@ -22,6 +22,16 @@ func newTokenCmd(gf *globalFlags) *cobra.Command {
 	parent := &cobra.Command{
 		Use:   "token",
 		Short: "Manage API tokens for the mutation API",
+		Long: `Manage API tokens. Each token holds the scopes it was minted with:
+read, write, admin, approve, superadmin, or inventory alone. Each is granted
+only by naming it, and admin implies neither approve nor superadmin.
+
+approve casts override votes. An override needs override_quorum (default 2)
+identities holding approve; a requester without approve (a write-only CI
+token) does not count toward it, and an approval through a token the
+requester minted does not count either. superadmin mints, lists and revokes
+tokens, so give approve and superadmin to different people: one holder of
+both can mint a second voter. bodega doctor names every token holding both.`,
 	}
 	parent.AddCommand(
 		newTokenGenerateCmd(gf),
@@ -54,7 +64,8 @@ once and cannot be retrieved later. A SHA-256 hash (with pepper) is stored.
 
 read and write may be narrowed to package types with a colon: write:npm,pypi.
 admin implies neither approve nor superadmin; a token holds each only by
-naming it. A request outside the token's scopes is refused with 403 naming
+naming it. An override counts only identities holding approve, and the
+requester only when its own token held approve when it asked. A request outside the token's scopes is refused with 403 naming
 the scope it lacks. Repeat the flag or separate scopes with commas.
 
 --scope inventory reaches reads and the push routes inventory sources
