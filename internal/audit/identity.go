@@ -119,6 +119,10 @@ func NormalizeBindCIDR(in string) (netip.Prefix, error) {
 // is refused as the key collision it is, and the overlap check below only ever
 // fires on a row written around this function.
 //
+// A binding with no Actor records the invoking user, as the CLI does: the
+// override quorum discounts a vote cast through a binding the requester
+// created, so no row may leave its creator blank.
+//
 // Rebinding a key to the identity it already has is a no-op reporting false.
 func (a *DB) AddIdentityBinding(ctx context.Context, b IdentityBinding) (bool, error) {
 	if !ValidBindKind(b.Kind) {
@@ -131,6 +135,10 @@ func (a *DB) AddIdentityBinding(ctx context.Context, b IdentityBinding) (bool, e
 	}
 	if b.Identity == "" {
 		return false, errors.New("a binding needs an identity to bind to")
+	}
+	b.Actor = strings.TrimSpace(b.Actor)
+	if b.Actor == "" {
+		b.Actor = CurrentActor()
 	}
 	if b.Kind == BindCIDR {
 		p, err := NormalizeBindCIDR(b.Key)

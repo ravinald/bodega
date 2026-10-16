@@ -28,6 +28,8 @@ const oidcAudience = "https://bodega.example"
 //
 //	acme/app on main      -> read,write:npm
 //	acme/ops              -> read,admin
+//	acme/oncall           -> read,approve
+//	acme/root             -> superadmin
 //	acme/publisher        -> write:pypi (no read)
 func newOIDCServer(t *testing.T) (*Server, *idptest.Issuer) {
 	t.Helper()
@@ -53,6 +55,8 @@ func newOIDCServerAt(t *testing.T, adminCIDR string, edit func(*config.Config)) 
 			Rules: []config.OIDCRule{
 				{Claims: map[string]string{"repository": "acme/app", "ref": "refs/heads/main"}, Scopes: "read,write:npm"},
 				{Claims: map[string]string{"repository": "acme/ops"}, Scopes: "read,admin"},
+				{Claims: map[string]string{"repository": "acme/oncall"}, Scopes: "read,approve"},
+				{Claims: map[string]string{"repository": "acme/root"}, Scopes: "superadmin"},
 				{Claims: map[string]string{"repository": "acme/publisher"}, Scopes: "write:pypi"},
 			},
 		}},
@@ -112,7 +116,7 @@ func TestAuthExchangeMintsScopedShortLivedToken(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
-	if err := s.auditDB.InsertScopedToken(context.Background(), "pre", "reader", audit.HashToken("bodega_ak_pre", invPepper), "", "read", nil); err != nil {
+	if err := s.auditDB.InsertScopedToken(context.Background(), "pre", "reader", audit.HashToken("bodega_ak_pre", invPepper), "", "read", "test-operator", nil); err != nil {
 		t.Fatal(err)
 	}
 	do(http.MethodGet, "/api/v1/packages/npm", adminAddr, "bodega_ak_pre", "")
@@ -188,13 +192,17 @@ func TestAuthExchangeRefusals(t *testing.T) {
 }
 
 // A token outside its scopes is refused with 403 naming the missing scope, on
-// read, write and admin routes alike.
+// read, write, admin, approve and superadmin routes alike. admin reaches
+// neither the votes nor token management, and approve and superadmin reach
+// nothing of admin's.
 func TestScopeRefusalOnReadWriteAndAdminRoutes(t *testing.T) {
 	s, is := newOIDCServer(t)
 	app, _, _ := exchange(t, s, ciToken(t, is, "acme/app", nil))
 	ops, _, _ := exchange(t, s, ciToken(t, is, "acme/ops", nil))
 	pub, _, _ := exchange(t, s, ciToken(t, is, "acme/publisher", nil))
-	if app == nil || ops == nil || pub == nil {
+	oncall, _, _ := exchange(t, s, ciToken(t, is, "acme/oncall", nil))
+	root, _, _ := exchange(t, s, ciToken(t, is, "acme/root", nil))
+	if app == nil || ops == nil || pub == nil || oncall == nil || root == nil {
 		t.Fatal("exchange failed")
 	}
 	cases := []struct {
@@ -205,11 +213,23 @@ func TestScopeRefusalOnReadWriteAndAdminRoutes(t *testing.T) {
 		{"write other type", http.MethodPost, "/api/v1/packages/pypi", app.Token, "write:pypi"},
 		{"write without write", http.MethodDelete, "/api/v1/packages/npm/left-pad", ops.Token, "write:npm"},
 		{"admin read", http.MethodGet, "/api/v1/audit", app.Token, "admin"},
-		{"admin mutation", http.MethodPost, "/api/v1/tokens", app.Token, "admin"},
-		{"queue list", http.MethodGet, "/api/v1/queue", app.Token, "admin"},
-		{"queue approve", http.MethodPost, "/api/v1/queue/1/approve", app.Token, "admin"},
-		{"queue dismiss", http.MethodPost, "/api/v1/queue/1/dismiss", app.Token, "admin"},
-		{"override list", http.MethodGet, "/api/v1/overrides", app.Token, "admin"},
+		{"admin mutation", http.MethodPost, "/api/v1/policies", app.Token, "admin"},
+		{"admin read as approver", http.MethodGet, "/api/v1/audit", oncall.Token, "admin"},
+		{"admin read as superadmin", http.MethodGet, "/api/v1/config", root.Token, "admin"},
+		{"token mint", http.MethodPost, "/api/v1/tokens", app.Token, "superadmin"},
+		{"token mint as admin", http.MethodPost, "/api/v1/tokens", ops.Token, "superadmin"},
+		{"token list as admin", http.MethodGet, "/api/v1/tokens", ops.Token, "superadmin"},
+		{"token revoke as admin", http.MethodDelete, "/api/v1/tokens/x", ops.Token, "superadmin"},
+		{"token mint as approver", http.MethodPost, "/api/v1/tokens", oncall.Token, "superadmin"},
+		{"queue list", http.MethodGet, "/api/v1/queue", app.Token, "admin or approve"},
+		{"queue list as superadmin", http.MethodGet, "/api/v1/queue", root.Token, "admin or approve"},
+		{"queue approve", http.MethodPost, "/api/v1/queue/1/approve", app.Token, "approve"},
+		{"queue approve as admin", http.MethodPost, "/api/v1/queue/1/approve", ops.Token, "approve"},
+		{"queue dismiss as admin", http.MethodPost, "/api/v1/queue/1/dismiss", ops.Token, "approve"},
+		{"override list", http.MethodGet, "/api/v1/overrides", app.Token, "admin or approve"},
+		{"override approve as admin", http.MethodPost, "/api/v1/overrides/x/approve", ops.Token, "approve"},
+		{"override reject as admin", http.MethodPost, "/api/v1/overrides/x/reject", ops.Token, "approve"},
+		{"override approve as superadmin", http.MethodPost, "/api/v1/overrides/x/approve", root.Token, "approve"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -227,8 +247,16 @@ func TestScopeRefusalOnReadWriteAndAdminRoutes(t *testing.T) {
 		{http.MethodGet, "/api/v1/packages/npm", app.Token},
 		{http.MethodGet, "/api/v1/audit", ops.Token},
 		{http.MethodGet, "/api/v1/queue", ops.Token},
-		{http.MethodPost, "/api/v1/queue/1/approve", ops.Token},
+		{http.MethodGet, "/api/v1/queue", oncall.Token},
+		{http.MethodPost, "/api/v1/queue/1/approve", oncall.Token},
+		{http.MethodPost, "/api/v1/queue/1/dismiss", oncall.Token},
 		{http.MethodGet, "/api/v1/overrides", ops.Token},
+		{http.MethodGet, "/api/v1/overrides", oncall.Token},
+		{http.MethodPost, "/api/v1/overrides/x/approve", oncall.Token},
+		{http.MethodPost, "/api/v1/overrides/x/reject", oncall.Token},
+		{http.MethodGet, "/api/v1/tokens", root.Token},
+		{http.MethodPost, "/api/v1/tokens", root.Token},
+		{http.MethodDelete, "/api/v1/tokens/x", root.Token},
 		{http.MethodPost, "/api/v1/overrides", app.Token},
 		{http.MethodGet, "/healthz", pub.Token},
 	} {
@@ -344,6 +372,32 @@ func TestMintedTokenScopes(t *testing.T) {
 	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"read,write:npm"`) {
 		t.Errorf("scoped mint: %d %s", rec.Code, rec.Body)
 	}
+	var minted struct{ ID string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &minted)
+	tokens, _ := s.auditDB.ListTokens(context.Background())
+	var createdBy string
+	for _, tk := range tokens {
+		if tk.ID == minted.ID {
+			createdBy = tk.CreatedBy
+		}
+	}
+	if createdBy != "ops" {
+		t.Errorf("API-minted token created_by = %q, want ops, the identity the minting token is bound to", createdBy)
+	}
+}
+
+// Minting over the API needs a caller with an identity to record as the new
+// token's creator, on a localhost-only server too, where the gate asks for no
+// token at all.
+func TestAPIMintRefusesACallerWithNoIdentity(t *testing.T) {
+	s := newInventoryServer(t, []string{"127.0.0.0/8"})
+	rec := send(s, http.MethodPost, "/api/v1/tokens", localAddr, "", `{"label":"x","scope":"read"}`)
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "bound to an identity") {
+		t.Errorf("anonymous localhost mint = %d %s, want 401 naming the identity it lacks", rec.Code, rec.Body)
+	}
+	if rec := send(s, http.MethodPost, "/api/v1/tokens", localAddr, fullToken, `{"label":"x","scope":"read"}`); rec.Code != http.StatusCreated {
+		t.Errorf("bound full token on localhost = %d %s, want 201", rec.Code, rec.Body)
+	}
 }
 
 // An exchanged token requests and votes on overrides under its principal's
@@ -361,13 +415,13 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 		t.Run(posture.name, func(t *testing.T) {
 			s, is := newOIDCServerAt(t, posture.cidr, func(c *config.Config) { c.OverrideQuorum = 3 })
 			app, _, _ := exchange(t, s, ciToken(t, is, "acme/app", nil))
-			ops, _, _ := exchange(t, s, ciToken(t, is, "acme/ops", nil))
-			opsAgain, _, _ := exchange(t, s, ciToken(t, is, "acme/ops", nil))
+			ops, _, _ := exchange(t, s, ciToken(t, is, "acme/oncall", nil))
+			opsAgain, _, _ := exchange(t, s, ciToken(t, is, "acme/oncall", nil))
 			if app == nil || ops == nil || opsAgain == nil {
 				t.Fatal("exchange failed")
 			}
 			appID := is.URL + "#repo:acme/app:ref:refs/heads/main"
-			opsID := is.URL + "#repo:acme/ops:ref:refs/heads/main"
+			opsID := is.URL + "#repo:acme/oncall:ref:refs/heads/main"
 
 			rec := send(s, http.MethodPost, "/api/v1/overrides", posture.addr, app.Token, overrideBody)
 			if rec.Code != http.StatusCreated {
@@ -392,14 +446,14 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 				tries["Basic"] = basic(app.Token)
 			}
 			for name, rec := range tries {
-				if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `lacks scope "admin"`) {
-					t.Errorf("write token approving over %s = %d %s, want 403 naming admin", name, rec.Code, rec.Body)
+				if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `lacks scope "approve"`) {
+					t.Errorf("write token approving over %s = %d %s, want 403 naming approve", name, rec.Code, rec.Body)
 				}
 			}
 
 			rec = send(s, http.MethodPost, approve, posture.addr, ops.Token, "")
 			if rec.Code != http.StatusOK {
-				t.Fatalf("admin token approving = %d %s, want 200", rec.Code, rec.Body)
+				t.Fatalf("approve token approving = %d %s, want 200", rec.Code, rec.Body)
 			}
 			got := decodeOverride(t, rec.Body.Bytes())
 			if len(got.Votes) != 1 || got.Votes[0].Identity != opsID {
@@ -410,7 +464,7 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 				t.Errorf("second exchange approving = %d %s, want 409", rec.Code, rec.Body)
 			}
 			if rec := send(s, http.MethodGet, "/api/v1/overrides", posture.addr, ops.Token, ""); rec.Code != http.StatusOK {
-				t.Errorf("admin token listing = %d %s, want 200", rec.Code, rec.Body)
+				t.Errorf("approve token listing = %d %s, want 200", rec.Code, rec.Body)
 			}
 
 			// A binding on the exchanged token wins over its principal.
@@ -436,6 +490,7 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 // CI token reaches it. A route missing from want fails here until it is
 // classified.
 func TestEveryAPIRouteHasAChosenScope(t *testing.T) {
+	const adminOrApprove = audit.ScopeAdmin + "|" + audit.ScopeApprove
 	want := map[string]string{
 		"GET /api/v1/packages":                                     audit.ScopeRead,
 		"GET /api/v1/packages/{type}":                              audit.ScopeRead,
@@ -454,22 +509,22 @@ func TestEveryAPIRouteHasAChosenScope(t *testing.T) {
 		"PATCH /api/v1/packages/{type}/{name}/freeze":              audit.ScopeWrite,
 		"PATCH /api/v1/packages/{type}/{name}/freeze/{version}":    audit.ScopeWrite,
 		"GET /api/v1/audit":                                        audit.ScopeAdmin,
-		"GET /api/v1/tokens":                                       audit.ScopeAdmin,
-		"POST /api/v1/tokens":                                      audit.ScopeAdmin,
-		"DELETE /api/v1/tokens/{id}":                               audit.ScopeAdmin,
+		"GET /api/v1/tokens":                                       audit.ScopeSuperadmin,
+		"POST /api/v1/tokens":                                      audit.ScopeSuperadmin,
+		"DELETE /api/v1/tokens/{id}":                               audit.ScopeSuperadmin,
 		"GET /api/v1/profiles/{name}/pins":                         audit.ScopeAdmin,
 		"POST /api/v1/inventory/sources/{instance}/{route...}":     audit.ScopeAdmin,
 		"GET /api/v1/inventory/{identity}":                         audit.ScopeAdmin,
 		"GET /api/v1/policies":                                     audit.ScopeAdmin,
 		"POST /api/v1/policies":                                    audit.ScopeAdmin,
 		"DELETE /api/v1/policies/{id}":                             audit.ScopeAdmin,
-		"GET /api/v1/overrides":                                    audit.ScopeAdmin,
+		"GET /api/v1/overrides":                                    adminOrApprove,
 		"POST /api/v1/overrides":                                   audit.ScopeWrite,
-		"POST /api/v1/overrides/{id}/approve":                      audit.ScopeAdmin,
-		"POST /api/v1/overrides/{id}/reject":                       audit.ScopeAdmin,
-		"GET /api/v1/queue":                                        audit.ScopeAdmin,
-		"POST /api/v1/queue/{id}/approve":                          audit.ScopeAdmin,
-		"POST /api/v1/queue/{id}/dismiss":                          audit.ScopeAdmin,
+		"POST /api/v1/overrides/{id}/approve":                      audit.ScopeApprove,
+		"POST /api/v1/overrides/{id}/reject":                       audit.ScopeApprove,
+		"GET /api/v1/queue":                                        adminOrApprove,
+		"POST /api/v1/queue/{id}/approve":                          audit.ScopeApprove,
+		"POST /api/v1/queue/{id}/dismiss":                          audit.ScopeApprove,
 		// HMAC over the body, not a token: the gate passes it as a push route.
 		"POST " + RevetWebhookPath:            audit.ScopeWrite,
 		"POST " + authExchangePath:            "",
@@ -510,7 +565,7 @@ func TestEveryAPIRouteHasAChosenScope(t *testing.T) {
 			}
 			return "x"
 		})
-		if got, _ := routeScope(httptest.NewRequest(method, concrete, nil)); got != scope {
+		if got, _ := routeScope(httptest.NewRequest(method, concrete, nil)); strings.Join(got, "|") != scope {
 			t.Errorf("%s: routeScope = %q, want %q", pattern, got, scope)
 		}
 	}

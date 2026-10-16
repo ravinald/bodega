@@ -11,7 +11,10 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
-const tokenScopesVersion = 36
+const (
+	tokenScopesVersion   = 36
+	approveScopesVersion = 37
+)
 
 // migrationBefore is the version the source holds immediately below v. The
 // numbering has gaps where another branch reserved a version, so v-1 can
@@ -45,6 +48,13 @@ func TestParseScopes(t *testing.T) {
 		{in: "write:rubygems", err: "unknown package type"},
 		{in: "admin:npm", err: "takes no package types"},
 		{in: "inventory,read", err: "combines with no other"},
+		{in: "superadmin approve admin read", want: "read,admin,approve,superadmin"},
+		{in: "approve", want: "approve"},
+		{in: "superadmin", want: "superadmin"},
+		{in: "approve:npm", err: "takes no package types"},
+		{in: "superadmin:npm", err: "takes no package types"},
+		{in: "inventory,approve", err: "combines with no other"},
+		{in: "superadmin,inventory", err: "combines with no other"},
 	}
 	for _, tc := range cases {
 		got, err := CanonicalScopes(tc.in)
@@ -91,6 +101,132 @@ func TestScopesAllows(t *testing.T) {
 	}
 }
 
+// admin, approve and superadmin are granted independently: none reaches a
+// route needing another.
+func TestAdminApproveSuperadminAreIndependent(t *testing.T) {
+	names := []string{ScopeAdmin, ScopeApprove, ScopeSuperadmin}
+	for _, held := range names {
+		sc, err := ParseScopes("read,write," + held)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, need := range names {
+			if got := sc.Allows(need, ""); got != (need == held) {
+				t.Errorf("a token holding %s: Allows(%s) = %v", held, need, got)
+			}
+		}
+	}
+}
+
+// Migration 037 widens every admin token to hold approve and superadmin, so
+// an upgrade takes no capability away, and leaves every other token alone.
+// The down migration narrows the widened ones back and deletes any token an
+// older binary would read as more than it was issued.
+func TestApproveScopesMigration(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	m := migrator(t, raw)
+	before := migrationBefore(t, approveScopesVersion)
+	if err := m.Migrate(before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope) VALUES
+		('full', 'ops', 'h1', 'read,write,admin'),
+		('narrow', 'ops', 'h2', 'read:npm,admin'),
+		('adm', 'ops', 'h3', 'admin'),
+		('ci', 'ci', 'h4', 'read,write:npm'),
+		('inv', 'web', 'h5', 'inventory')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Migrate(approveScopesVersion); err != nil {
+		t.Fatalf("migrate to %d: %v", approveScopesVersion, err)
+	}
+	scopes := func() string {
+		t.Helper()
+		rows, err := raw.Query(`SELECT id || '=' || scope || '/' || created_by FROM api_tokens ORDER BY id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+		}
+		return strings.Join(out, " ")
+	}
+	want := "adm=admin,approve,superadmin/ ci=read,write:npm/ full=read,write,admin,approve,superadmin/ " +
+		"inv=inventory/ narrow=read:npm,admin,approve,superadmin/"
+	if got := scopes(); got != want {
+		t.Errorf("after 037:\n got %s\nwant %s", got, want)
+	}
+	for _, id := range []string{"full", "narrow", "adm"} {
+		var s string
+		_ = raw.QueryRow(`SELECT scope FROM api_tokens WHERE id = ?`, id).Scan(&s)
+		if canon, err := CanonicalScopes(s); err != nil || canon != s {
+			t.Errorf("%s migrated to %q, which is not canonical (%q, %v)", id, s, canon, err)
+		}
+	}
+
+	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope, created_by) VALUES
+		('oncall', 'o', 'h6', 'read,approve', 'alice'),
+		('root', 'r', 'h7', 'superadmin', 'alice'),
+		('plain', 'p', 'h8', 'read,admin', 'alice')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Migrate(before); err != nil {
+		t.Fatalf("down: %v", err)
+	}
+	var ids []string
+	rows, _ := raw.Query(`SELECT id || '=' || scope FROM api_tokens ORDER BY id`)
+	for rows.Next() {
+		var s string
+		_ = rows.Scan(&s)
+		ids = append(ids, s)
+	}
+	_ = rows.Close()
+	if got := strings.Join(ids, " "); got != "adm=admin ci=read,write:npm full=read,write,admin inv=inventory narrow=read:npm,admin" {
+		t.Errorf("after down: %s, want the widened tokens narrowed and oncall, root and plain gone", got)
+	}
+	if _, err := raw.Exec(`SELECT created_by FROM api_tokens`); err == nil {
+		t.Error("created_by survived the down migration")
+	}
+}
+
+// Every token row names its creator: an exchanged token the principal it acts
+// for, any other the caller's identity, and no token is stored without one.
+func TestTokenRecordsCreator(t *testing.T) {
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	p := Principal{Subject: "alice", Issuer: "https://idp.example"}
+	if err := db.InsertExchangedToken(ctx, "ex", "oidc", "h1", "read,approve", time.Now().Add(time.Hour), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertScopedToken(ctx, "op", "ops", "h2", "", "superadmin", "bob", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertScopedToken(ctx, "anon", "x", "h3", "", "read", " ", nil); err == nil {
+		t.Error("a token with no creator was stored")
+	}
+	tokens, err := db.ListTokens(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, tk := range tokens {
+		got[tk.ID] = tk.CreatedBy
+	}
+	if len(got) != 2 || got["ex"] != p.Identity() || got["op"] != "bob" {
+		t.Errorf("created_by = %v, want ex=%s op=bob", got, p.Identity())
+	}
+}
+
 // A token stored as full before scopes migrates to read,write,admin; an
 // inventory token keeps its scope; the down migration drops anything an
 // older binary would widen.
@@ -127,8 +263,8 @@ func TestTokenScopesMigration(t *testing.T) {
 		}
 	}
 	_ = rows.Close()
-	if got["old"] != ScopeFull || got["inv"] != ScopeInventory {
-		t.Errorf("migrated scopes = %v, want old=%s inv=inventory", got, ScopeFull)
+	if got["old"] != "read,write,admin" || got["inv"] != ScopeInventory {
+		t.Errorf("migrated scopes = %v, want old=read,write,admin inv=inventory", got)
 	}
 	if _, err := raw.Exec(`INSERT INTO api_tokens (id, label, hash, scope) VALUES ('n', 'n', 'h3', 'write:npm'), ('x', 'x', 'h4', 'read,write,admin')`); err != nil {
 		t.Fatal(err)
@@ -163,7 +299,7 @@ func TestExchangedTokenRoundTripAndPrune(t *testing.T) {
 	if err := db.InsertExchangedToken(ctx, "dead", "oidc", "h2", "read", past, p); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertScopedToken(ctx, "op", "ops", "h3", "", "admin", &past); err != nil {
+	if err := db.InsertScopedToken(ctx, "op", "ops", "h3", "", "admin", "test-operator", &past); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InsertExchangedToken(ctx, "x", "oidc", "h4", "read", time.Now(), Principal{}); err == nil {

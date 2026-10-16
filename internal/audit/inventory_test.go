@@ -49,10 +49,10 @@ func TestScopedTokenRoundTrips(t *testing.T) {
 	if err := db.InsertToken(ctx, "a", "admin", "ha", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertScopedToken(ctx, "b", "host", "hb", "", ScopeInventory, nil); err != nil {
+	if err := db.InsertScopedToken(ctx, "b", "host", "hb", "", ScopeInventory, "test-operator", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertScopedToken(ctx, "c", "bad", "hc", "", "root", nil); err == nil {
+	if err := db.InsertScopedToken(ctx, "c", "bad", "hc", "", "root", "test-operator", nil); err == nil {
 		t.Error("InsertScopedToken accepted an unknown scope")
 	}
 	hashes, err := db.GetTokenHashes(ctx)

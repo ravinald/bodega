@@ -26,10 +26,10 @@ import (
 // would vote as one identity, or every person on one host as the same one.
 //
 // The token is held to the route's scope here as well as at the gate:
-// requesting needs write, approving or rejecting needs admin. The gate checks
+// requesting needs write, approving or rejecting needs approve. The gate checks
 // only a Bearer credential on a localhost-only server, while the identity
 // resolves from any form credentialFrom reads, so a write token sent as Basic
-// would otherwise cast an admin's vote.
+// would otherwise cast an approver's vote.
 func (s *Server) overrideCaller(w http.ResponseWriter, r *http.Request) (string, bool) {
 	identity, tok := s.overrideIdentity(r)
 	if tok == nil {

@@ -996,9 +996,9 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/overrides/{id}/approve", s.handleApproveOverride)
 	m.HandleFunc("POST /api/v1/overrides/{id}/reject", s.handleRejectOverride)
 
-	// The refusal review queue (F50). The list is an admin read like the
-	// audit trail; the two resolutions are mutations and pass the mutation
-	// gate before the handler requires an identity-bound token.
+	// The refusal review queue (F50). The list is an admin or approve read;
+	// the two resolutions are approve mutations and pass the mutation gate
+	// before the handler requires an identity-bound token.
 	m.HandleFunc("GET /api/v1/queue", s.handleListQueue)
 	m.HandleFunc("POST /api/v1/queue/{id}/approve", s.handleApproveQueue)
 	m.HandleFunc("POST /api/v1/queue/{id}/dismiss", s.handleDismissQueue)
@@ -1691,6 +1691,21 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "pepper not configured"})
 		return
 	}
+	// The token records who minted it, so the override quorum can discount a
+	// vote cast on a token the requester minted. That needs a caller with an
+	// identity, in the localhost-only posture too. The token naming it is held
+	// to superadmin here for the reason overrideCaller gives.
+	createdBy, tok := s.overrideIdentity(r)
+	if tok != nil && !authorizeScope(w, r, s.auditDB, s.logger, *tok) {
+		return
+	}
+	if createdBy == "" {
+		recordDenial(s.auditDB, r, audit.DenialTokenMissing, map[string]string{"route": "tokens"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "minting a token over the API requires a token bound to an identity " +
+			"(bodega identity bind token <id> <identity>) or one from bodega login or POST /api/v1/auth/exchange, " +
+			"sent as Authorization: Bearer <token>; on the bodega host, bodega token generate needs none"})
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
@@ -1738,7 +1753,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	if err := s.auditDB.InsertScopedToken(ctx, id, req.Label, hash, req.Comment, scope, expiresAt); err != nil {
+	if err := s.auditDB.InsertScopedToken(ctx, id, req.Label, hash, req.Comment, scope, createdBy, expiresAt); err != nil {
 		s.logger.Error("insert token failed", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
