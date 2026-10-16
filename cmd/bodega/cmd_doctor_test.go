@@ -935,6 +935,25 @@ func TestDoctorWarnsWhenTooFewIdentitiesCanApprove(t *testing.T) {
 		t.Errorf("an admin-only OIDC rule with nobody else approving: %+v, want WARN naming the rule", f)
 	}
 
+	// #135 after following "On-call approvers": the approve rule makes the
+	// row OK, and the admin rule beside it is still named in either order.
+	oncallRule := config.OIDCRule{Claims: map[string]string{"groups": "oncall-primary"}, Scopes: "read,approve"}
+	adminsRule := config.OIDCRule{Claims: map[string]string{"groups": "bodega-admins"}, Scopes: "read,admin"}
+	for _, tc := range []struct {
+		rules []config.OIDCRule
+		want  string
+	}{
+		{[]config.OIDCRule{oncallRule, adminsRule}, "okta rule 1 (read,admin)"},
+		{[]config.OIDCRule{adminsRule, oncallRule}, "okta rule 0 (read,admin)"},
+	} {
+		cfg := &config.Config{OIDCProviders: []config.OIDCProvider{{Name: "okta", Issuer: "https://idp.example", Rules: tc.rules}}}
+		f := approveReach(nil, nil, cfg, now)
+		if f.Status != host.StatusOK || !strings.Contains(f.Detail, "grants approve to every identity") ||
+			!strings.Contains(f.Detail, tc.want) || !strings.Contains(f.Detail, "migration 037") {
+			t.Errorf("approve rule beside an admin rule: %+v, want OK naming %q and migration 037", f, tc.want)
+		}
+	}
+
 	// The whole check through serverPosture, as doctor runs it.
 	var reach host.Finding
 	for _, r := range serverPosture(context.Background(), fakePosture{toks: toks, binds: binds}, nil) {

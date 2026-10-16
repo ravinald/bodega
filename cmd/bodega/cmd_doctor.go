@@ -892,6 +892,7 @@ func approveReach(tokens []audit.TokenInfo, binds []audit.IdentityBinding, cfg *
 	f := host.Finding{Check: "token-scope", Status: host.StatusOK}
 	quorum := cfg.ResolveOverrideQuorum()
 	var adminRules []string
+	approveRule := ""
 	requesters := false
 	if cfg != nil {
 		for _, p := range cfg.OIDCProviders {
@@ -902,14 +903,25 @@ func approveReach(tokens []audit.TokenInfo, binds []audit.IdentityBinding, cfg *
 				}
 				requesters = requesters || sc.Has(audit.ScopeWrite)
 				if sc.Has(audit.ScopeApprove) {
-					f.Detail = fmt.Sprintf("oidc_providers %s rule %d grants approve to every identity it matches", p.DisplayName(), i)
-					return f
+					if approveRule == "" {
+						approveRule = fmt.Sprintf("oidc_providers %s rule %d grants approve to every identity it matches", p.DisplayName(), i)
+					}
+					continue
 				}
 				if sc.Has(audit.ScopeAdmin) {
 					adminRules = append(adminRules, fmt.Sprintf("%s rule %d (%s)", p.DisplayName(), i, r.Scopes))
 				}
 			}
 		}
+	}
+	lostApprove := ""
+	if len(adminRules) > 0 {
+		lostApprove = "; these OIDC rules grant admin, which included approve and superadmin before migration 037 and does not now: " +
+			strings.Join(adminRules, ", ")
+	}
+	if approveRule != "" {
+		f.Detail = approveRule + lostApprove
+		return f
 	}
 	bound := map[string]string{}
 	for _, b := range binds {
@@ -939,11 +951,6 @@ func approveReach(tokens []audit.TokenInfo, binds []audit.IdentityBinding, cfg *
 		default:
 			unbound++
 		}
-	}
-	lostApprove := ""
-	if len(adminRules) > 0 {
-		lostApprove = "; these OIDC rules grant admin, which included approve and superadmin before migration 037 and does not now: " +
-			strings.Join(adminRules, ", ")
 	}
 	if len(voters) >= quorum {
 		f.Detail = fmt.Sprintf("%d identities hold approve, override_quorum is %d", len(voters), quorum) + lostApprove
