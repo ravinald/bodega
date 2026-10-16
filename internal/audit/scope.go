@@ -11,23 +11,30 @@ import (
 )
 
 // Scope names. read reaches the serving routes, write the package mutation
-// routes, admin the token, policy, audit and configuration surface. Each of
-// the three may be narrowed to package types. inventory reaches the push
-// routes inventory sources register, plus reads, and combines with nothing:
-// it is the credential a host holds to report what it installed, and its
-// reads are that same host fetching packages.
+// routes, admin the policy, audit and configuration surface. read and write
+// may be narrowed to package types. approve casts the votes on an override
+// and resolves a refusal-queue row; superadmin mints, lists and revokes
+// tokens. Each is granted only by naming it: admin implies neither, so the
+// operator who sets policy does not also approve exceptions to it or mint a
+// second voter. inventory reaches the push routes inventory sources
+// register, plus reads, and combines with nothing: it is the credential a
+// host holds to report what it installed, and its reads are that same host
+// fetching packages.
 const (
-	ScopeRead      = "read"
-	ScopeWrite     = "write"
-	ScopeAdmin     = "admin"
-	ScopeInventory = "inventory"
+	ScopeRead       = "read"
+	ScopeWrite      = "write"
+	ScopeAdmin      = "admin"
+	ScopeApprove    = "approve"
+	ScopeSuperadmin = "superadmin"
+	ScopeInventory  = "inventory"
 
-	// ScopeFull is every scope with no type restriction: what a token minted
-	// before scopes existed migrated to.
-	ScopeFull = "read,write,admin"
+	// ScopeFull is every scope but inventory with no type restriction: what a
+	// token minted before scopes existed holds after migrations 036 and 037.
+	ScopeFull = "read,write,admin,approve,superadmin"
 
 	// scopeLegacyFull is the stored value migration 036 rewrote. A store
-	// opened read-only is never migrated, so the parser still reads it.
+	// opened read-only is never migrated, so the parser still reads it, as
+	// ScopeFull: what 036 and 037 together would have made it.
 	scopeLegacyFull = "full"
 )
 
@@ -44,11 +51,11 @@ func (g Grant) String() string {
 	return g.Name + ":" + strings.Join(g.Types, ",")
 }
 
-// Scopes is a token's grants in canonical order: read, write, admin, each at
-// most once, types sorted.
+// Scopes is a token's grants in canonical order (scopeOrder), each at most
+// once, types sorted.
 type Scopes []Grant
 
-var scopeOrder = []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeInventory}
+var scopeOrder = []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeApprove, ScopeSuperadmin, ScopeInventory}
 
 // ParseScopes reads a scope list. Grants are separated by commas or spaces,
 // and a grant's types follow a colon with commas between them, so
@@ -57,14 +64,14 @@ var scopeOrder = []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeInventory}
 func ParseScopes(s string) (Scopes, error) {
 	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 	if len(fields) == 0 {
-		return nil, fmt.Errorf("no scope given: want one or more of read, write, admin (each optionally :<type>,...), or inventory")
+		return nil, fmt.Errorf("no scope given: want one or more of read, write (each optionally :<type>,...), admin, approve, superadmin, or inventory")
 	}
 	byName := map[string]*Grant{}
 	untyped := map[string]bool{}
 	var current *Grant
 	for _, f := range fields {
 		if f == scopeLegacyFull {
-			for _, n := range []string{ScopeRead, ScopeWrite, ScopeAdmin} {
+			for _, n := range []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeApprove, ScopeSuperadmin} {
 				untyped[n] = true
 				byName[n] = &Grant{Name: n}
 			}
@@ -74,12 +81,12 @@ func ParseScopes(s string) (Scopes, error) {
 		name, typ, typed := strings.Cut(f, ":")
 		if !typed && !isScopeName(name) {
 			if current == nil || untyped[current.Name] {
-				return nil, fmt.Errorf("unknown scope %q: want read, write, admin (each optionally :<type>,...), or inventory", f)
+				return nil, fmt.Errorf("unknown scope %q: want read, write (each optionally :<type>,...), admin, approve, superadmin, or inventory", f)
 			}
 			typ, name, typed = f, current.Name, true
 		}
 		if !isScopeName(name) {
-			return nil, fmt.Errorf("unknown scope %q: want read, write, admin (each optionally :<type>,...), or inventory", name)
+			return nil, fmt.Errorf("unknown scope %q: want read, write (each optionally :<type>,...), admin, approve, superadmin, or inventory", name)
 		}
 		g := byName[name]
 		if g == nil {
@@ -91,7 +98,7 @@ func ParseScopes(s string) (Scopes, error) {
 			untyped[name] = true
 			continue
 		}
-		if name == ScopeAdmin || name == ScopeInventory {
+		if name != ScopeRead && name != ScopeWrite {
 			return nil, fmt.Errorf("scope %q takes no package types: the routes it reaches are not per type", name)
 		}
 		if !manifest.IsKnownType(typ) {

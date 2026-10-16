@@ -173,3 +173,30 @@ func TestEventAndDiscoveryRowsCarryIdentityBesideTheAddress(t *testing.T) {
 		t.Fatalf("discovery row lost one of the two: client=%q identity=%q", rows[0].LastClient, rows[0].LastIdentity)
 	}
 }
+
+// A binding written with no actor records the invoking user, so no binding
+// leaves its creator blank.
+func TestBindingAlwaysRecordsItsActor(t *testing.T) {
+	t.Setenv("SUDO_USER", "alice")
+	ctx := context.Background()
+	db := newIdentityTestDB(t)
+	for _, b := range []IdentityBinding{
+		{Kind: BindToken, Key: "t1", Identity: "web-01"},
+		{Kind: BindToken, Key: "t2", Identity: "web-02", Actor: "bob"},
+	} {
+		if ok, err := db.AddIdentityBinding(ctx, b); err != nil || !ok {
+			t.Fatalf("bind %s: ok=%v err=%v", b.Key, ok, err)
+		}
+	}
+	list, err := db.ListIdentityBindings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, b := range list {
+		got[b.Key] = b.Actor
+	}
+	if got["t1"] != "alice" || got["t2"] != "bob" {
+		t.Errorf("actors = %v, want t1=alice (the invoking user) t2=bob", got)
+	}
+}

@@ -32,7 +32,7 @@ const cdxDoc = `{"bomFormat":"CycloneDX","specVersion":"1.6","metadata":{"timest
 // newInventoryServer builds a server with admin_permit_cidr on 10.0.0.0/8,
 // so tokens are required there, and two CycloneDX instances: "hosts"
 // enabled with a small body cap and "off" disabled. It mints one inventory
-// token bound to web-01 and one full token.
+// token bound to web-01 and one full token bound to ops.
 func newInventoryServer(t *testing.T, adminCIDR []string) *Server {
 	t.Helper()
 	dir := t.TempDir()
@@ -56,14 +56,16 @@ func newInventoryServer(t *testing.T, adminCIDR []string) *Server {
 	t.Cleanup(func() { _ = s.auditDB.Close() })
 	s.pepper = invPepper
 	ctx := context.Background()
-	if err := s.auditDB.InsertScopedToken(ctx, "inv1", "web-01", audit.HashToken(invToken, invPepper), "", audit.ScopeInventory, nil); err != nil {
+	if err := s.auditDB.InsertScopedToken(ctx, "inv1", "web-01", audit.HashToken(invToken, invPepper), "", audit.ScopeInventory, "test-operator", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.auditDB.InsertToken(ctx, "full1", "admin", audit.HashToken(fullToken, invPepper), "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{Kind: audit.BindToken, Key: "inv1", Identity: "web-01"}); err != nil {
-		t.Fatal(err)
+	for key, identity := range map[string]string{"inv1": "web-01", "full1": "ops"} {
+		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{Kind: audit.BindToken, Key: key, Identity: identity}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	s.refreshIdentities(ctx)
 	return s

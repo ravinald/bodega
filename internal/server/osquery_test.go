@@ -119,7 +119,7 @@ func TestOsqueryRoutesFromOutsideAdminCIDR(t *testing.T) {
 	t.Cleanup(func() { _ = s.auditDB.Close() })
 	s.pepper = invPepper
 	ctx := context.Background()
-	if err := s.auditDB.InsertScopedToken(ctx, "inv1", "shipper", audit.HashToken(invToken, invPepper), "", audit.ScopeInventory, nil); err != nil {
+	if err := s.auditDB.InsertScopedToken(ctx, "inv1", "shipper", audit.HashToken(invToken, invPepper), "", audit.ScopeInventory, "test-operator", nil); err != nil {
 		t.Fatal(err)
 	}
 

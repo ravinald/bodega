@@ -43,13 +43,19 @@ once and cannot be retrieved later. A SHA-256 hash (with pepper) is stored.
 
 --scope is required and says what the token may do. It is one or more of:
 
-  read    the package-serving routes (apt, pip, npm, go, cargo, ...)
-  write   the package mutation routes (create, import, delete, hide, freeze)
-  admin   tokens, policies, the audit trail and the configuration
+  read        the package-serving routes (apt, pip, npm, go, cargo, ...)
+  write       the package mutation routes (create, import, delete, hide,
+              freeze) and requesting an override
+  admin       policies, the audit trail, the configuration, inventory,
+              profiles, and listing overrides and the refusal queue
+  approve     approving or rejecting an override, and approving or
+              dismissing a refusal-queue row
+  superadmin  minting, listing and revoking tokens
 
-each optionally narrowed to package types with a colon: write:npm,pypi. A
-request outside the token's scopes is refused with 403 naming the scope it
-lacks. Repeat the flag or separate scopes with commas.
+read and write may be narrowed to package types with a colon: write:npm,pypi.
+admin implies neither approve nor superadmin; a token holds each only by
+naming it. A request outside the token's scopes is refused with 403 naming
+the scope it lacks. Repeat the flag or separate scopes with commas.
 
 --scope inventory reaches reads and the push routes inventory sources
 register, which is what a host posting its installed packages needs and
@@ -125,7 +131,7 @@ Examples:
 
 			// Store in DB.
 			ctx := context.Background()
-			if err := adb.InsertScopedToken(ctx, id, label, hash, comment, scope, expiresAt); err != nil {
+			if err := adb.InsertScopedToken(ctx, id, label, hash, comment, scope, audit.CurrentActor(), expiresAt); err != nil {
 				return fmt.Errorf("store token: %w", err)
 			}
 
@@ -161,7 +167,7 @@ Examples:
 			return nil
 		},
 	}
-	c.Flags().StringArrayVar(&scopeArgs, "scope", nil, "What the token may do: read, write, admin, each optionally :<type>,... (e.g. write:npm,pypi); or inventory. Required")
+	c.Flags().StringArrayVar(&scopeArgs, "scope", nil, "What the token may do: read, write (each optionally :<type>,..., e.g. write:npm,pypi), admin, approve, superadmin; or inventory. Required")
 	return c
 }
 

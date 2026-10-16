@@ -840,7 +840,7 @@ paths:
   /api/v1/tokens:
     get:
       summary: List API tokens
-      description: Returns metadata for all tokens. Hashes are never exposed.
+      description: Returns metadata for all tokens. Hashes are never exposed. A token presented must hold `superadmin`.
       operationId: listTokens
       tags: [status]
       security:
@@ -858,7 +858,10 @@ paths:
       summary: Create a new API token
       description: |
         Generates a new token. The raw token is included in the response
-        and cannot be retrieved later.
+        and cannot be retrieved later. The caller needs a token that names an
+        identity, as on the override routes, even on a server whose mutation
+        gate takes no token, and that token must hold `superadmin`. The
+        identity is recorded as the new token's `CreatedBy`.
       operationId: createToken
       tags: [status]
       security:
@@ -881,10 +884,11 @@ paths:
                 scope:
                   type: string
                   description: |
-                    What the token may do: one or more of read, write, admin, each
-                    optionally narrowed to package types (write:npm,pypi); or
-                    inventory. Required, so no token is minted for everything by
-                    default.
+                    What the token may do: one or more of read and write, each
+                    optionally narrowed to package types (write:npm,pypi), admin,
+                    approve and superadmin; or inventory. admin implies neither
+                    approve nor superadmin. Required, so no token is minted for
+                    everything by default.
                   example: "read,write:npm"
       responses:
         "201":
@@ -1208,8 +1212,8 @@ paths:
         bound with `bodega identity bind token`, or one minted by
         `POST /api/v1/auth/exchange` or `bodega login`, which acts as
         `<issuer>#<subject>`. A binding wins when a token has both. Listing
-        needs `admin`, because the list names every requester and voter;
-        requesting needs `write`, and approving or rejecting `admin`.
+        needs `admin` or `approve`, because the list names every requester and
+        voter; requesting needs `write`, and approving or rejecting `approve`.
       operationId: listOverrides
       tags: [status]
       security:
@@ -1236,7 +1240,7 @@ paths:
         "401":
           description: No token, or an operator-minted token bound to no identity
         "403":
-          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin` and `approve`
         "503":
           description: Audit database not configured
     post:
@@ -1320,7 +1324,7 @@ paths:
         "401":
           description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The caller requested this override, or the token lacks `admin`
+          description: The caller requested this override, or the token lacks `approve`
         "404":
           description: No override with that id
         "409":
@@ -1357,7 +1361,7 @@ paths:
         "401":
           description: No token, or an operator-minted token bound to no identity
         "403":
-          description: The token lacks `admin`
+          description: The token lacks `approve`
         "404":
           description: No override with that id
         "409":
@@ -1373,7 +1377,7 @@ paths:
         most recently refused first, each with the identities and client
         addresses that asked. Rows are written whatever `discover_mode` says.
         Restricted to IPs in `admin_permit_cidr`, and a token presented must
-        hold `admin`.
+        hold `admin` or `approve`.
       operationId: listQueue
       tags: [status]
       parameters:
@@ -1410,7 +1414,7 @@ paths:
         "400":
           description: Unknown type, check or state
         "403":
-          description: Client IP is not in admin_permit_cidr, or the token lacks `admin`
+          description: Client IP is not in admin_permit_cidr, or the token lacks `admin` and `approve`
         "503":
           description: Audit database not configured
 
@@ -1424,7 +1428,7 @@ paths:
         check, or the override already pending or active for that version
         and check. Like the override routes it requires a token bound to an
         identity, which is recorded as the actor, and the token must hold
-        `admin`: approving writes an allow-list rule or a profile pin. A row
+        `approve`: approving writes an allow-list rule or a profile pin. A row
         refused as known
         malware or for upstream provenance that failed to verify is refused
         with 409 and stays open.
@@ -1459,7 +1463,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token lacks `admin`
+          description: Client IP is not permitted, or the token lacks `approve`
         "404":
           description: No queue row with that id
         "409":
@@ -1472,7 +1476,7 @@ paths:
       summary: Close one queue row without admitting anything
       description: |
         Records the token identity as the actor, and the token must hold
-        `admin`. The row reopens if the same refusal happens again.
+        `approve`. The row reopens if the same refusal happens again.
       operationId: dismissQueue
       tags: [status]
       security:
@@ -1501,7 +1505,7 @@ paths:
         "401":
           description: No token, or a token bound to no identity
         "403":
-          description: Client IP is not permitted, or the token lacks `admin`
+          description: Client IP is not permitted, or the token lacks `approve`
         "404":
           description: No queue row with that id
         "409":
@@ -1512,6 +1516,7 @@ paths:
   /api/v1/tokens/{id}:
     delete:
       summary: Revoke a token
+      description: A token presented must hold `superadmin`.
       operationId: revokeToken
       tags: [status]
       security:
@@ -3087,14 +3092,21 @@ components:
           type: string
           example: "read,write:npm,pypi"
           description: |
-            read, write and admin, each optionally narrowed to package types;
-            or inventory, which reaches reads and the inventory push routes
+            read and write, each optionally narrowed to package types, admin,
+            approve and superadmin; or inventory, which reaches reads and the
+            inventory push routes
         Subject:
           type: string
           description: The ID token subject an exchanged token acts for; empty on a minted token
         Issuer:
           type: string
           description: The issuer of that ID token; empty on a minted token
+        CreatedBy:
+          type: string
+          description: |
+            The identity that minted the token: the caller's override identity
+            on the API, the principal for an exchanged token, the invoking user
+            on the CLI. Empty on a token minted before migration 037.
         CreatedAt:
           type: string
           format: date-time

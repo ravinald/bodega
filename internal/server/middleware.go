@@ -1057,54 +1057,86 @@ func bearerOf(r *http.Request) (string, bool) {
 	return auth, true
 }
 
-// adminPrefixes are the routes the admin scope reaches: tokens, policies,
-// the audit trail, the resolved configuration, the per-host inventory and
-// profile views, the votes on a two-person override, and the refusal review
-// queue. Every route here is also behind admin_permit_cidr.
+// adminPrefixes are the routes the admin scope reaches: policies, the audit
+// trail, the resolved configuration, the per-host inventory and profile
+// views, and anything under the override and queue paths that is neither a
+// vote nor a list. Every route here, and every superadmin and approve route,
+// is also behind admin_permit_cidr.
 //
-// The queue is admin read and write alike: its list names each requester and
-// client address, and approving a row writes an allow-list rule or edits a
-// profile, which is what POST /api/v1/policies does.
-//
-// Only the votes under /api/v1/overrides/ are admin among the override
-// mutations. Requesting an override is a write: the second person approving
-// is the act the admin scope separates from the first.
+// Requesting an override is a write: the second person approving is the act
+// the approve scope separates from the first.
 var adminPrefixes = []string{
-	"/api/v1/tokens", "/api/v1/policies", "/api/v1/audit", "/api/v1/config",
+	"/api/v1/policies", "/api/v1/audit", "/api/v1/config",
 	"/api/v1/inventory/", "/api/v1/profiles/", "/api/v1/overrides/", "/api/v1/queue",
 }
 
-// adminReads are routes whose read is admin while a mutation on the same path
-// is not. The override list names every requester and voter.
-var adminReads = []string{"/api/v1/overrides"}
+// superadminPrefixes are token minting, listing and revocation. Whoever can
+// mint a token can mint a second voter, so this sits apart from admin and
+// approve.
+var superadminPrefixes = []string{"/api/v1/tokens"}
 
-// routeScope names the scope a request needs and the package type it is
-// for, "" when the route is not tied to one type. An empty scope is a route
-// no token scope governs: the health probe and the token exchange itself.
+// approveVerbs are the votes under each prefix, <prefix><id>/<verb>.
+// Approving a queue row writes an allow-list rule or edits a profile, so it
+// grants an exception the way an override vote does.
+var approveVerbs = map[string][]string{
+	"/api/v1/overrides/": {"approve", "reject"},
+	"/api/v1/queue/":     {"approve", "dismiss"},
+}
+
+// reviewLists are reads that admin or approve reaches: an approver needs the
+// pending rows to vote on, and an operator the record of what was granted.
+// Each names every requester, so neither is a plain read.
+var reviewLists = []string{"/api/v1/overrides", "/api/v1/queue"}
+
+// routeScope names the scopes a request may present, any one of which
+// suffices, and the package type it is for, "" when the route is not tied to
+// one type. No scope is a route no token scope governs: the health probe and
+// the token exchange itself.
 //
 // Bulk import is write with no type here, because its body can name several;
 // handleBulkImport holds each entry to the token's types.
-func routeScope(r *http.Request) (scope, pkgType string) {
+func routeScope(r *http.Request) (scopes []string, pkgType string) {
 	p := r.URL.Path
 	if p == "/healthz" || strings.HasPrefix(p, authPathPrefix) {
-		return "", ""
+		return nil, ""
+	}
+	isRead := r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r)
+	for _, pre := range superadminPrefixes {
+		if strings.HasPrefix(p, pre) {
+			return []string{audit.ScopeSuperadmin}, ""
+		}
+	}
+	if isApproveVote(p) {
+		return []string{audit.ScopeApprove}, ""
+	}
+	if isRead && slices.Contains(reviewLists, p) {
+		return []string{audit.ScopeAdmin, audit.ScopeApprove}, ""
 	}
 	for _, pre := range adminPrefixes {
 		if strings.HasPrefix(p, pre) {
-			return audit.ScopeAdmin, ""
+			return []string{audit.ScopeAdmin}, ""
 		}
 	}
-	if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
-		if slices.Contains(adminReads, p) {
-			return audit.ScopeAdmin, ""
-		}
-		return audit.ScopeRead, scopeTypeOf(p)
+	if isRead {
+		return []string{audit.ScopeRead}, scopeTypeOf(p)
 	}
 	t, _ := parseAPIPackagePath(p)
 	if t == "import" {
 		t = ""
 	}
-	return audit.ScopeWrite, t
+	return []string{audit.ScopeWrite}, t
+}
+
+func isApproveVote(p string) bool {
+	for pre, verbs := range approveVerbs {
+		rest, ok := strings.CutPrefix(p, pre)
+		if !ok {
+			continue
+		}
+		id, verb, ok := strings.Cut(rest, "/")
+		return ok && id != "" && slices.Contains(verbs, verb)
+	}
+	return false
 }
 
 // scopeTypeOf is the package type a read path serves, or "".
@@ -1123,14 +1155,18 @@ func scopeTypeOf(p string) string {
 // 403 and the audit row when they do not.
 func authorizeScope(w http.ResponseWriter, r *http.Request, auditDB *audit.DB, logger *slog.Logger, tok audit.TokenHash) bool {
 	need, typ := routeScope(r)
-	if need == "" {
+	if len(need) == 0 {
 		return true
 	}
 	scopes, err := audit.ParseScopes(tok.Scope)
-	if err == nil && scopes.Allows(need, typ) {
+	if err == nil && slices.ContainsFunc(need, func(n string) bool { return scopes.Allows(n, typ) }) {
 		return true
 	}
-	refuseScope(w, r, auditDB, logger, tok, missingScope(need, typ))
+	missing := make([]string, len(need))
+	for i, n := range need {
+		missing[i] = missingScope(n, typ)
+	}
+	refuseScope(w, r, auditDB, logger, tok, strings.Join(missing, " or "))
 	return false
 }
 

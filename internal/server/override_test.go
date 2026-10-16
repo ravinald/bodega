@@ -55,7 +55,7 @@ func newOverrideServer(t *testing.T) *Server {
 		"w1": {writerToken, audit.ScopeWrite},
 		"r1": {readerToken, audit.ScopeRead},
 	} {
-		if err := s.auditDB.InsertScopedToken(ctx, id, id, audit.HashToken(st.tok, invPepper), "", st.scope, nil); err != nil {
+		if err := s.auditDB.InsertScopedToken(ctx, id, id, audit.HashToken(st.tok, invPepper), "", st.scope, "test-operator", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -139,15 +139,15 @@ func TestOverrideRoutesCheckScope(t *testing.T) {
 		want                            int
 		missing                         string
 	}{
-		{"write token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", false, http.StatusForbidden, "admin"},
-		{"write token rejecting", http.MethodPost, "/api/v1/overrides/" + id + "/reject", writerToken, "", false, http.StatusForbidden, "admin"},
-		{"write token approving over Basic", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", true, http.StatusForbidden, "admin"},
+		{"write token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", false, http.StatusForbidden, "approve"},
+		{"write token rejecting", http.MethodPost, "/api/v1/overrides/" + id + "/reject", writerToken, "", false, http.StatusForbidden, "approve"},
+		{"write token approving over Basic", http.MethodPost, "/api/v1/overrides/" + id + "/approve", writerToken, "", true, http.StatusForbidden, "approve"},
 		{"inventory token requesting", http.MethodPost, "/api/v1/overrides", scopedToken, overrideBody, false, http.StatusForbidden, "write"},
 		{"inventory token requesting over Basic", http.MethodPost, "/api/v1/overrides", scopedToken, "", true, http.StatusForbidden, "write"},
-		{"inventory token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", scopedToken, "", false, http.StatusForbidden, "admin"},
+		{"inventory token approving", http.MethodPost, "/api/v1/overrides/" + id + "/approve", scopedToken, "", false, http.StatusForbidden, "approve"},
 		{"read token requesting", http.MethodPost, "/api/v1/overrides", readerToken, overrideBody, false, http.StatusForbidden, "write"},
-		{"read token listing", http.MethodGet, "/api/v1/overrides", readerToken, "", false, http.StatusForbidden, "admin"},
-		{"write token listing over Basic", http.MethodGet, "/api/v1/overrides", writerToken, "", true, http.StatusForbidden, "admin"},
+		{"read token listing", http.MethodGet, "/api/v1/overrides", readerToken, "", false, http.StatusForbidden, "admin or approve"},
+		{"write token listing over Basic", http.MethodGet, "/api/v1/overrides", writerToken, "", true, http.StatusForbidden, "admin or approve"},
 	} {
 		var rec *httptest.ResponseRecorder
 		if tc.basic {
@@ -175,14 +175,20 @@ func TestOverrideRoutesCheckScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var admin int
+	var votes, lists int
 	for _, r := range rows {
-		if r.Status == audit.DenialTokenScope && strings.Contains(r.Details, `"missing_scope":"admin"`) {
-			admin++
+		if r.Status != audit.DenialTokenScope {
+			continue
+		}
+		if strings.Contains(r.Details, `"missing_scope":"approve"`) {
+			votes++
+		}
+		if strings.Contains(r.Details, `"missing_scope":"admin or approve"`) {
+			lists++
 		}
 	}
-	if admin != 6 {
-		t.Errorf("%d token_scope denials name missing_scope admin, want 6: %+v", admin, rows)
+	if votes != 4 || lists != 2 {
+		t.Errorf("token_scope denials name approve %d times and admin or approve %d, want 4 and 2: %+v", votes, lists, rows)
 	}
 }
 

@@ -1008,6 +1008,7 @@ type TokenInfo struct {
 	Scope     string
 	Subject   string // set on a token an OIDC exchange minted
 	Issuer    string
+	CreatedBy string // the identity that minted it; empty before migration 037
 	CreatedAt time.Time
 	ExpiresAt *time.Time // nil = never expires
 	LastUsed  *time.Time // nil = never used
@@ -1032,38 +1033,45 @@ func (h TokenHash) Principal() (Principal, bool) {
 	return Principal{Subject: h.Subject, Issuer: h.Issuer}, true
 }
 
-// InsertToken stores a new hashed API token with full scope.
+// InsertToken stores a new hashed API token with full scope, minted by the
+// invoking user.
 func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, expiresAt *time.Time) error {
-	return a.InsertScopedToken(ctx, id, label, hash, comment, ScopeFull, expiresAt)
+	return a.InsertScopedToken(ctx, id, label, hash, comment, ScopeFull, CurrentActor(), expiresAt)
 }
 
 // InsertScopedToken stores a new hashed API token limited to scope, which is
-// stored in canonical form.
-func (a *DB) InsertScopedToken(ctx context.Context, id, label, hash, comment, scope string, expiresAt *time.Time) error {
-	return a.insertToken(ctx, id, label, hash, comment, scope, expiresAt, Principal{})
+// stored in canonical form, recording createdBy as the identity that minted it.
+func (a *DB) InsertScopedToken(ctx context.Context, id, label, hash, comment, scope, createdBy string, expiresAt *time.Time) error {
+	return a.insertToken(ctx, id, label, hash, comment, scope, createdBy, expiresAt, Principal{})
 }
 
 // InsertExchangedToken stores a token an OIDC exchange minted, recording the
-// subject and issuer it acts for.
+// subject and issuer it acts for. The principal minted it for itself.
 func (a *DB) InsertExchangedToken(ctx context.Context, id, label, hash, scope string, expiresAt time.Time, p Principal) error {
 	if p.Subject == "" || p.Issuer == "" {
 		return fmt.Errorf("an exchanged token needs a subject and an issuer")
 	}
-	return a.insertToken(ctx, id, label, hash, "", scope, &expiresAt, p)
+	return a.insertToken(ctx, id, label, hash, "", scope, p.Identity(), &expiresAt, p)
 }
 
-func (a *DB) insertToken(ctx context.Context, id, label, hash, comment, scope string, expiresAt *time.Time, p Principal) error {
+// insertToken refuses a token with no creator: the override quorum discounts
+// a vote cast on a token the requester minted, and an empty creator would
+// match no requester.
+func (a *DB) insertToken(ctx context.Context, id, label, hash, comment, scope, createdBy string, expiresAt *time.Time, p Principal) error {
 	canon, err := CanonicalScopes(scope)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(createdBy) == "" {
+		return errors.New("a token needs the identity that minted it")
 	}
 	var exp sql.NullString
 	if expiresAt != nil {
 		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
 	}
 	_, err = a.writer().ExecContext(ctx,
-		"INSERT INTO api_tokens (id, label, hash, comment, scope, expires_at, subject, issuer) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		id, label, hash, comment, canon, exp, p.Subject, p.Issuer,
+		"INSERT INTO api_tokens (id, label, hash, comment, scope, expires_at, subject, issuer, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		id, label, hash, comment, canon, exp, p.Subject, p.Issuer, createdBy,
 	)
 	a.tokenGen.Add(1)
 	return err
@@ -1087,13 +1095,19 @@ func (a *DB) DeleteExpiredExchangedTokens(ctx context.Context, now time.Time) (i
 // ListTokens returns metadata for all tokens (never the hash).
 func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	rows, err := a.db.QueryContext(ctx,
-		"SELECT id, label, comment, scope, subject, issuer, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+		"SELECT id, label, comment, scope, subject, issuer, created_by, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
 	)
 	if err != nil && strings.Contains(err.Error(), "no such column") {
 		// A store opened read-only is never migrated, and bodega doctor reads
-		// one that predates migration 036 to report on the tokens in it.
+		// one that predates migration 037 to report on the tokens in it.
 		rows, err = a.db.QueryContext(ctx,
-			"SELECT id, label, comment, scope, '', '', created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+			"SELECT id, label, comment, scope, subject, issuer, '', created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+		)
+	}
+	if err != nil && strings.Contains(err.Error(), "no such column") {
+		// Older still: predates migration 036.
+		rows, err = a.db.QueryContext(ctx,
+			"SELECT id, label, comment, scope, '', '', '', created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
 		)
 	}
 	if err != nil {
@@ -1105,7 +1119,7 @@ func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
 	for rows.Next() {
 		var t TokenInfo
 		var created, expires, lastUsed sql.NullString
-		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &t.Scope, &t.Subject, &t.Issuer, &created, &expires, &lastUsed); err != nil {
+		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &t.Scope, &t.Subject, &t.Issuer, &t.CreatedBy, &created, &expires, &lastUsed); err != nil {
 			return nil, err
 		}
 		if created.Valid {

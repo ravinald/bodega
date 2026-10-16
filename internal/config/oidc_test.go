@@ -22,6 +22,7 @@ func TestLoadValidatesOIDCProviders(t *testing.T) {
 		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a","rules":[{"claims":{},"scopes":"read"}]}]}`, "no claims to match"},
 		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a","rules":[{"claims":{"sub":"*"},"scopes":"read"}]}]}`, "matches anything"},
 		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a","rules":[{"claims":{"sub":"x"},"scopes":"root"}]}]}`, "unknown scope"},
+		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a","rules":[{"claims":{"groups":"oncall-primary"},"scopes":"read,approve"},{"claims":{"sub":"x"},"scopes":"superadmin"}]}]}`, ""},
 		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a","rules":[{"claims":{"sub":"x"},"scopes":"inventory"}]}]}`, "cannot grant inventory"},
 		{`{"oidc_providers":[{"issuer":"https://idp.example","audience":"a",` + rule + `},{"issuer":"https://idp.example","audience":"b",` + rule + `}]}`, "configured twice"},
 	}
