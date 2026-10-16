@@ -835,7 +835,16 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 			if tc.also != "" && !strings.Contains(f.next, tc.also) {
 				t.Errorf("next %q does not name %q", f.next, tc.also)
 			}
-			if tc.details[audit.DetailNoTrustedRoot] == nil && strings.Contains(f.next, "trusted root") {
+			if tc.details["outcome"] == audit.ProvenanceUnknown {
+				noRoot := tc.details[audit.DetailNoTrustedRoot] == true
+				if strings.Contains(f.reason, "evidence could not be read") == noRoot {
+					t.Errorf("reason %q: says the evidence could not be read = %v, want %v", f.reason, noRoot, !noRoot)
+				}
+				if strings.Contains(f.reason, "no Sigstore trusted root") != noRoot {
+					t.Errorf("reason %q: names the missing trusted root = %v, want %v", f.reason, !noRoot, noRoot)
+				}
+			}
+			if tc.details[audit.DetailNoTrustedRoot] == nil && (strings.Contains(f.next, "trusted root") || strings.Contains(f.reason, "trusted root")) {
 				t.Errorf("next %q names the trusted root for a refusal that had one", f.next)
 			}
 			if strings.Contains(body, "http://") || strings.Contains(body, "https://") {
