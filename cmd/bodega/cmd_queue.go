@@ -151,7 +151,7 @@ func newQueueApproveCmd(gf *globalFlags) *cobra.Command {
 				fmt.Printf("Approved %d: requested override %s for %s past %s, expiring %s.\n",
 					q.ID, o.ID, queueSubject(q), o.Check, o.ExpiresAt.Format(time.RFC3339))
 				fmt.Printf("It applies once %d more identit(ies) other than %s approve it:\n  bodega override approve %s\n",
-					o.Quorum-len(o.Approvers()), o.RequestedBy, o.ID)
+					o.ApprovalsNeeded, o.RequestedBy, o.ID)
 			}
 			if res.Warning != "" {
 				fmt.Fprintln(cmd.ErrOrStderr(), "warning: "+res.Warning)

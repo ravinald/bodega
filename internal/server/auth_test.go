@@ -428,8 +428,9 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 				t.Fatalf("write token requesting = %d %s, want 201", rec.Code, rec.Body)
 			}
 			o := decodeOverride(t, rec.Body.Bytes())
-			if o.RequestedBy != appID {
-				t.Errorf("requested_by = %q, want %q", o.RequestedBy, appID)
+			if o.RequestedBy != appID || o.RequesterCounts || o.ApprovalsNeeded != 3 {
+				t.Errorf("requested = by %q, counted %v, needs %d; want by %q, not counted, needs 3",
+					o.RequestedBy, o.RequesterCounts, o.ApprovalsNeeded, appID)
 			}
 			approve := "/api/v1/overrides/" + o.ID + "/approve"
 
@@ -477,7 +478,10 @@ func TestOverrideRoutesAcceptExchangedTokens(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("bound exchanged token approving = %d %s, want 200", rec.Code, rec.Body)
 			}
-			if got := decodeOverride(t, rec.Body.Bytes()); got.Status != audit.OverrideStatusActive || len(got.Votes) != 2 || got.Votes[1].Identity != "erin" {
+			// The requester's token holds write, not approve, so it does not
+			// count: two approvers leave a quorum of 3 one short.
+			if got := decodeOverride(t, rec.Body.Bytes()); got.Status != audit.OverrideStatusPending || got.RequesterCounts ||
+				got.ApprovalsNeeded != 1 || len(got.Votes) != 2 || got.Votes[1].Identity != "erin" || !got.Votes[1].Counted {
 				t.Errorf("after the bound vote = %+v", got)
 			}
 		})

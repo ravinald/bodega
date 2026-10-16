@@ -99,7 +99,7 @@ func (s *Server) handleListQueue(w http.ResponseWriter, r *http.Request) {
 // request, and the two-person rule means nothing when the request carries no
 // identity, so both queue mutations require a token bound to one.
 func (s *Server) queueCaller(w http.ResponseWriter, r *http.Request) (string, int64, bool) {
-	identity, ok := s.overrideCaller(w, r)
+	caller, ok := s.overrideCaller(w, r)
 	if !ok {
 		return "", 0, false
 	}
@@ -112,7 +112,7 @@ func (s *Server) queueCaller(w http.ResponseWriter, r *http.Request) (string, in
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no queue row " + strconv.Quote(r.PathValue("id"))})
 		return "", 0, false
 	}
-	return identity, id, true
+	return caller.Identity, id, true
 }
 
 func (s *Server) handleApproveQueue(w http.ResponseWriter, r *http.Request) {

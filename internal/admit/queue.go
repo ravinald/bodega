@@ -277,10 +277,12 @@ func approveOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, row
 	if expires == "" {
 		expires = formatTTL(cfg.ResolveOverrideMaxTTL())
 	}
+	// Approving a queue row takes approve on the API and runs as the host's
+	// CLI otherwise, so the actor filing this request always counts.
 	return RequestOverride(ctx, adb, cfg, OverrideRequest{
 		Type: row.PkgType, Name: row.PkgName, Version: row.PkgVersion, Check: row.Check,
 		Reason: fmt.Sprintf("queue #%d: %s", row.ID, a.Reason), Expires: expires,
-	}, actor, now)
+	}, audit.OverrideCaller{Identity: actor, Scope: audit.ScopeApprove}, now)
 }
 
 func recordQueueEvent(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor string) {

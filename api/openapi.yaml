@@ -1247,8 +1247,10 @@ paths:
       summary: Request an override for one check on one version
       description: |
         Records a pending override requested by the token's identity. It
-        applies only once `override_quorum` distinct identities, the
-        requester included, have approved it, and only until it expires.
+        applies only once `override_quorum` distinct identities holding
+        `approve` have approved it, and only until it expires. The requester
+        counts toward the quorum only when their token holds `approve`
+        (`requester_counts`); `approvals_needed` says how many more it needs.
         `expires` is required and at most `override_max_ttl`.
       operationId: requestOverride
       tags: [status]
@@ -1793,7 +1795,16 @@ components:
           format: date-time
         quorum:
           type: integer
-          description: Distinct identities, the requester included, that must approve
+          description: Distinct identities holding approve that must approve, the requester included when requester_counts
+        requester_counts:
+          type: boolean
+          description: |
+            Whether the requester counts toward the quorum: their token held
+            `approve` at request time, or they requested on the host's CLI.
+            Recorded with the request.
+        approvals_needed:
+          type: integer
+          description: How many more counted approvals a pending override needs; 0 once it is not pending
         state:
           type: string
           enum: [pending, approved, rejected]
@@ -1823,6 +1834,18 @@ components:
         voted_at:
           type: string
           format: date-time
+        scope:
+          type: string
+          description: The scope the voter's token held when it voted, or `local` for the host's CLI
+        counted:
+          type: boolean
+          description: Whether the vote counts toward the quorum
+        not_counted:
+          type: string
+          description: |
+            Why an approval does not count: the voter's token lacks `approve`,
+            or the requester minted the voter's token or made its identity
+            binding. Absent when it counts.
 
     OverrideVoteRequest:
       type: object

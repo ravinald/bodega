@@ -28,7 +28,7 @@ func osvOverride(version string) OverrideRequest {
 // request records req as alice at at, failing the test on a refusal.
 func request(t *testing.T, adb *audit.DB, cfg *config.Config, req OverrideRequest, at time.Time) audit.Override {
 	t.Helper()
-	o, err := RequestOverride(t.Context(), adb, cfg, req, "alice", at)
+	o, err := RequestOverride(t.Context(), adb, cfg, req, audit.LocalOverrideCaller("alice"), at)
 	if err != nil {
 		t.Fatalf("RequestOverride: %v", err)
 	}
@@ -37,7 +37,7 @@ func request(t *testing.T, adb *audit.DB, cfg *config.Config, req OverrideReques
 
 func vote(t *testing.T, adb *audit.DB, id, who string, approve bool, at time.Time) audit.Override {
 	t.Helper()
-	o, err := VoteOverride(t.Context(), adb, id, who, approve, "", at)
+	o, err := VoteOverride(t.Context(), adb, id, audit.LocalOverrideCaller(who), approve, "", at)
 	if err != nil {
 		t.Fatalf("%s voting %v on %s: %v", who, approve, id, err)
 	}
@@ -66,7 +66,7 @@ func TestOverrideNeedsASecondIdentity(t *testing.T) {
 		t.Fatalf("requested = %+v, want pending under the default quorum of 2", o)
 	}
 
-	if _, err := VoteOverride(t.Context(), f.adb, o.ID, "alice", true, "", now); !errors.Is(err, audit.ErrSelfApproval) {
+	if _, err := VoteOverride(t.Context(), f.adb, o.ID, audit.LocalOverrideCaller("alice"), true, "", now); !errors.Is(err, audit.ErrSelfApproval) {
 		t.Fatalf("self-approval = %v, want ErrSelfApproval", err)
 	}
 	if res, row := admitMinimist(t, f, "1.2.0"); res.OK() || checkOf(t, row, audit.CheckOSV).Status != audit.CheckBlock {
@@ -107,7 +107,7 @@ func TestOverrideQuorum(t *testing.T) {
 	if o.State != audit.OverridePending {
 		t.Fatalf("2 of 3 = %+v, want pending", o)
 	}
-	if _, err := VoteOverride(t.Context(), f.adb, o.ID, "bob", true, "", now); !errors.Is(err, audit.ErrAlreadyVoted) {
+	if _, err := VoteOverride(t.Context(), f.adb, o.ID, audit.LocalOverrideCaller("bob"), true, "", now); !errors.Is(err, audit.ErrAlreadyVoted) {
 		t.Fatalf("bob again = %v, want ErrAlreadyVoted", err)
 	}
 	if res, _ := admitMinimist(t, f, "1.2.0"); res.OK() {
@@ -131,7 +131,7 @@ func TestOverrideRejection(t *testing.T) {
 	if o := vote(t, f.adb, pending.ID, "bob", false, now); o.State != audit.OverrideRejected {
 		t.Fatalf("rejected = %+v", o)
 	}
-	if _, err := VoteOverride(t.Context(), f.adb, pending.ID, "carol", true, "", now); !errors.Is(err, audit.ErrOverrideClosed) {
+	if _, err := VoteOverride(t.Context(), f.adb, pending.ID, audit.LocalOverrideCaller("carol"), true, "", now); !errors.Is(err, audit.ErrOverrideClosed) {
 		t.Fatalf("approve after reject = %v, want ErrOverrideClosed", err)
 	}
 	if res, _ := admitMinimist(t, f, "1.2.0"); res.OK() {
@@ -163,7 +163,7 @@ func TestOverrideExpiry(t *testing.T) {
 	if res, _ := admitMinimist(t, f, "1.2.0"); res.OK() {
 		t.Fatal("an expired override admitted the version")
 	}
-	if _, err := VoteOverride(t.Context(), f.adb, o.ID, "carol", false, "", time.Now()); !errors.Is(err, audit.ErrOverrideClosed) {
+	if _, err := VoteOverride(t.Context(), f.adb, o.ID, audit.LocalOverrideCaller("carol"), false, "", time.Now()); !errors.Is(err, audit.ErrOverrideClosed) {
 		t.Errorf("vote after expiry = %v, want ErrOverrideClosed", err)
 	}
 	list, err := ListOverrides(t.Context(), f.adb, audit.OverrideStatusExpired, time.Now())
@@ -253,7 +253,7 @@ func TestOverrideRequestAfterProvenanceRefusal(t *testing.T) {
 	requestFor := func(version string) error {
 		req := osvOverride(version)
 		req.Check = audit.CheckUpstreamProvenance
-		_, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now())
+		_, err := RequestOverride(ctx, f.adb, f.synced, req, audit.LocalOverrideCaller("alice"), time.Now())
 		return err
 	}
 	const never = "invalid upstream provenance is never overridden"
@@ -318,7 +318,7 @@ func TestRequestOverrideRefusals(t *testing.T) {
 	} {
 		req := osvOverride("1.2.0")
 		tc.edit(&req)
-		_, err := RequestOverride(t.Context(), f.adb, f.synced, req, "alice", time.Now())
+		_, err := RequestOverride(t.Context(), f.adb, f.synced, req, audit.LocalOverrideCaller("alice"), time.Now())
 		if !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err = %v, want ErrInvalidOverride containing %q", name, err, tc.want)
 		}
@@ -327,7 +327,7 @@ func TestRequestOverrideRefusals(t *testing.T) {
 	cfg.OverrideMaxTTL = "90d"
 	req := osvOverride("1.2.0")
 	req.Expires = "60d"
-	if _, err := RequestOverride(t.Context(), f.adb, &cfg, req, "alice", time.Now()); err != nil {
+	if _, err := RequestOverride(t.Context(), f.adb, &cfg, req, audit.LocalOverrideCaller("alice"), time.Now()); err != nil {
 		t.Errorf("60d under a 90d cap: %v", err)
 	}
 }
@@ -366,13 +366,13 @@ func TestUnwaivableBlockOutranksCheckOrder(t *testing.T) {
 	}
 	req := osvOverride("1.0.1")
 	req.Check = audit.CheckUpstreamProvenance
-	_, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now())
+	_, err := RequestOverride(ctx, f.adb, f.synced, req, audit.LocalOverrideCaller("alice"), time.Now())
 	want := "npm/minimist@1.0.1 was also refused by integration:aikido, and known malware is never overridden; an override of upstream_provenance cannot admit it"
 	if !errors.Is(err, ErrInvalidOverride) || !strings.Contains(err.Error(), want) {
 		t.Errorf("override request beside a malware block: %v, want %q", err, want)
 	}
 	req.Check = malware.Check
-	if _, err := RequestOverride(ctx, f.adb, f.synced, req, "alice", time.Now()); err == nil ||
+	if _, err := RequestOverride(ctx, f.adb, f.synced, req, audit.LocalOverrideCaller("alice"), time.Now()); err == nil ||
 		!strings.Contains(err.Error(), "was refused by integration:aikido") {
 		t.Errorf("override request for the malware check itself: %v", err)
 	}
@@ -383,4 +383,106 @@ func TestUnwaivableBlockOutranksCheckOrder(t *testing.T) {
 	req = osvOverride("1.0.2")
 	req.Check = audit.CheckNameSimilarity
 	request(t, f.adb, f.synced, req, time.Now())
+}
+
+// A requester whose token holds write but not approve does not count toward
+// the quorum, so one approver leaves the request pending and a second
+// approves it. Each step says how many approvals remain.
+func TestWriteOnlyRequesterNeedsTwoApprovers(t *testing.T) {
+	f := newAdmissionFixture(t)
+	now := time.Now()
+	ci := audit.OverrideCaller{Identity: "f46-ci", Scope: "read,write:npm", TokenCreatedBy: "ops"}
+	o, err := RequestOverride(t.Context(), f.adb, f.synced, osvOverride("1.2.0"), ci, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.RequesterCounts || o.ApprovalsNeeded != 2 {
+		t.Fatalf("requested = counts %v, needs %d; want not counted, needs 2", o.RequesterCounts, o.ApprovalsNeeded)
+	}
+	approver := func(who string) audit.OverrideCaller {
+		return audit.OverrideCaller{Identity: who, Scope: "read,approve", TokenCreatedBy: "ops", BindingActor: "ops"}
+	}
+	o, err = VoteOverride(t.Context(), f.adb, o.ID, approver("alice"), true, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.State != audit.OverridePending || o.ApprovalsNeeded != 1 {
+		t.Fatalf("after one approver: state %s, needs %d; want pending, needs 1", o.State, o.ApprovalsNeeded)
+	}
+	if res, _ := admitMinimist(t, f, "1.2.0"); res.OK() {
+		t.Fatal("a write-only requester plus one approver admitted the version")
+	}
+	o, err = VoteOverride(t.Context(), f.adb, o.ID, approver("bob"), true, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.State != audit.OverrideApproved || o.ApprovalsNeeded != 0 {
+		t.Fatalf("after two approvers: state %s, needs %d; want approved", o.State, o.ApprovalsNeeded)
+	}
+	if got := strings.Join(o.Approvers(), ","); got != "alice,bob" {
+		t.Errorf("approvers = %s, want alice,bob (the requester does not count)", got)
+	}
+	if res, row := admitMinimist(t, f, "1.2.0"); !res.OK() || checkOf(t, row, audit.CheckOSV).Status != audit.CheckOverridden {
+		t.Fatalf("approved override did not admit: %+v", row)
+	}
+}
+
+// A requester holding approve counts, so one approver is the quorum.
+func TestApproveHoldingRequesterCounts(t *testing.T) {
+	f := newAdmissionFixture(t)
+	now := time.Now()
+	oncall := audit.OverrideCaller{Identity: "alice", Scope: "read,write,approve", TokenCreatedBy: "ops"}
+	o, err := RequestOverride(t.Context(), f.adb, f.synced, osvOverride("1.2.0"), oncall, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.RequesterCounts || o.ApprovalsNeeded != 1 {
+		t.Fatalf("requested = counts %v, needs %d; want counted, needs 1", o.RequesterCounts, o.ApprovalsNeeded)
+	}
+	o, err = VoteOverride(t.Context(), f.adb, o.ID, audit.OverrideCaller{Identity: "bob", Scope: "approve", TokenCreatedBy: "ops"}, true, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.State != audit.OverrideApproved {
+		t.Fatalf("state = %s, want approved", o.State)
+	}
+}
+
+// An approval from a token the requester minted, through a binding the
+// requester made, or from a token without approve is recorded with its scope
+// and the reason, and does not count.
+func TestVoteTheRequesterManufacturedDoesNotCount(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		voter audit.OverrideCaller
+		why   string
+	}{
+		{"token minted by the requester", audit.OverrideCaller{Identity: "sock", Scope: "approve", TokenCreatedBy: "alice", BindingActor: "ops"}, "minted by the requester"},
+		{"binding made by the requester", audit.OverrideCaller{Identity: "sock", Scope: "approve", TokenCreatedBy: "ops", BindingActor: "alice"}, "binding was made by the requester"},
+		{"token without approve", audit.OverrideCaller{Identity: "sock", Scope: "read,write", TokenCreatedBy: "ops"}, "not approve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAdmissionFixture(t)
+			now := time.Now()
+			o := request(t, f.adb, f.synced, osvOverride("1.2.0"), now)
+			o, err := VoteOverride(t.Context(), f.adb, o.ID, tc.voter, true, "", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, ok := VoteBy(o, "sock")
+			if !ok || v.Counted || !strings.Contains(v.NotCounted, tc.why) || v.Scope != tc.voter.Scope {
+				t.Fatalf("vote = %+v, want recorded, scope %q, not counted because %q", v, tc.voter.Scope, tc.why)
+			}
+			if o.State != audit.OverridePending || o.ApprovalsNeeded != 1 {
+				t.Fatalf("state %s, needs %d; want pending, needs 1", o.State, o.ApprovalsNeeded)
+			}
+			stored, err := f.adb.GetOverride(t.Context(), o.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sv, _ := VoteBy(stored, "sock"); sv.Counted || sv.NotCounted != v.NotCounted || sv.Scope != v.Scope {
+				t.Errorf("stored vote = %+v, want %+v", sv, v)
+			}
+		})
+	}
 }

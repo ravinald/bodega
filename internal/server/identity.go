@@ -145,6 +145,7 @@ type cidrBinding struct {
 // cidr is sorted longest prefix first, so the first match is the answer.
 type identitySet struct {
 	byToken map[string]string // token id -> identity
+	actors  map[string]string // token id -> who made its binding
 	cidr    []cidrBinding
 	tokens  []audit.TokenHash
 }
@@ -165,11 +166,12 @@ func (s *identitySet) token(id string) *audit.TokenHash {
 // binding table that loses every row on one bad entry would attribute the
 // whole fleet to nobody, silently.
 func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) *identitySet {
-	set := &identitySet{byToken: make(map[string]string, len(bindings)), tokens: tokens}
+	set := &identitySet{byToken: make(map[string]string, len(bindings)), actors: make(map[string]string, len(bindings)), tokens: tokens}
 	for _, b := range bindings {
 		switch b.Kind {
 		case audit.BindToken:
 			set.byToken[b.Key] = b.Identity
+			set.actors[b.Key] = b.Actor
 		case audit.BindCIDR:
 			p, err := netip.ParsePrefix(b.Key)
 			if err != nil {

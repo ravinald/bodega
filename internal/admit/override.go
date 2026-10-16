@@ -35,9 +35,11 @@ type OverrideRequest struct {
 var ErrInvalidOverride = errors.New("invalid override request")
 
 // RequestOverride validates req and records it as pending, requested by
-// identity at now. The quorum is the one configured now, recorded with the
-// request.
-func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req OverrideRequest, identity string, now time.Time) (audit.Override, error) {
+// requester at now. The quorum is the one configured now, and whether the
+// requester counts toward it is whether they hold approve now; both are
+// recorded with the request.
+func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req OverrideRequest, requester audit.OverrideCaller, now time.Time) (audit.Override, error) {
+	identity := requester.Identity
 	if adb == nil {
 		return audit.Override{}, errors.New("no audit store is open; overrides are recorded there")
 	}
@@ -87,23 +89,25 @@ func RequestOverride(ctx context.Context, adb *audit.DB, cfg *config.Config, req
 		ID: hex.EncodeToString(b[:]), PkgType: req.Type, PkgName: req.Name, PkgVersion: req.Version,
 		Check: req.Check, Reason: req.Reason, RequestedBy: identity,
 		RequestedAt: now.UTC(), ExpiresAt: now.Add(ttl).UTC(),
-		Quorum: cfg.ResolveOverrideQuorum(), State: audit.OverridePending, Votes: []audit.OverrideVote{},
+		Quorum: cfg.ResolveOverrideQuorum(), RequesterCounts: requester.HoldsApprove(),
+		State: audit.OverridePending, Votes: []audit.OverrideVote{},
 	}
 	if err := adb.InsertOverride(ctx, o); err != nil {
 		return audit.Override{}, fmt.Errorf("record override: %w", err)
 	}
-	recordOverrideEvent(ctx, adb, o, identity, "requested", map[string]any{"reason": o.Reason})
-	o.Status = o.StatusAt(now)
-	return o, nil
+	recordOverrideEvent(ctx, adb, o, identity, "requested", map[string]any{"reason": o.Reason,
+		"requester_counts": o.RequesterCounts, "approvals_needed": o.Remaining()})
+	return withStatus(o, now), nil
 }
 
-// VoteOverride records identity's approval or rejection of override id. It
-// is the one place both surfaces decide one, so the rules in
+// VoteOverride records voter's approval or rejection of override id. It is
+// the one place both surfaces decide one, so the rules in
 // audit.DB.VoteOverride hold whichever way the vote arrived.
-func VoteOverride(ctx context.Context, adb *audit.DB, id, identity string, approve bool, comment string, now time.Time) (audit.Override, error) {
+func VoteOverride(ctx context.Context, adb *audit.DB, id string, voter audit.OverrideCaller, approve bool, comment string, now time.Time) (audit.Override, error) {
 	if adb == nil {
 		return audit.Override{}, errors.New("no audit store is open; overrides are recorded there")
 	}
+	identity := voter.Identity
 	if identity == "" {
 		return audit.Override{}, fmt.Errorf("%w: no identity to record the vote under", ErrInvalidOverride)
 	}
@@ -111,13 +115,37 @@ func VoteOverride(ctx context.Context, adb *audit.DB, id, identity string, appro
 	if !approve {
 		vote, status = audit.VoteReject, "reject"
 	}
-	o, err := adb.VoteOverride(ctx, id, identity, vote, strings.TrimSpace(comment), now)
+	o, err := adb.VoteOverride(ctx, id, voter, vote, strings.TrimSpace(comment), now)
 	if err != nil {
 		return o, err
 	}
-	recordOverrideEvent(ctx, adb, o, identity, status, map[string]any{"comment": strings.TrimSpace(comment)})
+	extra := map[string]any{"comment": strings.TrimSpace(comment), "scope": voter.Scope}
+	if v, ok := VoteBy(o, identity); ok && !v.Counted {
+		extra["not_counted"] = v.NotCounted
+	}
+	recordOverrideEvent(ctx, adb, o, identity, status, extra)
+	return withStatus(o, now), nil
+}
+
+// VoteBy returns identity's vote on o.
+func VoteBy(o audit.Override, identity string) (audit.OverrideVote, bool) {
+	for _, v := range o.Votes {
+		if v.Identity == identity {
+			return v, true
+		}
+	}
+	return audit.OverrideVote{}, false
+}
+
+// withStatus fills the fields an override carries as read at now and never
+// stores. Only a pending request still open to votes needs approvals.
+func withStatus(o audit.Override, now time.Time) audit.Override {
 	o.Status = o.StatusAt(now)
-	return o, nil
+	o.ApprovalsNeeded = 0
+	if o.Status == audit.OverrideStatusPending {
+		o.ApprovalsNeeded = o.Remaining()
+	}
+	return o
 }
 
 // ListOverrides returns every override with its Status as of now, keeping
@@ -132,7 +160,7 @@ func ListOverrides(ctx context.Context, adb *audit.DB, want string, now time.Tim
 	}
 	out := []audit.Override{}
 	for _, o := range all {
-		o.Status = o.StatusAt(now)
+		o = withStatus(o, now)
 		if want == "" || o.Status == want {
 			out = append(out, o)
 		}

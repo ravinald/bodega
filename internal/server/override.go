@@ -11,8 +11,8 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 )
 
-// overrideCaller returns the identity the request votes or requests under,
-// writing the refusal when there is none. Every override route requires one,
+// overrideCaller returns who the request votes or requests as, writing the
+// refusal when nobody is named. Every override route requires one,
 // in the localhost-only posture too, where the mutation gate asks for no
 // token: a quorum of identities means nothing when a vote can arrive with
 // nobody named on it.
@@ -30,33 +30,42 @@ import (
 // only a Bearer credential on a localhost-only server, while the identity
 // resolves from any form credentialFrom reads, so a write token sent as Basic
 // would otherwise cast an approver's vote.
-func (s *Server) overrideCaller(w http.ResponseWriter, r *http.Request) (string, bool) {
-	identity, tok := s.overrideIdentity(r)
+func (s *Server) overrideCaller(w http.ResponseWriter, r *http.Request) (audit.OverrideCaller, bool) {
+	caller, tok := s.overrideCallerOf(r)
 	if tok == nil {
 		recordDenial(s.auditDB, r, audit.DenialTokenMissing, map[string]string{"route": "overrides"})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the override routes require a token bound to an identity " +
 			"(bodega token generate, then bodega identity bind token <id> <identity>) or one from bodega login or POST /api/v1/auth/exchange, " +
 			"sent as Authorization: Bearer <token>"})
-		return "", false
+		return audit.OverrideCaller{}, false
 	}
 	if !authorizeScope(w, r, s.auditDB, s.logger, *tok) {
-		return "", false
+		return audit.OverrideCaller{}, false
 	}
-	return identity, true
+	return caller, true
 }
 
 func (s *Server) overrideIdentity(r *http.Request) (string, *audit.TokenHash) {
+	c, tok := s.overrideCallerOf(r)
+	return c.Identity, tok
+}
+
+// overrideCallerOf is overrideIdentity with what the quorum weighs about the
+// caller: the token's scope and creator, and who made the binding.
+func (s *Server) overrideCallerOf(r *http.Request) (audit.OverrideCaller, *audit.TokenHash) {
 	if m := identityMatchOf(r); m.Kind == audit.BindToken && m.Identity != "" {
-		if tok := s.identityNow().token(m.Key); tok != nil {
-			return m.Identity, tok
+		set := s.identityNow()
+		if tok := set.token(m.Key); tok != nil {
+			return audit.OverrideCaller{Identity: m.Identity, Scope: tok.Scope,
+				TokenCreatedBy: tok.CreatedBy, BindingActor: set.actors[m.Key]}, tok
 		}
 	}
 	if tok, ok := principalTokenOf(r); ok {
 		if p, ok := tok.Principal(); ok {
-			return p.Identity(), &tok
+			return audit.OverrideCaller{Identity: p.Identity(), Scope: tok.Scope, TokenCreatedBy: tok.CreatedBy}, &tok
 		}
 	}
-	return "", nil
+	return audit.OverrideCaller{}, nil
 }
 
 func (s *Server) handleListOverrides(w http.ResponseWriter, r *http.Request) {

@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	tokenScopesVersion   = 36
-	approveScopesVersion = 37
+	tokenScopesVersion     = 36
+	approveScopesVersion   = 37
+	requesterCountsVersion = 38
 )
 
 // migrationBefore is the version the source holds immediately below v. The
@@ -338,5 +339,85 @@ func TestRecordStampsPrincipal(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Identity != "https://idp.example" {
 		t.Errorf("rows = %+v, want one with identity https://idp.example", rows)
+	}
+}
+
+// A request pending when migration 038 runs keeps the rule it was made
+// under: its requester counts, as do the votes already cast, so one more
+// approval still meets a quorum of 2. Going back down deletes a vote that
+// did not count and rejects a pending request whose requester did not, since
+// the older binary would count both.
+func TestRequesterCountsMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	m := migrator(t, raw)
+	before := migrationBefore(t, requesterCountsVersion)
+	if err := m.Migrate(before); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	at, until := formatOverrideTime(now), formatOverrideTime(now.Add(time.Hour))
+	if _, err := raw.Exec(`INSERT INTO overrides (id, pkg_type, pkg_name, pkg_version, check_name, reason,
+		requested_by, requested_at, expires_at, quorum, state) VALUES
+		('old', 'npm', 'minimist', '1.2.0', 'osv', 'r', 'f46-ci', ?, ?, 3, 'pending')`, at, until); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO override_votes (override_id, identity, vote, voted_at) VALUES ('old', 'alice', 'approve', ?)`, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adb, err := Open(path)
+	if err != nil {
+		t.Fatalf("open (migrates to latest): %v", err)
+	}
+	o, err := adb.GetOverride(t.Context(), "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.RequesterCounts || len(o.Votes) != 1 || !o.Votes[0].Counted || o.Remaining() != 1 {
+		t.Fatalf("after 038: %+v, want the requester and alice counted, one approval remaining", o)
+	}
+	o, err = adb.VoteOverride(t.Context(), "old", OverrideCaller{Identity: "bob", Scope: "approve"}, VoteApprove, "", now)
+	if err != nil || o.State != OverrideApproved {
+		t.Fatalf("bob's approval = %v, %v; want approved by f46-ci, alice and bob", o.State, err)
+	}
+
+	newer := Override{ID: "new", PkgType: "npm", PkgName: "minimist", PkgVersion: "1.2.1", Check: CheckOSV, Reason: "r",
+		RequestedBy: "f46-ci", RequestedAt: now, ExpiresAt: now.Add(time.Hour), Quorum: 2}
+	if err := adb.InsertOverride(t.Context(), newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adb.VoteOverride(t.Context(), "new", OverrideCaller{Identity: "sock", Scope: "approve", TokenCreatedBy: "f46-ci"}, VoteApprove, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := adb.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = raw.Close() }()
+	if err := migrator(t, raw).Migrate(before); err != nil {
+		t.Fatalf("down: %v", err)
+	}
+	var state string
+	var votes int
+	if err := raw.QueryRow(`SELECT state, (SELECT count(*) FROM override_votes WHERE override_id = 'new') FROM overrides WHERE id = 'new'`).
+		Scan(&state, &votes); err != nil {
+		t.Fatal(err)
+	}
+	if state != OverrideRejected || votes != 0 {
+		t.Errorf("after down: new is %s with %d vote(s), want rejected with none", state, votes)
+	}
+	if err := raw.QueryRow(`SELECT state FROM overrides WHERE id = 'old'`).Scan(&state); err != nil || state != OverrideApproved {
+		t.Errorf("after down: old is %s (%v), want approved, untouched", state, err)
 	}
 }
