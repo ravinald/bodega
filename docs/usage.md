@@ -1231,7 +1231,7 @@ bodega token generate ci-pipeline "Jenkins deploy key" --scope write:npm # with 
 bodega token create web-01 --scope inventory                             # a host's inventory push credential
 ```
 
-`create` is an alias for `generate`. `--scope` is required and says what the token may do: one or more of `read`, `write` and `admin`, each optionally narrowed to package types (`write:npm,pypi`), or `inventory` alone. Repeat the flag or separate scopes with commas. There is no default, so no token is minted for everything because a flag was left off. See [Token scopes](#token-scopes) for what each one reaches.
+`create` is an alias for `generate`. `--scope` is required and says what the token may do: one or more of `read`, `write`, `admin`, `approve` and `superadmin`, with `read` and `write` optionally narrowed to package types (`write:npm,pypi`), or `inventory` alone. Repeat the flag or separate scopes with commas. There is no default, so no token is minted for everything because a flag was left off. See [Token scopes](#token-scopes) for what each one reaches.
 
 On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`), mode `0640` owned by root in the group the service runs in, or `0600` where the host names no service account. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
 
@@ -3124,7 +3124,7 @@ bodega pkg import left-pad.json
 | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `request <type> <name> <version> --check <check> --reason <text> --expires <duration>` | Records a pending override and prints its id. All three flags are required.                                                                          |
 | `approve <id> [--comment <text>]`                                                      | Records an approval. Refused for the requester, and for an identity that already voted. Says so when the approval is recorded but does not count.    |
-| `reject <id> [--comment <text>]`                                                       | Records a rejection, which cancels the override for good, pending or approved. Anyone may reject, the requester included.                            |
+| `reject <id> [--comment <text>]`                                                       | Records a rejection, which cancels the override for good, pending or approved. Needs `approve` on the API; see below for the requester.              |
 | `list [--pending\|--active\|--expired] [--json]`                                       | Lists overrides newest first, with their status, approvals so far against the quorum, requester, expiry and reason. The three filters are exclusive. |
 
 `--check` names one of the checks an admission row carries: `allowlist`, `age`, `osv`, `upstream_provenance`, `name_similarity`, or `integration:<instance>` for an [integration](#integrations). The version is the one the admission row records: the version, or the ref for a git entry pinned by ref. A pypi name matches in its PEP 503 form, so `Foo_Bar` and `foo-bar` are the same request.
@@ -3145,6 +3145,22 @@ The quorum is recorded with each request when it is made, so changing `override_
 - An approval does not count when the requester minted the voter's token (its `created_by`) or made the identity binding it resolved through (the binding's `actor`). The vote is still recorded, with `counted: false` and the reason in `not_counted`, and `approve` prints that reason. This catches one person minting a second voter, not two people agreeing.
 
 `request` and `approve` print how many more approvals the override needs; the JSON carries it as `approvals_needed`. `list` marks the requester `(counted)` or `(not counted)`.
+
+A worked example under the default `override_quorum` of 2. A GitHub Actions job holding `write:npm` requests an override with `POST /api/v1/overrides`, and the answer carries:
+
+```json
+{
+  "id": "9c41e07a2b5d8f13",
+  "requested_by": "https://token.actions.githubusercontent.com#repo:acme/web:ref:refs/heads/main",
+  "quorum": 2,
+  "requester_counts": false,
+  "approvals_needed": 2
+}
+```
+
+The requester's token holds no `approve`, so `list` shows it `(not counted)` and the job contributes nothing toward the quorum. dana, on call with `read,approve`, approves: one counted approval, one more needed, and the version is still refused. erin, also holding `approve`, approves: two counted identities, so the override is approved and the next admission of `left-pad@1.3.0` records the check as `overridden`. Had the request come from an operator at the host's CLI, or from a token holding `approve`, the requester would count and dana's approval alone would reach 2. Had dana's token been minted by the job's identity, her vote would be recorded with `counted: false` and the override would still need two.
+
+**Withdrawing a request.** A rejection needs `approve` on the API, like an approval, so a requester holding only `write` (the CI case) cannot reject its own request with its own token: it gets `403` naming `approve`. Withdraw it from the host's CLI (`bodega override reject <id>`), or ask someone holding `approve`. An unapproved request costs nothing while it waits, and it lapses at its expiry.
 
 **Who is voting.** On the CLI the identity is the operator: `SUDO_USER` under sudo, otherwise the OS user. On the API it is the identity the request's token is bound to with `bodega identity bind token`, or, for a token from [`POST /api/v1/auth/exchange`](#authentication) or `bodega login` that carries no binding, `<issuer>#<subject>`: the provider's issuer URL, `#`, then the ID token's `sub` claim, such as `https://token.actions.githubusercontent.com#repo:acme/app:ref:refs/heads/main`. Each exchange mints a new token, but the subject stays the same, so one workflow or person exchanging twice is one identity; a binding on the token wins over its subject. Identities are compared as plain strings across both surfaces, so `alice` at the shell and a token bound to `alice` are one identity, and two requests or votes from one identity never count twice. See [the threat model](threat-model.md#two-person-overrides) for what that does and does not prove.
 
@@ -5997,14 +6013,29 @@ A bodega token is a bearer credential with scopes. Operators mint long-lived one
 
 ### Token scopes
 
-Every token carries one or more scopes. Each of `read`, `write` and `admin` may be narrowed to package types with a colon.
+Every token carries one or more scopes. `read` and `write` may be narrowed to package types with a colon. Each scope is granted only by naming it: `admin` implies neither `approve` nor `superadmin`, and neither of those implies `admin`. The operator who sets policy does not also approve exceptions to it, and nobody approving exceptions can mint a second voter.
 
-| Scope       | Reaches                                                                                                                                                                                                                    |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read`      | Every `GET` and `HEAD` that is not an admin route: the package routes (`/apt/`, `/pypi/`, `/npm/`, `/go/` and the rest), the `/api/v1/packages` reads, `/client/`, status, metrics, git clone                              |
-| `write`     | `POST /api/v1/packages/{type}`, `POST /api/v1/packages/import`, `DELETE /api/v1/packages/{type}/{name}`, and the hide and freeze toggles                                                                                   |
-| `admin`     | `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/audit`, `/api/v1/config`, `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins` and `/api/v1/queue`, read or write; `GET /api/v1/overrides` and the override votes |
-| `inventory` | Reads, plus the push routes inventory sources register. Combines with no other scope; see [Inventory token scope](#inventory-token-scope)                                                                                  |
+| Scope        | Reaches                                                                                                                                                                                       |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`       | Every `GET` and `HEAD` that is not an admin route: the package routes (`/apt/`, `/pypi/`, `/npm/`, `/go/` and the rest), the `/api/v1/packages` reads, `/client/`, status, metrics, git clone |
+| `write`      | `POST /api/v1/packages/{type}`, `POST /api/v1/packages/import`, `DELETE /api/v1/packages/{type}/{name}`, the hide and freeze toggles, and `POST /api/v1/overrides` (requesting an override)   |
+| `admin`      | `/api/v1/policies`, `/api/v1/audit`, `/api/v1/config`, `/api/v1/inventory/{identity}` and `/api/v1/profiles/{name}/pins`, read or write; `GET /api/v1/overrides` and `GET /api/v1/queue`      |
+| `approve`    | `POST /api/v1/overrides/{id}/approve` and `/reject`, `POST /api/v1/queue/{id}/approve` and `/dismiss`; `GET /api/v1/overrides` and `GET /api/v1/queue`                                        |
+| `superadmin` | `/api/v1/tokens`: minting, listing and revoking tokens                                                                                                                                        |
+| `inventory`  | Reads, plus the push routes inventory sources register. Combines with no other scope; see [Inventory token scope](#inventory-token-scope)                                                     |
+
+The two lists, `GET /api/v1/overrides` and `GET /api/v1/queue`, take `admin` or `approve`: an approver needs the pending rows to vote on, and an operator needs the record of what was granted. Every other route takes exactly the scope in its row. Binding a token to an identity, and editing `oidc_providers`, happen on the host through the CLI and the config file, which only root reaches.
+
+A typical split:
+
+| Holder                    | Scopes                  |
+| ------------------------- | ----------------------- |
+| Every client              | `read` or `read:<type>` |
+| CI, developers            | `read,write:<type>`     |
+| On-call, security review  | `read,approve`          |
+| Platform operators        | `read,admin`            |
+| One or two named people   | `superadmin`            |
+| A host reporting packages | `inventory`             |
 
 `write:npm,pypi` reaches the write routes for npm and pypi only. A route tied to no single type (`GET /api/v1/packages`, `/client/plan`) is reached by any grant of its scope, narrowed or not. `POST /api/v1/packages/import` holds each entry in the body to the token's types and refuses the ones outside them in its per-entry results, because the body can name several types and the rest of the import still lands. `admin` takes no types. `/healthz` and the `/api/v1/auth/` routes need no scope.
 
@@ -6021,6 +6052,15 @@ The refusal is a `denied` audit row with status `token_scope`, and its `details`
 **What scopes do not change.** They constrain a token that is presented. A request that presents none is decided as before: the read path is open, an admin read inside `admin_permit_cidr` needs no token, and a server whose `admin_permit_cidr` is loopback-only takes mutations from localhost with no token. A credential that matches no token on a read is treated as no credential. See [Threat model](threat-model.md).
 
 **Tokens minted before scopes.** Every existing token migrates to `read,write,admin`, so nothing in use stops working. `bodega doctor` warns once per unexpired token still holding all three unrestricted, under the check `token-scope`, with the command to mint a narrower one; `bodega token list` counts them. Downgrading to a release without scopes deletes every token narrower than `read,write,admin` and every exchanged token, rather than widening them.
+
+**Upgrading to `approve` and `superadmin`.** Migration 037 widens every stored token holding `admin` to `admin,approve,superadmin`, so a token that could vote and mint before the upgrade still can. That leaves every former admin holding both halves of the two-person rule until you narrow it. `bodega doctor` reports, under `token-scope`:
+
+- each unexpired token holding `superadmin` and `approve` together, by id and label, with the commands that replace it: `bodega token generate <label> --scope ...` for a token with one of the two, then `bodega token revoke <id>`. For a token from an exchange, it names the `oidc_providers` rule to narrow instead.
+- when fewer than `override_quorum` identities can reach `approve` while some token or rule can request an override. A token counts only once it is bound to an identity (`bodega identity bind token`), since the override routes refuse an unbound one, and two tokens bound to one identity count once. One `oidc_providers` rule granting `approve` is enough, since it reaches every identity the provider vouches for. The local CLI is not counted.
+
+There is no command that edits a token's scopes in place; replacing it is the narrowing. Downgrading past 037 narrows the widened tokens back to `admin` and deletes any other token naming `admin`, `approve` or `superadmin`, because the older binary would read it as more than it was issued.
+
+> **`oidc_providers` rules are not widened.** They live in `config.json`, which no migration touches. A rule granting `admin` granted voting and minting before the upgrade and grants neither after, and the change lands on the next `bodega login` or exchange, once the tokens issued before the upgrade expire: override votes and `POST /api/v1/tokens` then answer `403`. Add `approve` (and `superadmin`, for the people who should mint) to that rule, or move those people to a rule of their own. `bodega doctor` names each rule granting `admin` without `approve` in its `token-scope` row.
 
 ### OIDC providers
 
@@ -6149,6 +6189,51 @@ Signed in to https://bodega.example.com as 00u1a2b3c4 (https://acme.okta.com/oau
 It reads `GET /api/v1/auth/providers` for the providers that offer a device flow (a `client_id`, and an issuer whose discovery document names a `device_authorization_endpoint`), asks for `--provider` when there is more than one, runs the flow against the provider directly, and trades the ID token at `POST /api/v1/auth/exchange`. The provider's OAuth client must allow the device grant and the `openid` scope. Scopes come from the same rules a CI token's do, matched on the person's claims (`sub`, `email`, `groups`).
 
 The token is written to `credentials.json` in the user config directory (`$XDG_CONFIG_HOME/bodega`, `~/.config/bodega` on Linux, `~/Library/Application Support/bodega` on macOS), mode `0600` in a `0700` directory, keyed by server URL. `bodega pkg import --server` and `bodega pin` use it for that server until it expires. `$BODEGA_TOKEN` still wins over it, and it wins over `token` in the config file. Run `bodega login` again once it expires.
+
+### On-call approvers
+
+Put the approver rotation in the identity provider rather than in bodega's token table. A rule mapping the on-call group to `read,approve` gives whoever is in that group at sign-in a short-lived token that can vote on overrides and resolve queue rows, and nothing else:
+
+```json
+"oidc_providers": [
+  {
+    "name": "okta",
+    "issuer": "https://acme.okta.com/oauth2/default",
+    "client_id": "0oa1bodegacli",
+    "rules": [
+      {"claims": {"groups": "oncall-primary"}, "scopes": "read,approve"},
+      {"claims": {"groups": "bodega-admins"}, "scopes": "read,admin"},
+      {"claims": {"email": "*@acme.com"}, "scopes": "read"}
+    ]
+  }
+]
+```
+
+Rules are tried in order and the first match decides, so the on-call rule sits above the broader ones, and an engineer in both groups signs in with `read,approve` while on call. At handoff the identity provider moves people in and out of `oncall-primary`, and no bodega operator acts. The engineer coming on call signs in:
+
+```bash
+bodega login --server https://bodega.example.com --provider okta
+```
+
+```text
+Open https://acme.okta.com/activate and enter code WDJB-MJHT
+Signed in to https://bodega.example.com as 00u5e6f7g8 (https://acme.okta.com/oauth2/default).
+  Scopes:  read,approve
+  Expires: Tue, 13 Oct 2026 19:42:08 PDT
+  Stored:  /home/dana/.config/bodega/credentials.json
+```
+
+`bodega override` acts on the host's own store, so an approver elsewhere votes through the [override endpoints](#override-endpoints) with the token `bodega login` stored:
+
+```bash
+BODEGA_TOKEN=$(jq -r '.servers["https://bodega.example.com"].token' ~/.config/bodega/credentials.json)
+curl -sSf -H "Authorization: Bearer $BODEGA_TOKEN" 'https://bodega.example.com/api/v1/overrides?status=pending'
+curl -sSf -X POST -H "Authorization: Bearer $BODEGA_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"comment": "checked the diff against 1.2.9"}' \
+  https://bodega.example.com/api/v1/overrides/3f9a1c0e5b7d2a64/approve
+```
+
+Both are approver routes, so they also need the engineer's address inside `admin_permit_cidr`. The vote counts as `https://acme.okta.com/oauth2/default#00u5e6f7g8`, the issuer and the person's `sub`, so signing in twice is still one voter. A person who leaves the group keeps their current token until `oidc_token_ttl` runs out (15 minutes by default) and gets a narrower one on the next sign-in. This rule also satisfies the `token-scope` reach check in `bodega doctor`, whatever `override_quorum` is, because it reaches the whole group.
 
 ---
 
@@ -6342,14 +6427,14 @@ Policy mutations invalidate the in-memory cache, so changes take effect on the n
 
 ### Override endpoints
 
-| Method | Path                                | Scope   | Description                                                              |
-| ------ | ----------------------------------- | ------- | ------------------------------------------------------------------------ |
-| GET    | `/api/v1/overrides[?status=STATUS]` | `admin` | List overrides; `status` is `pending`, `active`, `expired` or `rejected` |
-| POST   | `/api/v1/overrides`                 | `write` | Request one (JSON body: `{type, name, version, check, reason, expires}`) |
-| POST   | `/api/v1/overrides/{id}/approve`    | `admin` | Approve (optional JSON body: `{comment}`)                                |
-| POST   | `/api/v1/overrides/{id}/reject`     | `admin` | Reject (optional JSON body: `{comment}`)                                 |
+| Method | Path                                | Scope                | Description                                                              |
+| ------ | ----------------------------------- | -------------------- | ------------------------------------------------------------------------ |
+| GET    | `/api/v1/overrides[?status=STATUS]` | `admin` or `approve` | List overrides; `status` is `pending`, `active`, `expired` or `rejected` |
+| POST   | `/api/v1/overrides`                 | `write`              | Request one (JSON body: `{type, name, version, check, reason, expires}`) |
+| POST   | `/api/v1/overrides/{id}/approve`    | `approve`            | Approve (optional JSON body: `{comment}`)                                |
+| POST   | `/api/v1/overrides/{id}/reject`     | `approve`            | Reject (optional JSON body: `{comment}`)                                 |
 
-These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, or one minted by an exchange or `bodega login`, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to, or its `<issuer>#<subject>` (see [Who is voting](#bodega-override-requestapproverejectlist)), is the requester or the voter. A request with no token, or with an operator-minted token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. The bound token must also hold the scope in the table, whichever header form carries it: a token without it gets `403` naming the missing scope. Requesting is a write and voting is the second person's act, so a CI token minted with `write` can ask for an override and cannot approve one, and an `inventory` token can do neither. Listing needs `admin` because the list names every requester and voter. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
+These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and every one requires a bearer token bound to an identity, or one minted by an exchange or `bodega login`, including on a server whose `admin_permit_cidr` is localhost only, where other mutations take none. The identity the token is bound to, or its `<issuer>#<subject>` (see [Who is voting](#bodega-override-requestapproverejectlist)), is the requester or the voter. A request with no token, or with an operator-minted token bound to nothing, gets `401`, and a CIDR binding does not count, because it names a network rather than a person. The bound token must also hold the scope in the table, whichever header form carries it: a token without it gets `403` naming the missing scope. Requesting is a write and voting is the second person's act, so a CI token minted with `write` can ask for an override and can neither approve nor reject one, and an `inventory` token can do none of the three. Listing needs `admin` or `approve` because the list names every requester and voter. Approving your own request is `403`; a second vote from one identity, or a vote on an override that is approved, rejected or expired, is `409`; an unknown id is `404`. The GET is also restricted to `admin_permit_cidr`, like the other admin reads.
 
 `POST /api/v1/auth/exchange` and `GET /api/v1/auth/providers` are the OIDC routes; the exchange sits outside `admin_permit_cidr` because the ID token is the credential. See [Authentication](#authentication).
 
@@ -6361,7 +6446,7 @@ These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and
 | POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires}`); answers what the approval did  |
 | POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
 
-These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). All three need the `admin` scope: the list names each requester and client address, and approving writes an allow-list rule or a profile pin, which a CI token holding `write` must not do for the package it was refused. A token without `admin` gets `403` naming it. The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
+These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list needs `admin` or `approve`, because it names each requester and client address. Approving and dismissing need `approve`: approving writes an allow-list rule or a profile pin, which grants an exception the way an override vote does, and a CI token holding `write` must not do that for the package it was refused. A token without the scope gets `403` naming it. The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
 
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 

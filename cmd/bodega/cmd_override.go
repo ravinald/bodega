@@ -35,8 +35,16 @@ CLI they always do, so the default is the requester plus one other identity,
 while a write-only API token (a CI pipeline) needs two approvers. The requester
 can never approve their own request, and one identity voting twice counts once.
 An approval from a token the requester minted, or through an identity binding
-the requester made, is recorded but does not count. A rejection by anyone, the
-requester included, cancels it for good, an approved one included.
+the requester made, is recorded but does not count. A rejection cancels it for
+good, an approved one included. Rejecting needs approve like approving does, so
+a requester holding only write (CI) withdraws a request from the host's CLI or
+through someone holding approve, not with its own token.
+
+Scopes on the API: write requests, approve approves and rejects, and listing
+needs admin or approve. Approval sits outside admin on purpose: whoever sets
+policy does not also approve exceptions to it. Give superadmin, which mints
+tokens, to someone other than the approvers: a holder of both can mint a
+second voter for a request someone else made.
 
 Once approved, the next admission of that version records the check as
 "overridden" with the override's id in its admission row. It stops applying

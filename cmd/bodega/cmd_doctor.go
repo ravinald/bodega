@@ -714,6 +714,7 @@ type postureStore interface {
 	ListProvenancePolicies(ctx context.Context) ([]audit.ProvenancePolicy, error)
 	ListAdmissionModes(ctx context.Context) ([]audit.AdmissionMode, error)
 	ListTokens(ctx context.Context) ([]audit.TokenInfo, error)
+	ListIdentityBindings(ctx context.Context) ([]audit.IdentityBinding, error)
 }
 
 // serverPostureFindings resolves this machine's install and reports on it,
@@ -748,7 +749,7 @@ func serverPostureFindings(ctx context.Context, gf *globalFlags) []host.Finding 
 		return postureSkipped("could not read audit store at "+path+": "+err.Error(), skipRemedy(path, err))
 	}
 	defer db.Close()
-	return serverPosture(ctx, db)
+	return serverPosture(ctx, db, cfg)
 }
 
 // postureUnavailable marks the posture rows N/A: this host holds nothing to
@@ -787,7 +788,7 @@ func skipRemedy(path string, err error) string {
 // are the three ways an install ends up enforcing nothing: never configured,
 // configured and then silenced, and configured against an ecosystem the gate
 // cannot evaluate.
-func serverPosture(ctx context.Context, store postureStore) []host.Finding {
+func serverPosture(ctx context.Context, store postureStore, cfg *config.Config) []host.Finding {
 	rules, err := store.ListPolicies(ctx)
 	if err != nil {
 		return postureSkipped("read allow-list: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
@@ -822,15 +823,22 @@ func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 		return append(findings, host.Finding{Check: "token-scope", Status: host.StatusSkip,
 			Detail: "read tokens: " + err.Error(), Remediation: "repair the audit store, then re-run `bodega doctor`"})
 	}
-	return append(findings, tokenScope(tokens, time.Now())...)
+	binds, err := store.ListIdentityBindings(ctx)
+	if err != nil && !strings.Contains(err.Error(), "no such table") {
+		return append(findings, host.Finding{Check: "token-scope", Status: host.StatusSkip,
+			Detail: "read identity bindings: " + err.Error(), Remediation: "repair the audit store, then re-run `bodega doctor`"})
+	}
+	now := time.Now()
+	return append(append(findings, tokenScope(tokens, now)...), approveReach(tokens, binds, cfg, now))
 }
 
-// tokenScope warns once for each unexpired token holding read, write and
-// admin with no type restriction. Every token minted before scopes existed
-// migrated to exactly that, so on an upgraded install this is the list of
-// credentials still as broad as they were before scopes could narrow them.
-// A store doctor opened read-only may predate the migration and still say
-// "full", which the parser reads as the same three.
+// tokenScope warns once for each unexpired token that is broader than one
+// holder should be. Read, write and admin with no type restriction is what
+// every pre-scope token migrated to. Superadmin with approve is what
+// migration 037 gave every admin token, and it is the pairing the override
+// quorum cannot survive: the holder can mint a token for a second identity
+// and then vote alongside it. A store doctor opened read-only may predate
+// the migrations and still say "full", which the parser reads as all five.
 func tokenScope(tokens []audit.TokenInfo, now time.Time) []host.Finding {
 	var out []host.Finding
 	for _, t := range tokens {
@@ -838,22 +846,123 @@ func tokenScope(tokens []audit.TokenInfo, now time.Time) []host.Finding {
 			continue
 		}
 		sc, err := audit.ParseScopes(t.Scope)
-		if err != nil || !sc.HoldsAll() {
+		if err != nil {
 			continue
 		}
-		out = append(out, host.Finding{
+		var why []string
+		if sc.HoldsAll() {
+			why = append(why, "read, write and admin on every package type")
+		}
+		if sc.Has(audit.ScopeSuperadmin) && sc.Has(audit.ScopeApprove) {
+			why = append(why, "superadmin with approve, so its holder can mint a token for a second identity and approve alongside it")
+		}
+		if len(why) == 0 {
+			continue
+		}
+		f := host.Finding{
 			Check:  "token-scope",
 			Status: host.StatusWarn,
-			Detail: fmt.Sprintf("token %s (%s) holds read, write and admin on every package type", t.ID, t.Label),
-			Remediation: fmt.Sprintf("mint a token scoped to what %s does (bodega token generate %s --scope ...), move its holder to it, then bodega token revoke %s",
+			Detail: fmt.Sprintf("token %s (%s) holds %s", t.ID, t.Label, strings.Join(why, "; and ")),
+			Remediation: fmt.Sprintf("mint a token scoped to what %s does (bodega token generate %s --scope ...), giving approve and superadmin to different people, move its holder to it, then bodega token revoke %s",
 				t.Label, t.Label, t.ID),
-		})
+		}
+		if t.Subject != "" {
+			f.Remediation = fmt.Sprintf("narrow the oidc_providers rule for %s that granted %s; the token itself expires on its own, or bodega token revoke %s ends it now",
+				t.Issuer, t.Scope, t.ID)
+		}
+		out = append(out, f)
 	}
 	if len(out) == 0 {
 		out = append(out, host.Finding{Check: "token-scope", Status: host.StatusOK,
-			Detail: "no token holds read, write and admin unrestricted"})
+			Detail: "no token holds read, write and admin unrestricted, or superadmin with approve"})
 	}
 	return out
+}
+
+// approveReach warns when overrides can never be approved over the API:
+// fewer than override_quorum identities can reach approve. An OIDC rule
+// granting approve reaches every member of an identity-provider group,
+// which doctor cannot count, so one such rule is enough. A static token
+// counts only once bound to an identity, since the override routes refuse
+// an unbound one, and two tokens bound to one identity are one voter. The
+// local CLI is not counted: it is whoever holds root on the host. With no
+// live token and no rule holding write, nobody can request an override over
+// the API, so there is nothing for the count to fall short of.
+func approveReach(tokens []audit.TokenInfo, binds []audit.IdentityBinding, cfg *config.Config, now time.Time) host.Finding {
+	f := host.Finding{Check: "token-scope", Status: host.StatusOK}
+	quorum := cfg.ResolveOverrideQuorum()
+	var adminRules []string
+	requesters := false
+	if cfg != nil {
+		for _, p := range cfg.OIDCProviders {
+			for i, r := range p.Rules {
+				sc, err := audit.ParseScopes(r.Scopes)
+				if err != nil {
+					continue
+				}
+				requesters = requesters || sc.Has(audit.ScopeWrite)
+				if sc.Has(audit.ScopeApprove) {
+					f.Detail = fmt.Sprintf("oidc_providers %s rule %d grants approve to every identity it matches", p.DisplayName(), i)
+					return f
+				}
+				if sc.Has(audit.ScopeAdmin) {
+					adminRules = append(adminRules, fmt.Sprintf("%s rule %d (%s)", p.DisplayName(), i, r.Scopes))
+				}
+			}
+		}
+	}
+	bound := map[string]string{}
+	for _, b := range binds {
+		if b.Kind == audit.BindToken {
+			bound[b.Key] = b.Identity
+		}
+	}
+	voters := map[string]bool{}
+	unbound := 0
+	for _, t := range tokens {
+		if t.ExpiresAt != nil && t.ExpiresAt.Before(now) {
+			continue
+		}
+		sc, err := audit.ParseScopes(t.Scope)
+		if err != nil {
+			continue
+		}
+		requesters = requesters || sc.Has(audit.ScopeWrite)
+		if !sc.Has(audit.ScopeApprove) {
+			continue
+		}
+		switch {
+		case bound[t.ID] != "":
+			voters[bound[t.ID]] = true
+		case t.Subject != "":
+			voters[audit.Principal{Subject: t.Subject, Issuer: t.Issuer}.Identity()] = true
+		default:
+			unbound++
+		}
+	}
+	lostApprove := ""
+	if len(adminRules) > 0 {
+		lostApprove = "; these OIDC rules grant admin, which included approve and superadmin before migration 037 and does not now: " +
+			strings.Join(adminRules, ", ")
+	}
+	if len(voters) >= quorum {
+		f.Detail = fmt.Sprintf("%d identities hold approve, override_quorum is %d", len(voters), quorum) + lostApprove
+		return f
+	}
+	if !requesters {
+		f.Detail = "no live token and no OIDC rule holds write, so no override can be requested over the API" + lostApprove
+		return f
+	}
+	f.Status = host.StatusWarn
+	f.Detail = fmt.Sprintf("%d identities hold approve and no OIDC rule grants it, but override_quorum is %d: no override requested over the API can be approved",
+		len(voters), quorum)
+	if unbound > 0 {
+		f.Detail += fmt.Sprintf("; %d approve token(s) are bound to no identity, which the override routes refuse", unbound)
+	}
+	f.Detail += lostApprove
+	f.Remediation = "add approve to an oidc_providers rule for the approver group (\"scopes\": \"read,approve\"), " +
+		"or bodega token generate <label> --scope approve and bodega identity bind token <id> <identity> for each approver"
+	return f
 }
 
 // policyMode names the ecosystems in open admission mode because they have no

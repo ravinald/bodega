@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
 
 	_ "modernc.org/sqlite" // the audit store's driver, for the raw handles below
@@ -28,6 +30,7 @@ type fakePosture struct {
 	provs []audit.ProvenancePolicy
 	modes []audit.AdmissionMode
 	toks  []audit.TokenInfo
+	binds []audit.IdentityBinding
 }
 
 func (f fakePosture) ListPolicies(context.Context) ([]audit.PolicyInfo, error) {
@@ -42,6 +45,9 @@ func (f fakePosture) ListAdmissionModes(context.Context) ([]audit.AdmissionMode,
 	return f.modes, nil
 }
 func (f fakePosture) ListTokens(context.Context) ([]audit.TokenInfo, error) { return f.toks, nil }
+func (f fakePosture) ListIdentityBindings(context.Context) ([]audit.IdentityBinding, error) {
+	return f.binds, nil
+}
 
 func findingFor(t *testing.T, findings []host.Finding, check string) host.Finding {
 	t.Helper()
@@ -58,7 +64,7 @@ func findingFor(t *testing.T, findings []host.Finding, check string) host.Findin
 // no control in front of it. doctor has to name it, and name the two commands
 // that end it.
 func TestDoctorReportsZeroPolicyInstall(t *testing.T) {
-	f := findingFor(t, serverPosture(context.Background(), fakePosture{}), "policy-coverage")
+	f := findingFor(t, serverPosture(context.Background(), fakePosture{}, nil), "policy-coverage")
 	if !f.IsFinding() {
 		t.Fatalf("an install with no allow-list and no age gate reported %s; it must count toward the exit-2 findings", f.Status)
 	}
@@ -73,7 +79,7 @@ func TestDoctorReportsZeroPolicyInstall(t *testing.T) {
 // that never made one, not the one that made a small one.
 func TestDoctorAcceptsAnyPolicyCoverage(t *testing.T) {
 	store := fakePosture{ages: []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"}}}
-	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); f.IsFinding() {
+	if f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage"); f.IsFinding() {
 		t.Errorf("an install with a seeded age gate reported %s: %s", f.Status, f.Detail)
 	}
 }
@@ -82,11 +88,11 @@ func TestDoctorAcceptsAnyPolicyCoverage(t *testing.T) {
 // nothing, because warn is what the check runs at with no row.
 func TestDoctorCountsAProvenanceBlockAsCoverage(t *testing.T) {
 	store := fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "block"}}}
-	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); f.IsFinding() {
+	if f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage"); f.IsFinding() {
 		t.Errorf("an install with an npm provenance block reported %s: %s", f.Status, f.Detail)
 	}
 	store = fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "warn"}}}
-	if f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage"); !f.IsFinding() {
+	if f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage"); !f.IsFinding() {
 		t.Errorf("an install whose only policy is a provenance warn reported %s: %s", f.Status, f.Detail)
 	}
 }
@@ -95,12 +101,12 @@ func TestDoctorCountsAProvenanceBlockAsCoverage(t *testing.T) {
 // once every ecosystem it covers is on ignore.
 func TestDoctorReportsProvenanceSilencedEverywhere(t *testing.T) {
 	some := fakePosture{provs: []audit.ProvenancePolicy{{Ecosystem: "npm", Action: "ignore"}}}
-	if f := findingFor(t, serverPosture(context.Background(), some), "policy-ignored"); f.IsFinding() {
+	if f := findingFor(t, serverPosture(context.Background(), some, nil), "policy-ignored"); f.IsFinding() {
 		t.Errorf("npm alone on ignore reported %s: %s", f.Status, f.Detail)
 	}
 	all := fakePosture{provs: []audit.ProvenancePolicy{
 		{Ecosystem: "npm", Action: "ignore"}, {Ecosystem: "git", Action: "ignore"}, {Ecosystem: "binary", Action: "ignore"}}}
-	f := findingFor(t, serverPosture(context.Background(), all), "policy-ignored")
+	f := findingFor(t, serverPosture(context.Background(), all, nil), "policy-ignored")
 	if !f.IsFinding() || !strings.Contains(f.Detail, "upstream provenance") || !strings.Contains(f.Remediation, "bodega policy provenance set") {
 		t.Errorf("every covered ecosystem on ignore reported %s: %s / %s", f.Status, f.Detail, f.Remediation)
 	}
@@ -114,7 +120,7 @@ func TestDoctorReportsPolicySilencedEverywhere(t *testing.T) {
 		ages: []audit.AgePolicy{{Ecosystem: "npm", Action: "ignore"}, {Ecosystem: "pypi", Action: "ignore"}},
 		osvs: []audit.OSVPolicy{{Ecosystem: "npm", Action: "ignore"}},
 	}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-ignored")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-ignored")
 	if !f.IsFinding() {
 		t.Fatalf("every ecosystem on ignore reported %s: %s", f.Status, f.Detail)
 	}
@@ -134,7 +140,7 @@ func TestDoctorAcceptsAPartiallyIgnoredPolicy(t *testing.T) {
 		{Ecosystem: "npm", Action: "ignore"},
 		{Ecosystem: "pypi", MinAgeSeconds: 604800, Action: "warn"},
 	}}
-	if f := findingFor(t, serverPosture(context.Background(), store), "policy-ignored"); f.IsFinding() {
+	if f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-ignored"); f.IsFinding() {
 		t.Errorf("one ignored ecosystem out of two reported %s: %s", f.Status, f.Detail)
 	}
 }
@@ -146,7 +152,7 @@ func TestDoctorReportsRowsNoGateCanEvaluate(t *testing.T) {
 		ages: []audit.AgePolicy{{Ecosystem: "helm", MinAgeSeconds: 604800, Action: "block"}},
 		osvs: []audit.OSVPolicy{{Ecosystem: "git", Action: "block"}},
 	}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-ecosystem")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-ecosystem")
 	if !f.IsFinding() {
 		t.Fatalf("rows for helm and git reported %s: %s", f.Status, f.Detail)
 	}
@@ -171,7 +177,7 @@ func TestDoctorPassesOnAFreshInstall(t *testing.T) {
 		t.Fatalf("open audit db: %v", err)
 	}
 	defer db.Close()
-	for _, f := range serverPosture(context.Background(), db) {
+	for _, f := range serverPosture(context.Background(), db, nil) {
 		if f.IsFinding() {
 			t.Errorf("fresh install reported %s on %s: %s", f.Status, f.Check, f.Detail)
 		}
@@ -214,7 +220,7 @@ func TestDoctorIgnoredIsNotMaskedByADeadRow(t *testing.T) {
 			{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "ignore"},
 		},
 	}
-	findings := serverPosture(context.Background(), store)
+	findings := serverPosture(context.Background(), store, nil)
 	f := findingFor(t, findings, "policy-ignored")
 	if !f.IsFinding() {
 		t.Fatalf("a helm row the gate cannot date masked the silenced npm gate: %s %s", f.Status, f.Detail)
@@ -235,7 +241,7 @@ func TestDoctorCoverageSaysHowManyGatesAreInForce(t *testing.T) {
 		{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "ignore"},
 		{Ecosystem: "pypi", MinAgeSeconds: 604800, Action: "ignore"},
 	}}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage")
 	if !strings.Contains(f.Detail, "0 in force") {
 		t.Errorf("coverage reported %q on an install whose every gate is ignored", f.Detail)
 	}
@@ -248,7 +254,7 @@ func TestDoctorCoverageSaysHowManyGatesAreInForce(t *testing.T) {
 // policy_violation records disprove.
 func TestDoctorCoverageCountsTheOSVGate(t *testing.T) {
 	store := fakePosture{osvs: []audit.OSVPolicy{{Ecosystem: "npm", Action: "block"}}}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage")
 	if f.IsFinding() {
 		t.Fatalf("an install with a blocking OSV gate reported %s: %s", f.Status, f.Detail)
 	}
@@ -267,7 +273,7 @@ func TestDoctorCoverageInForceSpansBothGates(t *testing.T) {
 		ages: []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"}},
 		osvs: []audit.OSVPolicy{{Ecosystem: "npm", Action: "ignore"}},
 	}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage")
 	if !strings.Contains(f.Detail, "1 in force") {
 		t.Errorf("coverage reported %q on an install with one live gate and one silenced", f.Detail)
 	}
@@ -280,7 +286,7 @@ func TestDoctorCoverageStaysQuietWhenEveryGateRuns(t *testing.T) {
 		{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"},
 		{Ecosystem: "pypi", MinAgeSeconds: 604800, Action: "warn"},
 	}}
-	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	f := findingFor(t, serverPosture(context.Background(), store, nil), "policy-coverage")
 	if strings.Contains(f.Detail, "in force") {
 		t.Errorf("coverage qualified a fully enforcing install: %q", f.Detail)
 	}
@@ -804,17 +810,14 @@ func TestDoctorSummaryCountsWhatWasNotMeasured(t *testing.T) {
 // not. "full" is what an unmigrated store still says.
 func TestDoctorWarnsOnUnscopedTokens(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
-	store := fakePosture{toks: []audit.TokenInfo{
-		{ID: "legacy", Label: "ci", Scope: audit.ScopeFull},
+	toks := []audit.TokenInfo{
+		{ID: "legacy", Label: "ci", Scope: "read,write,admin"},
 		{ID: "old-store", Label: "ops", Scope: "full"},
 		{ID: "narrow", Label: "npm", Scope: "read,write:npm"},
 		{ID: "gone", Label: "x", Scope: audit.ScopeFull, ExpiresAt: &past},
-	}}
+	}
 	var warned []string
-	for _, f := range serverPosture(context.Background(), store) {
-		if f.Check != "token-scope" {
-			continue
-		}
+	for _, f := range tokenScope(toks, time.Now()) {
 		if f.Status != host.StatusWarn {
 			t.Errorf("token-scope row %+v, want WARN", f)
 		}
@@ -823,8 +826,123 @@ func TestDoctorWarnsOnUnscopedTokens(t *testing.T) {
 	if len(warned) != 2 || !strings.Contains(warned[0], "legacy") || !strings.Contains(warned[1], "old-store") {
 		t.Errorf("warnings = %v, want one each for legacy and old-store", warned)
 	}
-	clean := findingFor(t, serverPosture(context.Background(), fakePosture{toks: store.toks[2:]}), "token-scope")
+	clean := findingFor(t, serverPosture(context.Background(), fakePosture{toks: toks[2:]}, nil), "token-scope")
 	if clean.Status != host.StatusOK {
 		t.Errorf("no broad tokens: %+v, want OK", clean)
+	}
+}
+
+// Migration 037 gave every admin token superadmin and approve together. Each
+// live one is named with the commands that split it; an exchanged one points
+// at the OIDC rule instead, since that is what mints it again.
+func TestDoctorWarnsOnSuperadminWithApprove(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	toks := []audit.TokenInfo{
+		{ID: "migrated", Label: "ops", Scope: audit.ScopeFull},
+		{ID: "pair", Label: "alice", Scope: "approve,superadmin"},
+		{ID: "oidc", Label: "login", Scope: "approve,superadmin", Subject: "bob", Issuer: "https://idp.example"},
+		{ID: "approver", Label: "oncall", Scope: "read,approve"},
+		{ID: "minter", Label: "carol", Scope: "superadmin"},
+		{ID: "gone", Label: "x", Scope: "approve,superadmin", ExpiresAt: &past},
+	}
+	rows := tokenScope(toks, time.Now())
+	if len(rows) != 3 {
+		t.Fatalf("rows = %+v, want one each for migrated, pair and oidc", rows)
+	}
+	for i, id := range []string{"migrated", "pair", "oidc"} {
+		f := rows[i]
+		if f.Status != host.StatusWarn || !strings.Contains(f.Detail, "token "+id+" ") || !strings.Contains(f.Detail, "superadmin with approve") {
+			t.Errorf("row %d = %+v, want a WARN naming %s as superadmin with approve", i, f, id)
+		}
+	}
+	if !strings.Contains(rows[0].Detail, "(ops)") || !strings.Contains(rows[0].Detail, "read, write and admin") {
+		t.Errorf("migrated detail %q should name the label and both reasons", rows[0].Detail)
+	}
+	for _, want := range []string{"bodega token generate alice --scope", "bodega token revoke pair"} {
+		if !strings.Contains(rows[1].Remediation, want) {
+			t.Errorf("remediation %q does not name %q", rows[1].Remediation, want)
+		}
+	}
+	if !strings.Contains(rows[2].Remediation, "oidc_providers rule for https://idp.example") {
+		t.Errorf("exchanged token remediation %q should name the OIDC rule", rows[2].Remediation)
+	}
+}
+
+// approveReach counts identities, not tokens: an unbound approve token cannot
+// vote, two tokens bound to one identity are one voter, and one OIDC rule
+// granting approve reaches a group doctor cannot count.
+func TestDoctorWarnsWhenTooFewIdentitiesCanApprove(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	toks := []audit.TokenInfo{
+		{ID: "a1", Label: "alice", Scope: "read,approve"},
+		{ID: "a2", Label: "alice-laptop", Scope: "approve"},
+		{ID: "loose", Label: "nobody", Scope: "approve"},
+		{ID: "b-old", Label: "bob", Scope: "approve", ExpiresAt: &past},
+		{ID: "ci", Label: "ci", Scope: "write:npm"},
+	}
+	binds := []audit.IdentityBinding{
+		{Kind: audit.BindToken, Key: "a1", Identity: "alice"},
+		{Kind: audit.BindToken, Key: "a2", Identity: "alice"},
+		{Kind: audit.BindToken, Key: "b-old", Identity: "bob"},
+		{Kind: audit.BindToken, Key: "ci", Identity: "ci"},
+	}
+	now := time.Now()
+
+	f := approveReach(toks, binds, nil, now)
+	if f.Status != host.StatusWarn {
+		t.Fatalf("one approving identity against a quorum of 2: %+v, want WARN", f)
+	}
+	for _, want := range []string{"1 identities hold approve", "override_quorum is 2", "1 approve token(s) are bound to no identity"} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("detail %q does not say %q", f.Detail, want)
+		}
+	}
+	for _, want := range []string{`"read,approve"`, "bodega identity bind token"} {
+		if !strings.Contains(f.Remediation, want) {
+			t.Errorf("remediation %q does not name %q", f.Remediation, want)
+		}
+	}
+
+	exchanged := append(slices.Clone(toks), audit.TokenInfo{ID: "x", Label: "login", Scope: "read,approve", Subject: "dave", Issuer: "https://idp.example"})
+	if f := approveReach(exchanged, binds, nil, now); f.Status != host.StatusOK {
+		t.Errorf("alice plus an exchanged dave reach a quorum of 2: %+v, want OK", f)
+	}
+	if f := approveReach(exchanged, binds, &config.Config{OverrideQuorum: 3}, now); f.Status != host.StatusWarn {
+		t.Errorf("two identities against override_quorum 3: %+v, want WARN", f)
+	}
+
+	oncall := &config.Config{OverrideQuorum: 3, OIDCProviders: []config.OIDCProvider{{
+		Name: "corp", Issuer: "https://idp.example",
+		Rules: []config.OIDCRule{{Claims: map[string]string{"groups": "oncall-primary"}, Scopes: "read,approve"}},
+	}}}
+	if f := approveReach(nil, nil, oncall, now); f.Status != host.StatusOK || !strings.Contains(f.Detail, "corp rule 0") {
+		t.Errorf("an OIDC rule granting approve: %+v, want OK naming the rule", f)
+	}
+
+	// Nobody can request over the API, so nothing waits on the count.
+	if f := approveReach([]audit.TokenInfo{{ID: "r", Label: "mirror", Scope: "read"}}, nil, nil, now); f.Status != host.StatusOK {
+		t.Errorf("no write token anywhere: %+v, want OK", f)
+	}
+
+	// #135: a rule written as admin before migration 037 granted approve and
+	// stopped granting it with no change to config.
+	adminRule := &config.Config{OIDCProviders: []config.OIDCProvider{{
+		Name: "corp", Issuer: "https://idp.example",
+		Rules: []config.OIDCRule{{Claims: map[string]string{"groups": "platform"}, Scopes: "read,write,admin"}},
+	}}}
+	f = approveReach(nil, nil, adminRule, now)
+	if f.Status != host.StatusWarn || !strings.Contains(f.Detail, "corp rule 0 (read,write,admin)") || !strings.Contains(f.Detail, "migration 037") {
+		t.Errorf("an admin-only OIDC rule with nobody else approving: %+v, want WARN naming the rule", f)
+	}
+
+	// The whole check through serverPosture, as doctor runs it.
+	var reach host.Finding
+	for _, r := range serverPosture(context.Background(), fakePosture{toks: toks, binds: binds}, nil) {
+		if r.Check == "token-scope" {
+			reach = r
+		}
+	}
+	if reach.Status != host.StatusWarn || !strings.Contains(reach.Detail, "override_quorum") {
+		t.Errorf("serverPosture's last token-scope row = %+v, want the approve-reach WARN", reach)
 	}
 }
