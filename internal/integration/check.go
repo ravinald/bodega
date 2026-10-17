@@ -108,6 +108,9 @@ func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, 
 		}
 	default:
 		r.Reason = "not flagged by " + d.DisplayName
+		if a.Reason != "" {
+			r.Reason += ": " + a.Reason
+		}
 	}
 	return r
 }

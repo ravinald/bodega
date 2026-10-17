@@ -1091,12 +1091,16 @@ from a doctored one. Use an `https` URL; an `http` one, which the validator
 accepts for a mirror on a trusted network, hands both powers to anyone on the
 path.
 
-**A per-package API** (none ships yet) sends the purl of every version
-admitted, and usually an account token, so the vendor holds a dated record of
-what this organization pulls and when, tied to the account. That is a list of
-the dependencies an attacker would target, held by a third party. Its
-descriptor must say so, and an operator who cannot accept that should not
-enable it.
+**A per-package API**, which `socket` is, sends the purl of every version
+admitted that is not already in the instance's answer cache, with the account's
+API token, so the vendor holds a dated record of what this organization pulls
+and when, tied to the account. That is a list of the dependencies an attacker
+would target, held by a third party. `socket` sends the purl (ecosystem, name
+and version) to `api.socket.dev` and nothing else about the request: no client
+address, no manifest, no artifact. Its descriptor says so, and an operator who
+cannot accept that should not enable it. The vendor also decides verdicts the
+way a list publisher does: a doctored answer can refuse a version under
+`block`, or pass one it should have flagged.
 
 **Outages refuse under `block`.** A network failure, a timeout, a 5xx, a rate
 limit or a list that cannot be read is recorded as an error under the

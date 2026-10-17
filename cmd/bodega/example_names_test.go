@@ -21,7 +21,6 @@ var retiredNames = []string{
 	"bit" + "warden",
 	"shai" + "-hulud",
 	"check" + "marx",
-	"socket" + ".dev",
 	"net" + "box",
 	"hashi" + "corp",
 	"terra" + "form",

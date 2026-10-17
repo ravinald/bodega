@@ -30,6 +30,7 @@ import (
 	// The integration types bodega ships register here, because every
 	// admission path reaches this package.
 	_ "github.com/ravinald/bodega/internal/integration/malwarelist"
+	_ "github.com/ravinald/bodega/internal/integration/socket"
 )
 
 // Decision is the verdict on one manifest. Conflict with an existing package
