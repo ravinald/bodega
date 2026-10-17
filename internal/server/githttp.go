@@ -153,6 +153,15 @@ type gitTool struct {
 	backendStall   time.Duration // gitBackendStall
 }
 
+// mirrorStepsBound is the longest handleGitSmart can spend on the mirror
+// before runGitBackend takes over the response's deadline: the two local
+// inspections in gitMirrorUsable, the wait on a first clone, the refresh's
+// wait for the repository lock, and the refresh itself. The lock is shared
+// with cloneGitMirror, so its holder can be a clone as well as a refresh.
+func (g *gitTool) mirrorStepsBound() time.Duration {
+	return 2*gitConfigTimeout + g.mirrorWait + max(gitCloneTimeout, gitFetchTimeout) + gitFetchTimeout
+}
+
 // gitBackendCandidates are the fixed locations git-http-backend ships in when
 // it is not on PATH. It is not a PATH binary on most platforms: git installs
 // it in libexec and finds it through `git --exec-path`, which resolveGitTool
@@ -333,6 +342,17 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 		return
 	}
 
+	// Over HTTP/2 the server-wide WriteTimeout is a timer per stream, started
+	// when the stream opens, and it resets the stream with INTERNAL_ERROR when
+	// it fires whether or not anything has been written. The mirror steps
+	// below can outlast it, so without this deadline an HTTP/2 client waiting
+	// on them gets a protocol error instead of refs or the 503. Over HTTP/1.1
+	// it moves a connection deadline nothing writes against yet, which looks
+	// redundant and is not.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.gitTool.mirrorStepsBound())); err != nil {
+		s.logger.Warn("could not set a write deadline for this git request's mirror steps; the server-wide write timeout bounds them instead",
+			"namespace", ns, "repo", repo, "error", err)
+	}
 	if err := s.ensureGitMirror(ctx, ns+"/"+repo, dir, upstream); err != nil {
 		switch {
 		case errors.Is(err, errGitMirrorPending):
