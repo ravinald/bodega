@@ -211,8 +211,8 @@ func TestNpmWithoutProvenanceIsUnavailable(t *testing.T) {
 }
 
 // Published provenance is never skipped into a pass: a bundle that cannot be
-// read is unknown, and one with no trusted root to check it against is
-// invalid.
+// read is unknown, and so is one with no trusted root to check it against,
+// whether TUF failed or sigstore_trusted_root names no readable file.
 func TestNpmPublishedButUnverifiableIsNotAPass(t *testing.T) {
 	t.Run("bundle missing", func(t *testing.T) {
 		r := newRegistry(t)
@@ -229,8 +229,23 @@ func TestNpmPublishedButUnverifiableIsNotAPass(t *testing.T) {
 		v := newTestVerifier(t, r)
 		v.Root = func(context.Context) (root.TrustedMaterial, error) { return nil, errors.New("TUF unreachable") }
 		ev := v.Npm(context.Background(), "", "sigstore", "3.0.0")
-		if ev.Outcome != audit.ProvenanceInvalid || !strings.Contains(ev.Detail, "TUF unreachable") {
-			t.Fatalf("outcome %s (%s), want invalid naming the root failure", ev.Outcome, ev.Detail)
+		if ev.Outcome != audit.ProvenanceUnknown || !ev.NoTrustedRoot || !strings.Contains(ev.Detail, "TUF unreachable") {
+			t.Fatalf("outcome %s (%s), want unknown naming the root failure", ev.Outcome, ev.Detail)
+		}
+		if !strings.Contains(ev.Detail, "not checked") || strings.Contains(ev.Detail, "did not verify") {
+			t.Errorf("detail %q does not say the provenance went unchecked", ev.Detail)
+		}
+	})
+	t.Run("sigstore_trusted_root missing", func(t *testing.T) {
+		r := newRegistry(t)
+		r.packument(t, "sigstore", "3.0.0", sigstoreIntegrity, "/att/sigstore@3.0.0")
+		r.put("/att/sigstore@3.0.0", fixture(t, "npm-sigstore-3.0.0.attestations.json"))
+		missing := filepath.Join(t.TempDir(), "trusted_root.json")
+		v := newTestVerifier(t, r)
+		v.Root = SharedRoot(missing)
+		ev := v.Npm(context.Background(), "", "sigstore", "3.0.0")
+		if ev.Outcome != audit.ProvenanceUnknown || !ev.NoTrustedRoot || !strings.Contains(ev.Detail, missing) {
+			t.Fatalf("outcome %s (%s), want unknown naming %s", ev.Outcome, ev.Detail, missing)
 		}
 	})
 }
@@ -266,6 +281,41 @@ func TestGitHubReleaseAssetAttestationVerifies(t *testing.T) {
 	ve.SHA256 = strings.Repeat("ab", 32)
 	if got := c.Check(context.Background(), pm, ve); got.Provenance.Outcome != audit.ProvenanceUnavailable {
 		t.Errorf("an unattested digest is %s (%s), want unavailable", got.Provenance.Outcome, got.Reason)
+	}
+}
+
+// A release whose attestations were read but could not be checked for want
+// of a trusted root is unknown, and its result says so in Details without
+// carrying the root error there.
+func TestGitHubReleaseWithoutTrustedRootIsUnknown(t *testing.T) {
+	r := newRegistry(t)
+	r.putJSON(t, "/api/repos/cli/cli/releases/tags/v2.102.0", map[string]any{
+		"assets": []map[string]any{{"name": ghAsset, "digest": "sha256:" + ghAssetSHA256}},
+	})
+	r.putJSON(t, "/api/repos/cli/cli/attestations/sha256:"+ghAssetSHA256, map[string]any{
+		"attestations": []map[string]any{{"bundle": nil, "bundle_url": r.URL + "/blob/provenance.json.sn"}},
+	})
+	r.put("/blob/provenance.json.sn", fixture(t, "github-cli-2.102.0-provenance.json.sn"))
+
+	v := newTestVerifier(t, r)
+	v.Root = func(context.Context) (root.TrustedMaterial, error) { return nil, errors.New("TUF unreachable") }
+	c := &Checker{Verifier: v}
+	pm := &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "gh"}
+	ve := &manifest.VersionEntry{Version: "2.102.0", URL: r.URL + "/cli/cli/releases/download/v2.102.0/" + ghAsset}
+	res := c.Check(context.Background(), pm, ve)
+	if res.Provenance == nil || res.Provenance.Outcome != audit.ProvenanceUnknown {
+		t.Fatalf("result %+v, want unknown", res)
+	}
+	if !strings.Contains(res.Reason, "TUF unreachable") {
+		t.Errorf("reason %q does not carry the root error", res.Reason)
+	}
+	if res.Details[audit.DetailNoTrustedRoot] != true {
+		t.Errorf("details %v do not mark the missing trusted root", res.Details)
+	}
+	for k, d := range res.Details {
+		if strings.Contains(fmt.Sprint(d), "TUF unreachable") {
+			t.Errorf("details[%s] carries the root error: %v", k, d)
+		}
 	}
 }
 

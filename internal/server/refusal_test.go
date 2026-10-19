@@ -798,6 +798,8 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 			map[string]any{"outcome": audit.ProvenanceInvalid, "source_repository_uri": leak}, false, "override does not apply"},
 		{"provenance unknown", audit.CheckUpstreamProvenance, checkProvenance, "provenance could not be checked",
 			map[string]any{"outcome": audit.ProvenanceUnknown}, true, ""},
+		{"provenance unknown without a trusted root", audit.CheckUpstreamProvenance, checkProvenance, "provenance could not be checked",
+			map[string]any{"outcome": audit.ProvenanceUnknown, audit.DetailNoTrustedRoot: true}, true, "points `sigstore_trusted_root` at a readable trusted_root.json"},
 		{"similarity", audit.CheckNameSimilarity, checkSimilarity, "name_similarity", nil, true, ""},
 		{"integration", "integration:aikido", checkIntegrate, `integration "aikido"`,
 			map[string]any{"instance": "aikido", "outcome": "flagged", "purl": "pkg:npm/left-pad@1.3.0"}, true, ""},
@@ -832,6 +834,18 @@ func TestAdmitRefusalPerCheck(t *testing.T) {
 			}
 			if tc.also != "" && !strings.Contains(f.next, tc.also) {
 				t.Errorf("next %q does not name %q", f.next, tc.also)
+			}
+			if tc.details["outcome"] == audit.ProvenanceUnknown {
+				noRoot := tc.details[audit.DetailNoTrustedRoot] == true
+				if strings.Contains(f.reason, "evidence could not be read") == noRoot {
+					t.Errorf("reason %q: says the evidence could not be read = %v, want %v", f.reason, noRoot, !noRoot)
+				}
+				if strings.Contains(f.reason, "no Sigstore trusted root") != noRoot {
+					t.Errorf("reason %q: names the missing trusted root = %v, want %v", f.reason, !noRoot, noRoot)
+				}
+			}
+			if tc.details[audit.DetailNoTrustedRoot] == nil && (strings.Contains(f.next, "trusted root") || strings.Contains(f.reason, "trusted root")) {
+				t.Errorf("next %q names the trusted root for a refusal that had one", f.next)
 			}
 			if strings.Contains(body, "http://") || strings.Contains(body, "https://") {
 				t.Errorf("body carries a URL: %s", body)

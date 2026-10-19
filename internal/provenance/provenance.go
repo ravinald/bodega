@@ -48,6 +48,10 @@ type Evidence struct {
 	audit.UpstreamProvenance
 	// Detail says why, in words an operator acts on.
 	Detail string
+	// NoTrustedRoot is set on an unknown outcome reached because no Sigstore
+	// trusted root could be had, so no bundle was checked. The fix is the
+	// operator's, not the package's, and a refusal says so.
+	NoTrustedRoot bool
 	// PublishedAt is when the registry says the version checked was
 	// published, nil when it does not say. Published is the same for every
 	// version it lists; a version absent from it has an unknown time. Only
@@ -89,6 +93,14 @@ func unavailable(format string, a ...any) Evidence {
 
 func unknown(format string, a ...any) Evidence {
 	return Evidence{UpstreamProvenance: audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}, Detail: fmt.Sprintf(format, a...)}
+}
+
+// noRoot is published provenance that was not checked because the trusted
+// root could not be had: through TUF, or from sigstore_trusted_root.
+func noRoot(err error, format string, a ...any) Evidence {
+	ev := unknown(format+", but it was not checked, because there is no Sigstore trusted root to check it against: %v", append(a, err)...)
+	ev.NoTrustedRoot = true
+	return ev
 }
 
 func invalid(format string, a ...any) Evidence {
