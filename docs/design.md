@@ -40,7 +40,7 @@ Three problems kept showing up:
                           +------------------+
 ```
 
-The server is a single Go binary, and Linux and FreeBSD are peer platforms for it. FreeBSD release archives and an rc.d script are not shipped yet, so a FreeBSD server is built from source. No database server, no message queue, no container runtime. State lives in two places: manifest JSON files (what should exist) and a storage backend (what does exist), which is a local directory at `/var/lib/bodega` by default or an S3 bucket when `storage_backend` is `"s3"`. A SQLite file handles the audit trail, and `audit_sink` can send the event half of it to postgres, syslog or a JSONL file instead.
+The server is a single Go binary, and Linux and FreeBSD are peer platforms for it. Tagged releases ship FreeBSD archives for amd64 and arm64, and each archive carries the rc.d script, `docs/bodega.rc`. No database server, no message queue, no container runtime. State lives in two places: manifest JSON files (what should exist) and a storage backend (what does exist), which is a local directory at `/var/lib/bodega` by default or an S3 bucket when `storage_backend` is `"s3"`. A SQLite file handles the audit trail, and `audit_sink` can send the event half of it to postgres, syslog or a JSONL file instead.
 
 ### Storage layout
 
@@ -151,15 +151,18 @@ A fresh object gets none of this, deliberately. It _is_ the staging file, so it 
 
 ## Package types
 
-| Type   | Source                                    | Artifact                   | Client protocol                                       |
-| ------ | ----------------------------------------- | -------------------------- | ----------------------------------------------------- |
-| apt    | Package name, git repo, or apt-get source | .deb in Debian repo layout | deb822 `.sources` with `Signed-By:`; see below        |
-| git    | GitHub release tarball or bare clone      | .tar.gz or .bundle         | `curl https://bodega/git/<name>/<file>`               |
-| pypi   | Wheel build from requirements.txt         | .whl files                 | `pip install --index-url https://bodega/pypi/simple/` |
-| binary | Direct URL download                       | Original file              | `curl https://bodega/binaries/<name>/<ver>/<file>`    |
-| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go go get <module>`           |
-| helm   | Chart repo or direct URL                  | .tgz                       | `helm repo add bodega https://bodega/helm`            |
-| npm    | Registry upstream or local                | .tgz                       | `npm install --registry https://bodega/npm/`          |
+| Type      | Source                                              | Artifact                          | Client protocol                                                       |
+| --------- | --------------------------------------------------- | --------------------------------- | --------------------------------------------------------------------- |
+| apt       | Package name, git repo, or apt-get source           | .deb in Debian repo layout        | deb822 `.sources` with `Signed-By:`; see below                        |
+| git       | GitHub release tarball or bare clone                | .tar.gz or .bundle                | `curl https://bodega/git/<name>/<file>`                               |
+| pypi      | Wheel build from requirements.txt                   | .whl files                        | `pip install --index-url https://bodega/pypi/simple/`                 |
+| binary    | Direct URL download                                 | Original file                     | `curl https://bodega/binaries/<name>/<ver>/<file>`                    |
+| gomod     | GOPROXY upstream or local build                     | .zip, .mod, .info                 | `GOPROXY=https://bodega/go go get <module>`                           |
+| helm      | Chart repo or direct URL                            | .tgz                              | `helm repo add bodega https://bodega/helm`                            |
+| npm       | Registry upstream or local                          | .tgz                              | `npm install --registry https://bodega/npm/`                          |
+| cargo     | Sparse index and crate download upstream            | .crate                            | `registry = "sparse+https://bodega/cargo/"` in `~/.cargo/config.toml` |
+| freebsd   | pkg repository mirror or generated catalogue        | .pkg and the repository catalogue | `url: "https://bodega/freebsd/${ABI}/latest"` in a pkg repo file      |
+| distfiles | Ports `distinfo`, fetched from `distfiles_upstream` | Original distfile                 | `MASTER_SITE_OVERRIDE` at `https://bodega/distfiles/@<env>/`          |
 
 `internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and signs it there with a key `internal/aptsign` loads at startup and re-reads on every `SIGHUP`, held behind an `atomic.Pointer` because the reload writes it while request handlers read it. `InRelease` is the clearsigned `Release`; `Release.gpg` is the armored detached signature; `/apt/bodega-archive-keyring.{asc,gpg}` serve the public key from memory. With no key installed all four 404 and the unsigned `Release` still serves, which is the ordinary fallback apt has always taken. Signed and unsigned coexist at the same URLs indefinitely.
 
@@ -265,7 +268,7 @@ The match is exact and case-sensitive: `"Direct"` is not `"direct"`. Admission (
 
 ## Serve modes
 
-Every gomod, helm, and npm entry has a `mode` field:
+Every gomod, helm, npm and cargo entry has a `mode` field:
 
 - **hosted** (default): The artifact is built or fetched locally, uploaded to the storage backend, and served from there. You control exactly what's there. Nothing reaches upstream at serve time.
 - **proxy**: On cache miss, bodega fetches from the upstream registry, caches in the storage backend, and serves the response. Subsequent requests hit the cache. Mutable metadata (version lists, indexes) refreshes after a configurable TTL.
@@ -376,7 +379,7 @@ When bodega fetches a git entry, it scans the extracted source for dependency fi
 | `package.json`             | Create NpmEntry for each dependency (mode: proxy)           |
 | `Gemfile`, `pom.xml`, etc. | Log as found, unsupported ecosystem                         |
 
-Discovered entries default to proxy mode. The operator can change any entry to hosted if they want to build and pin it locally. Duplicate entries are skipped.
+Discovered gomod and npm entries default to proxy mode. Discovered pypi entries carry no mode, so they are hosted. The operator can change any entry to hosted if they want to build and pin it locally. Duplicate entries are skipped.
 
 ## Security model
 
@@ -453,7 +456,7 @@ The default is wide on purpose, because the common deployment puts a proxy on th
 `admin_permit_cidr` gates the whole admin surface, which is two sets of endpoints:
 
 - **The mutation API**: POST, DELETE and PATCH on `/api/v1/...`, gated by `MutationAuthMiddleware`.
-- **The four admin reads**: `GET /api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies` and `/api/v1/config`, gated by `requireAdmin` inside each handler. They sit outside the mutation middleware, which passes GET through so apt, pip, go and npm can fetch packages with no credential.
+- **The eight admin reads**: `GET /api/v1/audit`, `/api/v1/config`, `/api/v1/policies`, `/api/v1/tokens`, `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins`, `/api/v1/overrides` and `/api/v1/queue`, gated by `requireAdmin` inside each handler. They sit outside the mutation middleware, which passes GET through so apt, pip, go and npm can fetch packages with no credential.
 
 Two callers, one predicate: `server.AdminPermits`. They read the same list and used to answer separately, which is how they came to disagree about what an empty list means.
 
@@ -467,7 +470,7 @@ Both layers read the client IP that `trusted_proxies` resolved, so a permissive 
 
 #### An empty admin list permits nobody
 
-An empty `admin_permit_cidr` refuses every mutation **and** all four admin reads, from localhost included. It is a list an operator can empty, never a statement that there is nothing to control: reading it as "no restriction" left `/api/v1/audit` and `/api/v1/tokens` open to every source address that could reach the listener, while every mutation from the same address was refused.
+An empty `admin_permit_cidr` refuses every mutation **and** all eight admin reads, from localhost included. It is a list an operator can empty, never a statement that there is nothing to control: reading it as "no restriction" left `/api/v1/audit` and `/api/v1/tokens` open to every source address that could reach the listener, while every mutation from the same address was refused.
 
 Three ways the list can end up empty, and what each gets:
 
@@ -488,11 +491,11 @@ Both are re-read per request rather than captured when the handler chain is buil
 
 Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
-Package-serving read endpoints remain unauthenticated. That is a policy, not a limitation: this document used to justify it by saying package-manager clients cannot send auth headers, and that was wrong for all eight of them. What they can send is described under **Read-path identity** below, and bodega now reads it to attribute a request. What may be fetched is a separate question, and **Host profiles** below is the model that answers it: the read path consults it on every package route for the non-apt types. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+Package-serving read endpoints remain unauthenticated. That is a policy, not a limitation: this document used to justify it by saying package-manager clients cannot send auth headers, and that was wrong for all eight of them. What they can send is described under **Read-path identity** below, and bodega now reads it to attribute a request. What may be fetched is a separate question, and **Host profiles** below is the model that answers it: the read path consults it on every package route for the non-apt types. The eight admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
 
 ### Token scopes and OIDC exchange
 
-A token's scopes are checked by the same middleware that checks its existence. `routeScope` names what a request needs from its method and path alone (admin by path prefix, then read for `GET`, `HEAD` and git's upload-pack, then write), and the package type comes from the path the way the audit row's subject does. One classifier serves reads and mutations, so a route cannot be gated as admin on one path through the code and as write on another. Bulk import is the one handler that checks again, per entry, because its body names the types and the path names none. The method fallback makes any route missing from `adminPrefixes` a write or a read, so `TestEveryAPIRouteHasAChosenScope` reads the routes `server.go` registers and fails on any `/api/v1/` route nobody assigned a scope.
+A token's scopes are checked by the same middleware that checks its existence. `routeScope` names what a request needs from its method and path alone, checking in this order: superadmin for the token routes, approve for an override or queue vote, admin or approve for a read of the override or queue list, admin by path prefix, then read for `GET`, `HEAD` and git's upload-pack, then write, and the package type comes from the path the way the audit row's subject does. One classifier serves reads and mutations, so a route cannot be gated as admin on one path through the code and as write on another. Bulk import is the one handler that checks again, per entry, because its body names the types and the path names none. The method fallback makes any route missing from `adminPrefixes` a write or a read, so `TestEveryAPIRouteHasAChosenScope` reads the routes `server.go` registers and fails on any `/api/v1/` route nobody assigned a scope.
 
 Scopes constrain only a token that is presented. The read path stays open and `admin_permit_cidr` stays the boundary for a request with no token; scopes were added to stop a credential minted for one job from being a credential for every job, not to put a token in front of the reads.
 
@@ -646,7 +649,7 @@ Upstream proxy fetches validate that target URLs use HTTPS and don't resolve to 
 
 ### TLS
 
-One option: a cert/key pair in `tls_cert` and `tls_key`. Minimum TLS 1.3.
+One option: a cert/key pair in `tls_cert` and `tls_key`. The minimum is TLS 1.3 by default; `tls_min_version` set to `1.2` lowers it.
 
 bodega has no ACME client and does not plan one. `tls_autocert` and `tls_domain` were accepted by the config and the flag set and then refused at startup, which is worse than absent: an operator configured TLS, got a start failure, and had no way to reach the feature the message implied existed. The refusal was right and the offer was not, so the offer is gone. The deployment that prompted the question runs behind a firewall whose 443 is allowlisted, and `autocert` validates over TLS-ALPN-01 on 443 or HTTP-01 on a port 80 open to the whole internet, so neither challenge was reachable there anyway. Use `certbot`, or terminate TLS at a proxy in front and set `public_url`.
 
@@ -766,7 +769,7 @@ Key fields:
 | `proxy_cache_enabled`  | false                      | Global proxy/cache toggle                                                                                                                                                                                                 |
 | `metadata_ttl`         | 1h                         | How long mutable proxy resources are cached                                                                                                                                                                               |
 | `deny_list`            | []                         | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny`                                                                                                       |
-| `admin_permit_cidr`    | [127.0.0.0/8, ::1/128]     | CIDRs allowed to reach the admin surface: mutations and the four admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
+| `admin_permit_cidr`    | [127.0.0.0/8, ::1/128]     | CIDRs allowed to reach the admin surface: mutations and the eight admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
 | `trusted_proxies`      | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start                                                                                     |
 | `tls_min_version`      | 1.3                        | Floor for bodega's own listener; `1.2` or `1.3`                                                                                                                                                                           |
 | `tls_cert` / `tls_key` | (none)                     | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext                                                                                                                                   |
@@ -880,7 +883,7 @@ Bodega is a single static binary, and the server runs on Linux or FreeBSD. Linux
 1. An infrastructure-as-code tool creates a host with an IAM role. `bodega init --print-policy` prints the two policies that role and the setup principal need, runtime and setup, rather than broad S3 read/write.
 2. `bodega init` creates the bucket with encryption, versioning, lifecycle rules and public access blocked, and `bodega init check`, run under the service's credentials, asks the bucket whether they hold the runtime policy.
 3. The bootstrap script installs the binary, writes `/etc/bodega/config.json`, and enables the service running `bodega serve --addr :8080`.
-4. Other hosts configure their package managers to point at bodega. `bodega doctor --write-apt-sources` and `--write-pkg-repo` do this for apt and FreeBSD pkg on a host that has the binary; the other systems are configured by hand today.
+4. Other hosts configure their package managers to point at bodega. `bodega doctor --configure <systems> --apply` configures every system the server plans for on a host that has the binary (`--write-apt-sources` and `--write-pkg-repo` are aliases for apt and FreeBSD pkg), and the script `/client/setup.sh` serves does the same with `--apply` on a host without it.
 
 A deployment on the local backend skips the first two steps.
 

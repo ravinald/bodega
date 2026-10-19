@@ -1974,7 +1974,7 @@ func defaultConfigContent() []byte {
   "_comment_allow_plaintext": "allow_plaintext: authorize an unencrypted listener. With no cert pair bodega refuses to start unless this is true — set it for local use, or on a loopback listener behind a proxy that terminates TLS. --allow-plaintext=false overrides it back off.",
   "allow_plaintext": false,
 
-  "_comment_listen": "listen_addr: address bodega serve binds; --listen and $BODEGA_LISTEN_ADDR override it",
+  "_comment_listen": "listen_addr: address bodega serve binds; --addr and $BODEGA_LISTEN_ADDR override it",
   "listen_addr": ":8080",
 
   "_comment_proxy": "Proxy/cache: when enabled, the server fetches from upstream on cache miss",
@@ -1984,7 +1984,7 @@ func defaultConfigContent() []byte {
   "npm_upstream": "https://registry.npmjs.org",
   "pypi_upstream": "https://pypi.org",
 
-  "_comment_spool": "spool_dir: where a proxied upstream artifact is copied on its way to storage and the client. Empty means {build_root}/tmp. bodega serve refuses to start if it cannot create the directory or write in it. spool_max_artifact_bytes caps one artifact; a declared Content-Length over it is refused before a byte moves, and an undeclared body is refused as it crosses. spool_max_total_bytes is the budget shared by every fetch in flight, and a request over it gets 503 with Retry-After rather than a queue. Write 0 in either to remove that ceiling.",
+  "_comment_spool": "spool_dir: where a proxied upstream artifact is copied on its way to storage and the client. Empty means {storage_path}/tmp. bodega serve refuses to start if it cannot create the directory or write in it. spool_max_artifact_bytes caps one artifact; a declared Content-Length over it is refused before a byte moves, and an undeclared body is refused as it crosses. spool_max_total_bytes is the budget shared by every fetch in flight, and a request over it gets 503 with Retry-After rather than a queue. Write 0 in either to remove that ceiling.",
   "spool_dir": "",
   "spool_max_artifact_bytes": 8589934592,
   "spool_max_total_bytes": 34359738368,

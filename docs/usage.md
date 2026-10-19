@@ -47,23 +47,26 @@ Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default
   ...
 ```
 
-It sets SSE-S3 (AES-256) encryption, versioning, a full public access block and two lifecycle rules, then writes a zero-byte marker under each prefix in [Storage Layout](#storage-layout). Versioning is on because it is the only protection a manifest has against whoever can already write it: a rewrite leaves the previous version in place, and the runtime policy withholds the one action that removes it. See [S3 setup](#s3-setup) for the policies, the lifecycle rules and their retention.
+It sets SSE-S3 (AES-256) encryption, versioning and a full public access block, and writes the lifecycle rules: one bucket-wide rule that aborts incomplete multipart uploads, and one noncurrent-version expiry rule per artifact prefix, skipping `manifests/` and `attestations/`. It then writes a zero-byte marker under each prefix in [Storage Layout](#storage-layout). Versioning is on because it is the only protection a manifest has against whoever can already write it: a rewrite leaves the previous version in place, and the runtime policy withholds the one action that removes it. See [S3 setup](#s3-setup) for the policies, the lifecycle rules and their retention.
 
 - `bodega init --print-policy` prints the two IAM policies, setup and runtime, and changes nothing. `--print-policy=setup` or `--print-policy=runtime` prints one as bare JSON, ready to redirect into a file.
 - `bodega init check [BACKEND]` asks the bucket whether the current credentials hold the runtime policy, and names each action the API refused. It changes nothing.
 
-### `bodega build fetch [TYPE...] [NAME]`
+### `bodega build fetch [TYPE...] [NAME] [force]`
 
 Downloads raw sources without building or packaging. If no types are given, all ten are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd, distfiles`.
 
 When a name is given after the type, only that entry is fetched.
 
+A trailing `force` re-fetches even when the artifacts already exist. It is refused with `--backfill-published`, which fetches nothing for it to repeat.
+
 `fbsd` is accepted for `freebsd` by every command that takes a list of types: `build fetch`, `build run`, `build package`, `build upload`, `build sync`, `build status` and `pkg drift`. It is not a type. The help output does not list it, `manifest.AllTypes` does not hold it, and it resolves to `freebsd` before anything reads a manifest or composes a storage key, so nothing is ever stored under it. The commands that take exactly one type (`pkg create`, `show pkg`, `pkg delete` and the rest) refuse it: a spelling that reached a manifest path there would give one type two key prefixes, and whatever landed under the second is unreachable from every reader that asks for the first.
 
 ```bash
-bodega build fetch                 # fetch all types
-bodega build fetch git             # fetch git sources only
-bodega build fetch git widget      # fetch only widget
+bodega build fetch                   # fetch all types
+bodega build fetch git               # fetch git sources only
+bodega build fetch git widget        # fetch only widget
+bodega build fetch git widget force  # re-fetch widget even if present
 ```
 
 `--backfill-published` fetches nothing. It records `published_at` on every npm, pypi, gomod and cargo version that has none, reading each from upstream at most once every 250ms, and prints how many it filled and how many it could not. A gomod version whose `.info` is already in the build root is read from that file without a request. Each version it could not date is named with its reason, and the command exits non-zero when there is at least one. A type with no publish time to read (`apt`, `binary` and the rest) is refused when named and skipped when not. Run it once on a store fetched before bodega recorded publish times; a fetch dates every version it downloads from then on.
@@ -218,19 +221,44 @@ A specifier is a filter rather than a fact. An index that answers it with anothe
 #### Gaps
 
 - **Transitive dependencies are pip's to resolve.** Only the versions the manifest names are pinned. The wheels pip pulls in behind them are whatever the closure resolves to, and the manifest does not record them until `build package` scans the wheel metadata into `dep-graph.json`.
-- **An orphaned wheel already in object storage stays there.** `bodega build build pypi` removes a pinned distribution's wheels at versions no pin names before pip writes beside them, and the generated simple index publishes only versions an entry names, so a re-pin no longer leaves the old version installable. Neither reaches a wheel a previous run already uploaded: `Client.SyncDir` is upload-only. Delete the object to retire it.
-- **The build toolchain is not pinned.** `pip install --upgrade pip wheel setuptools` reaches the selected index like the wheel build does, but takes whatever version that index offers, so a fixed bodega release is paired with whatever pip installed today. A selected index carrying no pip fails the build there rather than reaching past itself.
+- **An orphaned wheel already in object storage stays there.** `bodega build run pypi` removes a pinned distribution's wheels at versions no pin names before pip writes beside them, and the generated simple index publishes only versions an entry names, so a re-pin no longer leaves the old version installable. Neither reaches a wheel a previous run already uploaded: `Client.SyncDir` is upload-only. Delete the object to retire it.
+- **The build toolchain is not pinned.** Nothing upgrades the venv's pip, so it is whatever the platform's `ensurepip` bundles, and a fixed bodega release is paired with whichever pip that host's `python3` ships. `setuptools` and `wheel` enter the wheelhouse only when the closure holds an sdist, at whatever version the selected index offers that day.
 - **Controlling the requirements language does not prove the origin of every byte.** A build installs build dependencies, obtains dynamically reported build requirements and runs build backends, and a build requirement can carry a direct reference of its own. What the generated file names is checked; what a `setup.py` reaches for while it runs is not. See [Threat model](threat-model.md).
-- **`bodega refresh` still orders pypi candidates as semver.** It proposes new manifest entries rather than resolving a fetch, so a `patch`-constrained entry will not see a post release offered to it.
+- **`bodega pkg refresh` still orders pypi candidates as semver.** It proposes new manifest entries rather than resolving a fetch, so a `patch`-constrained entry will not see a post release offered to it.
 
 ### `bodega build run [TYPE...] [NAME]`
 
-Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, gomod, helm, npm) are skipped for the build phase.
+Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, git, gomod, helm, npm, cargo, freebsd and distfiles) are fetched if needed and skipped for the build phase.
 
 ```bash
 bodega build run                   # build all types
 bodega build run apt               # build apt sources only
 bodega build run apt python3
+```
+
+### `bodega build package [TYPE...] [NAME]`
+
+Turns built sources into the artifacts `build upload` pushes. Each type runs whatever earlier stage it is missing first, so `bodega build package apt` on an empty build root fetches, builds and then packages. If no types are given, all ten are packaged in dependency order.
+
+When a name is given after the type, only that entry is packaged. `pypi` and `helm` ignore the name for the packaging step: `MANIFEST.sha256` and `index.yaml` describe the whole type, so naming one entry regenerates everything.
+
+| Type        | Packaging step                                                                                                | Runs first when missing     |
+| ----------- | ------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| `binary`    | None: the downloaded file is the artifact                                                                     | Nothing                     |
+| `git`       | Creates a git bundle from the bare repository and verifies it                                                 | `fetch`                     |
+| `apt`       | Copies each `.deb` into the `pool/main/<letter>/<name>/` layout, records its `_pool_path` and pins its digest | `fetch`, then `build`       |
+| `pypi`      | Writes `MANIFEST.sha256` over the wheels directory and scans wheel metadata into `dep-graph.json`             | `fetch`, then `build`       |
+| `gomod`     | None: the module zip is the artifact                                                                          | Nothing                     |
+| `helm`      | Regenerates `index.yaml` across every fetched chart                                                           | `fetch`                     |
+| `npm`       | None: the server generates the packument from the manifest entry                                              | `fetch`                     |
+| `cargo`     | None: the crate tarball is the artifact                                                                       | `fetch`                     |
+| `freebsd`   | None: fetch mirrors the repository, and no stage may touch its bytes                                          | `fetch`, for hosted entries |
+| `distfiles` | None: the distfiles directory is the artifact and `distinfo` is the metadata                                  | `fetch`                     |
+
+```bash
+bodega build package               # package all types
+bodega build package git           # package git only
+bodega build package apt python3
 ```
 
 ### `bodega build sync [TYPE...] [NAME[@VERSION]]`
@@ -320,7 +348,7 @@ It then reads every binary manifest in the store, whether or not the index lists
 
 ### `bodega pkg refresh [TYPE] [NAME] [--force]`
 
-Discovers available versions from upstream registries for entries with `version_constraint: "any"` or `version_constraint: "compatible"`. Creates manifest records for new versions without fetching them.
+Discovers available versions from upstream registries for every entry whose `version_constraint` is neither empty nor `exact`: `patch`, `compatible` and `any`. Creates manifest records for new versions without fetching them.
 
 For proxy-mode entries, versions are served on demand when a client requests them.
 
@@ -340,8 +368,9 @@ Detects and fixes inconsistencies in the manifest store:
 3. **Artifact sizes**: backfill ArtifactSize from local files
 4. **Apt placeholders**: version-less apt entries sitting beside a resolved one are removed
 5. **Pypi URLs**: entries recording the retired `pypi.org/packages/<filename>` wheel URL are rewritten to the registry root
-6. **Manifest sync**: all manifests are re-saved to the backend (S3)
-7. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
+6. **Pypi names**: manifests stored under a name PEP 503 does not canonicalize to are moved to the canonical name; one that collides with a manifest already there is reported and left in place
+7. **Manifest sync**: all manifests are re-saved to the backend (S3)
+8. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
 
 ```bash
 bodega repair                          # detect and fix
@@ -528,7 +557,7 @@ bodega pkg import --server https://bodega.example catalog.json
 BODEGA_SERVER=https://bodega.example bodega pkg import catalog.json
 ```
 
-The server URL resolves through the usual chain: `--server`, then `$BODEGA_SERVER`, then `server_url` in the config file. The bearer token comes from `$BODEGA_TOKEN`, then `token` in the config file, so a token never has to be written to disk on the host being cataloged.
+The server URL resolves through the usual chain: `--server`, then `$BODEGA_SERVER`, then `server_url` in the config file. The bearer token comes from `$BODEGA_TOKEN`, then the unexpired credential [`bodega login`](#bodega-login---server-url---provider-name---allow-plaintext) saved for that server, then `token` in the config file, so a token never has to be written to disk on the host being cataloged.
 
 Plaintext `http` is refused. A bearer token on an unencrypted link is readable by anything on the path, so the combination fails rather than warning; `--allow-plaintext` is the deliberate override for a trusted link.
 
@@ -786,7 +815,7 @@ For each installed package, the command reads the `Packages` indices over HTTP t
 - `Packages.gz` is read first, uncompressed `Packages` second.
 - An **`Architecture: all` package is found inside `binary-<arch>`**, because that is where every archive publishes one. Nothing publishes `binary-all`, and looking for it there is how a naive match loses every architecture-independent package on the host: 158 of the 635 above.
 
-Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `public_url`, then this host's own listener from `listen_addr`. The last one is for running the command on the bodega host itself. A loopback target is read over plaintext `http` without `--allow-plaintext`, because the refusal exists to keep a bearer token off a network others can read and there is no such network on `127.0.0.1`. The token comes from `$BODEGA_TOKEN` or `token` in the config file.
+Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `public_url`, then this host's own listener from `listen_addr`. The last one is for running the command on the bodega host itself. A loopback target is read over plaintext `http` without `--allow-plaintext`, because the refusal exists to keep a bearer token off a network others can read and there is no such network on `127.0.0.1`. The token comes from `$BODEGA_TOKEN`, then the unexpired credential `bodega login` saved for that server, then `token` in the config file.
 
 #### Gaps
 
@@ -1061,7 +1090,7 @@ Queries the configured audit sink. Under `audit_sink: "syslog"` or `"jsonl"` it 
 
 | Flag         | Default | Purpose                                                                                                                               |
 | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `--type`     |         | Event type: fetch, build, create, delete, cache                                                                                       |
+| `--type`     |         | Event type, from the list below                                                                                                       |
 | `--pkg-type` |         | Package type filter                                                                                                                   |
 | `--name`     |         | Package name filter                                                                                                                   |
 | `--client`   |         | Client IP filter                                                                                                                      |
@@ -1070,9 +1099,12 @@ Queries the configured audit sink. Under `audit_sink: "syslog"` or `"jsonl"` it 
 | `--since`    |         | Show events after this time (RFC3339 or YYYY-MM-DD)                                                                                   |
 | `--limit`    | `20`    | Max events to show                                                                                                                    |
 
+`--type` takes one of `init`, `reset`, `status`, `fetch`, `build`, `package`, `upload`, `sync`, `create`, `delete`, `repair`, `refresh`, `hide`, `freeze`, `edit`, `show`, `policy`, `revet`, `override`, `queue`, `inventory`, `serve_start`, `serve_stop`, `serve_fetch`, `cache` and `denied`. `fetch` is one entry of a `bodega build fetch`; a client downloading a package is `serve_fetch`. See [Audit Trail](#audit-trail) for what each type records.
+
 ```bash
 bodega audit events                                    # last 20 events
-bodega audit events --type fetch --limit 50            # last 50 fetches
+bodega audit events --type fetch --limit 50            # last 50 build fetch entries
+bodega audit events --type serve_fetch --limit 50      # last 50 client downloads
 bodega audit events --pkg-type gomod --since 2026-04-07
 bodega audit events --client 10.0.0.5
 bodega audit events --identity build-07                # every request one host made
@@ -1165,6 +1197,8 @@ What it keeps: the config file, and every artifact in storage. Stored artifacts 
 | `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
 | `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
 
+Every type also clears `attestations` under its root, where a fetch leaves the attestation envelopes it writes before upload.
+
 A path an override puts outside `build_root` is listed on its own under "Outside build_root, set by a `*_root` override", with the key that put it there, because that directory was chosen by hand and may sit beside something else. Check that list before typing the confirmation word.
 
 `reset` prints `Removed <path>` for each path it deletes and says nothing about one that was already absent. A path it cannot remove is named on stderr with the error, "Build artifacts cleared." is withheld, and the command exits non-zero after the audit step. A running `bodega serve` is still told to reload, because the manifests are already gone. Fix the cause (usually permissions under the path) and run `bodega reset` again.
@@ -1194,6 +1228,45 @@ $ bodega pkg checksum clear apt ngnix
 apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
 No cached checksums matched apt/ngnix; nothing was cleared. Run `bodega pkg checksum list --type apt` for the names this instance recorded.
 ```
+
+### `bodega apt key <generate|show|export|retire>`
+
+Manages the OpenPGP key the server signs the apt index with. The server only loads a key; generation lives here.
+
+| Subcommand             | Flags                                              |
+| ---------------------- | -------------------------------------------------- |
+| `generate`             | `--rsa`, `--rotate`, `--name`, `--email`, `--path` |
+| `show`                 | `--path`                                           |
+| `export`               | `--keyring`, `--path`                              |
+| `retire <fingerprint>` | `--path`                                           |
+
+`--path` reads or writes one named file instead of the paths the server searches. See [Signing the apt repository](#signing-the-apt-repository) for the search order, rotation and client setup.
+
+### `bodega attest <key|verify|backfill>`
+
+Manages the attestation signing key, checks an attestation against a pinned key and the artifact bytes, and signs attestations for objects pinned before bodega emitted them.
+
+| Subcommand                                  | Flags                                                                               |
+| ------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `key generate`                              | `--force`                                                                           |
+| `key show`                                  |                                                                                     |
+| `key retire <keyid>`                        |                                                                                     |
+| `verify <envelope-file\|type/name/version>` | `--key`, `--public-key`, `--artifact`, `--package`, `--server`, `--allow-plaintext` |
+| `backfill`                                  | `--type`                                                                            |
+
+See [Attestation signing key](#attestation-signing-key) for key management and [Attestations](#attestations) for verifying and backfilling.
+
+### `bodega freebsd key <generate|show|export>`
+
+Manages the key the server signs FreeBSD pkg catalogues with. `pkgrepo` is accepted for `freebsd`.
+
+| Subcommand | Flags                     |
+| ---------- | ------------------------- |
+| `generate` | `--eddsa`, `--path`       |
+| `show`     | `--path`                  |
+| `export`   | `--fingerprint`, `--path` |
+
+See [Key management](#key-management) under [Hosting your own pkg repository](#hosting-your-own-pkg-repository) for the algorithms, the export formats and client setup.
 
 ### `bodega pkg trust <show|reset> <type> <name>`
 
@@ -1239,9 +1312,9 @@ On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.co
 
 Lists all API tokens with their ID, label, scope, creation date, expiry, last use, and comment. Expired tokens are marked, and a token an [OIDC exchange](#ci-token-exchange) minted shows the subject it acts for in the comment column. A closing line on stderr counts the tokens still holding `read`, `write` and `admin` unrestricted; `bodega doctor` names each one.
 
-### `bodega login --server <url> [--provider NAME]`
+### `bodega login [--server URL] [--provider NAME] [--allow-plaintext]`
 
-Signs in through one of the server's `oidc_providers` with the OAuth device flow and stores the short-lived bodega token the server issues. See [Device sign-in](#device-sign-in).
+Signs in through one of the server's `oidc_providers` with the OAuth device flow and stores the short-lived bodega token the server issues. Without `--server` it signs in to `$BODEGA_SERVER`, then `server_url` from the config file, and fails naming all three when none is set. `--provider` picks the provider when the server offers more than one. An `http://` server is refused unless `--allow-plaintext` is passed, because the token would travel in the clear. See [Device sign-in](#device-sign-in).
 
 ### `bodega token revoke <id|label>`
 
@@ -1958,7 +2031,7 @@ bodega-latest: {
 
 `GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` is encoded whole, as `%2E` and `%2E%2E`, since a client resolves a literal dot segment away before it sends the request. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N]]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N]] [--write-apt-sources] [--write-pkg-repo] [--allow-plaintext]`
 
 Without flags, `doctor` reports and changes nothing. It has two writes, `--write-credentials` and `--configure`, and they run one at a time.
 
@@ -1979,6 +2052,8 @@ The pip check reads `/usr/local/etc/pip.conf`, `/usr/local/pip.conf` and `/etc/x
 bodega doctor --configure apt,pypi --url https://bodega.internal
 sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
 ```
+
+`--configure` refuses plain `http` unless `--allow-plaintext` is set, for `--url` and again for every file URL the plan names, since those carry the server's `public_url` rather than `--url`. Over plain HTTP the bearer token travels in the clear, and the plan and its files can be rewritten in transit together, digests included. Pass it only on a link you trust.
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
@@ -2573,7 +2648,7 @@ Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
 ```
 
-The `OSV` cell reads `n/a` on `binary`, `git` and `helm`. Those three have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
+The `OSV` cell reads `n/a` on `binary`, `git`, `helm`, `freebsd` and `distfiles`. Those five have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
 `GET /api/v1/packages/{type}/{name}/{version}` carries the same keys on the version's `metadata`, plus `vetting.osv.malware`, which lists the stamped ids that are malware records.
 
@@ -2581,7 +2656,7 @@ The `OSV` cell reads `n/a` on `binary`, `git` and `helm`. Those three have no OS
 
 Rejects or flags a version whose upstream publish timestamp is newer than the ecosystem's minimum age, which is the cheapest defense against a freshly published malicious release.
 
-A fresh install is seeded with `npm` and `pypi` at `7d warn`, and the startup banner names it. It is the only policy bodega ships turned on; the allow-list and the OSV gate are empty until you add a rule. The week is the window the 2025-2026 npm and PyPI campaigns were caught in, and `warn` rather than `block` so a first install reports instead of breaking a build. Checksum pinning does not reach this case: it guarantees today's bytes match the first fetch, including a first fetch that was already malicious.
+A fresh install is seeded with `npm` and `pypi` at `7d warn`, and the startup banner names it. It is the only policy bodega writes as a row. Two gates apply with no row at all: the OSV malware block refuses a version OSV records as malicious on every covered ecosystem until [`bodega policy osv malware`](#malware-records) sets another action, and [upstream provenance](#bodega-policy-provenance-setlist) runs at `warn` on every ecosystem it covers. The allow-list and the OSV advisory gate are empty until you add a rule. The week is the window the 2025-2026 npm and PyPI campaigns were caught in, and `warn` rather than `block` so a first install reports instead of breaking a build. Checksum pinning does not reach this case: it guarantees today's bytes match the first fetch, including a first fetch that was already malicious.
 
 The seed is a decision recorded once, in `policy_seeds` in the audit database, not a default re-applied at every start. So `bodega policy age remove npm` is permanent, an empty policy set stays empty across restarts, and an install created before this default gains nothing on upgrade. `bodega doctor` reports an install that enforces nothing.
 
@@ -2766,7 +2841,7 @@ A name equal to a popular one after normalization passes, as does one three or m
 
 The admissions source covers the pass-through proxy, whose fills write an admission row and no manifest, so a name clients have been pulling through the proxy is in use even though the store has never listed it. A name whose only rows are refusals is not in use, and neither is one whose admitted rows all carry a `name_similarity` warning: the check had already run and flagged it.
 
-The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload` and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists and every name with an admitted row, and `list` prints how many came from each source and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
+The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload`, `pkg prefetch` (unless `--dry-run` is set) and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists and every name with an admitted row, and `list` prints how many came from each source and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
 
 **Actions.** One row per ecosystem in `name_similarity_policy`; `set` overwrites, and `list` prints all three, with the unset ones at their default:
 
@@ -3465,7 +3540,8 @@ Recomputes the `.md5` sidecar for every manifest of one package type, or for the
 | `--local-config` |                        | `false`                    | Read and write manifests on the local filesystem instead of the configured backend, whichever driver it uses |
 | `-v, --verbose`  |                        | `false`                    | Verbose output (equivalent to `--log-level 2`)                                                               |
 | `--log-level`    | `BODEGA_LOG_LEVEL`     | `0`                        | Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace                                                |
-| `-V, --version`  |                        |                            | Print version and exit                                                                                       |
+
+`-V, --version` prints the version and exits. It is a flag on bare `bodega` only, not a global one: `bodega -V` answers, and `bodega build -V` is an unknown flag.
 
 ---
 
@@ -3514,7 +3590,7 @@ A default config is created on first run. All fields are optional.
 ```json
 {
   "storage_backend": "local",
-  "storage_path": "/var/lib/bodega/data",
+  "storage_path": "/var/lib/bodega",
   "storage_backends": {
     "bulk": { "driver": "local", "path": "/mnt/bulk/bodega" },
     "archive": {
@@ -3612,9 +3688,11 @@ The copy happens once rather than the file being read as a fallback on every sta
   "noble":          [{"url": "https://archive.ubuntu.com/ubuntu"}],
   "noble-updates":  [{"url": "https://archive.ubuntu.com/ubuntu"}],
   "noble-security": [{"url": "https://security.ubuntu.com/ubuntu"}],
-  "bookworm":       [{"url": "https://deb.debian.org/debian"}]
+  "bookworm":       [{"url": "https://deb.debian.org/debian", "components": ["main", "contrib", "non-free", "non-free-firmware"]}]
 }
 ```
+
+Each entry takes an optional `components` list, the components that archive publishes for the codename. They go on the `Components:` line of the sources stanza a client is handed, and each must match `^[a-z][a-z0-9-]*$`, since apt requests it as a path segment under `/apt/dists/<codename>/`. An entry without the list takes `main restricted universe multiverse`, which is Ubuntu's set, so a Debian upstream names its own. bodega reads no upstream `Release` file to learn them: a server that will not start until an upstream answers makes every client depend on a host it only proxies.
 
 **A codename may not appear in both `apt_suites` and `apt_upstreams`, and the load fails naming it.** bodega signs an index it generated and forwards the signature of one it mirrors; one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an `InRelease` whose digests do not describe the index it gets next. Mirror under the upstream's real codename and name the generated suite something local:
 
@@ -3638,7 +3716,7 @@ It is also consumed rather than displayed. Every `dist.tarball` bodega writes in
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
-`spool_dir`, `spool_max_artifact_bytes` and `spool_max_total_bytes` bound the disk the proxy spends copying upstream artifacts. An empty `spool_dir` means `{build_root}/tmp`, and `bodega serve` refuses to start when it cannot create that directory or write in it. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) for the two ceilings, what a refused client is told, and where the pressure is reported.
+`spool_dir`, `spool_max_artifact_bytes` and `spool_max_total_bytes` bound the disk the proxy spends copying upstream artifacts. An empty `spool_dir` means `{storage_path}/tmp`, `/var/lib/bodega/tmp` by default, and `bodega serve` refuses to start when it cannot create that directory or write in it. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) for the two ceilings, what a refused client is told, and where the pressure is reported.
 
 `audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
@@ -3994,7 +4072,7 @@ Every row names its backend in `backend` and reports the probe under `key` and `
 
 #### Object size
 
-S3 uploads go through the multipart uploader, so an artifact larger than 5 GB reaches an S3 backend. The part size is 16 MiB against S3's 10,000-part cap, which puts the ceiling at 160 GiB.
+S3 uploads go through the multipart uploader, so an artifact larger than 5 GB reaches an S3 backend. The part size is 16 MiB against S3's 10,000-part cap, which puts the ceiling at 160,000 MiB, about 156 GiB.
 
 ### Per-type build roots
 
@@ -4203,6 +4281,7 @@ The script reads these from `/etc/rc.conf`; set them with `sysrc`:
 | `bodega_chdir`         | `/var/lib/bodega`         | Working directory. A relative `manifest_dir` resolves against it.                       |
 | `bodega_logfile`       | `/var/log/bodega.log`     | Where the server's stdout and stderr go. Every directory above it must be root's alone. |
 | `bodega_restart_delay` | `5`                       | Seconds `daemon(8)` waits before restarting a server that exited.                       |
+| `bodega_env`           | unset                     | `VAR=value` pairs for the server's environment, set inline in `rc.conf`.                |
 | `bodega_env_file`      | unset                     | A file of `VAR=value` lines for the server's environment, such as S3 credentials.       |
 
 `bodega_flags` reaches `bodega serve`, not `daemon(8)`. The server's temporary files go to `tmp/` under `bodega_chdir`, which the account itself creates mode 0700 on every start; the script never runs as root on a path the account can write.
@@ -4304,13 +4383,17 @@ All version entries support:
 | `version_constraint` | string | One of: exact, compatible, patch, any                                                                                                 |
 | `checksum`           | object | `{"algorithm": "sha256", "value": "hex..."}`                                                                                          |
 | `checksum_verified`  | bool   | Whether checksum matches upstream publisher                                                                                           |
+| `artifact_digest`    | string | SHA-256 of the bytes the fetch stored, set by fetch and never by the operator. Can differ from `checksum`, which is what was declared |
 | `artifact_size`      | int64  | Size in bytes (set at fetch time)                                                                                                     |
 | `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
+| `dependencies`       | array  | What the version declares it needs, recorded at fetch. Empty means no fetch recorded any, not that it has none                        |
+| `platform`           | string | Target platform, e.g. `linux/amd64`; apt discovery sets it from the package's `Architecture`                                          |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
 | `baseline`           | bool   | Imported with [`pkg import --baseline`](#--baseline): a failing gate admits it and records the finding. Only that import sets it      |
 | `baseline_at`        | string | When the baseline import marked the version, RFC 3339 UTC                                                                             |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |
+| `description`        | string | Overrides the package-level description for this version                                                                              |
 | `metadata`           | object | Ecosystem-specific key-value pairs                                                                                                    |
 | `build_env`          | object | Build server's environment at artifact creation time                                                                                  |
 
@@ -4533,7 +4616,7 @@ sh setup.sh --url https://bodega-host:8443 --systems osquery --apply
 
 The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first.
 
-The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
+The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
 
 The diff redacts before it prints:
 
@@ -4548,7 +4631,7 @@ What the script states about the host: `os` from `uname -s`, which must be `linu
 
 An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. With `--systems osquery` the refusal says so for the secret: a rewritten flags file sends osqueryd's enroll secret, in clear, to whoever rewrote it. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
 
-A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
+A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
 
 | Client                         | What bodega composes                                                                                                         |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -4692,7 +4775,7 @@ bodega identity bind token <id> devbox-3                                # on the
 bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
 ```
 
-The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
 **FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`). Do not hand-write this one; ask the server:
 
@@ -4780,11 +4863,12 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                           |
-| ---------- | --------------- | ----------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                 |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite   |
+| Parameter  | Required        | Value                                                                                                                        |
+| ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                              |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                              |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite                                |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400` |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
@@ -4845,11 +4929,12 @@ web01	web	token:tok-web	npm	refuse	-	-	-	profile "web" is closed for npm, lists 
 web01	web	token:tok-web	cargo	install	~/.cargo/config.toml	https://bodega-host:8080/client/cargo?abi=FreeBSD%3A15%3Aamd64&os=freebsd	5615df6f182f7b726c66e34b9f4b2f347096a6e553e88cd7d146309268d5b74f	-
 web01	web	token:tok-web	freebsd	install	/usr/local/etc/pkg/repos/bodega.conf	https://bodega-host:8080/client/freebsd?abi=FreeBSD%3A15%3Aamd64&os=freebsd	95f4ae0f469790e2a8d1ecd93988bdf8b7c458f82d0044abc4c3950b360c2b75	-
 web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_tree configured, so it admits no distfile
+web01	web	token:tok-web	osquery	skip	-	-	-	this server runs no osquery source in server mode, so there is nothing for osqueryd to enroll with
 ```
 
 <!-- markdownlint-enable MD010 -->
 
-**JSON.** The same records under `records`, with empty fields as `""` and every value unescaped. A test reads `plan.txt` through the `sh` loop above, decodes each field by the rule above in `sh` itself, and fails if any record differs from the JSON one, including a profile named `-`, a host with no profile and an identity holding a tab and a backslash. Two of the ten from the plan above:
+**JSON.** The same records under `records`, with empty fields as `""` and every value unescaped. A test reads `plan.txt` through the `sh` loop above, decodes each field by the rule above in `sh` itself, and fails if any record differs from the JSON one, including a profile named `-`, a host with no profile and an identity holding a tab and a backslash. Two of the eleven from the plan above:
 
 ```json
 {
@@ -5201,7 +5286,7 @@ The proxy path streams: an upstream body is copied to a spool file, checksummed 
 
 | Key                        | Default                | What it bounds                                        |
 | -------------------------- | ---------------------- | ----------------------------------------------------- |
-| `spool_dir`                | `{build_root}/tmp`     | Where the spool files are written                     |
+| `spool_dir`                | `{storage_path}/tmp`   | Where the spool files are written                     |
 | `spool_max_artifact_bytes` | `8589934592` (8 GiB)   | The largest single artifact the proxy will copy       |
 | `spool_max_total_bytes`    | `34359738368` (32 GiB) | The bytes every fetch in flight may hold between them |
 
@@ -5211,7 +5296,7 @@ A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused
 
 **`spool_dir` is a startup condition.** `bodega serve` creates the directory and writes a probe file in it before it binds, and refuses to start naming the path if either fails. Left to the first large fetch, a misplaced spool surfaces as an `ENOSPC` or a permission error inside one proxy request — on the filesystem that by default also holds `audit_db` and the local store, which means the next thing to fail is something unrelated to the proxy.
 
-**Upgrading:** the spool used to be `os.TempDir()`, so `$TMPDIR` was the only lever and it was a process environment variable. It is now `{build_root}/tmp`, matching where `bodega repair keys` already spools. An install whose `build_root` is the shipped `/opt/bodega` and whose serving user cannot create `/opt/bodega/tmp` will refuse to start rather than silently spool somewhere else: create the directory for that user, or set `spool_dir`.
+**Upgrading:** the spool used to be `os.TempDir()`, so `$TMPDIR` was the only lever and it was a process environment variable. It is now `{storage_path}/tmp`, or `/var/lib/bodega/tmp` when `storage_path` is unset, as it is on an S3-only install. `bodega repair keys` and `bodega pkg move` spool there too. It sits under `storage_path` because the shipped systemd unit makes `storage_path` writable and `build_root` read-only, and because a spool on the storage filesystem turns the final move into a rename.
 
 **The per-artifact ceiling.** A `Content-Length` over `spool_max_artifact_bytes` is refused before a byte is read, which is the only way a client learns the artifact is too large without waiting for the whole transfer. A chunked or transparently-decompressed response declares no length, so that case is refused as the copy crosses the ceiling instead. Either way the spool file is removed, nothing is cached, and the error names the key. 8 GiB is roughly twice the largest thing a real archive publishes as one file — a CUDA `.deb` or a torch wheel runs 2-4 GB — and it refuses the runaway, which is otherwise bounded only by the 90-second upstream timeout times upstream bandwidth: about 11 GB at 1 Gbps, times however many fetches arrive at once.
 
@@ -5223,7 +5308,7 @@ A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused
 
 ```json
 "spool": {
-  "dir": "/opt/bodega/tmp",
+  "dir": "/var/lib/bodega/tmp",
   "in_flight": 3,
   "used_bytes": 3221225472,
   "peak_bytes": 7516192768,
@@ -5597,7 +5682,7 @@ It needs a ports tree on the server to read `distinfo` from. Keep it at the revi
 
 The default upstream is plain `http`, as `bsd.port.mk`'s own `MASTER_SITE_BACKUP` is. `distcache.FreeBSD.org` answers `https` with a certificate naming only `pkg.freebsd.org` and `pkgmir.geo.freebsd.org`, so an `https` URL for it fails verification. The transport carries no trust for this type: an attacker on the path can make a fetch fail the digest check and cannot make one pass it. `distfiles_upstream` is the only upstream bodega fetches over plain `http`, and the address check still applies to it: loopback, private and link-local hosts are refused over either scheme.
 
-The server reads the tree in the background at startup, because a cold walk of a full tree takes the better part of a minute (about 8s warm on the 15.1 test guest, twice what it took before the restriction scan followed includes; 43s cold was measured before that). A request arriving before the first read finishes waits up to 5 seconds, then answers `503` with `Retry-After: 30`. No refusal on `/distfiles/` names the tree's path, as configured or with its symlinks resolved, or why a read failed: the `503` says only that the index is loading or its last read failed, the `404` names the distfile, and a `451` names the file it stopped in relative to the tree. Both land in the server log with the root, and the `503` also carries the read error there. The tree is re-read in the background every 10 minutes after that, so a `git pull` under a running server is picked up without a restart.
+The server reads the tree in the background at startup, because a cold walk of a full tree takes the better part of a minute (about 8s warm on the 15.1 test guest, twice what it took before the restriction scan followed includes; 43s cold was measured before that). A request arriving before the first read finishes waits up to 5 seconds, then answers `503` with `Retry-After: 30`. No refusal on `/distfiles/` names the tree's path, as configured or with its symlinks resolved, or why a read failed: the `503` says only that the index is loading or its last read failed, the `404` names the distfile, and a `451` names the file it stopped in relative to the tree. Both land in the server log with the root, and the `503` also carries the read error there. After that, a request that finds the index more than 10 minutes old starts a re-read in the background and is answered from the index it found. Nothing re-reads on a timer, so a `git pull` under a running server is picked up by the first request after the index ages past 10 minutes, without a restart.
 
 #### The client environment
 
@@ -5907,7 +5992,7 @@ bodega serve --allow-plaintext
 
 Two refusals sit behind the same guard:
 
-- **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal — at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` marshals the whole resolved config back over the file, so a cert path cleared in the TUI reaches the listener with nothing else in the way.
+- **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal: at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` writes only the keys whose value differs from what `Load` resolved, and clearing `tls_cert` in the TUI removes the key on the next save, so a cert path cleared there reaches the listener with nothing else in the way.
 - **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with an `ERROR` on every start — the shipped `log_level` prints only `ERROR`, and a line the default install cannot see is not a warning. Off `:443` an authorized plaintext listener is silent: it serves what the operator asked for.
 
 bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries either key logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
@@ -6015,14 +6100,14 @@ A bodega token is a bearer credential with scopes. Operators mint long-lived one
 
 Every token carries one or more scopes. `read` and `write` may be narrowed to package types with a colon. Each scope is granted only by naming it: `admin` implies neither `approve` nor `superadmin`, and neither of those implies `admin`. The operator who sets policy does not also approve exceptions to it, and nobody approving exceptions can mint a second voter.
 
-| Scope        | Reaches                                                                                                                                                                                       |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read`       | Every `GET` and `HEAD` that is not an admin route: the package routes (`/apt/`, `/pypi/`, `/npm/`, `/go/` and the rest), the `/api/v1/packages` reads, `/client/`, status, metrics, git clone |
-| `write`      | `POST /api/v1/packages/{type}`, `POST /api/v1/packages/import`, `DELETE /api/v1/packages/{type}/{name}`, the hide and freeze toggles, and `POST /api/v1/overrides` (requesting an override)   |
-| `admin`      | `/api/v1/policies`, `/api/v1/audit`, `/api/v1/config`, `/api/v1/inventory/{identity}` and `/api/v1/profiles/{name}/pins`, read or write; `GET /api/v1/overrides` and `GET /api/v1/queue`      |
-| `approve`    | `POST /api/v1/overrides/{id}/approve` and `/reject`, `POST /api/v1/queue/{id}/approve` and `/dismiss`; `GET /api/v1/overrides` and `GET /api/v1/queue`                                        |
-| `superadmin` | `/api/v1/tokens`: minting, listing and revoking tokens                                                                                                                                        |
-| `inventory`  | Reads, plus the push routes inventory sources register. Combines with no other scope; see [Inventory token scope](#inventory-token-scope)                                                     |
+| Scope        | Reaches                                                                                                                                                                                                                 |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`       | Every `GET` and `HEAD` that is not an admin route: the package routes (`/apt/`, `/pypi/`, `/npm/`, `/go/` and the rest), the `/api/v1/packages` reads, `/client/`, status, metrics, git clone                           |
+| `write`      | `POST /api/v1/packages/{type}`, `POST /api/v1/packages/import`, `DELETE /api/v1/packages/{type}/{name}`, the hide and freeze toggles, and `POST /api/v1/overrides` (requesting an override)                             |
+| `admin`      | `/api/v1/policies`, read and write; `GET` on `/api/v1/audit`, `/api/v1/config`, `/api/v1/inventory/{identity}` and `/api/v1/profiles/{name}/pins`, which take no write; `GET /api/v1/overrides` and `GET /api/v1/queue` |
+| `approve`    | `POST /api/v1/overrides/{id}/approve` and `/reject`, `POST /api/v1/queue/{id}/approve` and `/dismiss`; `GET /api/v1/overrides` and `GET /api/v1/queue`                                                                  |
+| `superadmin` | `/api/v1/tokens`: minting, listing and revoking tokens                                                                                                                                                                  |
+| `inventory`  | Reads, plus the push routes inventory sources register. Combines with no other scope; see [Inventory token scope](#inventory-token-scope)                                                                               |
 
 The two lists, `GET /api/v1/overrides` and `GET /api/v1/queue`, take `admin` or `approve`: an approver needs the pending rows to vote on, and an operator needs the record of what was granted. Every other route takes exactly the scope in its row. Binding a token to an identity, and editing `oidc_providers`, happen on the host through the CLI and the config file, which only root reaches.
 
@@ -6251,11 +6336,13 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/packages/{type}/{name}/{version}`             | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
 | GET    | `/api/v1/status`                                       | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
 | GET    | `/api/v1/config`                                       | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
+| GET    | `/api/v1/metrics`                                      | Package, version, frozen, hidden, dependency-edge and orphan counts, overall and per type, from the stored metrics or computed on demand                                                |
 | GET    | `/api/v1/packages/{type}/{name}/{version}/attestation` | The newest attestation bodega signed for the version, else the `attestation_uri` passthrough; `?source=upstream` forces the passthrough. See [Attestations](#fetching)                  |
 | GET    | `/api/v1/attestation/keys`                             | Every published attestation signing key, unauthenticated. See [Attestation signing key](#attestation-signing-key)                                                                       |
 | GET    | `/api/v1/audit`                                        | Query audit events (supports filters)                                                                                                                                                   |
 | GET    | `/api/v1/profiles/{name}/pins`                         | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET    | `/client/plan`, `/client/plan.txt`                     | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
+| GET    | `/client/setup.sh`                                     | The client setup script, behind the same admission as the plan. See [Setup script](#setup-script)                                                                                       |
 | GET    | `/client/{system}`                                     | One system's client file, rendered for the requesting host                                                                                                                              |
 | GET    | `/client/osquery-ship.sh`                              | The osquery result-log shipper. See [Mode B: the result-log shipper](#mode-b-the-result-log-shipper)                                                                                    |
 | GET    | `/healthz`                                             | Health probe (returns `ok`)                                                                                                                                                             |
@@ -6450,13 +6537,13 @@ These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list needs 
 
 `POST /api/v1/policy/revet` is the threat-feed webhook. It sits outside `admin_permit_cidr` and the bearer-token requirement, and is authenticated by an HMAC over its body instead; see [Re-vet webhook](#re-vet-webhook).
 
-Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
+Mutation endpoints and the eight admin reads (`/api/v1/audit`, `/api/v1/config`, `/api/v1/policies`, `/api/v1/tokens`, `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins`, `/api/v1/overrides` and `/api/v1/queue`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
 
 That list lives in the audit database and is read per request, so `bodega acl admin add|remove` takes effect on a running server without a restart. `config.json` seeds it on first start and is ignored afterwards; see **Configuration**.
 
 The address compared against that list is the one `trusted_proxies` resolved, not the TCP peer. Behind a proxy the two differ by design; on a shared private network with the default trusted set they differ because a stranger said so.
 
-When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required, and it must hold the scope the route needs (`write` for the package routes, `admin` for tokens and policies). Generate tokens with `bodega token generate --scope ...` and pass them in the `Authorization` header. Widening the list is what turns that requirement on, which is why `bodega acl admin add` refuses to widen past localhost while no token exists.
+When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required, and it must hold the scope the route needs (`write` for the package routes, `admin` for policies, `superadmin` for tokens; see [Token scopes](#token-scopes)). Generate tokens with `bodega token generate --scope ...` and pass them in the `Authorization` header. Widening the list is what turns that requirement on, which is why `bodega acl admin add` refuses to widen past localhost while no token exists.
 
 **Create example (from localhost):**
 
@@ -6882,6 +6969,9 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 | `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API)                                                                                                                          |
 | `init`, `reset`, `status`, `show`                                 | Operator command                                                                                                                                             |
 | `policy`                                                          | A gate's action changed; today `bodega policy osv malware set`, with the action and reason in `details`                                                      |
+| `revet`                                                           | A re-vet refused an admitted version, or the [re-vet webhook](#re-vet-webhook) requested one                                                                 |
+| `override`                                                        | An override requested, approved or rejected. See [`bodega override`](#bodega-override-requestapproverejectlist)                                              |
+| `queue`                                                           | A review-queue row approved or dismissed. See [`bodega queue`](#bodega-queue-listapprovedismiss)                                                             |
 | `cache`                                                           | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the refusals decided on the way                                       |
 | `denied`                                                          | A request the server refused                                                                                                                                 |
 | `serve_start`, `serve_stop`                                       | `bodega serve` bound its listener / shut down                                                                                                                |
@@ -6889,7 +6979,7 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 
 That table is the whole set. A type absent from a trail is a gap to chase rather than a type the server was never going to write: `cache` was defined and reachable only through its two refusals for several releases, so an install proxying npm and cargo all day recorded nothing saying which artifacts had come from upstream, and nothing in the trail read as missing.
 
-**Cache outcomes.** A `cache` row's `status` names which of the five happened. The first two are written on the serving path, one per request, and carry the package type, name and version off the object key with the upstream that answered in `details`:
+**Cache outcomes.** A `cache` row's `status` names which of the seven happened. The first two are written on the serving path, one per request, and carry the package type, name and version off the object key with the upstream that answered in `details`:
 
 | Status              | Outcome                                                                                                                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -6897,6 +6987,7 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
 | `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record                              |
+| `policy_warn`       | A gate warned on a version a proxy fill admitted anyway. `details` carry the findings. An import or create writes the same status on its `create` row                                                       |
 | `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
 | `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
 
@@ -6925,14 +7016,20 @@ An object cached before bodega kept origins, filled by a path that fetches nothi
 | `token_expired`            | Bearer matched a token past its `expires_at`                                                                                                                                                                                                                                                                       |
 | `token_scope`              | A token presented on a route its scopes do not reach, read or mutation. `details` carries `token_id`, `scope` and `missing_scope`                                                                                                                                                                                  |
 | `oidc_refused`             | An ID token presented to `POST /api/v1/auth/exchange` failed verification or matched no rule. `details.reason` is the reason the caller was sent, never the token                                                                                                                                                  |
-| `admin_only`               | Admin-gated read (`/api/v1/config`, `/api/v1/audit`, tokens, policies) from outside `admin_permit_cidr`                                                                                                                                                                                                            |
+| `signature_invalid`        | A `POST /api/v1/policy/revet` body that is unsigned, mis-signed, stale or replayed. `details.reason` says which. See [Re-vet webhook](#re-vet-webhook)                                                                                                                                                             |
+| `admin_only`               | One of the eight admin reads (audit, config, policies, tokens, `inventory/{identity}`, `profiles/{name}/pins`, overrides, queue) from outside `admin_permit_cidr`                                                                                                                                                  |
 | `entry_frozen`             | `DELETE` on a package whose every version is frozen. The caller cleared the admin gate, which is what makes the attempt worth a row                                                                                                                                                                                |
 | `version_constraint`       | A gomod or npm request for a version outside the entry's `version_constraint`. `pkg_version` carries the version that was refused, `details` the constraint and the entry's own version                                                                                                                            |
 | `push_refused`             | A git smart-HTTP push against a read-only mirror, on the `info/refs?service=git-receive-pack` probe or the `git-receive-pack` POST. `pkg_name` is the namespace, `details` the repository path. The POST reaches this only from inside `admin_permit_cidr`; from anywhere else `ip_not_permitted` refuses it first |
+| `distfile_license`         | A distfile whose port forbids redistributing it (`RESTRICTED`), answered `451`. `details.reason` carries the port's reason                                                                                                                                                                                         |
+| `distfile_client`          | A distfile request from a client that did not measure the environment distfiles are admitted in, answered `451`. `details` carries the environment it sent and the reason                                                                                                                                          |
 | `spool_artifact_too_large` | A proxied artifact over `spool_max_artifact_bytes`. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory)                                                                                                                                                                        |
 | `spool_budget_exhausted`   | A proxy fetch arriving while `spool_max_total_bytes` is already held by the fetches in flight. `details` carries the bytes held and the number of fetches holding them                                                                                                                                             |
 | `client_unidentified`      | A `/client/` request from a host no identity binding names. See [Client plan and per-system files](#client-plan-and-per-system-files)                                                                                                                                                                              |
 | `withheld_version`         | A direct request for an npm tarball, pypi wheel or gomod file whose version [`bodega policy filter`](#bodega-policy-filter-setlist) withholds from the index. `details` names the gate (`age` or `osv`)                                                                                                            |
+| `hidden`                   | A package or version an operator hid, answered `404`. `details.incident` names the refusal                                                                                                                                                                                                                         |
+| `profile_membership`       | A package outside a closed profile's set. Adding the package to the profile admits it                                                                                                                                                                                                                              |
+| `profile_constraint`       | A version outside the profile's constraint for the package. Moving the pin admits it                                                                                                                                                                                                                               |
 | `client_excluded`          | `GET /client/{system}` for a system the host's profile excludes. `details` carries the profile and its reason                                                                                                                                                                                                      |
 
 The first eight gates run in the middleware chain, before any handler; the rest are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
@@ -6990,18 +7087,18 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 Every decision on whether a version may enter bodega writes one row to the `admissions` table, whatever the outcome, a clean pass included. A decision is made by `bodega pkg import`, `pkg edit`, `pkg create`, `POST /api/v1/packages`, `POST /api/v1/packages/import`, a build's fetch, and a proxy fill of a versioned artifact. The table goes wherever the events go: SQLite migration 024 and postgres migration 003 create it, and `syslog` and `jsonl` emit each row as a record of `kind: "admission"`.
 
-| Column          | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, one `integration:<instance>` entry per enabled [integration](#integrations), plus `override` on a row the retired `pkg create` prompt decided; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran, and an `overridden` entry adds `override`, the override's id |
-| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy`, `name_similarity_policy` and `integration_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                                                                                                                                                                                         |
-| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Column          | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pkg_type`      | The package type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `pkg_name`      | The package name as the manifest or the request names it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pkg_version`   | The version; a git entry pinned by ref records the ref, and a pypi entry the builder admits by name records none                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `object_key`    | NULL until the artifact's digest is pinned, then the key the bytes are stored under                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `decision`      | `admitted`, `policy_blocked` or `invalid`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `checks`        | A JSON array of `{check, action, status, detail}`, one entry each for `allowlist`, `age`, `osv`, `upstream_provenance` and `name_similarity`, one `integration:<instance>` entry per enabled [integration](#integrations), plus `override` on a row the retired `pkg create` prompt decided; the `upstream_provenance` entry adds a `provenance` object (`outcome`, `source_repository_uri`, `workflow_ref`, `builder_id`, `bundle_digest`) when the check ran, an `overridden` entry adds `override`, the override's id, and a `block` entry may add `unwaivable`, the reason no override or queue approval admits past it, set when the result named the version as hostile |
+| `policy_digest` | `sha256:` over the allow-list rules, the `age_policy`, `osv_policy`, `osv_malware_policy`, `upstream_provenance_policy`, `name_similarity_policy` and `integration_policy` rows, and the SHA-256 of each popular-name list, in force at the decision                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `actor`         | The OS user, for a CLI decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `identity`      | The host an identity binding resolved the request to, for an API decision or a proxy fill                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `decided_at`    | When the decision was made                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 In each check, `action` is what the configured policy does on a failure (`block`, `warn`, `ignore`, or `none` when no policy is set for the ecosystem; `upstream_provenance` and `name_similarity` record `warn` when none is set, because that is their default) and `status` is what happened: `pass`, `warn`, `block`, `overridden`, `baseline` or `not_evaluated`. `overridden` means the check failed and an approved, unexpired [override](#bodega-override-requestapproverejectlist) admitted the version anyway. `baseline` means the check failed on a version imported with [`--baseline`](#--baseline), which admits it with the finding in the detail. `not_evaluated` means the check did not run: an earlier check refused first, the entry names no upstream the allow-list can rule on, or the path has no version to date. It is never a pass.
 
@@ -7754,8 +7851,14 @@ Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare
 make check          # every job CI blocks on, cheapest leg first
 make build          # compile to ./dist/bodega
 make cross          # cross-compile for every pair in CROSS_TARGETS (linux and freebsd, amd64 and arm64, by default)
-make test           # run tests with race detector
+make install        # install to $(BINDIR), with sudo only if needed; PREFIX= or BINDIR= overrides it
+make uninstall      # remove bodega from $(BINDIR)
+make test           # race-test every package except internal/server
+make test-server    # race-test internal/server
 make test-verbose   # verbose test output
+make test-apt       # drive a real apt against a filtered codename in a container (needs docker)
+make harness        # lint the e2e harness and the served scripts, and run the harness self-test
+make e2e            # the full end-to-end suite against the two dev guests
 make bench          # run benchmarks
 make vet            # go vet
 make fmt            # goimports / gofmt
@@ -7764,24 +7867,22 @@ make lint           # golangci-lint
 make tidy           # go mod tidy + verify
 make tidy-check     # fail on go.mod / go.sum drift or a checksum mismatch (CI's tidy job)
 make ci-drift       # fail if the CI job list and this Makefile disagree
+make pin-check      # fail on any workflow `uses:` not pinned to a full commit SHA
 make clean          # remove build artifacts
 make depend         # install Go + golangci-lint (downloads the linux-amd64 toolchain)
+make help           # list every target with its description
 ```
 
-`make check` is the merge gate. CI's `vet`, `fmt` and `tidy` jobs call the same
-targets, so what passes locally is what the merge blocks on. Three lists have to
-agree and `make ci-drift` reads all three: `needs:` in
-`.github/workflows/ci.yml`, `CI_GATE_JOBS`, and `CI_GATE_TARGETS`, which pairs
-each CI job with the make target that runs it. That target must appear in
-`CHECK_LEGS`, which is `check`'s own prerequisite list, so a job added to CI
-with no leg fails the gate rather than passing it.
-The one exception is `CI_ONLY_GATE_JOBS`: gate jobs no local leg can run, each
-named with its reason. Today that is `test-freebsd`, which runs `go test ./...`
-on a FreeBSD kernel in a VM, so `make check` passing says nothing about it.
-Release archives are GoReleaser's, at tag time: `.goreleaser.yaml` builds
-`linux`, `darwin` and `freebsd` on `amd64` and `arm64`.
-`make fmt-check` requires `goimports` on `PATH` rather than skipping it, because
-a check that skips is weaker than the merge it stands in for.
+`make test` races every package except `internal/server`, and `make test-server` races that one alone. Both are legs of `make check`, and CI runs them as separate jobs, because `internal/server` takes several minutes under `-race` on its own. `test-apt` and `e2e` stay out of `check`: one pulls a container image and reaches `archive.ubuntu.com`, and the other needs both dev guests powered on.
+
+`make check` is the merge gate. CI's `vet`, `fmt` and `tidy` jobs call the same targets, so what passes locally is what the merge blocks on. Three lists have to agree and `make ci-drift` reads all three: `needs:` in `.github/workflows/ci.yml`, `CI_GATE_JOBS`, and `CI_GATE_TARGETS`, which pairs each CI job with the make target that runs it. That target must appear in `CHECK_LEGS`, which is `check`'s own prerequisite list, so a job added to CI with no leg fails the gate rather than passing it.
+
+The one exception is `CI_ONLY_GATE_JOBS`: gate jobs no local leg can run, each named with its reason. Today that is two jobs, so `make check` passing says nothing about either:
+
+- `test-freebsd` boots a FreeBSD VM to run `go test ./...` on a FreeBSD kernel, which a workstation or a Linux runner cannot offer.
+- `reproducible` runs the full GoReleaser pipeline twice, which needs the pinned `goreleaser` and `syft` that `make depend` does not install, and takes minutes `check` should not spend on every edit.
+
+Release archives are GoReleaser's, at tag time: `.goreleaser.yaml` builds `linux`, `darwin` and `freebsd` on `amd64` and `arm64`. `make fmt-check` requires `goimports` on `PATH` rather than skipping it, because a check that skips is weaker than the merge it stands in for.
 
 ### The S3 conformance suite
 
@@ -7808,13 +7909,34 @@ Run that after a crashed suite. `TestInitBucketAgainstALiveBucket` sits behind t
 ### Project structure
 
 ```text
-cmd/bodega/              Cobra commands + pipeline helpers
+cmd/bodega/             Cobra commands + pipeline helpers
 internal/
-  audit/                SQLite audit trail + checksum storage
+  admit/                Checks a manifest passes before it is written to the store
+  aptsign/              OpenPGP signing of the generated apt index
+  aptsources/           apt client configuration: the deb822 stanza and its one-line form
+  attest/               Builds, signs and verifies in-toto attestations about admitted artifacts
+  attestsign/           The attestation signing key
+  audit/                The audit store and its sinks (SQLite, Postgres, syslog, JSONL)
   builder/              Build orchestration per type
+  clientconf/           Each package client's configuration file and where it lives
   config/               Configuration resolution
+  deb822/               Debian control-file parsing
+  distinfo/             FreeBSD ports-tree distinfo digests and redistribution limits
+  entitle/              Whether a host profile may fetch a package at a version
+  host/                 Read-only inspection of the local machine for `bodega doctor`
+  hostpkg/              A package manager's installed-package report, turned into manifests
+  idp/                  OIDC ID-token verification and claim-to-scope mapping
+  integration/          The frame external admission checks are built on
+  inventory/            Which object backs each manifest entry, and what each host has installed
+  lockfile/             Dependency pins read from a project's lockfiles
   logging/              Structured leveled logging (slog)
-  manifest/             Manifest types, loader, MD5 integrity
+  manifest/             Manifest types, store, MD5 integrity
+  pins/                 Recorded version pins and the advisories against them
+  pkgrepos/             FreeBSD pkg client configuration
+  pkgsign/              Signing of a generated FreeBSD pkg catalogue
+  placement/            Which storage backend an upload writes to
+  policy/               Admission gates: allow-list, age, OSV, name similarity, index filter
+  provenance/           Upstream provenance verification (Sigstore)
   s3/                   AWS S3 client (used by storage/s3 adapter)
   server/               HTTP server, proxy/cache, middleware
   storage/              Pluggable object storage (local, S3)
@@ -7827,7 +7949,7 @@ docs/                   Public documentation
 
 1. Add entry struct + manifest envelope in `internal/manifest/types.go`
 2. Add type constant to `AllTypes`
-3. Add Store methods in `internal/manifest/loader.go` (Find, Remove, Save)
+3. Add Store methods in `internal/manifest/store.go` (Find, Remove, Save)
 4. Create builder in `internal/builder/<type>.go` (Fetch, Check, ArtifactPaths)
 5. Add HTTP routes in `internal/server/server.go`
 6. Add CLI cases in `cmd/bodega/cmd_create.go`, `cmd_delete.go`, `cmd_fetch.go`

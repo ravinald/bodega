@@ -533,9 +533,9 @@ func (s *Server) handler() http.Handler {
 // three refuse through this one function. Two refusals for one hazard, worded
 // differently, is how an operator learns to route around the second.
 //
-// allow_plaintext is the request. An empty tls_cert is not one: Save marshals
-// the whole resolved Config back over the file, so a cert path cleared in the
-// TUI reaches this function with nothing else having noticed.
+// allow_plaintext is the request. An empty tls_cert is not one: clearing the
+// cert path in the TUI removes the key on the next Save, so the empty value
+// reaches this function with nothing else having noticed.
 func (s *Server) guardPlaintext() error {
 	// Re-checked after config.Load has already run it: --tls-cert and
 	// --tls-key are written into the Config afterwards, so a clean file plus

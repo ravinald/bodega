@@ -13,6 +13,8 @@ make build                    # builds to ./dist/bodega
 sudo make install             # installs to /usr/local/bin/bodega
 ```
 
+`make install` writes to `/usr/local/bin`, or to `/opt/homebrew/bin` on a Mac where Homebrew has created that directory (Apple Silicon). `PREFIX=` or `BINDIR=` overrides it: `make install PREFIX=$HOME/.local` installs to `~/.local/bin`.
+
 The server runs on FreeBSD as well as Linux. The Makefile uses GNU make syntax, and FreeBSD's default `go` package trails the version `go.mod` requires, so install both by name:
 
 ```bash
@@ -31,7 +33,7 @@ make cross                    # builds ./dist/bodega-{linux,freebsd}-{amd64,arm6
 
 ## 2. Configure
 
-bodega works out of the box with local filesystem storage. A config file is created automatically on first run at `~/.config/bodega/config.json`.
+bodega works out of the box with local filesystem storage. The first run creates a config file at `/etc/bodega/config.json` when run as root, and at `~/.config/bodega/config.json` otherwise, unless `$BODEGA_CONFIG_FILE` names another path.
 
 For S3-backed storage, set the backend and bucket:
 
@@ -234,6 +236,9 @@ When a dependency like `libssl3` has a security issue or checksum mismatch:
 
 ```bash
 # Hide the bad version from clients (stays in manifest as a record)
+bodega pkg hide apt libssl3 3.0.13-0ubuntu3.1
+
+# Without a version, hide toggles every version of the package
 bodega pkg hide apt libssl3
 
 # Fetch again — bodega skips the hidden version
@@ -271,7 +276,7 @@ With proxy enabled, when a client requests a package not in storage, bodega fetc
 The REST API's create and delete endpoints are restricted to localhost by default. If you need to create or delete entries from another host (e.g., CI), generate a token and then widen the allow-list, in that order:
 
 ```bash
-bodega token generate ci-pipeline expiry 90d "CI deploy token"
+bodega token generate ci-pipeline expiry 90d "CI deploy token" --scope write
 # Displays the token once — save it. A hashed copy is stored in the audit DB.
 
 bodega acl admin add 10.0.0.0/8
@@ -313,5 +318,5 @@ To turn the gates on without breaking builds that already work, or approving eac
 - Run `bodega serve` as a service: [bodega.service](bodega.service) under systemd on Linux, [bodega.rc](bodega.rc) under rc.d on FreeBSD
 - Put nginx in front for TLS termination and caching at scale
 - Use the REST API for CI/CD integration (`POST /api/v1/packages/{type}`)
-- Query the audit trail to track package usage (`bodega audit events --type fetch`)
+- Query the audit trail to track package usage (`bodega audit events --type serve_fetch`)
 - Read [Design](design.md) for architecture details
