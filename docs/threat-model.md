@@ -235,8 +235,11 @@ risk:
   read: a lookup that got no answer (a rate limit, an outage), an answer
   that does not parse, or a packument that no longer lists the version. It
   is also `unknown` when bodega has no Sigstore trusted root to check a
-  bundle against (TUF unreachable, or a `sigstore_trusted_root` file that
-  cannot be read or parsed); only a bundle checked against a root and
+  bundle against: TUF unreachable, or a `sigstore_trusted_root` file that
+  cannot be read or parsed. `bodega serve` refuses to start when
+  `sigstore_trusted_root` names a file that is missing or does not parse,
+  so a bad file yields `unknown` only on a CLI admission, or after the file
+  breaks under a running server. Only a bundle checked against a root and
   failing is `invalid`.
   Nothing was verified, so it claims neither that provenance is absent nor
   that it failed, and unlike `invalid` an override may admit it. Under
@@ -391,15 +394,20 @@ https://user:secret@host/`), a schemeless `user:secret@host/x` and a
     `/api/v1/status` fields above are returned in full with no
     `Authorization` header. `/api/v1/audit` is gated the same way and
     returns the before and after manifest JSON a mutation recorded, as
-    written; `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies` and
-    `/api/v1/profiles/{name}/pins` share the gate and emit no version
-    `url`. `admin_permit_cidr` is therefore the boundary for the stored
-    credential on reads, not the token.
+    written; `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies`,
+    `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins` and
+    `GET /api/v1/queue` share the gate and emit no version `url`. The token
+    list is among them, so a tokenless request from the range reads what
+    only a `superadmin` token reaches. `admin_permit_cidr` is therefore the
+    boundary for the stored credential on reads, not the token.
   - **Mutations: the existing CIDR and token rules.** Create and the hide and
     freeze toggles return the whole manifest as stored. A mutation needs an
     address in `admin_permit_cidr`, and a bearer token holding `write` for
     the package's type only once that range reaches past loopback; a
-    loopback-only server takes mutations from localhost with no token.
+    loopback-only server takes mutations from localhost with no token,
+    `DELETE /api/v1/tokens/{id}` included. Every override route, queue
+    approve and dismiss, and `POST /api/v1/tokens` need a token bound to an
+    identity on every server, loopback-only included.
   - **Operator host and backend.** `bodega show pkg`, `pkg export`,
     `pkg edit`, the TUI, the builder's output, repair and validation
     diagnostics and the server log print or serialize the manifest as
@@ -664,29 +672,46 @@ defence against:
   that user can. Bodega controls _which_ packages run; it does not sandbox
   what they do once they run.
 - **What a token's scopes limit, and what they do not.** Every token carries
-  scopes: `read`, `write` and `admin`, each optionally narrowed to package
-  types, or `inventory`. A token presented on a route its scopes do not reach
-  is refused with `403` on reads and mutations alike, so a `read` token
-  written to a client host by `bodega doctor --write-credentials` cannot
-  `POST` or `DELETE` from that host even inside `admin_permit_cidr`.
-  `admin` covers every route that writes policy, profiles, tokens or
-  override votes, or that returns requester identities or client
-  addresses: the review queue's list, approve and dismiss included, so a CI
-  token refused a package cannot approve its own queue row into an
-  allow-list rule. What scopes do not limit:
-  - _A request that presents no token._ The read path stays open; an admin
-    read inside `admin_permit_cidr` needs no token; a loopback-only server
-    takes mutations from localhost with no token. A host inside the range
-    gets as much without its token as an `admin` token would give it, and
-    `admin_permit_cidr` stays the boundary for those. A credential that
-    matches no token on a read is no credential, as it was before.
+  one or more of six scopes: `read`, `write`, `admin`, `approve`,
+  `superadmin` and `inventory`. Only `read` and `write` take package types;
+  the other four reach the same routes whatever the type. `inventory`
+  combines with no other scope. A token presented on a route its scopes do
+  not reach is refused with `403` on reads and mutations alike, so a `read`
+  token written to a client host by `bodega doctor --write-credentials`
+  cannot `POST` or `DELETE` from that host even inside
+  `admin_permit_cidr`. `admin` covers the policy, audit, config, inventory
+  and profile routes: `/api/v1/policies`, `/api/v1/audit`,
+  `/api/v1/config`, `/api/v1/inventory/{identity}` and
+  `/api/v1/profiles/{name}/pins`. The token routes (`/api/v1/tokens`) need
+  `superadmin`. Override votes (`/api/v1/overrides/{id}/approve` and
+  `/reject`) and queue approve and dismiss (`/api/v1/queue/{id}/approve`
+  and `/dismiss`) need `approve`, so a CI token refused a package cannot
+  approve its own queue row into an allow-list rule. The override and
+  queue lists (`GET /api/v1/overrides`, `GET /api/v1/queue`) take either
+  `admin` or `approve`. `admin` implies neither `approve` nor
+  `superadmin`. What scopes do not limit:
+  - _A request that presents no token._ The read path stays open. Inside
+    `admin_permit_cidr` a request with no token gets the admin reads
+    (audit, config, policies, `inventory/{identity}`,
+    `profiles/{name}/pins` and the queue list) and the token list
+    (`GET /api/v1/tokens`), which no `admin` token reaches. A loopback-only
+    server takes mutations from localhost with no token, revoking a token
+    (`DELETE /api/v1/tokens/{id}`) included, so a tokenless localhost
+    request there reaches more than an `admin` token does.
+    `admin_permit_cidr` stays the boundary for those. Every override route,
+    the override list included, queue approve and dismiss, and minting a
+    token (`POST /api/v1/tokens`) still refuse a request that presents no
+    token bound to an identity, on every server. A credential that matches
+    no token on a read is no credential, as it was before.
   - _Routes tied to no type._ `write:npm` reaches only npm's write routes,
     but a narrowed `read` reaches every untyped read, such as the
     `/api/v1/packages` listing, `/api/v1/status` and `/client/`, which name
     packages of every type.
-  - _Tokens minted before scopes._ They migrated to `read,write,admin` so
-    nothing in use broke, and stay that broad until replaced. `bodega
-doctor` names each one under `token-scope`.
+  - _Tokens minted before scopes._ Migrations 036 and 037 gave them
+    `read,write,admin,approve,superadmin` so nothing in use broke, and they
+    stay that broad until replaced. Migration 037 also widened every token
+    holding `admin` to `admin,approve,superadmin`. `bodega doctor` names
+    each one under `token-scope`.
   - _The mapping an exchange applies._ An exchanged token is as narrow as
     the rule that matched. A rule matching `repository_owner` grants every
     repository in the organization, and one naming `repository` without
@@ -926,7 +951,9 @@ verify` checks that digest against the artifact you hold, so the statement
   where it came from.
 - **This policy.** `policyEvaluations` carries the admission row as
   recorded: the decision, every check's action and status, and the digest of
-  the allow-list, age, OSV and upstream provenance policy in force. A check
+  the policy in force: the allow-list, age, OSV, OSV malware, upstream
+  provenance, name-similarity and integration policy rows, and the
+  popular-name list loaded for each ecosystem. A check
   that did not run says `not_evaluated`, and an object pinned with no
   decision behind it carries nothing else. `verify` fails a statement whose decision is not `admitted`
   or whose checks include a `block`; it passes `not_evaluated`, so a consumer
@@ -1028,9 +1055,10 @@ host access with fewer people than the quorum, bind each person their own
 token, and read `bodega audit events --type override` the way you read token
 creation.
 
-**Two verdicts are never overridden:** an OSV malware record and upstream
-provenance that fails to verify. Both say the bytes are hostile, and a vote
-does not change what the bytes are. Every other check, the allow-list
+**Three verdicts are never overridden:** an OSV malware record, an
+integration verdict that flags a version as malware, and upstream
+provenance that fails to verify. All three say the bytes are hostile, and a
+vote does not change what the bytes are. Every other check, the allow-list
 included, can be overridden for one version at a time, so an approved override
 of `osv` admits a version with a known advisory exactly as written.
 
@@ -1045,9 +1073,11 @@ served after its override expires.
 ## Baseline marks and report mode
 
 A version imported with `bodega pkg import --baseline` is admitted past any
-failing gate except an OSV malware record and upstream provenance that fails
-to verify, and an ecosystem switched to report mode with `bodega policy
-enforce` admits whatever its gates would have refused (see
+failing gate except an OSV malware record, an integration verdict that flags
+a version as malware, and upstream provenance that fails to verify. An
+ecosystem switched to report mode with `bodega policy enforce` admits
+whatever its age, OSV, upstream provenance and name-similarity gates would
+have refused; every integration stays at its own action (see
 [usage.md](usage.md#rolling-out-enforcement)). Both are deliberate holes, sized
 to what hosts already run and to the time it takes to read a report.
 
@@ -1067,8 +1097,9 @@ the allow-list, because a host pinned to that version reads the index first.
 The index still names the package's unmarked versions, and each of those is
 refused at the artifact, so the hole is the marked versions and nothing else.
 
-Report mode leaves the OSV malware action blocking and the allow-list as its
-admission mode says. Every switch is a `policy` audit event naming who made it,
+Report mode leaves the OSV malware action blocking, the allow-list as its
+admission mode says, and every integration at its own action, so a
+`malware-list` instance under `block` still refuses. Every switch is a `policy` audit event naming who made it,
 so a report mode nobody switched back is visible in the audit trail, and
 `bodega policy report` lists every ecosystem's flagged checks with what each
 does once enforced.
@@ -1272,7 +1303,7 @@ set npm 7d block` turns the shipped `warn` into a refusal once you have
   clients: they are the install's own posture, and they take effect without a
   restart.
 
-On the bodega host itself, `doctor` adds four checks that read the audit
+On the bodega host itself, `doctor` adds five checks that read the audit
 database rather than the machine. They report `N/A` on a client host with no
 install, and `SKIPPED` where this account cannot read what they read:
 
@@ -1291,6 +1322,12 @@ install, and `SKIPPED` where this account cannot read what they read:
   allow-list rules, not because anyone ran `policy mode set`. It reports OK and
   names them: open is how a type without rules has always behaved, so it is a
   decision to record rather than a defect.
+- `token-scope`: one warning for each unexpired token that holds `read`,
+  `write` and `admin` on every package type, as every token minted before
+  scopes does, or that holds `superadmin` with `approve`, so
+  its holder can mint a token for a second identity and vote alongside it.
+  It also warns when fewer than `override_quorum` identities can reach
+  `approve` over the API, so no override can ever be approved there.
 
 ## See also
 

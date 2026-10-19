@@ -118,8 +118,8 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*ObjectStatus, err
 }
 
 // uploadPartSize is the multipart chunk. S3 caps an upload at 10,000 parts, so
-// 16 MiB puts the object ceiling at 160 GiB while holding at most
-// uploadPartSize × uploadConcurrency in memory at once.
+// 16 MiB puts the object ceiling at 160,000 MiB (about 156 GiB) while holding
+// at most uploadPartSize × uploadConcurrency in memory at once.
 const (
 	uploadPartSize    = 16 * 1024 * 1024
 	uploadConcurrency = 4
