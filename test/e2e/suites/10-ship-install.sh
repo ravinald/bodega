@@ -43,24 +43,28 @@ e2e_wait_for() {
 # ---- build -----------------------------------------------------------------
 
 E2E_HOST=local
-BIN="$REPO_ROOT/dist/bodega-linux-arm64"
+if ! srv_arch="$(e2e_goarch server)" || ! cli_arch="$(e2e_goarch client)"; then
+	e2e_block SHIP-BLOCK-ARCH "install on both guests" "a guest reported an architecture no build target maps to"
+	return 0
+fi
+ship_targets="linux/$srv_arch"
+[ "$cli_arch" = "$srv_arch" ] || ship_targets="$ship_targets linux/$cli_arch"
+BIN="$REPO_ROOT/dist/bodega-linux-$srv_arch"
 
 if [ "${E2E_SHIP:-yes}" = yes ]; then
-	# arm64 only. Both guests are aarch64, and an amd64 binary lands there as
-	# `cannot execute binary file`, which reads as a truncated upload.
-	e2e_local make -C "$REPO_ROOT" cross CROSS_TARGETS=linux/arm64 || true
-	check_eq SHIP-01 "make cross builds the arm64 binary" 0 "$E2E_RC" \
-		"Makefile" "make cross CROSS_TARGETS=linux/arm64" "$E2E_RC"
+	e2e_local make -C "$REPO_ROOT" cross "CROSS_TARGETS=$ship_targets" || true
+	check_eq SHIP-01 "make cross builds each guest's binary" 0 "$E2E_RC" \
+		"Makefile" "make cross CROSS_TARGETS=$ship_targets" "$E2E_RC"
 else
-	e2e_skip SHIP-01 "make cross builds the arm64 binary" "--no-ship"
+	e2e_skip SHIP-01 "make cross builds each guest's binary" "--no-ship"
 fi
 
 if [ -f "$BIN" ] || [ "${E2E_DRY_RUN:-no}" = yes ]; then
 	e2e_local file "$BIN" || true
-	check_contains SHIP-02 "the shipped binary is aarch64" "ARM aarch64" "$E2E_OUT" \
-		"test/e2e/README.md" "file dist/bodega-linux-arm64"
+	check_contains SHIP-02 "the server's binary is $srv_arch" "$(e2e_file_arch "$srv_arch")" "$E2E_OUT" \
+		"test/e2e/README.md" "file dist/bodega-linux-$srv_arch"
 else
-	e2e_record SHIP-02 FAIL "the shipped binary is aarch64" "dist/bodega-linux-arm64 exists" "missing" "file $BIN" 1 ""
+	e2e_record SHIP-02 FAIL "the server's binary is $srv_arch" "dist/bodega-linux-$srv_arch exists" "missing" "file $BIN" 1 ""
 	e2e_block SHIP-BLOCK-BIN "install on both guests" "no binary to ship"
 	return 0
 fi
@@ -71,7 +75,8 @@ for h in server client; do
 	E2E_HOST="$h"
 	n="$([ "$h" = server ] && echo 3 || echo 4)"
 	if [ "${E2E_SHIP:-yes}" = yes ]; then
-		if e2e_put "$h" "$BIN" /tmp/bodega-under-test &&
+		h_bin="$REPO_ROOT/dist/bodega-linux-$([ "$h" = server ] && echo "$srv_arch" || echo "$cli_arch")"
+		if e2e_put "$h" "$h_bin" /tmp/bodega-under-test &&
 			e2e_on "$h" "sudo install -o root -g root -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega"; then
 			e2e_record "SHIP-0$n" PASS "$h takes the new binary" "installed" "installed" "install /usr/local/bin/bodega" 0 ""
 		else
@@ -233,4 +238,4 @@ for t in apt git pypi binary gomod helm npm cargo freebsd; do
 		"internal/manifest/types.go:43" "curl $E2E_BASE_URL/api/v1/packages"
 done
 
-unset h n want missing help_out api_types t BIN
+unset h n want missing help_out api_types t BIN h_bin srv_arch cli_arch ship_targets

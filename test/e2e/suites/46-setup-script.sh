@@ -37,11 +37,12 @@ setup_digest="$(shasum -a 256 "$SETUP_SRC" | cut -d ' ' -f 1)"
 # ---- ship ------------------------------------------------------------------
 
 E2E_HOST=local
-SETUP_BIN="$REPO_ROOT/dist/bodega-linux-arm64"
+srv_arch="$(e2e_goarch server)" || srv_arch=arm64
+SETUP_BIN="$REPO_ROOT/dist/bodega-linux-$srv_arch"
 if [ "${E2E_SHIP:-yes}" = yes ]; then
-	e2e_local make -C "$REPO_ROOT" cross CROSS_TARGETS=linux/arm64 || true
-	check_eq SETUP-01 "make cross builds the server's arm64 binary" 0 "$E2E_RC" \
-		"Makefile" "make cross CROSS_TARGETS=linux/arm64" "$E2E_RC"
+	e2e_local make -C "$REPO_ROOT" cross "CROSS_TARGETS=linux/$srv_arch" || true
+	check_eq SETUP-01 "make cross builds the server's binary" 0 "$E2E_RC" \
+		"Makefile" "make cross CROSS_TARGETS=linux/$srv_arch" "$E2E_RC"
 	E2E_HOST=server
 	if e2e_put server "$SETUP_BIN" /tmp/bodega-under-test &&
 		e2e_on server "sudo install -o root -g root -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega" &&
@@ -51,7 +52,7 @@ if [ "${E2E_SHIP:-yes}" = yes ]; then
 		e2e_record SETUP-02 FAIL "the server takes the new binary and restarts" "running" "$E2E_ERR" "install; systemctl restart bodega" "$E2E_RC" ""
 	fi
 else
-	e2e_skip SETUP-01 "make cross builds the server's arm64 binary" "--no-ship"
+	e2e_skip SETUP-01 "make cross builds the server's binary" "--no-ship"
 	e2e_skip SETUP-02 "the server takes the new binary and restarts" "--no-ship"
 fi
 
@@ -319,5 +320,5 @@ setup_guest client "${E2E_CLIENT_ADDR:-127.0.0.1}" /usr/local/sbin:/usr/local/bi
 setup_guest freebsd "${E2E_FREEBSD_ADDR:-127.0.0.1}" "$SETUP_BASE_PATH" "fetch -q -o"
 
 rm -f "$setup_helper_local" "$setup_tamper_local"
-unset SETUP_SRC setup_digest SETUP_BIN SETUP_HELPER setup_helper_local SETUP_TAMPER setup_tamper_local SETUP_BASE_PATH
+unset SETUP_SRC setup_digest SETUP_BIN SETUP_HELPER setup_helper_local SETUP_TAMPER setup_tamper_local SETUP_BASE_PATH srv_arch
 unset -f setup_guest

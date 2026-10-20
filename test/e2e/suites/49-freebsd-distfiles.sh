@@ -102,7 +102,7 @@ ports_url="$E2E_BASE_URL/binaries/freebsd-ports/15.1-RELEASE/ports.txz"
 fd_make="$fd_as __MAKE_CONF=$FD_ROOT/make.conf make -C $FD_PORTS/$FD_PORT WRKDIRPREFIX=$FD_WRK"
 fd_make_http="$fd_make DISTDIR=$FD_DISTDIR"
 
-# The declaration a stock 15.1 arm64 client needs, measured against this
+# The declaration a stock 15.1 client needs, measured against this
 # tree: without the variables and absent files below, 140 ports read
 # something only the client holds and their distinfo cannot be placed, which
 # refuses every distfile. DISTDIR and WRKDIRPREFIX are added because this
@@ -111,8 +111,14 @@ fd_make_http="$fd_make DISTDIR=$FD_DISTDIR"
 # "unsupported". PORTSDIR cannot be declared at all, so it goes in make.conf,
 # where an undeclared variable is not checked.
 fd_decl_files='{"/usr/local/etc/aspell.ver": ["absent"], "/var/db/wanted-ports.conf": ["absent"], "/tmp/PERL5_DEFAULT": ["absent"], "/Makefile.common": ["absent"], "/usr/share/mk/Makefile.local": ["absent"]}'
+# ARCH is the ports framework's name for the client's machine: aarch64 where
+# Go says arm64, amd64 under both.
+case "$(e2e_goarch freebsd 2>/dev/null || echo arm64)" in
+amd64) fd_ports_arch=amd64 ;;
+*) fd_ports_arch=aarch64 ;;
+esac
 # shellcheck disable=SC2016 # ${PORTSDIR} is a make variable the client expands.
-fd_decl_stock='"LOCALBASE": ["/usr/local"], "ARCH": ["aarch64"], "USESDIR": ["${PORTSDIR}/Mk/Uses"], "NODEJS_VERSION": ["24"], "LLVM_DEFAULT": ["19"], "PKGNAMESUFFIX": [], "WANTEDPORTSCFG": [], "CFENGINE_VERSION": [], "CFGFILE": [], "KRB5_VERSION": [], "LLVM_SUFFIX": [], "WANT_PGSQL_VER": [], "XPDF_VERSION": [], "OPTIONS_DEFINE": []'
+fd_decl_stock='"LOCALBASE": ["/usr/local"], "ARCH": ["'"$fd_ports_arch"'"], "USESDIR": ["${PORTSDIR}/Mk/Uses"], "NODEJS_VERSION": ["24"], "LLVM_DEFAULT": ["19"], "PKGNAMESUFFIX": [], "WANTEDPORTSCFG": [], "CFENGINE_VERSION": [], "CFGFILE": [], "KRB5_VERSION": [], "LLVM_SUFFIX": [], "WANT_PGSQL_VER": [], "XPDF_VERSION": [], "OPTIONS_DEFINE": []'
 fd_decl_http="{$fd_decl_stock, \"DISTDIR\": [\"$FD_DISTDIR\"], \"WRKDIRPREFIX\": [\"$FD_WRK\"]}"
 # The DISTDIR delivery names its directory from ${BODEGA_DISTFILES_ENV}, and a
 # declared variable is compared while that digest expands, so make exits 2
@@ -464,7 +470,7 @@ check_eq FDIST-93 "what 47 cached under binaries/distfiles is put back" "$([ "${
 
 rm -f "$fd_conf" "$fd_check_file"
 unset FD_ROOT FD_PORTS FD_DISTDIR FD_WRK FD_MIRROR FD_SYSMK FD_PORT FD_SUBDIR FD_RPORT FD_SERVER_TREE \
-	FD_SERVER_ROOT FD_USER FD_USER_MARK fd_user_drop fd_as fd_bin fd_bin_stash fd_bin_moved ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http \
+	FD_SERVER_ROOT FD_USER FD_USER_MARK fd_user_drop fd_as fd_bin fd_bin_stash fd_bin_moved ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http fd_ports_arch \
 	fd_decl_distdir fd_storage fd_name fd_rname fd_check fd_digest fd_unmount fd_server_pins fd_conf \
 	fd_check_file fd_env fd_drift fd_route fd_fetch fd_rstatus fd_rbody fd_ustatus fd_ubody fd_nstatus fd_nbody fd_pstatus fd_pbody fd_art fd_digest2 \
 	fd_distroot fd_copy_rc fd_sopts fd_fopts fd_env2 fd_drift2

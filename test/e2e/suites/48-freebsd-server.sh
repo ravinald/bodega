@@ -58,8 +58,9 @@ fi
 FSRV_ROOT="${E2E_FREEBSD_STORAGE_ROOT:-/var/tmp/bodega-e2e-storage}"
 FSRV_MD="${E2E_FREEBSD_MD_UNIT:-48}"
 FSRV_MD_NOACL=$((FSRV_MD + 1))
-FSRV_BIN="$REPO_ROOT/dist/storage-freebsd-arm64.test"
-FSRV_GUEST_BIN="$REPO_ROOT/dist/guest-freebsd-arm64.test"
+fsrv_arch="$(e2e_goarch freebsd-server)" || fsrv_arch=arm64
+FSRV_BIN="$REPO_ROOT/dist/storage-freebsd-$fsrv_arch.test"
+FSRV_GUEST_BIN="$REPO_ROOT/dist/guest-freebsd-$fsrv_arch.test"
 
 # Order is the check id: FSRV-<FS>-<WHO>-01 is the first name here.
 FSRV_TESTS=(
@@ -103,22 +104,22 @@ fsrv_principal_drop="[ \"\$(sudo pw usershow -n $FSRV_PRINCIPAL 2>/dev/null | cu
 E2E_HOST=local
 fsrv_build_rc=0
 e2e_local rm -f "$FSRV_BIN" || fsrv_build_rc=$E2E_RC
-e2e_local env GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 \
+e2e_local env GOOS=freebsd "GOARCH=$fsrv_arch" CGO_ENABLED=0 \
 	go test -C "$REPO_ROOT" -c -o "$FSRV_BIN" ./internal/storage || fsrv_build_rc=$E2E_RC
-check_eq FSRV-01 "the internal/storage test binary builds for freebsd/arm64" 0 "$fsrv_build_rc" \
-	"internal/storage/guest_freebsd_test.go" "GOOS=freebsd GOARCH=arm64 go test -c ./internal/storage" "$fsrv_build_rc"
+check_eq FSRV-01 "the internal/storage test binary builds for freebsd/$fsrv_arch" 0 "$fsrv_build_rc" \
+	"internal/storage/guest_freebsd_test.go" "GOOS=freebsd GOARCH=$fsrv_arch go test -c ./internal/storage" "$fsrv_build_rc"
 fsrv_guest_rc=0
 e2e_local rm -f "$FSRV_GUEST_BIN" || fsrv_guest_rc=$E2E_RC
-e2e_local env GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 \
+e2e_local env GOOS=freebsd "GOARCH=$fsrv_arch" CGO_ENABLED=0 \
 	go test -C "$REPO_ROOT" -c -o "$FSRV_GUEST_BIN" ./test/e2e/guest || fsrv_guest_rc=$E2E_RC
-check_eq FSRV-06 "the test/e2e/guest test binary builds for freebsd/arm64" 0 "$fsrv_guest_rc" \
-	"test/e2e/guest/publish_freebsd_test.go" "GOOS=freebsd GOARCH=arm64 go test -c ./test/e2e/guest" "$fsrv_guest_rc"
+check_eq FSRV-06 "the test/e2e/guest test binary builds for freebsd/$fsrv_arch" 0 "$fsrv_guest_rc" \
+	"test/e2e/guest/publish_freebsd_test.go" "GOOS=freebsd GOARCH=$fsrv_arch go test -c ./test/e2e/guest" "$fsrv_guest_rc"
 fsrv_build_rc=$((fsrv_build_rc + fsrv_guest_rc))
 # A binary left by an earlier build would run the code as it was then, and
 # every cell below would grade that instead of this tree. A dry run built
 # nothing and deleted nothing, so there is no binary to hold it to.
 if [ "${E2E_DRY_RUN:-no}" != yes ] && { [ "$fsrv_build_rc" -ne 0 ] || [ ! -x "$FSRV_BIN" ] || [ ! -x "$FSRV_GUEST_BIN" ]; }; then
-	e2e_block FSRV-BLOCK-BUILD "internal/storage on FreeBSD" "a freebsd/arm64 test binary did not build: $(e2e_excerpt "$E2E_ERR")"
+	e2e_block FSRV-BLOCK-BUILD "internal/storage on FreeBSD" "a freebsd/$fsrv_arch test binary did not build: $(e2e_excerpt "$E2E_ERR")"
 	return 0
 fi
 
@@ -268,4 +269,4 @@ e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_M
 check_eq FSRV-05 "both memory disks are destroyed again" "gone" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -d -u $FSRV_MD_NOACL; mdconfig -l" "$E2E_RC"
 
-unset FSRV_PRINCIPAL FSRV_PRINCIPAL_MARK fsrv_principal_drop FSRV_ROOT FSRV_MD FSRV_MD_NOACL FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_NOACL_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc
+unset FSRV_PRINCIPAL FSRV_PRINCIPAL_MARK fsrv_principal_drop FSRV_ROOT FSRV_MD FSRV_MD_NOACL FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_NOACL_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc fsrv_arch

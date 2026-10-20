@@ -52,14 +52,15 @@ FBSD_ROOT="${E2E_FREEBSD_CLIENT_ROOT:-/var/tmp/bodega-e2e-freebsd}"
 # ---- ship ------------------------------------------------------------------
 #
 # `doctor --write-pkg-repo` runs on the host it configures, so the client needs
-# a FreeBSD build of the commit under test. Both FreeBSD guests are arm64.
+# a FreeBSD build of the commit under test, for the client's architecture.
 
 E2E_HOST=local
-FBSD_BIN="$REPO_ROOT/dist/bodega-freebsd-arm64"
+fbsd_arch="$(e2e_goarch freebsd)" || fbsd_arch=arm64
+FBSD_BIN="$REPO_ROOT/dist/bodega-freebsd-$fbsd_arch"
 if [ "${E2E_SHIP:-yes}" = yes ]; then
-	e2e_local make -C "$REPO_ROOT" cross CROSS_TARGETS=freebsd/arm64 || true
-	check_eq FBSD-01 "make cross builds the freebsd/arm64 binary" 0 "$E2E_RC" \
-		"Makefile" "make cross CROSS_TARGETS=freebsd/arm64" "$E2E_RC"
+	e2e_local make -C "$REPO_ROOT" cross "CROSS_TARGETS=freebsd/$fbsd_arch" || true
+	check_eq FBSD-01 "make cross builds the freebsd/$fbsd_arch binary" 0 "$E2E_RC" \
+		"Makefile" "make cross CROSS_TARGETS=freebsd/$fbsd_arch" "$E2E_RC"
 	E2E_HOST=freebsd
 	if e2e_put freebsd "$FBSD_BIN" /tmp/bodega-under-test &&
 		e2e_on freebsd "sudo install -o root -g wheel -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega"; then
@@ -68,7 +69,7 @@ if [ "${E2E_SHIP:-yes}" = yes ]; then
 		e2e_record FBSD-02 FAIL "the freebsd guest takes the new binary" "installed" "$E2E_ERR" "install /usr/local/bin/bodega" "$E2E_RC" ""
 	fi
 else
-	e2e_skip FBSD-01 "make cross builds the freebsd/arm64 binary" "--no-ship"
+	e2e_skip FBSD-01 "make cross builds the freebsd/$fbsd_arch binary" "--no-ship"
 	e2e_skip FBSD-02 "the freebsd guest takes the new binary" "--no-ship"
 fi
 
@@ -422,4 +423,4 @@ check_eq FBSD-PORTS-06 "the distfiles namespace is removed again" "0" "$E2E_OUT"
 E2E_HOST=freebsd
 e2e_on freebsd "rm -rf $FBSD_ROOT" || true
 
-unset FBSD_ROOT FBSD_BIN FBSD_PORT FBSD_SUBDIR FBSD_PORTS fbsd_make fbsd_fetch ports_sha
+unset FBSD_ROOT FBSD_BIN FBSD_PORT FBSD_SUBDIR FBSD_PORTS fbsd_make fbsd_fetch ports_sha fbsd_arch

@@ -57,7 +57,7 @@ e2e_index_check() {
 e2e_index_check SRV-IDX-apt "apt serves a Release index" \
 	"/apt/dists/noble/Release" "internal/server/apt.go:154"
 e2e_index_check SRV-IDX-apt-packages "apt serves a Packages index" \
-	"/apt/dists/noble/main/binary-arm64/Packages" "internal/server/apt.go:231"
+	"/apt/dists/noble/main/binary-${E2E_APT_ARCH}/Packages" "internal/server/apt.go:231"
 e2e_index_check SRV-IDX-pypi "pypi serves the simple index for a hosted wheel" \
 	"/pypi/simple/six/" "internal/server/pypi.go:62"
 e2e_index_check SRV-IDX-gomod "gomod serves @v/list for a hosted module" \
@@ -74,7 +74,7 @@ e2e_index_check SRV-IDX-cargo-config "cargo serves config.json" \
 # ---- artifact routes -------------------------------------------------------
 
 e2e_index_check SRV-ART-apt "apt serves the pool .deb" \
-	"/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_arm64.deb" "internal/server/apt.go:34"
+	"/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_${E2E_APT_ARCH}.deb" "internal/server/apt.go:34"
 e2e_index_check SRV-ART-git "git serves the bundle" \
 	"/git/uuid/uuid-v1.6.0.bundle" "internal/server/git.go:27"
 e2e_index_check SRV-ART-binary "binary serves the downloaded file" \

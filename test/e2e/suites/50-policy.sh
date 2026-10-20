@@ -144,11 +144,12 @@ if [ "${E2E_DRY_RUN:-no}" != yes ] && [ "${E2E_CLIENT_UP:-no}" != yes ]; then
 fi
 
 E2E_HOST=local
-REF_BIN="$REPO_ROOT/dist/bodega-linux-arm64"
+srv_arch="$(e2e_goarch server)" || srv_arch=arm64
+REF_BIN="$REPO_ROOT/dist/bodega-linux-$srv_arch"
 if [ "${E2E_SHIP:-yes}" = yes ]; then
-	e2e_local make -C "$REPO_ROOT" cross CROSS_TARGETS=linux/arm64 || true
-	check_eq POL-REF-01 "make cross builds the server's arm64 binary" 0 "$E2E_RC" \
-		"Makefile" "make cross CROSS_TARGETS=linux/arm64" "$E2E_RC"
+	e2e_local make -C "$REPO_ROOT" cross "CROSS_TARGETS=linux/$srv_arch" || true
+	check_eq POL-REF-01 "make cross builds the server's binary" 0 "$E2E_RC" \
+		"Makefile" "make cross CROSS_TARGETS=linux/$srv_arch" "$E2E_RC"
 	E2E_HOST=server
 	if e2e_put server "$REF_BIN" /tmp/bodega-under-test &&
 		e2e_on server "sudo install -o root -g root -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega"; then
@@ -157,7 +158,7 @@ if [ "${E2E_SHIP:-yes}" = yes ]; then
 		e2e_record POL-REF-02 FAIL "the server takes the new binary" "installed" "$E2E_ERR" "install /usr/local/bin/bodega" "$E2E_RC" ""
 	fi
 else
-	e2e_skip POL-REF-01 "make cross builds the server's arm64 binary" "--no-ship"
+	e2e_skip POL-REF-01 "make cross builds the server's binary" "--no-ship"
 	e2e_skip POL-REF-02 "the server takes the new binary" "--no-ship"
 fi
 
@@ -292,5 +293,5 @@ e2e_restart server || true
 check_eq POL-REF-05 "the server comes back with the posture restored" 0 "$E2E_RC" \
 	"test/e2e/suites/50-policy.sh" "systemctl restart bodega" "$E2E_RC"
 
-unset REF_BIN REF_DIR REF_HOST ref_cache_was ref_rule eco
+unset REF_BIN REF_DIR REF_HOST ref_cache_was ref_rule eco srv_arch
 unset -f ref_clear_caches ref_npm ref_pip ref_go ref_cargo ref_check

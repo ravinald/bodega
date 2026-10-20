@@ -216,6 +216,45 @@ e2e_put() {
 	scp -q "${opts[@]}" -- "$src" "$host:$dst"
 }
 
+# e2e_goarch <alias> — the guest's architecture as Go names it, on stdout.
+#
+# Every binary a suite ships and every architecture-named path it expects
+# follows this, because a binary built for the wrong architecture lands on the
+# guest as `cannot execute binary file`, which reads as a truncated upload.
+# E2E_GOARCH_<ALIAS> (E2E_GOARCH_FREEBSD_SERVER for freebsd-server) skips the
+# read. A dry run reaches no guest, so it takes arm64 unless that variable says
+# otherwise. Returns 2 naming the value when `uname -m` prints an architecture
+# this map does not know.
+e2e_goarch() {
+	local alias="$1" var
+	var="E2E_GOARCH_$(printf '%s' "$alias" | tr '[:lower:]-' '[:upper:]_')"
+	if [ -n "${!var:-}" ]; then
+		printf '%s' "${!var}"
+		return 0
+	fi
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		printf 'arm64'
+		return 0
+	fi
+	e2e_on "$alias" "uname -m" >/dev/null 2>&1 || return 2
+	case "$E2E_OUT" in
+	x86_64 | amd64) printf 'amd64' ;;
+	aarch64 | arm64) printf 'arm64' ;;
+	*)
+		printf 'e2e: %s reports architecture %q, which no build target maps to\n' "$alias" "$E2E_OUT" >&2
+		return 2
+		;;
+	esac
+}
+
+# e2e_file_arch <goarch> — what `file` prints for a binary of that architecture.
+e2e_file_arch() {
+	case "$1" in
+	amd64) printf 'x86-64' ;;
+	arm64) printf 'ARM aarch64' ;;
+	esac
+}
+
 # e2e_curl <alias> <curl-args...> — curl run on a guest, not here. The client
 # guest's source address is what the mutation ACL and the audit rows record, so
 # a request issued from the workstation tests a path nothing in production uses.

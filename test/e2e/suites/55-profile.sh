@@ -179,10 +179,10 @@ check_lacks PROF-13 "the filtered helm index publishes no unentitled chart" \
 	"podinfo-6.7.0.tgz" "$E2E_OUT" "internal/server/helm.go:28" "GET /helm/index.yaml"
 
 # apt is filtered at the index too, rather than gated per request.
-prof_body "/apt/dists/noble/main/binary-arm64/Packages" || true
+prof_body "/apt/dists/noble/main/binary-${E2E_APT_ARCH}/Packages" || true
 check_lacks PROF-14 "the filtered apt index publishes no unentitled package" \
 	"Package: hello" "$E2E_OUT" "internal/server/apt_profile.go:347" \
-	"GET /apt/dists/noble/main/binary-arm64/Packages"
+	"GET /apt/dists/noble/main/binary-${E2E_APT_ARCH}/Packages"
 
 # aptPoolGate is the backstop behind the index filter. An index that leaks the
 # package name and a pool that hands over the .deb are different failures: one
@@ -198,7 +198,7 @@ if [ -z "${E2E_APT_VERSION:-}" ]; then
 		"the apt fixture version is unresolved, so the pool URL would name no object" \
 		"internal/server/apt.go:64"
 else
-	prof_get "/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_arm64.deb" || true
+	prof_get "/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_${E2E_APT_ARCH}.deb" || true
 	check_ne PROF-14b "the apt pool refuses an unentitled .deb" "200" "$E2E_OUT" \
 		"internal/server/apt.go:64" "GET the pool .deb under a closed apt profile"
 fi
