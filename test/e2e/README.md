@@ -48,8 +48,11 @@ destructive by design.
 
 Each Linux guest needs:
 
-- A current Ubuntu or Debian release, on any architecture. The harness builds
-  for the guest's own `GOARCH`, so an arm64 guest needs an arm64 build.
+- A current Ubuntu or Debian release, on amd64 or arm64. Preflight reads each
+  guest's `uname -m` once (PRE-13), and every binary the suites build, every
+  apt path they expect and the helm download follow it. `E2E_GOARCH_SERVER`,
+  `E2E_GOARCH_CLIENT`, `E2E_GOARCH_FREEBSD` and `E2E_GOARCH_FREEBSD_SERVER`
+  skip the read, and a dry run takes arm64 unless they say otherwise.
 - `ssh` from the workstation as a user with passwordless `sudo`, by key. The
   harness never prompts, so a password-gated `sudo` hangs the run.
 - Outbound network to whatever upstream registries the suites fetch from.
@@ -63,8 +66,8 @@ needs and reports what it could not.
 
 Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `ssh` and `sudo` access, and room under `/var/tmp`. Suite 47 ships
-`dist/bodega-freebsd-arm64` to `freebsd`, so an amd64 guest needs that
-target changed. It points `pkg` at the Linux server through the stanza
+`dist/bodega-freebsd-<arch>` to `freebsd`, built for the architecture that
+guest reports. It points `pkg` at the Linux server through the stanza
 `bodega doctor --write-pkg-repo` writes, and removes the stanza again at the
 end. Suite 49 mounts its scratch ports tree and `/usr/share/mk` read-only
 with `nullfs` on `freebsd` and unmounts both at the end; on the Linux server it

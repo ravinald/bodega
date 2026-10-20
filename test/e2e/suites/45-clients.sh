@@ -51,9 +51,10 @@ check_eq CLI-00 "the client takes npm, pip and cargo from the archive" 0 "$E2E_R
 # helm is not in the Ubuntu archive. Its own install script is the documented
 # route and it is pinned rather than tracking latest, so a client failure is
 # attributable to a version.
+helm_arch="$(e2e_goarch client)" || helm_arch=arm64
 e2e_on client "command -v helm >/dev/null 2>&1 || \
-	(curl -fsSL https://get.helm.sh/helm-v3.16.2-linux-arm64.tar.gz -o $CLIENT_ROOT/helm.tgz && \
-	 tar -xzf $CLIENT_ROOT/helm.tgz -C $CLIENT_ROOT && sudo install -m0755 $CLIENT_ROOT/linux-arm64/helm /usr/local/bin/helm)" || true
+	(curl -fsSL https://get.helm.sh/helm-v3.16.2-linux-$helm_arch.tar.gz -o $CLIENT_ROOT/helm.tgz && \
+	 tar -xzf $CLIENT_ROOT/helm.tgz -C $CLIENT_ROOT && sudo install -m0755 $CLIENT_ROOT/linux-$helm_arch/helm /usr/local/bin/helm)" || true
 e2e_on client "helm version --short" || true
 check_matches CLI-01 "the client has a helm binary" '^v3\.' "$E2E_OUT" \
 	"test/e2e/README.md" "helm version --short"
@@ -345,4 +346,4 @@ e2e_on server "rm -rf $CLIENT_ROOT/gomod && mkdir -p $CLIENT_ROOT/gomod && cd $C
 check_eq CLI-GOMOD-01 "go get resolves a module through the bodega proxy" 0 "$E2E_RC" \
 	"internal/server/gomod.go:13" "GOPROXY=$E2E_BASE_URL/go go get github.com/google/uuid@v1.6.0" "$E2E_RC"
 
-unset server_fpr CLIENT_ROOT
+unset server_fpr CLIENT_ROOT helm_arch

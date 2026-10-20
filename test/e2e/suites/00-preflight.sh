@@ -70,6 +70,24 @@ for h in server client; do
 		"$h sudo is passwordless" "0" "$E2E_OUT" "test/e2e/README.md" "sudo -n id -u" "$E2E_RC"
 done
 
+# ---- architecture ----------------------------------------------------------
+#
+# Every binary the suites ship and every architecture-named path they expect
+# follows what each guest reports. Read here once and exported, so a later
+# suite asks no guest again and a guest the build cannot target stops the run
+# at its first suite rather than as an unexecutable upload fifty checks on.
+
+for h in server client; do
+	E2E_HOST="$h"
+	var="E2E_GOARCH_$(printf '%s' "$h" | tr '[:lower:]' '[:upper:]')"
+	arch="$(e2e_goarch "$h" 2>/dev/null)" || arch=""
+	check_matches "PRE-13-$h" "$h reports an architecture the build targets" \
+		'^(amd64|arm64)$' "${arch:-unknown}" "test/e2e/README.md" "uname -m"
+	[ -n "$arch" ] && printf -v "$var" '%s' "$arch" && export "${var?}"
+done
+E2E_APT_ARCH="${E2E_GOARCH_SERVER:-arm64}"
+export E2E_APT_ARCH
+
 # ---- clock -----------------------------------------------------------------
 #
 # Audit rows carry timestamps and several checks assert ordering across the two
@@ -155,4 +173,4 @@ for up in proxy.golang.org registry.npmjs.org index.crates.io pypi.org; do
 	esac
 done
 
-unset h local_now skew avail up pair alias name addr
+unset h local_now skew avail up pair alias name addr var arch
