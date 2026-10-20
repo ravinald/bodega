@@ -232,21 +232,23 @@ e2e_http client "/git/e2eopen/google/uuid.git/info/refs?service=git-upload-pack"
 check_ne PXY-05c "the open namespace is gone once git_upstreams is emptied" "200" "$E2E_OUT" \
 	"internal/server/git.go:72" "GET the same path with git_upstreams empty"
 
-# ---- binary_upstreams turns the storage read off ---------------------------
+# ---- binary_upstreams gates the storage read ------------------------------
 #
 # While the map is empty, /binaries/{path...} reads storage as it always has.
-# Once any entry exists, a request whose first segment names no key 404s as
-# no_namespace instead of falling through — including a path that resolved a
-# moment ago, which is what SRV-ART-binary asserts in 40-serve-hosted.sh.
-# Asserted in both directions: a check that only saw the 404 could not tell the
-# switch from a fixture that had gone missing, and the other direction is PXY-09
-# under the restore. The e2ebin upstream set above is never reached, because the
-# request names a different first segment.
+# Once any entry exists, a first segment naming no key reaches storage only
+# when a hosted manifest names the package the path resolves to; anything else
+# 404s as no_namespace. Asserted in both directions: the hosted fixture still
+# serves, and a name nothing hosts does not fall through to storage. The e2ebin
+# upstream set above is never reached, because neither request names it.
 
 E2E_HOST=client
 e2e_http client "/binaries/hello-binary/1.0.0/LICENSE" || true
-check_eq PXY-08 "one binary_upstreams entry 404s a path that served from storage" "404" "$E2E_OUT" \
-	"internal/server/binary.go:38" "GET /binaries/hello-binary/1.0.0/LICENSE with a namespace configured"
+check_eq PXY-08 "a hosted binary still serves with a binary_upstreams entry configured" "200" "$E2E_OUT" \
+	"internal/server/binary.go:47" "GET /binaries/hello-binary/1.0.0/LICENSE with a namespace configured"
+
+e2e_http client "/binaries/e2e-no-such-namespace/1.0.0/LICENSE" || true
+check_eq PXY-08b "a path no key and no manifest names 404s once a namespace is configured" "404" "$E2E_OUT" \
+	"internal/server/binary.go:54" "GET /binaries/e2e-no-such-namespace/1.0.0/LICENSE with a namespace configured"
 
 # ---- restore ---------------------------------------------------------------
 #
@@ -263,7 +265,7 @@ check_eq PXY-07 "the server returns to the hosted-only posture" 0 "$E2E_RC" \
 
 E2E_HOST=client
 e2e_http client "/binaries/hello-binary/1.0.0/LICENSE" || true
-check_eq PXY-09 "emptying binary_upstreams restores the storage read" "200" "$E2E_OUT" \
+check_eq PXY-09 "the hosted binary serves with binary_upstreams emptied" "200" "$E2E_OUT" \
 	"internal/server/binary.go:57" "GET /binaries/hello-binary/1.0.0/LICENSE with binary_upstreams empty"
 
 # ---- the switch off --------------------------------------------------------

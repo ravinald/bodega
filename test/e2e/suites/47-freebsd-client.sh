@@ -363,9 +363,8 @@ FBSD_PORTS="$FBSD_ROOT/usr/ports"
 fbsd_make="make -C $FBSD_PORTS/$FBSD_PORT PORTSDIR=$FBSD_PORTS DISTDIR=$FBSD_ROOT/distfiles WRKDIRPREFIX=$FBSD_ROOT/wrk"
 ports_sha="$(printf '%s' "$(e2e_fixture ports-txz)" | jq -r '.versions[0].sha256')"
 
-# The tarball is read from storage, and a binary_upstreams entry turns that
-# read off for every /binaries/ path its key does not name. Emptied first, so a
-# run that aborted with the namespace in place does not 404 the tree.
+# The tarball is read from storage. Emptied first, so a run that aborted with
+# a namespace in place cannot shadow the tree with a key of the same name.
 E2E_HOST=server
 e2e_config_set server '.binary_upstreams = {}' || true
 e2e_restart server || true
