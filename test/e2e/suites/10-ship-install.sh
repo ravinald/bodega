@@ -128,6 +128,16 @@ for h in server client; do
 		'$E2E_CLIENT_ADDR' '$E2E_CLIENT_HOST' | sudo tee -a /etc/hosts >/dev/null" || true
 done
 
+# The FreeBSD guests reach the server by name too, and suite 46 does so before
+# 47 and 49 write their own entry. A guest carrying a line from an earlier run
+# hid that order; a fresh one fails 46's fetch as an unresolvable host. BSD sed
+# takes the in-place suffix as a separate argument.
+for h in freebsd freebsd-server; do
+	E2E_HOST="$h"
+	e2e_on "$h" "sudo sed -i '' '/# bodega-e2e\$/d' /etc/hosts && \
+		printf '%s %s # bodega-e2e\n' '$E2E_SERVER_ADDR' '$E2E_SERVER_HOST' | sudo tee -a /etc/hosts >/dev/null" || true
+done
+
 E2E_HOST=client
 e2e_on client "getent hosts $E2E_SERVER_HOST | awk '{print \$1; exit}'" || true
 check_eq SHIP-08 "the client resolves the server by name" \
