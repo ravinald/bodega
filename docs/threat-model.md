@@ -394,20 +394,24 @@ https://user:secret@host/`), a schemeless `user:secret@host/x` and a
     `/api/v1/status` fields above are returned in full with no
     `Authorization` header. `/api/v1/audit` is gated the same way and
     returns the before and after manifest JSON a mutation recorded, as
-    written; `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies`,
+    written; `/api/v1/config`, `/api/v1/policies`,
     `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins` and
-    `GET /api/v1/queue` share the gate and emit no version `url`. The token
-    list is among them, so a tokenless request from the range reads what
-    only a `superadmin` token reaches. `admin_permit_cidr` is therefore the
-    boundary for the stored credential on reads, not the token.
+    `GET /api/v1/queue` share the gate and emit no version `url`.
+    `admin_permit_cidr` is therefore the boundary for the stored credential
+    on reads, not the token. The token list (`GET /api/v1/tokens`) is not
+    among them: it needs a token holding `superadmin` as well as an address
+    in the range, in either posture, and answers `401` to a request that
+    presents none.
   - **Mutations: the existing CIDR and token rules.** Create and the hide and
     freeze toggles return the whole manifest as stored. A mutation needs an
     address in `admin_permit_cidr`, and a bearer token holding `write` for
     the package's type only once that range reaches past loopback; a
     loopback-only server takes mutations from localhost with no token,
-    `DELETE /api/v1/tokens/{id}` included. Every override route, queue
-    approve and dismiss, and `POST /api/v1/tokens` need a token bound to an
-    identity on every server, loopback-only included.
+    except on the token routes. Minting, listing and revoking a token
+    (`/api/v1/tokens`) need a token holding `superadmin` on every server,
+    loopback-only included. Every override route, queue approve and
+    dismiss, and `POST /api/v1/tokens` also need a token bound to an
+    identity on every server.
   - **Operator host and backend.** `bodega show pkg`, `pkg export`,
     `pkg edit`, the TUI, the builder's output, repair and validation
     diagnostics and the server log print or serialize the manifest as
@@ -693,16 +697,17 @@ defence against:
   - _A request that presents no token._ The read path stays open. Inside
     `admin_permit_cidr` a request with no token gets the admin reads
     (audit, config, policies, `inventory/{identity}`,
-    `profiles/{name}/pins` and the queue list) and the token list
-    (`GET /api/v1/tokens`), which no `admin` token reaches. A loopback-only
-    server takes mutations from localhost with no token, revoking a token
-    (`DELETE /api/v1/tokens/{id}`) included, so a tokenless localhost
-    request there reaches more than an `admin` token does.
-    `admin_permit_cidr` stays the boundary for those. Every override route,
-    the override list included, queue approve and dismiss, and minting a
-    token (`POST /api/v1/tokens`) still refuse a request that presents no
-    token bound to an identity, on every server. A credential that matches
-    no token on a read is no credential, as it was before.
+    `profiles/{name}/pins` and the queue list), and a loopback-only server
+    takes mutations from localhost with no token. `admin_permit_cidr` stays
+    the boundary for those. The token routes are the exception in either
+    posture: listing, minting and revoking a token (`/api/v1/tokens`)
+    answer `401` to a request with no token, one that matches no token or
+    an expired one, because whoever reaches them can mint a second override
+    voter. Every override route, the override list included, queue approve
+    and dismiss, and minting a token also refuse a request that presents no
+    token bound to an identity, on every server. Off the token routes, a
+    credential that matches no token on a read is no credential, as it was
+    before.
   - _Routes tied to no type._ `write:npm` reaches only npm's write routes,
     but a narrowed `read` reaches every untyped read, such as the
     `/api/v1/packages` listing, `/api/v1/status` and `/client/`, which name

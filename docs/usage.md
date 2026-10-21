@@ -6134,7 +6134,7 @@ Forbidden: token 3f9c... lacks scope "write:pypi", which POST /api/v1/packages/p
 
 The refusal is a `denied` audit row with status `token_scope`, and its `details` name `token_id`, `scope` and `missing_scope`.
 
-**What scopes do not change.** They constrain a token that is presented. A request that presents none is decided as before: the read path is open, an admin read inside `admin_permit_cidr` needs no token, and a server whose `admin_permit_cidr` is loopback-only takes mutations from localhost with no token. A credential that matches no token on a read is treated as no credential. See [Threat model](threat-model.md).
+**What scopes do not change.** They constrain a token that is presented. A request that presents none is decided as before: the read path is open, an admin read inside `admin_permit_cidr` needs no token, and a server whose `admin_permit_cidr` is loopback-only takes mutations from localhost with no token. A credential that matches no token on a read is treated as no credential. The token routes (`/api/v1/tokens`) are the exception: they need a `superadmin` token in every posture, and refuse a request with no token, an unmatched one or an expired one with `401`. See [Threat model](threat-model.md).
 
 **Tokens minted before scopes.** Every existing token migrates to `read,write,admin`, so nothing in use stops working. `bodega doctor` warns once per unexpired token still holding all three unrestricted, under the check `token-scope`, with the command to mint a narrower one; `bodega token list` counts them. Downgrading to a release without scopes deletes every token narrower than `read,write,admin` and every exchanged token, rather than widening them.
 
@@ -6496,11 +6496,13 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 ### Token endpoints
 
-| Method | Path                  | Description                                                                            |
-| ------ | --------------------- | -------------------------------------------------------------------------------------- |
-| GET    | `/api/v1/tokens`      | List all tokens                                                                        |
-| POST   | `/api/v1/tokens`      | Create a new token (JSON body: `{label, scope, expiry, comment}`; `scope` is required) |
-| DELETE | `/api/v1/tokens/{id}` | Revoke a token                                                                         |
+| Method | Path                  | Scope        | Description                                                                            |
+| ------ | --------------------- | ------------ | -------------------------------------------------------------------------------------- |
+| GET    | `/api/v1/tokens`      | `superadmin` | List all tokens                                                                        |
+| POST   | `/api/v1/tokens`      | `superadmin` | Create a new token (JSON body: `{label, scope, expiry, comment}`; `scope` is required) |
+| DELETE | `/api/v1/tokens/{id}` | `superadmin` | Revoke a token                                                                         |
+
+Every token route needs a bearer token holding `superadmin` and an address in `admin_permit_cidr`, on every server, loopback-only included. A request with no token, one matching no token or an expired one answers `401`; a token without `superadmin` answers `403` naming it. Minting also needs that token bound to an identity, or minted by an exchange or `bodega login`, because the new token records who minted it. `bodega token list|generate|revoke` on the bodega host reads the audit database directly and needs no token.
 
 ### Policy endpoints
 

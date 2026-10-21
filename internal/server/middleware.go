@@ -859,6 +859,13 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // attribute the request. The exceptions are the admin reads, which
 // Server.requireAdmin gates with the same AdminPermits predicate this uses.
 //
+// The token routes (superadminPrefixes) are the exception to every tokenless
+// path here: the open read path, the admin reads a host in admin_permit_cidr
+// reaches with no credential, and the localhost-only posture's tokenless
+// mutations. They mint, list and revoke the tokens that cast override votes,
+// so each request to one needs a presented, unexpired token holding
+// superadmin, in both postures, after the admin_permit_cidr check.
+//
 // A token that is presented is held to its scopes on every route, read or
 // mutation, in both the localhost-only and the token-required posture:
 // routeScope names what the route needs, and a token without it is refused
@@ -879,6 +886,19 @@ func mutationAuth(admin NetsFunc, tokens *tokenCache, auditDB *audit.DB, pepper 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
+				if isSuperadminRoute(r.URL.Path) {
+					if !AdminPermits(admin.nets(), net.ParseIP(ClientIP(r))) {
+						logger.Warn("admin endpoint blocked: IP not in admin_permit_cidr",
+							"client_ip", ClientIP(r), "method", r.Method, "path", r.URL.Path)
+						recordDenial(auditDB, r, audit.DenialAdminOnly, nil)
+						http.Error(w, "Forbidden", http.StatusForbidden)
+						return
+					}
+					if r, ok := requireSuperadmin(w, r, tokens, auditDB, pepper, logger); ok {
+						next.ServeHTTP(w, r)
+					}
+					return
+				}
 				if cred, _ := credentialFrom(r); cred != "" {
 					if tok := tokens.match(cred, pepper, time.Now()); tok != nil {
 						r = withToken(r, *tok)
@@ -909,6 +929,13 @@ func mutationAuth(admin NetsFunc, tokens *tokenCache, auditDB *audit.DB, pepper 
 					"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
 				recordDenial(auditDB, r, audit.DenialIPNotPermitted, nil)
 				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+
+			if isSuperadminRoute(r.URL.Path) {
+				if r, ok := requireSuperadmin(w, r, tokens, auditDB, pepper, logger); ok {
+					next.ServeHTTP(w, r)
+				}
 				return
 			}
 
@@ -984,6 +1011,53 @@ func mutationAuth(admin NetsFunc, tokens *tokenCache, auditDB *audit.DB, pepper 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// requireSuperadmin authenticates a request to a superadminPrefixes route,
+// writing the 401 or 403 and its denial row when the request presents no
+// token, one that matches nothing, an expired one, or one without
+// superadmin. It returns the request carrying the token on success.
+func requireSuperadmin(w http.ResponseWriter, r *http.Request, tokens *tokenCache, auditDB *audit.DB, pepper string, logger *slog.Logger) (*http.Request, bool) {
+	auth, ok := bearerOf(r)
+	if !ok {
+		logger.Warn("token route blocked: no bearer credential",
+			"client_ip", ClientIP(r), "method", r.Method, "path", r.URL.Path)
+		recordDenial(auditDB, r, audit.DenialTokenMissing, map[string]string{"route": "tokens"})
+		http.Error(w, fmt.Sprintf("Unauthorized: %s %s needs a token holding %s, sent as Authorization: Bearer <token>; "+
+			"on the bodega host, bodega token list|generate|revoke needs none", r.Method, r.URL.Path, audit.ScopeSuperadmin),
+			http.StatusUnauthorized)
+		return r, false
+	}
+	matched := tokens.lookup(auth, pepper)
+	if matched == nil {
+		logger.Warn("token route blocked: invalid token",
+			"client_ip", ClientIP(r), "method", r.Method, "path", r.URL.Path)
+		recordDenial(auditDB, r, audit.DenialTokenInvalid,
+			map[string]string{"hash_prefix": hashPrefix(audit.HashToken(auth, pepper))})
+		http.Error(w, "Unauthorized: the bearer token matches no token on this server", http.StatusUnauthorized)
+		return r, false
+	}
+	if matched.ExpiresAt != nil && matched.ExpiresAt.Before(time.Now()) {
+		logger.Warn("token route blocked: token expired",
+			"token_id", matched.ID, "client_ip", ClientIP(r))
+		recordDenial(auditDB, r, audit.DenialTokenExpired,
+			map[string]string{
+				"token_id":   matched.ID,
+				"expired_at": matched.ExpiresAt.UTC().Format(time.RFC3339),
+			})
+		http.Error(w, "Unauthorized — token expired", http.StatusUnauthorized)
+		return r, false
+	}
+	r = withToken(r, *matched)
+	if !authorizeScope(w, r, auditDB, logger, *matched) {
+		return r, false
+	}
+	if auditDB != nil {
+		go func(id string) {
+			_ = auditDB.UpdateTokenLastUsed(context.Background(), id)
+		}(matched.ID)
+	}
+	return r, true
 }
 
 // tokenCache holds the token hashes the gate compares against, reloaded on a
@@ -1072,8 +1146,14 @@ var adminPrefixes = []string{
 
 // superadminPrefixes are token minting, listing and revocation. Whoever can
 // mint a token can mint a second voter, so this sits apart from admin and
-// approve.
+// approve. For the same reason these routes are the exception to every
+// tokenless path mutationAuth allows: a caller presenting no token must not
+// reach the routes that mint, list and revoke voters, in either posture.
 var superadminPrefixes = []string{"/api/v1/tokens"}
+
+func isSuperadminRoute(p string) bool {
+	return slices.ContainsFunc(superadminPrefixes, func(pre string) bool { return strings.HasPrefix(p, pre) })
+}
 
 // approveVerbs are the votes under each prefix, <prefix><id>/<verb>.
 // Approving a queue row writes an allow-list rule or edits a profile, so it
@@ -1101,10 +1181,8 @@ func routeScope(r *http.Request) (scopes []string, pkgType string) {
 		return nil, ""
 	}
 	isRead := r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r)
-	for _, pre := range superadminPrefixes {
-		if strings.HasPrefix(p, pre) {
-			return []string{audit.ScopeSuperadmin}, ""
-		}
+	if isSuperadminRoute(p) {
+		return []string{audit.ScopeSuperadmin}, ""
 	}
 	if isApproveVote(p) {
 		return []string{audit.ScopeApprove}, ""
