@@ -291,8 +291,21 @@ func contractErr(format string, args ...any) error {
 // discarded. A report from an unmapped external id is stored unbound.
 func (f *Frame) Ingest(ctx context.Context, inst *Instance, p Principal, b Batch) (IngestResult, error) {
 	res := IngestResult{Instance: inst.Name}
+	// Every ContractError is raised here, before the first write, so a
+	// refused batch stores nothing. A store error below can still leave the
+	// rows written before it: this pass is validation, not a transaction.
 	if err := checkBatch(inst, b); err != nil {
 		return res, err
+	}
+	for _, r := range b.Reports {
+		if firstNonEmpty(r.ExternalID, p.ExternalID) == "" {
+			return res, contractErr("source %s produced a report naming no host", inst.Name)
+		}
+	}
+	for _, a := range b.Attempts {
+		if firstNonEmpty(a.ExternalID, p.ExternalID) == "" {
+			return res, contractErr("source %s produced an attempt naming no host", inst.Name)
+		}
 	}
 	if p.Identity != "" && p.ExternalID != "" {
 		f.bindOnOwnAuthority(ctx, inst, p)
@@ -312,9 +325,6 @@ func (f *Frame) Ingest(ctx context.Context, inst *Instance, p Principal, b Batch
 	}
 	for _, r := range b.Reports {
 		ext := firstNonEmpty(r.ExternalID, p.ExternalID)
-		if ext == "" {
-			return res, contractErr("source %s produced a report naming no host", inst.Name)
-		}
 		id, err := identityOf(ext)
 		if err != nil {
 			return res, err
@@ -342,9 +352,6 @@ func (f *Frame) Ingest(ctx context.Context, inst *Instance, p Principal, b Batch
 	attempts := make([]audit.InventoryAttempt, 0, len(b.Attempts))
 	for _, a := range b.Attempts {
 		ext := firstNonEmpty(a.ExternalID, p.ExternalID)
-		if ext == "" {
-			return res, contractErr("source %s produced an attempt naming no host", inst.Name)
-		}
 		id, err := identityOf(ext)
 		if err != nil {
 			return res, err
@@ -473,14 +480,37 @@ func (f *Frame) poll(ctx context.Context, inst *Instance, pull PullSource) error
 	if err != nil {
 		return err
 	}
-	for _, d := range docs {
+	// A document that cannot be read or breaks the source contract is that
+	// host's defect, skipped so the hosts after it in a stable vendor order
+	// still land. A store error is nobody's document and ends the poll.
+	var skipped int
+	var firstSkip error
+	for i, d := range docs {
 		batch, err := pull.Normalize(d.Body, d.ExternalID)
 		if err != nil {
-			return fmt.Errorf("normalize: %w", err)
+			err = fmt.Errorf("normalize: %w", err)
+		} else if _, err = f.Ingest(ctx, inst, Principal{ExternalID: d.ExternalID}, batch); err != nil {
+			var bad *ContractError
+			if !errors.As(err, &bad) {
+				return err
+			}
 		}
-		if _, err := f.Ingest(ctx, inst, Principal{ExternalID: d.ExternalID}, batch); err != nil {
-			return err
+		if err == nil {
+			continue
 		}
+		skipped++
+		if firstSkip == nil {
+			firstSkip = err
+		}
+		f.logger.Warn("inventory poll skipped a document",
+			"instance", inst.Name, "type", inst.Source.Type(), "external_id", d.ExternalID, "index", i, "error", err)
+	}
+	if skipped > 0 && skipped == len(docs) {
+		return fmt.Errorf("skipped all %d documents; first: %w", skipped, firstSkip)
+	}
+	if skipped > 0 {
+		f.logger.Warn("inventory poll stored some documents and skipped others",
+			"instance", inst.Name, "type", inst.Source.Type(), "stored", len(docs)-skipped, "skipped", skipped)
 	}
 	return nil
 }
