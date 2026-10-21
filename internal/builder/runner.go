@@ -154,12 +154,28 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 		version = ve.Ref
 	}
 	err := c.checkPolicy(ctx, regType, candidate)
-	// A baseline version was already running somewhere when the list was
-	// written, so its refusal is recorded on the admission row and the build
-	// the mark exists to keep working goes on.
-	var baselined error
-	if ve.Baseline && policy.IsViolation(err) {
-		baselined, err = err, nil
+	// An override is a decision two people made about this refusal, and a
+	// baseline version was already running somewhere when the list was
+	// written; either way the refusal is recorded on the admission row and the
+	// build goes on. The override is read once, so the gate and the row agree.
+	var (
+		admittedPast error
+		override     audit.Override
+		overridden   bool
+	)
+	if policy.IsViolation(err) {
+		o, ok, oerr := admit.ActiveOverride(ctx, c.AuditDB, regType, name, version, audit.CheckAllowList, time.Now())
+		if oerr != nil {
+			c.logf("  policy: %s/%s@%s: overrides not read, so none applied: %v", regType, name, version, oerr)
+		}
+		switch {
+		case ok:
+			override, overridden = o, true
+			admittedPast, err = err, nil
+			c.logf("  policy: %s/%s@%s: allow-list refusal admitted by override %s", regType, name, version, o.ID)
+		case ve.Baseline:
+			admittedPast, err = err, nil
+		}
 	}
 	if err != nil && c.AuditDB != nil {
 		_ = c.AuditDB.Record(ctx, audit.Event{
@@ -180,8 +196,13 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 	if c.policyChecker != nil {
 		listed, _ := c.policyChecker.Listed(ctx, regType)
 		allow = admit.AllowListCheck(listed, candidate, err)
-		if baselined != nil {
-			allow, _ = admit.BaselineCheck(ve, admit.AllowListCheck(listed, candidate, baselined))
+		if admittedPast != nil {
+			refused := admit.AllowListCheck(listed, candidate, admittedPast)
+			if overridden {
+				allow = admit.OverriddenCheck(refused, override)
+			} else {
+				allow, _ = admit.BaselineCheck(ve, refused)
+			}
 		}
 	}
 	res := admit.Fetch(ctx, c.AuditDB, fetchCheckers(c.app, c.AuditDB), regType, name, ve, allow,

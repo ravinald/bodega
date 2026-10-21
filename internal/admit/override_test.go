@@ -305,13 +305,35 @@ func TestOverrideAllowList(t *testing.T) {
 	if c := checkOf(t, row, audit.CheckOSV); c.Status != audit.CheckPass {
 		t.Errorf("osv after an allow-list override = %+v, want it run and passed", c)
 	}
+	if n := violationsFor(t, f.adb, "1.2.8"); n != 0 {
+		t.Errorf("an overridden allow-list refusal wrote %d policy_violation events, want none", n)
+	}
 	if res, _ := admitMinimist(t, f, "1.2.0"); res.OK() || res.Check != "allow-list" {
 		t.Errorf("1.2.0 has no override: %+v", res)
+	}
+	if n := violationsFor(t, f.adb, "1.2.0"); n != 1 {
+		t.Errorf("the refused 1.2.0 wrote %d policy_violation events, want one", n)
 	}
 	cr := Create(t.Context(), policy.NewChecker(f.adb), f.adb, f.synced, minimist("1.2.8"), Who{Actor: "ravi"})
 	if !cr.OK() {
 		t.Errorf("pkg create path ignored the override: %s", cr.Reason)
 	}
+}
+
+// violationsFor counts the policy_violation events recorded on version.
+func violationsFor(t *testing.T, adb *audit.DB, version string) int {
+	t.Helper()
+	rows, err := adb.Query(t.Context(), audit.Filter{})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	n := 0
+	for _, row := range rows {
+		if row.Status == "policy_violation" && row.PkgVersion == version {
+			n++
+		}
+	}
+	return n
 }
 
 func TestRequestOverrideRefusals(t *testing.T) {

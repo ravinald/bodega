@@ -775,6 +775,85 @@ func TestBaselineIndexPassesTheAllowList(t *testing.T) {
 	}
 }
 
+// An approved allow-list override admits the version it names on a proxy
+// fill and the package's index past listed mode with no rule, the way
+// baseline does: 200 on both, the admission row records the allow-list
+// overridden with the override's id, and nothing records a refusal, so no
+// policy_violation cache event and no queue row. Another version of the same
+// package, which the override does not name, still answers 403 and writes
+// both.
+func TestOverrideProxyFillAndIndexPassTheAllowList(t *testing.T) {
+	stubAgeGate(t)
+	up := baselineFillUpstream(t)
+	s := newDiscoveryServer(t)
+	s.cfg.GomodUpstream = up.URL
+	ctx := t.Context()
+	saved := upstreamGuard
+	upstreamGuard = func(string) error { return nil }
+	t.Cleanup(func() { upstreamGuard = saved })
+	if err := s.store.AddVersion(ctx, manifest.TypeGomod, "example.com/mod", manifest.VersionEntry{Version: "v1.2.0", Mode: manifest.ModeProxy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.SetAdmissionMode(ctx, audit.AdmissionMode{Ecosystem: manifest.TypeGomod, Mode: audit.ModeListed}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	o, err := admit.RequestOverride(ctx, s.auditDB, s.cfg, admit.OverrideRequest{Type: manifest.TypeGomod, Name: "example.com/mod",
+		Version: "v1.2.0", Check: audit.CheckAllowList, Reason: "pinned by the build image, INC-3", Expires: "7d"},
+		audit.LocalOverrideCaller("alice"), now)
+	if err != nil {
+		t.Fatalf("RequestOverride: %v", err)
+	}
+	if _, err := admit.VoteOverride(ctx, s.auditDB, o.ID, audit.LocalOverrideCaller("bob"), true, "", now); err != nil {
+		t.Fatalf("VoteOverride: %v", err)
+	}
+
+	for _, path := range []string{"/go/example.com/mod/@v/v1.2.0.zip", "/go/example.com/mod/@v/list"} {
+		if rec := doRequest(s, http.MethodGet, path, nil); rec.Code != http.StatusOK {
+			t.Errorf("overridden %s: status %d, %s=%q, want 200 (%s)", path, rec.Code, refusalHeader, rec.Header().Get(refusalHeader), rec.Body.String())
+		}
+	}
+	rows, err := s.auditDB.Admissions(ctx, audit.AdmissionFilter{PkgType: manifest.TypeGomod, PkgName: "example.com/mod", PkgVersion: "v1.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Decision != audit.AdmissionAdmitted {
+		t.Fatalf("admission rows for the overridden fill = %+v, want one admitted", rows)
+	}
+	for _, c := range rows[0].Checks {
+		if c.Check == audit.CheckAllowList && (c.Status != audit.CheckOverridden || c.Override != o.ID) {
+			t.Errorf("allowlist = %+v, want overridden by %s", c, o.ID)
+		}
+	}
+	refusals := func() (violations, queued int) {
+		t.Helper()
+		events, err := s.auditDB.Query(ctx, audit.Filter{EventType: audit.EventCache})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			if e.Status == audit.CachePolicyViolation {
+				violations++
+			}
+		}
+		q, err := s.auditDB.ListQueue(ctx, audit.QueueFilter{PkgType: manifest.TypeGomod})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return violations, len(q)
+	}
+	if v, q := refusals(); v != 0 || q != 0 {
+		t.Errorf("after the overridden requests: %d policy_violation events and %d queue rows, want none", v, q)
+	}
+
+	if rec := doRequest(s, http.MethodGet, "/go/example.com/mod/@v/v1.3.0.zip", nil); rec.Code != http.StatusForbidden {
+		t.Errorf("v1.3.0, which no override names: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	if v, q := refusals(); v != 1 || q != 1 {
+		t.Errorf("after the refused v1.3.0: %d policy_violation events and %d queue rows, want one of each", v, q)
+	}
+}
+
 // Every check admission can block on answers its own refusal word, a reason
 // naming the check, and an override request only where an override applies.
 // The details carry URLs, as a real provenance or integration result does, so

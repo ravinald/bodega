@@ -218,28 +218,76 @@ func formatTTL(d time.Duration) string {
 	return d.String()
 }
 
-// loadOverrides reads the overrides that apply to pm at now, keyed by
-// version and check. An error leaves none loaded: an override that cannot be
-// read does not apply.
-func (ev *evaluation) loadOverrides(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, now time.Time) {
-	all, err := adb.ListOverrides(ctx, audit.OverrideFilter{PkgType: pm.Type, State: audit.OverrideApproved})
-	if err != nil {
-		ev.overrideErr = err
-		return
+// Overrides are the active approved overrides on one package at one moment,
+// keyed by version and check. The first one listed for a version and check
+// is the one that applies.
+type Overrides map[string]audit.Override
+
+// LoadOverrides reads the overrides on typ/name that apply at now. A read
+// error returns none alongside it: an override that cannot be read does not
+// apply, and the caller says so where its operator looks.
+func LoadOverrides(ctx context.Context, adb *audit.DB, typ, name string, now time.Time) (Overrides, error) {
+	if adb == nil {
+		return nil, nil
 	}
-	want := overrideNameKey(pm.Type, pm.Name)
+	all, err := adb.ListOverrides(ctx, audit.OverrideFilter{PkgType: typ, State: audit.OverrideApproved})
+	if err != nil {
+		return nil, err
+	}
+	want := overrideNameKey(typ, name)
+	var out Overrides
 	for _, o := range all {
 		if !o.Active(now) || overrideNameKey(o.PkgType, o.PkgName) != want {
 			continue
 		}
 		k := o.PkgVersion + "\x00" + o.Check
-		if _, seen := ev.overrides[k]; !seen {
-			if ev.overrides == nil {
-				ev.overrides = map[string]audit.Override{}
+		if _, seen := out[k]; !seen {
+			if out == nil {
+				out = Overrides{}
 			}
-			ev.overrides[k] = o
+			out[k] = o
 		}
 	}
+	return out, nil
+}
+
+// For returns the override naming check on version. An empty version matches
+// an override on any version of the package, which is what a request for a
+// package's index, naming no version, needs.
+func (ovs Overrides) For(version, check string) (audit.Override, bool) {
+	if version != "" {
+		o, ok := ovs[version+"\x00"+check]
+		return o, ok
+	}
+	for _, o := range ovs {
+		if o.Check == check {
+			return o, true
+		}
+	}
+	return audit.Override{}, false
+}
+
+// ActiveOverride returns the active approved override naming check on
+// typ/name at version at now; see LoadOverrides and Overrides.For.
+func ActiveOverride(ctx context.Context, adb *audit.DB, typ, name, version, check string, now time.Time) (audit.Override, bool, error) {
+	ovs, err := LoadOverrides(ctx, adb, typ, name, now)
+	if err != nil {
+		return audit.Override{}, false, err
+	}
+	o, ok := ovs.For(version, check)
+	return o, ok, nil
+}
+
+// OverriddenCheck renders c, a failed check, as the entry an override admits
+// it under: status overridden, the override's id, and a detail naming the
+// failure, the approvers and the expiry. Every path that admits past a
+// failure through an override writes it this way.
+func OverriddenCheck(c audit.AdmissionCheck, o audit.Override) audit.AdmissionCheck {
+	c.Status = audit.CheckOverridden
+	c.Override = o.ID
+	c.Detail = fmt.Sprintf("%s; overridden by %s (approved by %s; expires %s)",
+		c.Detail, o.ID, strings.Join(o.Approvers(), ", "), o.ExpiresAt.UTC().Format(time.RFC3339))
+	return c
 }
 
 // overrideNameKey is the form an override's package name is matched in: the
@@ -271,11 +319,7 @@ func (ev *evaluation) overrideCheck(pm *manifest.PackageManifest, i int, c audit
 	if !ok {
 		return c, false
 	}
-	c.Status = audit.CheckOverridden
-	c.Override = o.ID
-	c.Detail = fmt.Sprintf("%s; overridden by %s (approved by %s; expires %s)",
-		c.Detail, o.ID, strings.Join(o.Approvers(), ", "), o.ExpiresAt.UTC().Format(time.RFC3339))
-	return c, true
+	return OverriddenCheck(c, o), true
 }
 
 // reportedBlock is the block a refusal names when a version fails several
