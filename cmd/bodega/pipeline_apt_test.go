@@ -29,10 +29,26 @@ SOURCE_DATE_EPOCH=1577836800 dpkg-deb --build --root-owner-group stage "widget_$
 rm -rf stage
 `
 
+// aptNonReproducibleBuildScript is aptBuildScript with random bytes in the
+// description and no pinned timestamps, so no two builds match.
+const aptNonReproducibleBuildScript = `set -e
+v=$1
+rm -rf stage
+mkdir -p stage/DEBIAN
+printf 'Package: widget\nVersion: %s\nArchitecture: all\nMaintainer: bodega <admin@example.com>\nDescription: %s %s\n' "$v" "$(cat DESC)" "$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')" > stage/DEBIAN/control
+dpkg-deb --build --root-owner-group stage "widget_${v}_all.deb" >/dev/null
+rm -rf stage
+`
+
 // aptBuildUpstream is a git repository whose tags ra and rb carry build.sh
 // with two different descriptions, so the two refs build different bytes
 // under one .deb filename.
 func aptBuildUpstream(t *testing.T) string {
+	t.Helper()
+	return aptBuildUpstreamWith(t, aptBuildScript)
+}
+
+func aptBuildUpstreamWith(t *testing.T, script string) string {
 	t.Helper()
 	for _, tool := range []string{"git", "dpkg-deb"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -57,7 +73,7 @@ func aptBuildUpstream(t *testing.T) string {
 		}
 	}
 	git("-c", "init.defaultBranch=main", "init", "-q")
-	write("build.sh", aptBuildScript)
+	write("build.sh", script)
 	for _, ref := range []string{"ra", "rb"} {
 		write("DESC", "built at "+ref+"\n")
 		git("add", "build.sh", "DESC")
@@ -227,5 +243,51 @@ func TestEnsurePackagedAptSecondVersion(t *testing.T) {
 	// per version, so one run over 1.0 and 2.0 prints two.
 	if n := strings.Count(out, ">>> [apt] package widget"); n != 2 {
 		t.Errorf("the package stage printed %d version headers, want 2 from one run:\n%s", n, out)
+	}
+}
+
+func TestEnsurePackagedAptSecondVersionNonReproducible(t *testing.T) {
+	upstream := aptBuildUpstreamWith(t, aptNonReproducibleBuildScript)
+	c := newAptCascade(t, aptSourceEntry(upstream, "1.0", "ra"))
+
+	if s, out := c.run(t); s.HasFailures() {
+		t.Fatalf("packaging 1.0 failed: %+v\n%s", s.Results, out)
+	}
+	xPool := sha256File(t, c.poolFile("1.0"))
+	key := manifest.AptKey("pool/main/w/widget/widget_1.0_all.deb")
+
+	c.save(t, c.entry(t, "1.0"), aptSourceEntry(upstream, "2.0", "rb"))
+	s, out := c.run(t)
+	if s.HasFailures() {
+		t.Fatalf("adding version 2.0 failed: %+v\n%s", s.Results, out)
+	}
+	if strings.Contains(out, "Running: sh build.sh 1.0") {
+		t.Errorf("adding 2.0 rebuilt the packaged 1.0:\n%s", out)
+	}
+	if got := sha256File(t, c.poolFile("1.0")); got != xPool {
+		t.Errorf("1.0's pool file changed from %s to %s", xPool, got)
+	}
+	ve := c.entry(t, "1.0")
+	if ve.Checksum == nil || ve.Checksum.Value != xPool {
+		t.Errorf("1.0's stored checksum is %+v, want %s", ve.Checksum, xPool)
+	}
+	if ve.Metadata["_sha256"] != xPool {
+		t.Errorf("1.0's stored _sha256 is %q, want %s", ve.Metadata["_sha256"], xPool)
+	}
+	if pin, err := c.db.GetChecksum(t.Context(), key); err != nil || pin == nil || pin.Value != xPool {
+		t.Errorf("the pin for %s reads %+v (%v), want %s", key, pin, err, xPool)
+	}
+	if _, err := os.Stat(c.poolFile("2.0")); err != nil {
+		t.Errorf("2.0 has no pool file: %v", err)
+	}
+
+	s, out = c.run(t)
+	if s.HasFailures() {
+		t.Fatalf("third run failed: %+v\n%s", s.Results, out)
+	}
+	for _, header := range []string{">>> [apt] build", ">>> [apt] package"} {
+		if strings.Contains(out, header) {
+			t.Errorf("third run over packaged versions printed %q:\n%s", header, out)
+		}
 	}
 }

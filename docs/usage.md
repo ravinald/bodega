@@ -230,6 +230,8 @@ A specifier is a filter rather than a fact. An index that answers it with anothe
 
 Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, git, gomod, helm, npm, cargo, freebsd and distfiles) are fetched if needed and skipped for the build phase.
 
+apt builds only the versions whose `.deb` is not already built, so adding a version to a package leaves its built versions alone. A build that is not byte-reproducible would otherwise produce a `.deb` whose digest disagrees with the one already packaged, and the package stage would refuse it. To rebuild one, run `bodega build fetch apt <name> force`, which discards each version's source tree and the `.deb` its last build left, and then `bodega build run apt <name>`.
+
 ```bash
 bodega build run                   # build all types
 bodega build run apt               # build apt sources only
