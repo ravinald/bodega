@@ -487,3 +487,125 @@ func TestConfigLoadStopsOnABadInstance(t *testing.T) {
 		}
 	}
 }
+
+func pullFrame(t *testing.T, docs []Document) (*Frame, *Instance, *audit.DB, *syncBuffer) {
+	t.Helper()
+	db := openDB(t)
+	insts := configure(t, map[string]config.InventorySource{"tenant-a": {"type": "fake-pull", "tenant": "a", "enabled": true}})
+	insts[0].Source.(*fakePull).poll = func() ([]Document, error) { return docs, nil }
+	logs := &syncBuffer{}
+	return NewFrame(insts, db, nil, slog.New(slog.NewTextHandler(logs, nil))), insts[0], db, logs
+}
+
+func reportedHosts(t *testing.T, db *audit.DB, source string) []string {
+	t.Helper()
+	reports, err := db.InventoryReports(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hosts []string
+	for _, r := range reports {
+		hosts = append(hosts, r.ExternalID)
+	}
+	slices.Sort(hosts)
+	return hosts
+}
+
+// A pull source returns its documents in the same order every interval, so
+// one bad record must not keep the hosts after it out of the store.
+func TestPollSkipsADocumentThatDoesNotNormalize(t *testing.T) {
+	ctx := context.Background()
+	f, inst, db, logs := pullFrame(t, []Document{
+		{ExternalID: "host-1", Body: []byte(oneComponent)},
+		{ExternalID: "host-2", Body: []byte("not json")},
+		{ExternalID: "host-3", Body: []byte(oneComponent)},
+	})
+	if err := f.PollOnce(ctx, inst); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if got := reportedHosts(t, db, "tenant-a"); !slices.Equal(got, []string{"host-1", "host-3"}) {
+		t.Errorf("reported hosts = %v, want host-1 and host-3", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "external_id=host-2") || !strings.Contains(out, "instance=tenant-a") || !strings.Contains(out, "index=1") {
+		t.Errorf("skip log %q does not name host-2, its index and the instance", out)
+	}
+	st, err := db.InventorySourceStats(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastSuccess.IsZero() || st.LastError != "" {
+		t.Errorf("stats = %+v, want a recorded success and no error", st)
+	}
+}
+
+func TestPollSkipsADocumentThatNamesNoHost(t *testing.T) {
+	f, inst, db, logs := pullFrame(t, []Document{
+		{ExternalID: "host-1", Body: []byte(oneComponent)},
+		{ExternalID: "", Body: []byte(oneComponent)},
+		{ExternalID: "host-3", Body: []byte(oneComponent)},
+	})
+	if err := f.PollOnce(context.Background(), inst); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if got := reportedHosts(t, db, "tenant-a"); !slices.Equal(got, []string{"host-1", "host-3"}) {
+		t.Errorf("reported hosts = %v, want host-1 and host-3", got)
+	}
+	if !strings.Contains(logs.String(), "naming no host") {
+		t.Errorf("skip log %q does not carry the contract error", logs.String())
+	}
+}
+
+// A source that has broken outright skips every document, and that still
+// reads as a failed poll so the staleness check sees it.
+func TestPollThatSkipsEveryDocumentIsRecordedFailed(t *testing.T) {
+	ctx := context.Background()
+	f, inst, db, _ := pullFrame(t, []Document{
+		{ExternalID: "host-1", Body: []byte("not json")},
+		{ExternalID: "", Body: []byte(oneComponent)},
+	})
+	err := f.PollOnce(ctx, inst)
+	if err == nil || !strings.Contains(err.Error(), "skipped all 2 documents") {
+		t.Fatalf("PollOnce = %v, want the skip count", err)
+	}
+	st, err := db.InventorySourceStats(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LastSuccess.IsZero() || !strings.Contains(st.LastError, "skipped all 2 documents") || !strings.Contains(st.LastError, "normalize:") {
+		t.Errorf("stats = %+v, want no success and an error naming the skip count and the first reason", st)
+	}
+}
+
+// Every ContractError is raised before the first write, so a refused batch
+// leaves nothing a retry would append again.
+func TestRefusedBatchStoresNothing(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	insts := configure(t, map[string]config.InventorySource{"edge": {"type": "fake-push", "enabled": true}})
+	f := NewFrame(insts, db, nil, nil)
+	var called int
+	f.OnReport = func(context.Context, *Instance, audit.InventoryReport) { called++ }
+	comps := []Component{{Ecosystem: "npm", Name: "x"}}
+
+	cases := map[string]Batch{
+		"second report names no host": {Reports: []Report{{ExternalID: "node-1", Components: comps}, {Components: comps}}},
+		"attempt names no host":       {Reports: []Report{{ExternalID: "node-1", Components: comps}}, Attempts: []Attempt{{Destination: "pypi.org"}}},
+	}
+	for name, b := range cases {
+		_, err := f.Ingest(ctx, insts[0], Principal{}, b)
+		var ce *ContractError
+		if !errors.As(err, &ce) {
+			t.Errorf("%s: err = %v, want *ContractError", name, err)
+		}
+	}
+	if reports, _ := db.InventoryReports(ctx, "edge"); len(reports) != 0 {
+		t.Errorf("refused batches stored %d reports", len(reports))
+	}
+	if attempts, _ := db.InventoryAttempts(ctx, "edge"); len(attempts) != 0 {
+		t.Errorf("refused batches stored %d attempts", len(attempts))
+	}
+	if called != 0 {
+		t.Errorf("OnReport called %d times for refused batches", called)
+	}
+}
