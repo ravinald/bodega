@@ -554,3 +554,67 @@ func TestRevetIgnoresAnOriginRecordedForOtherBytes(t *testing.T) {
 		t.Errorf("notes = %v, want the upstream reported unknown", o.Notes)
 	}
 }
+
+// ageVerdict is an age checker whose answer a test sets.
+type ageVerdict struct{ action string }
+
+func (v *ageVerdict) Check(context.Context, *manifest.PackageManifest, *manifest.VersionEntry) policy.Result {
+	if v.action == policy.ActionBlock {
+		return policy.Result{Check: audit.CheckAge, Action: policy.ActionBlock, Reason: "published 2d ago, minimum 14d"}
+	}
+	return policy.Result{Check: audit.CheckAge, Action: policy.ActionPass, Reason: "published 20d ago"}
+}
+
+// A version admitted past age by an override has the gate re-run on every
+// re-vet, so the override's expiry refuses it again, and a version that has
+// since aged past the minimum passes on its own.
+func TestRevetRerunsAgeAfterOverride(t *testing.T) {
+	f := newRevetFixture(t, manifest.VersionEntry{})
+	f.osv.action = policy.ActionPass
+	now := time.Now()
+	req := osvOverride("1.2.0")
+	req.Check = audit.CheckAge
+	o := request(t, f.adb, &config.Config{}, req, now)
+	vote(t, f.adb, o.ID, "bob", true, now)
+	if err := f.adb.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeNpm, PkgName: "minimist", PkgVersion: "1.2.0", ObjectKey: revetKey,
+		Decision: audit.AdmissionAdmitted, Actor: "ravi", DecidedAt: now.Add(-time.Hour),
+		Checks: []audit.AdmissionCheck{
+			{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckPass},
+			{Check: audit.CheckAge, Action: policy.ActionBlock, Status: audit.CheckOverridden, Override: o.ID},
+			{Check: audit.CheckOSV, Action: policy.ActionBlock, Status: audit.CheckPass},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	age := &ageVerdict{action: policy.ActionBlock}
+	r := f.revetter(config.RevetReport)
+	r.Age = func() policy.VersionChecker { return age }
+	revet := func(at time.Time) (RevetOutcome, audit.AdmissionCheck) {
+		t.Helper()
+		r.Now = func() time.Time { return at }
+		out := r.One(t.Context(), target(), "schedule")
+		if out.Error != "" {
+			t.Fatalf("re-vet error: %s", out.Error)
+		}
+		return out, checkOf(t, minimistRows(t, f.adb)[0], audit.CheckAge)
+	}
+
+	if out, c := revet(now); out.Blocked() || c.Status != audit.CheckOverridden || c.Override != o.ID {
+		t.Errorf("(a) under an active override: %s, age %+v; want admitted, overridden by %s", out.Decision, c, o.ID)
+	}
+	out, c := revet(now.Add(8 * 24 * time.Hour))
+	if !out.Blocked() || out.Action != RevetReported || c.Status != audit.CheckBlock {
+		t.Errorf("(b) past the override's expiry: %s/%s, age %+v; want policy_blocked, reported, age block", out.Decision, out.Action, c)
+	}
+	if len(out.Failing) != 1 || out.Failing[0].Check != audit.CheckAge {
+		t.Errorf("(b) failing = %+v, want age", out.Failing)
+	}
+	if out, c := revet(now.Add(9 * 24 * time.Hour)); !out.Blocked() || c.Status != audit.CheckBlock {
+		t.Errorf("(d) after a re-vet that blocked: %s, age %+v; want age re-run and blocking", out.Decision, c)
+	}
+	age.action = policy.ActionPass
+	if out, c := revet(now.Add(10 * 24 * time.Hour)); out.Blocked() || c.Status != audit.CheckPass || strings.Contains(c.Detail, "not re-run") {
+		t.Errorf("(c) once aged past the minimum: %s, age %+v; want admitted, age re-run and passing", out.Decision, c)
+	}
+}

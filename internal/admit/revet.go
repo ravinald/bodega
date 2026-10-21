@@ -101,8 +101,9 @@ func (s *RevetSummary) Add(o RevetOutcome) {
 
 // Revetter re-runs admission over versions already admitted, whether into the
 // catalog or into the proxy cache: the
-// allow-list, OSV and upstream provenance, everything but the publish-age
-// gate, whose verdict only improves as a version gets older. Each version
+// allow-list, OSV and upstream provenance. The publish-age gate is re-run only
+// when the last decision recorded it failing, since a verdict that passed
+// only improves as a version gets older; see carriedAge. Each version
 // gets a new admission row beside the old one, so the table reads as the
 // history of what bodega concluded about it and when.
 type Revetter struct {
@@ -115,6 +116,8 @@ type Revetter struct {
 	OnBlock string
 	// Checkers replaces RevetCheckers, for a test that drives a verdict.
 	Checkers func() []policy.VersionChecker
+	// Age replaces the age checker a re-vet runs when carriedAge says to.
+	Age func() policy.VersionChecker
 
 	// Write is held around the read-modify-write of a hide, so it cannot
 	// interleave with another writer of the same manifest. Nil holds nothing.
@@ -303,14 +306,20 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 		allow = c
 	}
 	ev.set(0, allow)
-	ev.set(0, carriedAge(prev, ev.actions[audit.CheckAge]))
+	age, rerun := carriedAge(prev, ev.actions[audit.CheckAge])
+	var ageResults []policy.Result
+	if rerun {
+		ageResults = ev.runVersion(ctx, &cp, 0, []policy.VersionChecker{r.ageChecker()})
+	} else {
+		ev.set(0, age)
+	}
 
 	blocked := allow.Status == audit.CheckBlock
 	if blocked {
 		ev.notRunChecks(0, "not run: the allow-list refused this version", audit.CheckOSV, audit.CheckUpstreamProvenance)
 	} else {
 		checkers := r.checkers()
-		results := ev.runVersion(ctx, &cp, 0, checkers)
+		results := append(ageResults, ev.runVersion(ctx, &cp, 0, checkers)...)
 		combined := policy.Combine(results)
 		if !combined.Blocked() {
 			if changed := ev.commit(ctx, &cp, checkers); changed != nil {
@@ -516,26 +525,34 @@ func StreamIdentity(store storage.ObjectStore, res *storage.StreamResult) audit.
 	return obj
 }
 
-// carriedAge is the age entry of a re-vet row. The gate is not re-run,
-// because a version that was old enough at admission is older now, so the
-// verdict the last decision recorded is carried with its date. A block or a
-// verdict nobody evaluated is not carried: the first cannot have admitted the
-// version, and the second is not a verdict.
-func carriedAge(prev []audit.Admission, action string) audit.AdmissionCheck {
+// carriedAge is the age entry of a re-vet row, or true when the gate has to
+// be re-run instead. A pass or a warn is carried with its date, because a
+// version that was old enough at the last decision is older now. A block, an
+// override or a baseline mark is re-run: the version may have aged past the
+// minimum since, and an override or a mark may no longer apply, so carrying
+// either would cite an exception nobody holds. A verdict nobody evaluated is
+// not a verdict, and is neither carried nor re-run.
+func carriedAge(prev []audit.Admission, action string) (audit.AdmissionCheck, bool) {
 	if action == "" {
 		action = audit.ActionNone
 	}
 	if len(prev) > 0 {
 		for _, c := range prev[0].Checks {
-			if c.Check == audit.CheckAge && (c.Status == audit.CheckPass || c.Status == audit.CheckWarn) {
+			if c.Check != audit.CheckAge {
+				continue
+			}
+			switch c.Status {
+			case audit.CheckPass, audit.CheckWarn:
 				c.Detail = fmt.Sprintf("not re-run, carried from the decision of %s: %s",
 					prev[0].DecidedAt.UTC().Format(time.RFC3339), c.Detail)
-				return c
+				return c, false
+			case audit.CheckBlock, audit.CheckOverridden, audit.CheckBaseline:
+				return audit.AdmissionCheck{}, true
 			}
 		}
 	}
 	return audit.AdmissionCheck{Check: audit.CheckAge, Action: action, Status: audit.CheckNotEvaluated,
-		Detail: "not re-run: a version only gets older, and no earlier decision on record evaluated it"}
+		Detail: "not re-run: a version only gets older, and no earlier decision on record evaluated it"}, false
 }
 
 // record writes the re-vet's rows: one per object key the previous decision
@@ -697,6 +714,17 @@ func (r *Revetter) checkers() []policy.VersionChecker {
 		return r.Checkers()
 	}
 	return RevetCheckers(r.Cfg, r.DB)
+}
+
+// ageChecker judges age at the re-vet's clock, so a test moving Now moves
+// how old the version is along with which overrides are active.
+func (r *Revetter) ageChecker() policy.VersionChecker {
+	if r.Age != nil {
+		return r.Age()
+	}
+	c := policy.NewAgeChecker(r.DB)
+	c.Now = r.now
+	return c
 }
 
 func (r *Revetter) now() time.Time {

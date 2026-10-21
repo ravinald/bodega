@@ -3,13 +3,16 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/spf13/cobra"
 )
 
 // bodega queue lists open rows newest first, filters by check, approves under
@@ -83,5 +86,26 @@ func TestQueueCommands(t *testing.T) {
 	out, _ = queue("list", "--all", "--json")
 	if json.Unmarshal([]byte(out), &rows) != nil || len(rows) != 2 || rows[0].ResolvedBy != "alice" {
 		t.Errorf("list --all = %s", out)
+	}
+}
+
+// An override's expiry runs from its request, so the --expires help on both
+// commands that make one says so: one that reads "once approved" promises an
+// operator days the second approval has already spent.
+func TestOverrideExpiresHelpCountsFromRequest(t *testing.T) {
+	// Building the commands reads no config; the override keeps the scan
+	// that cannot tell so from reading /etc/bodega/config.json.
+	t.Setenv(config.EnvConfigFile, filepath.Join(t.TempDir(), "config.json"))
+	for name, cmd := range map[string]*cobra.Command{
+		"override request": newOverrideRequestCmd(&globalFlags{}),
+		"queue approve":    newQueueApproveCmd(&globalFlags{}),
+	} {
+		f := cmd.Flags().Lookup("expires")
+		if f == nil {
+			t.Fatalf("bodega %s has no --expires flag", name)
+		}
+		if !strings.Contains(f.Usage, "from the request") || strings.Contains(f.Usage, "once approved") {
+			t.Errorf("bodega %s --expires usage = %q, want it counted from the request", name, f.Usage)
+		}
 	}
 }
