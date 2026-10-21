@@ -32,6 +32,8 @@ func (d double) Lookup(ctx context.Context, q Query) (Answer, error) {
 	case "slow":
 		<-ctx.Done()
 		return Answer{}, ctx.Err()
+	case "claims-malware":
+		return Answer{Flagged: true, Reason: q.Name + " is bad", Flag: FlagMalware}, nil
 	}
 	return Answer{}, nil
 }
@@ -46,7 +48,7 @@ func init() {
 			{Key: "limit", Label: "Limit", Kind: KindInt, Default: "10", Min: 1, Max: 100},
 			{Key: "window", Label: "Window", Kind: KindDuration, Default: "1h", MinDuration: time.Minute, MaxDuration: 24 * time.Hour},
 			{Key: "strict", Label: "Strict", Kind: KindBool, Default: "false"},
-			{Key: "verdict", Label: "Verdict", Kind: KindEnum, Default: "clean", Options: []string{"clean", "flagged", "error", "slow"}},
+			{Key: "verdict", Label: "Verdict", Kind: KindEnum, Default: "clean", Options: []string{"clean", "flagged", "error", "slow", "claims-malware"}},
 			{Key: "endpoint", Label: "Endpoint", Kind: KindURL, Default: "https://api.example.test/"},
 			{Key: "api_token", Label: "API token", Kind: KindString, Secret: true, Required: true},
 		},
@@ -96,7 +98,7 @@ func TestValidateInstanceEveryKind(t *testing.T) {
 		"duration_unparsable":  {entry("window", "soon"), `integrations.vendor.window: want a duration`},
 		"duration_below_floor": {entry("window", "30s"), `from 1m to 1d, got "30s"`},
 		"bool_as_string":       {entry("strict", "yes"), `integrations.vendor.strict: want true or false, got "yes"`},
-		"enum_unknown":         {entry("verdict", "maybe"), `want one of clean, flagged, error, slow, got "maybe"`},
+		"enum_unknown":         {entry("verdict", "maybe"), `want one of clean, flagged, error, slow, claims-malware, got "maybe"`},
 		"url_scheme":           {entry("endpoint", "ftp://x/"), `integrations.vendor.endpoint: want an http or https URL`},
 		"url_userinfo":         {entry("endpoint", "https://u:p@x/"), `want an http or https URL with no user, password or fragment`},
 		"enabled_not_bool":     {entry("enabled", "true"), `integrations.vendor.enabled: want true or false`},
@@ -296,7 +298,7 @@ func TestCheckActionsAndErrors(t *testing.T) {
 		"act":  entry("enabled", true, "verdict", "error"),
 		"idle": entry("enabled", false, "verdict", "flagged"),
 	}
-	checks := Checks(raw, store)
+	checks := Checks(raw, "", store)
 	if len(checks) != 1 || checks[0].CheckName() != "integration:act" {
 		t.Fatalf("Checks = %d, want the enabled instance only", len(checks))
 	}
@@ -332,7 +334,7 @@ func TestCheckActionsAndErrors(t *testing.T) {
 // A timeout is an error under the action, not a pass.
 func TestCheckTimeout(t *testing.T) {
 	t.Setenv("BODEGA_SLOW_API_TOKEN", "sk")
-	c := Build("slow", entry("enabled", true, "verdict", "slow", KeyTimeout, "1s"), nil)
+	c := Build("slow", entry("enabled", true, "verdict", "slow", KeyTimeout, "1s"), "", nil)
 	pm, ve := crate("serde")
 	start := time.Now()
 	r := c.Check(context.Background(), pm, ve)
@@ -352,11 +354,11 @@ func TestCheckCachesPerPURL(t *testing.T) {
 	pm, ve := crate("serde")
 	ctx := context.Background()
 	before := probeLookups.Load()
-	c := Checks(raw, nil)[0]
+	c := Checks(raw, "", nil)[0]
 	now := time.Now()
 	c.now = func() time.Time { return now }
 	c.Check(ctx, pm, ve)
-	Checks(raw, nil)[0].Check(ctx, pm, ve)
+	Checks(raw, "", nil)[0].Check(ctx, pm, ve)
 	if n := probeLookups.Load() - before; n != 1 {
 		t.Errorf("two checks of one purl made %d lookups, want 1", n)
 	}
@@ -371,7 +373,7 @@ func TestCheckCachesPerPURL(t *testing.T) {
 		t.Errorf("after the TTL: %d lookups, want 3", n)
 	}
 	raw["cached"]["label"] = "changed"
-	Checks(raw, nil)[0].Check(ctx, pm, ve)
+	Checks(raw, "", nil)[0].Check(ctx, pm, ve)
 	if n := probeLookups.Load() - before; n != 4 {
 		t.Errorf("a changed entry reused the old cache: %d lookups, want 4", n)
 	}
@@ -382,7 +384,7 @@ func TestCheckCachesPerPURL(t *testing.T) {
 func TestChecksInvalidEntryFailsClosed(t *testing.T) {
 	t.Setenv("BODEGA_BROKEN_API_TOKEN", "")
 	t.Setenv(CredentialsEnv, "")
-	c := Checks(map[string]config.Integration{"broken": entry("enabled", true)}, nil)
+	c := Checks(map[string]config.Integration{"broken": entry("enabled", true)}, "", nil)
 	if len(c) != 1 {
 		t.Fatalf("Checks = %d", len(c))
 	}
@@ -395,7 +397,7 @@ func TestChecksInvalidEntryFailsClosed(t *testing.T) {
 func TestRunTest(t *testing.T) {
 	t.Setenv("BODEGA_PROBE_API_TOKEN", "sk")
 	var out strings.Builder
-	if err := RunTest(context.Background(), &out, "probe", entry("verdict", "flagged"), nil); err != nil {
+	if err := RunTest(context.Background(), &out, "probe", entry("verdict", "flagged"), "", nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"query:   pkg:cargo/serde@1.0.0", "latency: ", "answer:  flagged (serde is bad)", "quota:   41 of 50 left"} {
@@ -405,7 +407,7 @@ func TestRunTest(t *testing.T) {
 	}
 	store := &memStore{}
 	out.Reset()
-	if err := RunTest(context.Background(), &out, "probe", entry("verdict", "error"), store); err == nil {
+	if err := RunTest(context.Background(), &out, "probe", entry("verdict", "error"), "", store); err == nil {
 		t.Error("an erroring probe returned nil")
 	}
 	if store.errs["probe"] == "" {
@@ -440,5 +442,115 @@ func TestConfigLoadValidates(t *testing.T) {
 	write(`{"integrations": {"vendor": {"type": "every-kind", "enabled": false}}}`)
 	if err := load(); err != nil {
 		t.Errorf("valid disabled entry: %v", err)
+	}
+}
+
+// prepDouble is a malware type that has to prepare before it can answer, the
+// way the malware list downloads its list. A "telemetry" package is a hit it
+// lowers to risk.
+type prepDouble struct {
+	inst  *Instance
+	ready atomic.Bool
+}
+
+var prepCalls atomic.Int64
+
+func (d *prepDouble) Prepare(_ context.Context, _ string) error {
+	prepCalls.Add(1)
+	switch d.inst.String("prep") {
+	case "fail":
+		return errors.New("list host unreachable")
+	case "slow":
+		time.Sleep(1200 * time.Millisecond)
+	}
+	d.ready.Store(true)
+	return nil
+}
+
+func (d *prepDouble) Lookup(ctx context.Context, q Query) (Answer, error) {
+	if !d.ready.Load() {
+		return Answer{}, errors.New("not prepared")
+	}
+	if err := ctx.Err(); err != nil {
+		return Answer{}, err
+	}
+	if q.Name == "telemetry" {
+		return Answer{Flagged: true, Reason: "phones home", Flag: FlagRisk}, nil
+	}
+	return Answer{Flagged: true, Reason: "listed"}, nil
+}
+
+func init() {
+	Register(Descriptor{
+		Type: "prep-double", DisplayName: "Prep double", VendorURL: "https://example.test/", Cost: CostFree,
+		Ecosystems: []string{manifest.TypeCargo}, DataSent: "Nothing.", DefaultAction: policy.ActionBlock, Flags: FlagMalware,
+		Fields: []Field{{Key: "prep", Label: "Prep", Kind: KindEnum, Default: "ok", Options: []string{"ok", "slow", "fail"}}},
+		Probe:  Query{Ecosystem: manifest.TypeCargo, Name: "serde", Version: "1.0.0"},
+		New:    func(inst *Instance) (Checker, error) { return &prepDouble{inst: inst}, nil },
+	})
+}
+
+// Prepare runs before the timeout starts: a preparation longer than the
+// timeout still answers, through Check and through Probe.
+func TestPrepareIsOutsideTheTimeout(t *testing.T) {
+	e := config.Integration{"type": "prep-double", "enabled": true, "prep": "slow", KeyTimeout: "1s"}
+	pm, ve := crate("serde")
+	if r := Build("prep-slow", e, "", nil).Check(context.Background(), pm, ve); r.Details["outcome"] != "flagged" {
+		t.Errorf("Check after a slow Prepare: %+v", r)
+	}
+	if _, a, _, err := Build("prep-slow", e, "", nil).Probe(context.Background()); err != nil || !a.Flagged {
+		t.Errorf("Probe after a slow Prepare: %+v, %v", a, err)
+	}
+}
+
+// A Prepare error is recorded as a Lookup error is, under the action and as
+// the last error, and is not cached: the next check prepares again.
+func TestPrepareErrorIsRecordedNotCached(t *testing.T) {
+	store := &memStore{}
+	c := Build("prep-fail", config.Integration{"type": "prep-double", "enabled": true, "prep": "fail"}, "", store)
+	pm, ve := crate("serde")
+	before := prepCalls.Load()
+	for range 2 {
+		r := c.Check(context.Background(), pm, ve)
+		if r.Action != policy.ActionBlock || r.Reason != "error: list host unreachable" || r.Details["outcome"] != "error" {
+			t.Errorf("Prepare error: %+v", r)
+		}
+	}
+	if n := prepCalls.Load() - before; n != 2 {
+		t.Errorf("%d Prepare calls for two checks, want 2: an error is never cached", n)
+	}
+	if store.errs["prep-fail"] != "list host unreachable" {
+		t.Errorf("last error = %q", store.errs["prep-fail"])
+	}
+}
+
+// An answer lowers a malware type's hit to risk, and never raises a risk
+// type's hit to malware.
+func TestAnswerFlagLowersNeverRaises(t *testing.T) {
+	c := Build("prep-flags", config.Integration{"type": "prep-double", "enabled": true}, "", nil)
+	for name, malware := range map[string]bool{"serde": true, "telemetry": false} {
+		pm, ve := crate(name)
+		r := c.Check(context.Background(), pm, ve)
+		if r.Details["outcome"] != "flagged" || (r.Details["malware"] != nil) != malware {
+			t.Errorf("%s: %+v, want malware %v", name, r.Details, malware)
+		}
+	}
+	t.Setenv("BODEGA_RAISER_API_TOKEN", "sk")
+	pm, ve := crate("serde")
+	r := Build("raiser", entry("enabled", true, "verdict", "claims-malware"), "", nil).Check(context.Background(), pm, ve)
+	if r.Details["outcome"] != "flagged" || r.Details["malware"] != nil {
+		t.Errorf("a risk type's answer claiming malware was recorded %+v", r.Details)
+	}
+}
+
+// Checks and Build give every instance a state directory under log_dir, and
+// none without one.
+func TestStateDir(t *testing.T) {
+	raw := map[string]config.Integration{"prep-state": {"type": "prep-double", "enabled": true}}
+	if got, want := Checks(raw, "/var/log/bodega", nil)[0].Instance().StateDir, "/var/log/bodega/integrations/prep-state"; got != want {
+		t.Errorf("Checks: StateDir = %q, want %q", got, want)
+	}
+	if got := Build("prep-state", raw["prep-state"], "", nil).Instance().StateDir; got != "" {
+		t.Errorf("Build with no log_dir: StateDir = %q", got)
 	}
 }

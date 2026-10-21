@@ -1131,6 +1131,24 @@ from a doctored one. Use an `https` URL; an `http` one, which the validator
 accepts for a mirror on a trusted network, hands both powers to anyone on the
 path.
 
+**The on-disk list decides verdicts too.** `malware-list` keeps each list it
+downloads in `<log_dir>/integrations/<instance>/`, and every bodega process,
+`bodega serve` and each one-shot command, answers from that file while it is
+younger than `refresh_interval`, and from it during an outage for three
+intervals. Anyone who can write `log_dir` can drop an entry and admit a
+known-malicious version, or add one and refuse any version under `block`: the
+same boundary as `audit.db` beside it. The metadata file records the list's
+SHA-256, which catches a truncated or half-written copy, not a deliberate edit,
+since whoever rewrites the list can rewrite its metadata. The directory is
+`0700` and the files `0600`; keep `log_dir` owned by the bodega user.
+
+**Only a `MALWARE` row is unwaivable.** The list sorts rows by category in
+`reason`. A `MALWARE` hit is recorded as malware and no override or queue
+approval admits it. A `PROTESTWARE` or `TELEMETRY` hit is a `risk` hit: it
+refuses under `block` like any other, and an override may admit it. The
+`categories` field narrows which categories count; dropping `MALWARE` from it
+stops the list from refusing malware at all.
+
 **A per-package API**, which `socket` is, sends the purl of every version
 admitted that is not already in the instance's answer cache, with the account's
 API token, so the vendor holds a dated record of what this organization pulls

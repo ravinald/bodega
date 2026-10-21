@@ -112,6 +112,22 @@ type Answer struct {
 	// Quota is whatever the vendor reported about remaining requests, in its
 	// own words, for `bodega integration test`. Empty when it said nothing.
 	Quota string
+	// Flag is what this hit means, when it means less than the descriptor's
+	// Flags: a malware list that also carries telemetry rows answers those
+	// FlagRisk. Empty means the descriptor's Flags. See EffectiveFlag.
+	Flag Flag
+}
+
+// EffectiveFlag is what a flagged answer from d means. An answer can lower a
+// malware type's hit to risk, never raise a risk type's hit to malware: the
+// descriptor is what an operator read before enabling the instance, and a
+// type that could make its hits unwaivable one by one would not be the type
+// they enabled.
+func (d *Descriptor) EffectiveFlag(a Answer) Flag {
+	if d.Flags == FlagMalware && a.Flag != FlagRisk {
+		return FlagMalware
+	}
+	return FlagRisk
 }
 
 // Checker is what a type builds from one configured instance. Lookup returns
@@ -120,6 +136,15 @@ type Answer struct {
 // instance's action, so a vendor outage never reads as a pass.
 type Checker interface {
 	Lookup(ctx context.Context, q Query) (Answer, error)
+}
+
+// Preparer is a Checker that has state to get ready before it can answer for
+// an ecosystem, such as a list to download. The frame calls Prepare before it
+// starts the instance's timeout, so the timeout bounds one query and not the
+// preparation, which the type bounds itself. An error is recorded the way a
+// Lookup error is.
+type Preparer interface {
+	Prepare(ctx context.Context, ecosystem string) error
 }
 
 // Descriptor declares one integration type.
@@ -291,13 +316,27 @@ type Instance struct {
 	Name       string
 	Enabled    bool
 	Descriptor *Descriptor
-	values     map[string]any
+	// StateDir is the directory the instance may keep files in across
+	// processes, <log_dir>/integrations/<name>. Empty when there is no
+	// log_dir, and then a type keeps its state in memory only. The type
+	// creates it when it first writes.
+	StateDir string
+	values   map[string]any
 	// secretFiles are the <key>_file paths the entry names.
 	secretFiles map[string]string
 }
 
 // CheckName is the name the instance's verdicts carry in an admission row.
 func (i *Instance) CheckName() string { return CheckPrefix + i.Name }
+
+// StateDir is where instance name keeps its files under logDir, or "" when
+// logDir is "".
+func StateDir(logDir, name string) string {
+	if logDir == "" {
+		return ""
+	}
+	return filepath.Join(logDir, "integrations", name)
+}
 
 // CheckPrefix starts every integration's check name.
 const CheckPrefix = "integration:"
