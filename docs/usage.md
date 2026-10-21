@@ -7650,9 +7650,10 @@ Generated from the registry; a test fails when this table and the registry disag
 
 <!-- integration-types:begin -->
 
-| Type           | Name                                             | Cost | Ecosystems | Default action | What leaves the host                                                                                                                                                                                             |
-| -------------- | ------------------------------------------------ | ---- | ---------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `malware-list` | [Malware list](https://malware-list.aikido.dev/) | free | npm, pypi  | block          | Nothing per package: the whole list for each ecosystem is downloaded from the configured URL on the refresh interval, so the list's host sees this server's address and when it refreshes, never a package name. |
+| Type           | Name                                             | Cost      | Ecosystems              | Default action | What leaves the host                                                                                                                                                                                             |
+| -------------- | ------------------------------------------------ | --------- | ----------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `malware-list` | [Malware list](https://malware-list.aikido.dev/) | free      | npm, pypi               | block          | Nothing per package: the whole list for each ecosystem is downloaded from the configured URL on the refresh interval, so the list's host sees this server's address and when it refreshes, never a package name. |
+| `socket`       | [Socket.dev](https://socket.dev/)                | free-tier | npm, pypi, gomod, cargo | warn           | The package's purl (name and version) is sent to api.socket.dev.                                                                                                                                                 |
 
 <!-- integration-types:end -->
 
@@ -7668,6 +7669,38 @@ Reads a bulk JSON list of `{package_name, version, reason}` per ecosystem and fa
 The default is [Aikido's public list](https://malware-list.aikido.dev/), which needs no account. A list is downloaded on the first lookup for its ecosystem and again once it is older than `refresh_interval`; one download serves every lookup waiting on it. When a refresh fails, the last list keeps answering for three intervals, then each lookup records an error under the action. A list larger than 256 MiB, one that is not a JSON array, and an empty one are refused as errors rather than read as "nothing is malicious".
 
 `bodega integration test` asks about `npm` `lodash@4.17.21` and prints the size and fetch time of the list it matched against. The list publisher reports no quota.
+
+#### The `socket` type
+
+Sends each version's purl to [Socket.dev](https://socket.dev/)'s package API, which scores the published code from static analysis (install scripts, network and filesystem access, obfuscation, known malware) and reports alerts with severities. It catches a malicious package before any advisory names it, which OSV cannot. A hit means risk, not malware, so an [override](#bodega-override-requestapproverejectlist) may admit past it.
+
+| Key                   | Default    | Meaning                                                                                                             |
+| --------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------- |
+| `api_token`           | none       | Secret. A Socket organization API token with the `packages:list` scope. Required to enable the instance             |
+| `min_score`           | no floor   | Fail a version whose Socket overall score, as a whole number from 0 to 100, is below this. `0` sets no floor        |
+| `fail_alert_severity` | `critical` | Fail a version carrying any alert at or above this severity: `low`, `middle`, `high` or `critical` (Socket's words) |
+
+Setup, with the token read from standard input and stored mode `0600` beside the config file:
+
+```bash
+bodega integration add socket socket --set min_score=40
+bodega integration secret socket api_token < socket-token.txt
+bodega integration enable socket
+bodega integration test socket
+bodega policy integration set socket npm block
+```
+
+With no `integration_policy` row the action is `warn`: a failing version is admitted with a warning and the alert in its admission row. With no `socket` instance configured, or with one disabled, nothing is sent to Socket and nothing is recorded; admission runs exactly as it does without the type.
+
+**What leaves the host.** One `POST https://api.socket.dev/v0/purl?alerts=true` per version not already cached, carrying the version's purl (`pkg:npm/left-pad@1.3.0`; gomod is sent as `pkg:golang/...`) and the API token as a bearer token. The package name and version are all that is sent about the package: no client address, manifest or artifact. Socket keeps a dated, account-tied record of every purl asked about; see [threat model](threat-model.md#external-check-integrations).
+
+**What it records.** The admission row's `detail` names the score and every alert with its severity, whether or not the version failed: `not flagged by Socket.dev: score 82/100; alerts: installScripts (low), networkAccess (middle)`, or for a failure `Socket: critical alert malware (score 40/100; alerts: malware (critical))`.
+
+**Errors.** A network failure, a timeout, a 5xx, a 401 or 403 from a bad token, a 429 and a body that is not Socket's NDJSON are each an `error` under the action: `block` refuses the version, `warn` admits it with a warning. So are Socket's own placeholder answers, `notFound` (it cannot resolve the version) and `pendingScan` (it has not finished analyzing it), because neither is a verdict on the code. A 429's `Retry-After`, in seconds or as a date and capped at an hour (a minute when absent), is honored: until it passes, every lookup is an error without a request, so a rate-limited instance does not spend the quota it is waiting on.
+
+**Cost.** Socket meters its API in quota units, not calls: each token has a maximum quota per hour ([quota](https://docs.socket.dev/reference/quota)), the free tier's is 500 units an hour ([pricing](https://socket.dev/pricing), checked 2026-10-12), and the `POST /v0/purl` endpoint this type calls consumes 100 units per request ([batchPackageFetch](https://docs.socket.dev/reference/batchpackagefetch)). bodega sends one purl per request, so a free token covers about 5 lookups of new versions an hour. bodega makes one call per distinct purl per `cache_ttl` (default `1h`), per process: the CLI and a running `bodega serve` each keep their own cache, and errors are never cached. The sixth uncached version in an hour gets a 429, and every lookup after it records an error until `Retry-After` passes. Under `block` that refuses each of those versions; under the default `warn` they are admitted with an error warning and no Socket verdict. The free tier fits a low-traffic install, or any install left on `warn`. A busy proxy under `block` needs a paid quota, or a long `cache_ttl` (up to `7d`) so versions seen before spend nothing. Socket's pricing page also lists a monthly allowance of full scans; this type never runs a full scan, so that allowance does not apply. Socket's API documentation marks this endpoint deprecated since 2026-01-05, without naming a replacement.
+
+`bodega integration test` asks about `npm` `lodash@4.17.21` and prints its score and alerts. Socket documents no quota header on this endpoint, so the quota line reads `none reported`.
 
 ### Integrations view
 
