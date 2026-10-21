@@ -103,7 +103,7 @@ func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, 
 		r.Action = action
 		r.Reason = a.Reason
 		r.Details = map[string]any{"instance": c.inst.Name, "outcome": "flagged", "purl": q.PURL()}
-		if d.Flags == FlagMalware {
+		if d.EffectiveFlag(a) == FlagMalware {
 			r.Details["malware"] = []string{c.CheckName()}
 		}
 	default:
@@ -123,10 +123,20 @@ func (c *VersionCheck) Probe(ctx context.Context) (Query, Answer, time.Duration,
 		return q, Answer{}, 0, c.buildErr
 	}
 	start := time.Now()
+	if err := c.prepare(ctx, q.Ecosystem); err != nil {
+		return q, Answer{}, time.Since(start), err
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.inst.Duration(KeyTimeout))
 	defer cancel()
 	a, err := c.impl.Lookup(ctx, q)
 	return q, a, time.Since(start), err
+}
+
+func (c *VersionCheck) prepare(ctx context.Context, ecosystem string) error {
+	if p, ok := c.impl.(Preparer); ok {
+		return p.Prepare(ctx, ecosystem)
+	}
+	return nil
 }
 
 func (c *VersionCheck) lookup(ctx context.Context, q Query) (Answer, error) {
@@ -136,6 +146,9 @@ func (c *VersionCheck) lookup(ctx context.Context, q Query) (Answer, error) {
 	key := q.PURL()
 	if a, ok := c.cache.get(key, c.now()); ok {
 		return a, nil
+	}
+	if err := c.prepare(ctx, q.Ecosystem); err != nil {
+		return Answer{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.inst.Duration(KeyTimeout))
 	defer cancel()
@@ -204,7 +217,10 @@ var (
 // that no longer validates becomes a check that records the validation error
 // under its action on every version, rather than one that silently stops
 // running.
-func Checks(raw map[string]config.Integration, store Store) []*VersionCheck {
+//
+// logDir is the config's log_dir. Each instance keeps its files in its
+// StateDir under it.
+func Checks(raw map[string]config.Integration, logDir string, store Store) []*VersionCheck {
 	names := make([]string, 0, len(raw))
 	for n := range raw {
 		names = append(names, n)
@@ -218,14 +234,14 @@ func Checks(raw map[string]config.Integration, store Store) []*VersionCheck {
 		if !enabled {
 			continue
 		}
-		fp, _ := json.Marshal(raw[n])
+		fp, _ := json.Marshal([]any{logDir, raw[n]})
 		if l, ok := lives[n]; ok && l.fingerprint == string(fp) {
 			c := *l.check
 			c.store = store
 			out = append(out, &c)
 			continue
 		}
-		c := build(n, raw[n])
+		c := build(n, raw[n], logDir)
 		lives[n] = &live{fingerprint: string(fp), check: c}
 		cp := *c
 		cp.store = store
@@ -236,13 +252,13 @@ func Checks(raw map[string]config.Integration, store Store) []*VersionCheck {
 
 // Build constructs one instance's check whether or not it is enabled, for
 // `bodega integration test`. Its cache is its own.
-func Build(name string, raw config.Integration, store Store) *VersionCheck {
-	c := build(name, raw)
+func Build(name string, raw config.Integration, logDir string, store Store) *VersionCheck {
+	c := build(name, raw, logDir)
 	c.store = store
 	return c
 }
 
-func build(name string, raw config.Integration) *VersionCheck {
+func build(name string, raw config.Integration, logDir string) *VersionCheck {
 	inst, err := ValidateInstance(name, raw)
 	if err != nil {
 		t, _ := raw["type"].(string)
@@ -250,9 +266,10 @@ func build(name string, raw config.Integration) *VersionCheck {
 		if !ok {
 			d = &Descriptor{Type: t, DisplayName: name, DefaultAction: policy.ActionBlock}
 		}
-		return &VersionCheck{inst: &Instance{Name: name, Descriptor: d, values: map[string]any{}}, buildErr: err,
+		return &VersionCheck{inst: &Instance{Name: name, Descriptor: d, StateDir: StateDir(logDir, name), values: map[string]any{}}, buildErr: err,
 			cache: &answerCache{}, now: time.Now}
 	}
+	inst.StateDir = StateDir(logDir, name)
 	impl, err := inst.Descriptor.New(inst)
 	return &VersionCheck{inst: inst, impl: impl, buildErr: err, cache: &answerCache{}, now: time.Now}
 }
@@ -260,9 +277,10 @@ func build(name string, raw config.Integration) *VersionCheck {
 // RunTest makes one real query for the instance's probe package and writes
 // the answer, the latency and any quota the vendor reported. It is
 // `bodega integration test` and the TUI's Test action. A failed query is
-// recorded as the instance's last error and returned.
-func RunTest(ctx context.Context, out io.Writer, name string, entry config.Integration, store Store) error {
-	c := Build(name, entry, store)
+// recorded as the instance's last error and returned. logDir is the config's
+// log_dir, as Checks takes it.
+func RunTest(ctx context.Context, out io.Writer, name string, entry config.Integration, logDir string, store Store) error {
+	c := Build(name, entry, logDir, store)
 	q, a, latency, err := c.Probe(ctx)
 	fmt.Fprintf(out, "query:   %s\nlatency: %s\n", q.PURL(), latency.Round(time.Millisecond))
 	if err != nil {
