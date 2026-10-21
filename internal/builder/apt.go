@@ -606,7 +606,10 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				parentDir := filepath.Dir(sourceDir)
 				if err := mkdirAll(parentDir); err != nil {
 					fetchErr = fmt.Errorf("create dir %s: %w", parentDir, err)
-				} else {
+				} else if cfg.Force {
+					fetchErr = discardAptSourceBuild(d, name, ve, sourceDir)
+				}
+				if fetchErr == nil {
 					_, _ = fmt.Fprintf(out, "    Fetching source for %s via apt-get source...\n", sourceName)
 					if err := runCmd(out, parentDir, "apt-get", "source", "--download-only", sourceName); err != nil {
 						fetchErr = fmt.Errorf("apt-get source %s: %w", sourceName, err)
@@ -1183,6 +1186,25 @@ func locateAptSourceDeb(d dirs, name string, ve manifest.VersionEntry) (string, 
 	}
 	return "", fmt.Errorf("apt/%s: %d .deb files in %s are %s: %s — set deb_glob to the one this entry publishes",
 		name, len(own), d.sources, want, joinBases(own))
+}
+
+// discardAptSourceBuild removes an apt-get source entry's extracted tree and
+// the .deb its last build left, so a forced fetch extracts afresh (dpkg-source
+// refuses an existing target) and the build stage no longer reads the version
+// as built. The .deb sits in the sources/ directory every entry shares, so only
+// the one file locateAptSourceDeb selects for this version is removed; when it
+// selects none or several, nothing there is touched and the build stage reports
+// the ambiguity as it would without the force.
+func discardAptSourceBuild(d dirs, name string, ve manifest.VersionEntry, sourceDir string) error {
+	if deb, err := locateAptSourceDeb(d, name, ve); err == nil {
+		if err := os.Remove(deb); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove old build %s: %w", deb, err)
+		}
+	}
+	if err := os.RemoveAll(sourceDir); err != nil {
+		return fmt.Errorf("remove old source %s: %w", sourceDir, err)
+	}
+	return nil
 }
 
 // locateAptSourceDsc returns the .dsc `apt-get source` left in dir for this
