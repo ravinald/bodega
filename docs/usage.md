@@ -348,6 +348,8 @@ A store where no manifest carries a sidecar predates sidecars being written on e
 
 It then reads every binary manifest in the store, whether or not the index lists it, and checks each version's `filename` against the rule under [Binary-specific fields](#binary-specific-fields) and prints an `INVALID` row, with the reason, for each one that breaks it, or an `UNCHECKED` row for a manifest it cannot parse. Either row makes the command exit non-zero. Fix one by correcting `filename` or removing it with `bodega pkg edit`.
 
+It reads every apt manifest the same way and checks each version's `deb_glob` against the rule under [Apt-specific fields](#apt-specific-fields), printing `INVALID` or `UNCHECKED` rows under `Apt deb_glob:` with the same effect on the exit code. Fix one by correcting `deb_glob` or removing it with `bodega pkg edit`.
+
 ### `bodega pkg refresh [TYPE] [NAME] [--force]`
 
 Discovers available versions from upstream registries for every entry whose `version_constraint` is neither empty nor `exact`: `patch`, `compatible` and `any`. Creates manifest records for new versions without fetching them.
