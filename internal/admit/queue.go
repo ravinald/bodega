@@ -72,12 +72,14 @@ type QueueApproval struct {
 }
 
 // QueueResolution is what approving a row did. Exactly one of Rule,
-// Override and Profiles is set.
+// Override and Profiles is set. Warning names a check the approval could not
+// run, which the operator reads at approval time rather than in the event.
 type QueueResolution struct {
 	Row      audit.QueueRow    `json:"row"`
 	Rule     *audit.PolicyInfo `json:"rule,omitempty"`
 	Override *audit.Override   `json:"override,omitempty"`
 	Profiles []string          `json:"profiles,omitempty"`
+	Warning  string            `json:"warning,omitempty"`
 }
 
 // ApproveQueued resolves open row id by the action its check calls for: an
@@ -116,7 +118,7 @@ func ApproveQueued(ctx context.Context, adb *audit.DB, cfg *config.Config, id in
 	var resolution string
 	switch row.Check {
 	case QueueAllowList:
-		out.Rule, err = approveAllowList(ctx, adb, row, actor, a)
+		out.Rule, out.Warning, err = approveAllowList(ctx, adb, row, actor, a)
 		if err == nil {
 			resolution = "allow-list rule " + out.Rule.ID
 		}
@@ -163,34 +165,37 @@ func DismissQueued(ctx context.Context, adb *audit.DB, id int64, actor, reason s
 	return row, nil
 }
 
-func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor string, a QueueApproval) (*audit.PolicyInfo, error) {
+func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor string, a QueueApproval) (*audit.PolicyInfo, string, error) {
 	if err := policy.ValidateType(row.PkgType); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidQueue, err)
+		return nil, "", fmt.Errorf("%w: %v", ErrInvalidQueue, err)
 	}
 	pattern := row.Pattern
 	if pattern == "" {
 		pattern = row.PkgName
 	}
 	kind := policy.RuleKindForType(row.PkgType)
-	// A rule someone already added by hand resolves the row: inserting it
+	// A rule someone already added resolves the row before the near-popular
+	// comparison: it was confirmed when it was written, and inserting it
 	// again would only trip the table's uniqueness on type, kind and pattern.
-	rules, err := adb.ListPolicies(ctx)
+	existing, ok, err := adb.FindPolicy(ctx, row.PkgType, kind, pattern)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	for _, p := range rules {
-		if p.RegistryType == row.PkgType && p.RuleKind == kind && p.Pattern == pattern {
-			return &p, nil
-		}
+	if ok {
+		return &existing, "", nil
 	}
+	var warning string
 	check, err := policy.ConfirmNearPopular(ctx, adb, row.PkgType, pattern, a.ConfirmNearPopular)
 	var near *policy.NearPopularError
-	if errors.As(err, &near) {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidQueue, err)
+	switch {
+	case errors.As(err, &near):
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidQueue, err)
+	case err != nil:
+		warning = fmt.Sprintf("%s %q was not compared with the popular %s names: %v", row.PkgType, pattern, row.PkgType, err)
 	}
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rule := audit.PolicyInfo{
 		ID: hex.EncodeToString(b[:]), RegistryType: row.PkgType, RuleKind: kind,
@@ -198,11 +203,11 @@ func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, ac
 	}
 	details := fmt.Sprintf("id=%s kind=%s queue=%d", rule.ID, rule.RuleKind, row.ID) + check.AuditDetails()
 	if err := adb.InsertPolicy(ctx, rule); err != nil {
-		return nil, fmt.Errorf("insert allow-list rule %s %q: %w", row.PkgType, pattern, err)
+		return nil, "", fmt.Errorf("insert allow-list rule %s %q: %w", row.PkgType, pattern, err)
 	}
 	_ = adb.Record(ctx, audit.Event{EventType: audit.EventCreate, PkgType: "policy",
 		PkgName: row.PkgType + ":" + pattern, Actor: actor, Status: "success", Details: details})
-	return &rule, nil
+	return &rule, warning, nil
 }
 
 // approveProfile pins the refused version in every profile the row records.

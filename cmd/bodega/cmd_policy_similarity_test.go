@@ -202,3 +202,33 @@ func TestDiscoverPromoteAllHoldsBackANearPopularName(t *testing.T) {
 		t.Errorf("create events = %+v", events)
 	}
 }
+
+// A near-popular name an operator already confirmed is present, not held
+// back: promote-all counts it skipped and promote says so without asking.
+func TestDiscoverPromoteAllSkipsAConfirmedNearPopularRule(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, pypiDenial("reqeusts"))
+	if _, _, err := runDiscoverStdin(t, "y\n", "promote", "pypi", "reqeusts"); err != nil {
+		t.Fatalf("a yes: %v", err)
+	}
+
+	stdout, _, err := runDiscoverStdin(t, "", "promote-all", "pypi")
+	if err != nil {
+		t.Fatalf("promote-all: %v", err)
+	}
+	if !strings.Contains(stdout, "skipped 1") || !strings.Contains(stdout, "held back 0") || strings.Contains(stdout, "confirm with") {
+		t.Errorf("promote-all after a confirm:\n%s", stdout)
+	}
+
+	_, stderr, err := runDiscoverStdin(t, "y\n", "promote", "pypi", "reqeusts")
+	if err == nil || !strings.Contains(err.Error(), "already") || strings.Contains(stderr, "WARNING") {
+		t.Errorf("promote again = %v, stderr:\n%s\nwant an already-present error and no prompt", err, stderr)
+	}
+	_, stderr, err = runPolicy(t, "y\n", "add", "pypi", "reqeusts")
+	if err == nil || !strings.Contains(err.Error(), "already exists") || strings.Contains(stderr, "WARNING") {
+		t.Errorf("policy add again = %v, stderr:\n%s\nwant an already-exists error and no prompt", err, stderr)
+	}
+	if got := pypiRules(t, env.auditDB); len(got) != 1 {
+		t.Errorf("rules = %v", got)
+	}
+}

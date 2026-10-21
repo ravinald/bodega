@@ -275,6 +275,11 @@ func TestCreatePolicyConfirmsANearPopularName(t *testing.T) {
 	if d := newestCreate(); !strings.Contains(d, "near_popular=requests") || !strings.Contains(d, "distance=1") || !strings.Contains(d, "confirmed=yes") {
 		t.Errorf("confirmed event details = %q", d)
 	}
+	// The rule exists now, so a repeat is a duplicate, not a name to confirm.
+	rec = create(`{"registry_type":"pypi","pattern":"reqeusts"}`)
+	if rec.Code != http.StatusConflict || strings.Contains(rec.Body.String(), "near_popular") || !strings.Contains(rec.Body.String(), "already exists") {
+		t.Errorf("repeat = %d %s, want 409 already exists without near_popular", rec.Code, rec.Body)
+	}
 
 	if rec := create(`{"registry_type":"pypi","pattern":"requests","confirm_near_popular":"urllib3"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("a popular name = %d %s, want 201", rec.Code, rec.Body)

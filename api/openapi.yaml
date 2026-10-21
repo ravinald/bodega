@@ -1189,17 +1189,23 @@ paths:
           description: Unknown registry type, or pattern missing
         "409":
           description: |
-            The pattern is an exact name within two edits of a popular one,
-            and `confirm_near_popular` is absent or names another package.
-            No rule was written.
+            No rule was written. Either a rule with this type, kind and
+            pattern already exists (`id` names it), or the pattern is an exact
+            name within two edits of a popular one and `confirm_near_popular`
+            is absent or names another package (`near_popular` and `distance`
+            are set). An existing rule is reported first, so a client is never
+            asked to confirm a name it cannot insert.
           content:
             application/json:
               schema:
                 type: object
-                required: [error, near_popular, distance]
+                required: [error]
                 properties:
                   error:
                     type: string
+                  id:
+                    type: string
+                    description: The existing rule, when that is the conflict
                   near_popular:
                     type: string
                     description: The popular package the pattern sits near; send it back as confirm_near_popular
@@ -1978,6 +1984,13 @@ components:
           type: array
           items:
             type: string
+        warning:
+          type: string
+          description: |
+            A check the approval could not run. Set when an allow-list row's
+            name was not compared with the popular names because the popular
+            list could not be read; the rule was written anyway and its create
+            event records near_popular_check=failed.
 
     PolicyRule:
       type: object

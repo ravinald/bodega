@@ -2305,7 +2305,7 @@ Every other path that writes an exact rule makes the same comparison, and none w
 | `POST /api/v1/policies`                                                | 409 with `near_popular` and `distance`; resend with `confirm_near_popular` set to the popular name.              |
 | [`bodega queue approve`](#bodega-queue-listapprovedismiss)                                | Refused, row left open; rerun with `--confirm-near-popular <popular name>` (`confirm_near_popular` in the API). |
 
-A confirmation naming any other package is refused the same way as none. Repeating the name, rather than passing a yes flag, means the caller read the refusal for this name.
+A confirmation naming any other package is refused the same way as none. Repeating the name, rather than passing a yes flag, means the caller read the refusal for this name. A rule that already exists is reported as present before any comparison, on every path: `policy add` and `discover promote` refuse it without asking, `promote-all` counts it as skipped, a queue approval resolves to it, and the API answers 409 with the existing rule's `id`. When the popular list cannot be read, each path writes the rule and says so: the CLI commands on stderr, `bodega queue approve` and the queue API in the resolution's `warning`, and the TUI on its status line.
 
 ### `bodega policy remove <id|pattern> [--type TYPE]`
 
@@ -3460,7 +3460,7 @@ A `pypi`, `npm`, `gomod` or `cargo` entry is written the way a `no_manifest` row
 
 The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it. It writes as it goes; [`generate-manifests`](#bodega-discover-generate-manifests-type) is the same bulk work with a review step in the middle.
 
-`--as policy` never writes an exact npm, pypi or cargo rule within two edits of a popular name, since a typo a client requested is the likeliest thing an observe window holds. It holds each one back on its own line and promotes the rest, and the summary counts them apart from the skipped and no-namespace rows. The run still exits 0. Confirm one with the command the line names, which asks:
+`--as policy` never writes an exact npm, pypi or cargo rule within two edits of a popular name, since a typo a client requested is the likeliest thing an observe window holds. It holds each one back on its own line and promotes the rest, and the summary counts them apart from the skipped and no-namespace rows. A name already a rule is skipped before the comparison, so one confirmed earlier is never held back again. The run still exits 0. Confirm one with the command the line names, which asks:
 
 ```text
 ? pypi reqeusts (distance 1 from the popular package requests; confirm with: bodega discover promote pypi reqeusts)
@@ -6540,7 +6540,7 @@ Every token route needs a bearer token holding `superadmin` and an address in `a
 | Method | Path                           | Description                                                    |
 | ------ | ------------------------------ | -------------------------------------------------------------- |
 | GET    | `/api/v1/policies[?type=TYPE]` | List allow-list rules (optionally scoped to one registry type) |
-| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi or cargo name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular` |
+| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi or cargo name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular`. A rule that already exists answers 409 with its `id` |
 | DELETE | `/api/v1/policies/{id}`        | Remove a rule by ID                                            |
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.

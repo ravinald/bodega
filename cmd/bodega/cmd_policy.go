@@ -162,6 +162,11 @@ name similarity check, so add names both and asks before writing the rule.`,
 			id := hex.EncodeToString(idBytes)
 
 			ctx := context.Background()
+			if p, ok, err := adb.FindPolicy(ctx, regType, kind, pattern); err != nil {
+				return fmt.Errorf("look up the %s rule %q: %w", regType, pattern, err)
+			} else if ok {
+				return fmt.Errorf("%s %s %q already exists (id=%s)", regType, kind, pattern, p.ID)
+			}
 			nearDetails, err := promptNearPopular(ctx, cmd, adb, regType, pattern)
 			if err != nil {
 				return err

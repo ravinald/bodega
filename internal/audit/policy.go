@@ -46,6 +46,27 @@ func (a *DB) ListPolicies(ctx context.Context) ([]PolicyInfo, error) {
 	return scanPolicies(rows)
 }
 
+// FindPolicy returns the rule with this type, kind and pattern, the triple
+// the table keeps unique. ok is false when there is none.
+func (a *DB) FindPolicy(ctx context.Context, registryType, ruleKind, pattern string) (PolicyInfo, bool, error) {
+	rows, err := a.db.QueryContext(ctx,
+		`SELECT id, registry_type, rule_kind, pattern, comment, created_at, created_by
+		 FROM upstream_policies
+		 WHERE registry_type = ? AND rule_kind = ? AND pattern = ?`,
+		registryType, ruleKind, pattern,
+	)
+	if err != nil {
+		return PolicyInfo{}, false, err
+	}
+	defer rows.Close()
+
+	found, err := scanPolicies(rows)
+	if err != nil || len(found) == 0 {
+		return PolicyInfo{}, false, err
+	}
+	return found[0], true, nil
+}
+
 // GetPoliciesByType returns every rule for a single registry type. The policy
 // Checker uses this to build per-type matcher lists.
 func (a *DB) GetPoliciesByType(ctx context.Context, registryType string) ([]PolicyInfo, error) {

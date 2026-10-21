@@ -295,3 +295,26 @@ func TestApproveAllowListConfirmsANearPopularName(t *testing.T) {
 		t.Errorf("create events = %+v", events)
 	}
 }
+
+// A popular list that cannot be read lets the rule through, and the
+// resolution says the name was never compared so the approver reads it.
+func TestApproveAllowListReportsAnUnreadPopularList(t *testing.T) {
+	adb := openQueueStore(t)
+	if err := adb.SetPopularList(t.Context(), audit.PopularList{Ecosystem: manifest.TypePypi, Names: "not one name"}); err != nil {
+		t.Fatal(err)
+	}
+	row := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypePypi, PkgName: "reqeusts", PkgVersion: "2.0.0",
+		Check: QueueAllowList, Pattern: "reqeusts"})
+
+	res, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice", QueueApproval{Reason: "INC-1"}, queueT0)
+	if err != nil || res.Rule == nil {
+		t.Fatalf("approval = %+v, %v", res, err)
+	}
+	if !strings.Contains(res.Warning, "not compared") || !strings.Contains(res.Warning, "popular list") {
+		t.Errorf("warning = %q, want the read error", res.Warning)
+	}
+	events, _ := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+	if len(events) != 1 || !strings.Contains(events[0].Details, "near_popular_check=failed") {
+		t.Errorf("create events = %+v", events)
+	}
+}

@@ -1844,6 +1844,22 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 	kind := policy.RuleKindForType(req.RegistryType)
 	ctx := r.Context()
 
+	// An existing rule is answered before the near-popular comparison, so a
+	// client is never told to confirm a name it could not insert anyway.
+	existing, ok, err := s.auditDB.FindPolicy(ctx, req.RegistryType, kind, req.Pattern)
+	if err != nil {
+		s.logger.Error("look up policy failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if ok {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": fmt.Sprintf("%s %s %q already exists", req.RegistryType, kind, req.Pattern),
+			"id":    existing.ID,
+		})
+		return
+	}
+
 	check, err := policy.ConfirmNearPopular(ctx, s.auditDB, req.RegistryType, req.Pattern, req.ConfirmNearPopular)
 	var near *policy.NearPopularError
 	if errors.As(err, &near) {

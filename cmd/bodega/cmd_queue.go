@@ -153,6 +153,9 @@ func newQueueApproveCmd(gf *globalFlags) *cobra.Command {
 				fmt.Printf("It applies once %d more identit(ies) other than %s approve it:\n  bodega override approve %s\n",
 					o.ApprovalsNeeded, o.RequestedBy, o.ID)
 			}
+			if res.Warning != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: "+res.Warning)
+			}
 			return nil
 		},
 	}

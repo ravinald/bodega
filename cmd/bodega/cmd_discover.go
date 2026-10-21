@@ -288,6 +288,14 @@ nothing.`,
 					fmt.Printf("- %s %s (no_namespace only; add it to %s in config.json)\n", regType, a.PatternHint, noNamespaceConfigKey[regType])
 					continue
 				}
+				// An existing rule was confirmed when it was written, so it
+				// counts as present before the comparison can hold it back.
+				if _, ok, err := adb.FindPolicy(ctx, regType, policy.RuleKindForType(regType), a.PatternHint); err != nil {
+					return fmt.Errorf("look up %q: %w", a.PatternHint, err)
+				} else if ok {
+					skipped++
+					continue
+				}
 				// A bulk run has no one to ask, so a near-popular name is held
 				// back for the single promote, which prompts.
 				check, err := policy.ConfirmNearPopular(ctx, adb, regType, a.PatternHint, "")
@@ -456,6 +464,9 @@ func promoteOne(cmd *cobra.Command, gf *globalFlags, regType, pattern, comment s
 	if err := refuseNoNamespacePromotion(ctx, adb, regType, pattern); err != nil {
 		return err
 	}
+	if err := refuseExistingRule(ctx, adb, regType, pattern); err != nil {
+		return err
+	}
 	nearDetails, err := promptNearPopular(ctx, cmd, adb, regType, pattern)
 	if err != nil {
 		return err
@@ -464,6 +475,20 @@ func promoteOne(cmd *cobra.Command, gf *globalFlags, regType, pattern, comment s
 		return err
 	}
 	fmt.Printf("Promoted %s %q\n", regType, pattern)
+	return nil
+}
+
+// refuseExistingRule stops a promotion before the near-popular prompt when
+// the rule is already there, so nobody confirms a name only to hit the
+// table's uniqueness on type, kind and pattern.
+func refuseExistingRule(ctx context.Context, adb *audit.DB, regType, pattern string) error {
+	p, ok, err := adb.FindPolicy(ctx, regType, policy.RuleKindForType(regType), pattern)
+	if err != nil {
+		return fmt.Errorf("look up the %s rule %q: %w", regType, pattern, err)
+	}
+	if ok {
+		return fmt.Errorf("%s %q is already an allow-list rule (id=%s); nothing to promote", regType, pattern, p.ID)
+	}
 	return nil
 }
 
