@@ -6,6 +6,7 @@ import (
 	"crypto/sha1" //nolint:gosec // G505: Debian repository spec requires SHA1 in Packages/Release for legacy client compat.
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -283,8 +284,71 @@ func cloneAptSource(out io.Writer, name, url, ref, dir string) error {
 		_ = os.RemoveAll(dir)
 		return fmt.Errorf("apt entry %s: resolve HEAD of %s: %w: %s", name, dir, err, strings.TrimSpace(head))
 	}
+	marker := aptRefMarkerPath(dir)
+	if err := os.WriteFile(marker, []byte(ref), 0o644); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("apt entry %s: record ref in %s: %w", name, marker, err)
+	}
 	_, _ = fmt.Fprintf(out, "    Commit: %s\n", strings.TrimSpace(head))
 	return nil
+}
+
+// aptRefMarkerPath is where a clone records the ref it was made at. It sits
+// inside .git so it goes with the clone and build_cmd never sees it.
+func aptRefMarkerPath(cloneDir string) string {
+	return filepath.Join(cloneDir, ".git", "bodega-ref")
+}
+
+// aptRecordedRef reads the ref cloneDir was cloned at. recorded is false when
+// the clone carries no marker, which a clone from before markers existed does
+// not; such a clone was made at the default branch.
+func aptRecordedRef(cloneDir string) (ref string, recorded bool, err error) {
+	b, err := os.ReadFile(aptRefMarkerPath(cloneDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return string(b), true, nil
+}
+
+// aptCloneAtRef reports whether cloneDir holds a clone made at ref.
+func aptCloneAtRef(cloneDir, ref string) bool {
+	if fi, err := os.Stat(cloneDir); err != nil || !fi.IsDir() {
+		return false
+	}
+	recorded, ok, err := aptRecordedRef(cloneDir)
+	if err != nil {
+		return false
+	}
+	if !ok {
+		return ref == ""
+	}
+	return recorded == ref
+}
+
+// describeAptRef names a ref for a log line, an empty one being the default branch.
+func describeAptRef(ref string) string {
+	if ref == "" {
+		return "the default branch"
+	}
+	return "ref " + ref
+}
+
+// logAptRefChange says why an existing clone is being replaced when the ref it
+// was made at is not the one the entry names.
+func logAptRefChange(out io.Writer, name, cloneDir, ref string) {
+	if fi, err := os.Stat(cloneDir); err != nil || !fi.IsDir() || aptCloneAtRef(cloneDir, ref) {
+		return
+	}
+	was := "records no ref it was cloned at"
+	if recorded, ok, err := aptRecordedRef(cloneDir); err != nil {
+		was = fmt.Sprintf("has an unreadable ref record (%v)", err)
+	} else if ok {
+		was = "was cloned at " + describeAptRef(recorded)
+	}
+	_, _ = fmt.Fprintf(out, "    Re-fetching %s: %s %s, the entry names %s\n", name, cloneDir, was, describeAptRef(ref))
 }
 
 // cloneAptRef shallow-clones url at ref. A tag or branch goes through
@@ -331,11 +395,11 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 
 	switch {
 	case ve.URL != "" && ve.BuildCmd != "":
-		// Source build from git: fetch = clone dir exists.
+		// Source build from git: fetch = a clone made at the entry's ref.
+		// A version's directory outlives a change to its ref, so existence
+		// alone would let build_cmd run in a tree at another commit.
 		cloneDir := aptSourceDir(d, name, ve)
-		if fi, err := os.Stat(cloneDir); err == nil && fi.IsDir() {
-			s.Fetched = true
-		}
+		s.Fetched = aptCloneAtRef(cloneDir, ve.Ref)
 		if s.Fetched {
 			glob := ve.DebGlob
 			if glob == "" {
@@ -467,7 +531,11 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			if !cfg.Force {
 				stage := CheckAptStage(cfg, name, ve)
 				if stage.Fetched {
-					cfg.logf("  [apt] %s: already fetched, skipping", name)
+					if ve.URL != "" && ve.BuildCmd != "" {
+						cfg.logf("  [apt] %s: already fetched at %s, skipping", name, describeAptRef(ve.Ref))
+					} else {
+						cfg.logf("  [apt] %s: already fetched, skipping", name)
+					}
 					if err := cfg.verifyFetched(ctx, store, manifest.TypeApt, name, ve); err != nil {
 						cfg.logf("  [apt] %s: %v", name, err)
 						summary.Failures++
@@ -495,6 +563,7 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			case ve.URL != "" && ve.BuildCmd != "":
 				// Source build from git: clone and build later.
 				cloneDir := aptSourceDir(d, name, ve)
+				logAptRefChange(out, name, cloneDir, ve.Ref)
 				if err := os.RemoveAll(cloneDir); err != nil {
 					fetchErr = fmt.Errorf("remove old source %s: %w", cloneDir, err)
 				} else if err := cloneAptSource(out, name, ve.URL, ve.Ref, cloneDir); err != nil {
