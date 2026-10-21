@@ -36,8 +36,8 @@ type evaluation struct {
 	digestErr     error
 	actions       map[string]string
 	// overrides are the active overrides for the package, keyed by version
-	// and check; see loadOverrides.
-	overrides   map[string]audit.Override
+	// and check; see LoadOverrides.
+	overrides   Overrides
 	overrideErr error
 }
 
@@ -53,7 +53,7 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	}
 	ev.readActions(ctx, adb, pm.Type)
 	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
-	ev.loadOverrides(ctx, adb, pm, now)
+	ev.overrides, ev.overrideErr = LoadOverrides(ctx, adb, pm.Type, pm.Name, now)
 	return ev
 }
 
