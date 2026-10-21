@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -161,21 +162,16 @@ name similarity check, so add names both and asks before writing the rule.`,
 			id := hex.EncodeToString(idBytes)
 
 			ctx := context.Background()
-			details := fmt.Sprintf("id=%s kind=%s", id, kind)
-			popular, distance, near, err := policy.NearPopularName(ctx, adb, regType, pattern)
+			if p, ok, err := adb.FindPolicy(ctx, regType, kind, pattern); err != nil {
+				return fmt.Errorf("look up the %s rule %q: %w", regType, pattern, err)
+			} else if ok {
+				return fmt.Errorf("%s %s %q already exists (id=%s)", regType, kind, pattern, p.ID)
+			}
+			nearDetails, err := promptNearPopular(ctx, cmd, adb, regType, pattern)
 			if err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s was not compared with the popular %s names: %v\n", pattern, regType, err)
+				return err
 			}
-			if near {
-				ok, err := confirmNearPopular(cmd, regType, pattern, popular, distance)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					return fmt.Errorf("not added: %s %q is distance %d from the popular package %q", regType, pattern, distance, popular)
-				}
-				details += fmt.Sprintf(" near_popular=%s distance=%d confirmed=yes", popular, distance)
-			}
+			details := fmt.Sprintf("id=%s kind=%s", id, kind) + nearDetails
 			rule := audit.PolicyInfo{
 				ID:           id,
 				RegistryType: regType,
@@ -201,6 +197,28 @@ name similarity check, so add names both and asks before writing the rule.`,
 			return nil
 		},
 	}
+}
+
+// promptNearPopular runs policy.ConfirmNearPopular for a command on a
+// terminal: a near-popular exact pattern is asked about rather than refused,
+// and a yes becomes the confirmation. It returns the create event's
+// near_popular suffix, or an error when the rule must not be written.
+func promptNearPopular(ctx context.Context, cmd *cobra.Command, adb *audit.DB, regType, pattern string) (string, error) {
+	check, err := policy.ConfirmNearPopular(ctx, adb, regType, pattern, "")
+	var near *policy.NearPopularError
+	if errors.As(err, &near) {
+		ok, perr := confirmNearPopular(cmd, regType, pattern, near.Popular, near.Distance)
+		if perr != nil {
+			return "", perr
+		}
+		if !ok {
+			return "", fmt.Errorf("not added: %s %q is distance %d from the popular package %q", regType, pattern, near.Distance, near.Popular)
+		}
+		check = policy.NearPopularCheck{Popular: near.Popular, Distance: near.Distance}
+	} else if err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s was not compared with the popular %s names: %v\n", pattern, regType, err)
+	}
+	return check.AuditDetails(), nil
 }
 
 // confirmNearPopular asks whether to add an exact rule for a name near a

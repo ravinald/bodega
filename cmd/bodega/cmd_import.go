@@ -158,14 +158,14 @@ the gates.
 					}
 
 					if existing != nil && merge {
-						admit.MergeVersions(existing, pm)
+						added, folded := admit.MergeVersions(existing, pm)
 						if baseline {
 							admit.MarkHeld(existing, pm)
 						}
 						if err := store.SavePackage(ctx, existing); err != nil {
 							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
 						}
-						fmt.Printf("Merged %d version(s) into %s/%s\n", len(pm.Versions), pm.Type, pm.Name)
+						fmt.Printf("Merged into %s/%s: %d version(s) added, %d already held\n", pm.Type, pm.Name, added, folded)
 					} else {
 						pm.ConfigVersion = manifest.CurrentConfigVersion
 						if err := store.SavePackage(ctx, pm); err != nil {

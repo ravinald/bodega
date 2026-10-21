@@ -36,8 +36,8 @@ type evaluation struct {
 	digestErr     error
 	actions       map[string]string
 	// overrides are the active overrides for the package, keyed by version
-	// and check; see loadOverrides.
-	overrides   map[string]audit.Override
+	// and check; see LoadOverrides.
+	overrides   Overrides
 	overrideErr error
 }
 
@@ -53,7 +53,7 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	}
 	ev.readActions(ctx, adb, pm.Type)
 	ev.digest, ev.digestErr = policy.Digest(ctx, adb)
-	ev.loadOverrides(ctx, adb, pm, now)
+	ev.overrides, ev.overrideErr = LoadOverrides(ctx, adb, pm.Type, pm.Name, now)
 	return ev
 }
 
@@ -194,6 +194,13 @@ func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Re
 	}
 	ev.set(i, c)
 	return r
+}
+
+// prefetcher is a checker that can ask about every version of an admission
+// before the per-version loop does: an integration whose vendor charges per
+// request rather than per version.
+type prefetcher interface {
+	Prefetch(ctx context.Context, pm *manifest.PackageManifest)
 }
 
 // committer is a checker that holds a write back until the admission it

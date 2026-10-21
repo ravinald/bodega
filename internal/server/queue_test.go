@@ -227,3 +227,83 @@ func TestQueueAPI(t *testing.T) {
 		t.Errorf("queue events = %+v, want the approve and the dismiss", events)
 	}
 }
+
+// An exact rule near a popular name is refused with the popular name and the
+// distance in their own fields, and only a confirmation repeating that name
+// writes it. A name that is not near one writes whatever the field holds.
+func TestCreatePolicyConfirmsANearPopularName(t *testing.T) {
+	s := newOverrideServer(t)
+	create := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		return send(s, http.MethodPost, "/api/v1/policies", localAddr, aliceToken, body)
+	}
+
+	rec := create(`{"registry_type":"pypi","pattern":"reqeusts"}`)
+	var refusal struct {
+		Error       string `json:"error"`
+		NearPopular string `json:"near_popular"`
+		Distance    int    `json:"distance"`
+	}
+	if rec.Code != http.StatusConflict || json.Unmarshal(rec.Body.Bytes(), &refusal) != nil ||
+		refusal.NearPopular != "requests" || refusal.Distance != 1 || !strings.Contains(refusal.Error, "confirm_near_popular") {
+		t.Fatalf("unconfirmed = %d %s, want 409 naming requests at distance 1", rec.Code, rec.Body)
+	}
+	if rules, err := s.auditDB.ListPolicies(t.Context()); err != nil || len(rules) != 0 {
+		t.Fatalf("rules after a refusal = %+v %v", rules, err)
+	}
+	if rec := create(`{"registry_type":"pypi","pattern":"reqeusts","confirm_near_popular":"urllib3"}`); rec.Code != http.StatusConflict {
+		t.Errorf("confirming another package = %d %s, want 409", rec.Code, rec.Body)
+	}
+
+	if rec := create(`{"registry_type":"pypi","pattern":"reqeusts","confirm_near_popular":"requests"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("confirmed = %d %s, want 201", rec.Code, rec.Body)
+	}
+	newestCreate := func() string {
+		t.Helper()
+		events, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+		if err != nil || len(events) == 0 {
+			t.Fatalf("create events = %+v %v", events, err)
+		}
+		newest := events[0]
+		for _, e := range events {
+			if e.ID > newest.ID {
+				newest = e
+			}
+		}
+		return newest.Details
+	}
+	if d := newestCreate(); !strings.Contains(d, "near_popular=requests") || !strings.Contains(d, "distance=1") || !strings.Contains(d, "confirmed=yes") {
+		t.Errorf("confirmed event details = %q", d)
+	}
+	// The rule exists now, so a repeat is a duplicate, not a name to confirm.
+	rec = create(`{"registry_type":"pypi","pattern":"reqeusts"}`)
+	if rec.Code != http.StatusConflict || strings.Contains(rec.Body.String(), "near_popular") || !strings.Contains(rec.Body.String(), "already exists") {
+		t.Errorf("repeat = %d %s, want 409 already exists without near_popular", rec.Code, rec.Body)
+	}
+
+	if rec := create(`{"registry_type":"pypi","pattern":"requests","confirm_near_popular":"urllib3"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("a popular name = %d %s, want 201", rec.Code, rec.Body)
+	}
+	if d := newestCreate(); strings.Contains(d, "near_popular") {
+		t.Errorf("a name near nothing recorded %q", d)
+	}
+}
+
+// The queue API refuses an allow-list row near a popular name with a 400
+// that names the field, and leaves the row open for a confirmed approval.
+func TestQueueAPIConfirmsANearPopularName(t *testing.T) {
+	s := newOverrideServer(t)
+	if err := s.auditDB.RecordRefusal(t.Context(), audit.QueueRefusal{PkgType: manifest.TypePypi, PkgName: "reqeusts",
+		PkgVersion: "2.0.0", Check: admit.QueueAllowList, Pattern: "reqeusts"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/queue/" + strconv.FormatInt(oneQueueRow(t, s).ID, 10) + "/approve"
+	rec := send(s, http.MethodPost, path, localAddr, aliceToken, `{"reason":"needed"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "confirm_near_popular") {
+		t.Fatalf("unconfirmed approve = %d %s, want 400 naming confirm_near_popular", rec.Code, rec.Body)
+	}
+	oneQueueRow(t, s)
+	if rec := send(s, http.MethodPost, path, localAddr, aliceToken, `{"reason":"needed","confirm_near_popular":"requests"}`); rec.Code != http.StatusOK {
+		t.Errorf("confirmed approve = %d %s, want 200", rec.Code, rec.Body)
+	}
+}

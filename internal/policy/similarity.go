@@ -496,3 +496,63 @@ func NearPopularName(ctx context.Context, store SimilarityStore, typ, name strin
 	popular, distance, ok = list.Near(name)
 	return popular, distance, ok, nil
 }
+
+// NearPopularError refuses an exact rule for a name within
+// MaxSimilarityDistance of a popular one. The rule would exempt the name from
+// the check that exists to catch it, so a caller with no prompt to answer
+// lifts the refusal by repeating the popular name, which shows it read this
+// refusal for this name rather than setting a flag once for every name.
+type NearPopularError struct {
+	Type     string
+	Pattern  string
+	Popular  string
+	Distance int
+}
+
+func (e *NearPopularError) Error() string {
+	return fmt.Sprintf("%s %q is distance %d from the popular package %q, and an exact rule exempts it from the name similarity check. "+
+		"To add it anyway, repeat the popular name: confirm_near_popular=%q in an API request, or --confirm-near-popular %s on bodega queue approve",
+		e.Type, e.Pattern, e.Distance, e.Popular, e.Popular, e.Popular)
+}
+
+// NearPopularCheck is what ConfirmNearPopular found for a rule it let
+// through: a near-popular name the caller confirmed, a comparison that could
+// not run, or neither.
+type NearPopularCheck struct {
+	Popular  string
+	Distance int
+	Failed   bool
+}
+
+// AuditDetails is the suffix a rule's create event carries, the same keys on
+// every path that writes one.
+func (c NearPopularCheck) AuditDetails() string {
+	switch {
+	case c.Failed:
+		return " near_popular_check=failed"
+	case c.Popular != "":
+		return fmt.Sprintf(" near_popular=%s distance=%d confirmed=yes", c.Popular, c.Distance)
+	}
+	return ""
+}
+
+// ConfirmNearPopular decides whether an exact rule for pattern may be written
+// given the caller's confirmation. It returns a *NearPopularError when the
+// pattern is near a popular name and confirm does not name that package under
+// NormalizeName. When the popular list cannot be read it returns the read
+// error with Failed set, and the write goes ahead: refusing every rule while
+// the list is unreadable would stop allow-list maintenance over a check that
+// only protects one kind of rule.
+func ConfirmNearPopular(ctx context.Context, store SimilarityStore, typ, pattern, confirm string) (NearPopularCheck, error) {
+	popular, distance, near, err := NearPopularName(ctx, store, typ, pattern)
+	if err != nil {
+		return NearPopularCheck{Failed: true}, err
+	}
+	if !near {
+		return NearPopularCheck{}, nil
+	}
+	if strings.TrimSpace(confirm) == "" || NormalizeName(typ, confirm) != NormalizeName(typ, popular) {
+		return NearPopularCheck{}, &NearPopularError{Type: typ, Pattern: pattern, Popular: popular, Distance: distance}
+	}
+	return NearPopularCheck{Popular: popular, Distance: distance}, nil
+}

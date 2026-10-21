@@ -266,9 +266,12 @@ type FetchResult struct {
 // The builder and the proxy each run the allow-list themselves, because each
 // answers a refusal in its own way (a failed entry in a build summary, a 403
 // with a discovery row) and has already spent the lookup by the time it gets
-// here. allow is what that gate concluded, rendered by AllowListCheck, and an
-// override never turns it: the caller has already answered the refusal. The
-// per-version checks take overrides as every other admission does.
+// here. allow is what that gate concluded, rendered by AllowListCheck, with
+// the caller's override and baseline mark already applied: the caller reads
+// each once, lets its gate admit past a refusal on that answer, and renders
+// allow from the same answer (OverriddenCheck, BaselineCheck), so the row
+// cannot record a refusal the gate let through. Fetch never turns allow
+// itself. The per-version checks take overrides as every other admission does.
 // An allow refused records age and OSV as not evaluated and the decision as
 // policy_blocked, so a refusal leaves a row like a pass does. checkers nil
 // records them as not evaluated with notRunDetail as the reason: the proxy
@@ -555,6 +558,11 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 				Check:  block.Check, Version: ve.Version, Incident: incident, Details: block.Details}
 		}
 		return nil
+	}
+	for _, c := range checkers {
+		if p, ok := c.(prefetcher); ok {
+			p.Prefetch(ctx, pm)
+		}
 	}
 	for i := range pm.Versions {
 		if blocked := decide(i, ev.runVersion(ctx, pm, i, checkers)); blocked != nil {

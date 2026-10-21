@@ -138,6 +138,27 @@ type Checker interface {
 	Lookup(ctx context.Context, q Query) (Answer, error)
 }
 
+// BatchResult is one query's outcome in a batch: an answer, or the error
+// Lookup would have returned for it.
+type BatchResult struct {
+	Answer Answer
+	Err    error
+}
+
+// BatchChecker is a Checker whose vendor answers many queries in one
+// request, for a vendor that meters requests rather than queries. The frame
+// asks it about every uncached version of an admission at once, in chunks of
+// at most BatchLimit, and asks Lookup about one version at a time everywhere
+// else.
+type BatchChecker interface {
+	Checker
+	// BatchLimit is the most queries one LookupBatch call may carry.
+	BatchLimit() int
+	// LookupBatch answers qs keyed by each query's PURL. A query missing
+	// from the map is an error the frame names.
+	LookupBatch(ctx context.Context, qs []Query) map[string]BatchResult
+}
+
 // Preparer is a Checker that has state to get ready before it can answer for
 // an ecosystem, such as a list to download. The frame calls Prepare before it
 // starts the instance's timeout, so the timeout bounds one query and not the

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -119,6 +120,10 @@ type indexWithhold struct {
 	// keeps them too: withheld, the resolver of a host already pinned to one
 	// is told it does not exist.
 	baseline map[string]bool
+	// overrides are the active approved overrides on the package. An age or
+	// osv override exempts its version from that gate alone, the way the
+	// artifact route's admission applies it.
+	overrides admit.Overrides
 }
 
 // indexWithholdFor returns the filter pass for one proxied index, or nil when
@@ -140,6 +145,12 @@ func (s *Server) indexWithholdFor(r *http.Request, eco, name string) *indexWithh
 		return nil
 	}
 	iw := &indexWithhold{s: s, r: r, eco: eco, name: name, gate: gate, counts: map[string]int{}}
+	if ovs, err := admit.LoadOverrides(r.Context(), s.auditDB, eco, name, time.Now()); err != nil {
+		s.logger.Warn("overrides not read, so none applied to the filtered index",
+			"type", eco, "package", name, "error", err)
+	} else {
+		iw.overrides = ovs
+	}
 	if pm, _ := s.store.GetPackage(r.Context(), eco, name); pm != nil {
 		for _, ve := range pm.Versions {
 			if ve.Baseline && ve.Version != "" {
@@ -166,18 +177,40 @@ func (iw *indexWithhold) decide(versions []string, times map[string]time.Time) m
 			}
 			continue
 		}
+		_, ageOverride := iw.overrides.For(v, audit.CheckAge)
+		_, osvOverride := iw.overrides.For(v, audit.CheckOSV)
 		t, dated := times[v]
-		if !dated && iw.gate.Dates() {
+		if !dated && iw.gate.Dates() && !ageOverride {
 			iw.undated++
 			iw.s.logger.Warn("publish time unreadable; the version stays in the filtered index",
 				"type", iw.eco, "package", iw.name, "version", v)
 		}
-		if why := iw.gate.Withhold(iw.r.Context(), iw.name, v, t); why != "" {
+		if why := iw.withhold(v, t, ageOverride, osvOverride); why != "" {
 			out[v] = why
 			iw.counts[why]++
 		}
 	}
 	return out
+}
+
+// withhold is the gate's verdict on one version with its overrides applied.
+// An age override reads as no publish time, which the age gate keeps. An osv
+// override exempts the version from advisories but not from a malware record,
+// which no override admits past.
+func (iw *indexWithhold) withhold(v string, t time.Time, ageOverride, osvOverride bool) string {
+	if ageOverride {
+		t = time.Time{}
+	}
+	if !osvOverride {
+		return iw.gate.Withhold(iw.r.Context(), iw.name, v, t)
+	}
+	if !t.IsZero() && iw.gate.Young(t) {
+		return policy.WithheldAge
+	}
+	if iw.gate.Malicious(iw.r.Context(), iw.name, v) {
+		return policy.WithheldOSV
+	}
+	return ""
 }
 
 func (iw *indexWithhold) withheld() int {

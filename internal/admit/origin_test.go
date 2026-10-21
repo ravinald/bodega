@@ -1,6 +1,7 @@
 package admit
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -108,5 +109,84 @@ func TestMergeVersionsKeepsTheStoredEntry(t *testing.T) {
 	MergeVersions(existing, pkg("requests", manifest.VersionEntry{Version: "2.31.0", Mode: manifest.ModeProxy}))
 	if existing.Versions[0].Mode != manifest.ModeHosted {
 		t.Errorf("mode = %q, want the stored %q", existing.Versions[0].Mode, manifest.ModeHosted)
+	}
+}
+
+const (
+	osqueryAmd64 = "https://pkg.osquery.io/deb/pool/main/o/osquery/osquery_5.23.1-1.linux_amd64.deb"
+	osqueryArm64 = "https://pkg.osquery.io/deb/pool/main/o/osquery/osquery_5.23.1-1.linux_arm64.deb"
+)
+
+func aptEntry(url, sum string, origins ...string) manifest.VersionEntry {
+	ve := entry("5.23.1-1", origins...)
+	ve.URL = url
+	if sum != "" {
+		ve.Checksum = &manifest.Checksum{Algorithm: "sha256", Value: sum}
+	}
+	return ve
+}
+
+func osqueryPkg(versions ...manifest.VersionEntry) *manifest.PackageManifest {
+	return &manifest.PackageManifest{Name: "osquery", Type: manifest.TypeApt, Versions: versions}
+}
+
+// One apt version ships one .deb per architecture, two entries that differ
+// only by URL. Folding the second into the first loses its URL and checksum,
+// and the arm64 .deb is never fetched.
+func TestMergeVersionsKeepsASecondArchitectureAsItsOwnEntry(t *testing.T) {
+	amd := aptEntry(osqueryAmd64, "aaaa", "db01")
+	existing := osqueryPkg(amd)
+
+	added, folded := MergeVersions(existing, osqueryPkg(aptEntry(osqueryArm64, "bbbb", "db02")))
+	if added != 1 || folded != 0 {
+		t.Errorf("MergeVersions = (%d added, %d folded), want (1, 0)", added, folded)
+	}
+	if len(existing.Versions) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(existing.Versions), existing.Versions)
+	}
+	if got := existing.Versions[0]; got.URL != osqueryAmd64 || got.Checksum.Value != "aaaa" || !slices.Equal(Origins(got), []string{"db01"}) {
+		t.Errorf("amd64 entry changed: %+v", got)
+	}
+	if got := existing.Versions[1]; got.URL != osqueryArm64 || got.Checksum == nil || got.Checksum.Value != "bbbb" {
+		t.Errorf("arm64 entry = %+v, want its own URL and checksum", got)
+	}
+
+	added, folded = MergeVersions(existing, osqueryPkg(aptEntry(osqueryAmd64, "", "db03"), aptEntry(osqueryArm64, "", "db03")))
+	if added != 0 || folded != 2 {
+		t.Errorf("second merge = (%d added, %d folded), want (0, 2)", added, folded)
+	}
+	if len(existing.Versions) != 2 {
+		t.Fatalf("second merge left %d entries, want 2", len(existing.Versions))
+	}
+	for i, want := range [][]string{{"db01", "db03"}, {"db02", "db03"}} {
+		if got := Origins(existing.Versions[i]); !slices.Equal(got, want) {
+			t.Errorf("entry %d origins = %v, want %v", i, got, want)
+		}
+	}
+}
+
+// A host capture records an apt row with no URL, so it names the version and
+// nothing more: it folds into whichever entry holds that version. An npm URL
+// names a registry, not an artifact, so a different one is the same version.
+func TestMergeVersionsFoldsAURLlessAptEntryAndANonAptURL(t *testing.T) {
+	existing := osqueryPkg(aptEntry(osqueryAmd64, "aaaa", "db01"))
+	if added, folded := MergeVersions(existing, osqueryPkg(aptEntry("", "", "db02"))); added != 0 || folded != 1 {
+		t.Errorf("URL-less apt merge = (%d added, %d folded), want (0, 1)", added, folded)
+	}
+	if len(existing.Versions) != 1 || !slices.Equal(Origins(existing.Versions[0]), []string{"db01", "db02"}) {
+		t.Errorf("URL-less apt entry did not fold: %+v", existing.Versions)
+	}
+
+	npm := func(url, origin string) *manifest.PackageManifest {
+		ve := entry("1.3.0", origin)
+		ve.URL = url
+		return &manifest.PackageManifest{Name: "left-pad", Type: manifest.TypeNpm, Versions: []manifest.VersionEntry{ve}}
+	}
+	stored := npm("https://registry.npmjs.org/left-pad", "db01")
+	if added, folded := MergeVersions(stored, npm("https://npm.mirror.example/left-pad", "db02")); added != 0 || folded != 1 {
+		t.Errorf("npm merge = (%d added, %d folded), want (0, 1)", added, folded)
+	}
+	if len(stored.Versions) != 1 || stored.Versions[0].URL != "https://registry.npmjs.org/left-pad" {
+		t.Errorf("npm entry from a second registry did not fold onto the stored one: %+v", stored.Versions)
 	}
 }

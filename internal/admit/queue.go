@@ -62,22 +62,24 @@ var ErrInvalidQueue = errors.New("invalid queue resolution")
 
 // QueueApproval is what an approval carries besides the row: the operator's
 // reason, and for a row approved into an override, how long it applies.
-// Expires empty means override_max_ttl.
+// Expires empty means override_max_ttl. ConfirmNearPopular repeats the popular
+// name an allow-list row's exact pattern sits near, which is the only way such
+// a row is approved.
 type QueueApproval struct {
-	Reason  string `json:"reason"`
-	Expires string `json:"expires,omitempty"`
+	Reason             string `json:"reason"`
+	Expires            string `json:"expires,omitempty"`
+	ConfirmNearPopular string `json:"confirm_near_popular,omitempty"`
 }
 
 // QueueResolution is what approving a row did. Exactly one of Rule,
-// Override and Profiles is set.
+// Override and Profiles is set. Warning names a check the approval could not
+// run, which the operator reads at approval time rather than in the event.
 type QueueResolution struct {
 	Row      audit.QueueRow    `json:"row"`
 	Rule     *audit.PolicyInfo `json:"rule,omitempty"`
 	Override *audit.Override   `json:"override,omitempty"`
 	Profiles []string          `json:"profiles,omitempty"`
-	// Warning is something the approval did that the operator should read,
-	// such as an exact rule for a name within two edits of a popular one.
-	Warning string `json:"warning,omitempty"`
+	Warning  string            `json:"warning,omitempty"`
 }
 
 // ApproveQueued resolves open row id by the action its check calls for: an
@@ -116,7 +118,7 @@ func ApproveQueued(ctx context.Context, adb *audit.DB, cfg *config.Config, id in
 	var resolution string
 	switch row.Check {
 	case QueueAllowList:
-		out.Rule, out.Warning, err = approveAllowList(ctx, adb, row, actor, a.Reason)
+		out.Rule, out.Warning, err = approveAllowList(ctx, adb, row, actor, a)
 		if err == nil {
 			resolution = "allow-list rule " + out.Rule.ID
 		}
@@ -163,7 +165,7 @@ func DismissQueued(ctx context.Context, adb *audit.DB, id int64, actor, reason s
 	return row, nil
 }
 
-func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor, reason string) (*audit.PolicyInfo, string, error) {
+func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor string, a QueueApproval) (*audit.PolicyInfo, string, error) {
 	if err := policy.ValidateType(row.PkgType); err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrInvalidQueue, err)
 	}
@@ -172,16 +174,24 @@ func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, ac
 		pattern = row.PkgName
 	}
 	kind := policy.RuleKindForType(row.PkgType)
-	// A rule someone already added by hand resolves the row: inserting it
+	// A rule someone already added resolves the row before the near-popular
+	// comparison: it was confirmed when it was written, and inserting it
 	// again would only trip the table's uniqueness on type, kind and pattern.
-	rules, err := adb.ListPolicies(ctx)
+	existing, ok, err := adb.FindPolicy(ctx, row.PkgType, kind, pattern)
 	if err != nil {
 		return nil, "", err
 	}
-	for _, p := range rules {
-		if p.RegistryType == row.PkgType && p.RuleKind == kind && p.Pattern == pattern {
-			return &p, "", nil
-		}
+	if ok {
+		return &existing, "", nil
+	}
+	var warning string
+	check, err := policy.ConfirmNearPopular(ctx, adb, row.PkgType, pattern, a.ConfirmNearPopular)
+	var near *policy.NearPopularError
+	switch {
+	case errors.As(err, &near):
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidQueue, err)
+	case err != nil:
+		warning = fmt.Sprintf("%s %q was not compared with the popular %s names: %v", row.PkgType, pattern, row.PkgType, err)
 	}
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -189,15 +199,9 @@ func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, ac
 	}
 	rule := audit.PolicyInfo{
 		ID: hex.EncodeToString(b[:]), RegistryType: row.PkgType, RuleKind: kind,
-		Pattern: pattern, Comment: fmt.Sprintf("queue #%d: %s", row.ID, reason), CreatedBy: actor,
+		Pattern: pattern, Comment: fmt.Sprintf("queue #%d: %s", row.ID, a.Reason), CreatedBy: actor,
 	}
-	details := fmt.Sprintf("id=%s kind=%s queue=%d", rule.ID, rule.RuleKind, row.ID)
-	warning := ""
-	if popular, distance, near, err := policy.NearPopularName(ctx, adb, row.PkgType, pattern); err == nil && near {
-		warning = fmt.Sprintf("%s is %d edit(s) from the popular %s package %s, and an exact rule exempts it from the name similarity check",
-			pattern, distance, row.PkgType, popular)
-		details += fmt.Sprintf(" near_popular=%s distance=%d", popular, distance)
-	}
+	details := fmt.Sprintf("id=%s kind=%s queue=%d", rule.ID, rule.RuleKind, row.ID) + check.AuditDetails()
 	if err := adb.InsertPolicy(ctx, rule); err != nil {
 		return nil, "", fmt.Errorf("insert allow-list rule %s %q: %w", row.PkgType, pattern, err)
 	}

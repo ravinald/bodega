@@ -514,6 +514,13 @@ The JSON format is the same `PackageManifest` used internally:
 
 Without `--merge`, importing a package that already exists is an error. With `--merge`, new versions are added to the existing package.
 
+A merge matches an incoming entry to a stored one by version, and an entry whose version is already stored adds only its origins. apt is the exception: an apt entry with a `url` that no stored entry of the same version carries, and no URL-less stored entry of that version can take, is added as its own entry, with its own `url` and `checksum`. That is how a second architecture of one version is merged in: osquery publishes `5.23.1-1` as `osquery_5.23.1-1.linux_amd64.deb` and `osquery_5.23.1-1.linux_arm64.deb`, and merging the arm64 entry onto a stored amd64 one keeps both. Other types stay matched by version alone, because an npm or pypi `url` names a registry rather than an artifact. The output counts both cases:
+
+```console
+$ bodega pkg import --merge osquery-arm64.json
+Merged into apt/osquery: 1 version(s) added, 0 already held
+```
+
 #### `--origin`
 
 Every version entry records the host it was cataloged from, under the `_origin` metadata key. `bodega pkg convert` stamps it and the import preserves what arrives. The field is what lets a catalog holding four hosts' inventories answer which machine contributed a row, and what lets a baseline set for a class of host be built from the machine that defines the class.
@@ -2287,7 +2294,18 @@ $ bodega policy add pypi reqeusts
 Add the rule for "reqeusts", not "requests"? [y/N]:
 ```
 
-Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin that ends before an answer, so a script has to pipe the `y` in on purpose. A confirmed rule's `create` audit event records `near_popular` and `distance`. An npm `@scope/*` wildcard is not compared: it names no package.
+Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin that ends before an answer, so a script has to pipe the `y` in on purpose. A confirmed rule's `create` audit event records `near_popular`, `distance` and `confirmed=yes`. An npm `@scope/*` wildcard is not compared: it names no package. When the popular list cannot be read, the rule is written with a warning and the event records `near_popular_check=failed`.
+
+Every other path that writes an exact rule makes the same comparison, and none writes a near-popular one unconfirmed:
+
+| Path                                                                   | How it confirms                                                                                                  |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| [`bodega discover promote`](#bodega-discover-promote-type-pattern-comment---as-policymanifest) | The same prompt.                                                                                                 |
+| [`bodega discover promote-all`](#bodega-discover-promote-all-type---as-policymanifest)     | It cannot: it holds the name back and prints the `bodega discover promote` command that asks.                    |
+| `POST /api/v1/policies`                                                | 409 with `near_popular` and `distance`; resend with `confirm_near_popular` set to the popular name.              |
+| [`bodega queue approve`](#bodega-queue-listapprovedismiss)                                | Refused, row left open; rerun with `--confirm-near-popular <popular name>` (`confirm_near_popular` in the API). |
+
+A confirmation naming any other package is refused the same way as none. Repeating the name, rather than passing a yes flag, means the caller read the refusal for this name. A rule that already exists is reported as present before any comparison, on every path: `policy add` and `discover promote` refuse it without asking, `promote-all` counts it as skipped, a queue approval resolves to it, and the API answers 409 with the existing rule's `id`. When the popular list cannot be read, each path writes the rule and says so: the CLI commands on stderr, `bodega queue approve` and the queue API in the resolution's `warning`, and the TUI on its status line.
 
 ### `bodega policy remove <id|pattern> [--type TYPE]`
 
@@ -2899,6 +2917,8 @@ pypi       on      age < 3d                  2026-10-06
 
 `WITHHOLDS` is computed from the age and OSV policies in force and is shown for an ecosystem that is off too, so you can read what turning it on would do first. The filter is off by default, and the server reads the setting on every index request, so `set` takes effect without a restart.
 
+**What it keeps.** A version carrying an active [override](#bodega-override-requestapproverejectlist) stays in the filtered index, and its artifact is served, for the gate the override names only: an `age` override exempts the version from the age gate, and an `osv` override from the OSV advisory gate. A version OSV records as malicious stays withheld whatever override exists, because no override admits past malware. A version the stored manifest marks baseline is kept from both gates on the same terms.
+
 **What it withholds.** Only a gate whose action is `block`. A version OSV records as malicious is withheld whenever the malware action is `block`, which it is with no row set, whatever the advisory gate says: the artifact route refuses it either way. A version younger than the age gate's minimum, and a version the local OSV database (`osv_db_dir`) has a record for. A gate on `warn` or `ignore` withholds nothing, because the artifact route would serve that version and hiding it would refuse at the index what nobody refuses at the fetch. The filter never queries `api.osv.dev`, `osv_api_fallback` or not: one index read would be a query per listed version. A version the local database cannot answer for stays.
 
 **Which indexes.** The three bodega proxies from upstream:
@@ -3249,7 +3269,9 @@ The requester's token holds no `approve`, so `list` shows it `(not counted)` and
 
 **Audit.** Each request, approval and rejection writes an `override` event (`bodega audit events --type override`) with status `requested`, `approve` or `reject` and the id, check, state, approvers, quorum and expiry in its details. A `requested` event also records `requester_counts` and `approvals_needed`; a vote event records the voter's `scope` and, for an approval that did not count, `not_counted`. The requests and votes themselves live in the `overrides` and `override_votes` tables of the embedded SQLite store (migrations 032 and 038), beside the allow-list.
 
-**Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
+An `allowlist` override admits past the allow-list a build's fetch and a proxy fill each run before admission, and the admission row records it `overridden`. On a proxy request for a package's index (a packument, a simple page, an `@v/list`), an `allowlist` override on any version of the package lets the index through, because a host pinned to that version reads the index before the artifact; the artifact of any other version is still refused. A proxy request the override admits writes a WARN log line naming the override's id. With the [index filter](#bodega-policy-filter-setlist) on, an `age` or `osv` override also keeps its version in the filtered index.
+
+**Not yet covered.** A git smart HTTP request and a distfiles request run the allow-list without consulting overrides, so an `allowlist` override does not reach them: neither request names the version an override is keyed by. A git clone's `info/refs` and `git-upload-pack` legs name a repository and no ref, and a distfiles request names a file by its distinfo name, which has no version slot. A refusal on either route answers `403` and writes `policy_violation` whatever override exists, and the baseline mark does not reach them either.
 
 ### `bodega policy simulate`
 
@@ -3310,14 +3332,14 @@ bodega queue dismiss 14 --reason "typo of lodash"
 | Command                                                   | Effect                                                                                                                                       |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list [--type <type>] [--check <check>] [--all] [--json]` | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row. |
-| `approve <id> --reason <text> [--expires <duration>]`     | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only. |
+| `approve <id> --reason <text> [--expires <duration>] [--confirm-near-popular <name>]` | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only; `--confirm-near-popular` to an `allow-list` row only. |
 | `dismiss <id> --reason <text>`                            | Closes the row without admitting anything.                                                                                                   |
 
 **Which refusals write a row.** A row is written on every refusal of a client fetch by one of these checks, whatever `discover_mode` says:
 
 | Check                    | Written by                                                                                      | `approve` does                                                                                                                                                                                  |
 | ------------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest.               |
+| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest. An exact npm, pypi or cargo name within two edits of a popular one is refused and the row left open, naming the popular package; rerun with `--confirm-near-popular <that name>` to add the rule. |
 | `age`                    | The proxy fill's age gate                                                                       | Requests an override (below)                                                                                                                                                                    |
 | `osv`                    | The proxy fill's OSV gate, for an advisory                                                      | Requests an override                                                                                                                                                                            |
 | `malware`                | The proxy's malware gate, and the OSV gate when the record is `MAL-`                            | Refused; dismiss it                                                                                                                                                                             |
@@ -3413,7 +3435,7 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 
 #### `bodega discover promote <type> <pattern> [comment] [--as policy|manifest]`
 
-`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
+`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`, and records the same `create` audit event. An exact npm, pypi or cargo name within two edits of a popular package asks before writing, with the [`policy add` prompt](#bodega-policy-add-type-pattern-comment): anything but `y` or `yes`, or a stdin that ends first, writes nothing and exits non-zero.
 
 `--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
 
@@ -3439,6 +3461,15 @@ A `pypi`, `npm`, `gomod` or `cargo` entry is written the way a `no_manifest` row
 #### `bodega discover promote-all <type> [--as policy|manifest]`
 
 The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it. It writes as it goes; [`generate-manifests`](#bodega-discover-generate-manifests-type) is the same bulk work with a review step in the middle.
+
+`--as policy` never writes an exact npm, pypi or cargo rule within two edits of a popular name, since a typo a client requested is the likeliest thing an observe window holds. It holds each one back on its own line and promotes the rest, and the summary counts them apart from the skipped and no-namespace rows. A name already a rule is skipped before the comparison, so one confirmed earlier is never held back again. The run still exits 0. Confirm one with the command the line names, which asks:
+
+```text
+? pypi reqeusts (distance 1 from the popular package requests; confirm with: bodega discover promote pypi reqeusts)
++ pypi flask
+
+Promoted 1, skipped 0 (already present), held back 1 (near a popular name), 0 need a namespace key rather than a rule.
+```
 
 ```bash
 # 1. Set "discover_mode": "observe" in config.json, restart bodega. Leave it on.
@@ -4451,7 +4482,7 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 - **source_package**: the Debian source package this binary was built from, as `dpkg-query -W -f='${source:Package}'` reports it. Read by the OSV gate and by nothing else, because USN and DSA are keyed on it. Absent means no capture recorded one, which is not the same as equal to the name: see [apt](#apt) under the OSV gate for what the gate does with the difference.
 - **capture_suite**: the release the host this version was captured on was running, from `bodega pkg convert apt --suite` or the converting machine's `/etc/os-release`. Read by the OSV gate, which keys a distro advisory on the release because Ubuntu and Debian backport a fix without moving the upstream version. Ignored by the index generator: **suites** below decides where the `.deb` is published, and on a server whose `apt_codename` is a name of your own the two fields hold different values.
 - **build_cmd**: shell command to produce .deb
-- **ref**: on an entry with both `url` and `build_cmd`, the git ref the source is checked out at before `build_cmd` runs: a tag, a branch or a full commit SHA. This decides what is built, and the `.deb` is published under the entry's `version` whatever the ref holds. A ref the upstream does not have fails that entry's fetch, with an error naming the entry, the URL and the ref; the fetch never falls back to the default branch. With no `ref` the fetch builds the default branch and says so. Either way the fetch prints the commit it checked out.
+- **ref**: on an entry with both `url` and `build_cmd`, the git ref the source is checked out at before `build_cmd` runs: a tag, a branch or a full commit SHA. This decides what is built, and the `.deb` is published under the entry's `version` whatever the ref holds. A ref the upstream does not have fails that entry's fetch, with an error naming the entry, the URL and the ref; the fetch never falls back to the default branch. With no `ref` the fetch builds the default branch and says so. Either way the fetch prints the commit it checked out. The clone records the ref it was made at, so changing `ref` on a version already fetched re-fetches its source on the next fetch rather than building the old tree. A branch whose upstream tip moved still matches the recorded ref and is re-fetched only with `force`.
 - **deb_glob**: path glob to locate produced .deb
 - **suites**: apt suites this .deb is published to. Absent means the server's default suite (`apt_codename`). A suite name may not contain `/`. The pool is flat and shared, so one entry listed in two suites is one `.deb` served under both `dists/` trees.
 
@@ -6468,7 +6499,7 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 - **Body**: a JSON array of `PackageManifest`, or one manifest per line (NDJSON). Both decode one manifest at a time, so a large catalog never lands in memory whole. Types may be mixed in one push.
 - **Size**: 64 MiB, against 1 MiB on the single-package route. A bare 2000-package catalog is only about 220 KB, but a `pkg export` of a populated store carries architecture, section, pool path and description per entry and clears 1 MiB well before it clears the package count.
-- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
+- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. An apt entry whose `url` no stored entry of that version carries is added as its own entry, which is how a second architecture of one version is merged in. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
 - **Status**: `200` whenever the body parsed, including when every package was refused. `400` for a body that is not manifests, `413` over the size limit.
 
 ```json
@@ -6511,7 +6542,7 @@ Every token route needs a bearer token holding `superadmin` and an address in `a
 | Method | Path                           | Description                                                    |
 | ------ | ------------------------------ | -------------------------------------------------------------- |
 | GET    | `/api/v1/policies[?type=TYPE]` | List allow-list rules (optionally scoped to one registry type) |
-| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment}`)    |
+| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi or cargo name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular`. A rule that already exists answers 409 with its `id` |
 | DELETE | `/api/v1/policies/{id}`        | Remove a rule by ID                                            |
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
@@ -6534,7 +6565,7 @@ These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and
 | Method | Path                                  | Description                                                              |
 | ------ | ------------------------------------- | ------------------------------------------------------------------------ |
 | GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open` |
-| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires}`); answers what the approval did  |
+| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires, confirm_near_popular}`); answers what the approval did. An `allow-list` row near a popular name answers 400 and stays open without `confirm_near_popular` naming that name |
 | POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
 
 These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list needs `admin` or `approve`, because it names each requester and client address. Approving and dismissing need `approve`: approving writes an allow-list rule or a profile pin, which grants an exception the way an override vote does, and a CI token holding `write` must not do that for the package it was refused. A token without the scope gets `403` naming it. The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
@@ -6592,7 +6623,7 @@ Enforcement happens in four places:
 - **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
 - **Interactive create** (`bodega pkg create`): refuses like import does. The y/N prompt it once asked is gone; the way past a refusal is a [two-person override](#bodega-override-requestapproverejectlist).
 
-Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`.
+Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`. An allow-list refusal an active override or a baseline mark admits past is not a violation: nobody was refused, so it writes no `policy_violation` event, and its admission row records the allow-list check `overridden` (with the override's id) or `baseline`.
 
 ```bash
 # Turn on enforcement for git by pinning allowed orgs
@@ -6990,7 +7021,7 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | `cache_miss`        | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed                                      |
 | `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
-| `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record                              |
+| `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record. A refusal an override or a baseline mark admits past writes none; its admission row records `overridden` or `baseline` |
 | `policy_warn`       | A gate warned on a version a proxy fill admitted anyway. `details` carry the findings. An import or create writes the same status on its `create` row                                                       |
 | `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
 | `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
@@ -7081,7 +7112,7 @@ Denials record at every gate in the middleware chain, at the admin-read gate, an
 
 Callers past the first wait in arrival order, and none is discarded: a `denied` row is the record of who was turned away and has no second source. That is the difference between this path and `discover_mode`, whose queue drops an observation rather than delay a request. The wait shares the 10-second ceiling the write already had, so a database wedged for that long still loses the row, as it did before this bound existed.
 
-An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one.
+An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one. A refusal an active `allowlist` override or a baseline mark admits past is served, so it writes no `policy_violation` event and no queue row; the fill's admission row records the allow-list check `overridden`, naming the override, or `baseline`.
 
 `audit_events` and `timezone` in `config.json` apply to both handles: the CLI's and the one `bodega serve` opens for itself. A filter that leaves out `denied` therefore throws away the record of every refusal the server makes, which is the one record that has no other home — the journal rotates and is not reachable through `/api/v1/audit`. `bodega serve` logs an error naming the key when it starts with such a filter. Leave `audit_events` empty unless you have a reason.
 
@@ -7152,7 +7183,7 @@ Every source normalizes into one model:
 | Report    | source instance, external id, identity, observed time, received time, sequence number, previous report's sha256, components |
 | Attempt   | source instance, external id, identity, observed time, received time, destination host, ecosystem when inferable, detail    |
 
-A batch that breaks the source's own declaration is refused whole: reports from a source without the `inventory` capability, attempts from one without `attempts`, a component with no name or in an ecosystem outside the list above.
+A batch that breaks the source's own declaration is refused whole, and nothing from it is stored: reports from a source without the `inventory` capability, attempts from one without `attempts`, a component with no name or in an ecosystem outside the list above, a report or attempt naming no host. A push route answers `400`, so a client retrying the batch does not store its head twice.
 
 One host may report through several source instances. Each instance's reports are stored separately, and nothing in this layer merges or ranks them.
 
@@ -7388,6 +7419,8 @@ A report from an unmapped external id is stored with an empty identity, not drop
 A source that authenticates a host to an identity by its own means writes the mapping itself, as `cyclonedx` does from the token binding. If the table already maps that id to another identity, the table wins and the server logs a `WARN` naming both.
 
 `bodega inventory sources` lists each configured instance with its type, mode, capabilities, enabled state, last report time (and, for a pull source, last poll and whether it failed), and how many hosts it maps and how many unbound ids it has seen. `--json` adds `last_success` and `last_error` for pull sources.
+
+A pull poll stores each document it gets on its own. A document the source cannot normalize, or whose batch breaks the source contract, is skipped and logged at `WARN` with the instance, the host's external id, its position in the poll and the reason, and the rest of the poll is stored. A poll that skipped some documents logs one more `WARN` with the stored and skipped counts and still counts as a success. `bodega inventory sources` shows a poll `(failed)` only when the vendor call itself failed, a store write failed, or every document it returned was skipped; that last error names the skip count and the first reason. A poll that returned no documents is a success.
 
 ### Inventory token scope
 
@@ -7657,7 +7690,7 @@ Generated from the registry; a test fails when this table and the registry disag
 | Type           | Name                                             | Cost      | Ecosystems              | Default action | What leaves the host                                                                                                                                                                                             |
 | -------------- | ------------------------------------------------ | --------- | ----------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `malware-list` | [Malware list](https://malware-list.aikido.dev/) | free      | npm, pypi               | block          | Nothing per package: the whole list for each ecosystem is downloaded from the configured URL on the refresh interval, so the list's host sees this server's address and when it refreshes, never a package name. |
-| `socket`       | [Socket.dev](https://socket.dev/)                | free-tier | npm, pypi, gomod, cargo | warn           | The package's purl (name and version) is sent to api.socket.dev.                                                                                                                                                 |
+| `socket`       | [Socket.dev](https://socket.dev/)                | free-tier | npm, pypi, gomod, cargo | warn           | The purl (name and version) of every uncached version in one admission is sent to api.socket.dev, up to 1024 per request.                                                                                        |
 
 <!-- integration-types:end -->
 
@@ -7692,7 +7725,7 @@ When a refresh fails, the last list, in memory or on disk, keeps answering for t
 
 #### The `socket` type
 
-Sends each version's purl to [Socket.dev](https://socket.dev/)'s package API, which scores the published code from static analysis (install scripts, network and filesystem access, obfuscation, known malware) and reports alerts with severities. It catches a malicious package before any advisory names it, which OSV cannot. A hit means risk, not malware, so an [override](#bodega-override-requestapproverejectlist) may admit past it.
+Sends the purl of every uncached version in an admission to [Socket.dev](https://socket.dev/)'s package API in one request. Socket scores the published code from static analysis (install scripts, network and filesystem access, obfuscation, known malware) and reports alerts with severities. It catches a malicious package before any advisory names it, which OSV cannot. A hit means risk, not malware, so an [override](#bodega-override-requestapproverejectlist) may admit past it.
 
 | Key                   | Default    | Meaning                                                                                                             |
 | --------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------- |
@@ -7712,13 +7745,13 @@ bodega policy integration set socket npm block
 
 With no `integration_policy` row the action is `warn`: a failing version is admitted with a warning and the alert in its admission row. With no `socket` instance configured, or with one disabled, nothing is sent to Socket and nothing is recorded; admission runs exactly as it does without the type.
 
-**What leaves the host.** One `POST https://api.socket.dev/v0/purl?alerts=true` per version not already cached, carrying the version's purl (`pkg:npm/left-pad@1.3.0`; gomod is sent as `pkg:golang/...`) and the API token as a bearer token. The package name and version are all that is sent about the package: no client address, manifest or artifact. Socket keeps a dated, account-tied record of every purl asked about; see [threat model](threat-model.md#external-check-integrations).
+**What leaves the host.** One `POST https://api.socket.dev/v0/purl?alerts=true` per admission, carrying the purl of every version in it not already cached, up to 1024 purls per request (a larger admission is split into requests of 1024). Each purl names one version (`pkg:npm/left-pad@1.3.0`; gomod is sent as `pkg:golang/...`), and the API token goes as a bearer token. The package name and version are all that is sent about the package: no client address, manifest or artifact. Socket keeps a dated, account-tied record of every purl asked about; see [threat model](threat-model.md#external-check-integrations).
 
 **What it records.** The admission row's `detail` names the score and every alert with its severity, whether or not the version failed: `not flagged by Socket.dev: score 82/100; alerts: installScripts (low), networkAccess (middle)`, or for a failure `Socket: critical alert malware (score 40/100; alerts: malware (critical))`.
 
 **Errors.** A network failure, a timeout, a 5xx, a 401 or 403 from a bad token, a 429 and a body that is not Socket's NDJSON are each an `error` under the action: `block` refuses the version, `warn` admits it with a warning. So are Socket's own placeholder answers, `notFound` (it cannot resolve the version) and `pendingScan` (it has not finished analyzing it), because neither is a verdict on the code. A 429's `Retry-After`, in seconds or as a date and capped at an hour (a minute when absent), is honored: until it passes, every lookup is an error without a request, so a rate-limited instance does not spend the quota it is waiting on.
 
-**Cost.** Socket meters its API in quota units, not calls: each token has a maximum quota per hour ([quota](https://docs.socket.dev/reference/quota)), the free tier's is 500 units an hour ([pricing](https://socket.dev/pricing), checked 2026-10-12), and the `POST /v0/purl` endpoint this type calls consumes 100 units per request ([batchPackageFetch](https://docs.socket.dev/reference/batchpackagefetch)). bodega sends one purl per request, so a free token covers about 5 lookups of new versions an hour. bodega makes one call per distinct purl per `cache_ttl` (default `1h`), per process: the CLI and a running `bodega serve` each keep their own cache, and errors are never cached. The sixth uncached version in an hour gets a 429, and every lookup after it records an error until `Retry-After` passes. Under `block` that refuses each of those versions; under the default `warn` they are admitted with an error warning and no Socket verdict. The free tier fits a low-traffic install, or any install left on `warn`. A busy proxy under `block` needs a paid quota, or a long `cache_ttl` (up to `7d`) so versions seen before spend nothing. Socket's pricing page also lists a monthly allowance of full scans; this type never runs a full scan, so that allowance does not apply. Socket's API documentation marks this endpoint deprecated since 2026-01-05, without naming a replacement.
+**Cost.** Socket meters its API in quota units, not calls: each token has a maximum quota per hour ([quota](https://docs.socket.dev/reference/quota)), the free tier's is 500 units an hour ([pricing](https://socket.dev/pricing), checked 2026-10-12), and the `POST /v0/purl` endpoint this type calls consumes 100 units per request ([batchPackageFetch](https://docs.socket.dev/reference/batchpackagefetch)). A request costs 100 units whether it carries 1 purl or 1024 ([batchPackageFetch](https://docs.socket.dev/reference/batchpackagefetch)), so a free token's 500 units an hour buy 5 requests: 5 admissions of uncached versions an hour, each of up to 1024 versions. An import, edit, prefetch or create admits every version of one manifest in one request; a bundle of several manifests spends one request per manifest. A proxy fill or a builder fetch admits one version per request, so a busy proxy still gets about 5 new versions an hour on a free token. bodega asks about a distinct purl once per `cache_ttl` (default `1h`), per process: the CLI and a running `bodega serve` each keep their own cache, and errors are never cached. The sixth request in an hour gets a 429, and every version it carried, and every lookup after it, records an error until `Retry-After` passes. Under `block` that refuses each of those versions; under the default `warn` they are admitted with an error warning and no Socket verdict. The free tier fits a low-traffic install, or any install left on `warn`. A busy proxy under `block` needs a paid quota, or a long `cache_ttl` (up to `7d`) so versions seen before spend nothing. Socket's pricing page also lists a monthly allowance of full scans; this type never runs a full scan, so that allowance does not apply. Socket's API documentation marks this endpoint deprecated since 2026-01-05, without naming a replacement. Socket also lists an org-scoped `POST /v0/orgs/{org_slug}/purl` ([batchPackageFetchByOrg](https://docs.socket.dev/reference/batchpackagefetchbyorg)) with the same cost and limit, which this type does not use yet.
 
 `bodega integration test` asks about `npm` `lodash@4.17.21` and prints its score and alerts. Socket documents no quota header on this endpoint, so the quota line reads `none reported`.
 

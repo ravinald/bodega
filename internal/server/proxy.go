@@ -138,7 +138,8 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// resolver. The row is written below, once there is a resolved URL to put
 	// in it.
 	baseline := s.baselineLookup(ctx, regType, discoveryPkgName, s3Key, immutable)
-	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true, baseline)
+	override := s.allowListOverrideLookup(ctx, regType, discoveryPkgName, s3Key, immutable)
+	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true, baseline, override)
 	if !ok {
 		if decision == audit.DecisionDenied && immutable {
 			s.recordFillRefusal(r, regType, policyCandidate, discoveryPkgName, s3Key)
@@ -150,7 +151,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	}
 	// Before the resolve and the fetch, so a refused version's bytes never
 	// leave upstream; the allow-list above has already ruled on the name.
-	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable, baseline)
+	fill, ok := s.versionPolicyGate(w, r, regType, policyCandidate, discoveryPkgName, s3Key, decision, immutable, baseline, override)
 	if !ok {
 		return
 	}
@@ -781,7 +782,7 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 // after the gate has run, so it drives upstreamPolicyGate and
 // recordUpstreamAttempt directly.
 func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
-	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record, nil)
+	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record, nil, nil)
 	if !ok {
 		return false
 	}
@@ -803,11 +804,13 @@ func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.R
 // A refusal records what it knows, which on that path is no URL at all; the
 // allowed case records once the resolver has produced one.
 //
-// A violation on a request baseline answers for is let through with decision
-// denied, which is the allow-list's verdict and what the discovery row should
-// say; versionPolicyGate records it on the admission row as baseline. nil
-// means no request on that route can carry the mark.
-func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool, baseline baselineLookup) (string, bool) {
+// A violation on a request an active allow-list override or baseline answers
+// for is let through with decision denied, which is the allow-list's verdict
+// and what the discovery row should say; versionPolicyGate records it on the
+// admission row as overridden or baseline. The override is consulted first,
+// the order admission uses. A nil lookup means no request on that route can
+// carry the override or the mark.
+func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool, baseline baselineLookup, override overrideLookup) (string, bool) {
 	if s.policy == nil || regType == "" || policyCandidate == "" {
 		return "", true
 	}
@@ -824,6 +827,13 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		s.logger.Error("policy check failed", "error", err)
 		http.Error(w, "policy check failed", http.StatusInternalServerError)
 		return "", false
+	}
+	if violation && override != nil {
+		if o, ok := override(); ok {
+			s.logger.Warn("upstream admitted past the allow-list by override", "type", regType,
+				"candidate", policyCandidate, "key", s3Key, "override", o.ID)
+			return decision, true
+		}
 	}
 	if violation && baseline != nil {
 		if _, marked := baseline(); marked {
@@ -928,7 +938,7 @@ func allowListVerdict(decision, candidate string) audit.AdmissionCheck {
 // Mutable resources (a packument, an index, a version list) are not admitted:
 // they are not artifacts, nothing pins them, and a row per refresh would bury
 // the decisions an attestation cites.
-func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, name, s3Key, decision string, immutable bool, baseline baselineLookup) (fillAdmission, bool) {
+func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, policyCandidate, name, s3Key, decision string, immutable bool, baseline baselineLookup, override overrideLookup) (fillAdmission, bool) {
 	if s.auditDB == nil || !immutable {
 		return fillAdmission{}, true
 	}
@@ -947,6 +957,11 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		}
 	}
 	allow := allowListVerdict(decision, policyCandidate)
+	if override != nil && allow.Status == audit.CheckBlock {
+		if o, ok := override(); ok {
+			allow = admit.OverriddenCheck(allow, o)
+		}
+	}
 	if c, ok := admit.BaselineCheck(ve, allow); ok {
 		allow = c
 	}
@@ -1010,6 +1025,45 @@ func (s *Server) baselineLookup(ctx context.Context, regType, name, s3Key string
 			}
 		}
 		return entry, marked
+	}
+}
+
+// overrideLookup answers whether an active approved allow-list override names
+// what a proxy request fetches: the requested version for an artifact, any
+// version of the package for an index, for the reason baselineLookup gives.
+type overrideLookup func() (audit.Override, bool)
+
+// allowListOverrideLookup reads the override at most once per request, so
+// upstreamPolicyGate and versionPolicyGate share one answer and an override
+// expiring between them cannot leave the gate admitting a version the
+// admission row records as refused. An override that cannot be read does not
+// apply, and the failure is logged.
+func (s *Server) allowListOverrideLookup(ctx context.Context, regType, name, s3Key string, immutable bool) overrideLookup {
+	var (
+		done bool
+		o    audit.Override
+		ok   bool
+	)
+	return func() (audit.Override, bool) {
+		if done {
+			return o, ok
+		}
+		done = true
+		fill := fillIdentity(regType, name, s3Key)
+		if s.auditDB == nil || fill.typ == "" || fill.name == "" || (immutable && fill.version == "") {
+			return o, ok
+		}
+		version := fill.version
+		if !immutable {
+			version = ""
+		}
+		var err error
+		o, ok, err = admit.ActiveOverride(ctx, s.auditDB, fill.typ, fill.name, version, audit.CheckAllowList, time.Now())
+		if err != nil {
+			s.logger.Warn("overrides not read, so none applied to the allow-list", "type", fill.typ,
+				"package", fill.name, "version", fill.version, "error", err)
+		}
+		return o, ok
 	}
 }
 

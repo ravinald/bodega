@@ -1,8 +1,10 @@
-// Package socket is the Socket.dev integration: each version's purl is sent
-// to Socket's package API, which scores the published code from static
+// Package socket is the Socket.dev integration: every uncached version's purl
+// in one admission is sent to Socket's package API in one request, up to 1024
+// purls per request, and Socket scores the published code from static
 // analysis and reports alerts with severities. It catches malicious packages
-// no advisory names yet. It needs an API token, and the free tier's hourly
-// call quota is what the cache and the Retry-After gate protect.
+// no advisory names yet. It needs an API token. Socket charges quota units
+// per request whatever it carries, and the free tier's hourly quota units are
+// what the batching, the cache and the Retry-After gate protect.
 package socket
 
 import (
@@ -56,9 +58,19 @@ const defaultRetryAfter = time.Minute
 // cannot turn every admission into an error for days.
 const maxRetryAfter = time.Hour
 
-// maxResponseBytes bounds one response. One purl's row with alerts is a few
+// maxRowBytes bounds one NDJSON row. One purl's row with alerts is a few
 // kilobytes.
-const maxResponseBytes = 4 << 20
+const maxRowBytes = 4 << 20
+
+// maxBytesPerPURL is what each purl in a request adds to the response bound,
+// so a full chunk of rows with alerts is read whole while a stuck or hostile
+// server still cannot stream without end.
+const maxBytesPerPURL = 1 << 20
+
+// batchLimit is the most purls one POST /v0/purl carries. Socket refuses a
+// larger request with a 400: "batch size limit (default: 1024 PURLs per
+// request)", https://docs.socket.dev/reference/batchpackagefetch.
+const batchLimit = 1024
 
 func init() {
 	integration.Register(integration.Descriptor{
@@ -67,7 +79,7 @@ func init() {
 		VendorURL:     "https://socket.dev/",
 		Cost:          integration.CostFreeTier,
 		Ecosystems:    []string{manifest.TypeNpm, manifest.TypePypi, manifest.TypeGomod, manifest.TypeCargo},
-		DataSent:      "The package's purl (name and version) is sent to api.socket.dev.",
+		DataSent:      "The purl (name and version) of every uncached version in one admission is sent to api.socket.dev, up to 1024 per request.",
 		DefaultAction: policy.ActionWarn,
 		Flags:         integration.FlagRisk,
 		Fields: []integration.Field{
@@ -103,6 +115,8 @@ type checker struct {
 	retryAt time.Time
 }
 
+var _ integration.BatchChecker = (*checker)(nil)
+
 func newChecker(inst *integration.Instance) (integration.Checker, error) {
 	return &checker{inst: inst, minScore: inst.Int("min_score"),
 		failAt: slices.Index(Severities, inst.String("fail_alert_severity")), now: time.Now}, nil
@@ -110,10 +124,11 @@ func newChecker(inst *integration.Instance) (integration.Checker, error) {
 
 // artifact is the part of one NDJSON row of /purl this type reads.
 type artifact struct {
-	Type    string `json:"_type"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Score   *struct {
+	Type      string `json:"_type"`
+	InputPURL string `json:"inputPurl"`
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Score     *struct {
 		Overall float64 `json:"overall"`
 	} `json:"score"`
 	Alerts []alert `json:"alerts"`
@@ -124,30 +139,54 @@ type alert struct {
 	Severity string `json:"severity"`
 }
 
+// Lookup is the one-query case of LookupBatch, for `bodega integration test`
+// and every surface that admits one version.
 func (c *checker) Lookup(ctx context.Context, q integration.Query) (integration.Answer, error) {
+	r := c.LookupBatch(ctx, []integration.Query{q})[q.PURL()]
+	return r.Answer, r.Err
+}
+
+func (c *checker) BatchLimit() int { return batchLimit }
+
+// LookupBatch sends every query's purl in one request. A failure of the
+// request itself (a 429, a 5xx, the network, a body that is not NDJSON) is
+// the error for every query; a row Socket could not analyze is the error for
+// its own purl.
+func (c *checker) LookupBatch(ctx context.Context, qs []integration.Query) map[string]integration.BatchResult {
+	out := make(map[string]integration.BatchResult, len(qs))
+	fail := func(err error) map[string]integration.BatchResult {
+		for _, q := range qs {
+			out[q.PURL()] = integration.BatchResult{Err: err}
+		}
+		return out
+	}
 	c.mu.Lock()
 	retryAt := c.retryAt
 	c.mu.Unlock()
 	if now := c.now(); now.Before(retryAt) {
-		return integration.Answer{}, fmt.Errorf("rate limited by Socket: Retry-After allows the next query at %s", retryAt.UTC().Format(time.RFC3339))
+		return fail(fmt.Errorf("rate limited by Socket: Retry-After allows the next query at %s", retryAt.UTC().Format(time.RFC3339)))
 	}
 	// Read on every query rather than once at build, so a rotated token
 	// takes effect without a config change.
 	token, _, err := c.inst.Secret("api_token")
 	if err != nil {
-		return integration.Answer{}, err
+		return fail(err)
 	}
-	body, _ := json.Marshal(map[string]any{"components": []map[string]string{{"purl": q.PURL()}}})
+	components := make([]map[string]string, 0, len(qs))
+	for _, q := range qs {
+		components = append(components, map[string]string{"purl": q.PURL()})
+	}
+	body, _ := json.Marshal(map[string]any{"components": components})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+"purl?alerts=true", bytes.NewReader(body))
 	if err != nil {
-		return integration.Answer{}, err
+		return fail(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/x-ndjson")
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
-		return integration.Answer{}, fmt.Errorf("query Socket: %w", err)
+		return fail(fmt.Errorf("query Socket: %w", err))
 	}
 	defer resp.Body.Close()
 	switch {
@@ -156,15 +195,28 @@ func (c *checker) Lookup(ctx context.Context, q integration.Query) (integration.
 		c.mu.Lock()
 		c.retryAt = c.now().Add(wait)
 		c.mu.Unlock()
-		return integration.Answer{}, fmt.Errorf("rate limited by Socket (429); next query in %s", wait)
+		return fail(fmt.Errorf("rate limited by Socket (429); next query in %s", wait))
 	case resp.StatusCode != http.StatusOK:
-		return integration.Answer{}, fmt.Errorf("query Socket: %s", resp.Status)
+		return fail(fmt.Errorf("query Socket: %s", resp.Status))
 	}
-	a, err := readArtifact(io.LimitReader(resp.Body, maxResponseBytes))
+	limit := max(int64(maxRowBytes), int64(len(qs))*maxBytesPerPURL)
+	rows, err := readRows(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return integration.Answer{}, fmt.Errorf("query Socket for %s: %w", q.PURL(), err)
+		return fail(fmt.Errorf("query Socket: %w", err))
 	}
-	return c.judge(a), nil
+	for _, q := range qs {
+		purl := q.PURL()
+		r, ok := rows[purl]
+		switch {
+		case !ok:
+			out[purl] = integration.BatchResult{Err: fmt.Errorf("query Socket for %s: the response carried no package row for it", purl)}
+		case r.err != nil:
+			out[purl] = integration.BatchResult{Err: fmt.Errorf("query Socket for %s: %w", purl, r.err)}
+		default:
+			out[purl] = integration.BatchResult{Answer: c.judge(r.artifact)}
+		}
+	}
+	return out
 }
 
 // retryAfter reads a Retry-After header in either of its forms, seconds or
@@ -185,9 +237,18 @@ func retryAfter(h string, now time.Time) time.Duration {
 	return min(max(d, 0), maxRetryAfter)
 }
 
-func readArtifact(r io.Reader) (artifact, error) {
+type purlRow struct {
+	artifact artifact
+	err      error
+}
+
+// readRows reads the NDJSON response keyed by inputPurl, the purl as sent.
+// Socket documents neither row order nor a usable batchIndex, so the key is
+// the only way to tell which row answers which query.
+func readRows(r io.Reader) (map[string]purlRow, error) {
+	rows := map[string]purlRow{}
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64<<10), maxResponseBytes)
+	sc.Buffer(make([]byte, 64<<10), maxRowBytes)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
@@ -195,25 +256,34 @@ func readArtifact(r io.Reader) (artifact, error) {
 		}
 		var a artifact
 		if err := json.Unmarshal(line, &a); err != nil {
-			return artifact{}, fmt.Errorf("want newline-delimited JSON: %w", err)
+			return nil, fmt.Errorf("want newline-delimited JSON: %w", err)
 		}
 		if a.Type != "" {
 			continue
 		}
-		for _, al := range a.Alerts {
-			switch al.Type {
-			case alertNotFound:
-				return artifact{}, errors.New("socket could not resolve the package version")
-			case alertPendingScan:
-				return artifact{}, errors.New("socket has not finished analyzing the package version")
-			}
+		if _, dup := rows[a.InputPURL]; dup {
+			continue
 		}
-		return a, nil
+		rows[a.InputPURL] = purlRow{artifact: a, err: unanalyzed(a)}
 	}
 	if err := sc.Err(); err != nil {
-		return artifact{}, err
+		return nil, err
 	}
-	return artifact{}, errors.New("the response carried no package row")
+	return rows, nil
+}
+
+// unanalyzed is why a row carries no verdict on the code, or nil when it
+// does.
+func unanalyzed(a artifact) error {
+	for _, al := range a.Alerts {
+		switch al.Type {
+		case alertNotFound:
+			return errors.New("socket could not resolve the package version")
+		case alertPendingScan:
+			return errors.New("socket has not finished analyzing the package version")
+		}
+	}
+	return nil
 }
 
 // judge turns Socket's row into an answer. The reason names the score and
