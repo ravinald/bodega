@@ -48,8 +48,12 @@ second voter for a request someone else made.
 
 Once approved, the next admission of that version records the check as
 "overridden" with the override's id in its admission row. It stops applying
-at its expiry with nobody acting, so the next re-vet refuses the version
-again. An override never applies to known malware (an OSV MAL- record or a
+at its expiry with nobody acting. For an allowlist, age, osv or
+upstream_provenance override the next re-vet refuses the version again and
+acts under revet_on_block. Re-vet does not run name_similarity or integration
+checks, so an expired override of either stops applying at the next admission
+of that version (an import, a build's fetch or a proxy fill), and a version
+already admitted stays served. An override never applies to known malware (an OSV MAL- record or a
 malware-list integration hit) or to upstream provenance that failed to verify,
 and a request naming a check the version's newest admission recorded as one of
 those is refused.
@@ -98,7 +102,7 @@ func newOverrideRequestCmd(gf *globalFlags) *cobra.Command {
 	}
 	c.Flags().StringVar(&req.Check, "check", "", "the check to admit past: "+strings.Join(admit.OverrideChecks(), ", ")+", or integration:<instance>")
 	c.Flags().StringVar(&req.Reason, "reason", "", "why, for the approvers and the audit trail")
-	c.Flags().StringVar(&req.Expires, "expires", "", "how long it applies once approved, e.g. 7d or 72h; at most override_max_ttl")
+	c.Flags().StringVar(&req.Expires, "expires", "", "how long it applies, counted from the request rather than the approval, e.g. 7d or 72h; at most override_max_ttl")
 	c.Flags().BoolVar(&asJSON, "json", false, "print the override as JSON")
 	for _, f := range []string{"check", "reason", "expires"} {
 		_ = c.MarkFlagRequired(f)
