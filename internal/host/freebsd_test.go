@@ -626,7 +626,11 @@ func TestAptSourcesNAWithoutApt(t *testing.T) {
 	// <root>/etc is a regular file, so stat of <root>/etc/apt fails with
 	// ENOTDIR, which is not fs.ErrNotExist: the check measured nothing.
 	notDir := writeTree(t, map[string]string{"/etc": "not a directory\n"})
-	assertFinding(t, checkAptSources(notDir, "linux"), StatusSkip, "/etc/apt", "not a directory")
+	skipped := checkAptSources(notDir, "linux")
+	assertFinding(t, skipped, StatusSkip, "/etc/apt", "not a directory")
+	if skipped.Remediation == "" {
+		t.Error("a SKIPPED apt-sources row carries no remediation, so the Could not run: block cannot say what it needed")
+	}
 
 	empty := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(empty, "etc", "apt"), 0o755); err != nil {

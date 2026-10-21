@@ -46,6 +46,7 @@ func checkAptSources(root, goos string) Finding {
 	} else if err != nil {
 		f.Status = StatusSkip
 		f.Detail = "could not inspect /etc/apt: " + err.Error()
+		f.Remediation = "run doctor as a user that can stat /etc/apt, or repair the path the error names"
 		return f
 	}
 
