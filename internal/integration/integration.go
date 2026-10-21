@@ -212,9 +212,13 @@ func (d *Descriptor) Covers(ecosystem string) bool {
 const (
 	KeyCacheTTL = "cache_ttl"
 	KeyTimeout  = "timeout"
+	KeyRevet    = "revet"
 )
 
-func commonFields() []Field {
+// commonFields are the fields every type carries. revet defaults on only for
+// a free type: a sweep asks about every admitted version the instance
+// covers, which on a metered API spends the quota admission needs.
+func commonFields(cost Cost) []Field {
 	return []Field{
 		{Key: KeyCacheTTL, Label: "Cache TTL", Kind: KindDuration, Default: "1h",
 			MinDuration: time.Minute, MaxDuration: 7 * 24 * time.Hour,
@@ -222,6 +226,8 @@ func commonFields() []Field {
 		{Key: KeyTimeout, Label: "Timeout", Kind: KindDuration, Default: "10s",
 			MinDuration: time.Second, MaxDuration: 5 * time.Minute,
 			Help: "How long one query may take before it is recorded as an error under the instance's action."},
+		{Key: KeyRevet, Label: "Re-vet", Kind: KindBool, Default: strconv.FormatBool(cost == CostFree),
+			Help: "Ask this instance again on re-vet. Each re-vet sweep asks it about every admitted version it covers that is not in its answer cache."},
 	}
 }
 
@@ -260,7 +266,7 @@ func Register(d Descriptor) {
 	if strings.TrimSpace(d.DataSent) == "" {
 		panic("integration " + d.Type + ": a descriptor must say what leaves the host")
 	}
-	for _, c := range commonFields() {
+	for _, c := range commonFields(d.Cost) {
 		if _, ok := d.Field(c.Key); !ok {
 			d.Fields = append(d.Fields, c)
 		}

@@ -1170,8 +1170,16 @@ failed refresh. Under `warn` an outage admits with a warning on every version.
 
 **Answers are cached per purl for `cache_ttl`.** A version a vendor starts
 flagging after it answered is admitted again from the cache until the entry
-expires, and an admitted version is not asked again at all: integrations do
-not run on [re-vet](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
+expires. An admitted version is asked again on
+[re-vet](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration)
+only by an instance whose `revet` field is on, the default for a `free` type
+and not for a metered one. Such an instance sends one query per covered
+admitted version on each sweep it has no cached answer for, so for a
+per-query API every `revet_interval` sends that vendor a dated inventory of
+the catalog. Batching (E18) lowers the cost per purl and does not change what
+is sent. A lookup error on re-vet records `not_evaluated` rather than taking
+the action, so an outage or a rate limit never refuses or hides a version
+already admitted.
 
 **Secrets.** A vendor credential is never in the config file; a literal one
 there stops the load. It is read from `$CREDENTIALS_DIRECTORY`, then the
