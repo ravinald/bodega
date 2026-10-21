@@ -158,6 +158,10 @@ func ensurePackagedApt(bcfg *builder.Config, store *manifest.Store, entryFilter 
 				if s.HasFailures() {
 					continue
 				}
+				// Packaged answers for the built .deb's bytes, so a sample
+				// taken before the build is always false. A rebuild that
+				// reproduced what the pool holds needs no package run.
+				status = builder.CheckAptStage(bcfg, pm.Name, ve)
 			}
 			if !status.Packaged {
 				ss = append(ss, builder.PackageApt(bcfg, store, pm.Name))

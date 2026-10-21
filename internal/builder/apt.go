@@ -437,13 +437,27 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 		s.Built = s.Fetched // no separate build step
 	}
 
-	// Packaged = at least one .deb in the reprepro pool for this package.
-	poolGlob := filepath.Join(d.aptRepo, "pool", "main", "*", sourceName+"*.deb")
-	if matches, _ := filepath.Glob(poolGlob); len(matches) > 0 {
-		s.Packaged = true
-	}
-
+	s.Packaged = s.Built && aptPoolHoldsBuild(d, name, sourceName, ve)
 	return s
+}
+
+// aptPoolHoldsBuild reports whether the pool file this version's .deb would be
+// copied to already holds that .deb's bytes. A name match alone is not enough:
+// a ref change can rebuild a version under the same filename, and a pool file
+// from the earlier build is not this build. Any read error answers false, so
+// the package stage runs and reports it.
+func aptPoolHoldsBuild(d dirs, name, sourceName string, ve manifest.VersionEntry) bool {
+	deb, err := locateDebFile(d, name, ve)
+	if err != nil {
+		return false
+	}
+	pool := filepath.Join(d.aptRepo, filepath.FromSlash(aptPoolRelPath(sourceName, filepath.Base(deb))))
+	poolSum, err := fileSHA256(pool)
+	if err != nil {
+		return false
+	}
+	debSum, err := fileSHA256(deb)
+	return err == nil && debSum == poolSum
 }
 
 // FetchApt fetches the source for each apt package version. For versions with
@@ -846,6 +860,31 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			debName := filepath.Base(debFile)
 			_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", debName, humanBytes(fi.Size()))
 
+			// The digest is checked before the copy: a refused .deb must leave
+			// the pool serving the bytes the recorded digest names.
+			md5, sha1, sha256, err := computeDebHashes(debFile)
+			if err == nil {
+				err = verifyChecksum(ve.Checksum, sha256)
+				if err != nil {
+					err = aptDigestRefusal(d, name, ve, sha256, err)
+				}
+			} else {
+				err = fmt.Errorf("hash %s: %w", debFile, err)
+			}
+			if err != nil {
+				result.Err = err
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				if cfg.Logger != nil {
+					cfg.Logger.Audit("FAILED  apt/package/%s  (%s)  %v", name, result.Elapsed.Round(time.Millisecond), result.Err)
+				}
+				cfg.RecordAudit(audit.EventPackage, manifest.TypeApt, name, ve.Version, "failure", result.Elapsed, result.Err)
+				continue
+			}
+
 			// Copy .deb into pool/main/<letter>/<name>/ layout.
 			sourceName := aptSourceName(name, ve)
 			poolRelPath := aptPoolRelPath(sourceName, debName)
@@ -861,7 +900,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			}
 
 			dest := filepath.Join(poolDir, debName)
-			if err := copyFile(debFile, dest); err != nil {
+			if err := installPoolFile(debFile, dest, sha256); err != nil {
 				result.Err = fmt.Errorf("copy to pool: %w", err)
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
@@ -869,7 +908,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				_, _ = fmt.Fprintf(out, "    Copied to %s\n", poolRelPath)
 				result.Artifacts = []string{dest}
 
-				// Extract control data and compute hashes for the dynamic Packages index.
+				// Extract control data for the dynamic Packages index.
 				if control, err := extractDebControl(dest); err != nil {
 					_, _ = fmt.Fprintf(out, "    ERROR: could not extract control data: %v\n", err)
 					result.Err = err
@@ -892,25 +931,13 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					}
 					ve.Metadata["_pool_path"] = poolRelPath
 				}
-				if md5, sha1, sha256, err := computeDebHashes(dest); err != nil {
-					_, _ = fmt.Fprintf(out, "    WARNING: could not compute hashes: %v\n", err)
-				} else if err := verifyChecksum(ve.Checksum, sha256); err != nil {
-					// The fetch stage digested these same bytes. A package
-					// stage disagreeing means they changed in the build root
-					// between the two, so the record stands and this run does
-					// not overwrite it.
-					result.Err = fmt.Errorf("apt/%s: the .deb no longer matches the digest recorded at fetch: %w", name, err)
-					_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-					summary.Failures++
-				} else {
-					if ve.Metadata == nil {
-						ve.Metadata = make(map[string]string)
-					}
-					ve.Metadata["_md5"] = md5
-					ve.Metadata["_sha1"] = sha1
-					ve.Metadata["_sha256"] = sha256
-					ve.Checksum = newSHA256Checksum(sha256)
+				if ve.Metadata == nil {
+					ve.Metadata = make(map[string]string)
 				}
+				ve.Metadata["_md5"] = md5
+				ve.Metadata["_sha1"] = sha1
+				ve.Metadata["_sha256"] = sha256
+				ve.Checksum = newSHA256Checksum(sha256)
 				ve.ArtifactSize = fi.Size()
 				// Persist the updated metadata back to the store.
 				if updated, err := store.GetPackage(ctx, manifest.TypeApt, name); err == nil && updated != nil {
@@ -984,6 +1011,55 @@ func computeDebHashes(path string) (md5hex, sha1hex, sha256hex string, err error
 	return hex.EncodeToString(md5w.Sum(nil)),
 		hex.EncodeToString(sha1w.Sum(nil)),
 		hex.EncodeToString(sha256w.Sum(nil)), nil
+}
+
+// aptDigestRefusal explains a .deb whose digest disagrees with the one on
+// record. For a direct download or an apt-get fetch the record came from the
+// fetch, so the bytes changed in the build root since. A source build digests
+// nothing at fetch: its record is the first package run's, so a mismatch means
+// the build at the current ref produced different bytes under a version the
+// pool already serves.
+func aptDigestRefusal(d dirs, name string, ve manifest.VersionEntry, built string, mismatch error) error {
+	if ve.URL == "" || ve.BuildCmd == "" {
+		return fmt.Errorf("apt/%s: the .deb no longer matches the digest recorded at fetch: %w", name, mismatch)
+	}
+	if ve.Checksum == nil || ve.Checksum.Algorithm != "sha256" {
+		return fmt.Errorf("apt/%s@%s: %w", name, ve.Version, mismatch)
+	}
+	recorded := ve.Checksum.Value
+	var at string
+	switch ref, ok, err := aptRecordedRef(aptSourceDir(d, name, ve)); {
+	case err != nil:
+		at = fmt.Sprintf("an unreadable ref record (%v)", err)
+	case ok:
+		at = describeAptRef(ref)
+	default:
+		at = describeAptRef("")
+	}
+	return fmt.Errorf("apt/%s@%s: the .deb built from %s has sha256 %s, but this version was packaged with sha256 %s; "+
+		"the pool keeps serving the recorded bytes. To publish the changed build, give the entry a new version",
+		name, ve.Version, at, built, recorded)
+}
+
+// installPoolFile copies src into the pool at dst through a temporary file and
+// a rename, and refuses the copy unless its sha256 is want. src sits in a build
+// root a build may still be writing, so the bytes are checked after the copy
+// and the file apt serves is never left half-written.
+func installPoolFile(src, dst, want string) error {
+	tmp := dst + ".tmp"
+	if err := copyFile(src, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	got, err := fileSHA256(tmp)
+	if err == nil && got != want {
+		err = fmt.Errorf("%s changed during the copy: sha256 %s, verified %s", src, got, want)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // copyFile copies src to dst, creating dst if it doesn't exist.
