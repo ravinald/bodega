@@ -717,6 +717,14 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				continue
 			}
 
+			// A build that is not byte-reproducible yields a .deb whose digest
+			// disagrees with the pool copy, and the package stage would then
+			// refuse a version it already serves on every later run.
+			if !cfg.Force && CheckAptStage(cfg, name, ve).Built {
+				cfg.logf("  [apt] %s %s: already built, skipping; 'bodega build fetch apt %s force' rebuilds it", name, ve.Version, name)
+				continue
+			}
+
 			start := time.Now()
 			result := Result{Type: manifest.TypeApt, Name: name}
 			out := cfg.entryWriter(manifest.TypeApt, name)
