@@ -226,7 +226,12 @@ type VersionEntry struct {
 	BuildCmd string `json:"build_cmd,omitempty"`
 
 	// DebGlob is a path glob (relative to the source dir) that locates the
-	// produced .deb file after building.
+	// produced .deb file after building. Empty means "*.deb" in the clone for a
+	// git source build, whose clone is per version. For an apt-get source build
+	// it means the <source>_<version>_<arch>.deb dpkg-buildpackage leaves in the
+	// sources directory every apt entry shares, selected by filename. An
+	// apt-get source build refuses zero or several matches, under either the
+	// default or a DebGlob, rather than picking one.
 	DebGlob string `json:"deb_glob,omitempty"`
 
 	// Suites lists the apt suites (dists/<suite>/) this .deb is published to.
