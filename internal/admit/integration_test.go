@@ -3,6 +3,8 @@ package admit
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/integration"
+	"github.com/ravinald/bodega/internal/integration/malwarelist"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -251,5 +254,58 @@ func TestOverrideRequestRefusesMalwareListHit(t *testing.T) {
 	if _, err := RequestOverride(ctx, f.adb, &cfg, req, audit.LocalOverrideCaller("alice"), time.Now()); !errors.Is(err, ErrInvalidOverride) ||
 		!strings.Contains(err.Error(), "also refused by integration:aikido") {
 		t.Errorf("override request for a risk hit beside a malware-list hit: %v", err)
+	}
+}
+
+// A malware-list TELEMETRY hit refuses under block and is recorded waivable,
+// so an override request for it is accepted; a MALWARE hit from the same list
+// stays unwaivable. With categories set to MALWARE the TELEMETRY row passes.
+func TestMalwareListCategoryDecidesWaivable(t *testing.T) {
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"package_name":"toga-ai","version":"1.0.1053","reason":"TELEMETRY"},
+			{"package_name":"zq-evil","version":"1.0.0","reason":"MALWARE"}]`))
+	}))
+	defer list.Close()
+	f := newAdmissionFixture(t)
+	ctx := t.Context()
+	fetch := func(instance, name, version string, extra ...string) policy.Result {
+		t.Helper()
+		e := config.Integration{"type": malwarelist.Type, "enabled": true, "url": list.URL}
+		for i := 0; i+1 < len(extra); i += 2 {
+			e[extra[i]] = extra[i+1]
+		}
+		var checkers []policy.VersionChecker
+		for _, c := range integration.Checks(map[string]config.Integration{instance: e}, "", f.adb) {
+			checkers = append(checkers, c)
+		}
+		got := Fetch(ctx, f.adb, checkers, manifest.TypeNpm, name, manifest.VersionEntry{Version: version},
+			AllowListCheck(false, name, nil), Who{}, "")
+		if got.Block == nil {
+			return policy.Result{Action: policy.ActionPass}
+		}
+		return *got.Block
+	}
+	request := func(name, version, check string) error {
+		_, err := RequestOverride(ctx, f.adb, f.synced, OverrideRequest{Type: manifest.TypeNpm, Name: name, Version: version,
+			Check: check, Reason: "telemetry reviewed", Expires: "1d"}, audit.LocalOverrideCaller("alice"), time.Now())
+		return err
+	}
+
+	if r := fetch("aikido-cat", "toga-ai", "1.0.1053"); r.Check != "integration:aikido-cat" || r.Details["malware"] != nil ||
+		notOverridable(r) != "" {
+		t.Fatalf("TELEMETRY hit: %+v", r)
+	}
+	if err := request("toga-ai", "1.0.1053", "integration:aikido-cat"); err != nil {
+		t.Errorf("override request for a TELEMETRY hit: %v", err)
+	}
+	if r := fetch("aikido-cat", "zq-evil", "1.0.0"); r.Details["malware"] == nil || notOverridable(r) != "known malware is never overridden" {
+		t.Fatalf("MALWARE hit: %+v", r)
+	}
+	if err := request("zq-evil", "1.0.0", "integration:aikido-cat"); !errors.Is(err, ErrInvalidOverride) ||
+		!strings.Contains(err.Error(), "known malware is never overridden") {
+		t.Errorf("override request for a MALWARE hit: %v", err)
+	}
+	if r := fetch("aikido-malware-only", "toga-ai", "1.0.1053", "categories", "MALWARE"); r.Action != policy.ActionPass {
+		t.Errorf("TELEMETRY under categories=MALWARE: %+v", r)
 	}
 }

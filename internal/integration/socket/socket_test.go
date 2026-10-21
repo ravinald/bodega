@@ -268,7 +268,7 @@ func TestErrors(t *testing.T) {
 func TestFrameCachesAnswers(t *testing.T) {
 	s := newStub(t, http.StatusOK, row(0.9))
 	t.Setenv(integration.SecretEnv("socket-cache", "api_token"), sentinel)
-	checks := integration.Checks(map[string]config.Integration{"socket-cache": {"type": Type, "enabled": true}}, nil)
+	checks := integration.Checks(map[string]config.Integration{"socket-cache": {"type": Type, "enabled": true}}, "", nil)
 	if len(checks) != 1 {
 		t.Fatalf("%d checks", len(checks))
 	}

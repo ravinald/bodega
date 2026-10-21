@@ -593,7 +593,7 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 
 func appendIntegrations(out []policy.VersionChecker, cfg *config.Config, store integration.Store) []policy.VersionChecker {
 	if cfg != nil {
-		for _, c := range integration.Checks(cfg.Integrations, store) {
+		for _, c := range integration.Checks(cfg.Integrations, cfg.LogDir, store) {
 			out = append(out, c)
 		}
 	}

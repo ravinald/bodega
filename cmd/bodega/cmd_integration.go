@@ -147,6 +147,17 @@ func openIntegrationAuditDB(gf *globalFlags) *audit.DB {
 	return db
 }
 
+// integrationLogDir is the log_dir an instance keeps its state under, or ""
+// when the config does not load, which `test` must survive because it is how
+// an operator checks an entry they are repairing.
+func integrationLogDir(gf *globalFlags) string {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return ""
+	}
+	return cfg.LogDir
+}
+
 func yesNo(b bool) string {
 	if b {
 		return "yes"
@@ -463,7 +474,7 @@ here that reaches the network.`,
 				defer adb.Close()
 				store = adb
 			}
-			return integration.RunTest(cmd.Context(), cmd.OutOrStdout(), name, entry, store)
+			return integration.RunTest(cmd.Context(), cmd.OutOrStdout(), name, entry, integrationLogDir(gf), store)
 		},
 	}
 }

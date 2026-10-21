@@ -221,6 +221,10 @@ func (m appModel) integrationForm(d *integration.Descriptor, name string, base c
 	}
 	log := m.log
 	adb := m.auditDB
+	var logDir string
+	if m.cfg != nil {
+		logDir = m.cfg.LogDir
+	}
 	return popupModel{
 		kind:            popupForm,
 		integrationForm: true,
@@ -248,7 +252,7 @@ func (m appModel) integrationForm(d *integration.Descriptor, name string, base c
 			}
 			return func() tea.Msg {
 				var buf bytes.Buffer
-				err := integration.RunTest(context.Background(), &buf, name, entry, store)
+				err := integration.RunTest(context.Background(), &buf, name, entry, logDir, store)
 				return cmdOutputMsg{output: "Test " + name + ":\n" + strings.TrimRight(buf.String(), "\n"), err: err}
 			}
 		},
