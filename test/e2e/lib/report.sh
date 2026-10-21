@@ -109,7 +109,9 @@ e2e_file_issues() {
 		expected="$(printf '%s' "$json" | jq -r .expected)"
 		actual="$(printf '%s' "$json" | jq -r .actual)"
 		ref="$(printf '%s' "$json" | jq -r .ref)"
-		sev="${E2E_SEVERITY:-M}"
+		case "${E2E_SEVERITY:-M}" in
+		C) sev=critical ;; H) sev=high ;; L) sev=low ;; *) sev=medium ;;
+		esac
 
 		body="$(printf 'Found by `test/e2e` check `%s` (suite `%s`) on run `%s`, commit `%s`, host `%s`.\n\n**Expected**\n\n```\n%s\n```\n\n**Actual**\n\n```\n%s\n```\n\n**Reproduce**\n\n```\n%s\n```\n%s' \
 			"$id" "$suite" "$run_id" "$(printf '%s' "$json" | jq -r .commit)" "$host" \
@@ -124,8 +126,8 @@ e2e_file_issues() {
 		num="$(gh issue create \
 			--title "$id: $title" \
 			--body "$body" \
-			--label caveat \
-			--label "sev:$sev" \
+			--label follow-up \
+			--label "severity:$sev" \
 			2>&1 | tail -1)"
 		printf 'filed %s  <- %s\n' "$num" "$id"
 		printf '%s\t%s\t%s\n' "$id" "${num##*/}" "filed from run $run_id" >>"$E2E_KNOWN_FILE"

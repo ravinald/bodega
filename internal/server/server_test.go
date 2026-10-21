@@ -1192,7 +1192,7 @@ func TestAptReleaseValidUntil(t *testing.T) {
 	}
 }
 
-// TestAptVersionlessEntryNotPublished pins caveat #44's server half: an entry
+// TestAptVersionlessEntryNotPublished pins follow-up #44's server half: an entry
 // with no version reaches no index, because no CLI verb can address it to
 // hide, freeze or remove it afterwards.
 func TestAptVersionlessEntryNotPublished(t *testing.T) {
@@ -1223,7 +1223,7 @@ func TestAptVersionlessEntryNotPublished(t *testing.T) {
 	}
 }
 
-// TestAptStanzaFieldsAreNotDuplicated pins caveat #43. deb822 does not define
+// TestAptStanzaFieldsAreNotDuplicated pins follow-up #43. deb822 does not define
 // a repeated field, so a metadata copy scraped from upstream landing beside
 // bodega's own value leaves which one wins to a parser's choice, and in
 // direct-url and source-build modes the two disagree.

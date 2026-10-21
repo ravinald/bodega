@@ -1281,7 +1281,7 @@ func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
 }
 
 // TestClearedChecksumKeepsTheMirroredDebOutOfTheIndex is #225, and the
-// reproduction the caveat carried: TestAuditFallbackEntryAdoptsMirroredDeb with
+// reproduction the follow-up carried: TestAuditFallbackEntryAdoptsMirroredDeb with
 // the documented remedy run in the middle of it. `bodega pkg checksum clear apt
 // nginx` used to delete the rows aptMirroredPoolKeys reads, and the cached
 // upstream .deb stayed in pool/ under the exact filename the fallback entry
