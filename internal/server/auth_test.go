@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -391,12 +392,130 @@ func TestMintedTokenScopes(t *testing.T) {
 // token at all.
 func TestAPIMintRefusesACallerWithNoIdentity(t *testing.T) {
 	s := newInventoryServer(t, []string{"127.0.0.0/8"})
-	rec := send(s, http.MethodPost, "/api/v1/tokens", localAddr, "", `{"label":"x","scope":"read"}`)
+	if err := s.auditDB.InsertToken(context.Background(), "unbound", "unbound", audit.HashToken(unboundToken, invPepper), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec := send(s, http.MethodPost, "/api/v1/tokens", localAddr, unboundToken, `{"label":"x","scope":"read"}`)
 	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "bound to an identity") {
-		t.Errorf("anonymous localhost mint = %d %s, want 401 naming the identity it lacks", rec.Code, rec.Body)
+		t.Errorf("unbound superadmin token on localhost mint = %d %s, want 401 naming the identity it lacks", rec.Code, rec.Body)
 	}
 	if rec := send(s, http.MethodPost, "/api/v1/tokens", localAddr, fullToken, `{"label":"x","scope":"read"}`); rec.Code != http.StatusCreated {
 		t.Errorf("bound full token on localhost = %d %s, want 201", rec.Code, rec.Body)
+	}
+}
+
+// The token routes need a presented, unexpired token holding superadmin in
+// both postures: neither a tokenless host in admin_permit_cidr nor a
+// tokenless localhost caller on a loopback-only server reaches them.
+func TestTokenRoutesRequireSuperadminToken(t *testing.T) {
+	//nolint:gosec // G101: test fixtures, not credentials.
+	const (
+		noSuperToken  = "bodega_ak_nosuper"
+		expiredToken  = "bodega_ak_expired"
+		unmatchedCred = "bodega_ak_matches_nothing"
+	)
+	routes := []struct {
+		name, method, path, body string
+		ok                       int
+	}{
+		{"list", http.MethodGet, "/api/v1/tokens", "", http.StatusOK},
+		{"revoke", http.MethodDelete, "/api/v1/tokens/target", "", http.StatusOK},
+		{"mint", http.MethodPost, "/api/v1/tokens", `{"label":"x","scope":"read"}`, http.StatusCreated},
+	}
+	postures := []struct {
+		name, cidr, addr, ip string
+	}{
+		{"loopback only", "127.0.0.1/32", localAddr, "127.0.0.1"},
+		{"widened", "10.0.0.0/8", adminAddr, "10.0.0.5"},
+	}
+	creds := []struct {
+		name, token string
+		want        int
+		denial      string
+	}{
+		{"none", "", http.StatusUnauthorized, audit.DenialTokenMissing},
+		{"unmatched", unmatchedCred, http.StatusUnauthorized, audit.DenialTokenInvalid},
+		{"expired", expiredToken, http.StatusUnauthorized, audit.DenialTokenExpired},
+		{"without superadmin", noSuperToken, http.StatusForbidden, audit.DenialTokenScope},
+		{"superadmin", fullToken, 0, ""},
+	}
+	for _, p := range postures {
+		for _, rt := range routes {
+			for _, c := range creds {
+				t.Run(p.name+"/"+rt.name+"/"+c.name, func(t *testing.T) {
+					s := newInventoryServer(t, []string{p.cidr})
+					ctx := context.Background()
+					past := time.Now().Add(-time.Hour)
+					for _, tk := range []struct {
+						id, token, scope string
+						exp              *time.Time
+					}{
+						{"nosuper", noSuperToken, "write,admin,approve", nil},
+						{"expired", expiredToken, audit.ScopeFull, &past},
+						{"target", "bodega_ak_target", audit.ScopeFull, nil},
+					} {
+						if err := s.auditDB.InsertScopedToken(ctx, tk.id, tk.id, audit.HashToken(tk.token, invPepper), "", tk.scope, "test-operator", tk.exp); err != nil {
+							t.Fatal(err)
+						}
+					}
+
+					rec := send(s, rt.method, rt.path, p.addr, c.token, rt.body)
+					want := c.want
+					if want == 0 {
+						want = rt.ok
+					}
+					if rec.Code != want {
+						t.Fatalf("status = %d (%s), want %d", rec.Code, rec.Body, want)
+					}
+					if c.denial == "" {
+						return
+					}
+					if c.name == "none" {
+						for _, part := range []string{"superadmin", "Authorization: Bearer <token>", "bodega token list|generate|revoke"} {
+							if !strings.Contains(rec.Body.String(), part) {
+								t.Errorf("body %q does not say %q", rec.Body, part)
+							}
+						}
+					}
+					if rt.name == "revoke" {
+						toks, _ := s.auditDB.ListTokens(ctx)
+						if !slices.ContainsFunc(toks, func(tk audit.TokenInfo) bool { return tk.ID == "target" }) {
+							t.Error("a refused revoke deleted the target token")
+						}
+					}
+					rows := denials(t, s)
+					if len(rows) != 1 || rows[0].Status != c.denial || rows[0].ClientIP != p.ip {
+						t.Fatalf("denials = %+v, want one %s from %s", rows, c.denial, p.ip)
+					}
+					details := denialDetails(t, rows[0])
+					switch c.denial {
+					case audit.DenialTokenMissing:
+						if details["route"] != "tokens" {
+							t.Errorf("details = %v, want route tokens", details)
+						}
+					case audit.DenialTokenInvalid:
+						if details["hash_prefix"] == "" || strings.Contains(rows[0].Details, unmatchedCred) {
+							t.Errorf("details = %s, want a hash prefix and never the credential", rows[0].Details)
+						}
+					case audit.DenialTokenExpired:
+						if details["token_id"] != "expired" {
+							t.Errorf("details = %v, want token_id expired", details)
+						}
+					case audit.DenialTokenScope:
+						if details["missing_scope"] != audit.ScopeSuperadmin {
+							t.Errorf("details = %v, want missing_scope superadmin", details)
+						}
+					}
+				})
+			}
+		}
+	}
+
+	// The other admin reads keep their posture: a tokenless host in range
+	// still reads the audit trail.
+	s := newInventoryServer(t, []string{"10.0.0.0/8"})
+	if rec := send(s, http.MethodGet, "/api/v1/audit", adminAddr, "", ""); rec.Code != http.StatusOK {
+		t.Errorf("tokenless GET /api/v1/audit in range = %d %s, want 200", rec.Code, rec.Body)
 	}
 }
 
