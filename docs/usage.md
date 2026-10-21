@@ -7181,7 +7181,7 @@ Every source normalizes into one model:
 | Report    | source instance, external id, identity, observed time, received time, sequence number, previous report's sha256, components |
 | Attempt   | source instance, external id, identity, observed time, received time, destination host, ecosystem when inferable, detail    |
 
-A batch that breaks the source's own declaration is refused whole: reports from a source without the `inventory` capability, attempts from one without `attempts`, a component with no name or in an ecosystem outside the list above.
+A batch that breaks the source's own declaration is refused whole, and nothing from it is stored: reports from a source without the `inventory` capability, attempts from one without `attempts`, a component with no name or in an ecosystem outside the list above, a report or attempt naming no host. A push route answers `400`, so a client retrying the batch does not store its head twice.
 
 One host may report through several source instances. Each instance's reports are stored separately, and nothing in this layer merges or ranks them.
 
@@ -7417,6 +7417,8 @@ A report from an unmapped external id is stored with an empty identity, not drop
 A source that authenticates a host to an identity by its own means writes the mapping itself, as `cyclonedx` does from the token binding. If the table already maps that id to another identity, the table wins and the server logs a `WARN` naming both.
 
 `bodega inventory sources` lists each configured instance with its type, mode, capabilities, enabled state, last report time (and, for a pull source, last poll and whether it failed), and how many hosts it maps and how many unbound ids it has seen. `--json` adds `last_success` and `last_error` for pull sources.
+
+A pull poll stores each document it gets on its own. A document the source cannot normalize, or whose batch breaks the source contract, is skipped and logged at `WARN` with the instance, the host's external id, its position in the poll and the reason, and the rest of the poll is stored. A poll that skipped some documents logs one more `WARN` with the stored and skipped counts and still counts as a success. `bodega inventory sources` shows a poll `(failed)` only when the vendor call itself failed, a store write failed, or every document it returned was skipped; that last error names the skip count and the first reason. A poll that returned no documents is a success.
 
 ### Inventory token scope
 
