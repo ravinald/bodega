@@ -83,7 +83,8 @@ func ValidateOrigin(origin string) error {
 }
 
 // MergeVersions adds the versions existing does not carry and unions the
-// origins onto the ones it does.
+// origins onto the ones it does, and reports how many incoming entries it
+// appended and how many it folded into a stored one.
 //
 // A recorded version is never overwritten, which keeps a hosted entry from
 // being downgraded to proxy by a re-import of the host that first named it.
@@ -93,20 +94,45 @@ func ValidateOrigin(origin string) error {
 //
 // A ref-only entry (git) is matched by its Ref: matched by Version, every one
 // of them reads as "" and an incoming ref merges into whichever ref came first.
-func MergeVersions(existing, incoming *manifest.PackageManifest) {
+//
+// An apt entry with a URL is matched by version and URL. One apt version is
+// published as one .deb per architecture, entries that differ only by URL, so
+// matching by version alone folds the second architecture into the first and
+// its .deb is never fetched. A stored entry with no URL (what a host capture
+// records) still takes it, as it takes a URL-less incoming entry. Other types
+// stay matched by version: an npm or pypi URL names a registry rather than an
+// artifact, and a re-import from a second registry would add a duplicate.
+func MergeVersions(existing, incoming *manifest.PackageManifest) (added, folded int) {
 	for _, ve := range incoming.Versions {
-		found := false
-		for i := range existing.Versions {
-			if admissionVersion(existing.Versions[i]) == admissionVersion(ve) {
-				addOrigins(&existing.Versions[i], Origins(ve))
-				found = true
-				break
-			}
+		if i := mergeTarget(existing, ve); i >= 0 {
+			addOrigins(&existing.Versions[i], Origins(ve))
+			folded++
+			continue
 		}
-		if !found {
-			existing.Versions = append(existing.Versions, ve)
+		existing.Versions = append(existing.Versions, ve)
+		added++
+	}
+	return added, folded
+}
+
+// mergeTarget is the index of the stored entry ve folds into, or -1 when ve is
+// an entry of its own. An apt URL match beats a URL-less stored entry, so a
+// re-import of both architectures folds each onto its own.
+func mergeTarget(existing *manifest.PackageManifest, ve manifest.VersionEntry) int {
+	byURL := existing.Type == manifest.TypeApt && ve.URL != ""
+	urlless := -1
+	for i, stored := range existing.Versions {
+		if admissionVersion(stored) != admissionVersion(ve) {
+			continue
+		}
+		if !byURL || stored.URL == ve.URL {
+			return i
+		}
+		if stored.URL == "" && urlless < 0 {
+			urlless = i
 		}
 	}
+	return urlless
 }
 
 // addOrigins unions names into ve's recorded origins, keeping first-seen order.
