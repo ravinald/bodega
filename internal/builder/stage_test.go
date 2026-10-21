@@ -605,3 +605,136 @@ func TestGitArtifactPathsCoverBundlesAndReleases(t *testing.T) {
 		}
 	}
 }
+
+// writeBytes writes data at path, creating its parent directories.
+func writeBytes(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// builtAptKinds is one built efs-utils 2.0 per entry kind CheckAptStage
+// distinguishes. Each returns the entry and the .deb locateDebFile finds.
+var builtAptKinds = []struct {
+	kind  string
+	build func(t *testing.T, d dirs, debBytes []byte) (manifest.VersionEntry, string)
+}{
+	{"git source build", func(t *testing.T, d dirs, b []byte) (manifest.VersionEntry, string) {
+		ve := manifest.VersionEntry{Version: "2.0", URL: "https://example.com/example-corp/efs-utils", BuildCmd: "make deb", Ref: "v2.0.0"}
+		cloneDir := aptSourceDir(d, "efs-utils", ve)
+		mkDir(t, filepath.Join(cloneDir, ".git"))
+		if err := os.WriteFile(aptRefMarkerPath(cloneDir), []byte(ve.Ref), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		deb := filepath.Join(cloneDir, "efs-utils_2.0_all.deb")
+		writeBytes(t, deb, b)
+		return ve, deb
+	}},
+	{"direct URL", func(t *testing.T, d dirs, b []byte) (manifest.VersionEntry, string) {
+		ve := manifest.VersionEntry{Version: "2.0", URL: "https://example.com/efs-utils_2.0_all.deb"}
+		deb := filepath.Join(d.sources, "efs-utils", "efs-utils_2.0_all.deb")
+		writeBytes(t, deb, b)
+		return ve, deb
+	}},
+	{"apt-get source build", func(t *testing.T, d dirs, b []byte) (manifest.VersionEntry, string) {
+		ve := manifest.VersionEntry{Version: "2.0", BuildCmd: "dpkg-buildpackage -b -uc -us"}
+		mkDir(t, aptSourceDir(d, "efs-utils", ve))
+		deb := filepath.Join(d.sources, "efs-utils_2.0_all.deb")
+		writeBytes(t, deb, b)
+		return ve, deb
+	}},
+	{"apt-get download", func(t *testing.T, d dirs, b []byte) (manifest.VersionEntry, string) {
+		ve := manifest.VersionEntry{Version: "2.0"}
+		deb := filepath.Join(d.sources, "efs-utils", "efs-utils_2.0_all.deb")
+		writeBytes(t, deb, b)
+		return ve, deb
+	}},
+}
+
+func TestCheckAptStage_PackagedMatchesPoolCopy(t *testing.T) {
+	for _, k := range builtAptKinds {
+		t.Run(k.kind, func(t *testing.T) {
+			root := t.TempDir()
+			cfg := &Config{BuildRoot: root}
+			d := buildDirs(root)
+			ve, deb := k.build(t, d, []byte("efs-utils 2.0 bytes"))
+			if got, err := locateDebFile(d, "efs-utils", ve); err != nil || got != deb {
+				t.Fatalf("fixture: locateDebFile = %q, %v; want %q", got, err, deb)
+			}
+
+			if s := CheckAptStage(cfg, "efs-utils", ve); !s.Built || s.Packaged {
+				t.Fatalf("before the copy: %+v, want Built and not Packaged", s)
+			}
+			writeBytes(t, filepath.Join(d.aptRepo, filepath.FromSlash(aptPoolRelPath("efs-utils", filepath.Base(deb)))), []byte("efs-utils 2.0 bytes"))
+			if s := CheckAptStage(cfg, "efs-utils", ve); !s.Packaged {
+				t.Errorf("the pool holds this version's bytes at its pool path: %+v, want Packaged", s)
+			}
+		})
+	}
+}
+
+func TestCheckAptStage_PackagedIgnoresOtherPoolFiles(t *testing.T) {
+	built := []byte("efs-utils 2.0 bytes")
+	pool := func(d dirs, rel string) string { return filepath.Join(d.aptRepo, filepath.FromSlash(rel)) }
+	for _, k := range builtAptKinds {
+		for _, c := range []struct {
+			name  string
+			place func(t *testing.T, d dirs)
+		}{
+			{"flat copy", func(t *testing.T, d dirs) {
+				writeBytes(t, pool(d, "pool/main/e/efs-utils_2.0_all.deb"), built)
+			}},
+			{"prefix package flat", func(t *testing.T, d dirs) {
+				writeBytes(t, pool(d, "pool/main/e/efs-utils-extra_1.0_all.deb"), built)
+			}},
+			{"prefix package nested", func(t *testing.T, d dirs) {
+				writeBytes(t, pool(d, aptPoolRelPath("efs-utils-extra", "efs-utils-extra_1.0_all.deb")), built)
+				writeBytes(t, pool(d, "pool/main/e/efs-utils/efs-utils-extra_1.0_all.deb"), built)
+			}},
+			{"same path, other bytes", func(t *testing.T, d dirs) {
+				writeBytes(t, pool(d, aptPoolRelPath("efs-utils", "efs-utils_2.0_all.deb")), []byte("efs-utils 2.0 built at another ref"))
+			}},
+			{"another version only", func(t *testing.T, d dirs) {
+				writeBytes(t, pool(d, aptPoolRelPath("efs-utils", "efs-utils_1.9_all.deb")), built)
+			}},
+		} {
+			t.Run(k.kind+"/"+c.name, func(t *testing.T) {
+				root := t.TempDir()
+				cfg := &Config{BuildRoot: root}
+				d := buildDirs(root)
+				ve, _ := k.build(t, d, built)
+				c.place(t, d)
+				if s := CheckAptStage(cfg, "efs-utils", ve); !s.Built || s.Packaged {
+					t.Errorf("%+v, want Built and not Packaged", s)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckAptStage_PackagedRequiresBuilt(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb", Ref: "v2.0.1"}
+	d := buildDirs(root)
+
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
+	mkDir(t, filepath.Join(cloneDir, ".git"))
+	if err := os.WriteFile(aptRefMarkerPath(cloneDir), []byte("v2.0.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	touchFile(t, filepath.Join(cloneDir, "efs-utils_2.0.deb"))
+	touchFile(t, filepath.Join(d.aptRepo, filepath.FromSlash(aptPoolRelPath("efs-utils", "efs-utils_2.0.deb"))))
+
+	if s := CheckAptStage(cfg, "efs-utils", ve); s.Built || s.Packaged {
+		t.Errorf("a clone recorded at v2.0.0 with its .deb in the pool counted for ref v2.0.1: %+v", s)
+	}
+	ve.Ref = "v2.0.0"
+	if s := CheckAptStage(cfg, "efs-utils", ve); !s.Built || !s.Packaged {
+		t.Errorf("the same tree at the entry's ref did not read as packaged: %+v", s)
+	}
+}
