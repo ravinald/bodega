@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -258,6 +259,36 @@ func TestBulkImportMergeAccumulatesOrigins(t *testing.T) {
 	got := originsOf(t, s, "curl", "8.5.0")
 	if len(got) != 2 || got[0] != "db01" || got[1] != "db02" {
 		t.Errorf("origins = %v, want [db01 db02]", got)
+	}
+}
+
+// osquery ships one .deb per architecture under one version. A merge push of
+// the arm64 entry onto a stored amd64 one has to add it, or the arm64 .deb is
+// never fetched and the push still reports success.
+func TestBulkImportMergeAddsASecondArchitecture(t *testing.T) {
+	s, _, _ := refreshTestServer(t)
+	const amd64, arm64 = "https://pkg.osquery.io/deb/osquery_5.23.1-1.linux_amd64.deb", "https://pkg.osquery.io/deb/osquery_5.23.1-1.linux_arm64.deb"
+	entryAt := func(url string) string {
+		return fmt.Sprintf(`[{"config_version":1,"name":"osquery","type":"apt","versions":[{"version":"5.23.1-1","source_name":"osquery","url":%q}]}]`, url)
+	}
+
+	if _, resp := postImport(t, s, entryAt(amd64), ""); resp.Imported != 1 {
+		t.Fatalf("first push: imported = %d, want 1; results: %+v", resp.Imported, resp.Results)
+	}
+	if _, resp := postImport(t, s, entryAt(arm64), "merge=true"); resp.Merged != 1 {
+		t.Fatalf("merge push: merged = %d, want 1; results: %+v", resp.Merged, resp.Results)
+	}
+
+	pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, "osquery")
+	if pm == nil {
+		t.Fatal("apt/osquery is not in the store")
+	}
+	var urls []string
+	for _, ve := range pm.Versions {
+		urls = append(urls, ve.URL)
+	}
+	if !slices.Equal(urls, []string{amd64, arm64}) {
+		t.Errorf("stored URLs = %v, want [%s %s]", urls, amd64, arm64)
 	}
 }
 

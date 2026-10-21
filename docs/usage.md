@@ -514,6 +514,13 @@ The JSON format is the same `PackageManifest` used internally:
 
 Without `--merge`, importing a package that already exists is an error. With `--merge`, new versions are added to the existing package.
 
+A merge matches an incoming entry to a stored one by version, and an entry whose version is already stored adds only its origins. apt is the exception: an apt entry with a `url` that no stored entry of the same version carries, and no URL-less stored entry of that version can take, is added as its own entry, with its own `url` and `checksum`. That is how a second architecture of one version is merged in: osquery publishes `5.23.1-1` as `osquery_5.23.1-1.linux_amd64.deb` and `osquery_5.23.1-1.linux_arm64.deb`, and merging the arm64 entry onto a stored amd64 one keeps both. Other types stay matched by version alone, because an npm or pypi `url` names a registry rather than an artifact. The output counts both cases:
+
+```console
+$ bodega pkg import --merge osquery-arm64.json
+Merged into apt/osquery: 1 version(s) added, 0 already held
+```
+
 #### `--origin`
 
 Every version entry records the host it was cataloged from, under the `_origin` metadata key. `bodega pkg convert` stamps it and the import preserves what arrives. The field is what lets a catalog holding four hosts' inventories answer which machine contributed a row, and what lets a baseline set for a class of host be built from the machine that defines the class.
@@ -6470,7 +6477,7 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 - **Body**: a JSON array of `PackageManifest`, or one manifest per line (NDJSON). Both decode one manifest at a time, so a large catalog never lands in memory whole. Types may be mixed in one push.
 - **Size**: 64 MiB, against 1 MiB on the single-package route. A bare 2000-package catalog is only about 220 KB, but a `pkg export` of a populated store carries architecture, section, pool path and description per entry and clears 1 MiB well before it clears the package count.
-- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
+- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. An apt entry whose `url` no stored entry of that version carries is added as its own entry, which is how a second architecture of one version is merged in. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
 - **Status**: `200` whenever the body parsed, including when every package was refused. `400` for a body that is not manifests, `413` over the size limit.
 
 ```json

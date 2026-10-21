@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -146,6 +147,41 @@ func TestImportMergeAccumulatesOrigins(t *testing.T) {
 	got := originOf(t, env, "requests", "2.31.0")
 	if len(got) != 2 || got[0] != "db01" || got[1] != "db02" {
 		t.Errorf("origins = %v, want [db01 db02]", got)
+	}
+}
+
+// A second architecture of one apt version is an entry of its own, and the
+// merge line has to say it added one rather than echo the file's length.
+func TestImportMergeAddsASecondArchitecture(t *testing.T) {
+	env := newDiscoverEnv(t)
+	const amd64, arm64 = "https://pkg.osquery.io/deb/osquery_5.23.1-1.linux_amd64.deb", "https://pkg.osquery.io/deb/osquery_5.23.1-1.linux_arm64.deb"
+	entryAt := func(url string) string {
+		return fmt.Sprintf(`[{"config_version":1,"name":"osquery","type":"apt",`+
+			`"versions":[{"version":"5.23.1-1","source_name":"osquery","url":%q}]}]`, url)
+	}
+
+	if err := runImport(t, writeTemp(t, "amd64.json", entryAt(amd64))); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	var err error
+	out := captureStdout(t, func() { err = runImport(t, "--merge", writeTemp(t, "arm64.json", entryAt(arm64))) })
+	if err != nil {
+		t.Fatalf("merge import: %v", err)
+	}
+	if !strings.Contains(out, "1 version(s) added, 0 already held") {
+		t.Errorf("merge output = %q, want it to report one entry added", out)
+	}
+
+	pm := env.readManifest(t, manifest.TypeApt, "osquery")
+	if pm == nil {
+		t.Fatal("apt/osquery is not in the store")
+	}
+	var urls []string
+	for _, ve := range pm.Versions {
+		urls = append(urls, ve.URL)
+	}
+	if !slices.Equal(urls, []string{amd64, arm64}) {
+		t.Errorf("stored URLs = %v, want [%s %s]", urls, amd64, arm64)
 	}
 }
 
