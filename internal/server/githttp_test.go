@@ -88,12 +88,90 @@ func newGitUpstreamSubject(t *testing.T, subject string) string {
 	return root
 }
 
+// gitTestLog sends each server log record to the test's own log and keeps it
+// for assertions, so a failing git test prints the git-http-backend failure
+// with its cause and stderr rather than a bare 502.
+//
+// Git tests leave work running after they return: a first mirror that outlives
+// the request's wait keeps cloning and logs when it ends. t.Log from that point
+// panics, so records arriving after the test's cleanup are dropped. Cleanup
+// runs before the testing package marks the test done, and closed is read
+// under the same lock that covers t.Log.
+type gitTestLog struct {
+	mu      sync.Mutex
+	t       *testing.T
+	closed  bool
+	records []string
+}
+
+func newGitTestLog(t *testing.T) *slog.Logger {
+	l := &gitTestLog{t: t}
+	t.Cleanup(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.closed = true
+	})
+	return slog.New(gitTestLogHandler{Handler: slog.NewTextHandler(l, nil), log: l})
+}
+
+// Write receives one whole record per call: slog's text handler formats a
+// record into one buffer and writes it once.
+func (l *gitTestLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return len(p), nil
+	}
+	record := strings.TrimSuffix(string(p), "\n")
+	l.records = append(l.records, record)
+	l.t.Log(record)
+	return len(p), nil
+}
+
+// gitTestLogHandler carries the log alongside the handler so a test can reach
+// the records from the server's logger, and fails when that logger is not one.
+type gitTestLogHandler struct {
+	slog.Handler
+	log *gitTestLog
+}
+
+// gitServerLog is the records s has logged so far.
+func gitServerLog(t *testing.T, s *Server) []string {
+	t.Helper()
+	h, ok := s.logger.Handler().(gitTestLogHandler)
+	if !ok {
+		t.Fatalf("server logger handler is %T, not the test log newGitServer installs", s.logger.Handler())
+	}
+	h.log.mu.Lock()
+	defer h.log.mu.Unlock()
+	return append([]string(nil), h.log.records...)
+}
+
+// A record arriving after its test has finished is dropped rather than handed
+// to t.Log, which panics once the top-level test is done.
+func TestGitTestLogDropsRecordsAfterTheTest(t *testing.T) {
+	var logger *slog.Logger
+	var log *gitTestLog
+	t.Run("owner", func(t *testing.T) {
+		logger = newGitTestLog(t)
+		log = logger.Handler().(gitTestLogHandler).log
+		logger.Info("during")
+	})
+	logger.Info("after")
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if len(log.records) != 1 || !strings.Contains(log.records[0], `msg=during`) {
+		t.Errorf("records = %q, want only the one logged during the test", log.records)
+	}
+}
+
 // newGitServer wires a discovery server to a file:// upstream root under one
 // open namespace and one catalog namespace.
 func newGitServer(t *testing.T, upstreamRoot string) *Server {
 	t.Helper()
 	s := newDiscoveryServer(t)
 	requireGitTool(t, s)
+	s.logger = newGitTestLog(t)
 	url := "file://" + upstreamRoot + "/"
 	s.cfg.GitUpstreams = map[string]config.GitUpstream{
 		"corp":   {URL: url, Mode: config.UpstreamModeOpen},
@@ -1212,6 +1290,16 @@ exec `+sleep+` 60
 	if string(body) != "started\n" {
 		t.Errorf("body = %q, want what the child wrote before it went quiet", body)
 	}
+	// The record is logged before the handler returns, and the chunked
+	// response ends only after that, so it is in place once the body is read.
+	wantCause := `cause="` + errGitBackendStalled.Error() + `"`
+	logged := gitServerLog(t, s)
+	for _, record := range logged {
+		if strings.Contains(record, `msg="git-http-backend failed"`) && strings.Contains(record, wantCause) {
+			return
+		}
+	}
+	t.Errorf("no git-http-backend failed record with %s; server logged:\n%s", wantCause, strings.Join(logged, "\n"))
 }
 
 // A first mirror that outlives the request's wait answers 503 with
