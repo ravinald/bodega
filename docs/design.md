@@ -456,7 +456,7 @@ The default is wide on purpose, because the common deployment puts a proxy on th
 `admin_permit_cidr` gates the whole admin surface, which is two sets of endpoints:
 
 - **The mutation API**: POST, DELETE and PATCH on `/api/v1/...`, gated by `MutationAuthMiddleware`.
-- **The eight admin reads**: `GET /api/v1/audit`, `/api/v1/config`, `/api/v1/policies`, `/api/v1/tokens`, `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins`, `/api/v1/overrides` and `/api/v1/queue`, gated by `requireAdmin` inside each handler. They sit outside the mutation middleware, which passes GET through so apt, pip, go and npm can fetch packages with no credential.
+- **The eight admin reads**: `GET /api/v1/audit`, `/api/v1/config`, `/api/v1/policies`, `/api/v1/tokens`, `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins`, `/api/v1/overrides` and `/api/v1/queue`, gated by `requireAdmin` inside each handler. They sit outside the mutation middleware, which passes GET through so apt, pip, go and npm can fetch packages with no credential. The token list is the one admin read the middleware does gate: see [Token scopes and OIDC exchange](#token-scopes-and-oidc-exchange).
 
 Two callers, one predicate: `server.AdminPermits`. They read the same list and used to answer separately, which is how they came to disagree about what an empty list means.
 
@@ -464,7 +464,7 @@ The mutation half carries a second layer:
 
 1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs reach the admin surface. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries, or read the audit trail. Change it with `bodega acl admin add|remove`.
 
-2. **Bearer token**: When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`; they live in the audit database, not the config file. The admin reads take the IP layer alone.
+2. **Bearer token**: When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`; they live in the audit database, not the config file. The admin reads take the IP layer alone, except the token list, which needs a `superadmin` token as well.
 
 Both layers read the client IP that `trusted_proxies` resolved, so a permissive trusted set widens the first layer no matter how narrow `admin_permit_cidr` looks.
 
@@ -498,6 +498,8 @@ Package-serving read endpoints remain unauthenticated. That is a policy, not a l
 A token's scopes are checked by the same middleware that checks its existence. `routeScope` names what a request needs from its method and path alone, checking in this order: superadmin for the token routes, approve for an override or queue vote, admin or approve for a read of the override or queue list, admin by path prefix, then read for `GET`, `HEAD` and git's upload-pack, then write, and the package type comes from the path the way the audit row's subject does. One classifier serves reads and mutations, so a route cannot be gated as admin on one path through the code and as write on another. Bulk import is the one handler that checks again, per entry, because its body names the types and the path names none. The method fallback makes any route missing from `adminPrefixes` a write or a read, so `TestEveryAPIRouteHasAChosenScope` reads the routes `server.go` registers and fails on any `/api/v1/` route nobody assigned a scope.
 
 Scopes constrain only a token that is presented. The read path stays open and `admin_permit_cidr` stays the boundary for a request with no token; scopes were added to stop a credential minted for one job from being a credential for every job, not to put a token in front of the reads.
+
+The token routes are the exception. `MutationAuthMiddleware` sends every request under `superadminPrefixes` through `requireSuperadmin`, read or mutation, in the loopback-only posture and the widened one: after the `admin_permit_cidr` check, it answers `401` to no credential, one matching no token, or an expired one, and `403` to a token without `superadmin`, each with its denial row. Whoever reaches these routes can mint a second override voter or revoke the operator's own token, so a tokenless caller inside the range, or on localhost, must not. A route added under the prefix inherits the check with nothing in its handler. Nothing in the tree calls these routes: `bodega token` reads the audit database directly.
 
 The scope column replaced the `full`/`inventory` pair by a table rebuild, because SQLite cannot drop the old `CHECK` in place. `full` became `read,write,admin` so every token in use kept working, and the down migration deletes anything narrower rather than widening it to `full`, so a downgrade cannot hand a token more than it was issued.
 
