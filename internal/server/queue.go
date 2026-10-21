@@ -132,6 +132,9 @@ func (s *Server) handleApproveQueue(w http.ResponseWriter, r *http.Request) {
 	if res.Rule != nil && s.policy != nil {
 		s.policy.Invalidate()
 	}
+	if res.Warning != "" {
+		s.logger.Warn("queue approval", "id", id, "warning", res.Warning)
+	}
 	if len(res.Profiles) > 0 {
 		s.refreshProfiles(r.Context())
 	}

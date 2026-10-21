@@ -1147,6 +1147,13 @@ paths:
         one type has one meaningful match shape, and letting a caller pick
         produced rules that matched nothing. Adding a rule invalidates the
         checker's cache, so it takes effect on the next fetch.
+
+        An exact npm, pypi or cargo pattern within two edits of a popular
+        name is refused with 409: the rule would exempt the name from the
+        name similarity check. Repeat the popular name from the refusal in
+        `confirm_near_popular` to add it anyway. The `create` audit event of
+        a confirmed rule records `near_popular`, `distance` and
+        `confirmed=yes`.
       operationId: createPolicy
       tags: [status]
       security:
@@ -1165,6 +1172,12 @@ paths:
                   type: string
                 comment:
                   type: string
+                confirm_near_popular:
+                  type: string
+                  description: |
+                    The popular package a near-popular exact pattern sits
+                    near, as the 409 named it; compared after name
+                    normalization. Ignored for a pattern near no popular name.
       responses:
         "201":
           description: Rule created
@@ -1174,6 +1187,33 @@ paths:
                 $ref: "#/components/schemas/PolicyRule"
         "400":
           description: Unknown registry type, or pattern missing
+        "409":
+          description: |
+            No rule was written. Either a rule with this type, kind and
+            pattern already exists (`id` names it), or the pattern is an exact
+            name within two edits of a popular one and `confirm_near_popular`
+            is absent or names another package (`near_popular` and `distance`
+            are set). An existing rule is reported first, so a client is never
+            asked to confirm a name it cannot insert.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  id:
+                    type: string
+                    description: The existing rule, when that is the conflict
+                  near_popular:
+                    type: string
+                    description: The popular package the pattern sits near; send it back as confirm_near_popular
+                    example: requests
+                  distance:
+                    type: integer
+                    description: Edits between the pattern and near_popular
+                    example: 1
         "503":
           description: Audit database not configured
 
@@ -1453,6 +1493,9 @@ paths:
                 expires:
                   type: string
                   description: For a row approved into an override, a duration from now such as `7d`; defaults to `override_max_ttl`
+                confirm_near_popular:
+                  type: string
+                  description: For an allow-list row whose exact name sits within two edits of a popular one, that popular name, as the 400 named it. Without it the row is refused and stays open.
       responses:
         "200":
           description: Row approved; what the approval did
@@ -1461,7 +1504,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/QueueResolution"
         "400":
-          description: No reason, or an invalid expiry
+          description: No reason, an invalid expiry, or an allow-list row near a popular name without a `confirm_near_popular` naming it; the row stays open
         "401":
           description: No token, or a token bound to no identity
         "403":
@@ -1943,6 +1986,11 @@ components:
             type: string
         warning:
           type: string
+          description: |
+            A check the approval could not run. Set when an allow-list row's
+            name was not compared with the popular names because the popular
+            list could not be read; the rule was written anyway and its create
+            event records near_popular_check=failed.
 
     PolicyRule:
       type: object

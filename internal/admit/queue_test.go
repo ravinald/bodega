@@ -265,3 +265,56 @@ func TestDismissAndRequiredFields(t *testing.T) {
 		t.Errorf("unknown id: %v", err)
 	}
 }
+
+// An allow-list row whose exact name sits near a popular one is refused
+// before any rule is written, the row stays open, and an approval repeating
+// the popular name writes the rule.
+func TestApproveAllowListConfirmsANearPopularName(t *testing.T) {
+	adb := openQueueStore(t)
+	row := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypePypi, PkgName: "reqeusts", PkgVersion: "2.0.0",
+		Check: QueueAllowList, Pattern: "reqeusts"})
+
+	_, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice", QueueApproval{Reason: "INC-1"}, queueT0)
+	if !errors.Is(err, ErrInvalidQueue) || !strings.Contains(err.Error(), "requests") || !strings.Contains(err.Error(), "--confirm-near-popular") {
+		t.Fatalf("unconfirmed approval: %v, want ErrInvalidQueue naming requests and the flag", err)
+	}
+	if rules, _ := adb.ListPolicies(t.Context()); len(rules) != 0 {
+		t.Fatalf("rules after a refusal = %+v", rules)
+	}
+	if got, _ := adb.GetQueueRow(t.Context(), row.ID); got.State != audit.QueueOpen {
+		t.Fatalf("row after a refusal = %+v, want open", got)
+	}
+
+	res, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice",
+		QueueApproval{Reason: "INC-1", ConfirmNearPopular: "requests"}, queueT0)
+	if err != nil || res.Rule == nil || res.Rule.Pattern != "reqeusts" {
+		t.Fatalf("confirmed approval = %+v, %v", res, err)
+	}
+	events, _ := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+	if len(events) != 1 || !strings.Contains(events[0].Details, "near_popular=requests") || !strings.Contains(events[0].Details, "confirmed=yes") {
+		t.Errorf("create events = %+v", events)
+	}
+}
+
+// A popular list that cannot be read lets the rule through, and the
+// resolution says the name was never compared so the approver reads it.
+func TestApproveAllowListReportsAnUnreadPopularList(t *testing.T) {
+	adb := openQueueStore(t)
+	if err := adb.SetPopularList(t.Context(), audit.PopularList{Ecosystem: manifest.TypePypi, Names: "not one name"}); err != nil {
+		t.Fatal(err)
+	}
+	row := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypePypi, PkgName: "reqeusts", PkgVersion: "2.0.0",
+		Check: QueueAllowList, Pattern: "reqeusts"})
+
+	res, err := ApproveQueued(t.Context(), adb, &config.Config{}, row.ID, "alice", QueueApproval{Reason: "INC-1"}, queueT0)
+	if err != nil || res.Rule == nil {
+		t.Fatalf("approval = %+v, %v", res, err)
+	}
+	if !strings.Contains(res.Warning, "not compared") || !strings.Contains(res.Warning, "popular list") {
+		t.Errorf("warning = %q, want the read error", res.Warning)
+	}
+	events, _ := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+	if len(events) != 1 || !strings.Contains(events[0].Details, "near_popular_check=failed") {
+		t.Errorf("create events = %+v", events)
+	}
+}

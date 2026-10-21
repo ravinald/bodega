@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -157,7 +158,9 @@ func newDiscoverPromoteCmd(gf *globalFlags) *cobra.Command {
 		Use:   "promote <type> <pattern> [comment]",
 		Short: "Promote one discovered pattern to an allow-list rule or manifest entries",
 		Long: `--as policy (the default) inserts an allow-list rule with the type's natural
-rule kind and the captured pattern. Same write path as 'bodega policy add'.
+rule kind and the captured pattern. Same write path as 'bodega policy add',
+including its prompt before an exact npm, pypi or cargo rule within two edits
+of a popular name.
 
 --as manifest writes package manifest entries instead, one per no_manifest
 observation in the bucket, in proxy mode with the upstream URL the handler
@@ -192,7 +195,7 @@ Examples:
 			}
 			switch as {
 			case promoteAsPolicy:
-				return promoteOne(gf, regType, pattern, comment)
+				return promoteOne(cmd, gf, regType, pattern, comment)
 			case promoteAsManifest:
 				return promoteManifest(gf, os.Stdout, regType, pattern)
 			}
@@ -230,7 +233,9 @@ func newDiscoverPromoteAllCmd(gf *globalFlags) *cobra.Command {
 		Long: `--as policy (the default) inserts an allow-list rule for every distinct
 pattern observed for the given type. Already-existing rules are skipped
 (duplicate-key on upstream_policies). Use this after an observe window to
-widen the allow-list to what clients actually reached for.
+widen the allow-list to what clients actually reached for. An exact npm, pypi
+or cargo name within two edits of a popular one is held back, with the
+'bodega discover promote' command that asks about it.
 
 --as manifest writes a package manifest entry for every no_manifest
 observation of the type instead, and is idempotent: a second run adds
@@ -273,7 +278,7 @@ nothing.`,
 				return err
 			}
 
-			added, skipped, unconfigured := 0, 0, 0
+			added, skipped, nearPopular, unconfigured := 0, 0, 0, 0
 			for _, a := range rows {
 				if noNamespaceOnly(a) {
 					// Same refusal as `promote`, reported per pattern rather
@@ -283,7 +288,28 @@ nothing.`,
 					fmt.Printf("- %s %s (no_namespace only; add it to %s in config.json)\n", regType, a.PatternHint, noNamespaceConfigKey[regType])
 					continue
 				}
-				err := insertPolicyRule(ctx, adb, regType, a.PatternHint, "promoted from discovery")
+				// An existing rule was confirmed when it was written, so it
+				// counts as present before the comparison can hold it back.
+				if _, ok, err := adb.FindPolicy(ctx, regType, policy.RuleKindForType(regType), a.PatternHint); err != nil {
+					return fmt.Errorf("look up %q: %w", a.PatternHint, err)
+				} else if ok {
+					skipped++
+					continue
+				}
+				// A bulk run has no one to ask, so a near-popular name is held
+				// back for the single promote, which prompts.
+				check, err := policy.ConfirmNearPopular(ctx, adb, regType, a.PatternHint, "")
+				var near *policy.NearPopularError
+				if errors.As(err, &near) {
+					nearPopular++
+					fmt.Printf("? %s %s (distance %d from the popular package %s; confirm with: bodega discover promote %s %s)\n",
+						regType, a.PatternHint, near.Distance, near.Popular, regType, a.PatternHint)
+					continue
+				}
+				if err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s was not compared with the popular %s names: %v\n", a.PatternHint, regType, err)
+				}
+				err = insertPolicyRule(ctx, adb, regType, a.PatternHint, "promoted from discovery", check.AuditDetails())
 				switch {
 				case err == nil:
 					added++
@@ -294,7 +320,8 @@ nothing.`,
 					return fmt.Errorf("insert %q: %w", a.PatternHint, err)
 				}
 			}
-			fmt.Printf("\nPromoted %d, skipped %d (already present), %d need a namespace key rather than a rule.\n", added, skipped, unconfigured)
+			fmt.Printf("\nPromoted %d, skipped %d (already present), held back %d (near a popular name), %d need a namespace key rather than a rule.\n",
+				added, skipped, nearPopular, unconfigured)
 			return nil
 		},
 	}
@@ -414,7 +441,7 @@ func newDiscoverExportCmd(gf *globalFlags) *cobra.Command {
 // promoteOne is the single-rule path shared by `discover promote` and
 // (internally) by `discover promote-all`'s per-row loop. Keeping this in
 // one place ensures both commands write rules identically to `policy add`.
-func promoteOne(gf *globalFlags, regType, pattern, comment string) error {
+func promoteOne(cmd *cobra.Command, gf *globalFlags, regType, pattern, comment string) error {
 	if err := policy.ValidateType(regType); err != nil {
 		return err
 	}
@@ -437,10 +464,31 @@ func promoteOne(gf *globalFlags, regType, pattern, comment string) error {
 	if err := refuseNoNamespacePromotion(ctx, adb, regType, pattern); err != nil {
 		return err
 	}
-	if err := insertPolicyRule(ctx, adb, regType, pattern, comment); err != nil {
+	if err := refuseExistingRule(ctx, adb, regType, pattern); err != nil {
+		return err
+	}
+	nearDetails, err := promptNearPopular(ctx, cmd, adb, regType, pattern)
+	if err != nil {
+		return err
+	}
+	if err := insertPolicyRule(ctx, adb, regType, pattern, comment, nearDetails); err != nil {
 		return err
 	}
 	fmt.Printf("Promoted %s %q\n", regType, pattern)
+	return nil
+}
+
+// refuseExistingRule stops a promotion before the near-popular prompt when
+// the rule is already there, so nobody confirms a name only to hit the
+// table's uniqueness on type, kind and pattern.
+func refuseExistingRule(ctx context.Context, adb *audit.DB, regType, pattern string) error {
+	p, ok, err := adb.FindPolicy(ctx, regType, policy.RuleKindForType(regType), pattern)
+	if err != nil {
+		return fmt.Errorf("look up the %s rule %q: %w", regType, pattern, err)
+	}
+	if ok {
+		return fmt.Errorf("%s %q is already an allow-list rule (id=%s); nothing to promote", regType, pattern, p.ID)
+	}
 	return nil
 }
 
@@ -488,7 +536,9 @@ func errNoNamespacePromotion(regType, pattern string) error {
 	return fmt.Errorf(`every observation of %s %q is no_namespace: a client asked for a namespace nothing is configured for, and an allow-list rule does not give it one. Add the key to %s in config.json instead — "%s": {%q: {"url": "https://forge.example/", "mode": "catalog"}} — then re-run the request. --as manifest does not help either; this pattern has no no_manifest row`, regType, pattern, key, key, pattern)
 }
 
-func insertPolicyRule(ctx context.Context, adb *audit.DB, regType, pattern, comment string) error {
+// insertPolicyRule writes the rule and its create event. nearDetails is the
+// policy.NearPopularCheck suffix the caller's confirmation produced.
+func insertPolicyRule(ctx context.Context, adb *audit.DB, regType, pattern, comment, nearDetails string) error {
 	kind := policy.RuleKindForType(regType)
 	if kind == "" {
 		return fmt.Errorf("no rule kind registered for type %q", regType)
@@ -498,14 +548,25 @@ func insertPolicyRule(ctx context.Context, adb *audit.DB, regType, pattern, comm
 		return fmt.Errorf("generate id: %w", err)
 	}
 	id := hex.EncodeToString(idBytes)
-	return adb.InsertPolicy(ctx, audit.PolicyInfo{
+	if err := adb.InsertPolicy(ctx, audit.PolicyInfo{
 		ID:           id,
 		RegistryType: regType,
 		RuleKind:     kind,
 		Pattern:      pattern,
 		Comment:      comment,
 		CreatedBy:    "discover",
+	}); err != nil {
+		return err
+	}
+	_ = adb.Record(ctx, audit.Event{
+		EventType: audit.EventCreate,
+		PkgType:   "policy",
+		PkgName:   regType + ":" + pattern,
+		Actor:     audit.CurrentActor(),
+		Status:    "success",
+		Details:   fmt.Sprintf("id=%s kind=%s", id, kind) + nearDetails,
 	})
+	return nil
 }
 
 // ---- Manifest promotion ----------------------------------------------------
