@@ -1113,6 +1113,45 @@ while [ $i -lt 16 ]; do printf 'chunk%02d\n' $i; `+sleep+` 1; i=$((i+1)); done
 	}
 }
 
+// A mirror step that outlasts the server-wide write timeout before the
+// backend starts still gets the response served. Over HTTP/2 that timeout is
+// a per-stream timer, so a clone or refresh slower than it used to reset the
+// stream with INTERNAL_ERROR before any headers. The git wrapper sleeps past
+// the 300ms WriteTimeout on one step, so the result does not depend on load.
+func TestGitSlowMirrorStepOutlivesTheServerWriteTimeout(t *testing.T) {
+	sleep := lookPath(t, "sleep")
+	for _, step := range []string{"clone", "remote"} {
+		for _, h2 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("step=%s/http2=%v", step, h2), func(t *testing.T) {
+				t.Parallel()
+				s := newGitServer(t, newGitUpstream(t))
+				s.gitTool.git = writeScript(t, `if [ "$1" = `+step+` ]; then `+sleep+` 1; fi
+exec `+s.gitTool.git+` "$@"
+`)
+				s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\nrefs\n'
+`)
+				ts := startGitTestServer(t, s, 300*time.Millisecond, h2)
+
+				resp, err := ts.Client().Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack")
+				if err != nil {
+					t.Fatalf("GET info/refs: %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if h2 && resp.ProtoMajor != 2 {
+					t.Fatalf("negotiated %s, want HTTP/2", resp.Proto)
+				}
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("read body after %d bytes: %v", len(body), err)
+				}
+				if resp.StatusCode != http.StatusOK || string(body) != "refs\n" {
+					t.Errorf("status %d, body %q; want 200 and the backend's whole body", resp.StatusCode, body)
+				}
+			})
+		}
+	}
+}
+
 // Output that lands inside the window where the write deadline is not moved
 // still counts: every gap below is shorter than the stall, so the response
 // completes. "progress" arrives about halfway into the two-second coalescing
@@ -1181,50 +1220,75 @@ exec `+sleep+` 60
 // The clone carries on, and the next request is served from it.
 func TestGitFirstMirrorOutlivingTheWaitAnswers503(t *testing.T) {
 	sleep := lookPath(t, "sleep")
-	s := newGitServer(t, newGitUpstream(t))
-	s.gitTool.mirrorWait = 200 * time.Millisecond
-	s.gitTool.git = writeScript(t, `if [ "$1" = clone ]; then `+sleep+` 1.5; fi
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("http2=%v", h2), func(t *testing.T) {
+			t.Parallel()
+			s := newGitServer(t, newGitUpstream(t))
+			s.gitTool.mirrorWait = 200 * time.Millisecond
+			s.gitTool.git = writeScript(t, `if [ "$1" = clone ]; then `+sleep+` 1.5; fi
 exec `+s.gitTool.git+` "$@"
 `)
-	ts := startGitTestServer(t, s, 500*time.Millisecond, false)
-	url := ts.URL + "/git/corp/" + gitTestRepo
+			// A WriteTimeout shorter than mirrorWait: over HTTP/2 it is a
+			// per-stream timer that resets the stream before the 503 is written
+			// unless the handler moved the deadline first.
+			ts := startGitTestServer(t, s, 100*time.Millisecond, h2)
+			url := ts.URL + "/git/corp/" + gitTestRepo
 
-	resp, err := ts.Client().Get(url + "/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET info/refs during the first mirror: %v", err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read 503 body: %v", err)
-	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body %q", resp.StatusCode, body)
-	}
-	if got := resp.Header.Get("Retry-After"); got != "60" {
-		t.Errorf("Retry-After = %q, want %q", got, "60")
-	}
-	if !strings.Contains(string(body), "mirroring corp/"+gitTestRepo) {
-		t.Errorf("body = %q, want it to name the mirror in progress", body)
-	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
-		t.Errorf("Content-Type = %q; git shows the client only a text/plain body", resp.Header.Get("Content-Type"))
-	}
+			resp, err := ts.Client().Get(url + "/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET info/refs during the first mirror: %v", err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatalf("read 503 body: %v", err)
+			}
+			if h2 && resp.ProtoMajor != 2 {
+				t.Fatalf("negotiated %s, want HTTP/2", resp.Proto)
+			}
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body %q", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Retry-After"); got != "60" {
+				t.Errorf("Retry-After = %q, want %q", got, "60")
+			}
+			if !strings.Contains(string(body), "mirroring corp/"+gitTestRepo) {
+				t.Errorf("body = %q, want it to name the mirror in progress", body)
+			}
+			if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+				t.Errorf("Content-Type = %q; git shows the client only a text/plain body", resp.Header.Get("Content-Type"))
+			}
 
-	stamp := filepath.Join(mirrorDir(s, "corp"), gitFetchStamp)
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if _, err := os.Stat(stamp); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the mirror never completed after the 503: %s absent", stamp)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	dest := filepath.Join(t.TempDir(), "clone")
-	runGitCLI(t, t.TempDir(), "clone", "-q", url, dest)
-	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
-		t.Errorf("clone after the mirror finished: HEAD subject = %q, want %q", got, "first")
+			stamp := filepath.Join(mirrorDir(s, "corp"), gitFetchStamp)
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				if _, err := os.Stat(stamp); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the mirror never completed after the 503: %s absent", stamp)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if h2 {
+				// git(1) does not trust the test server's certificate, so the
+				// HTTP/2 leg checks the mirror answers rather than cloning it.
+				resp, err := ts.Client().Get(url + "/info/refs?service=git-upload-pack")
+				if err != nil {
+					t.Fatalf("GET info/refs after the mirror finished: %v", err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("info/refs after the mirror finished: status %d, want 200", resp.StatusCode)
+				}
+				return
+			}
+			dest := filepath.Join(t.TempDir(), "clone")
+			runGitCLI(t, t.TempDir(), "clone", "-q", url, dest)
+			if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+				t.Errorf("clone after the mirror finished: HEAD subject = %q, want %q", got, "first")
+			}
+		})
 	}
 }
