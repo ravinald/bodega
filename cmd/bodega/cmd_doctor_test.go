@@ -965,3 +965,21 @@ func TestDoctorWarnsWhenTooFewIdentitiesCanApprove(t *testing.T) {
 		t.Errorf("serverPosture's last token-scope row = %+v, want the approve-reach WARN", reach)
 	}
 }
+
+// A skipped check whose producer set no remediation still has to appear in
+// "Could not run:", or the block vanishes while the run exits 3.
+func TestPrintRemediationListsSkipWithoutRemedy(t *testing.T) {
+	findings := []host.Finding{
+		{Check: "pip-conf", Status: host.StatusOK},
+		{Check: "apt-sources", Status: host.StatusSkip, Detail: "could not inspect /etc/apt: not a directory"},
+	}
+	out := capture(t, func() { printRemediation("Could not run:", findings, host.Finding.IsSkipped) })
+	for _, want := range []string{"Could not run:", "[apt-sources] could not inspect /etc/apt: not a directory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "pip-conf") {
+		t.Errorf("output lists a row the predicate drops:\n%s", out)
+	}
+}

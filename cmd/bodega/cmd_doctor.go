@@ -236,14 +236,20 @@ func printRemediation(heading string, findings []host.Finding, keep func(host.Fi
 	// times and bury the row that is genuinely its own.
 	var order []string
 	checks := map[string][]string{}
+	// A row with no remedy is listed under its detail instead of dropped: a
+	// skipped check missing from "Could not run:" reads as one that ran.
 	for _, f := range findings {
-		if !keep(f) || f.Remediation == "" {
+		if !keep(f) {
 			continue
 		}
-		if _, seen := checks[f.Remediation]; !seen {
-			order = append(order, f.Remediation)
+		remedy := f.Remediation
+		if remedy == "" {
+			remedy = f.Detail
 		}
-		checks[f.Remediation] = append(checks[f.Remediation], f.Check)
+		if _, seen := checks[remedy]; !seen {
+			order = append(order, remedy)
+		}
+		checks[remedy] = append(checks[remedy], f.Check)
 	}
 	if len(order) == 0 {
 		return
