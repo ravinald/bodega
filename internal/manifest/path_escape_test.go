@@ -161,3 +161,67 @@ func TestBinaryFilenameIsRefusedWhereverItReachesAKey(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateDebGlobConfinesToTheBuildModeRoot pins the per-mode root: a git
+// source build globs inside its clone, an apt-get source build inside the
+// shared sources directory one level above its tree.
+func TestValidateDebGlobConfinesToTheBuildModeRoot(t *testing.T) {
+	git := func(g string) VersionEntry {
+		return VersionEntry{Version: "1.0", URL: "https://example.invalid/x.git", BuildCmd: "make deb", DebGlob: g}
+	}
+	src := func(g string) VersionEntry {
+		return VersionEntry{Version: "1.0", BuildCmd: "dpkg-buildpackage -us -uc", DebGlob: g}
+	}
+	for _, tc := range []struct {
+		name string
+		ve   VersionEntry
+		ok   bool
+	}{
+		{"git empty", git(""), true},
+		{"git *.deb", git("*.deb"), true},
+		{"git build/*.deb", git("build/*.deb"), true},
+		{"git out/foo_*.deb", git("out/foo_*.deb"), true},
+		{"source ../*.deb", src("../*.deb"), true},
+		{"source ../efs-utils_*.deb", src("../efs-utils_*.deb"), true},
+		{"git ../*.deb", git("../*.deb"), false},
+		{"git ..", git(".."), false},
+		{"source ../../*.deb", src("../../*.deb"), false},
+		{"source a/../../x.deb", src("a/../../x.deb"), false},
+		{"git /abs/*.deb", git("/abs/*.deb"), false},
+		{"source /abs/*.deb", src("/abs/*.deb"), false},
+		{"git ./x.deb", git("./x.deb"), false},
+		{"git a//b.deb", git("a//b.deb"), false},
+		{`git a\b.deb`, git(`a\b.deb`), false},
+		{"git NUL", git("a\x00.deb"), false},
+		{"git [", git("["), false},
+		{"no build_cmd", VersionEntry{Version: "1.0", URL: "https://example.invalid/x.deb", DebGlob: "*.deb"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateDebGlob(tc.ve)
+			if tc.ok && err != nil {
+				t.Errorf("ValidateDebGlob(%q) refused: %v", tc.ve.DebGlob, err)
+			}
+			if !tc.ok {
+				if err == nil {
+					t.Fatalf("ValidateDebGlob(%q) passed", tc.ve.DebGlob)
+				}
+				if !strings.Contains(err.Error(), "deb_glob") || !strings.Contains(err.Error(), "published") {
+					t.Errorf("error %q does not name the field and why it matters", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSavePackageRefusesEscapingDebGlob(t *testing.T) {
+	pm := &PackageManifest{Type: TypeApt, Name: "widget", Versions: []VersionEntry{
+		{Version: "1.0", URL: "https://example.invalid/widget.git", BuildCmd: "make deb", DebGlob: "../../*.deb"},
+	}}
+	err := NewLocalStore(t.TempDir()).SavePackage(t.Context(), pm)
+	if err == nil {
+		t.Fatal("SavePackage wrote a git source entry with deb_glob ../../*.deb")
+	}
+	if !strings.Contains(err.Error(), "widget@1.0") {
+		t.Errorf("error %q does not name the version", err)
+	}
+}

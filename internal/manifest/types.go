@@ -833,6 +833,69 @@ func ValidateBinaryFilenames(pm *PackageManifest) error {
 	return nil
 }
 
+// ValidateDebGlob rejects an apt entry's deb_glob unless it is a clean
+// relative pattern that stays inside the directory its build mode reads. Empty
+// is allowed and means the build mode's default.
+//
+// The pattern chooses which file the package stage publishes, so one that
+// leaves the build root publishes any .deb the server user can read. The root
+// differs per build mode: a git source build (url and build_cmd) globs inside
+// its own clone, so no ".." is legal; an apt-get source build (build_cmd, no
+// url) leaves its .deb in the sources directory one level above the extracted
+// tree, so a single leading "../" is legal and nothing above it. An entry with
+// no build_cmd never reads the field.
+func ValidateDebGlob(ve VersionEntry) error {
+	g := ve.DebGlob
+	if g == "" {
+		return nil
+	}
+	refuse := func(why, next string) error {
+		return fmt.Errorf("invalid deb_glob %q: %s; deb_glob chooses which file is published, so %s", g, why, next)
+	}
+	if ve.BuildCmd == "" {
+		return refuse("only an entry with build_cmd reads it", "remove it, or add the build_cmd that produces the .deb")
+	}
+	fix := "set it to a clean relative pattern such as \"*.deb\" or \"build/*.deb\", or remove it to use the default"
+	if strings.ContainsAny(g, "\\\x00") {
+		return refuse("it contains '\\' or NUL", fix)
+	}
+	if path.IsAbs(g) {
+		return refuse("it is absolute", fix)
+	}
+	if path.Clean(g) != g {
+		return refuse("it is not in clean form (no \".\" segment, no empty segment, no trailing '/', no \"..\" after a name)", fix)
+	}
+	if _, err := path.Match(g, ""); err != nil {
+		return refuse("it is a malformed pattern", fix)
+	}
+	if ve.URL != "" {
+		if g == ".." || strings.HasPrefix(g, "../") {
+			return refuse("it leaves the clone a git source build reads", fix)
+		}
+		return nil
+	}
+	if rel := path.Join("tree", g); rel == ".." || strings.HasPrefix(rel, "../") {
+		return refuse("it leaves the sources directory an apt-get source build reads; at most one leading \"../\" is legal",
+			"set it to a pattern such as \"../<name>_*.deb\", or remove it to select by the dpkg filename")
+	}
+	return nil
+}
+
+// ValidateDebGlobs applies ValidateDebGlob to every version of an apt manifest
+// and names the first offending version. Other types carry no deb_glob and
+// pass.
+func ValidateDebGlobs(pm *PackageManifest) error {
+	if pm == nil || pm.Type != TypeApt {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		if err := ValidateDebGlob(ve); err != nil {
+			return fmt.Errorf("apt %s@%s: %w", pm.Name, ve.Version, err)
+		}
+	}
+	return nil
+}
+
 // versionedName returns "name@version" or just "name" when version is empty.
 func versionedName(name, version string) string {
 	if version == "" {

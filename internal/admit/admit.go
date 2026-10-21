@@ -395,6 +395,9 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if err := manifest.ValidateBinaryFilenames(pm); err != nil {
 		return err
 	}
+	if err := manifest.ValidateDebGlobs(pm); err != nil {
+		return err
+	}
 	// Only apt and git read dep_policy. Other types ignore it, so refusing a
 	// stray value there would reject a manifest whose behavior it cannot change.
 	if pm.Type == manifest.TypeApt || pm.Type == manifest.TypeGit {

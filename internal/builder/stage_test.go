@@ -964,3 +964,65 @@ func TestFetchAptSourcePicksItsOwnDsc(t *testing.T) {
 		})
 	}
 }
+
+func TestLocateDebFileGitSourceRefusesSymlinkOutOfClone(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb"}
+
+	outside := filepath.Join(t.TempDir(), "stolen_1.0_all.deb")
+	touchFile(t, outside)
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
+	mkDir(t, cloneDir)
+	link := filepath.Join(cloneDir, "x.deb")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := locateDebFile(d, "efs-utils", ve)
+	if err == nil {
+		t.Fatalf("locateDebFile = %q, want a refusal of the link leaving the clone", got)
+	}
+	for _, want := range []string{link, "stolen_1.0_all.deb", "outside the build root"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	if s := CheckAptStage(cfg, "efs-utils", ve); s.Built {
+		t.Errorf("a .deb symlinked out of the clone counted as built: %+v", s)
+	}
+}
+
+func TestLocateDebFileRefusesInvalidStoredDebGlob(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb", DebGlob: "../*.deb"}
+
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
+	mkDir(t, cloneDir)
+	touchFile(t, filepath.Join(cloneDir, "efs-utils_2.0.deb"))
+	touchFile(t, filepath.Join(d.sources, "other_1.0_all.deb"))
+
+	if _, err := locateDebFile(d, "efs-utils", ve); err == nil || !strings.Contains(err.Error(), "deb_glob") {
+		t.Fatalf("locateDebFile err = %v, want the deb_glob refusal", err)
+	}
+	if s := CheckAptStage(cfg, "efs-utils", ve); s.Built {
+		t.Errorf("an entry with a refused deb_glob counted as built: %+v", s)
+	}
+}
+
+func TestLocateDebFileAptSourceRefusesSymlinkOutOfSources(t *testing.T) {
+	d := buildDirs(t.TempDir())
+	outside := filepath.Join(t.TempDir(), "efs-utils_2.0_all.deb")
+	touchFile(t, outside)
+	ve := aptSourceEntry("2.0")
+	mkDir(t, aptSourceDir(d, "efs-utils", ve))
+	if err := os.Symlink(outside, filepath.Join(d.sources, "efs-utils_2.0_all.deb")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := locateDebFile(d, "efs-utils", ve); err == nil || !strings.Contains(err.Error(), "outside the build root") {
+		t.Fatalf("locateDebFile = %q, %v; want the symlink refused", got, err)
+	}
+}
