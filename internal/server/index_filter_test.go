@@ -1,18 +1,23 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // The fixture every ecosystem below shares: two releases well outside a 7d
@@ -732,5 +737,70 @@ func TestIndexFilterKeepsABaselineVersion(t *testing.T) {
 	}
 	if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code != http.StatusOK {
 		t.Errorf("baseline tarball status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+}
+
+// An approved age override keeps its version in the filtered packument and
+// lets its tarball through, though the age gate withholds it. The same
+// version once OSV records it as malware is withheld again whatever the
+// override says, since no override admits past malware.
+func TestIndexFilterKeepsAnOverriddenVersion(t *testing.T) {
+	s := filteringServer(t, manifest.TypeNpm)
+	s.cfg.NpmUpstream = npmFilterUpstream(t).URL
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "widget", Type: manifest.TypeNpm}
+	for _, v := range []string{"4.2.0", "4.3.0"} {
+		pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: v, Mode: manifest.ModeProxy})
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	o, err := admit.RequestOverride(t.Context(), s.auditDB, s.cfg, admit.OverrideRequest{Type: manifest.TypeNpm, Name: "widget",
+		Version: "4.3.0", Check: audit.CheckAge, Reason: "security fix needed today, INC-4", Expires: "7d"},
+		audit.LocalOverrideCaller("alice"), now)
+	if err != nil {
+		t.Fatalf("RequestOverride: %v", err)
+	}
+	if _, err := admit.VoteOverride(t.Context(), s.auditDB, o.ID, audit.LocalOverrideCaller("bob"), true, "", now); err != nil {
+		t.Fatalf("VoteOverride: %v", err)
+	}
+
+	rec := get(t, s, "/npm/widget")
+	if !strings.Contains(rec.Body.String(), `"4.3.0"`) || rec.Header().Get(filteredHeader) != "" {
+		t.Errorf("overridden 4.3.0 withheld; header %q, body %s", rec.Header().Get(filteredHeader), rec.Body)
+	}
+	if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code != http.StatusOK {
+		t.Errorf("overridden tarball status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("MAL-2026-9.json")
+		_ = json.NewEncoder(f).Encode(map[string]any{
+			"id": "MAL-2026-9",
+			"affected": []map[string]any{{
+				"package":  map[string]string{"name": "widget", "ecosystem": "npm"},
+				"versions": []string{"4.3.0"},
+			}},
+		})
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+	s.cfg.OSVDBDir = filepath.Join(t.TempDir(), "osv")
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(t.Context(), "npm"); err != nil {
+		t.Fatalf("sync npm: %v", err)
+	}
+	s.indexFilter = policy.NewIndexFilter(s.auditDB, admit.OSVChecker(s.cfg, s.auditDB))
+
+	rec = get(t, s, "/npm/widget")
+	if strings.Contains(rec.Body.String(), `"4.3.0"`) {
+		t.Errorf("malicious 4.3.0 stayed in the index under an age override: %s", rec.Body)
+	}
+	if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code != http.StatusForbidden {
+		t.Errorf("malicious tarball status = %d, want 403 (body %s)", rec.Code, rec.Body)
 	}
 }

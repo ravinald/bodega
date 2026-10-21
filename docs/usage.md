@@ -2906,6 +2906,8 @@ pypi       on      age < 3d                  2026-10-06
 
 `WITHHOLDS` is computed from the age and OSV policies in force and is shown for an ecosystem that is off too, so you can read what turning it on would do first. The filter is off by default, and the server reads the setting on every index request, so `set` takes effect without a restart.
 
+**What it keeps.** A version carrying an active [override](#bodega-override-requestapproverejectlist) stays in the filtered index, and its artifact is served, for the gate the override names only: an `age` override exempts the version from the age gate, and an `osv` override from the OSV advisory gate. A version OSV records as malicious stays withheld whatever override exists, because no override admits past malware. A version the stored manifest marks baseline is kept from both gates on the same terms.
+
 **What it withholds.** Only a gate whose action is `block`. A version OSV records as malicious is withheld whenever the malware action is `block`, which it is with no row set, whatever the advisory gate says: the artifact route refuses it either way. A version younger than the age gate's minimum, and a version the local OSV database (`osv_db_dir`) has a record for. A gate on `warn` or `ignore` withholds nothing, because the artifact route would serve that version and hiding it would refuse at the index what nobody refuses at the fetch. The filter never queries `api.osv.dev`, `osv_api_fallback` or not: one index read would be a query per listed version. A version the local database cannot answer for stays.
 
 **Which indexes.** The three bodega proxies from upstream:
@@ -3254,7 +3256,9 @@ The requester's token holds no `approve`, so `list` shows it `(not counted)` and
 
 **Audit.** Each request, approval and rejection writes an `override` event (`bodega audit events --type override`) with status `requested`, `approve` or `reject` and the id, check, state, approvers, quorum and expiry in its details. A `requested` event also records `requester_counts` and `approvals_needed`; a vote event records the voter's `scope` and, for an approval that did not count, `not_counted`. The requests and votes themselves live in the `overrides` and `override_votes` tables of the embedded SQLite store (migrations 032 and 038), beside the allow-list.
 
-**Not yet covered.** A build's fetch and a proxy fill run their own allow-list gate and answer a refusal before admission sees it, so an `allowlist` override does not reach them; it applies to the version checks on those paths and to the allow-list everywhere else.
+An `allowlist` override admits past the allow-list a build's fetch and a proxy fill each run before admission, and the admission row records it `overridden`. On a proxy request for a package's index (a packument, a simple page, an `@v/list`), an `allowlist` override on any version of the package lets the index through, because a host pinned to that version reads the index before the artifact; the artifact of any other version is still refused. A proxy request the override admits writes a WARN log line naming the override's id. With the [index filter](#bodega-policy-filter-setlist) on, an `age` or `osv` override also keeps its version in the filtered index.
+
+**Not yet covered.** A git smart HTTP request and a distfiles request run the allow-list without consulting overrides, so an `allowlist` override does not reach them: neither request names the version an override is keyed by. A git clone's `info/refs` and `git-upload-pack` legs name a repository and no ref, and a distfiles request names a file by its distinfo name, which has no version slot. A refusal on either route answers `403` and writes `policy_violation` whatever override exists, and the baseline mark does not reach them either.
 
 ### `bodega policy simulate`
 
@@ -6597,7 +6601,7 @@ Enforcement happens in four places:
 - **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
 - **Interactive create** (`bodega pkg create`): refuses like import does. The y/N prompt it once asked is gone; the way past a refusal is a [two-person override](#bodega-override-requestapproverejectlist).
 
-Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`.
+Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`. An allow-list refusal an active override or a baseline mark admits past is not a violation: nobody was refused, so it writes no `policy_violation` event, and its admission row records the allow-list check `overridden` (with the override's id) or `baseline`.
 
 ```bash
 # Turn on enforcement for git by pinning allowed orgs
@@ -6995,7 +6999,7 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | `cache_miss`        | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed                                      |
 | `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
-| `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record                              |
+| `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record. A refusal an override or a baseline mark admits past writes none; its admission row records `overridden` or `baseline` |
 | `policy_warn`       | A gate warned on a version a proxy fill admitted anyway. `details` carry the findings. An import or create writes the same status on its `create` row                                                       |
 | `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
 | `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
@@ -7086,7 +7090,7 @@ Denials record at every gate in the middleware chain, at the admin-read gate, an
 
 Callers past the first wait in arrival order, and none is discarded: a `denied` row is the record of who was turned away and has no second source. That is the difference between this path and `discover_mode`, whose queue drops an observation rather than delay a request. The wait shares the 10-second ceiling the write already had, so a database wedged for that long still loses the row, as it did before this bound existed.
 
-An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one.
+An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one. A refusal an active `allowlist` override or a baseline mark admits past is served, so it writes no `policy_violation` event and no queue row; the fill's admission row records the allow-list check `overridden`, naming the override, or `baseline`.
 
 `audit_events` and `timezone` in `config.json` apply to both handles: the CLI's and the one `bodega serve` opens for itself. A filter that leaves out `denied` therefore throws away the record of every refusal the server makes, which is the one record that has no other home — the journal rotates and is not reachable through `/api/v1/audit`. `bodega serve` logs an error naming the key when it starts with such a filter. Leave `audit_events` empty unless you have a reason.
 
