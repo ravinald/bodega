@@ -50,19 +50,24 @@ type RevetFilter struct {
 
 // RevetTarget is one admitted version, cataloged or served only from the
 // proxy cache. Version is the label admission rows key it by: the version, or
-// a git entry's ref.
+// a git entry's ref. ObjectKey is set for a proxy-cached object whose key
+// names no version, such as a distfile: several of them share (type, name,
+// ""), so the key is what identifies the target.
 type RevetTarget struct {
 	Type, Name, Version string
+	ObjectKey           string
 }
 
 // RevetOutcome is one version's re-vet.
 type RevetOutcome struct {
-	Type     string `json:"type"`
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	Previous string `json:"previous_decision,omitempty"`
-	Decision string `json:"decision,omitempty"`
-	Action   string `json:"action,omitempty"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	// ObjectKey names the object re-vetted when its key names no version.
+	ObjectKey string `json:"object_key,omitempty"`
+	Previous  string `json:"previous_decision,omitempty"`
+	Decision  string `json:"decision,omitempty"`
+	Action    string `json:"action,omitempty"`
 	// Failing are the checks that refused, in row order.
 	Failing []audit.AdmissionCheck `json:"failing,omitempty"`
 	// Envelopes are the attestation keys this re-vet signed.
@@ -165,10 +170,15 @@ var ErrNoRevetTargets = errors.New("no admitted version matches")
 // cache: hiding is a manifest flag, and such a version has no manifest.
 const noCatalogEntry = "not hidden: no catalog entry exists to hide; the version is served from the proxy cache"
 
+// noVersionInKey is the detail of every per-version check of an unversioned
+// object's re-vet: the fill that admitted it ran none of them either.
+const noVersionInKey = "not re-run: the object's key names no version the per-version checks can evaluate"
+
 // Targets lists the versions f selects: the cataloged ones in catalog order,
 // then, sorted, every version the admissions table holds an admitted or
 // pinned decision for that has no catalog entry, which is what a proxy fill
-// leaves behind.
+// leaves behind, then, sorted, one target per pinned object whose key names
+// no version. A version filter selects none of the last.
 func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, error) {
 	if r.DB == nil {
 		return nil, errors.New("no audit store is open; a re-vet writes admission rows and has nowhere to write them")
@@ -191,11 +201,11 @@ func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, e
 		want = manifest.SafeName(f.Name)
 	}
 	cutoff := r.now().Add(-f.OlderThan)
-	old := func(t, name, v string) (bool, error) {
+	old := func(tg RevetTarget) (bool, error) {
 		if f.OlderThan <= 0 {
 			return true, nil
 		}
-		prev, err := r.previous(ctx, t, name, v)
+		prev, err := r.previous(ctx, tg)
 		if err != nil {
 			return false, err
 		}
@@ -223,7 +233,7 @@ func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, e
 				if f.Version != "" && v != f.Version {
 					continue
 				}
-				if ok, err := old(t, pm.Name, v); err != nil {
+				if ok, err := old(RevetTarget{Type: t, Name: pm.Name, Version: v}); err != nil {
 					return nil, err
 				} else if !ok {
 					continue
@@ -240,18 +250,27 @@ func (r *Revetter) Targets(ctx context.Context, f RevetFilter) ([]RevetTarget, e
 			"error", err)
 		admitted = nil
 	}
+	// The query sorts versioned rows ahead of unversioned ones only within a
+	// name, so the objects are collected apart and appended after.
+	var objects []RevetTarget
 	for _, a := range admitted {
 		safe := manifest.SafeName(a.PkgName)
 		if (want != "" && safe != want) || cataloged[RevetTarget{Type: a.PkgType, Name: safe, Version: a.PkgVersion}] {
 			continue
 		}
-		if ok, err := old(a.PkgType, a.PkgName, a.PkgVersion); err != nil {
+		tg := RevetTarget{Type: a.PkgType, Name: a.PkgName, Version: a.PkgVersion, ObjectKey: a.ObjectKey}
+		if ok, err := old(tg); err != nil {
 			return nil, err
 		} else if !ok {
 			continue
 		}
-		out = append(out, RevetTarget{Type: a.PkgType, Name: a.PkgName, Version: a.PkgVersion})
+		if tg.ObjectKey != "" {
+			objects = append(objects, tg)
+			continue
+		}
+		out = append(out, tg)
 	}
+	out = append(out, objects...)
 	if len(out) == 0 && (f.Name != "" || f.Version != "") {
 		return nil, ErrNoRevetTargets
 	}
@@ -289,7 +308,7 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	r.serial.Lock()
 	defer r.serial.Unlock()
 
-	out := RevetOutcome{Type: tg.Type, Name: tg.Name, Version: tg.Version}
+	out := RevetOutcome{Type: tg.Type, Name: tg.Name, Version: tg.Version, ObjectKey: tg.ObjectKey}
 	if r.DB == nil {
 		out.Error = "no audit store is open"
 		return out
@@ -299,7 +318,7 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 		out.Error = err.Error()
 		return out
 	}
-	prev, err := r.previous(ctx, tg.Type, tg.Name, tg.Version)
+	prev, err := r.previous(ctx, tg)
 	if err != nil {
 		// A write-only sink has no history to read, and the re-vet is
 		// still worth recording: its rows carry no object key and no
@@ -322,18 +341,25 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 		allow = c
 	}
 	ev.set(0, allow)
-	age, rerun := carriedAge(prev, ev.actions[audit.CheckAge])
 	var ageResults []policy.Result
-	if rerun {
-		ageResults = ev.runVersion(ctx, &cp, 0, []policy.VersionChecker{r.ageChecker()})
-	} else {
-		ev.set(0, age)
+	if tg.ObjectKey == "" {
+		age, rerun := carriedAge(prev, ev.actions[audit.CheckAge])
+		if rerun {
+			ageResults = ev.runVersion(ctx, &cp, 0, []policy.VersionChecker{r.ageChecker()})
+		} else {
+			ev.set(0, age)
+		}
 	}
 
 	blocked := allow.Status == audit.CheckBlock
-	if blocked {
+	switch {
+	case tg.ObjectKey != "":
+		// The fill admitted it on the allow-list alone, so that is all a
+		// re-vet has to rule on.
+		ev.notRunChecks(0, noVersionInKey, ev.versionChecks...)
+	case blocked:
 		ev.notRunChecks(0, "not run: the allow-list refused this version", ev.versionChecks...)
-	} else {
+	default:
 		results := append(ageResults, ev.runVersion(ctx, &cp, 0, checkers)...)
 		for _, res := range results {
 			if msg, ok := res.Details[integration.RevetErrorKey].(string); ok {
@@ -383,19 +409,25 @@ func (r *Revetter) lookup(ctx context.Context, tg RevetTarget) (*manifest.Packag
 	if err != nil {
 		return nil, manifest.VersionEntry{}, false, err
 	}
-	if pm != nil {
+	if pm != nil && tg.ObjectKey == "" {
 		for _, ve := range pm.Versions {
 			if admissionVersion(ve) == tg.Version {
 				return pm, ve, true, nil
 			}
 		}
 	}
-	admitted, err := r.DB.AdmittedVersions(ctx, audit.AdmissionFilter{PkgType: tg.Type, PkgName: tg.Name, PkgVersion: tg.Version})
+	label := fmt.Sprintf("%s/%s@%s", tg.Type, tg.Name, tg.Version)
+	f := audit.AdmissionFilter{PkgType: tg.Type, PkgName: tg.Name, PkgVersion: tg.Version}
+	if tg.ObjectKey != "" {
+		label = fmt.Sprintf("%s/%s object %s", tg.Type, tg.Name, tg.ObjectKey)
+		f = audit.AdmissionFilter{PkgType: tg.Type, PkgName: tg.Name, ObjectKey: tg.ObjectKey}
+	}
+	admitted, err := r.DB.AdmittedVersions(ctx, f)
 	if err != nil {
-		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s/%s@%s is not in the catalog, and the admissions table could not be read: %w", tg.Type, tg.Name, tg.Version, err)
+		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s is not in the catalog, and the admissions table could not be read: %w", label, err)
 	}
 	if len(admitted) == 0 {
-		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s/%s@%s is neither in the catalog nor admitted to the proxy cache", tg.Type, tg.Name, tg.Version)
+		return nil, manifest.VersionEntry{}, false, fmt.Errorf("%s is neither in the catalog nor admitted to the proxy cache", label)
 	}
 	ve := manifest.VersionEntry{Version: tg.Version, Mode: manifest.ModeProxy}
 	return &manifest.PackageManifest{Type: tg.Type, Name: tg.Name, Versions: []manifest.VersionEntry{ve}}, ve, false, nil
@@ -403,19 +435,22 @@ func (r *Revetter) lookup(ctx context.Context, tg RevetTarget) (*manifest.Packag
 
 // previous is the newest decision on record for the version: every row
 // sharing the newest decided_at, which is one per object key a pypi release
-// was pinned under.
-func (r *Revetter) previous(ctx context.Context, typ, name, version string) ([]audit.Admission, error) {
+// was pinned under. For an unversioned object it is the newest decision
+// pinned under that object's key alone; its siblings under the name are
+// other targets.
+func (r *Revetter) previous(ctx context.Context, tg RevetTarget) ([]audit.Admission, error) {
 	if !r.DB.EventsQueryable() {
 		return nil, fmt.Errorf("audit_sink %s keeps no admissions table this process can query", r.DB.SinkName())
 	}
-	rows, err := r.DB.Admissions(ctx, audit.AdmissionFilter{PkgType: typ, PkgName: name, PkgVersion: version, Limit: 200})
+	rows, err := r.DB.Admissions(ctx, audit.AdmissionFilter{PkgType: tg.Type, PkgName: tg.Name, PkgVersion: tg.Version,
+		ObjectKey: tg.ObjectKey, Limit: 200})
 	if err != nil {
 		return nil, err
 	}
 	var out []audit.Admission
 	for _, row := range rows {
 		// An empty filter field matches everything.
-		if row.PkgVersion != version {
+		if row.PkgVersion != tg.Version {
 			continue
 		}
 		if len(out) > 0 && !row.DecidedAt.Equal(out[0].DecidedAt) {
@@ -428,8 +463,8 @@ func (r *Revetter) previous(ctx context.Context, typ, name, version string) ([]a
 
 // allowList rules on what admission ruled on: the name for a type the list
 // keys by name, the upstream URL for every other. A URL-keyed version whose
-// entry names no URL, which is every version a helm, binary or apt proxy
-// fill admitted, is ruled on by the upstream each of its pinned objects was
+// entry names no URL, which is every version a helm, binary, apt or distfiles
+// proxy fill admitted, is ruled on by the upstream each of its pinned objects was
 // cached from, and refused if any of them is outside the list. Without that
 // the re-vet of such a version re-runs nothing, and a narrowed allow-list
 // never reaches what the cache already serves.
@@ -441,7 +476,9 @@ func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifes
 	listed, _ := r.Allow.Listed(ctx, pm.Type)
 	ve := pm.Versions[0]
 	candidates := []string{policy.CandidateFor(pm.Type, pm.Name, ve.URL)}
-	if candidates[0] == "" && !policy.KeysByName(pm.Type) {
+	// A hosted entry was uploaded rather than fetched, so it has no upstream
+	// to rule on, as its admission recorded.
+	if candidates[0] == "" && !policy.KeysByName(pm.Type) && (!cataloged || ve.Mode != manifest.ModeHosted) {
 		var unknown []string
 		candidates, unknown = r.cacheOrigins(ctx, ve, cataloged, prev)
 		for _, why := range unknown {
@@ -587,7 +624,7 @@ func (r *Revetter) record(ctx context.Context, out *RevetOutcome, ev *evaluation
 		}
 	}
 	if len(keys) == 0 {
-		keys = []string{""}
+		keys = []string{out.ObjectKey}
 	}
 	if ev.digestErr != nil {
 		out.Notes = append(out.Notes, "recorded with no policy digest: "+ev.digestErr.Error())
@@ -627,10 +664,14 @@ func (r *Revetter) onBlock(ctx context.Context, out *RevetOutcome, ve manifest.V
 			action = RevetHidden
 		}
 	}
-	details, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"decision": out.Decision, "previous_decision": out.Previous, "action": action,
 		"failing": out.Failing, "trigger": trigger,
-	})
+	}
+	if out.ObjectKey != "" {
+		fields["object_key"] = out.ObjectKey
+	}
+	details, _ := json.Marshal(fields)
 	if err := r.DB.Record(ctx, audit.Event{
 		EventType: audit.EventRevet, PkgType: out.Type, PkgName: out.Name, PkgVersion: out.Version,
 		Actor: RevetActor, Status: "policy_violation", Details: string(details),
@@ -638,7 +679,7 @@ func (r *Revetter) onBlock(ctx context.Context, out *RevetOutcome, ve manifest.V
 		out.Notes = append(out.Notes, "audit event not written: "+err.Error())
 	}
 	r.logger().Warn("re-vet refused an admitted version", "cataloged", cataloged,
-		"type", out.Type, "package", out.Name, "version", out.Version, "action", action,
+		"type", out.Type, "package", out.Name, "version", out.Version, "object_key", out.ObjectKey, "action", action,
 		"previous", out.Previous, "failing", failingSummary(out.Failing))
 	return action
 }
