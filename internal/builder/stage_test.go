@@ -285,6 +285,28 @@ func TestCheckAptStage_SourceBuildBuilt(t *testing.T) {
 	}
 }
 
+func TestCheckAptStage_SourceBuildOtherRefNotFetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb", Ref: "v2.0.1"}
+	d := buildDirs(root)
+
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
+	mkDir(t, filepath.Join(cloneDir, ".git"))
+	if err := os.WriteFile(aptRefMarkerPath(cloneDir), []byte("v2.0.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	touchFile(t, filepath.Join(cloneDir, "efs-utils_2.0.deb"))
+
+	if s := CheckAptStage(cfg, "efs-utils", ve); s.Fetched || s.Built {
+		t.Errorf("a clone recorded at v2.0.0 counted for ref v2.0.1: %+v", s)
+	}
+	ve.Ref = "v2.0.0"
+	if s := CheckAptStage(cfg, "efs-utils", ve); !s.Fetched || !s.Built {
+		t.Errorf("a clone recorded at the entry's ref did not count: %+v", s)
+	}
+}
+
 func TestCheckAptStage_AptGetFetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
