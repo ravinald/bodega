@@ -116,3 +116,106 @@ func TestFetchAptSourceEmptyRefBuildsDefaultBranch(t *testing.T) {
 		t.Errorf("fetch output does not name the built commit %s:\n%s", tip, out)
 	}
 }
+
+// aptRefFetcher returns a fetch of one source-build entry that keeps its build
+// root and manifest store across calls, rewriting the entry's ref before each.
+// Each call returns its own output only.
+func aptRefFetcher(t *testing.T, url string) (fetch func(ref string) (*Summary, string), dir string) {
+	t.Helper()
+	const pkg = "widget"
+	ve := manifest.VersionEntry{Version: "0.1.1", URL: url, BuildCmd: "true"}
+	pm := &manifest.PackageManifest{Type: manifest.TypeApt, Name: pkg, Versions: []manifest.VersionEntry{ve}}
+	cfg, store, _ := pinEnv(t, pm)
+	fetch = func(ref string) (*Summary, string) {
+		t.Helper()
+		got, err := store.GetPackage(t.Context(), manifest.TypeApt, pkg)
+		if err != nil {
+			t.Fatalf("GetPackage: %v", err)
+		}
+		got.Versions[0].Ref = ref
+		if err := store.SavePackage(t.Context(), got); err != nil {
+			t.Fatalf("SavePackage: %v", err)
+		}
+		var out bytes.Buffer
+		cfg.Stdout = &out
+		return FetchApt(cfg, store, pkg), out.String()
+	}
+	return fetch, aptSourceDir(buildDirs(cfg.rootFor(manifest.TypeApt)), pkg, ve)
+}
+
+func TestFetchAptSourceRefChangeRefetches(t *testing.T) {
+	upstream, release, tip := aptRefUpstream(t)
+	fetch, dir := aptRefFetcher(t, upstream)
+
+	if s, out := fetch(""); s.Failures != 0 {
+		t.Fatalf("fetch with no ref failed: %+v\n%s", s.Results, out)
+	}
+	if got := gitIn(t, dir, "rev-parse", "HEAD"); got != tip {
+		t.Fatalf("first fetch checked out %s, want the default branch tip %s", got, tip)
+	}
+
+	s, out := fetch("v0.1.1")
+	if s.Failures != 0 {
+		t.Fatalf("fetch at v0.1.1 failed: %+v\n%s", s.Results, out)
+	}
+	if got := gitIn(t, dir, "rev-parse", "HEAD"); got != release {
+		t.Errorf("a ref change on the same version left the source at %s, want %s:\n%s", got, release, out)
+	}
+	if !strings.Contains(out, "Commit: "+release) {
+		t.Errorf("re-fetch output does not name the built commit %s:\n%s", release, out)
+	}
+	for _, want := range []string{"Re-fetching widget", dir, "the default branch", "ref v0.1.1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("re-fetch output does not say %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestFetchAptSourceUnmarkedCloneRefetchesAtRef(t *testing.T) {
+	upstream, release, _ := aptRefUpstream(t)
+	fetch, dir := aptRefFetcher(t, upstream)
+
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runCmdCapture("", "git", "clone", "-q", upstream, dir); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+
+	s, out := fetch("v0.1.1")
+	if s.Failures != 0 {
+		t.Fatalf("fetch at v0.1.1 failed: %+v\n%s", s.Results, out)
+	}
+	if got := gitIn(t, dir, "rev-parse", "HEAD"); got != release {
+		t.Errorf("an unmarked clone was trusted at %s, want %s:\n%s", got, release, out)
+	}
+	if !strings.Contains(out, "records no ref") {
+		t.Errorf("re-fetch output does not say the clone recorded no ref:\n%s", out)
+	}
+}
+
+func TestFetchAptSourceUnchangedRefSkips(t *testing.T) {
+	upstream, _, _ := aptRefUpstream(t)
+
+	for _, tc := range []struct{ kind, ref, says string }{
+		{"tag", "v0.1.1", "already fetched at ref v0.1.1"},
+		{"no ref", "", "already fetched at the default branch"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			fetch, _ := aptRefFetcher(t, upstream)
+			if s, out := fetch(tc.ref); s.Failures != 0 {
+				t.Fatalf("first fetch failed: %+v\n%s", s.Results, out)
+			}
+			s, out := fetch(tc.ref)
+			if s.Failures != 0 {
+				t.Fatalf("second fetch failed: %+v\n%s", s.Results, out)
+			}
+			if !strings.Contains(out, tc.says) {
+				t.Errorf("second fetch did not skip with %q:\n%s", tc.says, out)
+			}
+			if strings.Contains(out, "Commit:") {
+				t.Errorf("second fetch cloned again:\n%s", out)
+			}
+		})
+	}
+}
