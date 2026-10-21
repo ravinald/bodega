@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -178,5 +180,130 @@ func TestFetchAptKeepsEachArchitectureOnItsOwnEntry(t *testing.T) {
 
 	if s := FetchApt(cfg, store, pkg); s.Failures != 0 {
 		t.Fatalf("a re-fetch of both architectures was refused: %+v", s.Results)
+	}
+}
+
+// writeTestDeb builds a .deb at dest whose control data PackageApt can read.
+// Two calls differing only in description give two byte streams under one name.
+func writeTestDeb(t *testing.T, dest, name, version, description string) {
+	t.Helper()
+	if _, err := exec.LookPath("dpkg-deb"); err != nil {
+		t.Skip("dpkg-deb is required to produce a .deb whose control data PackageApt can read")
+	}
+	staging := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(filepath.Join(staging, "DEBIAN"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	control := "Package: " + name + "\nVersion: " + version +
+		"\nArchitecture: all\nMaintainer: bodega <admin@example.com>\nDescription: " + description + "\n"
+	if err := os.WriteFile(filepath.Join(staging, "DEBIAN", "control"), []byte(control), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("dpkg-deb", "--build", "--root-owner-group", staging, dest).CombinedOutput(); err != nil {
+		t.Fatalf("dpkg-deb --build: %v\n%s", err, out)
+	}
+}
+
+// TestPackageAptRefusalLeavesPoolUntouched replaces a packaged version's .deb
+// with other bytes under the same name. The package stage refuses it, and the
+// refusal has to leave the pool, the manifest and the pin as they were: a pool
+// file the record does not vouch for is served to every client.
+func TestPackageAptRefusalLeavesPoolUntouched(t *testing.T) {
+	const pkg, version, debName = "widget", "2.0", "widget_2.0_all.deb"
+	for _, tc := range []struct {
+		kind  string
+		entry manifest.VersionEntry
+		deb   func(d dirs, ve manifest.VersionEntry) string
+	}{
+		{"direct URL", manifest.VersionEntry{Version: version, URL: "https://example.com/" + debName},
+			func(d dirs, ve manifest.VersionEntry) string { return aptFetchedDeb(d, pkg, ve) }},
+		{"git source build", manifest.VersionEntry{Version: version, URL: "https://example.com/widget.git", BuildCmd: "make deb", Ref: "v2.0.0"},
+			func(d dirs, ve manifest.VersionEntry) string {
+				cloneDir := aptSourceDir(d, pkg, ve)
+				if err := os.MkdirAll(filepath.Join(cloneDir, ".git"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(aptRefMarkerPath(cloneDir), []byte(ve.Ref), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(cloneDir, debName)
+			}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			pm := &manifest.PackageManifest{Type: manifest.TypeApt, Name: pkg, Versions: []manifest.VersionEntry{tc.entry}}
+			cfg, store, db := pinEnv(t, pm)
+			d := buildDirs(cfg.rootFor(manifest.TypeApt))
+			deb := tc.deb(d, tc.entry)
+			writeTestDeb(t, deb, pkg, version, "first build")
+
+			if s := PackageApt(cfg, store, pkg); s.Failures != 0 {
+				t.Fatalf("first package failed: %+v", s.Results)
+			}
+			poolFile := filepath.Join(d.aptRepo, filepath.FromSlash(aptPoolRelPath(pkg, debName)))
+			poolBefore, err := fileSHA256(poolFile)
+			if err != nil {
+				t.Fatalf("first package left no pool file: %v", err)
+			}
+			before, err := store.GetPackage(t.Context(), manifest.TypeApt, pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			veBefore := before.Versions[0]
+			if veBefore.Checksum == nil || veBefore.Checksum.Value != poolBefore {
+				t.Fatalf("first package recorded %+v, want %s", veBefore.Checksum, poolBefore)
+			}
+
+			writeTestDeb(t, deb, pkg, version, "changed build")
+			rebuilt, err := fileSHA256(deb)
+			if err != nil || rebuilt == poolBefore {
+				t.Fatalf("fixture: the rebuilt .deb has sha256 %s (%v), want bytes other than %s", rebuilt, err, poolBefore)
+			}
+
+			s := PackageApt(cfg, store, pkg)
+			if s.Failures != 1 || len(s.Results) != 1 || s.Results[0].Err == nil {
+				t.Fatalf("a .deb with other bytes was not refused once: %+v", s.Results)
+			}
+			if got, err := fileSHA256(poolFile); err != nil || got != poolBefore {
+				t.Errorf("the refused package left the pool file at sha256 %s (%v), want %s", got, err, poolBefore)
+			}
+			after, err := store.GetPackage(t.Context(), manifest.TypeApt, pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			veAfter := after.Versions[0]
+			if veAfter.Checksum == nil || veAfter.Checksum.Value != poolBefore {
+				t.Errorf("the refusal rewrote the checksum to %+v, want %s", veAfter.Checksum, poolBefore)
+			}
+			for _, k := range []string{"_pool_path", "_md5", "_sha1", "_sha256"} {
+				if veAfter.Metadata[k] != veBefore.Metadata[k] {
+					t.Errorf("the refusal rewrote %s from %q to %q", k, veBefore.Metadata[k], veAfter.Metadata[k])
+				}
+			}
+			if veAfter.ArtifactSize != veBefore.ArtifactSize {
+				t.Errorf("the refusal rewrote artifact_size from %d to %d", veBefore.ArtifactSize, veAfter.ArtifactSize)
+			}
+			if pin, err := db.GetChecksum(t.Context(), manifest.AptKey(aptPoolRelPath(pkg, debName))); err != nil || pin == nil || pin.Value != poolBefore {
+				t.Errorf("the pin reads %+v (%v), want %s", pin, err, poolBefore)
+			}
+
+			msg := s.Results[0].Err.Error()
+			if tc.entry.BuildCmd == "" {
+				if !strings.Contains(msg, "recorded at fetch") {
+					t.Errorf("a direct download's refusal changed wording: %q", msg)
+				}
+				return
+			}
+			for _, want := range []string{"ref v2.0.0", poolBefore, rebuilt, "version"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the refusal %q does not name %q", msg, want)
+				}
+			}
+			if strings.Contains(msg, "recorded at fetch") {
+				t.Errorf("a source build's refusal says the digest was recorded at fetch, which it was not: %q", msg)
+			}
+		})
 	}
 }
