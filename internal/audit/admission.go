@@ -143,6 +143,9 @@ type AdmissionFilter struct {
 	PkgType    string
 	PkgName    string
 	PkgVersion string
+	// ObjectKey keeps rows pinned under that key. In AdmittedVersions it
+	// selects the unversioned object at that key and no version.
+	ObjectKey string
 	// Since keeps rows decided at or after it; zero keeps every row.
 	Since time.Time
 	Limit int // 0 = default (1000)
@@ -258,6 +261,12 @@ func (a *DB) Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, er
 // the table holds an admitted or pinned decision for. A version whose only
 // rows are refusals with no object behind them was never served, and is left
 // out. f.Limit is ignored: the list is the set of versions, not of rows.
+//
+// A row with no version is listed once per object key it was pinned under,
+// with ObjectKey set: a distfile or a binary whose key names no version
+// shares (type, name, "") with every sibling file, so only the key tells them
+// apart. One with no key either is a decision about the package, not about
+// anything served, and is left out. A version filter selects none of these.
 func (a *DB) AdmittedVersions(ctx context.Context, f AdmissionFilter) ([]AdmissionPin, error) {
 	r, err := a.reader("admission decisions")
 	if err != nil {
@@ -280,19 +289,35 @@ type admittedVersionLister interface {
 // buildAdmittedVersionsQuery renders AdmittedVersions' read. ph renders the
 // nth bind placeholder, as in pinTx.
 func buildAdmittedVersionsQuery(f AdmissionFilter, ph func(int) string) (string, []any) {
-	where := []string{"pkg_version <> ''", "(decision = 'admitted' OR object_key IS NOT NULL)"}
 	var args []any
-	for _, c := range []struct{ col, val string }{
-		{"pkg_type", f.PkgType}, {"pkg_name", f.PkgName}, {"pkg_version", f.PkgVersion},
-	} {
-		if c.val == "" {
-			continue
+	match := func(where []string, cols ...struct{ col, val string }) string {
+		for _, c := range cols {
+			if c.val == "" {
+				continue
+			}
+			args = append(args, c.val)
+			where = append(where, c.col+" = "+ph(len(args)))
 		}
-		args = append(args, c.val)
-		where = append(where, c.col+" = "+ph(len(args)))
+		return strings.Join(where, " AND ")
 	}
-	return `SELECT pkg_type, pkg_name, pkg_version FROM admissions WHERE ` + strings.Join(where, " AND ") +
-		` GROUP BY pkg_type, pkg_name, pkg_version ORDER BY pkg_type, pkg_name, pkg_version`, args
+	typ, name := struct{ col, val string }{"pkg_type", f.PkgType}, struct{ col, val string }{"pkg_name", f.PkgName}
+	var parts []string
+	if f.ObjectKey == "" {
+		parts = append(parts, `SELECT pkg_type, pkg_name, pkg_version, '' AS object_key FROM admissions WHERE `+
+			match([]string{"pkg_version <> ''", "(decision = 'admitted' OR object_key IS NOT NULL)"},
+				typ, name, struct{ col, val string }{"pkg_version", f.PkgVersion})+
+			` GROUP BY pkg_type, pkg_name, pkg_version`)
+	}
+	if f.PkgVersion == "" {
+		parts = append(parts, `SELECT pkg_type, pkg_name, pkg_version, object_key FROM admissions WHERE `+
+			match([]string{"pkg_version = ''", "object_key IS NOT NULL", "object_key <> ''"},
+				typ, name, struct{ col, val string }{"object_key", f.ObjectKey})+
+			` GROUP BY pkg_type, pkg_name, pkg_version, object_key`)
+	}
+	if len(parts) == 0 {
+		return `SELECT pkg_type, pkg_name, pkg_version, object_key FROM admissions WHERE 1 = 0`, nil
+	}
+	return strings.Join(parts, " UNION ALL ") + ` ORDER BY 1, 2, 3, 4`, args
 }
 
 func scanAdmittedVersions(rows *sql.Rows) ([]AdmissionPin, error) {
@@ -300,7 +325,7 @@ func scanAdmittedVersions(rows *sql.Rows) ([]AdmissionPin, error) {
 	var out []AdmissionPin
 	for rows.Next() {
 		var p AdmissionPin
-		if err := rows.Scan(&p.PkgType, &p.PkgName, &p.PkgVersion); err != nil {
+		if err := rows.Scan(&p.PkgType, &p.PkgName, &p.PkgVersion, &p.ObjectKey); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -435,7 +460,7 @@ func buildAdmissionQuery(f AdmissionFilter, ph func(int) string, since func(time
 		args  []any
 	)
 	for _, c := range []struct{ col, val string }{
-		{"pkg_type", f.PkgType}, {"pkg_name", f.PkgName}, {"pkg_version", f.PkgVersion},
+		{"pkg_type", f.PkgType}, {"pkg_name", f.PkgName}, {"pkg_version", f.PkgVersion}, {"object_key", f.ObjectKey},
 	} {
 		if c.val == "" {
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -207,5 +208,60 @@ func TestPinAdmissionOnAWriteOnlySink(t *testing.T) {
 	}
 	if _, err := db.Admissions(context.Background(), AdmissionFilter{}); !IsUnqueryable(err) {
 		t.Errorf("Admissions on a write-only sink = %v, want the unqueryable refusal", err)
+	}
+}
+
+// A row with no version is listed once per object key it was pinned under,
+// so a distfile and each of two binaries sharing (binary, tool, "") come back
+// as targets of their own. A row with neither a version nor a key decided
+// about the package, not about any object, and is left out.
+func TestAdmittedVersionsListsUnversionedObjectsByKey(t *testing.T) {
+	for name, open := range admissionStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db := open(t)
+			t0 := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+			rows := []Admission{
+				{PkgType: "distfiles", PkgName: "zsh-5.9.tar.xz", ObjectKey: "distfiles/zsh-5.9.tar.xz"},
+				{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-linux.tgz"},
+				{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-darwin.tgz"},
+				{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-darwin.tgz"},
+				{PkgType: "binary", PkgName: "tool"},
+				{PkgType: "binary", PkgName: "tool", PkgVersion: "1.0.0"},
+			}
+			for i, r := range rows {
+				r.Decision = AdmissionAdmitted
+				r.DecidedAt = t0.Add(time.Duration(i) * time.Minute)
+				r.Checks = []AdmissionCheck{{Check: CheckAllowList, Action: ActionNone, Status: CheckPass}}
+				if err := db.RecordAdmission(ctx, r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := db.AdmittedVersions(ctx, AdmissionFilter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []AdmissionPin{
+				{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-darwin.tgz"},
+				{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-linux.tgz"},
+				{PkgType: "binary", PkgName: "tool", PkgVersion: "1.0.0"},
+				{PkgType: "distfiles", PkgName: "zsh-5.9.tar.xz", ObjectKey: "distfiles/zsh-5.9.tar.xz"},
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("AdmittedVersions = %+v, want %+v", got, want)
+			}
+			if got, err := db.AdmittedVersions(ctx, AdmissionFilter{PkgType: "binary", PkgVersion: "1.0.0"}); err != nil ||
+				!slices.Equal(got, want[2:3]) {
+				t.Errorf("AdmittedVersions(binary@1.0.0) = %+v (%v), want only the version", got, err)
+			}
+			if got, err := db.AdmittedVersions(ctx, AdmissionFilter{PkgType: "binary", ObjectKey: "binaries/tool/tool-linux.tgz"}); err != nil ||
+				!slices.Equal(got, want[1:2]) {
+				t.Errorf("AdmittedVersions(tool-linux.tgz) = %+v (%v), want only that object", got, err)
+			}
+			byKey, err := db.Admissions(ctx, AdmissionFilter{PkgType: "binary", PkgName: "tool", ObjectKey: "binaries/tool/tool-darwin.tgz", Limit: 1})
+			if err != nil || len(byKey) != 1 || byKey[0].ObjectKey != "binaries/tool/tool-darwin.tgz" {
+				t.Errorf("Admissions(tool-darwin.tgz) = %+v (%v), want the newest row at that key", byKey, err)
+			}
+		})
 	}
 }

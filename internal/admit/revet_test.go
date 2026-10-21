@@ -554,3 +554,177 @@ func TestRevetIgnoresAnOriginRecordedForOtherBytes(t *testing.T) {
 		t.Errorf("notes = %v, want the upstream reported unknown", o.Notes)
 	}
 }
+
+// unversionedObject is a proxy-cached object whose key names no version, the
+// upstream it was fetched from, and what a re-vet against a list naming only
+// good.example.com decides about it.
+type unversionedObject struct {
+	key, origin, decision string
+}
+
+// cacheUnversionedFill records what a distfiles or binary fill of a key
+// naming no version leaves behind: the object, its sha256, an admitted row of
+// (type, name, "") pinned under the key, and the upstream it came from.
+func (f revetFixture) cacheUnversionedFill(t *testing.T, typ, name string, o unversionedObject) {
+	t.Helper()
+	ctx := t.Context()
+	if err := f.objects.Put(ctx, o.key, []byte("bytes of "+o.key)); err != nil {
+		t.Fatal(err)
+	}
+	notRun := "not run: a " + typ + " proxy fill names no version the age and OSV checks can evaluate"
+	if err := f.adb.RecordAdmission(ctx, audit.Admission{
+		PkgType: typ, PkgName: name, ObjectKey: o.key,
+		Decision: audit.AdmissionAdmitted, DecidedAt: time.Now().Add(-20 * 24 * time.Hour),
+		Checks: []audit.AdmissionCheck{
+			AllowListCheck(true, o.origin, nil),
+			{Check: audit.CheckAge, Action: audit.ActionNone, Status: audit.CheckNotEvaluated, Detail: notRun},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.StoreChecksum(ctx, o.key, typ, name, "", "sha256", strings.Repeat("cd", 32), "computed"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.objects.GetStream(ctx, o.key)
+	if err != nil || res == nil {
+		t.Fatalf("open cached object: %v", err)
+	}
+	_ = res.Body.Close()
+	if err := f.adb.StoreCacheOrigin(ctx, o.key, o.origin, StreamIdentity(f.objects, res)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A distfile or binary whose key names no version is a re-vet target of its
+// own, identified by its key, since siblings under one name share (type,
+// name, ""). It is ruled on by the allow-list against the upstream recorded
+// for it and nothing else, and refusing one leaves its sibling admitted.
+func TestRevetUnversionedObjectRerunsAllowListPerKey(t *testing.T) {
+	cases := []struct {
+		name, typ, pkg, pattern string
+		objects                 []unversionedObject
+	}{
+		{"distfile", manifest.TypeDistfiles, "zsh-5.9.tar.xz", "good.example.com", []unversionedObject{
+			{manifest.DistfilesKey("zsh-5.9.tar.xz"), "https://evil.example.com/zsh-5.9.tar.xz", audit.AdmissionPolicyBlocked},
+		}},
+		{"two binaries under one name", manifest.TypeBinary, "tool", "https://good.example.com/", []unversionedObject{
+			{manifest.BinaryKey("tool", "", "tool-darwin.tgz"), "https://good.example.com/tool-darwin.tgz", audit.AdmissionAdmitted},
+			{manifest.BinaryKey("tool", "", "tool-linux.tgz"), "https://evil.example.com/tool-linux.tgz", audit.AdmissionPolicyBlocked},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRevetFixture(t, manifest.VersionEntry{})
+			for _, o := range c.objects {
+				f.cacheUnversionedFill(t, c.typ, c.pkg, o)
+			}
+			if err := f.adb.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "r1", RegistryType: c.typ,
+				RuleKind: policy.RuleKindForType(c.typ), Pattern: c.pattern}); err != nil {
+				t.Fatal(err)
+			}
+			ring, err := attestsign.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer := ring.Signer()
+			rv := f.revetter(config.RevetReport)
+			rv.Allow = policy.NewChecker(f.adb)
+			rv.Stores = storage.NewSingle(f.objects)
+			rv.Emitter = &attest.Emitter{Signer: func() attestsign.Signer { return signer }, Admissions: f.adb, PlatformID: "bodega://test"}
+
+			targets, err := rv.Targets(t.Context(), RevetFilter{Type: c.typ, Name: c.pkg})
+			var want []RevetTarget
+			for _, o := range c.objects {
+				want = append(want, RevetTarget{Type: c.typ, Name: c.pkg, ObjectKey: o.key})
+			}
+			if err != nil || !slices.Equal(targets, want) {
+				t.Fatalf("targets = %+v (%v), want %+v", targets, err, want)
+			}
+			if got, err := rv.Targets(t.Context(), RevetFilter{Type: c.typ, Name: c.pkg, Version: "5.9"}); len(got) != 0 {
+				t.Errorf("a --version filter selected %+v (%v), want no unversioned object", got, err)
+			}
+
+			for i, o := range c.objects {
+				out := rv.One(t.Context(), targets[i], "schedule")
+				if out.Error != "" || out.Decision != o.decision || out.ObjectKey != o.key {
+					t.Fatalf("%s: outcome = %+v, want %s", o.key, out, o.decision)
+				}
+				rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: c.typ, PkgName: c.pkg, ObjectKey: o.key})
+				if err != nil || len(rows) != 2 || rows[0].Actor != RevetActor || rows[0].ObjectKey != o.key ||
+					rows[0].PkgVersion != "" || rows[0].Decision != o.decision {
+					t.Fatalf("%s: rows = %+v (%v), want the re-vet's beside the fill's, pinned to its own key", o.key, rows, err)
+				}
+				for _, ch := range rows[0].Checks {
+					if ch.Check == audit.CheckAllowList {
+						continue
+					}
+					if ch.Status != audit.CheckNotEvaluated || ch.Detail != noVersionInKey {
+						t.Errorf("%s: %s = %+v, want not_evaluated: %s", o.key, ch.Check, ch, noVersionInKey)
+					}
+				}
+				if o.decision != audit.AdmissionPolicyBlocked {
+					if len(out.Notes) != 0 || out.Action != RevetNone {
+						t.Errorf("%s: outcome = %+v, want a clean pass", o.key, out)
+					}
+					continue
+				}
+				if out.Action != RevetReported || !slices.Contains(out.Notes, noCatalogEntry) {
+					t.Errorf("%s: outcome = %+v, want reported with %q", o.key, out, noCatalogEntry)
+				}
+				if len(out.Failing) != 1 || out.Failing[0].Check != audit.CheckAllowList || !strings.Contains(out.Failing[0].Detail, o.origin) {
+					t.Errorf("%s: failing = %+v, want the allow-list naming %s", o.key, out.Failing, o.origin)
+				}
+				if len(out.Envelopes) != 1 {
+					t.Errorf("%s: envelopes = %v (%v), want the revocation", o.key, out.Envelopes, out.Notes)
+				}
+				evs, err := f.adb.Query(t.Context(), audit.Filter{EventType: audit.EventRevet, PkgName: c.pkg})
+				if err != nil || !slices.ContainsFunc(evs, func(e audit.StoredEvent) bool { return strings.Contains(e.Details, o.key) }) {
+					t.Errorf("%s: revet events = %+v (%v), want one naming the key", o.key, evs, err)
+				}
+			}
+		})
+	}
+}
+
+// A hosted entry was uploaded, so like its admission the re-vet finds no
+// upstream to rule on and says only that, not that something went missing.
+func TestRevetHostedEntryWithNoURLNamesNoUpstream(t *testing.T) {
+	f := newRevetFixture(t, manifest.VersionEntry{})
+	f.osv.action = policy.ActionPass
+	ctx := t.Context()
+	if err := f.store.AddVersion(ctx, manifest.TypeBinary, "tool", manifest.VersionEntry{Version: "1.0.0", Mode: manifest.ModeHosted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.objects.Put(ctx, binaryKey, []byte("uploaded bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.RecordAdmission(ctx, audit.Admission{
+		PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0", ObjectKey: binaryKey,
+		Decision: audit.AdmissionAdmitted, DecidedAt: time.Now().Add(-20 * 24 * time.Hour),
+		Checks: []audit.AdmissionCheck{AllowListCheck(true, "", nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.InsertPolicy(ctx, audit.PolicyInfo{ID: "r1", RegistryType: manifest.TypeBinary,
+		RuleKind: policy.RuleKindForType(manifest.TypeBinary), Pattern: "https://good.example.com/"}); err != nil {
+		t.Fatal(err)
+	}
+	rv := f.revetter(config.RevetReport)
+	rv.Allow = policy.NewChecker(f.adb)
+	rv.Stores = storage.NewSingle(f.objects)
+
+	o := rv.One(ctx, RevetTarget{Type: manifest.TypeBinary, Name: "tool", Version: "1.0.0"}, "schedule")
+	if o.Error != "" || o.Decision != audit.AdmissionAdmitted {
+		t.Fatalf("outcome = %+v", o)
+	}
+	if len(o.Notes) != 0 {
+		t.Errorf("notes = %v, want none", o.Notes)
+	}
+	rows, err := f.adb.Admissions(ctx, audit.AdmissionFilter{PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0"})
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = %+v (%v)", rows, err)
+	}
+	if c := checkOf(t, rows[0], audit.CheckAllowList); c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "names no upstream") {
+		t.Errorf("allow-list = %+v, want not_evaluated naming no upstream", c)
+	}
+}

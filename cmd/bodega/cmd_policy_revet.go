@@ -47,10 +47,15 @@ catalog entry to hide: it is reported, and its envelope still revokes it.
 Under hide, such a version, or one whose hide failed, also makes the run
 exit non-zero, since it is still served; under report none does.
 
-For a helm, binary or apt version the proxy cached, whose catalog entry
-names no upstream, the allow-list is re-run against the upstream recorded
-when the object was cached. With none recorded, the allow-list entry is
-not_evaluated and the outcome notes that the upstream is unknown.
+For a helm, binary, apt or distfiles version the proxy cached, whose
+catalog entry names no upstream, the allow-list is re-run against the
+upstream recorded when the object was cached. With none recorded, the
+allow-list entry is not_evaluated and the outcome notes that the upstream
+is unknown.
+
+A distfile or binary object whose key names no version is re-vetted per
+cached object, with its key in the VERSION column. It is ruled on by the
+allow-list alone, as its fill was, and --version never selects it.
 
 With an attestation key installed, each refusal of a pinned object signs
 a new envelope whose policy evaluations record the block, and a pass that
@@ -128,7 +133,7 @@ user the server runs as so it can read the key.
 				sum.Walked, sum.Admitted, sum.Blocked, sum.Hidden, sum.Frozen, sum.Errors)
 			for _, o := range outcomes {
 				if o.Blocked() && o.Action != admit.RevetHidden && o.Action != admit.RevetAlreadyHidden {
-					fmt.Fprintf(os.Stderr, "WARN: %s/%s@%s is refused and still served (%s)\n", o.Type, o.Name, o.Version, o.Action)
+					fmt.Fprintf(os.Stderr, "WARN: %s/%s@%s is refused and still served (%s)\n", o.Type, o.Name, revetVersion(o), o.Action)
 				}
 			}
 			if sum.Hidden == 0 {
@@ -151,7 +156,7 @@ user the server runs as so it can read the key.
 	}
 	cmd.Flags().StringVar(&f.Type, "type", "", "Restrict the walk to one registry type")
 	cmd.Flags().StringVar(&f.Name, "name", "", "Restrict the walk to one package name")
-	cmd.Flags().StringVar(&f.Version, "version", "", "Restrict the walk to one version (or git ref)")
+	cmd.Flags().StringVar(&f.Version, "version", "", "Restrict the walk to one version (or git ref); excludes objects whose key names no version")
 	cmd.Flags().StringVar(&olderThan, "older-than", "", "Only versions whose newest decision is older than this (e.g. 7d, 72h)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Print each outcome as JSON")
 	return cmd
@@ -212,8 +217,17 @@ func printRevet(outcomes []admit.RevetOutcome) error {
 		for _, e := range o.Envelopes {
 			detail = append(detail, "signed "+e)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.Type, o.Name, o.Version,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.Type, o.Name, revetVersion(o),
 			dash(o.Previous), dash(o.Decision), dash(o.Action), strings.Join(detail, "; "))
 	}
 	return w.Flush()
+}
+
+// revetVersion is what the VERSION column shows: the version, or for an
+// object whose key names none, the key, so sibling files are told apart.
+func revetVersion(o admit.RevetOutcome) string {
+	if o.ObjectKey != "" {
+		return o.ObjectKey
+	}
+	return o.Version
 }

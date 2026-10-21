@@ -273,3 +273,43 @@ func admissionsOf(t *testing.T, s *Server) []audit.Admission {
 	}
 	return rows
 }
+
+// An open-mode namespaced binary names no version, so its fill records a row
+// of (binary, <namespace>/<rest>, "") pinned to the object and the upstream
+// that supplied it. After the allow-list is narrowed past that upstream, the
+// server's own revetter finds the object as a target and refuses it, reading
+// back exactly what the fill left.
+func TestRevetRefusesAnUnversionedBinaryFillOutsideANarrowedList(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/dl/tool-linux.tgz", "tool bytes")
+	s.cfg.BinaryUpstreams = map[string]config.BinaryUpstream{
+		"acme": {URL: up.ts.URL + "/dl/", Mode: config.UpstreamModeOpen},
+	}
+	seedBinaryPolicy(t, s, up.ts.URL+"/dl/")
+
+	if status, body := getStatusAndBody(t, s, "/binaries/acme/tool-linux.tgz"); status != http.StatusOK {
+		t.Fatalf("fill = %d, want 200 (%s); upstream saw %v", status, body, up.paths())
+	}
+	if !up.sawPath("/dl/tool-linux.tgz") {
+		t.Fatalf("upstream saw %v, want the fill to reach it", up.paths())
+	}
+
+	if _, err := s.auditDB.DeletePolicyByID(t.Context(), "test-"+up.ts.URL+"/dl/"); err != nil {
+		t.Fatal(err)
+	}
+	seedBinaryPolicy(t, s, "https://good.example.com/")
+
+	targets, err := s.revet.rv.Targets(t.Context(), admit.RevetFilter{Type: manifest.TypeBinary})
+	const key = manifest.BinaryPrefix + "acme/tool-linux.tgz"
+	if err != nil || len(targets) != 1 || targets[0].ObjectKey != key || targets[0].Version != "" {
+		t.Fatalf("targets = %+v (%v), want the filled object by its key", targets, err)
+	}
+	o := s.revet.rv.One(t.Context(), targets[0], "schedule")
+	if o.Error != "" || o.Decision != audit.AdmissionPolicyBlocked || o.Action != admit.RevetReported || o.ObjectKey != key {
+		t.Fatalf("outcome = %+v, want policy_blocked and reported for %s", o, key)
+	}
+	if len(o.Failing) != 1 || o.Failing[0].Check != audit.CheckAllowList || !strings.Contains(o.Failing[0].Detail, up.ts.URL) {
+		t.Errorf("failing = %+v, want the allow-list naming the recorded upstream %s", o.Failing, up.ts.URL)
+	}
+}

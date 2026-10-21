@@ -2932,7 +2932,9 @@ Admission decides once. A version that passed OSV a month ago may have an adviso
 
 It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware) and [upstream provenance](#bodega-policy-provenance-setlist). The publish-age gate is skipped, because a version only gets older. The age verdict the last decision recorded is carried into the new row, labeled `not re-run, carried from the decision of <time>`; a version with no earlier age verdict records `not_evaluated`.
 
-The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary or apt version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`.
+The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary, apt or distfiles version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`. A `hosted` catalog entry was uploaded rather than fetched, so like its admission it records the allow-list as `not_evaluated` with `the entry names no upstream the allow-list can rule on`, and no note.
+
+**Objects whose key names no version** (a distfile, a binary at `binaries/<name>/<file>`, an open-mode namespaced binary whose path is not `<name>/<version>/<file>`) are re-vetted per cached object, not per version: several files can share one name and an empty version, so each object key is its own target, and the VERSION column and the `object_key` field of `--json` show the key. The fill admitted such an object on the allow-list alone, so that is all the re-vet rules on: the allow-list against the upstream recorded for that object, with every per-version check `not_evaluated` and the detail `not re-run: the object's key names no version the per-version checks can evaluate`. A refusal is reported and revoked like any proxy-cached version's. `--version` never selects one; `--type` and `--name` do.
 
 Each version gets a **new** admission row beside the old one, with actor `revet` and the trigger as its identity: the operator's name for this command, `schedule` for the [scheduled re-vet](#scheduled-re-vet), `webhook` for the [webhook](#re-vet-webhook). The old row is kept, so `bodega audit admissions <type> <name> <version>` reads as the history of what bodega concluded and when. The new row carries the object key the previous decision was pinned under, one row per key for a pypi release with several wheels.
 
@@ -2949,7 +2951,7 @@ WARN: npm/minimist@1.2.5 is refused and still served (reported)
 | -------------- | ------------------------------------------------------------------------------------------- |
 | `--type`       | One registry type                                                                           |
 | `--name`       | One package, spelled as anywhere else (`@types/node`, `github.com/spf13/cobra`)             |
-| `--version`    | One version, or a git entry's ref                                                           |
+| `--version`    | One version, or a git entry's ref; never selects an object whose key names no version       |
 | `--older-than` | Only versions whose newest decision is older than this (`7d`, `72h`); none on record counts |
 | `--json`       | One object per version: the decisions, the failing checks, signed envelopes and notes       |
 
@@ -3021,7 +3023,7 @@ The route is exempt from `admin_permit_cidr` and takes no bearer token. It is au
 }
 ```
 
-`version` is optional; without it every admitted version of the package is re-vetted. `reason` is free text, truncated to 512 bytes, written to the journal and to a `revet` audit event with status `requested`.
+`version` is optional; without it every admitted version of the package is re-vetted, along with each of its cached objects whose key names no version. With it, none of those objects is. `reason` is free text, truncated to 512 bytes, written to the journal and to a `revet` audit event with status `requested`.
 
 Compute the signature over the exact bytes you send:
 

@@ -553,7 +553,10 @@ defence against:
   frozen version is never hidden under either setting. Neither is a version
   served only from the proxy cache: it is re-vetted, reported and revoked on
   the same schedule, but has no catalog entry to hide, so it stays served
-  until an operator imports and hides it or refuses the package. The webhook narrows the
+  until an operator imports and hides it or refuses the package. A cached
+  object whose key names no version, a distfile or an unversioned binary, is
+  re-vetted per object key on the allow-list alone, so a narrowed list reports
+  and revokes it, and no advisory reaches it. The webhook narrows the
   window to the feed's own latency, and only for the packages the feed names.
   See
   [`bodega policy revet`](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
