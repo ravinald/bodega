@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +53,9 @@ type VersionCheck struct {
 	// records it as an error under the action rather than skipping.
 	buildErr error
 	now      func() time.Time
+	// held is the error a Prefetch got for each purl. It lives on this copy
+	// only, so it lasts one admission and never reaches the answer cache.
+	held map[string]error
 }
 
 // Instance is the configured instance this check runs.
@@ -147,6 +151,9 @@ func (c *VersionCheck) lookup(ctx context.Context, q Query) (Answer, error) {
 	if a, ok := c.cache.get(key, c.now()); ok {
 		return a, nil
 	}
+	if err, ok := c.held[key]; ok {
+		return Answer{}, err
+	}
 	if err := c.prepare(ctx, q.Ecosystem); err != nil {
 		return Answer{}, err
 	}
@@ -154,15 +161,85 @@ func (c *VersionCheck) lookup(ctx context.Context, q Query) (Answer, error) {
 	defer cancel()
 	a, err := c.impl.Lookup(ctx, q)
 	if err != nil {
-		if ctx.Err() != nil && !errors.Is(err, context.DeadlineExceeded) {
-			err = fmt.Errorf("%w: %v", ctx.Err(), err)
-		}
-		return Answer{}, err
+		return Answer{}, withDeadline(ctx, err)
 	}
 	// Only answers are cached. An error is retried on the next admission,
 	// so an outage ends when the vendor is back rather than when a TTL does.
 	c.cache.put(key, a, c.now().Add(c.inst.Duration(KeyCacheTTL)))
 	return a, nil
+}
+
+// withDeadline names the context's end in a lookup error that does not
+// already say it, so a timeout reads as one.
+func withDeadline(ctx context.Context, err error) error {
+	if ctx.Err() != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ctx.Err(), err)
+	}
+	return err
+}
+
+// Prefetch asks a BatchChecker about every version of pm that Check would
+// send it, in as few requests as its batch limit allows, so the per-version
+// Check that follows reads the answers from the cache. A vendor that meters
+// requests then charges one request per admission rather than one per
+// version. Any other type, or an instance that did not build, sends nothing
+// here and is asked by Check as before.
+func (c *VersionCheck) Prefetch(ctx context.Context, pm *manifest.PackageManifest) {
+	bc, ok := c.impl.(BatchChecker)
+	if !ok || c.buildErr != nil || !c.inst.Descriptor.Covers(pm.Type) {
+		return
+	}
+	now := c.now()
+	seen := map[string]bool{}
+	var qs []Query
+	for _, ve := range pm.Versions {
+		version := strings.TrimSpace(ve.Version)
+		if version == "" || version == "*" {
+			continue
+		}
+		q := Query{Ecosystem: pm.Type, Name: pm.Name, Version: version}
+		key := q.PURL()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, ok := c.cache.get(key, now); !ok {
+			qs = append(qs, q)
+		}
+	}
+	if len(qs) == 0 {
+		return
+	}
+	c.held = map[string]error{}
+	if err := c.prepare(ctx, pm.Type); err != nil {
+		for _, q := range qs {
+			c.held[q.PURL()] = err
+		}
+		return
+	}
+	limit := max(bc.BatchLimit(), 1)
+	for chunk := range slices.Chunk(qs, limit) {
+		c.prefetchChunk(ctx, bc, chunk)
+	}
+}
+
+func (c *VersionCheck) prefetchChunk(ctx context.Context, bc BatchChecker, qs []Query) {
+	ctx, cancel := context.WithTimeout(ctx, c.inst.Duration(KeyTimeout))
+	defer cancel()
+	got := bc.LookupBatch(ctx, qs)
+	expires := c.now().Add(c.inst.Duration(KeyCacheTTL))
+	for _, q := range qs {
+		key := q.PURL()
+		r, ok := got[key]
+		switch {
+		case !ok:
+			c.held[key] = fmt.Errorf("%s returned no answer for %s", c.inst.Descriptor.DisplayName, key)
+		case r.Err != nil:
+			c.held[key] = withDeadline(ctx, r.Err)
+		default:
+			c.cache.put(key, r.Answer, expires)
+		}
+	}
 }
 
 type cachedAnswer struct {

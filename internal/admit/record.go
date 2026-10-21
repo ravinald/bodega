@@ -196,6 +196,13 @@ func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Re
 	return r
 }
 
+// prefetcher is a checker that can ask about every version of an admission
+// before the per-version loop does: an integration whose vendor charges per
+// request rather than per version.
+type prefetcher interface {
+	Prefetch(ctx context.Context, pm *manifest.PackageManifest)
+}
+
 // committer is a checker that holds a write back until the admission it
 // judged is decided: the upstream provenance check's trust-on-first-use pin.
 type committer interface {

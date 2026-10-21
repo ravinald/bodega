@@ -554,3 +554,70 @@ func TestStateDir(t *testing.T) {
 		t.Errorf("Build with no log_dir: StateDir = %q", got)
 	}
 }
+
+// batchDouble answers many queries in one call, counting both kinds of call.
+type batchDouble struct{}
+
+var batchCalls, batchSingleLookups atomic.Int64
+
+func (batchDouble) Lookup(context.Context, Query) (Answer, error) {
+	batchSingleLookups.Add(1)
+	return Answer{Reason: "single"}, nil
+}
+
+func (batchDouble) BatchLimit() int { return 10 }
+
+func (batchDouble) LookupBatch(_ context.Context, qs []Query) map[string]BatchResult {
+	batchCalls.Add(1)
+	out := map[string]BatchResult{}
+	for _, q := range qs {
+		out[q.PURL()] = BatchResult{Answer: Answer{Reason: "batched"}}
+	}
+	return out
+}
+
+func init() {
+	Register(Descriptor{
+		Type: "batch-double", DisplayName: "Batch double", VendorURL: "https://example.test/", Cost: CostFree,
+		Ecosystems: []string{manifest.TypeCargo}, DataSent: "Nothing.", DefaultAction: policy.ActionWarn, Flags: FlagRisk,
+		Probe: Query{Ecosystem: manifest.TypeCargo, Name: "serde", Version: "1.0.0"},
+		New:   func(*Instance) (Checker, error) { return batchDouble{}, nil },
+	})
+}
+
+// Prefetch then Check asks a Checker once per version and a BatchChecker
+// once for all of them.
+func TestPrefetchBatchesOnlyBatchCheckers(t *testing.T) {
+	t.Setenv("BODEGA_PLAIN_API_TOKEN", "sk")
+	pm := &manifest.PackageManifest{Type: manifest.TypeCargo, Name: "serde",
+		Versions: []manifest.VersionEntry{{Version: "1.0.0"}, {Version: "1.0.1"}, {Version: "1.0.2"}}}
+	ctx := context.Background()
+
+	before := probeLookups.Load()
+	plain := Build("plain", entry("enabled", true), "", nil)
+	plain.Prefetch(ctx, pm)
+	if n := probeLookups.Load() - before; n != 0 {
+		t.Errorf("Prefetch on a plain Checker made %d lookups", n)
+	}
+	for i := range pm.Versions {
+		plain.Check(ctx, pm, &pm.Versions[i])
+	}
+	if n := probeLookups.Load() - before; n != 3 {
+		t.Errorf("plain Checker: %d lookups for 3 versions, want 3", n)
+	}
+
+	batches, singles := batchCalls.Load(), batchSingleLookups.Load()
+	batched := Build("batched", config.Integration{"type": "batch-double", "enabled": true}, "", nil)
+	batched.Prefetch(ctx, pm)
+	for i := range pm.Versions {
+		if r := batched.Check(ctx, pm, &pm.Versions[i]); !strings.Contains(r.Reason, "batched") {
+			t.Errorf("%s: %+v", pm.Versions[i].Version, r)
+		}
+	}
+	if n := batchCalls.Load() - batches; n != 1 {
+		t.Errorf("BatchChecker: %d batch calls, want 1", n)
+	}
+	if n := batchSingleLookups.Load() - singles; n != 0 {
+		t.Errorf("BatchChecker: %d single lookups, want 0", n)
+	}
+}
