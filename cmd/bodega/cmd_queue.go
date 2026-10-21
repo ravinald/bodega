@@ -161,6 +161,8 @@ func newQueueApproveCmd(gf *globalFlags) *cobra.Command {
 	}
 	c.Flags().StringVar(&a.Reason, "reason", "", "why, for the audit trail (required)")
 	c.Flags().StringVar(&a.Expires, "expires", "", "how long the override this requests applies, counted from the request rather than its approval, e.g. 7d; defaults to override_max_ttl")
+	c.Flags().StringVar(&a.ConfirmNearPopular, "confirm-near-popular", "",
+		"the popular package an allow-list row's exact name sits near, repeated to approve the rule anyway")
 	c.Flags().BoolVar(&asJSON, "json", false, "print the resolution as JSON")
 	_ = c.MarkFlagRequired("reason")
 	return c
