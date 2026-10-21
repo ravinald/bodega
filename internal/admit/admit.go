@@ -559,6 +559,11 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		}
 		return nil
 	}
+	for _, c := range checkers {
+		if p, ok := c.(prefetcher); ok {
+			p.Prefetch(ctx, pm)
+		}
+	}
 	for i := range pm.Versions {
 		if blocked := decide(i, ev.runVersion(ctx, pm, i, checkers)); blocked != nil {
 			return blocked
