@@ -39,6 +39,15 @@ func checkAptSources(root, goos string) Finding {
 		f.Detail = "apt is Linux-only; check not applicable on this platform"
 		return f
 	}
+	if _, err := os.Stat(filepath.Join(root, "/etc/apt")); errors.Is(err, fs.ErrNotExist) {
+		f.Status = StatusNA
+		f.Detail = "/etc/apt is absent; apt is not installed on this host"
+		return f
+	} else if err != nil {
+		f.Status = StatusSkip
+		f.Detail = "could not inspect /etc/apt: " + err.Error()
+		return f
+	}
 
 	dir := filepath.Join(root, "/etc/apt/sources.list.d")
 	paths := []string{filepath.Join(root, "/etc/apt/sources.list")}

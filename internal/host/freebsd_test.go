@@ -620,6 +620,25 @@ func TestMakeConfSitesComeFromTheRenderer(t *testing.T) {
 	}
 }
 
+func TestAptSourcesNAWithoutApt(t *testing.T) {
+	assertFinding(t, checkAptSources(t.TempDir(), "linux"), StatusNA, "/etc/apt")
+
+	// <root>/etc is a regular file, so stat of <root>/etc/apt fails with
+	// ENOTDIR, which is not fs.ErrNotExist: the check measured nothing.
+	notDir := writeTree(t, map[string]string{"/etc": "not a directory\n"})
+	assertFinding(t, checkAptSources(notDir, "linux"), StatusSkip, "/etc/apt", "not a directory")
+
+	empty := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(empty, "etc", "apt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, checkAptSources(empty, "linux"), StatusOK)
+
+	public := writeTree(t, map[string]string{"/etc/apt/sources.list": "deb http://deb.debian.org/debian bookworm main\n"})
+	assertFinding(t, checkAptSources(public, "linux"), StatusWarn, "deb.debian.org")
+	assertFinding(t, checkAptSources(public, "darwin"), StatusNA)
+}
+
 func TestChecksAgainstFixtureRootPerOS(t *testing.T) {
 	tree := map[string]string{
 		"/etc/apt/sources.list.d/ubuntu.sources": "URIs: http://archive.ubuntu.com/ubuntu\n",
