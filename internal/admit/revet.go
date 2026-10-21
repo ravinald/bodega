@@ -15,6 +15,7 @@ import (
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/integration"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -106,7 +107,8 @@ func (s *RevetSummary) Add(o RevetOutcome) {
 
 // Revetter re-runs admission over versions already admitted, whether into the
 // catalog or into the proxy cache: the
-// allow-list, OSV and upstream provenance. The publish-age gate is re-run only
+// allow-list, OSV, upstream provenance and each enabled integration instance
+// whose revet field is on. The publish-age gate is re-run only
 // when the last decision recorded it failing, since a verdict that passed
 // only improves as a version gets older; see carriedAge. Each version
 // gets a new admission row beside the old one, so the table reads as the
@@ -143,10 +145,22 @@ type Revetter struct {
 	serial sync.Mutex
 }
 
-// RevetCheckers are the per-version checks a re-vet runs: VersionCheckers
-// without the age gate.
+// RevetCheckers are the per-version checks a re-vet runs: OSV, upstream
+// provenance and each enabled integration instance in name order, the last
+// built by integration.Checks so a re-vet and an admission in one process
+// share an instance, its answer cache and its quota.
 func RevetCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
-	return []policy.VersionChecker{OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb)}
+	var store integration.Store
+	if adb != nil {
+		store = adb
+	}
+	out := []policy.VersionChecker{OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb)}
+	if cfg != nil {
+		for _, c := range integration.Checks(cfg.Integrations, cfg.LogDir, store) {
+			out = append(out, c.ForRevet())
+		}
+	}
+	return out
 }
 
 // ErrNoRevetTargets is Targets finding nothing the filter names.
@@ -320,6 +334,8 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	cp := *pm
 	cp.Versions = []manifest.VersionEntry{ve}
 	ev := newEvaluation(ctx, r.DB, &cp, r.now())
+	checkers := r.checkers()
+	ev.include(ctx, &cp, checkers)
 	allow := r.allowList(ctx, &out, &cp, cataloged, prev)
 	if c, ok := ev.admitPast(&cp, 0, allow); ok {
 		allow = c
@@ -342,10 +358,14 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 		// re-vet has to rule on.
 		ev.notRunChecks(0, noVersionInKey, ev.versionChecks...)
 	case blocked:
-		ev.notRunChecks(0, "not run: the allow-list refused this version", audit.CheckOSV, audit.CheckUpstreamProvenance)
+		ev.notRunChecks(0, "not run: the allow-list refused this version", ev.versionChecks...)
 	default:
-		checkers := r.checkers()
 		results := append(ageResults, ev.runVersion(ctx, &cp, 0, checkers)...)
+		for _, res := range results {
+			if msg, ok := res.Details[integration.RevetErrorKey].(string); ok {
+				out.Notes = append(out.Notes, res.Check+" could not be asked: "+msg)
+			}
+		}
 		combined := policy.Combine(results)
 		if !combined.Blocked() {
 			if changed := ev.commit(ctx, &cp, checkers); changed != nil {

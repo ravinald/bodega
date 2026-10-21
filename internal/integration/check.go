@@ -56,7 +56,22 @@ type VersionCheck struct {
 	// held is the error a Prefetch got for each purl. It lives on this copy
 	// only, so it lasts one admission and never reaches the answer cache.
 	held map[string]error
+	// revet asks as a re-vet does: an instance with revet off is not asked,
+	// and an error rules nothing, since the version was already admitted on
+	// evidence and an outage adds none.
+	revet bool
 }
+
+// ForRevet is this check as a re-vet runs it. It shares the instance's
+// answer cache and whatever quota state its type holds.
+func (c VersionCheck) ForRevet() *VersionCheck {
+	c.revet = true
+	return &c
+}
+
+// RevetErrorKey is the Details key a re-vet result carries the lookup error
+// under, so the re-vet can say which instance could not be asked.
+const RevetErrorKey = "revet_error"
 
 // Instance is the configured instance this check runs.
 func (c *VersionCheck) Instance() *Instance { return c.inst }
@@ -73,6 +88,11 @@ func (c *VersionCheck) ActionFor(ctx context.Context, ecosystem string) string {
 func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) policy.Result {
 	r := policy.Result{Check: c.CheckName(), Action: policy.ActionPass}
 	d := c.inst.Descriptor
+	if c.revet && c.buildErr == nil && !c.inst.Bool(KeyRevet) {
+		r.Action = policy.ActionNotEvaluated
+		r.Reason = "not re-run: revet is off for this instance"
+		return r
+	}
 	if !d.Covers(pm.Type) {
 		r.Action = policy.ActionNotEvaluated
 		r.Reason = fmt.Sprintf("%s covers %s, not %s", d.DisplayName, strings.Join(d.Ecosystems, ", "), pm.Type)
@@ -100,9 +120,15 @@ func (c *VersionCheck) Check(ctx context.Context, pm *manifest.PackageManifest, 
 		if c.store != nil {
 			_ = c.store.RecordIntegrationError(ctx, c.inst.Name, err.Error())
 		}
+		r.Details = map[string]any{"instance": c.inst.Name, "outcome": "error", "purl": q.PURL()}
+		if c.revet {
+			r.Action = policy.ActionNotEvaluated
+			r.Reason = "not re-run: " + err.Error()
+			r.Details[RevetErrorKey] = err.Error()
+			return r
+		}
 		r.Action = action
 		r.Reason = "error: " + err.Error()
-		r.Details = map[string]any{"instance": c.inst.Name, "outcome": "error", "purl": q.PURL()}
 	case a.Flagged:
 		r.Action = action
 		r.Reason = a.Reason
@@ -335,6 +361,11 @@ func Build(name string, raw config.Integration, logDir string, store Store) *Ver
 	return c
 }
 
+// Clock is what an instance built after it is set reads the time from: its
+// answer cache's expiry and whatever its type times itself, such as a list's
+// refresh. A test outside this package replaces it to move both at once.
+var Clock = time.Now
+
 func build(name string, raw config.Integration, logDir string) *VersionCheck {
 	inst, err := ValidateInstance(name, raw)
 	if err != nil {
@@ -344,11 +375,11 @@ func build(name string, raw config.Integration, logDir string) *VersionCheck {
 			d = &Descriptor{Type: t, DisplayName: name, DefaultAction: policy.ActionBlock}
 		}
 		return &VersionCheck{inst: &Instance{Name: name, Descriptor: d, StateDir: StateDir(logDir, name), values: map[string]any{}}, buildErr: err,
-			cache: &answerCache{}, now: time.Now}
+			cache: &answerCache{}, now: Clock}
 	}
 	inst.StateDir = StateDir(logDir, name)
 	impl, err := inst.Descriptor.New(inst)
-	return &VersionCheck{inst: inst, impl: impl, buildErr: err, cache: &answerCache{}, now: time.Now}
+	return &VersionCheck{inst: inst, impl: impl, buildErr: err, cache: &answerCache{}, now: Clock}
 }
 
 // RunTest makes one real query for the instance's probe package and writes

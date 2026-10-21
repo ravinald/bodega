@@ -2950,7 +2950,9 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 
 Admission decides once. A version that passed OSV a month ago may have an advisory today, and `bodega policy osv rescan` records that advisory without changing what is served. `revet` re-runs admission itself over versions already admitted and acts on the answer: every cataloged version, and every version the proxy cache admitted on a fill, which has an admission row and no catalog entry.
 
-It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware) and [upstream provenance](#bodega-policy-provenance-setlist). The publish-age gate runs only when the last decision recorded it failing. An age verdict of `pass` or `warn` is carried into the new row, labeled `not re-run, carried from the decision of <time>`, because a version that was old enough then is older now. An age verdict of `block`, `overridden` or `baseline` is re-run, because a version that failed the gate may since have aged past it, and an override or baseline mark it was admitted under may no longer apply: the row records `pass` once the version is old enough, `overridden` while an age override is active, `baseline` while the mark stands, and `block` otherwise, which refuses the version like any other failing check. A version with no earlier age verdict, or one recorded `not_evaluated`, records `not_evaluated`. Name similarity and [integrations](#integrations) are not re-run.
+It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-policy-osv-syncsetlistremoverescanmalware), [upstream provenance](#bodega-policy-provenance-setlist) and every enabled [integration](#integrations) instance whose `revet` field is on. The publish-age gate runs only when the last decision recorded it failing. An age verdict of `pass` or `warn` is carried into the new row, labeled `not re-run, carried from the decision of <time>`, because a version that was old enough then is older now. An age verdict of `block`, `overridden` or `baseline` is re-run, because a version that failed the gate may since have aged past it, and an override or baseline mark it was admitted under may no longer apply: the row records `pass` once the version is old enough, `overridden` while an age override is active, `baseline` while the mark stands, and `block` otherwise, which refuses the version like any other failing check. A version with no earlier age verdict, or one recorded `not_evaluated`, records `not_evaluated`. Name similarity is not re-run.
+
+An integration instance is asked on re-vet only when its [`revet`](#integrations) field is on, which by default it is for a `free` type and not for a `free-tier` or `paid` one; an instance with it off records `not_evaluated` with `not re-run: revet is off for this instance`. Re-vet asks through the instance admission uses in the same process, so it shares that instance's answer cache and its type's quota gate. A hit is decided as at admission: under `block` it refuses the version, and a `malware` type's hit is never overridden. An error is not: the version was admitted on evidence, and an outage or a rate limit adds none, so the entry records `not_evaluated` with `not re-run: <error>`, the decision follows the other checks, the outcome carries the note `integration:<instance> could not be asked: <error>`, and the error is stored as the instance's last error.
 
 The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary, apt or distfiles version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`. A `hosted` catalog entry was uploaded rather than fetched, so like its admission it records the allow-list as `not_evaluated` with `the entry names no upstream the allow-list can rule on`, and no note.
 
@@ -7588,12 +7590,13 @@ A descriptor states:
 | What a hit means     | `malware` (the version was published to do harm) or `risk` (the vendor judges it risky). A type must state one. One answer can lower a `malware` type's hit to `risk`, never raise a `risk` type's hit |
 | Fields               | Each with a key, label, help text, kind (`string`, `int`, `duration`, `bool`, `enum`, `url`), default, bounds, and a secret flag                                                                       |
 
-Every type also takes two fields the frame adds:
+Every type also takes three fields the frame adds:
 
-| Key         | Default | Meaning                                                                                                                           |
-| ----------- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_ttl` | `1h`    | How long an answer for one purl is reused. From `1m` to `7d`. Errors are never cached, so an outage ends when the vendor recovers |
-| `timeout`   | `10s`   | How long one query may take before it is recorded as an error. From `1s` to `5m`                                                  |
+| Key         | Default                                     | Meaning                                                                                                                                                                                                                                                         |
+| ----------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_ttl` | `1h`                                        | How long an answer for one purl is reused. From `1m` to `7d`. Errors are never cached, so an outage ends when the vendor recovers                                                                                                                               |
+| `timeout`   | `10s`                                       | How long one query may take before it is recorded as an error. From `1s` to `5m`                                                                                                                                                                                |
+| `revet`     | `true` for a `free` type, `false` otherwise | Ask the instance again on [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration). Each sweep asks it about every admitted version it covers that is not in its answer cache, so it is off by default for a metered type |
 
 An instance is one configured use of a type. Its name is lowercase letters, digits, `_` and `-`, at most 63 characters, and it is part of the check name the admission row records: `integration:<instance>`. Several instances of one type (two mirrors of a list, say) are separate checks.
 
@@ -7669,7 +7672,7 @@ bodega policy integration list
 | error: network, timeout, 5xx, rate limit, no list | warn          | block         | pass, recorded |
 | ecosystem not covered, or no concrete version     | not_evaluated | not_evaluated | not_evaluated  |
 
-An error takes the action, so under `block` an unreachable vendor refuses the version rather than admitting it unchecked. Each error is also stored as the instance's last error, which `bodega integration list` shows.
+At admission an error takes the action, so under `block` an unreachable vendor refuses the version rather than admitting it unchecked. On re-vet the error row does not apply: an error records `not_evaluated` and never refuses a version already admitted. Each error is also stored as the instance's last error, which `bodega integration list` shows.
 
 ### Admission
 
@@ -7679,7 +7682,7 @@ An [override](#bodega-override-requestapproverejectlist) or a [queue](#bodega-qu
 
 Each instance caches answers per purl (`pkg:npm/lodash@4.17.21`) for `cache_ttl`, in the process that asked. A changed entry starts with an empty cache.
 
-[Re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) does not run integrations yet: it re-checks OSV and upstream provenance only.
+[Re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) runs every enabled instance whose `revet` field is on, after OSV and upstream provenance, and names every enabled instance in its row. A hit refuses as at admission; an error records `not_evaluated` rather than taking the action.
 
 ### Shipped types
 

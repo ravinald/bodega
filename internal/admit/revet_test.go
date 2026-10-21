@@ -3,9 +3,14 @@ package admit
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +18,8 @@ import (
 	"github.com/ravinald/bodega/internal/attestsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/integration"
+	"github.com/ravinald/bodega/internal/integration/malwarelist"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -790,5 +797,192 @@ func TestRevetRerunsAgeAfterOverride(t *testing.T) {
 	age.action = policy.ActionPass
 	if out, c := revet(now.Add(10 * 24 * time.Hour)); out.Blocked() || c.Status != audit.CheckPass || strings.Contains(c.Detail, "not re-run") {
 		t.Errorf("(c) once aged past the minimum: %s, age %+v; want admitted, age re-run and passing", out.Decision, c)
+	}
+}
+
+// meterDouble is a metered type whose Lookup counts its calls per instance.
+type meterDouble struct{ inst *integration.Instance }
+
+var meterCalls sync.Map // instance name > *atomic.Int64
+
+func meterCount(instance string) int64 {
+	n, _ := meterCalls.LoadOrStore(instance, new(atomic.Int64))
+	return n.(*atomic.Int64).Load()
+}
+
+func (d meterDouble) Lookup(context.Context, integration.Query) (integration.Answer, error) {
+	n, _ := meterCalls.LoadOrStore(d.inst.Name, new(atomic.Int64))
+	n.(*atomic.Int64).Add(1)
+	if d.inst.String("verdict") == "error" {
+		return integration.Answer{}, errors.New("429 Too Many Requests")
+	}
+	return integration.Answer{}, nil
+}
+
+func init() {
+	integration.Register(integration.Descriptor{
+		Type: "revet-meter", DisplayName: "Revet meter", VendorURL: "https://example.test/", Cost: integration.CostFreeTier,
+		Ecosystems: []string{manifest.TypeNpm}, DataSent: "Nothing.", DefaultAction: policy.ActionBlock, Flags: integration.FlagRisk,
+		Fields: []integration.Field{{Key: "verdict", Label: "Verdict", Kind: integration.KindEnum, Default: "clean",
+			Options: []string{"clean", "error"}}},
+		New: func(inst *integration.Instance) (integration.Checker, error) { return meterDouble{inst}, nil },
+	})
+}
+
+// newIntegrationRevet catalogs npm/left-pad@1.3.0 with an admitted row from
+// a month ago and returns a revetter running RevetCheckers itself, with
+// integrations configured.
+func newIntegrationRevet(t *testing.T, integrations map[string]config.Integration) (*Revetter, admissionFixture) {
+	t.Helper()
+	f := newAdmissionFixture(t)
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeNpm, "left-pad", manifest.VersionEntry{Version: "1.3.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.adb.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeNpm, PkgName: "left-pad", PkgVersion: "1.3.0",
+		Decision: audit.AdmissionAdmitted, Actor: "ravi", DecidedAt: time.Now().Add(-30 * 24 * time.Hour),
+		Checks: []audit.AdmissionCheck{{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckPass}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := *f.synced
+	cfg.LogDir = t.TempDir()
+	cfg.Integrations = integrations
+	return &Revetter{Cfg: &cfg, DB: f.adb, Store: store, OnBlock: config.RevetReport}, f
+}
+
+var leftPad = RevetTarget{Type: manifest.TypeNpm, Name: "left-pad", Version: "1.3.0"}
+
+// newestRevetRow is the latest row a re-vet wrote for left-pad.
+func newestRevetRow(t *testing.T, f admissionFixture) audit.Admission {
+	t.Helper()
+	rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeNpm, PkgName: "left-pad"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newest audit.Admission
+	for _, r := range rows {
+		if r.Actor == RevetActor && (newest.Actor == "" || !r.DecidedAt.Before(newest.DecidedAt)) {
+			newest = r
+		}
+	}
+	if newest.Actor == "" {
+		t.Fatal("no re-vet row for left-pad")
+	}
+	return newest
+}
+
+// A version admitted while the malware list did not name it is refused by
+// the re-vet that runs after the list names it, once the instance's answer
+// cache and list refresh have both passed, and the refusal is unwaivable.
+func TestRevetRunsMalwareListAddedAfterAdmission(t *testing.T) {
+	var listed atomic.Bool
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if listed.Load() {
+			_, _ = w.Write([]byte(`[{"package_name":"left-pad","version":"1.3.0","reason":"MALWARE"}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"package_name":"zq-other","version":"1.0.0","reason":"MALWARE"}]`))
+	}))
+	defer list.Close()
+	now := time.Now()
+	integration.Clock = func() time.Time { return now }
+	t.Cleanup(func() { integration.Clock = time.Now })
+
+	r, f := newIntegrationRevet(t, map[string]config.Integration{
+		"revet-aikido": {"type": malwarelist.Type, "enabled": true, "url": list.URL}})
+	r.Now = func() time.Time { return now }
+	if o := r.One(t.Context(), leftPad, "schedule"); o.Decision != audit.AdmissionAdmitted || o.Error != "" {
+		t.Fatalf("before listing: %+v", o)
+	}
+	if c := checkOf(t, newestRevetRow(t, f), "integration:revet-aikido"); c.Status != audit.CheckPass || c.Action != policy.ActionBlock {
+		t.Errorf("before listing, the integration entry = %+v", c)
+	}
+
+	listed.Store(true)
+	now = now.Add(7 * time.Hour) // past cache_ttl (1h) and refresh_interval (6h)
+	o := r.One(t.Context(), leftPad, "schedule")
+	if o.Decision != audit.AdmissionPolicyBlocked {
+		t.Fatalf("after listing: %+v", o)
+	}
+	i := slices.IndexFunc(o.Failing, func(c audit.AdmissionCheck) bool { return c.Check == "integration:revet-aikido" })
+	if i < 0 || o.Failing[i].Action != policy.ActionBlock || o.Failing[i].Unwaivable != "known malware is never overridden" {
+		t.Errorf("failing = %+v, want integration:revet-aikido block carrying the malware detail", o.Failing)
+	}
+}
+
+// A free-tier type is not asked on re-vet until its operator turns revet
+// on, and then once per answer cache lifetime.
+func TestRevetSkipsMeteredInstanceUnlessOn(t *testing.T) {
+	r, f := newIntegrationRevet(t, map[string]config.Integration{
+		"revet-meter-off": {"type": "revet-meter", "enabled": true}})
+	o := r.One(t.Context(), leftPad, "schedule")
+	if n := meterCount("revet-meter-off"); n != 0 {
+		t.Errorf("revet off: Lookup called %d times", n)
+	}
+	c := checkOf(t, newestRevetRow(t, f), "integration:revet-meter-off")
+	if c.Status != audit.CheckNotEvaluated || c.Detail != "not re-run: revet is off for this instance" || c.Action != policy.ActionBlock {
+		t.Errorf("revet off: entry = %+v", c)
+	}
+	if o.Decision != audit.AdmissionAdmitted || slices.ContainsFunc(o.Notes, func(n string) bool { return strings.Contains(n, "revet-meter-off") }) {
+		t.Errorf("revet off: outcome = %+v", o)
+	}
+
+	r, _ = newIntegrationRevet(t, map[string]config.Integration{
+		"revet-meter-on": {"type": "revet-meter", "enabled": true, "revet": true}})
+	r.One(t.Context(), leftPad, "schedule")
+	if n := meterCount("revet-meter-on"); n != 1 {
+		t.Errorf("revet on, first sweep: Lookup called %d times, want 1", n)
+	}
+	r.One(t.Context(), leftPad, "schedule")
+	if n := meterCount("revet-meter-on"); n != 1 {
+		t.Errorf("revet on, second sweep inside cache_ttl: Lookup called %d times, want 1", n)
+	}
+}
+
+// An error on re-vet rules nothing: the version stays admitted under block,
+// the entry and a note say why, and the last error is stored.
+func TestRevetIntegrationErrorIsNotEvaluated(t *testing.T) {
+	r, f := newIntegrationRevet(t, map[string]config.Integration{
+		"revet-meter-err": {"type": "revet-meter", "enabled": true, "revet": true, "verdict": "error"}})
+	o := r.One(t.Context(), leftPad, "schedule")
+	if o.Decision != audit.AdmissionAdmitted {
+		t.Fatalf("Decision = %s, failing %+v", o.Decision, o.Failing)
+	}
+	c := checkOf(t, newestRevetRow(t, f), "integration:revet-meter-err")
+	if c.Status != audit.CheckNotEvaluated || c.Detail != "not re-run: 429 Too Many Requests" || c.Action != policy.ActionBlock {
+		t.Errorf("entry = %+v", c)
+	}
+	if !slices.Contains(o.Notes, "integration:revet-meter-err could not be asked: 429 Too Many Requests") {
+		t.Errorf("notes = %q", o.Notes)
+	}
+	last, err := f.adb.IntegrationErrors(t.Context())
+	if err != nil || !strings.Contains(last["revet-meter-err"].Message, "429") {
+		t.Errorf("last error = %+v, %v", last, err)
+	}
+}
+
+// An allow-list refusal on re-vet asks no integration and names each one
+// as not run.
+func TestRevetAllowListRefusalSkipsIntegrations(t *testing.T) {
+	r, f := newIntegrationRevet(t, map[string]config.Integration{
+		"revet-meter-allow": {"type": "revet-meter", "enabled": true, "revet": true}})
+	if err := f.adb.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "r1", RegistryType: manifest.TypeNpm, RuleKind: policy.KindPackage, Pattern: "lodash"}); err != nil {
+		t.Fatal(err)
+	}
+	r.Allow = policy.NewChecker(f.adb)
+	if o := r.One(t.Context(), leftPad, "schedule"); o.Decision != audit.AdmissionPolicyBlocked {
+		t.Fatalf("Decision = %s", o.Decision)
+	}
+	if n := meterCount("revet-meter-allow"); n != 0 {
+		t.Errorf("Lookup called %d times after the allow-list refused", n)
+	}
+	c := checkOf(t, newestRevetRow(t, f), "integration:revet-meter-allow")
+	if c.Status != audit.CheckNotEvaluated || c.Detail != "not run: the allow-list refused this version" {
+		t.Errorf("entry = %+v", c)
 	}
 }
