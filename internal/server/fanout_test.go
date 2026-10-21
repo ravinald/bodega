@@ -297,7 +297,7 @@ func TestAptPoolListingIsCached(t *testing.T) {
 	}
 }
 
-// TestPackageRouteWithoutStorageDoesNotBlameS3 pins caveat #34. A local
+// TestPackageRouteWithoutStorageDoesNotBlameS3 pins follow-up #34. A local
 // install whose storage_path cannot be created used to serve a 503 naming a
 // backend the config never asked for, sending operators after a bucket.
 func TestPackageRouteWithoutStorageDoesNotBlameS3(t *testing.T) {
