@@ -2294,7 +2294,18 @@ $ bodega policy add pypi reqeusts
 Add the rule for "reqeusts", not "requests"? [y/N]:
 ```
 
-Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin that ends before an answer, so a script has to pipe the `y` in on purpose. A confirmed rule's `create` audit event records `near_popular` and `distance`. An npm `@scope/*` wildcard is not compared: it names no package.
+Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin that ends before an answer, so a script has to pipe the `y` in on purpose. A confirmed rule's `create` audit event records `near_popular`, `distance` and `confirmed=yes`. An npm `@scope/*` wildcard is not compared: it names no package. When the popular list cannot be read, the rule is written with a warning and the event records `near_popular_check=failed`.
+
+Every other path that writes an exact rule makes the same comparison, and none writes a near-popular one unconfirmed:
+
+| Path                                                                   | How it confirms                                                                                                  |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| [`bodega discover promote`](#bodega-discover-promote-type-pattern-comment---as-policymanifest) | The same prompt.                                                                                                 |
+| [`bodega discover promote-all`](#bodega-discover-promote-all-type---as-policymanifest)     | It cannot: it holds the name back and prints the `bodega discover promote` command that asks.                    |
+| `POST /api/v1/policies`                                                | 409 with `near_popular` and `distance`; resend with `confirm_near_popular` set to the popular name.              |
+| [`bodega queue approve`](#bodega-queue-listapprovedismiss)                                | Refused, row left open; rerun with `--confirm-near-popular <popular name>` (`confirm_near_popular` in the API). |
+
+A confirmation naming any other package is refused the same way as none. Repeating the name, rather than passing a yes flag, means the caller read the refusal for this name.
 
 ### `bodega policy remove <id|pattern> [--type TYPE]`
 
@@ -3319,14 +3330,14 @@ bodega queue dismiss 14 --reason "typo of lodash"
 | Command                                                   | Effect                                                                                                                                       |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list [--type <type>] [--check <check>] [--all] [--json]` | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row. |
-| `approve <id> --reason <text> [--expires <duration>]`     | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only. |
+| `approve <id> --reason <text> [--expires <duration>] [--confirm-near-popular <name>]` | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only; `--confirm-near-popular` to an `allow-list` row only. |
 | `dismiss <id> --reason <text>`                            | Closes the row without admitting anything.                                                                                                   |
 
 **Which refusals write a row.** A row is written on every refusal of a client fetch by one of these checks, whatever `discover_mode` says:
 
 | Check                    | Written by                                                                                      | `approve` does                                                                                                                                                                                  |
 | ------------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest.               |
+| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest. An exact npm, pypi or cargo name within two edits of a popular one is refused and the row left open, naming the popular package; rerun with `--confirm-near-popular <that name>` to add the rule. |
 | `age`                    | The proxy fill's age gate                                                                       | Requests an override (below)                                                                                                                                                                    |
 | `osv`                    | The proxy fill's OSV gate, for an advisory                                                      | Requests an override                                                                                                                                                                            |
 | `malware`                | The proxy's malware gate, and the OSV gate when the record is `MAL-`                            | Refused; dismiss it                                                                                                                                                                             |
@@ -3422,7 +3433,7 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 
 #### `bodega discover promote <type> <pattern> [comment] [--as policy|manifest]`
 
-`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
+`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`, and records the same `create` audit event. An exact npm, pypi or cargo name within two edits of a popular package asks before writing, with the [`policy add` prompt](#bodega-policy-add-type-pattern-comment): anything but `y` or `yes`, or a stdin that ends first, writes nothing and exits non-zero.
 
 `--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
 
@@ -3448,6 +3459,15 @@ A `pypi`, `npm`, `gomod` or `cargo` entry is written the way a `no_manifest` row
 #### `bodega discover promote-all <type> [--as policy|manifest]`
 
 The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it. It writes as it goes; [`generate-manifests`](#bodega-discover-generate-manifests-type) is the same bulk work with a review step in the middle.
+
+`--as policy` never writes an exact npm, pypi or cargo rule within two edits of a popular name, since a typo a client requested is the likeliest thing an observe window holds. It holds each one back on its own line and promotes the rest, and the summary counts them apart from the skipped and no-namespace rows. The run still exits 0. Confirm one with the command the line names, which asks:
+
+```text
+? pypi reqeusts (distance 1 from the popular package requests; confirm with: bodega discover promote pypi reqeusts)
++ pypi flask
+
+Promoted 1, skipped 0 (already present), held back 1 (near a popular name), 0 need a namespace key rather than a rule.
+```
 
 ```bash
 # 1. Set "discover_mode": "observe" in config.json, restart bodega. Leave it on.
@@ -6520,7 +6540,7 @@ Every token route needs a bearer token holding `superadmin` and an address in `a
 | Method | Path                           | Description                                                    |
 | ------ | ------------------------------ | -------------------------------------------------------------- |
 | GET    | `/api/v1/policies[?type=TYPE]` | List allow-list rules (optionally scoped to one registry type) |
-| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment}`)    |
+| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi or cargo name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular` |
 | DELETE | `/api/v1/policies/{id}`        | Remove a rule by ID                                            |
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
@@ -6543,7 +6563,7 @@ These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and
 | Method | Path                                  | Description                                                              |
 | ------ | ------------------------------------- | ------------------------------------------------------------------------ |
 | GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open` |
-| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires}`); answers what the approval did  |
+| POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires, confirm_near_popular}`); answers what the approval did. An `allow-list` row near a popular name answers 400 and stays open without `confirm_near_popular` naming that name |
 | POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
 
 These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list needs `admin` or `approve`, because it names each requester and client address. Approving and dismissing need `approve`: approving writes an allow-list rule or a profile pin, which grants an exception the way an override vote does, and a CI token holding `write` must not do that for the package it was refused. A token without the scope gets `403` naming it. The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.

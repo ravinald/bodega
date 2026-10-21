@@ -118,9 +118,6 @@ func (v *queueView) resolve() {
 			if res.Override != nil && res.Override.Status == audit.OverrideStatusPending {
 				v.status += fmt.Sprintf(" It applies once another identity runs: bodega override approve %s", res.Override.ID)
 			}
-			if res.Warning != "" {
-				v.status += " Warning: " + res.Warning
-			}
 		}
 	} else {
 		if _, err := admit.DismissQueued(ctx, v.db, row.ID, actor, v.reason, v.now()); err != nil {

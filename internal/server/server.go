@@ -1824,9 +1824,10 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		RegistryType string `json:"registry_type"`
-		Pattern      string `json:"pattern"`
-		Comment      string `json:"comment"`
+		RegistryType       string `json:"registry_type"`
+		Pattern            string `json:"pattern"`
+		Comment            string `json:"comment"`
+		ConfirmNearPopular string `json:"confirm_near_popular"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -1841,6 +1842,21 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := policy.RuleKindForType(req.RegistryType)
+	ctx := r.Context()
+
+	check, err := policy.ConfirmNearPopular(ctx, s.auditDB, req.RegistryType, req.Pattern, req.ConfirmNearPopular)
+	var near *policy.NearPopularError
+	if errors.As(err, &near) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":        err.Error(),
+			"near_popular": near.Popular,
+			"distance":     near.Distance,
+		})
+		return
+	}
+	if err != nil {
+		s.logger.Warn("policy rule not compared with the popular names", "type", req.RegistryType, "pattern", req.Pattern, "error", err)
+	}
 
 	idBytes := make([]byte, 16)
 	if _, err := cryptoRand.Read(idBytes); err != nil {
@@ -1857,7 +1873,6 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 		Comment:      req.Comment,
 		CreatedBy:    "api",
 	}
-	ctx := r.Context()
 	if err := s.auditDB.InsertPolicy(ctx, rule); err != nil {
 		s.logger.Error("insert policy failed", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -1872,7 +1887,7 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 		PkgName:   req.RegistryType + ":" + req.Pattern,
 		ClientIP:  ClientIP(r),
 		Status:    "success",
-		Details:   fmt.Sprintf("id=%s kind=%s", id, kind),
+		Details:   fmt.Sprintf("id=%s kind=%s", id, kind) + check.AuditDetails(),
 	})
 	writeJSON(w, http.StatusCreated, rule)
 }

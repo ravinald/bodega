@@ -112,3 +112,93 @@ func TestPolicySimilaritySetListLoad(t *testing.T) {
 		t.Errorf("stored policy = %+v, %v", p, err)
 	}
 }
+
+func runDiscoverStdin(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	var errb bytes.Buffer
+	stdout = captureStdout(t, func() {
+		cmd := newDiscoverCmd(&globalFlags{})
+		cmd.SetArgs(args)
+		cmd.SetIn(strings.NewReader(stdin))
+		cmd.SetErr(&errb)
+		cmd.SetOut(os.Stdout)
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		err = cmd.Execute()
+	})
+	return stdout, errb.String(), err
+}
+
+func pypiDenial(name string) audit.DiscoveryRow {
+	return audit.DiscoveryRow{RegistryType: manifest.TypePypi, Host: "pypi.org", PatternHint: name, PkgName: name,
+		PkgVersion: "1.0.0", Decision: audit.DecisionDenied, LastClient: "10.0.0.5"}
+}
+
+func policyCreateEvents(t *testing.T, adbPath string) []audit.StoredEvent {
+	t.Helper()
+	adb, err := audit.Open(adbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adb.Close()
+	events, err := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// discover promote asks about a near-popular name the way policy add does,
+// and the rule it writes leaves a create event.
+func TestDiscoverPromoteConfirmsANearPopularName(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, pypiDenial("reqeusts"))
+
+	_, stderr, err := runDiscoverStdin(t, "n\n", "promote", "pypi", "reqeusts")
+	if err == nil {
+		t.Fatal("a no promoted the rule")
+	}
+	if !strings.Contains(stderr, "requests") || !strings.Contains(stderr, "distance 1") {
+		t.Errorf("prompt does not name the popular package:\n%s", stderr)
+	}
+	if _, _, err := runDiscoverStdin(t, "", "promote", "pypi", "reqeusts"); err == nil {
+		t.Error("a stdin that ended before an answer promoted the rule")
+	}
+	if got := pypiRules(t, env.auditDB); len(got) != 0 {
+		t.Fatalf("rules after refusals = %v", got)
+	}
+
+	if _, _, err := runDiscoverStdin(t, "y\n", "promote", "pypi", "reqeusts"); err != nil {
+		t.Fatalf("a yes: %v", err)
+	}
+	if got := pypiRules(t, env.auditDB); len(got) != 1 || got[0] != "reqeusts" {
+		t.Fatalf("rules = %v", got)
+	}
+	events := policyCreateEvents(t, env.auditDB)
+	if len(events) != 1 || events[0].PkgName != "pypi:reqeusts" || events[0].PkgType != "policy" ||
+		!strings.Contains(events[0].Details, "near_popular=requests") || !strings.Contains(events[0].Details, "confirmed=yes") {
+		t.Errorf("create events = %+v", events)
+	}
+}
+
+// promote-all writes nothing near a popular name, names each one with the
+// command that confirms it, and still promotes the rest.
+func TestDiscoverPromoteAllHoldsBackANearPopularName(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, pypiDenial("reqeusts"), pypiDenial("flask"))
+
+	stdout, _, err := runDiscoverStdin(t, "", "promote-all", "pypi")
+	if err != nil {
+		t.Fatalf("promote-all: %v", err)
+	}
+	if got := pypiRules(t, env.auditDB); len(got) != 1 || got[0] != "flask" {
+		t.Errorf("rules = %v, want flask alone", got)
+	}
+	for _, want := range []string{"reqeusts", "requests", "bodega discover promote pypi reqeusts", "held back 1"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("output does not name %q:\n%s", want, stdout)
+		}
+	}
+	if events := policyCreateEvents(t, env.auditDB); len(events) != 1 || events[0].PkgName != "pypi:flask" {
+		t.Errorf("create events = %+v", events)
+	}
+}
