@@ -27,7 +27,12 @@ not, and checks each version's filename override, which must be a clean
 relative path. A manifest it cannot parse is UNCHECKED. One carrying a parent reference, an absolute path, an
 empty or "." segment, a backslash or a NUL is INVALID:
 the fetch refuses that version and any write of its manifest is refused until
-the filename is corrected.`,
+the filename is corrected.
+
+It checks each apt version's deb_glob the same way. One that is not a clean
+relative pattern inside its build mode's root (the clone for a git source
+build, the shared sources directory for an apt-get source build), or that is
+set on an entry with no build_cmd, is INVALID: the build refuses that version.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := loadStore(gf)
 			if err != nil {
@@ -44,7 +49,8 @@ the filename is corrected.`,
 				return nil
 			}
 
-			return errors.Join(reportIntegrity(out, results), reportBinaryFilenames(backgroundCtx(), out, store, results))
+			return errors.Join(reportIntegrity(out, results), reportBinaryFilenames(backgroundCtx(), out, store, results),
+				reportDebGlobs(backgroundCtx(), out, store, results))
 		},
 	}
 }
@@ -146,6 +152,43 @@ func reportBinaryFilenames(ctx context.Context, out io.Writer, store *manifest.S
 	}
 	if invalid > 0 {
 		return fmt.Errorf("%d binary version(s) carry a filename the fetch refuses, or could not be checked", invalid)
+	}
+	return nil
+}
+
+// reportDebGlobs prints one row per apt version whose deb_glob
+// manifest.ValidateDebGlob refuses, and returns a non-nil error when there is
+// any. It reads the same object list reportBinaryFilenames does, for the same
+// reasons.
+func reportDebGlobs(ctx context.Context, out io.Writer, store *manifest.Store, results []manifest.IntegrityResult) error {
+	var invalid int
+	row := func(status, subject string, err error) {
+		if invalid == 0 {
+			fmt.Fprintf(out, "\nApt deb_glob:\n")
+		}
+		invalid++
+		fmt.Fprintf(out, "  %-12s %s  (%v)\n", status, subject, err)
+	}
+	for _, r := range results {
+		if r.Type != manifest.TypeApt {
+			continue
+		}
+		pm, err := store.ReadPackageObject(ctx, r.Path)
+		if err != nil {
+			row("UNCHECKED", r.Path, err)
+			continue
+		}
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if err := manifest.ValidateDebGlob(ve); err != nil {
+				row("INVALID", fmt.Sprintf("%s/%s@%s", manifest.TypeApt, pm.Name, ve.Version), err)
+			}
+		}
+	}
+	if invalid > 0 {
+		return fmt.Errorf("%d apt version(s) carry a deb_glob the build refuses, or could not be checked", invalid)
 	}
 	return nil
 }

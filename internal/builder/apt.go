@@ -401,12 +401,8 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 		cloneDir := aptSourceDir(d, name, ve)
 		s.Fetched = aptCloneAtRef(cloneDir, ve.Ref)
 		if s.Fetched {
-			glob := ve.DebGlob
-			if glob == "" {
-				glob = "*.deb"
-			}
-			matches, _ := filepath.Glob(filepath.Join(cloneDir, glob))
-			s.Built = len(matches) > 0
+			_, err := locateDebFile(d, name, ve)
+			s.Built = err == nil
 		}
 
 	case ve.URL != "":
@@ -733,6 +729,18 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			out := cfg.entryWriter(manifest.TypeApt, name)
 
 			_, _ = fmt.Fprintf(out, "\n>>> [apt] build %s\n", name)
+
+			// Refused before build_cmd runs, since the .deb it would produce
+			// could never be located.
+			if err := manifest.ValidateDebGlob(ve); err != nil {
+				result.Err = fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				continue
+			}
 
 			cloneDir := aptSourceDir(d, name, ve)
 			if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
@@ -1112,6 +1120,9 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
 			return "", fmt.Errorf("source directory not found at %s — run 'fetch apt' and 'build apt' first", cloneDir)
 		}
+		if err := manifest.ValidateDebGlob(ve); err != nil {
+			return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+		}
 		glob := ve.DebGlob
 		if glob == "" {
 			glob = "*.deb"
@@ -1119,6 +1130,9 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		matches, err := filepath.Glob(filepath.Join(cloneDir, glob))
 		if err != nil || len(matches) == 0 {
 			return "", fmt.Errorf("no .deb found matching %s in %s — run 'build apt' first", glob, cloneDir)
+		}
+		if err := aptDebInRoot(cloneDir, matches[0]); err != nil {
+			return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
 		}
 		return matches[0], nil
 
@@ -1140,6 +1154,9 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		if err != nil || len(matches) == 0 {
 			return "", fmt.Errorf("no .deb found for %s in %s — run 'fetch apt' first", sourceName, pkgDir)
 		}
+		if err := aptDebInRoot(pkgDir, matches[0]); err != nil {
+			return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+		}
 		return matches[0], nil
 	}
 }
@@ -1151,6 +1168,9 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 // and anything but exactly one candidate is refused rather than guessed at.
 func locateAptSourceDeb(d dirs, name string, ve manifest.VersionEntry) (string, error) {
 	sourceName := aptSourceName(name, ve)
+	if err := manifest.ValidateDebGlob(ve); err != nil {
+		return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+	}
 	if ve.DebGlob != "" {
 		sourceDir := aptSourceDir(d, name, ve)
 		matches, err := filepath.Glob(filepath.Join(sourceDir, ve.DebGlob))
@@ -1162,6 +1182,9 @@ func locateAptSourceDeb(d dirs, name string, ve manifest.VersionEntry) (string, 
 			return "", fmt.Errorf("apt/%s: no .deb matches deb_glob %q from %s — run 'build apt', or correct deb_glob",
 				name, ve.DebGlob, sourceDir)
 		case 1:
+			if err := aptDebInRoot(d.sources, matches[0]); err != nil {
+				return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+			}
 			return matches[0], nil
 		}
 		return "", fmt.Errorf("apt/%s: deb_glob %q matches %d files: %s — narrow deb_glob to the one this entry publishes",
@@ -1182,10 +1205,43 @@ func locateAptSourceDeb(d dirs, name string, ve manifest.VersionEntry) (string, 
 		return "", fmt.Errorf("apt/%s: no .deb for %s in %s (found %s) — run 'build apt', or set deb_glob when the build names its binary package differently from its source",
 			name, want, d.sources, found)
 	case 1:
+		if err := aptDebInRoot(d.sources, own[0]); err != nil {
+			return "", fmt.Errorf("apt/%s@%s: %w", name, ve.Version, err)
+		}
 		return own[0], nil
 	}
 	return "", fmt.Errorf("apt/%s: %d .deb files in %s are %s: %s — set deb_glob to the one this entry publishes",
 		name, len(own), d.sources, want, joinBases(own))
+}
+
+// aptDebInRoot refuses a .deb a glob matched unless it is a regular file whose
+// resolved path stays inside root. Clone content comes from whatever upstream
+// the manifest's url names, so a symlink committed there would otherwise
+// publish any .deb the server user can read, under the default glob as much as
+// under deb_glob. The root is resolved too, since the build root may itself sit
+// behind a symlink (macOS /var is one).
+func aptDebInRoot(root, match string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve build root %s: %w", root, err)
+	}
+	resolved, err := filepath.EvalSymlinks(match)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w — remove the dangling link, or rebuild", match, err)
+	}
+	rel, err := filepath.Rel(realRoot, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing %s: it points to %s, outside the build root %s, and only a .deb inside that root is published — remove the link from the source, or point deb_glob at the file the build produced",
+			match, resolved, realRoot)
+	}
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", resolved, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing %s: it is not a regular file (mode %s) — narrow deb_glob so it matches only the built .deb", match, fi.Mode())
+	}
+	return nil
 }
 
 // discardAptSourceBuild removes an apt-get source entry's extracted tree and

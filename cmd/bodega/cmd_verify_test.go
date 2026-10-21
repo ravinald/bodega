@@ -225,3 +225,43 @@ func TestVerifyReportsUnparseableBinaryManifest(t *testing.T) {
 		t.Errorf("verify did not name the manifest it could not check:\n%s", out)
 	}
 }
+
+// TestVerifyReportsAnEscapingDebGlob covers an apt manifest written before
+// deb_glob was checked: verify names it before a build publishes the file it
+// reaches.
+func TestVerifyReportsAnEscapingDebGlob(t *testing.T) {
+	dir := verifyEnv(t)
+	store := manifest.NewLocalStore(dir)
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeApt,
+		Name: "widget",
+		Versions: []manifest.VersionEntry{{
+			Version: "1.0", URL: "https://example.invalid/widget.git", BuildCmd: "make deb", DebGlob: "placeholder.deb",
+		}},
+	}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+	mpath := filepath.Join(dir, manifest.TypeApt, "widget", "manifest.json")
+	data, err := os.ReadFile(mpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mpath, []byte(strings.Replace(string(data), `"placeholder.deb"`, `"../../*.deb"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RestampMD5(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runVerify(t)
+	if err == nil {
+		t.Fatalf("verify exited 0 on an escaping deb_glob:\n%s", out)
+	}
+	if !strings.Contains(out, "INVALID") || !strings.Contains(out, "apt/widget@1.0") {
+		t.Errorf("verify did not name the version carrying the deb_glob:\n%s", out)
+	}
+}
