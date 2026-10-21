@@ -738,3 +738,229 @@ func TestCheckAptStage_PackagedRequiresBuilt(t *testing.T) {
 		t.Errorf("the same tree at the entry's ref did not read as packaged: %+v", s)
 	}
 }
+
+// aptSourceEntry is efs-utils as an apt-get source build: build_cmd, no url.
+func aptSourceEntry(version string) manifest.VersionEntry {
+	return manifest.VersionEntry{Version: version, BuildCmd: "dpkg-buildpackage -us -uc"}
+}
+
+func TestLocateDebFileAptSourceSelectsItsOwnDeb(t *testing.T) {
+	d := buildDirs(t.TempDir())
+	for _, f := range []string{"aaa_1.0_all.deb", "efs-utils-extra_2.0_all.deb", "efs-utils_1.0_all.deb", "efs-utils_2.0_all.deb"} {
+		touchFile(t, filepath.Join(d.sources, f))
+	}
+	mkDir(t, filepath.Join(d.sources, "efs-utils-2.0"))
+	want := filepath.Join(d.sources, "efs-utils_2.0_all.deb")
+
+	for _, version := range []string{"2.0", "1:2.0"} {
+		got, err := locateDebFile(d, "efs-utils", aptSourceEntry(version))
+		if err != nil || got != want {
+			t.Errorf("version %s: locateDebFile = %q, %v; want %q", version, got, err, want)
+		}
+	}
+}
+
+func TestLocateDebFileAptSourceNoMatchNamesCandidates(t *testing.T) {
+	d := buildDirs(t.TempDir())
+	touchFile(t, filepath.Join(d.sources, "aaa_1.0_all.deb"))
+	mkDir(t, filepath.Join(d.sources, "efs-utils-2.0"))
+
+	got, err := locateDebFile(d, "efs-utils", aptSourceEntry("2.0"))
+	if err == nil {
+		t.Fatalf("locateDebFile = %q, want an error: no .deb is efs-utils 2.0", got)
+	}
+	for _, want := range []string{"efs-utils", "2.0", "aaa_1.0_all.deb", "deb_glob", d.sources} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+func TestLocateDebFileAptSourceRefusesAmbiguous(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files []string
+		glob  string
+	}{
+		{"default selection", []string{"efs-utils_2.0_amd64.deb", "efs-utils_2.0_arm64.deb"}, ""},
+		{"deb_glob", []string{"aaa_1.0_all.deb", "efs-utils_2.0_all.deb"}, "../*.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := buildDirs(t.TempDir())
+			for _, f := range tc.files {
+				touchFile(t, filepath.Join(d.sources, f))
+			}
+			ve := aptSourceEntry("2.0")
+			ve.DebGlob = tc.glob
+			mkDir(t, aptSourceDir(d, "efs-utils", ve))
+
+			got, err := locateDebFile(d, "efs-utils", ve)
+			if err == nil {
+				t.Fatalf("locateDebFile = %q, want an error naming %v", got, tc.files)
+			}
+			for _, want := range append(tc.files, "deb_glob") {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckAptStageAptSourceNotBuiltByAnotherEntry(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(cfg.rootFor(manifest.TypeApt))
+	ve := aptSourceEntry("2.0")
+	touchFile(t, filepath.Join(d.sources, "aaa_1.0_all.deb"))
+	mkDir(t, aptSourceDir(d, "efs-utils", ve))
+
+	if s := CheckAptStage(cfg, "efs-utils", ve); !s.Fetched || s.Built {
+		t.Errorf("with only aaa's .deb: %+v, want Fetched and not Built", s)
+	}
+	touchFile(t, filepath.Join(d.sources, "efs-utils_2.0_all.deb"))
+	if s := CheckAptStage(cfg, "efs-utils", ve); !s.Built {
+		t.Errorf("with efs-utils_2.0_all.deb present: %+v, want Built", s)
+	}
+}
+
+func TestBuildAptAptSourceFindsTheParentDeb(t *testing.T) {
+	for _, tc := range []struct {
+		buildCmd string
+		failures int
+	}{
+		{"touch ../efs-utils_2.0_all.deb", 0},
+		{"true", 1},
+	} {
+		t.Run(tc.buildCmd, func(t *testing.T) {
+			ve := manifest.VersionEntry{Version: "2.0", BuildCmd: tc.buildCmd}
+			cfg, store, _ := pinEnv(t, &manifest.PackageManifest{Type: manifest.TypeApt, Name: "efs-utils", Versions: []manifest.VersionEntry{ve}})
+			var log strings.Builder
+			cfg.Stdout = &log
+			d := buildDirs(cfg.rootFor(manifest.TypeApt))
+			mkDir(t, aptSourceDir(d, "efs-utils", ve))
+			touchFile(t, filepath.Join(d.sources, "aaa_1.0_all.deb"))
+
+			sum := BuildApt(cfg, store, "efs-utils")
+			if sum.Failures != tc.failures || len(sum.Results) != 1 {
+				t.Fatalf("failures = %d over %d results, want %d over 1\n%s", sum.Failures, len(sum.Results), tc.failures, log.String())
+			}
+			res := sum.Results[0]
+			if tc.failures == 0 {
+				want := filepath.Join(d.sources, "efs-utils_2.0_all.deb")
+				if len(res.Artifacts) != 1 || res.Artifacts[0] != want {
+					t.Errorf("artifacts = %v, want [%s]", res.Artifacts, want)
+				}
+				return
+			}
+			if res.Err == nil || !strings.Contains(res.Err.Error(), "aaa_1.0_all.deb") {
+				t.Errorf("failure %v does not name aaa_1.0_all.deb", res.Err)
+			}
+		})
+	}
+}
+
+func TestPackageAptAptSourceEntriesKeepTheirOwnDeb(t *testing.T) {
+	aaa := &manifest.PackageManifest{Type: manifest.TypeApt, Name: "aaa", Versions: []manifest.VersionEntry{aptSourceEntry("1.0")}}
+	efs := &manifest.PackageManifest{Type: manifest.TypeApt, Name: "efs-utils", Versions: []manifest.VersionEntry{aptSourceEntry("2.0")}}
+	cfg, store, _ := pinEnv(t, aaa)
+	if err := store.SavePackage(t.Context(), efs); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	cfg.Stdout = &log
+	d := buildDirs(cfg.rootFor(manifest.TypeApt))
+	mkDir(t, aptSourceDir(d, "aaa", aaa.Versions[0]))
+	mkDir(t, aptSourceDir(d, "efs-utils", efs.Versions[0]))
+	writeTestDeb(t, filepath.Join(d.sources, "aaa_1.0_all.deb"), "aaa", "1.0", "aaa")
+	efsDeb := filepath.Join(d.sources, "efs-utils_2.0_all.deb")
+	writeTestDeb(t, efsDeb, "efs-utils", "2.0", "efs-utils")
+
+	if sum := PackageApt(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("PackageApt failed: %+v\n%s", sum.Results, log.String())
+	}
+
+	poolDir := filepath.Join(d.aptRepo, "pool", "main", "e", "efs-utils")
+	entries, err := os.ReadDir(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "efs-utils_2.0_all.deb" {
+		t.Fatalf("%s holds %v, want only efs-utils_2.0_all.deb", poolDir, names)
+	}
+	poolSum, err := fileSHA256(filepath.Join(poolDir, names[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, _ := fileSHA256(efsDeb); built != poolSum {
+		t.Errorf("pool copy %s, built .deb %s: different bytes", poolSum, built)
+	}
+	stored, err := store.GetPackage(t.Context(), manifest.TypeApt, "efs-utils")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stored.Versions[0].Metadata["_pool_path"], aptPoolRelPath("efs-utils", "efs-utils_2.0_all.deb"); got != want {
+		t.Errorf("_pool_path = %q, want %q", got, want)
+	}
+}
+
+func TestFetchAptSourcePicksItsOwnDsc(t *testing.T) {
+	shims := t.TempDir()
+	argvLog := filepath.Join(shims, "dpkg-source.log")
+	for name, body := range map[string]string{
+		"apt-get":     "#!/bin/sh\nexit 0\n",
+		"dpkg-source": "#!/bin/sh\necho \"$@\" >> " + argvLog + "\n[ -f \"$2\" ] || exit 1\nmkdir -p \"$3\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(shims, name), []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", shims+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, tc := range []struct {
+		name    string
+		dscs    []string
+		wantArg string
+	}{
+		{"own dsc beside a prefix sibling", []string{"efs-utils-extra_1.0.dsc", "efs-utils_2.0.dsc"}, "efs-utils_2.0.dsc"},
+		{"only a prefix sibling", []string{"efs-utils-extra_1.0.dsc"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(argvLog)
+			ve := aptSourceEntry("2.0")
+			cfg, store, _ := pinEnv(t, &manifest.PackageManifest{Type: manifest.TypeApt, Name: "efs-utils", Versions: []manifest.VersionEntry{ve}})
+			var log strings.Builder
+			cfg.Stdout = &log
+			d := buildDirs(cfg.rootFor(manifest.TypeApt))
+			for _, f := range tc.dscs {
+				touchFile(t, filepath.Join(d.sources, f))
+			}
+
+			sum := FetchApt(cfg, store, "efs-utils")
+			calls, _ := os.ReadFile(argvLog)
+			lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+			if tc.wantArg != "" {
+				if sum.Failures != 0 {
+					t.Fatalf("fetch failed: %+v\n%s", sum.Results, log.String())
+				}
+				if len(lines) != 1 || filepath.Base(strings.Fields(lines[0])[1]) != tc.wantArg {
+					t.Errorf("dpkg-source calls %q, want one with %s", calls, tc.wantArg)
+				}
+				return
+			}
+			if sum.Failures != 1 || len(sum.Results) != 1 || sum.Results[0].Err == nil {
+				t.Fatalf("fetch did not fail: %+v\n%s", sum.Results, log.String())
+			}
+			if err := sum.Results[0].Err.Error(); !strings.Contains(err, "efs-utils-extra_1.0.dsc") {
+				t.Errorf("error %q does not name efs-utils-extra_1.0.dsc", err)
+			}
+			if len(calls) != 0 {
+				t.Errorf("dpkg-source ran: %q", calls)
+			}
+		})
+	}
+}
