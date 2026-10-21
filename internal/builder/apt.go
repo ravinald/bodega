@@ -423,12 +423,8 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 			s.Fetched = true
 		}
 		if s.Fetched {
-			glob := ve.DebGlob
-			if glob == "" {
-				glob = "../*.deb"
-			}
-			matches, _ := filepath.Glob(filepath.Join(sourceDir, glob))
-			s.Built = len(matches) > 0
+			_, err := locateDebFile(d, name, ve)
+			s.Built = err == nil
 		}
 
 	default:
@@ -615,16 +611,13 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					if err := runCmd(out, parentDir, "apt-get", "source", "--download-only", sourceName); err != nil {
 						fetchErr = fmt.Errorf("apt-get source %s: %w", sourceName, err)
 					} else {
-						// Extract the source.
-						if err := runCmd(out, parentDir, "dpkg-source", "-x", sourceName+"*.dsc", sourceDir); err != nil {
-							// Try glob match for the .dsc file.
-							dscMatches, _ := filepath.Glob(filepath.Join(parentDir, sourceName+"*.dsc"))
-							if len(dscMatches) > 0 {
-								err = runCmd(out, parentDir, "dpkg-source", "-x", dscMatches[0], sourceDir)
-							}
-							if err != nil {
-								fetchErr = fmt.Errorf("extract source: %w", err)
-							}
+						// runCmd runs no shell, so the .dsc has to be named
+						// exactly: a glob would reach dpkg-source as a literal.
+						dsc, err := locateAptSourceDsc(parentDir, name, ve)
+						if err != nil {
+							fetchErr = err
+						} else if err := runCmd(out, parentDir, "dpkg-source", "-x", dsc, sourceDir); err != nil {
+							fetchErr = fmt.Errorf("extract source %s: %w", filepath.Base(dsc), err)
 						}
 						if fetchErr == nil {
 							artifactPath = sourceDir
@@ -756,21 +749,17 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				_, _ = fmt.Fprintf(out, "    No build_cmd configured; skipping compilation step.\n")
 			}
 
-			// Locate the produced .deb to confirm the build succeeded.
-			glob := ve.DebGlob
-			if glob == "" {
-				glob = "*.deb"
-			}
-			matches, err := filepath.Glob(filepath.Join(cloneDir, glob))
-			if err != nil || len(matches) == 0 {
-				result.Err = fmt.Errorf("no .deb found matching %s in %s after build", glob, cloneDir)
+			// The .deb the stage check and the package stage will read is the
+			// one that confirms this build, so all three agree on it.
+			if deb, err := locateDebFile(d, name, ve); err != nil {
+				result.Err = err
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
 			} else {
-				result.Artifacts = []string{matches[0]}
-				fi, _ := os.Stat(matches[0])
+				result.Artifacts = []string{deb}
+				fi, _ := os.Stat(deb)
 				if fi != nil {
-					_, _ = fmt.Fprintf(out, "    Built: %s (%s)\n", filepath.Base(matches[0]), humanBytes(fi.Size()))
+					_, _ = fmt.Fprintf(out, "    Built: %s (%s)\n", filepath.Base(deb), humanBytes(fi.Size()))
 				}
 			}
 
@@ -1131,17 +1120,7 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		return "", fmt.Errorf("no .deb found at %s — run 'fetch apt' first", dest)
 
 	case ve.BuildCmd != "":
-		// apt-get source build: .deb produced by dpkg-buildpackage.
-		sourceDir := aptSourceDir(d, name, ve)
-		glob := ve.DebGlob
-		if glob == "" {
-			glob = "../*.deb"
-		}
-		matches, err := filepath.Glob(filepath.Join(sourceDir, glob))
-		if err != nil || len(matches) == 0 {
-			return "", fmt.Errorf("no .deb found matching %s for %s — run 'build apt' first", glob, sourceName)
-		}
-		return matches[0], nil
+		return locateAptSourceDeb(d, name, ve)
 
 	default:
 		// apt-get download: .deb in per-package subdir.
@@ -1152,6 +1131,130 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		}
 		return matches[0], nil
 	}
+}
+
+// locateAptSourceDeb returns the .deb an apt-get source build produced for this
+// entry. dpkg-buildpackage writes it beside the source tree, in sources/, which
+// every apt entry shares, so a loose glob there answers with whichever entry's
+// .deb sorts first. Selection is by the dpkg filename's package and version,
+// and anything but exactly one candidate is refused rather than guessed at.
+func locateAptSourceDeb(d dirs, name string, ve manifest.VersionEntry) (string, error) {
+	sourceName := aptSourceName(name, ve)
+	if ve.DebGlob != "" {
+		sourceDir := aptSourceDir(d, name, ve)
+		matches, err := filepath.Glob(filepath.Join(sourceDir, ve.DebGlob))
+		if err != nil {
+			return "", fmt.Errorf("apt/%s: deb_glob %q: %w", name, ve.DebGlob, err)
+		}
+		switch len(matches) {
+		case 0:
+			return "", fmt.Errorf("apt/%s: no .deb matches deb_glob %q from %s — run 'build apt', or correct deb_glob",
+				name, ve.DebGlob, sourceDir)
+		case 1:
+			return matches[0], nil
+		}
+		return "", fmt.Errorf("apt/%s: deb_glob %q matches %d files: %s — narrow deb_glob to the one this entry publishes",
+			name, ve.DebGlob, len(matches), joinBases(matches))
+	}
+
+	own, present, err := aptOwnFiles(d.sources, ".deb", sourceName, ve.Version)
+	if err != nil {
+		return "", fmt.Errorf("apt/%s: read %s: %w", name, d.sources, err)
+	}
+	want := describeAptPick(sourceName, ve.Version)
+	switch len(own) {
+	case 0:
+		found := "no .deb files"
+		if len(present) > 0 {
+			found = joinBases(present)
+		}
+		return "", fmt.Errorf("apt/%s: no .deb for %s in %s (found %s) — run 'build apt', or set deb_glob when the build names its binary package differently from its source",
+			name, want, d.sources, found)
+	case 1:
+		return own[0], nil
+	}
+	return "", fmt.Errorf("apt/%s: %d .deb files in %s are %s: %s — set deb_glob to the one this entry publishes",
+		name, len(own), d.sources, want, joinBases(own))
+}
+
+// locateAptSourceDsc returns the .dsc `apt-get source` left in dir for this
+// entry, by the same rules locateAptSourceDeb selects a .deb.
+func locateAptSourceDsc(dir, name string, ve manifest.VersionEntry) (string, error) {
+	sourceName := aptSourceName(name, ve)
+	own, present, err := aptOwnFiles(dir, ".dsc", sourceName, ve.Version)
+	if err != nil {
+		return "", fmt.Errorf("apt/%s: read %s: %w", name, dir, err)
+	}
+	want := describeAptPick(sourceName, ve.Version)
+	switch len(own) {
+	case 0:
+		found := "no .dsc files"
+		if len(present) > 0 {
+			found = joinBases(present)
+		}
+		return "", fmt.Errorf("apt/%s: apt-get source left no .dsc for %s in %s (found %s) — apt-get source fetches the archive's candidate, so run 'apt-get update' or re-pin the entry to a version the archive offers",
+			name, want, dir, found)
+	case 1:
+		return own[0], nil
+	}
+	return "", fmt.Errorf("apt/%s: %d .dsc files in %s are %s: %s — remove the stale ones from %s and fetch again",
+		name, len(own), dir, want, joinBases(own), dir)
+}
+
+// aptOwnFiles lists the files directly in dir ending in ext, and of those the
+// ones whose dpkg filename (<package>_<version>[_<arch>]<ext>) names pkg and,
+// when version is set, that version. dpkg drops the epoch from the filename or
+// percent-encodes its colon, so both forms answer for a pinned "N:" version.
+func aptOwnFiles(dir, ext, pkg, version string) (own, present []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ext) {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		present = append(present, path)
+		fields := strings.Split(strings.TrimSuffix(e.Name(), ext), "_")
+		if len(fields) < 2 || fields[0] != pkg {
+			continue
+		}
+		if version != "" && !aptVersionMatches(fields[1], version) {
+			continue
+		}
+		own = append(own, path)
+	}
+	return own, present, nil
+}
+
+// aptVersionMatches reports whether a version field from a dpkg filename names
+// want, with or without want's epoch.
+func aptVersionMatches(field, want string) bool {
+	got := strings.ReplaceAll(strings.ReplaceAll(field, "%3a", ":"), "%3A", ":")
+	if got == want {
+		return true
+	}
+	epoch, rest, ok := strings.Cut(want, ":")
+	if !ok || epoch == "" || strings.Trim(epoch, "0123456789") != "" {
+		return false
+	}
+	return got == rest
+}
+
+func describeAptPick(pkg, version string) string {
+	if version == "" {
+		return "package " + pkg + " (any version)"
+	}
+	return "package " + pkg + " version " + version
+}
+
+func joinBases(paths []string) string {
+	bases := make([]string, len(paths))
+	for i, p := range paths {
+		bases[i] = filepath.Base(p)
+	}
+	return strings.Join(bases, ", ")
 }
 
 // splitLines splits a string into individual lines.
