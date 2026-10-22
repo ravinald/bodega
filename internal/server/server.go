@@ -810,11 +810,18 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // re-fetch, and `retire` would leave the process signing with a key no longer
 // on disk until something restarted it and broke every client at once.
 //
-// Order matters twice. The key is installed before the rebuild, because the
-// rebuild is what signs. And a manifest read that fails does not abandon the
-// rest: the key half of a reload staying inert because the backend hiccuped is
-// the same trap in a rarer shape, and the hourly tick already treats a failed
-// manifest read as non-fatal and rebuilds anyway.
+// Order matters three times. The key is installed before the rebuild, because
+// the rebuild is what signs. The access lists, identity bindings and profile
+// bindings are installed before it too: they are cheap to read and decide what
+// every route serves, while the rebuild can take tens of seconds on a server
+// mirroring several components, and a pin or an ACL change waiting behind it
+// is served unenforced for that long. Nothing in the rebuild depends on them,
+// because it reads profiles from the audit database itself
+// (aptProfileViews) rather than from the set refreshProfiles stores. And a
+// manifest read that fails does not abandon the rest: the key half of a reload
+// staying inert because the backend hiccuped is the same trap in a rarer
+// shape, and the hourly tick already treats a failed manifest read as
+// non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
 	s.logger.Info("reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
@@ -822,10 +829,10 @@ func (s *Server) reload(ctx context.Context) {
 	s.loadAptSigner()
 	s.loadPkgSigner()
 	s.loadAttestSigner()
-	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
 	s.refreshIdentities(ctx)
 	s.refreshProfiles(ctx)
+	s.rebuildAptSnapshot(ctx)
 	s.logger.Info("reload complete")
 }
 

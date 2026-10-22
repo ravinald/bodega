@@ -1439,3 +1439,64 @@ func TestPoolGateDecidesANonMainDebByTheProfile(t *testing.T) {
 		t.Errorf("upstream GETs for a refused universe artifact = %d, want 0", got)
 	}
 }
+
+// TestReloadEnforcesAProfileChangeBeforeTheAptRebuild holds the apt rebuild on
+// an upstream that does not answer and asserts a rebinding reload is already
+// enforced. Admission state installed after the rebuild leaves every non-apt
+// route serving what the operator just forbade for as long as the rebuild
+// runs, which on a server mirroring several components is tens of seconds.
+func TestReloadEnforcesAProfileChangeBeforeTheAptRebuild(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	aptProfileBind(t, s, "before", "block", "nginx")
+	writeProfile(t, s, "after",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, "block")}, nil)
+
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/", nil), "before-host")
+	if p := s.profileFor(req); p == nil || p.Name() != "before" {
+		t.Fatalf("profile before the rebind = %v, want before", p)
+	}
+
+	if _, err := s.auditDB.BindProfile(t.Context(), audit.ProfileBinding{Identity: "before-host", Profile: "after"}); err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	release := archive.hold(t)
+	s.aptUpstreamIdx.Clear()
+	snap := s.aptSnap.Load()
+
+	done := make(chan struct{})
+	go func() {
+		s.reload(t.Context())
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if p := s.profileFor(req); p != nil && p.Name() == "after" {
+			break
+		}
+		if time.Now().After(deadline) {
+			release()
+			<-done
+			t.Fatal("the rebinding reload was not enforced while the apt rebuild was still running; admission state has to land before the rebuild")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("reload returned while the upstream was held, so nothing here proves the rebuild was still running")
+	default:
+	}
+	if s.aptSnap.Load() != snap {
+		t.Fatal("the apt snapshot changed while the upstream was held")
+	}
+
+	release()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("reload did not return after the upstream was released")
+	}
+	if s.aptSnap.Load() == snap {
+		t.Error("the rebuild never published, so the held upstream was not what it was waiting on")
+	}
+}
