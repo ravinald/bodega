@@ -1180,11 +1180,11 @@ func TestSetupScriptConfiguresAMirroredCodenameWithNoSigningKey(t *testing.T) {
 	if err := os.WriteFile(script, clientSetupScript, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sh", script, "--url", srv.URL, "--allow-plaintext", "--systems", "apt", "--apply")
+	cmd := exec.Command("sh", script, "--url", srv.URL, "--allow-plaintext", "--systems", "apt", "--codename", "resolute", "--apply")
 	cmd.Env = []string{"HOME=" + t.TempDir(), "BODEGA_TOKEN=" + f.token, "PATH=" + stub + ":" + os.Getenv("PATH"), "TMPDIR=" + os.TempDir()}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("sh setup.sh --systems apt --apply: %v\n%s", err, out)
+		t.Fatalf("sh setup.sh --systems apt --codename resolute --apply: %v\n%s", err, out)
 	}
 
 	sources, err := os.ReadFile(root + clientconf.AptSourcesPath)
