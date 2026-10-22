@@ -2074,7 +2074,18 @@ sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
 bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
 ```
 
-The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
+A mirrored base and its pockets are one choice, and doctor configures them together. A codename named `<base>-updates`, `<base>-backports` or `<base>-security` belongs to `<base>` when the server mirrors that too, so an instance mirroring every pocket of `resolute` and of `noble` offers two choices, `noble` and `resolute`, and one serving a single base needs no `--suite` at all. The stanza lists every pocket of the base the server mirrors, in Ubuntu's order, and leaves out the ones it does not:
+
+```text
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: resolute resolute-updates resolute-backports resolute-security
+Components: main restricted universe multiverse
+```
+
+A stanza naming the base alone breaks a stock host twice. The host already runs packages from `-updates` and `-security`, so the first `-dev` package fails on its runtime half (`libpq-dev : Depends: libpq5 (= 18.3-1) but it is not going to be installed`), and the host stops receiving security fixes with nothing to report it. `--suite resolute-updates` is refused for the same reason, and the reason names `resolute` as the codename to pass. A generated suite is never grouped: it keeps a stanza of its own with `Signed-By:`, even beside a mirrored codename that shares its prefix.
+
+The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile's filtered codename is generated from its base's index alone and carries none of the pockets, so while the server mirrors a pocket of that base the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
 For FreeBSD the plan names `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it.
 
@@ -4902,12 +4913,12 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                                                        |
-| ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                              |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                              |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite                                |
-| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400` |
+| Parameter  | Required        | Value                                                                                                                                 |
+| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                       |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                       |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`          |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
@@ -5266,6 +5277,8 @@ URIs: https://bodega-host:8080/apt/
 Suites: noble noble-updates noble-security
 Components: main restricted universe multiverse
 ```
+
+The pockets in that list are one choice to a client. [`bodega doctor --configure apt`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) and [`GET /client/plan`](#client-plan-and-per-system-files) group `noble-updates`, `noble-backports` and `noble-security` under `noble` when `noble` is mirrored too, and write the stanza above in Ubuntu's order with whichever pockets are configured. A host is never handed one pocket on its own: `codename=noble-updates` is refused and the reason names `noble`. Mirror the pockets beside the base, because a host reading the base alone cannot install a `-dev` package whose runtime library it already took from `-updates`, and receives no security fixes.
 
 bodega parses no index. The upstream `Release` names the components, architectures and `by-hash` digests, apt reads them, and the next request arrives with the path already composed, so any component the upstream publishes resolves, not only `main`.
 
