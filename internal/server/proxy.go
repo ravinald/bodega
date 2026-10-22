@@ -945,9 +945,17 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	fill := fillIdentity(regType, name, s3Key)
 	var checkers []policy.VersionChecker
 	notRun := ""
-	if fetchGatedTypes[fill.typ] && fill.version != "" {
+	switch {
+	case fetchGatedTypes[fill.typ] && fill.version != "":
 		checkers = fetchCheckers(s.cfg, s.auditDB)
-	} else {
+	case fill.typ == manifest.TypeApt && fill.version != "":
+		// Only a mirrored .deb reaches here with a version: bodega's own pool
+		// is served from storage, and a dists/ key names none.
+		if res, on := s.aptMirrorOSV(r.Context(), strings.TrimPrefix(s3Key, manifest.AptPrefix)); on {
+			checkers = []policy.VersionChecker{verdict{res}}
+		}
+	}
+	if checkers == nil {
 		notRun = "not run: a " + fill.typ + " proxy fill names no version the age and OSV checks can evaluate"
 	}
 	ve := manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy}
