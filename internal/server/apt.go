@@ -42,6 +42,9 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	poolPath := "pool/" + p
+	if s.aptPoolHidden(w, r, poolPath) {
+		return
+	}
 	// The backstop, and the one route where the profile predicate is not the
 	// control: apt_profile.go states why the filtered index carries that
 	// weight for apt and this does not.
@@ -115,9 +118,10 @@ func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(distpath, "/")
 
 	// A mirrored codename is served entirely from upstream and never reaches
-	// the generated snapshot below. config.Load refuses a codename in both
-	// sets, so this branch cannot shadow a suite bodega signs.
-	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) {
+	// the generated snapshot below, unless a hidden version made the rebuild
+	// rewrite it (apt_hide.go). config.Load refuses a codename in both sets, so
+	// this branch cannot shadow a suite bodega signs.
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) && !s.aptMirrorRewritten(parts[0]) {
 		s.handleAptMirrorDists(w, r, parts[0], strings.Join(parts[1:], "/"))
 		return
 	}
@@ -413,6 +417,13 @@ type aptSnapshot struct {
 	// it and is signed, so a per-request filter would put a key operation on
 	// the hottest cached path.
 	profileViews map[string]map[string]*aptSuiteIndex
+
+	// hidden is every mirrored version an operator hid, as this rebuild read
+	// it, and the pool refuses each. mirrorRewritten names the mirrored
+	// codenames whose index in suites is bodega's rewrite rather than absent:
+	// those are served from the snapshot and signed with bodega's key.
+	hidden          aptMirrorHides
+	mirrorRewritten map[string]bool
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -534,12 +545,20 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	// them unchanged and one snapshot retires as a unit. A profile's Release
 	// and its Packages have to be generated together for the reason every
 	// suite's do: the first carries the digests of the second.
-	for _, ps := range s.aptProfileIndexes(ctx, views, date, snap.validUntil) {
+	snap.hidden = s.aptMirrorHidesFrom(ctx)
+	for _, ps := range s.aptProfileIndexes(ctx, views, snap.hidden, date, snap.validUntil) {
 		snap.suites[ps.codename] = ps.index
 		if snap.profileSuites == nil {
 			snap.profileSuites = map[string]string{}
 		}
 		snap.profileSuites[ps.codename] = ps.profile
+	}
+	for codename, idx := range s.aptMirrorRewrites(ctx, snap.hidden, date, snap.validUntil) {
+		snap.suites[codename] = idx
+		if snap.mirrorRewritten == nil {
+			snap.mirrorRewritten = map[string]bool{}
+		}
+		snap.mirrorRewritten[codename] = true
 	}
 	s.auditAptEntries(ctx, served, poolMap)
 	s.reportPinFeasibility(ctx)
@@ -839,6 +858,20 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []a
 // carrying that architecture and skips with a notice, as it does for an
 // upstream archive laid out the same way.
 func (s *Server) aptIndexFrom(suite string, components []string, packages map[string]map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	return s.aptIndexWithHeader(aptReleaseHeader{origin: "bodega", label: "bodega", suite: suite, codename: suite}, components, packages, date, validUntil)
+}
+
+// aptReleaseHeader is the identity half of a generated Release. bodega's own
+// suites and the filtered codenames are bodega's and say so; a rewritten
+// mirrored codename keeps the archive's, for the reason apt_hide.go gives.
+type aptReleaseHeader struct {
+	origin, label, suite, codename, version string
+}
+
+// aptIndexWithHeader is aptIndexFrom with the Release's identity fields named
+// by the caller.
+func (s *Server) aptIndexWithHeader(header aptReleaseHeader, components []string, packages map[string]map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	suite := header.suite
 	archSet := map[string]bool{}
 	for _, comp := range components {
 		for arch := range packages[comp] {
@@ -878,10 +911,17 @@ func (s *Server) aptIndexFrom(suite string, components []string, packages map[st
 	}
 
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "Origin: bodega\n")
-	fmt.Fprintf(&buf, "Label: bodega\n")
-	fmt.Fprintf(&buf, "Suite: %s\n", suite)
-	fmt.Fprintf(&buf, "Codename: %s\n", suite)
+	if header.origin != "" {
+		fmt.Fprintf(&buf, "Origin: %s\n", header.origin)
+	}
+	if header.label != "" {
+		fmt.Fprintf(&buf, "Label: %s\n", header.label)
+	}
+	fmt.Fprintf(&buf, "Suite: %s\n", header.suite)
+	if header.version != "" {
+		fmt.Fprintf(&buf, "Version: %s\n", header.version)
+	}
+	fmt.Fprintf(&buf, "Codename: %s\n", header.codename)
 	fmt.Fprintf(&buf, "Components: %s\n", strings.Join(components, " "))
 	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
 	fmt.Fprintf(&buf, "Date: %s\n", date.Format(time.RFC1123Z))
@@ -1106,11 +1146,19 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	// one's stanza: those carry Signed-By: or Trusted:, and a mirrored codename
 	// must carry neither, so folding them onto one Suites: line would apply
 	// the wrong trust to half of it.
+	//
+	// A mirrored codename the rebuild rewrote to drop a hidden version is
+	// bodega's document now, signed with bodega's key, and renders as a
+	// generated suite does.
 	for _, codename := range mirrored {
 		one := st
 		one.Suites = []string{codename}
-		one.Mirrored = true
-		one.Components = s.cfg.AptComponentsFor(codename)
+		if s.aptMirrorRewritten(codename) {
+			one.Components = s.aptServedComponents(one.Suites)
+		} else {
+			one.Mirrored = true
+			one.Components = s.cfg.AptComponentsFor(codename)
+		}
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	// A filtered codename renders as what it is: a suite bodega generated and
@@ -1789,7 +1837,12 @@ func (s *Server) mirroredStanzas(st aptsources.State) []aptsources.Sources {
 	var order []string
 	byKey := map[string][]string{}
 	comps := map[string][]string{}
+	var rewritten []string
 	for _, codename := range s.cfg.MirroredAptCodenames() {
+		if s.aptMirrorRewritten(codename) {
+			rewritten = append(rewritten, codename)
+			continue
+		}
 		effective := aptsources.MirroredComponentList(s.cfg.AptComponentsFor(codename))
 		key := componentsKey(effective)
 		if _, seen := byKey[key]; !seen {
@@ -1804,6 +1857,14 @@ func (s *Server) mirroredStanzas(st aptsources.State) []aptsources.Sources {
 		one.Suites = byKey[key]
 		one.Mirrored = true
 		one.Components = comps[key]
+		out = append(out, aptsources.Render(one))
+	}
+	// A codename rewritten to drop a hidden version is bodega-signed, so it
+	// cannot share a stanza with one apt verifies against the distro keyring.
+	if len(rewritten) > 0 {
+		one := st
+		one.Suites = rewritten
+		one.Components = s.aptServedComponents(rewritten)
 		out = append(out, aptsources.Render(one))
 	}
 	return out

@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -51,7 +52,7 @@ Hidden packages and versions are excluded.
 			}
 			ctx := context.Background()
 			args, jsonOut := stripJSON(args)
-			return runShow(ctx, store, args, false, jsonOut)
+			return runShow(ctx, store, args, false, jsonOut, nil)
 		},
 	}
 }
@@ -81,7 +82,7 @@ frozen flags, build environment, and raw JSON.
 			}
 			ctx := context.Background()
 			args, jsonOut := stripJSON(args)
-			return runShow(ctx, store, args, true, jsonOut)
+			return runShow(ctx, store, args, true, jsonOut, loadMirrorHides(ctx, gf, args))
 		},
 	}
 }
@@ -95,14 +96,16 @@ func stripJSON(args []string) ([]string, bool) {
 }
 
 // runShow dispatches based on arg depth. admin=true shows hidden/frozen/build_env.
-func runShow(ctx context.Context, store *manifest.Store, args []string, admin, jsonOut bool) error {
+// hides are the mirrored apt hides the listing names beside the manifests,
+// and are nil on the client view, which shows nothing hidden.
+func runShow(ctx context.Context, store *manifest.Store, args []string, admin, jsonOut bool, hides []audit.AptMirrorHide) error {
 	switch len(args) {
 	case 0:
 		return showTypeSummary(ctx, store, admin, jsonOut)
 	case 1:
-		return showPackageList(ctx, store, args[0], admin, jsonOut)
+		return showPackageList(ctx, store, args[0], admin, jsonOut, hides)
 	case 2:
-		return showVersionList(ctx, store, args[0], args[1], admin, jsonOut)
+		return showVersionList(ctx, store, args[0], args[1], admin, jsonOut, hides)
 	case 3:
 		return showVersionDetail(ctx, store, args[0], args[1], args[2], admin, jsonOut)
 	default:
@@ -164,7 +167,7 @@ func showTypeSummary(ctx context.Context, store *manifest.Store, admin, jsonOut 
 
 // ---------- depth 1: package list ----------
 
-func showPackageList(ctx context.Context, store *manifest.Store, typ string, admin, jsonOut bool) error {
+func showPackageList(ctx context.Context, store *manifest.Store, typ string, admin, jsonOut bool, hides []audit.AptMirrorHide) error {
 	if !isValidType(typ) {
 		return fmt.Errorf("unknown type %q — must be one of: %s", typ, strings.Join(manifest.AllTypes, ", "))
 	}
@@ -176,6 +179,10 @@ func showPackageList(ctx context.Context, store *manifest.Store, typ string, adm
 		Latest      string `json:"latest,omitempty"`
 		Mode        string `json:"mode,omitempty"`
 		Hidden      int    `json:"hidden,omitempty"`
+		// MirrorHidden lists the versions of a mirrored apt package hidden
+		// server-wide. A package served only from a mirror has no manifest,
+		// so it appears in the list through this field alone.
+		MirrorHidden []audit.AptMirrorHide `json:"mirror_hidden,omitempty"`
 	}
 	var pkgs []pkgInfo
 
@@ -218,16 +225,41 @@ func showPackageList(ctx context.Context, store *manifest.Store, typ string, adm
 		})
 	}
 
+	byName := map[string][]audit.AptMirrorHide{}
+	var hiddenNames []string
+	for _, h := range hides {
+		if byName[h.Name] == nil {
+			hiddenNames = append(hiddenNames, h.Name)
+		}
+		byName[h.Name] = append(byName[h.Name], h)
+	}
+	for i := range pkgs {
+		if hs := byName[pkgs[i].Name]; hs != nil {
+			pkgs[i].MirrorHidden = hs
+			pkgs[i].Hidden += len(hs)
+			delete(byName, pkgs[i].Name)
+		}
+	}
+	for _, name := range hiddenNames {
+		if hs := byName[name]; hs != nil {
+			pkgs = append(pkgs, pkgInfo{Name: name, Mode: "mirrored", Hidden: len(hs), MirrorHidden: hs})
+		}
+	}
+
 	if jsonOut {
 		return printJSON(pkgs)
 	}
 
+	defer printMirrorHides(hides)
 	if admin {
 		fmt.Printf("%-35s %-10s %-12s %-10s %-8s\n", "PACKAGE", "VERSIONS", "LATEST", "MODE", "HIDDEN")
 	} else {
 		fmt.Printf("%-35s %-10s %-12s %-10s\n", "PACKAGE", "VERSIONS", "LATEST", "MODE")
 	}
 	for _, p := range pkgs {
+		if p.Mode == "mirrored" {
+			continue
+		}
 		if admin {
 			fmt.Printf("%-35s %-10d %-12s %-10s %-8d\n", p.Name, p.Versions, p.Latest, p.Mode, p.Hidden)
 		} else {
@@ -239,15 +271,26 @@ func showPackageList(ctx context.Context, store *manifest.Store, typ string, adm
 
 // ---------- depth 2: version list ----------
 
-func showVersionList(ctx context.Context, store *manifest.Store, typ, name string, admin, jsonOut bool) error {
+func showVersionList(ctx context.Context, store *manifest.Store, typ, name string, admin, jsonOut bool, hides []audit.AptMirrorHide) error {
 	pm, err := store.GetPackage(ctx, typ, name)
+	if (err != nil || pm == nil) && len(hides) > 0 {
+		if jsonOut {
+			return printJSON(mirroredPackageJSON{Name: name, Type: typ, MirrorHidden: hides})
+		}
+		fmt.Printf("Package: %s (mirrored; no manifest)\n", name)
+		printMirrorHides(hides)
+		return nil
+	}
 	if err != nil || pm == nil {
 		return fmt.Errorf("%s/%s not found", typ, name)
 	}
 
 	if jsonOut {
 		if admin {
-			return printJSON(pm)
+			return printJSON(struct {
+				*manifest.PackageManifest
+				MirrorHidden []audit.AptMirrorHide `json:"mirror_hidden,omitempty"`
+			}{pm, hides})
 		}
 		// Filter hidden for repo view.
 		filtered := *pm
@@ -330,7 +373,105 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	if len(flagged) > 0 {
 		fmt.Printf("\nFlagged by OSV:\n%s\n", strings.Join(flagged, "\n"))
 	}
+	printMirrorHides(hides)
 	return nil
+}
+
+// mirroredPackageJSON is pkg show's --json for an apt package bodega serves
+// only from a mirror, which has hides and no manifest to print.
+type mirroredPackageJSON struct {
+	Name         string                `json:"name"`
+	Type         string                `json:"type"`
+	MirrorHidden []audit.AptMirrorHide `json:"mirror_hidden"`
+}
+
+// printMirrorHides renders the mirrored apt hides under a listing, saying who
+// set each and when, since the record is the only place that is kept.
+func printMirrorHides(hides []audit.AptMirrorHide) {
+	if len(hides) == 0 {
+		return
+	}
+	fmt.Printf("\nHidden mirrored versions (server-wide):\n")
+	fmt.Printf("%-35s %-24s %-16s %-21s %s\n", "PACKAGE", "VERSION", "HIDDEN BY", "HIDDEN AT", "CODENAMES")
+	for _, h := range hides {
+		fmt.Printf("%-35s %-24s %-16s %-21s %s\n", h.Name, h.Version, h.HiddenBy,
+			h.HiddenAt.UTC().Format(time.RFC3339), strings.Join(h.Codenames, " "))
+	}
+}
+
+// loadMirrorHides reads the mirrored apt hides an admin listing of args names:
+// every one for a type listing, one package's for a package listing, none for
+// any other type or depth. An audit store that cannot be opened is a warning,
+// not a failure, so the manifest half of the listing still prints.
+func loadMirrorHides(ctx context.Context, gf *globalFlags, args []string) []audit.AptMirrorHide {
+	if len(args) == 0 || len(args) > 2 || args[0] != manifest.TypeApt {
+		return nil
+	}
+	adb, err := openAuditDBErr(gf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: mirrored apt hides not listed: %v\n", err)
+		return nil
+	}
+	if adb == nil {
+		return nil
+	}
+	defer adb.Close()
+	name := ""
+	if len(args) == 2 {
+		name = args[1]
+	}
+	hides, err := adb.ListAptMirrorHides(ctx, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: mirrored apt hides not listed: %v\n", err)
+		return nil
+	}
+	return hides
+}
+
+// newPkgListCmd is `bodega pkg list TYPE`: the admin listing of one type,
+// hidden versions included, with the mirrored apt hides beside it.
+func newPkgListCmd(gf *globalFlags) *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "list TYPE",
+		Short: "List one type's packages, hidden versions and mirrored apt hides included",
+		Example: `  bodega pkg list apt
+  bodega pkg list apt --json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := loadStore(gf)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			return showPackageList(ctx, store, args[0], true, jsonOut, loadMirrorHides(ctx, gf, args))
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print JSON")
+	return cmd
+}
+
+// newPkgShowCmd is `bodega pkg show TYPE NAME`: one package's versions in the
+// admin view, with any mirrored apt hide on it.
+func newPkgShowCmd(gf *globalFlags) *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "show TYPE NAME",
+		Short: "Show one package's versions, hidden ones and mirrored apt hides included",
+		Example: `  bodega pkg show apt php8.5-fpm
+  bodega pkg show apt php8.5-fpm --json`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := loadStore(gf)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			return showVersionList(ctx, store, args[0], args[1], true, jsonOut, loadMirrorHides(ctx, gf, args))
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print JSON")
+	return cmd
 }
 
 // originCell renders the hosts a version was cataloged from. A dash rather

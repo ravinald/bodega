@@ -49,7 +49,7 @@ func TestShowVersionList_FlaggedVersionNamesItsFindings(t *testing.T) {
 		manifest.VersionEntry{Version: "1.2.9"})
 
 	out := captureStdout(t, func() {
-		if err := showVersionList(context.Background(), store, manifest.TypeNpm, "minimist", true, false); err != nil {
+		if err := showVersionList(context.Background(), store, manifest.TypeNpm, "minimist", true, false, nil); err != nil {
 			t.Errorf("showVersionList: %v", err)
 		}
 	})
@@ -91,7 +91,7 @@ func TestShowVersionList_UncoveredEcosystemReadsNA(t *testing.T) {
 				}})
 
 			out := captureStdout(t, func() {
-				if err := showVersionList(context.Background(), store, typ, "hello", true, false); err != nil {
+				if err := showVersionList(context.Background(), store, typ, "hello", true, false, nil); err != nil {
 					t.Errorf("showVersionList: %v", err)
 				}
 			})
@@ -133,7 +133,7 @@ func TestShowVersionList_RangeEntryIsNeverDated(t *testing.T) {
 			Metadata: map[string]string{policy.OSVMetaCheckedAt: "2026-01-01T00:00:00Z"}})
 
 	out := captureStdout(t, func() {
-		if err := showVersionList(context.Background(), store, manifest.TypeNpm, "minimist", true, false); err != nil {
+		if err := showVersionList(context.Background(), store, manifest.TypeNpm, "minimist", true, false, nil); err != nil {
 			t.Errorf("showVersionList: %v", err)
 		}
 	})
@@ -172,7 +172,7 @@ func TestShowVersionListDisplaysOrigins(t *testing.T) {
 		manifest.VersionEntry{Version: "2.32.0"})
 
 	out := captureStdout(t, func() {
-		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", true, false); err != nil {
+		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", true, false, nil); err != nil {
 			t.Errorf("showVersionList: %v", err)
 		}
 	})
@@ -196,7 +196,7 @@ func TestShowVersionListWithholdsOriginsFromTheRepoTable(t *testing.T) {
 		manifest.VersionEntry{Version: "2.31.0", Metadata: map[string]string{admit.MetaOrigin: "db01"}})
 
 	out := captureStdout(t, func() {
-		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", false, false); err != nil {
+		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", false, false, nil); err != nil {
 			t.Errorf("showVersionList: %v", err)
 		}
 	})
