@@ -75,12 +75,32 @@ const (
 // aptProfileSuite is one profile's filtered codename: which upstream suite it
 // derives from, what it is served as, and the predicate that decides its
 // contents.
+//
+// base is the suite this codename reads, which for a pocket is the pocket and
+// not the base the profile names; scope is always the latter. They differ for
+// the pockets alone, which is how a caller tells the two apart.
 type aptProfileSuite struct {
 	profile  string
+	scope    string
 	base     string
 	codename string
 	permit   *entitle.Profile
 	index    *aptSuiteIndex
+}
+
+// pocket reports whether this codename filters a pocket of the profile's base
+// rather than the base itself.
+func (ps aptProfileSuite) pocket() bool { return ps.base != ps.scope }
+
+// logAttrs names the profile and the suite read, with the pocket broken out so
+// a log line about noble-security-web reads as a pocket of noble and not as a
+// base somebody configured.
+func (ps aptProfileSuite) logAttrs() []any {
+	attrs := []any{"profile", ps.profile, "base", ps.scope}
+	if ps.pocket() {
+		attrs = append(attrs, "pocket", ps.base)
+	}
+	return attrs
 }
 
 // aptProfileView is one profile that governs apt and the predicate every index
@@ -130,8 +150,17 @@ func (s *Server) aptProfileViews(ctx context.Context) []aptProfileView {
 }
 
 // aptProfileSuites resolves every profile that scopes apt onto an upstream
-// base into a codename this server can generate, dropping the ones it cannot
-// with the reason.
+// base into the codenames this server can generate, dropping the ones it
+// cannot with the reason.
+//
+// One codename per suite the host reads: the base, and each of its pockets
+// this server mirrors, as <pocket>-<profile>. A stock Ubuntu host runs packages
+// from -updates and -security, so a profile served the base alone cannot
+// install a -dev package whose runtime half is newer than the release, and
+// stops receiving security fixes. Filtering the union of base and pockets into
+// one codename was the other road, and it loses which pocket a version came
+// from: the Release would describe no upstream suite, and apt's pinning by
+// suite stops meaning anything on the host.
 //
 // A profile absent from this list is not a profile bodega stopped filtering:
 // it derives no codename, and its hosts read a filtered view of the generated
@@ -155,12 +184,14 @@ func (s *Server) aptProfileSuites(views []aptProfileView) []aptProfileSuite {
 				"mirrored", strings.Join(s.cfg.MirroredAptCodenames(), " "))
 			continue
 		}
-		codename := config.ProfileAptCodename(base, v.profile)
-		if err := s.cfg.ValidateProfileAptCodename(codename, base, v.profile); err != nil {
-			s.logger.Error("a profile's filtered apt codename cannot be served", "error", err)
-			continue
+		for _, suite := range append([]string{base}, s.aptMirroredPockets(base)...) {
+			codename := config.ProfileAptCodename(suite, v.profile)
+			if err := s.cfg.ValidateProfileAptCodename(codename, suite, v.profile); err != nil {
+				s.logger.Error("a profile's filtered apt codename cannot be served", "error", err)
+				continue
+			}
+			out = append(out, aptProfileSuite{profile: v.profile, scope: base, base: suite, codename: codename, permit: v.permit})
 		}
-		out = append(out, aptProfileSuite{profile: v.profile, base: base, codename: codename, permit: v.permit})
 	}
 	return s.dropCollidingCodenames(out)
 }
@@ -176,6 +207,11 @@ func (s *Server) aptProfileSuites(views []aptProfileView) []aptProfileSuite {
 // offered a package, request it, and aptPoolGate refuses them mid-transaction,
 // which is the outcome this file exists to prevent. Dropping both instead
 // fails `apt update` on both, and the log names the rename that fixes it.
+//
+// A pocket's codename collides the same way and is dropped by the same rule:
+// "web" over noble derives noble-security-web from noble-security, which is
+// the base codename of "security-web" over noble. The pocket is named in the
+// log as the suite it derives from, so the pair reads as the overlap it is.
 //
 // ValidateProfileAptCodename cannot catch this. It is handed one profile and
 // checks it against the config, and the profile it collides with is in neither.
@@ -207,9 +243,11 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // aptProfileIndexes generates and signs one filtered dists/ tree per profile
 // that scopes apt, for the snapshot under construction.
 //
-// One fetch per (base, architecture) serves every profile over that base. Two
+// One fetch per (suite, architecture) serves every profile over that suite. Two
 // profiles filtering noble read one upstream Packages between them, which is
 // the difference between a linear cost in profiles and a linear cost in bases.
+// A pocket is a suite like any other here, so a read that fails withdraws that
+// pocket's codename alone, and planApt refuses the host naming the pocket.
 func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, date, validUntil time.Time) (served []aptProfileSuite) {
 	suites := s.aptProfileSuites(views)
 	if len(suites) == 0 {
@@ -224,7 +262,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 			var err error
 			if release, err = s.aptUpstreamRelease(ctx, ps.base); err != nil {
 				s.logger.Error("could not read the upstream Release for a profile's apt base, so its filtered codename is not regenerated at this rebuild",
-					"profile", ps.profile, "base", ps.base, "error", err)
+					append(ps.logAttrs(), "error", err)...)
 				continue
 			}
 			releases[ps.base] = release
@@ -232,13 +270,13 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 		arches, err := s.aptUpstreamArches(ps.base, release)
 		if err != nil {
 			s.logger.Error("could not tell which architectures a profile's apt base publishes, so its filtered codename is not regenerated at this rebuild",
-				"profile", ps.profile, "base", ps.base, "error", err)
+				append(ps.logAttrs(), "error", err)...)
 			continue
 		}
 		packages, err := s.aptFilteredPackages(ctx, ps, arches, release, cache)
 		if err != nil {
 			s.logger.Error("a profile's filtered apt codename is not regenerated at this rebuild, so it stops being served until the read succeeds",
-				"profile", ps.profile, "codename", ps.codename, "error", err)
+				append(ps.logAttrs(), "codename", ps.codename, "error", err)...)
 			continue
 		}
 		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
@@ -265,7 +303,9 @@ type aptIndexRead struct {
 // whole codename when one it does carry cannot be read or parsed.
 //
 // A filter that keeps nothing fails the same way, when the profile lists apt
-// packages at all. Closed with nothing listed permits nothing deliberately and
+// packages at all and the suite is the base. A pocket is exempt: -backports
+// carrying none of a baseline is the ordinary case, and withdrawing its
+// codename for that would refuse every host the profile binds. Closed with nothing listed permits nothing deliberately and
 // serves an empty index; closed with entries none of which match a paragraph is
 // a misspelled source or an unsatisfiable pin, and the served result is
 // identical — a signed empty Packages, every package on the host kept back, and
@@ -318,7 +358,7 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, ar
 		if err != nil {
 			return nil, fmt.Errorf("filter the upstream Packages for %s/%s: %w", ps.base, arch, err)
 		}
-		if kept == 0 && ps.permit.Lists(manifest.TypeApt) {
+		if kept == 0 && !ps.pocket() && ps.permit.Lists(manifest.TypeApt) {
 			return nil, fmt.Errorf("the filter kept none of the %d paragraphs %s/%s publishes, and the profile lists apt packages: a name that matches no source in this base, or a pin no paragraph carries. Serving it would sign an empty Packages and report every package on the host as kept back",
 				dropped, ps.base, arch)
 		}

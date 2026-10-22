@@ -13,8 +13,8 @@
 #   ./run.sh                    # full pass
 #   ./run.sh --self-test        # the harness's own tests, no guest needed
 #   ./run.sh --list             # suite names
-#   ./run.sh --suite 45-        # only suites whose name starts 45-
-#   ./run.sh --no-ship          # reuse what is installed; for iterating
+#   ./run.sh --suite 45-        # suites starting 45-, after preflight and ship
+#   ./run.sh --no-ship          # measure what is installed; for iterating
 #   ./run.sh --file <run-id>    # open an issue per unmapped FAIL
 #
 # Before a long unattended run:
@@ -148,7 +148,10 @@ while [ $# -gt 0 ]; do
 		ALLOW_DIRTY=yes
 		SHIP=no
 		;;
-	--preflight) SUITE_FILTER="00-" ;;
+	--preflight)
+		SUITE_FILTER="00-"
+		SHIP=no
+		;;
 	--validate) MODE=validate ;;
 	--deadline)
 		DEADLINE_MIN="${2:?--deadline needs minutes}"
@@ -250,6 +253,10 @@ export E2E_DRY_RUN E2E_DRY_PLAN
 
 [ "$E2E_DRY_RUN" = yes ] && printf 'DRY RUN — no guest is contacted and nothing is measured\n'
 printf 'bodega e2e  run=%s  commit=%s\n' "$E2E_RUN_ID" "$E2E_COMMIT"
+if [ "$SHIP" = no ]; then
+	printf '%s\n' "$E2E_NOT_SHIPPED_NOTE"
+	printf '%s\n' "$E2E_NOT_SHIPPED_NOTE" >"$E2E_RUN_DIR/not-shipped"
+fi
 printf 'server=%s  client=%s\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
 printf 'freebsd=%s  freebsd-server=%s\n\n' "$E2E_FREEBSD_HOST" "$E2E_FREEBSD_SERVER_HOST"
 
@@ -295,21 +302,7 @@ for suite_file in "${E2E_SUITE_FILES[@]}"; do
 		continue
 	fi
 
-	# 00-preflight is a prerequisite, not a suite you can filter away. It sets
-	# the reachability flags every other suite reads, so skipping it turns a
-	# filtered run into a wall of BLOCKED and a filter typo into a run that
-	# measures nothing.
-	case "$suite" in
-	00-*) ;;
-	*)
-		if [ -n "$SUITE_FILTER" ]; then
-			case "$suite" in
-			"$SUITE_FILTER"*) ;;
-			*) continue ;;
-			esac
-		fi
-		;;
-	esac
+	e2e_suite_selected "$suite" "$SUITE_FILTER" "$SHIP" || continue
 
 	E2E_SUITE="$suite"
 	E2E_HOST="local"
