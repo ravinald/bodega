@@ -150,7 +150,7 @@ func TestRefreshReloadsManifestsFromDisk(t *testing.T) {
 	if snap == nil || snap.suites["noble"] == nil {
 		t.Fatal("no snapshot after refresh")
 	}
-	packages := string(snap.suites["noble"].packages["amd64"])
+	packages := string(snap.suites["noble"].packages["main"]["amd64"])
 	if !strings.Contains(packages, "EDITED-BY-HAND") {
 		t.Errorf("out-of-band manifest edit did not reach the index:\n%s", packages)
 	}
@@ -283,7 +283,7 @@ func TestNoListingWhenEveryEntryCarriesPoolPath(t *testing.T) {
 		t.Errorf("%d pool listings for an index every entry addresses directly, want 0", n)
 	}
 	snap := s.aptSnap.Load()
-	if snap == nil || !strings.Contains(string(snap.suites["noble"].packages["amd64"]), "Package: hello") {
+	if snap == nil || !strings.Contains(string(snap.suites["noble"].packages["main"]["amd64"]), "Package: hello") {
 		t.Error("the entry with _pool_path did not reach the index")
 	}
 }
@@ -322,7 +322,7 @@ func TestLateDebIsNotHiddenByTheCachedListing(t *testing.T) {
 	if snap == nil {
 		t.Fatal("no snapshot")
 	}
-	packages := string(snap.suites["noble"].packages["amd64"])
+	packages := string(snap.suites["noble"].packages["main"]["amd64"])
 	if !strings.Contains(packages, "Package: late") {
 		t.Errorf("a .deb uploaded after the cached listing stayed out of the index:\n%s", packages)
 	}
