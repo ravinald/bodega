@@ -54,9 +54,11 @@ NBX_LONG="${NBX_LONG:-2400}"
 # The cold catalog bootstrap adds roughly one distribution per round; NetBox's
 # closure is about 100.
 NBX_CATALOG_ROUNDS="${NBX_CATALOG_ROUNDS:-150}"
-# F67's deadman clears a lock 30 minutes after it was applied. A phase that
-# runs longer re-applies it well inside that.
-NBX_RELOCK_SECS=1200
+# F67's deadman clears a lock 30 minutes after it was applied. Every step
+# boundary re-applies a lock older than this, so only a single step running
+# past the remaining 20 minutes can outlive it, and a lock that did lapse is
+# caught when it is next re-applied or read.
+NBX_RELOCK_SECS=600
 NBX_REASON="e2e suite 58: NetBox v4.7.2 phase 1 install"
 
 # ---- state the cleanup reads ------------------------------------------------
@@ -78,6 +80,11 @@ nbx_prior_discover=""
 nbx_drops_base=0
 nbx_drops_acc=0
 nbx_locked_at=0
+nbx_client_lapsed=no
+nbx_server_ips=""
+nbx_server_locked_at=0
+nbx_server_lapsed=no
+nbx_conf_before=""
 
 nbx_host="${E2E_BASE_URL#*://}"
 nbx_host="${nbx_host%%[:/]*}"
@@ -177,11 +184,14 @@ nbx_drops_now() {
 }
 
 # nbx_lock_client — lock, or re-lock to re-arm the deadman, carrying the
-# movement since the previous lock into the phase's total.
+# movement since the previous lock into the phase's total. A re-lock that
+# finds no counter means the lock lapsed, and the traffic sent while it was
+# gone was never counted, so the phase is marked rather than credited zero.
 nbx_lock_client() {
 	local n
 	if [ "$nbx_locked_client" = yes ]; then
 		n="$(nbx_drops_now client)"
+		[ -n "$n" ] || nbx_client_lapsed=yes
 		nbx_drops_acc=$((nbx_drops_acc + ${n:-0} - nbx_drops_base))
 	fi
 	e2e_egress_lock client "$nbx_server_addr" || return 1
@@ -191,19 +201,48 @@ nbx_lock_client() {
 	nbx_drops_base="${n:-0}"
 }
 
-# nbx_keepalive — re-arm the client's deadman when the lock is getting old.
+# nbx_lock_server <ip>... — the same for phase 6's server lock. The server's
+# counter is not asserted, only that the lock held throughout, so a lapse is
+# all a re-lock records. A re-lock that fails has already removed the lock.
+nbx_lock_server() {
+	if [ "$nbx_locked_server" = yes ] && [ -z "$(nbx_drops_now server)" ]; then
+		nbx_server_lapsed=yes
+	fi
+	if ! e2e_egress_lock server "$@"; then
+		[ "$nbx_locked_server" = yes ] && nbx_server_lapsed=yes
+		return 1
+	fi
+	nbx_locked_server=yes
+	nbx_server_ips="$*"
+	nbx_server_locked_at="$(date -u +%s)"
+}
+
+# nbx_keepalive — re-arm each lock's deadman when the lock is getting old.
+# Called at every step boundary, since one install step can run for most of
+# the deadman's 30 minutes.
 nbx_keepalive() {
-	[ "$nbx_locked_client" = yes ] || return 0
-	[ $(($(date -u +%s) - nbx_locked_at)) -ge "$NBX_RELOCK_SECS" ] || return 0
-	nbx_lock_client || true
+	local now
+	now="$(date -u +%s)"
+	if [ "$nbx_locked_client" = yes ] && [ $((now - nbx_locked_at)) -ge "$NBX_RELOCK_SECS" ]; then
+		nbx_lock_client || true
+	fi
+	if [ "$nbx_locked_server" = yes ] && [ $((now - nbx_server_locked_at)) -ge "$NBX_RELOCK_SECS" ]; then
+		# shellcheck disable=SC2086  # one address per word
+		nbx_lock_server $nbx_server_ips || true
+	fi
 }
 
 # nbx_phase_drops <phase> — R11: the client tried no route but bodega.
 nbx_phase_drops() {
-	local phase="$1" n moved
+	local phase="$1" n moved lapsed="$nbx_client_lapsed"
 	E2E_HOST=client
 	n="$(nbx_drops_now client)"
-	if [ -z "$n" ]; then
+	nbx_client_lapsed=no
+	if [ "$lapsed" = yes ]; then
+		e2e_record "NBX-P$phase-DROPS" FAIL "phase $phase: the client sent nothing around bodega" \
+			"0 packets dropped" "the lock lapsed during the phase and was re-applied, so what the client sent meanwhile was never counted" \
+			"e2e_egress_drops client before each re-lock" 1 "test/e2e/lib/egress.sh:15"
+	elif [ -z "$n" ]; then
 		e2e_record "NBX-P$phase-DROPS" FAIL "phase $phase: the client sent nothing around bodega" \
 			"0 packets dropped" "the drop counter could not be read, so the lock was gone before the phase ended" \
 			"e2e_egress_drops client" 1 "test/e2e/lib/egress.sh:334"
@@ -315,6 +354,43 @@ sudo apt-get clean
 EOF
 }
 
+# nbx_script_sources_off <root> [sudo] — every apt source but bodega's set
+# aside under <root>, so apt has no second place to look. <root> is empty on a
+# guest; the self-test passes a scratch tree and no sudo.
+nbx_script_sources_off() {
+	local r="$1" s="${2-sudo}"
+	cat <<EOF
+for f in $r/etc/apt/sources.list $r/etc/apt/sources.list.d/*.sources $r/etc/apt/sources.list.d/*.list; do
+	[ -f "\$f" ] && [ "\$f" != $r/etc/apt/sources.list.d/bodega.sources ] && $s mv "\$f" "\$f.e2e-netbox-off"
+done
+true
+EOF
+}
+
+# nbx_script_sources_on <root> [sudo] — the inverse, over both places the
+# set-aside writes. The original wins over anything written under its name
+# since, which is the state the run found.
+nbx_script_sources_on() {
+	local r="$1" s="${2-sudo}"
+	cat <<EOF
+for f in $r/etc/apt/sources.list.e2e-netbox-off $r/etc/apt/sources.list.d/*.e2e-netbox-off; do
+	[ -e "\$f" ] && $s mv -f "\$f" "\${f%.e2e-netbox-off}"
+done
+true
+EOF
+}
+
+# nbx_script_conf_digest — a hash of every apt source and pip.conf, one file
+# per line, which the restore check compares against the one preflight read.
+nbx_script_conf_digest() {
+	cat <<'EOF'
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/pip.conf; do
+	[ -f "$f" ] && sha256sum "$f"
+done
+true
+EOF
+}
+
 # ---- install -----------------------------------------------------------------
 
 # nbx_install <id-prefix> — NetBox's standalone install, start to login page.
@@ -327,6 +403,7 @@ nbx_install() {
 	e2e_on client "mkdir -p $NBX_WORK && touch $NBX_WORK/apt-installed && { wc -l < /var/log/apt/history.log 2>/dev/null || echo 0; }" || true
 	before="${E2E_OUT:-0}"
 
+	nbx_keepalive
 	nbx_long client "sudo DEBIAN_FRONTEND=noninteractive apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $NBX_APT" || true
 	nbx_rc "$p-APT" "the apt packages NetBox's install guide names install through bodega" \
 		"internal/server/apt.go" "apt-get update && apt-get install -y $NBX_APT"
@@ -343,29 +420,35 @@ nbx_install() {
 		printf '%s\\n' \"\$seg\" | sed -n -E 's/^(Install|Upgrade|Reinstall|Downgrade): //p' | names" || true
 	nbx_apt_fetched="$E2E_OUT"
 
+	nbx_keepalive
 	nbx_long client "bash -s" <<<"$(nbx_script_tarball)" || true
 	nbx_rc "$p-TARBALL" "the NetBox $NBX_TAG release tarball comes from bodega's git release route" \
 		"internal/server/git.go" "curl $E2E_BASE_URL/git/netbox/netbox-$NBX_TAG.tar.gz | tar -x"
 
+	nbx_keepalive
 	nbx_long client "bash -s" <<<"$(nbx_script_database)" || true
 	nbx_rc "$p-DB" "NetBox's PostgreSQL database and role are created" \
 		"docs.netbox.dev installation step 1" "psql: CREATE ROLE netbox; CREATE DATABASE netbox"
 
 	[ "$p" = NBX-P1 ] && nbx_catalog
 
+	nbx_keepalive
 	nbx_long client "rm -f $NBX_WORK/pip.log $NBX_WORK/pip-report.json && cd $NBX_ROOT && python3 -m venv venv &&
 		$nbx_pip_env venv/bin/pip install --log $NBX_WORK/pip.log --report $NBX_WORK/pip-report.json -r requirements.txt" || true
 	nbx_rc "$p-PIP" "pip install -r requirements.txt resolves NetBox's closure through bodega" \
 		"internal/server/pypi.go" "python3 -m venv venv && venv/bin/pip install --report ... -r requirements.txt"
 
+	nbx_keepalive
 	nbx_long client "cd $NBX_ROOT/netbox && ../venv/bin/python manage.py check" || true
 	nbx_rc "$p-CHECK" "manage.py check exits 0" "docs.netbox.dev installation step 3" \
 		"cd $NBX_ROOT/netbox && ../venv/bin/python manage.py check"
 
+	nbx_keepalive
 	nbx_long client "cd $NBX_ROOT/netbox && ../venv/bin/python manage.py migrate --no-input" || true
 	nbx_rc "$p-MIGRATE" "manage.py migrate completes" "docs.netbox.dev installation step 3" \
 		"cd $NBX_ROOT/netbox && ../venv/bin/python manage.py migrate --no-input"
 
+	nbx_keepalive
 	nbx_long client "bash -s" <<<"$(nbx_script_login)" || true
 	check_eq "$p-LOGIN" "the NetBox dev server answers /login/ with 200" "200" "$E2E_OUT" \
 		"docs.netbox.dev installation step 3" "manage.py runserver 127.0.0.1:8000; curl /login/"
@@ -450,15 +533,13 @@ nbx_cleanup() {
 		nbx_long client "bash -s" <<<"$(nbx_script_remove)" >/dev/null 2>&1 || true
 	fi
 	if [ "$nbx_client_configured" = yes ]; then
-		e2e_on client "o=$NBX_WORK/orig
-			for f in /etc/apt/sources.list.d/bodega.sources /etc/pip.conf; do
-				b=\$(basename \$f)
-				if [ -f \$o/\$b ]; then sudo install -m 0644 \$o/\$b \$f; else sudo rm -f \$f; fi
-			done
-			for f in /etc/apt/sources.list.d/*.e2e-netbox-off; do
-				[ -e \"\$f\" ] && sudo mv \"\$f\" \"\${f%.e2e-netbox-off}\"
-			done
-			sudo find /etc/apt/sources.list.d /etc -maxdepth 1 -name '*.bodega-*' -newer \$o -delete" >/dev/null 2>&1 || true
+		e2e_on client "bash -s" <<<"o=$NBX_WORK/orig
+for f in /etc/apt/sources.list.d/bodega.sources /etc/pip.conf; do
+	b=\$(basename \$f)
+	if [ -f \$o/\$b ]; then sudo install -m 0644 \$o/\$b \$f; else sudo rm -f \$f; fi
+done
+$(nbx_script_sources_on "")
+sudo find /etc/apt/sources.list.d /etc -maxdepth 1 -name '*.bodega-*' -newer \$o -delete" >/dev/null 2>&1 || true
 	fi
 	e2e_on client "rm -rf $NBX_WORK" >/dev/null 2>&1 || true
 
@@ -592,6 +673,22 @@ nbx_preflight() {
 	e2e_record NBX-PRE-CIDR PASS "the client's /32 carries no identity binding" "unbound" "unbound" \
 		"bodega identity list" 0 "cmd/bodega/cmd_identity.go:59"
 
+	# A source still set aside by a run whose cleanup never ran is the
+	# original, and setting aside again would overwrite it with whatever apt
+	# was given since.
+	E2E_HOST=client
+	e2e_on client "find /etc/apt -name '*.e2e-netbox-off'" || true
+	if [ "${E2E_DRY_RUN:-no}" != yes ] && [ -n "$E2E_OUT" ]; then
+		e2e_block NBX-PRE-CLIENT-CONF "no apt source on the client is still set aside by an earlier run" \
+			"$(printf '%s' "$E2E_OUT" | tr '\n' ' ')is left from a run whose cleanup did not finish; move each back to its name without .e2e-netbox-off"
+		return 1
+	fi
+	e2e_on client "bash -s" <<<"$(nbx_script_conf_digest)" || true
+	nbx_conf_before="$E2E_OUT"
+	e2e_record NBX-PRE-CLIENT-CONF PASS "no apt source on the client is still set aside by an earlier run" "none" "none" \
+		"find /etc/apt -name '*.e2e-netbox-off'" 0 ""
+
+	E2E_HOST=server
 	# What the cleanup puts back. The whole config file rather than one key:
 	# phase 1 changes discover_mode, proxy_cache_enabled and apt_upstreams, and
 	# restoring each by hand is three chances to leave one changed.
@@ -757,15 +854,14 @@ nbx_phase1() {
 	# fails `apt-get update` for a reason that is not bodega's.
 	E2E_HOST=client
 	nbx_client_configured=yes
-	e2e_on client "mkdir -p $NBX_WORK/orig &&
-		for f in /etc/apt/sources.list.d/bodega.sources /etc/pip.conf; do [ -f \$f ] && cp -p \$f $NBX_WORK/orig/; done
-		for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-			[ -f \"\$f\" ] && [ \"\$f\" != /etc/apt/sources.list.d/bodega.sources ] && sudo mv \"\$f\" \"\$f.e2e-netbox-off\"
-		done; true" || true
+	e2e_on client "bash -s" <<<"mkdir -p $NBX_WORK/orig
+for f in /etc/apt/sources.list.d/bodega.sources /etc/pip.conf; do [ -f \$f ] && cp -p \$f $NBX_WORK/orig/; done
+$(nbx_script_sources_off "")" || true
 	e2e_on client "sudo bodega doctor --configure apt,pypi --apply --url $E2E_BASE_URL --allow-plaintext" || true
 	nbx_rc NBX-P1-CONFIGURE "bodega doctor configures apt and pip on the client" "cmd/bodega/cmd_doctor.go" \
 		"sudo bodega doctor --configure apt,pypi --apply --url $E2E_BASE_URL --allow-plaintext"
 
+	nbx_keepalive
 	nbx_git_entry
 	nbx_install NBX-P1
 	nbx_evidence
@@ -967,6 +1063,8 @@ nbx_phase4() {
 	# mirrored codename the profile names no base for is served whole, so a
 	# package outside the set is either absent from what the client reads or
 	# refused at the pool. The check id says which one happened.
+	nbx_keepalive
+	E2E_HOST=client
 	e2e_on client "apt-cache show $NBX_APT_OUTSIDE 2>/dev/null | awk '/^Source:/ {print \$2; exit}'" || true
 	src="${E2E_OUT:-$NBX_APT_OUTSIDE}"
 	e2e_on client "apt-cache policy $NBX_APT_OUTSIDE | awk '/Candidate:/ {print \$2}'" || true
@@ -1067,14 +1165,13 @@ nbx_phase6() {
 	# first address on 8080, and only the server listens there. Traffic to
 	# its own address leaves through lo, which the lock already accepts, so
 	# naming it widens nothing.
-	if ! e2e_egress_lock server "$nbx_server_addr" "$nbx_client_addr" "$ws"; then
+	if ! nbx_lock_server "$nbx_server_addr" "$nbx_client_addr" "$ws"; then
 		e2e_record NBX-P6-LOCK FAIL "the server is cut off from every upstream" "lock holds" \
 			"e2e_egress_lock refused or did not hold; its stderr is in the run output" \
 			"e2e_egress_lock server $nbx_server_addr $nbx_client_addr $ws" 1 "test/e2e/lib/egress.sh:269"
 		nbx_phase_drops 6
 		return 0
 	fi
-	nbx_locked_server=yes
 	e2e_record NBX-P6-LOCK PASS "the server is cut off from every upstream" "lock holds" "lock holds" \
 		"e2e_egress_lock server $nbx_server_addr $nbx_client_addr $ws" 0 "test/e2e/lib/egress.sh:269"
 	e2e_on server "curl -m 5 -sS -o /dev/null https://pypi.org/simple/" || true
@@ -1084,13 +1181,32 @@ nbx_phase6() {
 	nbx_lock_client || true
 	nbx_remove NBX-P6
 	nbx_install NBX-P6
+	nbx_phase6_release
+	nbx_phase_drops 6
+}
 
+# nbx_phase6_release — read that the server's lock held through the
+# reinstall, then remove it. Removing a lock succeeds on a guest with none, so
+# without this read a lock the deadman cleared mid-install would leave every
+# NBX-P6 install check passing on a server that could reach its upstreams.
+nbx_phase6_release() {
+	local n rc=0
 	E2E_HOST=server
-	e2e_egress_unlock server || true
+	n="$(e2e_egress_drops server 2>&1)" || true
+	if [ "$nbx_server_lapsed" = no ] && [[ "$n" =~ ^[0-9]+$ ]]; then
+		e2e_record NBX-P6-HELD PASS "the server's lock held through the reinstall" "lock loaded throughout" \
+			"lock loaded, $n dropped" "e2e_egress_drops server" 0 "test/e2e/lib/egress.sh:15"
+	else
+		e2e_record NBX-P6-HELD FAIL "the server's lock held through the reinstall" "lock loaded throughout" \
+			"$(e2e_excerpt "lapsed and re-applied: $nbx_server_lapsed; now: $n")" "e2e_egress_drops server" 1 \
+			"test/e2e/lib/egress.sh:15; the NBX-P6 install checks are no evidence for the outage claim"
+	fi
+	nbx_server_lapsed=no
+	e2e_egress_unlock server || rc=$?
+	E2E_RC="$rc"
 	nbx_rc NBX-P6-UNLOCK "the server's lock is removed before the restore" "test/e2e/lib/egress.sh:317" \
 		"e2e_egress_unlock server"
-	[ "$E2E_RC" = 0 ] && nbx_locked_server=no
-	nbx_phase_drops 6
+	[ "$rc" = 0 ] && nbx_locked_server=no
 }
 
 # ---- phase 7 -----------------------------------------------------------------
@@ -1138,9 +1254,33 @@ nbx_phase7() {
 
 	E2E_HOST=client
 	e2e_on client "test -e $NBX_ROOT && echo $NBX_ROOT; test -e $NBX_WORK && echo $NBX_WORK;
-		command -v psql >/dev/null 2>&1 && (cd /tmp && sudo -u postgres psql -tAc \"SELECT 'netbox database' FROM pg_database WHERE datname = 'netbox'\" 2>/dev/null); true" || true
-	check_eq NBX-RESTORE-NETBOX "no NetBox tree, venv or database is left on the client" "" "$E2E_OUT" \
-		"test/e2e/suites/58-realworld-netbox.sh" "test -e $NBX_ROOT; psql -c 'SELECT datname FROM pg_database'"
+		command -v psql >/dev/null 2>&1 && (cd /tmp && sudo -u postgres psql -tAc \"SELECT 'netbox database' FROM pg_database WHERE datname = 'netbox' UNION ALL SELECT 'netbox role' FROM pg_roles WHERE rolname = 'netbox'\" 2>/dev/null); true" || true
+	check_eq NBX-RESTORE-NETBOX "no NetBox tree, venv, database or role is left on the client" "" "$E2E_OUT" \
+		"test/e2e/suites/58-realworld-netbox.sh" "test -e $NBX_ROOT; psql: pg_database and pg_roles for netbox"
+
+	nbx_restore_client_conf
+}
+
+# nbx_restore_client_conf — the client's apt sources and pip.conf are the
+# files preflight hashed, and nothing is left set aside.
+nbx_restore_client_conf() {
+	local left changed
+	E2E_HOST=client
+	e2e_on client "find /etc/apt -name '*.e2e-netbox-off'" || true
+	left="$(printf '%s' "$E2E_OUT" | tr '\n' ' ' | sed 's/ $//')"
+	e2e_on client "bash -s" <<<"$(nbx_script_conf_digest)" || true
+	changed="$(diff <(printf '%s\n' "$nbx_conf_before" | sed '/^$/d') <(printf '%s\n' "$E2E_OUT" | sed '/^$/d') |
+		sed -n -E 's/^([<>]) [0-9a-f]+ +(.*)/\1 \2/p' | tr '\n' ' ' | sed 's/ $//')"
+	if [ -z "$left" ] && [ -z "$changed" ]; then
+		e2e_record NBX-RESTORE-CLIENT-CONF PASS "the client's apt sources and pip.conf are as the run found them" \
+			"nothing set aside; every file unchanged" "nothing set aside; every file unchanged" \
+			"find /etc/apt -name '*.e2e-netbox-off'; sha256sum against preflight" 0 "test/e2e/suites/58-realworld-netbox.sh"
+	else
+		e2e_record NBX-RESTORE-CLIENT-CONF FAIL "the client's apt sources and pip.conf are as the run found them" \
+			"nothing set aside; every file unchanged" \
+			"$(e2e_excerpt "set aside: ${left:-none}; changed (< before, > after): ${changed:-none}")" \
+			"find /etc/apt -name '*.e2e-netbox-off'; sha256sum against preflight" 1 "test/e2e/suites/58-realworld-netbox.sh"
+	fi
 }
 
 # ---- run ---------------------------------------------------------------------
@@ -1161,6 +1301,9 @@ nbx_main() {
 	fi
 	nbx_phase7
 }
+
+# The self-test sources the suite for its functions alone.
+[ "${NBX_SOURCE_ONLY:-no}" = yes ] && return 0
 
 nbx_main
 nbx_cleanup

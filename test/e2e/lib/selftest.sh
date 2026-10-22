@@ -739,6 +739,59 @@ t_ok "issue filing dry-run names each failure" yes \
 t_ok "issue filing dry-run skips mapped failures" yes \
 	"$(case "$dryrun" in *SELF-20*) echo no ;; *) echo yes ;; esac)"
 
+# ---- suite 58 --------------------------------------------------------------
+
+E2E_BASE_URL="http://192.0.2.1:8080"
+# shellcheck source=../suites/58-realworld-netbox.sh
+NBX_SOURCE_ONLY=yes . "$E2E_DIR/suites/58-realworld-netbox.sh"
+
+# The set-aside covers sources.list as well as sources.list.d, so the restore
+# has to: a restore that globbed only the directory left sources.list renamed
+# on every run.
+nbx_root="$work/nbx-root"
+nbx_off=".$NBX_PROFILE-off"
+mkdir -p "$nbx_root/etc/apt/sources.list.d"
+printf 'deb http://archive.example/ubuntu noble main\n' >"$nbx_root/etc/apt/sources.list"
+printf 'Types: deb\n' >"$nbx_root/etc/apt/sources.list.d/ubuntu.sources"
+printf 'Types: deb\nURIs: http://192.0.2.1:8080/apt\n' >"$nbx_root/etc/apt/sources.list.d/bodega.sources"
+bash -c "$(nbx_script_sources_off "$nbx_root" "")"
+t_ok "suite 58 sets sources.list aside" "no yes" \
+	"$([ -e "$nbx_root/etc/apt/sources.list" ] && echo yes || echo no) $([ -e "$nbx_root/etc/apt/sources.list$nbx_off" ] && echo yes || echo no)"
+t_ok "suite 58 leaves bodega.sources in place" yes \
+	"$([ -e "$nbx_root/etc/apt/sources.list.d/bodega.sources" ] && echo yes || echo no)"
+bash -c "$(nbx_script_sources_on "$nbx_root" "")"
+t_ok "suite 58 restores sources.list" "deb http://archive.example/ubuntu noble main" \
+	"$(cat "$nbx_root/etc/apt/sources.list" 2>/dev/null)"
+t_ok "suite 58 restores sources.list.d" "Types: deb" "$(cat "$nbx_root/etc/apt/sources.list.d/ubuntu.sources" 2>/dev/null)"
+t_ok "suite 58 leaves nothing set aside" "" "$(find "$nbx_root" -name "*$nbx_off")"
+
+# Removing a lock succeeds on a guest with none, so phase 6 reads the server's
+# lock before removing it; a lock the deadman cleared mid-install is a FAIL.
+# shellcheck disable=SC2329  # stubs the suite calls
+e2e_egress_unlock() { E2E_RC=0; }
+# shellcheck disable=SC2329
+e2e_egress_drops() {
+	printf 'e2e: no egress lock on server\n' >&2
+	return 1
+}
+nbx_locked_server=yes
+nbx_phase6_release
+t_ok "suite 58: a lapsed server lock fails NBX-P6-HELD" FAIL "$(verdict_of NBX-P6-HELD)"
+t_ok "suite 58: the server lock is still removed" no "$nbx_locked_server"
+
+# shellcheck disable=SC2329
+e2e_egress_drops() { printf '7\n'; }
+nbx_locked_server=yes
+nbx_phase6_release
+t_ok "suite 58: a held server lock passes NBX-P6-HELD" PASS "$(verdict_of NBX-P6-HELD)"
+
+# A lapse a keepalive found and re-locked leaves a counter to read at the end,
+# so the lapse is carried on its own rather than read from the counter.
+nbx_locked_server=yes
+nbx_server_lapsed=yes
+nbx_phase6_release
+t_ok "suite 58: a lapse re-locked mid-install fails NBX-P6-HELD" FAIL "$(verdict_of NBX-P6-HELD)"
+
 # ---- verdict ---------------------------------------------------------------
 
 printf '\n%d case(s), %d failure(s)\n' "$cases" "$fails"
