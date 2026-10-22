@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/aptsign"
@@ -980,5 +981,133 @@ func TestClientAptPlanKeepsAGeneratedSuiteOnItsOwnStanza(t *testing.T) {
 	_, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=local")
 	if !strings.Contains(body, "Suites: local\n") || !strings.Contains(body, "Signed-By: "+aptsources.ClientKeyringPath) {
 		t.Errorf("generated stanza =\n%s\nwant Suites: local alone and Signed-By:", body)
+	}
+}
+
+// B146 R1, R3: whether the plan ships bodega's keyring follows what the stanza
+// names. A mirrored stanza names no Signed-By:, so it never needs the keyring
+// and never waits on a signing key to serve one. A generated suite with no
+// signing key at all renders Trusted: yes and names no keyring either; the
+// skip is for a stanza that names the keyring while none can be served.
+func TestClientAptPlanShipsTheKeyringOnlyForAGeneratedSuite(t *testing.T) {
+	const (
+		keyLoaded = iota
+		noKey
+		noKeyring
+	)
+	for _, c := range []struct {
+		name, codename string
+		key            int
+		want           []string
+	}{
+		{"mirrored, no key", "resolute", noKey, []string{clientconf.AptSourcesPath}},
+		{"mirrored, key", "resolute", keyLoaded, []string{clientconf.AptSourcesPath}},
+		{"mirrored, key with no keyring", "resolute", noKeyring, []string{clientconf.AptSourcesPath}},
+		{"generated, key", "local", keyLoaded, []string{clientconf.AptSourcesPath, aptsources.ClientKeyringPath}},
+		{"generated, no key", "local", noKey, []string{clientconf.AptSourcesPath}},
+		{"generated, key with no keyring", "local", noKeyring, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, f := pocketServer(t)
+			switch c.key {
+			case noKey:
+				s.aptSign.Store(nil)
+			case noKeyring:
+				sign := *s.aptSign.Load()
+				sign.keyring = nil
+				s.aptSign.Store(&sign)
+			}
+			recs := aptPlanRecords(t, s, f.token, c.codename)
+			if c.want == nil {
+				const reason = "the stanza names bodega's keyring and no apt signing key is loaded to serve it"
+				if len(recs) != 1 || recs[0].Action != planSkip || recs[0].Reason != reason {
+					t.Fatalf("plan = %+v, want one skip with reason %q", recs, reason)
+				}
+				return
+			}
+			var got []string
+			for _, r := range recs {
+				if r.Action != planInstall {
+					t.Fatalf("plan = %+v, want installs only", recs)
+				}
+				got = append(got, r.Path)
+			}
+			if strings.Join(got, " ") != strings.Join(c.want, " ") {
+				t.Errorf("plan installs %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// B146 R4: the served script, run against a mirror-only server with no apt
+// signing key, writes the sources file and never asks for the keyring. The
+// plan's /etc paths are moved under a temporary root on the way to the script
+// so --apply writes without root.
+func TestSetupScriptConfiguresAMirroredCodenameWithNoSigningKey(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp", "curl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	s, f := pocketServer(t)
+	s.aptSign.Store(nil)
+	s.cfg.AptSuites, s.cfg.AptCodename = nil, ""
+	for c := range s.cfg.AptUpstreams {
+		if strings.HasPrefix(c, "noble") {
+			delete(s.cfg.AptUpstreams, c)
+		}
+	}
+
+	root := t.TempDir()
+	var mu sync.Mutex
+	var fetched []string
+	handler := s.Handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fetched = append(fetched, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path != "/client/plan.txt" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write([]byte(strings.ReplaceAll(rec.Body.String(), "\t/etc/", "\t"+root+"/etc/")))
+	}))
+	defer srv.Close()
+	s.cfg.PublicURL = srv.URL
+
+	stub := t.TempDir()
+	if err := os.WriteFile(stub+"/uname", []byte("#!/bin/sh\necho Linux\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := t.TempDir() + "/setup.sh"
+	if err := os.WriteFile(script, clientSetupScript, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", script, "--url", srv.URL, "--allow-plaintext", "--systems", "apt", "--apply")
+	cmd.Env = []string{"HOME=" + t.TempDir(), "BODEGA_TOKEN=" + f.token, "PATH=" + stub + ":" + os.Getenv("PATH"), "TMPDIR=" + os.TempDir()}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sh setup.sh --systems apt --apply: %v\n%s", err, out)
+	}
+
+	sources, err := os.ReadFile(root + clientconf.AptSourcesPath)
+	if err != nil {
+		t.Fatalf("the script wrote no sources file: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(sources), "Suites: resolute ") || strings.Contains(string(sources), "Signed-By:") {
+		t.Errorf("sources file =\n%s\nwant the mirrored resolute stanza with no Signed-By:", sources)
+	}
+	if _, err := os.Stat(root + aptsources.ClientKeyringPath); !os.IsNotExist(err) {
+		t.Errorf("the script wrote %s beside a mirrored stanza (stat: %v)", aptsources.ClientKeyringPath, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range fetched {
+		if p == aptsources.KeyringRoute {
+			t.Errorf("the script fetched %s for a mirrored codename; requests: %v", p, fetched)
+		}
 	}
 }
