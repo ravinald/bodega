@@ -393,7 +393,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			return skip("this server serves no apt suite")
 		case h.q.Codename != "":
 			if base, ok := s.aptPocketBase(h.q.Codename); ok {
-				return skip(fmt.Sprintf("%s is a pocket of %s, and pockets are configured together with their base: pass codename=%s", h.q.Codename, base, base))
+				return skip(fmt.Sprintf("%s is a pocket of %s, and pockets are configured together with their base: name %s with %s", h.q.Codename, base, base, clientconf.AptSuiteRemedy(base)))
 			}
 			for i := range choices {
 				if choices[i].Suite == h.q.Codename {
@@ -401,7 +401,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 				}
 			}
 			if src == nil {
-				return skip(fmt.Sprintf("this server serves no apt suite named %s. It serves %s", h.q.Codename, strings.Join(names, ", ")))
+				return skip(fmt.Sprintf("this server serves no apt suite named %s. It serves %s: name one with %s", h.q.Codename, strings.Join(names, ", "), clientconf.AptSuiteRemedy("<suite>")))
 			}
 		case len(choices) == 1:
 			src = &choices[0]
