@@ -108,11 +108,15 @@ check and writes `dry-run-plan.txt`, which is every command the real run will
 issue, in order. A dry run changes nothing outside its results directory:
 builds and deletions go into the plan, not the tree.
 
-Other flags: `--suite <prefix>` runs a subset (00-preflight always runs
-regardless, because it sets the reachability flags the others read),
-`--no-ship` reuses whatever is installed on the guests, `--allow-dirty` permits
-an uncommitted tree, `--self-test` runs the harness's own tests with no guest
-needed.
+Other flags: `--suite <prefix>` runs a subset and still ships: 00-preflight
+always runs because it sets the reachability flags the others read, and
+10-ship-install runs too, so a filtered run measures HEAD rather than whatever
+was installed last. `--no-ship` measures whatever binary is already installed
+on the guests, skips 10-ship-install under `--suite`, and says so in the header
+and in `report.md` with `not shipped: measuring the binary already installed on
+the guests`, because the run's `commit=` still names HEAD. `--dry-run` and
+`--preflight` never ship. `--allow-dirty` permits an uncommitted tree,
+`--self-test` runs the harness's own tests with no guest needed.
 
 `make harness` runs the lint and the self-test, and is a leg of `make check`.
 `make e2e` runs the full pass.
