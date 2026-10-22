@@ -14,6 +14,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -274,7 +275,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			aptSuites := cfg.ServedAptSuites()
 			if slices.ContainsFunc(rows, func(p audit.OSVPolicy) bool { return p.Ecosystem == manifest.TypeApt }) {
 				var notes []string
-				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, aptSuites)
+				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, cfg)
 				for _, n := range notes {
 					fmt.Fprintf(os.Stderr, "warning: %s\n", n)
 				}
@@ -284,18 +285,21 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
 			untrimmed := map[string][]string{}
+			missing := map[string][]string{}
 			covered := policy.OSVEcosystems()
 			for _, p := range rows {
-				synced, age, old := osvDBState(db, p.Ecosystem, aptSuites)
+				st := osvDBState(db, p.Ecosystem, aptSuites)
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 					p.Ecosystem, renderAction(p.Action, p.Ecosystem, covered),
-					p.UpdatedAt.Format("2006-01-02"), synced, age)
+					p.UpdatedAt.Format("2006-01-02"), st.synced, st.age)
 				stored = append(stored, p.Ecosystem)
-				untrimmed[p.Ecosystem] = old
+				untrimmed[p.Ecosystem] = st.untrimmed
+				missing[p.Ecosystem] = st.missing
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
+			reportMissing(stored, missing)
 			reportUntrimmed(stored, untrimmed)
 			fmt.Printf("\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
 				db.Dir(), onOff(cfg.OSVAPIFallback))
@@ -343,7 +347,8 @@ func newPolicyOSVRemoveCmd(gf *globalFlags) *cobra.Command {
 var osvExportBase = policy.DefaultOSVExportBase
 
 // aptOSVSuites is the apt release set both sync and list resolve from: the
-// suites this bodega serves, plus the releases its own manifests record. One
+// suites this bodega serves, the codenames it mirrors, and the releases its own
+// manifests record. One
 // function because the two commands have to agree: a release sync fetches for
 // and list omits is a gate whose health report contradicts the gate.
 //
@@ -357,11 +362,16 @@ var osvExportBase = policy.DefaultOSVExportBase
 // Both entry fields are read, because the lookup reads both: capture_suite when
 // the capture recorded one, the publishing suites when it did not.
 //
+// The apt_upstreams codenames are in the set because the server's pool gate
+// answers a mirrored .deb from the release its codename belongs to. A pocket
+// such as resolute-security folds onto resolute when the export is resolved.
+//
 // A store or a package that will not load degrades to what did load and comes
 // back in notes rather than as an error. The no-argument sync is what a cron
 // runs, and this read happens before any fetch: returning here over one
 // unparsable apt manifest leaves npm, pypi, gomod and cargo unsynced too.
-func aptOSVSuites(ctx context.Context, gf *globalFlags, served []string) (suites, notes []string) {
+func aptOSVSuites(ctx context.Context, gf *globalFlags, cfg *config.Config) (suites, notes []string) {
+	served := append(slices.Clone(cfg.ServedAptSuites()), cfg.MirroredAptCodenames()...)
 	out := make([]string, 0, len(served)+4)
 	seen := map[string]bool{}
 	add := func(s string) {
@@ -408,9 +418,10 @@ per ecosystem, and record when each was fetched. With no arguments every
 covered ecosystem is synced.
 
 apt expands to one index per release, because OSV keys Ubuntu and Debian
-advisories on the release. The set is the suites this server serves plus
-the releases its own manifests record, so a capture from a release nobody
-publishes is fetched for too. Those releases are distilled out of one
+advisories on the release. The set is the suites this server serves, the
+codenames it mirrors from apt_upstreams (a pocket such as noble-security
+folds onto noble), and the releases its own manifests record, so a capture
+from a release nobody publishes is fetched for too. Those releases are distilled out of one
 archive each: OSV stopped rebuilding its per-release archives in October
 2024 and keeps the aggregate current. A suite OSV publishes no records for
 is named on stderr and fetched for nothing; entries published to it warn at
@@ -449,7 +460,7 @@ and point osv_db_dir at the copy.`,
 			aptSuites := cfg.ServedAptSuites()
 			if slices.Contains(ecosystems, manifest.TypeApt) {
 				var notes []string
-				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, aptSuites)
+				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, cfg)
 				skipped = append(skipped, notes...)
 			}
 
@@ -521,6 +532,16 @@ and point osv_db_dir at the copy.`,
 	}
 }
 
+// osvState is one list row's database columns, plus the exports behind them
+// that need a line under the table.
+type osvState struct {
+	synced, age string
+	untrimmed   []string
+	// missing is every export the row resolves to that has no index. Any one
+	// of them makes the row read "never", and the row alone cannot say which.
+	missing []string
+}
+
 // osvDBState renders one ecosystem's sync time and age for the list table. An
 // ecosystem that was never synced reads "never" rather than a blank column:
 // the gate warns on it, and the operator has to see which one.
@@ -533,32 +554,50 @@ and point osv_db_dir at the copy.`,
 // the DB SYNCED column on purpose: such an archive is stale in size, not in
 // content, and a column reading "never" or an age warning would tell an
 // operator their advisories are old when they are current.
-func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (string, string, []string) {
+func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) osvState {
 	if !policy.OSVCovers(ecosystem) {
 		// A stored row for a type the gate cannot query. "never" would read as
 		// a sync nobody has run yet, and there is no sync that would fix it;
 		// reportUncovered names the row under the table.
-		return "n/a", "-", nil
+		return osvState{synced: "n/a", age: "-"}
 	}
 	osvEcos, _ := policy.OSVExportsFor(ecosystem, aptSuites)
 	if len(osvEcos) == 0 {
-		return "never", "-", nil
+		return osvState{synced: "never", age: "-"}
 	}
 	var oldest time.Time
-	var untrimmed []string
+	var st osvState
 	for _, osvEco := range osvEcos {
 		meta, err := db.Meta(osvEco)
 		if err != nil {
-			return "never", "-", nil
+			st.missing = append(st.missing, osvEco)
+			continue
 		}
 		if !meta.Trimmed {
-			untrimmed = append(untrimmed, osvEco)
+			st.untrimmed = append(st.untrimmed, osvEco)
 		}
 		if oldest.IsZero() || meta.FetchedAt.Before(oldest) {
 			oldest = meta.FetchedAt
 		}
 	}
-	return oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest)), untrimmed
+	if len(st.missing) > 0 {
+		return osvState{synced: "never", age: "-", missing: st.missing}
+	}
+	st.synced, st.age = oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest))
+	return st
+}
+
+// reportMissing names, per row, the exports the gate has no index for. For apt
+// that is one release, and the release is what the operator needs: a mirrored
+// codename whose release is missing is served unchecked, so "never" on the
+// apt row alone does not say which hosts are exposed.
+func reportMissing(order []string, byRow map[string][]string) {
+	for _, row := range order {
+		if ecos := byRow[row]; len(ecos) > 0 {
+			fmt.Printf("\nNo synced OSV export for %s: %s. The gate cannot answer from it; run 'bodega policy osv sync %s'.\n",
+				row, strings.Join(ecos, ", "), row)
+		}
+	}
 }
 
 // reportUntrimmed names the archives written before the trim, per row, with

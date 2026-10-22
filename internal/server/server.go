@@ -223,6 +223,13 @@ type Server struct {
 	// fleet running `apt install` at the same minute makes one upstream fetch
 	// of a .deb rather than one per host.
 	aptMirror keyedMutex
+	// aptOSVUnchecked holds the releases the OSV gate has already logged as
+	// unable to answer for a mirrored .deb, so a fleet's installs log the gap
+	// once rather than once per artifact.
+	aptOSVUnchecked sync.Map
+	// aptPoolIdx maps each mirrored pool path to its Packages paragraph, which
+	// is where the OSV gate reads the epoch the pool filename drops.
+	aptPoolIdx aptPoolIndexCache
 }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level
