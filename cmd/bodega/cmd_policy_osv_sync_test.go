@@ -76,7 +76,7 @@ func osvBucket(t *testing.T) *httptest.Server {
 			// The aggregate archive carries every release at once, with the
 			// release in each affected entry's ecosystem string; the distill
 			// filter is what keys an index on one release.
-			rels := []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS"}
+			rels := []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Ubuntu:26.04:LTS"}
 			if eco == "Debian" {
 				rels = []string{"Debian:12"}
 			}
@@ -411,5 +411,76 @@ func TestListCommand_NamesAnArchiveSyncedBeforeTheTrim(t *testing.T) {
 	}
 	if strings.Contains(stdout, "never") {
 		t.Errorf("the advisories in that archive are current; the row must keep its sync time:\n%s", stdout)
+	}
+}
+
+// mirrorAptCodenames adds apt_upstreams entries to the config syncInstall
+// wrote, each pointing at the same archive root.
+func mirrorAptCodenames(t *testing.T, root string, codenames ...string) {
+	t.Helper()
+	cfgPath := filepath.Join(root, "config.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	ups := map[string]any{}
+	for _, c := range codenames {
+		ups[c] = []any{map[string]any{"url": "https://archive.ubuntu.com/ubuntu"}}
+	}
+	cfg["apt_upstreams"] = ups
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSyncCommand_MirroredCodenameFetchesItsRelease is F74's first half: the
+// CI pair serves noble and mirrors resolute with its pockets, and the server's
+// pool gate answers a mirrored .deb from resolute's index. A sync resolving
+// from the served suites alone never fetches it, and list has to say which
+// release is missing rather than only that one is.
+func TestSyncCommand_MirroredCodenameFetchesItsRelease(t *testing.T) {
+	root := syncInstall(t, "noble", "noble")
+	mirrorAptCodenames(t, root, "resolute", "resolute-security", "resolute-updates")
+	setOSVPolicy(t, root, manifest.TypeApt, "block")
+
+	stdout, stderr, err := runSync(t, "apt")
+	if err != nil {
+		t.Fatalf("sync apt: %v (%s)", err, stderr)
+	}
+	for _, eco := range []string{"Ubuntu:24.04:LTS", "Ubuntu:26.04:LTS"} {
+		if !strings.Contains(stdout, eco) {
+			t.Errorf("%s is missing from the table:\n%s", eco, stdout)
+		}
+	}
+	if n := strings.Count(stdout, "Ubuntu:26.04:LTS"); n != 1 {
+		t.Errorf("three resolute codenames are one release and one fetch; the table names it %d times:\n%s", n, stdout)
+	}
+	if strings.Contains(stderr, "resolute") {
+		t.Errorf("a pocket folds onto its release and is never skipped: %q", stderr)
+	}
+
+	resolute, err := filepath.Glob(filepath.Join(root, "osv", "Ubuntu-26.04-LTS.*"))
+	if err != nil || len(resolute) == 0 {
+		t.Fatalf("the resolute index is not where list looks for it: %v %v", resolute, err)
+	}
+	for _, f := range resolute {
+		if err := os.Remove(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, _, err = runOSVCmd(t, newPolicyOSVListCmd(&globalFlags{}))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(stdout, "never") || !strings.Contains(stdout, "No synced OSV export for apt: Ubuntu:26.04:LTS.") {
+		t.Errorf("list must name the mirrored release with no index:\n%s", stdout)
 	}
 }

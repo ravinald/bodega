@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -12,6 +13,7 @@ import (
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -157,6 +159,9 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// once a fleet is warm: the probe below is per pool path and the cache
 	// read is not.
 	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
+		if !s.aptMirrorHitGate(w, r, poolPath) {
+			return
+		}
 		// The audit row is unconditional. This shortcut is the only path a
 		// cached .deb is served by, and it used to write through
 		// recordAptPoolHit, whose first line returns on discovery being off —
@@ -184,6 +189,135 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// a stored full URL would be a second parse of the same string.
 	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
 	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
+}
+
+// aptMirrorOSV is the OSV gate's verdict on one .deb a mirrored codename
+// serves, and false when the apt advisory action is unset or ignore, which
+// leaves the fetch exactly as ungated as it was before the gate covered apt.
+//
+// The question is the one a manifest entry is asked: the source package, read
+// off the pool path, in the release the mirrored codename belongs to. A pool
+// path names no codename, so the release comes from apt_upstreams, and it is
+// only placeable while the mirrored codenames are one release (resolute with
+// its pockets). Two releases share a pool, and a noble revision checked
+// against resolute's ranges sits below every resolute fix and reads
+// vulnerable; that is aptAmbiguousSuiteReason's rule, reached from the pool.
+//
+// Whatever cannot be answered comes back not evaluated, never warn: the
+// fetch is served, the admission row says why it went unchecked, and the log
+// says so once per release. A warn per artifact would bury the advisory warns
+// beside it, and a refusal would stop every install on a host whose release
+// nobody has synced yet.
+func (s *Server) aptMirrorOSV(ctx context.Context, poolPath string) (policy.Result, bool) {
+	if s.auditDB == nil {
+		return policy.Result{}, false
+	}
+	switch p, err := s.auditDB.GetOSVPolicy(ctx, manifest.TypeApt); {
+	case errors.Is(err, audit.ErrOSVPolicyNotFound):
+		return policy.Result{}, false
+	case err == nil && p.Action != policy.ActionWarn && p.Action != policy.ActionBlock:
+		return policy.Result{}, false
+	}
+	name, version := manifest.AptDebIdentity(path.Base(poolPath))
+	if name == "" || version == "" {
+		return policy.Result{}, false
+	}
+	codename, release, why := s.aptMirrorRelease()
+	if why != "" {
+		return s.aptMirrorUnchecked(release, why), true
+	}
+	if _, err := policy.SharedOSVDatabase(s.cfg.ResolveOSVDBDir()).Meta(release); err != nil && !s.cfg.OSVAPIFallback {
+		return s.aptMirrorUnchecked(release, fmt.Sprintf(
+			"no synced OSV export for %s, the release mirrored codename %s belongs to (%v); run 'bodega policy osv sync apt'",
+			release, codename, err)), true
+	}
+	ve := manifest.VersionEntry{Version: version, SourcePackage: aptPoolSourceName(poolPath),
+		CaptureSuite: codename, Mode: manifest.ModeProxy}
+	res := admit.OSVChecker(s.cfg, s.auditDB).Check(ctx, &manifest.PackageManifest{Type: manifest.TypeApt, Name: name}, &ve)
+	if res.Action == policy.ActionWarn && res.Details["vulns"] == nil && res.Details["malware"] == nil {
+		return s.aptMirrorUnchecked(release, res.Reason), true
+	}
+	return res, true
+}
+
+// aptMirrorRelease is the one release every mirrored codename belongs to, a
+// codename of it for the lookup to name, and why there is none when there is
+// not. release is also the key the unchecked log is deduplicated on.
+func (s *Server) aptMirrorRelease() (codename, release, why string) {
+	byRelease := map[string]string{}
+	var releases []string
+	for _, c := range s.cfg.MirroredAptCodenames() {
+		rel := policy.AptOSVEcosystem(c)
+		if rel == "" {
+			rel = c
+		}
+		if _, ok := byRelease[rel]; !ok {
+			byRelease[rel] = c
+			releases = append(releases, rel)
+		}
+	}
+	switch {
+	case len(releases) > 1:
+		return "", "mirrored releases " + strings.Join(releases, ", "), fmt.Sprintf(
+			"this bodega mirrors %d releases (%s) from one pool, and a pool path names none of them, so nothing places this .deb in one release's advisories",
+			len(releases), strings.Join(releases, ", "))
+	case len(releases) == 0:
+		return "", "no mirrored release", "no codename is mirrored"
+	}
+	rel := releases[0]
+	if policy.AptOSVEcosystem(byRelease[rel]) == "" {
+		return "", rel, fmt.Sprintf("mirrored codename %s names no release OSV publishes an Ubuntu or Debian export for", rel)
+	}
+	return byRelease[rel], rel, ""
+}
+
+// aptMirrorUnchecked is the not-evaluated verdict for a mirrored .deb the gate
+// cannot answer for, logged the first time each release produces one.
+func (s *Server) aptMirrorUnchecked(release, reason string) policy.Result {
+	if _, seen := s.aptOSVUnchecked.LoadOrStore(release, true); !seen {
+		s.logger.Warn("mirrored apt is served unchecked by the OSV gate",
+			"release", release, "reason", reason)
+	}
+	return policy.Result{Check: audit.CheckOSV, Action: policy.ActionNotEvaluated, Reason: "not run: " + reason}
+}
+
+// aptMirrorHitGate runs the OSV gate on a mirrored .deb served out of the
+// cache, and returns false once it has written a refusal.
+//
+// The miss is gated in versionPolicyGate like every other fill. The hit is
+// gated here as well because a mirrored .deb has no manifest entry for
+// 'bodega policy osv rescan' to revisit, so a version cached before its
+// advisory was published would otherwise be served for as long as the cache
+// holds it. A row is written only for a finding: one per cached install would
+// bury the decisions the rows exist for.
+func (s *Server) aptMirrorHitGate(w http.ResponseWriter, r *http.Request, poolPath string) bool {
+	res, on := s.aptMirrorOSV(r.Context(), poolPath)
+	if !on || (res.Action != policy.ActionWarn && res.Action != policy.ActionBlock) {
+		return true
+	}
+	name, version := manifest.AptDebIdentity(path.Base(poolPath))
+	fill := fillAdmission{typ: manifest.TypeApt, name: name, version: version}
+	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckNotEvaluated,
+		Detail: "not run: served from the cache, which the allow-list ruled on when it was filled"}
+	ctx, cancel := auditContext(r)
+	fr := admit.Fetch(ctx, s.auditDB, []policy.VersionChecker{verdict{res}}, fill.typ, fill.name,
+		manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy}, allow, admit.Who{Identity: Identity(r)}, "")
+	cancel()
+	s.recordFillPolicyEvent(r, fill, fr)
+	if fr.Block == nil {
+		for _, warn := range fr.Warns {
+			s.logger.Warn("cached apt fetch served with a policy warning", "package", name,
+				"version", version, "check", warn.Check, "reason", warn.Reason)
+		}
+		return true
+	}
+	f := admitRefusal(fill.typ, name, admitBlock{check: fr.Block.Check, version: version,
+		incident: fr.Incident, details: fr.Block.Details})
+	s.logger.Warn("cached apt fetch blocked by policy", "package", name, "version", version,
+		"check", fr.Block.Check, "reason", fr.Block.Reason, "incident", f.incident)
+	s.queueResult(r, fill.typ, name, version, *fr.Block, f)
+	f.write(w, r)
+	return false
 }
 
 // recordAptPoolHit writes the discovery row alone for a .deb served out of the
