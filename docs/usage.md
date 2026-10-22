@@ -1926,9 +1926,13 @@ PROFILE  TYPE  PACKAGE    REASON
 web      apt   libexpat1  this profile serves a filtered apt codename, which closes on the source package; libexpat1 is a binary built from source expat, so it matches no paragraph in the index. List expat instead
 ```
 
-**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The name is the source and the version is each paragraph's own `Version:`, so that the pool predicate behind the index compares the same version off the `.deb` filename. A binNMU is where the two spellings of one release diverge: source `nginx` at `1.24.0-2ubuntu7.1` ships `nginx-common` at `+b1`, so an exact pin holds the binaries at the version you wrote and drops that source's rebuilt ones, and apt reports the group as kept back. `bodega profile check` names the binary and version a pin drops without failing the gate, since the repair is to widen the constraint to `any` and that discards the reason the pin records. A profile that lists apt packages and whose pins match no paragraph at all serves no codename: `apt update` fails on the source line rather than the host being told its installed set no longer exists.
+**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The name is the source and the version is each paragraph's own `Version:`, so that the pool predicate behind the index compares the same version off the `.deb` filename. A binNMU is where the two spellings of one release diverge: source `nginx` at `1.24.0-2ubuntu7.1` ships `nginx-common` at `+b1`, so an exact pin holds the binaries at the version you wrote and drops that source's rebuilt ones, and apt reports the group as kept back. `bodega profile check` names the binary and version a pin drops without failing the gate, since the repair is to widen the constraint to `any` and that discards the reason the pin records. A profile that lists apt packages and whose pins match no paragraph of its base at all serves no codename: `apt update` fails on the source line rather than the host being told its installed set no longer exists.
 
-The filtered codename is a generated suite: bodega signs its `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
+**Each pocket gets a filtered codename of its own.** When the server also mirrors `noble-updates`, `noble-backports` or `noble-security`, the rebuild derives `<pocket>-<profile>` from each one it mirrors (`noble-updates-web`, `noble-security-web`), filtered by the same profile from that pocket's own `Release` and `Packages`. A stock Ubuntu host already runs packages from `-updates` and `-security`, and a host reading the base alone could not install a `-dev` package whose runtime half came from a pocket, and would stop receiving security fixes. Each codename keeps the pocket it came from, so its `Release` describes one upstream suite. A pocket whose filter keeps nothing is served empty rather than withdrawn: `-backports` carrying none of a baseline is the normal case.
+
+Pocket codenames follow the base's collision rule. `web` over `noble` derives `noble-security-web` from `noble-security`, which is also the base codename of `security-web` over `noble`, so the rebuild serves neither and logs both as `web over noble-security, security-web over noble`. A pocket whose upstream read fails is withdrawn for that rebuild alone, logged with the profile, the pocket and the error. Either way the host's plan refuses apt and names the pocket with no codename, rather than writing a stanza that installs cleanly and stops the host's security fixes.
+
+The filtered codenames are generated suites: bodega signs each `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
 
 ```bash
 bodega doctor --write-apt-sources --url https://bodega.internal
@@ -1941,10 +1945,12 @@ wrote /etc/apt/sources.list.d/bodega.sources
 Profile "web": this host reads noble-web, a filtered view of what bodega mirrors.
 ```
 
+On a server mirroring `noble`, `noble-updates` and `noble-security`, the stanza names the base's codename first and the pockets' in Ubuntu's order:
+
 ```text
 Types: deb
 URIs: https://bodega.internal/apt/
-Suites: noble-web
+Suites: noble-web noble-updates-web noble-security-web
 Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
@@ -2096,7 +2102,7 @@ Components: main restricted universe multiverse
 
 A stanza naming the base alone breaks a stock host twice. The host already runs packages from `-updates` and `-security`, so the first `-dev` package fails on its runtime half (`libpq-dev : Depends: libpq5 (= 18.3-1) but it is not going to be installed`), and the host stops receiving security fixes with nothing to report it. `--suite resolute-updates` is refused for the same reason, and the reason names `resolute` as the codename to pass. A generated suite is never grouped: it keeps a stanza of its own with `Signed-By:`, even beside a mirrored codename that shares its prefix.
 
-The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile's filtered codename is generated from its base's index alone and carries none of the pockets, so while the server mirrors a pocket of that base the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
+The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile-bound host gets the base's filtered codename and one per mirrored pocket on one `Suites:` line (see [apt under a profile](#apt-under-a-profile)). When the rebuild withdrew a pocket's codename, the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
 For FreeBSD the plan names `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it.
 
