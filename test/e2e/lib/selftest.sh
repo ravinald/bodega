@@ -688,6 +688,19 @@ t_ok "PASS counter agrees with the file" \
 t_ok "FAIL counter agrees with the file" \
 	"$(jq -rs '[.[]|select(.verdict=="FAIL")]|length' "$E2E_FINDINGS")" "$E2E_N_FAIL"
 
+# ---- suite selection -------------------------------------------------------
+
+selected() { e2e_suite_selected "$@" && echo run || echo skip; }
+t_ok "filter 58, ship yes runs 00-preflight" run "$(selected 00-preflight 58 yes)"
+t_ok "filter 58, ship yes runs 10-ship-install" run "$(selected 10-ship-install 58 yes)"
+t_ok "filter 58, ship yes runs 58-x" run "$(selected 58-x 58 yes)"
+t_ok "filter 58, ship yes skips 45-clients" skip "$(selected 45-clients 58 yes)"
+t_ok "filter 58, ship no skips 10-ship-install" skip "$(selected 10-ship-install 58 no)"
+t_ok "filter 58, ship no runs 00-preflight" run "$(selected 00-preflight 58 no)"
+t_ok "no filter, ship no runs 10-ship-install" run "$(selected 10-ship-install "" no)"
+t_ok "no filter runs 45-clients" run "$(selected 45-clients "" yes)"
+t_ok "no filter runs 95-destructive" run "$(selected 95-destructive "" no)"
+
 # ---- report ----------------------------------------------------------------
 
 e2e_report "$E2E_FINDINGS" "$work/report.md" selftest-run
@@ -698,6 +711,13 @@ t_ok "report has an XPASS section" yes \
 	"$(grep -q 'Fixed (XPASS)' "$work/report.md" && echo yes || echo no)"
 t_ok "report has a blocked section" yes \
 	"$(grep -q '## Blocked' "$work/report.md" && echo yes || echo no)"
+t_ok "a shipped run's report carries no not-shipped line" no \
+	"$(grep -q '^not shipped:' "$work/report.md" && echo yes || echo no)"
+printf '%s\n' "$E2E_NOT_SHIPPED_NOTE" >"$work/not-shipped"
+e2e_report "$E2E_FINDINGS" "$work/report.md" selftest-run
+t_ok "a run that did not ship says so in its report" yes \
+	"$(grep -qx "$E2E_NOT_SHIPPED_NOTE" "$work/report.md" && echo yes || echo no)"
+rm -f "$work/not-shipped"
 
 E2E_SEVERITY=M
 # Captured to a variable rather than piped into grep -q: under `set -o pipefail`

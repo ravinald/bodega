@@ -11,12 +11,20 @@
 [ -n "${E2E_LIB_REPORT:-}" ] && return 0
 E2E_LIB_REPORT=1
 
+# A run that did not ship carries HEAD's commit in its name and header while
+# the guests run whatever was installed last, so the commit is no evidence of
+# what was measured. run.sh leaves this line in the run directory, where a
+# later --report re-render still finds it.
+E2E_NOT_SHIPPED_NOTE='not shipped: measuring the binary already installed on the guests'
+
 # A known-issues row names a tracker issue by number or a backlog item by id,
 # and only the number takes a #.
 E2E_JQ_ISSUE_REF='def e2e_issue_ref: if type == "number" then "#\(.)" else . end; '
 
 e2e_report() {
 	local findings="$1" out="$2" run_id="$3"
+	local not_shipped
+	not_shipped="$(dirname "$out")/not-shipped"
 
 	{
 		printf '# bodega e2e run %s\n\n' "$run_id"
@@ -25,6 +33,9 @@ e2e_report() {
 		printf '| started | %s |\n' "$(jq -rs 'if length>0 then .[0].ts else "-" end' "$findings")"
 		printf '| finished | %s |\n' "$(jq -rs 'if length>0 then .[-1].ts else "-" end' "$findings")"
 		printf '| checks | %s |\n\n' "$(jq -rs 'length' "$findings")"
+		if [ -e "$not_shipped" ]; then
+			printf '%s\n\n' "$E2E_NOT_SHIPPED_NOTE"
+		fi
 
 		printf '## Verdicts\n\n'
 		printf '| verdict | count |\n|---|---:|\n'

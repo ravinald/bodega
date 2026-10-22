@@ -196,3 +196,24 @@ e2e_excerpt() {
 		printf '%s… [%d bytes total]' "${s:0:$E2E_EXCERPT_BYTES}" "${#s}"
 	fi
 }
+
+# e2e_suite_selected <suite> <filter> <ship> -> exit 0 when the suite runs.
+#
+# 00-preflight is a prerequisite, not a suite you can filter away. It sets the
+# reachability flags every other suite reads, so skipping it turns a filtered
+# run into a wall of BLOCKED and a filter typo into a run that measures
+# nothing. 10-ship-install is the same kind of prerequisite whenever the run
+# ships: filtered away, the run measures whatever binary the guests already
+# hold and reports it under HEAD's commit.
+e2e_suite_selected() {
+	local suite="$1" filter="$2" ship="$3"
+	case "$suite" in
+	00-*) return 0 ;;
+	10-ship-install) [ "$ship" = yes ] && return 0 ;;
+	esac
+	[ -z "$filter" ] && return 0
+	case "$suite" in
+	"$filter"*) return 0 ;;
+	esac
+	return 1
+}
