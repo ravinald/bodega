@@ -430,7 +430,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	records, err := plan.Select(req.systems)
 	if err != nil {
-		if hint := suiteHint(plan, req); hint != "" {
+		if hint := suiteHint(err, req); hint != "" {
 			return fmt.Errorf("%w\n%s", err, hint)
 		}
 		return err
@@ -503,19 +503,22 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 // doctorOSRelease is where suiteHint reads this host's codename.
 var doctorOSRelease = osReleasePath
 
-// suiteHint suggests --suite when the server refused to choose among the apt
-// suites it serves and this host's own codename is one of them. It is only a
-// suggestion: the host's release is the likely answer, not a certain one, and
-// a host deliberately reading another suite would be rewritten without notice.
-func suiteHint(plan clientconf.Plan, req planRequest) string {
-	if req.suite != "" {
+// suiteHint suggests --suite when the refusal Select returned holds the apt
+// skip for a server that would not choose among its suites, and this host's
+// own codename is one of them. Any other refusal gets nothing, since --suite
+// fixes none of them. It is only a suggestion: the host's release is the
+// likely answer, not a certain one, and a host deliberately reading another
+// suite would be rewritten without notice.
+func suiteHint(selectErr error, req planRequest) string {
+	var blocked *clientconf.BlockedError
+	if req.suite != "" || !errors.As(selectErr, &blocked) {
 		return ""
 	}
 	local := osReleaseCodename(doctorOSRelease)
 	if local == "" {
 		return ""
 	}
-	for _, r := range plan.Records {
+	for _, r := range blocked.Records {
 		if r.System != manifest.TypeApt || r.Action != clientconf.PlanSkip {
 			continue
 		}

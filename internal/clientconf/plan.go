@@ -107,22 +107,36 @@ func (p Plan) Select(systems []string) ([]PlanRecord, error) {
 			return nil, fmt.Errorf("the plan lists no system named %q. It lists: %s", s, strings.Join(listed, ", "))
 		}
 	}
-	var out []PlanRecord
-	var blocked []string
+	var out, blocked []PlanRecord
 	for _, r := range p.Records {
 		if !slices.Contains(systems, r.System) {
 			continue
 		}
 		if r.Action != PlanInstall {
-			blocked = append(blocked, fmt.Sprintf("  %s (%s): %s", r.System, r.Action, r.Reason))
+			blocked = append(blocked, r)
 			continue
 		}
 		out = append(out, r)
 	}
 	if len(blocked) > 0 {
-		return nil, fmt.Errorf("the plan installs nothing for a system you named, so nothing was written:\n%s", strings.Join(blocked, "\n"))
+		return nil, &BlockedError{Records: blocked}
 	}
 	return out, nil
+}
+
+// BlockedError is Select refusing because a named system's record does not
+// install. Records holds exactly those records, so a caller adding advice to
+// the refusal can tell which record it answers rather than scanning the plan.
+type BlockedError struct {
+	Records []PlanRecord
+}
+
+func (e *BlockedError) Error() string {
+	lines := make([]string, len(e.Records))
+	for i, r := range e.Records {
+		lines[i] = fmt.Sprintf("  %s (%s): %s", r.System, r.Action, r.Reason)
+	}
+	return "the plan installs nothing for a system you named, so nothing was written:\n" + strings.Join(lines, "\n")
 }
 
 // aptSuiteChoiceLead opens the reason an apt skip carries when the server
