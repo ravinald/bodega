@@ -50,6 +50,42 @@ func (h aptMirrorHides) hides(name, version string) bool {
 	return h[name][version]
 }
 
+// poolHides reports which hide a pool filename's version falls under, and
+// returns that hide's version as recorded, epoch included.
+//
+// A Debian pool filename drops the epoch: vim at 2:9.1.0016-1ubuntu7 lives at
+// vim_9.1.0016-1ubuntu7_amd64.deb. A hide is keyed on the Packages version, so
+// an exact lookup would miss every epoch'd version and serve the withdrawn
+// .deb. Versions differing only in epoch name the same pool file, so matching
+// on the version with its epoch removed is exact for the path. A filename that
+// does carry one (spelled %3a, which AptDebIdentity decodes) is compared with
+// the epoch, since there the path does tell the two apart.
+func (h aptMirrorHides) poolHides(name, poolVersion string) (string, bool) {
+	versions := h[name]
+	if versions[poolVersion] {
+		return poolVersion, true
+	}
+	if aptStripEpoch(poolVersion) != poolVersion {
+		return "", false
+	}
+	var match string
+	for v := range versions {
+		if aptStripEpoch(v) == poolVersion && (match == "" || v < match) {
+			match = v
+		}
+	}
+	return match, match != ""
+}
+
+// aptStripEpoch removes a Debian version's "N:" epoch, when it has one.
+func aptStripEpoch(version string) string {
+	epoch, rest, found := strings.Cut(version, ":")
+	if !found || epoch == "" || strings.Trim(epoch, "0123456789") != "" {
+		return version
+	}
+	return rest
+}
+
 // permits is the filter predicate: a paragraph whose Package and Version an
 // operator hid is dropped, and every other paragraph is kept.
 func (h aptMirrorHides) permits(fields map[string]string) bool {
@@ -243,8 +279,9 @@ func (s *Server) aptPoolHidden(w http.ResponseWriter, r *http.Request, poolPath 
 	if snap == nil || len(snap.hidden) == 0 {
 		return false
 	}
-	name, version := manifest.AptDebIdentity(path.Base(poolPath))
-	if !snap.hidden.hides(name, version) {
+	name, poolVersion := manifest.AptDebIdentity(path.Base(poolPath))
+	version, hidden := snap.hidden.poolHides(name, poolVersion)
+	if !hidden {
 		return false
 	}
 	f := newRefusal(checkHidden, manifest.TypeApt, name, version, http.StatusForbidden)

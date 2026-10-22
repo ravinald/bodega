@@ -167,3 +167,73 @@ func TestLocateMirroredAptVersion(t *testing.T) {
 		t.Errorf("the refusal does not name the codenames searched: %v", err)
 	}
 }
+
+// A pool filename drops the epoch, so the pool refusal has to match a hide
+// recorded with one against a path that carries none.
+func TestMirroredHidePoolRefusesAnEpochVersion(t *testing.T) {
+	const (
+		epochVersion = "1:2.0-1"
+		epochDeb     = "pool/main/e/epochpkg/epochpkg_2.0-1_amd64.deb"
+		spelledDeb   = "pool/main/e/epochpkg/epochpkg_1%3a2.0-1_amd64.deb"
+		otherDeb     = "pool/main/e/epochpkg/epochpkg_3%3a2.0-1_amd64.deb"
+	)
+	packages := aptProfilePackages() + strings.Join([]string{
+		"Package: epochpkg",
+		"Version: " + epochVersion,
+		"Architecture: amd64",
+		"Filename: " + epochDeb,
+		"Size: 42",
+		"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+		"Description: fixture package with an epoch",
+		"", "",
+	}, "\n")
+	pool := aptProfilePool()
+	pool[epochDeb] = "\x21<arch>\nepochpkg bytes"
+	pool[spelledDeb] = "\x21<arch>\nepochpkg bytes"
+	pool[otherDeb] = "\x21<arch>\nepochpkg epoch 3 bytes"
+	s, archive := aptProfileServerWith(t, "amd64", packages, pool)
+
+	found, err := LocateMirroredAptVersion(context.Background(), s.cfg, nil, "epochpkg", epochVersion)
+	if err != nil || len(found) != 1 {
+		t.Fatalf("locate the epoch'd version = %v, %v; want it found", found, err)
+	}
+	hideMirrored(t, s, "epochpkg", epochVersion)
+
+	if _, body := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"/"+packagesPath); strings.Contains(string(body), "Package: epochpkg") {
+		t.Errorf("the mirrored Packages still lists the hidden epochpkg:\n%s", body)
+	}
+	for i, deb := range []string{epochDeb, spelledDeb} {
+		code, body := mirrorGet(t, s, "/apt/"+deb)
+		if code != http.StatusForbidden {
+			t.Fatalf("pool fetch of %s = %d, want 403:\n%s", deb, code, body)
+		}
+		if got := archive.count(deb); got != 0 {
+			t.Errorf("upstream GETs for %s = %d, want 0", deb, got)
+		}
+		if i > 0 {
+			continue
+		}
+		ev := profileDenial(t, s, audit.DenialHidden)
+		if ev.PkgName != "epochpkg" || ev.PkgVersion != epochVersion {
+			t.Errorf("denial row names %s %s, want epochpkg %s", ev.PkgName, ev.PkgVersion, epochVersion)
+		}
+	}
+
+	if code, _ := mirrorGet(t, s, "/apt/"+otherDeb); code == http.StatusForbidden {
+		t.Errorf("pool fetch of a different epoch spelled in the path was refused as hidden")
+	}
+}
+
+func TestAptStripEpoch(t *testing.T) {
+	for in, want := range map[string]string{
+		"2:9.1.0016-1ubuntu7": "9.1.0016-1ubuntu7",
+		"9.1.0016-1ubuntu7":   "9.1.0016-1ubuntu7",
+		"0:1.0":               "1.0",
+		"1.0:2-1":             "1.0:2-1",
+		":1.0":                ":1.0",
+	} {
+		if got := aptStripEpoch(in); got != want {
+			t.Errorf("aptStripEpoch(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
