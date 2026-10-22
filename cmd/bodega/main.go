@@ -206,11 +206,11 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		noReloadSignal(newPackageCmd(gf)),
 	)
 
-	// Package management commands: bodega pkg {create,edit,import,prefetch,convert,delete,freeze,hide,refresh,verify,checksum,storage,group,drift,move}
+	// Package management commands: bodega pkg {create,edit,import,prefetch,convert,delete,freeze,hide,list,show,refresh,verify,checksum,storage,group,drift,move}
 	pkgParent := &cobra.Command{
 		Use:     "pkg",
 		Aliases: []string{"package"},
-		Short:   "Package management (create, edit, import, prefetch, convert, delete, freeze, hide, refresh, verify, storage, group, drift, move)",
+		Short:   "Package management (create, edit, import, prefetch, convert, delete, freeze, hide, list, show, refresh, verify, storage, group, drift, move)",
 	}
 	pkgParent.AddCommand(
 		signalsReload(newCreateCmd(gf)),
@@ -223,6 +223,8 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		signalsReload(newRemoveCmd(gf)),
 		signalsReload(newFreezeCmd(gf)),
 		signalsReload(newHideCmd(gf)),
+		noReloadSignal(newPkgListCmd(gf)),
+		noReloadSignal(newPkgShowCmd(gf)),
 		signalsReload(newRefreshCmd(gf)),
 		noReloadSignal(newVerifyCmd(gf)),
 		noReloadSignal(newChecksumCmd(gf)),

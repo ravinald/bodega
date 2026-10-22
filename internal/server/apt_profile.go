@@ -83,6 +83,9 @@ type aptProfileSuite struct {
 	codename string
 	permit   *entitle.Profile
 	index    *aptSuiteIndex
+	// hidden is every mirrored version an operator hid server-wide, which a
+	// filtered codename drops whatever its profile permits.
+	hidden aptMirrorHides
 }
 
 // pocket reports whether this codename filters a pocket of the profile's base
@@ -245,7 +248,7 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // the difference between a linear cost in profiles and a linear cost in bases.
 // A pocket is a suite like any other here, so a read that fails withdraws that
 // pocket's codename alone, and planApt refuses the host naming the pocket.
-func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, date, validUntil time.Time) (served []aptProfileSuite) {
+func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, hidden aptMirrorHides, date, validUntil time.Time) (served []aptProfileSuite) {
 	suites := s.aptProfileSuites(views)
 	if len(suites) == 0 {
 		return nil
@@ -254,6 +257,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 	cache := map[string]aptIndexRead{}
 	out := make([]aptProfileSuite, 0, len(suites))
 	for _, ps := range suites {
+		ps.hidden = hidden
 		release, ok := releases[ps.base]
 		if !ok {
 			var err error
@@ -341,26 +345,16 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 	kept, dropped := map[string]int{}, map[string]int{}
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			key := ps.base + "/" + comp.name + "/" + arch
-			read, ok := cache[key]
-			if !ok {
-				body, err := s.aptUpstreamPackages(ctx, ps.base, comp.name, arch, release)
-				switch {
-				case errors.Is(err, errUpstreamNotFound):
-					read = aptIndexRead{notPublished: true}
-					s.logger.Info("an apt base declares an architecture this archive does not serve, so filtered codenames over it carry the rest; the arch is served from another host (ports.ubuntu.com for Ubuntu's non-x86 ports) and reaching it needs its own apt_upstreams entry",
-						"base", ps.base, "component", comp.name, "arch", arch)
-				case err != nil:
-					return nil, nil, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", ps.base, comp.name, arch, err)
-				default:
-					read = aptIndexRead{body: body}
-				}
-				cache[key] = read
+			read, err := s.aptUpstreamRead(ctx, ps.base, comp.name, arch, release, cache)
+			if err != nil {
+				return nil, nil, err
 			}
 			if read.notPublished {
 				continue
 			}
-			filtered, k, d, err := filterAptPackages(read.body, ps.permit)
+			filtered, k, d, err := filterAptParagraphs(read.body, func(fields map[string]string) bool {
+				return ps.hidden.permits(fields) && aptProfilePermits(ps.permit, fields)
+			})
 			if err != nil {
 				return nil, nil, fmt.Errorf("filter the upstream Packages for %s/%s/%s: %w", ps.base, comp.name, arch, err)
 			}
@@ -389,6 +383,30 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 		}
 	}
 	return components, out, nil
+}
+
+// aptUpstreamRead reads one (base, component, architecture) Packages through
+// cache, recording a 404 as an architecture the archive does not carry rather
+// than as a failure, for the reason aptFilteredPackages gives.
+func (s *Server) aptUpstreamRead(ctx context.Context, base, component, arch string, release map[string]string, cache map[string]aptIndexRead) (aptIndexRead, error) {
+	key := base + "/" + component + "/" + arch
+	if read, ok := cache[key]; ok {
+		return read, nil
+	}
+	body, err := s.aptUpstreamPackages(ctx, base, component, arch, release)
+	var read aptIndexRead
+	switch {
+	case errors.Is(err, errUpstreamNotFound):
+		read = aptIndexRead{notPublished: true}
+		s.logger.Info("an apt base declares an architecture this archive does not serve, so filtered codenames over it carry the rest; the arch is served from another host (ports.ubuntu.com for Ubuntu's non-x86 ports) and reaching it needs its own apt_upstreams entry",
+			"base", base, "component", component, "arch", arch)
+	case err != nil:
+		return aptIndexRead{}, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", base, component, arch, err)
+	default:
+		read = aptIndexRead{body: body}
+	}
+	cache[key] = read
+	return read, nil
 }
 
 // filterAptPackages copies through the paragraphs a profile permits and drops
@@ -432,10 +450,23 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 // source version proper needs a capture recording ${source:Version}, which no
 // catalog holds today.
 func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, dropped int, err error) {
+	return filterAptParagraphs(index, func(fields map[string]string) bool { return aptProfilePermits(p, fields) })
+}
+
+// aptProfilePermits is the profile half of the filter: the paragraph's source
+// package, at the paragraph's own version.
+func aptProfilePermits(p *entitle.Profile, fields map[string]string) bool {
+	source := deb822.SourceName(fields)
+	return source != "" && p.Permits(manifest.TypeApt, source, fields["Version"]).Permitted
+}
+
+// filterAptParagraphs copies through the paragraphs keep accepts, as upstream's
+// own bytes, and fails the whole index on one that does not parse, for the
+// reasons filterAptPackages gives.
+func filterAptParagraphs(index []byte, keep func(fields map[string]string) bool) (out []byte, kept, dropped int, err error) {
 	var buf bytes.Buffer
 	err = deb822.ParseStreamRaw(bytes.NewReader(index), func(raw []byte, fields map[string]string) error {
-		source := deb822.SourceName(fields)
-		if source == "" || !p.Permits(manifest.TypeApt, source, fields["Version"]).Permitted {
+		if !keep(fields) {
 			dropped++
 			return nil
 		}
