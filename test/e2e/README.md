@@ -26,6 +26,7 @@ it needs several hosts, a real network between them, and several minutes.
 | `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client`    |
 | none: `internal/storage`'s ACL and extattr syscalls | `freebsd-server` | `48-freebsd-server`    |
 | `make fetch` through the `distfiles` type           | `freebsd`        | `49-freebsd-distfiles` |
+| `apt-get`, `pip`, `curl`: one real application      | `client`         | `58-realworld-netbox`  |
 
 `48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
 `freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
@@ -34,6 +35,15 @@ mounted `-o acls`, each as an unprivileged user and as root. It also runs
 `test/e2e/guest` on a ZFS dataset with `aclmode` and `aclinherit` set to
 `passthrough`, where it checks what a reader other than the owner can do with a
 published object rather than what its ACL says.
+
+`58-realworld-netbox` installs one real application with the client's egress
+locked to the server, learns a profile from what it fetched, reinstalls under
+that profile, and reinstalls again with the server cut off from every upstream.
+On a server that has never cataloged the application's pip closure, phase 1
+builds it through the observe and `discover generate-manifests` loop, roughly
+one distribution per round, so a cold first run takes about an hour. The git
+entry and the pypi entries it adds stay behind for the next run; everything else
+it changes, it puts back.
 
 ## Host requirements
 
@@ -126,7 +136,7 @@ one-line answer. Below it:
 | --------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------- |
 | `PASS`    | The check measured what it expected.                               | Nothing.                                                               |
 | `FAIL`    | A defect, or a harness bug.                                        | Triage. Every FAIL is a candidate issue.                               |
-| `XFAIL`   | Failed, and `known-issues.tsv` maps it to an open issue.           | Nothing. It is already filed.                                          |
+| `XFAIL`   | Failed, and `known-issues.tsv` maps it to an open issue or item.   | Nothing. It is already filed.                                          |
 | `XPASS`   | Passed, and it maps to an open issue.                              | **Close the issue and delete the row.**                                |
 | `SKIP`    | A precondition is absent by design (no container runtime, no TLS). | Read the reason; some skips are themselves findings.                   |
 | `BLOCKED` | A prerequisite failed, so this never ran.                          | Fix the prerequisite. A blocked check is neither a pass nor a failure. |
@@ -176,7 +186,7 @@ check id, so the next run's XFAIL mapping is a one-line append to
 
 ```text
 run.sh                  orchestrator: guards, run state, suite loop, report
-known-issues.tsv        check-id -> issue number. FAIL becomes XFAIL, PASS becomes XPASS
+known-issues.tsv        check-id -> issue number or drover item id. FAIL becomes XFAIL, PASS becomes XPASS
 lib/assert.sh           every verdict goes through e2e_record, the only writer of findings.jsonl
 lib/remote.sh           ssh/scp; e2e_on runs one command string on "server" or "client"
 lib/bodega.sh           bodega CLI, config, restart, HTTP helpers

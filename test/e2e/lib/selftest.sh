@@ -97,6 +97,14 @@ t_ok "XFAIL carries the issue number" 319 "$(field_of SELF-20 issue)"
 check_eq SELF-21 "a mapped pass means it was fixed" same same
 t_ok "mapped PASS -> XPASS" XPASS "$(verdict_of SELF-21)"
 
+# A drover item id rather than a tracker number: a defect filed as a backlog
+# item has no issue number, and tonumber on "F72" failed the jq that writes the
+# record, so the check vanished from findings.jsonl instead of reading XFAIL.
+printf '%s\t%s\t%s\n' SELF-24 F72 "no profile delete" >>"$E2E_KNOWN_FILE"
+check_eq SELF-24 "a failure mapped to a drover item is expected" want got
+t_ok "item-mapped FAIL -> XFAIL" XFAIL "$(verdict_of SELF-24)"
+t_ok "XFAIL carries the item id" F72 "$(field_of SELF-24 issue)"
+
 check_eq SELF-22 "an unmapped pass stays a pass" same same
 t_ok "unmapped PASS -> PASS" PASS "$(verdict_of SELF-22)"
 t_ok "unmapped check has a null issue" null "$(field_of SELF-22 issue)"

@@ -25,7 +25,8 @@ E2E_N_XFAIL=0
 E2E_N_XPASS=0
 E2E_N_DRY=0
 
-# e2e_known <check-id> -> prints the issue number, or nothing.
+# e2e_known <check-id> -> prints the tracker issue number or drover item id,
+# or nothing.
 e2e_known() {
 	[ -f "${E2E_KNOWN_FILE:-}" ] || return 0
 	awk -v id="$1" '$0 !~ /^#/ && $1 == id { print $2; exit }' "$E2E_KNOWN_FILE"
@@ -91,7 +92,9 @@ e2e_record() {
 		--argjson rc "${rc:-0}" \
 		'{id:$id,suite:$suite,title:$title,host:$host,verdict:$verdict,
 		  expected:$expected,actual:$actual,cmd:$cmd,rc:$rc,ref:$ref,
-		  issue:(if $issue == "" then null else ($issue|tonumber) end),
+		  issue:(if $issue == "" then null
+		         elif ($issue|test("^[0-9]+$")) then ($issue|tonumber)
+		         else $issue end),
 		  commit:$commit,ts:$ts}' >>"$E2E_FINDINGS"
 
 	e2e_progress "$verdict" "$id" "$title"

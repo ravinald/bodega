@@ -15,3 +15,4 @@
 PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
+NBX-RESTORE-PROFILE	F72	bodega has no profile delete, so e2e-netbox outlives the run

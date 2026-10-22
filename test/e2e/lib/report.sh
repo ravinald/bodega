@@ -11,6 +11,10 @@
 [ -n "${E2E_LIB_REPORT:-}" ] && return 0
 E2E_LIB_REPORT=1
 
+# A known-issues row names a tracker issue by number or a drover item by id
+# (F72), and only the number takes a #.
+E2E_JQ_ISSUE_REF='def e2e_issue_ref: if type == "number" then "#\(.)" else . end; '
+
 e2e_report() {
 	local findings="$1" out="$2" run_id="$3"
 
@@ -58,7 +62,7 @@ e2e_report() {
 		if [ "$nxpass" -gt 0 ]; then
 			printf '## Fixed (XPASS)\n\n'
 			printf 'These map to an open issue and now pass. Close the issue, drop the row from `known-issues.tsv`.\n\n'
-			jq -rs '.[] | select(.verdict=="XPASS") | "- **\(.id)** #\(.issue) — \(.title)"' "$findings"
+			jq -rs "$E2E_JQ_ISSUE_REF"'.[] | select(.verdict=="XPASS") | "- **\(.id)** \(.issue | e2e_issue_ref) — \(.title)"' "$findings"
 			printf '\n'
 		fi
 
@@ -66,7 +70,7 @@ e2e_report() {
 		nxfail="$(jq -rs '[.[] | select(.verdict=="XFAIL")] | length' "$findings")"
 		if [ "$nxfail" -gt 0 ]; then
 			printf '## Known failures (XFAIL)\n\n'
-			jq -rs '.[] | select(.verdict=="XFAIL") | "- **\(.id)** #\(.issue) — \(.title)"' "$findings"
+			jq -rs "$E2E_JQ_ISSUE_REF"'.[] | select(.verdict=="XFAIL") | "- **\(.id)** \(.issue | e2e_issue_ref) — \(.title)"' "$findings"
 			printf '\n'
 		fi
 

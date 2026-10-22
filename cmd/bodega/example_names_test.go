@@ -76,15 +76,24 @@ func walkAuthored(t *testing.T, visit func(path string, body string)) {
 	}
 }
 
+// realApplicationSuite installs the application its name names, from that
+// application's real repository: the clone URL, the release route and the
+// install paths have to resolve, so the name in it is data rather than an
+// example. Anywhere else it may appear only as part of the suite's file name.
+var realApplicationSuite = "58-realworld-" + "net" + "box"
+
 func TestNoRetiredVendorNameSurvivesInAnExample(t *testing.T) {
 	walkAuthored(t, func(p, body string) {
-		lower := strings.ToLower(body)
+		if p == "test/e2e/suites/"+realApplicationSuite+".sh" {
+			return
+		}
+		lower := strings.ReplaceAll(strings.ToLower(body), realApplicationSuite, "")
 		for _, needle := range retiredNames {
 			if !strings.Contains(lower, needle) {
 				continue
 			}
 			for i, line := range strings.Split(body, "\n") {
-				if strings.Contains(strings.ToLower(line), needle) {
+				if strings.Contains(strings.ReplaceAll(strings.ToLower(line), realApplicationSuite, ""), needle) {
 					t.Errorf("%s:%d names %q, which examples no longer use; pick a fictional name:\n  %s",
 						p, i+1, needle, strings.TrimSpace(line))
 				}

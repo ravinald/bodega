@@ -326,8 +326,9 @@ if [ -z "$SUITE_FILTER" ] && [ "$E2E_DRY_RUN" = no ]; then
 	uncovered=""
 	while IFS=$'\t' read -r kid kissue _; do
 		case "$kid" in '' | '#'*) continue ;; esac
+		case "$kissue" in *[!0-9]*) ;; *) kissue="#$kissue" ;; esac
 		jq -e --arg id "$kid" 'select(.id==$id)' "$E2E_FINDINGS" >/dev/null 2>&1 ||
-			uncovered="$uncovered $kid(#$kissue)"
+			uncovered="$uncovered $kid($kissue)"
 	done <"$E2E_KNOWN_FILE"
 	if [ -n "$uncovered" ]; then
 		printf '\nknown issues with no check yet:%s\n' "$uncovered"
