@@ -146,12 +146,17 @@ func (e *BlockedError) Error() string {
 const aptSuiteChoiceLead = "this server serves %d apt suites ("
 
 // AptSuiteChoiceReason is the skip reason for a request that named no suite
-// on a server serving several. It names the remedy for both callers, since
-// the query parameter means nothing to someone running doctor.
+// on a server serving several.
 func AptSuiteChoiceReason(suites []string) string {
-	return fmt.Sprintf(aptSuiteChoiceLead+"%s), each with the pockets it mirrors, so which one this host reads is its own fact: "+
-		"run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script",
-		len(suites), strings.Join(suites, ", "))
+	return fmt.Sprintf(aptSuiteChoiceLead+"%s), each with the pockets it mirrors, so which one this host reads is its own fact: name it with %s",
+		len(suites), strings.Join(suites, ", "), AptSuiteRemedy("<suite>"))
+}
+
+// AptSuiteRemedy names how each entry point states the apt suite, since one
+// plan reaches doctor, the setup script and direct requests alike, and each
+// takes the suite under a different name.
+func AptSuiteRemedy(suite string) string {
+	return fmt.Sprintf("--suite %[1]s for bodega doctor, --codename %[1]s for the setup script, or codename=%[1]s on a direct /client/plan request", suite)
 }
 
 // AptSuiteChoices returns the suites an AptSuiteChoiceReason lists, and false

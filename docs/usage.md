@@ -2076,12 +2076,12 @@ A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
-`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none. Doctor refuses, lists the choices, and suggests the host's own `VERSION_CODENAME` when the server serves it. It never sends that codename unasked:
+`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `--codename`, `BODEGA_CODENAME` or `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none. Doctor refuses, lists the choices, and suggests the host's own `VERSION_CODENAME` when the server serves it. It never sends that codename unasked:
 
 ```
 $ sudo bodega doctor --configure apt --apply --url https://bodega.internal
 Error: the plan installs nothing for a system you named, so nothing was written:
-  apt (skip): this server serves 2 apt suites (noble, resolute), each with the pockets it mirrors, so which one this host reads is its own fact: run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script
+  apt (skip): this server serves 2 apt suites (noble, resolute), each with the pockets it mirrors, so which one this host reads is its own fact: name it with --suite <suite> for bodega doctor, --codename <suite> for the setup script, or codename=<suite> on a direct /client/plan request
   This host's VERSION_CODENAME in /etc/os-release is noble, which this server serves. To read it, re-run with --suite noble
 ```
 
@@ -4642,7 +4642,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `d54ec52ff9f3ccf2fdb622bb18c1f44d68946921dec417c579837ac3ea43e253`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `68fdaa7d35a7f8765b4a2a2f2e92ee5be67149069ee767e5cdbf394ac82d9876`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4694,7 +4694,14 @@ The diff redacts before it prints:
 
 The files themselves are written unredacted, and a backup of a file that held a secret carries it too, with the original's mode.
 
-What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` from `VERSION_CODENAME` in `/etc/os-release` on Linux, since `lsb_release` is absent from minimal images. On an instance serving no apt suite by the host's codename, the plan skips apt and names the suites it does serve, and `bodega doctor --configure apt --suite <suite>` is the way through.
+What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` on Linux, from `VERSION_CODENAME` in `/etc/os-release` since `lsb_release` is absent from minimal images. On an instance serving no apt suite by that codename, or serving several when the host states none, the plan skips apt and names the suites it does serve.
+
+`--codename <suite>` names the apt suite in place of `VERSION_CODENAME`, and so does `BODEGA_CODENAME`; the flag wins when both are set. It is the way through on a host whose `/etc/os-release` carries no usable `VERSION_CODENAME`, and on a host that should read a suite other than its own. The value is held to the rule `VERSION_CODENAME` is, lowercase letters, digits, `.`, `+` and `-`, and anything else stops the script before it asks the server for a plan. A pocket such as `noble-updates` is refused by the server, which names its base. On FreeBSD the codename is not sent.
+
+```sh
+sh setup.sh --url https://bodega-host:8080 --codename noble
+BODEGA_CODENAME=noble sh setup.sh --url https://bodega-host:8080
+```
 
 An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. With `--systems osquery` the refusal says so for the secret: a rewritten flags file sends osqueryd's enroll secret, in clear, to whoever rewrote it. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
 
