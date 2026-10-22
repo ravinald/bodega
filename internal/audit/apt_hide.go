@@ -11,7 +11,8 @@ import (
 
 // AptMirrorHide is one version of a mirrored apt package an operator withdrew
 // from every host. Name and Version are the binary package's, as a Packages
-// stanza and a pool filename carry them. Codenames records where the version
+// stanza carries them, epoch included; a pool filename drops the epoch, which
+// the server's pool refusal accounts for. Codenames records where the version
 // was found when the hide was set; the rebuild drops the stanza wherever it
 // appears, so it describes the decision rather than limiting it.
 type AptMirrorHide struct {
