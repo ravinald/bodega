@@ -792,6 +792,73 @@ nbx_server_lapsed=yes
 nbx_phase6_release
 t_ok "suite 58: a lapse re-locked mid-install fails NBX-P6-HELD" FAIL "$(verdict_of NBX-P6-HELD)"
 
+# Phase 7 asserts the state in which e2e_egress_drops exits non-zero, and the
+# suite runs under errexit: an unguarded read there ended the run before any
+# RESTORE check was recorded. A regression aborts this script at the call.
+E2E_DRY_RUN=no
+# shellcheck disable=SC2329
+e2e_egress_drops() {
+	printf 'e2e: no egress lock on client (192.0.2.2)\n' >&2
+	return 1
+}
+nbx_restore_lock client
+t_ok "suite 58: no lock on the client passes NBX-RESTORE-LOCK-client" PASS "$(verdict_of NBX-RESTORE-LOCK-client)"
+# shellcheck disable=SC2329
+e2e_egress_drops() {
+	printf 'e2e: could not read the egress drop count on server\n' >&2
+	return 1
+}
+nbx_restore_lock server
+t_ok "suite 58: an unreadable counter fails NBX-RESTORE-LOCK-server" FAIL "$(verdict_of NBX-RESTORE-LOCK-server)"
+# shellcheck disable=SC2329
+e2e_egress_drops() { printf '0\n'; }
+nbx_restore_lock server
+t_ok "suite 58: a loaded lock fails NBX-RESTORE-LOCK-server" FAIL "$(verdict_of NBX-RESTORE-LOCK-server)"
+
+# With no profile delete (F72) each run leaves the profile behind empty; the
+# next run reuses that, and still refuses one holding entries or hosts.
+nbx_list_head="PROFILE     TYPES  ENTRIES  HOSTS  CREATED     DESCRIPTION"
+nbx_profile_reuse=no
+nbx_preflight_profile "$nbx_list_head
+web         1      4        2      2026-10-01  web hosts" && nbx_rc_pre=0 || nbx_rc_pre=$?
+t_ok "suite 58: an absent profile passes NBX-PRE-PROFILE" "0 PASS no" \
+	"$nbx_rc_pre $(verdict_of NBX-PRE-PROFILE) $nbx_profile_reuse"
+nbx_preflight_profile "$nbx_list_head
+$NBX_PROFILE  3      0        0      2026-10-21  e2e suite 58" && nbx_rc_pre=0 || nbx_rc_pre=$?
+t_ok "suite 58: an empty, unbound leftover is reused" "0 PASS yes" \
+	"$nbx_rc_pre $(verdict_of NBX-PRE-PROFILE) $nbx_profile_reuse"
+for nbx_row in "3      12       0" "3      0        1"; do
+	nbx_profile_reuse=no
+	nbx_preflight_profile "$nbx_list_head
+$NBX_PROFILE  $nbx_row      2026-10-21  e2e suite 58" && nbx_rc_pre=0 || nbx_rc_pre=$?
+	t_ok "suite 58: a profile with entries or hosts ($nbx_row) blocks" "1 BLOCKED no" \
+		"$nbx_rc_pre $(verdict_of NBX-PRE-PROFILE) $nbx_profile_reuse"
+done
+
+# A server mirroring several suites names none in the plan, and doctor then
+# refuses apt and pip together, so the client's codename goes on every call.
+nbx_doctor_cmds="$work/nbx-doctor"
+: >"$nbx_doctor_cmds"
+nbx_os_codename=resolute
+# shellcheck disable=SC2329
+e2e_on() {
+	E2E_ERR=""
+	E2E_RC=0
+	case "$2" in
+	*os-release*) E2E_OUT="$nbx_os_codename" ;;
+	*) printf '%s\n' "$2" >>"$nbx_doctor_cmds" && E2E_OUT="" ;;
+	esac
+}
+nbx_configure_client && nbx_rc_cfg=0 || nbx_rc_cfg=$?
+t_ok "suite 58: doctor is given the client's codename" "0 PASS 1" \
+	"$nbx_rc_cfg $(verdict_of NBX-P1-CONFIGURE) $(awk '/bodega doctor/ && / --suite resolute /' "$nbx_doctor_cmds" | wc -l | tr -d ' ')"
+nbx_os_codename=""
+: >"$nbx_doctor_cmds"
+nbx_configure_client && nbx_rc_cfg=0 || nbx_rc_cfg=$?
+t_ok "suite 58: no codename fails NBX-P1-CONFIGURE and runs no doctor" "1 FAIL 0" \
+	"$nbx_rc_cfg $(verdict_of NBX-P1-CONFIGURE) $(wc -l <"$nbx_doctor_cmds" | tr -d ' ')"
+t_ok "suite 58: the FAIL names the codename it read" "VERSION_CODENAME=" "$(field_of NBX-P1-CONFIGURE actual)"
+
 # ---- verdict ---------------------------------------------------------------
 
 printf '\n%d case(s), %d failure(s)\n' "$cases" "$fails"

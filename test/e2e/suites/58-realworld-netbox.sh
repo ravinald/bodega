@@ -72,6 +72,7 @@ nbx_locked_client=no
 nbx_locked_server=no
 nbx_config_saved=no
 nbx_profile_made=no
+nbx_profile_reuse=no
 nbx_cidr_bound=no
 nbx_client_configured=no
 nbx_netbox_touched=no
@@ -607,6 +608,33 @@ nbx_restore_traps() {
 
 # ---- preflight ---------------------------------------------------------------
 
+# nbx_preflight_profile <profile list output> — no profile named e2e-netbox,
+# or one holding no entry and bound to no host. With no `profile delete`
+# (F72) every run's cleanup leaves the profile behind empty, and refusing that
+# would make the suite run once per server. One holding entries or a binding
+# is somebody's, and the cleanup would empty it.
+nbx_preflight_profile() {
+	local row
+	row="$(printf '%s\n' "$1" | awk -v p="$NBX_PROFILE" '$1 == p { print $3, $4; exit }')"
+	case "$row" in
+	"")
+		e2e_record NBX-PRE-PROFILE PASS "no profile named $NBX_PROFILE holds entries or hosts" "absent, or empty and unbound" \
+			"absent" "bodega profile list" 0 "cmd/bodega/cmd_profile.go:632"
+		;;
+	"0 0")
+		nbx_profile_reuse=yes
+		e2e_record NBX-PRE-PROFILE PASS "no profile named $NBX_PROFILE holds entries or hosts" "absent, or empty and unbound" \
+			"present with 0 entries and 0 hosts; reused" "bodega profile list" 0 "cmd/bodega/cmd_profile.go:632"
+		;;
+	*)
+		E2E_HOST=server
+		e2e_block NBX-PRE-PROFILE "no profile named $NBX_PROFILE holds entries or hosts" \
+			"$NBX_PROFILE already exists with entries and hosts '$row', and this suite will not empty a profile it did not leave empty (bodega has no profile delete yet, F72)"
+		return 1
+		;;
+	esac
+}
+
 nbx_preflight() {
 	local root avail mem
 	nbx_phase "preflight"
@@ -656,13 +684,7 @@ nbx_preflight() {
 
 	E2E_HOST=server
 	e2e_bodega server "profile list" || true
-	if printf '%s\n' "$E2E_OUT" | awk -v p="$NBX_PROFILE" '$1 == p { found = 1 } END { exit !found }'; then
-		e2e_block NBX-PRE-PROFILE "no profile named $NBX_PROFILE exists" \
-			"$NBX_PROFILE already exists, and this suite will not empty a profile it did not create (bodega has no profile delete yet, F72)"
-		return 1
-	fi
-	e2e_record NBX-PRE-PROFILE PASS "no profile named $NBX_PROFILE exists" "absent" "absent" \
-		"bodega profile list" 0 "cmd/bodega/cmd_profile.go:632"
+	nbx_preflight_profile "$E2E_OUT" || return 1
 
 	e2e_bodega server "identity list" || true
 	if printf '%s\n' "$E2E_OUT" | grep -Fq "$nbx_client_addr/32"; then
@@ -826,17 +848,26 @@ nbx_phase1() {
 			"bodega policy mode set $t open"
 	done
 
-	e2e_bodega server "profile create $NBX_PROFILE --description 'e2e suite 58: NetBox v4.7.2'" || true
-	[ "$E2E_RC" = 0 ] && nbx_profile_made=yes
-	nbx_rc NBX-P1-PROFILE "profile $NBX_PROFILE is created" "cmd/bodega/cmd_profile.go:131" \
-		"bodega profile create $NBX_PROFILE"
+	if [ "$nbx_profile_reuse" = yes ]; then
+		nbx_profile_made=yes
+		e2e_record NBX-P1-PROFILE PASS "profile $NBX_PROFILE is created" "created, or an empty leftover reused" \
+			"reused the empty, unbound leftover preflight found" "bodega profile list" 0 "cmd/bodega/cmd_profile.go:131"
+	else
+		e2e_bodega server "profile create $NBX_PROFILE --description 'e2e suite 58: NetBox v4.7.2'" || true
+		[ "$E2E_RC" = 0 ] && nbx_profile_made=yes
+		nbx_rc NBX-P1-PROFILE "profile $NBX_PROFILE is created" "cmd/bodega/cmd_profile.go:131" \
+			"bodega profile create $NBX_PROFILE"
+	fi
 	if [ "$nbx_profile_made" != yes ] && [ "${E2E_DRY_RUN:-no}" != yes ]; then
 		return 1
 	fi
+	# A reused profile keeps the rules an earlier phase 2 left, pinned and
+	# blocking, and `profile set` keeps any value it is not given; floating is
+	# what a new profile starts at.
 	for t in $NBX_TYPES; do
-		e2e_bodega server "profile set $NBX_PROFILE $t --membership closed --expansion warn" || true
+		e2e_bodega server "profile set $NBX_PROFILE $t --membership closed --expansion warn --version-default floating" || true
 		nbx_rc "NBX-P1-SET-$t" "$t is closed at expansion warn" "cmd/bodega/cmd_profile.go:913" \
-			"bodega profile set $NBX_PROFILE $t --membership closed --expansion warn"
+			"bodega profile set $NBX_PROFILE $t --membership closed --expansion warn --version-default floating"
 	done
 	e2e_bodega server "identity bind cidr $nbx_client_addr/32 $NBX_IDENTITY --comment 'e2e suite 58'" || true
 	[ "$E2E_RC" = 0 ] && nbx_cidr_bound=yes
@@ -857,15 +888,35 @@ nbx_phase1() {
 	e2e_on client "bash -s" <<<"mkdir -p $NBX_WORK/orig
 for f in /etc/apt/sources.list.d/bodega.sources /etc/pip.conf; do [ -f \$f ] && cp -p \$f $NBX_WORK/orig/; done
 $(nbx_script_sources_off "")" || true
-	e2e_on client "sudo bodega doctor --configure apt,pypi --apply --url $E2E_BASE_URL --allow-plaintext" || true
-	nbx_rc NBX-P1-CONFIGURE "bodega doctor configures apt and pip on the client" "cmd/bodega/cmd_doctor.go" \
-		"sudo bodega doctor --configure apt,pypi --apply --url $E2E_BASE_URL --allow-plaintext"
+	nbx_configure_client || return 1
 
 	nbx_keepalive
 	nbx_git_entry
 	nbx_install NBX-P1
 	nbx_evidence
 	nbx_phase_drops 1
+}
+
+# nbx_configure_client — doctor with the client's own codename. A server that
+# mirrors serves several apt suites and names none in the plan, and doctor
+# refuses the whole plan, pip included, when apt has no codename to write.
+nbx_configure_client() {
+	local codename cmd rc
+	E2E_HOST=client
+	e2e_on client "sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '\"'" || true
+	codename="$E2E_OUT"
+	[ "${E2E_DRY_RUN:-no}" = yes ] && codename="${codename:-resolute}"
+	if ! [[ "$codename" =~ ^[a-z0-9-]+$ ]]; then
+		e2e_record NBX-P1-CONFIGURE FAIL "bodega doctor configures apt and pip on the client" \
+			"VERSION_CODENAME in /etc/os-release" "$(e2e_excerpt "VERSION_CODENAME=$codename")" \
+			"sed -n s/^VERSION_CODENAME=//p /etc/os-release" 1 "cmd/bodega/cmd_doctor.go:124"
+		return 1
+	fi
+	cmd="sudo bodega doctor --configure apt,pypi --apply --suite $codename --url $E2E_BASE_URL --allow-plaintext"
+	e2e_on client "$cmd" || true
+	rc="$E2E_RC"
+	nbx_rc NBX-P1-CONFIGURE "bodega doctor configures apt and pip on the client" "cmd/bodega/cmd_doctor.go:124" "$cmd"
+	[ "$rc" = 0 ]
 }
 
 # nbx_evidence — R5: every package the client fetched in phase 1 has a row
@@ -1212,23 +1263,12 @@ nbx_phase6_release() {
 # ---- phase 7 -----------------------------------------------------------------
 
 nbx_phase7() {
-	local t m want n role
+	local t m want role
 	nbx_phase "7: restore"
 	nbx_cleanup
 
 	for role in client server; do
-		E2E_HOST="$role"
-		n="$(e2e_egress_drops "$role" 2>&1)"
-		case "${E2E_DRY_RUN:-no}:$n" in
-		yes:* | *"no egress lock on"*)
-			e2e_record "NBX-RESTORE-LOCK-$role" PASS "the $role carries no egress lock" "no lock" "no lock" \
-				"e2e_egress_drops $role" 0 "test/e2e/lib/egress.sh:334"
-			;;
-		*)
-			e2e_record "NBX-RESTORE-LOCK-$role" FAIL "the $role carries no egress lock" "no lock" \
-				"$(e2e_excerpt "$n")" "e2e_egress_drops $role" 1 "test/e2e/lib/egress.sh:334"
-			;;
-		esac
+		nbx_restore_lock "$role"
 	done
 
 	E2E_HOST=server
@@ -1259,6 +1299,26 @@ nbx_phase7() {
 		"test/e2e/suites/58-realworld-netbox.sh" "test -e $NBX_ROOT; psql: pg_database and pg_roles for netbox"
 
 	nbx_restore_client_conf
+}
+
+# nbx_restore_lock <role> — the role carries no lock. e2e_egress_drops exits
+# non-zero for exactly the state this asserts, so its status is read from what
+# it printed: under the suite's errexit an unguarded read ends the run here,
+# before any RESTORE check is recorded.
+nbx_restore_lock() {
+	local n
+	E2E_HOST="$1"
+	n="$(e2e_egress_drops "$1" 2>&1)" || true
+	case "${E2E_DRY_RUN:-no}:$n" in
+	yes:* | *"no egress lock on"*)
+		e2e_record "NBX-RESTORE-LOCK-$1" PASS "the $1 carries no egress lock" "no lock" "no lock" \
+			"e2e_egress_drops $1" 0 "test/e2e/lib/egress.sh:334"
+		;;
+	*)
+		e2e_record "NBX-RESTORE-LOCK-$1" FAIL "the $1 carries no egress lock" "no lock" \
+			"$(e2e_excerpt "$n")" "e2e_egress_drops $1" 1 "test/e2e/lib/egress.sh:334"
+		;;
+	esac
 }
 
 # nbx_restore_client_conf — the client's apt sources and pip.conf are the
