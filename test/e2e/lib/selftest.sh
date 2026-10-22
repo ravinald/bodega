@@ -97,6 +97,14 @@ t_ok "XFAIL carries the issue number" 319 "$(field_of SELF-20 issue)"
 check_eq SELF-21 "a mapped pass means it was fixed" same same
 t_ok "mapped PASS -> XPASS" XPASS "$(verdict_of SELF-21)"
 
+# A backlog id rather than a tracker number: tonumber on "B12" failed the jq
+# that writes the record, so the check vanished from findings.jsonl instead of
+# reading XFAIL.
+printf '%s\t%s\t%s\n' SELF-24 B12 "filed as a backlog item" >>"$E2E_KNOWN_FILE"
+check_eq SELF-24 "a failure mapped to a backlog item is expected" want got
+t_ok "item-mapped FAIL -> XFAIL" XFAIL "$(verdict_of SELF-24)"
+t_ok "XFAIL carries the item id" B12 "$(field_of SELF-24 issue)"
+
 check_eq SELF-22 "an unmapped pass stays a pass" same same
 t_ok "unmapped PASS -> PASS" PASS "$(verdict_of SELF-22)"
 t_ok "unmapped check has a null issue" null "$(field_of SELF-22 issue)"
@@ -664,43 +672,14 @@ t_ok "setup osquery freebsd: a host with osqueryd disabled gets osqueryd_enable 
 	"0 sysrc osqueryd_enable=YES;service osqueryd restart;" \
 	"$(osq_run "$osq_secret" --systems osquery --allow-plaintext --apply) $(osq_calls)"
 
-# ---- egress lock rules -----------------------------------------------------
+# ---- local suites ----------------------------------------------------------
 
-# shellcheck source=egress.sh
-. "$E2E_DIR/lib/egress.sh"
-
-# egress_has <text> <line> — yes when <text> holds <line> as a whole line.
-egress_has() { case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) echo yes ;; *) echo no ;; esac }
-egress_count() { printf '%s\n' "$1" | awk -v l="$2" '$0 == l { n++ } END { print n + 0 }'; }
-
-nft_rules="$(e2e_egress_rules_nft 172.30.24.111 10.0.0.2)"
-pf_rules="$(e2e_egress_rules_pf 172.30.24.111 10.0.0.2)"
-
-t_ok "egress nft: the output chain drops by policy" yes \
-	"$(egress_has "$nft_rules" $'\t\ttype filter hook output priority filter; policy drop;')"
-t_ok "egress nft: the final rule counts what it drops" yes \
-	"$(egress_has "$nft_rules" $'\t\tcounter name "dropped" drop')"
-t_ok "egress pf: the anchor ends in an outbound block" "block drop out quick all" "${pf_rules##*$'\n'}"
-t_ok "egress pf: no rule logs" no "$(case "$pf_rules" in *log*) echo yes ;; *) echo no ;; esac)"
-for ip in 172.30.24.111 10.0.0.2; do
-	t_ok "egress nft: one ICMP and one TCP accept for $ip" "1 1" \
-		"$(egress_count "$nft_rules" $'\t\t'"ip daddr $ip meta l4proto icmp accept") $(egress_count "$nft_rules" $'\t\t'"ip daddr $ip meta l4proto tcp accept")"
-	t_ok "egress pf: one ICMP and one TCP pass for $ip" "1 1" \
-		"$(egress_count "$pf_rules" "pass out quick inet proto icmp to $ip keep state") $(egress_count "$pf_rules" "pass out quick inet proto tcp to $ip keep state")"
-done
-t_ok "egress: no rule in either set names UDP" no \
-	"$(case "$nft_rules $pf_rules" in *udp* | *domain* | *53*) echo yes ;; *) echo no ;; esac)"
-
-for bad in '10.0.0.1;reboot' 'pypi.org' '1.2.3.4/0' '10.0.0.1 any' ''; do
-	set +e
-	nft_out="$(e2e_egress_rules_nft 172.30.24.111 "$bad" 2>/dev/null)"
-	nft_rc=$?
-	pf_out="$(e2e_egress_rules_pf 172.30.24.111 "$bad" 2>/dev/null)"
-	pf_rc=$?
-	set -e
-	t_ok "egress: $(printf '%q' "$bad") is refused before any rule prints" "2 2 0 0" \
-		"$nft_rc $pf_rc ${#nft_out} ${#pf_out}"
-done
+# Suites kept outside the repository under local/ bring their own cases, and
+# a checkout without that directory runs only the cases above.
+if [ -f "$E2E_DIR/local/selftest.sh" ]; then
+	# shellcheck source=/dev/null
+	. "$E2E_DIR/local/selftest.sh"
+fi
 
 # ---- counters --------------------------------------------------------------
 

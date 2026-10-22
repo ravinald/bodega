@@ -126,7 +126,7 @@ one-line answer. Below it:
 | --------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------- |
 | `PASS`    | The check measured what it expected.                               | Nothing.                                                               |
 | `FAIL`    | A defect, or a harness bug.                                        | Triage. Every FAIL is a candidate issue.                               |
-| `XFAIL`   | Failed, and `known-issues.tsv` maps it to an open issue.           | Nothing. It is already filed.                                          |
+| `XFAIL`   | Failed, and `known-issues.tsv` maps it to an open issue or item.   | Nothing. It is already filed.                                          |
 | `XPASS`   | Passed, and it maps to an open issue.                              | **Close the issue and delete the row.**                                |
 | `SKIP`    | A precondition is absent by design (no container runtime, no TLS). | Read the reason; some skips are themselves findings.                   |
 | `BLOCKED` | A prerequisite failed, so this never ran.                          | Fix the prerequisite. A blocked check is neither a pass nor a failure. |
@@ -176,7 +176,7 @@ check id, so the next run's XFAIL mapping is a one-line append to
 
 ```text
 run.sh                  orchestrator: guards, run state, suite loop, report
-known-issues.tsv        check-id -> issue number. FAIL becomes XFAIL, PASS becomes XPASS
+known-issues.tsv        check-id -> issue number or backlog item id. FAIL becomes XFAIL, PASS becomes XPASS
 lib/assert.sh           every verdict goes through e2e_record, the only writer of findings.jsonl
 lib/remote.sh           ssh/scp; e2e_on runs one command string on "server" or "client"
 lib/bodega.sh           bodega CLI, config, restart, HTTP helpers
@@ -294,63 +294,18 @@ verdict those do not express.
 `make harness` must pass before a suite lands: `shellcheck -x`, `shfmt -d` and
 the self-test are a leg of `make check`.
 
-## Egress lock
+## Local suites
 
-Every guest has an open route to the internet, so a client install that
-succeeds proves nothing about where the bytes came from. `lib/egress.sh` locks
-a guest's outbound traffic to the addresses a suite names, which is what tells
-a fetch through bodega from a fallback to upstream:
+`local/` holds suites kept outside the repository: checks that validate a build against a particular deployment or application, which have no reason to ship to everyone who clones bodega. `.gitignore` excludes it. Its layout mirrors this directory:
 
-```bash
-# shellcheck source=../lib/egress.sh
-. "${E2E_DIR:?}/lib/egress.sh"
-
-e2e_egress_lock client 172.30.24.111 || true   # the server's address
-# ... fetch through bodega ...
-drops="$(e2e_egress_drops client)" || true
-e2e_egress_unlock client || true
+```text
+local/suites/*.sh       sourced in filename order among suites/*.sh, so a local 58- runs before 95-destructive
+local/lib/*.sh          libraries those suites source; --validate parses them
+local/selftest.sh       sourced by lib/selftest.sh before its verdict, with t_ok and $work in scope
+local/known-issues.tsv  read after known-issues.tsv, same format
 ```
 
-The role is any harness alias (`server`, `client`, `freebsd`,
-`freebsd-server`, or `freebsd_server`), and the OS is read from the guest with
-`uname -s`. Under the lock:
-
-- every inbound packet is accepted;
-- outbound is accepted on loopback, for established and related flows, and for
-  ICMP and TCP to the named addresses;
-- every other outbound packet is dropped and counted. That includes all UDP,
-  and DNS with it, on purpose: `10-ship-install` writes `/etc/hosts` for every
-  name a suite uses, so a resolver lookup during a locked run is a client
-  reaching for upstream, and a drop count above the probe's is that finding.
-
-On Linux the rules live in one nftables table, `inet bodega_e2e`, with a named
-counter `dropped` on the final drop. On FreeBSD they live in one pf anchor,
-`bodega_e2e`; locking enables pf and adds an `anchor "bodega_e2e"` hook to the
-main ruleset only when they were not already there, and removing the lock
-reverses only what locking did. That state lives in
-`/var/run/bodega-e2e-egress`.
-
-The lock checks itself before `e2e_egress_lock` returns: a TCP connect to
-`1.1.1.1:443` (`E2E_EGRESS_PROBE_IP`, `E2E_EGRESS_PROBE_PORT`) must fail within
-5 seconds and one to the first named address on port 8080 must succeed. Either
-going the wrong way removes the lock and fails with the guest, the rules and
-what was seen. A second lock replaces the rules and resets the counter.
-
-**The deadman.** Every lock arms a timer on the guest that removes the lock
-after 30 minutes whether the harness comes back or not: the transient systemd
-unit `bodega-e2e-egress-deadman` on Linux, a detached `sleep 1800` under
-`daemon(8)` on FreeBSD. Removing the lock disarms it, and a second lock re-arms
-it rather than starting another.
-
-To remove a lock by hand:
-
-```bash
-sudo nft delete table inet bodega_e2e                        # Linux
-sudo systemctl stop bodega-e2e-egress-deadman.timer
-
-sudo pfctl -a bodega_e2e -F all                              # FreeBSD
-sudo sh /var/run/bodega-e2e-egress/remove.sh                 # also restores pf
-```
+A checkout without `local/` runs, validates and self-tests the tracked suites alone, which is what CI does. `make harness` lints whatever `shfmt -f test/e2e` finds, so on a checkout that has `local/`, its scripts are held to the same `shellcheck -x` and `shfmt` rules.
 
 ## What this run does not cover
 
