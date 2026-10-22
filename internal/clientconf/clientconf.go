@@ -75,7 +75,12 @@ func everywhere(p string) map[string]string {
 // which is the bypass doctor's goproxy-env check exists to report.
 func GoProxy(base string) string { return strings.TrimRight(base, "/") + "/go" }
 
-// Pip renders pip's global index-url.
+// Pip renders pip's global index-url, and a trusted-host naming the index's
+// host when the base is plaintext: pip ignores an http index whose host is
+// not trusted and reports "no matching distribution", so a pip.conf without
+// it installs nothing. The host is written without its port, because pip
+// matches a bare trusted-host against an index on any port, and without IPv6
+// brackets, which is the form pip prints in its own --trusted-host hint.
 //
 // /etc/pip.conf on FreeBSD too. pip's global search there is
 // /etc/xdg/pip/pip.conf, /etc/pip.conf and sys.prefix/pip.conf, measured with
@@ -91,8 +96,16 @@ func Pip(base string) File {
 			OSFreeBSD: "/etc/pip.conf",
 			OSDarwin:  "/Library/Application Support/pip/pip.conf",
 		},
-		Content: fmt.Sprintf("[global]\nindex-url = %s/pypi/simple/\n", trim(base)),
+		Content: fmt.Sprintf("[global]\nindex-url = %s/pypi/simple/\n", trim(base)) + pipTrustedHost(base),
 	}
+}
+
+func pipTrustedHost(base string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "http" || u.Hostname() == "" {
+		return ""
+	}
+	return "trusted-host = " + u.Hostname() + "\n"
 }
 
 // Npm renders the registry line of a user .npmrc, the file `bodega doctor
