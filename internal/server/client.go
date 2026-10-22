@@ -333,9 +333,18 @@ func (s *Server) planDistfiles(h *clientHost, one func(clientconf.File) []planFi
 // planApt picks the one stanza this host installs, by the rule
 // aptHostSources applies for /api/v1/status, narrowed by the codename the
 // host states. A signed stanza brings the keyring its Signed-By: names.
+//
+// A mirrored base and its pockets are one choice, rendered as one stanza. A
+// stock host already runs packages from -updates and -security, so a stanza
+// naming the base alone cannot install a -dev package whose runtime half is
+// newer than the release, and the host stops receiving security fixes with
+// nothing to report it.
 func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.File) []planFile) []planFile {
 	skip := func(reason string) []planFile {
 		return []planFile{{system: manifest.TypeApt, action: planSkip, reason: reason}}
+	}
+	refuse := func(reason string) []planFile {
+		return []planFile{{system: manifest.TypeApt, action: planRefuse, reason: reason}}
 	}
 	if h.q.OS != clientconf.OSLinux {
 		return skip("apt runs on Debian-family Linux, not " + h.q.OS)
@@ -344,12 +353,17 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 	var src *aptsources.Sources
 	if base, _ := h.profile.AptScope(); base != "" {
 		if h.q.Codename != "" && h.q.Codename != base {
-			return []planFile{{system: manifest.TypeApt, action: planRefuse,
-				reason: fmt.Sprintf("profile %q scopes apt to %s, and this host reports %s", h.profile.Name(), base, h.q.Codename)}}
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this host reports %s", h.profile.Name(), base, h.q.Codename))
 		}
 		if st.Host == nil {
-			return []planFile{{system: manifest.TypeApt, action: planRefuse,
-				reason: fmt.Sprintf("profile %q scopes apt to %s and no filtered codename answers for it yet; the index rebuild has not produced one", h.profile.Name(), base)}}
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s and no filtered codename answers for it yet; the index rebuild has not produced one", h.profile.Name(), base))
+		}
+		// A filtered codename is generated from its base's index alone, so it
+		// carries none of the pockets beside it. Writing it as the host's only
+		// source would hold back every update the pockets publish.
+		if pockets := s.aptMirroredPockets(base); len(pockets) > 0 {
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and its filtered codename %s is generated from %s alone: this server also serves %s, which no filtered codename covers, so a host reading only %s would stop receiving updates and security fixes",
+				h.profile.Name(), base, st.Host.Suite, base, strings.Join(pockets, ", "), st.Host.Suite))
 		}
 		src = st.Host
 	} else {
@@ -363,6 +377,14 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			if served.Suite == "" || filtered[served.Suite] {
 				continue
 			}
+			if served.Mirrored {
+				if _, ok := s.aptPocketBase(served.Suite); ok {
+					continue
+				}
+				if pockets := s.aptMirroredPockets(served.Suite); len(pockets) > 0 {
+					served = s.aptPocketStanza(r, served.Suite, pockets)
+				}
+			}
 			choices = append(choices, served)
 			names = append(names, served.Suite)
 		}
@@ -370,6 +392,9 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		case len(choices) == 0:
 			return skip("this server serves no apt suite")
 		case h.q.Codename != "":
+			if base, ok := s.aptPocketBase(h.q.Codename); ok {
+				return skip(fmt.Sprintf("%s is a pocket of %s, and pockets are configured together with their base: pass codename=%s", h.q.Codename, base, base))
+			}
 			for i := range choices {
 				if choices[i].Suite == h.q.Codename {
 					src = &choices[i]
@@ -381,7 +406,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		case len(choices) == 1:
 			src = &choices[0]
 		default:
-			return skip(fmt.Sprintf("this server serves %d apt suites (%s), so which one this host reads is its own fact: pass codename=<suite>",
+			return skip(fmt.Sprintf("this server serves %d apt suites (%s), each with the pockets it mirrors, so which one this host reads is its own fact: pass codename=<suite>",
 				len(choices), strings.Join(names, ", ")))
 		}
 	}
@@ -397,6 +422,58 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		})
 	}
 	return out
+}
+
+// aptPocketSuffixes are the pockets a mirrored Ubuntu base carries, in the
+// order Ubuntu's own sources file names them.
+var aptPocketSuffixes = []string{"-updates", "-backports", "-security"}
+
+// aptPocketBase names the mirrored base a mirrored suite is a pocket of. A
+// pocket whose base this server does not mirror belongs to nothing and stays a
+// choice of its own.
+func (s *Server) aptPocketBase(suite string) (string, bool) {
+	if !s.cfg.MirrorsAptCodename(suite) {
+		return "", false
+	}
+	for _, suffix := range aptPocketSuffixes {
+		if base, ok := strings.CutSuffix(suite, suffix); ok && base != "" && s.cfg.MirrorsAptCodename(base) {
+			return base, true
+		}
+	}
+	return "", false
+}
+
+// aptMirroredPockets lists the pockets of base this server mirrors, in
+// aptPocketSuffixes order.
+func (s *Server) aptMirroredPockets(base string) []string {
+	var out []string
+	for _, suffix := range aptPocketSuffixes {
+		if s.cfg.MirrorsAptCodename(base + suffix) {
+			out = append(out, base+suffix)
+		}
+	}
+	return out
+}
+
+// aptPocketStanza renders a mirrored base and its pockets as one stanza. The
+// Components: line is the union of what each suite's upstreams declare, for
+// the reason AptComponentsFor takes a union across hosts: apt reads one line
+// for every suite on the stanza, and a component any of them publishes is one
+// apt may request.
+func (s *Server) aptPocketStanza(r *http.Request, base string, pockets []string) aptsources.Sources {
+	one := s.aptSourcesState(r)
+	one.Suites = append([]string{base}, pockets...)
+	one.Mirrored = true
+	seen := map[string]bool{}
+	for _, suite := range one.Suites {
+		for _, c := range aptsources.MirroredComponentList(s.cfg.AptComponentsFor(suite)) {
+			if !seen[c] {
+				seen[c] = true
+				one.Components = append(one.Components, c)
+			}
+		}
+	}
+	return aptsources.Render(one)
 }
 
 // planFreeBSD picks this host's repository by ABI, the same choice `bodega

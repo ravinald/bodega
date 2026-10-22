@@ -1131,3 +1131,38 @@ func TestPoolRefusesADebOutsideAProfileThatNamesNoBase(t *testing.T) {
 		t.Fatalf("pool fetch inside the profile = %d, want 200", code)
 	}
 }
+
+// B144 R5, the measurement: a profile's filtered codename is generated from
+// its base's index alone. With fixture-updates mirrored beside the base, the
+// rebuild still derives one codename, from fixture, and none from the pocket,
+// so a host reading fixture-web would see nothing -updates publishes. The plan
+// refuses that stanza rather than write it as the host's only source.
+func TestFilteredCodenameDoesNotCoverTheBasesPockets(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
+	if len(recs) == 0 || recs[0].Action != planInstall {
+		t.Fatalf("with no pocket served, plan = %+v, want the filtered stanza installed", recs)
+	}
+
+	s.cfg.AptUpstreams[mirroredCodename+"-updates"] = []config.AptUpstream{{URL: archive.URL()}}
+	s.rebuildAptSnapshot(context.Background())
+	_, byCodename := s.aptFilteredSuites()
+	if len(byCodename) != 1 || byCodename["fixture-web"] != "web" {
+		t.Fatalf("filtered codenames = %v, want fixture-web alone: a pocket derived a codename of its own", byCodename)
+	}
+	for _, ps := range s.aptProfileSuites(s.aptProfileViews(context.Background())) {
+		if ps.base != mirroredCodename {
+			t.Errorf("profile %s filters base %s, want %s alone", ps.profile, ps.base, mirroredCodename)
+		}
+	}
+
+	recs = planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
+	if len(recs) != 1 || recs[0].Action != planRefuse {
+		t.Fatalf("with fixture-updates served, plan = %+v, want one refusal", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "fixture-updates") || !strings.Contains(recs[0].Reason, "no filtered codename covers") {
+		t.Errorf("reason = %q, want it to name the uncovered pocket", recs[0].Reason)
+	}
+}
