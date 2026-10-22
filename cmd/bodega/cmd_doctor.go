@@ -44,7 +44,7 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext bool
+	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro bool
 	var token, baseURL, pkgABI, aptSuite string
 	var configure []string
 	var pkgRelease int
@@ -135,6 +135,17 @@ on a FreeBSD host by default. The tags the pkg override disables follow the
 major release the ABI carries; --release says otherwise for a host whose
 release is not the one the repository is named for.
 
+--quiet-ubuntu-pro, with --configure apt, adds two steps to the plan on a
+host carrying ubuntu-pro-client's apt hook and not attached to Ubuntu Pro:
+pro config set apt_news=false and systemctl mask esm-cache.service. The hook
+reaches esm.ubuntu.com on every update whatever the apt sources say. Each
+step is printed with its undo before anything changes, and the ones that ran
+are recorded in /etc/bodega/doctor-ubuntu-pro.json. --restore-ubuntu-pro
+undoes those and only those.
+
+  sudo bodega doctor --configure apt --quiet-ubuntu-pro --apply --url https://bodega.internal
+  sudo bodega doctor --restore-ubuntu-pro
+
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -146,6 +157,12 @@ See docs/threat-model.md for the rationale behind each check.`,
 				systems = append(systems, manifest.TypeFreeBSD)
 			}
 			configuring := len(systems) > 0 || cmd.Flags().Changed("configure")
+			if restorePro && (writeCreds || configuring) {
+				return fmt.Errorf("run one write at a time: --restore-ubuntu-pro undoes what --quiet-ubuntu-pro ran, and nothing else")
+			}
+			if restorePro {
+				return ubuntuPro.restore()
+			}
 			if writeCreds && configuring {
 				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
 					"--configure (and --write-apt-sources, --write-pkg-repo) applies the plan this server holds for the host")
@@ -154,23 +171,30 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if !configuring {
-				for _, f := range []string{"apply", "suite", "abi", "release"} {
+				for _, f := range []string{"apply", "suite", "abi", "release", "quiet-ubuntu-pro"} {
 					if cmd.Flags().Changed(f) {
 						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
 							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
 					}
 				}
 			}
+			if quietPro && len(systems) > 0 && !slices.Contains(systems, manifest.TypeApt) {
+				return fmt.Errorf("--quiet-ubuntu-pro quiets apt's second path out, so it runs with apt.\n" +
+					"  Add it:  bodega doctor --configure apt --quiet-ubuntu-pro")
+			}
 			if configuring {
 				return configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
-					suite: aptSuite, abi: pkgABI, release: pkgRelease,
+					suite: aptSuite, abi: pkgABI, release: pkgRelease, quietPro: quietPro,
 					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
 				})
 			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
 				findings = append(findings, fn())
+			}
+			if f, ok := ubuntuPro.finding(); ok {
+				findings = append(findings, f)
 			}
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
@@ -211,6 +235,10 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Alias for --configure apt --apply")
 	c.Flags().BoolVar(&writePkgRepo, "write-pkg-repo", false,
 		"Alias for --configure freebsd --apply")
+	c.Flags().BoolVar(&quietPro, "quiet-ubuntu-pro", false,
+		"With --configure apt: also set Ubuntu Pro's apt_news false and mask esm-cache.service on an unattached host")
+	c.Flags().BoolVar(&restorePro, "restore-ubuntu-pro", false,
+		"Undo the Ubuntu Pro steps --quiet-ubuntu-pro recorded, and nothing else")
 	c.Flags().StringVar(&aptSuite, "suite", "",
 		"The apt codename to configure, for an instance serving several and no profile to choose between them")
 	c.Flags().StringVar(&pkgABI, "abi", "",
@@ -380,6 +408,7 @@ type planRequest struct {
 	release        int
 	apply          bool
 	allowPlaintext bool
+	quietPro       bool
 }
 
 // configureFromPlan applies the plan GET /client/plan returns for this host,
@@ -469,23 +498,44 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("\n%s", d)
 		changed++
 	}
+	var proSteps []string
+	if req.quietPro {
+		steps, why, err := ubuntuPro.quietSteps()
+		if err != nil {
+			return err
+		}
+		printQuietPlan(steps, why)
+		proSteps = steps
+	}
 	switch {
-	case changed == 0:
+	case changed == 0 && len(proSteps) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
+		return nil
+	case !req.apply && len(proSteps) > 0:
+		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) and run the %d Ubuntu Pro step(s) above.\n",
+			changed, len(proSteps))
 		return nil
 	case !req.apply:
 		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) above.\n", changed)
 		return nil
 	}
-	applied, err := clientconf.Apply(changes, clientconf.BackupSuffix(time.Now()))
-	for _, a := range applied {
-		if a.Backup != "" {
-			fmt.Printf("backed up  %s -> %s\n", a.Target, a.Backup)
+	if changed > 0 {
+		applied, err := clientconf.Apply(changes, clientconf.BackupSuffix(time.Now()))
+		for _, a := range applied {
+			if a.Backup != "" {
+				fmt.Printf("backed up  %s -> %s\n", a.Target, a.Backup)
+			}
+			fmt.Printf("wrote      %s\n", a.Target)
 		}
-		fmt.Printf("wrote      %s\n", a.Target)
+		if err != nil {
+			return err
+		}
 	}
-	if err != nil {
-		return err
+	if len(proSteps) > 0 {
+		if err := ubuntuPro.quiet(proSteps); err != nil {
+			return err
+		}
+		fmt.Printf("recorded   %s (undo: bodega doctor --restore-ubuntu-pro)\n", ubuntuPro.record)
 	}
 	for _, c := range changes {
 		switch {
