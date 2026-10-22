@@ -379,7 +379,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			if served.Suite == "" || filtered[served.Suite] {
 				continue
 			}
-			if served.Mirrored {
+			if served.Mirrored || s.aptMirrorRewritten(served.Suite) {
 				if _, ok := s.aptPocketBase(served.Suite); ok {
 					continue
 				}
@@ -464,9 +464,17 @@ func (s *Server) aptMirroredPockets(base string) []string {
 // the reason AptComponentsFor takes a union across hosts: apt reads one line
 // for every suite on the stanza, and a component any of them publishes is one
 // apt may request.
+//
+// A group the rebuild rewrote to drop a hidden version is rewritten whole
+// (apt_hide.go), so the stanza is bodega-signed and names what the generated
+// Releases declare.
 func (s *Server) aptPocketStanza(r *http.Request, base string, pockets []string) aptsources.Sources {
 	one := s.aptSourcesState(r)
 	one.Suites = append([]string{base}, pockets...)
+	if s.aptMirrorRewritten(base) {
+		one.Components = s.aptServedComponents(one.Suites)
+		return aptsources.Render(one)
+	}
 	one.Mirrored = true
 	seen := map[string]bool{}
 	for _, suite := range one.Suites {

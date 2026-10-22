@@ -438,6 +438,34 @@ bodega pkg hide apt libssl3 3.0.0-ubuntu2  # hide specific version
 bodega pkg hide apt libssl3                # unhide (toggle)
 ```
 
+#### Mirrored apt versions
+
+An apt package bodega serves only from a mirrored codename (one in `apt_upstreams`) has no manifest entry to flag. For one of those, `VERSION` is required, and `pkg hide` records a server-wide hide on that binary package and version instead of answering "not found":
+
+```bash
+sudo bodega pkg hide apt php8.5-fpm 8.5.4-0ubuntu1   # hide one mirrored build
+sudo bodega pkg hide apt php8.5-fpm 8.5.4-0ubuntu1   # remove the hide (toggle)
+```
+
+Before it records anything, the command reads each mirrored codename's upstream `Packages` and refuses a version none of them lists, naming the codenames it searched. A typo in the version is refused there rather than recorded as a hide that drops nothing. The hide lives in the audit store (`audit_db`, or `audit.db` under `log_dir`), and the server reads it at every index rebuild, so it survives a restart. The command signals the running server, which rebuilds at once.
+
+With the hide in place:
+
+- Every apt index bodega serves drops the stanza: the mirrored codename that carries it, and every profile's filtered codename over it.
+- `/apt/pool/` refuses the `.deb` with 403, and writes a `denied` audit row with status `hidden` naming the package and version.
+- A version with an epoch is hidden as `Packages` spells it (`2:9.1.0016-1ubuntu7`, what `apt-cache madison` prints), and the pool refusal still finds it: the pool filename omits the epoch (`vim_9.1.0016-1ubuntu7_amd64.deb`), so a pool request matches a hide on the version with its epoch removed, and the audit row names the version as hidden, epoch included. Two builds differing only in epoch share that pool filename, so hiding one refuses the file for both. A filename that spells its epoch (`%3a`) is matched with it.
+- `bodega pkg list apt` and `bodega pkg show apt <name>` list the hide with who set it and when. `--json` carries the same fields under `mirror_hidden`.
+
+**A hidden mirrored codename becomes bodega-signed.** A mirrored index is the archive's own signed document, so dropping a stanza from it means bodega rewrites `Packages`, generates the `Release`, and signs it with bodega's apt key. The rewrite covers the base and every pocket of it this server mirrors (`resolute`, `resolute-updates`, `resolute-security`), because a host reads them through one stanza and `Signed-By:` applies to all of it. The `Release` keeps the archive's `Origin`, `Label`, `Suite`, `Codename` and `Version`, so `apt update` does not stop on a changed origin and pin preferences on `o=Ubuntu` keep matching. What changes on the host:
+
+- The stanza for that codename names bodega's keyring (`Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg`) in place of the distro keyring. `bodega doctor --write-apt-sources` installs the new stanza and the keyring together. A host still carrying the old stanza fails `apt update` with a signature error on that codename until it is rewritten.
+- The rewritten `Release` lists `Packages` alone, so `Translation-*`, `Contents-*` and the `by-hash` tree are not served for that codename. A filtered codename has the same limit.
+- The chain of trust ends at the archive's TLS certificate rather than at its signing key, as it does for a filtered codename. See [docs/threat-model.md](threat-model.md).
+
+A codename with no hidden stanza in it stays proxied byte-for-byte. Removing the last hide in a group returns it to the archive's own `InRelease` at the next rebuild, and the host's stanza has to go back to the distro keyring with it.
+
+With no apt signing key installed, bodega does not rewrite the index, because an unsigned rewrite would need `[trusted=yes]` on every host. The pool still refuses the version, and the server logs an error saying the index still lists it. Run `bodega apt key generate` and reload.
+
 ### `bodega pkg freeze TYPE NAME`
 
 Toggle the `frozen` flag on every version of a package. Frozen versions cannot be built, edited, or deleted. When every version is already frozen, `freeze` unfreezes them all; otherwise it freezes them all. It takes exactly two arguments: freezing one version is done through the REST API (`PATCH /api/v1/packages/{type}/{name}/freeze/{version}`) or by setting `frozen` on that version with `bodega pkg edit` or the TUI's `E` editor.
