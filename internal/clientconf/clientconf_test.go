@@ -352,3 +352,22 @@ func TestNamespacedBinaryPath(t *testing.T) {
 		t.Errorf("Binary content = %q, want %q", f.Content, want)
 	}
 }
+
+// TestPipTrustedHost pins the trusted-host pip needs before it reads a
+// plaintext index. The IPv6 form was measured against pip 26.2.1: with no
+// trusted-host it ignores http://[2001:db8::5]:8080/ and suggests
+// `--trusted-host 2001:db8::5`, and with that bracketless line it does not.
+func TestPipTrustedHost(t *testing.T) {
+	for _, tc := range []struct {
+		base, want string
+	}{
+		{"http://10.0.0.5:8080", "[global]\nindex-url = http://10.0.0.5:8080/pypi/simple/\ntrusted-host = 10.0.0.5\n"},
+		{"http://bodega.internal/", "[global]\nindex-url = http://bodega.internal/pypi/simple/\ntrusted-host = bodega.internal\n"},
+		{"http://[2001:db8::5]:8080", "[global]\nindex-url = http://[2001:db8::5]:8080/pypi/simple/\ntrusted-host = 2001:db8::5\n"},
+		{"https://bodega.internal", "[global]\nindex-url = https://bodega.internal/pypi/simple/\n"},
+	} {
+		if got := Pip(tc.base).Content; got != tc.want {
+			t.Errorf("Pip(%q).Content = %q, want %q", tc.base, got, tc.want)
+		}
+	}
+}

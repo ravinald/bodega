@@ -2066,6 +2066,8 @@ sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
 
 `--configure` refuses plain `http` unless `--allow-plaintext` is set, for `--url` and again for every file URL the plan names, since those carry the server's `public_url` rather than `--url`. Over plain HTTP the bearer token travels in the clear, and the plan and its files can be rewritten in transit together, digests included. Pass it only on a link you trust.
 
+A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url` it writes `trusted-host = <host>`, the base's hostname without its port and, for an IPv6 literal, without brackets. pip ignores an `http` index whose host is not trusted, and does so as a warning followed by "no matching distribution", which names the package rather than the transport, so a `pip.conf` without it installs nothing. The bare host matches the index on any port. An `https` base writes no `trusted-host`.
+
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
 `--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none:
