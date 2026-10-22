@@ -146,3 +146,102 @@ func TestDoctorConfigureRefusesMixedOrOrphanedFlags(t *testing.T) {
 		}
 	}
 }
+
+// B142: a server serving two suites refuses a plan that names none, and
+// doctor's refusal names its own flag rather than only the query parameter.
+// The host's codename is suggested when served, and never sent unasked.
+func TestDoctorConfigureNamesSuiteOnAMultiSuiteServer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var queries []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			Identity: "web-host", Profile: "web", Match: "cidr:192.0.2.1/32",
+			System: "apt", Action: clientconf.PlanSkip,
+			Reason: clientconf.AptSuiteChoiceReason([]string{"noble", "resolute"}),
+		}}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	osRelease := filepath.Join(t.TempDir(), "os-release")
+	prev := doctorOSRelease
+	doctorOSRelease = osRelease
+	t.Cleanup(func() { doctorOSRelease = prev })
+
+	for _, tc := range []struct{ codename, hint string }{
+		{"noble", "re-run with --suite noble"},
+		{"trixie", ""},
+		{"", ""},
+	} {
+		if err := os.WriteFile(osRelease, []byte("ID=ubuntu\nVERSION_CODENAME="+tc.codename+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		queries = nil
+		_, err := runDoctor(t, "--configure", "apt", "--url", srv.URL, "--allow-plaintext")
+		if err == nil {
+			t.Fatalf("VERSION_CODENAME=%q: doctor accepted a skipped apt plan", tc.codename)
+		}
+		msg := err.Error()
+		for _, want := range []string{"--suite <suite>", "codename=<suite>", "(noble, resolute)"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("VERSION_CODENAME=%q: refusal lacks %q:\n%s", tc.codename, want, msg)
+			}
+		}
+		if tc.hint != "" && !strings.Contains(msg, tc.hint) {
+			t.Errorf("VERSION_CODENAME=%q: refusal lacks %q:\n%s", tc.codename, tc.hint, msg)
+		}
+		if tc.hint == "" && strings.Contains(msg, "VERSION_CODENAME") {
+			t.Errorf("VERSION_CODENAME=%q is not served, yet the refusal suggests it:\n%s", tc.codename, msg)
+		}
+		if len(queries) != 1 || strings.Contains(queries[0], "codename") {
+			t.Errorf("VERSION_CODENAME=%q: plan queries %q, want one with no codename", tc.codename, queries)
+		}
+	}
+}
+
+// B142: the --suite hint follows the apt skip that blocked the run, so a
+// refusal for any other system, or one Select raises before reading a single
+// record, carries no suggestion that --suite would fix it.
+func TestDoctorConfigureSuiteHintOnlyOnTheAptRefusal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{
+			{System: "apt", Action: clientconf.PlanSkip, Reason: clientconf.AptSuiteChoiceReason([]string{"noble", "resolute"})},
+			{System: "freebsd", Action: clientconf.PlanSkip, Reason: "this host runs linux"},
+			{System: "osquery", Action: clientconf.PlanSkip, Reason: "no osquery profile"},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	osRelease := filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(osRelease, []byte("ID=ubuntu\nVERSION_CODENAME=noble\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := doctorOSRelease
+	doctorOSRelease = osRelease
+	t.Cleanup(func() { doctorOSRelease = prev })
+
+	for _, tc := range []struct {
+		systems string
+		hint    bool
+	}{
+		{"freebsd", false},
+		{"osquery", false},
+		{"apt,osquery", false},
+		{"apt,npm", false},
+		{"apt", true},
+		{"apt,freebsd", true},
+	} {
+		_, err := runDoctor(t, "--configure", tc.systems, "--url", srv.URL, "--allow-plaintext")
+		if err == nil {
+			t.Fatalf("--configure %s: doctor accepted a plan that installs nothing", tc.systems)
+		}
+		if got := strings.Contains(err.Error(), "--suite noble"); got != tc.hint {
+			t.Errorf("--configure %s: hint present = %v, want %v:\n%s", tc.systems, got, tc.hint, err)
+		}
+	}
+}

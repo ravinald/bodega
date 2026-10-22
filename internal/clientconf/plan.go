@@ -107,22 +107,70 @@ func (p Plan) Select(systems []string) ([]PlanRecord, error) {
 			return nil, fmt.Errorf("the plan lists no system named %q. It lists: %s", s, strings.Join(listed, ", "))
 		}
 	}
-	var out []PlanRecord
-	var blocked []string
+	var out, blocked []PlanRecord
 	for _, r := range p.Records {
 		if !slices.Contains(systems, r.System) {
 			continue
 		}
 		if r.Action != PlanInstall {
-			blocked = append(blocked, fmt.Sprintf("  %s (%s): %s", r.System, r.Action, r.Reason))
+			blocked = append(blocked, r)
 			continue
 		}
 		out = append(out, r)
 	}
 	if len(blocked) > 0 {
-		return nil, fmt.Errorf("the plan installs nothing for a system you named, so nothing was written:\n%s", strings.Join(blocked, "\n"))
+		return nil, &BlockedError{Records: blocked}
 	}
 	return out, nil
+}
+
+// BlockedError is Select refusing because a named system's record does not
+// install. Records holds exactly those records, so a caller adding advice to
+// the refusal can tell which record it answers rather than scanning the plan.
+type BlockedError struct {
+	Records []PlanRecord
+}
+
+func (e *BlockedError) Error() string {
+	lines := make([]string, len(e.Records))
+	for i, r := range e.Records {
+		lines[i] = fmt.Sprintf("  %s (%s): %s", r.System, r.Action, r.Reason)
+	}
+	return "the plan installs nothing for a system you named, so nothing was written:\n" + strings.Join(lines, "\n")
+}
+
+// aptSuiteChoiceLead opens the reason an apt skip carries when the server
+// serves several suites and the request named none. The client reads the
+// suite list back out of it, so the server and the client format and parse
+// it here rather than each keeping its own copy of the wording.
+const aptSuiteChoiceLead = "this server serves %d apt suites ("
+
+// AptSuiteChoiceReason is the skip reason for a request that named no suite
+// on a server serving several. It names the remedy for both callers, since
+// the query parameter means nothing to someone running doctor.
+func AptSuiteChoiceReason(suites []string) string {
+	return fmt.Sprintf(aptSuiteChoiceLead+"%s), each with the pockets it mirrors, so which one this host reads is its own fact: "+
+		"run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script",
+		len(suites), strings.Join(suites, ", "))
+}
+
+// AptSuiteChoices returns the suites an AptSuiteChoiceReason lists, and false
+// for any other reason.
+func AptSuiteChoices(reason string) ([]string, bool) {
+	var n int
+	if _, err := fmt.Sscanf(reason, aptSuiteChoiceLead, &n); err != nil {
+		return nil, false
+	}
+	_, rest, ok := strings.Cut(reason, "(")
+	list, _, closed := strings.Cut(rest, ")")
+	if !ok || !closed {
+		return nil, false
+	}
+	suites := strings.Split(list, ", ")
+	if len(suites) != n {
+		return nil, false
+	}
+	return suites, true
 }
 
 // Change is one install record fetched, checked and read against the host.

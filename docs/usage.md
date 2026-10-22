@@ -2070,7 +2070,16 @@ A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
-`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none:
+`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none. Doctor refuses, lists the choices, and suggests the host's own `VERSION_CODENAME` when the server serves it. It never sends that codename unasked:
+
+```
+$ sudo bodega doctor --configure apt --apply --url https://bodega.internal
+Error: the plan installs nothing for a system you named, so nothing was written:
+  apt (skip): this server serves 2 apt suites (noble, resolute), each with the pockets it mirrors, so which one this host reads is its own fact: run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script
+  This host's VERSION_CODENAME in /etc/os-release is noble, which this server serves. To read it, re-run with --suite noble
+```
+
+Name the codename with `--suite`:
 
 ```bash
 bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
