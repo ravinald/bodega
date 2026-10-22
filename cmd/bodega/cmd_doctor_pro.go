@@ -61,13 +61,20 @@ var ubuntuPro = &proHost{
 	run:    runProTool,
 }
 
-// runProTool bounds every call: an unattached `pro status` can ask
-// Canonical's contract server, and on the egress-locked host this row exists
-// for that would otherwise hang doctor on a resolver timeout.
+const proToolTimeout = 30 * time.Second
+
+// runProTool bounds every call: `pro status` asks Canonical's contract
+// server, and on the egress-locked host this row exists for that would
+// otherwise hang doctor on a connect that never completes. A call cut off at
+// the bound returns an error wrapping context.DeadlineExceeded, so a caller
+// can tell a host that cannot answer from a tool that refused.
 func runProTool(argv []string) (string, error) {
-	ctx, cancel := context.WithTimeout(backgroundCtx(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(backgroundCtx(), proToolTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("no answer within %s, %w: %w", proToolTimeout, ctx.Err(), err)
+	}
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -94,7 +101,7 @@ func (h *proHost) finding() (host.Finding, bool) {
 	if err != nil {
 		f.Status = host.StatusSkip
 		f.Detail = esmHookConf + " is present and " + err.Error()
-		f.Remediation = "run `pro status --format json` to see why it fails, then re-run `bodega doctor`"
+		f.Remediation = "run `pro api u.pro.status.is_attached.v1` and `pro status --format json` to see why they fail, then re-run `bodega doctor`"
 		return f, true
 	}
 	if attached {
@@ -109,18 +116,53 @@ func (h *proHost) finding() (host.Finding, bool) {
 	return f, true
 }
 
+// attached asks pro api first because it reads the host's own attachment
+// state, while `pro status` contacts Canonical's contract server and so never
+// answers on a host whose egress reaches only bodega. An ubuntu-pro-client
+// too old to know the endpoint falls back to `pro status`.
 func (h *proHost) attached() (bool, error) {
+	attached, apiErr := h.attachedAPI()
+	if apiErr == nil {
+		return attached, nil
+	}
 	out, err := h.run([]string{"pro", "status", "--format", "json"})
 	if err != nil {
-		return false, fmt.Errorf("`pro status --format json` failed (%v): %s", err, out)
+		msg := fmt.Sprintf("%v, and the fallback `pro status --format json` failed (%v): %s", apiErr, err, out)
+		if errors.Is(err, context.DeadlineExceeded) {
+			msg += "; `pro status` needs to reach Canonical's contract server, so on a host that cannot, " +
+				"run `pro config set apt_news=false` and `systemctl mask esm-cache.service` by hand"
+		}
+		return false, errors.New(msg)
 	}
 	var st struct {
 		Attached *bool `json:"attached"`
 	}
 	if err := json.Unmarshal([]byte(out), &st); err != nil || st.Attached == nil {
-		return false, fmt.Errorf("`pro status --format json` printed no attached field this doctor can read")
+		return false, fmt.Errorf("%v, and the fallback `pro status --format json` printed no attached field this doctor can read", apiErr)
 	}
 	return *st.Attached, nil
+}
+
+func (h *proHost) attachedAPI() (bool, error) {
+	out, err := h.run([]string{"pro", "api", "u.pro.status.is_attached.v1"})
+	if err != nil {
+		return false, fmt.Errorf("`pro api u.pro.status.is_attached.v1` failed (%v): %s", err, out)
+	}
+	var resp struct {
+		Result string `json:"result"`
+		Data   struct {
+			Attributes struct {
+				IsAttached *bool `json:"is_attached"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return false, fmt.Errorf("`pro api u.pro.status.is_attached.v1` printed no JSON this doctor can read: %s", out)
+	}
+	if resp.Result != "success" || resp.Data.Attributes.IsAttached == nil {
+		return false, fmt.Errorf("`pro api u.pro.status.is_attached.v1` did not report is_attached (result %q): %s", resp.Result, out)
+	}
+	return *resp.Data.Attributes.IsAttached, nil
 }
 
 // quietSteps plans what --quiet-ubuntu-pro changes on this host. It plans
