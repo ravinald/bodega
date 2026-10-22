@@ -120,9 +120,11 @@ type State struct {
 	// Fingerprints are the loaded signing keys, uppercase hex, in load order.
 	Fingerprints []string
 
-	// Components go on the Components: line for a mirrored codename. Empty
-	// renders MirroredComponents. It is read only when Mirrored is set: a suite
-	// bodega generates carries exactly the one component bodega builds.
+	// Components go on the Components: line. Empty renders MirroredComponents
+	// for a mirrored codename and Component for a generated one: a suite bodega
+	// builds from its catalog carries main alone, while a filtered codename
+	// carries what its base does, which the server reads off the Release it
+	// generated.
 	Components []string
 
 	// Mirrored marks these codenames as proxied from an upstream archive
@@ -209,8 +211,11 @@ func Render(st State) Sources {
 	}
 
 	components := Component
-	if st.Mirrored {
+	switch {
+	case st.Mirrored:
 		components = strings.Join(MirroredComponentList(st.Components), " ")
+	case len(st.Components) > 0:
+		components = strings.Join(st.Components, " ")
 	}
 
 	stanza := []string{
@@ -230,11 +235,11 @@ func Render(st State) Sources {
 		out.Notes = append(out.Notes, MirroredNote)
 	case st.Signed:
 		stanza = append(stanza, "Signed-By: "+ClientKeyringPath)
-		out.OneLine = fmt.Sprintf("deb [signed-by=%s] %s %s %s", ClientKeyringPath, uri, suites[0], Component)
+		out.OneLine = fmt.Sprintf("deb [signed-by=%s] %s %s %s", ClientKeyringPath, uri, suites[0], components)
 		out.Notes = append(out.Notes, SignedNote)
 	default:
 		stanza = append(stanza, "Trusted: yes")
-		out.OneLine = fmt.Sprintf("deb [trusted=yes] %s %s %s", uri, suites[0], Component)
+		out.OneLine = fmt.Sprintf("deb [trusted=yes] %s %s %s", uri, suites[0], components)
 		out.Notes = append(out.Notes, UnsignedNote)
 	}
 	if strings.TrimRight(st.PublicURL, "/") == "" {

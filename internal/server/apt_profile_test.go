@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1314,5 +1315,127 @@ func TestPoolGateDecidesAPocketOnlyVersionByTheProfile(t *testing.T) {
 	}
 	if code, _ := f.get(t, "/apt/"+pocketHtopDeb); code != http.StatusForbidden {
 		t.Errorf("pool fetch of the pocket's htop = %d, want 403: the profile does not list it", code)
+	}
+}
+
+const (
+	universePdnsDeb  = "pool/universe/p/pdns/pdns-server_4.9.4-1_amd64.deb"
+	universeRedisDeb = "pool/universe/r/redis/redis-server_7.0.15-1_amd64.deb"
+)
+
+// aptProfileAddUniverse republishes the fixture base with a universe
+// component beside main, carrying pdns-server and redis-server, and serves
+// both .debs. Stock Ubuntu keeps most of a server's stack there, which is why
+// a filtered codename carrying main alone drops it.
+func aptProfileAddUniverse(t *testing.T, archive *fixtureArchive) {
+	t.Helper()
+	stanza := func(pkg, source, version, poolPath string) string {
+		return strings.Join([]string{
+			"Package: " + pkg, "Source: " + source, "Version: " + version, "Architecture: amd64",
+			"Filename: " + poolPath, "Size: 42",
+			"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+			"Description: fixture universe package", "", "",
+		}, "\n")
+	}
+	universe := stanza("pdns-server", "pdns", "4.9.4-1", universePdnsDeb) + stanza("redis-server", "redis", "7.0.15-1", universeRedisDeb)
+	main := aptProfilePackages()
+
+	var digests []string
+	base := "dists/" + mirroredCodename + "/"
+	for _, c := range []struct{ comp, body string }{{"main", main}, {"universe", universe}} {
+		rel := c.comp + "/binary-amd64/Packages"
+		gz := gzipFixture(c.body)
+		digests = append(digests,
+			" "+sha256Hex(c.body)+" "+strconv.Itoa(len(c.body))+" "+rel,
+			" "+sha256Hex(string(gz))+" "+strconv.Itoa(len(gz))+" "+rel+".gz")
+		archive.setObject(base+rel, c.body)
+		archive.setObject(base+rel+".gz", string(gz))
+	}
+	archive.setObject(base+"Release", strings.Join(append([]string{
+		"Origin: Ubuntu", "Label: Ubuntu",
+		"Suite: " + mirroredCodename, "Codename: " + mirroredCodename,
+		"Components: main universe",
+		"Architectures: amd64",
+		"SHA256:",
+	}, append(digests, "")...), "\n"))
+	archive.setObject(universePdnsDeb, "\x21<arch>\npdns-server bytes")
+	archive.setObject(universeRedisDeb, "\x21<arch>\nredis-server bytes")
+}
+
+// B150 R1, R2, R4: a base publishing main and universe yields a filtered
+// codename carrying both, each filtered by the profile under its own path and
+// each named in the signed Release, and the plan's stanza names both in the
+// upstream's order. A profile permitting nginx from main and pdns from
+// universe would otherwise lose pdns-server on the host it was learned from.
+func TestAFilteredCodenameCarriesEveryComponentItsBaseMirrors(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	aptProfileAddUniverse(t, archive)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx", "pdns")
+
+	mainIdx := aptProfileIndex(t, s, "fixture-web")
+	if !strings.Contains(mainIdx, "Package: nginx\n") || strings.Contains(mainIdx, "Package: htop") {
+		t.Errorf("main Packages =\n%s\nwant nginx and no htop", mainIdx)
+	}
+	code, universe := mirrorGet(t, s, "/apt/dists/fixture-web/universe/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("GET the filtered universe Packages = %d, want 200", code)
+	}
+	if !strings.Contains(string(universe), "Package: pdns-server\n") || strings.Contains(string(universe), "redis-server") {
+		t.Errorf("universe Packages =\n%s\nwant pdns-server and no redis-server", universe)
+	}
+
+	code, release := mirrorGet(t, s, "/apt/dists/fixture-web/Release")
+	if code != http.StatusOK {
+		t.Fatalf("GET the filtered Release = %d, want 200", code)
+	}
+	parsed := mustParseRelease(t, release)
+	if parsed["Components"] != "main universe" {
+		t.Errorf("Release Components = %q, want %q", parsed["Components"], "main universe")
+	}
+	digests := aptReleaseDigests(parsed)
+	if got := digests["main/binary-amd64/Packages"]; got != sha256Hex(mainIdx) {
+		t.Errorf("Release digest for main = %s, served body hashes to %s", got, sha256Hex(mainIdx))
+	}
+	if got := digests["universe/binary-amd64/Packages"]; got != sha256Hex(string(universe)) {
+		t.Errorf("Release digest for universe = %s, served body hashes to %s", got, sha256Hex(string(universe)))
+	}
+
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
+	if len(recs) == 0 || recs[0].Action != planInstall {
+		t.Fatalf("plan = %+v, want the filtered stanza installed", recs)
+	}
+	u, err := url.Parse(recs[0].URL)
+	if err != nil {
+		t.Fatalf("parse record URL %q: %v", recs[0].URL, err)
+	}
+	code, body := clientGet(t, s, f.token, u.RequestURI())
+	if code != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", u.RequestURI(), code, body)
+	}
+	if !strings.Contains(body, "Suites: fixture-web\nComponents: main universe\n") {
+		t.Errorf("sources file =\n%s\nwant Components: main universe on the filtered stanza", body)
+	}
+}
+
+// B150 R3: the pool gate decides a universe .deb the way it decides a main
+// one, by the source in the path and the profile, so a permitted package
+// outside main installs and an unlisted one is refused before any fetch.
+func TestPoolGateDecidesANonMainDebByTheProfile(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	aptProfileAddUniverse(t, archive)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx", "pdns")
+
+	if code, body := f.get(t, "/apt/"+universePdnsDeb); code != http.StatusOK {
+		t.Errorf("pool fetch of universe pdns-server = %d, want 200: %s", code, body)
+	}
+	code, body := f.get(t, "/apt/"+universeRedisDeb)
+	if code != http.StatusForbidden {
+		t.Fatalf("pool fetch of universe redis-server = %d, want 403: the profile does not list it", code)
+	}
+	if !strings.Contains(body, entitle.RefusalMembership) {
+		t.Errorf("the refusal does not name the membership rule:\n%s", body)
+	}
+	if got := archive.count(universeRedisDeb); got != 0 {
+		t.Errorf("upstream GETs for a refused universe artifact = %d, want 0", got)
 	}
 }

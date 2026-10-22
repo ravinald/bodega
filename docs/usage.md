@@ -1951,9 +1951,11 @@ On a server mirroring `noble`, `noble-updates` and `noble-security`, the stanza 
 Types: deb
 URIs: https://bodega.internal/apt/
 Suites: noble-web noble-updates-web noble-security-web
-Components: main
+Components: main restricted universe multiverse
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
+
+**A filtered codename carries every component its base mirrors.** That is each component the base's upstream `Release` declares that bodega mirrors for the codename: the `components` on its `apt_upstreams` entry, or Ubuntu's four when the entry names none (see [`components`](#components)). Each is filtered by the profile under its own `<component>/binary-<arch>/Packages`, the filtered `Release` lists them in the upstream's order, and the stanza's `Components:` line is read off that `Release`, as the union across the base and its pockets. A component the upstream declares and the entry leaves out is not served, and the rebuild logs it at Info. On stock Ubuntu, `pdns-server`, `nginx` and `php8.5-fpm` live in `universe`, so a profile learned from a host running them installs them under the profile as the host did before the profile named a base.
 
 The server composes that stanza, because which codename a host reads is a fact only the running instance holds. Pass `--token` for a host identified by a token; a host bound with `bodega identity bind cidr` is identified by its address and needs none. A host bodega cannot identify is told which codenames exist rather than handed one, and `--suite` is how it is configured anyway.
 
@@ -1969,7 +1971,7 @@ The following packages will be upgraded:
 
 That is the whole point of the design. The same policy enforced at fetch time gives `403` mid-transaction and `E: Failed to fetch`, with nothing upgraded.
 
-Three limits, stated rather than left to be found:
+Two limits, stated rather than left to be found:
 
 - **The `sources.list` is a scoping boundary, not an authorization one.** The host can edit it and read the unfiltered mirrored codename; the codename's name is not a secret either. What refuses the artifacts behind it is the request predicate at `/apt/pool/`, which runs on identity:
 
@@ -1979,7 +1981,6 @@ Three limits, stated rather than left to be found:
   ```
 
 - **bodega re-signs an index it did not verify a signature on.** It checks the archive's TLS certificate and the SHA256 the archive's own `Release` publishes for the `Packages` beside it, and it holds no distro keyring to check `InRelease` against. A mirrored codename forwards the archive's signature intact; a filtered one does not. See [Threat model](threat-model.md).
-- **One component, `main`**, matching every other generated suite. A base publishing more is named in the server log, and packages outside `main` are not served under the profile.
 
 Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back. An architecture the base's `Release` names and the archive answers 404 for is the exception: it is dropped from the filtered `Release` and the rest is served, because `archive.ubuntu.com` declares all seven and carries two, and the codename is withdrawn only when none survives.
 
