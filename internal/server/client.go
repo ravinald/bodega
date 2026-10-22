@@ -334,11 +334,11 @@ func (s *Server) planDistfiles(h *clientHost, one func(clientconf.File) []planFi
 // aptHostSources applies for /api/v1/status, narrowed by the codename the
 // host states. A signed stanza brings the keyring its Signed-By: names.
 //
-// A mirrored base and its pockets are one choice, rendered as one stanza. A
-// stock host already runs packages from -updates and -security, so a stanza
-// naming the base alone cannot install a -dev package whose runtime half is
-// newer than the release, and the host stops receiving security fixes with
-// nothing to report it.
+// A mirrored base and its pockets are one choice, rendered as one stanza, and
+// so are a profile's filtered codenames over them. A stock host already runs
+// packages from -updates and -security, so a stanza naming the base alone
+// cannot install a -dev package whose runtime half is newer than the release,
+// and the host stops receiving security fixes with nothing to report it.
 func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.File) []planFile) []planFile {
 	skip := func(reason string) []planFile {
 		return []planFile{{system: manifest.TypeApt, action: planSkip, reason: reason}}
@@ -355,17 +355,18 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		if h.q.Codename != "" && h.q.Codename != base {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this host reports %s", h.profile.Name(), base, h.q.Codename))
 		}
-		if st.Host == nil {
+		suites, missing := s.aptProfileHostSuites(h.profile)
+		if len(suites) == 0 {
 			return refuse(fmt.Sprintf("profile %q scopes apt to %s and no filtered codename answers for it yet; the index rebuild has not produced one", h.profile.Name(), base))
 		}
-		// A filtered codename is generated from its base's index alone, so it
-		// carries none of the pockets beside it. Writing it as the host's only
-		// source would hold back every update the pockets publish.
-		if pockets := s.aptMirroredPockets(base); len(pockets) > 0 {
-			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and its filtered codename %s is generated from %s alone: this server also serves %s, which no filtered codename covers, so a host reading only %s would stop receiving updates and security fixes",
-				h.profile.Name(), base, st.Host.Suite, base, strings.Join(pockets, ", "), st.Host.Suite))
+		if len(missing) > 0 {
+			return refuse(fmt.Sprintf("profile %q scopes apt to %s, and this server mirrors %s with no filtered codename for the profile: the rebuild withdrew it, and the server log names why (a codename another profile also derives, or an upstream read that failed). A host reading %s alone would stop receiving the updates and security fixes those pockets publish",
+				h.profile.Name(), base, strings.Join(missing, ", "), strings.Join(suites, " ")))
 		}
-		src = st.Host
+		one := s.aptSourcesState(r)
+		one.Suites = suites
+		rendered := aptsources.Render(one)
+		src = &rendered
 	} else {
 		filtered := map[string]bool{}
 		for _, c := range st.Filtered {

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1132,37 +1133,186 @@ func TestPoolRefusesADebOutsideAProfileThatNamesNoBase(t *testing.T) {
 	}
 }
 
-// B144 R5, the measurement: a profile's filtered codename is generated from
-// its base's index alone. With fixture-updates mirrored beside the base, the
-// rebuild still derives one codename, from fixture, and none from the pocket,
-// so a host reading fixture-web would see nothing -updates publishes. The plan
-// refuses that stanza rather than write it as the host's only source.
-func TestFilteredCodenameDoesNotCoverTheBasesPockets(t *testing.T) {
-	s, archive := aptProfileServer(t)
-	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+const (
+	// The pocket republishes both sources at a newer version, which is what
+	// -updates is: the fix a stock host already runs and the base never sees.
+	pocketNginxVersion = "1.24.0-2ubuntu7.2"
+	pocketNginxDeb     = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.2_amd64.deb"
+	pocketHtopDeb      = "pool/main/h/htop/htop_3.3.0-4ubuntu0.1_amd64.deb"
+)
 
-	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
-	if len(recs) == 0 || recs[0].Action != planInstall {
-		t.Fatalf("with no pocket served, plan = %+v, want the filtered stanza installed", recs)
+// aptProfilePocketPackages is the base fixture's index at the pocket's
+// versions, with Filename moved to match, so nothing in it is published by
+// the base.
+func aptProfilePocketPackages() string {
+	return strings.NewReplacer(profileNginxVersion, pocketNginxVersion, "3.3.0-4build1", "3.3.0-4ubuntu0.1").Replace(aptProfilePackages())
+}
+
+// aptProfileAddPocket publishes pocket's dists/ tree on archive with the
+// pocket's own index, serves its pool objects, and mirrors it.
+func aptProfileAddPocket(t *testing.T, s *Server, archive *fixtureArchive, pocket string) {
+	t.Helper()
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate upstream key: %v", err)
 	}
+	for rel, body := range fixtureDistsArch(t, kr, aptProfilePocketPackages(), "amd64") {
+		archive.setObject(strings.Replace(rel, "dists/"+mirroredCodename+"/", "dists/"+pocket+"/", 1), body)
+	}
+	archive.setObject(pocketNginxDeb, "\x21<arch>\nnginx pocket bytes")
+	archive.setObject(pocketHtopDeb, "\x21<arch>\nhtop pocket bytes")
+	s.cfg.AptUpstreams[pocket] = []config.AptUpstream{{URL: archive.URL()}}
+}
 
-	s.cfg.AptUpstreams[mirroredCodename+"-updates"] = []config.AptUpstream{{URL: archive.URL()}}
+// B145 R1, R5: a profile over a base derives one codename for the base and one
+// for each pocket mirrored beside it, each filtered from its own suite. The
+// pocket's codename carries the pocket's version of a permitted source and
+// none of the base's, which is what makes a -dev package installable.
+func TestFilteredCodenamesCoverTheBasesPockets(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+	aptProfileAddPocket(t, s, archive, mirroredCodename+"-updates")
 	s.rebuildAptSnapshot(context.Background())
+
 	_, byCodename := s.aptFilteredSuites()
-	if len(byCodename) != 1 || byCodename["fixture-web"] != "web" {
-		t.Fatalf("filtered codenames = %v, want fixture-web alone: a pocket derived a codename of its own", byCodename)
+	if len(byCodename) != 2 || byCodename["fixture-web"] != "web" || byCodename["fixture-updates-web"] != "web" {
+		t.Fatalf("filtered codenames = %v, want fixture-web and fixture-updates-web for web", byCodename)
 	}
 	for _, ps := range s.aptProfileSuites(s.aptProfileViews(context.Background())) {
-		if ps.base != mirroredCodename {
-			t.Errorf("profile %s filters base %s, want %s alone", ps.profile, ps.base, mirroredCodename)
+		want := strings.TrimSuffix(ps.codename, "-web")
+		if ps.base != want || ps.scope != mirroredCodename {
+			t.Errorf("%s reads %s scoped to %s, want %s scoped to %s", ps.codename, ps.base, ps.scope, want, mirroredCodename)
 		}
 	}
 
-	recs = planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
-	if len(recs) != 1 || recs[0].Action != planRefuse {
-		t.Fatalf("with fixture-updates served, plan = %+v, want one refusal", recs)
+	pocket := aptProfileIndex(t, s, "fixture-updates-web")
+	if !strings.Contains(pocket, "Version: "+pocketNginxVersion+"\n") || strings.Contains(pocket, "Package: htop") {
+		t.Errorf("fixture-updates-web Packages =\n%s\nwant the pocket's nginx and no htop", pocket)
 	}
-	if !strings.Contains(recs[0].Reason, "fixture-updates") || !strings.Contains(recs[0].Reason, "no filtered codename covers") {
-		t.Errorf("reason = %q, want it to name the uncovered pocket", recs[0].Reason)
+	if strings.Contains(pocket, "Version: "+profileNginxVersion+"\n") {
+		t.Errorf("fixture-updates-web carries the base's nginx: it was filtered from the wrong suite")
+	}
+	if base := aptProfileIndex(t, s, "fixture-web"); strings.Contains(base, pocketNginxVersion) {
+		t.Errorf("fixture-web carries the pocket's nginx: it was filtered from the wrong suite")
+	}
+}
+
+// B145 R4, R5: the plan for a profile-bound host writes the base's filtered
+// codename and each pocket's, in Ubuntu's order, as one signed stanza. The
+// file at the record's URL is the one whose digest the record carries.
+func TestClientAptPlanWritesThePocketsFilteredCodenames(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+	aptProfileAddPocket(t, s, archive, mirroredCodename+"-security")
+	aptProfileAddPocket(t, s, archive, mirroredCodename+"-updates")
+	s.rebuildAptSnapshot(context.Background())
+
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
+	if len(recs) == 0 || recs[0].Action != planInstall {
+		t.Fatalf("plan = %+v, want the filtered stanza installed", recs)
+	}
+	u, err := url.Parse(recs[0].URL)
+	if err != nil {
+		t.Fatalf("parse record URL %q: %v", recs[0].URL, err)
+	}
+	code, body := clientGet(t, s, f.token, u.RequestURI())
+	if code != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", u.RequestURI(), code, body)
+	}
+	if sum := sha256.Sum256([]byte(body)); hex.EncodeToString(sum[:]) != recs[0].SHA256 {
+		t.Errorf("the file at %s does not match the digest its record carries", recs[0].URL)
+	}
+	if !strings.Contains(body, "Suites: fixture-web fixture-updates-web fixture-security-web\n") || !strings.Contains(body, "Signed-By: ") {
+		t.Errorf("sources file =\n%s\nwant Suites: fixture-web fixture-updates-web fixture-security-web, signed", body)
+	}
+}
+
+// B145 R3, R4: a pocket whose upstream read fails withdraws that pocket's
+// codename alone, logged with the pocket it read, and the plan refuses the
+// host naming it rather than write a stanza that stops its security fixes.
+func TestAFailedPocketReadWithdrawsThatPocketAlone(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+	aptProfileAddPocket(t, s, archive, mirroredCodename+"-updates")
+	// Mirrored and never published: the Release read 404s.
+	s.cfg.AptUpstreams[mirroredCodename+"-security"] = []config.AptUpstream{{URL: archive.URL()}}
+	var logged bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s.rebuildAptSnapshot(context.Background())
+
+	_, byCodename := s.aptFilteredSuites()
+	if byCodename["fixture-web"] != "web" || byCodename["fixture-updates-web"] != "web" {
+		t.Errorf("filtered codenames = %v, want fixture-web and fixture-updates-web kept", byCodename)
+	}
+	if _, ok := byCodename["fixture-security-web"]; ok {
+		t.Errorf("fixture-security-web served from a pocket whose Release did not read")
+	}
+	var line string
+	for _, l := range strings.Split(logged.String(), "\n") {
+		if strings.Contains(l, "pocket=fixture-security") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, "profile=web") || !strings.Contains(line, "error=") {
+		t.Errorf("no log line names profile, pocket and error together:\n%s", logged.String())
+	}
+
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeApt)
+	if len(recs) != 1 || recs[0].Action != planRefuse {
+		t.Fatalf("plan = %+v, want one refusal", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "fixture-security") || strings.Contains(recs[0].Reason, "fixture-updates,") {
+		t.Errorf("reason = %q, want it to name fixture-security alone", recs[0].Reason)
+	}
+}
+
+// B145 R2: a pocket's codename collides like a base's. "web" over noble
+// derives noble-security-web from noble-security, which is "security-web"
+// over noble's own base codename, so neither is served and the log names both.
+func TestAPocketCodenameCollisionDropsBothProfiles(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	for _, c := range []string{"noble", "noble-security"} {
+		s.cfg.AptUpstreams[c] = []config.AptUpstream{{URL: archive.URL()}}
+	}
+	aptProfileBindBase(t, s, "web", "noble", audit.ExpansionBlock, "nginx")
+	aptProfileBindBase(t, s, "security-web", "noble", audit.ExpansionBlock, "nginx")
+	var logged bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	got := map[string]string{}
+	for _, ps := range s.aptProfileSuites(s.aptProfileViews(context.Background())) {
+		got[ps.codename] = ps.profile + " over " + ps.base
+	}
+	if _, ok := got["noble-security-web"]; ok {
+		t.Errorf("noble-security-web served as %s; two profiles derive it", got["noble-security-web"])
+	}
+	if got["noble-web"] != "web over noble" || got["noble-security-security-web"] != "security-web over noble-security" {
+		t.Errorf("derived = %v, want each profile's other codenames kept", got)
+	}
+	for _, want := range []string{"codename=noble-security-web", "web over noble-security", "security-web over noble"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("collision log missing %q:\n%s", want, logged.String())
+		}
+	}
+}
+
+// B145 R6: the pool gate admits a version only a pocket publishes when the
+// profile permits its source, and refuses one it does not. The filtered
+// codename is what told the host the version exists; the gate keys on the
+// source and version alone, so a pocket is no wider a door than the base.
+func TestPoolGateDecidesAPocketOnlyVersionByTheProfile(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+	aptProfileAddPocket(t, s, archive, mirroredCodename+"-updates")
+	s.rebuildAptSnapshot(context.Background())
+
+	if base := aptProfileIndex(t, s, "fixture-web"); strings.Contains(base, pocketNginxDeb) {
+		t.Fatalf("the base publishes %s; the case needs a version the pocket alone carries", pocketNginxDeb)
+	}
+	if code, body := f.get(t, "/apt/"+pocketNginxDeb); code != http.StatusOK {
+		t.Errorf("pool fetch of the pocket's nginx = %d, want 200: %s", code, body)
+	}
+	if code, _ := f.get(t, "/apt/"+pocketHtopDeb); code != http.StatusForbidden {
+		t.Errorf("pool fetch of the pocket's htop = %d, want 403: the profile does not list it", code)
 	}
 }
