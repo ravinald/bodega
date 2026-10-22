@@ -406,8 +406,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		case len(choices) == 1:
 			src = &choices[0]
 		default:
-			return skip(fmt.Sprintf("this server serves %d apt suites (%s), each with the pockets it mirrors, so which one this host reads is its own fact: pass codename=<suite>",
-				len(choices), strings.Join(names, ", ")))
+			return skip(clientconf.AptSuiteChoiceReason(names))
 		}
 	}
 	out := one(clientconf.Apt(*src))

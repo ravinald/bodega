@@ -430,6 +430,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	records, err := plan.Select(req.systems)
 	if err != nil {
+		if hint := suiteHint(plan, req); hint != "" {
+			return fmt.Errorf("%w\n%s", err, hint)
+		}
 		return err
 	}
 	if len(plan.Records) > 0 {
@@ -495,6 +498,33 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 	}
 	return nil
+}
+
+// doctorOSRelease is where suiteHint reads this host's codename.
+var doctorOSRelease = osReleasePath
+
+// suiteHint suggests --suite when the server refused to choose among the apt
+// suites it serves and this host's own codename is one of them. It is only a
+// suggestion: the host's release is the likely answer, not a certain one, and
+// a host deliberately reading another suite would be rewritten without notice.
+func suiteHint(plan clientconf.Plan, req planRequest) string {
+	if req.suite != "" {
+		return ""
+	}
+	local := osReleaseCodename(doctorOSRelease)
+	if local == "" {
+		return ""
+	}
+	for _, r := range plan.Records {
+		if r.System != manifest.TypeApt || r.Action != clientconf.PlanSkip {
+			continue
+		}
+		if suites, ok := clientconf.AptSuiteChoices(r.Reason); ok && slices.Contains(suites, local) {
+			return fmt.Sprintf("  This host's VERSION_CODENAME in %s is %s, which this server serves. To read it, re-run with --suite %s",
+				doctorOSRelease, local, local)
+		}
+	}
+	return ""
 }
 
 // getPlanFile fetches one URL a plan names. The URL carries the server's

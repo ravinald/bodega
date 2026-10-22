@@ -125,6 +125,40 @@ func (p Plan) Select(systems []string) ([]PlanRecord, error) {
 	return out, nil
 }
 
+// aptSuiteChoiceLead opens the reason an apt skip carries when the server
+// serves several suites and the request named none. The client reads the
+// suite list back out of it, so the server and the client format and parse
+// it here rather than each keeping its own copy of the wording.
+const aptSuiteChoiceLead = "this server serves %d apt suites ("
+
+// AptSuiteChoiceReason is the skip reason for a request that named no suite
+// on a server serving several. It names the remedy for both callers, since
+// the query parameter means nothing to someone running doctor.
+func AptSuiteChoiceReason(suites []string) string {
+	return fmt.Sprintf(aptSuiteChoiceLead+"%s), each with the pockets it mirrors, so which one this host reads is its own fact: "+
+		"run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script",
+		len(suites), strings.Join(suites, ", "))
+}
+
+// AptSuiteChoices returns the suites an AptSuiteChoiceReason lists, and false
+// for any other reason.
+func AptSuiteChoices(reason string) ([]string, bool) {
+	var n int
+	if _, err := fmt.Sscanf(reason, aptSuiteChoiceLead, &n); err != nil {
+		return nil, false
+	}
+	_, rest, ok := strings.Cut(reason, "(")
+	list, _, closed := strings.Cut(rest, ")")
+	if !ok || !closed {
+		return nil, false
+	}
+	suites := strings.Split(list, ", ")
+	if len(suites) != n {
+		return nil, false
+	}
+	return suites, true
+}
+
 // Change is one install record fetched, checked and read against the host.
 type Change struct {
 	Record PlanRecord
