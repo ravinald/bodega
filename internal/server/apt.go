@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"sort"
@@ -237,8 +238,8 @@ func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, suite
 	if !ok {
 		return
 	}
-	data, found := idx.packages[arch]
-	if component != "main" || !found {
+	data, found := idx.packages[component][arch]
+	if !found {
 		http.NotFound(w, r)
 		return
 	}
@@ -255,8 +256,8 @@ func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, sui
 	if !ok {
 		return
 	}
-	data, found := idx.packagesGz[arch]
-	if component != "main" || !found {
+	data, found := idx.packagesGz[component][arch]
+	if !found {
 		http.NotFound(w, r)
 		return
 	}
@@ -363,10 +364,13 @@ const (
 // aptSuiteIndex is one suite's generated dists/<suite>/ tree.
 type aptSuiteIndex struct {
 	release    []byte
-	inRelease  []byte            // nil when unsigned
-	releaseGPG []byte            // nil when unsigned
-	packages   map[string][]byte // arch -> Packages
-	packagesGz map[string][]byte // arch -> Packages.gz
+	inRelease  []byte // nil when unsigned
+	releaseGPG []byte // nil when unsigned
+	// components is the Release's Components: line, in its order, and the
+	// one a client stanza for this suite has to name.
+	components []string
+	packages   map[string]map[string][]byte // component -> arch -> Packages
+	packagesGz map[string]map[string][]byte // component -> arch -> Packages.gz
 }
 
 // aptSnapshot is one internally consistent generation of every served suite's
@@ -793,6 +797,7 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []a
 		arches = []string{"amd64"}
 	}
 
+	generated := []string{aptsources.Component}
 	stanzas := make(map[string][]aptStanza, len(arches))
 	packages := make(map[string][]byte, len(arches))
 	for _, arch := range arches {
@@ -800,7 +805,7 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []a
 		packages[arch], _, _ = aptPackagesBody(stanzas[arch], nil)
 	}
 	if len(views) == 0 {
-		return s.aptIndexFrom(suite, packages, date, validUntil), nil
+		return s.aptIndexFrom(suite, generated, map[string]map[string][]byte{aptsources.Component: packages}, date, validUntil), nil
 	}
 	perProfile := make(map[string]*aptSuiteIndex, len(views))
 	for _, v := range views {
@@ -812,53 +817,64 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []a
 		}
 		s.logger.Info("filtered a generated apt suite for a profile",
 			"profile", v.profile, "suite", suite, "kept", kept, "dropped", dropped)
-		perProfile[v.profile] = s.aptIndexFrom(suite, filtered, date, validUntil)
+		perProfile[v.profile] = s.aptIndexFrom(suite, generated, map[string]map[string][]byte{aptsources.Component: filtered}, date, validUntil)
 	}
-	return s.aptIndexFrom(suite, packages, date, validUntil), perProfile
+	return s.aptIndexFrom(suite, generated, map[string]map[string][]byte{aptsources.Component: packages}, date, validUntil), perProfile
 }
 
-// aptIndexFrom assembles one generated suite from its Packages bodies: the
-// gzip variants, the Release that carries their digests, and the signature
-// over it.
+// aptIndexFrom assembles one generated suite from its Packages bodies, keyed
+// component then architecture: the gzip variants, the Release that carries
+// their digests, and the signature over it. components orders the
+// Components: line and the digest list; a suite bodega builds names main
+// alone, and a filtered codename names what its base carries.
 //
 // Shared with the filtered codenames a profile is served under, which differ
 // from a manifest-built suite in where the stanzas came from and in nothing
 // else. Two copies of this would be two answers to what a bodega-signed
 // Release says, and the one that drifted would fail as a hash mismatch on the
 // client rather than as anything visible here.
-func (s *Server) aptIndexFrom(suite string, packages map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
-	arches := make([]string, 0, len(packages))
-	for arch := range packages {
-		arches = append(arches, arch)
+//
+// Architectures: is the union across components. A component missing one of
+// them gets no digest line for it, which apt reads as the component not
+// carrying that architecture and skips with a notice, as it does for an
+// upstream archive laid out the same way.
+func (s *Server) aptIndexFrom(suite string, components []string, packages map[string]map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	archSet := map[string]bool{}
+	for _, comp := range components {
+		for arch := range packages[comp] {
+			archSet[arch] = true
+		}
 	}
-	sort.Strings(arches)
+	arches := slices.Sorted(maps.Keys(archSet))
 
 	idx := &aptSuiteIndex{
-		packages:   make(map[string][]byte, len(arches)),
-		packagesGz: make(map[string][]byte, len(arches)),
+		components: components,
+		packages:   make(map[string]map[string][]byte, len(components)),
+		packagesGz: make(map[string]map[string][]byte, len(components)),
 	}
 	type indexEntry struct {
 		path string
 		data []byte
 	}
 	var entries []indexEntry
-	for _, arch := range arches {
-		pkgData := packages[arch]
-		entries = append(entries, indexEntry{
-			path: "main/binary-" + arch + "/Packages",
-			data: pkgData,
-		})
-		// Gzip variant.
-		var gz bytes.Buffer
-		gw := gzip.NewWriter(&gz)
-		_, _ = gw.Write(pkgData)
-		_ = gw.Close()
-		entries = append(entries, indexEntry{
-			path: "main/binary-" + arch + "/Packages.gz",
-			data: gz.Bytes(),
-		})
-		idx.packages[arch] = pkgData
-		idx.packagesGz[arch] = gz.Bytes()
+	for _, comp := range components {
+		idx.packages[comp] = map[string][]byte{}
+		idx.packagesGz[comp] = map[string][]byte{}
+		for _, arch := range arches {
+			pkgData, ok := packages[comp][arch]
+			if !ok {
+				continue
+			}
+			var gz bytes.Buffer
+			gw := gzip.NewWriter(&gz)
+			_, _ = gw.Write(pkgData)
+			_ = gw.Close()
+			entries = append(entries,
+				indexEntry{path: comp + "/binary-" + arch + "/Packages", data: pkgData},
+				indexEntry{path: comp + "/binary-" + arch + "/Packages.gz", data: gz.Bytes()})
+			idx.packages[comp][arch] = pkgData
+			idx.packagesGz[comp][arch] = gz.Bytes()
+		}
 	}
 
 	var buf bytes.Buffer
@@ -866,7 +882,7 @@ func (s *Server) aptIndexFrom(suite string, packages map[string][]byte, date, va
 	fmt.Fprintf(&buf, "Label: bodega\n")
 	fmt.Fprintf(&buf, "Suite: %s\n", suite)
 	fmt.Fprintf(&buf, "Codename: %s\n", suite)
-	fmt.Fprintf(&buf, "Components: main\n")
+	fmt.Fprintf(&buf, "Components: %s\n", strings.Join(components, " "))
 	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
 	fmt.Fprintf(&buf, "Date: %s\n", date.Format(time.RFC1123Z))
 	fmt.Fprintf(&buf, "Valid-Until: %s\n", validUntil.Format(time.RFC1123Z))
@@ -878,6 +894,31 @@ func (s *Server) aptIndexFrom(suite string, packages map[string][]byte, date, va
 	idx.release = buf.Bytes()
 	s.signAptRelease(idx, suite)
 	return idx
+}
+
+// aptServedComponents is the Components: line for a stanza naming suites: the
+// union of what each one's generated Release declares, in the order they are
+// first named, so a filtered base and its pockets share one line the way the
+// mirrored stanza they replace does. A suite the snapshot does not carry
+// contributes nothing, and none at all leaves the line to the renderer.
+func (s *Server) aptServedComponents(suites []string) []string {
+	snap := s.aptSnap.Load()
+	if snap == nil {
+		return nil
+	}
+	var out []string
+	for _, suite := range suites {
+		idx := snap.suites[suite]
+		if idx == nil {
+			continue
+		}
+		for _, c := range idx.components {
+			if !slices.Contains(out, c) {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
 }
 
 // aptSigning is the loaded signing key and the two renderings of its public
@@ -1078,6 +1119,7 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	for _, codename := range out.Filtered {
 		one := st
 		one.Suites = []string{codename}
+		one.Components = s.aptServedComponents(one.Suites)
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	out.Profile, out.Host = s.aptHostSources(r, st, out)
@@ -1125,6 +1167,7 @@ func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptSta
 			}
 			one := st
 			one.Suites = suites
+			one.Components = s.aptServedComponents(suites)
 			rendered := aptsources.Render(one)
 			return p.Name(), &rendered
 		}

@@ -9,12 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/entitle"
@@ -59,12 +62,6 @@ import (
 // trust ends at the archive's certificate rather than at its signing key.
 
 const (
-	// aptProfileComponent is the only component a filtered codename carries.
-	// Every generated suite serves main alone — handleAptPackages 404s the
-	// rest — and a filtered view is a generated suite. A base whose packages
-	// live in universe is named in the log rather than silently half-served.
-	aptProfileComponent = "main"
-
 	// aptProfileFetchTimeout bounds one upstream index fetch. A rebuild walks
 	// (profile x architecture) and runs on a timer nothing waits on, so a slow
 	// archive must cost a bounded amount rather than hold the rebuild until
@@ -267,25 +264,25 @@ func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, 
 			}
 			releases[ps.base] = release
 		}
-		arches, err := s.aptUpstreamArches(ps.base, release)
+		layout, err := s.aptUpstreamComponents(ps.base, release)
 		if err != nil {
-			s.logger.Error("could not tell which architectures a profile's apt base publishes, so its filtered codename is not regenerated at this rebuild",
+			s.logger.Error("could not tell which components and architectures a profile's apt base publishes, so its filtered codename is not regenerated at this rebuild",
 				append(ps.logAttrs(), "error", err)...)
 			continue
 		}
-		packages, err := s.aptFilteredPackages(ctx, ps, arches, release, cache)
+		components, packages, err := s.aptFilteredPackages(ctx, ps, layout, release, cache)
 		if err != nil {
 			s.logger.Error("a profile's filtered apt codename is not regenerated at this rebuild, so it stops being served until the read succeeds",
 				append(ps.logAttrs(), "codename", ps.codename, "error", err)...)
 			continue
 		}
-		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
+		ps.index = s.aptIndexFrom(ps.codename, components, packages, date, validUntil)
 		out = append(out, ps)
 	}
 	return out
 }
 
-// aptIndexRead is one (base, architecture) upstream read, shared across every
+// aptIndexRead is one (base, component, architecture) upstream read, shared across every
 // profile deriving from that base: the decompressed index, or the fact that
 // this archive publishes no such architecture. The second is cached for the
 // same reason as the first — without it, a base two profiles derive from
@@ -298,18 +295,23 @@ type aptIndexRead struct {
 	notPublished bool
 }
 
-// aptFilteredPackages filters one profile's view of every architecture its
-// base publishes, dropping the ones the archive does not carry and failing the
-// whole codename when one it does carry cannot be read or parsed.
+// aptFilteredPackages filters one profile's view of every component and
+// architecture its base publishes, dropping the ones the archive does not
+// carry and failing the whole codename when one it does carry cannot be read
+// or parsed. It returns the components that kept at least one architecture,
+// in the order layout lists them, and their bodies keyed component then arch.
 //
 // A filter that keeps nothing fails the same way, when the profile lists apt
-// packages at all and the suite is the base. A pocket is exempt: -backports
-// carrying none of a baseline is the ordinary case, and withdrawing its
-// codename for that would refuse every host the profile binds. Closed with nothing listed permits nothing deliberately and
-// serves an empty index; closed with entries none of which match a paragraph is
-// a misspelled source or an unsatisfiable pin, and the served result is
-// identical — a signed empty Packages, every package on the host kept back, and
-// one Info line carrying the counts.
+// packages at all and the suite is the base. The count is per architecture
+// across every component, because a profile listing nginx alone keeps nothing
+// from main on Ubuntu and that is its baseline, not a misspelling. A pocket is
+// exempt: -backports carrying none of a baseline is the ordinary case, and
+// withdrawing its codename for that would refuse every host the profile
+// binds. Closed with nothing listed permits nothing deliberately and serves an
+// empty index; closed with entries none of which match a paragraph is a
+// misspelled source or an unsatisfiable pin, and the served result is
+// identical — a signed empty Packages, every package on the host kept back,
+// and one Info line carrying the counts.
 //
 // A 404 is a different class from every other failure and has to stay apart
 // from it, because Ubuntu guarantees one. archive.ubuntu.com publishes a
@@ -333,45 +335,60 @@ type aptIndexRead struct {
 // answering. Withdrawing it when no architecture survives at all is the same
 // rule: an empty Release is a suite with no architectures, which apt reads the
 // same way.
-func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, arches []string, release map[string]string, cache map[string]aptIndexRead) (map[string][]byte, error) {
-	out := make(map[string][]byte, len(arches))
-	for _, arch := range arches {
-		read, ok := cache[ps.base+"/"+arch]
-		if !ok {
-			body, err := s.aptUpstreamPackages(ctx, ps.base, arch, release)
-			switch {
-			case errors.Is(err, errUpstreamNotFound):
-				read = aptIndexRead{notPublished: true}
-				s.logger.Info("an apt base declares an architecture this archive does not serve, so filtered codenames over it carry the rest; the arch is served from another host (ports.ubuntu.com for Ubuntu's non-x86 ports) and reaching it needs its own apt_upstreams entry",
-					"base", ps.base, "arch", arch)
-			case err != nil:
-				return nil, fmt.Errorf("read the upstream Packages for %s/%s: %w", ps.base, arch, err)
-			default:
-				read = aptIndexRead{body: body}
+func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, layout []aptUpstreamComponent, release map[string]string, cache map[string]aptIndexRead) ([]string, map[string]map[string][]byte, error) {
+	out := make(map[string]map[string][]byte, len(layout))
+	var components []string
+	kept, dropped := map[string]int{}, map[string]int{}
+	for _, comp := range layout {
+		for _, arch := range comp.arches {
+			key := ps.base + "/" + comp.name + "/" + arch
+			read, ok := cache[key]
+			if !ok {
+				body, err := s.aptUpstreamPackages(ctx, ps.base, comp.name, arch, release)
+				switch {
+				case errors.Is(err, errUpstreamNotFound):
+					read = aptIndexRead{notPublished: true}
+					s.logger.Info("an apt base declares an architecture this archive does not serve, so filtered codenames over it carry the rest; the arch is served from another host (ports.ubuntu.com for Ubuntu's non-x86 ports) and reaching it needs its own apt_upstreams entry",
+						"base", ps.base, "component", comp.name, "arch", arch)
+				case err != nil:
+					return nil, nil, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", ps.base, comp.name, arch, err)
+				default:
+					read = aptIndexRead{body: body}
+				}
+				cache[key] = read
 			}
-			cache[ps.base+"/"+arch] = read
+			if read.notPublished {
+				continue
+			}
+			filtered, k, d, err := filterAptPackages(read.body, ps.permit)
+			if err != nil {
+				return nil, nil, fmt.Errorf("filter the upstream Packages for %s/%s/%s: %w", ps.base, comp.name, arch, err)
+			}
+			kept[arch] += k
+			dropped[arch] += d
+			s.logger.Info("filtered an upstream apt index for a profile",
+				"profile", ps.profile, "codename", ps.codename, "component", comp.name, "arch", arch,
+				"kept", k, "dropped", d)
+			if out[comp.name] == nil {
+				out[comp.name] = map[string][]byte{}
+				components = append(components, comp.name)
+			}
+			out[comp.name][arch] = filtered
 		}
-		if read.notPublished {
-			continue
-		}
-		filtered, kept, dropped, err := filterAptPackages(read.body, ps.permit)
-		if err != nil {
-			return nil, fmt.Errorf("filter the upstream Packages for %s/%s: %w", ps.base, arch, err)
-		}
-		if kept == 0 && !ps.pocket() && ps.permit.Lists(manifest.TypeApt) {
-			return nil, fmt.Errorf("the filter kept none of the %d paragraphs %s/%s publishes, and the profile lists apt packages: a name that matches no source in this base, or a pin no paragraph carries. Serving it would sign an empty Packages and report every package on the host as kept back",
-				dropped, ps.base, arch)
-		}
-		s.logger.Info("filtered an upstream apt index for a profile",
-			"profile", ps.profile, "codename", ps.codename, "arch", arch,
-			"kept", kept, "dropped", dropped)
-		out[arch] = filtered
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("%s publishes none of the %d architectures its Release names (%s); the filtered Release would name no architecture at all, which apt reads as a suite that does not support the host",
-			ps.base, len(arches), strings.Join(arches, " "))
+		return nil, nil, fmt.Errorf("%s publishes none of the architectures its Release names in any component bodega mirrors; the filtered Release would name no architecture at all, which apt reads as a suite that does not support the host",
+			ps.base)
 	}
-	return out, nil
+	if !ps.pocket() && ps.permit.Lists(manifest.TypeApt) {
+		for _, arch := range slices.Sorted(maps.Keys(kept)) {
+			if kept[arch] == 0 {
+				return nil, nil, fmt.Errorf("the filter kept none of the %d paragraphs %s publishes for %s across %s, and the profile lists apt packages: a name that matches no source in this base, or a pin no paragraph carries. Serving it would sign an empty Packages and report every package on the host as kept back",
+					dropped[arch], ps.base, arch, strings.Join(components, " "))
+			}
+		}
+	}
+	return components, out, nil
 }
 
 // filterAptPackages copies through the paragraphs a profile permits and drops
@@ -434,8 +451,25 @@ func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, drop
 	return buf.Bytes(), kept, dropped, nil
 }
 
-// aptUpstreamArches reads the base codename's Release and returns the
-// architectures it both names and publishes a digest for.
+// aptUpstreamComponent is one component a filtered codename carries and the
+// architectures its base publishes a Packages digest for under it.
+type aptUpstreamComponent struct {
+	name   string
+	arches []string
+}
+
+// aptUpstreamComponents reads the base codename's Release and returns, in the
+// Release's own order, every component it declares that bodega mirrors for
+// that codename, each with the architectures it both names and publishes a
+// digest for.
+//
+// Mirrored means what MirroredComponentList resolves: the apt_upstreams
+// components, or Ubuntu's four when none are configured. That is the line a
+// host reading the unfiltered codename installs, so a filtered codename
+// carrying less would drop packages the same host could install a moment
+// before its profile named a base; on stock Ubuntu that is everything in
+// universe. The Release narrows it from the other side, because a component
+// the archive does not declare has no Packages to fetch.
 //
 // The SHA256 block is the second half because an index with no digest beside
 // it is one bodega would sign without having checked it against anything, and
@@ -446,27 +480,47 @@ func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, drop
 // Ubuntu's names seven architectures and publishes a digest for all seven
 // while archive.ubuntu.com carries two, so the answer here is an upper bound
 // and aptFilteredPackages drops what 404s out of it.
-func (s *Server) aptUpstreamArches(base string, release map[string]string) ([]string, error) {
+func (s *Server) aptUpstreamComponents(base string, release map[string]string) ([]aptUpstreamComponent, error) {
 	declared := strings.Fields(release["Architectures"])
 	if len(declared) == 0 {
 		return nil, fmt.Errorf("the Release for %q names no Architectures", base)
 	}
+	mirrored := aptsources.MirroredComponentList(s.cfg.AptComponentsFor(base))
+	upstream := strings.Fields(release["Components"])
+	if len(upstream) == 0 {
+		upstream = mirrored
+	}
+	want := make(map[string]bool, len(mirrored))
+	for _, c := range mirrored {
+		want[c] = true
+	}
 	published := aptReleaseDigests(release)
-	var out []string
-	for _, arch := range declared {
-		if _, ok := published[aptPackagesPath(arch)+".gz"]; ok {
-			out = append(out, arch)
+	var out []aptUpstreamComponent
+	var unmirrored []string
+	for _, comp := range upstream {
+		if !want[comp] {
+			unmirrored = append(unmirrored, comp)
+			continue
+		}
+		var arches []string
+		for _, arch := range declared {
+			if _, ok := published[aptPackagesPath(comp, arch)+".gz"]; ok {
+				arches = append(arches, arch)
+			}
+		}
+		if len(arches) > 0 {
+			sort.Strings(arches)
+			out = append(out, aptUpstreamComponent{name: comp, arches: arches})
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("the Release for %q publishes no %s/binary-*/Packages.gz for any of the architectures it names (%s)",
-			base, aptProfileComponent, strings.Join(declared, " "))
+		return nil, fmt.Errorf("the Release for %q publishes no <component>/binary-*/Packages.gz for any component bodega mirrors (%s) and architecture it names (%s)",
+			base, strings.Join(mirrored, " "), strings.Join(declared, " "))
 	}
-	if comps := strings.Fields(release["Components"]); len(comps) > 1 {
-		s.logger.Info("a filtered apt codename carries one component; the base publishes more, and packages outside it are not served under the profile",
-			"base", base, "served", aptProfileComponent, "upstream", strings.Join(comps, " "))
+	if len(unmirrored) > 0 {
+		s.logger.Info("an apt base declares components its apt_upstreams entry does not list, so filtered codenames over it leave them out; add them to the entry's components to serve them",
+			"base", base, "unmirrored", strings.Join(unmirrored, " "))
 	}
-	sort.Strings(out)
 	return out, nil
 }
 
@@ -493,8 +547,8 @@ func (s *Server) aptUpstreamRelease(ctx context.Context, base string) (map[strin
 // catches the failure a mirror produces on its own: a Packages body from one
 // sync beside a Release from the next, which would have bodega sign an index
 // whose stanzas name .deb digests the pool no longer has.
-func (s *Server) aptUpstreamPackages(ctx context.Context, base, arch string, release map[string]string) ([]byte, error) {
-	rest := aptPackagesPath(arch) + ".gz"
+func (s *Server) aptUpstreamPackages(ctx context.Context, base, component, arch string, release map[string]string) ([]byte, error) {
+	rest := aptPackagesPath(component, arch) + ".gz"
 	want := aptReleaseDigests(release)[rest]
 	body, err := s.aptUpstreamFetch(ctx, base, rest)
 	if err != nil {
@@ -594,12 +648,12 @@ func (s *Server) aptUpstreamCached(key string) ([]byte, bool) {
 	return doc.body, true
 }
 
-// aptPackagesPath is the Release-relative path of one architecture's Packages
-// index, which is both what the digest list keys on and what the fetch asks
+// aptPackagesPath is the Release-relative path of one component and
+// architecture's Packages index, which is both what the digest list keys on and what the fetch asks
 // for. One spelling, because a mismatch between the two reads as an archive
 // that publishes no digest rather than as a typo.
-func aptPackagesPath(arch string) string {
-	return aptProfileComponent + "/binary-" + arch + "/Packages"
+func aptPackagesPath(component, arch string) string {
+	return component + "/binary-" + arch + "/Packages"
 }
 
 // aptReleaseDigests indexes a Release's SHA256 block by path. Each line is

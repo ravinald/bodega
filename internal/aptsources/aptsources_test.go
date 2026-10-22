@@ -207,12 +207,17 @@ func TestMirroredStanzaNamesTheComponentsTheCodenameServes(t *testing.T) {
 		t.Errorf("one-line = %q, want the configured components", got.OneLine)
 	}
 
-	// A generated suite carries the one component bodega builds, whatever is
-	// set: bodega signs what it generates and generates only main.
-	generated := base
-	generated.Components = []string{"universe"}
-	got = Render(generated)
-	if !strings.Contains(got.Deb822, "Components: "+Component) {
-		t.Errorf("a generated suite took a component bodega does not publish:\n%s", got.Deb822)
+	// A generated suite naming no components carries the one bodega builds
+	// from its catalog. A filtered codename names the ones its signed Release
+	// declares, and the line has to carry them or apt never fetches them.
+	got = Render(base)
+	if !strings.Contains(got.Deb822, "Components: "+Component+"\n") {
+		t.Errorf("a generated suite naming no components did not render %s:\n%s", Component, got.Deb822)
+	}
+	filtered := base
+	filtered.Components = []string{"main", "universe"}
+	got = Render(filtered)
+	if !strings.Contains(got.Deb822, "Components: main universe\n") || !strings.HasSuffix(got.OneLine, " main universe") {
+		t.Errorf("a filtered codename lost the components its Release declares:\n%s\n%s", got.Deb822, got.OneLine)
 	}
 }

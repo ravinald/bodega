@@ -365,6 +365,7 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		}
 		one := s.aptSourcesState(r)
 		one.Suites = suites
+		one.Components = s.aptServedComponents(suites)
 		rendered := aptsources.Render(one)
 		src = &rendered
 	} else {
