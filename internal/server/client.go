@@ -411,7 +411,10 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 		}
 	}
 	out := one(clientconf.Apt(*src))
-	if src.Signed {
+	// A mirrored stanza carries Signed: true for the upstream signature, but
+	// names no Signed-By:, so apt verifies it with the distro keyring and
+	// bodega's would sit unread.
+	if src.Signed && !src.Mirrored {
 		ring := s.aptSign.Load().ring()
 		if len(ring) == 0 {
 			return skip("the stanza names bodega's keyring and no apt signing key is loaded to serve it")

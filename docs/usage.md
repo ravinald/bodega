@@ -4709,7 +4709,7 @@ A host with the binary applies the same plan with [`bodega doctor --configure`](
 
 | Client                         | What bodega composes                                                                                                         |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| apt                            | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                            |
+| apt                            | a `bodega.sources` stanza for the suite this host's profile reads, and the keyring its `Signed-By:` names when it names one  |
 | FreeBSD `pkg`                  | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                        |
 | pip, npm, cargo, Go, helm, git | each file below; `doctor --write-credentials` places the token each one reads, and for helm also registers the repository    |
 | FreeBSD ports (`make.conf`)    | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles) |
