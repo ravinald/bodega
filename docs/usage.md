@@ -1926,9 +1926,13 @@ PROFILE  TYPE  PACKAGE    REASON
 web      apt   libexpat1  this profile serves a filtered apt codename, which closes on the source package; libexpat1 is a binary built from source expat, so it matches no paragraph in the index. List expat instead
 ```
 
-**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The name is the source and the version is each paragraph's own `Version:`, so that the pool predicate behind the index compares the same version off the `.deb` filename. A binNMU is where the two spellings of one release diverge: source `nginx` at `1.24.0-2ubuntu7.1` ships `nginx-common` at `+b1`, so an exact pin holds the binaries at the version you wrote and drops that source's rebuilt ones, and apt reports the group as kept back. `bodega profile check` names the binary and version a pin drops without failing the gate, since the repair is to widen the constraint to `any` and that discards the reason the pin records. A profile that lists apt packages and whose pins match no paragraph at all serves no codename: `apt update` fails on the source line rather than the host being told its installed set no longer exists.
+**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The name is the source and the version is each paragraph's own `Version:`, so that the pool predicate behind the index compares the same version off the `.deb` filename. A binNMU is where the two spellings of one release diverge: source `nginx` at `1.24.0-2ubuntu7.1` ships `nginx-common` at `+b1`, so an exact pin holds the binaries at the version you wrote and drops that source's rebuilt ones, and apt reports the group as kept back. `bodega profile check` names the binary and version a pin drops without failing the gate, since the repair is to widen the constraint to `any` and that discards the reason the pin records. A profile that lists apt packages and whose pins match no paragraph of its base at all serves no codename: `apt update` fails on the source line rather than the host being told its installed set no longer exists.
 
-The filtered codename is a generated suite: bodega signs its `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
+**Each pocket gets a filtered codename of its own.** When the server also mirrors `noble-updates`, `noble-backports` or `noble-security`, the rebuild derives `<pocket>-<profile>` from each one it mirrors (`noble-updates-web`, `noble-security-web`), filtered by the same profile from that pocket's own `Release` and `Packages`. A stock Ubuntu host already runs packages from `-updates` and `-security`, and a host reading the base alone could not install a `-dev` package whose runtime half came from a pocket, and would stop receiving security fixes. Each codename keeps the pocket it came from, so its `Release` describes one upstream suite. A pocket whose filter keeps nothing is served empty rather than withdrawn: `-backports` carrying none of a baseline is the normal case.
+
+Pocket codenames follow the base's collision rule. `web` over `noble` derives `noble-security-web` from `noble-security`, which is also the base codename of `security-web` over `noble`, so the rebuild serves neither and logs both as `web over noble-security, security-web over noble`. A pocket whose upstream read fails is withdrawn for that rebuild alone, logged with the profile, the pocket and the error. Either way the host's plan refuses apt and names the pocket with no codename, rather than writing a stanza that installs cleanly and stops the host's security fixes.
+
+The filtered codenames are generated suites: bodega signs each `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
 
 ```bash
 bodega doctor --write-apt-sources --url https://bodega.internal
@@ -1941,10 +1945,12 @@ wrote /etc/apt/sources.list.d/bodega.sources
 Profile "web": this host reads noble-web, a filtered view of what bodega mirrors.
 ```
 
+On a server mirroring `noble`, `noble-updates` and `noble-security`, the stanza names the base's codename first and the pockets' in Ubuntu's order:
+
 ```text
 Types: deb
 URIs: https://bodega.internal/apt/
-Suites: noble-web
+Suites: noble-web noble-updates-web noble-security-web
 Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
@@ -2070,12 +2076,12 @@ A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
-`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none. Doctor refuses, lists the choices, and suggests the host's own `VERSION_CODENAME` when the server serves it. It never sends that codename unasked:
+`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `--codename`, `BODEGA_CODENAME` or `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none. Doctor refuses, lists the choices, and suggests the host's own `VERSION_CODENAME` when the server serves it. It never sends that codename unasked:
 
 ```
 $ sudo bodega doctor --configure apt --apply --url https://bodega.internal
 Error: the plan installs nothing for a system you named, so nothing was written:
-  apt (skip): this server serves 2 apt suites (noble, resolute), each with the pockets it mirrors, so which one this host reads is its own fact: run bodega doctor --configure apt --suite <suite>, or pass codename=<suite> on a direct request or to the setup script
+  apt (skip): this server serves 2 apt suites (noble, resolute), each with the pockets it mirrors, so which one this host reads is its own fact: name it with --suite <suite> for bodega doctor, --codename <suite> for the setup script, or codename=<suite> on a direct /client/plan request
   This host's VERSION_CODENAME in /etc/os-release is noble, which this server serves. To read it, re-run with --suite noble
 ```
 
@@ -2096,7 +2102,7 @@ Components: main restricted universe multiverse
 
 A stanza naming the base alone breaks a stock host twice. The host already runs packages from `-updates` and `-security`, so the first `-dev` package fails on its runtime half (`libpq-dev : Depends: libpq5 (= 18.3-1) but it is not going to be installed`), and the host stops receiving security fixes with nothing to report it. `--suite resolute-updates` is refused for the same reason, and the reason names `resolute` as the codename to pass. A generated suite is never grouped: it keeps a stanza of its own with `Signed-By:`, even beside a mirrored codename that shares its prefix.
 
-The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile's filtered codename is generated from its base's index alone and carries none of the pockets, so while the server mirrors a pocket of that base the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
+The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile-bound host gets the base's filtered codename and one per mirrored pocket on one `Suites:` line (see [apt under a profile](#apt-under-a-profile)). When the rebuild withdrew a pocket's codename, the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
 For FreeBSD the plan names `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it.
 
@@ -4636,7 +4642,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `d54ec52ff9f3ccf2fdb622bb18c1f44d68946921dec417c579837ac3ea43e253`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `68fdaa7d35a7f8765b4a2a2f2e92ee5be67149069ee767e5cdbf394ac82d9876`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4688,7 +4694,14 @@ The diff redacts before it prints:
 
 The files themselves are written unredacted, and a backup of a file that held a secret carries it too, with the original's mode.
 
-What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` from `VERSION_CODENAME` in `/etc/os-release` on Linux, since `lsb_release` is absent from minimal images. On an instance serving no apt suite by the host's codename, the plan skips apt and names the suites it does serve, and `bodega doctor --configure apt --suite <suite>` is the way through.
+What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` on Linux, from `VERSION_CODENAME` in `/etc/os-release` since `lsb_release` is absent from minimal images. On an instance serving no apt suite by that codename, or serving several when the host states none, the plan skips apt and names the suites it does serve.
+
+`--codename <suite>` names the apt suite in place of `VERSION_CODENAME`, and so does `BODEGA_CODENAME`; the flag wins when both are set. It is the way through on a host whose `/etc/os-release` carries no usable `VERSION_CODENAME`, and on a host that should read a suite other than its own. The value is held to the rule `VERSION_CODENAME` is, lowercase letters, digits, `.`, `+` and `-`, and anything else stops the script before it asks the server for a plan. A pocket such as `noble-updates` is refused by the server, which names its base. On FreeBSD the codename is not sent.
+
+```sh
+sh setup.sh --url https://bodega-host:8080 --codename noble
+BODEGA_CODENAME=noble sh setup.sh --url https://bodega-host:8080
+```
 
 An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. With `--systems osquery` the refusal says so for the secret: a rewritten flags file sends osqueryd's enroll secret, in clear, to whoever rewrote it. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
 

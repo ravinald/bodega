@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -965,8 +966,101 @@ func TestClientAptPlanRefusesAPocketCodename(t *testing.T) {
 	if len(recs) != 1 || recs[0].Action == planInstall {
 		t.Fatalf("codename=resolute-updates plan = %+v, want no install", recs)
 	}
-	if !strings.Contains(recs[0].Reason, "pass codename=resolute") {
-		t.Errorf("reason = %q, want it to name codename=resolute", recs[0].Reason)
+	for _, want := range []string{"--suite resolute", "--codename resolute", "codename=resolute"} {
+		if !strings.Contains(recs[0].Reason, want) {
+			t.Errorf("reason = %q, want it to name %s", recs[0].Reason, want)
+		}
+	}
+}
+
+// setupScriptAgainst runs the served setup script as a Linux host against s,
+// recording the query of every plan request it makes.
+func setupScriptAgainst(t *testing.T, s *Server, token string, env []string, args ...string) (string, []url.Values, error) {
+	t.Helper()
+	var plans []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/client/plan") {
+			plans = append(plans, r.URL.Query())
+		}
+		s.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	s.cfg.PublicURL = srv.URL
+
+	stub := t.TempDir()
+	if err := os.WriteFile(stub+"/uname", []byte("#!/bin/sh\necho Linux\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := t.TempDir() + "/setup.sh"
+	if err := os.WriteFile(script, clientSetupScript, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", append([]string{script, "--url", srv.URL, "--allow-plaintext"}, args...)...)
+	cmd.Env = append([]string{"HOME=" + t.TempDir(), "PATH=" + stub + ":" + os.Getenv("PATH"), "TMPDIR=" + os.TempDir(), "BODEGA_TOKEN=" + token}, env...)
+	out, err := cmd.CombinedOutput()
+	return string(out), plans, err
+}
+
+// B147 R1, R4: a script user on a server serving several suites names one,
+// and the flag wins over BODEGA_CODENAME, which wins over VERSION_CODENAME.
+func TestSetupScriptCodenameReachesThePlan(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		env  []string
+		args []string
+		want string
+	}{
+		{"flag", nil, []string{"--codename", "noble"}, "noble"},
+		{"flag=", nil, []string{"--codename=resolute"}, "resolute"},
+		{"variable", []string{"BODEGA_CODENAME=resolute"}, nil, "resolute"},
+		{"flag over variable", []string{"BODEGA_CODENAME=resolute"}, []string{"--codename", "noble"}, "noble"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, f := pocketServer(t)
+			out, plans, err := setupScriptAgainst(t, s, f.token, c.env, append(c.args, "--systems", "apt")...)
+			if err != nil {
+				t.Fatalf("sh setup.sh %v: %v\n%s", c.args, err, out)
+			}
+			if len(plans) != 1 || plans[0].Get("codename") != c.want {
+				t.Fatalf("plan requests = %v, want one carrying codename=%s", plans, c.want)
+			}
+			if strings.Contains(out, "apt suites (") || !strings.Contains(out, "Suites: "+c.want) {
+				t.Errorf("the dry run does not configure %s:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
+// B147 R1, R4: a value that is no apt suite name stops the script before it
+// asks the server anything.
+func TestSetupScriptRefusesABadCodename(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh is not on PATH")
+	}
+	for _, c := range []struct {
+		env  []string
+		args []string
+		bad  string
+	}{
+		{nil, []string{"--codename", "Noble"}, "Noble"},
+		{[]string{"BODEGA_CODENAME=noble;id"}, nil, "noble;id"},
+	} {
+		s, f := pocketServer(t)
+		out, plans, err := setupScriptAgainst(t, s, f.token, c.env, c.args...)
+		if err == nil {
+			t.Errorf("sh setup.sh %v %v exited 0, want a refusal:\n%s", c.env, c.args, out)
+		}
+		if len(plans) != 0 {
+			t.Errorf("sh setup.sh %v %v asked for a plan before refusing: %v", c.env, c.args, plans)
+		}
+		if !strings.Contains(out, "codename "+c.bad+" ") || !strings.Contains(out, "[a-z0-9.+-]") {
+			t.Errorf("refusal of %q does not name the value and the accepted pattern:\n%s", c.bad, out)
+		}
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -1101,9 +1102,11 @@ func (s *Server) aptFilteredSuites() (names []string, byCodename map[string]stri
 // aptHostSources picks the one stanza the requesting host should install.
 //
 // A host bound to a profile that scopes apt reads that profile's filtered
-// codename and nothing else: reading the base beside it would hand the same
+// codenames and nothing else: reading the base beside them would hand the same
 // client an unfiltered index for the same packages, and apt takes the highest
-// version it is offered from either.
+// version it is offered from either. With a pocket of the base mirrored and its
+// codename withdrawn there is no answer, for the reason aptProfileHostSuites
+// gives.
 //
 // Everyone else gets an answer only when there is one codename to give. With
 // several served and no profile to choose between them, naming one would point
@@ -1113,21 +1116,17 @@ func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptSta
 		p := s.profileFor(r)
 		base, _ := p.AptScope()
 		if base != "" {
-			_, byCodename := s.aptFilteredSuites()
-			for codename, profile := range byCodename {
-				if profile != p.Name() {
-					continue
-				}
-				one := st
-				one.Suites = []string{codename}
-				rendered := aptsources.Render(one)
-				return p.Name(), &rendered
+			suites, missing := s.aptProfileHostSuites(p)
+			if len(suites) == 0 || len(missing) > 0 {
+				// The rebuild refused the base or has not run since the
+				// profile was written. Naming the base instead would serve
+				// this host the unfiltered index its profile exists to narrow.
+				return p.Name(), nil
 			}
-			// The profile scopes apt and no codename answers for it: the
-			// rebuild refused the base or has not run since the profile was
-			// written. Naming the base instead would serve this host the
-			// unfiltered index its profile exists to narrow.
-			return p.Name(), nil
+			one := st
+			one.Suites = suites
+			rendered := aptsources.Render(one)
+			return p.Name(), &rendered
 		}
 	}
 	if len(out.Sources) == 1 {
@@ -1135,6 +1134,35 @@ func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptSta
 		return "", &one
 	}
 	return "", nil
+}
+
+// aptProfileHostSuites lists the filtered codenames a host bound to p reads,
+// the base's first and then each mirrored pocket's in aptPocketSuffixes order,
+// and separately the mirrored pockets whose codename this snapshot does not
+// carry. suites is empty when the base's own codename is missing.
+//
+// A missing pocket is reported rather than skipped. A stanza naming the base
+// and -updates without -security installs cleanly, and the host stops
+// receiving security fixes with nothing on it reporting that.
+func (s *Server) aptProfileHostSuites(p *entitle.Profile) (suites, missing []string) {
+	base, _ := p.AptScope()
+	if base == "" {
+		return nil, nil
+	}
+	_, byCodename := s.aptFilteredSuites()
+	if codename := config.ProfileAptCodename(base, p.Name()); byCodename[codename] == p.Name() {
+		suites = append(suites, codename)
+	} else {
+		return nil, nil
+	}
+	for _, pocket := range s.aptMirroredPockets(base) {
+		if codename := config.ProfileAptCodename(pocket, p.Name()); byCodename[codename] == p.Name() {
+			suites = append(suites, codename)
+		} else {
+			missing = append(missing, pocket)
+		}
+	}
+	return suites, missing
 }
 
 // publicBase returns the base URL clients reach this server at, with no

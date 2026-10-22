@@ -19,13 +19,16 @@ prog=bodega-setup
 
 usage() {
 	cat <<'EOF'
-usage: sh setup.sh --url <bodega base URL> [--apply] [--systems a,b] [--allow-plaintext]
+usage: sh setup.sh --url <bodega base URL> [--apply] [--systems a,b] [--codename <suite>] [--allow-plaintext]
 
   --url <base>        where bodega answers, e.g. https://bodega.internal
                       (or set BODEGA_URL)
   --apply             back up each file that differs, then write it.
                       Without it the script prints a diff and writes nothing.
   --systems a,b       only these systems; the plan lists the rest
+  --codename <suite>  the apt suite this host reads, in place of
+                      VERSION_CODENAME from /etc/os-release
+                      (or set BODEGA_CODENAME)
   --allow-plaintext   permit an http:// URL. Without TLS the plan and the
                       files could be rewritten in transit, digests included.
 
@@ -54,6 +57,7 @@ unset BODEGA_OSQUERY_SECRET
 apply=no
 plaintext=no
 systems=
+codename_set=${BODEGA_CODENAME:-}
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -69,6 +73,12 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--systems=*) systems=${1#--systems=} ;;
+	--codename)
+		[ $# -ge 2 ] || die "--codename needs a value, e.g. --codename noble"
+		codename_set=$2
+		shift
+		;;
+	--codename=*) codename_set=${1#--codename=} ;;
 	--apply) apply=yes ;;
 	--allow-plaintext) plaintext=yes ;;
 	-h | --help)
@@ -85,6 +95,9 @@ base=${base%/}
 
 case $token in
 *[!A-Za-z0-9_.-]*) die "BODEGA_TOKEN holds characters no bodega token has; check what was pasted into it" ;;
+esac
+case $codename_set in
+*[!a-z0-9.+-]*) die "codename $codename_set is not an apt suite name, which is lowercase letters, digits, '.', '+' and '-' ([a-z0-9.+-]); pass the suite as the server lists it, e.g. --codename noble" ;;
 esac
 case $osq_secret in
 *[!A-Za-z0-9_.-]*) die "BODEGA_OSQUERY_SECRET holds characters no bodega enroll secret has; check what was pasted into it" ;;
@@ -120,7 +133,9 @@ abi=
 codename=
 case $os in
 linux)
-	if [ -r /etc/os-release ]; then
+	if [ -n "$codename_set" ]; then
+		codename=$codename_set
+	elif [ -r /etc/os-release ]; then
 		codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d "\"'" | sed -n 1p)
 	fi
 	case $codename in
