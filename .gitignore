@@ -29,5 +29,6 @@ AGENTS.md
 docs-internal
 local.mk
 test/e2e/hosts.env
+test/e2e/local
 # END attic
 test/e2e/results/

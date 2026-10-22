@@ -38,6 +38,17 @@ REPO_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 . "$E2E_DIR/lib/report.sh"
 
 E2E_KNOWN_FILE="$E2E_DIR/known-issues.tsv"
+E2E_KNOWN_LOCAL="$E2E_DIR/local/known-issues.tsv"
+
+# local/ holds suites kept outside the repository, with their own lib/,
+# selftest.sh and known-issues.tsv. They sort by name among the tracked
+# suites, so a local 58- still runs before 95-destructive, and a checkout
+# without local/ runs the tracked suites alone.
+mapfile -t E2E_SUITE_FILES < <(
+	for f in "$E2E_DIR"/suites/*.sh "$E2E_DIR"/local/suites/*.sh; do
+		[ -e "$f" ] && printf '%s\t%s\n' "${f##*/}" "$f"
+	done | sort | cut -f2
+)
 
 die() {
 	printf 'run.sh: %s\n' "$1" >&2
@@ -159,7 +170,8 @@ validate)
 	# It reaches no guest and takes under a second, so it is the cheapest thing
 	# to run before a long unattended pass.
 	rc=0
-	for f in "$E2E_DIR"/lib/*.sh "$E2E_DIR"/suites/*.sh "$E2E_DIR/run.sh"; do
+	for f in "$E2E_DIR"/lib/*.sh "$E2E_DIR"/local/lib/*.sh "${E2E_SUITE_FILES[@]}" "$E2E_DIR/run.sh"; do
+		[ -e "$f" ] || continue
 		if bash -n "$f"; then
 			printf 'ok     %s\n' "${f#"$E2E_DIR"/}"
 		else
@@ -167,7 +179,7 @@ validate)
 			rc=1
 		fi
 	done
-	for f in "$E2E_DIR"/suites/*.sh; do
+	for f in "${E2E_SUITE_FILES[@]}"; do
 		if ! grep -q 'lib/assert.sh' "$f"; then
 			printf 'PREAMBLE %s does not source lib/assert.sh\n' "${f#"$E2E_DIR"/}"
 			rc=1
@@ -177,7 +189,7 @@ validate)
 	;;
 selftest) exec "$E2E_DIR/lib/selftest.sh" ;;
 list)
-	for s in "$E2E_DIR"/suites/*.sh; do
+	for s in "${E2E_SUITE_FILES[@]}"; do
 		printf '%s\n' "$(basename "$s" .sh)"
 	done
 	exit 0
@@ -233,7 +245,7 @@ trap cleanup EXIT
 
 export E2E_FREEBSD_HOST E2E_FREEBSD_SERVER_HOST E2E_HOST_ALIASES
 export E2E_DIR REPO_ROOT E2E_RUN_ID E2E_RUN_DIR E2E_LOG_DIR E2E_FINDINGS
-export E2E_COMMIT E2E_SSH_CTL_DIR E2E_KNOWN_FILE E2E_ARTIFACT_DIR
+export E2E_COMMIT E2E_SSH_CTL_DIR E2E_KNOWN_FILE E2E_KNOWN_LOCAL E2E_ARTIFACT_DIR
 export E2E_DRY_RUN E2E_DRY_PLAN
 
 [ "$E2E_DRY_RUN" = yes ] && printf 'DRY RUN — no guest is contacted and nothing is measured\n'
@@ -263,7 +275,7 @@ export E2E_SHIP
 RUN_STARTED="$(date -u +%s)"
 DEADLINE_HIT=no
 
-for suite_file in "$E2E_DIR"/suites/*.sh; do
+for suite_file in "${E2E_SUITE_FILES[@]}"; do
 	suite="$(basename "$suite_file" .sh)"
 
 	# A deadline turns an overnight hang into a report. Every ssh call already
@@ -326,9 +338,10 @@ if [ -z "$SUITE_FILTER" ] && [ "$E2E_DRY_RUN" = no ]; then
 	uncovered=""
 	while IFS=$'\t' read -r kid kissue _; do
 		case "$kid" in '' | '#'*) continue ;; esac
+		case "$kissue" in *[!0-9]*) ;; *) kissue="#$kissue" ;; esac
 		jq -e --arg id "$kid" 'select(.id==$id)' "$E2E_FINDINGS" >/dev/null 2>&1 ||
-			uncovered="$uncovered $kid(#$kissue)"
-	done <"$E2E_KNOWN_FILE"
+			uncovered="$uncovered $kid($kissue)"
+	done < <(cat "$E2E_KNOWN_FILE" "$E2E_KNOWN_LOCAL" 2>/dev/null)
 	if [ -n "$uncovered" ]; then
 		printf '\nknown issues with no check yet:%s\n' "$uncovered"
 	fi
