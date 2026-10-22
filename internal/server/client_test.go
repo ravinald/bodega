@@ -13,8 +13,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/aptsign"
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 	"github.com/ravinald/bodega/internal/pkgsign"
@@ -862,5 +865,120 @@ func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
 		if got, _ := os.ReadFile(scriptHome + "/" + rel); !strings.Contains(string(got), want) {
 			t.Errorf("%s lost bodega's credential after --apply:\n%s", rel, got)
 		}
+	}
+}
+
+// pocketServer mirrors two Ubuntu bases with their pockets beside one suite
+// bodega generates and signs, the layout F68's live run found the plan
+// configuring one pocket of.
+func pocketServer(t *testing.T) (*Server, *profileFixture) {
+	t.Helper()
+	s := hostedServer(t)
+	s.cfg.PublicURL = "http://bodega.example.com:8080"
+	s.cfg.AptCodename = "local"
+	s.cfg.AptSuites = []string{"local"}
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{}
+	for _, c := range []string{"noble", "noble-updates", "noble-security", "resolute", "resolute-updates", "resolute-security", "resolute-backports"} {
+		s.cfg.AptUpstreams[c] = []config.AptUpstream{{URL: "https://archive.ubuntu.com/ubuntu"}}
+	}
+	own, err := aptsign.Generate("bodega", "bodega@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate bodega key: %v", err)
+	}
+	pub, _ := own.PublicKey()
+	ring, _ := own.Keyring()
+	s.aptSign.Store(&aptSigning{signer: own, pubArmored: pub, keyring: ring})
+	return s, clientProfile(t, s)
+}
+
+func aptPlanRecords(t *testing.T, s *Server, token, codename string) []planRecord {
+	t.Helper()
+	query := "os=linux"
+	if codename != "" {
+		query += "&codename=" + codename
+	}
+	return planRecordFor(planJSON(t, s, token, query), manifest.TypeApt)
+}
+
+// B144 R1, R2, R7: a base's pockets are one choice and one stanza, in Ubuntu's
+// own order. A stanza naming resolute alone cannot install libpq-dev on a host
+// already running libpq5 from -updates.
+func TestClientAptPlanGroupsPocketsUnderTheirBase(t *testing.T) {
+	s, f := pocketServer(t)
+	recs := aptPlanRecords(t, s, f.token, "resolute")
+	if len(recs) == 0 || recs[0].Action != planInstall || recs[0].Path != clientconf.AptSourcesPath {
+		t.Fatalf("codename=resolute plan = %+v, want the sources file installed", recs)
+	}
+	code, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=resolute")
+	if code != http.StatusOK {
+		t.Fatalf("GET /client/apt = %d: %s", code, body)
+	}
+	want := "Types: deb\nURIs: http://bodega.example.com:8080/apt/\nSuites: resolute resolute-updates resolute-backports resolute-security\nComponents: " + aptsources.MirroredComponents + "\n"
+	if body != want {
+		t.Errorf("stanza =\n%s\nwant\n%s", body, want)
+	}
+
+	// noble has no backports mirrored, so its stanza leaves the pocket out.
+	_, body = clientGet(t, s, f.token, "/client/apt?os=linux&codename=noble")
+	if !strings.Contains(body, "Suites: noble noble-updates noble-security\n") || strings.Contains(body, "Signed-By:") {
+		t.Errorf("noble stanza =\n%s\nwant its two served pockets and no Signed-By:", body)
+	}
+}
+
+// B144 R1, R6, R7: with two bases and a generated suite served, the refusal
+// counts choices, not pockets.
+func TestClientAptPlanRefusalListsBasesNotPockets(t *testing.T) {
+	s, f := pocketServer(t)
+	recs := aptPlanRecords(t, s, f.token, "")
+	if len(recs) != 1 || recs[0].Action != planSkip {
+		t.Fatalf("plan with no codename = %+v, want one skip", recs)
+	}
+	if want := "serves 3 apt suites (local, noble, resolute)"; !strings.Contains(recs[0].Reason, want) {
+		t.Errorf("reason = %q, want it to contain %q", recs[0].Reason, want)
+	}
+
+	// Without the generated suite, the two choices are the two bases.
+	s.cfg.AptSuites, s.cfg.AptCodename = nil, ""
+	recs = aptPlanRecords(t, s, f.token, "")
+	if want := "serves 2 apt suites (noble, resolute)"; len(recs) != 1 || !strings.Contains(recs[0].Reason, want) {
+		t.Errorf("plan = %+v, want a skip containing %q", recs, want)
+	}
+
+	// One base served needs no codename.
+	for c := range s.cfg.AptUpstreams {
+		if strings.HasPrefix(c, "noble") {
+			delete(s.cfg.AptUpstreams, c)
+		}
+	}
+	recs = aptPlanRecords(t, s, f.token, "")
+	if len(recs) == 0 || recs[0].Action != planInstall || recs[0].Path != clientconf.AptSourcesPath {
+		t.Errorf("one base served, plan = %+v, want the sources file installed", recs)
+	}
+}
+
+// B144 R4, R7: a pocket is not a choice of its own, and the reason names the
+// base to pass.
+func TestClientAptPlanRefusesAPocketCodename(t *testing.T) {
+	s, f := pocketServer(t)
+	recs := aptPlanRecords(t, s, f.token, "resolute-updates")
+	if len(recs) != 1 || recs[0].Action == planInstall {
+		t.Fatalf("codename=resolute-updates plan = %+v, want no install", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "pass codename=resolute") {
+		t.Errorf("reason = %q, want it to name codename=resolute", recs[0].Reason)
+	}
+}
+
+// B144 R3, R7: the generated suite is never grouped, and keeps Signed-By:.
+func TestClientAptPlanKeepsAGeneratedSuiteOnItsOwnStanza(t *testing.T) {
+	s, f := pocketServer(t)
+	s.cfg.AptUpstreams["local-updates"] = []config.AptUpstream{{URL: "https://archive.ubuntu.com/ubuntu"}}
+	recs := aptPlanRecords(t, s, f.token, "local")
+	if len(recs) != 2 || recs[1].Path != aptsources.ClientKeyringPath {
+		t.Fatalf("codename=local plan = %+v, want the stanza and its keyring", recs)
+	}
+	_, body := clientGet(t, s, f.token, "/client/apt?os=linux&codename=local")
+	if !strings.Contains(body, "Suites: local\n") || !strings.Contains(body, "Signed-By: "+aptsources.ClientKeyringPath) {
+		t.Errorf("generated stanza =\n%s\nwant Suites: local alone and Signed-By:", body)
 	}
 }
