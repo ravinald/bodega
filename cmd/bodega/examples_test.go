@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,5 +94,55 @@ func assertParses(t *testing.T, line string) {
 	}
 	if err := target.ParseFlags(rest); err != nil {
 		t.Errorf("%q: %v (the flags live on a different command, or no longer exist)", line, err)
+	}
+}
+
+// A group with no RunE of its own answered an unknown verb with its help and
+// exit 0, so `bodega profile delete` read as success before it existed. Walks
+// the tree rather than a list so the next group is covered when it lands.
+func TestEveryGroupRefusesAnUnknownSubcommand(t *testing.T) {
+	loadFrom(t, "{}")
+	run := func(args ...string) (string, error) {
+		root := newRootCmd()
+		root.SetArgs(args)
+		var stdout, stderr bytes.Buffer
+		root.SetOut(&stdout)
+		root.SetErr(&stderr)
+		err := root.Execute()
+		return stderr.String(), err
+	}
+
+	var groups [][]string
+	var walk func(*cobra.Command, []string)
+	walk = func(cmd *cobra.Command, path []string) {
+		if len(path) > 0 && cmd.HasSubCommands() && !cmd.Runnable() {
+			groups = append(groups, path)
+		}
+		for _, sub := range cmd.Commands() {
+			walk(sub, append(slices.Clone(path), sub.Name()))
+		}
+	}
+	// The registered tree, since the pass under test makes every group
+	// runnable and a group with a RunE of its own decides what an argument
+	// means.
+	walk(buildRootCmd(&globalFlags{}), nil)
+	if len(groups) == 0 {
+		t.Fatal("found no groups, so this test checks nothing")
+	}
+
+	for _, path := range groups {
+		t.Run(strings.Join(path, " "), func(t *testing.T) {
+			stderr, err := run(append(slices.Clone(path), "bogus-subcommand")...)
+			if err == nil {
+				t.Errorf("bodega %s bogus-subcommand succeeded, so main exits 0", strings.Join(path, " "))
+			}
+			want := `unknown command "bogus-subcommand" for "bodega ` + strings.Join(path, " ") + `"`
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr does not carry %q:\n%s", want, stderr)
+			}
+			if _, err := run(path...); err != nil {
+				t.Errorf("bare bodega %s returned %v, want its help and exit 0", strings.Join(path, " "), err)
+			}
+		})
 	}
 }
