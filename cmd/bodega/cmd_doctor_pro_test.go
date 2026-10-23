@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,16 +18,25 @@ import (
 // attached, pro config show answers aptNews, and systemctl is-enabled answers
 // unit. api set to "unknown" makes pro api fail as an ubuntu-pro-client that
 // predates it, and "failure" makes it return a failed result; statusErr makes
-// pro status fail with it. calls logs every argv; ran logs only the ones not
+// pro status fail with it, and lookErr makes the lookup of pro fail with it.
+// calls logs every argv; ran logs only the ones not
 // scripted above, which is how a test sees what a step changed.
 type fakePro struct {
 	attached  string
 	api       string
 	statusErr error
+	lookErr   error
 	aptNews   string
 	unit      string
 	calls     []string
 	ran       []string
+}
+
+func (f *fakePro) lookPath(file string) (string, error) {
+	if f.lookErr != nil {
+		return "", &exec.Error{Name: file, Err: f.lookErr}
+	}
+	return "/usr/bin/" + file, nil
 }
 
 func (f *fakePro) run(argv []string) (string, error) {
@@ -73,7 +83,7 @@ func stubUbuntuPro(t *testing.T, hook bool, f *fakePro) *proHost {
 		}
 	}
 	saved := ubuntuPro
-	ubuntuPro = &proHost{root: root, record: filepath.Join(t.TempDir(), "etc", "doctor-ubuntu-pro.json"), run: f.run}
+	ubuntuPro = &proHost{root: root, record: filepath.Join(t.TempDir(), "etc", "doctor-ubuntu-pro.json"), run: f.run, lookPath: f.lookPath}
 	t.Cleanup(func() { ubuntuPro = saved })
 	return ubuntuPro
 }
@@ -162,6 +172,50 @@ func TestUbuntuProHookRowSkipsWhenProFails(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The hook is a dpkg conffile, so a removed but unpurged ubuntu-pro-client
+// leaves it behind with no pro to run it. That host has nothing to report and
+// nothing to quiet, and doctor asks no pro anything.
+func TestUbuntuProHookLeftoverWithoutPro(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fake := &fakePro{lookErr: exec.ErrNotFound}
+	h := stubUbuntuPro(t, true, fake)
+	if f, ok := h.finding(); ok {
+		t.Fatalf("finding = %+v, want no row", f)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("finding ran %v with pro gone", fake.calls)
+	}
+
+	srv, _ := planServer(t, map[string]string{"apt": "Types: deb\n"})
+	out, err := runDoctor(t, "--configure", "apt", "--quiet-ubuntu-pro", "--apply", "--url", srv.URL, "--allow-plaintext")
+	if err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	want := "nothing to quiet: 20apt-esm-hook.conf is left from a removed ubuntu-pro-client; nothing runs it"
+	if !strings.Contains(out, want) {
+		t.Errorf("plan lacks %q:\n%s", want, out)
+	}
+	if len(fake.calls) != 0 {
+		t.Errorf("--quiet-ubuntu-pro ran %v with pro gone", fake.calls)
+	}
+	if _, err := os.Stat(h.record); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--apply wrote %s with nothing to quiet: %v", h.record, err)
+	}
+}
+
+// A lookup that fails for any reason but absence leaves the question open.
+func TestUbuntuProHookRowSkipsWhenLookupFails(t *testing.T) {
+	fake := &fakePro{lookErr: os.ErrPermission}
+	h := stubUbuntuPro(t, true, fake)
+	f, ok := h.finding()
+	if !ok || f.Status != host.StatusSkip || !strings.Contains(f.Detail, "looking up `pro` in $PATH failed") {
+		t.Fatalf("finding = %v %+v, want a SKIPPED row naming the lookup", ok, f)
+	}
+	if len(fake.calls) != 0 {
+		t.Errorf("finding ran %v after the lookup failed", fake.calls)
 	}
 }
 
