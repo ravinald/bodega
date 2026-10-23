@@ -392,6 +392,11 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if !manifest.IsKnownType(pm.Type) {
 		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
 	}
+	if pm.Type == manifest.TypeGomod {
+		if err := manifest.ValidateGomodName(pm.Name); err != nil {
+			return err
+		}
+	}
 	if err := manifest.ValidateBinaryFilenames(pm); err != nil {
 		return err
 	}

@@ -26,7 +26,9 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
   3. Artifact sizes: backfill ArtifactSize from local files
   4. Apt placeholders: version-less apt entries left beside a resolved one
   5. Pypi URLs: entries carrying the retired pypi.org/packages/ wheel URL
-  6. Pypi names: manifests stored under a name PEP 503 does not canonicalize to
+  6. Manifest names: pypi manifests stored under a name PEP 503 does not
+     canonicalize to, and gomod manifests stored under the Go proxy's escaped
+     module path ("github.com/!burnt!sushi/toml") rather than go.mod's
   7. Manifest sync: all manifests are re-saved to the backend (S3)
   8. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
 
@@ -105,7 +107,7 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 			issues += repairPypiWheelURLs(ctx, store, dryRun, os.Stdout)
 
 			// Phase 6: Manifests stored under a non-canonical name.
-			fmt.Println("\nPhase 6: Checking pypi manifests for non-canonical names...")
+			fmt.Println("\nPhase 6: Checking pypi and gomod manifests for non-canonical names...")
 			found, unresolved := repairPypiNames(ctx, store, dryRun, os.Stdout)
 			issues += found
 
@@ -159,7 +161,7 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 				suppressReload(cmd)
 			}
 			if unresolved > 0 {
-				return fmt.Errorf("%d non-canonical pypi manifest(s) are still stored where no read composes their path; the lines above name each one and what blocked the rename. Nothing was moved, so merge the two manifests by hand and re-run", unresolved)
+				return fmt.Errorf("%d non-canonical manifest(s) are still stored where no read composes their path; the lines above name each one and what blocked the rename. Nothing was moved, so merge the two manifests by hand and re-run", unresolved)
 			}
 			return nil
 		},

@@ -8,6 +8,8 @@ import (
 
 	"net/http"
 
+	modulepath "golang.org/x/mod/module"
+
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -23,22 +25,31 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		s.handleGomodSumdb(w, r, rest)
 		return
 	}
-	var module, file, upstream string
+	var escaped, file, upstream string
 	if m, ok := strings.CutSuffix(fullPath, "/@latest"); ok && m != "" {
 		// Stored beside @v/list under the name the handler's mutable checks
 		// already recognize, so it is cached, refreshed and filtered as the
 		// listing is.
-		module, file = m, "@latest"
-		upstream = s.cfg.GomodUpstream + "/" + module + "/@latest"
+		escaped, file = m, "@latest"
+		upstream = s.cfg.GomodUpstream + "/" + escaped + "/@latest"
 	} else {
 		idx := strings.Index(fullPath, "/@v/")
 		if idx < 0 {
 			http.NotFound(w, r)
 			return
 		}
-		module = fullPath[:idx]
+		escaped = fullPath[:idx]
 		file = fullPath[idx+4:] // "list", "v1.30.0.info", etc.
-		upstream = s.cfg.GomodUpstream + "/" + module + "/@v/" + file
+		upstream = s.cfg.GomodUpstream + "/" + escaped + "/@v/" + file
+	}
+	// The wire carries an uppercase letter as "!" plus its lowercase; every
+	// manifest, profile entry and discovery row names the module as go.mod
+	// spells it. The upstream URL and the storage key keep the wire form,
+	// which is what the upstream serves and what the cache already holds.
+	module, err := modulepath.UnescapePath(escaped)
+	if err != nil {
+		http.Error(w, "module path "+escaped+" is not a valid escaped Go module path: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	s3Key := manifest.GomodFileKey(module, file)

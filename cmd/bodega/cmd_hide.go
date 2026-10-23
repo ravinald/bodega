@@ -43,6 +43,12 @@ Running it again removes the hide.`,
 				version = args[2]
 			}
 
+			if t == manifest.TypeGomod {
+				if err := manifest.ValidateGomodName(name); err != nil {
+					return err
+				}
+			}
+
 			cfg, err := loadConfig(gf)
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)

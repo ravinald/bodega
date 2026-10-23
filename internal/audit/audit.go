@@ -608,6 +608,20 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
 			}
 		}
+		renamed, collisions, err := rewriteEscapedGomodNames(context.Background(), wdb)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("rewrite escaped gomod names: %w", err)
+		}
+		if renamed > 0 {
+			slog.Info("gomod profile entries and overrides renamed to their go.mod spelling", "rows", renamed)
+		}
+		// Error, not Warn: the shipped default log_level prints only Error,
+		// and the escaped row matches no request until somebody removes it.
+		for _, c := range collisions {
+			slog.Error("gomod profile entry left under the escaped module path: the profile already lists its go.mod spelling, so no request matches it. Remove one with bodega profile remove",
+				"profile", c.Profile, "escaped", c.Escaped, "go_mod_spelling", c.Decoded)
+		}
 		seeded, err := seedDefaultAgePolicy(context.Background(), wdb)
 		if err != nil {
 			closeAll()

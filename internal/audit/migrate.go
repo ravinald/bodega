@@ -13,6 +13,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	modulepath "golang.org/x/mod/module"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -199,4 +200,127 @@ func backfillChecksumIdentity(ctx context.Context, db *sql.DB) (int64, error) {
 		return 0, fmt.Errorf("commit checksum backfill: %w", err)
 	}
 	return int64(len(fix)), nil
+}
+
+// GomodNameCollision is one escaped gomod row the rewrite left in place
+// because the go.mod spelling it decodes to is already taken.
+type GomodNameCollision struct {
+	Table   string
+	Profile string
+	Escaped string
+	Decoded string
+}
+
+// RewriteEscapedGomodNames renames every gomod profile entry and override
+// still spelled in the Go proxy's escaped form ("github.com/!burnt!sushi/toml")
+// to the go.mod spelling, and returns how many rows it renamed and which it
+// could not.
+//
+// That form was the only one a request matched before the handler decoded the
+// wire path, so an operator who listed or pinned an uppercase module wrote it
+// that way, and every check now compares the go.mod spelling. A row whose
+// decoded name the same profile already lists is left alone and returned: the
+// two carry different constraints, and choosing one is not a sweep's decision.
+// Rows that do not decode are left alone too, since no request ever matched
+// them in either spelling.
+//
+// It runs on every read-write open rather than once behind a schema version:
+// the query touches only gomod rows holding "!", a collision stays reported
+// until somebody resolves it, and a row an older binary writes later is
+// corrected on the next start.
+func (a *DB) RewriteEscapedGomodNames(ctx context.Context) (int, []GomodNameCollision, error) {
+	if a.readOnly {
+		return 0, nil, errors.New("audit db is read-only")
+	}
+	return rewriteEscapedGomodNames(ctx, a.wdb)
+}
+
+func rewriteEscapedGomodNames(ctx context.Context, db *sql.DB) (int, []GomodNameCollision, error) {
+	type entry struct{ profile, escaped, decoded string }
+	readEntries := func(query string, scan func(*sql.Rows) (entry, error)) ([]entry, error) {
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		// Closed before any write, for the reason backfillChecksumIdentity
+		// gives: the write handle has one connection.
+		defer rows.Close()
+		var out []entry
+		for rows.Next() {
+			e, err := scan(rows)
+			if err != nil {
+				return nil, err
+			}
+			decoded, err := modulepath.UnescapePath(e.escaped)
+			if err != nil {
+				continue
+			}
+			e.decoded = decoded
+			out = append(out, e)
+		}
+		return out, rows.Err()
+	}
+
+	entries, err := readEntries(
+		`SELECT profile, pkg_name FROM profile_entries WHERE pkg_type = 'gomod' AND instr(pkg_name, '!') > 0`,
+		func(r *sql.Rows) (entry, error) {
+			var e entry
+			return e, r.Scan(&e.profile, &e.escaped)
+		})
+	if err != nil {
+		return 0, nil, fmt.Errorf("read escaped gomod profile entries: %w", err)
+	}
+	overrides, err := readEntries(
+		`SELECT DISTINCT '', pkg_name FROM overrides WHERE pkg_type = 'gomod' AND instr(pkg_name, '!') > 0`,
+		func(r *sql.Rows) (entry, error) {
+			var e entry
+			return e, r.Scan(&e.profile, &e.escaped)
+		})
+	if err != nil {
+		return 0, nil, fmt.Errorf("read escaped gomod overrides: %w", err)
+	}
+	if len(entries) == 0 && len(overrides) == 0 {
+		return 0, nil, nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin gomod name rewrite: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	renamed := 0
+	var collisions []GomodNameCollision
+	for _, e := range entries {
+		var taken int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM profile_entries WHERE profile = ? AND pkg_type = 'gomod' AND pkg_name = ?`,
+			e.profile, e.decoded).Scan(&taken); err != nil {
+			return 0, nil, fmt.Errorf("check profile %s for gomod %s: %w", e.profile, e.decoded, err)
+		}
+		if taken > 0 {
+			collisions = append(collisions, GomodNameCollision{Table: "profile_entries", Profile: e.profile, Escaped: e.escaped, Decoded: e.decoded})
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE profile_entries SET pkg_name = ? WHERE profile = ? AND pkg_type = 'gomod' AND pkg_name = ?`,
+			e.decoded, e.profile, e.escaped); err != nil {
+			return 0, nil, fmt.Errorf("rename gomod %s to %s in profile %s: %w", e.escaped, e.decoded, e.profile, err)
+		}
+		renamed++
+	}
+	// An override is keyed by its own id, so two spellings of one module are
+	// two requests rather than a conflict, and each is renamed.
+	for _, e := range overrides {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE overrides SET pkg_name = ? WHERE pkg_type = 'gomod' AND pkg_name = ?`, e.decoded, e.escaped)
+		if err != nil {
+			return 0, nil, fmt.Errorf("rename gomod override %s to %s: %w", e.escaped, e.decoded, err)
+		}
+		n, _ := res.RowsAffected()
+		renamed += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit gomod name rewrite: %w", err)
+	}
+	return renamed, collisions, nil
 }
