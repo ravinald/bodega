@@ -242,6 +242,32 @@ func TestApproveProfilePinsInEachProfile(t *testing.T) {
 	}
 }
 
+// A git row is stored only under a name `bodega profile add` would accept,
+// so the queue cannot write an entry the CLI refuses, and an org-scoped
+// repository the CLI accepts is approved.
+func TestApproveProfileGitNameMatchesCLI(t *testing.T) {
+	adb := openQueueStore(t)
+	if err := adb.CreateProfileWith(t.Context(), audit.Profile{Name: "web"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{GitUpstreams: map[string]config.GitUpstream{
+		"github":  {URL: "https://github.com/"},
+		"freebsd": {URL: "https://github.com/freebsd/"},
+	}}
+	bad := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypeGit, PkgName: "github/louislam", Check: QueueProfile, Profile: "web"})
+	if _, err := ApproveQueued(t.Context(), adb, cfg, bad.ID, "alice", QueueApproval{Reason: "needed"}, queueT0); !errors.Is(err, ErrInvalidQueue) {
+		t.Errorf("approve github/louislam: err = %v, want ErrInvalidQueue", err)
+	}
+	good := queued(t, adb, audit.QueueRefusal{PkgType: manifest.TypeGit, PkgName: "freebsd/freebsd-ports", Check: QueueProfile, Profile: "web"})
+	if _, err := ApproveQueued(t.Context(), adb, cfg, good.ID, "alice", QueueApproval{Reason: "needed"}, queueT0); err != nil {
+		t.Fatalf("approve freebsd/freebsd-ports: %v", err)
+	}
+	d, err := adb.GetProfile(t.Context(), "web")
+	if err != nil || len(d.Entries) != 1 || d.Entries[0].Name != "freebsd/freebsd-ports" {
+		t.Errorf("web entries = %+v (%v), want only freebsd/freebsd-ports", d.Entries, err)
+	}
+}
+
 // Dismissing closes the row without admitting anything, and both resolutions
 // require a reason and an actor.
 func TestDismissAndRequiredFields(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -1154,28 +1155,87 @@ func TestProfileEntryVerbsMatchTheSpellingTheGateHolds(t *testing.T) {
 	}
 }
 
-// A git entry names a repository or a whole namespace, and nothing between.
-// Any other form would be stored and never matched by the smart-HTTP gate,
-// which reads as a listed repository that is refused anyway.
+// withGitUpstreams adds git_upstreams to the config newDiscoverEnv wrote, in
+// the three shapes a namespace takes: a forge's host root, one owner on it,
+// and a forge whose groups nest.
+func withGitUpstreams(t *testing.T) {
+	t.Helper()
+	path := os.Getenv(config.EnvConfigFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	doc["git_upstreams"] = map[string]any{
+		"github":  map[string]any{"url": "https://github.com/"},
+		"freebsd": map[string]any{"url": "https://github.com/freebsd/"},
+		"gitlab":  map[string]any{"url": "https://gitlab.com/"},
+	}
+	raw, err = json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// A git entry names a namespace, or the namespace followed by a repository's
+// path at least as deep as the namespace's URL implies. Any other form would
+// be stored and never matched by the smart-HTTP gate, which reads as a listed
+// repository that is refused anyway.
 func TestProfileAddGitEntryForms(t *testing.T) {
 	newDiscoverEnv(t)
+	withGitUpstreams(t)
 	mustRunProfile(t, "create", "kuma")
-	for _, name := range []string{"github", "github/louislam/uptime-kuma"} {
+	for _, name := range []string{
+		"github", "github/louislam/uptime-kuma", "github/louislam/uptime-kuma/extra",
+		"freebsd", "freebsd/freebsd-ports",
+		"gitlab/group/sub/repo",
+		"legacy-bundle",
+	} {
 		if _, err := runProfile(t, "add", "kuma", "git", name); err != nil {
 			t.Errorf("add git %q: %v", name, err)
 		}
 	}
-	for _, name := range []string{
-		"github/louislam", "github/louislam/uptime-kuma.git", "github/louislam/uptime-kuma/extra",
-		"github//uptime-kuma", "github/../uptime-kuma",
+	for _, tc := range []struct{ name, want string }{
+		{"github/louislam", "https://github.com/"},
+		{"github/louislam", "at least 2 path segment(s), e.g. github/<owner>/<repo>"},
+		{"freebsd/freebsd-ports.git", "write freebsd/freebsd-ports"},
+		{"github/louislam/uptime-kuma.git", "ends in .git"},
+		{"github//uptime-kuma", "empty"},
+		{"github/./uptime-kuma", `"."`},
+		{"github/../uptime-kuma", `".."`},
+		{"bitbucket/owner/repo", "Configured namespaces: freebsd, github, gitlab"},
 	} {
-		_, err := runProfile(t, "add", "kuma", "git", name)
+		_, err := runProfile(t, "add", "kuma", "git", tc.name)
 		if err == nil {
-			t.Errorf("add git %q was accepted; it is neither a repository nor a namespace", name)
+			t.Errorf("add git %q was accepted; no clone path matches it", tc.name)
 			continue
 		}
-		if !strings.Contains(err.Error(), "<namespace>/<owner>/<repo>") || !strings.Contains(err.Error(), "  <namespace> ") {
-			t.Errorf("add git %q refused with %q, want it to name both entry forms", name, err)
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("add git %q refused with %q, want it to contain %q", tc.name, err, tc.want)
 		}
+	}
+}
+
+// The refusal names the depth the namespace's own URL implies, so an
+// org-scoped namespace is not answered with the host-root example.
+func TestRequireGitEntryNameExampleFollowsNamespace(t *testing.T) {
+	cfg := &config.Config{GitUpstreams: map[string]config.GitUpstream{
+		"corp": {URL: "https://git.corp.example/platform/"},
+	}}
+	err := requireGitEntryName(cfg, manifest.TypeGit, "corp/a.git")
+	if err == nil || !strings.Contains(err.Error(), "write corp/a") {
+		t.Errorf("corp/a.git: err = %v, want the suffix-free name", err)
+	}
+	if err := requireGitEntryName(cfg, manifest.TypeGit, "corp/tool"); err != nil {
+		t.Errorf("corp/tool under an org-scoped namespace: %v", err)
+	}
+	if err := requireGitEntryName(cfg, manifest.TypePypi, "corp/x/y/z.git"); err != nil {
+		t.Errorf("a non-git type was judged by the git rule: %v", err)
 	}
 }

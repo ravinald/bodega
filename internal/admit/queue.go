@@ -123,7 +123,7 @@ func ApproveQueued(ctx context.Context, adb *audit.DB, cfg *config.Config, id in
 			resolution = "allow-list rule " + out.Rule.ID
 		}
 	case QueueProfile:
-		out.Profiles, err = approveProfile(ctx, adb, row, actor, a.Reason, now)
+		out.Profiles, err = approveProfile(ctx, adb, cfg, row, actor, a.Reason, now)
 		if err == nil {
 			resolution = "pinned in profile " + strings.Join(out.Profiles, ", ")
 		}
@@ -216,12 +216,19 @@ func approveAllowList(ctx context.Context, adb *audit.DB, row audit.QueueRow, ac
 // `bodega profile pin` makes, with the reason and the actor on the entry.
 // A row with no version names a package refused at the membership level,
 // which is admitted by listing it with no constraint.
-func approveProfile(ctx context.Context, adb *audit.DB, row audit.QueueRow, actor, reason string, now time.Time) ([]string, error) {
+func approveProfile(ctx context.Context, adb *audit.DB, cfg *config.Config, row audit.QueueRow, actor, reason string, now time.Time) ([]string, error) {
 	if len(row.Profiles) == 0 {
 		return nil, fmt.Errorf("%w: queue row %d names no profile to admit it into", ErrInvalidQueue, row.ID)
 	}
 	if !manifest.IsKnownType(row.PkgType) {
 		return nil, fmt.Errorf("%w: unknown type %q", ErrInvalidQueue, row.PkgType)
+	}
+	// The same check `bodega profile add` runs, so the two writers cannot
+	// store a git entry one of them would refuse.
+	if row.PkgType == manifest.TypeGit {
+		if err := cfg.ValidateGitEntryName(row.PkgName); err != nil {
+			return nil, fmt.Errorf("%w: %v; `bodega queue dismiss %d` closes the row", ErrInvalidQueue, err, row.ID)
+		}
 	}
 	var done []string
 	for _, name := range row.Profiles {

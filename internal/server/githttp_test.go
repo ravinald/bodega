@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1499,5 +1500,72 @@ func TestGitProfileUnknownNamespaceStill404s(t *testing.T) {
 	rows := waitForNoNamespace(t, f.s)
 	if len(rows) != 1 || rows[0].PkgName != "gitlab" || rows[0].PatternHint != "gitlab" {
 		t.Errorf("no_namespace rows = %+v, want one keyed on %q", rows, "gitlab")
+	}
+}
+
+// Every namespace shape gets a refusal whose suggested entry the CLI accepts:
+// the client body's `bodega profile add` and the discovery row's pattern both
+// pass ValidateGitEntryName, which is what `bodega profile add` and `bodega
+// queue approve` run. The names are refused before any upstream is reached,
+// so the https URLs below are never dialed.
+func TestGitProfileRefusalSuggestsAnEntryTheCLIAccepts(t *testing.T) {
+	f := gitProfileHost(t, "corp/team/tool")
+	f.s.cfg.GitUpstreams["github"] = config.GitUpstream{URL: "https://github.com/", Mode: config.UpstreamModeOpen}
+	f.s.cfg.GitUpstreams["freebsd"] = config.GitUpstream{URL: "https://github.com/freebsd/", Mode: config.UpstreamModeOpen}
+	f.s.cfg.GitUpstreams["gitlab"] = config.GitUpstream{URL: "https://gitlab.com/", Mode: config.UpstreamModeOpen}
+	suggested := regexp.MustCompile("`bodega profile add kuma git ([^`]+)`")
+
+	for _, tc := range []struct{ shape, clone, want string }{
+		{"host-root", "github/louislam/uptime-kuma.git", "github/louislam/uptime-kuma"},
+		{"org-scoped", "freebsd/freebsd-ports.git", "freebsd/freebsd-ports"},
+		{"nested-group", "gitlab/group/sub/repo.git", "gitlab/group/sub/repo"},
+	} {
+		t.Run(tc.shape, func(t *testing.T) {
+			status, body := getWithToken(t, f.s, f.token, "/git/"+tc.clone+"/info/refs?service=git-upload-pack")
+			if status != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (%s)", status, body)
+			}
+			m := suggested.FindStringSubmatch(body)
+			if m == nil || m[1] != tc.want {
+				t.Fatalf("refusal suggests %v, want %q in:\n%s", m, tc.want, body)
+			}
+			if err := f.s.cfg.ValidateGitEntryName(m[1]); err != nil {
+				t.Errorf("the client is told to run `bodega profile add kuma git %s`, which the CLI refuses: %v", m[1], err)
+			}
+		})
+	}
+
+	rows := waitForBinaryRows(t, f.s, audit.DecisionDenied, 3)
+	if len(rows) != 3 {
+		t.Fatalf("denied rows = %d, want 3 (%+v)", len(rows), rows)
+	}
+	for _, row := range rows {
+		entry := strings.TrimPrefix(row.PatternHint, "bodega profile add kuma git ")
+		if err := f.s.cfg.ValidateGitEntryName(entry); err != nil {
+			t.Errorf("pattern_hint %q suggests an entry the CLI refuses: %v", row.PatternHint, err)
+		}
+	}
+}
+
+// A clone path shallower than its namespace's repositories names nothing a
+// profile could list, so it is a 404 with no row rather than a refusal
+// suggesting an entry the CLI would reject.
+func TestGitProfileUnlistablePathIs404(t *testing.T) {
+	f := gitProfileHost(t, "corp/team/tool")
+	f.s.cfg.GitUpstreams["github"] = config.GitUpstream{URL: "https://github.com/", Mode: config.UpstreamModeOpen}
+
+	status, body := getWithToken(t, f.s, f.token, "/git/github/louislam.git/info/refs?service=git-upload-pack")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (%s)", status, body)
+	}
+	if strings.Contains(body, "bodega profile add") {
+		t.Errorf("the 404 suggests a profile entry:\n%s", body)
+	}
+	rows, err := f.s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{Decision: audit.DecisionDenied})
+	if err != nil {
+		t.Fatalf("list discovery: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("denied rows = %+v, want none for a path no entry can name", rows)
 	}
 }

@@ -1663,12 +1663,14 @@ entries[0] and entries[1] both name pypi/django, which is one entry: the later r
   Keep the one you mean
 ```
 
-A `git` entry takes one of two forms, and `add` refuses anything else with a message naming both:
+A `git` entry is the namespace, or the namespace followed by the repository's path. `add` and `bodega queue approve` both refuse anything else, naming the namespace's URL and the depth it requires:
 
-| Entry                        | Admits                                                  |
-| ---------------------------- | ------------------------------------------------------- |
-| `<namespace>/<owner>/<repo>` | that one repository, e.g. `github/louislam/uptime-kuma` |
-| `<namespace>`                | every repository the `git_upstreams` namespace serves   |
+| Entry                | Admits                                                                             |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| `<namespace>/<path>` | that one repository, e.g. `github/louislam/uptime-kuma` or `freebsd/freebsd-ports` |
+| `<namespace>`        | every repository the `git_upstreams` namespace serves                              |
+
+The path is whatever follows the namespace in the clone URL. How deep it runs depends on the namespace's `url`: under `"github": { "url": "https://github.com/" }` a repository is `<owner>/<repo>`, so `github/louislam` is refused as too short, while under `"freebsd": { "url": "https://github.com/freebsd/" }` the URL already names the owner and the clone `/git/freebsd/freebsd-ports.git` is listed as `freebsd/freebsd-ports`. There is no maximum, so a forge with nested groups lists `gitlab/group/sub/repo`. The first segment has to be a configured namespace; `add` lists the configured ones when it is not.
 
 The repository has no `.git` suffix, though the clone URL carries one. A namespace entry admits the whole forge: `bodega profile add web git github` lets every host bound to `web` clone anything on GitHub that the allow-list passes. List repositories instead. A refused clone names the repository in its discovery row and in the `profile add` command it prints, so a profile learned from observed rows lists repositories. A legacy bundle is listed under its bundle name, which is the one-segment form; see [Git smart-HTTP](#git-smart-http).
 
@@ -5295,7 +5297,7 @@ What is on disk is inspected rather than counted. `git clone --mirror` creates t
 
 A profile closed for `git` admits a clone when it lists the repository (`github/louislam/uptime-kuma`) or the namespace (`github`). The namespace entry admits every repository on that forge to every host the profile binds, so prefer repository entries and keep the namespace form for a forge you trust whole, such as an internal one.
 
-Both legs of a clone, `info/refs` and `git-upload-pack`, are judged against the same name. A refused clone is a 403 and, under `--expansion warn` or `block`, a discovery row with decision `denied`, `pkg_name` set to the repository and a pattern of `bodega profile add <profile> git <namespace>/<owner>/<repo>`:
+Both legs of a clone, `info/refs` and `git-upload-pack`, are judged against the same name. A refused clone is a 403 and, under `--expansion warn` or `block`, a discovery row with decision `denied`, `pkg_name` set to the repository and a pattern of `bodega profile add <profile> git <namespace>/<path>`, an entry `add` accepts. A clone path too short to name a repository under its namespace (`/git/github/louislam.git` where `github` points at `https://github.com/`) is a 404 with no row instead, because no entry could admit it except the namespace:
 
 ```text
 $ bodega discover list git
