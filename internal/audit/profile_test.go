@@ -2,7 +2,11 @@ package audit
 
 import (
 	"errors"
+	"maps"
+	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -208,5 +212,176 @@ func TestProfileNameIsAddressable(t *testing.T) {
 		if err := db.CreateProfile(ctx, Profile{Name: bad}); err == nil {
 			t.Errorf("profile name %q was accepted; the CLI could not address it again", bad)
 		}
+	}
+}
+
+// seedDeletableProfile writes a profile carrying a row in every table
+// DeleteProfile clears, plus a second profile it must leave alone.
+func seedDeletableProfile(t *testing.T, db *DB, name string) {
+	t.Helper()
+	ctx := t.Context()
+	if err := db.CreateProfileWith(ctx, Profile{Name: name},
+		[]ProfileTypeRule{
+			{Type: manifest.TypeApt, Membership: MembershipOpen, VersionDefault: VersionFloating},
+			{Type: manifest.TypePypi, Membership: MembershipOpen, VersionDefault: VersionFloating},
+		},
+		[]ProfileEntry{
+			{Type: manifest.TypeApt, Name: "nginx"},
+			{Type: manifest.TypeApt, Name: "curl"},
+			{Type: manifest.TypePypi, Name: "requests"},
+		}); err != nil {
+		t.Fatalf("create %s: %v", name, err)
+	}
+	if _, err := db.AcceptInventoryBaseline(ctx, InventoryBaseline{
+		Profile:    name,
+		Components: []BaselineComponent{{Ecosystem: "deb", Name: "nginx"}},
+	}); err != nil {
+		t.Fatalf("accept baseline for %s: %v", name, err)
+	}
+}
+
+// profileRowCounts counts every row stored under a profile's name, so a
+// refusal can be shown to have removed nothing.
+func profileRowCounts(t *testing.T, db *DB, name string) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for table, query := range map[string]string{
+		"profiles":         `SELECT COUNT(*) FROM profiles WHERE name = ?`,
+		"profile_types":    `SELECT COUNT(*) FROM profile_types WHERE profile = ?`,
+		"profile_entries":  `SELECT COUNT(*) FROM profile_entries WHERE profile = ?`,
+		"profile_bindings": `SELECT COUNT(*) FROM profile_bindings WHERE profile = ?`,
+		"baselines":        `SELECT COUNT(*) FROM inventory_baselines WHERE profile = ?`,
+		"components": `SELECT COUNT(*) FROM inventory_baseline_components
+			WHERE baseline_id IN (SELECT id FROM inventory_baselines WHERE profile = ?)`,
+	} {
+		var n int
+		if err := db.db.QueryRowContext(t.Context(), query, name).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		out[table] = n
+	}
+	return out
+}
+
+func TestDeleteProfileRemovesEveryRow(t *testing.T) {
+	ctx := t.Context()
+	db := profileTestDB(t)
+	seedDeletableProfile(t, db, "web")
+	seedDeletableProfile(t, db, "db")
+	untouched := profileRowCounts(t, db, "db")
+
+	d, err := db.DeleteProfile(ctx, "web", false)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if d.Types != 2 || d.Entries != 3 || d.Baselines != 1 || d.BaselineComponents != 1 || len(d.Unbound) != 0 {
+		t.Errorf("deletion counts = %+v, want 2 types, 3 entries, 1 baseline, 1 component, none unbound", d)
+	}
+	for table, n := range profileRowCounts(t, db, "web") {
+		if n != 0 {
+			t.Errorf("%s still holds %d rows for a deleted profile", table, n)
+		}
+	}
+	if _, err := db.GetProfile(ctx, "web"); !errors.Is(err, ErrNoProfile) {
+		t.Errorf("GetProfile after delete returned %v, want ErrNoProfile", err)
+	}
+	if got := profileRowCounts(t, db, "db"); !maps.Equal(got, untouched) {
+		t.Errorf("deleting web changed db: before %v, after %v", untouched, got)
+	}
+	if b, err := db.CurrentInventoryBaseline(ctx, "", "web"); err != nil || b != nil {
+		t.Errorf("a profile re-created as web would adopt baseline %+v (err %v)", b, err)
+	}
+}
+
+func TestDeleteProfileRefusesABoundProfile(t *testing.T) {
+	ctx := t.Context()
+	db := profileTestDB(t)
+	seedDeletableProfile(t, db, "web")
+	for _, id := range []string{"web02", "web01"} {
+		if _, err := db.BindProfile(ctx, ProfileBinding{Identity: id, Profile: "web"}); err != nil {
+			t.Fatalf("bind %s: %v", id, err)
+		}
+	}
+	before := profileRowCounts(t, db, "web")
+
+	_, err := db.DeleteProfile(ctx, "web", false)
+	if !errors.Is(err, ErrProfileBound) {
+		t.Fatalf("deleting a bound profile returned %v, want ErrProfileBound", err)
+	}
+	if !strings.Contains(err.Error(), "web01, web02") {
+		t.Errorf("the refusal does not name the bound identities: %v", err)
+	}
+	if after := profileRowCounts(t, db, "web"); !maps.Equal(before, after) {
+		t.Errorf("a refused delete removed rows: before %v, after %v", before, after)
+	}
+}
+
+func TestDeleteProfileUnbindRemovesTheBindings(t *testing.T) {
+	ctx := t.Context()
+	db := profileTestDB(t)
+	seedDeletableProfile(t, db, "web")
+	seedDeletableProfile(t, db, "db")
+	for id, p := range map[string]string{"web01": "web", "web02": "web", "db01": "db"} {
+		if _, err := db.BindProfile(ctx, ProfileBinding{Identity: id, Profile: p}); err != nil {
+			t.Fatalf("bind %s: %v", id, err)
+		}
+	}
+
+	d, err := db.DeleteProfile(ctx, "web", true)
+	if err != nil {
+		t.Fatalf("delete --unbind: %v", err)
+	}
+	if !slices.Equal(d.Unbound, []string{"web01", "web02"}) {
+		t.Errorf("unbound = %v, want [web01 web02]", d.Unbound)
+	}
+	for table, n := range profileRowCounts(t, db, "web") {
+		if n != 0 {
+			t.Errorf("%s still holds %d rows for a deleted profile", table, n)
+		}
+	}
+	bindings, err := db.ListProfileBindings(ctx, "")
+	if err != nil {
+		t.Fatalf("list bindings: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].Identity != "db01" {
+		t.Errorf("bindings after delete = %+v, want db01 alone", bindings)
+	}
+}
+
+func TestDeleteProfileRefusesAnUnknownName(t *testing.T) {
+	db := profileTestDB(t)
+	_, err := db.DeleteProfile(t.Context(), "nope", false)
+	if !errors.Is(err, ErrNoProfile) {
+		t.Fatalf("deleting an unknown profile returned %v, want ErrNoProfile", err)
+	}
+	for _, want := range []string{`"nope"`, "bodega profile list"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %s: %v", want, err)
+		}
+	}
+}
+
+func TestDeleteProfileRefusesAReadOnlyDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	seedDeletableProfile(t, seed, "web")
+	_ = seed.Close()
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	ro, err := Open(path)
+	if err != nil {
+		t.Fatalf("read-only open: %v", err)
+	}
+	defer ro.Close()
+	if !ro.ReadOnly() {
+		t.Skip("the file opened writable, as it does for root")
+	}
+	if _, err := ro.DeleteProfile(t.Context(), "web", true); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("delete on a read-only db returned %v, want a read-only error", err)
 	}
 }

@@ -476,6 +476,101 @@ func (a *DB) UnbindProfile(ctx context.Context, identity string) (bool, error) {
 	return n == 1, err
 }
 
+// ProfileDeletion is what DeleteProfile removed, counted per table.
+type ProfileDeletion struct {
+	Profile            string
+	Types              int64
+	Entries            int64
+	Baselines          int64
+	BaselineComponents int64
+	Unbound            []string
+}
+
+// ErrProfileBound is returned by DeleteProfile for a profile identities still
+// resolve to, when it was not asked to unbind them.
+var ErrProfileBound = errors.New("profile is bound")
+
+// DeleteProfile removes a profile and everything stored under its name, in one
+// transaction. A bound profile is refused unless unbind is set: deleting it
+// would leave each of those hosts bound to a name nothing defines, and the
+// operator would learn which hosts changed policy from the hosts.
+//
+// The baselines go with it because a baseline is keyed by the profile name and
+// the newest row is the one in force: one left behind would be adopted by a
+// profile later created under the same name.
+func (a *DB) DeleteProfile(ctx context.Context, name string, unbind bool) (ProfileDeletion, error) {
+	name = strings.TrimSpace(name)
+	del := ProfileDeletion{Profile: name}
+	if a.readOnly {
+		return del, errors.New("audit db is read-only")
+	}
+	tx, err := a.writer().BeginTx(ctx, nil)
+	if err != nil {
+		return del, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profiles WHERE name = ?`, name).Scan(&n); err != nil {
+		return del, err
+	}
+	if n == 0 {
+		return del, fmt.Errorf("%w: %q; bodega profile list shows the names that exist", ErrNoProfile, name)
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT identity FROM profile_bindings WHERE profile = ? ORDER BY identity`, name)
+	if err != nil {
+		return del, err
+	}
+	var bound []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return del, err
+		}
+		bound = append(bound, id)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return del, err
+	}
+	if len(bound) > 0 && !unbind {
+		return del, fmt.Errorf("%w: %q is bound to %s", ErrProfileBound, name, strings.Join(bound, ", "))
+	}
+
+	exec := func(dst *int64, query string) error {
+		res, err := tx.ExecContext(ctx, query, name)
+		if err != nil {
+			return err
+		}
+		*dst, err = res.RowsAffected()
+		return err
+	}
+	var unboundN, profilesN int64
+	for _, step := range []struct {
+		dst   *int64
+		query string
+	}{
+		{&unboundN, `DELETE FROM profile_bindings WHERE profile = ?`},
+		{&del.Entries, `DELETE FROM profile_entries WHERE profile = ?`},
+		{&del.Types, `DELETE FROM profile_types WHERE profile = ?`},
+		{&del.BaselineComponents, `DELETE FROM inventory_baseline_components
+		   WHERE baseline_id IN (SELECT id FROM inventory_baselines WHERE profile = ?)`},
+		{&del.Baselines, `DELETE FROM inventory_baselines WHERE profile = ?`},
+		{&profilesN, `DELETE FROM profiles WHERE name = ?`},
+	} {
+		if err := exec(step.dst, step.query); err != nil {
+			return del, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return del, err
+	}
+	del.Unbound = bound
+	return del, nil
+}
+
 // ListProfileBindings returns every binding, or those of one profile when it
 // is named. Ordered by identity.
 func (a *DB) ListProfileBindings(ctx context.Context, profile string) ([]ProfileBinding, error) {
