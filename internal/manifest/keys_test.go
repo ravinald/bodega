@@ -1,6 +1,9 @@
 package manifest
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // roundTrip is one type's constructor output and the identity ParseKey must
 // read back out of it.
@@ -233,5 +236,39 @@ func TestParseKeySplitsFlatFilenamesOnTheVersionRule(t *testing.T) {
 		if name != tc.name || version != tc.version {
 			t.Errorf("ParseKey(%q) = (_, %q, %q), want (%q, %q)", tc.key, name, version, tc.name, tc.version)
 		}
+	}
+}
+
+func TestGomodKeysAreTheEscapedModulePath(t *testing.T) {
+	for module, want := range map[string]string{
+		"github.com/BurntSushi/toml": "gomod/github.com/!burnt!sushi/toml/@v/list",
+		"golang.org/x/mod":           "gomod/golang.org/x/mod/@v/list",
+		// A manifest named in the escaped form before such names were refused
+		// keeps the key its objects were written under.
+		"github.com/!burnt!sushi/toml": "gomod/github.com/!burnt!sushi/toml/@v/list",
+	} {
+		if got := GomodListKey(module); got != want {
+			t.Errorf("GomodListKey(%q) = %q, want %q", module, got, want)
+		}
+	}
+}
+
+func TestValidateGomodNameRefusesTheEscapedForm(t *testing.T) {
+	if err := ValidateGomodName("github.com/BurntSushi/toml"); err != nil {
+		t.Errorf("the go.mod spelling was refused: %v", err)
+	}
+	err := ValidateGomodName("github.com/!burnt!sushi/toml")
+	if err == nil || !strings.Contains(err.Error(), "github.com/BurntSushi/toml") {
+		t.Errorf("the escaped form = %v, want a refusal naming github.com/BurntSushi/toml", err)
+	}
+	if err := ValidateGomodName("github.com/!!x/toml"); err == nil {
+		t.Errorf("a name with '!' that does not decode was accepted")
+	}
+}
+
+func TestParseKeyReadsAGomodKeyBackInGoModSpelling(t *testing.T) {
+	typ, name, version := ParseKey(GomodKey("github.com/BurntSushi/toml", "v1.4.0", ".zip"))
+	if typ != TypeGomod || name != "github.com/BurntSushi/toml" || version != "v1.4.0" {
+		t.Errorf("ParseKey = (%q, %q, %q), want (gomod, github.com/BurntSushi/toml, v1.4.0)", typ, name, version)
 	}
 }

@@ -106,8 +106,9 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			}
 
 			// Use pm.Name (original module path with slashes) for the upstream URL,
-			// not the safe name from the index which has slashes replaced with --.
-			base := proxy + "/" + pm.Name + "/@v/" + ve.Version
+			// not the safe name from the index which has slashes replaced with --,
+			// escaped as the proxy protocol requires of an uppercase letter.
+			base := proxy + "/" + manifest.GomodEscapedPath(pm.Name) + "/@v/" + ve.Version
 
 			var fetchErr error
 			for _, ext := range []string{".info", ".mod", ".zip"} {

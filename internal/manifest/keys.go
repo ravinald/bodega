@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	modulepath "golang.org/x/mod/module"
 )
 
 // Object keys — the one derivation of where an artifact's bytes live.
@@ -662,10 +664,24 @@ func AptKey(poolPath string) string {
 }
 
 // GomodFileKey returns the key for one file under a module's @v/ directory.
-// module keeps its slashes; file is what the Go client asks for verbatim
-// ("v1.30.0.zip", "list", "@latest").
+// module is the go.mod spelling and is stored escaped, as the proxy protocol
+// carries it, so the key is the request path a client sends and an upstream
+// response cached under it is found again; file is what the Go client asks
+// for verbatim ("v1.30.0.zip", "list", "@latest").
 func GomodFileKey(module, file string) string {
-	return gomodPrefix + module + "/@v/" + file
+	return gomodPrefix + GomodEscapedPath(module) + "/@v/" + file
+}
+
+// GomodEscapedPath returns module in the proxy protocol's escaped form, an
+// uppercase letter becoming "!" plus its lowercase. A path that does not escape
+// (one already carrying "!", which a manifest written before names were
+// refused in that form may hold) is returned unchanged, so its objects keep the
+// key they were written under.
+func GomodEscapedPath(module string) string {
+	if escaped, err := modulepath.EscapePath(module); err == nil {
+		return escaped
+	}
+	return module
 }
 
 // GomodSumdbKey returns the key a checksum-database response is cached under.
@@ -894,8 +910,13 @@ func ParseKey(key string) (typ, name, version string) {
 		if idx < 0 {
 			return TypeGomod, "", ""
 		}
-		// The module path keeps its slashes, so it is not a safe name.
+		// The module path keeps its slashes, so it is not a safe name. It is
+		// stored escaped and read back as go.mod spells it, the name every
+		// constructor above takes.
 		module, file := rest[:idx], rest[idx+len("/@v/"):]
+		if decoded, err := modulepath.UnescapePath(module); err == nil {
+			module = decoded
+		}
 		for _, ext := range []string{".zip", ".info", ".mod"} {
 			if base, found := strings.CutSuffix(file, ext); found {
 				return TypeGomod, module, base
