@@ -404,6 +404,10 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 		s = ensureMirroredFreeBSD(bcfg, store, "")
 	case manifest.TypeDistfiles:
 		s = ensureFetchedDistfiles(bcfg, store, "")
+	case manifest.TypeRubygems:
+		// No stage writes a gem to disk, so there is nothing to stage. A gem
+		// file already under rubygems_root still uploads.
+		s = &builder.Summary{}
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

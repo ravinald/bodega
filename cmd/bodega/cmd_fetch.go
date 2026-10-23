@@ -152,6 +152,8 @@ it once before a hosted index can date them.`,
 					allSummaries = append(allSummaries,
 						builder.FetchDistfiles(bcfg, store, entryFilter),
 					)
+				case manifest.TypeRubygems:
+					fmt.Fprintf(os.Stdout, "\n>>> [rubygems] nothing to %s: gems are pulled through /rubygems/ on first request\n", "fetch")
 				}
 			}
 

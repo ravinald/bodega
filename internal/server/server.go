@@ -1014,6 +1014,9 @@ func (s *Server) registerRoutes() {
 	// cargo sparse registry (sparse+https://bodega/cargo/)
 	m.HandleFunc("GET /cargo/{path...}", s.handleCargo)
 
+	// RubyGems registry (gem sources / Bundler source https://bodega/rubygems/)
+	m.HandleFunc("GET /rubygems/{path...}", s.handleRubygems)
+
 	// FreeBSD pkg repository mirror. One route for the whole tree: the path a
 	// pkg client composes is <abi>/<repo>/<rest>, and rest is a repository
 	// root file or a catalogue record's own repopath, which carries any

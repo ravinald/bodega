@@ -1241,6 +1241,7 @@ What it keeps: the config file, and every artifact in storage. Stored artifacts 
 | `helm`      | `helm_root`      | `charts`                                                                                                                   |
 | `npm`       | `npm_root`       | `npm`                                                                                                                      |
 | `cargo`     | `cargo_root`     | `cargo`                                                                                                                    |
+| `rubygems`  | `rubygems_root`  | `rubygems`                                                                                                                 |
 | `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
 | `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
 
@@ -3840,6 +3841,7 @@ A default config is created on first run. All fields are optional.
   "helm_root": "",
   "npm_root": "",
   "cargo_root": "",
+  "rubygems_root": "",
   "freebsd_root": "",
   "tls_cert": "",
   "tls_key": "",
@@ -3860,6 +3862,7 @@ A default config is created on first run. All fields are optional.
   "pypi_upstream": "https://pypi.org",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
+  "rubygems_upstream": "https://rubygems.org",
   "distfiles_upstream": "http://distcache.FreeBSD.org/ports-distfiles/",
   "distfiles_ports_tree": "",
   "distfiles_environment_variables": {},
@@ -4303,18 +4306,19 @@ S3 uploads go through the multipart uploader, so an artifact larger than 5 GB re
 
 Each type can build under its own directory instead of `build_root`, which is what puts wheels on a large volume and binaries on fast SSD. One key per type, empty meaning `build_root`:
 
-| Key              | Type      | Directory it roots                                                               |
-| ---------------- | --------- | -------------------------------------------------------------------------------- |
-| `apt_root`       | apt       | `<root>/apt-repo`                                                                |
-| `git_root`       | git       | `<root>/bundles`                                                                 |
-| `pypi_root`      | pypi      | `<root>/wheels`                                                                  |
-| `binary_root`    | binary    | `<root>/binaries`                                                                |
-| `gomod_root`     | gomod     | `<root>/gomod`                                                                   |
-| `helm_root`      | helm      | `<root>/charts`                                                                  |
-| `npm_root`       | npm       | `<root>/npm`                                                                     |
-| `cargo_root`     | cargo     | `<root>/cargo`                                                                   |
-| `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                 |
-| `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>` |
+| Key              | Type      | Directory it roots                                                                    |
+| ---------------- | --------- | ------------------------------------------------------------------------------------- |
+| `apt_root`       | apt       | `<root>/apt-repo`                                                                     |
+| `git_root`       | git       | `<root>/bundles`                                                                      |
+| `pypi_root`      | pypi      | `<root>/wheels`                                                                       |
+| `binary_root`    | binary    | `<root>/binaries`                                                                     |
+| `gomod_root`     | gomod     | `<root>/gomod`                                                                        |
+| `helm_root`      | helm      | `<root>/charts`                                                                       |
+| `npm_root`       | npm       | `<root>/npm`                                                                          |
+| `cargo_root`     | cargo     | `<root>/cargo`                                                                        |
+| `rubygems_root`  | rubygems  | `<root>/rubygems`, which nothing writes yet: every gem is pulled through `/rubygems/` |
+| `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                      |
+| `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>`      |
 
 Every command that reads or writes an artifact resolves through the same root: `bodega build run`, `fetch`, `package`, `upload`, `sync`, `repair` and the TUI. An upload that finds nothing names the directory it walked, so a root one command resolved differently from the build is visible in the skip line rather than reported as an empty build:
 
@@ -4337,7 +4341,7 @@ Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`,
 
 `custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
 
-**Gap:** the TUI's config form shows four of the ten roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
+**Gap:** the TUI's config form shows four of the eleven roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `rubygems_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -5040,6 +5044,42 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 `deps` is the dependency list `bodega build fetch` recorded from the upstream sparse index for that version, and `[]` where it recorded none: cargo refuses to deserialize a line missing the member, before it reaches the crate the line describes. The record comes from the index rather than from the `Cargo.toml` inside the `.crate`, because a registry dependency carries `name`, `req`, `features`, `optional`, `default_features`, `target` and `kind`, and `Cargo.toml`'s workspace inheritance, `path` dependencies and `git` dependencies map onto none of that. The registry resolved them when the crate was published, and the index line is where that resolution is written down. An index host that cannot be reached during a fetch logs a warning and records nothing; the crate's own bytes are unaffected and a later `--force` fetch fills the record in.
 
 **Gap:** a generated index line declares `features: {}`. bodega records no cargo feature table, so a crate whose dependency needs a named feature resolves and downloads but may not compile. Recording the feature map is the same mechanism as `deps` and waits on nothing but the work.
+
+**RubyGems** (`~/.gemrc` for `gem`, `~/.bundle/config` for Bundler):
+
+```yaml
+---
+:sources:
+- https://bodega-host:8080/rubygems/
+```
+
+```yaml
+---
+BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: "https://bodega-host:8080/rubygems/"
+```
+
+`gem sources --remove https://rubygems.org/ --add https://bodega-host:8080/rubygems/` writes the first, and `bundle config set --global mirror.https://rubygems.org https://bodega-host:8080/rubygems/` the second. Both are needed. `gem` reads its source list, while Bundler reads the `source` line in the Gemfile, so the mirror is what sends a Gemfile naming `https://rubygems.org` to bodega without editing it. A source list that keeps rubygems.org beside bodega lets `gem` reach rubygems.org for anything bodega refuses.
+
+**Gap:** `bodega doctor --configure` and the setup script do not write these two files yet, so install them by hand. The TUI and the web UI show both.
+
+bodega serves the registry under `/rubygems/`, proxied from [`rubygems_upstream`](#upstream-hosts) byte for byte:
+
+| Path                                                             | What it is                                                   | Cached as                               |
+| ---------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------- |
+| `versions`                                                       | Bundler's compact index: every gem and its versions          | mutable, refreshed after `metadata_ttl` |
+| `info/<gem>`                                                     | Bundler's compact index: one gem's versions and dependencies | mutable                                 |
+| `gems/<name>-<version>[-<platform>].gem`                         | A gem file                                                   | immutable                               |
+| `quick/Marshal.4.8/<name>-<version>[-<platform>].gemspec.rz`     | A gemspec, which `gem` reads before the gem                  | immutable                               |
+| `specs.4.8.gz`, `latest_specs.4.8.gz`, `prerelease_specs.4.8.gz` | The full index `gem` reads without a compact index client    | mutable                                 |
+| `api/v1/dependencies?gems=<a>,<b>`                               | The dependency API older Bundler versions query              | mutable, one copy per gem list          |
+
+Any other path under `/rubygems/` is a 404, and no upstream request is made for it. A cached `versions` or `info/<gem>` outlives an upstream outage as every mutable document does: within `stale_grace` the client gets the cached copy.
+
+Bundler updates `versions` by asking for the bytes past the copy it holds, with `If-None-Match` on the ETag it was last given, and checks the joined file against `Repr-Digest`. bodega answers `Range` and `If-None-Match` itself, from the whole document it fetched and cached. Both the `ETag` and the `Repr-Digest` are computed over the bytes served, so a cache hit and a miss describe the same document, and the digest of an unmodified document is the one rubygems.org publishes.
+
+A gem file passes the same gates as a cargo crate download: the [upstream allow-list](#upstream-allow-list) on the gem name (`bodega policy add rubygems <gem>`, matched exactly, since RubyGems names are case-sensitive and `-` and `_` are distinct), a discovery row, the hidden-package and hidden-version checks, and the entry's `version_constraint`. The version is the one the file name carries, so a platform build's discovery row reads `nokogiri` at `1.16.7-x86_64-linux`. Hiding `1.16.7` withholds every build of that release, and a constraint is held against the release with the platform cut off, so an exact pin on `1.16.7` admits `nokogiri-1.16.7-x86_64-linux.gem`. A gem name may hold `-` and digits (`concurrent-ruby`, `net-http2`), so the name ends at the first `-` that opens a version followed by nothing or by a platform, which always opens with a letter. A name whose own tail is a dotted version (`foo-2.0`) is the one form no rule can split correctly.
+
+**Gap:** the age, OSV and similarity checks do not run on a gem yet, and a host's profile does not filter `versions` or `info/<gem>`.
 
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 
@@ -6415,7 +6455,7 @@ Stripping at the proxy is still the right belt, but it is no longer the only one
 
 #### Caching in front of a profile-enforced bodega
 
-Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/helm/`, `/git/`, `/binaries/` and `/apt/`, or let it obey the headers bodega sends and nothing more.
+Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/rubygems/`, `/helm/`, `/git/`, `/binaries/` and `/apt/`, or let it obey the headers bodega sends and nothing more.
 
 A profile decides what those routes return, so one URL answers two hosts with two documents. A shared cache cannot evaluate a profile: it stores the first answer and hands it to the next host, with no denial row written and no error anywhere. bodega closes this from its side — artifacts go out `private`, indexes go out `no-cache, no-store, must-revalidate` — but a proxy configured to cache past the response headers reopens it. In nginx that means not setting `proxy_ignore_headers Cache-Control` and not forcing `proxy_cache_valid` on these locations.
 
@@ -7107,7 +7147,7 @@ Which upstreams may be reached at all is the allow-list's decision, not this swi
 
 ### Upstream hosts
 
-Seven flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
+Eight flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
 
 | Key                  | Default                                         | What that host serves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | -------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -7117,6 +7157,7 @@ Seven flat keys name the registries a proxying instance fetches from. They are n
 | `pypi_upstream`      | `https://pypi.org`                              | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404, and the log line beside it names the index that was read. The body does not, because the route takes no token and the URL may carry credentials. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
 | `cargo_upstream`     | `https://index.crates.io`                       | The sparse index, and nothing else. A crate tarball request to this host is a 404                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `cargo_dl_upstream`  | `https://static.crates.io/crates`               | Crate tarballs. bodega appends `/{crate}/{version}/download`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `rubygems_upstream`  | `https://rubygems.org`                          | Gem files, gemspecs, Bundler's compact index, the full index files and the dependency API, all under one root. Load refuses anything but an https URL with no userinfo, query or fragment                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `distfiles_upstream` | `http://distcache.FreeBSD.org/ports-distfiles/` | Ports distfiles, by distinfo name. Plain `http` on purpose; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 crates.io names its own download root in `https://index.crates.io/config.json`, and bodega does not read it. Fetching that document at startup would make `bodega serve` fail to bind because a registry was unreachable, and an operator mirroring the index is not thereby mirroring the tarballs: point the two keys wherever each actually lives.
@@ -8248,24 +8289,27 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 
 `freebsd` keeps everything literal as well, for a different reason: the key is the path the upstream repository serves the object at, so an ABI's colons and a hashed filename's `~` and `$` all survive into it. S3 accepts all three in a key and every POSIX filesystem accepts them in a path, and encoding them would buy nothing while costing a decoder at four call sites — where a wrong decode serves the wrong bytes under a signature that still verifies.
 
-| Type      | S3 prefix       | Example key                                                                       |
-| --------- | --------------- | --------------------------------------------------------------------------------- |
-| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                     |
-| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                               |
-| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                  |
-| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`              |
-| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                               |
-| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                                 |
-| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                   |
-| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                                |
-| cargo     | `cargo/index/`  | `cargo/index/se/rd/serde`                                                         |
-| distfiles | `distfiles/`    | `distfiles/zsh-5.9.2.tar.xz`                                                      |
-| freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`   |
-| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                             |
-| attest    | `attestations/` | `attestations/npm/lodash/lodash-4.17.21.tgz/20261010T120000.000000000Z.dsse.json` |
-| index     | `index.json`    | Fast startup without loading every manifest                                       |
-| graph     | `graph.json`    | Dependency graph with typed edges                                                 |
-| metrics   | `metrics.json`  | Dashboard metrics                                                                 |
+| Type      | S3 prefix         | Example key                                                                       |
+| --------- | ----------------- | --------------------------------------------------------------------------------- |
+| apt       | `packages/apt/`   | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                     |
+| git       | `repos/`          | `repos/widget/widget-v4.5.7.bundle`                                               |
+| pypi      | `pypi/wheels/`    | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                  |
+| binary    | `binaries/`       | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`              |
+| gomod     | `gomod/`          | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                               |
+| helm      | `charts/`         | `charts/ingress-nginx-4.11.0.tgz`                                                 |
+| npm       | `npm/`            | `npm/lodash/lodash-4.17.21.tgz`                                                   |
+| cargo     | `cargo/crates/`   | `cargo/crates/serde-1.0.200.crate`                                                |
+| cargo     | `cargo/index/`    | `cargo/index/se/rd/serde`                                                         |
+| rubygems  | `rubygems/gems/`  | `rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem`                                  |
+| rubygems  | `rubygems/quick/` | `rubygems/quick/Marshal.4.8/rack-3.1.8.gemspec.rz`                                |
+| rubygems  | `rubygems/index/` | `rubygems/index/info/rack`                                                        |
+| distfiles | `distfiles/`      | `distfiles/zsh-5.9.2.tar.xz`                                                      |
+| freebsd   | `freebsd/`        | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`   |
+| manifests | `manifests/`      | `manifests/apt/python3/manifest.json`                                             |
+| attest    | `attestations/`   | `attestations/npm/lodash/lodash-4.17.21.tgz/20261010T120000.000000000Z.dsse.json` |
+| index     | `index.json`      | Fast startup without loading every manifest                                       |
+| graph     | `graph.json`      | Dependency graph with typed edges                                                 |
+| metrics   | `metrics.json`    | Dashboard metrics                                                                 |
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

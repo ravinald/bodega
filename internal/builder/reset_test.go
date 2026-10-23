@@ -34,6 +34,7 @@ func overriddenConfig(t *testing.T) (*Config, map[string]string) {
 		HelmRoot:      roots[manifest.TypeHelm],
 		NpmRoot:       roots[manifest.TypeNpm],
 		CargoRoot:     roots[manifest.TypeCargo],
+		RubygemsRoot:  roots[manifest.TypeRubygems],
 		FreeBSDRoot:   roots[manifest.TypeFreeBSD],
 		DistfilesRoot: roots[manifest.TypeDistfiles],
 	}

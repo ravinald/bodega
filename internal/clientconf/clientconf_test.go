@@ -453,3 +453,28 @@ func TestNodeMirrorQuotesTheProfileValue(t *testing.T) {
 		t.Errorf("NodeMirror content = %q, want %q", got, want)
 	}
 }
+
+func TestRubygemsRendersGemrcAndBundlerMirror(t *testing.T) {
+	files := Rubygems(testBase + "/")
+	if len(files) != 2 {
+		t.Fatalf("Rubygems rendered %d files, want ~/.gemrc and ~/.bundle/config", len(files))
+	}
+	for i, want := range []struct{ path, content string }{
+		{"~/.gemrc", "---\n:sources:\n- https://bodega.example.com/rubygems/\n"},
+		{"~/.bundle/config", "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://bodega.example.com/rubygems/\"\n"},
+	} {
+		f := files[i]
+		if f.System != manifest.TypeRubygems || f.Content != want.content {
+			t.Errorf("file %d: system %q content %q, want rubygems and %q", i, f.System, f.Content, want.content)
+		}
+		for _, os := range []string{OSLinux, OSFreeBSD, OSDarwin} {
+			if got := f.Path(os); got != want.path {
+				t.Errorf("file %d on %s at %q, want %q", i, os, got, want.path)
+			}
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(f.Content), &doc); err != nil {
+			t.Errorf("%s is not YAML: %v", want.path, err)
+		}
+	}
+}

@@ -85,6 +85,10 @@ const (
 	npmPrefix        = "npm/"
 	cargoCratePrefix = "cargo/crates/"
 	cargoIndexPrefix = "cargo/index/"
+
+	rubygemsGemPrefix   = "rubygems/gems/"
+	rubygemsSpecPrefix  = "rubygems/quick/"
+	rubygemsIndexPrefix = "rubygems/index/"
 )
 
 // StoragePrefixes returns the top-level key prefixes documented in the
@@ -107,6 +111,9 @@ func StoragePrefixes() []string {
 		AptPrefix,
 		PypiWheelPrefix,
 		GitPrefix,
+		rubygemsGemPrefix,
+		rubygemsIndexPrefix,
+		rubygemsSpecPrefix,
 	}
 }
 
@@ -737,6 +744,84 @@ func CargoIndexKey(indexPath string) string {
 	return cargoIndexPrefix + indexPath
 }
 
+// RubygemsGemKey returns the key for a .gem file. version carries a platform
+// build's suffix ("1.16.7-x86_64-linux"), which is how the file is named.
+func RubygemsGemKey(name, version string) string {
+	return rubygemsGemPrefix + SafeName(name) + "-" + version + ".gem"
+}
+
+// RubygemsSpecKey returns the key for a quick/Marshal.4.8 gemspec, keyed by
+// its file name under that directory. It never changes under its name.
+func RubygemsSpecKey(file string) string {
+	return rubygemsSpecPrefix + "Marshal.4.8/" + file
+}
+
+// RubygemsIndexKey returns the key for a cached compact or full index
+// document, keyed by the registry path the client requested. Regenerable,
+// routed by type.
+func RubygemsIndexKey(indexPath string) string {
+	return rubygemsIndexPrefix + indexPath
+}
+
+// RubygemsGemIdentity splits a gem file name, <name>-<version>[-<platform>].gem,
+// into the gem name and the version with any platform suffix kept on it:
+// "nokogiri-1.16.7-x86_64-linux.gem" is "nokogiri" at "1.16.7-x86_64-linux".
+// Anything that is not a .gem name yields two empty strings.
+//
+// The name may hold "-" and digits ("concurrent-ruby", "net-http2", "md-5"),
+// so the split is at the first "-" that opens a version followed by either
+// nothing or a platform. A RubyGems version never holds "-" (Gem::Version
+// rewrites one to ".pre."), and every platform RubyGems names opens with a
+// letter, so "md-5-1.0" is "md-5" at "1.0": the "5" cannot be the version
+// because what follows it opens with a digit. A gem whose own name ends in a
+// dotted digit run ("foo-2.0") is ambiguous with no rule that could tell, and
+// splits there.
+func RubygemsGemIdentity(filename string) (name, version string) {
+	base, found := strings.CutSuffix(filename, ".gem")
+	if !found {
+		return "", ""
+	}
+	for i := 1; i < len(base)-1; i++ {
+		if base[i] != '-' {
+			continue
+		}
+		rest := base[i+1:]
+		ver, platform, hasPlatform := strings.Cut(rest, "-")
+		if !isGemVersion(ver) {
+			continue
+		}
+		if hasPlatform && (platform == "" || !isASCIILetter(platform[0])) {
+			continue
+		}
+		return base[:i], rest
+	}
+	return "", ""
+}
+
+// isGemVersion reports whether s reads as a RubyGems version: dot-separated
+// alphanumeric segments, the first of them all digits.
+func isGemVersion(s string) bool {
+	first, _, _ := strings.Cut(s, ".")
+	if first == "" || strings.Trim(first, "0123456789") != "" {
+		return false
+	}
+	for _, seg := range strings.Split(s, ".") {
+		if seg == "" {
+			return false
+		}
+		for i := 0; i < len(seg); i++ {
+			if c := seg[i]; !isASCIILetter(c) && (c < '0' || c > '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 // ArtifactKeys returns every object key holding this version's bytes, primary
 // first.
 //
@@ -793,6 +878,9 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 
 	case TypeCargo:
 		return []string{CargoCrateKey(pm.Name, ve.Version)}, nil
+
+	case TypeRubygems:
+		return []string{RubygemsGemKey(pm.Name, ve.Version)}, nil
 
 	case TypeFreeBSD:
 		// The repository root, catalogue first: these are the keys this
@@ -938,6 +1026,32 @@ func ParseKey(key string) (typ, name, version string) {
 		// the crate name by cargo's convention, not by anything constructed
 		// here, and config.json sits in the same place.
 		return TypeCargo, "", ""
+
+	case strings.HasPrefix(key, rubygemsGemPrefix):
+		n, v := RubygemsGemIdentity(strings.TrimPrefix(key, rubygemsGemPrefix))
+		if n == "" {
+			return TypeRubygems, "", ""
+		}
+		return TypeRubygems, n, v
+
+	case strings.HasPrefix(key, rubygemsSpecPrefix):
+		// "Marshal.4.8/<name>-<version>[-<platform>].gemspec.rz", the same
+		// name a gem file carries under another suffix.
+		base, found := strings.CutSuffix(lastSegment(key), ".gemspec.rz")
+		if !found {
+			return TypeRubygems, "", ""
+		}
+		n, v := RubygemsGemIdentity(base + ".gem")
+		if n == "" {
+			return TypeRubygems, "", ""
+		}
+		return TypeRubygems, n, v
+
+	case strings.HasPrefix(key, rubygemsIndexPrefix):
+		// Keyed by the registry path the client requested: versions,
+		// info/<gem>, the full index files, a dependency API answer. None of
+		// them names a version.
+		return TypeRubygems, "", ""
 
 	case strings.HasPrefix(key, helmPrefix):
 		if key == HelmIndexKey {

@@ -98,6 +98,25 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "1.2.3",
 		},
 	},
+	TypeRubygems: {
+		{
+			key:     RubygemsGemKey("concurrent-ruby", "1.3.4"),
+			name:    "concurrent-ruby",
+			version: "1.3.4",
+		},
+		// A platform build keeps its suffix as part of the version, which is
+		// how the file is named and what tells it apart from the pure-Ruby gem.
+		{
+			key:     RubygemsGemKey("nokogiri", "1.16.7-x86_64-linux"),
+			name:    "nokogiri",
+			version: "1.16.7-x86_64-linux",
+		},
+		{
+			key:     RubygemsSpecKey("concurrent-ruby-1.3.4.gemspec.rz"),
+			name:    "concurrent-ruby",
+			version: "1.3.4",
+		},
+	},
 	TypeFreeBSD: {
 		// latest/: the catalogue's repopath carries "~" and "$", and the ABI
 		// directory carries colons. All of it survives into the key, so a
@@ -270,5 +289,38 @@ func TestParseKeyReadsAGomodKeyBackInGoModSpelling(t *testing.T) {
 	typ, name, version := ParseKey(GomodKey("github.com/BurntSushi/toml", "v1.4.0", ".zip"))
 	if typ != TypeGomod || name != "github.com/BurntSushi/toml" || version != "v1.4.0" {
 		t.Errorf("ParseKey = (%q, %q, %q), want (gomod, github.com/BurntSushi/toml, v1.4.0)", typ, name, version)
+	}
+}
+
+func TestRubygemsGemIdentity(t *testing.T) {
+	for _, tc := range []struct{ file, name, version string }{
+		{"rack-3.1.8.gem", "rack", "3.1.8"},
+		{"concurrent-ruby-1.3.4.gem", "concurrent-ruby", "1.3.4"},
+		{"net-http-persistent-4.0.4.gem", "net-http-persistent", "4.0.4"},
+		{"mini_portile2-2.8.7.gem", "mini_portile2", "2.8.7"},
+		{"net-http2-0.18.5.gem", "net-http2", "0.18.5"},
+		// A name whose own tail is a digit segment: "5" is not the version,
+		// because what follows it opens with a digit and no platform does.
+		{"md-5-1.0.gem", "md-5", "1.0"},
+		{"x25519-1.0.10.gem", "x25519", "1.0.10"},
+		{"rails-7.1.0.beta1.gem", "rails", "7.1.0.beta1"},
+		{"RedCloth-4.3.4.gem", "RedCloth", "4.3.4"},
+		// Platform builds keep the suffix on the version.
+		{"nokogiri-1.16.7-x86_64-linux.gem", "nokogiri", "1.16.7-x86_64-linux"},
+		{"ffi-1.17.0-x86_64-linux-gnu.gem", "ffi", "1.17.0-x86_64-linux-gnu"},
+		{"sass-embedded-1.77.8-arm64-darwin.gem", "sass-embedded", "1.77.8-arm64-darwin"},
+		{"jruby-openssl-0.15.0-java.gem", "jruby-openssl", "0.15.0-java"},
+		// Not a gem file name.
+		{"rack-3.1.8.tgz", "", ""},
+		{"rack.gem", "", ""},
+		{"-1.0.gem", "", ""},
+		{"rack-.gem", "", ""},
+		{"rack-1..0.gem", "", ""},
+		{"rack-1.0-.gem", "", ""},
+	} {
+		name, version := RubygemsGemIdentity(tc.file)
+		if name != tc.name || version != tc.version {
+			t.Errorf("RubygemsGemIdentity(%q) = %q, %q, want %q, %q", tc.file, name, version, tc.name, tc.version)
+		}
 	}
 }

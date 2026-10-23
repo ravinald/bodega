@@ -82,3 +82,32 @@ func TestLoad_GomodSumdbURL(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_RubygemsUpstream(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RubygemsUpstream != config.DefaultRubygemsUpstream {
+		t.Errorf("rubygems_upstream default = %q, want %s", cfg.RubygemsUpstream, config.DefaultRubygemsUpstream)
+	}
+
+	writeConfig(t, `{"rubygems_upstream":"https://gems.example.com/"}`)
+	cfg, err = config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RubygemsUpstream != "https://gems.example.com" {
+		t.Errorf("rubygems_upstream = %q, want the trailing slash trimmed", cfg.RubygemsUpstream)
+	}
+
+	for _, bad := range []string{"http://rubygems.org", "rubygems.org", "https://", "https://u:p@gems.example/", "https://gems.example/?x=1"} {
+		writeConfig(t, `{"rubygems_upstream":"`+bad+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted rubygems_upstream %q", bad)
+		} else if !strings.Contains(err.Error(), "rubygems_upstream") {
+			t.Errorf("error %q does not name rubygems_upstream", err)
+		}
+	}
+}

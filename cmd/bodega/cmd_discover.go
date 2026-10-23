@@ -645,6 +645,9 @@ func buildManifestEntries(rows []audit.DiscoveryRow) (entries []manifestEntry, n
 // a URL that 404s. gomod produces these constantly: go resolves an unknown
 // module through /@v/list and /@v/@latest, and neither request carries a
 // version.
+// rubygemsSpecDir is where a RubyGems registry serves gemspecs.
+const rubygemsSpecDir = "quick/Marshal.4.8/"
+
 func versionlessNamesArtifact(regType string) bool {
 	switch regType {
 	case manifest.TypeGit, manifest.TypeBinary, manifest.TypePypi:
@@ -681,6 +684,13 @@ func manifestURL(row audit.DiscoveryRow) string {
 		// distribution name in it is normalized, so trimming at the fixed
 		// segment is what works for a package whose name carries a "_" or ".".
 		artifact = "/simple/"
+	case manifest.TypeRubygems:
+		// A gem file and its gemspec sit under the registry root at fixed
+		// directories, and a gem name never holds "/".
+		artifact = "/gems/"
+		if strings.Contains(row.UpstreamURL, "/"+rubygemsSpecDir) {
+			artifact = "/" + rubygemsSpecDir
+		}
 	default:
 		return row.UpstreamURL
 	}
