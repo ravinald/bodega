@@ -49,6 +49,28 @@ type fixtureArchive struct {
 	objects map[string]string
 	hits    sync.Map // path -> *atomic.Int64
 	delay   time.Duration
+	// gate, while set, parks every GET until it is closed: an upstream slow
+	// enough that a rebuild reading it is still running when the test looks.
+	gate chan struct{}
+}
+
+// hold parks every GET from here on until release is called.
+func (a *fixtureArchive) hold(t testing.TB) (release func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	a.mu.Lock()
+	a.gate = gate
+	a.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	return release
+}
+
+func (a *fixtureArchive) gated() chan struct{} {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.gate
 }
 
 // setObject replaces what the archive serves at rel, which is an upstream
@@ -104,6 +126,9 @@ func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive 
 			ctr.(*atomic.Int64).Add(1)
 			if a.delay > 0 {
 				time.Sleep(a.delay)
+			}
+			if gate := a.gated(); gate != nil {
+				<-gate
 			}
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
