@@ -275,7 +275,9 @@ func TestMavenAllowListRefusal(t *testing.T) {
 	if n := upstreamSaw(up, "thing-1.0.jar"); n != 0 {
 		t.Errorf("upstream saw the refused artifact %d times", n)
 	}
-	// A groupId wildcard does not reach a groupId nested under it.
+	// The exact rule admits every version of its artifact, not only the one
+	// fetched first. Whether org.example:* stays out of org.example.core is
+	// not observable here, because the exact rule admits widget either way.
 	if code, _, _ := getMaven(t, s, "org/example/core/widget/1.1.0/widget-1.1.0.jar"); code != http.StatusOK {
 		t.Errorf("exact rule stopped admitting %s: %d", mavenWidgetName, code)
 	}
