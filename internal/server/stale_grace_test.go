@@ -234,3 +234,51 @@ func TestNewServerReadsStaleGrace(t *testing.T) {
 		t.Errorf("stale grace = %s, want the 3s default for a Config built in code", s.cache.StaleGrace)
 	}
 }
+
+func TestEveryUpstreamClientDialsWithinTheConnectTimeout(t *testing.T) {
+	saved := upstreamConnectTimeout.Load()
+	t.Cleanup(func() { upstreamConnectTimeout.Store(saved) })
+	newACLServer(t, &config.Config{UpstreamConnectTimeout: "1s"})
+
+	// 10.255.255.1 is private, so the publish-time guard would refuse it
+	// before any dial. The stand-in still has to be called: the guard is half
+	// of what that client is.
+	savedGuard := upstreamGuard
+	var guarded atomic.Int32
+	upstreamGuard = func(string) error { guarded.Add(1); return nil }
+	t.Cleanup(func() { upstreamGuard = savedGuard })
+
+	if distfilesUpstreamClient.Timeout != 0 {
+		t.Errorf("distfiles client timeout = %s, want none", distfilesUpstreamClient.Timeout)
+	}
+	if publishTimeClient.Timeout != 10*time.Second {
+		t.Errorf("publish-time client timeout = %s, want 10s", publishTimeClient.Timeout)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		client *http.Client
+	}{
+		{"distfiles", distfilesUpstreamClient},
+		{"publish-time", publishTimeClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			resp, err := tc.client.Get("http://10.255.255.1/")
+			elapsed := time.Since(start)
+			if err == nil {
+				resp.Body.Close()
+				t.Skip("10.255.255.1 answered from this host; nothing here drops SYNs")
+			}
+			if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+				t.Skipf("no route to 10.255.255.1 from this sandbox: %v", err)
+			}
+			if elapsed > 2*time.Second {
+				t.Fatalf("connect failed after %s, want within upstream_connect_timeout (1s) plus 1s: %v", elapsed, err)
+			}
+		})
+	}
+	if guarded.Load() == 0 {
+		t.Error("publish-time fetch dialed without running upstreamGuard")
+	}
+}

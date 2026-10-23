@@ -460,7 +460,7 @@ func (s *Server) isCacheStale(status *storage.ObjectInfo) bool {
 // client's until Timeout fires.
 var upstreamClient = &http.Client{
 	Timeout:   90 * time.Second,
-	Transport: newUpstreamTransport(),
+	Transport: upstreamTransport,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxUpstreamRedirects {
 			return fmt.Errorf("stopped after %d redirects", len(via))
@@ -468,6 +468,10 @@ var upstreamClient = &http.Client{
 		return upstreamGuard(req.URL.String())
 	},
 }
+
+// upstreamTransport is the one transport every upstream client in this
+// package dials through, so upstream_connect_timeout bounds all of them.
+var upstreamTransport = newUpstreamTransport()
 
 // upstreamConnectTimeout is upstream_connect_timeout in nanoseconds, set by
 // newServer. upstreamClient is shared by every Server in the process, so the
