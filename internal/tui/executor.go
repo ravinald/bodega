@@ -149,7 +149,7 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		s.Print(buf)
 		totalFail += s.Failures
 	case manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
-		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeFreeBSD,
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeFreeBSD,
 		manifest.TypeDistfiles:
 		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
 	case manifest.TypeMaven:
@@ -202,6 +202,8 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		fmt.Fprintf(buf, "No separate package step for freebsd — the mirrored catalogue carries FreeBSD's own signature and must not be regenerated.\n")
 	case manifest.TypeDistfiles:
 		fmt.Fprintf(buf, "No separate package step for distfiles — the DISTDIR is the artifact and distinfo is its metadata.\n")
+	case manifest.TypeRubygems:
+		fmt.Fprintf(buf, "No separate package step for rubygems — clients read the proxied compact index.\n")
 	default:
 		return fmt.Errorf("package: no package stage for entry type %q", entryType)
 	}
@@ -391,6 +393,10 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, audi
 			sum = builder.FetchDistfiles(bc, store, entryFilter)
 		case manifest.TypeMaven:
 			fmt.Fprintf(buf, "No fetch stage for maven — the /maven/ route proxies every artifact from maven_upstream.\n")
+		case manifest.TypeRubygems:
+			// Not a failure: a gem is served by pulling it through on request,
+			// and nothing fetches one ahead of a client yet.
+			fmt.Fprintf(buf, "No fetcher for rubygems — gems are pulled through /rubygems/ on first request.\n")
 		default:
 			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}

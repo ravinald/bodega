@@ -104,6 +104,8 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 			return ""
 		}
 		return filepath.Join(buildDirs(cfg.rootFor(typ)).maven, filepath.FromSlash(p))
+	case manifest.TypeRubygems:
+		return rubygemsGemPath(buildDirs(cfg.rootFor(typ)), name, ve)
 	case manifest.TypeDistfiles:
 		if manifest.DistfilesValidName(name) != nil {
 			return ""

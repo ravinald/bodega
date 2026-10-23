@@ -810,6 +810,17 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 		// Sparse index lookup: trailing path segment is the crate name.
 		parts := strings.Split(full, "/")
 		return "cargo", parts[len(parts)-1], ""
+	case strings.HasPrefix(path, "/rubygems/"):
+		full := strings.TrimPrefix(path, "/rubygems/")
+		switch {
+		case strings.HasPrefix(full, "gems/"):
+			if n, v := manifest.RubygemsGemIdentity(strings.TrimPrefix(full, "gems/")); n != "" {
+				return "rubygems", n, v
+			}
+		case strings.HasPrefix(full, "info/"):
+			return "rubygems", strings.TrimPrefix(full, "info/"), ""
+		}
+		return "rubygems", "", ""
 	case strings.HasPrefix(path, "/freebsd-profile/"):
 		// The profile's filtered view of the same tree, one segment deeper.
 		if _, rest, ok := strings.Cut(strings.TrimPrefix(path, "/freebsd-profile/"), "/"); ok {

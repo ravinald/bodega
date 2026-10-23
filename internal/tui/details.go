@@ -1012,8 +1012,12 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.storedAndClientFields(n))
 
-	case manifest.TypeCargo:
-		sb.WriteString(field("Crate", pm.Name))
+	case manifest.TypeCargo, manifest.TypeRubygems:
+		label := "Crate"
+		if n.EntryType == manifest.TypeRubygems {
+			label = "Gem"
+		}
+		sb.WriteString(field(label, pm.Name))
 		sb.WriteByte('\n')
 		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')

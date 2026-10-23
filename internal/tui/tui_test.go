@@ -1380,15 +1380,16 @@ var clientURLSeeds = map[string]struct {
 	name  string
 	entry manifest.VersionEntry
 }{
-	manifest.TypeApt:    {"pkg-a", manifest.VersionEntry{Version: "1.0"}},
-	manifest.TypePypi:   {"pkg-b", manifest.VersionEntry{Version: "1.0"}},
-	manifest.TypeGomod:  {"example.com/m", manifest.VersionEntry{Version: "v1.0.0"}},
-	manifest.TypeNpm:    {"pkg-c", manifest.VersionEntry{Version: "1.0.0"}},
-	manifest.TypeHelm:   {"chart", manifest.VersionEntry{Version: "1.0.0"}},
-	manifest.TypeGit:    {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
-	manifest.TypeBinary: {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
-	manifest.TypeCargo:  {"time", manifest.VersionEntry{Version: "0.3.36"}},
-	manifest.TypeMaven:  {"org.slf4j:slf4j-api", manifest.VersionEntry{Version: "2.0.13"}},
+	manifest.TypeApt:      {"pkg-a", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypePypi:     {"pkg-b", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypeGomod:    {"example.com/m", manifest.VersionEntry{Version: "v1.0.0"}},
+	manifest.TypeNpm:      {"pkg-c", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeHelm:     {"chart", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeGit:      {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
+	manifest.TypeBinary:   {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
+	manifest.TypeCargo:    {"time", manifest.VersionEntry{Version: "0.3.36"}},
+	manifest.TypeMaven:    {"org.slf4j:slf4j-api", manifest.VersionEntry{Version: "2.0.13"}},
+	manifest.TypeRubygems: {"rack", manifest.VersionEntry{Version: "3.1.8"}},
 	// The version is the ABI, which is what the pkg.conf stanza leaves as a
 	// literal ${ABI} and what the route carries.
 	manifest.TypeFreeBSD: {"latest", manifest.VersionEntry{

@@ -46,7 +46,7 @@ func RuleKindForType(registryType string) string {
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		return KindPackage
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return KindPrefix
@@ -258,7 +258,9 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 		return manifest.CanonicalPypiName(candidate) == manifest.CanonicalPypiName(r.Pattern)
 	case manifest.TypeNpm:
 		return matchNpm(candidate, r.Pattern)
-	case manifest.TypeCargo:
+	case manifest.TypeCargo, manifest.TypeRubygems:
+		// A gem name is case-sensitive and "-" and "_" are distinct in it,
+		// so nothing is folded.
 		return candidate == r.Pattern
 	case manifest.TypeMaven:
 		return matchMaven(candidate, r.Pattern)
@@ -283,7 +285,7 @@ func CandidateFor(registryType, packageName, entryURL string) string {
 // package name rather than on an upstream URL.
 func KeysByName(registryType string) bool {
 	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		return true
 	}
 	return false
@@ -344,7 +346,7 @@ func SuggestPattern(regType, host, fullPath, pkgName string) string {
 			}
 		}
 		return pkgName
-	case manifest.TypeCargo, manifest.TypeMaven:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		return pkgName
 	case manifest.TypeGomod:
 		// Module paths look like host/org/repo... — propose host+org/.

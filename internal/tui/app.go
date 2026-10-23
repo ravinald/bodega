@@ -1410,6 +1410,7 @@ var createTypeOptions = []string{
 	manifest.TypeMaven,
 	manifest.TypeNpm,
 	manifest.TypePypi,
+	manifest.TypeRubygems,
 }
 
 // auditTypeOptions is the package-type filter for the audit query form, with an
@@ -1810,7 +1811,11 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
-	case manifest.TypeCargo:
+	case manifest.TypeCargo, manifest.TypeRubygems:
+		nameHint, sourceHint := "crate name, e.g. serde or tokio", "sparse index URL; leave empty for index.crates.io"
+		if entryType == manifest.TypeRubygems {
+			nameHint, sourceHint = "gem name, exactly as published, e.g. rack or concurrent-ruby", "registry root; leave empty for rubygems_upstream"
+		}
 		modeVal := restore("Mode", "hosted")
 		isProxy := modeVal == "proxy"
 		constraintVal := prevLabelSelect["Version"]
@@ -1830,12 +1835,12 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Options: []string{"hosted", "proxy"},
 				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
-				Hint: "crate name, e.g. serde or tokio"},
+				Hint: nameHint},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
 			{Label: "Source URL", Value: restore("Source URL", ""),
-				Hint: "sparse index URL; leave empty for index.crates.io"},
+				Hint: sourceHint},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
 			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
@@ -2108,9 +2113,9 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for npm entries"
 		}
-	case manifest.TypeCargo:
+	case manifest.TypeCargo, manifest.TypeRubygems:
 		if fieldValueFromSlice(fields, "Version") == "" {
-			return "Version is required for cargo entries"
+			return "Version is required for " + entryType + " entries"
 		}
 	case manifest.TypeMaven:
 		if group, artifact, ok := strings.Cut(fieldValueFromSlice(fields, "Name"), ":"); !ok || group == "" || artifact == "" {
@@ -2196,7 +2201,7 @@ func validateRemote(entryType string, fields []formField) string {
 		if url != "" {
 			return validateURLReachable(url)
 		}
-	case manifest.TypeNpm, manifest.TypeCargo:
+	case manifest.TypeNpm, manifest.TypeCargo, manifest.TypeRubygems:
 		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			return validateURLReachable(url)
@@ -2395,7 +2400,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeHelm:
 		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven:
+	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		// nothing extra
 
 	case manifest.TypeFreeBSD:
@@ -2561,9 +2566,9 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
-	case manifest.TypeCargo, manifest.TypeMaven:
-		// Neither Source URL names a package: cargo's is the sparse index
-		// root and maven's form has none. The Name field is required.
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
+		// No Source URL here names a package: cargo's and rubygems' are the
+		// registry root and maven's form has none. The Name field is required.
 		return ""
 	default:
 		seg := lastURLSegment(rawURL)
