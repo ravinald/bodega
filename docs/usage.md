@@ -2117,9 +2117,9 @@ bodega-latest: {
 
 `GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` is encoded whole, as `%2E` and `%2E%2E`, since a client resolves a literal dot segment away before it sends the request. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N] [--quiet-ubuntu-pro]] [--restore-ubuntu-pro] [--write-apt-sources] [--write-pkg-repo] [--allow-plaintext]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N] [--quiet-ubuntu-pro] [--quiet-os-callers]] [--restore-ubuntu-pro] [--restore-os-callers] [--ntp-server HOST] [--write-apt-sources] [--write-pkg-repo] [--allow-plaintext]`
 
-Without flags, `doctor` reports and changes nothing. It has three writes, `--write-credentials`, `--configure` and `--restore-ubuntu-pro`, and they run one at a time.
+Without flags, `doctor` reports and changes nothing. It has four writes, `--write-credentials`, `--configure`, `--restore-ubuntu-pro` and `--restore-os-callers`, and they run one at a time.
 
 It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. A row whose check names no next step is listed there under its detail line, so every skipped check appears in the block. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
 
@@ -2133,6 +2133,14 @@ Both checks certify the configuration doctor ran under, and each detail line say
 The pip check reads `/usr/local/etc/pip.conf`, `/usr/local/pip.conf` and `/etc/xdg/pip/pip.conf` on FreeBSD beside the paths it reads everywhere, and the npm check reads `/usr/local/etc/npmrc`. pip itself ignores the first of those; doctor reads it because the ports convention puts a file there, and a warning about a file pip never reads costs less than an `OK` over one an operator believes is in force.
 
 On a host carrying `ubuntu-pro-client`'s apt hook, `/etc/apt/apt.conf.d/20apt-esm-hook.conf`, doctor asks `pro api u.pro.status.is_attached.v1` whether Ubuntu Pro is attached and warns in an **`ubuntu-pro-hook`** row when it is not. The hook's `APT::Update::Pre-Invoke` starts `apt-news.service` and `esm-cache.service`, and its upgrade hook runs `apt-esm-json-hook`. Each contacts `esm.ubuntu.com` whatever the apt sources say, so a host `--configure apt` pointed at bodega still calls out on every `apt-get update`, and on an egress-locked network spends each update on resolver timeouts. The remediation is `pro config set apt_news=false` and `systemctl mask esm-cache.service`. An attached host, which pays for what the hook fetches, gets no row, and so does a host without the hook. So does a host whose `pro` is gone: the hook is a dpkg conffile, so `apt remove ubuntu-pro-client` without a purge leaves it behind, and its commands do nothing once the client's binaries are gone. Doctor looks `pro` up in `$PATH` first and asks it nothing when it is absent, and `--quiet-ubuntu-pro` plans nothing there and writes no record. The `pro api` call reads the host's own attachment state, so it answers without a route out. An `ubuntu-pro-client` too old to know it, or one that returns a failed result, falls back to `pro status --format json`, which contacts Canonical's contract server and so needs that route. When both fail the row is `SKIPPED` and names each command that failed. Each call gets 30 seconds, and a `pro status` cut off there says so and names `pro config set apt_news=false` and `systemctl mask esm-cache.service` as the steps to run by hand.
+
+On Linux, three more rows name the OS services that reach out on their own whatever bodega serves. A host configured for bodega and locked to it was measured calling all three. Each row warns only while its caller is active and is absent otherwise, and each reads files and `systemctl is-enabled` or `is-active` alone, never the network, so it answers in under a second on a locked host:
+
+- **`chrony-nts`** warns when `/usr/sbin/chronyd` is installed, `systemctl is-active` answers `active` for `chrony.service` or `chronyd.service` (Debian and Ubuntu name the unit `chrony`, RHEL and Fedora `chronyd`), a source in its configuration uses `nts`, and no source is the bodega server or a host named with `--ntp-server`. Doctor reads `/etc/chrony/chrony.conf` (or `/etc/chrony.conf`) and every file it pulls in through `include`, `confdir` (`*.conf`) and `sourcedir` (`*.sources`), which is where Ubuntu puts its NTS pools. NTS key exchange is TCP 4460, and a host that cannot reach the NTS servers keeps no time at all; that surfaces later as TLS failures and apt `Valid-Until` errors that look like bodega's. The remediation is to point chrony at an internal NTP server (`server <host> iburst`), or to allow TCP 4460 to the NTS servers. The bodega server is the host in `--url`, or `public_url` from the config file. `--ntp-server` takes a host or a comma-separated list, and is repeatable.
+- **`motd-news`** warns when `/etc/default/motd-news` has `ENABLED=1` or `motd-news.timer` is enabled; `motd-news.service` fetches `motd.ubuntu.com` over HTTPS. The remediation is `ENABLED=0` in that file and `systemctl disable --now motd-news.timer`.
+- **`snapd-refresh`** warns when snapd is installed and either `snapd.service` or `snapd.socket` is active. With no snap installed, snapd asks the store and goes to standby seconds after boot, leaving only the socket, so the service alone would miss it. It checks `api.snapcraft.io` for refreshes on its own schedule. The remediation is `snap refresh --hold`, or, to keep snaps current from inside the network, a Snap Store Proxy set with `snap set system proxy.store=<store-id>`. This row sits beside the `snapd` row, which reports snapd being there at all.
+
+A failure to read `/etc/default/motd-news` or chrony's configuration reports the row `SKIPPED`, naming the error.
 
 `--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is refused by name and left out otherwise: its flags file alone points at a secret nothing wrote and a daemon nothing installed, so only the setup script configures it.
 
@@ -2190,6 +2198,23 @@ sudo bodega doctor --restore-ubuntu-pro
 ```
 
 `--quiet-ubuntu-pro` is refused without `--configure`, and with a `--configure` list that does not name `apt`. `--restore-ubuntu-pro` runs alone.
+
+`--quiet-os-callers`, accepted with any `--configure` list, adds the `motd-news` and `snapd-refresh` remediations to the plan, each step printed beside its undo before anything is written:
+
+```text
+motd-news  sed -i 's/^[[:space:]]*ENABLED=.*/ENABLED=0/' /etc/default/motd-news  (undo: sed -i 's/^[[:space:]]*ENABLED=.*/ENABLED=1/' /etc/default/motd-news)
+motd-news  systemctl disable --now motd-news.timer  (undo: systemctl enable --now motd-news.timer)
+snapd-refresh  snap refresh --hold  (undo: snap refresh --unhold)
+```
+
+As with `--quiet-ubuntu-pro`, a step whose end state the host already has is left out, so a timer already disabled or a refresh hold already set to `forever` (read from `snap refresh --time`) is not planned and not recorded. A host with nothing to quiet, or one that is not Linux, gets `nothing to quiet` and no step. With `--apply` the steps run after the files are written, and each one that succeeded is recorded in `/etc/bodega/doctor-os-callers.json`. `--restore-os-callers` runs the undo of every recorded step and deletes the record. chrony is reported only and never reconfigured: the right time source is the operator's to choose.
+
+```bash
+sudo bodega doctor --configure apt --quiet-os-callers --apply --url https://bodega.internal
+sudo bodega doctor --restore-os-callers
+```
+
+`--quiet-os-callers` is refused without `--configure`. `--restore-os-callers` runs alone.
 
 For FreeBSD the plan names `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it.
 

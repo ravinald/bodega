@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -32,12 +31,14 @@ const (
 	proStepESMCache = "esm-cache"
 )
 
-var proStepArgv = map[string]struct{ do, undo []string }{
+var proSteps = map[string]quietStep{
 	proStepAptNews: {
+		row:  "ubuntu-pro",
 		do:   []string{"pro", "config", "set", "apt_news=false"},
 		undo: []string{"pro", "config", "set", "apt_news=true"},
 	},
 	proStepESMCache: {
+		row:  "ubuntu-pro",
 		do:   []string{"systemctl", "mask", "esm-cache.service"},
 		undo: []string{"systemctl", "unmask", "esm-cache.service"},
 	},
@@ -81,8 +82,11 @@ func runProTool(argv []string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-type proRecord struct {
-	Steps []string `json:"steps"`
+func (h *proHost) ledger() stepRecord {
+	return stepRecord{
+		path: h.record, steps: proSteps, run: h.run,
+		quietFlag: "--quiet-ubuntu-pro", restoreFlag: "--restore-ubuntu-pro", what: "Ubuntu Pro steps",
+	}
 }
 
 // finding reports the ESM hook on a host Ubuntu Pro is not attached to. A
@@ -216,104 +220,4 @@ func (h *proHost) quietSteps() (steps []string, why string, err error) {
 		why = "apt_news is already false and esm-cache.service already masked"
 	}
 	return steps, why, nil
-}
-
-// printQuietPlan writes the steps into the plan output, each beside its undo,
-// before anything is written.
-func printQuietPlan(steps []string, why string) {
-	if len(steps) == 0 {
-		fmt.Printf("\nubuntu-pro  nothing to quiet: %s\n", why)
-		return
-	}
-	fmt.Println()
-	for _, s := range steps {
-		a := proStepArgv[s]
-		fmt.Printf("ubuntu-pro  %s  (undo: %s)\n", strings.Join(a.do, " "), strings.Join(a.undo, " "))
-	}
-}
-
-// quiet runs steps and adds each one that succeeded to the record, so a run
-// that fails halfway can still be undone for the part it changed.
-func (h *proHost) quiet(steps []string) error {
-	rec, err := h.load()
-	if err != nil {
-		return err
-	}
-	var runErr error
-	for _, s := range steps {
-		argv := proStepArgv[s].do
-		if out, err := h.run(argv); err != nil {
-			runErr = fmt.Errorf("%s failed (%v): %s; nothing after it ran. Re-run as root", strings.Join(argv, " "), err, out)
-			break
-		}
-		fmt.Printf("ran        %s\n", strings.Join(argv, " "))
-		if !slices.Contains(rec.Steps, s) {
-			rec.Steps = append(rec.Steps, s)
-		}
-	}
-	if err := h.save(rec); err != nil {
-		return errors.Join(runErr, err)
-	}
-	return runErr
-}
-
-// restore undoes the recorded steps and nothing else, and deletes the record
-// once every undo succeeded.
-func (h *proHost) restore() error {
-	rec, err := h.load()
-	if err != nil {
-		return err
-	}
-	if len(rec.Steps) == 0 {
-		fmt.Printf("Nothing to restore: %s records no step --quiet-ubuntu-pro ran on this host.\n", h.record)
-		return nil
-	}
-	for len(rec.Steps) > 0 {
-		argv := proStepArgv[rec.Steps[0]].undo
-		if out, err := h.run(argv); err != nil {
-			return errors.Join(
-				fmt.Errorf("%s failed (%v): %s. Re-run as root; %s still records what is left", strings.Join(argv, " "), err, out, h.record),
-				h.save(rec))
-		}
-		fmt.Printf("ran        %s\n", strings.Join(argv, " "))
-		rec.Steps = rec.Steps[1:]
-	}
-	if err := os.Remove(h.record); err != nil {
-		return fmt.Errorf("every step was undone, and removing %s failed: %w", h.record, err)
-	}
-	return nil
-}
-
-func (h *proHost) load() (proRecord, error) {
-	var rec proRecord
-	b, err := os.ReadFile(h.record)
-	if errors.Is(err, fs.ErrNotExist) {
-		return rec, nil
-	}
-	if err != nil {
-		return rec, fmt.Errorf("read %s: %w", h.record, err)
-	}
-	if err := json.Unmarshal(b, &rec); err != nil {
-		return rec, fmt.Errorf("%s is not the record --quiet-ubuntu-pro writes (%v); move it aside, then re-run", h.record, err)
-	}
-	for _, s := range rec.Steps {
-		if _, ok := proStepArgv[s]; !ok {
-			return rec, fmt.Errorf("%s names a step this doctor does not know, %q; move it aside, then re-run", h.record, s)
-		}
-	}
-	return rec, nil
-}
-
-func (h *proHost) save(rec proRecord) error {
-	b, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(h.record), 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(h.record), err)
-	}
-	if err := os.WriteFile(h.record, append(b, '\n'), 0o644); err != nil {
-		return fmt.Errorf("record the Ubuntu Pro steps in %s: %w; undo them by hand with the commands printed above", h.record, err)
-	}
-	return nil
 }
