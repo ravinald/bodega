@@ -4642,10 +4642,12 @@ rustup is the case it exists for. `dist/channel-rust-stable.toml`, its `.sha256`
   "rust": {
     "url": "https://static.rust-lang.org/",
     "mode": "open",
-    "revalidate": ["dist/channel-rust-*", "rustup/release-*"]
+    "revalidate": ["dist/channel-rust-*", "rustup/release-*", "rustup/dist/*/*"]
   }
 }
 ```
+
+`rustup/dist/*/*` covers `rustup-init` and its `.sha256` under `rustup/dist/<triple>/`, which `rustup-init.sh` downloads to bootstrap a host and upstream rewrites in place on every rustup release; without it every fresh host starts on the first `rustup-init` the server fetched.
 
 On the client:
 
