@@ -84,7 +84,7 @@ func (guardedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := upstreamGuard(req.URL.String()); err != nil {
 		return nil, err
 	}
-	return http.DefaultTransport.RoundTrip(req)
+	return upstreamTransport.RoundTrip(req)
 }
 
 // publishTimeClient holds every publish-time fetch to the rule the proxy

@@ -225,6 +225,7 @@ var rewindSpool = func(f *os.File) error {
 // redirect hop, and no overall timeout: a distfile can run to gigabytes, and
 // the server's own write timeout bounds the request that caused the fetch.
 var distfilesUpstreamClient = &http.Client{
+	Transport: upstreamTransport,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxUpstreamRedirects {
 			return fmt.Errorf("stopped after %d redirects", len(via))
