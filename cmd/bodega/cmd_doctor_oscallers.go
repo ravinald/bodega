@@ -438,14 +438,29 @@ var snapdBinaries = []string{"/usr/lib/snapd/snapd", "/usr/libexec/snapd/snapd"}
 
 func (h *osCallersHost) snapdInstalled() bool { return slices.ContainsFunc(snapdBinaries, h.exists) }
 
-// snapdActive counts the socket as well as the service: with no snaps
-// installed snapd goes to standby seconds after boot, once it has asked the
-// store, and the socket starts it again on demand.
-func (h *osCallersHost) snapdActive() bool {
+// snapdState tells a running snapd from one in standby behind its socket:
+// with no snaps installed snapd goes to standby seconds after boot, once it
+// has asked the store, and the socket starts it again on demand. Only a
+// running snapd can be asked anything without being woken.
+func (h *osCallersHost) snapdState() (running, standby bool) {
 	if !h.snapdInstalled() {
-		return false
+		return false, false
 	}
-	return h.unitState("is-active", "snapd.service") == "active" || h.unitState("is-active", "snapd.socket") == "active"
+	if h.unitState("is-active", "snapd.service") == "active" {
+		return true, false
+	}
+	return false, h.unitState("is-active", "snapd.socket") == "active"
+}
+
+// holdRecorded reports whether the record says --quiet-os-callers applied
+// the refresh hold. It is the only answer a standby snapd gives without being
+// woken, and it cannot see a hold applied, or lifted, by hand.
+func (h *osCallersHost) holdRecorded() (bool, error) {
+	rec, err := h.ledger().load()
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(rec.Steps, oscStepSnapHold), nil
 }
 
 var snapRefreshTime = []string{"snap", "refresh", "--time", "--abs-time"}
@@ -456,22 +471,36 @@ const snapHoldWindow = 30 * 24 * time.Hour
 
 // snapdRefresh asks snapd for its hold only while snapd.service is running.
 // The question goes to snapd's socket, and a snapd in standby that it wakes
-// asks the store, which is the call this row exists to report.
+// asks the store, which is the call this row exists to report. In standby the
+// row reads the record --quiet-os-callers writes instead.
 func (h *osCallersHost) snapdRefresh() (host.Finding, bool) {
 	f := host.Finding{Check: "snapd-refresh"}
-	if !h.snapdInstalled() {
+	running, standby := h.snapdState()
+	if !running && !standby {
 		return f, false
 	}
 	remedy := "snap refresh --hold to stop the refresh checks; to keep snaps current from inside the network, " +
 		"run a Snap Store Proxy and point snapd at it with snap set system proxy.store=<store-id>. " +
 		"bodega doctor --configure <system> --quiet-os-callers --apply runs the hold and records it for --restore-os-callers"
-	if h.unitState("is-active", "snapd.service") != "active" {
-		if h.unitState("is-active", "snapd.socket") != "active" {
+	record := h.ledger().path
+	if standby {
+		recorded, err := h.holdRecorded()
+		if err != nil {
+			f.Status = host.StatusSkip
+			f.Detail = "snapd is in standby behind snapd.socket, so its refresh hold is read from " + record +
+				" rather than by waking snapd, and that record could not be used: " + err.Error()
+			f.Remediation = "make " + record + " readable JSON again, or move it aside, then re-run `bodega doctor`; " +
+				"moved aside, its recorded steps are no longer undone by --restore-os-callers, and " +
+				"bodega doctor --configure <system> --quiet-os-callers --apply records the hold again"
+			return f, true
+		}
+		if recorded {
 			return f, false
 		}
 		f.Status = host.StatusWarn
 		f.Detail = "snapd is in standby behind snapd.socket, which starts it on demand to check api.snapcraft.io for refreshes; " +
-			"its refresh hold could not be read without waking snapd"
+			"a hold applied by hand cannot be seen without waking snapd, and " +
+			"bodega doctor --configure <system> --quiet-os-callers --apply records the hold in " + record + " where this row can read it"
 		f.Remediation = remedy
 		return f, true
 	}
@@ -487,6 +516,9 @@ func (h *osCallersHost) snapdRefresh() (host.Finding, bool) {
 	}
 	f.Status = host.StatusWarn
 	f.Detail = "snapd is running with no refresh hold reaching 30 days out, and checks api.snapcraft.io for refreshes on its own schedule, whatever bodega serves"
+	if recorded, err := h.holdRecorded(); err == nil && recorded {
+		f.Detail += "; " + record + " says bodega applied a hold and snapd now reports none, so it was lifted by hand or lapsed"
+	}
 	f.Remediation = remedy
 	return f, true
 }
@@ -509,8 +541,16 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 	if h.unitState("is-enabled", "motd-news.timer") == "enabled" {
 		steps = append(steps, oscStepMotdTimer)
 	}
-	snapd := h.snapdActive()
-	if snapd {
+	running, standby := h.snapdState()
+	snapd := running || standby
+	// A standby snapd whose hold the record already names is left asleep;
+	// with no such record the operator has asked doctor to change snapd, so
+	// waking it to read the hold is part of that.
+	recorded := false
+	if standby {
+		recorded, _ = h.holdRecorded()
+	}
+	if snapd && !recorded {
 		out, err := h.run(snapRefreshTime)
 		if err != nil {
 			return nil, "", fmt.Errorf("--quiet-os-callers cannot read snapd's refresh hold: `%s` failed (%v): %s", shellJoin(snapRefreshTime), err, out)
@@ -521,9 +561,12 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 	}
 	if len(steps) == 0 {
 		why = "motd-news is off, and snapd is "
-		if snapd {
+		switch {
+		case recorded:
+			why += "in standby with its refresh hold recorded in " + h.ledger().path
+		case snapd:
 			why += "already held"
-		} else {
+		default:
 			why += "not active"
 		}
 	}
