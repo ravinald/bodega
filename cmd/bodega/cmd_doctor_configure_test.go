@@ -304,3 +304,25 @@ func TestDoctorConfigureAppliesAVendorArchive(t *testing.T) {
 		t.Errorf("--archive without apt = %v, want a refusal naming --configure apt", err)
 	}
 }
+
+// An install record's reason is a note the operator reads before applying,
+// such as why npm's plan leaves node-gyp's mirror out, so doctor prints it.
+func TestDoctorConfigurePrintsAnInstallRecordsNote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const content = "registry=https://b/npm/\n"
+	sum := sha256.Sum256([]byte(content))
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			Identity: "web-host", System: "npm", Action: clientconf.PlanInstall, Path: "~/.npmrc",
+			URL: srv.URL + "/client/npm", SHA256: hex.EncodeToString(sum[:]), Reason: "node-gyp is left pointing at nodejs.org",
+		}}})
+	})
+	mux.HandleFunc("GET /client/npm", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, content) })
+	out, err := runDoctor(t, "--configure", "npm", "--url", srv.URL, "--allow-plaintext")
+	if err != nil || !strings.Contains(out, "note       npm        node-gyp is left pointing at nodejs.org") {
+		t.Errorf("--configure npm = %v:\n%s", err, out)
+	}
+}

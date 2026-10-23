@@ -102,7 +102,17 @@ type clientQuery struct {
 	// Archive selects one vendor archive's stanza on /client/apt, which is
 	// the URL a plan's archive record names.
 	Archive string
+	// Root says the plan is applied as root, which puts per-host files where
+	// a per-user one would otherwise go: npm's node-gyp mirror.
+	Root bool
+	// File selects a system's companion file on /client/{system}, which is
+	// the URL a plan's companion record names. clientFileNodeMirror is the
+	// one value.
+	File string
 }
+
+// clientFileNodeMirror is npm's NODEJS_ORG_MIRROR file on /client/npm.
+const clientFileNodeMirror = "node-mirror"
 
 var (
 	clientABIRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$`)
@@ -146,6 +156,16 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	if q.Archive = v.Get("archive"); q.Archive != "" && !clientCodenameRe.MatchString(q.Archive) {
 		return q, fmt.Errorf("archive=%q is not an apt suite name", q.Archive)
 	}
+	switch raw := v.Get("root"); raw {
+	case "", "0":
+	case "1":
+		q.Root = true
+	default:
+		return q, fmt.Errorf("root=%q is not 0 or 1. Pass root=1 when the plan is applied as root", raw)
+	}
+	if q.File = v.Get("file"); q.File != "" && q.File != clientFileNodeMirror {
+		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s", q.File, clientFileNodeMirror)
+	}
 	return q, nil
 }
 
@@ -182,6 +202,9 @@ func (q clientQuery) encode() string {
 	}
 	if q.Release != 0 {
 		v.Set("release", strconv.Itoa(q.Release))
+	}
+	if q.Root {
+		v.Set("root", "1")
 	}
 	return v.Encode()
 }
@@ -309,8 +332,10 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return []planFile{{system: sys, action: planInstall, path: path, content: []byte(f.Content)}}
 	}
 	switch sys {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeHelm:
-		return one(clientconf.ForType(sys, clientconf.Inputs{Base: h.base, BinaryUpstreams: s.cfg.BinaryUpstreams})[0])
+	case manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeHelm:
+		return one(clientconf.ForType(sys, clientconf.Inputs{Base: h.base})[0])
+	case manifest.TypeNpm:
+		return s.planNpm(h, one)
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:
@@ -347,6 +372,32 @@ func (s *Server) planGit(h *clientHost, one func(clientconf.File) []planFile) []
 			reason: fmt.Sprintf("profile %q covers none of the git namespaces this server rewrites", h.profile.Name())}}
 	}
 	return one(clientconf.Git(h.base, covered))
+}
+
+// planNpm renders .npmrc and, when a nodejs.org namespace is open, the file
+// pointing node-gyp at it: the profile.d script under root=1, the user's
+// environment.d file otherwise. Why the second file is missing, when the
+// operator would expect it, rides on the .npmrc record's reason, because a
+// skip record would make --configure npm refuse the registry line with it.
+func (s *Server) planNpm(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	npmrc := clientconf.Npm(h.base, s.cfg.BinaryUpstreams)
+	out := one(npmrc)
+	notes := npmrc.Notes
+	mirror := clientconf.NodeMirror(h.base, s.cfg.BinaryUpstreams, h.q.Root)
+	switch path := mirror.Path(h.q.OS); {
+	case mirror.Content == "":
+	case path == "":
+		notes = append(notes, "node-gyp is left pointing at nodejs.org: nothing on "+h.q.OS+" reads a per-user environment file. Re-run as root to install "+clientconf.NodeMirrorSystemPath)
+	default:
+		v, _ := url.ParseQuery(h.q.encode())
+		v.Set("file", clientFileNodeMirror)
+		out = append(out, planFile{system: manifest.TypeNpm, action: planInstall, path: path,
+			content: []byte(mirror.Content), url: h.base + "/client/" + manifest.TypeNpm + "?" + v.Encode()})
+	}
+	if out[0].action == planInstall {
+		out[0].reason = strings.Join(notes, ". ")
+	}
+	return out
 }
 
 // planDistfiles renders make.conf and the client check it includes. The two
@@ -785,6 +836,10 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 		s.serveClientAptArchive(w, r, h, sys)
 		return
 	}
+	if h.q.File != "" {
+		s.serveClientNodeMirror(w, r, h, sys)
+		return
+	}
 	files := s.planSystem(r, h, sys)
 	f := files[0]
 	switch f.action {
@@ -818,6 +873,30 @@ func (s *Server) serveClientAptArchive(w http.ResponseWriter, r *http.Request, h
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(s.aptArchiveFile(h, h.q.Archive).Content))
+	noteClient(r, sys, h, "", "")
+}
+
+// serveClientNodeMirror serves the NODEJS_ORG_MIRROR file a plan's npm
+// companion record names, asking the profile first as planSystem does.
+func (s *Server) serveClientNodeMirror(w http.ResponseWriter, r *http.Request, h *clientHost, sys string) {
+	if sys != manifest.TypeNpm {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusBadRequest, "", "file="+clientFileNodeMirror+" selects npm's node-gyp mirror file, and applies to /client/npm alone\n")
+		return
+	}
+	if reason := h.profile.Excludes(sys); reason != "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusForbidden, audit.DenialClientExcluded, reason+"\n")
+		return
+	}
+	f := clientconf.NodeMirror(h.base, s.cfg.BinaryUpstreams, h.q.Root)
+	if f.Content == "" || f.Path(h.q.OS) == "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusNotFound, "",
+			"this server has no binary_upstreams namespace on https://nodejs.org/ in open mode, or this host has no path for the file, so there is no node-gyp mirror file to serve\n")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(f.Content))
 	noteClient(r, sys, h, "", "")
 }
 

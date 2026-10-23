@@ -241,41 +241,121 @@ done`
 	}
 }
 
-// The plan's npm file carries node-gyp's disturl when the server fronts
-// nodejs.org, and the digest the plan publishes covers that line: doctor
-// --configure refuses any file whose bytes do not hash to the record.
-func TestClientPlanNpmCarriesDisturlUnderItsDigest(t *testing.T) {
+// The npm plan is .npmrc plus, for an open nodejs.org namespace, the file
+// setting NODEJS_ORG_MIRROR: profile.d under root=1, the user's environment.d
+// file otherwise. A catalog namespace or a FreeBSD user gets the registry
+// line alone and a note on its record. Every file the plan names is served
+// at its URL with bytes its digest covers, and no file carries disturl.
+func TestClientPlanNpmPointsNodeGypThroughNodeMirror(t *testing.T) {
+	const registry = "registry=https://bodega.internal/npm/\n"
+	open := map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen}}
 	for _, tc := range []struct {
 		name      string
 		upstreams map[string]config.BinaryUpstream
-		want      string
+		query     string
+		want      map[string]string
+		note      string
 	}{
-		{"nodejs namespace", map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/"}},
-			"registry=https://bodega.internal/npm/\ndisturl=https://bodega.internal/binaries/node/dist\n"},
-		{"other host", map[string]config.BinaryUpstream{"node": {URL: "https://mirror.example.com/"}},
-			"registry=https://bodega.internal/npm/\n"},
+		{"open namespace, user", open, "os=linux",
+			map[string]string{"~/.npmrc": registry, clientconf.NodeMirrorUserPath: "NODEJS_ORG_MIRROR=https://bodega.internal/binaries/node/dist\n"}, ""},
+		{"open namespace, root", open, "os=linux&root=1",
+			map[string]string{"~/.npmrc": registry, clientconf.NodeMirrorSystemPath: "export NODEJS_ORG_MIRROR='https://bodega.internal/binaries/node/dist'\n"}, ""},
+		{"open namespace, freebsd root", open, "os=freebsd&root=1",
+			map[string]string{"~/.npmrc": registry, clientconf.NodeMirrorSystemPath: "export NODEJS_ORG_MIRROR='https://bodega.internal/binaries/node/dist'\n"}, ""},
+		{"open namespace, freebsd user", open, "os=freebsd",
+			map[string]string{"~/.npmrc": registry}, "nothing on freebsd reads a per-user environment file"},
+		{"catalog namespace", map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/", Mode: config.UpstreamModeCatalog}}, "os=linux",
+			map[string]string{"~/.npmrc": registry}, `binary_upstreams["node"] is in catalog mode`},
+		{"no namespace", nil, "os=linux", map[string]string{"~/.npmrc": registry}, ""},
+		{"other host", map[string]config.BinaryUpstream{"node": {URL: "https://mirror.example.com/", Mode: config.UpstreamModeOpen}}, "os=linux",
+			map[string]string{"~/.npmrc": registry}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := hostedServer(t)
 			s.cfg.PublicURL = "https://bodega.internal"
 			s.cfg.BinaryUpstreams = tc.upstreams
 			f := bindProfile(t, s, "open", "open-host", nil, nil)
-			recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeNpm)
-			if len(recs) != 1 || recs[0].Action != clientconf.PlanInstall {
-				t.Fatalf("npm records = %+v, want one install", recs)
+			recs := planRecordFor(planJSON(t, s, f.token, tc.query), manifest.TypeNpm)
+			if len(recs) != len(tc.want) {
+				t.Fatalf("npm records = %+v, want %d", recs, len(tc.want))
 			}
-			u, err := url.Parse(recs[0].URL)
-			if err != nil {
-				t.Fatal(err)
+			if (tc.note == "") != (recs[0].Reason == "") || !strings.Contains(recs[0].Reason, tc.note) {
+				t.Errorf(".npmrc reason = %q, want one holding %q", recs[0].Reason, tc.note)
 			}
-			code, body := clientGet(t, s, f.token, u.RequestURI())
-			if code != http.StatusOK || body != tc.want {
-				t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, tc.want)
-			}
-			if _, err := clientconf.NewChange(recs[0], []byte(body), t.TempDir()); err != nil {
-				t.Errorf("NewChange refused the served file: %v", err)
+			for _, rec := range recs {
+				want, ok := tc.want[rec.Path]
+				if rec.Action != clientconf.PlanInstall || !ok {
+					t.Fatalf("record %+v, want an install at one of %v", rec, tc.want)
+				}
+				u, err := url.Parse(rec.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				code, body := clientGet(t, s, f.token, u.RequestURI())
+				if code != http.StatusOK || body != want || strings.Contains(body, "disturl") {
+					t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, want)
+				}
+				if _, err := clientconf.NewChange(rec, []byte(body), t.TempDir()); err != nil {
+					t.Errorf("NewChange refused the served file: %v", err)
+				}
 			}
 		})
+	}
+}
+
+// A host E21 configured holds a disturl line in ~/.npmrc. The next apply of
+// the npm plan drops it, keeps the credential, backs up the old file, and
+// writes the environment file in its place.
+func TestClientPlanNpmRemovesAnE21Disturl(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	s.cfg.BinaryUpstreams = map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen}}
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	home := t.TempDir()
+	old := "registry=https://bodega.internal/npm/\ndisturl=https://bodega.internal/binaries/node/dist\n//bodega.internal/npm/:_authToken=bodega_ak_npm\n" //nolint:gosec // G101: fixture token
+	if err := os.WriteFile(home+"/.npmrc", []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var changes []clientconf.Change
+	for _, rec := range planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeNpm) {
+		u, _ := url.Parse(rec.URL)
+		_, body := clientGet(t, s, f.token, u.RequestURI())
+		c, err := clientconf.NewChange(rec, []byte(body), home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changes = append(changes, c)
+	}
+	if _, err := clientconf.Apply(changes, ".bodega-test"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(home + "/.npmrc"); string(got) != "registry=https://bodega.internal/npm/\n//bodega.internal/npm/:_authToken=bodega_ak_npm\n" {
+		t.Errorf(".npmrc after apply = %q, want the registry line and the credential", got)
+	}
+	if got, _ := os.ReadFile(home + "/.npmrc.bodega-test"); string(got) != old {
+		t.Errorf("backup = %q, want the E21 file %q", got, old)
+	}
+	if got, _ := os.ReadFile(home + "/.config/environment.d/60-bodega-node.conf"); string(got) != "NODEJS_ORG_MIRROR=https://bodega.internal/binaries/node/dist\n" {
+		t.Errorf("environment.d file = %q", got)
+	}
+}
+
+// file= and root= are validated like every other host fact, and the mirror
+// file is npm's alone.
+func TestClientNodeMirrorRouteRefusals(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.BinaryUpstreams = map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen}}
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	for path, want := range map[string]int{
+		"/client/npm?os=linux&file=other":         http.StatusBadRequest,
+		"/client/npm?os=linux&root=yes":           http.StatusBadRequest,
+		"/client/pypi?os=linux&file=node-mirror":  http.StatusBadRequest,
+		"/client/npm?os=freebsd&file=node-mirror": http.StatusNotFound,
+		"/client/npm?os=linux&file=node-mirror":   http.StatusOK,
+	} {
+		if code, body := clientGet(t, s, f.token, path); code != want {
+			t.Errorf("GET %s = %d %q, want %d", path, code, body, want)
+		}
 	}
 }
 
