@@ -4825,7 +4825,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `68fdaa7d35a7f8765b4a2a2f2e92ee5be67149069ee767e5cdbf394ac82d9876`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `79cf11562d282f83140ae2dc0101fa4691229de659cdc652a9cbc3b4a435924e`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4981,7 +4981,7 @@ registry=https://bodega-host:8080/npm/
 
 The trailing slash matters: it is what matches the `//bodega-host:8080/npm/:_authToken=` line `bodega doctor --write-credentials` writes into the same file. For one command, `npm install --registry https://bodega-host:8080/npm/ <package>`.
 
-A package that builds a native module runs node-gyp, which fetches Node's headers (`<disturl>/v<node>/node-v<node>-headers.tar.gz` and `SHASUMS256.txt`) from `https://nodejs.org/dist` unless `disturl` names another host. The registry line does not cover that fetch, so a host locked to bodega fails the build, and a host that is not locked reaches nodejs.org behind bodega's back. When the server's config has a `binary_upstreams` namespace whose `url` is `https://nodejs.org/` (with or without the trailing slash, under any key), the file gains a second line pointing node-gyp at it:
+A package that builds a native module runs node-gyp, which fetches Node's headers (`<mirror>/v<node>/node-v<node>-headers.tar.gz` and `SHASUMS256.txt`) from `https://nodejs.org/dist` unless the `NODEJS_ORG_MIRROR` environment variable names another base. The registry line does not cover that fetch, so a host locked to bodega fails the build, and a host that is not locked reaches nodejs.org behind bodega's back. When the server's config has a `binary_upstreams` namespace whose `url` is `https://nodejs.org/` (under any key) in `open` mode, the plan gains a second file that sets the variable:
 
 ```json
 "binary_upstreams": {
@@ -4992,12 +4992,28 @@ A package that builds a native module runs node-gyp, which fetches Node's header
 }
 ```
 
-```ini
-registry=https://bodega-host:8080/npm/
-disturl=https://bodega-host:8080/binaries/nodejs/dist
+Run as root, `bodega doctor --configure npm` and the setup script install `/etc/profile.d/bodega-node.sh`, which every login shell reads:
+
+```sh
+export NODEJS_ORG_MIRROR='https://bodega-host:8080/binaries/nodejs/dist'
 ```
 
-The line names whichever key the namespace has; two namespaces on nodejs.org resolve to the first in sorted order. A namespace on any other host, including a nodejs.org mirror, adds nothing, because bodega cannot tell that it serves the same tree. `"mode": "open"` is what makes the headers reachable: under the default `catalog` mode the namespace answers only paths a manifest entry names, and node-gyp asks for the headers of whatever Node version runs the build. The header tarballs never change under their name, so the namespace needs no `revalidate`. The plan `bodega doctor --configure npm` installs, the web page and the TUI all render the same two lines, and the plan's digest covers both.
+Run as the user, they install `~/.config/environment.d/60-bodega-node.conf` instead, which the user's systemd manager reads and passes to the sessions it starts. A FreeBSD host has no per-user file to install, so a run there that is not root installs the registry line alone and says so.
+
+```ini
+NODEJS_ORG_MIRROR=https://bodega-host:8080/binaries/nodejs/dist
+```
+
+`.npmrc` carries no `disturl` line. npm forwards an unknown key to node-gyp only as `npm_config_disturl`, warns `Unknown user config "disturl"` on every command, and says its next major version stops forwarding it, after which node-gyp would fall back to nodejs.org without an error. A host configured with the older `disturl` line loses it on the next `--configure npm --apply`, which keeps the previous `.npmrc` as the usual `.bodega-<timestamp>` backup.
+
+Neither file reaches a system service. A systemd unit that builds native modules (a CI runner, a build agent) needs the variable in its own unit:
+
+```ini
+[Service]
+Environment=NODEJS_ORG_MIRROR=https://bodega-host:8080/binaries/nodejs/dist
+```
+
+The value names whichever key the namespace has; two namespaces on nodejs.org resolve to the first in sorted order. A namespace on any other host, including a nodejs.org mirror, adds nothing, because bodega cannot tell that it serves the same tree. Under the default `catalog` mode the namespace answers only paths a manifest entry names, and node-gyp asks for the headers of whatever Node version runs the build, so the plan leaves the file out and the npm record carries a note saying why: a host that is not locked keeps reaching nodejs.org rather than failing every native build with a 404. The header tarballs never change under their name, so the namespace needs no `revalidate`. The web page and the TUI show the root form of the file, and the plan's digest covers both files.
 
 bodega rewrites every `dist.tarball` in a packument onto its own `/npm/` route before serving it. Relayed as upstream wrote them, those URLs name `registry.npmjs.org`, and npm's resolver replaces the origin while keeping the upstream path — so the client asks for `/<package>/-/<file>.tgz` with the `/npm` prefix dropped and gets a 404. On a deployment where that path happened to resolve it would get the tarball from a request bodega never sees, past the hidden-package and hidden-version checks, the version constraint, the audit row, the checksum and the cache.
 

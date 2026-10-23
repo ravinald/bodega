@@ -498,6 +498,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	if len(req.archives) > 0 {
 		q.Set("archives", strings.Join(req.archives, ","))
 	}
+	if os.Geteuid() == 0 {
+		q.Set("root", "1")
+	}
 	var plan clientconf.Plan
 	if err := getJSON(client, "/client/plan?"+q.Encode(), &plan); err != nil {
 		return err
@@ -516,6 +519,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			profile = "profile " + r.Profile
 		}
 		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, client.BaseURL)
+	}
+	for _, rec := range records {
+		if rec.Reason != "" {
+			fmt.Printf("note       %-10s %s\n", rec.System, rec.Reason)
+		}
 	}
 	home, _ := os.UserHomeDir()
 	var changes []clientconf.Change

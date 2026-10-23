@@ -160,6 +160,7 @@ freebsd)
 esac
 
 query="os=$os"
+[ "$(id -u)" != 0 ] || query="$query&root=1"
 [ -z "$abi" ] || query="$query&abi=$abi"
 [ -z "$codename" ] || query="$query&codename=$(printf '%s' "$codename" | sed 's/+/%2B/g')"
 
@@ -520,7 +521,9 @@ blocked=
 while IFS=$tab read -r identity profile match system action path url sha reason <&3; do
 	selected "$system" || continue
 	case $action in
-	install) ;;
+	install)
+		[ "$reason" = - ] || printf '%-8s %-10s %s\n' note "$system" "$(dec "$reason")"
+		;;
 	refuse | skip)
 		if [ -n "$want" ]; then
 			blocked="$blocked

@@ -25,7 +25,8 @@ const (
 )
 
 // PlanRecord is one line of a client plan: one file for one system, or the
-// reason a system has none. The host's identity rides on every record rather
+// reason a system has none. An install record's reason, when it has one, is
+// a note the operator reads before applying it. The host's identity rides on every record rather
 // than on a header line, so a loop reading plan.txt needs one case, not two.
 type PlanRecord struct {
 	Identity string `json:"identity"`
