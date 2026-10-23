@@ -46,6 +46,15 @@ const (
 	// directory is derived from it, so the two must not drift.
 	DefaultStoragePath = "/var/lib/bodega"
 
+	// DefaultUpstreamConnectTimeout is short against net.Dialer's 30s because
+	// an upstream that drops SYNs would otherwise hold a request past the 15s
+	// pip gives up at, and the stale fallback behind it would never reach a
+	// client.
+	DefaultUpstreamConnectTimeout = "5s"
+	// DefaultStaleGrace is how long a request holding a stale cached copy waits
+	// for the upstream before taking that copy, inside every client's timeout.
+	DefaultStaleGrace = "3s"
+
 	// DefaultSpoolMaxArtifactBytes is the largest single upstream artifact the
 	// proxy will copy to disk. 8 GiB is roughly twice the biggest thing a real
 	// archive publishes as one file — a CUDA .deb or a torch wheel runs 2-4 GB
@@ -115,37 +124,39 @@ type Config struct {
 	// provenance is verified against, for a host that cannot reach Sigstore's
 	// TUF repository. Empty means fetch it through TUF. serve refuses to
 	// start when it names a file that is missing or does not parse.
-	SigstoreTrustedRoot string   `json:"sigstore_trusted_root,omitempty"`
-	ServerURL           string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
-	Token               string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
-	ProxyCacheEnabled   bool     `json:"proxy_cache_enabled"`
-	MetadataTTL         string   `json:"metadata_ttl,omitempty"`
-	GomodUpstream       string   `json:"gomod_upstream,omitempty"`
-	GomodSumdbURL       string   `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
-	NpmUpstream         string   `json:"npm_upstream,omitempty"`
-	PypiUpstream        string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
-	CargoUpstream       string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
-	CargoDLUpstream     string   `json:"cargo_dl_upstream,omitempty"`
-	DiscoverMode        string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
-	GomodRoot           string   `json:"gomod_root,omitempty"`
-	HelmRoot            string   `json:"helm_root,omitempty"`
-	NpmRoot             string   `json:"npm_root,omitempty"`
-	CargoRoot           string   `json:"cargo_root,omitempty"`
-	FreeBSDRoot         string   `json:"freebsd_root,omitempty"`
-	DistfilesRoot       string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
-	AuditDB             string   `json:"audit_db,omitempty"`
-	DenyList            []string `json:"deny_list,omitempty"`
-	Timezone            string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
-	AuditEvents         []string `json:"audit_events,omitempty"`      // event types to record; empty = all
-	AuditSink           string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
-	AuditSinkDSN        string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
-	StorageBackend      string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
-	StoragePath         string   `json:"storage_path,omitempty"`      // root directory for local backend
-	AptCodename         string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
-	AptSuites           []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
-	AptSigningName      string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
-	AptSigningEmail     string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
-	AdminPermitCIDR     []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+	SigstoreTrustedRoot    string   `json:"sigstore_trusted_root,omitempty"`
+	ServerURL              string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token                  string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
+	ProxyCacheEnabled      bool     `json:"proxy_cache_enabled"`
+	MetadataTTL            string   `json:"metadata_ttl,omitempty"`
+	UpstreamConnectTimeout string   `json:"upstream_connect_timeout,omitempty"` // bound on one TCP connect to an upstream
+	StaleGrace             string   `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
+	GomodUpstream          string   `json:"gomod_upstream,omitempty"`
+	GomodSumdbURL          string   `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
+	NpmUpstream            string   `json:"npm_upstream,omitempty"`
+	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
+	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
+	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
+	DiscoverMode           string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
+	GomodRoot              string   `json:"gomod_root,omitempty"`
+	HelmRoot               string   `json:"helm_root,omitempty"`
+	NpmRoot                string   `json:"npm_root,omitempty"`
+	CargoRoot              string   `json:"cargo_root,omitempty"`
+	FreeBSDRoot            string   `json:"freebsd_root,omitempty"`
+	DistfilesRoot          string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
+	AuditDB                string   `json:"audit_db,omitempty"`
+	DenyList               []string `json:"deny_list,omitempty"`
+	Timezone               string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
+	AuditEvents            []string `json:"audit_events,omitempty"`      // event types to record; empty = all
+	AuditSink              string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
+	AuditSinkDSN           string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
+	StorageBackend         string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
+	StoragePath            string   `json:"storage_path,omitempty"`      // root directory for local backend
+	AptCodename            string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
+	AptSuites              []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
+	AptSigningName         string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
+	AptSigningEmail        string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
+	AdminPermitCIDR        []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 
 	// OSV gate. osv_db_dir holds the per-ecosystem archives `bodega policy osv
 	// sync` writes and defaults to {storage_path}/osv, so a connected host
@@ -1019,6 +1030,18 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 
 	// Proxy/cache.
 	cfg.MetadataTTL = firstNonEmpty(cfg.MetadataTTL, "1h")
+	cfg.UpstreamConnectTimeout = firstNonEmpty(cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout)
+	cfg.StaleGrace = firstNonEmpty(cfg.StaleGrace, DefaultStaleGrace)
+	// The server parses both with no error path, so a typo here would become
+	// a zero: no connect bound at all, or no grace.
+	for _, d := range []struct{ key, val, example string }{
+		{"upstream_connect_timeout", cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout},
+		{"stale_grace", cfg.StaleGrace, DefaultStaleGrace},
+	} {
+		if v, err := time.ParseDuration(d.val); err != nil || v <= 0 {
+			return nil, fmt.Errorf("invalid %s %q (want a positive Go duration, e.g. %q)", d.key, d.val, d.example)
+		}
+	}
 	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")
 	cfg.GomodSumdbURL = strings.TrimRight(firstNonEmpty(cfg.GomodSumdbURL, "https://sum.golang.org"), "/")
 	if err := validateSumdbURL(cfg.GomodSumdbURL); err != nil {
@@ -2021,6 +2044,8 @@ func defaultConfigContent() []byte {
   "_comment_proxy": "Proxy/cache: when enabled, the server fetches from upstream on cache miss",
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
+  "upstream_connect_timeout": "5s",
+  "stale_grace": "3s",
   "gomod_upstream": "https://proxy.golang.org",
   "gomod_sumdb_url": "https://sum.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
