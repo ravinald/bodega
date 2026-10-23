@@ -59,8 +59,12 @@ func (f *fakeOS) run(argv []string) (string, error) {
 	return "", nil
 }
 
+// oscRecord is where stubOSCallers puts the record under its fixture root, so
+// a test seeds one through files.
+const oscRecord = "/etc/bodega/doctor-os-callers.json"
+
 // stubOSCallers points the package's osCallersHost at a fixture root holding
-// files, and a scratch record, for the length of the test.
+// files, and the record beneath it, for the length of the test.
 func stubOSCallers(t *testing.T, files map[string]string, f *fakeOS) *osCallersHost {
 	t.Helper()
 	root := t.TempDir()
@@ -74,7 +78,7 @@ func stubOSCallers(t *testing.T, files map[string]string, f *fakeOS) *osCallersH
 		}
 	}
 	saved := osCallers
-	osCallers = &osCallersHost{goos: "linux", root: root, record: filepath.Join(t.TempDir(), "etc", "doctor-os-callers.json"), run: f.run}
+	osCallers = &osCallersHost{goos: "linux", root: root, record: filepath.Join(root, oscRecord), run: f.run}
 	t.Cleanup(func() { osCallers = saved })
 	return osCallers
 }
@@ -121,62 +125,79 @@ func TestOSCallerRows(t *testing.T) {
 		fake     fakeOS
 		internal []string
 		check    string
-		want     bool
+		want     host.Status // "" for no row
 		detail   []string
 		remedy   []string
 	}{
-		{"chrony over NTS", ubuntuChrony, fakeOS{chrony: "active"}, nil, "chrony-nts", true,
+		{"chrony over NTS", ubuntuChrony, fakeOS{chrony: "active"}, nil, "chrony-nts", host.StatusWarn,
 			[]string{"1.ntp.ubuntu.com", "ntp-bootstrap.ubuntu.com", "TCP 4460", "keeps no time", "TLS", "Valid-Until"},
 			[]string{"server <host> iburst", "allow TCP 4460"}},
 		{"chrony through an included file", map[string]string{
 			"/usr/sbin/chronyd":    "",
 			"/etc/chrony.conf":     "include /etc/chrony.d/*.conf\n",
 			"/etc/chrony.d/a.conf": "server time.cloudflare.com iburst nts\n"},
-			fakeOS{chrony: "active"}, nil, "chrony-nts", true, []string{"time.cloudflare.com"}, nil},
+			fakeOS{chrony: "active"}, nil, "chrony-nts", host.StatusWarn, []string{"time.cloudflare.com"}, nil},
 		{"chrony with an internal source the operator names", withFiles(ubuntuChrony, map[string]string{
 			"/etc/chrony/conf.d/lan.conf": "server ntp.internal iburst\n"}),
-			fakeOS{chrony: "active"}, []string{"NTP.internal"}, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, []string{"NTP.internal"}, "chrony-nts", "", nil, nil},
 		{"chrony from the bodega server over NTS", map[string]string{
 			"/usr/sbin/chronyd":       "",
 			"/etc/chrony/chrony.conf": "server bodega.internal iburst nts\n"},
-			fakeOS{chrony: "active"}, []string{"bodega.internal"}, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, []string{"bodega.internal"}, "chrony-nts", "", nil, nil},
 		{"chrony without NTS", map[string]string{
 			"/usr/sbin/chronyd":       "",
 			"/etc/chrony/chrony.conf": "pool ntp.ubuntu.com iburst\n! server x nts\n"},
-			fakeOS{chrony: "active"}, nil, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, nil, "chrony-nts", "", nil, nil},
 		{"chrony config left without chronyd", map[string]string{
 			"/etc/chrony/chrony.conf": "server ntp-bootstrap.ubuntu.com nts\n"},
-			fakeOS{chrony: "active"}, nil, "chrony-nts", false, nil, nil},
-		{"chrony under its RHEL unit name", ubuntuChrony, fakeOS{chronyd: "active"}, nil, "chrony-nts", true,
+			fakeOS{chrony: "active"}, nil, "chrony-nts", "", nil, nil},
+		{"chrony under its RHEL unit name", ubuntuChrony, fakeOS{chronyd: "active"}, nil, "chrony-nts", host.StatusWarn,
 			[]string{"ntp-bootstrap.ubuntu.com"}, nil},
-		{"chrony installed but not running", ubuntuChrony, fakeOS{chrony: "failed"}, nil, "chrony-nts", false, nil, nil},
+		{"chrony installed but not running", ubuntuChrony, fakeOS{chrony: "failed"}, nil, "chrony-nts", "", nil, nil},
 		{"motd-news file and timer enabled", map[string]string{motdNewsDefaults: "# comment\nENABLED=1\n"},
-			fakeOS{timer: "enabled"}, nil, "motd-news", true,
+			fakeOS{timer: "enabled"}, nil, "motd-news", host.StatusWarn,
 			[]string{"ENABLED=1", "motd-news.timer is enabled", "needs both", "motd.ubuntu.com"},
 			[]string{"ENABLED=0", "systemctl disable --now motd-news.timer"}},
 		{"motd-news file enabled, timer disabled", map[string]string{motdNewsDefaults: "ENABLED=1\n"},
-			fakeOS{timer: "disabled"}, nil, "motd-news", false, nil, nil},
+			fakeOS{timer: "disabled"}, nil, "motd-news", "", nil, nil},
 		{"motd-news file enabled, no timer", map[string]string{motdNewsDefaults: "ENABLED=1\n"},
-			fakeOS{}, nil, "motd-news", false, nil, nil},
+			fakeOS{}, nil, "motd-news", "", nil, nil},
 		{"motd-news timer enabled, file disabled", map[string]string{motdNewsDefaults: "ENABLED=0\n"},
-			fakeOS{timer: "enabled"}, nil, "motd-news", false, nil, nil},
-		{"motd-news timer enabled, no file", nil, fakeOS{timer: "enabled"}, nil, "motd-news", false, nil, nil},
+			fakeOS{timer: "enabled"}, nil, "motd-news", "", nil, nil},
+		{"motd-news timer enabled, no file", nil, fakeOS{timer: "enabled"}, nil, "motd-news", "", nil, nil},
 		{"motd-news off", map[string]string{motdNewsDefaults: "ENABLED=1\nENABLED=0\n"},
-			fakeOS{timer: "disabled"}, nil, "motd-news", false, nil, nil},
+			fakeOS{timer: "disabled"}, nil, "motd-news", "", nil, nil},
 		{"snapd active and unheld", snapd, fakeOS{snapd: "active", socket: "active", refreshTime: "timer: 00:00~24:00/4\nlast: n/a\nnext: n/a"},
-			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, []string{"snap refresh --hold", "proxy.store"}},
+			nil, "snapd-refresh", host.StatusWarn, []string{"api.snapcraft.io"}, []string{"snap refresh --hold", "proxy.store"}},
 		{"snapd held forever", snapd, fakeOS{snapd: "active", refreshTime: "timer: 00:00~24:00/4\nhold: forever\nnext: n/a"},
-			nil, "snapd-refresh", false, nil, nil},
+			nil, "snapd-refresh", "", nil, nil},
 		{"snapd held past 30 days", snapd, fakeOS{snapd: "active", refreshTime: "hold: " + time.Now().Add(31*24*time.Hour).UTC().Format(time.RFC3339)},
-			nil, "snapd-refresh", false, nil, nil},
+			nil, "snapd-refresh", "", nil, nil},
 		{"snapd held under 30 days", snapd, fakeOS{snapd: "active", refreshTime: "hold: " + time.Now().Add(29*24*time.Hour).UTC().Format(time.RFC3339)},
-			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, nil},
+			nil, "snapd-refresh", host.StatusWarn, []string{"api.snapcraft.io"}, nil},
 		{"snapd hold lapsed", snapd, fakeOS{snapd: "active", refreshTime: "hold: 2026-10-20T13:05:00Z"},
-			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, nil},
-		{"snapd in standby behind its socket", snapd, fakeOS{socket: "active"}, nil, "snapd-refresh", true,
-			[]string{"socket", "could not be read without waking snapd"}, []string{"snap refresh --hold"}},
-		{"snapd inactive", snapd, fakeOS{}, nil, "snapd-refresh", false, nil, nil},
-		{"snapd not installed", nil, fakeOS{snapd: "active"}, nil, "snapd-refresh", false, nil, nil},
+			nil, "snapd-refresh", host.StatusWarn, []string{"api.snapcraft.io"}, nil},
+		{"snapd in standby, no record", snapd, fakeOS{socket: "active"}, nil, "snapd-refresh", host.StatusWarn,
+			[]string{"socket", "hold applied by hand cannot be seen without waking snapd", "--quiet-os-callers --apply records the hold in", oscRecord},
+			[]string{"snap refresh --hold", "proxy.store"}},
+		{"snapd in standby, hold recorded", withFiles(snapd, map[string]string{oscRecord: `{"steps": ["snap-refresh-hold"]}`}),
+			fakeOS{socket: "active"}, nil, "snapd-refresh", "", nil, nil},
+		{"snapd in standby, record without the hold", withFiles(snapd, map[string]string{oscRecord: `{"steps": ["motd-news"]}`}),
+			fakeOS{socket: "active"}, nil, "snapd-refresh", host.StatusWarn, []string{"hold applied by hand"}, nil},
+		{"snapd in standby, malformed record", withFiles(snapd, map[string]string{oscRecord: "{not json"}),
+			fakeOS{socket: "active"}, nil, "snapd-refresh", host.StatusSkip,
+			[]string{oscRecord, "is not the record --quiet-os-callers writes"}, []string{oscRecord, "move it aside"}},
+		{"snapd in standby, record names an unknown step", withFiles(snapd, map[string]string{oscRecord: `{"steps": ["bogus"]}`}),
+			fakeOS{socket: "active"}, nil, "snapd-refresh", host.StatusSkip, []string{oscRecord, `"bogus"`}, []string{"move it aside"}},
+		{"snapd active and unheld, hold recorded", withFiles(snapd, map[string]string{oscRecord: `{"steps": ["snap-refresh-hold"]}`}),
+			fakeOS{snapd: "active", refreshTime: "timer: 00:00~24:00/4"}, nil, "snapd-refresh", host.StatusWarn,
+			[]string{"api.snapcraft.io", oscRecord + " says bodega applied a hold and snapd now reports none", "lifted by hand or lapsed"}, nil},
+		{"snapd active and unheld, malformed record", withFiles(snapd, map[string]string{oscRecord: "{not json"}),
+			fakeOS{snapd: "active", refreshTime: "timer: 00:00~24:00/4"}, nil, "snapd-refresh", host.StatusWarn, []string{"api.snapcraft.io"}, nil},
+		{"snapd active and held, record malformed", withFiles(snapd, map[string]string{oscRecord: "{not json"}),
+			fakeOS{snapd: "active", refreshTime: "hold: forever"}, nil, "snapd-refresh", "", nil, nil},
+		{"snapd inactive", snapd, fakeOS{}, nil, "snapd-refresh", "", nil, nil},
+		{"snapd not installed", nil, fakeOS{snapd: "active"}, nil, "snapd-refresh", "", nil, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,8 +205,8 @@ func TestOSCallerRows(t *testing.T) {
 			h := stubOSCallers(t, tc.files, &fake)
 			fs := h.findings(tc.internal)
 			f, ok := rowNamed(fs, tc.check)
-			if ok != tc.want {
-				t.Fatalf("%s row = %v (%+v), want %v", tc.check, ok, fs, tc.want)
+			if ok != (tc.want != "") {
+				t.Fatalf("%s row = %v (%+v), want %q", tc.check, ok, fs, tc.want)
 			}
 			for _, c := range fake.calls {
 				if strings.HasPrefix(c, "systemctl is-") {
@@ -198,8 +219,8 @@ func TestOSCallerRows(t *testing.T) {
 			if !ok {
 				return
 			}
-			if f.Status != host.StatusWarn {
-				t.Errorf("status = %s, want WARN", f.Status)
+			if f.Status != tc.want {
+				t.Errorf("status = %s, want %s", f.Status, tc.want)
 			}
 			for _, want := range tc.detail {
 				if !strings.Contains(f.Detail, want) {
@@ -263,6 +284,23 @@ func TestDoctorConfigureQuietOSCallersPlan(t *testing.T) {
 	out, err = runDoctor(t, append(base, "--quiet-os-callers")...)
 	if err != nil || !strings.Contains(out, "os-callers  nothing to quiet: motd-news is off, and snapd is already held") {
 		t.Errorf("a quiet host = %v, want nothing to quiet:\n%s", err, out)
+	}
+
+	standby := &fakeOS{socket: "active"}
+	h := stubOSCallers(t, withFiles(files, map[string]string{motdNewsDefaults: "ENABLED=0\n", oscRecord: `{"steps": ["snap-refresh-hold"]}`}), standby)
+	out, err = runDoctor(t, append(base, "--quiet-os-callers")...)
+	if err != nil || !strings.Contains(out, "os-callers  nothing to quiet: motd-news is off, and snapd is in standby with its refresh hold recorded in "+h.record) {
+		t.Errorf("a standby snapd with its hold recorded = %v, want nothing to quiet:\n%s", err, out)
+	}
+	if slices.ContainsFunc(standby.calls, func(c string) bool { return strings.HasPrefix(c, "snap ") }) {
+		t.Errorf("planning against a standby snapd with its hold recorded ran %v; it would wake snapd", standby.calls)
+	}
+
+	unrecorded := &fakeOS{socket: "active", refreshTime: "timer: 00:00~24:00/4"}
+	stubOSCallers(t, withFiles(files, map[string]string{motdNewsDefaults: "ENABLED=0\n"}), unrecorded)
+	out, err = runDoctor(t, append(base, "--quiet-os-callers")...)
+	if err != nil || !strings.Contains(out, "snapd-refresh  snap refresh --hold") || !slices.Contains(unrecorded.calls, "snap refresh --time --abs-time") {
+		t.Errorf("a standby snapd with no record = %v, calls %v, want its hold read and planned:\n%s", err, unrecorded.calls, out)
 	}
 
 	if _, err := runDoctor(t, "--quiet-os-callers"); err == nil {
@@ -370,5 +408,48 @@ func TestDoctorQuietOSCallersClearsItsRows(t *testing.T) {
 		if strings.Contains(after, row+" ") {
 			t.Errorf("the %s row survived --quiet-os-callers --apply:\n%s", row, after)
 		}
+	}
+}
+
+// On a socket-activated snapd the hold --apply runs wakes snapd, which goes
+// back to standby, so the next report cannot ask it and reads the record.
+func TestDoctorQuietOSCallersClearsSnapdInStandby(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv, _ := planServer(t, map[string]string{"apt": "deb x\n"})
+	stubUbuntuPro(t, false, &fakePro{})
+	fake := &fakeOS{snapd: "", socket: "active", refreshTime: "timer: 00:00~24:00/4\nlast: n/a\nnext: n/a"}
+	h := stubOSCallers(t, map[string]string{"/usr/lib/snapd/snapd": ""}, fake)
+
+	saved := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = saved })
+
+	before, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+	if !strings.Contains(before, "snapd-refresh ") {
+		t.Fatalf("the unquieted standby host lacks the snapd-refresh row:\n%s", before)
+	}
+
+	out, err := runDoctor(t, "--configure", "apt", "--quiet-os-callers", "--apply", "--url", srv.URL, "--allow-plaintext")
+	if err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	if !slices.Equal(fake.ran, []string{"snap refresh --hold"}) {
+		t.Fatalf("--apply ran %v, want the snapd hold alone", fake.ran)
+	}
+	b, err := os.ReadFile(h.record)
+	if err != nil || !strings.Contains(string(b), `"snap-refresh-hold"`) {
+		t.Fatalf("record after --apply = %s (%v), want snap-refresh-hold", b, err)
+	}
+
+	fake.calls = nil
+	after, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+	if !strings.Contains(after, "CHECK") {
+		t.Fatalf("the second run printed no report:\n%s", after)
+	}
+	if strings.Contains(after, "snapd-refresh ") {
+		t.Errorf("the snapd-refresh row survived --quiet-os-callers --apply on a standby snapd:\n%s", after)
+	}
+	if slices.ContainsFunc(fake.calls, func(c string) bool { return strings.HasPrefix(c, "snap ") }) {
+		t.Errorf("the report ran %v against a standby snapd", fake.calls)
 	}
 }
