@@ -825,6 +825,8 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 	}
 }
 
+const reloadRequested = "reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings"
+
 // reload is what SIGHUP does: re-read everything the server holds outside its
 // own memory and rebuild what is derived from it.
 //
@@ -853,8 +855,6 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // staying inert because the backend hiccuped is the same trap in a rarer
 // shape, and the hourly tick already treats a failed manifest read as
 // non-fatal and rebuilds anyway.
-const reloadRequested = "reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings"
-
 func (s *Server) reload(ctx context.Context) {
 	s.logger.Info(reloadRequested)
 	s.refreshAdmission(ctx)
