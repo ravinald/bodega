@@ -1533,7 +1533,7 @@ bodega audit events --type denied --identity build-07
 
 Bindings are read per request through a 30-second cache, on the same schedule as the CIDR lists, so a change lands on a running server without a restart and at once on `systemctl reload bodega`.
 
-### `bodega profile <create|list|show|bind|unbind|set|add|remove|pin|pins|unpin|diff|check>`
+### `bodega profile <create|list|show|bind|unbind|set|add|remove|delete|pin|pins|unpin|diff|check>`
 
 Declares what one class of host may fetch, and the version rule each package carries for that class. Everything else in bodega holds one answer for the whole fleet; a profile is the axis that varies by consumer.
 
@@ -1543,11 +1543,11 @@ The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. a
 
 Three levels:
 
-| Level           | Command                | Decides                                                                                                         |
-| --------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------- |
-| the profile     | `create`, `bind`       | which hosts it governs                                                                                          |
-| the type marker | `set`                  | membership (`closed`, `open`), the version default (`pinned`, `floating`) and the expansion action for one type |
-| the entry       | `add`, `pin`, `remove` | one package, and optionally a constraint overriding its type's default                                          |
+| Level           | Command                    | Decides                                                                                                         |
+| --------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| the profile     | `create`, `bind`, `delete` | which hosts it governs                                                                                          |
+| the type marker | `set`                      | membership (`closed`, `open`), the version default (`pinned`, `floating`) and the expansion action for one type |
+| the entry       | `add`, `pin`, `remove`     | one package, and optionally a constraint overriding its type's default                                          |
 
 ```bash
 bodega profile create web --description "public web tier"
@@ -1803,6 +1803,35 @@ bodega profile unbind devbox
 ```
 
 `bind` refuses a name no identity binding produces. A profile bound to a typo is inert: no request ever resolves to that name, so the profile is never consulted and nothing reports it. `--force` binds ahead of the identity binding. The same inertness arrives later when the identity binding is removed underneath a live profile binding, so `bodega profile show` marks a bound host no identity binding still resolves to.
+
+#### Deleting a profile
+
+`remove` takes one entry out and `unbind` detaches one host; `delete` removes the profile itself, with everything stored under its name: its type markers, its entries and the inventory baselines accepted for it. All of it goes in one transaction, so a failure leaves the profile as it was.
+
+```bash
+bodega profile delete web
+bodega profile delete web --unbind
+```
+
+The baselines go with it because a baseline is keyed by the profile's name, not by the row: one left behind would be the baseline in force for the next profile created as `web`. A profile re-created under the same name starts with none.
+
+A profile that any identity is still bound to is refused, because deleting it changes what those hosts may fetch, and nothing else would tell you which ones:
+
+```text
+$ bodega profile delete web
+Error: profile is bound: "web" is bound to web01, web02
+  Unbind each identity with: bodega profile unbind <identity>
+  Or delete it and its bindings together: bodega profile delete web --unbind
+```
+
+`--unbind` removes those bindings in the same transaction. The success line counts what went:
+
+```text
+$ bodega profile delete web --unbind
+Deleted profile web (1 types, 2 entries, 0 baselines, 2 identities unbound).
+```
+
+The audit row is a `delete` event naming the profile, the counts and every identity it unbound. Like every other profile edit, `delete` signals the running server to reload, and `profile list` and the next apt rebuild stop reading the profile from then on. An unknown name is an error, and `bodega profile list` shows the names that exist.
 
 #### Falsifying a profile: `diff` and `check`
 

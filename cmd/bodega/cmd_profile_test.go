@@ -386,6 +386,108 @@ func TestProfileBindRefusesAnUnknownIdentity(t *testing.T) {
 	}
 }
 
+// A bound profile is refused with the identities named and the command that
+// deletes it anyway; deleting it would change what those hosts may fetch.
+func TestProfileDeleteRefusesABoundProfile(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "open", "--version-default", "floating")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	if _, err := adb.BindProfile(context.Background(), audit.ProfileBinding{Identity: "web01", Profile: "web"}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	_ = adb.Close()
+
+	_, err = runProfile(t, "delete", "web")
+	if err == nil {
+		t.Fatal("a bound profile was deleted without --unbind")
+	}
+	for _, want := range []string{"web01", "bodega profile delete web --unbind"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if out := mustRunProfile(t, "show", "web"); !strings.Contains(out, "nginx") {
+		t.Errorf("a refused delete removed the profile's entries:\n%s", out)
+	}
+
+	out := mustRunProfile(t, "delete", "web", "--unbind")
+	if !strings.Contains(out, "Deleted profile web (1 types, 1 entries, 0 baselines, 1 identities unbound).") {
+		t.Errorf("delete did not report what it removed:\n%s", out)
+	}
+	if _, err := runProfile(t, "show", "web"); err == nil {
+		t.Error("show found a deleted profile")
+	}
+}
+
+func TestProfileDeleteReportsAndAuditsTheCounts(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "open", "--version-default", "floating")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "add", "web", "apt", "curl")
+
+	out := mustRunProfile(t, "delete", "web")
+	if !strings.Contains(out, "Deleted profile web (1 types, 2 entries, 0 baselines, 0 identities unbound).") {
+		t.Errorf("delete did not print its counts:\n%s", out)
+	}
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = adb.Close() }()
+	events, err := adb.Query(context.Background(), audit.Filter{PkgType: "profile", Limit: 100})
+	if err != nil {
+		t.Fatalf("query audit events: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.EventType == audit.EventDelete && strings.HasPrefix(ev.Details, "delete profile") {
+			found = true
+			if !strings.Contains(ev.Details, "types=1 entries=2 baselines=0 unbound=0") {
+				t.Errorf("the audit row does not carry the counts: %q", ev.Details)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no delete event among %d profile audit rows", len(events))
+	}
+}
+
+// A group with no RunE answered an unknown verb with its help and exit 0, so
+// `bodega profile delete` read as success before it existed.
+func TestProfileRefusesAnUnknownSubcommand(t *testing.T) {
+	loadFrom(t, "{}")
+	run := func(args ...string) (string, error) {
+		root := newRootCmd()
+		root.SetArgs(args)
+		var stdout, stderr bytes.Buffer
+		root.SetOut(&stdout)
+		root.SetErr(&stderr)
+		err := root.Execute()
+		return stderr.String(), err
+	}
+
+	stderr, err := run("profile", "bogus")
+	if err == nil {
+		t.Fatal("bodega profile bogus succeeded, so main exits 0")
+	}
+	for _, want := range []string{`unknown command "bogus" for "bodega profile"`, "delete", "unbind"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr does not mention %q:\n%s", want, stderr)
+		}
+	}
+	if _, err := run("profile"); err != nil {
+		t.Errorf("bare bodega profile returned %v, want its help and exit 0", err)
+	}
+}
+
 // Every mutation writes an audit event, as `bodega acl` does. A control whose
 // changes are not recorded is one nobody can review.
 func TestProfileMutationsAreAudited(t *testing.T) {

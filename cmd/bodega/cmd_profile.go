@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -24,7 +25,7 @@ import (
 
 func newProfileCmd(gf *globalFlags) *cobra.Command {
 	parent := &cobra.Command{
-		Use:   "profile <create|list|show|bind|unbind|set|add|remove|pin|pins|unpin|diff|check>",
+		Use:   "profile <create|list|show|bind|unbind|set|add|remove|delete|pin|pins|unpin|diff|check>",
 		Short: "Declare what one class of host may fetch",
 		Long: `A profile names the set of packages one class of host may fetch, and the
 version rule each of them carries for that class.
@@ -59,7 +60,18 @@ Examples:
   bodega profile bind web db01
   bodega profile diff web --origin db01
   bodega profile check`,
+		// A group with no RunE answers any argument with its help and exit 0,
+		// so a script calling a verb that does not exist reads success. Cobra
+		// checks unknown subcommands only on the root.
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return cmd.Help()
+			}
+			return unknownSubcommand(cmd, args[0])
+		},
 	}
+	noReloadSignalSelf(parent)
 	// The write verbs signal, the read verbs do not. A profile edit used to
 	// change nothing the server held that a TTL would not pick up on its own,
 	// because every index filter ran over the response on the way out. apt is
@@ -75,6 +87,7 @@ Examples:
 		signalsReload(newProfileSetCmd(gf)),
 		signalsReload(newProfileAddCmd(gf)),
 		signalsReload(newProfileRemoveCmd(gf)),
+		signalsReload(newProfileDeleteCmd(gf)),
 		signalsReload(newProfilePinCmd(gf)),
 		newProfilePinsCmd(gf),
 		signalsReload(newProfileUnpinCmd(gf)),
@@ -1843,6 +1856,66 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 	}
 	c.Flags().BoolVar(&force, "force", false, "Remove the last entry of a closed type, which leaves it permitting nothing")
 	return c
+}
+
+func newProfileDeleteCmd(gf *globalFlags) *cobra.Command {
+	var unbind bool
+	c := &cobra.Command{
+		Use:   "delete <profile>",
+		Short: "Delete a profile with its markers, entries and baselines",
+		Long: `Delete a profile and everything stored under its name: its per-type
+markers, its entries and the inventory baselines accepted for it. A profile
+re-created under the same name starts with none of them.
+
+A profile an identity is bound to is refused, because deleting it changes what
+those hosts may fetch. --unbind removes the bindings in the same transaction.
+
+Examples:
+  bodega profile delete web
+  bodega profile delete web --unbind`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			profile := args[0]
+			ctx := backgroundCtx()
+			adb, err := openProfileStore(gf)
+			if err != nil {
+				return err
+			}
+			defer adb.Close()
+			d, err := adb.DeleteProfile(ctx, profile, unbind)
+			if errors.Is(err, audit.ErrProfileBound) {
+				return fmt.Errorf("%w\n  Unbind each identity with: bodega profile unbind <identity>\n"+
+					"  Or delete it and its bindings together: bodega profile delete %s --unbind", err, profile)
+			}
+			if err != nil {
+				return err
+			}
+			counts := fmt.Sprintf("types=%d entries=%d baselines=%d unbound=%d",
+				d.Types, d.Entries, d.Baselines, len(d.Unbound))
+			details := "delete profile " + counts
+			if len(d.Unbound) > 0 {
+				details += " identities=" + strings.Join(d.Unbound, ",")
+			}
+			recordProfileEvent(ctx, adb, audit.EventDelete, d.Profile, "", details)
+			fmt.Printf("Deleted profile %s (%d types, %d entries, %d baselines, %d identities unbound).\n",
+				d.Profile, d.Types, d.Entries, d.Baselines, len(d.Unbound))
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&unbind, "unbind", false, "Also remove every binding to the profile")
+	return c
+}
+
+// unknownSubcommand is cobra's root-command refusal, for a group below it.
+func unknownSubcommand(cmd *cobra.Command, name string) error {
+	var valid []string
+	for _, c := range cmd.Commands() {
+		if c.IsAvailableCommand() {
+			valid = append(valid, "  "+c.Name())
+		}
+	}
+	return fmt.Errorf("unknown command %q for %q\n\nValid subcommands:\n%s",
+		name, cmd.CommandPath(), strings.Join(valid, "\n"))
 }
 
 // findProfileEntry returns the index of the entry the gate would match for a
