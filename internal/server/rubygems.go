@@ -93,7 +93,8 @@ func rubygemsFileNames(file, name string) bool {
 // rubygemsRelease is the version a gem file names with its platform suffix
 // cut off: "1.16.7" for "1.16.7-x86_64-linux". A manifest entry's constraint
 // is a statement about releases, and every platform build of one is that
-// release.
+// release, so both the entry's version and the requested one pass through
+// this before they are compared.
 func rubygemsRelease(version string) string {
 	release, _, _ := strings.Cut(version, "-")
 	return release
@@ -119,7 +120,7 @@ func (s *Server) handleRubygemsVersioned(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		vc, baseVer := packageVersionConstraint(pm)
-		if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, release, vc) {
+		if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(rubygemsRelease(baseVer), release, vc) {
 			s.refuseVersionConstraint(w, r, manifest.TypeRubygems, name, baseVer, version, vc)
 			return
 		}

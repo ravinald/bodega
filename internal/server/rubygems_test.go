@@ -360,6 +360,33 @@ func TestRubygemsGemRefusedByAVersionConstraint(t *testing.T) {
 	if rec := doRequest(s, http.MethodGet, "/rubygems/gems/nokogiri-1.16.6-x86_64-linux.gem", nil); rec.Code != http.StatusOK {
 		t.Errorf("a platform build of the pinned release: %d, want 200 (%s)", rec.Code, rec.Body.String())
 	}
+
+	// An operator pins a platform build in the form bodega create prompts
+	// for, and the pin is still a statement about the release.
+	t.Run("pin on a platform build", func(t *testing.T) {
+		g := newGemRegistry(t)
+		s := gemServer(t, g)
+		g.routes["/gems/nokogiri-1.16.7-aarch64-linux.gem"] = "\x00nokogiri 1.16.7 aarch64"
+		g.routes["/gems/nokogiri-1.16.6-x86_64-linux.gem"] = "\x00nokogiri 1.16.6"
+		addVersion(t, s, manifest.TypeRubygems, "nokogiri", manifest.VersionEntry{
+			Version: "1.16.7-x86_64-linux", Mode: manifest.ModeProxy, VersionConstraint: manifest.ConstraintExact,
+		})
+
+		for _, file := range []string{"nokogiri-1.16.7-x86_64-linux.gem", "nokogiri-1.16.7-aarch64-linux.gem", "nokogiri-1.16.7.gem"} {
+			if rec := doRequest(s, http.MethodGet, "/rubygems/gems/"+file, nil); rec.Code != http.StatusOK {
+				t.Errorf("%s under a pin on 1.16.7-x86_64-linux: %d, want 200 (%s)", file, rec.Code, rec.Body.String())
+			}
+		}
+		before := g.total()
+		rec := doRequest(s, http.MethodGet, "/rubygems/gems/nokogiri-1.16.6-x86_64-linux.gem", nil)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("another release's build under the pin: %d, want 403 (%s)", rec.Code, rec.Body.String())
+		}
+		refusalIncident(t, rec.Header(), checkConstraint)
+		if n := g.total() - before; n != 0 {
+			t.Errorf("upstream contacted %d times for a version the constraint refused", n)
+		}
+	})
 }
 
 // B156: during an outage a stale info or versions file is served within
