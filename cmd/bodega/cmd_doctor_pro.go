@@ -86,8 +86,8 @@ type proRecord struct {
 }
 
 // finding reports the ESM hook on a host Ubuntu Pro is not attached to. A
-// host without the hook, and an attached one, which is paying for what the
-// hook fetches, get no row at all.
+// host without the hook, one whose pro is gone, and an attached one, which is
+// paying for what the hook fetches, get no row at all.
 func (h *proHost) finding() (host.Finding, bool) {
 	f, ok, _ := h.check()
 	return f, ok
