@@ -234,7 +234,18 @@ type Server struct {
 	// aptPoolIdx maps each mirrored pool path to its Packages paragraph, which
 	// is where the OSV gate reads the epoch the pool filename drops.
 	aptPoolIdx aptPoolIndexCache
+
+	// reloadSignals, when set, is a SIGHUP channel the caller registered
+	// before New. Start otherwise registers its own.
+	reloadSignals chan os.Signal
 }
+
+// SetReloadSignals hands Start a channel already registered for SIGHUP.
+// serve registers it before loading anything, because New builds the first
+// apt index and that can take tens of seconds: a SIGHUP in that window with no
+// handler registered takes Go's default action and kills the process, and one
+// buffered here is acted on as soon as Start runs.
+func (s *Server) SetReloadSignals(ch chan os.Signal) { s.reloadSignals = ch }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level
 // routed events are unaffected. Default is false.
@@ -661,6 +672,23 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	// Before the PID file and READY=1, either of which invites a SIGHUP.
+	sighupCh := s.reloadSignals
+	if sighupCh == nil {
+		sighupCh = make(chan os.Signal, 1)
+		signal.Notify(sighupCh, syscall.SIGHUP)
+	}
+	// Without this the handler goroutine outlives the server it belongs to and
+	// keeps reloading global state on every later SIGHUP, so a process that
+	// stops and restarts a server ends up with several of them racing.
+	stopReloads := make(chan struct{})
+	defer func() {
+		signal.Stop(sighupCh)
+		close(stopReloads)
+	}()
+	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
+	go s.serveReloads(sighupCh, stopReloads)
+
 	// Write PID file so CLI commands can signal us to reload.
 	pidPath := filepath.Join(s.cfg.LogDir, "bodega.pid")
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err == nil {
@@ -738,24 +766,6 @@ func (s *Server) Start(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Serve(ln)
-	}()
-
-	// SIGHUP reloads the manifest index, the signing key, and the caches
-	// built from them.
-	sighupCh := make(chan os.Signal, 1)
-	signal.Notify(sighupCh, syscall.SIGHUP)
-	// Without this the handler goroutine outlives the server it belongs to and
-	// keeps reloading global state on every later SIGHUP, so a process that
-	// stops and restarts a server ends up with several of them racing.
-	defer func() {
-		signal.Stop(sighupCh)
-		close(sighupCh)
-	}()
-	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
-	go func() {
-		for range sighupCh {
-			s.reload(context.Background())
-		}
 	}()
 
 	// Wait for shutdown signal or server error.
@@ -843,18 +853,69 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // staying inert because the backend hiccuped is the same trap in a rarer
 // shape, and the hourly tick already treats a failed manifest read as
 // non-fatal and rebuilds anyway.
+const reloadRequested = "reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings"
+
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt, pkg and attestation signing keys, the CIDR access lists, the identity bindings and the profile bindings")
+	s.logger.Info(reloadRequested)
+	s.refreshAdmission(ctx)
+	s.reloadIndex(ctx)
+}
+
+// refreshAdmission installs the state that decides who is served what.
+func (s *Server) refreshAdmission(ctx context.Context) {
+	s.refreshACLs(ctx)
+	s.refreshIdentities(ctx)
+	s.refreshProfiles(ctx)
+}
+
+// reloadIndex is the slow half of a reload: the manifests, the signing keys
+// and the apt rebuild that signs with them.
+func (s *Server) reloadIndex(ctx context.Context) {
 	s.reloadManifests(ctx)
 	s.warnShadowedBinaries()
 	s.loadAptSigner()
 	s.loadPkgSigner()
 	s.loadAttestSigner()
-	s.refreshACLs(ctx)
-	s.refreshIdentities(ctx)
-	s.refreshProfiles(ctx)
 	s.rebuildAptSnapshot(ctx)
 	s.logger.Info("reload complete")
+}
+
+// serveReloads answers SIGHUP until stop closes. Admission state is installed
+// on the signal's own goroutine, and the rebuild is handed to a second one
+// that runs at most one at a time and coalesces whatever arrives meanwhile
+// into one more pass.
+//
+// One goroutine doing both is what held a binding back for 23s on a server
+// that had just started. Every `bodega profile` verb signals the server, so an
+// operator scripting create, set and bind sent three SIGHUPs, and the
+// `systemctl reload` after them queued behind the first one's rebuild: its
+// refreshIdentities ran only once that rebuild returned.
+func (s *Server) serveReloads(sig <-chan os.Signal, stop <-chan struct{}) {
+	ctx := context.Background()
+	rebuild := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-rebuild:
+				s.reloadIndex(ctx)
+			}
+		}
+	}()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-sig:
+			s.logger.Info(reloadRequested)
+			s.refreshAdmission(ctx)
+			select {
+			case rebuild <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 // sd_notify: hand-rolled so bodega stays single-binary. No-op when
