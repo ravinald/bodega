@@ -242,8 +242,8 @@ func (h *osCallersHost) unitState(verb, unit string) string {
 // findings reports a row per caller that is active on this host, and none for
 // one that is absent or off. internal names the hosts chrony may take time
 // from without calling out: the bodega server and any the operator names.
-// Every row is read from files and systemctl, never the network, so it
-// answers on a host whose egress reaches only bodega.
+// Every row is read from files, systemctl and a snapd already running, never
+// the network, so it answers on a host whose egress reaches only bodega.
 func (h *osCallersHost) findings(internal []string) []host.Finding {
 	if h.goos != "linux" {
 		return nil
@@ -410,6 +410,10 @@ func (h *osCallersHost) motdEnabled() (bool, error) {
 	return enabled, nil
 }
 
+// motdNews warns only when both halves are on: motd-news.service, which the
+// timer alone starts, runs 50-motd-news --force, and the script exits before
+// fetching unless ENABLED=1. A login runs it without --force and prints the
+// cache, so either half off makes no request.
 func (h *osCallersHost) motdNews() (host.Finding, bool) {
 	f := host.Finding{Check: "motd-news"}
 	enabled, err := h.motdEnabled()
@@ -419,46 +423,71 @@ func (h *osCallersHost) motdNews() (host.Finding, bool) {
 		f.Remediation = skipRemedy(h.path(motdNewsDefaults), err)
 		return f, true
 	}
-	timer := h.unitState("is-enabled", "motd-news.timer") == "enabled"
-	if !enabled && !timer {
+	if !enabled || h.unitState("is-enabled", "motd-news.timer") != "enabled" {
 		return f, false
 	}
-	var why []string
-	if enabled {
-		why = append(why, motdNewsDefaults+" has ENABLED=1")
-	}
-	if timer {
-		why = append(why, "motd-news.timer is enabled")
-	}
 	f.Status = host.StatusWarn
-	f.Detail = strings.Join(why, " and ") + "; motd-news.service fetches motd.ubuntu.com over HTTPS twice a day"
-	f.Remediation = "set ENABLED=0 in " + motdNewsDefaults + " and systemctl disable --now motd-news.timer, " +
-		"or bodega doctor --configure <system> --quiet-os-callers --apply, which records both for --restore-os-callers"
+	f.Detail = motdNewsDefaults + " has ENABLED=1 and motd-news.timer is enabled, and the fetch needs both; " +
+		"motd-news.service fetches motd.ubuntu.com over HTTPS twice a day"
+	f.Remediation = "set ENABLED=0 in " + motdNewsDefaults + " or systemctl disable --now motd-news.timer (either stops the fetch), " +
+		"or bodega doctor --configure <system> --quiet-os-callers --apply, which does both and records them for --restore-os-callers"
 	return f, true
 }
 
 var snapdBinaries = []string{"/usr/lib/snapd/snapd", "/usr/libexec/snapd/snapd"}
 
+func (h *osCallersHost) snapdInstalled() bool { return slices.ContainsFunc(snapdBinaries, h.exists) }
+
 // snapdActive counts the socket as well as the service: with no snaps
 // installed snapd goes to standby seconds after boot, once it has asked the
 // store, and the socket starts it again on demand.
 func (h *osCallersHost) snapdActive() bool {
-	if !slices.ContainsFunc(snapdBinaries, h.exists) {
+	if !h.snapdInstalled() {
 		return false
 	}
 	return h.unitState("is-active", "snapd.service") == "active" || h.unitState("is-active", "snapd.socket") == "active"
 }
 
+var snapRefreshTime = []string{"snap", "refresh", "--time", "--abs-time"}
+
+// snapHoldWindow is how far out a refresh hold has to reach before the row
+// treats snapd as quiet; a nearer one lapses and snapd asks the store again.
+const snapHoldWindow = 30 * 24 * time.Hour
+
+// snapdRefresh asks snapd for its hold only while snapd.service is running.
+// The question goes to snapd's socket, and a snapd in standby that it wakes
+// asks the store, which is the call this row exists to report.
 func (h *osCallersHost) snapdRefresh() (host.Finding, bool) {
 	f := host.Finding{Check: "snapd-refresh"}
-	if !h.snapdActive() {
+	if !h.snapdInstalled() {
+		return f, false
+	}
+	remedy := "snap refresh --hold to stop the refresh checks; to keep snaps current from inside the network, " +
+		"run a Snap Store Proxy and point snapd at it with snap set system proxy.store=<store-id>. " +
+		"bodega doctor --configure <system> --quiet-os-callers --apply runs the hold and records it for --restore-os-callers"
+	if h.unitState("is-active", "snapd.service") != "active" {
+		if h.unitState("is-active", "snapd.socket") != "active" {
+			return f, false
+		}
+		f.Status = host.StatusWarn
+		f.Detail = "snapd is in standby behind snapd.socket, which starts it on demand to check api.snapcraft.io for refreshes; " +
+			"its refresh hold could not be read without waking snapd"
+		f.Remediation = remedy
+		return f, true
+	}
+	out, err := h.run(snapRefreshTime)
+	if err != nil {
+		f.Status = host.StatusSkip
+		f.Detail = "could not read snapd's refresh hold: `" + shellJoin(snapRefreshTime) + "` failed (" + err.Error() + "): " + out
+		f.Remediation = "run `" + shellJoin(snapRefreshTime) + "` to see why snapd did not answer, then re-run `bodega doctor`"
+		return f, true
+	}
+	if snapHeld(out, time.Now()) {
 		return f, false
 	}
 	f.Status = host.StatusWarn
-	f.Detail = "snapd is active (its service, or the socket that starts it) and checks api.snapcraft.io for refreshes on its own schedule, whatever bodega serves"
-	f.Remediation = "snap refresh --hold to stop the refresh checks; to keep snaps current from inside the network, " +
-		"run a Snap Store Proxy and point snapd at it with snap set system proxy.store=<store-id>. " +
-		"bodega doctor --configure <system> --quiet-os-callers --apply runs the hold and records it for --restore-os-callers"
+	f.Detail = "snapd is running with no refresh hold reaching 30 days out, and checks api.snapcraft.io for refreshes on its own schedule, whatever bodega serves"
+	f.Remediation = remedy
 	return f, true
 }
 
@@ -482,11 +511,11 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 	}
 	snapd := h.snapdActive()
 	if snapd {
-		out, err := h.run([]string{"snap", "refresh", "--time"})
+		out, err := h.run(snapRefreshTime)
 		if err != nil {
-			return nil, "", fmt.Errorf("--quiet-os-callers cannot read snapd's refresh hold: `snap refresh --time` failed (%v): %s", err, out)
+			return nil, "", fmt.Errorf("--quiet-os-callers cannot read snapd's refresh hold: `%s` failed (%v): %s", shellJoin(snapRefreshTime), err, out)
 		}
-		if !heldForever(out) {
+		if !snapHeld(out, time.Now()) {
 			steps = append(steps, oscStepSnapHold)
 		}
 	}
@@ -501,12 +530,21 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 	return steps, why, nil
 }
 
-func heldForever(refreshTime string) bool {
+// snapHeld reads the hold line of `snap refresh --time --abs-time`: forever,
+// or an RFC 3339 time past snapHoldWindow from now. A hold already lapsed,
+// or one snapd printed in a form this does not parse, is not a hold.
+func snapHeld(refreshTime string, now time.Time) bool {
 	for line := range strings.Lines(refreshTime) {
 		k, v, ok := strings.Cut(line, ":")
-		if ok && strings.TrimSpace(k) == "hold" && strings.TrimSpace(v) == "forever" {
+		if !ok || strings.TrimSpace(k) != "hold" {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if v == "forever" {
 			return true
 		}
+		t, err := time.Parse(time.RFC3339, v)
+		return err == nil && t.After(now.Add(snapHoldWindow))
 	}
 	return false
 }
