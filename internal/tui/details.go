@@ -587,6 +587,7 @@ func clientFiles(cfg *config.Config, store *manifest.Store, entryType, name stri
 	in := clientconf.Inputs{Base: clientBase(cfg)}
 	if cfg != nil {
 		in.GitUpstreams = cfg.GitUpstreams
+		in.BinaryUpstreams = cfg.BinaryUpstreams
 	}
 	pm, err := store.GetPackage(context.Background(), entryType, name)
 	if err != nil {

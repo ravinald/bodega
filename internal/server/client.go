@@ -267,7 +267,7 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 	}
 	switch sys {
 	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeHelm:
-		return one(clientconf.ForType(sys, clientconf.Inputs{Base: h.base})[0])
+		return one(clientconf.ForType(sys, clientconf.Inputs{Base: h.base, BinaryUpstreams: s.cfg.BinaryUpstreams})[0])
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:

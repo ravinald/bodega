@@ -241,6 +241,44 @@ done`
 	}
 }
 
+// The plan's npm file carries node-gyp's disturl when the server fronts
+// nodejs.org, and the digest the plan publishes covers that line: doctor
+// --configure refuses any file whose bytes do not hash to the record.
+func TestClientPlanNpmCarriesDisturlUnderItsDigest(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		upstreams map[string]config.BinaryUpstream
+		want      string
+	}{
+		{"nodejs namespace", map[string]config.BinaryUpstream{"node": {URL: "https://nodejs.org/"}},
+			"registry=https://bodega.internal/npm/\ndisturl=https://bodega.internal/binaries/node/dist\n"},
+		{"other host", map[string]config.BinaryUpstream{"node": {URL: "https://mirror.example.com/"}},
+			"registry=https://bodega.internal/npm/\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := hostedServer(t)
+			s.cfg.PublicURL = "https://bodega.internal"
+			s.cfg.BinaryUpstreams = tc.upstreams
+			f := bindProfile(t, s, "open", "open-host", nil, nil)
+			recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeNpm)
+			if len(recs) != 1 || recs[0].Action != clientconf.PlanInstall {
+				t.Fatalf("npm records = %+v, want one install", recs)
+			}
+			u, err := url.Parse(recs[0].URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, body := clientGet(t, s, f.token, u.RequestURI())
+			if code != http.StatusOK || body != tc.want {
+				t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, tc.want)
+			}
+			if _, err := clientconf.NewChange(recs[0], []byte(body), t.TempDir()); err != nil {
+				t.Errorf("NewChange refused the served file: %v", err)
+			}
+		})
+	}
+}
+
 // A profile named "-" and no profile at all are two plan.txt lines, not one.
 func TestClientPlanTextTellsALiteralDashFromEmpty(t *testing.T) {
 	for in, want := range map[string]string{"": "-", "-": `\0055`, "--": "--", `\-`: `\\-`, "a\tb\nc\r": `a\tb\nc\r`} {
@@ -763,7 +801,7 @@ func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
 		}
 	}
 	files := map[string]string{
-		"npm":  clientconf.Npm("https://h").Content,
+		"npm":  clientconf.Npm("https://h", nil).Content,
 		"helm": clientconf.Helm("https://h").Content,
 		"pypi": clientconf.Pip("https://h").Content,
 	}

@@ -53,7 +53,7 @@ func TestRenderers(t *testing.T) {
 		},
 		{
 			name:    "npm",
-			got:     Npm(testBase),
+			got:     Npm(testBase, nil),
 			content: "registry=https://bodega.example.com/npm/\n",
 			paths:   everywhere("~/.npmrc"),
 		},
@@ -369,5 +369,46 @@ func TestPipTrustedHost(t *testing.T) {
 		if got := Pip(tc.base).Content; got != tc.want {
 			t.Errorf("Pip(%q).Content = %q, want %q", tc.base, got, tc.want)
 		}
+	}
+}
+
+// npm's file names node-gyp's disturl only when a binary namespace fronts
+// nodejs.org, whatever the namespace is called. Without one the file is the
+// registry line alone, because a disturl naming a namespace bodega does not
+// serve breaks every native build instead of leaking it.
+func TestNpmDisturlFollowsANodejsNamespace(t *testing.T) {
+	registry := "registry=https://bodega.example.com/npm/\n"
+	cases := []struct {
+		name      string
+		upstreams map[string]config.BinaryUpstream
+		want      string
+	}{
+		{"no binary namespace", nil, registry},
+		{"nodejs namespace", map[string]config.BinaryUpstream{
+			"nodejs": {URL: "https://nodejs.org/"},
+		}, registry + "disturl=https://bodega.example.com/binaries/nodejs/dist\n"},
+		{"other key, no trailing slash", map[string]config.BinaryUpstream{
+			"rustup": {URL: "https://static.rust-lang.org/"},
+			"node":   {URL: "https://nodejs.org"},
+		}, registry + "disturl=https://bodega.example.com/binaries/node/dist\n"},
+		{"other host only", map[string]config.BinaryUpstream{
+			"nodejs": {URL: "https://nodejs.example.com/"},
+			"dist":   {URL: "https://nodejs.org/dist/"},
+		}, registry},
+		{"two nodejs namespaces pick the first sorted", map[string]config.BinaryUpstream{
+			"zeta":  {URL: "https://nodejs.org/"},
+			"alpha": {URL: "https://NodeJS.org/"},
+		}, registry + "disturl=https://bodega.example.com/binaries/alpha/dist\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Npm(testBase+"/", tc.upstreams).Content; got != tc.want {
+				t.Errorf("Npm content = %q, want %q", got, tc.want)
+			}
+			got := ForType(manifest.TypeNpm, Inputs{Base: testBase, BinaryUpstreams: tc.upstreams})
+			if len(got) != 1 || got[0].Content != tc.want {
+				t.Errorf("ForType(npm) = %+v, want one file holding %q", got, tc.want)
+			}
+		})
 	}
 }

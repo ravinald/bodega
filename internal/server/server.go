@@ -1213,7 +1213,7 @@ func (s *Server) clientFiles(r *http.Request, t string, pm *manifest.PackageMani
 	if isPackageHidden(pm) {
 		return out
 	}
-	in := clientconf.Inputs{Base: s.publicBase(r), GitUpstreams: s.cfg.GitUpstreams}
+	in := clientconf.Inputs{Base: s.publicBase(r), GitUpstreams: s.cfg.GitUpstreams, BinaryUpstreams: s.cfg.BinaryUpstreams}
 	switch t {
 	case manifest.TypeApt:
 		in.Apt = s.aptSourcesForPackage(r, pm)
