@@ -719,6 +719,24 @@ t_ok "a run that did not ship says so in its report" yes \
 	"$(grep -qx "$E2E_NOT_SHIPPED_NOTE" "$work/report.md" && echo yes || echo no)"
 rm -f "$work/not-shipped"
 
+# commit_row <findings> — every report line from the commit row up to the
+# started row, so a commit cell broken across lines comes back as several.
+commit_row() {
+	e2e_report "$1" "$work/commit/report.md" selftest-run
+	sed -n '/^| commit /,/^| started /{/^| started /!p;}' "$work/commit/report.md"
+}
+mkdir -p "$work/commit"
+for n in 1 2 3; do
+	jq -cn --arg n "$n" '{id: "C-\($n)", verdict: "PASS", suite: "s", ts: "t\($n)", commit: "deadbee"}'
+done >"$work/commit/findings.jsonl"
+# shellcheck disable=SC2016  # backticks are the markdown cell, not a substitution
+t_ok "report's commit row is one line for three findings" '| commit | `deadbee` |' \
+	"$(commit_row "$work/commit/findings.jsonl")"
+: >"$work/commit/empty.jsonl"
+# shellcheck disable=SC2016  # backticks are the markdown cell, not a substitution
+t_ok "report's commit row reads unknown for no findings" '| commit | `unknown` |' \
+	"$(commit_row "$work/commit/empty.jsonl")"
+
 E2E_SEVERITY=M
 # Captured to a variable rather than piped into grep -q: under `set -o pipefail`
 # grep's early exit SIGPIPEs the producer, and the whole substitution reports
