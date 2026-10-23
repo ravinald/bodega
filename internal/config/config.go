@@ -584,6 +584,82 @@ func cleanUpstreamPath(p string) string {
 	return cleaned
 }
 
+// gitRepoDepth is how many path segments a repository name under git
+// namespace ns carries after the namespace: two (<owner>/<repo>) when the
+// upstream URL stops at the host, one when the URL already names an owner or
+// group. It is a minimum, not a count: a forge with nested groups puts a
+// repository deeper, and the smart-HTTP gate matches it at whatever depth the
+// clone path has. ok is false for a namespace git_upstreams does not name.
+func (c *Config) gitRepoDepth(ns string) (depth int, ok bool) {
+	up, ok := c.GitUpstreams[ns]
+	if !ok {
+		return 0, false
+	}
+	u, err := url.Parse(up.URL)
+	if err != nil {
+		return 2, true
+	}
+	if p := strings.Trim(u.Path, "/"); p != "" {
+		return 1, true
+	}
+	return 2, true
+}
+
+// ValidateGitEntryName refuses a git profile entry the gate could never
+// match. The gate looks a clone up as <namespace>/<path after the namespace>,
+// without the .git suffix, and then as the bare namespace; the legacy bundle
+// route looks one up under its one-segment bundle name.
+//
+// Counting segments cannot answer this, because how deep a repository sits
+// depends on the namespace's URL and on the forge's group nesting. A
+// host-root namespace whose name is one segment short (github/louislam) is
+// refused: without the forge's own depth it cannot be told from an owner,
+// and an entry naming an owner admits nothing.
+func (c *Config) ValidateGitEntryName(name string) error {
+	segs := strings.Split(name, "/")
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("git entry %q has an empty, \".\" or \"..\" segment, which no clone path carries", name)
+		}
+	}
+	if len(segs) == 1 {
+		return nil
+	}
+	ns, repo := segs[0], segs[1:]
+	depth, ok := c.gitRepoDepth(ns)
+	if !ok {
+		namespaces := make([]string, 0, len(c.GitUpstreams))
+		for k := range c.GitUpstreams {
+			namespaces = append(namespaces, k)
+		}
+		sort.Strings(namespaces)
+		configured := "none; add one to git_upstreams in config.json"
+		if len(namespaces) > 0 {
+			configured = strings.Join(namespaces, ", ")
+		}
+		return fmt.Errorf("git entry %q names namespace %q, which git_upstreams does not configure, so no clone could ever match it.\n"+
+			"  Configured namespaces: %s", name, ns, configured)
+	}
+	if strings.HasSuffix(repo[len(repo)-1], ".git") {
+		return fmt.Errorf("git entry %q ends in .git, which the clone URL carries and the entry does not: write %s",
+			name, strings.TrimSuffix(name, ".git"))
+	}
+	if len(repo) < depth {
+		return fmt.Errorf("git entry %q is too short to name a repository under namespace %q.\n"+
+			"  %q points at %s, so a repository is the namespace followed by at least %d path segment(s), e.g. %s",
+			name, ns, ns, c.GitUpstreams[ns].URL, depth, gitEntryExample(ns, depth))
+	}
+	return nil
+}
+
+// gitEntryExample is one repository name of the minimum depth under ns.
+func gitEntryExample(ns string, depth int) string {
+	if depth == 1 {
+		return ns + "/<repo>"
+	}
+	return ns + "/<owner>/<repo>"
+}
+
 // AptUpstream is one upstream archive serving a mirrored codename.
 //
 // There is no Mode field, and that is the decision rather than an omission.
