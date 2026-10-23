@@ -561,6 +561,11 @@ func validateDoc(doc *profileDoc) error {
 		if strings.TrimSpace(e.Name) == "" {
 			return fmt.Errorf("entries[%d]: an entry needs a package name", i)
 		}
+		if e.Type == manifest.TypeGomod {
+			if err := manifest.ValidateGomodName(e.Name); err != nil {
+				return fmt.Errorf("entries[%d]: %w", i, err)
+			}
+		}
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
@@ -1680,6 +1685,11 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	}
 	if err := requireGitEntryName(typ, name); err != nil {
 		return err
+	}
+	if typ == manifest.TypeGomod {
+		if err := manifest.ValidateGomodName(name); err != nil {
+			return err
+		}
 	}
 	ctx := backgroundCtx()
 	adb, err := openProfileStore(gf)

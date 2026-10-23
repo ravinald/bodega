@@ -752,3 +752,32 @@ func TestBackfillReadsEitherColumnName(t *testing.T) {
 		})
 	}
 }
+
+// A gomod entry written in the Go proxy's escaped form by an install that
+// predates decoding is renamed by the next read-write open, before anything
+// serves from it.
+func TestOpenRewritesEscapedGomodProfileEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.CreateProfileWith(t.Context(), Profile{Name: "build"}, nil,
+		[]ProfileEntry{{Profile: "build", Type: manifest.TypeGomod, Name: "github.com/!burnt!sushi/toml"}}); err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+	_ = db.Close()
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	d, err := db.GetProfile(t.Context(), "build")
+	if err != nil {
+		t.Fatalf("read profile: %v", err)
+	}
+	if len(d.Entries) != 1 || d.Entries[0].Name != "github.com/BurntSushi/toml" {
+		t.Errorf("after reopening, the profile lists %+v, want github.com/BurntSushi/toml", d.Entries)
+	}
+}

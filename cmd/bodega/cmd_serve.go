@@ -122,6 +122,19 @@ output continues to respect log_level in the config.`,
 			handler := logging.NewHandler(os.Stderr, level)
 			logger := slog.New(handler)
 
+			// Before binding: a hidden gomod manifest still stored under the
+			// escaped module path is one no request finds, so its module would
+			// be served. A collision is logged and does not stop the start; the
+			// manifest under the go.mod spelling is the one every read finds.
+			renamed, err := store.RenameEscapedGomod(backgroundCtx())
+			for _, m := range renamed {
+				logger.Info("gomod manifest renamed to its go.mod spelling", "from", m.Stored, "to", m.Canonical)
+			}
+			if err != nil {
+				logger.Error("gomod manifests are still stored under the escaped module path, where no request finds them; merge each pair by hand and run bodega repair",
+					"manifests", store.Label(), "error", err)
+			}
+
 			// A repository with no packages is legal and serves a valid
 			// Release whose Packages digest is the SHA-256 of the empty
 			// string. So does one whose manifest root is missing, and from

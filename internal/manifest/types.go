@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"golang.org/x/mod/module"
 )
 
 // CurrentConfigVersion is the schema version written to all manifests.
@@ -759,6 +761,21 @@ func CanonicalName(typ, name string) string {
 		return CanonicalPypiName(name)
 	}
 	return name
+}
+
+// ValidateGomodName refuses a module path written in the Go proxy protocol's
+// escaped form, where an uppercase letter travels as "!" plus its lowercase.
+// Every name bodega shows or accepts for a module is the go.mod spelling, so an
+// escaped one is an entry nothing will ever match. No module path may contain
+// "!", which is what makes the refusal safe.
+func ValidateGomodName(name string) error {
+	if !strings.Contains(name, "!") {
+		return nil
+	}
+	if decoded, err := module.UnescapePath(name); err == nil {
+		return fmt.Errorf("gomod %q is the Go proxy's escaped form of a module path; write it as go.mod spells it: %s", name, decoded)
+	}
+	return fmt.Errorf("gomod %q contains '!', which no module path may; write the path as go.mod spells it", name)
 }
 
 // ValidatePackageName rejects the two names SafeName cannot make into an

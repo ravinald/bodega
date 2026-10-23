@@ -19,6 +19,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"golang.org/x/mod/module"
 )
 
 const (
@@ -339,7 +341,7 @@ func (s *Store) MisnamedPackages(ctx context.Context) ([]MisnamedPackage, error)
 		if nameCarriesSlash(typ) {
 			stored = unsafeName(stored)
 		}
-		canonical := CanonicalName(typ, stored)
+		canonical := storedCanonicalName(typ, stored)
 		if canonical == stored {
 			continue
 		}
@@ -352,6 +354,58 @@ func (s *Store) MisnamedPackages(ctx context.Context) ([]MisnamedPackage, error)
 		return strings.Compare(a.Stored, b.Stored)
 	})
 	return out, nil
+}
+
+// storedCanonicalName is the name a manifest stored under this segment is read
+// by today. It is CanonicalName plus one gomod rule that holds for stored names
+// only: a module path written in the Go proxy's escaped form (an uppercase
+// letter as "!" plus its lowercase) was the only spelling a request matched
+// before the handler decoded the wire path, so a store may hold one, and every
+// read now composes the go.mod spelling. No module path may contain "!", which
+// is what makes the decoded name the same module rather than a guess.
+func storedCanonicalName(typ, stored string) string {
+	if typ == TypeGomod && strings.Contains(stored, "!") {
+		if decoded, err := module.UnescapePath(stored); err == nil {
+			return decoded
+		}
+	}
+	return CanonicalName(typ, stored)
+}
+
+// RenameEscapedGomod moves every gomod manifest stored under the proxy's escaped
+// spelling onto the go.mod spelling, persists the index when it moved any, and
+// returns the ones it moved.
+//
+// It runs before the server binds, unlike the pypi rename `bodega repair`
+// leaves to the operator, because the two fail in opposite directions: an
+// unreachable pypi manifest refuses its distribution, while an unreachable
+// gomod manifest drops its hidden flag and its version constraint, and with
+// the proxy on the module is fetched from upstream and served. A collision is
+// returned in err, naming both manifests, and neither is touched; the rest
+// are still renamed.
+func (s *Store) RenameEscapedGomod(ctx context.Context) ([]MisnamedPackage, error) {
+	misnamed, err := s.MisnamedPackages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var renamed []MisnamedPackage
+	var errs []error
+	for _, m := range misnamed {
+		if m.Type != TypeGomod {
+			continue
+		}
+		if err := s.RenameToCanonical(ctx, m); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		renamed = append(renamed, m)
+	}
+	if len(renamed) > 0 {
+		if err := s.SaveIndex(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("save the index after renaming %d gomod manifest(s): %w", len(renamed), err))
+		}
+	}
+	return renamed, errors.Join(errs...)
 }
 
 // nameCarriesSlash reports whether a stored path segment for this type can
