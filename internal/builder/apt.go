@@ -495,6 +495,7 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	srcDir := d.sources
 	if err := mkdirAll(srcDir); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeApt, "fetch", err)
 		return summary
 	}
 
@@ -506,6 +507,7 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeApt, name, err)
 			continue
 		}
 
@@ -732,6 +734,7 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeApt, name, err)
 			continue
 		}
 
@@ -847,6 +850,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 
 	if err := mkdirAll(d.aptRepo); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeApt, "package", err)
 		return summary
 	}
 
@@ -858,6 +862,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeApt, name, err)
 			continue
 		}
 

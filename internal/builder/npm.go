@@ -100,6 +100,7 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [npm] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeNpm, name, err)
 			continue
 		}
 

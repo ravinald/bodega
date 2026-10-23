@@ -460,6 +460,21 @@ func (p *Placer) destination(ctx context.Context, typ string, ap builder.Artifac
 // refuses a rule change that would split the tree. Every other type resolves
 // one key per version.
 func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ string) (int, error) {
+	return p.UploadTypeAfter(ctx, bcfg, typ, nil)
+}
+
+// UploadTypeAfter is UploadType for a type whose stages have just run and
+// returned staged. An artifact of a package one of them failed stays local:
+// whatever is on disk under that package is what the failed stage left, a
+// download whose checksum it refused included. So does every artifact no
+// package owns, such as a generated index, once any of them failed, since it
+// was written from the same state. pypi's wheels sync as one directory, so any
+// failure keeps all of them. A nil staged withholds nothing.
+func (p *Placer) UploadTypeAfter(ctx context.Context, bcfg *builder.Config, typ string, staged *builder.Summary) (int, error) {
+	if typ == manifest.TypePypi && staged != nil && staged.HasFailures() {
+		fmt.Fprintf(p.out, "    withheld: the pypi wheels directory, since a pypi stage failed\n")
+		return 0, nil
+	}
 	if typ == manifest.TypePypi {
 		if p.only != "" {
 			// One pypi package cannot be uploaded apart from the rest of its
@@ -508,7 +523,29 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 			typ, builder.ArtifactDir(bcfg, typ))
 		return 0, nil
 	}
-	return p.UploadPaths(ctx, typ, paths)
+	return p.UploadPaths(ctx, typ, withhold(p.out, paths, staged))
+}
+
+// withhold drops the paths UploadTypeAfter keeps local, naming each one.
+func withhold(out io.Writer, paths []builder.ArtifactPath, staged *builder.Summary) []builder.ArtifactPath {
+	if staged == nil || !staged.HasFailures() {
+		return paths
+	}
+	failed := map[string]bool{}
+	for _, r := range staged.Results {
+		if r.Err != nil {
+			failed[r.Name] = true
+		}
+	}
+	var kept []builder.ArtifactPath
+	for _, ap := range paths {
+		if ap.Package == "" || failed[ap.Package] {
+			fmt.Fprintf(out, "    withheld: %s, since a stage it depends on failed\n", ap.ObjectKey)
+			continue
+		}
+		kept = append(kept, ap)
+	}
+	return kept
 }
 
 // ArtifactPaths returns every local artifact of one type that is ready to

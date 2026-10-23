@@ -2,9 +2,11 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -53,5 +55,76 @@ func TestPackageHelmWritesOneKeyPerChart(t *testing.T) {
 	}
 	if got := len(doc.Entries["cert-manager"]); got != len(versions) {
 		t.Fatalf("want %d releases under cert-manager, got %d", len(versions), got)
+	}
+}
+
+// readOnlyDir makes dir unwritable for the rest of the test and restores it
+// before TempDir's cleanup has to delete what is inside. root ignores the mode,
+// so the test cannot observe a refusal there.
+func readOnlyDir(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes through a read-only directory")
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+}
+
+// An index.yaml that cannot be created is a failed package stage. Logged and
+// dropped, it left `build upload helm` exiting 0 over a repository with no
+// index, and every client 404ing on /helm/index.yaml.
+func TestPackageHelmFailsWhenTheIndexCannotBeCreated(t *testing.T) {
+	root := t.TempDir()
+	manifestDir := t.TempDir()
+	cfg := &Config{BuildRoot: root, ManifestDir: manifestDir, Stdout: io.Discard}
+	store := manifest.NewLocalStore(manifestDir)
+	d := buildDirs(root)
+	if err := os.MkdirAll(d.charts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyDir(t, d.charts)
+
+	s := PackageHelm(cfg, store)
+	if !s.HasFailures() {
+		t.Fatalf("PackageHelm over a read-only charts directory reported no failure: %+v", s)
+	}
+	if err := s.FirstError(); err == nil || !strings.Contains(err.Error(), "index.yaml") || !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("FirstError = %v, want the index.yaml permission error", err)
+	}
+}
+
+// A charts directory the fetch cannot create fails the stage once, rather than
+// returning an empty summary that reads as nothing to do.
+func TestFetchHelmFailsWhenTheChartsDirectoryCannotBeCreated(t *testing.T) {
+	root := t.TempDir()
+	manifestDir := t.TempDir()
+	cfg := &Config{BuildRoot: root, ManifestDir: manifestDir, Stdout: io.Discard}
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(context.Background(), manifest.TypeHelm, "podinfo", manifest.VersionEntry{Version: "6.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyDir(t, root)
+
+	s := FetchHelm(cfg, store, "")
+	if s.Failures != 1 {
+		t.Fatalf("FetchHelm reported %d failure(s), want 1: %+v", s.Failures, s)
+	}
+	if err := s.FirstError(); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("FirstError = %v, want the mkdir permission error", err)
+	}
+}
+
+// A run with nothing selected has nothing to fail.
+func TestPackageHelmWithNoChartsSucceeds(t *testing.T) {
+	root := t.TempDir()
+	manifestDir := t.TempDir()
+	cfg := &Config{BuildRoot: root, ManifestDir: manifestDir, Stdout: io.Discard}
+	if err := os.MkdirAll(buildDirs(root).charts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if s := PackageHelm(cfg, manifest.NewLocalStore(manifestDir)); s.HasFailures() || s.FirstError() != nil {
+		t.Fatalf("PackageHelm with no charts failed: %v", s.FirstError())
 	}
 }

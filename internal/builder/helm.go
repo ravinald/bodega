@@ -39,6 +39,7 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 
 	if err := mkdirAll(d.charts); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeHelm, "fetch", err)
 		return summary
 	}
 
@@ -50,6 +51,7 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [helm] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeHelm, name, err)
 			continue
 		}
 
@@ -171,6 +173,7 @@ func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 	f, err := os.Create(indexPath)
 	if err != nil {
 		cfg.logf("ERROR creating index.yaml: %v", err)
+		summary.fail(manifest.TypeHelm, "index.yaml", fmt.Errorf("create index.yaml: %w", err))
 		return summary
 	}
 	defer func() { _ = f.Close() }()
@@ -212,7 +215,7 @@ func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 
 	if err := f.Close(); err != nil {
 		cfg.logf("ERROR writing index.yaml: %v", err)
-		summary.Failures++
+		summary.fail(manifest.TypeHelm, "index.yaml", fmt.Errorf("write index.yaml: %w", err))
 	}
 
 	_, _ = fmt.Fprintf(out, "  [helm] index.yaml written with %d chart(s)\n", summary.Total)

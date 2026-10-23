@@ -157,11 +157,15 @@ When a name is given after the type, only that entry is built.`,
 			}
 
 			total, failures := 0, 0
+			var firstErr error
 			for _, s := range allSummaries {
 				s.Print(buildOut)
 				s.LogErrors(buildLogger, "build")
 				total += s.Total
 				failures += s.Failures
+				if firstErr == nil {
+					firstErr = s.FirstError()
+				}
 			}
 
 			fmt.Fprintf(buildOut, "\nTotal entries: %d  Failures: %d\n", total, failures)
@@ -173,7 +177,7 @@ When a name is given after the type, only that entry is built.`,
 			}
 
 			if failures > 0 {
-				return fmt.Errorf("%d build(s) failed", failures)
+				return fmt.Errorf("%d build(s) failed; first error: %w", failures, firstErr)
 			}
 			return nil
 		},

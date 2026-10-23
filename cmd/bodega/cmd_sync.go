@@ -78,29 +78,30 @@ use 'upload' instead.`,
 				return err
 			}
 
-			totalUploaded := 0
+			var tally uploadTally
 			for _, t := range types {
 				fmt.Printf("\n--- sync: %s ---\n", t)
 				n, err := pl.UploadType(ctx, bcfg, t)
-				totalUploaded += n
+				tally.uploaded += n
 				if err != nil {
-					return err
+					tally.failed(1, err)
 				}
 			}
-
-			if storageBackend != "" {
-				if err := confirmPlaced(pl, types[0], selector, storageBackend); err != nil {
-					return err
-				}
-			}
-
-			fmt.Printf("\nSync complete. Total files uploaded: %d\n", totalUploaded)
 
 			// Update metrics after sync.
 			if err := store.SaveIndex(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
 			}
 
+			if err := tally.err("sync"); err != nil {
+				return err
+			}
+			if storageBackend != "" {
+				if err := confirmPlaced(pl, types[0], selector, storageBackend); err != nil {
+					return err
+				}
+			}
+			fmt.Printf("\nSync complete. Total files uploaded: %d\n", tally.uploaded)
 			return nil
 		},
 	}

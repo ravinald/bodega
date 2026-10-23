@@ -274,7 +274,7 @@ bodega build sync binary example-tool-v2            # push one package
 bodega build sync binary example-tool-v2@2.15.0 --storage bulk
 ```
 
-Every type but `pypi` uploads one object per manifest version, to the backend that version records: a git bundle to `repos/<name>/`, a `.deb` to the pool path its entry carries, a binary to `binaries/<name>/<version>/`. `pypi` wheels have no per-version object key, so they sync as a directory to `pypi/wheels/` on the backend `storage_by_type.pypi` names. A version whose artifact is not on disk is skipped, and so is a type with none.
+Every type but `pypi` uploads one object per manifest version, to the backend that version records: a git bundle to `repos/<name>/`, a `.deb` to the pool path its entry carries, a binary to `binaries/<name>/<version>/`. `pypi` wheels have no per-version object key, so they sync as a directory to `pypi/wheels/` on the backend `storage_by_type.pypi` names. A version whose artifact is not on disk is skipped, and so is a type with none. A type whose upload fails does not stop the next one, and the command exits non-zero with a last line counting what failed and what landed.
 
 A name after the types narrows the push to one package. An argument that is neither a known type nor a package in the catalog is an error, so `bodega build sync gitt` still fails on the typo instead of filtering for a package nothing is called and exiting 0 having pushed nothing. `pypi` is skipped when a name is given, because one package of it cannot reach storage apart from the rest.
 
@@ -292,6 +292,14 @@ bodega build upload binary example-tool-v2@2.15.0 --storage bulk
 ```
 
 A name narrows the **upload**, not the cascade: `fetch`, `build` and `package` still run across the whole type, because the stage that would need the filter takes none. `bodega build sync` is the push with nothing in front of it. `pypi` is skipped when a name is given, since one package of it cannot reach storage apart from the rest.
+
+A failed stage fails the command, but not the rest of the run. Every other type still uploads, and so does every package of the same type whose stages succeeded. A package whose stage failed keeps its artifacts local, because whatever is on disk under it is what the failed stage left. Its type's generated files (a helm `index.yaml`, say) stay local too, since they were written from the same state, and so does all of `pypi` when any `pypi` stage fails. The command then exits non-zero, and its last line counts both sides and names the first error:
+
+```text
+Error: upload failed: 1 artifact(s) failed, 1 file(s) uploaded; first error: helm/index.yaml: create index.yaml: open /opt/bodega/charts/index.yaml: permission denied
+```
+
+A run with nothing to do exits 0. `build sync`, `build fetch`, `build run` and `build package` exit non-zero the same way, and their last line names the first error as well.
 
 #### Placing one version at write time
 

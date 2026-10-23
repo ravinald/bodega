@@ -146,15 +146,19 @@ When a name is given after the type, only that entry is packaged.`,
 			}
 
 			total, failures := 0, 0
+			var firstErr error
 			for _, s := range allSummaries {
 				s.Print(os.Stdout)
 				total += s.Total
 				failures += s.Failures
+				if firstErr == nil {
+					firstErr = s.FirstError()
+				}
 			}
 
 			fmt.Printf("\nTotal entries: %d  Failures: %d\n", total, failures)
 			if failures > 0 {
-				return fmt.Errorf("%d package(s) failed", failures)
+				return fmt.Errorf("%d package(s) failed; first error: %w", failures, firstErr)
 			}
 			return nil
 		},
