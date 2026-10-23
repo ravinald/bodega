@@ -1153,3 +1153,29 @@ func TestProfileEntryVerbsMatchTheSpellingTheGateHolds(t *testing.T) {
 		t.Errorf("the entry survived its own removal:\n%s", show)
 	}
 }
+
+// A git entry names a repository or a whole namespace, and nothing between.
+// Any other form would be stored and never matched by the smart-HTTP gate,
+// which reads as a listed repository that is refused anyway.
+func TestProfileAddGitEntryForms(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "kuma")
+	for _, name := range []string{"github", "github/louislam/uptime-kuma"} {
+		if _, err := runProfile(t, "add", "kuma", "git", name); err != nil {
+			t.Errorf("add git %q: %v", name, err)
+		}
+	}
+	for _, name := range []string{
+		"github/louislam", "github/louislam/uptime-kuma.git", "github/louislam/uptime-kuma/extra",
+		"github//uptime-kuma", "github/../uptime-kuma",
+	} {
+		_, err := runProfile(t, "add", "kuma", "git", name)
+		if err == nil {
+			t.Errorf("add git %q was accepted; it is neither a repository nor a namespace", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "<namespace>/<owner>/<repo>") || !strings.Contains(err.Error(), "  <namespace> ") {
+			t.Errorf("add git %q refused with %q, want it to name both entry forms", name, err)
+		}
+	}
+}

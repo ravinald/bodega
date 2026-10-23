@@ -1380,3 +1380,124 @@ exec `+s.gitTool.git+` "$@"
 		})
 	}
 }
+
+// gitProfileHost binds a host whose profile closes git under block and lists
+// entries, against an upstream serving team/tool.git under the open corp
+// namespace.
+func gitProfileHost(t *testing.T, entries ...string) *profileFixture {
+	t.Helper()
+	s := newGitServer(t, newGitUpstream(t))
+	listed := make([]audit.ProfileEntry, 0, len(entries))
+	for _, name := range entries {
+		listed = append(listed, audit.ProfileEntry{Type: manifest.TypeGit, Name: name})
+	}
+	return bindProfile(t, s, "kuma", "kuma01", []audit.ProfileTypeRule{
+		closedRule(manifest.TypeGit, audit.VersionFloating, audit.ExpansionBlock),
+	}, listed)
+}
+
+// cloneAs runs a real clone through the fixture's credential, so both legs
+// of the protocol (info/refs, then git-upload-pack) pass the gate.
+func (f *profileFixture) cloneAs(t *testing.T, url string) {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "c")
+	runGitCLI(t, t.TempDir(), "-c", "http.extraHeader=Authorization: Bearer "+f.token, "clone", "-q", url, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+		t.Errorf("cloned HEAD subject = %q, want %q", got, "first")
+	}
+}
+
+// gitLegs issues the two requests one clone makes, info/refs and the
+// upload-pack POST, and returns their statuses.
+func (f *profileFixture) gitLegs(t *testing.T, base, repo string) (infoRefs, uploadPack int) {
+	t.Helper()
+	do := func(method, path, body string) int {
+		req, err := http.NewRequestWithContext(t.Context(), method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+f.token)
+		if method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	return do(http.MethodGet, "/git/corp/"+repo+"/info/refs?service=git-upload-pack", ""),
+		do(http.MethodPost, "/git/corp/"+repo+"/git-upload-pack", "0000")
+}
+
+// A repository entry is the narrow form: it admits that repository and no
+// other under the same forge. Suite 56 measured the namespace form admitting
+// louislam/dockge to a host learned from a clone of louislam/uptime-kuma.
+func TestGitProfileRepositoryEntryAdmitsOnlyThatRepository(t *testing.T) {
+	f := gitProfileHost(t, "corp/team/tool")
+	ts := httptest.NewServer(f.s.Handler())
+	t.Cleanup(ts.Close)
+
+	f.cloneAs(t, ts.URL+"/git/corp/"+gitTestRepo)
+
+	infoRefs, uploadPack := f.gitLegs(t, ts.URL, "team/other.git")
+	if infoRefs != http.StatusForbidden || uploadPack != http.StatusForbidden {
+		t.Fatalf("unlisted repository: info/refs = %d, git-upload-pack = %d, want 403 for both legs",
+			infoRefs, uploadPack)
+	}
+
+	rows := waitForBinaryRows(t, f.s, audit.DecisionDenied, 1)
+	if len(rows) != 1 {
+		t.Fatalf("denied rows = %d, want 1 — both legs of one clone upsert one row (%+v)", len(rows), rows)
+	}
+	if rows[0].PkgName != "corp/team/other" {
+		t.Errorf("pkg_name = %q, want %q — the row names the refused repository, not its forge",
+			rows[0].PkgName, "corp/team/other")
+	}
+	if want := "bodega profile add kuma git corp/team/other"; rows[0].PatternHint != want {
+		t.Errorf("pattern_hint = %q, want %q", rows[0].PatternHint, want)
+	}
+}
+
+// A namespace entry keeps the meaning every profile written before repository
+// entries gave it: the whole forge.
+func TestGitProfileNamespaceEntryStillAdmitsEveryRepository(t *testing.T) {
+	f := gitProfileHost(t, "corp")
+	ts := httptest.NewServer(f.s.Handler())
+	t.Cleanup(ts.Close)
+
+	f.cloneAs(t, ts.URL+"/git/corp/"+gitTestRepo)
+
+	// The upstream has no team/other.git, so an admitted request reaches the
+	// mirror clone and fails there. Anything but 403 says the gate passed it.
+	if infoRefs, _ := f.gitLegs(t, ts.URL, "team/other.git"); infoRefs == http.StatusForbidden {
+		t.Errorf("a namespace entry refused team/other with 403; it lists the whole namespace")
+	}
+	rows, err := f.s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{Decision: audit.DecisionDenied})
+	if err != nil {
+		t.Fatalf("list discovery: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("denied rows = %+v, want none under a namespace entry", rows)
+	}
+}
+
+// The profile gate sits behind the namespace lookup, so a bound host asking
+// for a namespace no config names still gets the 404 and the namespace-keyed
+// row rather than a profile refusal naming a repository nobody can serve.
+func TestGitProfileUnknownNamespaceStill404s(t *testing.T) {
+	f := gitProfileHost(t, "corp/team/tool")
+	ts := httptest.NewServer(f.s.Handler())
+	t.Cleanup(ts.Close)
+
+	status, _ := getWithToken(t, f.s, f.token, "/git/gitlab/team/tool.git/info/refs?service=git-upload-pack")
+	if status != http.StatusNotFound {
+		t.Fatalf("unknown namespace = %d, want 404", status)
+	}
+	rows := waitForNoNamespace(t, f.s)
+	if len(rows) != 1 || rows[0].PkgName != "gitlab" || rows[0].PatternHint != "gitlab" {
+		t.Errorf("no_namespace rows = %+v, want one keyed on %q", rows, "gitlab")
+	}
+}

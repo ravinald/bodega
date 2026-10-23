@@ -1655,6 +1655,15 @@ entries[0] and entries[1] both name pypi/django, which is one entry: the later r
   Keep the one you mean
 ```
 
+A `git` entry takes one of two forms, and `add` refuses anything else with a message naming both:
+
+| Entry                        | Admits                                                  |
+| ---------------------------- | ------------------------------------------------------- |
+| `<namespace>/<owner>/<repo>` | that one repository, e.g. `github/louislam/uptime-kuma` |
+| `<namespace>`                | every repository the `git_upstreams` namespace serves   |
+
+The repository has no `.git` suffix, though the clone URL carries one. A namespace entry admits the whole forge: `bodega profile add web git github` lets every host bound to `web` clone anything on GitHub that the allow-list passes. List repositories instead. A refused clone names the repository in its discovery row and in the `profile add` command it prints, so a profile learned from observed rows lists repositories. A legacy bundle is listed under its bundle name, which is the one-segment form; see [Git smart-HTTP](#git-smart-http).
+
 `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
 
 #### Pins as recorded decisions
@@ -1928,8 +1937,8 @@ The refusal arrives at the pull.
 ```text
 $ git clone http://bodega:8080/git/github/foo/bar.git
 Cloning into 'bar'...
-remote: bodega refused git/github (profile, incident 4d5e6f708192): membership: profile "web" does not list git/github.
-remote: Next step: ask an operator to add it with `bodega profile add web git github`, or to open the type with `bodega profile set web git --membership open`.
+remote: bodega refused git/github/foo/bar (profile, incident 4d5e6f708192): membership: profile "web" does not list git/github/foo/bar.
+remote: Next step: ask an operator to add it with `bodega profile add web git github/foo/bar`, or to open the type with `bodega profile set web git --membership open`.
 fatal: unable to access 'http://bodega:8080/git/github/foo/bar.git/': The requested URL returned error: 403
 ```
 
@@ -5224,6 +5233,20 @@ What is on disk is inspected rather than counted. `git clone --mirror` creates t
 **Repointing `git_upstreams[ns].url` re-clones.** Every mirror records the URL its own clone used, and bodega compares it against the configured upstream before serving. A mismatch is a forge migration, a host swap or a typo correction, so the mirror is discarded and cloned from the new URL, with both URLs in a `WARN`. Budget for the transfer: repointing a namespace with fifty mirrors under it re-clones all fifty, one per first request after the change.
 
 `open` and `catalog` behave here as they do everywhere: a `catalog` namespace never clones a repository no manifest entry names, and answers 404 instead. With `discover_mode` set to `"observe"` the 404 also records a `no_manifest` discovery row, and `bodega discover promote git <pattern> --as manifest` turns that row into the entry, after which the same clone succeeds. With discovery off the 404 records nothing. The pattern is the upstream host and the first segment of its path (`github.com/freebsd/` for a namespace pointing there), not the `<org>/<repo>` the entry is named for; `bodega discover list git` prints it. The allow-list runs before the clone, so a denied upstream is a 403 with nothing written to disk.
+
+#### Profiles
+
+A profile closed for `git` admits a clone when it lists the repository (`github/louislam/uptime-kuma`) or the namespace (`github`). The namespace entry admits every repository on that forge to every host the profile binds, so prefer repository entries and keep the namespace form for a forge you trust whole, such as an internal one.
+
+Both legs of a clone, `info/refs` and `git-upload-pack`, are judged against the same name. A refused clone is a 403 and, under `--expansion warn` or `block`, a discovery row with decision `denied`, `pkg_name` set to the repository and a pattern of `bodega profile add <profile> git <namespace>/<owner>/<repo>`:
+
+```text
+$ bodega discover list git
+TYPE  PATTERN                                             HOST  COUNT  DECISIONS  LAST SEEN
+git   bodega profile add web git github/louislam/dockge         1      denied     2026-10-23 09:14
+```
+
+A namespace no `git_upstreams` key names is still a 404 with a `no_namespace` row keyed on the namespace, because the fix there is a config key rather than a profile entry. A path that is not one of the two served suffixes is not judged by the profile: it is served nothing either way, a push refused with 403 and the rest with 404.
 
 #### Refresh
 
