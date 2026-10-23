@@ -161,14 +161,14 @@ func TestApplyKeepsTheCredentialTheWriterPlaced(t *testing.T) {
 		name, system, planned, existing, want string
 	}{
 		{
-			name: "npm fenced", system: "npm", planned: Npm(base).Content,
+			name: "npm fenced", system: "npm", planned: Npm(base, nil).Content,
 			existing: "registry=https://registry.npmjs.org/\n" + fence("//h/npm/:_authToken=bodega_ak_x"),
-			want:     Npm(base).Content + fence("//h/npm/:_authToken=bodega_ak_x"),
+			want:     Npm(base, nil).Content + fence("//h/npm/:_authToken=bodega_ak_x"),
 		},
 		{
-			name: "npm unfenced after npm rewrote it", system: "npm", planned: Npm(base).Content,
+			name: "npm unfenced after npm rewrote it", system: "npm", planned: Npm(base, nil).Content,
 			existing: "color=false\n//h/npm/:_authToken=bodega_ak_x\n",
-			want:     Npm(base).Content + "//h/npm/:_authToken=bodega_ak_x\n",
+			want:     Npm(base, nil).Content + "//h/npm/:_authToken=bodega_ak_x\n",
 		},
 		{
 			name: "helm fenced", system: "helm", planned: Helm(base).Content,
@@ -229,7 +229,7 @@ func TestApplyKeepsTheCredentialTheWriterPlaced(t *testing.T) {
 func TestDiffPrintsNoCredential(t *testing.T) {
 	home := t.TempDir()
 	cases := []struct{ system, existing, planned string }{
-		{"npm", "//h/npm/:_authToken=bodega_ak_kept\n//other/:_authToken=bodega_ak_gone\n_auth = bodega_ak_b64\n", Npm("https://h").Content},
+		{"npm", "//h/npm/:_authToken=bodega_ak_kept\n//other/:_authToken=bodega_ak_gone\n_auth = bodega_ak_b64\n", Npm("https://h", nil).Content},
 		{"helm", HelmDocument("- name: bodega\n  url: https://h/helm\n  password: bodega_ak_kept\n- name: x\n  password: 'bodega_ak_gone'\n"), Helm("https://h").Content},
 		{"pypi", "[global]\nindex-url = https://op:bodega_ak_url@pypi.internal/simple/\n", Pip("https://h").Content},
 		{"pypi", "", "[global]\nindex-url = https://op:bodega_ak_new@h/pypi/simple/\n"},

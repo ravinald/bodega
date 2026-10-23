@@ -4922,6 +4922,24 @@ registry=https://bodega-host:8080/npm/
 
 The trailing slash matters: it is what matches the `//bodega-host:8080/npm/:_authToken=` line `bodega doctor --write-credentials` writes into the same file. For one command, `npm install --registry https://bodega-host:8080/npm/ <package>`.
 
+A package that builds a native module runs node-gyp, which fetches Node's headers (`<disturl>/v<node>/node-v<node>-headers.tar.gz` and `SHASUMS256.txt`) from `https://nodejs.org/dist` unless `disturl` names another host. The registry line does not cover that fetch, so a host locked to bodega fails the build, and a host that is not locked reaches nodejs.org behind bodega's back. When the server's config has a `binary_upstreams` namespace whose `url` is `https://nodejs.org/` (with or without the trailing slash, under any key), the file gains a second line pointing node-gyp at it:
+
+```json
+"binary_upstreams": {
+  "nodejs": {
+    "url": "https://nodejs.org/",
+    "mode": "open"
+  }
+}
+```
+
+```ini
+registry=https://bodega-host:8080/npm/
+disturl=https://bodega-host:8080/binaries/nodejs/dist
+```
+
+The line names whichever key the namespace has; two namespaces on nodejs.org resolve to the first in sorted order. A namespace on any other host, including a nodejs.org mirror, adds nothing, because bodega cannot tell that it serves the same tree. `"mode": "open"` is what makes the headers reachable: under the default `catalog` mode the namespace answers only paths a manifest entry names, and node-gyp asks for the headers of whatever Node version runs the build. The header tarballs never change under their name, so the namespace needs no `revalidate`. The plan `bodega doctor --configure npm` installs, the web page and the TUI all render the same two lines, and the plan's digest covers both.
+
 bodega rewrites every `dist.tarball` in a packument onto its own `/npm/` route before serving it. Relayed as upstream wrote them, those URLs name `registry.npmjs.org`, and npm's resolver replaces the origin while keeping the upstream path — so the client asks for `/<package>/-/<file>.tgz` with the `/npm` prefix dropped and gets a 404. On a deployment where that path happened to resolve it would get the tarball from a request bodega never sees, past the hidden-package and hidden-version checks, the version constraint, the audit row, the checksum and the cache.
 
 The scheme and host it rewrites to come from [`public_url`](#configuration), or from the request when no `public_url` is set. The cached object is still the document the registry served: the rewrite happens on the way out, so a cache hit and a cache miss hand the client the same URLs and the stored copy remains evidence of what upstream published.
