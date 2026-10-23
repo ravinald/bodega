@@ -29,6 +29,10 @@ import (
 	"github.com/ravinald/bodega/internal/provenance"
 )
 
+// doctorExit ends a report with its CI-gating code, distinct from cobra's 1.
+// A variable so a test can read a report that has findings.
+var doctorExit = os.Exit
+
 // newDoctorCmd reports host-level configuration that would silently bypass
 // bodega's supply-chain controls, and the server's own policy posture where
 // this machine holds an install. The checks are read-only: doctor changes
@@ -252,7 +256,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				printRemediation("Could not run:", findings, host.Finding.IsSkipped)
 			}
 			if code := doctorSummary(os.Stdout, actionable, skipped); code != 0 {
-				os.Exit(code) //nolint:revive // CI-gating exit codes distinct from cobra's 1
+				doctorExit(code)
 			}
 			return nil
 		},
