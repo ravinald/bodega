@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,21 +13,38 @@ import (
 	"github.com/ravinald/bodega/internal/host"
 )
 
-// fakePro scripts the tools proHost runs: pro status answers attached,
-// pro config show answers aptNews, and systemctl is-enabled answers unit.
-// Every other argv succeeds and is logged, which is how a test sees what a
-// step changed.
+// fakePro scripts the tools proHost runs: pro api and pro status answer
+// attached, pro config show answers aptNews, and systemctl is-enabled answers
+// unit. api set to "unknown" makes pro api fail as an ubuntu-pro-client that
+// predates it, and "failure" makes it return a failed result; statusErr makes
+// pro status fail with it. calls logs every argv; ran logs only the ones not
+// scripted above, which is how a test sees what a step changed.
 type fakePro struct {
-	attached string
-	aptNews  string
-	unit     string
-	ran      []string
+	attached  string
+	api       string
+	statusErr error
+	aptNews   string
+	unit      string
+	calls     []string
+	ran       []string
 }
 
 func (f *fakePro) run(argv []string) (string, error) {
 	cmd := strings.Join(argv, " ")
+	f.calls = append(f.calls, cmd)
 	switch cmd {
+	case "pro api u.pro.status.is_attached.v1":
+		switch f.api {
+		case "unknown":
+			return "usage: pro <command> [flags]\nargument <command>: invalid choice: 'api'", errors.New("exit status 2")
+		case "failure":
+			return `{"_schema_version":"v1","data":{"meta":{}},"errors":[{"title":"x"}],"result":"failure"}`, errors.New("exit status 1")
+		}
+		return `{"_schema_version":"v1","data":{"attributes":{"is_attached":` + f.attached + `},"type":"IsAttached"},"result":"success"}`, nil
 	case "pro status --format json":
+		if f.statusErr != nil {
+			return "", f.statusErr
+		}
 		return `{"_doc":"x","attached":` + f.attached + `,"services":[]}`, nil
 	case "pro config show apt_news":
 		return "apt_news " + f.aptNews, nil
@@ -64,18 +83,27 @@ func TestUbuntuProHookRow(t *testing.T) {
 		name     string
 		hook     bool
 		attached string
+		api      string
 		wantRow  bool
 	}{
-		{"unattached with the hook", true, "false", true},
-		{"attached with the hook", true, "true", false},
-		{"no hook", false, "false", false},
+		{"unattached with the hook", true, "false", "", true},
+		{"attached with the hook", true, "true", "", false},
+		{"no hook", false, "false", "", false},
+		{"pro api unknown, pro status unattached", true, "false", "unknown", true},
+		{"pro api failure, pro status unattached", true, "false", "failure", true},
+		{"pro api unknown, pro status attached", true, "true", "unknown", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := stubUbuntuPro(t, tc.hook, &fakePro{attached: tc.attached})
+			fake := &fakePro{attached: tc.attached, api: tc.api}
+			h := stubUbuntuPro(t, tc.hook, fake)
 			f, ok := h.finding()
 			if ok != tc.wantRow {
 				t.Fatalf("row = %v (%+v), want %v", ok, f, tc.wantRow)
+			}
+			askedStatus := slices.Contains(fake.calls, "pro status --format json")
+			if wantStatus := tc.hook && tc.api != ""; askedStatus != wantStatus {
+				t.Errorf("pro status asked = %v, want %v; calls %v", askedStatus, wantStatus, fake.calls)
 			}
 			if !ok {
 				return
@@ -98,13 +126,42 @@ func TestUbuntuProHookRow(t *testing.T) {
 }
 
 // A pro that will not answer leaves the question open, and the row says the
-// check did not run rather than guessing either way.
+// check did not run rather than guessing either way. A pro status cut off at
+// the bound is the egress-locked host, so the row names the steps to run by
+// hand rather than leaving the operator to guess why.
 func TestUbuntuProHookRowSkipsWhenProFails(t *testing.T) {
-	h := stubUbuntuPro(t, true, &fakePro{})
-	h.run = func([]string) (string, error) { return "boom", errors.New("exit status 1") }
-	f, ok := h.finding()
-	if !ok || f.Status != host.StatusSkip {
-		t.Fatalf("finding = %v %+v, want a SKIPPED row", ok, f)
+	cases := []struct {
+		name      string
+		statusErr error
+		want      []string
+		wantNot   []string
+	}{
+		{"pro status fails", errors.New("exit status 1"),
+			[]string{"`pro api u.pro.status.is_attached.v1` failed", "`pro status --format json` failed"},
+			[]string{"contract server"}},
+		{"pro status times out", fmt.Errorf("no answer within 30s, %w: signal: killed", context.DeadlineExceeded),
+			[]string{"`pro api u.pro.status.is_attached.v1` failed", "`pro status --format json` failed",
+				"Canonical's contract server", "pro config set apt_news=false", "systemctl mask esm-cache.service"},
+			nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := stubUbuntuPro(t, true, &fakePro{api: "unknown", statusErr: tc.statusErr})
+			f, ok := h.finding()
+			if !ok || f.Status != host.StatusSkip {
+				t.Fatalf("finding = %v %+v, want a SKIPPED row", ok, f)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(f.Detail, want) {
+					t.Errorf("detail lacks %q: %s", want, f.Detail)
+				}
+			}
+			for _, not := range tc.wantNot {
+				if strings.Contains(f.Detail, not) {
+					t.Errorf("detail carries %q: %s", not, f.Detail)
+				}
+			}
+		})
 	}
 }
 
@@ -135,6 +192,9 @@ func TestDoctorConfigureQuietUbuntuProPlan(t *testing.T) {
 	}
 	if len(fake.ran) != 0 {
 		t.Errorf("the dry run ran %v", fake.ran)
+	}
+	if slices.Contains(fake.calls, "pro status --format json") {
+		t.Errorf("pro api answered and pro status was still asked: %v", fake.calls)
 	}
 
 	stubUbuntuPro(t, true, &fakePro{attached: "true"})
