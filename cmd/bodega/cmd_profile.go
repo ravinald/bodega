@@ -1683,20 +1683,20 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	if err := requirePackageType(typ); err != nil {
 		return err
 	}
-	if err := requireGitEntryName(typ, name); err != nil {
-		return err
-	}
 	if typ == manifest.TypeGomod {
 		if err := manifest.ValidateGomodName(name); err != nil {
 			return err
 		}
 	}
 	ctx := backgroundCtx()
-	adb, err := openProfileStore(gf)
+	cfg, adb, err := openACLStore(gf)
 	if err != nil {
 		return err
 	}
 	defer adb.Close()
+	if err := requireGitEntryName(cfg, typ, name); err != nil {
+		return err
+	}
 
 	d, err := adb.GetProfile(ctx, profile)
 	if err != nil {
@@ -2479,28 +2479,14 @@ func requirePackageType(typ string) error {
 		typ, strings.Join(manifest.AllTypes, ", "))
 }
 
-// requireGitEntryName refuses a git entry the gate could never match. The
-// smart-HTTP gate looks a clone up as <namespace>/<owner>/<repo> and then as
-// <namespace>, and the bundle route as its one-segment bundle name, so any
-// other form is an entry that silently admits nothing. A repository with a
-// trailing .git is the commonest of those, copied from a clone URL.
-func requireGitEntryName(typ, name string) error {
+// requireGitEntryName refuses a git entry the gate could never match. How
+// deep a repository name runs depends on the namespace's URL, so the answer
+// comes from the config rather than from a segment count.
+func requireGitEntryName(cfg *config.Config, typ, name string) error {
 	if typ != manifest.TypeGit {
 		return nil
 	}
-	segs := strings.Split(name, "/")
-	ok := len(segs) == 1 || (len(segs) == 3 && !strings.HasSuffix(segs[2], ".git"))
-	for _, seg := range segs {
-		if seg == "" || seg == "." || seg == ".." {
-			ok = false
-		}
-	}
-	if ok {
-		return nil
-	}
-	return fmt.Errorf("git entry %q is neither of the two forms a profile lists:\n"+
-		"  <namespace>/<owner>/<repo>  one repository, e.g. github/torvalds/linux (no .git suffix)\n"+
-		"  <namespace>                 every repository that git_upstreams namespace serves, e.g. github", name)
+	return cfg.ValidateGitEntryName(name)
 }
 
 // openProfileStore refuses a read-only install and opens the audit database,

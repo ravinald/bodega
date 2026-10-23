@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -100,9 +101,24 @@ func (s *Server) handleGitNamespace(w http.ResponseWriter, r *http.Request) {
 // serves. It is honored so no existing profile changes meaning, but it is not
 // what a refusal suggests: the row and the refusal both name the repository,
 // so a profile learned from observed rows lists repositories.
+//
+// A clone path no profile entry could name (github/louislam.git under a
+// host-root namespace) is answered 404 where the profile would refuse it,
+// rather than with a refusal whose `bodega profile add` the CLI rejects. Where
+// the profile permits it anyway, it passes unrecorded: a reach row would carry
+// the same unlistable hint.
 func (s *Server) gitEntitleGate(w http.ResponseWriter, r *http.Request, ns, pkgName string) bool {
-	if d := s.profileFor(r).Covers(manifest.TypeGit, ns); d.Permitted && !d.Outside {
+	p := s.profileFor(r)
+	if d := p.Covers(manifest.TypeGit, ns); d.Permitted && !d.Outside {
 		return true
+	}
+	if err := s.cfg.ValidateGitEntryName(pkgName); err != nil && p != nil {
+		if p.Covers(manifest.TypeGit, pkgName).Permitted {
+			return true
+		}
+		http.Error(w, fmt.Sprintf("%s names no repository under git namespace %q, so no profile entry can admit it; check the clone URL", pkgName, ns),
+			http.StatusNotFound)
+		return false
 	}
 	return s.entitleGate(w, r, manifest.TypeGit, pkgName, "")
 }
