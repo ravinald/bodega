@@ -60,18 +60,7 @@ Examples:
   bodega profile bind web db01
   bodega profile diff web --origin db01
   bodega profile check`,
-		// A group with no RunE answers any argument with its help and exit 0,
-		// so a script calling a verb that does not exist reads success. Cobra
-		// checks unknown subcommands only on the root.
-		Args: cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
-				return cmd.Help()
-			}
-			return unknownSubcommand(cmd, args[0])
-		},
 	}
-	noReloadSignalSelf(parent)
 	// The write verbs signal, the read verbs do not. A profile edit used to
 	// change nothing the server held that a TTL would not pick up on its own,
 	// because every index filter ran over the response on the way out. apt is
@@ -1904,18 +1893,6 @@ Examples:
 	}
 	c.Flags().BoolVar(&unbind, "unbind", false, "Also remove every binding to the profile")
 	return c
-}
-
-// unknownSubcommand is cobra's root-command refusal, for a group below it.
-func unknownSubcommand(cmd *cobra.Command, name string) error {
-	var valid []string
-	for _, c := range cmd.Commands() {
-		if c.IsAvailableCommand() {
-			valid = append(valid, "  "+c.Name())
-		}
-	}
-	return fmt.Errorf("unknown command %q for %q\n\nValid subcommands:\n%s",
-		name, cmd.CommandPath(), strings.Join(valid, "\n"))
 }
 
 // findProfileEntry returns the index of the entry the gate would match for a

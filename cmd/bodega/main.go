@@ -93,10 +93,17 @@ func main() {
 	}
 }
 
-// newRootCmd constructs the root cobra.Command and attaches all sub-commands.
+// newRootCmd constructs the root cobra.Command, attaches all sub-commands,
+// and makes every group refuse a subcommand it does not know.
 func newRootCmd() *cobra.Command {
-	gf := &globalFlags{}
+	root := buildRootCmd(&globalFlags{})
+	refuseUnknownSubcommands(root)
+	return root
+}
 
+// buildRootCmd is the tree as registered, before refuseUnknownSubcommands
+// makes its groups runnable.
+func buildRootCmd(gf *globalFlags) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "bodega",
 		Short: "Manage a centralized package repository",
@@ -283,6 +290,45 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	)
 
 	return root
+}
+
+// refuseUnknownSubcommands gives every group with no RunE of its own the
+// refusal cobra applies only at the root. Without it a group answers any
+// argument with its help and exit 0, so a script calling a mistyped or
+// not-yet-shipped verb reads success. It runs once over the finished tree so
+// a group added later is covered without remembering to opt in.
+func refuseUnknownSubcommands(cmd *cobra.Command) {
+	for _, child := range cmd.Commands() {
+		refuseUnknownSubcommands(child)
+	}
+	if cmd.HasParent() && cmd.HasSubCommands() && !cmd.Runnable() {
+		cmd.Args = cobra.ArbitraryArgs
+		cmd.RunE = func(c *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return unknownSubcommand(c, args[0])
+			}
+			// Printing help changed nothing, whatever the group lends its
+			// subtree.
+			suppressReload(c)
+			return c.Help()
+		}
+		// The guard demands a classification of every runnable command, and
+		// this RunE only prints help. Self-only, so build and pkg, which
+		// classify each verb rather than the group, lend nothing downward.
+		noReloadSignalSelf(cmd)
+	}
+}
+
+// unknownSubcommand is cobra's root-command refusal, for a group below it.
+func unknownSubcommand(cmd *cobra.Command, name string) error {
+	var valid []string
+	for _, c := range cmd.Commands() {
+		if c.IsAvailableCommand() {
+			valid = append(valid, "  "+c.Name())
+		}
+	}
+	return fmt.Errorf("unknown command %q for %q\n\nValid subcommands:\n%s",
+		name, cmd.CommandPath(), strings.Join(valid, "\n"))
 }
 
 // loadConfig resolves the runtime Config from the global flags.
