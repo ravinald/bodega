@@ -1,0 +1,11 @@
+-- apt_archives is the comma-separated list of vendor archive codenames a
+-- profile that scopes apt admits beside its filtered base. A vendor archive
+-- is read unfiltered, under the vendor's own key, so to a scoped host it is a
+-- second package source of the kind apt_base exists to rule out: the server
+-- refuses every vendor codename this list does not name, on /client/plan, on
+-- /client/apt?archive= and on the mirrored dists/ and pool routes.
+--
+-- Empty on every row written before it, which for a scoped profile means no
+-- vendor archive at all. That is the state the profile was meant to be in
+-- already; what changes is that the server now enforces it.
+ALTER TABLE profile_types ADD COLUMN apt_archives TEXT NOT NULL DEFAULT '';

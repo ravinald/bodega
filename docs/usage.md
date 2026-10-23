@@ -1571,16 +1571,17 @@ bodega profile show web
 
 `set` writes the per-type marker. Both flags are optional on a type that already has one: what you do not name keeps the value it has.
 
-| Flag                | Value      | Meaning                                                                         |
-| ------------------- | ---------- | ------------------------------------------------------------------------------- |
-| `--membership`      | `closed`   | only the packages this profile lists                                            |
-| `--membership`      | `open`     | every package of this type in the catalog                                       |
-| `--version-default` | `pinned`   | only the version each entry names                                               |
-| `--version-default` | `floating` | any version                                                                     |
-| `--expansion`       | `warn`     | serve it, and record the reach outside the class                                |
-| `--expansion`       | `block`    | refuse it with 403                                                              |
-| `--expansion`       | `ignore`   | serve it and record nothing                                                     |
-| `--base`            | codename   | apt only: the mirrored codename this profile's filtered index is generated from |
+| Flag                | Value      | Meaning                                                                                                          |
+| ------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--membership`      | `closed`   | only the packages this profile lists                                                                             |
+| `--membership`      | `open`     | every package of this type in the catalog                                                                        |
+| `--version-default` | `pinned`   | only the version each entry names                                                                                |
+| `--version-default` | `floating` | any version                                                                                                      |
+| `--expansion`       | `warn`     | serve it, and record the reach outside the class                                                                 |
+| `--expansion`       | `block`    | refuse it with 403                                                                                               |
+| `--expansion`       | `ignore`   | serve it and record nothing                                                                                      |
+| `--base`            | codename   | apt only: the mirrored codename this profile's filtered index is generated from                                  |
+| `--archives`        | codenames  | apt only: the [vendor archives](#apt-under-a-profile) a profile with a base admits, comma-separated; `''` clears |
 
 The marker's presence is itself an answer. A type with **no** marker is one the profile states no rule for, and the fleet-wide controls decide it alone; a type **with** a marker is decided by the profile even when no entry names a package.
 
@@ -1993,6 +1994,23 @@ $ bodega profile set web apt --membership closed --base noble
 ```
 
 **A profile with no base still governs apt.** `--base` buys a filtered view of a _mirrored_ codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the arrangement above avoids. Add `--base` to buy back the legible half.
+
+**A profile with a base lists the vendor archives its hosts may use.** A [vendor archive](#vendor-archives) is served unfiltered under the vendor's own key, so beside `noble-web` it is a second package source carrying whatever the vendor publishes. A profile with `--base` refuses every vendor archive it does not list, and starts with none listed:
+
+```bash
+bodega profile set web apt --archives stable,noble-pgdg
+bodega profile set web apt --archives ''
+```
+
+The first admits two, the second clears the list. Each codename must be one `apt_upstreams` mirrors with `signing_key_url` and `signing_key_fingerprint` set; `set` reads the server's config to check, refuses anything else and lists the ones that qualify, so it needs the config file where it runs (`BODEGA_CONFIG_FILE` names it). The list keeps its value across a `set` that does not name `--archives`, and `bodega profile show` prints it in the `APT ARCHIVES` column. A refused archive is a `403` on `archives=` in the plan, on `/client/apt?archive=`, and on `/apt/dists/<codename>/` and `/apt/pool/` for a host that wrote the stanza by hand. Each refusal names the codename, the profile and the `bodega profile set ... --archives` command that admits it; on the apt routes it also writes a `denied` discovery row whose pattern is that command:
+
+```text
+$ curl -s 'https://bodega.internal/client/plan?os=linux&codename=noble&archives=stable'
+profile "web" scopes apt to noble and does not list the vendor archive stable, which a host would read unfiltered beside its filtered codename.
+  Ask an operator to admit it with `bodega profile set web apt --archives stable`
+```
+
+The base and its pockets are never refused, keyed or not. A pool path names no codename, so the pool refuses a `.deb` by the archive it [resolves to](#resolving-a-pool-path): an archive root that also serves a codename the profile admits is never refused. A profile with no base reads every mirrored codename unfiltered already, and its list is stored but not consulted until it names one.
 
 **Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
 
@@ -5575,6 +5593,8 @@ Signed-By: /etc/apt/keyrings/bodega-stable.asc
 ```
 
 The `Components:` line is the entry's `components`, or Ubuntu's four when it names none, which is wrong for most vendors: set it. The key is written before the stanza, so a failed run never leaves a stanza naming a key that is not there. A codename the server does not mirror, or mirrors with no key, is refused with `400` and the codenames that would work. A codename that is already on the host's own stanza is refused too, since two stanzas for one suite with different `Signed-By:` values stop every `apt update` with "Conflicting values set for option Signed-By". When the key cannot be served, the plan skips apt and names the status, rather than install a stanza apt cannot verify.
+
+A host whose profile scopes apt with `--base` is refused, with `403`, every vendor archive the profile does not list, on the plan, on `/client/apt?archive=`, and on `/apt/dists/` and `/apt/pool/` for a stanza written by hand. `bodega profile set <profile> apt --archives stable` admits one; see [apt under a profile](#apt-under-a-profile). A host with no profile, or one whose profile names no base, is served as above.
 
 #### Open mode only
 

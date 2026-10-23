@@ -156,11 +156,29 @@ func aptMirrorPkgName(codename, rest string) string {
 // it first.
 func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poolPath string, store storage.ObjectStore) {
 	key := manifest.AptKey(poolPath)
+	p := s.profileFor(r)
+	refused := s.aptRefusedArchiveRoots(p)
+	refuse := func(base string) bool {
+		codenames := refused[base]
+		if len(codenames) == 0 {
+			return false
+		}
+		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
+		s.refuseAptArchive(w, r, p, codenames[0], base+"/"+poolPath, name)
+		return true
+	}
 
 	// A cached .deb needs no archive resolved for it, which is the common case
 	// once a fleet is warm: the probe below is per pool path and the cache
-	// read is not.
+	// read is not. The exception is a host whose profile refuses a vendor
+	// archive, where the archive the object came from is the whole question.
 	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
+		if len(refused) > 0 {
+			base, ok := s.aptResolvePoolUpstream(w, r, poolPath)
+			if !ok || refuse(base) {
+				return
+			}
+		}
 		if !s.aptMirrorHitGate(w, r, poolPath) {
 			return
 		}
@@ -183,6 +201,9 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	}
 	if base == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if refuse(base) {
 		return
 	}
 

@@ -20,6 +20,7 @@ import (
 	"github.com/ulikunitz/xz"
 
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/entitle"
@@ -843,4 +844,93 @@ func aptPoolSourceName(poolPath string) string {
 		return ""
 	}
 	return parts[3]
+}
+
+// ---- vendor archives under a scoped profile --------------------------------
+
+// aptArchiveRefused reports whether p refuses the mirrored codename as a
+// vendor archive. A profile that scopes apt reads one filtered codename, and
+// a vendor archive is served unfiltered under the vendor's own key: beside the
+// filtered one it is a second package source of the kind the scope exists to
+// rule out, so the profile admits only the vendor codenames it lists.
+//
+// A vendor codename is one with a signing key configured, which is what
+// archives= accepts. The profile's own base and its pockets are the host's
+// distribution even when keyed, and an unscoped host keeps reading every
+// mirrored codename, since nothing it reads is filtered to begin with.
+func (s *Server) aptArchiveRefused(p *entitle.Profile, codename string) bool {
+	base, _ := p.AptScope()
+	if base == "" || codename == base {
+		return false
+	}
+	if _, keyed := s.cfg.AptSigningKeyFor(codename); !keyed {
+		return false
+	}
+	if of, ok := s.aptPocketBase(codename); ok && of == base {
+		return false
+	}
+	return !slices.Contains(p.AptArchives(), codename)
+}
+
+// aptArchiveRefusalText names the codename, the profile and the command that
+// would admit it, keeping what the profile already lists so running the
+// command as printed does not drop another archive.
+func aptArchiveRefusalText(p *entitle.Profile, codename string) (reason, next string) {
+	base, _ := p.AptScope()
+	reason = fmt.Sprintf("profile %q scopes apt to %s and does not list the vendor archive %s, which a host would read unfiltered beside its filtered codename.",
+		p.Name(), base, codename)
+	next = fmt.Sprintf("ask an operator to admit it with `bodega profile set %s apt --archives %s`.",
+		p.Name(), strings.Join(append(slices.Clone(p.AptArchives()), codename), ","))
+	return reason, next
+}
+
+// refuseAptArchive writes the 403 for a vendor codename the host's profile
+// does not list, on the mirrored dists/ and pool routes, with the denied
+// discovery row that puts the reach in front of whoever reads
+// `bodega discover list apt`, and the audit row the incident names.
+func (s *Server) refuseAptArchive(w http.ResponseWriter, r *http.Request, p *entitle.Profile, codename, upstreamURL, pkgName string) {
+	f := newRefusal(checkProfile, manifest.TypeApt, pkgName, "", http.StatusForbidden)
+	f.reason, f.next = aptArchiveRefusalText(p, codename)
+	host, _ := splitUpstreamURL(upstreamURL)
+	s.recordDiscoveryRaw(r.Context(), r, manifest.TypeApt, host,
+		fmt.Sprintf("bodega profile set %s apt --archives %s", p.Name(), codename),
+		pkgName, "", audit.DecisionDenied, upstreamURL)
+	recordDenialFor(s.auditDB, r, manifest.TypeApt, pkgName, "", audit.DenialProfileMembership, map[string]string{
+		"profile":  p.Name(),
+		"rule":     "apt_archives",
+		"archive":  codename,
+		"incident": f.incident,
+	})
+	f.write(w, r)
+}
+
+// aptRefusedArchiveRoots maps each archive root that serves only vendor
+// codenames p refuses to those codenames. A pool path names no codename, so
+// the root a .deb resolves to is the only thing that says which archive it
+// came from, and a root that also serves a codename p admits is left alone:
+// the same pool path may be the host's own distribution's.
+func (s *Server) aptRefusedArchiveRoots(p *entitle.Profile) map[string][]string {
+	if base, _ := p.AptScope(); base == "" {
+		return nil
+	}
+	refused := map[string][]string{}
+	admitted := map[string]bool{}
+	for codename, ups := range s.cfg.AptUpstreams {
+		bad := s.aptArchiveRefused(p, codename)
+		for _, up := range ups {
+			if bad {
+				refused[up.URL] = append(refused[up.URL], codename)
+			} else {
+				admitted[up.URL] = true
+			}
+		}
+	}
+	for root, codenames := range refused {
+		if admitted[root] {
+			delete(refused, root)
+			continue
+		}
+		sort.Strings(codenames)
+	}
+	return refused
 }

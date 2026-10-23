@@ -231,7 +231,8 @@ func (s *Server) admitClient(w http.ResponseWriter, r *http.Request, subject str
 }
 
 // clientHostFor reads the host facts an admitted request states, and writes
-// the 400 itself when they are malformed. m is the binding IdentityMiddleware
+// the 400 itself when they are malformed and the 403 when the host's profile
+// refuses a vendor archive they name (aptArchiveRefused). m is the binding IdentityMiddleware
 // resolved, the same one profileFor reads the identity from, so the plan's
 // profile and the rule it reports describe one resolution.
 func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject string, m identityMatch) (*clientHost, bool) {
@@ -243,7 +244,20 @@ func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject s
 		s.writeClientError(w, r, subject, http.StatusBadRequest, "", err.Error())
 		return nil, false
 	}
-	return &clientHost{q: q, match: m, profile: s.profileFor(r), base: s.publicBase(r)}, true
+	h := &clientHost{q: q, match: m, profile: s.profileFor(r), base: s.publicBase(r)}
+	names := q.Archives
+	if q.Archive != "" {
+		names = append(slices.Clone(names), q.Archive)
+	}
+	for _, c := range names {
+		if s.aptArchiveRefused(h.profile, c) {
+			reason, next := aptArchiveRefusalText(h.profile, c)
+			s.writeClientErrorFor(w, r, subject, h, http.StatusForbidden, audit.DenialClientExcluded,
+				reason+"\n  "+strings.TrimSuffix(strings.ToUpper(next[:1])+next[1:], ".")+"\n")
+			return nil, false
+		}
+	}
+	return h, true
 }
 
 // unidentifiedText is the 403 body for a host no binding names. It gives the
