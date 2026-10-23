@@ -851,14 +851,14 @@ For each installed package, the command reads the `Packages` indices over HTTP t
 
 - The suites come from `GET /api/v1/status`, which reports both sets. `--suite` narrows that to a named list.
 - Each suite's `Release` names its components and architectures. Only architectures this host has packages for are fetched.
-- `Packages.gz` is read first, uncompressed `Packages` second.
+- Each index is the compression the suite's `Release` digests, `.gz` first, then `.xz`, then plain `Packages`, and the fetched file is checked against that digest before it is parsed. A mirrored Debian pocket such as `bookworm-updates` digests `Packages.xz` and no `Packages.gz`, so `.xz` is what gets read there. debian-security's `updates/main` components are read from the bare `main/` tree, the way apt reads them.
 - An **`Architecture: all` package is found inside `binary-<arch>`**, because that is where every archive publishes one. Nothing publishes `binary-all`, and looking for it there is how a naive match loses every architecture-independent package on the host: 158 of the 635 above.
 
 Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `public_url`, then this host's own listener from `listen_addr`. The last one is for running the command on the bodega host itself. A loopback target is read over plaintext `http` without `--allow-plaintext`, because the refusal exists to keep a bearer token off a network others can read and there is no such network on `127.0.0.1`. The token comes from `$BODEGA_TOKEN`, then the unexpired credential `bodega login` saved for that server, then `token` in the config file.
 
 #### Gaps
 
-- **`Packages.xz` is not read.** Go ships no xz decoder, and every archive publishing `.xz` publishes `.gz` beside it. An archive publishing only `.xz` is named in an error rather than counted as empty, since an index silently read as zero packages would turn every package in it into an unresolved one.
+- **An index the command cannot read fails the run.** A suite whose `Release` 404s, digests no `Packages` index for a component and architecture it names, or digests a file other than the one the server returns is named in an error, with the files its `Release` does list, rather than counted as empty: an index silently read as zero packages would turn every package in it into an unresolved one. `--suite` leaves such a suite out.
 - **Coverage decays from the moment it is measured.** A version that leaves the archive while pinned turns into an apt error at the next `update`, not a warning now. Re-run this after every upgrade window and re-read the counts.
 - **Nothing is installed and nothing is written to the manifest store.** The output is a file to review, then copy. Pinning a host is separate from cataloging it: see [Cataloging a host end to end](#cataloging-a-host-end-to-end).
 

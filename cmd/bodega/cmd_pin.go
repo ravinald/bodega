@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/ulikunitz/xz"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
@@ -306,17 +310,10 @@ func pinReadIndices(client *Client, suites []string, rows []hostpkg.AptRow, errw
 		if err != nil {
 			return nil, err
 		}
-		if release == nil {
-			fmt.Fprintf(errw, "pin apt: %s publishes no Release, so nothing is matched against it\n", suite)
-			continue
-		}
-		components := strings.Fields(release["Components"])
-		if len(components) == 0 {
-			components = []string{"main"}
-		}
-		for _, component := range components {
+		digests := pinReleaseDigests(release)
+		for _, component := range pinComponents(release) {
 			for _, arch := range pinArches(release, rows) {
-				n, err := pinReadPackages(client, idx, want, component, arch, suite)
+				n, err := pinReadPackages(client, idx, want, component, arch, suite, digests)
 				if err != nil {
 					return nil, err
 				}
@@ -355,9 +352,10 @@ func pinArches(release map[string]string, rows []hostpkg.AptRow) []string {
 	return out
 }
 
-// pinReadRelease fetches a suite's Release. A 404 is an answer: the server
-// reported the suite, so a missing Release means an upstream that does not
-// publish one under that name rather than a failure to report.
+// pinReadRelease fetches a suite's Release. A 404 is an error rather than an
+// empty suite: the Release is what names the components, architectures and
+// index files to read, and a suite the server reported but cannot describe
+// would otherwise leave every package it serves unresolved with no word why.
 func pinReadRelease(client *Client, suite string) (map[string]string, error) {
 	resp, err := client.Get("/apt/dists/" + suite + "/Release")
 	if err != nil {
@@ -365,7 +363,8 @@ func pinReadRelease(client *Client, suite string) (map[string]string, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+		return nil, fmt.Errorf("the server reports suite %s but answers 404 for %s/apt/dists/%s/Release, so there is no list of components, architectures or Packages files to read for it\n"+
+			"Leave the suite out with --suite, or check the server's apt_suites and apt_upstreams for it", suite, client.BaseURL, suite)
 	}
 	if resp.StatusCode != http.StatusOK {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -384,17 +383,14 @@ func pinReadRelease(client *Client, suite string) (map[string]string, error) {
 
 // pinReadPackages folds one component and architecture's index into idx,
 // returning how many installed packages it accounted for.
-func pinReadPackages(client *Client, idx servedIndex, want map[string]bool, component, arch, suite string) (int, error) {
-	dir := "/apt/dists/" + suite + "/" + component + "/binary-" + arch + "/"
-
-	body, err := pinOpenPackages(client, dir)
+func pinReadPackages(client *Client, idx servedIndex, want map[string]bool, component, arch, suite string, digests map[string]string) (int, error) {
+	body, err := pinOpenPackages(client, suite, component, arch, digests)
 	if err != nil {
 		return 0, err
 	}
 	if body == nil {
 		return 0, nil
 	}
-	defer func() { _ = body.Close() }()
 
 	matched := 0
 	err = deb822.ParseStream(body, func(fields map[string]string) error {
@@ -418,64 +414,147 @@ func pinReadPackages(client *Client, idx servedIndex, want map[string]bool, comp
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("parse %s%s: %w", client.BaseURL, dir, err)
+		return 0, fmt.Errorf("parse %s/apt/dists/%s/%s/binary-%s: %w", client.BaseURL, suite, component, arch, err)
 	}
 	return matched, nil
 }
 
-// pinOpenPackages returns a reader over one index, gzip first. A nil reader
-// and no error means the archive publishes neither form here, which is normal
-// for a component and architecture pair a suite does not carry.
-//
-// Packages.xz is not read. Go has no xz decoder in its standard library, and
-// every archive that publishes .xz publishes .gz beside it; an archive that
-// someday publishes only .xz is named in the error rather than counted as
-// empty, because an index silently read as zero packages turns every package
-// in it into an unresolved one.
-func pinOpenPackages(client *Client, dir string) (io.ReadCloser, error) {
-	gzResp, err := client.Get(dir + "Packages.gz")
-	if err != nil {
-		return nil, err
-	}
-	if gzResp.StatusCode == http.StatusOK {
-		zr, err := gzip.NewReader(gzResp.Body)
-		if err != nil {
-			_ = gzResp.Body.Close()
-			return nil, fmt.Errorf("decompress %s%sPackages.gz: %w", client.BaseURL, dir, err)
-		}
-		return pinReadCloser{zr, gzResp.Body}, nil
-	}
-	_ = gzResp.Body.Close()
+// pinPackagesCompressions is the order an index is chosen in when a Release
+// digests more than one, the order the server's filtered codenames read a
+// base in. Plain comes last because Debian's Release digests an uncompressed
+// Packages its archive does not serve: bookworm-updates lists one beside the
+// .xz, and fetching it 404s.
+var pinPackagesCompressions = []string{".gz", ".xz", ""}
 
-	plain, err := client.Get(dir + "Packages")
+// pinIndexLimit bounds one fetched index. The whole file is held so its
+// digest can be checked before a byte of it is parsed; an uncompressed Ubuntu
+// universe index is under 100 MiB.
+const pinIndexLimit = 512 << 20
+
+// pinReleaseDigests indexes a Release's SHA256 block by path. Each line is
+// "<digest> <size> <path>", and deb822 hands the whole block over as one
+// newline-joined value.
+func pinReleaseDigests(release map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(release["SHA256"], "\n") {
+		f := strings.Fields(line)
+		if len(f) == 3 {
+			out[f[2]] = f[0]
+		}
+	}
+	return out
+}
+
+// pinComponents is the Release's component list under the names its tree is
+// served by. debian-security declares updates/main and so on over a bare
+// main/... tree and digests the bare paths, and apt strips the prefix the
+// same way.
+func pinComponents(release map[string]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range strings.Fields(release["Components"]) {
+		c = strings.TrimPrefix(c, "updates/")
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"main"}
+	}
+	return out
+}
+
+// pinOpenPackages returns a reader over one component and architecture's
+// index, chosen from the compressions the Release digests and checked against
+// that digest before anything reads it. A mirrored codename is served byte for
+// byte, so the Release is the archive's own and names the only files worth
+// asking for: Debian's updates and security pockets digest Packages.xz and no
+// Packages.gz.
+//
+// A Release digesting no Packages here is an error rather than an empty index,
+// because an index silently read as zero packages turns every package in it
+// into an unresolved one. A digested index the server answers 404 for is
+// empty: Ubuntu's Release digests every architecture it names while the
+// archive serves two of them.
+func pinOpenPackages(client *Client, suite, component, arch string, digests map[string]string) (io.Reader, error) {
+	base := component + "/binary-" + arch + "/Packages"
+	var path, want string
+	for _, ext := range pinPackagesCompressions {
+		if d := digests[base+ext]; d != "" {
+			path, want = base+ext, d
+			break
+		}
+	}
+	if path == "" {
+		return nil, pinNoIndexError(client, suite, component, arch, digests)
+	}
+
+	loc := "/apt/dists/" + suite + "/" + path
+	resp, err := client.Get(loc)
 	if err != nil {
 		return nil, err
 	}
-	if plain.StatusCode == http.StatusOK {
-		return plain.Body, nil
-	}
-	_ = plain.Body.Close()
-	if gzResp.StatusCode == http.StatusNotFound && plain.StatusCode == http.StatusNotFound {
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
-	return nil, fmt.Errorf("no readable index at %s%s: Packages.gz answered %s, Packages answered %s\n"+
-		"bodega serves a mirrored codename byte for byte, so an archive that publishes only Packages.xz cannot be read here; "+
-		"any other status is the server's own answer",
-		client.BaseURL, dir, gzResp.Status, plain.Status)
-}
-
-// pinReadCloser closes the gzip reader and the response body under it. Closing
-// only the decompressor leaks the connection.
-type pinReadCloser struct {
-	io.Reader
-	under io.Closer
-}
-
-func (p pinReadCloser) Close() error {
-	if gz, ok := p.Reader.(io.Closer); ok {
-		_ = gz.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("GET %s%s: %s\n%s", client.BaseURL, loc, resp.Status, serverError(payload))
 	}
-	return p.under.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, pinIndexLimit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s%s: %w", client.BaseURL, loc, err)
+	}
+	if len(body) > pinIndexLimit {
+		return nil, fmt.Errorf("%s%s is larger than %d MiB, more than any archive's index; refusing to read it",
+			client.BaseURL, loc, pinIndexLimit>>20)
+	}
+	sum := sha256.Sum256(body)
+	if got := hex.EncodeToString(sum[:]); got != strings.ToLower(want) {
+		return nil, fmt.Errorf("%s%s has SHA256 %s but the %s Release digests %s for it: the server's index and Release disagree, "+
+			"which is a mirror caught mid-sync or a proxy rewriting the file; re-run once the mirror settles",
+			client.BaseURL, loc, got, suite, want)
+	}
+
+	switch {
+	case strings.HasSuffix(path, ".gz"):
+		zr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decompress %s%s: %w", client.BaseURL, loc, err)
+		}
+		return zr, nil
+	case strings.HasSuffix(path, ".xz"):
+		xr, err := xz.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("decompress %s%s: %w", client.BaseURL, loc, err)
+		}
+		return xr, nil
+	}
+	return bytes.NewReader(body), nil
+}
+
+// pinNoIndexError names what the Release does digest, narrowed to its
+// Packages indices: a full SHA256 block runs to thousands of Contents and
+// translation lines that say nothing about why this pair is missing.
+func pinNoIndexError(client *Client, suite, component, arch string, digests map[string]string) error {
+	var listed []string
+	for p := range digests {
+		if strings.Contains(p, "/Packages") {
+			listed = append(listed, p)
+		}
+	}
+	sort.Strings(listed)
+	what := "it digests no Packages index at all"
+	if len(digests) == 0 {
+		what = "it carries no SHA256 block, so it digests no file at all"
+	} else if len(listed) > 0 {
+		what = "the Packages indices it digests are:\n  " + strings.Join(listed, "\n  ")
+	}
+	return fmt.Errorf("the %s Release at %s/apt/dists/%s/Release digests no %s/binary-%s/Packages{.gz,.xz,}, so component %s on %s cannot be read; %s\n"+
+		"Leave the suite out with --suite if the server is not meant to answer for it",
+		suite, client.BaseURL, suite, component, arch, component, arch, what)
 }
 
 // pinEmit writes both artifacts and the coverage counts.

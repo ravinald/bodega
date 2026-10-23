@@ -3,13 +3,19 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/ulikunitz/xz"
 
 	"github.com/ravinald/bodega/internal/hostpkg"
 )
@@ -28,9 +34,9 @@ const pinFixtureInventory = "apparmor\t3.0.4-2ubuntu2.5\tamd64\tinstall ok insta
 // pinFixtureServer answers the two routes the command reads: the status
 // endpoint that names the served suites, and the dists/ tree.
 //
-// jammy publishes Packages.gz only, the way a mirrored Ubuntu archive does.
-// local publishes plain Packages, the way bodega's own generated suite does,
-// so one fixture drives both halves of the compressed-first fallback.
+// jammy's Release digests Packages.gz only, the way a mirrored Ubuntu
+// archive's does for what it serves. local's digests plain Packages, so one
+// fixture drives both a compressed and an uncompressed read.
 func pinFixtureServer(t *testing.T) (*httptest.Server, *[]string) {
 	t.Helper()
 
@@ -60,13 +66,15 @@ func pinFixtureServer(t *testing.T) (*httptest.Server, *[]string) {
 		_, _ = w.Write([]byte(`{"healthy":true,"apt":{"suites":["local"],"mirrored":["jammy"]}}`))
 	})
 	mux.HandleFunc("/apt/dists/jammy/Release", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("Origin: Ubuntu\nSuite: jammy\nComponents: main\nArchitectures: amd64 i386\n"))
+		_, _ = w.Write([]byte(pinFixtureRelease("Origin: Ubuntu\nSuite: jammy\nComponents: main\nArchitectures: amd64 i386\n",
+			map[string][]byte{"main/binary-amd64/Packages.gz": gz.Bytes()})))
 	})
 	mux.HandleFunc("/apt/dists/jammy/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(gz.Bytes())
 	})
 	mux.HandleFunc("/apt/dists/local/Release", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("Origin: bodega\nSuite: local\nComponents: main\nArchitectures: amd64\n"))
+		_, _ = w.Write([]byte(pinFixtureRelease("Origin: bodega\nSuite: local\nComponents: main\nArchitectures: amd64\n",
+			map[string][]byte{"main/binary-amd64/Packages": []byte(local)})))
 	})
 	mux.HandleFunc("/apt/dists/local/main/binary-amd64/Packages", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(local))
@@ -79,6 +87,185 @@ func pinFixtureServer(t *testing.T) (*httptest.Server, *[]string) {
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &requested
+}
+
+// pinFixtureRelease appends a SHA256 block digesting files to a Release
+// header, in sorted order so the document is stable across runs.
+func pinFixtureRelease(header string, files map[string][]byte) string {
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("SHA256:\n")
+	for _, p := range paths {
+		sum := sha256.Sum256(files[p])
+		fmt.Fprintf(&b, " %s %d %s\n", hex.EncodeToString(sum[:]), len(files[p]), p)
+	}
+	return b.String()
+}
+
+func pinGzip(t *testing.T, body string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func pinXz(t *testing.T, body string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := xz.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// pinDebianServer serves Debian pockets the way a bodega mirroring them does,
+// byte for byte:
+//
+//   - bookworm-updates digests Packages.xz and an uncompressed Packages the
+//     archive does not serve, and no Packages.gz.
+//   - bookworm-security does the same under Components: updates/main over a
+//     bare main/ tree.
+//   - bookworm digests all three and serves all three, so the choice of
+//     compression is the command's.
+//   - nopackages digests only translation files.
+//   - tampered serves a Packages.xz whose bytes differ from its digest.
+//   - gone is reported by the status endpoint and answers 404 for its Release.
+func pinDebianServer(t *testing.T) (*httptest.Server, *[]string) {
+	t.Helper()
+	const arches = "Architectures: amd64 arm64\n"
+	updates := "Package: apparmor\nVersion: 3.0.4-2ubuntu2.5\nArchitecture: amd64\n"
+	security := "Package: zerofree\nVersion: 1.1.1-1build3\nArchitecture: amd64\n"
+	release := "Package: fwupd\nVersion: 1.7.9-1~22.04.3\nArchitecture: amd64\n"
+
+	routes := map[string][]byte{}
+	releases := map[string]string{}
+	pocket := func(suite, components string, digested map[string][]byte, served map[string][]byte) {
+		releases[suite] = pinFixtureRelease("Suite: "+suite+"\nComponents: "+components+"\n"+arches, digested)
+		for p, b := range served {
+			routes["/apt/dists/"+suite+"/"+p] = b
+		}
+	}
+	updatesXz := pinXz(t, updates)
+	pocket("bookworm-updates", "main",
+		map[string][]byte{"main/binary-amd64/Packages.xz": updatesXz, "main/binary-amd64/Packages": []byte(updates)},
+		map[string][]byte{"main/binary-amd64/Packages.xz": updatesXz})
+	securityXz := pinXz(t, security)
+	pocket("bookworm-security", "updates/main",
+		map[string][]byte{"main/binary-amd64/Packages.xz": securityXz, "main/binary-amd64/Packages": []byte(security)},
+		map[string][]byte{"main/binary-amd64/Packages.xz": securityXz})
+	all := map[string][]byte{
+		"main/binary-amd64/Packages.gz": pinGzip(t, release),
+		"main/binary-amd64/Packages.xz": pinXz(t, release),
+		"main/binary-amd64/Packages":    []byte(release),
+	}
+	pocket("bookworm", "main", all, all)
+	pocket("nopackages", "main",
+		map[string][]byte{"main/i18n/Translation-en.xz": []byte("x"), "contrib/binary-amd64/Packages.xz": []byte("y")}, nil)
+	pocket("tampered", "main",
+		map[string][]byte{"main/binary-amd64/Packages.xz": updatesXz},
+		map[string][]byte{"main/binary-amd64/Packages.xz": securityXz})
+
+	var (
+		mu        sync.Mutex
+		requested []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requested = append(requested, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/api/v1/status" {
+			_, _ = w.Write([]byte(`{"healthy":true,"apt":{"mirrored":["bookworm","bookworm-updates","bookworm-security","nopackages","tampered","gone"]}}`))
+			return
+		}
+		if suite, ok := strings.CutSuffix(strings.TrimPrefix(r.URL.Path, "/apt/dists/"), "/Release"); ok && releases[suite] != "" {
+			_, _ = w.Write([]byte(releases[suite]))
+			return
+		}
+		if b, ok := routes[r.URL.Path]; ok {
+			_, _ = w.Write(b)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requested
+}
+
+// TestPinAptReadsTheCompressionTheReleaseDigests covers the Debian pockets a
+// bodega mirrors: two that publish only Packages.xz, one of them under
+// debian-security's updates/ component prefix, and one publishing all three
+// where Packages.gz is the one fetched.
+func TestPinAptReadsTheCompressionTheReleaseDigests(t *testing.T) {
+	for _, tc := range []struct {
+		suite, resolves, fetched, unfetched string
+	}{
+		{"bookworm-updates", "Package: apparmor", "main/binary-amd64/Packages.xz", "main/binary-amd64/Packages.gz"},
+		{"bookworm-security", "Package: zerofree", "main/binary-amd64/Packages.xz", "updates/main"},
+		{"bookworm", "Package: fwupd", "main/binary-amd64/Packages.gz", "main/binary-amd64/Packages.xz"},
+	} {
+		t.Run(tc.suite, func(t *testing.T) {
+			srv, requested := pinDebianServer(t)
+			stdout, stderr, err := runPinApt(t, "--server", srv.URL, "--allow-plaintext", "--suite", tc.suite)
+			if err != nil {
+				t.Fatalf("pin apt: %v\n%s", err, stderr)
+			}
+			if !strings.Contains(stdout, tc.resolves) {
+				t.Errorf("%s did not resolve from %s:\n%s", tc.resolves, tc.suite, stdout)
+			}
+			joined := strings.Join(*requested, " ")
+			if !strings.Contains(joined, "/apt/dists/"+tc.suite+"/"+tc.fetched) {
+				t.Errorf("%s was not fetched: %s", tc.fetched, joined)
+			}
+			if strings.Contains(joined, "/apt/dists/"+tc.suite+"/"+tc.unfetched) {
+				t.Errorf("%s was fetched when the Release chose otherwise: %s", tc.unfetched, joined)
+			}
+		})
+	}
+}
+
+// TestPinAptRefusesAnIndexItCannotRead keeps an unreadable pocket from being
+// counted as an empty one, which would report every package it serves as
+// unresolved.
+func TestPinAptRefusesAnIndexItCannotRead(t *testing.T) {
+	for _, tc := range []struct {
+		suite string
+		want  []string
+	}{
+		{"nopackages", []string{"nopackages Release", "main/binary-amd64/Packages{.gz,.xz,}", "contrib/binary-amd64/Packages.xz"}},
+		{"gone", []string{"suite gone", "404", "/apt/dists/gone/Release", "--suite"}},
+		{"tampered", []string{"/apt/dists/tampered/main/binary-amd64/Packages.xz", "SHA256", "tampered Release digests"}},
+	} {
+		t.Run(tc.suite, func(t *testing.T) {
+			srv, _ := pinDebianServer(t)
+			stdout, stderr, err := runPinApt(t, "--server", srv.URL, "--allow-plaintext", "--suite", tc.suite)
+			if err == nil {
+				t.Fatalf("pin apt read %s without complaint:\n%s\n%s", tc.suite, stdout, stderr)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error does not name %q:\n%v", w, err)
+				}
+			}
+		})
+	}
 }
 
 // runPinApt drives the real command against a scratch config, returning what
