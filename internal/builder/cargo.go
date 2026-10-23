@@ -184,6 +184,7 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		pm, err := store.GetPackage(ctx, manifest.TypeCargo, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [cargo] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeCargo, name, err)
 			continue
 		}
 

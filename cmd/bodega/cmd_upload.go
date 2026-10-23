@@ -87,32 +87,38 @@ one NAME@VERSION, and pypi cannot take it.`,
 				return err
 			}
 
-			totalUploaded := 0
+			var tally uploadTally
 			for _, t := range types {
 				fmt.Printf("\n--- upload: %s ---\n", t)
-				if err := ensureUploadable(t, bcfg, store); err != nil {
-					return err
-				}
-				n, err := pl.UploadType(ctx, bcfg, t)
-				totalUploaded += n
+				staged, err := ensureUploadable(t, bcfg, store)
 				if err != nil {
 					return err
 				}
-			}
-
-			if storageBackend != "" {
-				if err := confirmPlaced(pl, types[0], selector, storageBackend); err != nil {
-					return err
+				if staged.HasFailures() {
+					fmt.Printf("    cascade for %s failed: %d stage failure(s)\n", t, staged.Failures)
+					tally.failed(staged.Failures, staged.FirstError())
+				}
+				n, err := pl.UploadTypeAfter(ctx, bcfg, t, staged)
+				tally.uploaded += n
+				if err != nil {
+					tally.failed(1, err)
 				}
 			}
-
-			fmt.Printf("\nUpload complete. Total files uploaded: %d\n", totalUploaded)
 
 			// Update metrics after upload.
 			if err := store.SaveIndex(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
 			}
 
+			if err := tally.err("upload"); err != nil {
+				return err
+			}
+			if storageBackend != "" {
+				if err := confirmPlaced(pl, types[0], selector, storageBackend); err != nil {
+					return err
+				}
+			}
+			fmt.Printf("\nUpload complete. Total files uploaded: %d\n", tally.uploaded)
 			return nil
 		},
 	}
@@ -121,4 +127,30 @@ one NAME@VERSION, and pypi cannot take it.`,
 	cmd.Flags().StringVar(&storageBackend, "storage", "",
 		"Backend one version's bytes are written to, overriding the placement hierarchy; needs one type and NAME@VERSION")
 	return cmd
+}
+
+// uploadTally is what an upload or sync run reports once every type has had
+// its turn. A failure in one type no longer stops the next, so the count of
+// what landed and of what did not are both needed for the last line.
+type uploadTally struct {
+	uploaded int
+	failures int
+	first    error
+}
+
+func (u *uploadTally) failed(n int, err error) {
+	u.failures += n
+	if u.first == nil {
+		u.first = err
+	}
+}
+
+// err is the run's last line when anything failed, which cobra prints after
+// the per-type output, and nil when nothing did.
+func (u *uploadTally) err(verb string) error {
+	if u.failures == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s failed: %d artifact(s) failed, %d file(s) uploaded; first error: %w",
+		verb, u.failures, u.uploaded, u.first)
 }

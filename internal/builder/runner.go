@@ -634,6 +634,41 @@ func (s *Summary) Print(w io.Writer) {
 // HasFailures returns true when at least one entry failed.
 func (s *Summary) HasFailures() bool { return s.Failures > 0 }
 
+// FirstError returns the first failed result's error, prefixed with the type
+// and name it belongs to. It is nil only when nothing failed: a failure counted
+// with no Result behind it still answers, so a caller's last line never reads
+// as a nil error.
+func (s *Summary) FirstError() error {
+	for _, r := range s.Results {
+		if r.Err != nil {
+			return fmt.Errorf("%s/%s: %w", r.Type, r.Name, r.Err)
+		}
+	}
+	if s.HasFailures() {
+		return fmt.Errorf("%d failure(s) recorded with no error; see the output above", s.Failures)
+	}
+	return nil
+}
+
+// fail records a failure no entry's own Result carries: a directory the stage
+// could not create, an index it could not write. Logged alone, each leaves a
+// summary reading zero failures over a stage that did nothing, and every
+// command reading it exits 0.
+func (s *Summary) fail(typ, name string, err error) {
+	s.Failures++
+	s.Results = append(s.Results, Result{Type: typ, Name: name, Err: err})
+}
+
+// loadFailed records a package the index lists whose manifest record would not
+// load. The callers also land here on a nil record with a nil error, so one
+// is supplied.
+func (s *Summary) loadFailed(typ, name string, err error) {
+	if err == nil {
+		err = errors.New("listed in the index, but no manifest record loaded")
+	}
+	s.fail(typ, name, fmt.Errorf("load package: %w", err))
+}
+
 // LogErrors writes all failed results to the error log with full context.
 func (s *Summary) LogErrors(logger *logging.BuildLogger, operation string) {
 	if logger == nil {

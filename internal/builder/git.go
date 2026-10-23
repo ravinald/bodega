@@ -113,10 +113,12 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 
 	if err := mkdirAll(d.repos); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeGit, "fetch", err)
 		return summary
 	}
 	if err := mkdirAll(d.sources); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeGit, "fetch", err)
 		return summary
 	}
 
@@ -128,6 +130,7 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [git] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeGit, name, err)
 			continue
 		}
 
@@ -333,6 +336,7 @@ func PackageGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 
 	if err := mkdirAll(d.bundles); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeGit, "package", err)
 		return summary
 	}
 
@@ -344,6 +348,7 @@ func PackageGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [git] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeGit, name, err)
 			continue
 		}
 

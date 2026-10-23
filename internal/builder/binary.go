@@ -136,6 +136,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 	summary := &Summary{}
 	if err := mkdirAll(cfg.rootFor(manifest.TypeBinary)); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypeBinary, "fetch", err)
 		return summary
 	}
 
@@ -147,6 +148,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 		pm, err := store.GetPackage(ctx, manifest.TypeBinary, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [binary] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeBinary, name, err)
 			continue
 		}
 

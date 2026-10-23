@@ -1462,6 +1462,7 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 	wheelsDir := pypiWheelsDir(d)
 	if err := mkdirAll(wheelsDir); err != nil {
 		cfg.logf("ERROR: %v", err)
+		summary.fail(manifest.TypePypi, "wheels", err)
 		return summary
 	}
 
