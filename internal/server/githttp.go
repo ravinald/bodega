@@ -274,10 +274,12 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// and as a push in the child.
 	serviceParams := r.URL.Query()["service"]
 	if strings.HasSuffix(rest, "/"+gitServiceReceivePack) || slices.Contains(serviceParams, gitServiceReceivePack) {
-		// A write attempt by a caller who already passed the read gate, which
-		// is the same question "who was turned away" asks of every other
-		// refusal. The namespace is the subject; the repository is in the path
-		// the row's details carry.
+		// A write attempt, recorded because it is the same question "who was
+		// turned away" asks of every other refusal. A POST to git-receive-pack
+		// reaches here without the profile gate, which judges only the two
+		// fetch suffixes, so the row says a push was tried, not that the caller
+		// may read. The namespace is the subject; the repository is in the
+		// path the row's details carry.
 		recordDenialFor(s.auditDB, r, manifest.TypeGit, ns, "", audit.DenialPushRefused, nil)
 		http.Error(w, "bodega mirrors are read-only; pushes are refused", http.StatusForbidden)
 		return
@@ -305,7 +307,7 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// 'discover promote --as manifest' writes an entry under. The two have to
 	// be the same string or promoting a no_manifest row leaves the 404 in
 	// place. The upstream keeps the .git suffix; the manifest name drops it.
-	pkgName := ns + "/" + strings.TrimSuffix(repo, ".git")
+	pkgName := gitPkgName(ns, repo)
 	upstream := gu.URL + repo
 
 	if gu.Mode != config.UpstreamModeOpen {

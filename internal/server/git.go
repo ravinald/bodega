@@ -82,13 +82,37 @@ func (s *Server) handleGitNamespace(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// The namespace is the unit a profile lists for smart-HTTP, because it is
-	// the unit git_upstreams keys on and the only package identity a clone URL
-	// carries. A clone names no version, so membership is the whole decision.
-	if !s.entitleGate(w, r, manifest.TypeGit, ns, "") {
+	// A path that is not a smart-HTTP fetch skips the profile gate: it names
+	// no repository to judge, and handleGitSmart serves it nothing, refusing a
+	// push and 404ing the rest. Gating it on the namespace instead would leave
+	// a denied row whose hint admits the whole forge.
+	if repo, _, ok := gitSmartService(rest); ok && !s.gitEntitleGate(w, r, ns, gitPkgName(ns, repo)) {
 		return
 	}
 	s.handleGitSmart(w, r, ns, rest, gu)
+}
+
+// gitEntitleGate is entitleGate for a smart-HTTP clone. A profile lists either
+// the repository (github/torvalds/linux) or its namespace (github), and either
+// admits it. A clone names no version, so membership is the whole decision.
+//
+// The namespace entry is the older form and admits every repository the forge
+// serves. It is honored so no existing profile changes meaning, but it is not
+// what a refusal suggests: the row and the refusal both name the repository,
+// so a profile learned from observed rows lists repositories.
+func (s *Server) gitEntitleGate(w http.ResponseWriter, r *http.Request, ns, pkgName string) bool {
+	if d := s.profileFor(r).Covers(manifest.TypeGit, ns); d.Permitted && !d.Outside {
+		return true
+	}
+	return s.entitleGate(w, r, manifest.TypeGit, pkgName, "")
+}
+
+// gitPkgName is the package identity of one smart-HTTP repository: the
+// namespace and the repository path, without the .git suffix the upstream
+// URL keeps. It is the manifest name catalog mode looks up and the name a
+// profile entry lists, so the two cannot drift apart.
+func gitPkgName(ns, repo string) string {
+	return ns + "/" + strings.TrimSuffix(repo, ".git")
 }
 
 // splitNamespace splits a namespaced upstream path into its first segment and
