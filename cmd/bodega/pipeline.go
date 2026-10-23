@@ -377,9 +377,11 @@ func ensureMirroredFreeBSD(bcfg *builder.Config, store *manifest.Store, entryFil
 }
 
 // ensureUploadable runs whatever cascade a type needs before its artifacts are
-// read off disk. One switch instead of one arm per type in each of the upload
-// commands, which is where the two drifted.
-func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) error {
+// read off disk, and returns what those stages reported. One switch instead of
+// one arm per type in each of the upload commands, which is where the two
+// drifted. The error is for a type with no cascade; a stage that failed is in
+// the summary, so the caller can still upload what the others produced.
+func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*builder.Summary, error) {
 	var s *builder.Summary
 	switch t {
 	case manifest.TypeBinary:
@@ -406,10 +408,7 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather
 		// than skipping it. Refuse by name instead.
-		return fmt.Errorf("no upload cascade for type %q", t)
+		return nil, fmt.Errorf("no upload cascade for type %q", t)
 	}
-	if s.HasFailures() {
-		return fmt.Errorf("cascade for %s failed", t)
-	}
-	return nil
+	return s, nil
 }

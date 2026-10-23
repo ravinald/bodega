@@ -103,6 +103,12 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		pm, err := store.GetPackage(ctx, manifest.TypeDistfiles, safe)
 		if err != nil || pm == nil {
 			cfg.logf("  [distfiles] %s: ERROR loading package: %v", safe, err)
+			// The filter matches pm.Name or the safe name, and only the safe
+			// name is known here; a record that will not load fails a run
+			// that named it or named nothing.
+			if entryFilter == "" || safe == entryFilter {
+				summary.loadFailed(manifest.TypeDistfiles, safe, err)
+			}
 			continue
 		}
 		if entryFilter != "" && pm.Name != entryFilter && safe != entryFilter {

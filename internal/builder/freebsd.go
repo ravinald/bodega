@@ -134,6 +134,7 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 		pm, err := store.GetPackage(ctx, manifest.TypeFreeBSD, repo)
 		if err != nil || pm == nil {
 			cfg.logf("  [freebsd] %s: ERROR loading package: %v", repo, err)
+			summary.loadFailed(manifest.TypeFreeBSD, repo, err)
 			continue
 		}
 

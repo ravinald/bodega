@@ -133,11 +133,12 @@ func TestEveryTypeHasAnUploadCascade(t *testing.T) {
 	store := manifest.NewLocalStore(cfg.ManifestDir)
 
 	for _, typ := range manifest.AllTypes {
-		if err := ensureUploadable(typ, bcfg, store); err != nil {
-			t.Errorf("ensureUploadable(%q) on an empty store = %v, want nil", typ, err)
+		s, err := ensureUploadable(typ, bcfg, store)
+		if err != nil || s.HasFailures() {
+			t.Errorf("ensureUploadable(%q) on an empty store = %v, %v, want no failures", typ, s, err)
 		}
 	}
-	if err := ensureUploadable("conda", bcfg, store); err == nil {
+	if _, err := ensureUploadable("conda", bcfg, store); err == nil {
 		t.Error("ensureUploadable on a type the switch does not cover returned nil, want an error naming it")
 	}
 }

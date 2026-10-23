@@ -156,10 +156,14 @@ it once before a hosted index can date them.`,
 			}
 
 			total, failures := 0, 0
+			var firstErr error
 			for _, s := range allSummaries {
 				s.Print(os.Stdout)
 				total += s.Total
 				failures += s.Failures
+				if firstErr == nil {
+					firstErr = s.FirstError()
+				}
 			}
 
 			fmt.Printf("\nTotal entries: %d  Failures: %d\n", total, failures)
@@ -171,7 +175,7 @@ it once before a hosted index can date them.`,
 			}
 
 			if failures > 0 {
-				return fmt.Errorf("%d fetch(es) failed", failures)
+				return fmt.Errorf("%d fetch(es) failed; first error: %w", failures, firstErr)
 			}
 			return nil
 		},

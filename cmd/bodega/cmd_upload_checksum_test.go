@@ -334,3 +334,52 @@ func TestFetchDistfilesFailsTheCommandWhenTheDistdirCannotBeCreated(t *testing.T
 		t.Fatalf("build fetch distfiles: %v, want it to fail naming one failed fetch", err)
 	}
 }
+
+// A charts directory the package stage cannot write is a failed upload, not an
+// upload of zero files. The chart already on disk still goes up, the index it
+// could not write does not, and the last line counts both.
+func TestUploadHelmFailsWhenTheChartsDirectoryIsReadOnly(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes through a read-only directory")
+	}
+	e := newUploadEnv(t)
+	e.seed(t, &manifest.PackageManifest{Type: manifest.TypeHelm, Name: "podinfo", Versions: []manifest.VersionEntry{{Version: "6.0.0", Frozen: true}}})
+	charts := filepath.Join(e.buildRoot, "charts")
+	writeFile(t, charts, "podinfo/6.0.0/podinfo-6.0.0.tgz", "chart bytes")
+	if err := os.Chmod(charts, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(charts, 0o755) })
+
+	out, err := runUploadResult(t, manifest.TypeHelm)
+	if err == nil {
+		t.Fatalf("build upload helm over a read-only charts directory exited 0\n%s", out)
+	}
+	for _, want := range []string{"upload failed: 1 artifact(s) failed, 1 file(s) uploaded", "index.yaml", "permission denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q\n%s", err, want, out)
+		}
+	}
+	if strings.Contains(out, "Upload complete") {
+		t.Errorf("a failed upload printed the success line\n%s", out)
+	}
+	storage := filepath.Join(filepath.Dir(e.buildRoot), "storage")
+	if _, err := os.Stat(filepath.Join(storage, manifest.HelmChartKey("podinfo", "6.0.0"))); err != nil {
+		t.Errorf("the chart that was on disk was not uploaded: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(storage, manifest.HelmIndexKey)); err == nil {
+		t.Errorf("an index.yaml reached storage from a package stage that failed\n%s", out)
+	}
+}
+
+// A run with nothing to upload has nothing to fail.
+func TestUploadHelmWithNothingToDoExitsZero(t *testing.T) {
+	newUploadEnv(t)
+	out, err := runUploadResult(t, manifest.TypeHelm)
+	if err != nil {
+		t.Fatalf("build upload helm with no helm entries: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Upload complete. Total files uploaded: 0") {
+		t.Errorf("want the success line\n%s", out)
+	}
+}

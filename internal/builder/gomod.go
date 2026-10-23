@@ -59,6 +59,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		pm, err := store.GetPackage(ctx, manifest.TypeGomod, name)
 		if err != nil || pm == nil {
 			cfg.logf("  [gomod] %s: ERROR loading package: %v", name, err)
+			summary.loadFailed(manifest.TypeGomod, name, err)
 			continue
 		}
 
