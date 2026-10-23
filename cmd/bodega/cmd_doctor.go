@@ -44,9 +44,9 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro bool
+	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS bool
 	var token, baseURL, pkgABI, aptSuite string
-	var configure []string
+	var configure, ntpServers []string
 	var pkgRelease int
 	c := &cobra.Command{
 		Use:   "doctor",
@@ -146,6 +146,18 @@ undoes those and only those.
   sudo bodega doctor --configure apt --quiet-ubuntu-pro --apply --url https://bodega.internal
   sudo bodega doctor --restore-ubuntu-pro
 
+On Linux, doctor also names the OS services that call out whatever bodega
+serves: chrony taking time over NTS (chrony-nts), motd-news (motd-news) and
+snapd's refresh check (snapd-refresh). --ntp-server names an internal time
+source the chrony-nts row accepts, beside the bodega server itself.
+--quiet-os-callers, with --configure, turns motd-news off and holds snap
+refreshes, each step printed with its undo, and records the ones that ran in
+/etc/bodega/doctor-os-callers.json. chrony is reported only: the time source
+is the operator's to choose. --restore-os-callers undoes the recorded steps.
+
+  sudo bodega doctor --configure apt --quiet-os-callers --apply --url https://bodega.internal
+  sudo bodega doctor --restore-os-callers
+
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -157,11 +169,17 @@ See docs/threat-model.md for the rationale behind each check.`,
 				systems = append(systems, manifest.TypeFreeBSD)
 			}
 			configuring := len(systems) > 0 || cmd.Flags().Changed("configure")
-			if restorePro && (writeCreds || configuring) {
+			if restorePro && (writeCreds || configuring || restoreOS) {
 				return fmt.Errorf("run one write at a time: --restore-ubuntu-pro undoes what --quiet-ubuntu-pro ran, and nothing else")
 			}
 			if restorePro {
-				return ubuntuPro.restore()
+				return ubuntuPro.ledger().restore()
+			}
+			if restoreOS && (writeCreds || configuring) {
+				return fmt.Errorf("run one write at a time: --restore-os-callers undoes what --quiet-os-callers ran, and nothing else")
+			}
+			if restoreOS {
+				return osCallers.ledger().restore()
 			}
 			if writeCreds && configuring {
 				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
@@ -171,7 +189,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if !configuring {
-				for _, f := range []string{"apply", "suite", "abi", "release", "quiet-ubuntu-pro"} {
+				for _, f := range []string{"apply", "suite", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers"} {
 					if cmd.Flags().Changed(f) {
 						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
 							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
@@ -185,7 +203,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if configuring {
 				return configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
-					suite: aptSuite, abi: pkgABI, release: pkgRelease, quietPro: quietPro,
+					suite: aptSuite, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
 					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
 				})
 			}
@@ -196,6 +214,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if f, ok := ubuntuPro.finding(); ok {
 				findings = append(findings, f)
 			}
+			findings = append(findings, osCallers.findings(internalTimeSources(gf, baseURL, ntpServers))...)
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 
@@ -239,6 +258,12 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"With --configure apt: also set Ubuntu Pro's apt_news false and mask esm-cache.service on an unattached host")
 	c.Flags().BoolVar(&restorePro, "restore-ubuntu-pro", false,
 		"Undo the Ubuntu Pro steps --quiet-ubuntu-pro recorded, and nothing else")
+	c.Flags().BoolVar(&quietOS, "quiet-os-callers", false,
+		"With --configure: also turn motd-news off and hold snap refreshes on a Linux host")
+	c.Flags().BoolVar(&restoreOS, "restore-os-callers", false,
+		"Undo the steps --quiet-os-callers recorded, and nothing else")
+	c.Flags().StringSliceVar(&ntpServers, "ntp-server", nil,
+		"An internal time source the chrony-nts row accepts beside the bodega server (comma-separated or repeated)")
 	c.Flags().StringVar(&aptSuite, "suite", "",
 		"The apt codename to configure, for an instance serving several and no profile to choose between them")
 	c.Flags().StringVar(&pkgABI, "abi", "",
@@ -409,6 +434,7 @@ type planRequest struct {
 	apply          bool
 	allowPlaintext bool
 	quietPro       bool
+	quietOS        bool
 }
 
 // configureFromPlan applies the plan GET /client/plan returns for this host,
@@ -498,22 +524,37 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("\n%s", d)
 		changed++
 	}
-	var proSteps []string
+	var proPlan, osPlan []string
 	if req.quietPro {
 		steps, why, err := ubuntuPro.quietSteps()
 		if err != nil {
 			return err
 		}
-		printQuietPlan(steps, why)
-		proSteps = steps
+		ubuntuPro.ledger().printPlan(steps, why, "ubuntu-pro")
+		proPlan = steps
+	}
+	if req.quietOS {
+		steps, why, err := osCallers.quietSteps()
+		if err != nil {
+			return err
+		}
+		osCallers.ledger().printPlan(steps, why, "os-callers")
+		osPlan = steps
 	}
 	switch {
-	case changed == 0 && len(proSteps) == 0:
+	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		return nil
-	case !req.apply && len(proSteps) > 0:
-		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) and run the %d Ubuntu Pro step(s) above.\n",
-			changed, len(proSteps))
+	case !req.apply && len(proPlan)+len(osPlan) > 0:
+		var runs []string
+		if len(proPlan) > 0 {
+			runs = append(runs, fmt.Sprintf("%d Ubuntu Pro step(s)", len(proPlan)))
+		}
+		if len(osPlan) > 0 {
+			runs = append(runs, fmt.Sprintf("%d OS caller step(s)", len(osPlan)))
+		}
+		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) and run the %s above.\n",
+			changed, strings.Join(runs, " and "))
 		return nil
 	case !req.apply:
 		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) above.\n", changed)
@@ -531,11 +572,17 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			return err
 		}
 	}
-	if len(proSteps) > 0 {
-		if err := ubuntuPro.quiet(proSteps); err != nil {
+	for _, q := range []struct {
+		ledger stepRecord
+		steps  []string
+	}{{ubuntuPro.ledger(), proPlan}, {osCallers.ledger(), osPlan}} {
+		if len(q.steps) == 0 {
+			continue
+		}
+		if err := q.ledger.quiet(q.steps); err != nil {
 			return err
 		}
-		fmt.Printf("recorded   %s (undo: bodega doctor --restore-ubuntu-pro)\n", ubuntuPro.record)
+		fmt.Printf("recorded   %s (undo: bodega doctor %s)\n", q.ledger.path, q.ledger.restoreFlag)
 	}
 	for _, c := range changes {
 		switch {
