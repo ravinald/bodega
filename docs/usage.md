@@ -3787,6 +3787,8 @@ A default config is created on first run. All fields are optional.
   "token": "",
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
+  "upstream_connect_timeout": "5s",
+  "stale_grace": "3s",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
   "pypi_upstream": "https://pypi.org",
@@ -6913,11 +6915,21 @@ When `proxy_cache_enabled` is `true`, the server fetches from upstream on cache 
 | Immutable | Forever        | `.zip`, `.mod`, `.info`, `.tgz` (versioned) |
 | Mutable   | `metadata_ttl` | `@v/list`, `index.yaml`, packument          |
 
-Configure the TTL:
+Configure the TTL and the two bounds on waiting for an upstream:
 
 ```json
-{ "metadata_ttl": "1h" }
+{ "metadata_ttl": "1h", "upstream_connect_timeout": "5s", "stale_grace": "3s" }
 ```
+
+| Key                        | Default | What it bounds                                                                                                                                     |
+| -------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `metadata_ttl`             | `1h`    | How long a cached mutable document is served without asking the upstream                                                                           |
+| `upstream_connect_timeout` | `5s`    | One TCP connect to any upstream. Without it an upstream that drops packets holds the request for the dialer's 30s, longer than pip, npm or go wait |
+| `stale_grace`              | `3s`    | How long a request for a mutable document past `metadata_ttl` waits on the upstream before it is served the cached copy                            |
+
+`upstream_connect_timeout` and `stale_grace` are Go durations. Load refuses a value for either that does not parse or is not above zero, naming the key.
+
+**During an upstream outage.** A request for a mutable document bodega holds a copy of is answered within `stale_grace`: if the upstream has not answered by then, the client gets the cached copy (recorded as a cache hit, the same as when the upstream fetch fails outright) and the refresh carries on in the background, bounded by the 90s upstream timeout, even after the client hangs up. A refresh that succeeds replaces the cached copy, so the next request gets the fresh one. Only one refresh per document runs at a time, and a request arriving during it is served the cached copy at once. A request bodega holds no copy for waits on the upstream: against an unreachable host it gets `502 upstream fetch failed` after `upstream_connect_timeout`, and against a host that accepts the connection and never answers, it waits until the client gives up or the 90s upstream timeout fires. An immutable artifact already cached is never refetched, so an outage does not touch it.
 
 **A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. For `npm` it covers the packument and the tarball together, for the same reason at one remove: the proxied packument has every `dist.tarball` rewritten onto this server's own `/npm/{pkg}/-/{tarball}`, so a tarball route that refused what the packument published would fail `npm install` on a URL bodega itself named.
 

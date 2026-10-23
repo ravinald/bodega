@@ -16,11 +16,13 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -34,6 +36,10 @@ type CacheConfig struct {
 	// MetadataTTL is how long mutable resources (e.g. @v/list, index.yaml,
 	// packument) are considered fresh before re-checking upstream.
 	MetadataTTL time.Duration
+	// StaleGrace is how long a request holding a stale cached copy waits for
+	// the upstream before it is served that copy and the refresh carries on in
+	// the background. Zero waits for the upstream however long it takes.
+	StaleGrace time.Duration
 }
 
 // proxyOrCache serves an S3 object, optionally fetching from upstream on miss.
@@ -156,6 +162,30 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		return
 	}
 
+	// A stale copy on hand changes what waiting costs: the client can be
+	// answered now, so it is not made to wait out an upstream that drops
+	// packets. One refresh per key, so a client retrying against a silent
+	// upstream does not stack a fetch per attempt.
+	graced := status != nil && status.Exists && !immutable && s.cache.StaleGrace > 0
+	var release func()
+	if graced {
+		var claimed bool
+		if release, claimed = s.claimStaleRefresh(s3Key); !claimed {
+			s.logger.Info("a refresh of this stale cached copy is already running, serving the cached copy", "key", s3Key)
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
+				s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, obj)
+			})
+			return
+		}
+		// A refresh that outlives the request takes the claim with it, and
+		// releases it once the cache is written.
+		defer func() {
+			if release != nil {
+				release()
+			}
+		}()
+	}
+
 	// Before the resolve rather than after it: the resolve is itself an
 	// upstream read for pypi, and a line printed after it describes the second
 	// fetch while leaving the first with no trace in the log at all. The URL is
@@ -231,14 +261,38 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 	}
 
-	up, err := openUpstream(ctx, upstreamURL, requiresIdentityEncoding(regType))
-	if err != nil {
-		fail(err)
-		return
+	var fetched upstreamFetch
+	if graced {
+		// Detached so that a client giving up does not cancel the refresh it
+		// is waiting on; upstreamClient's Timeout is what bounds it instead.
+		fetchCtx := context.WithoutCancel(ctx)
+		results := make(chan upstreamFetch, 1)
+		go func() { results <- s.fetchUpstream(fetchCtx, upstreamURL, regType) }()
+		timer := time.NewTimer(s.cache.StaleGrace)
+		defer timer.Stop()
+		answered := false
+		select {
+		case fetched = <-results:
+			answered = true
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		if !answered {
+			go s.finishStaleRefresh(fetchCtx, results, store, s3Key, release)
+			release = nil
+			s.logger.Warn("upstream did not answer within stale_grace, serving the stale cached copy and refreshing in the background",
+				"url", upstreamURL, "stale_grace", s.cache.StaleGrace)
+			// Recorded as the failed-fetch fallback records it: the attempt
+			// row is already written, and these are cached bytes.
+			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
+				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, obj)
+			})
+			return
+		}
+	} else {
+		fetched = s.fetchUpstream(ctx, upstreamURL, regType)
 	}
-	defer up.body.Close()
-
-	spool, err := s.spoolUpstream(up)
+	up, spool, err := fetched.up, fetched.spool, fetched.err
 	if err != nil {
 		if reason := spoolDenialReason(err); reason != "" {
 			s.recordSpoolRefusal(r, regType, discoveryPkgName, s3Key, reason, err)
@@ -328,6 +382,55 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	}
 }
 
+// upstreamFetch is an upstream body read to the spool, or why it was not. The
+// body is closed by the time it is returned; up carries the URL that answered
+// and the content type.
+type upstreamFetch struct {
+	up    *upstreamStream
+	spool *spooledUpstream
+	err   error
+}
+
+// fetchUpstream opens upstreamURL and spools its body. A spool refusal comes
+// back as the error spoolUpstream gave, so spoolDenialReason still reads it.
+func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string) upstreamFetch {
+	up, err := openUpstream(ctx, upstreamURL, requiresIdentityEncoding(regType))
+	if err != nil {
+		return upstreamFetch{err: err}
+	}
+	defer up.body.Close()
+	spool, err := s.spoolUpstream(up)
+	if err != nil {
+		return upstreamFetch{err: err}
+	}
+	return upstreamFetch{up: up, spool: spool}
+}
+
+// claimStaleRefresh takes the one refresh slot for s3Key. It reports false
+// when another request holds it, and the release it returns frees the slot.
+func (s *Server) claimStaleRefresh(s3Key string) (func(), bool) {
+	if _, held := s.staleRefreshes.LoadOrStore(s3Key, struct{}{}); held {
+		return nil, false
+	}
+	return func() { s.staleRefreshes.Delete(s3Key) }, true
+}
+
+// finishStaleRefresh waits out a refresh whose request has already been
+// answered from the stale copy, and caches what it fetched exactly as a
+// foreground refresh does. Only mutable documents take this path, so there is
+// no checksum to verify and no admission to pin.
+func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstreamFetch, store storage.ObjectStore, s3Key string, release func()) {
+	defer release()
+	res := <-results
+	if res.err != nil {
+		s.logger.Error("background refresh of a stale cached copy failed, the stale copy stays", "key", s3Key, "error", res.err)
+		return
+	}
+	defer res.spool.close()
+	s.fillCache(ctx, store, s3Key, res.spool.path(), res.up.url, res.spool.sha256, res.spool.size)
+	s.logger.Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
+}
+
 // cacheEnabled returns true if the proxy/cache feature is active.
 func (s *Server) cacheEnabled() bool {
 	return s.cache.Enabled
@@ -356,13 +459,38 @@ func (s *Server) isCacheStale(status *storage.ObjectInfo) bool {
 // redirecting to itself would otherwise spend a request per hop and hold the
 // client's until Timeout fires.
 var upstreamClient = &http.Client{
-	Timeout: 90 * time.Second,
+	Timeout:   90 * time.Second,
+	Transport: newUpstreamTransport(),
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxUpstreamRedirects {
 			return fmt.Errorf("stopped after %d redirects", len(via))
 		}
 		return upstreamGuard(req.URL.String())
 	},
+}
+
+// upstreamConnectTimeout is upstream_connect_timeout in nanoseconds, set by
+// newServer. upstreamClient is shared by every Server in the process, so the
+// dialer reads this on each connect rather than taking it at construction.
+var upstreamConnectTimeout atomic.Int64
+
+func init() {
+	d, _ := time.ParseDuration(config.DefaultUpstreamConnectTimeout)
+	upstreamConnectTimeout.Store(int64(d))
+}
+
+// newUpstreamTransport is http.DefaultTransport with a connect bound. Its
+// dialer waits 30s on a SYN nobody answers, which outlasts every package
+// client's own timeout, so a blackholed upstream held each request until the
+// client had already given up. The clone keeps the environment proxy, the TLS
+// handshake timeout and the idle-connection limits.
+func newUpstreamTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := net.Dialer{Timeout: time.Duration(upstreamConnectTimeout.Load()), KeepAlive: 30 * time.Second}
+		return d.DialContext(ctx, network, addr)
+	}
+	return t
 }
 
 // maxUpstreamRedirects is net/http's own default, restated because
