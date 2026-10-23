@@ -117,6 +117,17 @@ func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(distpath, "/")
 
+	// Before the rewritten-or-proxied choice below: a vendor codename the
+	// host's profile does not list is refused whichever of the two serves it.
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) {
+		if p := s.profileFor(r); s.aptArchiveRefused(p, parts[0]) {
+			rest := strings.Join(parts[1:], "/")
+			s.refuseAptArchive(w, r, p, parts[0],
+				s.cfg.AptUpstreams[parts[0]][0].URL+"/dists/"+parts[0]+"/"+rest, aptMirrorPkgName(parts[0], rest))
+			return
+		}
+	}
+
 	// A mirrored codename is served entirely from upstream and never reaches
 	// the generated snapshot below, unless a hidden version made the rebuild
 	// rewrite it (apt_hide.go). config.Load refuses a codename in both sets, so

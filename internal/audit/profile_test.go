@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"database/sql"
 	"errors"
 	"maps"
 	"os"
@@ -383,5 +384,75 @@ func TestDeleteProfileRefusesAReadOnlyDB(t *testing.T) {
 	}
 	if _, err := ro.DeleteProfile(t.Context(), "web", true); err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Errorf("delete on a read-only db returned %v, want a read-only error", err)
+	}
+}
+
+const profileAptArchivesVersion = 40
+
+// Migration 040 on a database the schema before it wrote: a scoped apt rule
+// keeps every field it had and reads back with no vendor archive listed,
+// which is the empty list a scoped profile refuses every vendor archive under.
+func TestProfileAptArchivesMigrationKeepsExistingRules(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "audit.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	m := migrator(t, raw)
+	if err := m.Migrate(profileAptArchivesVersion - 1); err != nil {
+		t.Fatalf("migrate to %d: %v", profileAptArchivesVersion-1, err)
+	}
+	for _, q := range []string{
+		`INSERT INTO profiles (name, description, actor) VALUES ('edge', '', 'ravi')`,
+		`INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, apt_base, actor)
+		 VALUES ('edge', 'apt', 'closed', 'floating', 'block', 'noble', 'ravi')`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	_ = raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open audit db past %d: %v", profileAptArchivesVersion, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	d, err := db.GetProfile(ctx, "edge")
+	if err != nil {
+		t.Fatalf("get profile: %v", err)
+	}
+	if len(d.Types) != 1 {
+		t.Fatalf("types = %+v, want the one apt rule", d.Types)
+	}
+	r := d.Types[0]
+	if r.AptBase != "noble" || r.Membership != MembershipClosed || r.Expansion != ExpansionBlock || r.AptArchives != nil {
+		t.Errorf("migrated rule = %+v, want base noble, closed, block and no archives", r)
+	}
+
+	r.AptArchives = []string{"stable", "noble-pgdg", "stable", ""}
+	if err := db.SetProfileTypeRule(ctx, r); err != nil {
+		t.Fatalf("set archives: %v", err)
+	}
+	d, err = db.GetProfile(ctx, "edge")
+	if err != nil {
+		t.Fatalf("get profile: %v", err)
+	}
+	if got := strings.Join(d.Types[0].AptArchives, ","); got != "noble-pgdg,stable" {
+		t.Errorf("stored archives = %q, want noble-pgdg,stable", got)
+	}
+
+	r.AptArchives = nil
+	if err := db.SetProfileTypeRule(ctx, r); err != nil {
+		t.Fatalf("clear archives: %v", err)
+	}
+	if d, _ = db.GetProfile(ctx, "edge"); d.Types[0].AptArchives != nil {
+		t.Errorf("cleared archives read back as %v", d.Types[0].AptArchives)
+	}
+
+	if err := db.SetProfileTypeRule(ctx, ProfileTypeRule{Profile: "edge", Type: manifest.TypeNpm,
+		Membership: MembershipOpen, VersionDefault: VersionFloating, AptArchives: []string{"stable"}}); err == nil {
+		t.Error("archives on an npm rule were stored; nothing reads them there")
 	}
 }

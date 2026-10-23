@@ -727,7 +727,7 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 				fmt.Println("  none — this profile states no rule for any type, so it permits everything")
 			} else {
 				w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tAPT BASE\tENTRIES")
+				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tAPT BASE\tAPT ARCHIVES\tENTRIES")
 				for _, t := range d.Types {
 					n := 0
 					for _, e := range d.Entries {
@@ -741,8 +741,9 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 						// printing a value there would read as a rule in force.
 						expansion = t.Expansion
 					}
-					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%d\n",
-						t.Type, t.Membership, t.VersionDefault, expansion, orDash(t.AptBase), n)
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+						t.Type, t.Membership, t.VersionDefault, expansion, orDash(t.AptBase),
+						orDash(strings.Join(t.AptArchives, ",")), n)
 				}
 				_ = w.Flush()
 			}
@@ -914,7 +915,7 @@ func newProfileUnbindCmd(gf *globalFlags) *cobra.Command {
 }
 
 func newProfileSetCmd(gf *globalFlags) *cobra.Command {
-	var membership, versionDefault, expansion, base string
+	var membership, versionDefault, expansion, base, archives string
 	var force bool
 	c := &cobra.Command{
 		Use:   "set <profile> <type>",
@@ -936,6 +937,10 @@ a fetch outside the set.
   --base <codename>      apt only: the mirrored codename this profile's
                          filtered index is generated from
 
+  --archives <codename>[,<codename>...]
+                         apt only: the vendor archives a host under a
+                         profile with --base may add; --archives '' clears
+
 --base is what makes apt enforceable under a profile, and it applies to a
 closed apt rule alone. bodega serves the profile a codename of its own,
 "<base>-<profile>", holding a filtered view of the base's Packages signed with
@@ -945,6 +950,14 @@ abort an apt transaction the client had already planned.
 
   bodega profile set web apt --membership closed --base noble
   bodega doctor --write-apt-sources --token ... --url https://bodega.internal
+
+A vendor archive (a mirrored codename with signing_key_url set) is served
+unfiltered under the vendor's own key, so a profile with --base refuses every
+one it does not list: in doctor's archives=, at /client/apt?archive=, and on
+/apt/dists/<codename>/ and the pool for a stanza written by hand. List the ones
+its hosts may use; each must be a codename this server mirrors with a key.
+
+  bodega profile set web apt --archives stable,noble-pgdg
 
 freebsd rules name packages inside a pkg repository, and a profile that
 states one is served a catalogue bodega filters and re-signs with its own pkg
@@ -981,8 +994,8 @@ name keeps the value it has.`,
 			if err := requirePackageType(typ); err != nil {
 				return err
 			}
-			if membership == "" && versionDefault == "" && expansion == "" && !cmd.Flags().Changed("base") {
-				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s>, --expansion <%s> or --base <codename>",
+			if membership == "" && versionDefault == "" && expansion == "" && !cmd.Flags().Changed("base") && !cmd.Flags().Changed("archives") {
+				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s>, --expansion <%s>, --base <codename> or --archives <codename,...>",
 					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"),
 					strings.Join(audit.Expansions(), "|"))
 			}
@@ -1008,7 +1021,7 @@ name keeps the value it has.`,
 			for _, t := range d.Types {
 				if t.Type == typ {
 					rule.Membership, rule.VersionDefault = t.Membership, t.VersionDefault
-					rule.Expansion, rule.AptBase = t.Expansion, t.AptBase
+					rule.Expansion, rule.AptBase, rule.AptArchives = t.Expansion, t.AptBase, t.AptArchives
 				}
 			}
 			if membership != "" {
@@ -1026,6 +1039,12 @@ name keeps the value it has.`,
 			if err := checkProfileAptBase(gf, profile, rule); err != nil {
 				return err
 			}
+			if cmd.Flags().Changed("archives") {
+				rule.AptArchives = audit.NormalizeAptArchives(strings.Split(archives, ","))
+				if err := checkProfileAptArchives(gf, rule); err != nil {
+					return err
+				}
+			}
 			rule.Actor = audit.CurrentActor()
 
 			if rule.Membership == audit.MembershipClosed && refusesUnlisted(rule.Expansion) && !force {
@@ -1040,7 +1059,7 @@ name keeps the value it has.`,
 			details := fmt.Sprintf("membership=%s version_default=%s expansion=%s",
 				rule.Membership, rule.VersionDefault, rule.Expansion)
 			if typ == manifest.TypeApt {
-				details += fmt.Sprintf(" apt_base=%q", rule.AptBase)
+				details += fmt.Sprintf(" apt_base=%q apt_archives=%q", rule.AptBase, strings.Join(rule.AptArchives, ","))
 			}
 			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ, details)
 			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
@@ -1058,6 +1077,17 @@ name keeps the value it has.`,
 			case typ == manifest.TypeApt:
 				fmt.Printf("  no base: this profile's hosts read the mirrored codenames unfiltered\n")
 			}
+			if typ == manifest.TypeApt && cmd.Flags().Changed("archives") {
+				switch {
+				case len(rule.AptArchives) > 0 && rule.AptBase == "":
+					fmt.Printf("  vendor archives: %s, consulted once the rule names a base; until then every vendor archive is served\n",
+						strings.Join(rule.AptArchives, " "))
+				case len(rule.AptArchives) > 0:
+					fmt.Printf("  vendor archives: %s; every other one is refused to this profile's hosts\n", strings.Join(rule.AptArchives, " "))
+				case rule.AptBase != "":
+					fmt.Println("  vendor archives: none; every one is refused to this profile's hosts")
+				}
+			}
 			return nil
 		},
 	}
@@ -1065,8 +1095,41 @@ name keeps the value it has.`,
 	c.Flags().StringVar(&versionDefault, "version-default", "", "pinned | floating")
 	c.Flags().StringVar(&expansion, "expansion", "", "warn | block | ignore (closed types only; default warn)")
 	c.Flags().StringVar(&base, "base", "", "apt only: the mirrored codename the filtered index is generated from")
+	c.Flags().StringVar(&archives, "archives", "", "apt only: comma-separated vendor archive codenames a scoped profile admits ('' clears)")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
 	return c
+}
+
+// checkProfileAptArchives refuses a vendor archive this instance could not
+// serve. Unlike the base check it needs the config: a codename that is not
+// mirrored with a key is one archives= refuses anyway, so storing it admits
+// nothing and reads as a decision someone made.
+func checkProfileAptArchives(gf *globalFlags, rule audit.ProfileTypeRule) error {
+	if len(rule.AptArchives) == 0 {
+		return nil
+	}
+	if rule.Type != manifest.TypeApt {
+		return fmt.Errorf("--archives is read on the apt rule alone; %q would store it where nothing reads it", rule.Type)
+	}
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return fmt.Errorf("--archives is checked against apt_upstreams, and the config would not load: %w\n"+
+			"  Run this where the server's config file is, or name it with BODEGA_CONFIG_FILE", err)
+	}
+	keyed := cfg.AptKeyedCodenames()
+	var bad []string
+	for _, c := range rule.AptArchives {
+		if !slices.Contains(keyed, c) {
+			bad = append(bad, c)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return fmt.Errorf("--archives names %s, which is not a codename apt_upstreams mirrors with signing_key_url and signing_key_fingerprint set.\n"+
+		"  Vendor archives here:  %s\n"+
+		"  Add one:               signing_key_url and signing_key_fingerprint on its apt_upstreams entry",
+		strings.Join(bad, ", "), orNone(strings.Join(keyed, " ")))
 }
 
 // checkProfileAptBase refuses a base this instance could not serve, at the

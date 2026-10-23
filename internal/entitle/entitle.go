@@ -169,6 +169,18 @@ func (p *Profile) AptScope() (base, refused string) {
 	return r.AptBase, ""
 }
 
+// AptArchives returns the vendor archive codenames this profile's apt rule
+// admits, sorted, and nil when it names none or states no apt rule. It is
+// consulted only while AptScope answers a base: an unscoped host reads every
+// mirrored codename unfiltered already, so a list there would admit nothing
+// it lacked.
+func (p *Profile) AptArchives() []string {
+	if p == nil {
+		return nil
+	}
+	return p.types[manifest.TypeApt].AptArchives
+}
+
 // Fingerprint identifies everything this profile says about typ: the marker
 // and every entry of that type. A catalog built for the profile is stale the
 // moment it changes, and a binding refresh builds a new Profile for an

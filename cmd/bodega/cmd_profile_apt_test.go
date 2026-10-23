@@ -594,3 +594,63 @@ func TestOpeningAnAptRuleOverALiveBaseNamesBothWaysOut(t *testing.T) {
 	// The route it prints is one an operator can run.
 	mustRunProfile(t, "set", "web", "apt", "--membership", "open", "--base", "")
 }
+
+// E24: --archives stores the vendor codenames a scoped profile admits, keeps
+// them across a set that does not name it, clears with ”, and refuses a
+// codename the config does not mirror with a key, listing the ones it does.
+func TestProfileSetAptArchives(t *testing.T) {
+	newDiscoverEnv(t)
+	path := os.Getenv(config.EnvConfigFile)
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg["apt_codename"] = "house"
+	cfg["apt_upstreams"] = map[string]any{
+		"noble": []any{map[string]any{"url": "https://archive.ubuntu.com/ubuntu"}},
+		"stable": []any{map[string]any{"url": "https://apt.grafana.com", "components": []string{"main"},
+			"signing_key_url": "https://apt.grafana.com/gpg.key", "signing_key_fingerprint": strings.Repeat("A", 40)}},
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	for _, bad := range []string{"noble", "jammy", "stable,jammy"} {
+		msg, err := runProfile(t, "set", "web", "apt", "--archives", bad)
+		if err == nil {
+			t.Fatalf("--archives %s was accepted", bad)
+		}
+		if text := msg + err.Error(); !strings.Contains(text, "Vendor archives here:  stable") {
+			t.Errorf("--archives %s refusal does not list the keyed codenames:\n%s", bad, text)
+		}
+	}
+
+	mustRunProfile(t, "set", "web", "apt", "--archives", "stable")
+	shown := mustRunProfile(t, "show", "web")
+	if !strings.Contains(shown, "APT ARCHIVES") || !strings.Contains(shown, " stable ") {
+		t.Errorf("show does not list the archive:\n%s", shown)
+	}
+	mustRunProfile(t, "set", "web", "apt", "--version-default", "floating")
+	if shown := mustRunProfile(t, "show", "web"); !strings.Contains(shown, " stable ") {
+		t.Errorf("a set not naming --archives dropped the list:\n%s", shown)
+	}
+	mustRunProfile(t, "set", "web", "apt", "--archives", "")
+	if shown := mustRunProfile(t, "show", "web"); strings.Contains(shown, " stable ") {
+		t.Errorf("--archives '' left the list in place:\n%s", shown)
+	}
+	if _, err := runProfile(t, "set", "web", "npm", "--membership", "open", "--archives", "stable"); err == nil {
+		t.Error("--archives on an npm rule was accepted")
+	}
+}

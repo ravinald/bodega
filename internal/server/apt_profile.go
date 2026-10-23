@@ -20,6 +20,7 @@ import (
 	"github.com/ulikunitz/xz"
 
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/entitle"
@@ -843,4 +844,195 @@ func aptPoolSourceName(poolPath string) string {
 		return ""
 	}
 	return parts[3]
+}
+
+// ---- vendor archives under a scoped profile --------------------------------
+
+// aptArchiveRefused reports whether p refuses the mirrored codename as a
+// vendor archive. A profile that scopes apt reads one filtered codename, and
+// a vendor archive is served unfiltered under the vendor's own key: beside the
+// filtered one it is a second package source of the kind the scope exists to
+// rule out, so the profile admits only the vendor codenames it lists.
+//
+// A vendor codename is one with a signing key configured, which is what
+// archives= accepts. The profile's own base and its pockets are the host's
+// distribution even when keyed, and an unscoped host keeps reading every
+// mirrored codename, since nothing it reads is filtered to begin with.
+func (s *Server) aptArchiveRefused(p *entitle.Profile, codename string) bool {
+	base, _ := p.AptScope()
+	if base == "" || codename == base {
+		return false
+	}
+	if _, keyed := s.cfg.AptSigningKeyFor(codename); !keyed {
+		return false
+	}
+	if of, ok := s.aptPocketBase(codename); ok && of == base {
+		return false
+	}
+	return !slices.Contains(p.AptArchives(), codename)
+}
+
+// aptArchiveRefusalText names the codename, the profile and the command that
+// would admit it, keeping what the profile already lists so running the
+// command as printed does not drop another archive.
+func aptArchiveRefusalText(p *entitle.Profile, codename string) (reason, next string) {
+	base, _ := p.AptScope()
+	reason = fmt.Sprintf("profile %q scopes apt to %s and does not list the vendor archive %s, which a host would read unfiltered beside its filtered codename.",
+		p.Name(), base, codename)
+	next = fmt.Sprintf("ask an operator to admit it with `bodega profile set %s apt --archives %s`.",
+		p.Name(), strings.Join(append(slices.Clone(p.AptArchives()), codename), ","))
+	return reason, next
+}
+
+// refuseAptArchive writes the 403 for a vendor codename the host's profile
+// does not list, on the mirrored dists/ and pool routes, with the denied
+// discovery row that puts the reach in front of whoever reads
+// `bodega discover list apt`, and the audit row the incident names.
+func (s *Server) refuseAptArchive(w http.ResponseWriter, r *http.Request, p *entitle.Profile, codename, upstreamURL, pkgName string) {
+	reason, next := aptArchiveRefusalText(p, codename)
+	s.refuseAptArchiveWith(w, r, p, codename, upstreamURL, pkgName, reason, next)
+}
+
+func (s *Server) refuseAptArchiveWith(w http.ResponseWriter, r *http.Request, p *entitle.Profile, codename, upstreamURL, pkgName, reason, next string) {
+	f := newRefusal(checkProfile, manifest.TypeApt, pkgName, "", http.StatusForbidden)
+	f.reason, f.next = reason, next
+	host, _ := splitUpstreamURL(upstreamURL)
+	s.recordDiscoveryRaw(r.Context(), r, manifest.TypeApt, host,
+		fmt.Sprintf("bodega profile set %s apt --archives %s", p.Name(), codename),
+		pkgName, "", audit.DecisionDenied, upstreamURL)
+	recordDenialFor(s.auditDB, r, manifest.TypeApt, pkgName, "", audit.DenialProfileMembership, map[string]string{
+		"profile":  p.Name(),
+		"rule":     "apt_archives",
+		"archive":  codename,
+		"incident": f.incident,
+	})
+	f.write(w, r)
+}
+
+// aptRefusedArchiveRoots maps each archive root that serves only vendor
+// codenames p refuses to those codenames. A pool path names no codename, so
+// the root a .deb resolves to is the only thing that says which archive it
+// came from, and a root that also serves a codename p admits is left alone:
+// the same pool path may be the host's own distribution's.
+func (s *Server) aptRefusedArchiveRoots(p *entitle.Profile) map[string][]string {
+	if base, _ := p.AptScope(); base == "" {
+		return nil
+	}
+	refused := map[string][]string{}
+	admitted := map[string]bool{}
+	for codename, ups := range s.cfg.AptUpstreams {
+		bad := s.aptArchiveRefused(p, codename)
+		for _, up := range ups {
+			if bad {
+				refused[up.URL] = append(refused[up.URL], codename)
+			} else {
+				admitted[up.URL] = true
+			}
+		}
+	}
+	for root, codenames := range refused {
+		if admitted[root] {
+			delete(refused, root)
+			continue
+		}
+		sort.Strings(codenames)
+	}
+	return refused
+}
+
+// aptAdmitCachedDeb decides whether a cached pool object may go to a host
+// whose profile refuses the vendor archives in refused, and returns false
+// once it has written the refusal.
+//
+// The object's recorded origin answers first, because it says where these
+// bytes came from without asking the network: a refusal that rested on a live
+// probe failed open whenever the vendor did not answer one HEAD, had dropped
+// the file, or left a negative entry in aptRoutes, and served its .deb out of
+// the cache. An origin under a root no longer configured says nothing about
+// today's archives, so it falls through with an unrecorded one.
+//
+// The probe is the fallback, and a probe that places the file nowhere is not
+// a pass. It is not a refusal either: upstream drops a superseded .deb from
+// the host's own distribution as routinely as a vendor does, and the cached
+// copy is what a host pinned to it still needs. The profile's own filtered
+// index separates the two, since it lists only what the host's base and
+// pockets carry; a pool path it does not list is refused.
+func (s *Server) aptAdmitCachedDeb(w http.ResponseWriter, r *http.Request, p *entitle.Profile, refused map[string][]string, poolPath, key string, obj cachedObject) bool {
+	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
+	refuse := func(root string) bool {
+		if codenames := refused[root]; len(codenames) > 0 {
+			s.refuseAptArchive(w, r, p, codenames[0], root+"/"+poolPath, name)
+			return true
+		}
+		return false
+	}
+
+	if s.auditDB != nil {
+		if origin := s.cachedOrigin(r, key, obj); origin != "" {
+			for _, root := range s.cfg.AptPoolUpstreams() {
+				if strings.HasPrefix(origin, root+"/") {
+					return !refuse(root)
+				}
+			}
+		}
+	}
+
+	base, ok := s.aptResolvePoolUpstream(w, r, poolPath)
+	if !ok {
+		return false
+	}
+	if base != "" {
+		return !refuse(base)
+	}
+	if s.aptProfileIndexLists(p, poolPath) {
+		return true
+	}
+
+	roots := slices.Sorted(maps.Keys(refused))
+	var codenames []string
+	for _, root := range roots {
+		codenames = append(codenames, refused[root]...)
+	}
+	sort.Strings(codenames)
+	admit := "<codename>"
+	if len(codenames) == 1 {
+		admit = codenames[0]
+	}
+	scope, _ := p.AptScope()
+	noun := "archive"
+	if len(codenames) > 1 {
+		noun = "archives"
+	}
+	reason := fmt.Sprintf("profile %q scopes apt to %s and does not list the vendor %s %s. No origin is recorded for the cached %s, no configured archive answered for it, and the profile's filtered index does not carry it, so it cannot be shown to come from the host's own distribution.",
+		p.Name(), scope, noun, strings.Join(codenames, ", "), poolPath)
+	next := fmt.Sprintf("retry once the archive answers again; if the package belongs to a vendor archive, admit it with `bodega profile set %s apt --archives %s`.",
+		p.Name(), strings.Join(append(slices.Clone(p.AptArchives()), admit), ","))
+	s.refuseAptArchiveWith(w, r, p, strings.Join(codenames, ","), roots[0]+"/"+poolPath, name, reason, next)
+	return false
+}
+
+// aptProfileIndexLists reports whether a filtered codename the current
+// snapshot serves to p names poolPath as a Filename. It scans every Packages
+// body of those codenames, which is why it runs only once the recorded origin
+// and the probe have both failed to place the file.
+func (s *Server) aptProfileIndexLists(p *entitle.Profile, poolPath string) bool {
+	snap := s.aptSnap.Load()
+	if snap == nil {
+		return false
+	}
+	line := []byte("\nFilename: " + poolPath + "\n")
+	for codename, profile := range snap.profileSuites {
+		idx := snap.suites[codename]
+		if profile != p.Name() || idx == nil {
+			continue
+		}
+		for _, arches := range idx.packages {
+			for _, body := range arches {
+				if bytes.HasPrefix(body, line[1:]) || bytes.Contains(body, line) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

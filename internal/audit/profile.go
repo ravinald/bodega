@@ -121,9 +121,13 @@ type ProfileTypeRule struct {
 	// derives from, and has meaning on the apt row alone. Empty means the
 	// profile does not scope apt: no synthetic codename is generated and a
 	// host under it reads the mirrored codename unchanged.
-	AptBase   string
-	Actor     string
-	UpdatedAt time.Time
+	AptBase string
+	// AptArchives are the vendor archive codenames a host under a profile
+	// that scopes apt may add beside the filtered base, sorted. A scoped host
+	// is refused every other one, because a vendor archive is read unfiltered.
+	AptArchives []string
+	Actor       string
+	UpdatedAt   time.Time
 }
 
 // ProfileEntry names one package inside a profile. Constraint is empty when
@@ -286,7 +290,7 @@ func (a *DB) GetProfile(ctx context.Context, name string) (*ProfileDetail, error
 
 func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRule, error) {
 	rows, err := a.db.QueryContext(ctx,
-		`SELECT profile, pkg_type, membership, version_default, expansion, apt_base, actor, updated_at
+		`SELECT profile, pkg_type, membership, version_default, expansion, apt_base, apt_archives, actor, updated_at
 		   FROM profile_types WHERE profile = ? ORDER BY pkg_type`, profile)
 	if err != nil {
 		return nil, err
@@ -295,11 +299,12 @@ func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRul
 	var out []ProfileTypeRule
 	for rows.Next() {
 		var r ProfileTypeRule
-		var ts string
+		var ts, archives string
 		if err := rows.Scan(&r.Profile, &r.Type, &r.Membership, &r.VersionDefault,
-			&r.Expansion, &r.AptBase, &r.Actor, &ts); err != nil {
+			&r.Expansion, &r.AptBase, &archives, &r.Actor, &ts); err != nil {
 			return nil, err
 		}
+		r.AptArchives = splitAptArchives(archives)
 		r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, ts)
 		out = append(out, r)
 	}
@@ -333,6 +338,7 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 // SetProfileTypeRule writes or replaces one type marker.
 func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 	r.Expansion = ExpansionOrDefault(r.Expansion)
+	r.AptArchives = NormalizeAptArchives(r.AptArchives)
 	if err := validateProfileTypeRule(r); err != nil {
 		return err
 	}
@@ -343,17 +349,19 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 		return errors.New("audit db is read-only")
 	}
 	_, err := a.writer().ExecContext(ctx, insertProfileTypeSQL,
-		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.AptBase, r.Actor)
+		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.AptBase,
+		strings.Join(r.AptArchives, ","), r.Actor)
 	return err
 }
 
-const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, apt_base, actor)
-	 VALUES (?, ?, ?, ?, ?, ?, ?)
+const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, apt_base, apt_archives, actor)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	 ON CONFLICT(profile, pkg_type) DO UPDATE SET
 	     membership = excluded.membership,
 	     version_default = excluded.version_default,
 	     expansion = excluded.expansion,
 	     apt_base = excluded.apt_base,
+	     apt_archives = excluded.apt_archives,
 	     actor = excluded.actor,
 	     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
@@ -627,9 +635,10 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	if err := validateProfileName(p.Name); err != nil {
 		return err
 	}
-	for _, r := range types {
-		if err := validateProfileTypeRule(r); err != nil {
-			return fmt.Errorf("%s: %w", r.Type, err)
+	for i := range types {
+		types[i].AptArchives = NormalizeAptArchives(types[i].AptArchives)
+		if err := validateProfileTypeRule(types[i]); err != nil {
+			return fmt.Errorf("%s: %w", types[i].Type, err)
 		}
 	}
 	for i := range entries {
@@ -664,7 +673,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	for _, r := range types {
 		if _, err := tx.ExecContext(ctx, insertProfileTypeSQL,
 			p.Name, r.Type, r.Membership, r.VersionDefault,
-			ExpansionOrDefault(r.Expansion), r.AptBase, r.Actor); err != nil {
+			ExpansionOrDefault(r.Expansion), r.AptBase, strings.Join(r.AptArchives, ","), r.Actor); err != nil {
 			return fmt.Errorf("%s: %w", r.Type, err)
 		}
 	}
@@ -698,7 +707,37 @@ func validateProfileTypeRule(r ProfileTypeRule) error {
 		return fmt.Errorf("apt base %q on a %s rule: the base names the mirrored codename an apt index is filtered from and is read on the apt rule alone",
 			r.AptBase, r.Type)
 	}
+	if len(r.AptArchives) > 0 && r.Type != manifest.TypeApt {
+		return fmt.Errorf("apt archives %s on a %s rule: the list names vendor apt archives and is read on the apt rule alone",
+			strings.Join(r.AptArchives, ","), r.Type)
+	}
+	for _, c := range r.AptArchives {
+		if strings.ContainsAny(c, ", \t\n") {
+			return fmt.Errorf("apt archive %q is not a codename: it carries a comma or whitespace", c)
+		}
+	}
 	return nil
+}
+
+// NormalizeAptArchives drops empty names and duplicates and sorts the rest,
+// so the stored column and every comparison against it read one spelling of
+// one list.
+func NormalizeAptArchives(in []string) []string {
+	var out []string
+	for _, c := range in {
+		if c = strings.TrimSpace(c); c != "" {
+			out = append(out, c)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+func splitAptArchives(stored string) []string {
+	if stored == "" {
+		return nil
+	}
+	return strings.Split(stored, ",")
 }
 
 func validateProfileEntry(e ProfileEntry) error {
