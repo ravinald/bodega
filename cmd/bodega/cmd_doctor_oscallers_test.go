@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/host"
 )
@@ -14,7 +15,7 @@ import (
 // fakeOS scripts the local tools osCallersHost runs: systemctl is-enabled
 // motd-news.timer answers timer, systemctl is-active chrony.service answers
 // chrony and chronyd.service answers chronyd, snapd.service answers snapd and
-// snapd.socket answers socket, and snap refresh --time answers refreshTime. calls logs every argv;
+// snapd.socket answers socket, and snap refresh --time --abs-time answers refreshTime. calls logs every argv;
 // ran logs only the ones not scripted, which is how a test sees what a step
 // changed.
 type fakeOS struct {
@@ -51,7 +52,7 @@ func (f *fakeOS) run(argv []string) (string, error) {
 			return "inactive", errors.New("exit status 3")
 		}
 		return f.socket, nil
-	case "snap refresh --time":
+	case "snap refresh --time --abs-time":
 		return f.refreshTime, nil
 	}
 	f.ran = append(f.ran, cmd)
@@ -149,18 +150,31 @@ func TestOSCallerRows(t *testing.T) {
 		{"chrony under its RHEL unit name", ubuntuChrony, fakeOS{chronyd: "active"}, nil, "chrony-nts", true,
 			[]string{"ntp-bootstrap.ubuntu.com"}, nil},
 		{"chrony installed but not running", ubuntuChrony, fakeOS{chrony: "failed"}, nil, "chrony-nts", false, nil, nil},
-		{"motd-news file enabled", map[string]string{motdNewsDefaults: "# comment\nENABLED=1\n"},
-			fakeOS{}, nil, "motd-news", true,
-			[]string{"ENABLED=1", "motd.ubuntu.com"},
+		{"motd-news file and timer enabled", map[string]string{motdNewsDefaults: "# comment\nENABLED=1\n"},
+			fakeOS{timer: "enabled"}, nil, "motd-news", true,
+			[]string{"ENABLED=1", "motd-news.timer is enabled", "needs both", "motd.ubuntu.com"},
 			[]string{"ENABLED=0", "systemctl disable --now motd-news.timer"}},
-		{"motd-news timer enabled", map[string]string{motdNewsDefaults: "ENABLED=0\n"},
-			fakeOS{timer: "enabled"}, nil, "motd-news", true, []string{"motd-news.timer is enabled"}, nil},
+		{"motd-news file enabled, timer disabled", map[string]string{motdNewsDefaults: "ENABLED=1\n"},
+			fakeOS{timer: "disabled"}, nil, "motd-news", false, nil, nil},
+		{"motd-news file enabled, no timer", map[string]string{motdNewsDefaults: "ENABLED=1\n"},
+			fakeOS{}, nil, "motd-news", false, nil, nil},
+		{"motd-news timer enabled, file disabled", map[string]string{motdNewsDefaults: "ENABLED=0\n"},
+			fakeOS{timer: "enabled"}, nil, "motd-news", false, nil, nil},
+		{"motd-news timer enabled, no file", nil, fakeOS{timer: "enabled"}, nil, "motd-news", false, nil, nil},
 		{"motd-news off", map[string]string{motdNewsDefaults: "ENABLED=1\nENABLED=0\n"},
 			fakeOS{timer: "disabled"}, nil, "motd-news", false, nil, nil},
-		{"snapd active", snapd, fakeOS{snapd: "active"}, nil, "snapd-refresh", true,
-			[]string{"api.snapcraft.io"}, []string{"snap refresh --hold", "proxy.store"}},
+		{"snapd active and unheld", snapd, fakeOS{snapd: "active", socket: "active", refreshTime: "timer: 00:00~24:00/4\nlast: n/a\nnext: n/a"},
+			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, []string{"snap refresh --hold", "proxy.store"}},
+		{"snapd held forever", snapd, fakeOS{snapd: "active", refreshTime: "timer: 00:00~24:00/4\nhold: forever\nnext: n/a"},
+			nil, "snapd-refresh", false, nil, nil},
+		{"snapd held past 30 days", snapd, fakeOS{snapd: "active", refreshTime: "hold: " + time.Now().Add(31*24*time.Hour).UTC().Format(time.RFC3339)},
+			nil, "snapd-refresh", false, nil, nil},
+		{"snapd held under 30 days", snapd, fakeOS{snapd: "active", refreshTime: "hold: " + time.Now().Add(29*24*time.Hour).UTC().Format(time.RFC3339)},
+			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, nil},
+		{"snapd hold lapsed", snapd, fakeOS{snapd: "active", refreshTime: "hold: 2026-10-20T13:05:00Z"},
+			nil, "snapd-refresh", true, []string{"api.snapcraft.io"}, nil},
 		{"snapd in standby behind its socket", snapd, fakeOS{socket: "active"}, nil, "snapd-refresh", true,
-			[]string{"socket"}, nil},
+			[]string{"socket", "could not be read without waking snapd"}, []string{"snap refresh --hold"}},
 		{"snapd inactive", snapd, fakeOS{}, nil, "snapd-refresh", false, nil, nil},
 		{"snapd not installed", nil, fakeOS{snapd: "active"}, nil, "snapd-refresh", false, nil, nil},
 	}
@@ -174,8 +188,11 @@ func TestOSCallerRows(t *testing.T) {
 				t.Fatalf("%s row = %v (%+v), want %v", tc.check, ok, fs, tc.want)
 			}
 			for _, c := range fake.calls {
-				if !strings.HasPrefix(c, "systemctl is-") {
-					t.Errorf("a report ran %q; rows read files and systemctl alone", c)
+				if strings.HasPrefix(c, "systemctl is-") {
+					continue
+				}
+				if c != "snap refresh --time --abs-time" || tc.fake.snapd != "active" {
+					t.Errorf("a report ran %q; rows read files and systemctl, and ask snapd only while snapd.service runs", c)
 				}
 			}
 			if !ok {
@@ -299,5 +316,59 @@ func TestDoctorRestoreOSCallersUndoesOnlyWhatItRan(t *testing.T) {
 	out, err = runDoctor(t, "--restore-os-callers")
 	if err != nil || len(fake.ran) != 0 || !strings.Contains(out, "Nothing to restore") {
 		t.Errorf("second restore = %v, ran %v:\n%s", err, fake.ran, out)
+	}
+}
+
+// The rows and the steps that quiet them have to agree: once --apply has run
+// every step, the next report carries neither row. The runner here plays the
+// host, so each step changes what the next read answers.
+func TestDoctorQuietOSCallersClearsItsRows(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv, _ := planServer(t, map[string]string{"apt": "deb x\n"})
+	stubUbuntuPro(t, false, &fakePro{})
+	fake := &fakeOS{timer: "enabled", snapd: "active", socket: "active", refreshTime: "timer: 00:00~24:00/4\nlast: n/a\nnext: n/a"}
+	h := stubOSCallers(t, map[string]string{motdNewsDefaults: "ENABLED=1\n", "/usr/lib/snapd/snapd": ""}, fake)
+	h.run = func(argv []string) (string, error) {
+		out, err := fake.run(argv)
+		switch strings.Join(argv, " ") {
+		case strings.Join(osCallerSteps[oscStepMotdNews].do, " "):
+			if werr := os.WriteFile(h.path(motdNewsDefaults), []byte("ENABLED=0\n"), 0o644); werr != nil {
+				t.Fatal(werr)
+			}
+		case "systemctl disable --now motd-news.timer":
+			fake.timer = "disabled"
+		case "snap refresh --hold":
+			fake.refreshTime = "timer: 00:00~24:00/4\nlast: n/a\nhold: forever\nnext: n/a"
+		}
+		return out, err
+	}
+
+	saved := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = saved })
+
+	before, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+	for _, row := range []string{"motd-news", "snapd-refresh"} {
+		if !strings.Contains(before, row+" ") {
+			t.Fatalf("the unquieted host lacks the %s row:\n%s", row, before)
+		}
+	}
+
+	out, err := runDoctor(t, "--configure", "apt", "--quiet-os-callers", "--apply", "--url", srv.URL, "--allow-plaintext")
+	if err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	if len(fake.ran) != 3 {
+		t.Fatalf("--apply ran %v, want the three OS caller steps", fake.ran)
+	}
+
+	after, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+	if !strings.Contains(after, "CHECK") {
+		t.Fatalf("the second run printed no report:\n%s", after)
+	}
+	for _, row := range []string{"motd-news", "snapd-refresh"} {
+		if strings.Contains(after, row+" ") {
+			t.Errorf("the %s row survived --quiet-os-callers --apply:\n%s", row, after)
+		}
 	}
 }
