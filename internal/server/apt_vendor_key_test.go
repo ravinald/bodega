@@ -7,11 +7,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/aptsign"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -217,5 +221,251 @@ func TestClientPlanRefusesAnArchiveWithNoKey(t *testing.T) {
 				t.Errorf("archives=stable,%s refusal lacks %q:\n%s", c, want, body)
 			}
 		}
+	}
+}
+
+const vendorGrafanaDeb = "pool/main/g/grafana/grafana_10.4.2_amd64.deb"
+
+// scopedVendorServer is vendorArchiveServer with noble and stable served by
+// fixture archives of their own, and a second host bound to "edge", a profile
+// scoping apt to noble that lists nginx and grafana and no vendor archive.
+// The first host's profile states no apt rule, so it is unscoped.
+func scopedVendorServer(t *testing.T) (s *Server, unscoped, scoped *profileFixture) {
+	t.Helper()
+	s, unscoped, scoped, _, _ = scopedVendorArchives(t)
+	return s, unscoped, scoped
+}
+
+// scopedVendorArchives is scopedVendorServer with the noble and stable
+// fixture archives returned, for a test that makes one stop answering.
+func scopedVendorArchives(t *testing.T) (s *Server, unscoped, scoped *profileFixture, noble, stable *fixtureArchive) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv(aptsign.CredentialsEnv, dir)
+	kr, err := aptsign.Generate("bodega test archive", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate signing key: %v", err)
+	}
+	if err := kr.WritePrivate(filepath.Join(dir, aptsign.KeyFileName)); err != nil {
+		t.Fatalf("write signing key: %v", err)
+	}
+	s, unscoped, _, _ = vendorArchiveServer(t)
+	if s.aptSign.Load() == nil {
+		t.Fatal("no apt signing key loaded; the filtered codename would be unsigned")
+	}
+
+	upstreamKR, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate upstream key: %v", err)
+	}
+	nobleObjects := fixtureDistsFor(t, upstreamKR, "noble", aptProfilePackages(), "amd64")
+	for rel, body := range aptProfilePool() {
+		nobleObjects[rel] = body
+	}
+	stableObjects := fixtureDistsFor(t, upstreamKR, "stable", fixturePackages(vendorGrafanaDeb, "grafana bytes"), "amd64")
+	stableObjects[vendorGrafanaDeb] = "grafana bytes"
+	noble, stable = newFixtureArchive(t, nobleObjects), newFixtureArchive(t, stableObjects)
+	s.cfg.AptUpstreams["noble"][0].URL = noble.URL()
+	s.cfg.AptUpstreams["stable"][0].URL = stable.URL()
+	// On, so a .deb one host fetched is a cache hit for the next, which is
+	// the branch that resolves no archive unless it has to.
+	s.cache = CacheConfig{Enabled: true, MetadataTTL: time.Hour}
+
+	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+	rule.AptBase = "noble"
+	scoped = bindProfile(t, s, "edge", "edge-host", []audit.ProfileTypeRule{rule},
+		[]audit.ProfileEntry{{Type: manifest.TypeApt, Name: "nginx"}, {Type: manifest.TypeApt, Name: "grafana"}})
+	s.rebuildAptSnapshot(t.Context())
+	return s, unscoped, scoped, noble, stable
+}
+
+// listArchives rewrites edge's apt rule to admit the named vendor archives and
+// drops the cached profile set, as the SIGHUP after a profile write does.
+func listArchives(t *testing.T, s *Server, archives ...string) {
+	t.Helper()
+	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+	rule.Profile, rule.AptBase, rule.AptArchives = "edge", "noble", archives
+	if err := s.auditDB.SetProfileTypeRule(t.Context(), rule); err != nil {
+		t.Fatalf("list archives: %v", err)
+	}
+	s.refreshProfiles(t.Context())
+}
+
+func assertArchiveRefusal(t *testing.T, what string, code int, body string) {
+	t.Helper()
+	if code != http.StatusForbidden {
+		t.Fatalf("%s = %d, want 403: %s", what, code, body)
+	}
+	for _, want := range []string{"stable", `profile "edge"`, "bodega profile set edge apt --archives stable"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%s refusal lacks %q:\n%s", what, want, body)
+		}
+	}
+}
+
+// E24 R2 and R4: a scoped host is refused archives= on the plan and on
+// /client/apt until its profile lists the archive, and served after; the
+// unscoped host is served throughout.
+func TestScopedProfileGovernsVendorArchivesOnTheClientRoutes(t *testing.T) {
+	s, unscoped, scoped := scopedVendorServer(t)
+	const plan = "/client/plan?os=linux&codename=noble&archives=stable"
+	const stanza = "/client/apt?os=linux&codename=noble&archive=stable"
+
+	code, body := clientGet(t, s, scoped.token, plan)
+	assertArchiveRefusal(t, "scoped plan", code, body)
+	// One reason for one decision, whichever route refused it.
+	profileDenial(t, s, audit.DenialProfileMembership)
+	code, body = clientGet(t, s, scoped.token, stanza)
+	assertArchiveRefusal(t, "scoped /client/apt?archive=", code, body)
+	if code, body := clientGet(t, s, scoped.token, "/client/plan?os=linux&codename=noble"); code != http.StatusOK {
+		t.Fatalf("scoped plan naming no archive = %d: %s", code, body)
+	}
+
+	hasArchive := func(token string) bool {
+		for _, r := range planRecordFor(planJSON(t, s, token, "os=linux&codename=noble&archives=stable"), manifest.TypeApt) {
+			if r.Path == clientconf.AptArchiveSourcesPath("stable") && r.Action == planInstall {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasArchive(unscoped.token) {
+		t.Error("the unscoped host's plan lost the stable archive")
+	}
+
+	listArchives(t, s, "stable")
+	if !hasArchive(scoped.token) {
+		t.Error("the scoped host's plan does not install stable once its profile lists it")
+	}
+	if code, body := clientGet(t, s, scoped.token, stanza); code != http.StatusOK || !strings.Contains(body, "Suites: stable\n") {
+		t.Errorf("scoped /client/apt?archive=stable once listed = %d:\n%s", code, body)
+	}
+	if !hasArchive(unscoped.token) {
+		t.Error("the unscoped host's plan lost the stable archive")
+	}
+
+	// A list naming another archive admits that one alone.
+	listArchives(t, s, "noble-pgdg")
+	code, body = clientGet(t, s, scoped.token, plan)
+	if code != http.StatusForbidden || !strings.Contains(body, "--archives noble-pgdg,stable") {
+		t.Errorf("scoped plan with only noble-pgdg listed = %d, want 403 keeping the listed one in the command:\n%s", code, body)
+	}
+}
+
+// E24 R3 and R4: the mirrored dists/ tree and the pool refuse a scoped host a
+// vendor codename its profile does not list, with a denied discovery row, so
+// a stanza written by hand reaches nothing. The host's own distribution is
+// served throughout, and so is the unscoped host.
+func TestScopedProfileGovernsVendorArchivesOnTheAptRoutes(t *testing.T) {
+	s, unscoped, scoped := scopedVendorServer(t)
+	const inRelease = "/apt/dists/stable/InRelease"
+	const pool = "/apt/" + vendorGrafanaDeb
+
+	code, body := clientGet(t, s, scoped.token, inRelease)
+	assertArchiveRefusal(t, "scoped "+inRelease, code, body)
+	rows := waitForAptRows(t, s, audit.DecisionDenied, 1)
+	if !strings.Contains(rows[0].PatternHint, "bodega profile set edge apt --archives stable") {
+		t.Errorf("denied row = %+v, want the command that admits the archive as its hint", rows[0])
+	}
+	code, body = clientGet(t, s, scoped.token, pool)
+	assertArchiveRefusal(t, "scoped "+pool, code, body)
+
+	for _, path := range []string{inRelease, pool} {
+		if code, body := clientGet(t, s, unscoped.token, path); code != http.StatusOK {
+			t.Errorf("unscoped %s = %d: %s", path, code, body)
+		}
+	}
+	// The pool path now has a remembered route, which must not let the
+	// scoped host past.
+	code, body = clientGet(t, s, scoped.token, pool)
+	assertArchiveRefusal(t, "scoped "+pool+" after an unscoped fetch", code, body)
+
+	for _, path := range []string{"/apt/dists/noble-edge/InRelease", "/apt/dists/noble/InRelease", "/apt/" + profileNginxDeb} {
+		if code, body := clientGet(t, s, scoped.token, path); code != http.StatusOK {
+			t.Errorf("scoped host's own distribution %s = %d: %s", path, code, body)
+		}
+	}
+
+	listArchives(t, s, "stable")
+	for _, path := range []string{inRelease, pool} {
+		if code, body := clientGet(t, s, scoped.token, path); code != http.StatusOK {
+			t.Errorf("scoped %s once listed = %d: %s", path, code, body)
+		}
+		if code, body := clientGet(t, s, unscoped.token, path); code != http.StatusOK {
+			t.Errorf("unscoped %s = %d: %s", path, code, body)
+		}
+	}
+}
+
+// overwriteCached replaces the cached object at poolPath with bytes no fetch
+// wrote, which is a cached .deb whose origin nothing recorded.
+func overwriteCached(t *testing.T, s *Server, poolPath, body string) {
+	t.Helper()
+	local := filepath.Join(t.TempDir(), "deb")
+	if err := os.WriteFile(local, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", local, err)
+	}
+	if err := s.typeStore(manifest.TypeApt).PutFile(t.Context(), local, manifest.AptKey(poolPath)); err != nil {
+		t.Fatalf("overwrite cached %s: %v", poolPath, err)
+	}
+}
+
+// E24 R3: a cached vendor .deb stays refused to a scoped host when nothing
+// upstream answers for it, whether the archive is down or a negative route is
+// remembered, and a cached .deb of the host's own base stays served after
+// upstream drops it. Both hold with the origin recorded and without it.
+func TestScopedProfileVendorRefusalSurvivesAnArchiveThatDoesNotAnswer(t *testing.T) {
+	s, unscoped, scoped, noble, stable := scopedVendorArchives(t)
+	const grafana = "/apt/" + vendorGrafanaDeb
+	const nginx = "/apt/" + profileNginxDeb
+	for _, path := range []string{grafana, nginx} {
+		if code, body := clientGet(t, s, unscoped.token, path); code != http.StatusOK {
+			t.Fatalf("unscoped warm %s = %d: %s", path, code, body)
+		}
+	}
+
+	s.aptRoutes.put(vendorGrafanaDeb, "")
+	code, body := clientGet(t, s, scoped.token, grafana)
+	assertArchiveRefusal(t, "scoped "+grafana+" behind a negative route", code, body)
+
+	stable.ts.Close()
+	noble.removeObject(profileNginxDeb)
+	s.aptRoutes = aptRouteCache{}
+	code, body = clientGet(t, s, scoped.token, grafana)
+	assertArchiveRefusal(t, "scoped "+grafana+" with stable down", code, body)
+	if code, body := clientGet(t, s, scoped.token, nginx); code != http.StatusOK {
+		t.Errorf("scoped %s after upstream dropped it = %d: %s", nginx, code, body)
+	}
+	if code, body := clientGet(t, s, unscoped.token, grafana); code != http.StatusOK {
+		t.Errorf("unscoped %s with stable down = %d: %s", grafana, code, body)
+	}
+
+	// No origin recorded: the probe places neither file, and the profile's
+	// filtered index is what tells the base's .deb from the vendor's.
+	overwriteCached(t, s, vendorGrafanaDeb, "grafana bytes, uploaded")
+	overwriteCached(t, s, profileNginxDeb, "nginx bytes, uploaded")
+	s.aptRoutes = aptRouteCache{}
+	code, body = clientGet(t, s, scoped.token, grafana)
+	if code != http.StatusForbidden {
+		t.Fatalf("scoped %s with no recorded origin = %d, want 403: %s", grafana, code, body)
+	}
+	for _, want := range []string{`profile "edge"`, "vendor archives noble-pgdg, stable", "No origin is recorded", "bodega profile set edge apt --archives <codename>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("unrecorded-origin refusal lacks %q:\n%s", want, body)
+		}
+	}
+	if code, body := clientGet(t, s, scoped.token, nginx); code != http.StatusOK || body != "nginx bytes, uploaded" {
+		t.Errorf("scoped %s with no recorded origin = %d: %s", nginx, code, body)
+	}
+
+	// Unplaced, it could still be noble-pgdg's, so listing stable alone does
+	// not admit it; listing every vendor archive leaves nothing to refuse.
+	listArchives(t, s, "stable")
+	if code, body := clientGet(t, s, scoped.token, grafana); code != http.StatusForbidden {
+		t.Errorf("scoped unplaced %s with noble-pgdg still refused = %d: %s", grafana, code, body)
+	}
+	listArchives(t, s, "noble-pgdg", "stable")
+	if code, body := clientGet(t, s, scoped.token, grafana); code != http.StatusOK {
+		t.Errorf("scoped %s once every vendor archive is listed = %d: %s", grafana, code, body)
 	}
 }

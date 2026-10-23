@@ -168,6 +168,12 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 // a 404 on a declared architecture passes here and fails on Ubuntu.
 func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string, alsoDeclared ...string) map[string]string {
 	t.Helper()
+	return fixtureDistsFor(t, kr, mirroredCodename, packages, arch, alsoDeclared...)
+}
+
+// fixtureDistsFor is fixtureDistsArch for a codename other than the fixture's.
+func fixtureDistsFor(t *testing.T, kr *aptsign.KeyRing, codename, packages, arch string, alsoDeclared ...string) map[string]string {
+	t.Helper()
 	packagesPath := "main/binary-" + arch + "/Packages"
 	sum := sha256.Sum256([]byte(packages))
 	digest := hex.EncodeToString(sum[:])
@@ -192,8 +198,8 @@ func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string, 
 	release := strings.Join(append([]string{
 		"Origin: Ubuntu",
 		"Label: Ubuntu",
-		"Suite: " + mirroredCodename,
-		"Codename: " + mirroredCodename,
+		"Suite: " + codename,
+		"Codename: " + codename,
 		"Components: main",
 		"Architectures: " + strings.Join(append([]string{arch}, alsoDeclared...), " "),
 		"Acquire-By-Hash: yes",
@@ -209,7 +215,7 @@ func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string, 
 		t.Fatalf("detach-sign fixture Release: %v", err)
 	}
 
-	base := "dists/" + mirroredCodename + "/"
+	base := "dists/" + codename + "/"
 	return map[string]string{
 		base + "Release":            release,
 		base + "InRelease":          string(inRelease),
