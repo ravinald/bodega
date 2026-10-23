@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -138,5 +139,136 @@ func TestGomodUndecodablePathIs400(t *testing.T) {
 	}
 	if got := up.paths(); len(got) != 0 {
 		t.Errorf("an undecodable path reached the upstream: %v", got)
+	}
+}
+
+// Before the handler decoded the wire path, the escaped form was the only
+// spelling a request matched, so an existing install catalogued, hid and
+// listed uppercase modules that way. These run the rename an upgraded server
+// runs before it serves.
+
+func saveGomodManifest(t *testing.T, s *Server, name string, hidden bool) {
+	t.Helper()
+	if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion, Name: name, Type: manifest.TypeGomod,
+		Versions: []manifest.VersionEntry{{Version: "v1.4.0", Hidden: hidden}},
+	}); err != nil {
+		t.Fatalf("save gomod manifest %s: %v", name, err)
+	}
+}
+
+func profileEntryNames(t *testing.T, s *Server, profile string) []string {
+	t.Helper()
+	d, err := s.auditDB.GetProfile(t.Context(), profile)
+	if err != nil {
+		t.Fatalf("read profile %s: %v", profile, err)
+	}
+	var names []string
+	for _, e := range d.Entries {
+		names = append(names, e.Name)
+	}
+	return names
+}
+
+func TestGomodHiddenManifestUnderEscapedNameStaysHiddenAfterRename(t *testing.T) {
+	s, up := tomlUpstream(t)
+	saveGomodManifest(t, s, tomlEscaped, true)
+
+	renamed, err := s.store.RenameEscapedGomod(t.Context())
+	if err != nil || len(renamed) != 1 {
+		t.Fatalf("RenameEscapedGomod = %v, %v; want one rename and no error", renamed, err)
+	}
+	status, body := getStatusAndBody(t, s, tomlInfo)
+	if status != http.StatusNotFound || !strings.Contains(body, "hidden") {
+		t.Errorf("GET %s with every version hidden = %d %q, want the hidden refusal", tomlInfo, status, body)
+	}
+	if got := up.paths(); len(got) != 0 {
+		t.Errorf("a hidden module reached the upstream: %v", got)
+	}
+}
+
+func TestGomodProfileEntryUnderEscapedNameAdmitsAfterRewrite(t *testing.T) {
+	s, _ := tomlUpstream(t)
+	f := bindProfile(t, s, "build", "build01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeGomod, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeGomod, Name: tomlEscaped}})
+
+	if _, _, err := s.auditDB.RewriteEscapedGomodNames(t.Context()); err != nil {
+		t.Fatalf("RewriteEscapedGomodNames: %v", err)
+	}
+	s.refreshProfiles(t.Context())
+	for _, p := range []string{tomlList, tomlInfo} {
+		if status, body := f.get(t, p); status != http.StatusOK {
+			t.Errorf("GET %s with %s listed before the rewrite = %d, want 200: %s", p, tomlEscaped, status, body)
+		}
+	}
+	if got := profileEntryNames(t, s, "build"); len(got) != 1 || got[0] != tomlModule {
+		t.Errorf("the profile lists %v, want [%s]", got, tomlModule)
+	}
+}
+
+func TestGomodEscapedNameRewriteRenamesOnlyEscapedNamesAndIsIdempotent(t *testing.T) {
+	s, _ := tomlUpstream(t)
+	const lower = "golang.org/x/mod"
+	saveGomodManifest(t, s, tomlEscaped, false)
+	saveGomodManifest(t, s, lower, false)
+	writeProfile(t, s, "build",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeGomod, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeGomod, Name: tomlEscaped}, {Type: manifest.TypeGomod, Name: lower}})
+
+	renamed, err := s.store.RenameEscapedGomod(t.Context())
+	if err != nil || len(renamed) != 1 || renamed[0].Stored != tomlEscaped || renamed[0].Canonical != tomlModule {
+		t.Fatalf("RenameEscapedGomod = %+v, %v; want %s renamed to %s", renamed, err, tomlEscaped, tomlModule)
+	}
+	rows, collisions, err := s.auditDB.RewriteEscapedGomodNames(t.Context())
+	if err != nil || rows != 1 || len(collisions) != 0 {
+		t.Fatalf("RewriteEscapedGomodNames = %d, %v, %v; want one row renamed", rows, collisions, err)
+	}
+
+	got := s.store.ListPackages(manifest.TypeGomod)
+	if !slices.Contains(got, manifest.SafeName(tomlModule)) || !slices.Contains(got, manifest.SafeName(lower)) || slices.Contains(got, manifest.SafeName(tomlEscaped)) {
+		t.Errorf("the index lists %v, want %s and %s and not %s", got, tomlModule, lower, tomlEscaped)
+	}
+	for _, name := range []string{tomlModule, lower} {
+		if pm, err := s.store.GetPackage(t.Context(), manifest.TypeGomod, name); err != nil || pm == nil {
+			t.Errorf("GetPackage(%s) = %v, %v; want the manifest", name, pm, err)
+		}
+	}
+	if names := profileEntryNames(t, s, "build"); !slices.Equal(names, []string{tomlModule, lower}) {
+		t.Errorf("the profile lists %v, want [%s %s]", names, tomlModule, lower)
+	}
+
+	if renamed, err := s.store.RenameEscapedGomod(t.Context()); err != nil || len(renamed) != 0 {
+		t.Errorf("a second RenameEscapedGomod = %v, %v; want nothing", renamed, err)
+	}
+	if rows, collisions, err := s.auditDB.RewriteEscapedGomodNames(t.Context()); err != nil || rows != 0 || len(collisions) != 0 {
+		t.Errorf("a second RewriteEscapedGomodNames = %d, %v, %v; want nothing", rows, collisions, err)
+	}
+}
+
+// Both spellings already present is two sets of entries for one module; the
+// rewrite names the pair and moves neither.
+func TestGomodEscapedNameRewriteRefusesACollision(t *testing.T) {
+	s, _ := tomlUpstream(t)
+	saveGomodManifest(t, s, tomlEscaped, true)
+	saveGomodManifest(t, s, tomlModule, false)
+	writeProfile(t, s, "build",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeGomod, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeGomod, Name: tomlEscaped}, {Type: manifest.TypeGomod, Name: tomlModule}})
+
+	renamed, err := s.store.RenameEscapedGomod(t.Context())
+	if err == nil || len(renamed) != 0 || !strings.Contains(err.Error(), tomlEscaped) || !strings.Contains(err.Error(), tomlModule) {
+		t.Errorf("RenameEscapedGomod over a collision = %v, %v; want an error naming both and nothing renamed", renamed, err)
+	}
+	if pm, _ := s.store.GetPackage(t.Context(), manifest.TypeGomod, tomlModule); pm == nil || pm.Versions[0].Hidden {
+		t.Errorf("the manifest under %s was overwritten: %+v", tomlModule, pm)
+	}
+
+	rows, collisions, err := s.auditDB.RewriteEscapedGomodNames(t.Context())
+	if err != nil || rows != 0 || len(collisions) != 1 || collisions[0].Escaped != tomlEscaped || collisions[0].Decoded != tomlModule {
+		t.Errorf("RewriteEscapedGomodNames over a collision = %d, %+v, %v; want the pair reported and nothing renamed", rows, collisions, err)
+	}
+	if names := profileEntryNames(t, s, "build"); len(names) != 2 {
+		t.Errorf("the profile lists %v, want both spellings left in place", names)
 	}
 }

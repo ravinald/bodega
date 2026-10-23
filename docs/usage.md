@@ -4927,6 +4927,8 @@ The checksum database comes through the same `GOPROXY`, so a host whose egress r
 
 Every name bodega shows or accepts for a module is the go.mod spelling: `github.com/BurntSushi/toml`, never the proxy protocol's escaped form `github.com/!burnt!sushi/toml`. The go command sends the escaped form, and bodega decodes it once at the edge, so the hidden-package check, the catalog lookup, the version constraint, the profile gate and the discovery row's `pkg_name` and `pattern_hint` all use the go.mod spelling. A request path that does not decode answers 400 naming the path. Only the upstream URL and the storage key keep the escaped form, which is what the upstream serves and what the cache already holds. `bodega profile add`, `bodega pkg import` and `bodega pkg hide` refuse a gomod name containing `!` and print the go.mod spelling to use instead.
 
+An install upgraded from a release that matched only the escaped form may hold manifests, profile entries and overrides named that way. `bodega serve` renames each gomod manifest to the go.mod spelling before it binds, and every read-write open of the audit database renames the profile entries and overrides. Where the go.mod spelling is already taken (a manifest under both names, or a profile listing both), neither is moved and the start logs the pair at error level: merge the manifests by hand, or `bodega profile remove` one entry. `bodega repair check` lists any escaped manifest that remains.
+
 Go toolchains are modules (`golang.org/toolchain`), so a `go.mod` naming a newer `toolchain` line resolves through the proxy and the checksum database above with no further configuration.
 
 **Helm** (`~/.config/helm/repositories.yaml` on Linux and FreeBSD, `~/Library/Preferences/helm/repositories.yaml` on macOS):
