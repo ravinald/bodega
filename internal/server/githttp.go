@@ -305,7 +305,7 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// 'discover promote --as manifest' writes an entry under. The two have to
 	// be the same string or promoting a no_manifest row leaves the 404 in
 	// place. The upstream keeps the .git suffix; the manifest name drops it.
-	pkgName := ns + "/" + strings.TrimSuffix(repo, ".git")
+	pkgName := gitPkgName(ns, repo)
 	upstream := gu.URL + repo
 
 	if gu.Mode != config.UpstreamModeOpen {
