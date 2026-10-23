@@ -53,12 +53,15 @@ type proHost struct {
 	record string
 	// run executes one tool and returns its combined output.
 	run func(argv []string) (string, error)
+	// lookPath finds pro before anything asks it a question.
+	lookPath func(string) (string, error)
 }
 
 var ubuntuPro = &proHost{
-	root:   "/",
-	record: "/etc/bodega/doctor-ubuntu-pro.json",
-	run:    runProTool,
+	root:     "/",
+	record:   "/etc/bodega/doctor-ubuntu-pro.json",
+	run:      runProTool,
+	lookPath: exec.LookPath,
 }
 
 const proToolTimeout = 30 * time.Second
@@ -86,26 +89,44 @@ type proRecord struct {
 // host without the hook, and an attached one, which is paying for what the
 // hook fetches, get no row at all.
 func (h *proHost) finding() (host.Finding, bool) {
-	f := host.Finding{Check: "ubuntu-pro-hook"}
+	f, ok, _ := h.check()
+	return f, ok
+}
+
+// check is finding plus, when there is no row, why not. The hook is a dpkg
+// conffile, so `apt remove ubuntu-pro-client` leaves it behind with pro gone;
+// its commands are guarded on the client's binaries existing, so nothing runs
+// it and there is nothing to report.
+func (h *proHost) check() (f host.Finding, ok bool, why string) {
+	f = host.Finding{Check: "ubuntu-pro-hook"}
 	hook := filepath.Join(h.root, esmHookConf)
 	if _, err := os.Stat(hook); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return f, false
+			return f, false, "no " + esmHookConf
 		}
 		f.Status = host.StatusSkip
 		f.Detail = "could not stat " + hook + ": " + err.Error()
 		f.Remediation = skipRemedy(hook, err)
-		return f, true
+		return f, true, ""
+	}
+	if _, err := h.lookPath("pro"); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return f, false, filepath.Base(esmHookConf) + " is left from a removed ubuntu-pro-client; nothing runs it"
+		}
+		f.Status = host.StatusSkip
+		f.Detail = esmHookConf + " is present and looking up `pro` in $PATH failed: " + err.Error()
+		f.Remediation = "run `command -v pro` to see why the lookup fails, then re-run `bodega doctor`"
+		return f, true, ""
 	}
 	attached, err := h.attached()
 	if err != nil {
 		f.Status = host.StatusSkip
 		f.Detail = esmHookConf + " is present and " + err.Error()
 		f.Remediation = "run `pro api u.pro.status.is_attached.v1` and `pro status --format json` to see why they fail, then re-run `bodega doctor`"
-		return f, true
+		return f, true, ""
 	}
 	if attached {
-		return f, false
+		return f, false, "Ubuntu Pro is attached"
 	}
 	f.Status = host.StatusWarn
 	f.Detail = esmHookConf + " starts apt-news.service and esm-cache.service on every apt update and runs " +
@@ -113,7 +134,7 @@ func (h *proHost) finding() (host.Finding, bool) {
 		"Ubuntu Pro is not attached, so they fetch nothing this host uses"
 	f.Remediation = "pro config set apt_news=false and systemctl mask esm-cache.service, " +
 		"or bodega doctor --configure apt --quiet-ubuntu-pro --apply, which records both for --restore-ubuntu-pro"
-	return f, true
+	return f, true, ""
 }
 
 // attached asks pro api first because it reads the host's own attachment
@@ -170,9 +191,9 @@ func (h *proHost) attachedAPI() (bool, error) {
 // step whose end state the host already has, so the record never claims a
 // change somebody else made.
 func (h *proHost) quietSteps() (steps []string, why string, err error) {
-	switch f, ok := h.finding(); {
+	switch f, ok, why := h.check(); {
 	case !ok:
-		return nil, "no " + esmHookConf + ", or Ubuntu Pro is attached", nil
+		return nil, why, nil
 	case f.Status != host.StatusWarn:
 		return nil, "", fmt.Errorf("--quiet-ubuntu-pro cannot plan: %s", f.Detail)
 	}
