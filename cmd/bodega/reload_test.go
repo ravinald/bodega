@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -458,4 +461,201 @@ func syncNpmOSVDB(t *testing.T, dir string) {
 	if _, err := db.Sync(t.Context(), "npm"); err != nil {
 		t.Fatalf("sync npm: %v", err)
 	}
+}
+
+const reloadStartupTreeEnv = "BODEGA_TEST_RELOAD_STARTUP_TREE"
+
+// TestUnitReloadDuringStartupNeitherKillsNorRestarts runs the unit's own
+// ExecReload against a serve that is still inside New, and asserts the same
+// process goes on to serve and acts on the reload.
+//
+// The child is held by its apt signing key: $CREDENTIALS_DIRECTORY holds a
+// FIFO where LoadCredential= would put the file, so New blocks reading it,
+// immediately before the first apt build, until the parent writes the key.
+// Before serve registered SIGHUP first thing, a signal there took Go's default
+// action and the process died. Under the shipped unit that is no restart
+// either: Restart=on-failure counts SIGHUP as a clean exit, so the server
+// stays down.
+func TestUnitReloadDuringStartupNeitherKillsNorRestarts(t *testing.T) {
+	execReload := unitExecReload(t)
+
+	tree := t.TempDir()
+	creds := filepath.Join(tree, "creds")
+	for _, d := range []string{"etc", "var", "log"} {
+		if err := os.MkdirAll(filepath.Join(tree, d), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.MkdirAll(creds, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", creds, err)
+	}
+	cfg := fmt.Sprintf(`{"config_version":1,"manifest_dir":%q,"storage_path":%q,"log_dir":%q,"audit_db":%q,"allow_plaintext":true,"log_level":2}`,
+		filepath.Join(tree, "var", "manifests"), filepath.Join(tree, "var"),
+		filepath.Join(tree, "log"), filepath.Join(tree, "log", "audit.db"))
+	if err := os.WriteFile(filepath.Join(tree, "etc", "config.json"), []byte(cfg+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	keyFIFO := filepath.Join(creds, aptsign.KeyFileName)
+	if err := syscall.Mkfifo(keyFIFO, 0o600); err != nil {
+		t.Fatalf("mkfifo %s: %v", keyFIFO, err)
+	}
+	key := testSigningKey(t)
+
+	addr := freeAddr(t)
+	child := exec.Command(os.Args[0], "-test.run=TestServeHeldAtStartupHelper", "-test.timeout=120s")
+	child.Env = append(os.Environ(), reloadStartupTreeEnv+"="+tree,
+		serveAddrEnv+"="+addr, aptsign.CredentialsEnv+"="+creds, "HOME="+tree)
+	var log syncLog
+	child.Stdout, child.Stderr = &log, &log
+	if err := child.Start(); err != nil {
+		t.Fatalf("start serve: %v", err)
+	}
+	// Closed rather than sent on, so every select below and the cleanup all
+	// see the exit.
+	exited := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = child.Wait(); close(exited) }()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-exited
+		if t.Failed() {
+			t.Logf("serve:\n%s", log.String())
+		}
+	})
+
+	// Opening the write end returns only once the child has opened the read
+	// end, which is the moment it is parked inside New.
+	opened := make(chan *os.File, 1)
+	go func() {
+		f, err := os.OpenFile(keyFIFO, os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open %s for write: %v", keyFIFO, err)
+			close(opened)
+			return
+		}
+		opened <- f
+	}()
+	var w *os.File
+	select {
+	case w = <-opened:
+	case <-exited:
+		t.Fatalf("serve exited before reading its signing key: %v", waitErr)
+	case <-time.After(30 * time.Second):
+		t.Fatal("serve never opened its signing key")
+	}
+	if w == nil {
+		t.FailNow()
+	}
+
+	argv := strings.Fields(strings.ReplaceAll(execReload, "$MAINPID", strconv.Itoa(child.Process.Pid)))
+	if out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput(); err != nil {
+		t.Fatalf("ExecReload %q: %v\n%s", execReload, err, out)
+	}
+	select {
+	case <-exited:
+		t.Fatalf("ExecReload during startup killed serve: %v", waitErr)
+	case <-time.After(time.Second):
+	}
+
+	if _, err := w.Write(key); err != nil {
+		t.Fatalf("write signing key: %v", err)
+	}
+	_ = w.Close()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if resp, err := http.Get("http://" + addr + "/healthz"); err == nil {
+			_ = resp.Body.Close()
+			break
+		}
+		select {
+		case <-exited:
+			t.Fatalf("serve exited after the startup reload: %v", waitErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("serve never answered /healthz")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// The admission half, which runs on the signal's own goroutine. The
+	// rebuild half re-reads the key from the FIFO, which now has no writer.
+	for !strings.Contains(log.String(), "reload requested") {
+		if time.Now().After(deadline) {
+			t.Fatal("the reload sent during startup was never acted on")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-exited:
+		t.Fatalf("serve exited: %v", waitErr)
+	default:
+	}
+}
+
+func TestServeHeldAtStartupHelper(t *testing.T) {
+	tree := os.Getenv(reloadStartupTreeEnv)
+	if tree == "" {
+		t.Skip("child half of TestUnitReloadDuringStartupNeitherKillsNorRestarts")
+	}
+	audit.DefaultPepperPaths = pepperPaths(tree)
+	t.Setenv("BODEGA_CONFIG_FILE", filepath.Join(tree, "etc", "config.json"))
+	cmd := newServeCmd(&globalFlags{})
+	cmd.SetArgs([]string{"--addr", os.Getenv(serveAddrEnv), "--allow-plaintext", "--quiet"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+}
+
+// unitExecReload is the ExecReload= line of the unit bodega ships, read from
+// the file rather than copied, so a change there reaches this test.
+func unitExecReload(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "bodega.service"))
+	if err != nil {
+		t.Fatalf("read docs/bodega.service: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "ExecReload="); ok {
+			return v
+		}
+	}
+	t.Fatal("docs/bodega.service has no ExecReload= line")
+	return ""
+}
+
+func testSigningKey(t *testing.T) []byte {
+	t.Helper()
+	kr, err := aptsign.Generate("bodega reload test", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate signing key: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), aptsign.KeyFileName)
+	if err := kr.WritePrivate(path); err != nil {
+		t.Fatalf("write signing key: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read signing key: %v", err)
+	}
+	return data
+}
+
+// syncLog is the child's combined output, written by exec's copier goroutine
+// and read by the test.
+type syncLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
