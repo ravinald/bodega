@@ -848,7 +848,7 @@ func TestPlanAndCredentialWriterConvergeInEitherOrder(t *testing.T) {
 		client, system string
 		planned        string
 	}{
-		{"npm", "npm", clientconf.Npm(base.String()).Content},
+		{"npm", "npm", clientconf.Npm(base.String(), nil).Content},
 		{"helm", "helm", clientconf.Helm(base.String()).Content},
 	} {
 		for _, credentialFirst := range []bool{true, false} {

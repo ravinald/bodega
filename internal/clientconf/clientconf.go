@@ -111,13 +111,42 @@ func pipTrustedHost(base string) string {
 // Npm renders the registry line of a user .npmrc, the file `bodega doctor
 // --write-credentials` writes the path-scoped token into. The trailing slash
 // is what makes the registry match that token's //host/npm/ key.
-func Npm(base string) File {
+//
+// When binaryUpstreams holds a namespace on https://nodejs.org/, a disturl
+// line points node-gyp at it too. node-gyp fetches Node's headers and
+// SHASUMS256.txt for every native build from nodejs.org unless disturl names
+// another host, so without the line a host locked to bodega still reaches
+// nodejs.org the first time a package compiles an addon.
+func Npm(base string, binaryUpstreams map[string]config.BinaryUpstream) File {
+	content := fmt.Sprintf("registry=%s/npm/\n", trim(base))
+	if ns := NodeDistNamespace(binaryUpstreams); ns != "" {
+		content += fmt.Sprintf("disturl=%s/binaries/%s/dist\n", trim(base), ns)
+	}
 	return File{
 		System:  manifest.TypeNpm,
 		Label:   ".npmrc",
 		Paths:   everywhere("~/.npmrc"),
-		Content: fmt.Sprintf("registry=%s/npm/\n", trim(base)),
+		Content: content,
 	}
+}
+
+// NodeDistNamespace is the binary_upstreams namespace whose upstream is
+// https://nodejs.org/, or "" when there is none. Two such namespaces resolve
+// to the first in sorted order, so two renders of one config agree.
+func NodeDistNamespace(binaryUpstreams map[string]config.BinaryUpstream) string {
+	var found []string
+	for ns, up := range binaryUpstreams {
+		u, err := url.Parse(up.URL)
+		if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Host, "nodejs.org") || strings.Trim(u.Path, "/") != "" {
+			continue
+		}
+		found = append(found, ns)
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	sort.Strings(found)
+	return found[0]
 }
 
 // Cargo renders the source replacement that redirects crates.io to bodega's
@@ -459,10 +488,12 @@ func Osquery(base string, src OsqueryPlan) []File {
 type Inputs struct {
 	Base         string
 	GitUpstreams map[string]config.GitUpstream
-	GitBundles   []GitBundle
-	Apt          []aptsources.Sources
-	FreeBSD      []pkgrepos.Repo
-	Binary       []BinaryLink
+	// BinaryUpstreams decides whether npm's file carries a disturl line.
+	BinaryUpstreams map[string]config.BinaryUpstream
+	GitBundles      []GitBundle
+	Apt             []aptsources.Sources
+	FreeBSD         []pkgrepos.Repo
+	Binary          []BinaryLink
 	// Osquery is the one server-mode source a host enrolls with: osqueryd
 	// takes its config from exactly one server.
 	Osquery *OsqueryPlan
@@ -478,7 +509,7 @@ func ForType(entryType string, in Inputs) []File {
 	case manifest.TypePypi:
 		out = append(out, Pip(in.Base))
 	case manifest.TypeNpm:
-		out = append(out, Npm(in.Base))
+		out = append(out, Npm(in.Base, in.BinaryUpstreams))
 	case manifest.TypeCargo:
 		out = append(out, Cargo(in.Base))
 	case manifest.TypeGomod:
