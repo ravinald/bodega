@@ -1,7 +1,10 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,5 +212,47 @@ func TestBinaryRevalidatePatterns(t *testing.T) {
 	}
 	if n := up.hits("/" + tarball); n != 1 {
 		t.Errorf("the dated tarball was fetched %d times, want 1: it never changes", n)
+	}
+}
+
+// TestRustupRecipeRevalidates reads the rust namespace out of docs/usage.md
+// rather than a copy of its list, so the recipe an operator pastes is the one
+// tested.
+func TestRustupRecipeRevalidates(t *testing.T) {
+	usage, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block string
+	for _, part := range strings.Split(string(usage), "```json\n")[1:] {
+		if body, _, _ := strings.Cut(part, "```"); strings.Contains(body, "https://static.rust-lang.org/") {
+			block = body
+			break
+		}
+	}
+	if block == "" {
+		t.Fatal("docs/usage.md has no ```json block naming https://static.rust-lang.org/: the rustup recipe moved or lost its fence")
+	}
+	var recipe struct {
+		BinaryUpstreams map[string]config.BinaryUpstream `json:"binary_upstreams"`
+	}
+	if err := json.Unmarshal([]byte("{"+block+"}"), &recipe); err != nil {
+		t.Fatalf("the rustup recipe in docs/usage.md is not valid JSON once wrapped in {}: %v\n%s", err, block)
+	}
+	patterns := recipe.BinaryUpstreams["rust"].Revalidate
+	if len(patterns) == 0 {
+		t.Fatalf("the rustup recipe has no binary_upstreams.rust.revalidate list:\n%s", block)
+	}
+	for p, want := range map[string]bool{
+		"dist/channel-rust-stable.toml":                                   true,
+		"rustup/release-stable.toml":                                      true,
+		"rustup/dist/x86_64-unknown-linux-gnu/rustup-init":                true,
+		"rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256":         true,
+		"rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init":      false,
+		"dist/2026-01-01/rust-std-1.90.0-x86_64-unknown-linux-gnu.tar.xz": false,
+	} {
+		if got := revalidates(patterns, p); got != want {
+			t.Errorf("recipe %q: revalidates(%s) = %v, want %v", patterns, p, got, want)
+		}
 	}
 }
