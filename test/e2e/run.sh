@@ -222,15 +222,22 @@ assert_tree_clean
 
 E2E_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 [ "$ALLOW_DIRTY" = yes ] && E2E_COMMIT="$E2E_COMMIT-dirty"
-E2E_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$E2E_COMMIT"
+# Two runs from one checkout can start in the same second, so the time and
+# commit alone do not name a run. The random suffix does, and the plain mkdir
+# turns the collision it cannot rule out into a refusal: a shared directory
+# merges both runs' findings into one file and each reports the other's checks.
+E2E_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$E2E_COMMIT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 E2E_RUN_DIR="$E2E_DIR/results/$E2E_RUN_ID"
+mkdir -p "$E2E_DIR/results"
+mkdir "$E2E_RUN_DIR" 2>/dev/null ||
+	die "cannot create run directory $E2E_RUN_DIR: it exists or is not writable; start the run again for a new id" 1
 E2E_LOG_DIR="$E2E_RUN_DIR/logs"
 E2E_FINDINGS="$E2E_RUN_DIR/findings.jsonl"
 E2E_SSH_CTL_DIR="$(mktemp -d /tmp/e2e-ssh.XXXXXX)"
 E2E_ARTIFACT_DIR="$E2E_RUN_DIR/artifacts"
 E2E_DRY_PLAN="$E2E_RUN_DIR/dry-run-plan.txt"
 
-mkdir -p "$E2E_LOG_DIR" "$E2E_ARTIFACT_DIR"
+mkdir "$E2E_LOG_DIR" "$E2E_ARTIFACT_DIR"
 : >"$E2E_DRY_PLAN"
 : >"$E2E_FINDINGS"
 

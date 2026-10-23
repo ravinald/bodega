@@ -263,6 +263,47 @@ t_ok "a dry run leaves an existing build output alone" 'an earlier build' \
 t_ok "a dry run contacts no guest" untouched \
 	"$([ -e "$work/contacted" ] && echo contacted || echo untouched)"
 
+# Runs started together from one checkout each get a run directory of their
+# own, so neither run's findings or report counts the other's checks.
+dry_pair() {
+	env -u E2E_LIB_REMOTE -u E2E_LIB_ASSERT -u E2E_LIB_REPORT -u E2E_FREEBSD_CLIENT_HOST \
+		E2E_HOSTS_ENV=/dev/null PATH="$work/drybin:$work/bin:$PATH" \
+		E2E_SERVER_HOST=s.example E2E_CLIENT_HOST=c.example \
+		E2E_FREEBSD_HOST=f.example E2E_FREEBSD_SERVER_HOST=fs.example \
+		E2E_ALLOWED_HOSTS="s.example c.example f.example fs.example" \
+		bash "$dry_root/test/e2e/run.sh" --dry-run --no-ship --suite 00- >"$work/pair-$1.out" 2>&1
+}
+set +e
+dry_pair a &
+pair_a=$!
+dry_pair b &
+pair_b=$!
+wait "$pair_a"
+pair_a_rc=$?
+wait "$pair_b"
+pair_b_rc=$?
+set -e
+pair_report() { awk '$1 == "report:" {print $2}' "$work/pair-$1.out"; }
+pair_own() {
+	local mine theirs
+	mine="$(dirname "$(pair_report "$1")")/findings.jsonl"
+	theirs="$(dirname "$(pair_report "$2")")/findings.jsonl"
+	if [ -s "$mine" ] && [ -z "$(jq -r .id "$mine" | sort | uniq -d)" ] &&
+		[ "$(wc -l <"$mine")" = "$(wc -l <"$theirs")" ]; then
+		echo own
+	else
+		echo "mixed: $(jq -r .id "$mine" 2>/dev/null | tr '\n' ' ')"
+	fi
+}
+t_ok "two concurrent dry runs both exit 0" "0 0" "$pair_a_rc $pair_b_rc"
+t_ok "two concurrent dry runs write different reports" differ \
+	"$(
+		a="$(pair_report a)" b="$(pair_report b)"
+		[ -n "$a" ] && [ "$a" != "$b" ] && echo differ || echo "same: $a"
+	)"
+t_ok "the first concurrent run's findings are its own" own "$(pair_own a b)"
+t_ok "the second concurrent run's findings are its own" own "$(pair_own b a)"
+
 # Suite 48 names its scratch dataset from `zfs list` of the storage root's
 # parent. The command runs here in a real shell, with sudo and zfs stubbed and
 # zfs refusing a path that does not exist the way the guest's does, so a lookup
