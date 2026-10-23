@@ -209,6 +209,30 @@ func Cargo(base string) File {
 	}
 }
 
+// Rubygems renders the two files that send gem and Bundler to bodega's
+// registry. ~/.gemrc replaces gem's source list outright, since a list that
+// kept rubygems.org beside bodega would let a miss here go straight there.
+// Bundler reads the source a Gemfile names rather than gem's list, so the
+// mirror setting rewrites https://rubygems.org to bodega without editing any
+// Gemfile.
+func Rubygems(base string) []File {
+	root := trim(base) + "/rubygems/"
+	return []File{
+		{
+			System:  manifest.TypeRubygems,
+			Label:   "gem sources",
+			Paths:   everywhere("~/.gemrc"),
+			Content: fmt.Sprintf("---\n:sources:\n- %s\n", root),
+		},
+		{
+			System:  manifest.TypeRubygems,
+			Label:   "Bundler mirror",
+			Paths:   everywhere("~/.bundle/config"),
+			Content: fmt.Sprintf("---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: %q\n", root),
+		},
+	}
+}
+
 // Gomod renders the go env file `go env -w` writes, which the toolchain reads
 // on every invocation, so no shell profile has to export anything.
 func Gomod(base string) File {
@@ -595,6 +619,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Npm(in.Base, in.BinaryUpstreams), mirror)
 	case manifest.TypeCargo:
 		out = append(out, Cargo(in.Base))
+	case manifest.TypeRubygems:
+		out = append(out, Rubygems(in.Base)...)
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:

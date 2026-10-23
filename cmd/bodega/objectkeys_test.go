@@ -247,6 +247,21 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/cargo/serde/1.0.200/download",
 		},
 		{
+			// A platform build: the suffix is part of the version in the
+			// local path, the key and the route alike.
+			typ:  manifest.TypeRubygems,
+			pkg:  "nokogiri",
+			ve:   manifest.VersionEntry{Version: "1.16.7-x86_64-linux"},
+			body: "gem-bytes",
+			local: map[string]string{
+				"rubygems/nokogiri/1.16.7-x86_64-linux/nokogiri-1.16.7-x86_64-linux.gem": "gem-bytes",
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				return artifactPathUpload(builder.RubygemsArtifactPaths(bcfg, store, ""), dst, t)
+			},
+			url: "/rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem",
+		},
+		{
 			// A mirrored repository: the name is the repository directory and
 			// the version is the ABI, so the local tree, the object key and
 			// the route are all the path a pkg client composes. The package

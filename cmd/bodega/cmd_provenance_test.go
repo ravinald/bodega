@@ -36,7 +36,7 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 	if _, err := runRoot(t, "policy", "provenance", "set", "npm", "allow"); err == nil {
 		t.Error("an action outside warn|block|ignore was accepted")
 	}
-	if _, err := runRoot(t, "policy", "provenance", "set", "rubygems", "warn"); err == nil {
+	if _, err := runRoot(t, "policy", "provenance", "set", "quicklisp", "warn"); err == nil {
 		t.Error("an unknown ecosystem was accepted")
 	}
 	out, err = runRoot(t, "policy", "provenance", "list")

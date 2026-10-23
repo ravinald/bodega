@@ -24,6 +24,7 @@ var uncoveredReason = map[string]string{
 	manifest.TypePypi:      "PyPI publishes PEP 740 attestations, which bodega does not verify yet",
 	manifest.TypeGomod:     "Go modules carry no publisher signature; the checksum database proves every client sees the same bytes, not who published them",
 	manifest.TypeCargo:     "crates.io publishes no provenance bodega can verify",
+	manifest.TypeRubygems:  "bodega does not verify the Sigstore attestations RubyGems.org publishes yet",
 	manifest.TypeHelm:      "a chart's .prov file is a PGP signature with no key bodega is configured to trust, and is not verified yet",
 	manifest.TypeApt:       "a .deb carries no publisher provenance; the archive's Release signature covers the index, not who built the package",
 	manifest.TypeFreeBSD:   "the pkg repository signature covers the catalogue, not who built the package",

@@ -137,11 +137,13 @@ type Config struct {
 	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
 	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
-	DiscoverMode           string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
+	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"` // serves gem files, the compact index and the full index from one root
+	DiscoverMode           string   `json:"discover_mode,omitempty"`     // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string   `json:"gomod_root,omitempty"`
 	HelmRoot               string   `json:"helm_root,omitempty"`
 	NpmRoot                string   `json:"npm_root,omitempty"`
 	CargoRoot              string   `json:"cargo_root,omitempty"`
+	RubygemsRoot           string   `json:"rubygems_root,omitempty"`
 	FreeBSDRoot            string   `json:"freebsd_root,omitempty"`
 	DistfilesRoot          string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
 	AuditDB                string   `json:"audit_db,omitempty"`
@@ -360,6 +362,11 @@ var legacyKeyAliases = map[string]string{"shell_height": "logwindow_height"}
 // attacker on the path can make a fetch fail and cannot make one succeed.
 const DefaultDistfilesUpstream = "http://distcache.FreeBSD.org/ports-distfiles/"
 
+// DefaultRubygemsUpstream is the RubyGems registry root. rubygems.org serves
+// the gem files, Bundler's compact index and the legacy full index from the
+// one host, so one key names all three.
+const DefaultRubygemsUpstream = "https://rubygems.org"
+
 // DistfilesEnvironment is the declared client environment distfiles admission
 // reads ports against.
 func (cfg *Config) DistfilesEnvironment() distinfo.EnvironmentSpec {
@@ -464,6 +471,7 @@ var reservedPathElements = map[string]string{
 	"apt":       "served route and apt storage element",
 	"binaries":  "served route and binary storage root",
 	"cargo":     "served route and cargo storage root",
+	"rubygems":  "served route and rubygems storage root",
 	"git":       "served route",
 	"go":        "served route",
 	"healthz":   "served route",
@@ -559,16 +567,22 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 // tree heads verify against the key it already holds, but a plain-http fetch
 // still leaks every module a host resolves to the path.
 func validateSumdbURL(raw string) error {
+	return validateRootURL("gomod_sumdb_url", raw, "https://sum.golang.org")
+}
+
+// validateRootURL holds an upstream key the server appends request paths to:
+// https, a host, and nothing a composed URL would carry past the path.
+func validateRootURL(key, raw, def string) error {
 	u, err := url.Parse(raw)
 	switch {
 	case err != nil:
-		return fmt.Errorf("gomod_sumdb_url %q does not parse: %v", raw, err)
+		return fmt.Errorf("%s %q does not parse: %v", key, raw, err)
 	case u.Scheme != "https":
-		return fmt.Errorf("gomod_sumdb_url %q must be an https URL (default https://sum.golang.org)", raw)
+		return fmt.Errorf("%s %q must be an https URL (default %s)", key, raw, def)
 	case u.Host == "":
-		return fmt.Errorf("gomod_sumdb_url %q names no host", raw)
+		return fmt.Errorf("%s %q names no host", key, raw)
 	case u.User != nil, u.RawQuery != "", u.Fragment != "":
-		return fmt.Errorf("gomod_sumdb_url %q carries userinfo, a query or a fragment — the request path is appended to it", raw)
+		return fmt.Errorf("%s %q carries userinfo, a query or a fragment — the request path is appended to it", key, raw)
 	}
 	return nil
 }
@@ -1212,6 +1226,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
+	cfg.RubygemsUpstream = strings.TrimRight(firstNonEmpty(cfg.RubygemsUpstream, DefaultRubygemsUpstream), "/")
+	if err := validateRootURL("rubygems_upstream", cfg.RubygemsUpstream, DefaultRubygemsUpstream); err != nil {
+		return nil, err
+	}
 	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
 
 	// crates.io publishes the index and the tarballs on separate hosts, and
@@ -2221,6 +2239,7 @@ func defaultConfigContent() []byte {
   "_comment_cargo_upstream": "cargo_upstream is the sparse index; cargo_dl_upstream is the separate host the crate tarballs come from. crates.io names the second in its own config.json — bodega does not fetch that at startup, so an instance mirroring the index must name both keys.",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
+  "rubygems_upstream": "https://rubygems.org",
 
   "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter, and folded to lower case before the reserved-name check so \"Repos\" is refused with \"repos\". The url must be https, end in \"/\", and carry no userinfo, no query, no fragment and no uncleaned path. A key may share a name with an uploaded git package: /git/{name}/{file} serves the bundle and /git/{ns}/{org}/{repo}.git/... resolves the upstream.",
   "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",
@@ -2244,6 +2263,7 @@ func defaultConfigContent() []byte {
   "helm_root": "",
   "npm_root": "",
   "cargo_root": "",
+  "rubygems_root": "",
 
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",

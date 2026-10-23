@@ -576,6 +576,8 @@ func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter 
 		return builder.NpmArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeCargo:
 		return builder.CargoArtifactPaths(cfg, store, entryFilter), noRelease, nil
+	case manifest.TypeRubygems:
+		return builder.RubygemsArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeFreeBSD:
 		return builder.FreeBSDArtifactPaths(cfg, store, entryFilter)
 	case manifest.TypeDistfiles:

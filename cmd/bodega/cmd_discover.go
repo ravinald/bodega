@@ -653,6 +653,9 @@ func versionlessNamesArtifact(regType string) bool {
 	return false
 }
 
+// rubygemsSpecDir is where a RubyGems registry serves gemspecs.
+const rubygemsSpecDir = "quick/Marshal.4.8/"
+
 // manifestURL maps a discovery row's upstream URL onto the URL shape
 // VersionEntry.URL means for that type.
 //
@@ -681,6 +684,13 @@ func manifestURL(row audit.DiscoveryRow) string {
 		// distribution name in it is normalized, so trimming at the fixed
 		// segment is what works for a package whose name carries a "_" or ".".
 		artifact = "/simple/"
+	case manifest.TypeRubygems:
+		// A gem file and its gemspec sit under the registry root at fixed
+		// directories, and a gem name never holds "/".
+		artifact = "/gems/"
+		if strings.Contains(row.UpstreamURL, "/"+rubygemsSpecDir) {
+			artifact = "/" + rubygemsSpecDir
+		}
 	default:
 		return row.UpstreamURL
 	}

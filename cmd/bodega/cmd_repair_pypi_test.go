@@ -125,6 +125,22 @@ func TestPromotedPypiURLIsTheRegistryRoot(t *testing.T) {
 	}
 }
 
+// A gem row records the file it fetched; the entry's URL is the registry root
+// either way, so a gemspec row promotes to the same entry.
+func TestPromotedRubygemsURLIsTheRegistryRoot(t *testing.T) {
+	for _, up := range []string{
+		"https://rubygems.org/gems/nokogiri-1.16.7-x86_64-linux.gem",
+		"https://rubygems.org/quick/Marshal.4.8/nokogiri-1.16.7-x86_64-linux.gemspec.rz",
+	} {
+		got := manifestURL(audit.DiscoveryRow{
+			RegistryType: manifest.TypeRubygems, PkgName: "nokogiri", PkgVersion: "1.16.7-x86_64-linux", UpstreamURL: up,
+		})
+		if got != "https://rubygems.org" {
+			t.Errorf("manifestURL(%s) = %q, want https://rubygems.org", up, got)
+		}
+	}
+}
+
 // B75 R3: a rename the repair could not make leaves the distribution
 // unreachable, so the command has to fail rather than print "(repaired)" over
 // the ERROR line it just wrote. The operator's next step is a merge by hand,

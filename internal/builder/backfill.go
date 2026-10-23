@@ -96,6 +96,8 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 	case manifest.TypeCargo:
 		d := buildDirs(cfg.rootFor(typ))
 		return cargoCratePath(d, name, ve)
+	case manifest.TypeRubygems:
+		return rubygemsGemPath(buildDirs(cfg.rootFor(typ)), name, ve)
 	case manifest.TypeDistfiles:
 		if manifest.DistfilesValidName(name) != nil {
 			return ""

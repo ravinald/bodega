@@ -182,7 +182,7 @@ func TestAdmitRecordsAllowListAndInvalidRefusals(t *testing.T) {
 	}
 
 	bad := minimist("1.0.0")
-	bad.Type = "rubygems"
+	bad.Type = "quicklisp"
 	res = Admit(t.Context(), nil, f.adb, f.synced, bad, "ravi")
 	if res.Decision != Invalid || len(res.Admissions) != 1 {
 		t.Fatalf("Decision = %v with %d rows, want Invalid with one", res.Decision, len(res.Admissions))

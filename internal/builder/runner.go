@@ -46,6 +46,10 @@ type Config struct {
 	CargoRoot   string
 	FreeBSDRoot string
 
+	// RubygemsRoot roots the gem files upload reads. No stage writes one
+	// yet; a gem is pulled through the server's /rubygems/ route instead.
+	RubygemsRoot string
+
 	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
 	// <root>/distfiles/@<environment digest>/. DistfilesPortsTree is the ports
 	// tree whose distinfo admits each file, and DistfilesUpstream is where a
@@ -366,6 +370,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.CargoRoot != "" {
 			return c.CargoRoot
 		}
+	case "rubygems":
+		if c.RubygemsRoot != "" {
+			return c.RubygemsRoot
+		}
 	case "freebsd":
 		if c.FreeBSDRoot != "" {
 			return c.FreeBSDRoot
@@ -419,6 +427,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		HelmRoot:       app.HelmRoot,
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
+		RubygemsRoot:   app.RubygemsRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
 		DistfilesRoot:  app.DistfilesRoot,
 		AutoImportDeps: true,
@@ -459,6 +468,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.npm
 	case manifest.TypeCargo:
 		return d.cargo
+	case manifest.TypeRubygems:
+		return d.rubygems
 	case manifest.TypeFreeBSD:
 		return d.freebsd
 	case manifest.TypeDistfiles:
@@ -504,6 +515,8 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.npm}
 	case manifest.TypeCargo:
 		return []string{d.cargo}
+	case manifest.TypeRubygems:
+		return []string{d.rubygems}
 	case manifest.TypeFreeBSD:
 		return []string{d.freebsd}
 	case manifest.TypeDistfiles:
@@ -693,6 +706,7 @@ type dirs struct {
 	charts   string
 	npm      string
 	cargo    string
+	rubygems string
 	freebsd  string
 
 	// distfiles is a DISTDIR: <DIST_SUBDIR>/<file> beneath it, exactly as
@@ -712,6 +726,7 @@ func buildDirs(root string) dirs {
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
 		cargo:    filepath.Join(root, "cargo"),
+		rubygems: filepath.Join(root, "rubygems"),
 		freebsd:  filepath.Join(root, "freebsd"),
 
 		distfiles: filepath.Join(root, "distfiles"),

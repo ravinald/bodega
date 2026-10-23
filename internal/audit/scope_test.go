@@ -46,7 +46,7 @@ func TestParseScopes(t *testing.T) {
 		{in: "", err: "no scope"},
 		{in: "root", err: "unknown scope"},
 		{in: "read,npm", err: "unknown scope"},
-		{in: "write:rubygems", err: "unknown package type"},
+		{in: "write:quicklisp", err: "unknown package type"},
 		{in: "admin:npm", err: "takes no package types"},
 		{in: "inventory,read", err: "combines with no other"},
 		{in: "superadmin approve admin read", want: "read,admin,approve,superadmin"},

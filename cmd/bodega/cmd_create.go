@@ -119,6 +119,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeRubygems:
+				name, ve, err = collectRubygemsVersion(r, name, "", "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypeFreeBSD:
 				name, ve, err = collectFreeBSDVersion(r, name, "", "")
 				if err != nil {
@@ -543,6 +549,26 @@ func collectCargoVersion(r *bufio.Reader, name, url, version string) (string, ma
 		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
 	}
 	url, _ = prompt(r, "Sparse registry URL (leave blank for index.crates.io)", url)
+	return name, manifest.VersionEntry{Version: version, URL: url}, nil
+}
+
+// collectRubygemsVersion prompts for one gem version. The name is taken as
+// typed: RubyGems names are case-sensitive, and "-" and "_" are distinct.
+func collectRubygemsVersion(r *bufio.Reader, name, url, version string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Gem name, exactly as published (e.g. rack, concurrent-ruby)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if name == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
+	}
+	if version, err = prompt(r, "Version (a platform build carries its suffix, e.g. 1.16.7-x86_64-linux)", version); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if version == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
+	}
+	url, _ = prompt(r, "Registry URL (leave blank for rubygems_upstream)", url)
 	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }
 
