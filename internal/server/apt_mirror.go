@@ -169,26 +169,23 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	}
 
 	// A cached .deb needs no archive resolved for it, which is the common case
-	// once a fleet is warm: the probe below is per pool path and the cache
-	// read is not. The exception is a host whose profile refuses a vendor
-	// archive, where the archive the object came from is the whole question.
+	// once a fleet is warm: the probe is per pool path and the cache read is
+	// not. The exception is a host whose profile refuses a vendor archive,
+	// where the archive the object came from is the whole question and
+	// aptAdmitCachedDeb answers it.
 	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
-		if len(refused) > 0 {
-			base, ok := s.aptResolvePoolUpstream(w, r, poolPath)
-			if !ok || refuse(base) {
-				return
-			}
-		}
-		if !s.aptMirrorHitGate(w, r, poolPath) {
-			return
-		}
 		// The audit row is unconditional. This shortcut is the only path a
 		// cached .deb is served by, and it used to write through
 		// recordAptPoolHit, whose first line returns on discovery being off —
 		// so on a default install every mirrored .deb after the first was
 		// served with nothing in the trail saying the cache answered it.
 		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
-		s.serveCacheHit(w, r, store, key, true, func(obj cachedObject) {
+		s.serveCacheHitIf(w, r, store, key, true, func(obj cachedObject) bool {
+			if len(refused) > 0 && !s.aptAdmitCachedDeb(w, r, p, refused, poolPath, key, obj) {
+				return false
+			}
+			return s.aptMirrorHitGate(w, r, poolPath)
+		}, func(obj cachedObject) {
 			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
 			s.recordAptPoolHit(r, poolPath, key)
 		})

@@ -275,7 +275,7 @@ func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject s
 	for _, c := range names {
 		if s.aptArchiveRefused(h.profile, c) {
 			reason, next := aptArchiveRefusalText(h.profile, c)
-			s.writeClientErrorFor(w, r, subject, h, http.StatusForbidden, audit.DenialClientExcluded,
+			s.writeClientErrorFor(w, r, subject, h, http.StatusForbidden, audit.DenialProfileMembership,
 				reason+"\n  "+strings.TrimSuffix(strings.ToUpper(next[:1])+next[1:], ".")+"\n")
 			return nil, false
 		}

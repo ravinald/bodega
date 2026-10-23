@@ -1699,12 +1699,26 @@ func identifyObject(ctx context.Context, store storage.ObjectStore, s3Key string
 // immutable is the caller's artifact flag: a versioned object is an artifact
 // the serve_fetch row names by key, and a mutable index is not.
 func (s *Server) serveCacheHit(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, immutable bool, record func(cachedObject)) {
+	s.serveCacheHitIf(w, r, store, s3Key, immutable, nil, record)
+}
+
+// serveCacheHitIf is serveCacheHit with admit consulted on the opened object
+// before anything is recorded or sent. admit writes its own refusal and
+// returns false; a nil admit serves every hit. The decision reads the handle
+// that supplies the bytes for the reason serveCacheHit records off it: a
+// verdict taken on an earlier Head is a verdict on whatever sat at the key
+// then.
+func (s *Server) serveCacheHitIf(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, immutable bool, admit func(cachedObject) bool, record func(cachedObject)) {
 	res, ok := s.openStored(w, r, store, s3Key)
 	if !ok {
 		return
 	}
 	defer func() { _ = res.Body.Close() }()
-	record(cachedObject{store: store, id: streamIdentity(store, res)})
+	obj := cachedObject{store: store, id: streamIdentity(store, res)}
+	if admit != nil && !admit(obj) {
+		return
+	}
+	record(obj)
 	if immutable {
 		noteServed(r, s3Key, "")
 	}
