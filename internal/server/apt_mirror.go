@@ -346,7 +346,7 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[s
 	}
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			read, err := s.aptUpstreamRead(ctx, codename, comp.name, arch, release, reads)
+			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, reads)
 			if err != nil {
 				return err
 			}

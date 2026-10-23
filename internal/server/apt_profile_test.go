@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ulikunitz/xz"
 
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
@@ -1163,6 +1165,88 @@ func aptProfileAddPocket(t *testing.T, s *Server, archive *fixtureArchive, pocke
 	archive.setObject(pocketNginxDeb, "\x21<arch>\nnginx pocket bytes")
 	archive.setObject(pocketHtopDeb, "\x21<arch>\nhtop pocket bytes")
 	s.cfg.AptUpstreams[pocket] = []config.AptUpstream{{URL: archive.URL()}}
+}
+
+// aptProfileAddDebianPocket publishes pocket's dists/ tree the way Debian
+// does: a Release whose Components: line is components, digesting the pocket's
+// index under main/ in each compression exts names and serving only those.
+func aptProfileAddDebianPocket(t *testing.T, s *Server, archive *fixtureArchive, pocket, components string, exts ...string) {
+	t.Helper()
+	packages := aptProfilePocketPackages()
+	rest := "main/binary-amd64/Packages"
+	digests := []string{}
+	for _, ext := range exts {
+		var body []byte
+		switch ext {
+		case ".gz":
+			body = gzipFixture(packages)
+		case ".xz":
+			var buf bytes.Buffer
+			xw, err := xz.NewWriter(&buf)
+			if err != nil {
+				t.Fatalf("xz writer: %v", err)
+			}
+			_, _ = io.WriteString(xw, packages)
+			if err := xw.Close(); err != nil {
+				t.Fatalf("xz close: %v", err)
+			}
+			body = buf.Bytes()
+		default:
+			body = []byte(packages)
+		}
+		sum := sha256.Sum256(body)
+		digests = append(digests, fmt.Sprintf(" %s %d %s%s", hex.EncodeToString(sum[:]), len(body), rest, ext))
+		archive.setObject("dists/"+pocket+"/"+rest+ext, string(body))
+	}
+	archive.setObject("dists/"+pocket+"/Release", strings.Join(append([]string{
+		"Origin: Debian",
+		"Suite: " + pocket,
+		"Codename: " + pocket,
+		"Components: " + components,
+		"Architectures: amd64",
+		"SHA256:",
+	}, append(digests, "")...), "\n"))
+	archive.setObject(pocketNginxDeb, "\x21<arch>\nnginx pocket bytes")
+	archive.setObject(pocketHtopDeb, "\x21<arch>\nhtop pocket bytes")
+	s.cfg.AptUpstreams[pocket] = []config.AptUpstream{{URL: archive.URL()}}
+}
+
+// B151: Debian's -updates and -security pockets digest Packages.xz and no .gz,
+// and debian-security names its components updates/main over a bare main/
+// tree. Each derives a filtered codename carrying the bare component and the
+// pocket's own index, and a Release digesting every compression builds the
+// same one.
+func TestFilteredCodenameReadsADebianPocket(t *testing.T) {
+	for _, tc := range []struct {
+		name, pocket, components string
+		exts                     []string
+	}{
+		{"xz alone", mirroredCodename + "-updates", "main", []string{".xz"}},
+		{"updates/ components", mirroredCodename + "-security", "updates/main", []string{".xz"}},
+		{"every compression", mirroredCodename + "-backports", "main", []string{"", ".gz", ".xz"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, archive := aptProfileServer(t)
+			aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+			aptProfileAddDebianPocket(t, s, archive, tc.pocket, tc.components, tc.exts...)
+			s.rebuildAptSnapshot(context.Background())
+
+			codename := tc.pocket + "-web"
+			if _, byCodename := s.aptFilteredSuites(); byCodename[codename] != "web" {
+				t.Fatalf("filtered codenames = %v, want %s for web", byCodename, codename)
+			}
+			code, release := mirrorGet(t, s, "/apt/dists/"+codename+"/Release")
+			if code != http.StatusOK {
+				t.Fatalf("GET the %s Release = %d, want 200", codename, code)
+			}
+			if got := mustParseRelease(t, release)["Components"]; got != "main" {
+				t.Errorf("the %s Release names Components %q, want main", codename, got)
+			}
+			if index := aptProfileIndex(t, s, codename); !strings.Contains(index, "Version: "+pocketNginxVersion+"\n") || strings.Contains(index, "Package: htop") {
+				t.Errorf("%s Packages =\n%s\nwant the pocket's nginx and no htop", codename, index)
+			}
+		})
+	}
 }
 
 // B145 R1, R5: a profile over a base derives one codename for the base and one
