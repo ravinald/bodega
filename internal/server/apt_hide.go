@@ -221,7 +221,7 @@ func (s *Server) aptMirrorRewrite(ctx context.Context, codename string, hidden a
 	dropped := 0
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			read, err := s.aptUpstreamRead(ctx, codename, comp.name, arch, release, cache)
+			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, cache)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -353,7 +353,7 @@ func (s *Server) mirroredCodenameCarries(ctx context.Context, codename, name, ve
 	cache := map[string]aptIndexRead{}
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			read, err := s.aptUpstreamRead(ctx, codename, comp.name, arch, release, cache)
+			read, err := s.aptUpstreamRead(ctx, codename, comp, arch, release, cache)
 			if err != nil {
 				return false, err
 			}
