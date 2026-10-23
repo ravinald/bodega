@@ -247,6 +247,33 @@ e2e_goarch() {
 	esac
 }
 
+# server and client may run FreeBSD, where a Linux binary fails as `exec
+# format error` and a GNU flag fails as a usage line: both read as a broken
+# guest rather than as a wrong assumption about one. E2E_GOOS_<ALIAS> skips the
+# `uname -s` read and preflight sets it for server and client, so later suites
+# ask no guest again. A dry run takes linux unless that variable says otherwise.
+e2e_goos() {
+	local alias="$1" var
+	var="E2E_GOOS_$(printf '%s' "$alias" | tr '[:lower:]-' '[:upper:]_')"
+	if [ -n "${!var:-}" ]; then
+		printf '%s' "${!var}"
+		return 0
+	fi
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		printf 'linux'
+		return 0
+	fi
+	e2e_on "$alias" "uname -s" >/dev/null 2>&1 || return 2
+	case "$E2E_OUT" in
+	Linux) printf 'linux' ;;
+	FreeBSD) printf 'freebsd' ;;
+	*)
+		printf 'e2e: %s reports operating system %q, which no build target maps to\n' "$alias" "$E2E_OUT" >&2
+		return 2
+		;;
+	esac
+}
+
 # e2e_file_arch <goarch> — what `file` prints for a binary of that architecture.
 e2e_file_arch() {
 	case "$1" in
