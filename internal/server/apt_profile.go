@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ulikunitz/xz"
+
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
@@ -345,7 +347,7 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 	kept, dropped := map[string]int{}, map[string]int{}
 	for _, comp := range layout {
 		for _, arch := range comp.arches {
-			read, err := s.aptUpstreamRead(ctx, ps.base, comp.name, arch, release, cache)
+			read, err := s.aptUpstreamRead(ctx, ps.base, comp, arch, release, cache)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -388,12 +390,13 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 // aptUpstreamRead reads one (base, component, architecture) Packages through
 // cache, recording a 404 as an architecture the archive does not carry rather
 // than as a failure, for the reason aptFilteredPackages gives.
-func (s *Server) aptUpstreamRead(ctx context.Context, base, component, arch string, release map[string]string, cache map[string]aptIndexRead) (aptIndexRead, error) {
+func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstreamComponent, arch string, release map[string]string, cache map[string]aptIndexRead) (aptIndexRead, error) {
+	component := comp.name
 	key := base + "/" + component + "/" + arch
 	if read, ok := cache[key]; ok {
 		return read, nil
 	}
-	body, err := s.aptUpstreamPackages(ctx, base, component, arch, release)
+	body, err := s.aptUpstreamPackages(ctx, base, comp.index[arch], arch, release)
 	var read aptIndexRead
 	switch {
 	case errors.Is(err, errUpstreamNotFound):
@@ -482,11 +485,31 @@ func filterAptParagraphs(index []byte, keep func(fields map[string]string) bool)
 	return buf.Bytes(), kept, dropped, nil
 }
 
-// aptUpstreamComponent is one component a filtered codename carries and the
-// architectures its base publishes a Packages digest for under it.
+// aptUpstreamComponent is one component a filtered codename carries, the
+// architectures its base publishes a Packages digest for under it, and which
+// compression of each architecture's index that digest is for.
 type aptUpstreamComponent struct {
 	name   string
 	arches []string
+	index  map[string]string // arch -> Release-relative path of the Packages to fetch
+}
+
+// aptPackagesCompressions is the order an index is chosen in when a Release
+// digests more than one. Plain comes last because Debian's Release digests an
+// uncompressed Packages its archive does not serve: bookworm-updates lists one
+// beside the .xz, and fetching it 404s.
+var aptPackagesCompressions = []string{".gz", ".xz", ""}
+
+// aptPackagesIndex returns the Release-relative path of the Packages index to
+// fetch for one component and architecture, or "" when the Release digests
+// none of its compressions.
+func aptPackagesIndex(published map[string]string, component, arch string) string {
+	for _, ext := range aptPackagesCompressions {
+		if idx := aptPackagesPath(component, arch) + ext; published[idx] != "" {
+			return idx
+		}
+	}
+	return ""
 }
 
 // aptUpstreamComponents reads the base codename's Release and returns, in the
@@ -501,6 +524,11 @@ type aptUpstreamComponent struct {
 // before its profile named a base; on stock Ubuntu that is everything in
 // universe. The Release narrows it from the other side, because a component
 // the archive does not declare has no Packages to fetch.
+//
+// debian-security declares its components as updates/main and so on while its
+// SHA256 paths and served tree use bare main/..., and apt strips the prefix
+// the same way, so a component is matched, fetched and republished under the
+// bare name.
 //
 // The SHA256 block is the second half because an index with no digest beside
 // it is one bodega would sign without having checked it against anything, and
@@ -528,24 +556,32 @@ func (s *Server) aptUpstreamComponents(base string, release map[string]string) (
 	published := aptReleaseDigests(release)
 	var out []aptUpstreamComponent
 	var unmirrored []string
+	seen := map[string]bool{}
 	for _, comp := range upstream {
+		comp = strings.TrimPrefix(comp, "updates/")
+		if seen[comp] {
+			continue
+		}
+		seen[comp] = true
 		if !want[comp] {
 			unmirrored = append(unmirrored, comp)
 			continue
 		}
 		var arches []string
+		index := map[string]string{}
 		for _, arch := range declared {
-			if _, ok := published[aptPackagesPath(comp, arch)+".gz"]; ok {
+			if idx := aptPackagesIndex(published, comp, arch); idx != "" {
 				arches = append(arches, arch)
+				index[arch] = idx
 			}
 		}
 		if len(arches) > 0 {
 			sort.Strings(arches)
-			out = append(out, aptUpstreamComponent{name: comp, arches: arches})
+			out = append(out, aptUpstreamComponent{name: comp, arches: arches, index: index})
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("the Release for %q publishes no <component>/binary-*/Packages.gz for any component bodega mirrors (%s) and architecture it names (%s)",
+		return nil, fmt.Errorf("the Release for %q publishes no <component>/binary-*/Packages{.gz,.xz,} for any component bodega mirrors (%s) and architecture it names (%s)",
 			base, strings.Join(mirrored, " "), strings.Join(declared, " "))
 	}
 	if len(unmirrored) > 0 {
@@ -570,16 +606,15 @@ func (s *Server) aptUpstreamRelease(ctx context.Context, base string) (map[strin
 	return deb822.ParseSingle(body)
 }
 
-// aptUpstreamPackages fetches one architecture's compressed Packages index and
-// returns it decompressed, after checking it against the digest the Release
+// aptUpstreamPackages fetches one architecture's Packages index at rest, the
+// compression aptUpstreamComponents chose, and returns it decompressed, after checking it against the digest the Release
 // published for it.
 //
 // The digest check is not a signature and does not pretend to be one. It
 // catches the failure a mirror produces on its own: a Packages body from one
 // sync beside a Release from the next, which would have bodega sign an index
 // whose stanzas name .deb digests the pool no longer has.
-func (s *Server) aptUpstreamPackages(ctx context.Context, base, component, arch string, release map[string]string) ([]byte, error) {
-	rest := aptPackagesPath(component, arch) + ".gz"
+func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch string, release map[string]string) ([]byte, error) {
 	want := aptReleaseDigests(release)[rest]
 	body, err := s.aptUpstreamFetch(ctx, base, rest)
 	if err != nil {
@@ -591,12 +626,23 @@ func (s *Server) aptUpstreamPackages(ctx context.Context, base, component, arch 
 				rest, base, arch)
 		}
 	}
-	gz, err := gzip.NewReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
+	var r io.Reader = bytes.NewReader(body)
+	switch {
+	case strings.HasSuffix(rest, ".gz"):
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
+		}
+		defer func() { _ = gz.Close() }()
+		r = gz
+	case strings.HasSuffix(rest, ".xz"):
+		xr, err := xz.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
+		}
+		r = xr
 	}
-	defer func() { _ = gz.Close() }()
-	out, err := io.ReadAll(io.LimitReader(gz, maxUpstreamBody+1))
+	out, err := io.ReadAll(io.LimitReader(r, maxUpstreamBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
 	}
