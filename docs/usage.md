@@ -2183,6 +2183,8 @@ A stanza naming the base alone breaks a stock host twice. The host already runs 
 
 The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile-bound host gets the base's filtered codename and one per mirrored pocket on one `Suites:` line (see [apt under a profile](#apt-under-a-profile)). When the rebuild withdrew a pocket's codename, the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
+`--archive <codename>` adds a vendor archive the server mirrors to `--configure apt`: the vendor's key at `/etc/apt/keyrings/bodega-<codename>.asc` and a stanza at `/etc/apt/sources.list.d/bodega-<codename>.sources` whose `Signed-By:` names it. Repeat it, or comma-separate, for several. It is refused without `--configure`, and with a `--configure` list that does not name `apt`. See [Vendor archives](#vendor-archives) for the server half and the fingerprint the key is checked against.
+
 `--configure apt` leaves the Ubuntu Pro hook alone unless asked. `--quiet-ubuntu-pro` adds the `ubuntu-pro-hook` remediation to the plan as two steps, each printed beside its undo before anything is written:
 
 ```text
@@ -5112,12 +5114,14 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                                                                 |
-| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                       |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                       |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base |
-| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`          |
+| Parameter  | Required        | Value                                                                                                                                    |
+| ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                          |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                          |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base    |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`             |
+| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives) |
+| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                             |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
@@ -5135,7 +5139,7 @@ The host resolves the way a package route resolves it: a bound token, then the l
 | `sha256`   | hex SHA-256 of what `url` serves                                                                      |
 | `reason`   | why a `refuse` or `skip` record has no file                                                           |
 
-- **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together.
+- **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. Each codename in `archives=` adds two more: its stanza, and the vendor key that stanza names, fetched from `/apt/keys/<codename>.asc`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together.
 - **`refuse`** is a system the host's profile excludes: closed, listing nothing of that type, and blocking the rest. It also covers a profile that scopes apt to a codename other than the one the host states, and a git profile covering none of the served namespaces. A refusal is a record rather than an absence, so a host can tell "not for you" from "not configured".
 - **`skip`** is a system with nothing to install here for a reason that is not the profile's: the wrong operating system (apt on FreeBSD, pkg and distfiles on Linux), nothing configured on the server, a fact the host did not state, or a choice only the operator can make, such as two pkg repositories serving the same ABI. `binary` is always a skip: a binary is downloaded by URL, not configured. `osquery` is a skip when no enabled `osquery` source runs in `server` mode, when more than one does (osqueryd takes its config from one server), and when the host reaches bodega over `http://`, since osqueryd speaks only https to its server.
 
@@ -5512,7 +5516,51 @@ Set it whenever the upstream is not Ubuntu, and check the printed line against t
 
 #### `[trusted=yes]` is not needed, and is wrong here
 
-The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a source line naming a mirrored codename: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored codename with neither option, and say why beside the line.
+The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a source line naming a mirrored distribution codename: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. A vendor archive is the exception to the second half, because no stock keyring carries its key: its stanza names the vendor's own key, which bodega serves (see [Vendor archives](#vendor-archives)). The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored codename with neither option, and say why beside the line.
+
+#### Vendor archives
+
+A vendor archive (Grafana's, Docker's, PostgreSQL's PGDG, NodeSource's) mirrors like any other codename, and its `InRelease` reaches the client signed by the vendor. No stock keyring carries that key, and a host locked to bodega cannot fetch it from the vendor. Two keys on the `apt_upstreams` entry have bodega serve it:
+
+| Key                       | Value                                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `signing_key_url`         | where the vendor publishes its key, `https` only                                                        |
+| `signing_key_fingerprint` | the key's OpenPGP primary key fingerprint, 40 hex digits. Spaces are ignored, so gpg's output pastes in |
+
+Set both or neither: config load refuses one without the other, a URL that is not `https`, and a fingerprint that is not 40 hex digits, naming the codename. Two entries for one codename may not name two fingerprints, because one `InRelease` is signed by one key. A codename with neither key behaves as it did before.
+
+Grafana's archive, mirrored as `stable`:
+
+```json
+"apt_upstreams": {
+  "stable": [{"url": "https://apt.grafana.com",
+              "components": ["main"],
+              "signing_key_url": "https://apt.grafana.com/gpg.key",
+              "signing_key_fingerprint": "B53A E77B ADB6 30A6 8304  6005 963F A277 1045 8545"}]
+}
+```
+
+`GET /apt/keys/stable.asc` then serves that key. On the first request bodega fetches `signing_key_url` through the same upstream client, allow-list and SSRF guard every mirrored fetch uses, parses it, and serves it only when its primary key fingerprint equals `signing_key_fingerprint`. Only the matching key is served, armored, so a vendor file carrying a second key never reaches `Signed-By:`. A mismatch answers `502` and logs the URL, the configured fingerprint and every fingerprint the file carried. A verified key is held in memory for the life of the process, so later requests need no upstream; a restart fetches and checks it again. A codename with no key configured answers `404`.
+
+**The fingerprint is how you decide to trust the vendor, and bodega does not decide it for you.** The URL is authenticated by TLS alone, and anything that can rewrite what `apt.grafana.com` serves could hand bodega a different key. Take the fingerprint from the vendor's documentation, or from `gpg --show-keys --with-fingerprint` on a copy you fetched another way, and write it into the config yourself. bodega's check makes the key it serves the one you named; it says nothing about whether the vendor deserves that trust.
+
+A host configures the archive with `--archive`, repeatable, beside its own codename:
+
+```bash
+sudo bodega doctor --configure apt --suite noble --archive stable --apply --url https://bodega.internal
+```
+
+That is `archives=stable` on [`GET /client/plan`](#client-plan-and-per-system-files), and it adds two files to apt after the host's own stanza, each under a SHA-256 of what its URL serves: the key at `/etc/apt/keyrings/bodega-stable.asc`, and the stanza at `/etc/apt/sources.list.d/bodega-stable.sources`:
+
+```text
+Types: deb
+URIs: https://bodega.internal/apt/
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/bodega-stable.asc
+```
+
+The `Components:` line is the entry's `components`, or Ubuntu's four when it names none, which is wrong for most vendors: set it. The key is written before the stanza, so a failed run never leaves a stanza naming a key that is not there. A codename the server does not mirror, or mirrors with no key, is refused with `400` and the codenames that would work. A codename that is already on the host's own stanza is refused too, since two stanzas for one suite with different `Signed-By:` values stop every `apt update` with "Conflicting values set for option Signed-By". When the key cannot be served, the plan skips apt and names the status, rather than install a stanza apt cannot verify.
 
 #### Open mode only
 

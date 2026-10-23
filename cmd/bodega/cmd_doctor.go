@@ -46,7 +46,7 @@ import (
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
 	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS bool
 	var token, baseURL, pkgABI, aptSuite string
-	var configure, ntpServers []string
+	var configure, ntpServers, aptArchives []string
 	var pkgRelease int
 	c := &cobra.Command{
 		Use:   "doctor",
@@ -130,6 +130,15 @@ codename other than the profile's.
 
   bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
 
+--archive adds a vendor archive this server mirrors (Grafana's, Docker's,
+PGDG) to the apt system: the vendor's key at
+/etc/apt/keyrings/bodega-<codename>.asc and a stanza at
+/etc/apt/sources.list.d/bodega-<codename>.sources whose Signed-By: names it.
+The server serves the key only once it matches the fingerprint the operator
+configured. Repeat it for several.
+
+  bodega doctor --configure apt --suite noble --archive stable --url https://bodega.internal
+
 --abi is the pkg ABI the freebsd system is configured for, "pkg config abi"
 on a FreeBSD host by default. The tags the pkg override disables follow the
 major release the ABI carries; --release says otherwise for a host whose
@@ -189,7 +198,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if !configuring {
-				for _, f := range []string{"apply", "suite", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers"} {
+				for _, f := range []string{"apply", "suite", "archive", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers"} {
 					if cmd.Flags().Changed(f) {
 						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
 							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
@@ -200,10 +209,14 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return fmt.Errorf("--quiet-ubuntu-pro quiets apt's second path out, so it runs with apt.\n" +
 					"  Add it:  bodega doctor --configure apt --quiet-ubuntu-pro")
 			}
+			if len(aptArchives) > 0 && len(systems) > 0 && !slices.Contains(systems, manifest.TypeApt) {
+				return fmt.Errorf("--archive adds a vendor archive to the apt system, and apt is not among the systems named.\n" +
+					"  Add it:  bodega doctor --configure apt --archive <codename>")
+			}
 			if configuring {
 				return configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
-					suite: aptSuite, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
+					suite: aptSuite, archives: aptArchives, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
 					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
 				})
 			}
@@ -266,6 +279,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"An internal time source the chrony-nts row accepts beside the bodega server (comma-separated or repeated)")
 	c.Flags().StringVar(&aptSuite, "suite", "",
 		"The apt codename to configure, for an instance serving several and no profile to choose between them")
+	c.Flags().StringSliceVar(&aptArchives, "archive", nil,
+		"A vendor apt archive this server mirrors to configure with its key, by codename (repeatable)")
 	c.Flags().StringVar(&pkgABI, "abi", "",
 		"The pkg ABI to configure for; defaults to what `pkg config abi` reports on this host")
 	c.Flags().IntVar(&pkgRelease, "release", 0,
@@ -430,6 +445,7 @@ type planRequest struct {
 	token, baseURL string
 	systems        []string
 	suite, abi     string
+	archives       []string
 	release        int
 	apply          bool
 	allowPlaintext bool
@@ -478,6 +494,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	if req.release > 0 {
 		q.Set("release", strconv.Itoa(req.release))
+	}
+	if len(req.archives) > 0 {
+		q.Set("archives", strings.Join(req.archives, ","))
 	}
 	var plan clientconf.Plan
 	if err := getJSON(client, "/client/plan?"+q.Encode(), &plan); err != nil {
@@ -584,10 +603,12 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		fmt.Printf("recorded   %s (undo: bodega doctor %s)\n", q.ledger.path, q.ledger.restoreFlag)
 	}
+	aptHinted := false
 	for _, c := range changes {
 		switch {
 		case c.Unchanged():
-		case c.Record.System == manifest.TypeApt && c.Target == clientconf.AptSourcesPath:
+		case c.Record.System == manifest.TypeApt && strings.HasSuffix(c.Target, ".sources") && !aptHinted:
+			aptHinted = true
 			fmt.Println("\nApply it:  apt-get update")
 		case c.Record.System == manifest.TypeFreeBSD:
 			fmt.Println("\nApply it:  pkg update")

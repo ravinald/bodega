@@ -198,3 +198,75 @@ func TestNoAptUpstreamsIsUnchanged(t *testing.T) {
 		t.Errorf("ServedAptSuites() = %q, want the generated suites untouched", got)
 	}
 }
+
+const grafanaFingerprint = "B53AE77BADB630A683046005963FA27710458545"
+
+func grafanaUpstream(keyURL, fpr string) map[string]any {
+	up := map[string]any{"url": "https://apt.grafana.com", "components": []string{"main"}}
+	if keyURL != "" {
+		up["signing_key_url"] = keyURL
+	}
+	if fpr != "" {
+		up["signing_key_fingerprint"] = fpr
+	}
+	return map[string]any{"stable": []any{up}}
+}
+
+// E22 R1: a vendor key is a URL and a fingerprint together, and each refusal
+// names the codename and the key at fault.
+func TestAptUpstreamSigningKeyRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		upstreams map[string]any
+		wantIn    string
+	}{
+		{"url without fingerprint", grafanaUpstream("https://apt.grafana.com/gpg.key", ""), "signing_key_url and signing_key_fingerprint go together"},
+		{"fingerprint without url", grafanaUpstream("", grafanaFingerprint), "signing_key_url and signing_key_fingerprint go together"},
+		{"plain http url", grafanaUpstream("http://apt.grafana.com/gpg.key", grafanaFingerprint), `signing_key_url "http://apt.grafana.com/gpg.key" must use the https scheme`},
+		{"url with no host", grafanaUpstream("https:///gpg.key", grafanaFingerprint), "names no host"},
+		{"short fingerprint", grafanaUpstream("https://apt.grafana.com/gpg.key", "963FA27710458545"), `signing_key_fingerprint "963FA27710458545" is not an OpenPGP primary key fingerprint`},
+		{"non-hex fingerprint", grafanaUpstream("https://apt.grafana.com/gpg.key", "Z53AE77BADB630A683046005963FA27710458545"), "is not an OpenPGP primary key fingerprint"},
+		{
+			name: "two entries, two fingerprints",
+			upstreams: map[string]any{"stable": []any{
+				map[string]string{"url": "https://apt.grafana.com", "signing_key_url": "https://apt.grafana.com/gpg.key", "signing_key_fingerprint": grafanaFingerprint},
+				map[string]string{"url": "https://mirror.example.com/grafana", "signing_key_url": "https://mirror.example.com/gpg.key", "signing_key_fingerprint": strings.Repeat("A", 40)},
+			}},
+			wantIn: "differs from " + grafanaFingerprint,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": tc.upstreams})
+			_, err := loadApt(t)
+			if err == nil {
+				t.Fatal("Load accepted it")
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) || !strings.Contains(err.Error(), `apt_upstreams["stable"]`) {
+				t.Errorf("error = %q, want it to name the codename and contain %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// E22 R1: a fingerprint as gpg prints it, spaced and in either case, loads
+// normalized, and a codename with no key reports none.
+func TestAptUpstreamSigningKeyAccepted(t *testing.T) {
+	spaced := "b53a e77b adb6 30a6 8304  6005 963f a277 1045 8545"
+	up := grafanaUpstream("https://apt.grafana.com/gpg.key", spaced)
+	up["noble"] = []any{map[string]string{"url": "https://archive.ubuntu.com/ubuntu"}}
+	writeAptConfig(t, map[string]any{"apt_codename": "local", "apt_upstreams": up})
+	cfg, err := loadApt(t)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	key, ok := cfg.AptSigningKeyFor("stable")
+	if !ok || key.URL != "https://apt.grafana.com/gpg.key" || key.Fingerprint != grafanaFingerprint {
+		t.Errorf("AptSigningKeyFor(stable) = %+v, %v; want the URL and %s", key, ok, grafanaFingerprint)
+	}
+	if _, ok := cfg.AptSigningKeyFor("noble"); ok {
+		t.Error("noble names no key and reports one")
+	}
+	if got := cfg.AptKeyedCodenames(); strings.Join(got, ",") != "stable" {
+		t.Errorf("AptKeyedCodenames = %v, want [stable]", got)
+	}
+}
