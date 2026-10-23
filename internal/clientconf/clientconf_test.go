@@ -372,43 +372,84 @@ func TestPipTrustedHost(t *testing.T) {
 	}
 }
 
-// npm's file names node-gyp's disturl only when a binary namespace fronts
-// nodejs.org, whatever the namespace is called. Without one the file is the
-// registry line alone, because a disturl naming a namespace bodega does not
-// serve breaks every native build instead of leaking it.
-func TestNpmDisturlFollowsANodejsNamespace(t *testing.T) {
+// .npmrc is the registry line alone whatever binary_upstreams holds: npm
+// warns on a disturl line and its next major stops forwarding it. node-gyp's
+// mirror is NodeMirror's file, rendered only for an open nodejs.org
+// namespace, under whatever key it has. A catalog namespace leaves a note on
+// .npmrc instead, because it would 404 every header no manifest names.
+func TestNpmPointsNodeGypThroughNodeMirror(t *testing.T) {
 	registry := "registry=https://bodega.example.com/npm/\n"
 	cases := []struct {
 		name      string
 		upstreams map[string]config.BinaryUpstream
-		want      string
+		mirror    string
+		note      string
 	}{
-		{"no binary namespace", nil, registry},
-		{"nodejs namespace", map[string]config.BinaryUpstream{
-			"nodejs": {URL: "https://nodejs.org/"},
-		}, registry + "disturl=https://bodega.example.com/binaries/nodejs/dist\n"},
-		{"other key, no trailing slash", map[string]config.BinaryUpstream{
-			"rustup": {URL: "https://static.rust-lang.org/"},
-			"node":   {URL: "https://nodejs.org"},
-		}, registry + "disturl=https://bodega.example.com/binaries/node/dist\n"},
+		{"no binary namespace", nil, "", ""},
+		{"open nodejs namespace", map[string]config.BinaryUpstream{
+			"nodejs": {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen},
+		}, "https://bodega.example.com/binaries/nodejs/dist", ""},
+		{"other key", map[string]config.BinaryUpstream{
+			"rustup": {URL: "https://static.rust-lang.org/", Mode: config.UpstreamModeOpen},
+			"node":   {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen},
+		}, "https://bodega.example.com/binaries/node/dist", ""},
+		{"catalog nodejs namespace", map[string]config.BinaryUpstream{
+			"nodejs": {URL: "https://nodejs.org/", Mode: config.UpstreamModeCatalog},
+		}, "", `binary_upstreams["nodejs"] is in catalog mode`},
 		{"other host only", map[string]config.BinaryUpstream{
-			"nodejs": {URL: "https://nodejs.example.com/"},
-			"dist":   {URL: "https://nodejs.org/dist/"},
-		}, registry},
+			"nodejs": {URL: "https://nodejs.example.com/", Mode: config.UpstreamModeOpen},
+			"dist":   {URL: "https://nodejs.org/dist/", Mode: config.UpstreamModeOpen},
+		}, "", ""},
 		{"two nodejs namespaces pick the first sorted", map[string]config.BinaryUpstream{
-			"zeta":  {URL: "https://nodejs.org/"},
-			"alpha": {URL: "https://NodeJS.org/"},
-		}, registry + "disturl=https://bodega.example.com/binaries/alpha/dist\n"},
+			"zeta":  {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen},
+			"alpha": {URL: "https://NodeJS.org/", Mode: config.UpstreamModeOpen},
+		}, "https://bodega.example.com/binaries/alpha/dist", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := Npm(testBase+"/", tc.upstreams).Content; got != tc.want {
-				t.Errorf("Npm content = %q, want %q", got, tc.want)
+			npmrc := Npm(testBase+"/", tc.upstreams)
+			if npmrc.Content != registry {
+				t.Errorf("Npm content = %q, want %q", npmrc.Content, registry)
+			}
+			if got := strings.Join(npmrc.Notes, "\n"); (tc.note == "") != (got == "") || !strings.Contains(got, tc.note) {
+				t.Errorf("Npm notes = %q, want one holding %q", got, tc.note)
+			}
+			wantSystem, wantUser := "", ""
+			if tc.mirror != "" {
+				wantSystem = "export NODEJS_ORG_MIRROR='" + tc.mirror + "'\n"
+				wantUser = "NODEJS_ORG_MIRROR=" + tc.mirror + "\n"
+			}
+			sys := NodeMirror(testBase, tc.upstreams, true)
+			if sys.Content != wantSystem || sys.Path(OSLinux) != NodeMirrorSystemPath || sys.Path(OSFreeBSD) != NodeMirrorSystemPath {
+				t.Errorf("NodeMirror(system) = %+v, want %q at %s", sys, wantSystem, NodeMirrorSystemPath)
+			}
+			user := NodeMirror(testBase, tc.upstreams, false)
+			if user.Content != wantUser || user.Path(OSLinux) != NodeMirrorUserPath || user.Path(OSFreeBSD) != "" {
+				t.Errorf("NodeMirror(user) = %+v, want %q at %s on linux alone", user, wantUser, NodeMirrorUserPath)
 			}
 			got := ForType(manifest.TypeNpm, Inputs{Base: testBase, BinaryUpstreams: tc.upstreams})
-			if len(got) != 1 || got[0].Content != tc.want {
-				t.Errorf("ForType(npm) = %+v, want one file holding %q", got, tc.want)
+			want := 1
+			if tc.mirror != "" {
+				want = 2
+			}
+			if len(got) != want || got[0].Content != registry || (want == 2 && got[1].Content != wantSystem) {
+				t.Errorf("ForType(npm) = %+v, want .npmrc and %d mirror file(s)", got, want-1)
+			}
+			for _, f := range got {
+				if strings.Contains(f.Content, "disturl") {
+					t.Errorf("ForType(npm) still renders disturl: %q", f.Content)
+				}
 			}
 		})
+	}
+}
+
+// The profile script is sourced by every login shell, so a quote in the URL
+// stays inside the value rather than ending it.
+func TestNodeMirrorQuotesTheProfileValue(t *testing.T) {
+	up := map[string]config.BinaryUpstream{"nodejs": {URL: "https://nodejs.org/", Mode: config.UpstreamModeOpen}}
+	got := NodeMirror("https://h/it's", up, true).Content
+	if want := `export NODEJS_ORG_MIRROR='https://h/it'\''s/binaries/nodejs/dist'` + "\n"; got != want {
+		t.Errorf("NodeMirror content = %q, want %q", got, want)
 	}
 }

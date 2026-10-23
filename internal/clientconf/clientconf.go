@@ -112,22 +112,69 @@ func pipTrustedHost(base string) string {
 // --write-credentials` writes the path-scoped token into. The trailing slash
 // is what makes the registry match that token's //host/npm/ key.
 //
-// When binaryUpstreams holds a namespace on https://nodejs.org/, a disturl
-// line points node-gyp at it too. node-gyp fetches Node's headers and
-// SHASUMS256.txt for every native build from nodejs.org unless disturl names
-// another host, so without the line a host locked to bodega still reaches
-// nodejs.org the first time a package compiles an addon.
+// node-gyp's mirror is not set here. npm forwards an unknown .npmrc key such
+// as disturl to node-gyp only as npm_config_disturl, warns "Unknown user
+// config" on every command it runs, and says its next major version stops
+// forwarding it, at which point node-gyp falls back to nodejs.org with no
+// error. NodeMirror sets the variable node-gyp reads itself instead. When a
+// nodejs.org namespace exists but is not open, the file carries a note
+// saying why no NodeMirror file accompanies it.
 func Npm(base string, binaryUpstreams map[string]config.BinaryUpstream) File {
-	content := fmt.Sprintf("registry=%s/npm/\n", trim(base))
-	if ns := NodeDistNamespace(binaryUpstreams); ns != "" {
-		content += fmt.Sprintf("disturl=%s/binaries/%s/dist\n", trim(base), ns)
-	}
-	return File{
+	f := File{
 		System:  manifest.TypeNpm,
 		Label:   ".npmrc",
 		Paths:   everywhere("~/.npmrc"),
-		Content: content,
+		Content: fmt.Sprintf("registry=%s/npm/\n", trim(base)),
 	}
+	if ns := NodeDistNamespace(binaryUpstreams); ns != "" && binaryUpstreams[ns].Mode != config.UpstreamModeOpen {
+		f.Notes = append(f.Notes, fmt.Sprintf(
+			"node-gyp is left pointing at nodejs.org: binary_upstreams[%q] is in catalog mode, so it would answer 404 for every Node header tarball no manifest entry names and fail native builds. Set \"mode\": \"open\" on it to route node-gyp through bodega", ns))
+	}
+	return f
+}
+
+// Where NodeMirror's file goes. The profile.d script is read by every login
+// shell on the host; environment.d is read by the user's systemd manager and
+// the sessions it starts. Neither reaches a system service.
+const (
+	NodeMirrorSystemPath = "/etc/profile.d/bodega-node.sh"
+	NodeMirrorUserPath   = "~/.config/environment.d/60-bodega-node.conf"
+)
+
+// NodeMirror renders the file that sets NODEJS_ORG_MIRROR, which node-gyp
+// reads in place of https://nodejs.org/dist when it fetches Node's headers
+// and SHASUMS256.txt for a native build. Without it a host locked to bodega
+// still reaches nodejs.org the first time a package compiles an addon.
+//
+// system selects the profile.d script, for a run as root, over the user's
+// environment.d file. The user form has no FreeBSD path, since nothing there
+// reads environment.d. Content is empty unless a nodejs.org namespace exists
+// in open mode: under catalog it answers only paths a manifest names, and
+// node-gyp asks for the headers of whatever Node version runs the build.
+func NodeMirror(base string, binaryUpstreams map[string]config.BinaryUpstream, system bool) File {
+	f := File{System: manifest.TypeNpm, Label: "node-gyp mirror"}
+	if system {
+		f.Paths = map[string]string{OSLinux: NodeMirrorSystemPath, OSFreeBSD: NodeMirrorSystemPath}
+	} else {
+		f.Paths = map[string]string{OSLinux: NodeMirrorUserPath}
+	}
+	ns := NodeDistNamespace(binaryUpstreams)
+	if ns == "" || binaryUpstreams[ns].Mode != config.UpstreamModeOpen {
+		return f
+	}
+	mirror := fmt.Sprintf("%s/binaries/%s/dist", trim(base), ns)
+	if system {
+		f.Content = "export NODEJS_ORG_MIRROR=" + shellQuote(mirror) + "\n"
+	} else {
+		f.Content = "NODEJS_ORG_MIRROR=" + mirror + "\n"
+	}
+	return f
+}
+
+// shellQuote single-quotes s for sh, so a profile script sourced by every
+// login shell runs no part of a URL as code.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // NodeDistNamespace is the binary_upstreams namespace whose upstream is
@@ -522,7 +569,7 @@ func Osquery(base string, src OsqueryPlan) []File {
 type Inputs struct {
 	Base         string
 	GitUpstreams map[string]config.GitUpstream
-	// BinaryUpstreams decides whether npm's file carries a disturl line.
+	// BinaryUpstreams decides whether npm gets a NodeMirror file.
 	BinaryUpstreams map[string]config.BinaryUpstream
 	GitBundles      []GitBundle
 	Apt             []aptsources.Sources
@@ -543,7 +590,9 @@ func ForType(entryType string, in Inputs) []File {
 	case manifest.TypePypi:
 		out = append(out, Pip(in.Base))
 	case manifest.TypeNpm:
-		out = append(out, Npm(in.Base, in.BinaryUpstreams))
+		mirror := NodeMirror(in.Base, in.BinaryUpstreams, true)
+		mirror.Notes = append(mirror.Notes, "For one user rather than the host: "+NodeMirrorUserPath+", holding the line without export")
+		out = append(out, Npm(in.Base, in.BinaryUpstreams), mirror)
 	case manifest.TypeCargo:
 		out = append(out, Cargo(in.Base))
 	case manifest.TypeGomod:
