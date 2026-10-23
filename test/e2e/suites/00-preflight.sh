@@ -84,6 +84,9 @@ for h in server client; do
 	check_matches "PRE-13-$h" "$h reports an architecture the build targets" \
 		'^(amd64|arm64)$' "${arch:-unknown}" "test/e2e/README.md" "uname -m"
 	[ -n "$arch" ] && printf -v "$var" '%s' "$arch" && export "${var?}"
+	var="E2E_GOOS_$(printf '%s' "$h" | tr '[:lower:]' '[:upper:]')"
+	os="$(e2e_goos "$h")" || os=""
+	[ -n "$os" ] && printf -v "$var" '%s' "$os" && export "${var?}"
 done
 E2E_APT_ARCH="${E2E_GOARCH_SERVER:-arm64}"
 export E2E_APT_ARCH
@@ -117,12 +120,22 @@ done
 
 for h in server client; do
 	E2E_HOST="$h"
-	e2e_on "$h" "df -BG --output=avail / | tail -1 | tr -dc '0-9'" || true
+	# FreeBSD's df has neither -B nor --output. GNU's -BG rounds up and the KiB
+	# count divided here rounds down, so a FreeBSD guest at 4.9G fails where a
+	# Linux one passes: the stricter reading is the one that cannot run a spool
+	# out of disk.
+	if [ "$(e2e_goos "$h" 2>/dev/null)" = freebsd ]; then
+		df_cmd="df -kP /"
+		e2e_on "$h" "df -kP / | awk 'NR==2 {print int(\$4 / 1048576)}'" || true
+	else
+		df_cmd="df -BG /"
+		e2e_on "$h" "df -BG --output=avail / | tail -1 | tr -dc '0-9'" || true
+	fi
 	avail="${E2E_OUT:-0}"
 	if [ "${avail:-0}" -ge 5 ]; then
-		e2e_record "PRE-09-$h" PASS "$h has at least 5G free on /" ">=5G" "${avail}G" "df -BG /" 0 ""
+		e2e_record "PRE-09-$h" PASS "$h has at least 5G free on /" ">=5G" "${avail}G" "$df_cmd" 0 ""
 	else
-		e2e_record "PRE-09-$h" FAIL "$h has at least 5G free on /" ">=5G" "${avail}G" "df -BG /" 0 ""
+		e2e_record "PRE-09-$h" FAIL "$h has at least 5G free on /" ">=5G" "${avail}G" "$df_cmd" 0 ""
 	fi
 done
 
@@ -173,4 +186,4 @@ for up in proxy.golang.org registry.npmjs.org index.crates.io pypi.org; do
 	esac
 done
 
-unset h local_now skew avail up pair alias name addr var arch
+unset h local_now skew avail up pair alias name addr var arch os df_cmd

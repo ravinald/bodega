@@ -91,6 +91,10 @@ the suite creates with `pw useradd` and removes at the end. It removes a
 leftover account of that name only when the comment field marks it as the
 suite's; one that is not stays in place and fails the run.
 
+A hosts file may also name FreeBSD guests as `server` and `client`, which is the only way bodega's own server runs its extattr and POSIX.1e ACL storage paths under the whole suite rather than under suite 48 alone. Preflight reads each guest's `uname -s` once, and suites 00 and 10 follow it: `PRE-09` reads `df -kP` instead of GNU `df`, and suite 10 builds and installs `dist/bodega-freebsd-<arch>` with the same check ids it records on Linux. `E2E_GOOS_SERVER` and `E2E_GOOS_CLIENT` skip the read, and a dry run takes `linux` unless they say otherwise. Suites past 10 still assume Linux on both.
+
+A FreeBSD server needs, before the first run, what the install notes at the top of [`docs/bodega.rc`](../../docs/bodega.rc) list: the script at `/usr/local/etc/rc.d/bodega`, the `bodega` account from `pw useradd`, `/etc/bodega`, `/var/lib/bodega` and `/var/log/bodega` with their ownership, a `/etc/bodega/config.json`, and `sysrc bodega_enable=YES`. It also needs `jq`, `curl` and `sudo` from `pkg`. Suite 10 reads the service account from `sysrc -n bodega_user` and the startup banner from the file `sysrc -n bodega_logfile` names, restarts with `service bodega restart`, and waits for `service bodega status` and a loopback `/healthz`, because the rc script returns before the listener binds.
+
 ## Running it
 
 ```bash

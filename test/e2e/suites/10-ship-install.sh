@@ -47,9 +47,13 @@ if ! srv_arch="$(e2e_goarch server)" || ! cli_arch="$(e2e_goarch client)"; then
 	e2e_block SHIP-BLOCK-ARCH "install on both guests" "a guest reported an architecture no build target maps to"
 	return 0
 fi
-ship_targets="linux/$srv_arch"
-[ "$cli_arch" = "$srv_arch" ] || ship_targets="$ship_targets linux/$cli_arch"
-BIN="$REPO_ROOT/dist/bodega-linux-$srv_arch"
+if ! srv_os="$(e2e_goos server)" || ! cli_os="$(e2e_goos client)"; then
+	e2e_block SHIP-BLOCK-OS "install on both guests" "a guest reported an operating system no build target maps to"
+	return 0
+fi
+ship_targets="$srv_os/$srv_arch"
+[ "$cli_os/$cli_arch" = "$ship_targets" ] || ship_targets="$ship_targets $cli_os/$cli_arch"
+BIN="$REPO_ROOT/dist/bodega-$srv_os-$srv_arch"
 
 if [ "${E2E_SHIP:-yes}" = yes ]; then
 	e2e_local make -C "$REPO_ROOT" cross "CROSS_TARGETS=$ship_targets" || true
@@ -62,9 +66,9 @@ fi
 if [ -f "$BIN" ] || [ "${E2E_DRY_RUN:-no}" = yes ]; then
 	e2e_local file "$BIN" || true
 	check_contains SHIP-02 "the server's binary is $srv_arch" "$(e2e_file_arch "$srv_arch")" "$E2E_OUT" \
-		"test/e2e/README.md" "file dist/bodega-linux-$srv_arch"
+		"test/e2e/README.md" "file dist/bodega-$srv_os-$srv_arch"
 else
-	e2e_record SHIP-02 FAIL "the server's binary is $srv_arch" "dist/bodega-linux-$srv_arch exists" "missing" "file $BIN" 1 ""
+	e2e_record SHIP-02 FAIL "the server's binary is $srv_arch" "dist/bodega-$srv_os-$srv_arch exists" "missing" "file $BIN" 1 ""
 	e2e_block SHIP-BLOCK-BIN "install on both guests" "no binary to ship"
 	return 0
 fi
@@ -75,9 +79,11 @@ for h in server client; do
 	E2E_HOST="$h"
 	n="$([ "$h" = server ] && echo 3 || echo 4)"
 	if [ "${E2E_SHIP:-yes}" = yes ]; then
-		h_bin="$REPO_ROOT/dist/bodega-linux-$([ "$h" = server ] && echo "$srv_arch" || echo "$cli_arch")"
+		h_bin="$REPO_ROOT/dist/bodega-$([ "$h" = server ] && echo "$srv_os-$srv_arch" || echo "$cli_os-$cli_arch")"
+		# FreeBSD has no root group; root's primary group there is wheel.
+		root_group="$([ "$(e2e_goos "$h")" = freebsd ] && echo wheel || echo root)"
 		if e2e_put "$h" "$h_bin" /tmp/bodega-under-test &&
-			e2e_on "$h" "sudo install -o root -g root -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega"; then
+			e2e_on "$h" "sudo install -o root -g $root_group -m 0755 /tmp/bodega-under-test /usr/local/bin/bodega"; then
 			e2e_record "SHIP-0$n" PASS "$h takes the new binary" "installed" "installed" "install /usr/local/bin/bodega" 0 ""
 		else
 			e2e_record "SHIP-0$n" FAIL "$h takes the new binary" "installed" "$E2E_ERR" "install /usr/local/bin/bodega" "$E2E_RC" ""
@@ -122,7 +128,9 @@ check_eq SHIP-07 "the installed binary registers every top-level command" \
 
 for h in server client; do
 	E2E_HOST="$h"
-	e2e_on "$h" "sudo sed -i '/# bodega-e2e\$/d' /etc/hosts && \
+	sed_inplace="sed -i"
+	[ "$(e2e_goos "$h")" = freebsd ] && sed_inplace="sed -i ''"
+	e2e_on "$h" "sudo $sed_inplace '/# bodega-e2e\$/d' /etc/hosts && \
 		printf '%s %s # bodega-e2e\n%s %s # bodega-e2e\n' \
 		'$E2E_SERVER_ADDR' '$E2E_SERVER_HOST' \
 		'$E2E_CLIENT_ADDR' '$E2E_CLIENT_HOST' | sudo tee -a /etc/hosts >/dev/null" || true
@@ -145,8 +153,22 @@ check_eq SHIP-08 "the client resolves the server by name" \
 
 # ---- listener --------------------------------------------------------------
 
+# A FreeBSD server runs under docs/bodega.rc, which reads its account and log
+# file from rc.conf. Its start returns once daemon(8) has forked, before the
+# listener binds, so status alone says the supervisor is up and not that the
+# server answers; the wait there polls loopback too.
 E2E_HOST=server
-e2e_on server "systemctl show bodega -p User --value" || true
+if [ "$srv_os" = freebsd ]; then
+	e2e_on server "sysrc -n bodega_user" || true
+	svc_restart="service bodega restart"
+	svc_ready="sudo service bodega status >/dev/null && curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8080/healthz"
+	svc_unit="docs/bodega.rc"
+else
+	e2e_on server "systemctl show bodega -p User --value" || true
+	svc_restart="systemctl restart bodega"
+	svc_ready="systemctl is-active --quiet bodega"
+	svc_unit="docs/bodega.service"
+fi
 [ -n "$E2E_OUT" ] && E2E_SERVICE_USER="$E2E_OUT"
 
 e2e_on server "sudo cp -p /etc/bodega/config.json /etc/bodega/config.json.e2e-orig" || true
@@ -164,12 +186,23 @@ e2e_on server "sudo jq '.listen_addr = \"0.0.0.0:8080\"
 check_eq SHIP-09 "the server config takes a reachable listen address" 0 "$E2E_RC" \
 	"internal/config/config.go" "jq .listen_addr=0.0.0.0:8080" "$E2E_RC"
 
-e2e_on server "sudo systemctl restart bodega" || true
-if e2e_wait_for server 30 "systemctl is-active --quiet bodega"; then
-	e2e_record SHIP-10 PASS "the service comes back active" active active "systemctl restart bodega" 0 "docs/bodega.service"
+if [ "$srv_os" = freebsd ]; then
+	e2e_on server "sysrc -n bodega_logfile" || true
+	svc_log="${E2E_OUT:-/var/log/bodega.log}"
+	svc_tail="sudo tail -n 300 $svc_log"
+	svc_last="sudo tail -n 20 $svc_log"
 else
-	e2e_on server "sudo journalctl -u bodega -n 20 --no-pager" || true
-	e2e_record SHIP-10 FAIL "the service comes back active" active "not active in 30s" "systemctl restart bodega" 1 "docs/bodega.service"
+	svc_log="journalctl -u bodega"
+	svc_tail="sudo journalctl -u bodega --no-pager -n 300"
+	svc_last="sudo journalctl -u bodega -n 20 --no-pager"
+fi
+
+e2e_on server "sudo $svc_restart" || true
+if e2e_wait_for server 30 "$svc_ready"; then
+	e2e_record SHIP-10 PASS "the service comes back active" active active "$svc_restart" 0 "$svc_unit"
+else
+	e2e_on server "$svc_last" || true
+	e2e_record SHIP-10 FAIL "the service comes back active" active "not active in 30s" "$svc_restart" 1 "$svc_unit"
 fi
 
 E2E_BASE_URL="http://$E2E_SERVER_HOST:8080"
@@ -198,9 +231,10 @@ e2e_on server "sudo jq -r '.apt_upstreams // {} | keys | length' /etc/bodega/con
 mirrored_n="${E2E_OUT:-0}"
 e2e_on server "sudo jq -r '.apt_upstreams // {} | keys | join(\" \")' /etc/bodega/config.json" || true
 mirrored_suites="$E2E_OUT"
-# The last banner in the window, not the first: the journal holds every restart
-# this guest has ever done, and an assertion over all of them measures history.
-e2e_on server "sudo journalctl -u bodega --no-pager -n 300 | awk '/bodega.sources/{buf=\"\"} {buf=buf \$0 \"\\n\"} END{printf \"%s\", buf}'" || true
+# The last banner in the window, not the first: the journal or log holds every
+# restart this guest has ever done, and an assertion over all of them measures
+# history.
+e2e_on server "$svc_tail | awk '/bodega.sources/{buf=\"\"} {buf=buf \$0 \"\\n\"} END{printf \"%s\", buf}'" || true
 banner="$E2E_OUT"
 
 if [ "${mirrored_n:-0}" -lt 2 ]; then
@@ -212,11 +246,11 @@ else
 	check_contains SHIP-APT-01 "the banner collapses the mirrored codenames onto one stanza" \
 		"Suites: $mirrored_suites" "$banner" \
 		"internal/server/apt.go:1692; every mirrored codename on one Suites: line, as the generated half already prints; four printed as four stanzas is four sources entries where apt wants one" \
-		"journalctl -u bodega | the last startup banner"
+		"$svc_log | the last startup banner"
 	check_contains SHIP-APT-02 "the mirrored stanza names the components its codename serves" \
 		"Components: main restricted universe multiverse" "$banner" \
 		"internal/aptsources/aptsources.go:189; the same line docs/usage.md prints under Mirroring an upstream archive, against Components: main which drops universe and multiverse" \
-		"journalctl -u bodega | the last startup banner"
+		"$svc_log | the last startup banner"
 fi
 unset mirrored_n mirrored_suites banner
 
@@ -227,12 +261,16 @@ unset mirrored_n mirrored_suites banner
 # an ownership pass after any such command; this suite just ran several.
 
 E2E_HOST=server
+stat_user="stat -c '%U'" stat_group="stat -c '%G'" root_owner="root:root" stat_cmd="stat -c %U:%G"
+if [ "$srv_os" = freebsd ]; then
+	stat_user="stat -f '%Su'" stat_group="stat -f '%Sg'" root_owner="root:wheel" stat_cmd="stat -f %Su:%Sg"
+fi
 e2e_on server "sudo chown -R $E2E_SERVICE_USER /var/log/bodega /var/lib/bodega 2>/dev/null; \
-	stat -c '%U' /etc/bodega/config.json" || true
-check_ne SHIP-12 "the config is not left owned by root alone" "root:root" "$E2E_OUT:$(
-	e2e_on server "stat -c '%G' /etc/bodega/config.json" >/dev/null 2>&1
+	$stat_user /etc/bodega/config.json" || true
+check_ne SHIP-12 "the config is not left owned by root alone" "$root_owner" "$E2E_OUT:$(
+	e2e_on server "$stat_group /etc/bodega/config.json" >/dev/null 2>&1
 	printf '%s' "$E2E_OUT"
-)" "docs/bodega.service" "stat -c %U:%G /etc/bodega/config.json"
+)" "$svc_unit" "$stat_cmd /etc/bodega/config.json"
 
 # ---- the type list ---------------------------------------------------------
 #
@@ -248,4 +286,5 @@ for t in apt git pypi binary gomod helm npm cargo freebsd; do
 		"internal/manifest/types.go:43" "curl $E2E_BASE_URL/api/v1/packages"
 done
 
-unset h n want missing help_out api_types t BIN h_bin srv_arch cli_arch ship_targets
+unset h n want missing help_out api_types t BIN h_bin srv_arch cli_arch srv_os cli_os ship_targets \
+	root_group sed_inplace svc_restart svc_ready svc_unit svc_log svc_tail svc_last stat_user stat_group root_owner stat_cmd
