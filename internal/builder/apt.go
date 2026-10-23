@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -154,6 +155,36 @@ func aptPinOnOffer(name, sourceName, want string) error {
 	}
 	return fmt.Errorf("apt/%s: the manifest pins %s and the local cache offers %s for %s — run 'apt-get update' or re-pin the entry",
 		name, want, have, sourceName)
+}
+
+// debianVersion is the Debian policy version syntax: an optional numeric
+// epoch, then an upstream part opening with a digit. A colon past the epoch is
+// legal only when an epoch is present.
+var debianVersion = regexp.MustCompile(`^(?:[0-9]+:[0-9][A-Za-z0-9.+~:-]*|[0-9][A-Za-z0-9.+~-]*)$`)
+
+// aptGetSource runs `apt-get source --download-only` pinned to version, so an
+// entry builds the source it names rather than whatever the archive's candidate
+// is today. An empty version fetches the candidate, which is what such an entry
+// asks for. The version reaches apt as part of one argv element and never a
+// shell, but apt parses that element itself (<pkg>=<ver>, <pkg>/<release>), so
+// anything outside Debian version syntax is refused before the call.
+func aptGetSource(out io.Writer, dir, name, sourceName, version string) error {
+	target := sourceName
+	if version != "" {
+		if !debianVersion.MatchString(version) {
+			return fmt.Errorf("apt/%s: version %q is not a Debian version (an optional N: epoch, then an upstream part opening with a digit, using only letters, digits and . + ~ - :) — fix the entry's version before fetching", name, version)
+		}
+		target = sourceName + "=" + version
+	}
+	_, _ = fmt.Fprintf(out, "    Fetching source for %s via apt-get source...\n", target)
+	if err := runCmd(out, dir, "apt-get", "source", "--download-only", target); err != nil {
+		if version == "" {
+			return fmt.Errorf("apt-get source %s: %w", sourceName, err)
+		}
+		return fmt.Errorf("apt/%s: apt-get source could not supply %s version %s: %w — run 'apt-cache showsrc %s' to see whether the archive still carries it, then run 'apt-get update' or re-pin the entry",
+			name, sourceName, version, err, sourceName)
+	}
+	return nil
 }
 
 // aptDebVersion reads the version out of a .deb filename, which dpkg builds as
@@ -606,9 +637,8 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					fetchErr = discardAptSourceBuild(d, name, ve, sourceDir)
 				}
 				if fetchErr == nil {
-					_, _ = fmt.Fprintf(out, "    Fetching source for %s via apt-get source...\n", sourceName)
-					if err := runCmd(out, parentDir, "apt-get", "source", "--download-only", sourceName); err != nil {
-						fetchErr = fmt.Errorf("apt-get source %s: %w", sourceName, err)
+					if err := aptGetSource(out, parentDir, name, sourceName, ve.Version); err != nil {
+						fetchErr = err
 					} else {
 						// runCmd runs no shell, so the .dsc has to be named
 						// exactly: a glob would reach dpkg-source as a literal.
@@ -1278,8 +1308,8 @@ func locateAptSourceDsc(dir, name string, ve manifest.VersionEntry) (string, err
 		if len(present) > 0 {
 			found = joinBases(present)
 		}
-		return "", fmt.Errorf("apt/%s: apt-get source left no .dsc for %s in %s (found %s) — apt-get source fetches the archive's candidate, so run 'apt-get update' or re-pin the entry to a version the archive offers",
-			name, want, dir, found)
+		return "", fmt.Errorf("apt/%s: apt-get source left no .dsc for %s in %s (found %s) — run 'apt-cache showsrc %s' to see what the archive offers, then run 'apt-get update' or re-pin the entry to a version it carries",
+			name, want, dir, found, sourceName)
 	case 1:
 		return own[0], nil
 	}

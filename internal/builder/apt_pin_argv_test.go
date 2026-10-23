@@ -157,3 +157,88 @@ func TestAptPolicyVersionsReadsTheVersionTable(t *testing.T) {
 		t.Errorf("aptPolicyVersions on an installed package = %v, want [2.10-2]", got)
 	}
 }
+
+// aptSourceStub puts an apt-get on PATH that writes each argv element to its
+// own line of a log, then either exits 100 as apt does on a version it cannot
+// supply or leaves dsc in its working directory, plus a dpkg-source that
+// unpacks to an empty tree. Returns the argv log path.
+func aptSourceStub(t *testing.T, dsc string, fail bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	argvLog := filepath.Join(dir, "argv.log")
+	result := "touch " + dsc + "\n"
+	if fail {
+		result = "echo \"E: Can not find version '2.10-2' of package 'hello'\" >&2\nexit 100\n"
+	}
+	for name, body := range map[string]string{
+		"apt-get":     "printf '%s\\n' \"$@\" >> " + argvLog + "\n" + result,
+		"dpkg-source": "mkdir -p \"$3\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o700); err != nil { //nolint:gosec // test-owned shim
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argvLog
+}
+
+func aptSourcePinned(version string) *manifest.PackageManifest {
+	return &manifest.PackageManifest{
+		Type:     manifest.TypeApt,
+		Name:     "hello",
+		Versions: []manifest.VersionEntry{{Version: version, BuildCmd: "true"}},
+	}
+}
+
+// `apt-get source hello` takes the archive's candidate, so an entry pinning a
+// version the archive has moved past could never build.
+func TestAptSourceFetchPassesThePinToAptGetSource(t *testing.T) {
+	argvLog := aptSourceStub(t, "hello_2.10-2.dsc", false)
+	cfg, store, _ := pinEnv(t, aptSourcePinned("2.10-2"))
+
+	if s := FetchApt(cfg, store, "hello"); s.Failures != 0 {
+		t.Fatalf("fetch reported %d failures: %+v", s.Failures, s.Results)
+	}
+	if got, want := readArgv(t, argvLog), "source\n--download-only\nhello=2.10-2\n"; got != want {
+		t.Errorf("apt-get argv = %q, want %q", got, want)
+	}
+}
+
+func TestAptSourceFetchNamesThePinAptCannotSupply(t *testing.T) {
+	aptSourceStub(t, "", true)
+	cfg, store, _ := pinEnv(t, aptSourcePinned("2.10-2"))
+
+	s := FetchApt(cfg, store, "hello")
+	if s.Failures != 1 || s.Results[0].Err == nil {
+		t.Fatalf("a version apt cannot supply did not fail the fetch: %+v", s.Results)
+	}
+	err := s.Results[0].Err.Error()
+	for _, want := range []string{"apt/hello", "hello version 2.10-2", "apt-cache showsrc hello"} {
+		if !strings.Contains(err, want) {
+			t.Errorf("the refusal does not name %q: %s", want, err)
+		}
+	}
+}
+
+func TestAptSourceFetchRefusesANonDebianVersion(t *testing.T) {
+	for _, v := range []string{"1.0 extra", "v1.0", "1.0/noble", "1.0=2", "-1", "1:"} {
+		argvLog := aptSourceStub(t, "hello_1.0.dsc", false)
+		cfg, store, _ := pinEnv(t, aptSourcePinned(v))
+
+		s := FetchApt(cfg, store, "hello")
+		if s.Failures != 1 || s.Results[0].Err == nil || !strings.Contains(s.Results[0].Err.Error(), "not a Debian version") {
+			t.Errorf("version %q: want a refusal naming the syntax, got %+v", v, s.Results)
+		}
+		if got := readArgv(t, argvLog); got != "" {
+			t.Errorf("version %q reached apt-get as %q", v, got)
+		}
+	}
+}
+
+func TestDebianVersionAcceptsPolicyVersions(t *testing.T) {
+	for _, v := range []string{"2.10-2", "1:2.3.4-1ubuntu0.1", "2:1.0~rc1+dfsg-3", "0.9", "1:1.2:3-4"} {
+		if !debianVersion.MatchString(v) {
+			t.Errorf("debianVersion refused %q", v)
+		}
+	}
+}
