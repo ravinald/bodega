@@ -204,7 +204,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"spool_max_total_bytes":    int64(4 << 20),
 		// Load parses this one, so the string filler's "value-<key>" is
 		// refused before the round trip can measure anything.
-		"osv_db_max_age": "72h",
+		"osv_db_max_age":           "72h",
+		"upstream_connect_timeout": "2s",
+		"stale_grace":              "1s",
 		// Load parses or enumerates these three.
 		"revet_interval": "24h",
 		"revet_rate":     2.5,
@@ -442,6 +444,41 @@ func TestLoad_RevetKeys(t *testing.T) {
 	var unset *config.Config
 	if unset.ResolveRevetInterval() != 0 || unset.ResolveRevetPause() != time.Second || unset.ResolveRevetOnBlock() != config.RevetReport {
 		t.Error("unset re-vet keys do not resolve to off, 1/s and report")
+	}
+}
+
+// The server parses both keys with no error path, so a typo would become no
+// connect bound or no grace at all.
+func TestLoad_UpstreamWaitKeys(t *testing.T) {
+	for _, tc := range []struct{ body, connect, grace, want string }{
+		{`{}`, "5s", "3s", ""},
+		{`{"upstream_connect_timeout": "2s", "stale_grace": "500ms"}`, "2s", "500ms", ""},
+		{`{"upstream_connect_timeout": "5"}`, "", "", `invalid upstream_connect_timeout "5"`},
+		{`{"upstream_connect_timeout": "0s"}`, "", "", `invalid upstream_connect_timeout "0s"`},
+		{`{"stale_grace": "-1s"}`, "", "", `invalid stale_grace "-1s"`},
+		{`{"stale_grace": "soon"}`, "", "", `invalid stale_grace "soon"`},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			isolateConfig(t)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+			cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if cfg.UpstreamConnectTimeout != tc.connect || cfg.StaleGrace != tc.grace {
+					t.Errorf("resolved %q / %q, want %q / %q", cfg.UpstreamConnectTimeout, cfg.StaleGrace, tc.connect, tc.grace)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Load error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

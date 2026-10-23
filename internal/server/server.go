@@ -102,6 +102,10 @@ type Server struct {
 	// until its origin row does, so a hit arriving inside that window can
 	// still name the fetch it is reading. See internal/server/proxy.go.
 	fills cacheFills
+	// staleRefreshes holds the cache keys whose stale copy is being refreshed
+	// from upstream, so a second request for one serves the copy rather than
+	// starting a second fetch. See claimStaleRefresh.
+	staleRefreshes sync.Map
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
@@ -260,9 +264,19 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	if ttl == 0 {
 		ttl = time.Hour
 	}
+	// Load has refused a value that does not parse, so a zero here is a
+	// Config built in code and takes the default.
+	grace, _ := time.ParseDuration(cfg.StaleGrace)
+	if grace <= 0 {
+		grace, _ = time.ParseDuration(config.DefaultStaleGrace)
+	}
 	s.cache = CacheConfig{
 		Enabled:     cfg.ProxyCacheEnabled,
 		MetadataTTL: ttl,
+		StaleGrace:  grace,
+	}
+	if d, _ := time.ParseDuration(cfg.UpstreamConnectTimeout); d > 0 {
+		upstreamConnectTimeout.Store(int64(d))
 	}
 	// Proxy spool. Resolved and probed here, refused in Start: the spool is
 	// disk the server spends on behalf of every proxy client, and the default

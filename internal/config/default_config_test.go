@@ -26,6 +26,9 @@ func TestDefaultConfigContent(t *testing.T) {
 		"build_root":      DefaultBuildRoot,
 		"log_dir":         DefaultLogDir,
 		"metadata_ttl":    "1h",
+		// Written out so an operator sees both upstream waits exist.
+		"upstream_connect_timeout": DefaultUpstreamConnectTimeout,
+		"stale_grace":              DefaultStaleGrace,
 		// Written out rather than left to the default: an operator sizing a
 		// spool volume needs the number in front of them, and 0 in the file
 		// means "no ceiling" rather than "use the default".
