@@ -23,13 +23,17 @@ E2E_JQ_ISSUE_REF='def e2e_issue_ref: if type == "number" then "#\(.)" else . end
 
 e2e_report() {
 	local findings="$1" out="$2" run_id="$3"
-	local not_shipped
+	local not_shipped commit
 	not_shipped="$(dirname "$out")/not-shipped"
+	# jq -n still evaluates the filter when it cannot open the file, printing
+	# "unknown" before it exits non-zero, so a fallback appended with || would
+	# print it twice.
+	commit="$(jq -rn 'first(inputs.commit) // "unknown"' "$findings" 2>/dev/null)" || commit=unknown
 
 	{
 		printf '# bodega e2e run %s\n\n' "$run_id"
 		printf '| field | value |\n|---|---|\n'
-		printf '| commit | `%s` |\n' "$(jq -r 'first(.commit) // "unknown"' "$findings" 2>/dev/null || echo unknown)"
+		printf '| commit | `%s` |\n' "$commit"
 		printf '| started | %s |\n' "$(jq -rs 'if length>0 then .[0].ts else "-" end' "$findings")"
 		printf '| finished | %s |\n' "$(jq -rs 'if length>0 then .[-1].ts else "-" end' "$findings")"
 		printf '| checks | %s |\n\n' "$(jq -rs 'length' "$findings")"
