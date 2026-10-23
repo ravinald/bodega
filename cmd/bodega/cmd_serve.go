@@ -85,6 +85,12 @@ refuses to start if it is missing or is not a Sigstore trusted root.
 Use --quiet to suppress the startup banner for scripted use; log-level
 output continues to respect log_level in the config.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// First, so a reload sent while the store loads or the first apt
+			// index builds is held for Start rather than killing the process.
+			reloads := make(chan os.Signal, 1)
+			signal.Notify(reloads, syscall.SIGHUP)
+			defer signal.Stop(reloads)
+
 			cfg, err := loadConfig(gf)
 			if err != nil {
 				return err
@@ -156,6 +162,7 @@ output continues to respect log_level in the config.`,
 
 			srv := server.New(cfg, store, stores, resolvedAddr, logger)
 			srv.SetQuiet(quiet)
+			srv.SetReloadSignals(reloads)
 
 			// Graceful shutdown on SIGTERM/SIGINT.
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
