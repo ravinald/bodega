@@ -137,11 +137,13 @@ type Config struct {
 	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
 	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
-	DiscoverMode           string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
+	MavenUpstream          string   `json:"maven_upstream,omitempty"` // repository root in the Maven layout; /maven/<path> is appended to it
+	DiscoverMode           string   `json:"discover_mode,omitempty"`  // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string   `json:"gomod_root,omitempty"`
 	HelmRoot               string   `json:"helm_root,omitempty"`
 	NpmRoot                string   `json:"npm_root,omitempty"`
 	CargoRoot              string   `json:"cargo_root,omitempty"`
+	MavenRoot              string   `json:"maven_root,omitempty"`
 	FreeBSDRoot            string   `json:"freebsd_root,omitempty"`
 	DistfilesRoot          string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
 	AuditDB                string   `json:"audit_db,omitempty"`
@@ -569,6 +571,29 @@ func validateSumdbURL(raw string) error {
 		return fmt.Errorf("gomod_sumdb_url %q names no host", raw)
 	case u.User != nil, u.RawQuery != "", u.Fragment != "":
 		return fmt.Errorf("gomod_sumdb_url %q carries userinfo, a query or a fragment — the request path is appended to it", raw)
+	}
+	return nil
+}
+
+// DefaultMavenUpstream is Maven Central's repository root.
+const DefaultMavenUpstream = "https://repo.maven.apache.org/maven2"
+
+// validateMavenUpstream refuses a maven_upstream the route could not append a
+// repository path to. https only: unlike a distfile, nothing downstream of
+// the transport checks a jar against a digest bodega holds.
+func validateMavenUpstream(raw string) error {
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return fmt.Errorf("maven_upstream %q does not parse: %v", raw, err)
+	case u.Scheme != "https":
+		return fmt.Errorf("maven_upstream %q must be an https URL (default %s)", raw, DefaultMavenUpstream)
+	case u.Host == "":
+		return fmt.Errorf("maven_upstream %q names no host", raw)
+	case u.User != nil:
+		return fmt.Errorf("maven_upstream carries userinfo before the host — bodega reads no credential from this file and would copy it into logs and error messages. Remove everything between \"//\" and %q", u.Host)
+	case u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("maven_upstream %q carries a query or fragment — the repository path is appended to it, which would land after it", raw)
 	}
 	return nil
 }
@@ -1212,6 +1237,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
+	cfg.MavenUpstream = strings.TrimRight(firstNonEmpty(cfg.MavenUpstream, DefaultMavenUpstream), "/")
+	if err := validateMavenUpstream(cfg.MavenUpstream); err != nil {
+		return nil, err
+	}
 	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
 
 	// crates.io publishes the index and the tarballs on separate hosts, and
@@ -2221,6 +2250,7 @@ func defaultConfigContent() []byte {
   "_comment_cargo_upstream": "cargo_upstream is the sparse index; cargo_dl_upstream is the separate host the crate tarballs come from. crates.io names the second in its own config.json — bodega does not fetch that at startup, so an instance mirroring the index must name both keys.",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
+  "maven_upstream": "https://repo.maven.apache.org/maven2",
 
   "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter, and folded to lower case before the reserved-name check so \"Repos\" is refused with \"repos\". The url must be https, end in \"/\", and carry no userinfo, no query, no fragment and no uncleaned path. A key may share a name with an uploaded git package: /git/{name}/{file} serves the bundle and /git/{ns}/{org}/{repo}.git/... resolves the upstream.",
   "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",

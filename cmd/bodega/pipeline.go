@@ -404,6 +404,10 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 		s = ensureMirroredFreeBSD(bcfg, store, "")
 	case manifest.TypeDistfiles:
 		s = ensureFetchedDistfiles(bcfg, store, "")
+	case manifest.TypeMaven:
+		// No stage writes a maven artifact locally yet: the route proxies
+		// every request, so there is nothing to make uploadable.
+		s = &builder.Summary{}
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

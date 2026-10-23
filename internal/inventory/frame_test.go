@@ -277,7 +277,7 @@ func TestBatchOutsideDeclaredCapabilitiesIsRefused(t *testing.T) {
 	if !errors.As(err, &ce) {
 		t.Errorf("attempts from a source without the attempts capability: err = %v, want *ContractError", err)
 	}
-	_, err = f.Ingest(ctx, insts[0], Principal{ExternalID: "h"}, Batch{Reports: []Report{{Components: []Component{{Ecosystem: "maven", Name: "x"}}}}})
+	_, err = f.Ingest(ctx, insts[0], Principal{ExternalID: "h"}, Batch{Reports: []Report{{Components: []Component{{Ecosystem: "conda", Name: "x"}}}}})
 	if !errors.As(err, &ce) {
 		t.Errorf("component in an unknown ecosystem: err = %v, want *ContractError", err)
 	}

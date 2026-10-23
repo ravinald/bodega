@@ -247,6 +247,24 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/cargo/serde/1.0.200/download",
 		},
 		{
+			// No builder stage writes maven yet, so the upload is the key
+			// constructor itself: what this case holds together is the route,
+			// inventory and delete reading the one layout manifest/keys.go
+			// names. The groupId's dots become directories on the way in.
+			typ:  manifest.TypeMaven,
+			pkg:  "com.example.corp:widget",
+			ve:   manifest.VersionEntry{Version: "1.0.0"},
+			body: "pom-bytes",
+			upload: func(t *testing.T, _ *builder.Config, _ *manifest.Store, dst storage.ObjectStore) []string {
+				key := manifest.MavenKey("com/example/corp/widget/1.0.0/widget-1.0.0.pom")
+				if err := dst.Put(t.Context(), key, []byte("pom-bytes")); err != nil {
+					t.Fatal(err)
+				}
+				return []string{key}
+			},
+			url: "/maven/com/example/corp/widget/1.0.0/widget-1.0.0.pom",
+		},
+		{
 			// A mirrored repository: the name is the repository directory and
 			// the version is the ABI, so the local tree, the object key and
 			// the route are all the path a pkg client composes. The package

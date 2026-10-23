@@ -46,7 +46,7 @@ func RuleKindForType(registryType string) string {
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven:
 		return KindPackage
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return KindPrefix
@@ -260,6 +260,8 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 		return matchNpm(candidate, r.Pattern)
 	case manifest.TypeCargo:
 		return candidate == r.Pattern
+	case manifest.TypeMaven:
+		return matchMaven(candidate, r.Pattern)
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return strings.HasPrefix(candidate, r.Pattern)
 	}
@@ -281,10 +283,26 @@ func CandidateFor(registryType, packageName, entryURL string) string {
 // package name rather than on an upstream URL.
 func KeysByName(registryType string) bool {
 	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven:
 		return true
 	}
 	return false
+}
+
+// matchMaven handles an exact <groupId>:<artifactId> plus <groupId>:*, which
+// admits every artifact of one groupId and no groupId nested under it: a JVM
+// framework publishes dozens of artifacts under one groupId, and
+// org.springframework:* is not a claim about org.springframework.boot.
+func matchMaven(candidate, pattern string) bool {
+	if candidate == pattern {
+		return true
+	}
+	group, ok := strings.CutSuffix(pattern, ":*")
+	if !ok {
+		return false
+	}
+	candGroup, _, found := strings.Cut(candidate, ":")
+	return found && candGroup == group
 }
 
 // matchNpm handles exact package names plus the `@scope/*` wildcard form.
@@ -326,7 +344,7 @@ func SuggestPattern(regType, host, fullPath, pkgName string) string {
 			}
 		}
 		return pkgName
-	case manifest.TypeCargo:
+	case manifest.TypeCargo, manifest.TypeMaven:
 		return pkgName
 	case manifest.TypeGomod:
 		// Module paths look like host/org/repo... — propose host+org/.

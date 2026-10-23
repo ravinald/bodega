@@ -121,6 +121,20 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "FreeBSD:14:amd64",
 		},
 	},
+	TypeMaven: {
+		// The groupId's directories rejoin with dots, and every companion of
+		// one version reads back as that version.
+		{
+			key:     MavenKey("org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar.sha1"),
+			name:    "org.apache.commons:commons-lang3",
+			version: "3.14.0",
+		},
+		// Artifact-level metadata names no version.
+		{
+			key:  MavenKey("org/apache/commons/commons-lang3/maven-metadata.xml"),
+			name: "org.apache.commons:commons-lang3",
+		},
+	},
 	TypeDistfiles: {
 		// A port with no DIST_SUBDIR: the name is the bare file, and the
 		// version inside it stays in the name.

@@ -21,7 +21,13 @@ func TestArtifactPathForVersionCoversEveryType(t *testing.T) {
 	ve := manifest.VersionEntry{Version: "1.0.0", Ref: "v1.0.0", URL: "https://example.com/example-pkg-1.0.0.tgz"}
 
 	for _, typ := range manifest.AllTypes {
-		got := artifactPathForVersion(cfg, typ, "example-pkg", ve)
+		name := "example-pkg"
+		if typ == manifest.TypeMaven {
+			// A maven identity is <groupId>:<artifactId>; anything else names
+			// no file in the repository layout.
+			name = "com.example:example-pkg"
+		}
+		got := artifactPathForVersion(cfg, typ, name, ve)
 		skip := slices.Contains(globTypes, typ)
 		switch {
 		case skip && got != "":

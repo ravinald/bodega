@@ -85,6 +85,7 @@ const (
 	npmPrefix        = "npm/"
 	cargoCratePrefix = "cargo/crates/"
 	cargoIndexPrefix = "cargo/index/"
+	mavenPrefix      = "maven/"
 )
 
 // StoragePrefixes returns the top-level key prefixes documented in the
@@ -103,6 +104,7 @@ func StoragePrefixes() []string {
 		FreeBSDPrefix,
 		gomodPrefix,
 		ManifestsPrefix,
+		mavenPrefix,
 		npmPrefix,
 		AptPrefix,
 		PypiWheelPrefix,
@@ -794,6 +796,16 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 	case TypeCargo:
 		return []string{CargoCrateKey(pm.Name, ve.Version)}, nil
 
+	case TypeMaven:
+		// The POM alone: it is the one file every version publishes, and the
+		// rest (jar, aar, classifiers, companions) depends on a packaging the
+		// entry does not record.
+		p, ok := MavenArtifactPath(pm.Name, ve.Version)
+		if !ok {
+			return nil, fmt.Errorf("maven %s@%s: want a <groupId>:<artifactId> name and a version", pm.Name, ve.Version)
+		}
+		return []string{MavenKey(p)}, nil
+
 	case TypeFreeBSD:
 		// The repository root, catalogue first: these are the keys this
 		// package can name without asking a backend what it holds. The
@@ -938,6 +950,13 @@ func ParseKey(key string) (typ, name, version string) {
 		// the crate name by cargo's convention, not by anything constructed
 		// here, and config.json sits in the same place.
 		return TypeCargo, "", ""
+
+	case strings.HasPrefix(key, mavenPrefix):
+		mp, ok := ParseMavenPath(strings.TrimPrefix(key, mavenPrefix))
+		if !ok {
+			return TypeMaven, "", ""
+		}
+		return TypeMaven, mp.Name(), mp.Version
 
 	case strings.HasPrefix(key, helmPrefix):
 		if key == HelmIndexKey {

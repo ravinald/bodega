@@ -1000,6 +1000,18 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.storedAndClientFields(n))
 
+	case manifest.TypeMaven:
+		sb.WriteString(field("Coordinate", pm.Name))
+		sb.WriteByte('\n')
+		sb.WriteString(field("Version", ve.Version))
+		sb.WriteByte('\n')
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
+		sb.WriteByte('\n')
+		sb.WriteString(boolField("Hidden", ve.Hidden))
+		sb.WriteByte('\n')
+		sb.WriteString(m.storedAndClientFields(n))
+
 	case manifest.TypeCargo:
 		sb.WriteString(field("Crate", pm.Name))
 		sb.WriteByte('\n')

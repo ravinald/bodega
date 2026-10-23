@@ -44,6 +44,7 @@ type Config struct {
 	HelmRoot    string
 	NpmRoot     string
 	CargoRoot   string
+	MavenRoot   string
 	FreeBSDRoot string
 
 	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
@@ -366,6 +367,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.CargoRoot != "" {
 			return c.CargoRoot
 		}
+	case "maven":
+		if c.MavenRoot != "" {
+			return c.MavenRoot
+		}
 	case "freebsd":
 		if c.FreeBSDRoot != "" {
 			return c.FreeBSDRoot
@@ -419,6 +424,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		HelmRoot:       app.HelmRoot,
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
+		MavenRoot:      app.MavenRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
 		DistfilesRoot:  app.DistfilesRoot,
 		AutoImportDeps: true,
@@ -459,6 +465,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.npm
 	case manifest.TypeCargo:
 		return d.cargo
+	case manifest.TypeMaven:
+		return d.maven
 	case manifest.TypeFreeBSD:
 		return d.freebsd
 	case manifest.TypeDistfiles:
@@ -504,6 +512,8 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.npm}
 	case manifest.TypeCargo:
 		return []string{d.cargo}
+	case manifest.TypeMaven:
+		return []string{d.maven}
 	case manifest.TypeFreeBSD:
 		return []string{d.freebsd}
 	case manifest.TypeDistfiles:
@@ -693,6 +703,7 @@ type dirs struct {
 	charts   string
 	npm      string
 	cargo    string
+	maven    string
 	freebsd  string
 
 	// distfiles is a DISTDIR: <DIST_SUBDIR>/<file> beneath it, exactly as
@@ -712,6 +723,7 @@ func buildDirs(root string) dirs {
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
 		cargo:    filepath.Join(root, "cargo"),
+		maven:    filepath.Join(root, "maven"),
 		freebsd:  filepath.Join(root, "freebsd"),
 
 		distfiles: filepath.Join(root, "distfiles"),

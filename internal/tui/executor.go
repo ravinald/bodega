@@ -152,6 +152,8 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeFreeBSD,
 		manifest.TypeDistfiles:
 		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
+	case manifest.TypeMaven:
+		fmt.Fprintf(buf, "No build step for maven — the /maven/ route proxies every artifact from maven_upstream.\n")
 	default:
 		return fmt.Errorf("build: no build stage for entry type %q", entryType)
 	}
@@ -194,6 +196,8 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		fmt.Fprintf(buf, "No separate package step for npm — the server generates the packument from the manifest entry.\n")
 	case manifest.TypeCargo:
 		fmt.Fprintf(buf, "No separate package step for cargo — clients read the proxied sparse index.\n")
+	case manifest.TypeMaven:
+		fmt.Fprintf(buf, "No package step for maven — the /maven/ route proxies every artifact from maven_upstream.\n")
 	case manifest.TypeFreeBSD:
 		fmt.Fprintf(buf, "No separate package step for freebsd — the mirrored catalogue carries FreeBSD's own signature and must not be regenerated.\n")
 	case manifest.TypeDistfiles:
@@ -385,6 +389,8 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, audi
 			sum = builder.FetchFreeBSD(bc, store, entryFilter)
 		case manifest.TypeDistfiles:
 			sum = builder.FetchDistfiles(bc, store, entryFilter)
+		case manifest.TypeMaven:
+			fmt.Fprintf(buf, "No fetch stage for maven — the /maven/ route proxies every artifact from maven_upstream.\n")
 		default:
 			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}

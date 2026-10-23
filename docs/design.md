@@ -377,7 +377,8 @@ When bodega fetches a git entry, it scans the extracted source for dependency fi
 | `requirements.txt`         | Populate pypi base_requirements, create PypiPackage entries |
 | `go.mod`                   | Create GomodEntry for each require (mode: proxy)            |
 | `package.json`             | Create NpmEntry for each dependency (mode: proxy)           |
-| `Gemfile`, `pom.xml`, etc. | Log as found, unsupported ecosystem                         |
+| `pom.xml`, `build.gradle`  | Log as found: maven is served; dependencies are not read    |
+| `Gemfile`, etc.            | Log as found, unsupported ecosystem                         |
 
 Discovered gomod and npm entries default to proxy mode. Discovered pypi entries carry no mode, so they are hosted. The operator can change any entry to hosted if they want to build and pin it locally. Duplicate entries are skipped.
 

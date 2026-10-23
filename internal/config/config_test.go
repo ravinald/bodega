@@ -237,6 +237,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"oidc_token_ttl": "10m",
 		// Load requires an https URL.
 		"gomod_sumdb_url": "https://sum.example.com",
+		"maven_upstream":  "https://maven.example.com/maven2",
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

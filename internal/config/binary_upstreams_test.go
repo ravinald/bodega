@@ -82,3 +82,28 @@ func TestLoad_GomodSumdbURL(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_MavenUpstream(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MavenUpstream != config.DefaultMavenUpstream {
+		t.Errorf("maven_upstream default = %q, want %s", cfg.MavenUpstream, config.DefaultMavenUpstream)
+	}
+
+	writeConfig(t, `{"maven_upstream":"https://maven.example/repo/"}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil || cfg.MavenUpstream != "https://maven.example/repo" {
+		t.Errorf("maven_upstream with a trailing slash = %q, %v; want it trimmed", cfg.MavenUpstream, err)
+	}
+
+	for _, bad := range []string{"http://repo.maven.apache.org/maven2", "repo.maven.apache.org", "https://", "https://u:p@maven.example/", "https://maven.example/?x=1"} {
+		writeConfig(t, `{"maven_upstream":"`+bad+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted maven_upstream %q", bad)
+		} else if !strings.Contains(err.Error(), "maven_upstream") {
+			t.Errorf("error %q does not name maven_upstream", err)
+		}
+	}
+}

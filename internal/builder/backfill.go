@@ -96,6 +96,14 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 	case manifest.TypeCargo:
 		d := buildDirs(cfg.rootFor(typ))
 		return cargoCratePath(d, name, ve)
+	case manifest.TypeMaven:
+		// The repository layout under the type's own directory, POM first:
+		// the one file every version publishes.
+		p, ok := manifest.MavenArtifactPath(name, ve.Version)
+		if !ok {
+			return ""
+		}
+		return filepath.Join(buildDirs(cfg.rootFor(typ)).maven, filepath.FromSlash(p))
 	case manifest.TypeDistfiles:
 		if manifest.DistfilesValidName(name) != nil {
 			return ""

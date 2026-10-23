@@ -1015,6 +1015,7 @@ var fetchGatedTypes = map[string]bool{
 	manifest.TypePypi:  true,
 	manifest.TypeGomod: true,
 	manifest.TypeCargo: true,
+	manifest.TypeMaven: true,
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age

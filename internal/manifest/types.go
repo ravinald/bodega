@@ -26,6 +26,7 @@ const (
 	TypeHelm   = "helm"
 	TypeNpm    = "npm"
 	TypeCargo  = "cargo"
+	TypeMaven  = "maven"
 
 	// TypeFreeBSD is a mirrored FreeBSD pkg repository. Named for the OS
 	// rather than for pkg, because "pkg" is already bodega's own subcommand
@@ -55,7 +56,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeFreeBSD, TypeDistfiles}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeFreeBSD, TypeDistfiles}
 
 // Dependency is one dependency a version declares, recorded in the shape the
 // registry protocol publishes rather than the shape the ecosystem's build file

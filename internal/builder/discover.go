@@ -142,8 +142,16 @@ func ScanDeps(cfg *Config, store *manifest.Store, name string, ve manifest.Versi
 		}
 	}
 
+	// --- Log-only: a served ecosystem whose build files are not read ---
+	for _, fname := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
+		if _, err := os.Stat(filepath.Join(worktree, fname)); err == nil {
+			result.FilesFound = append(result.FilesFound, fname+" (maven, not read)")
+			_, _ = fmt.Fprintf(out, "    Found: %s (maven is served under /maven/, but its dependencies are not read -- manual entry needed)\n", fname)
+		}
+	}
+
 	// --- Log-only: unsupported ecosystems ---
-	for _, fname := range []string{"Gemfile", "pom.xml", "build.gradle", "Cargo.toml"} {
+	for _, fname := range []string{"Gemfile", "Cargo.toml"} {
 		if _, err := os.Stat(filepath.Join(worktree, fname)); err == nil {
 			result.FilesFound = append(result.FilesFound, fname+" (unsupported)")
 			_, _ = fmt.Fprintf(out, "    Found: %s (unsupported ecosystem -- manual entry needed)\n", fname)
