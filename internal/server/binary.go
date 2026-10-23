@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"path"
 	"sort"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -191,5 +192,17 @@ func (s *Server) handleBinaryUpstream(w http.ResponseWriter, r *http.Request, ns
 	// policyCandidate is the upstream URL: binary is a URL-scoped type, so the
 	// allow-list matches a URL prefix. discoveryPkgName is <namespace>/<rest>,
 	// which is what 'discover promote --as manifest' writes the entry under.
-	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeBinary, upstream, pkgName, true, true)
+	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeBinary, upstream, pkgName, !revalidates(bu.Revalidate, rest), true)
+}
+
+// revalidates reports whether rest names a path the namespace marked as
+// moving under a fixed name. Patterns were checked at load, so a match error
+// cannot occur here.
+func revalidates(patterns []string, rest string) bool {
+	for _, pat := range patterns {
+		if ok, _ := path.Match(pat, rest); ok {
+			return true
+		}
+	}
+	return false
 }

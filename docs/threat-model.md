@@ -894,14 +894,15 @@ the policy existed.
 A resolver policy that refuses the public registries' names to server
 subnets is a cheap layer beside the firewall. These are the hosts bodega's
 built-in upstreams fetch from: the defaults of `gomod_upstream`,
-`npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream` and
-`distfiles_upstream`, plus `files.pythonhosted.org`, where PyPI's index sends
-every file download. `crates.io` publishes its index and its tarballs on
-separate subdomains, so it takes a wildcard. As an RPZ zone, where `CNAME .`
-answers NXDOMAIN:
+`gomod_sumdb_url`, `npm_upstream`, `pypi_upstream`, `cargo_upstream`,
+`cargo_dl_upstream` and `distfiles_upstream`, plus `files.pythonhosted.org`,
+where PyPI's index sends every file download. `crates.io` publishes its
+index and its tarballs on separate subdomains, so it takes a wildcard. As an RPZ
+zone, where `CNAME .` answers NXDOMAIN:
 
 ```zone
 proxy.golang.org         CNAME .
+sum.golang.org           CNAME .
 registry.npmjs.org       CNAME .
 pypi.org                 CNAME .
 files.pythonhosted.org   CNAME .
@@ -916,6 +917,7 @@ dnsmasq's `address=/<name>/`, which covers subdomains without the `*.`):
 
 ```text
 proxy.golang.org
+sum.golang.org
 registry.npmjs.org
 pypi.org
 files.pythonhosted.org
@@ -925,10 +927,12 @@ distcache.FreeBSD.org
 ```
 
 Apply it to the client subnets and exempt bodega's own address, which still
-has to resolve every one of them. Go clients also query `sum.golang.org`
-directly unless `GOSUMDB` names something else; bodega does not proxy the
-checksum database, so blocking that name breaks `go get` rather than
-forcing it through bodega.
+has to resolve every one of them. bodega proxies the checksum database under
+`/go/sumdb/sum.golang.org/` and answers the go command's `supported` probe,
+so a client with `GOPROXY` on bodega sends its `sum.golang.org` lookups
+there, and blocking the name costs it nothing. A client whose `GOPROXY`
+still lists `direct`, or a bodega with `proxy_cache_enabled` off, queries
+`sum.golang.org` itself, and the block shows up as a failed `go get`.
 
 Upstreams an operator adds are not on the list: `apt_upstreams`, `helm`
 repositories, FreeBSD `pkg` repositories, and any of the defaults above

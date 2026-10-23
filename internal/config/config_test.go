@@ -233,6 +233,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 			Rules: []config.OIDCRule{{Claims: map[string]string{"repository": "acme/app"}, Scopes: "read,write:npm"}},
 		}},
 		"oidc_token_ttl": "10m",
+		// Load requires an https URL.
+		"gomod_sumdb_url": "https://sum.example.com",
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

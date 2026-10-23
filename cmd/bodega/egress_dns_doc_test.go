@@ -16,6 +16,7 @@ func TestThreatModelDNSListCoversBuiltInUpstreams(t *testing.T) {
 	cfg := loadFrom(t, `{}`)
 	hosts := map[string]string{
 		"gomod_upstream":     cfg.GomodUpstream,
+		"gomod_sumdb_url":    cfg.GomodSumdbURL,
 		"npm_upstream":       cfg.NpmUpstream,
 		"pypi_upstream":      cfg.PypiUpstream,
 		"cargo_upstream":     cfg.CargoUpstream,
