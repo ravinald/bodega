@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -61,6 +62,7 @@ func TestLoad_GitUpstreamsInvalid(t *testing.T) {
 		{"url has no host", `{"git_upstreams":{"corp":{"url":"https:///path/"}}}`, "corp"},
 		{"url has no trailing slash", `{"git_upstreams":{"corp":{"url":"https://git.corp.example"}}}`, "corp"},
 		{"mode unknown", `{"git_upstreams":{"corp":{"url":"https://git.corp.example/","mode":"wide-open"}}}`, "corp"},
+		{"revalidate on git", `{"git_upstreams":{"corp":{"url":"https://git.corp.example/","revalidate":["*"]}}}`, "corp"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writeConfig(t, tc.body)
@@ -110,7 +112,7 @@ func TestGitUpstreamsRoundTrip(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	for ns, w := range want {
-		if got.GitUpstreams[ns] != w {
+		if !reflect.DeepEqual(got.GitUpstreams[ns], w) {
 			t.Errorf("git_upstreams[%q] = %+v after a save/load cycle, want %+v", ns, got.GitUpstreams[ns], w)
 		}
 	}

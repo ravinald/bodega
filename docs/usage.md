@@ -4600,6 +4600,29 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 
 - **sha256**: expected hex digest
 
+A `binary_upstreams` namespace caches every path forever by default, which is right for a release asset and wrong for a pointer that moves under a fixed name. `revalidate` lists the paths that move, as `path.Match` patterns matched against the path after `/binaries/<namespace>/`. A matching path follows `metadata_ttl` the way a package index does; every other path is still cached forever. `*` does not cross a `/`. Load refuses a malformed pattern and refuses the key on a `git_upstreams` entry, naming the namespace.
+
+rustup is the case it exists for. `dist/channel-rust-stable.toml`, its `.sha256` and `.asc`, and `rustup/release-stable.toml` change every release, while the dated trees under `dist/YYYY-MM-DD/` and `rustup/archive/<version>/` never do:
+
+```json
+"binary_upstreams": {
+  "rust": {
+    "url": "https://static.rust-lang.org/",
+    "mode": "open",
+    "revalidate": ["dist/channel-rust-*", "rustup/release-*"]
+  }
+}
+```
+
+On the client:
+
+```sh
+export RUSTUP_DIST_SERVER=https://bodega-host:8080/binaries/rust
+export RUSTUP_UPDATE_ROOT=https://bodega-host:8080/binaries/rust/rustup
+```
+
+bodega serves the bytes unchanged, so rustup's sha256 and GPG checks pass against the cached files as they do against `static.rust-lang.org`. A `catalog` namespace works too, but every component path a channel manifest names has to be cataloged before `rustup install` can fetch it.
+
 ### Helm-specific fields
 
 ```json
@@ -4830,6 +4853,10 @@ GOPROXY=https://bodega-host:8080/go
 ```
 
 That is the file `go env -w GOPROXY=https://bodega-host:8080/go` writes, and the toolchain reads it on every run, so no shell profile has to export anything. The value has no `direct` entry after it: with one, a module bodega does not hold is fetched straight from its VCS host, and `bodega doctor` reports that as a bypass. doctor walks the list as the go command does: entries split on `,` or `|`, trimmed, and read up to the first `off` or `direct`. A reachable `direct` or `proxy.golang.org` warns whichever separator precedes it, and anything after `off` is never consulted, so `https://bodega-host:8080/go,off` passes. doctor resolves the value the way the go command does: a non-empty `GOPROXY` in the environment first, then this file (at `$GOENV` when that is set, and not at all under `GOENV=off`), so a host configured with the file alone passes, and an environment override that brings `direct` back still warns. A file doctor cannot read is reported `SKIPPED` rather than as a fallback it did not observe.
+
+The checksum database comes through the same `GOPROXY`, so a host whose egress reaches only bodega leaves `GOSUMDB` at its default. The go command asks `<GOPROXY>/sumdb/sum.golang.org/supported` before its first lookup; bodega answers 200 without contacting anything, and every `lookup/`, `tile/` and `latest` request after that goes to bodega, which fetches it from `gomod_sumdb_url` (default `https://sum.golang.org`) and serves the bytes unchanged. The go command verifies each signed tree head and record against the `sum.golang.org` key compiled into it, so the relay cannot vouch for a hash the database did not sign. `latest` and `lookup/` documents follow `metadata_ttl`, since the tree head they carry moves; a full tile is cached forever and a partial tile (`.p/<width>`) follows `metadata_ttl`, because it grows under one name. Any other database name under `/go/sumdb/` is a 404, and with `proxy_cache_enabled` off `supported` is a 404 too, which sends the go command to the database directly as before. `/go/<module>/@latest` is proxied as a mutable document, with the hidden-package refusal and profile filter `@v/list` gets; a profile that would drop the version `@latest` names answers 404 rather than another version.
+
+Go toolchains are modules (`golang.org/toolchain`), so a `go.mod` naming a newer `toolchain` line resolves through the proxy and the checksum database above with no further configuration.
 
 **Helm** (`~/.config/helm/repositories.yaml` on Linux and FreeBSD, `~/Library/Preferences/helm/repositories.yaml` on macOS):
 
@@ -6871,11 +6898,12 @@ Which upstreams may be reached at all is the allow-list's decision, not this swi
 
 ### Upstream hosts
 
-Six flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
+Seven flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
 
 | Key                  | Default                                         | What that host serves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | -------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gomod_upstream`     | `https://proxy.golang.org`                      | The whole module proxy protocol: `@v/list`, `@v/{version}.info`, `.mod` and `.zip`, all on one host                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `gomod_sumdb_url`    | `https://sum.golang.org`                        | The checksum database, relayed under `/go/sumdb/sum.golang.org/`. Load refuses anything but an https URL                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `npm_upstream`       | `https://registry.npmjs.org`                    | Packuments and tarballs, both on one host                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `pypi_upstream`      | `https://pypi.org`                              | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404, and the log line beside it names the index that was read. The body does not, because the route takes no token and the URL may carry credentials. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
 | `cargo_upstream`     | `https://index.crates.io`                       | The sparse index, and nothing else. A crate tarball request to this host is a 404                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |

@@ -668,6 +668,12 @@ func GomodFileKey(module, file string) string {
 	return gomodPrefix + module + "/@v/" + file
 }
 
+// GomodSumdbKey returns the key a checksum-database response is cached under.
+// "sumdb" holds no dot, so no module path can produce the same prefix.
+func GomodSumdbKey(db, rest string) string {
+	return gomodPrefix + "sumdb/" + db + "/" + rest
+}
+
 // GomodKey returns the key for one of a module version's three artifacts.
 // ext is ".zip", ".info" or ".mod".
 func GomodKey(module, version, ext string) string {
