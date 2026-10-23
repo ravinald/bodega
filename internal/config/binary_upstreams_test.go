@@ -18,6 +18,7 @@ func TestLoad_BinaryUpstreamsInvalid(t *testing.T) {
 		{"url not https", `{"binary_upstreams":{"vendor":{"url":"http://dl.vendor.example/"}}}`, "vendor"},
 		{"url has no trailing slash", `{"binary_upstreams":{"vendor":{"url":"https://dl.vendor.example"}}}`, "vendor"},
 		{"mode unknown", `{"binary_upstreams":{"vendor":{"url":"https://dl.vendor.example/","mode":"wide-open"}}}`, "vendor"},
+		{"revalidate pattern malformed", `{"binary_upstreams":{"vendor":{"url":"https://dl.vendor.example/","revalidate":["dist/["]}}}`, "vendor"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writeConfig(t, tc.body)
@@ -59,5 +60,25 @@ func TestLoad_BinaryUpstreamsDefaultsToCatalog(t *testing.T) {
 	}
 	if got := cfg.BinaryUpstreams["explicit"].Mode; got != config.UpstreamModeOpen {
 		t.Errorf("binary_upstreams[\"explicit\"].Mode = %q, want %q", got, config.UpstreamModeOpen)
+	}
+}
+
+func TestLoad_GomodSumdbURL(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GomodSumdbURL != "https://sum.golang.org" {
+		t.Errorf("gomod_sumdb_url default = %q, want https://sum.golang.org", cfg.GomodSumdbURL)
+	}
+
+	for _, bad := range []string{"http://sum.golang.org", "sum.golang.org", "https://", "https://u:p@sum.example/"} {
+		writeConfig(t, `{"gomod_sumdb_url":"`+bad+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted gomod_sumdb_url %q", bad)
+		} else if !strings.Contains(err.Error(), "gomod_sumdb_url") {
+			t.Errorf("error %q does not name gomod_sumdb_url", err)
+		}
 	}
 }

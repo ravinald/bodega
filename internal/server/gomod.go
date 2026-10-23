@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"time"
@@ -15,16 +16,32 @@ import (
 func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	fullPath := r.PathValue("path")
-	idx := strings.Index(fullPath, "/@v/")
-	if idx < 0 {
-		http.NotFound(w, r)
+	// No module path can begin "sumdb/": the first element of one carries a
+	// dot, which is the rule that lets the protocol put the checksum database
+	// under the same root.
+	if rest, ok := strings.CutPrefix(fullPath, "sumdb/"); ok {
+		s.handleGomodSumdb(w, r, rest)
 		return
 	}
-	module := fullPath[:idx]
-	file := fullPath[idx+4:] // "list", "v1.30.0.info", etc.
+	var module, file, upstream string
+	if m, ok := strings.CutSuffix(fullPath, "/@latest"); ok && m != "" {
+		// Stored beside @v/list under the name the handler's mutable checks
+		// already recognize, so it is cached, refreshed and filtered as the
+		// listing is.
+		module, file = m, "@latest"
+		upstream = s.cfg.GomodUpstream + "/" + module + "/@latest"
+	} else {
+		idx := strings.Index(fullPath, "/@v/")
+		if idx < 0 {
+			http.NotFound(w, r)
+			return
+		}
+		module = fullPath[:idx]
+		file = fullPath[idx+4:] // "list", "v1.30.0.info", etc.
+		upstream = s.cfg.GomodUpstream + "/" + module + "/@v/" + file
+	}
 
 	s3Key := manifest.GomodFileKey(module, file)
-	upstream := s.cfg.GomodUpstream + "/" + module + "/@v/" + file
 	immutable := file != "list" && !strings.HasSuffix(file, "latest")
 
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeGomod, module)
@@ -56,26 +73,38 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	if proxied && s.refuseWithheld(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
 		return
 	}
-	if file == "list" {
+	if file == "list" || file == "@latest" {
 		permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module)
 		var withhold *indexWithhold
 		if proxied {
 			withhold = s.indexWithholdFor(r, manifest.TypeGomod, module)
 		}
 		if permit != nil || withhold != nil {
-			rw := &indexFilterWriter{
-				ResponseWriter: w,
-				subject:        module + "/@v/list",
-				filter: func(b []byte) []byte {
-					b = filterGomodList(b, permit)
-					if withhold != nil {
-						b = withhold.gomodList(b)
-						withhold.finish(w.Header())
-					}
-					return b
-				},
+			filterList := func(b []byte) []byte {
+				b = filterGomodList(b, permit)
+				if withhold != nil {
+					b = withhold.gomodList(b)
+					withhold.finish(w.Header())
+				}
+				return b
+			}
+			rw := &indexFilterWriter{ResponseWriter: w, subject: module + "/@v/list", filter: filterList}
+			if file == "@latest" {
+				rw.subject = module + "/@latest"
+				rw.filter = func(b []byte) []byte { return b }
 			}
 			s.serveGomodFile(rw, r, pm, module, file, s3Key, upstream, immutable)
+			if file == "@latest" && rw.status == http.StatusOK && !rw.tooBig {
+				// @latest names one version and cannot be filtered down to
+				// another, so a version the list would drop is a 404. The go
+				// command reads @latest only when the list offers nothing
+				// suitable, and a 404 there is the same answer the filtered
+				// list already gave.
+				if v := gomodLatestVersion(rw.body.Bytes()); v != "" && len(bytes.TrimSpace(filterList([]byte(v+"\n")))) == 0 {
+					http.Error(w, module+"/@latest names "+v+", which this host may not fetch; no other version is offered in its place", http.StatusNotFound)
+					return
+				}
+			}
 			if err := rw.flush(); err != nil {
 				s.logger.Error("gomod list response failed", "module", module, "error", err)
 			}
@@ -142,6 +171,62 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 	}
 	s.proxyVersion(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
 }
+
+// gomodLatestVersion reads Version from an @latest document. A document that
+// does not parse names nothing, and is passed through for the go command to
+// report.
+func gomodLatestVersion(body []byte) string {
+	var doc struct{ Version string }
+	if json.Unmarshal(body, &doc) != nil {
+		return ""
+	}
+	return doc.Version
+}
+
+// handleGomodSumdb proxies the checksum database under /go/sumdb/, the part of
+// the GOPROXY protocol that lets a host reaching only bodega verify go.sum
+// lines. The go command checks every tree head and record against the public
+// key it already holds, so bodega relays bytes it cannot forge.
+//
+// Only sum.golang.org is served: gomod_sumdb_url is where its bytes come from,
+// and answering for another database name would hand the client that host's
+// records under a name its key does not cover.
+func (s *Server) handleGomodSumdb(w http.ResponseWriter, r *http.Request, p string) {
+	name, rest, _ := strings.Cut(p, "/")
+	if name != gomodSumdbName || !isSafePath(rest) {
+		http.NotFound(w, r)
+		return
+	}
+	var immutable bool
+	switch {
+	case rest == "supported":
+		// A 200 routes every lookup here; a 404 sends the go command to the
+		// database directly. With the proxy off the lookups below cannot be
+		// answered, so the honest answer is the 404.
+		if !s.cacheEnabled() {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	case rest == "latest", strings.HasPrefix(rest, "lookup/"):
+		immutable = false
+	case strings.HasPrefix(rest, "tile/"):
+		// A full tile never changes. A partial one (".p/<width>") is
+		// rewritten as the log grows, under the same name.
+		immutable = !strings.Contains(rest, ".p/")
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	// No allow-list candidate: the database is not a package, and refusing a
+	// lookup under module rules would fail `go` for modules bodega serves.
+	s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), manifest.GomodSumdbKey(gomodSumdbName, rest),
+		s.cfg.GomodSumdbURL+"/"+rest, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, immutable, false)
+}
+
+// gomodSumdbName is the checksum database the go command names by default.
+const gomodSumdbName = "sum.golang.org"
 
 // gomodRecordedTime returns the publish time recorded for the version a .info
 // request names. Any other file, or a version with none recorded, is served

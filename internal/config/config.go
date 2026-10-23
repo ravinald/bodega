@@ -121,6 +121,7 @@ type Config struct {
 	ProxyCacheEnabled   bool     `json:"proxy_cache_enabled"`
 	MetadataTTL         string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream       string   `json:"gomod_upstream,omitempty"`
+	GomodSumdbURL       string   `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
 	NpmUpstream         string   `json:"npm_upstream,omitempty"`
 	PypiUpstream        string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream       string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
@@ -415,6 +416,12 @@ const (
 type Upstream struct {
 	URL  string `json:"url"`            // upstream base, https, ends in "/"
 	Mode string `json:"mode,omitempty"` // UpstreamModeOpen or UpstreamModeCatalog; empty means catalog
+	// Revalidate holds path.Match patterns, matched against the path after
+	// the namespace, naming the upstream paths that move under a fixed name
+	// (rustup's dist/channel-rust-stable.toml). Those follow metadata_ttl;
+	// every other path is cached forever. Binary namespaces only: a git
+	// namespace caches nothing by path.
+	Revalidate []string `json:"revalidate,omitempty"`
 }
 
 // GitUpstream and BinaryUpstream are aliases rather than distinct structs so
@@ -518,6 +525,12 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 			return fmt.Errorf("%s[%q]: url path %q is not in cleaned form (%q) — a \"..\" here escapes the intended root, the same refusal the request half already gets", key, ns, u.Path, cleanUpstreamPath(u.Path))
 		}
 
+		for _, pat := range up.Revalidate {
+			if _, err := path.Match(pat, ""); err != nil {
+				return fmt.Errorf("%s[%q]: revalidate pattern %q is malformed: %v (path.Match syntax, matched against the path after %s%s/)", key, ns, pat, err, route, ns)
+			}
+		}
+
 		switch up.Mode {
 		case "":
 			up.Mode = UpstreamModeCatalog
@@ -526,6 +539,25 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 		default:
 			return fmt.Errorf("%s[%q]: invalid mode %q (want %q or %q; empty means %q)", key, ns, up.Mode, UpstreamModeOpen, UpstreamModeCatalog, UpstreamModeCatalog)
 		}
+	}
+	return nil
+}
+
+// validateSumdbURL refuses a gomod_sumdb_url the checksum-database proxy
+// cannot use. The go command trusts what comes back only because its signed
+// tree heads verify against the key it already holds, but a plain-http fetch
+// still leaks every module a host resolves to the path.
+func validateSumdbURL(raw string) error {
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return fmt.Errorf("gomod_sumdb_url %q does not parse: %v", raw, err)
+	case u.Scheme != "https":
+		return fmt.Errorf("gomod_sumdb_url %q must be an https URL (default https://sum.golang.org)", raw)
+	case u.Host == "":
+		return fmt.Errorf("gomod_sumdb_url %q names no host", raw)
+	case u.User != nil, u.RawQuery != "", u.Fragment != "":
+		return fmt.Errorf("gomod_sumdb_url %q carries userinfo, a query or a fragment — the request path is appended to it", raw)
 	}
 	return nil
 }
@@ -988,6 +1020,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Proxy/cache.
 	cfg.MetadataTTL = firstNonEmpty(cfg.MetadataTTL, "1h")
 	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")
+	cfg.GomodSumdbURL = strings.TrimRight(firstNonEmpty(cfg.GomodSumdbURL, "https://sum.golang.org"), "/")
+	if err := validateSumdbURL(cfg.GomodSumdbURL); err != nil {
+		return nil, err
+	}
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
@@ -1115,6 +1151,11 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 
 	if err := validateUpstreams("git_upstreams", "/git/", cfg.GitUpstreams); err != nil {
 		return nil, err
+	}
+	for ns, up := range cfg.GitUpstreams {
+		if len(up.Revalidate) > 0 {
+			return nil, fmt.Errorf("git_upstreams[%q]: revalidate applies to binary_upstreams only — a git namespace serves a fresh clone, never a path-cached object. Remove the key", ns)
+		}
 	}
 
 	if err := validateUpstreams("binary_upstreams", "/binaries/", cfg.BinaryUpstreams); err != nil {
@@ -1981,6 +2022,7 @@ func defaultConfigContent() []byte {
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
+  "gomod_sumdb_url": "https://sum.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
   "pypi_upstream": "https://pypi.org",
 
