@@ -12,14 +12,14 @@ import (
 )
 
 // fakeOS scripts the local tools osCallersHost runs: systemctl is-enabled
-// motd-news.timer answers timer, systemctl is-active snapd.service answers
-// snapd and snapd.socket answers socket, and snap refresh --time answers
-// refreshTime. calls logs every argv;
+// motd-news.timer answers timer, systemctl is-active chrony.service answers
+// chrony and chronyd.service answers chronyd, snapd.service answers snapd and
+// snapd.socket answers socket, and snap refresh --time answers refreshTime. calls logs every argv;
 // ran logs only the ones not scripted, which is how a test sees what a step
 // changed.
 type fakeOS struct {
-	timer, snapd, socket, refreshTime string
-	calls, ran                        []string
+	timer, chrony, chronyd, snapd, socket, refreshTime string
+	calls, ran                                         []string
 }
 
 func (f *fakeOS) run(argv []string) (string, error) {
@@ -31,6 +31,16 @@ func (f *fakeOS) run(argv []string) (string, error) {
 			return "Failed to get unit file state for motd-news.timer: No such file or directory", errors.New("exit status 1")
 		}
 		return f.timer, nil
+	case "systemctl is-active chrony.service":
+		if f.chrony == "" {
+			return "inactive", errors.New("exit status 3")
+		}
+		return f.chrony, nil
+	case "systemctl is-active chronyd.service":
+		if f.chronyd == "" {
+			return "inactive", errors.New("exit status 3")
+		}
+		return f.chronyd, nil
 	case "systemctl is-active snapd.service":
 		if f.snapd == "" {
 			return "inactive", errors.New("exit status 3")
@@ -114,28 +124,31 @@ func TestOSCallerRows(t *testing.T) {
 		detail   []string
 		remedy   []string
 	}{
-		{"chrony over NTS", ubuntuChrony, fakeOS{}, nil, "chrony-nts", true,
+		{"chrony over NTS", ubuntuChrony, fakeOS{chrony: "active"}, nil, "chrony-nts", true,
 			[]string{"1.ntp.ubuntu.com", "ntp-bootstrap.ubuntu.com", "TCP 4460", "keeps no time", "TLS", "Valid-Until"},
 			[]string{"server <host> iburst", "allow TCP 4460"}},
 		{"chrony through an included file", map[string]string{
 			"/usr/sbin/chronyd":    "",
 			"/etc/chrony.conf":     "include /etc/chrony.d/*.conf\n",
 			"/etc/chrony.d/a.conf": "server time.cloudflare.com iburst nts\n"},
-			fakeOS{}, nil, "chrony-nts", true, []string{"time.cloudflare.com"}, nil},
+			fakeOS{chrony: "active"}, nil, "chrony-nts", true, []string{"time.cloudflare.com"}, nil},
 		{"chrony with an internal source the operator names", withFiles(ubuntuChrony, map[string]string{
 			"/etc/chrony/conf.d/lan.conf": "server ntp.internal iburst\n"}),
-			fakeOS{}, []string{"NTP.internal"}, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, []string{"NTP.internal"}, "chrony-nts", false, nil, nil},
 		{"chrony from the bodega server over NTS", map[string]string{
 			"/usr/sbin/chronyd":       "",
 			"/etc/chrony/chrony.conf": "server bodega.internal iburst nts\n"},
-			fakeOS{}, []string{"bodega.internal"}, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, []string{"bodega.internal"}, "chrony-nts", false, nil, nil},
 		{"chrony without NTS", map[string]string{
 			"/usr/sbin/chronyd":       "",
 			"/etc/chrony/chrony.conf": "pool ntp.ubuntu.com iburst\n! server x nts\n"},
-			fakeOS{}, nil, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, nil, "chrony-nts", false, nil, nil},
 		{"chrony config left without chronyd", map[string]string{
 			"/etc/chrony/chrony.conf": "server ntp-bootstrap.ubuntu.com nts\n"},
-			fakeOS{}, nil, "chrony-nts", false, nil, nil},
+			fakeOS{chrony: "active"}, nil, "chrony-nts", false, nil, nil},
+		{"chrony under its RHEL unit name", ubuntuChrony, fakeOS{chronyd: "active"}, nil, "chrony-nts", true,
+			[]string{"ntp-bootstrap.ubuntu.com"}, nil},
+		{"chrony installed but not running", ubuntuChrony, fakeOS{chrony: "failed"}, nil, "chrony-nts", false, nil, nil},
 		{"motd-news file enabled", map[string]string{motdNewsDefaults: "# comment\nENABLED=1\n"},
 			fakeOS{}, nil, "motd-news", true,
 			[]string{"ENABLED=1", "motd.ubuntu.com"},
@@ -186,7 +199,7 @@ func TestOSCallerRows(t *testing.T) {
 }
 
 func TestOSCallerRowsAbsentOffLinux(t *testing.T) {
-	fake := &fakeOS{timer: "enabled", snapd: "active"}
+	fake := &fakeOS{timer: "enabled", chrony: "active", snapd: "active"}
 	h := stubOSCallers(t, withFiles(ubuntuChrony, map[string]string{motdNewsDefaults: "ENABLED=1\n"}), fake)
 	h.goos = "freebsd"
 	if fs := h.findings(nil); len(fs) != 0 || len(fake.calls) != 0 {
@@ -200,7 +213,7 @@ func TestDoctorConfigureQuietOSCallersPlan(t *testing.T) {
 	base := []string{"--configure", "npm", "--url", srv.URL, "--allow-plaintext"}
 	files := withFiles(ubuntuChrony, map[string]string{motdNewsDefaults: "ENABLED=1\n", "/usr/lib/snapd/snapd": ""})
 
-	fake := &fakeOS{timer: "enabled", snapd: "active", refreshTime: "timer: 00:00~24:00/4\nlast: today\nnext: tomorrow"}
+	fake := &fakeOS{timer: "enabled", chrony: "active", snapd: "active", refreshTime: "timer: 00:00~24:00/4\nlast: today\nnext: tomorrow"}
 	stubOSCallers(t, files, fake)
 	out, err := runDoctor(t, base...)
 	if err != nil || strings.Contains(out, "motd-news") || len(fake.calls) != 0 {

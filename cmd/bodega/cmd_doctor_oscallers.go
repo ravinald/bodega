@@ -265,7 +265,7 @@ var chronyConfs = []string{"/etc/chrony/chrony.conf", "/etc/chrony.conf"}
 
 func (h *osCallersHost) chronyNTS(internal []string) (host.Finding, bool) {
 	f := host.Finding{Check: "chrony-nts"}
-	if !h.exists("/usr/sbin/chronyd") {
+	if !h.chronyActive() {
 		return f, false
 	}
 	var conf string
@@ -305,6 +305,16 @@ func (h *osCallersHost) chronyNTS(internal []string) (host.Finding, bool) {
 		" or a file under its sourcedir, then systemctl restart chrony), or allow TCP 4460 to the NTS servers; " +
 		"bodega doctor --ntp-server <host> names an internal one this row accepts"
 	return f, true
+}
+
+// chronyActive asks for both unit names: Debian and Ubuntu call it chrony,
+// RHEL and Fedora chronyd. A chrony that is installed but stopped, disabled
+// or masked makes no NTS key exchange, so it has nothing to warn about.
+func (h *osCallersHost) chronyActive() bool {
+	if !h.exists("/usr/sbin/chronyd") {
+		return false
+	}
+	return h.unitState("is-active", "chrony.service") == "active" || h.unitState("is-active", "chronyd.service") == "active"
 }
 
 type chronySource struct {
