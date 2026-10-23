@@ -431,3 +431,35 @@ func algorithmName(a packet.PublicKeyAlgorithm) string {
 		return fmt.Sprintf("algo-%d", a)
 	}
 }
+
+// VendorKey returns, armored, the one public key in raw whose primary key
+// fingerprint is want (uppercase hex), with every primary fingerprint raw
+// carries so a mismatch can name what arrived instead. raw may be armored, in
+// one block or several, or binary, which covers how vendors publish a gpg.key.
+//
+// Only the matching entity is re-serialized. A vendor file carrying a second
+// key would otherwise reach Signed-By: whole, and apt would trust a key the
+// operator never named.
+func VendorKey(raw []byte, want string) (armored []byte, found []string, err error) {
+	ring, err := readEntities(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse OpenPGP key: %w", err)
+	}
+	var match *openpgp.Entity
+	for _, e := range ring {
+		fpr := fingerprint(e)
+		found = append(found, fpr)
+		if fpr == want {
+			match = e
+		}
+	}
+	if match == nil {
+		return nil, found, fmt.Errorf("no key with primary fingerprint %s", want)
+	}
+	var buf bytes.Buffer
+	if err := match.Serialize(&buf); err != nil {
+		return nil, found, fmt.Errorf("serialize key %s: %w", want, err)
+	}
+	armored, err = armorBytes(openpgp.PublicKeyType, buf.Bytes())
+	return armored, found, err
+}

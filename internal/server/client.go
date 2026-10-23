@@ -96,6 +96,12 @@ type clientQuery struct {
 	// overrides disable, for a host whose release is not the one its
 	// repository is named for. Zero keeps the repository's own.
 	Release int
+	// Archives are the mirrored vendor codenames the plan adds a key and a
+	// stanza for, beside the host's own distribution stanza.
+	Archives []string
+	// Archive selects one vendor archive's stanza on /client/apt, which is
+	// the URL a plan's archive record names.
+	Archive string
 }
 
 var (
@@ -127,7 +133,41 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 		}
 		q.Release = n
 	}
+	for _, c := range strings.Split(v.Get("archives"), ",") {
+		c = strings.TrimSpace(c)
+		if c == "" || slices.Contains(q.Archives, c) {
+			continue
+		}
+		if !clientCodenameRe.MatchString(c) {
+			return q, fmt.Errorf("archives=%q names %q, which is not an apt suite name. Pass the mirrored codenames comma-separated, for example archives=stable", v.Get("archives"), c)
+		}
+		q.Archives = append(q.Archives, c)
+	}
+	if q.Archive = v.Get("archive"); q.Archive != "" && !clientCodenameRe.MatchString(q.Archive) {
+		return q, fmt.Errorf("archive=%q is not an apt suite name", q.Archive)
+	}
 	return q, nil
+}
+
+// checkAptArchives refuses a named archive this server cannot configure: one
+// it does not mirror, or mirrors with no vendor key, since a stanza naming a
+// Signed-By: file nothing serves fails every "apt update".
+func (s *Server) checkAptArchives(q clientQuery) error {
+	names := q.Archives
+	if q.Archive != "" {
+		names = append(slices.Clone(names), q.Archive)
+	}
+	var bad []string
+	for _, c := range names {
+		if _, ok := s.cfg.AptSigningKeyFor(c); !ok {
+			bad = append(bad, c)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return fmt.Errorf("this server cannot configure the apt archive %s: an archive is a codename apt_upstreams mirrors with signing_key_url and signing_key_fingerprint set.\n"+
+		"  Archives it configures: %s", strings.Join(bad, ", "), aptKeyedList(s.cfg))
 }
 
 // encode is the query string a plan's file URLs carry, so /client/{system}
@@ -196,6 +236,9 @@ func (s *Server) admitClient(w http.ResponseWriter, r *http.Request, subject str
 // profile and the rule it reports describe one resolution.
 func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject string, m identityMatch) (*clientHost, bool) {
 	q, err := parseClientQuery(r)
+	if err == nil {
+		err = s.checkAptArchives(q)
+	}
 	if err != nil {
 		s.writeClientError(w, r, subject, http.StatusBadRequest, "", err.Error())
 		return nil, false
@@ -425,7 +468,54 @@ func (s *Server) planApt(r *http.Request, h *clientHost, one func(clientconf.Fil
 			content: ring, url: h.base + aptsources.KeyringRoute,
 		})
 	}
+	return append(out, s.planAptArchives(r, h, aptStanzaSuites(src.Deb822))...)
+}
+
+// aptStanzaSuites reads the Suites: line back out of a rendered stanza.
+func aptStanzaSuites(deb822 string) []string {
+	for _, line := range strings.Split(deb822, "\n") {
+		if rest, ok := strings.CutPrefix(line, "Suites: "); ok {
+			return strings.Fields(rest)
+		}
+	}
+	return nil
+}
+
+// planAptArchives renders each vendor archive the host named: its stanza,
+// then the key that stanza's Signed-By: names, in the order Apply relies on
+// to write the key first. The key's digest is over the bytes the key route
+// serves, so a key that cannot be fetched or fails its fingerprint check
+// refuses the whole system rather than installing a stanza apt cannot verify.
+//
+// An archive already on the host's own stanza is refused: two stanzas naming
+// one suite with different Signed-By: values stop every "apt update" with
+// "Conflicting values set for option Signed-By".
+func (s *Server) planAptArchives(r *http.Request, h *clientHost, mainSuites []string) []planFile {
+	var out []planFile
+	for _, c := range h.q.Archives {
+		if slices.Contains(mainSuites, c) {
+			return []planFile{{system: manifest.TypeApt, action: planRefuse,
+				reason: fmt.Sprintf("%s is already on this host's apt stanza, so a second stanza for it would conflict on Signed-By; drop it from archives", c)}}
+		}
+		armored, status := s.aptVendorKey(r, c)
+		if armored == nil {
+			return []planFile{{system: manifest.TypeApt, action: planSkip,
+				reason: fmt.Sprintf("the vendor key for %s could not be served (%d %s); the server log names why", c, status, http.StatusText(status))}}
+		}
+		v, _ := url.ParseQuery(h.q.encode())
+		v.Set("archive", c)
+		f := s.aptArchiveFile(h, c)
+		out = append(out,
+			planFile{system: manifest.TypeApt, action: planInstall, path: f.Path(clientconf.OSLinux),
+				content: []byte(f.Content), url: h.base + "/client/" + manifest.TypeApt + "?" + v.Encode()},
+			planFile{system: manifest.TypeApt, action: planInstall, path: clientconf.AptArchiveKeyPath(c),
+				content: armored, url: h.base + aptVendorKeyRoute + c + ".asc"})
+	}
 	return out
+}
+
+func (s *Server) aptArchiveFile(h *clientHost, codename string) clientconf.File {
+	return clientconf.AptArchive(h.base, codename, s.cfg.AptComponentsFor(codename))
 }
 
 // aptPocketSuffixes are the pockets a mirrored Ubuntu base carries, in the
@@ -691,6 +781,10 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if h.q.Archive != "" {
+		s.serveClientAptArchive(w, r, h, sys)
+		return
+	}
 	files := s.planSystem(r, h, sys)
 	f := files[0]
 	switch f.action {
@@ -705,6 +799,25 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(f.content)
+	noteClient(r, sys, h, "", "")
+}
+
+// serveClientAptArchive serves the stanza a plan's archive record names. The
+// profile is asked first, as planSystem asks it, so a host whose profile
+// excludes apt is refused the vendor stanza as it is refused its own.
+func (s *Server) serveClientAptArchive(w http.ResponseWriter, r *http.Request, h *clientHost, sys string) {
+	if sys != manifest.TypeApt {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusBadRequest, "", "archive= selects an apt vendor archive's stanza, and applies to /client/apt alone\n")
+		return
+	}
+	if reason := h.profile.Excludes(sys); reason != "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusForbidden, audit.DenialClientExcluded, reason+"\n")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(s.aptArchiveFile(h, h.q.Archive).Content))
 	noteClient(r, sys, h, "", "")
 }
 

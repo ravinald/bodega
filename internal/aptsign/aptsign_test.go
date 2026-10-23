@@ -505,3 +505,33 @@ func TestInCredentialsDirBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// A vendor file carrying two keys yields only the one the fingerprint names,
+// so Signed-By: never trusts the other. A fingerprint matching neither names
+// both in what it found.
+func TestVendorKeyKeepsOnlyTheNamedKey(t *testing.T) {
+	a, err := Generate("vendor-a", "a@example.invalid", KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Generate("vendor-b", "b@example.invalid", KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa, _ := a.PublicKey()
+	pb, _ := b.PublicKey()
+	both := append(append([]byte{}, pa...), pb...)
+
+	out, found, err := VendorKey(both, b.Fingerprints()[0])
+	if err != nil || len(found) != 2 {
+		t.Fatalf("VendorKey = %v, found %v; want both read", err, found)
+	}
+	_, got, err := VendorKey(out, "")
+	if len(got) != 1 || got[0] != b.Fingerprints()[0] {
+		t.Fatalf("served key holds %v (%v), want only %s", got, err, b.Fingerprints()[0])
+	}
+
+	if _, found, err := VendorKey(both, strings.Repeat("0", 40)); err == nil || len(found) != 2 {
+		t.Errorf("unmatched fingerprint = %v, found %v; want an error naming both", err, found)
+	}
+}

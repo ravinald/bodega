@@ -611,6 +611,78 @@ type AptUpstream struct {
 	// index and forwards whatever path arrives, so any component named here
 	// resolves whether or not bodega has ever heard of it.
 	Components []string `json:"components,omitempty"`
+
+	// SigningKeyURL is where the archive publishes the OpenPGP key that signs
+	// its InRelease, e.g. "https://apt.grafana.com/gpg.key". Set for a vendor
+	// archive whose key no stock client carries: a mirrored codename forwards
+	// the upstream signature, and a host locked to bodega cannot fetch the key
+	// from the vendor itself. GET /apt/keys/<codename>.asc serves it.
+	SigningKeyURL string `json:"signing_key_url,omitempty"`
+
+	// SigningKeyFingerprint is the primary key fingerprint the key at
+	// SigningKeyURL must carry, 40 hex digits. It is the operator's decision to
+	// trust the vendor, taken out of band: the URL alone is authenticated by
+	// TLS and nothing else. Load normalizes it to uppercase with no spaces.
+	SigningKeyFingerprint string `json:"signing_key_fingerprint,omitempty"`
+}
+
+// aptFingerprintPattern is a normalized OpenPGP v4 primary key fingerprint.
+var aptFingerprintPattern = regexp.MustCompile(`^[0-9A-F]{40}$`)
+
+// AptSigningKey is a mirrored codename's vendor key, as Load validated it.
+type AptSigningKey struct {
+	URL         string
+	Fingerprint string
+}
+
+// AptSigningKeyFor returns the vendor key configured for a mirrored codename,
+// and false when none is. Load guarantees every entry of one codename that
+// names a key names the same fingerprint, so the first one found answers.
+func (c *Config) AptSigningKeyFor(codename string) (AptSigningKey, bool) {
+	for _, up := range c.AptUpstreams[codename] {
+		if up.SigningKeyURL != "" {
+			return AptSigningKey{URL: up.SigningKeyURL, Fingerprint: up.SigningKeyFingerprint}, true
+		}
+	}
+	return AptSigningKey{}, false
+}
+
+// AptKeyedCodenames returns the mirrored codenames that carry a vendor key,
+// sorted.
+func (c *Config) AptKeyedCodenames() []string {
+	var out []string
+	for _, codename := range c.MirroredAptCodenames() {
+		if _, ok := c.AptSigningKeyFor(codename); ok {
+			out = append(out, codename)
+		}
+	}
+	return out
+}
+
+// validateAptSigningKey refuses half a key pair, a key URL that is not https,
+// and a fingerprint that is not 40 hex digits, and normalizes the fingerprint.
+func validateAptSigningKey(codename string, i int, up *AptUpstream) error {
+	if up.SigningKeyURL == "" && up.SigningKeyFingerprint == "" {
+		return nil
+	}
+	if up.SigningKeyURL == "" || up.SigningKeyFingerprint == "" {
+		return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_url and signing_key_fingerprint go together — the URL says where the key is, the fingerprint says which key you trust. Set both, or neither", codename, i)
+	}
+	u, err := url.Parse(up.SigningKeyURL)
+	switch {
+	case err != nil:
+		return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_url %q does not parse: %v", codename, i, up.SigningKeyURL, err)
+	case u.Scheme != "https":
+		return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_url %q must use the https scheme", codename, i, up.SigningKeyURL)
+	case u.Host == "":
+		return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_url %q names no host", codename, i, up.SigningKeyURL)
+	}
+	fpr := strings.ToUpper(strings.ReplaceAll(up.SigningKeyFingerprint, " ", ""))
+	if !aptFingerprintPattern.MatchString(fpr) {
+		return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_fingerprint %q is not an OpenPGP primary key fingerprint: want 40 hex digits (spaces allowed), as `gpg --show-keys --with-fingerprint <key>` prints it", codename, i, up.SigningKeyFingerprint)
+	}
+	up.SigningKeyFingerprint = fpr
+	return nil
 }
 
 // aptComponentPattern is what a component name may look like: what apt puts in
@@ -661,6 +733,20 @@ func validateAptUpstreams(ups map[string][]AptUpstream) error {
 				}
 			}
 			list[i].URL = strings.TrimRight(up.URL, "/")
+			if err := validateAptSigningKey(codename, i, &list[i]); err != nil {
+				return err
+			}
+		}
+		var fpr string
+		for i, up := range list {
+			switch {
+			case up.SigningKeyFingerprint == "":
+			case fpr == "":
+				fpr = up.SigningKeyFingerprint
+			case up.SigningKeyFingerprint != fpr:
+				return fmt.Errorf("apt_upstreams[%q][%d]: signing_key_fingerprint %s differs from %s on an earlier entry: a codename is one InRelease and is signed by one key, so /apt/keys/%s.asc can serve only one",
+					codename, i, up.SigningKeyFingerprint, fpr, codename)
+			}
 		}
 	}
 	return nil

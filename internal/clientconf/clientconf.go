@@ -273,6 +273,40 @@ func Apt(src aptsources.Sources) File {
 	}
 }
 
+// AptArchiveKeyPath is where a client installs a vendor archive's key, and
+// what that archive's Signed-By: names.
+func AptArchiveKeyPath(codename string) string {
+	return "/etc/apt/keyrings/bodega-" + codename + ".asc"
+}
+
+// AptArchiveSourcesPath is where a client installs a vendor archive's stanza,
+// beside AptSourcesPath rather than in it, so configuring one archive never
+// rewrites the host's distribution stanza.
+func AptArchiveSourcesPath(codename string) string {
+	return "/etc/apt/sources.list.d/bodega-" + codename + ".sources"
+}
+
+// AptArchive renders the stanza for a vendor archive bodega mirrors as
+// codename. Signed-By: names the vendor's own key, because a mirrored
+// codename forwards the upstream InRelease unchanged and no stock keyring
+// carries a vendor's key.
+func AptArchive(base, codename string, components []string) File {
+	stanza := strings.Join([]string{
+		"Types: deb",
+		"URIs: " + trim(base) + "/apt/",
+		"Suites: " + codename,
+		"Components: " + strings.Join(aptsources.MirroredComponentList(components), " "),
+		"Signed-By: " + AptArchiveKeyPath(codename),
+	}, "\n")
+	return File{
+		System:  manifest.TypeApt,
+		Label:   "Vendor archive sources",
+		Scope:   codename,
+		Paths:   map[string]string{OSLinux: AptArchiveSourcesPath(codename)},
+		Content: stanza + "\n",
+	}
+}
+
 // FreeBSD wraps a repository file pkgrepos rendered, overrides included.
 func FreeBSD(repo pkgrepos.Repo) File {
 	return File{

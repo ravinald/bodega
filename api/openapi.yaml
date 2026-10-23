@@ -720,6 +720,7 @@ paths:
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
         - $ref: "#/components/parameters/ClientRelease"
+        - $ref: "#/components/parameters/ClientArchives"
       responses:
         "200":
           description: The host's plan
@@ -747,6 +748,7 @@ paths:
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
         - $ref: "#/components/parameters/ClientRelease"
+        - $ref: "#/components/parameters/ClientArchives"
       responses:
         "200":
           description: The host's plan
@@ -823,6 +825,14 @@ paths:
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
         - $ref: "#/components/parameters/ClientRelease"
+        - name: archive
+          in: query
+          schema:
+            type: string
+            example: stable
+          description: >-
+            apt only. Serves the stanza for one vendor archive, the URL a plan's
+            archive record names, rather than the host's own stanza.
       responses:
         "200":
           description: The file's content
@@ -1704,6 +1714,20 @@ components:
         FreeBSD major release whose repository tags the pkg overrides disable,
         for a host whose release is not the one its repository is named for.
         Absent keeps the repository's own. FreeBSD only.
+
+    ClientArchives:
+      name: archives
+      in: query
+      schema:
+        type: string
+        example: stable,noble-pgdg
+      description: >-
+        Comma-separated vendor apt codenames this server mirrors with
+        signing_key_url and signing_key_fingerprint set. For each, the apt
+        system adds the vendor's key at /etc/apt/keyrings/bodega-<codename>.asc
+        and a stanza at /etc/apt/sources.list.d/bodega-<codename>.sources whose
+        Signed-By names it. A codename not mirrored, or mirrored with no key,
+        is refused with 400 naming the codenames that would work.
 
   responses:
     BadRequest:

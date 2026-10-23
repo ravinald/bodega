@@ -223,6 +223,8 @@ type Server struct {
 	// aptRoutes remembers which configured archive answered for each pool
 	// path, because a pool request carries no codename to resolve it by.
 	aptRoutes aptRouteCache
+	// aptVendorKeys holds the vendor keys /apt/keys/ has verified.
+	aptVendorKeys aptVendorKeys
 	// aptMirror serializes concurrent misses for one mirrored object, so a
 	// fleet running `apt install` at the same minute makes one upstream fetch
 	// of a .deb rather than one per host.
@@ -975,6 +977,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.gpg", s.handleAptKeyring)
 	m.HandleFunc("GET /apt/bodega-archive-keyring.asc", s.handleAptPublicKey)
+	m.HandleFunc("GET /apt/keys/{file}", s.handleAptVendorKey)
 
 	// PyPI simple index (PEP 503)
 	m.HandleFunc("GET /pypi/simple/", s.handlePypiIndex)

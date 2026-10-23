@@ -245,3 +245,62 @@ func TestDoctorConfigureSuiteHintOnlyOnTheAptRefusal(t *testing.T) {
 		}
 	}
 }
+
+// E22 R3, R4: --archive reaches the plan as archives=, repeated or
+// comma-joined, and --apply writes the stanza and the key it brings. The plan
+// roots both paths under a fixture directory, since the real ones are /etc's.
+func TestDoctorConfigureAppliesAVendorArchive(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	stanza := clientconf.AptArchive("https://bodega.internal", "stable", []string{"main"}).Content
+	files := map[string]string{
+		"/stanza": stanza,
+		"/key":    "-----BEGIN PGP PUBLIC KEY BLOCK-----\nfixture\n-----END PGP PUBLIC KEY BLOCK-----\n",
+	}
+	paths := map[string]string{
+		"/stanza": filepath.Join(root, clientconf.AptArchiveSourcesPath("stable")),
+		"/key":    filepath.Join(root, clientconf.AptArchiveKeyPath("stable")),
+	}
+	var queries []string
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query().Get("archives"))
+		var plan clientconf.Plan
+		for _, u := range []string{"/stanza", "/key"} {
+			sum := sha256.Sum256([]byte(files[u]))
+			plan.Records = append(plan.Records, clientconf.PlanRecord{
+				Identity: "web-host", Match: "cidr:192.0.2.1/32", System: "apt", Action: clientconf.PlanInstall,
+				Path: paths[u], URL: srv.URL + u, SHA256: hex.EncodeToString(sum[:]),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	for u, body := range files {
+		mux.HandleFunc("GET "+u, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) })
+	}
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	out, err := runDoctor(t, "--configure", "apt", "--archive", "stable", "--archive", "noble-pgdg",
+		"--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil {
+		t.Fatalf("doctor --archive --apply = %v:\n%s", err, out)
+	}
+	if len(queries) != 1 || queries[0] != "stable,noble-pgdg" {
+		t.Errorf("plan archives= %q, want one request naming both", queries)
+	}
+	for u, path := range paths {
+		if got, err := os.ReadFile(path); err != nil || string(got) != files[u] {
+			t.Errorf("%s = %q (%v), want %q", path, got, err, files[u])
+		}
+	}
+	if !strings.Contains(out, "Apply it:  apt-get update") {
+		t.Errorf("no apt-get update hint after writing a .sources file:\n%s", out)
+	}
+
+	if _, err := runDoctor(t, "--configure", "npm", "--archive", "stable", "--url", srv.URL); err == nil ||
+		!strings.Contains(err.Error(), "--configure apt --archive") {
+		t.Errorf("--archive without apt = %v, want a refusal naming --configure apt", err)
+	}
+}
