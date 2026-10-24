@@ -423,6 +423,21 @@ func parseCargo(data []byte) ([]Entry, error) {
 // locked against any other source would be fetched from the wrong place.
 var rubygemsOrg = []string{"https://rubygems.org", "http://rubygems.org"}
 
+// foreignGemRemotes returns the remotes that are not rubygems.org. Bundler
+// writes every global source of a Gemfile into one GEM section and records no
+// remote per spec, so a single foreign remote taints the whole section: a
+// private gem whose name is also taken on rubygems.org would otherwise be
+// fetched and pinned from the public registry.
+func foreignGemRemotes(remotes []string) []string {
+	var foreign []string
+	for _, r := range remotes {
+		if !slices.Contains(rubygemsOrg, strings.TrimRight(r, "/")) {
+			foreign = append(foreign, r)
+		}
+	}
+	return foreign
+}
+
 var (
 	gemSpecLine     = regexp.MustCompile(`^    ([^\s(]+) \(([^)\s]+)\)$`)
 	gemChecksumLine = regexp.MustCompile(`^  ([^\s(]+) \(([^)\s]+)\)(?: (\S+))?$`)
@@ -450,11 +465,12 @@ func parseGemfileLock(data []byte) ([]Entry, error) {
 			return
 		}
 		reason := ""
-		switch {
-		case section == "GIT":
+		if section == "GIT" {
 			reason = "git source " + strings.Join(remotes, ", ") + " is a checkout, not a published gem"
-		case !slices.ContainsFunc(remotes, func(r string) bool { return slices.Contains(rubygemsOrg, strings.TrimRight(r, "/")) }):
-			reason = "source " + strings.Join(remotes, ", ") + " is not rubygems.org"
+		} else if foreign := foreignGemRemotes(remotes); len(foreign) > 0 {
+			reason = "source " + strings.Join(foreign, ", ") + " is not rubygems.org, and Gemfile.lock does not say which of the GEM section's remotes each spec came from"
+		} else if len(remotes) == 0 {
+			reason = "GEM section names no remote, so its source cannot be confirmed as rubygems.org"
 		}
 		for i := start; i < len(out); i++ {
 			out[i].Unsupported = reason

@@ -765,7 +765,7 @@ The version keeps the [baseline mark](#--baseline) the store already holds for i
 
 A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`, and rubygems from `rubygems_upstream`. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
 
-An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io, a gem from a `GIT` section or from a `GEM` remote other than rubygems.org. A `PATH` gem is the project's own tree and is skipped, as a Cargo workspace member is.
+An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io, a gem from a `GIT` section or from a `GEM` section listing any remote other than rubygems.org (Bundler records no remote per spec, so one foreign remote makes every spec in its section unsupported). A `PATH` gem is the project's own tree and is skipped, as a Cargo workspace member is.
 
 **Digest comparison.** The digest a lockfile records is held against the one bodega pinned for the same version:
 

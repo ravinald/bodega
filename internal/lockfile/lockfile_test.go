@@ -237,6 +237,35 @@ func TestParseGemfileLock(t *testing.T) {
 	}
 }
 
+func TestParseGemfileLockMixedRemotes(t *testing.T) {
+	mixed := "GEM\n  remote: https://gems.acme.internal/\n  remote: https://rubygems.org/\n  specs:\n    acme-internal (1.0.0)\n    rack (3.1.8)\n\nPLATFORMS\n  ruby\n"
+	got, err := Parse(GemfileLock, []byte(mixed))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %+v; want acme-internal and rack", got)
+	}
+	for _, e := range got {
+		if !strings.Contains(e.Unsupported, "https://gems.acme.internal/ is not rubygems.org") || strings.Contains(e.Unsupported, "https://rubygems.org/") {
+			t.Errorf("%s = %q; want unsupported naming only the private remote, since the lockfile cannot attribute a spec to one remote", e.Name, e.Unsupported)
+		}
+	}
+
+	for name, data := range map[string]string{
+		"no remote":    "GEM\n  specs:\n    rack (3.1.8)\n",
+		"rubygems.org": "GEM\n  remote: https://rubygems.org/\n  remote: http://rubygems.org\n  specs:\n    rack (3.1.8)\n",
+	} {
+		got, err := Parse(GemfileLock, []byte(data))
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%s: Parse = %+v, %v", name, got, err)
+		}
+		if want := name == "no remote"; (got[0].Unsupported != "") != want {
+			t.Errorf("%s: unsupported = %q; want unsupported=%v", name, got[0].Unsupported, want)
+		}
+	}
+}
+
 func TestParseGemfileLockSources(t *testing.T) {
 	data := `GIT
   remote: https://github.com/example/widget.git
