@@ -2,7 +2,7 @@ package server
 
 import (
 	"bytes"
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // G501: the compact index's own checksum, which Bundler compares; it guards nothing here.
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"

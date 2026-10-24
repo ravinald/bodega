@@ -79,7 +79,7 @@ func (d *rbDecoder) long() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	c := int8(c0)
+	c := int8(c0) //nolint:gosec // G115: the type byte is signed in Ruby's format; the wrap is the decoding.
 	switch {
 	case c == 0:
 		return 0, nil
@@ -345,12 +345,12 @@ func (e *rbEncoder) long(x int64) {
 		e.buf.WriteByte(byte(x + 5))
 		return
 	case x < 0 && x > -124:
-		e.buf.WriteByte(byte(x - 5))
+		e.buf.WriteByte(byte(x - 5)) //nolint:gosec // G115: -128..-6 written as its two's-complement byte, as w_long does.
 		return
 	}
 	var out [9]byte
 	for i := 1; i < len(out); i++ {
-		out[i] = byte(x)
+		out[i] = byte(x) //nolint:gosec // G115: the low byte, taken on purpose.
 		x >>= 8
 		if x == 0 {
 			out[0] = byte(i)
@@ -358,7 +358,7 @@ func (e *rbEncoder) long(x int64) {
 			return
 		}
 		if x == -1 {
-			out[0] = byte(-i)
+			out[0] = byte(-i) //nolint:gosec // G115: a negative byte count, two's complement, as w_long writes it.
 			e.buf.Write(out[:i+1])
 			return
 		}

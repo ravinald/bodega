@@ -3,7 +3,8 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/md5"
+	"context"
+	"crypto/md5" //nolint:gosec // G501: the compact index's own checksum, which Bundler compares; it guards nothing here.
 	"encoding/base64"
 	"encoding/hex"
 	"io"
@@ -145,12 +146,26 @@ func TestRubygemsClosedProfileAtBlock(t *testing.T) {
 		if n := g.hitsFor("/gems/rails-7.1.0.gem"); n != 0 {
 			t.Errorf("the refused gem reached the upstream %d times", n)
 		}
-		rows := waitForDecision(t, s, audit.DecisionDenied, 1)
-		if rows[0].PatternHint != "bodega profile add web rubygems rails" {
-			t.Errorf("the denied row's pattern_hint = %q, want the command that closes it", rows[0].PatternHint)
+		for _, row := range waitForDecision(t, s, audit.DecisionDenied, 1) {
+			if row.PatternHint != "bodega profile add web rubygems rails" {
+				t.Errorf("the denied row's pattern_hint = %q, want the command that closes it", row.PatternHint)
+			}
 		}
-		if row := profileDenial(t, s, audit.DenialProfileMembership); row.PkgName != "rails" {
-			t.Errorf("the denial row names %q, want rails", row.PkgName)
+		// One refused request, one denial row: the gem and its gemspec are
+		// two requests.
+		denials, err := s.auditDB.Query(context.Background(), audit.Filter{EventType: audit.EventDenied})
+		if err != nil {
+			t.Fatalf("query denials: %v", err)
+		}
+		var paths []string
+		for _, row := range denials {
+			if row.Status != audit.DenialProfileMembership || row.PkgName != "rails" {
+				t.Errorf("denial row %+v, want a membership refusal of rails", row.Event)
+			}
+			paths = append(paths, denialDetails(t, row)["path"])
+		}
+		if len(paths) != 2 || paths[0] == paths[1] {
+			t.Errorf("denial rows for paths %v, want one per refused request", paths)
 		}
 	})
 
