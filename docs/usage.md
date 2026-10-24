@@ -5289,14 +5289,14 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                                                                    |
-| ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                          |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                          |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base    |
-| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`             |
-| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives) |
-| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                             |
+| Parameter  | Required        | Value                                                                                                                                                   |
+| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                                         |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                                         |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base                   |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`                            |
+| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives)                |
+| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                            |
 | `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven` |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
@@ -5313,7 +5313,7 @@ The host resolves the way a package route resolves it: a bound token, then the l
 | `path`     | where the file goes on this `os`. A leading `~` is the home directory of the user the file configures |
 | `url`      | where to fetch it                                                                                     |
 | `sha256`   | hex SHA-256 of what `url` serves                                                                      |
-| `reason`   | why a `refuse` or `skip` record has no file                                                           |
+| `reason`   | why a `refuse` or `skip` record has no file; on an `install` record, a note printed beside it         |
 
 - **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. Each codename in `archives=` adds two more: its stanza, and the vendor key that stanza names, fetched from `/apt/keys/<codename>.asc`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together. `rubygems` has two: `~/.gemrc`, and Bundler's `~/.bundle/config`, fetched from `/client/rubygems?file=bundler`, since `gem` reads only the first and Bundler only the second. `maven` has two: `~/.m2/settings.xml`, which the client merges into an existing one rather than replacing, and Gradle's `~/.gradle/init.d/bodega.gradle`, fetched from `/client/maven?file=gradle`. The first record's `reason` is the wrapper note described under [Setup script](#setup-script).
 - **`refuse`** is a system the host's profile excludes: closed, listing nothing of that type, and blocking the rest. It also covers a profile that scopes apt to a codename other than the one the host states, and a git profile covering none of the served namespaces. A refusal is a record rather than an absence, so a host can tell "not for you" from "not configured".
