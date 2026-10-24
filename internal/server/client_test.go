@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1321,5 +1322,114 @@ func TestSetupScriptConfiguresAMirroredCodenameWithNoSigningKey(t *testing.T) {
 		if p == aptsources.KeyringRoute {
 			t.Errorf("the script fetched %s for a mirrored codename; requests: %v", p, fetched)
 		}
+	}
+}
+
+// F82: rubygems installs ~/.gemrc and Bundler's mirror, each at a URL that
+// serves the bytes the plan's digest names, and an apply under a fixture home
+// writes both and backs up the gemrc it replaces.
+func TestClientPlanRubygemsInstallsGemrcAndBundlerMirror(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	want := map[string]string{
+		"~/.gemrc":         "---\n:sources:\n- https://bodega.internal/rubygems/\n",
+		"~/.bundle/config": "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://bodega.internal/rubygems/\"\n",
+	}
+	wantURL := map[string]string{
+		"~/.gemrc":         "https://bodega.internal/client/rubygems?os=linux",
+		"~/.bundle/config": "https://bodega.internal/client/rubygems?file=bundler&os=linux",
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(home+"/.gemrc", []byte("---\n:sources:\n- https://rubygems.org/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeRubygems)
+	if len(recs) != len(want) {
+		t.Fatalf("rubygems records = %+v, want ~/.gemrc and ~/.bundle/config", recs)
+	}
+	var changes []clientconf.Change
+	for _, rec := range recs {
+		if rec.Action != clientconf.PlanInstall || want[rec.Path] == "" || rec.URL != wantURL[rec.Path] {
+			t.Fatalf("record %+v, want an install at one of %v from %v", rec, want, wantURL)
+		}
+		u, _ := url.Parse(rec.URL)
+		code, body := clientGet(t, s, f.token, u.RequestURI())
+		if code != http.StatusOK || body != want[rec.Path] {
+			t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, want[rec.Path])
+		}
+		c, err := clientconf.NewChange(rec, []byte(body), home)
+		if err != nil {
+			t.Fatalf("NewChange refused the served file: %v", err)
+		}
+		changes = append(changes, c)
+	}
+	if _, err := clientconf.Apply(changes, ".bodega-test"); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range want {
+		if got, _ := os.ReadFile(home + "/" + strings.TrimPrefix(path, "~/")); string(got) != content {
+			t.Errorf("%s after apply = %q, want %q", path, got, content)
+		}
+	}
+	if got, _ := os.ReadFile(home + "/.gemrc.bodega-test"); !strings.Contains(string(got), "https://rubygems.org/") {
+		t.Errorf("backup = %q, want the gemrc it replaced", got)
+	}
+}
+
+// file=bundler is rubygems' alone, and a profile excluding rubygems refuses
+// the companion as it refuses the gemrc.
+func TestClientBundlerRouteRefusals(t *testing.T) {
+	s := hostedServer(t)
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	for path, want := range map[string]int{
+		"/client/npm?os=linux&file=bundler":           http.StatusBadRequest,
+		"/client/rubygems?os=linux&file=node-mirror":  http.StatusBadRequest,
+		"/client/rubygems?os=freebsd&file=bundler":    http.StatusOK,
+		"/client/rubygems?os=linux&file=bundler":      http.StatusOK,
+		"/client/rubygems?os=linux&file=bundler-conf": http.StatusBadRequest,
+	} {
+		if code, body := clientGet(t, s, f.token, path); code != want {
+			t.Errorf("GET %s = %d %q, want %d", path, code, body, want)
+		}
+	}
+
+	closed := bindProfile(t, s, "closed", "closed-host",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRubygems, audit.VersionFloating, audit.ExpansionBlock)}, nil)
+	recs := planRecordFor(planJSON(t, s, closed.token, "os=linux"), manifest.TypeRubygems)
+	if len(recs) != 1 || recs[0].Action != planRefuse {
+		t.Errorf("rubygems under a closed profile = %+v, want one refusal", recs)
+	}
+	if code, _ := clientGet(t, s, closed.token, "/client/rubygems?os=linux&file=bundler"); code != http.StatusForbidden {
+		t.Errorf("GET the Bundler file under a closed profile = %d, want 403", code)
+	}
+}
+
+// F82 R3: the served script configures rubygems when --systems names it,
+// writing both files into the running user's home.
+func TestSetupScriptConfiguresRubygems(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp", "curl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	s := hostedServer(t)
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	home := t.TempDir()
+	if err := os.WriteFile(home+"/.gemrc", []byte("---\n:sources:\n- https://rubygems.org/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := setupScriptAgainst(t, s, f.token, []string{"HOME=" + home}, "--systems", "rubygems", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh --systems rubygems --apply: %v\n%s", err, out)
+	}
+	for _, c := range clientconf.Rubygems(s.cfg.PublicURL) {
+		target := home + "/" + strings.TrimPrefix(c.Path(clientconf.OSLinux), "~/")
+		if got, _ := os.ReadFile(target); string(got) != c.Content {
+			t.Errorf("%s = %q, want %q\n%s", target, got, c.Content, out)
+		}
+	}
+	if backups, _ := filepath.Glob(home + "/.gemrc.bodega-*"); len(backups) != 1 {
+		t.Errorf("gemrc backups = %v, want one\n%s", backups, out)
 	}
 }
