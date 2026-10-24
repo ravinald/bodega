@@ -168,3 +168,59 @@ func TestRubygemsProfileTakesSetAddPinAndRemove(t *testing.T) {
 		t.Error("concurrent-ruby is still covered after remove")
 	}
 }
+
+// A maven entry is a <groupId>:<artifactId> coordinate or a groupId-wide
+// <groupId>:*, and a name in any other form is refused before it is stored:
+// the gate compares coordinates, so a path or a bare artifactId would be an
+// entry nothing ever matches.
+func TestMavenProfileTakesSetAddPinAndRemove(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "ci")
+	mustRunProfile(t, "add", "ci", "maven", "org.springframework.boot:*")
+	mustRunProfile(t, "add", "ci", "maven", "com.google.guava:guava")
+	mustRunProfile(t, "pin", "ci", "maven", "org.apache.commons:commons-lang3", "3.14.0", "--reason", "3.15 changes StringUtils.split")
+	mustRunProfile(t, "set", "ci", "maven", "--membership", "closed", "--expansion", "block")
+
+	for _, bad := range []string{"guava", "com/google/guava/guava", "com.google.guava:guava:33.0", "com..guava:guava", "com.google.guava:", ":guava", "com.google.*:guava"} {
+		if _, err := runProfile(t, "add", "ci", "maven", bad); err == nil || !strings.Contains(err.Error(), "maven") {
+			t.Errorf("add maven %q = %v, want a refusal naming the coordinate form", bad, err)
+		}
+	}
+	if _, err := runProfile(t, "remove", "ci", "maven", "guava"); err == nil {
+		t.Error("remove took a maven name that is not a coordinate")
+	}
+
+	p := storedProfile(t, env, "ci")
+	if !p.Governs(manifest.TypeMaven) {
+		t.Fatal("set ci maven stored no maven rule")
+	}
+	for name, want := range map[string]bool{
+		"com.google.guava:guava":                    true,
+		"org.springframework.boot:spring-boot":      true,
+		"org.springframework.boot:spring-boot-test": true,
+		"org.springframework:spring-core":           false,
+		"org.springframework.boot.experimental:x":   false,
+		"com.google.guava:failureaccess":            false,
+	} {
+		if got := p.Covers(manifest.TypeMaven, name).Permitted; got != want {
+			t.Errorf("Covers(maven, %s) = %v, want %v", name, got, want)
+		}
+	}
+	if !p.Permits(manifest.TypeMaven, "org.apache.commons:commons-lang3", "3.14.0").Permitted ||
+		p.Permits(manifest.TypeMaven, "org.apache.commons:commons-lang3", "3.15.0").Permitted {
+		t.Error("the commons-lang3 pin does not hold 3.14.0 and refuse 3.15.0")
+	}
+
+	out, err := runProfile(t, "check", "ci")
+	if strings.Contains(out, "org.springframework.boot:*") {
+		t.Errorf("profile check reported the groupId-wide entry as a package it could not find (%v):\n%s", err, out)
+	}
+	if !strings.Contains(out, "1 maven groupId-wide entry not checked") {
+		t.Errorf("profile check does not say the groupId-wide entry went unchecked:\n%s", out)
+	}
+
+	mustRunProfile(t, "remove", "ci", "maven", "org.springframework.boot:*")
+	if storedProfile(t, env, "ci").Covers(manifest.TypeMaven, "org.springframework.boot:spring-boot").Permitted {
+		t.Error("org.springframework.boot:spring-boot is still covered after the groupId-wide entry was removed")
+	}
+}
