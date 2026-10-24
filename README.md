@@ -6,7 +6,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ravinald/bodega.svg)](https://pkg.go.dev/github.com/ravinald/bodega)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-bodega is a self-hosted package repository for the hosts you run. It mirrors, builds, and serves ten package types to their native clients, so `apt-get`, `pip`, `npm`, `go`, `cargo`, `helm`, and FreeBSD's `pkg` all fetch from one server on your network instead of from the internet. Your hosts keep working when an upstream registry is down, compromised, or somewhere they aren't allowed to reach.
+bodega is a self-hosted package repository for the hosts you run. It mirrors, builds, and serves twelve package types to their native clients, so `apt-get`, `pip`, `npm`, `go`, `cargo`, `gem`, `helm`, Maven, Gradle, and FreeBSD's `pkg` all fetch from one server on your network instead of from the internet. Your hosts keep working when an upstream registry is down, compromised, or somewhere they aren't allowed to reach.
 
 Every package is a manifest: a name, a type, and the versions you allow. bodega pins each version's checksum on first fetch, decides at request time whether a version may be served, and records every fetch, change, and refusal in an audit trail. Artifacts live on local disk, in S3, or across several named backends.
 
@@ -119,7 +119,7 @@ Every command takes `--help`, with examples. [Usage](docs/usage.md#commands) cov
 
 ## Status
 
-Pre-1.0: the CLI, the manifest schema, and the config format still change between versions. All ten package types serve their native clients today, and an end-to-end suite drives each one against a running server on Linux and FreeBSD hosts. That suite runs by hand, so the automated gate is unit tests and linters. pypi and clone-mode git pin no digest on first fetch; [Threat model](docs/threat-model.md) covers both gaps.
+Pre-1.0: the CLI, the manifest schema, and the config format still change between versions. All twelve package types serve their native clients today, and an end-to-end suite drives each one against a running server on Linux and FreeBSD hosts. That suite runs by hand, so the automated gate is unit tests and linters. pypi and clone-mode git pin no digest on first fetch; [Threat model](docs/threat-model.md) covers both gaps.
 
 ## License
 

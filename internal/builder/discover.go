@@ -143,15 +143,20 @@ func ScanDeps(cfg *Config, store *manifest.Store, name string, ve manifest.Versi
 	}
 
 	// --- Log-only: a served ecosystem whose build files are not read ---
-	for _, fname := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
-		if _, err := os.Stat(filepath.Join(worktree, fname)); err == nil {
-			result.FilesFound = append(result.FilesFound, fname+" (maven, not read)")
-			_, _ = fmt.Fprintf(out, "    Found: %s (maven is served under /maven/, but its dependencies are not read -- manual entry needed)\n", fname)
+	for _, f := range []struct{ name, typ string }{
+		{"pom.xml", manifest.TypeMaven},
+		{"build.gradle", manifest.TypeMaven},
+		{"build.gradle.kts", manifest.TypeMaven},
+		{"Gemfile", manifest.TypeRubygems},
+	} {
+		if _, err := os.Stat(filepath.Join(worktree, f.name)); err == nil {
+			result.FilesFound = append(result.FilesFound, fmt.Sprintf("%s (%s, not read)", f.name, f.typ))
+			_, _ = fmt.Fprintf(out, "    Found: %s (%s is served under /%s/, but its dependencies are not read -- manual entry needed)\n", f.name, f.typ, f.typ)
 		}
 	}
 
 	// --- Log-only: unsupported ecosystems ---
-	for _, fname := range []string{"Gemfile", "Cargo.toml"} {
+	for _, fname := range []string{"Cargo.toml"} {
 		if _, err := os.Stat(filepath.Join(worktree, fname)); err == nil {
 			result.FilesFound = append(result.FilesFound, fname+" (unsupported)")
 			_, _ = fmt.Fprintf(out, "    Found: %s (unsupported ecosystem -- manual entry needed)\n", fname)
