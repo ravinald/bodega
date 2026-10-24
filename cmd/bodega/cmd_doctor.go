@@ -63,6 +63,7 @@ outside bodega's allow-list. Common findings:
   - Homebrew with auto-update enabled
   - pip / cargo / npm / apt configured to talk to public registries directly
   - gem sources or Bundler's mirror still naming rubygems.org
+  - Maven or Gradle with no bodega mirror or init script
   - GOPROXY unset or falling through to proxy.golang.org
   - on FreeBSD, a pkg repository still enabled at pkg.FreeBSD.org, or a
     make.conf that does not send distfiles through bodega
@@ -230,6 +231,9 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, fn())
 			}
 			if f, ok := host.CheckRubygems(); ok {
+				findings = append(findings, f)
+			}
+			if f, ok := host.CheckMaven(); ok {
 				findings = append(findings, f)
 			}
 			if f, ok := ubuntuPro.finding(); ok {

@@ -3,6 +3,7 @@ package host
 import (
 	"bufio"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -335,6 +336,148 @@ func bundlerMirror(getenv func(string) string, home string) (mirror, from string
 		}
 	}
 	return "", "", nil
+}
+
+// mavenTools is what the maven check reads from the host, so a test can
+// stand in for which build tools are on PATH and where their homes are.
+type mavenTools struct {
+	lookPath func(string) (string, error)
+	getenv   func(string) string
+	home     string
+}
+
+// CheckMaven reports whether Maven and Gradle resolve through bodega: Maven
+// by a <mirror> of * in ~/.m2/settings.xml, Gradle by bodega's init script.
+// ok is false on a host with neither tool, where the row would describe a
+// client nobody runs. A distribution a wrapper downloaded counts as
+// installed, since a CI runner building with ./mvnw or ./gradlew often has
+// neither tool on PATH.
+func CheckMaven() (f Finding, ok bool) {
+	home, _ := os.UserHomeDir()
+	return checkMaven(mavenTools{lookPath: exec.LookPath, getenv: os.Getenv, home: home})
+}
+
+func checkMaven(t mavenTools) (Finding, bool) {
+	gradleHome := t.getenv("GRADLE_USER_HOME")
+	if gradleHome == "" && t.home != "" {
+		gradleHome = filepath.Join(t.home, ".gradle")
+	}
+	m2 := ""
+	if t.home != "" {
+		m2 = filepath.Join(t.home, ".m2")
+	}
+	mvn := toolPresent(t.lookPath, "mvn", m2)
+	gradle := toolPresent(t.lookPath, "gradle", gradleHome)
+	if !mvn && !gradle {
+		return Finding{}, false
+	}
+	f := Finding{Check: "maven"}
+	var found, unread, clean []string
+	if mvn {
+		path := filepath.Join(m2, "settings.xml")
+		switch mirror, others, err := mavenMirror(path); {
+		case err != nil:
+			unread = append(unread, err.Error())
+		case mirror == "":
+			found = append(found, path+" has no bodega mirror of *, so Maven fetches from every repository a POM names")
+		case len(others) > 0:
+			found = append(found, path+" lists "+strings.Join(others, ", ")+" beside bodega's mirror, and Maven sends the repositories each names there")
+		default:
+			clean = append(clean, "Maven's mirror ("+mirror+")")
+		}
+	}
+	if gradle {
+		path := filepath.Join(gradleHome, "init.d", "bodega.gradle")
+		switch repo, err := gradleInitURL(path); {
+		case errors.Is(err, fs.ErrNotExist) && t.getenv("GRADLE_USER_HOME") != "":
+			found = append(found, "no "+path+", so Gradle fetches from every repository a build names (GRADLE_USER_HOME moves init.d away from the ~/.gradle the plan writes, so copy bodega.gradle there)")
+		case errors.Is(err, fs.ErrNotExist):
+			found = append(found, "no "+path+", so Gradle fetches from every repository a build names")
+		case err != nil:
+			unread = append(unread, "Gradle's init script could not be read: "+err.Error())
+		case repo == "":
+			found = append(found, path+" sets no bodega repository")
+		default:
+			clean = append(clean, "Gradle's init script ("+repo+")")
+		}
+	}
+	switch {
+	case len(found) > 0:
+		f.Status = StatusWarn
+		f.Detail = strings.Join(append(found, unread...), "; ") + "; bypasses bodega's maven proxy"
+		f.Remediation = "bodega doctor --configure maven --apply --url <bodega base URL>"
+	case len(unread) > 0:
+		f.Status = StatusSkip
+		f.Detail = strings.Join(unread, "; ")
+		f.Remediation = "run doctor as the user whose Maven and Gradle config these are, or repair what the error names"
+	default:
+		f.Status = StatusOK
+		f.Detail = strings.Join(clean, " and ") + " point at bodega"
+	}
+	return f, true
+}
+
+// toolPresent reports whether name is on PATH, or its wrapper has downloaded
+// a distribution under home/wrapper/dists.
+func toolPresent(lookPath func(string) (string, error), name, home string) bool {
+	if _, err := lookPath(name); err == nil {
+		return true
+	}
+	if home == "" {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "wrapper", "dists"))
+	return err == nil && len(entries) > 0
+}
+
+// mavenMirror reads settings.xml's mirrors: the url of the one bodega's plan
+// writes (id bodega, mirrorOf *), and every other mirror, each of which takes
+// the repositories it names ahead of a * pattern. A missing file has no
+// mirror and is no error.
+func mavenMirror(path string) (mirror string, others []string, err error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("%s could not be read: %w", path, err)
+	}
+	var doc struct {
+		Mirrors []struct {
+			ID       string `xml:"id"`
+			MirrorOf string `xml:"mirrorOf"`
+			URL      string `xml:"url"`
+		} `xml:"mirrors>mirror"`
+	}
+	if err := xml.Unmarshal(data, &doc); err != nil {
+		return "", nil, fmt.Errorf("%s is not XML Maven can read: %w", path, err)
+	}
+	for _, m := range doc.Mirrors {
+		id, of := strings.TrimSpace(m.ID), strings.TrimSpace(m.MirrorOf)
+		if id == "bodega" && of == "*" && mirror == "" {
+			mirror = strings.TrimSpace(m.URL)
+			continue
+		}
+		others = append(others, fmt.Sprintf("mirror %q (mirrorOf %s)", id, of))
+	}
+	return mirror, others, nil
+}
+
+// gradleInitURL is the repository bodega's init script at path sets, or ""
+// when the file sets none.
+func gradleInitURL(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "def bodegaUrl = '"); ok {
+			if v, ok = strings.CutSuffix(v, "'"); ok && v != "" {
+				return v, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // rooted prefixes each path with root, and returns paths unchanged when root

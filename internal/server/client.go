@@ -106,8 +106,8 @@ type clientQuery struct {
 	// a per-user one would otherwise go: npm's node-gyp mirror.
 	Root bool
 	// File selects a system's companion file on /client/{system}, which is
-	// the URL a plan's companion record names: clientFileNodeMirror or
-	// clientFileBundler.
+	// the URL a plan's companion record names: clientFileNodeMirror,
+	// clientFileBundler or clientFileGradle.
 	File string
 }
 
@@ -117,6 +117,8 @@ const (
 	clientFileNodeMirror = "node-mirror"
 	// clientFileBundler is Bundler's mirror file on /client/rubygems.
 	clientFileBundler = "bundler"
+	// clientFileGradle is Gradle's init script on /client/maven.
+	clientFileGradle = "gradle"
 )
 
 var (
@@ -169,9 +171,9 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 		return q, fmt.Errorf("root=%q is not 0 or 1. Pass root=1 when the plan is applied as root", raw)
 	}
 	switch q.File = v.Get("file"); q.File {
-	case "", clientFileNodeMirror, clientFileBundler:
+	case "", clientFileNodeMirror, clientFileBundler, clientFileGradle:
 	default:
-		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s, %s", q.File, clientFileNodeMirror, clientFileBundler)
+		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s, %s, %s", q.File, clientFileNodeMirror, clientFileBundler, clientFileGradle)
 	}
 	return q, nil
 }
@@ -359,6 +361,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return s.planNpm(h, one)
 	case manifest.TypeRubygems:
 		return planRubygems(h, one)
+	case manifest.TypeMaven:
+		return s.planMaven(h, one)
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:
@@ -436,6 +440,26 @@ func planRubygems(h *clientHost, one func(clientconf.File) []planFile) []planFil
 		bundler[0].url = h.base + "/client/" + manifest.TypeRubygems + "?" + v.Encode()
 	}
 	return append(out, bundler...)
+}
+
+// planMaven renders Maven's settings.xml and Gradle's init script. Both,
+// because Maven reads no init script and Gradle no settings.xml mirror. How
+// each project's wrapper is pointed at bodega rides on the settings.xml
+// record's reason: the property is in a file the project commits, which the
+// plan does not write.
+func (s *Server) planMaven(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	files := clientconf.Maven(h.base, s.cfg.BinaryUpstreams)
+	out := one(files[0])
+	if out[0].action == planInstall {
+		out[0].reason = strings.Join(files[0].Notes, ". ")
+	}
+	gradle := one(files[1])
+	if gradle[0].action == planInstall {
+		v, _ := url.ParseQuery(h.q.encode())
+		v.Set("file", clientFileGradle)
+		gradle[0].url = h.base + "/client/" + manifest.TypeMaven + "?" + v.Encode()
+	}
+	return append(out, gradle...)
 }
 
 // planDistfiles renders make.conf and the client check it includes. The two
@@ -881,6 +905,9 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	case clientFileBundler:
 		s.serveClientBundler(w, r, h, sys)
 		return
+	case clientFileGradle:
+		s.serveClientGradle(w, r, h, sys)
+		return
 	}
 	files := s.planSystem(r, h, sys)
 	f := files[0]
@@ -958,6 +985,25 @@ func (s *Server) serveClientBundler(w http.ResponseWriter, r *http.Request, h *c
 	w.WriteHeader(http.StatusOK)
 	//nolint:gosec // G705: a YAML file served as text/plain, never HTML; the one interpolated value is this server's own base URL.
 	_, _ = w.Write([]byte(clientconf.Rubygems(h.base)[1].Content))
+	noteClient(r, sys, h, "", "")
+}
+
+// serveClientGradle serves the Gradle init script a plan's maven companion
+// record names, asking the profile first as planSystem does.
+func (s *Server) serveClientGradle(w http.ResponseWriter, r *http.Request, h *clientHost, sys string) {
+	if sys != manifest.TypeMaven {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusBadRequest, "", "file="+clientFileGradle+" selects Gradle's init script, and applies to /client/maven alone\n")
+		return
+	}
+	if reason := h.profile.Excludes(sys); reason != "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusForbidden, audit.DenialClientExcluded, reason+"\n")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: a Groovy script served as text/plain, never HTML; the one interpolated value is this server's own base URL.
+	_, _ = w.Write([]byte(clientconf.Maven(h.base, s.cfg.BinaryUpstreams)[1].Content))
 	noteClient(r, sys, h, "", "")
 }
 

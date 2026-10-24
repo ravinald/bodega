@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // Plan actions. install is a file to write; refuse is a system the host's
@@ -188,7 +190,8 @@ type Change struct {
 	Old     []byte
 	Existed bool
 	// New is what Apply writes: the fetched file, which matched the plan's
-	// digest, plus any credential KeepCredential carried over from Old.
+	// digest, plus any credential KeepCredential carried over from Old, or
+	// for Maven's settings.xml, Old with the fetched file's mirrors merged in.
 	New []byte
 }
 
@@ -229,6 +232,9 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	}
 	c.Existed = true
 	c.New = KeepCredential(rec.System, c.Old, content)
+	if rec.System == manifest.TypeMaven && rec.Path == MavenSettingsPath {
+		c.New = MergeMavenSettings(c.Old, content)
+	}
 	return c, nil
 }
 
