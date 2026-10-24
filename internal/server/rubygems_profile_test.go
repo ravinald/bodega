@@ -1,0 +1,313 @@
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// Fixtures written by Ruby 2.6's own Marshal, not by rbMarshal, so the reader
+// is tested against the format rather than against itself.
+//
+//	specs: [[name, Gem::Version, platform]] for concurrent-ruby 1.3.4,
+//	       nokogiri 1.15.0, 1.16.7 and 1.16.7-x86_64-linux, rails 7.1.0, the
+//	       "ruby" platform one shared String so the stream carries object links
+//	deps:  [{name:, number:, platform:, dependencies:}] for nokogiri 1.15.0,
+//	       nokogiri 1.16.7 and rails 7.1.0
+const (
+	gemProfileSpecsB64 = "H4sIADn/22oAA2PhiOaK5vBUEknOz0suLSpKzSvRLSpNqmSzYnMNCbUSdE/NtbIKSy0qzszPi2bzVOIy1DPWM2GzZgjxVOIEKwQyQQbw5uVn56dnFmWCBEKt2UCKuQ31DE31DEAiDtz4FJnpmeNQ5CDsqSRYYWEWb2aim5OZV1oBs4+rKDEzpxjJHC5zPUOYXQCX9smy1gAAAA=="
+	gemProfileDepsB64  = "BAhbCHsJOgluYW1lSSINbm9rb2dpcmkGOgZFVDoLbnVtYmVySSILMS4xNS4wBjsGVDoNcGxhdGZvcm1JIglydWJ5BjsGVDoRZGVwZW5kZW5jaWVzWwZbB0kiCXJhY2MGOwZUSSILfj4gMS40BjsGVHsJOwBJIg1ub2tvZ2lyaQY7BlQ7B0kiCzEuMTYuNwY7BlQ7CEkiCXJ1YnkGOwZUOwlbBlsHSSIJcmFjYwY7BlRJIgt+PiAxLjQGOwZUewk7AEkiCnJhaWxzBjsGVDsHSSIKNy4xLjAGOwZUOwhJIglydWJ5BjsGVDsJWwA="
+
+	gemProfileInfoNokogiri = "---\n" +
+		"1.15.0 racc:~> 1.4|checksum:dddd\n" +
+		"1.16.7 mini_portile2:~> 2.8.2,racc:~> 1.4|checksum:bbbb\n" +
+		"1.16.7-x86_64-linux racc:~> 1.4|checksum:cccc\n"
+	gemProfileInfoConcurrent = "---\n1.3.4 |checksum:aaaa,ruby:>= 2.3\n"
+	gemProfileInfoRails      = "---\n7.1.0 |checksum:eeee\n"
+)
+
+func md5Hex(s string) string {
+	sum := md5.Sum([]byte(s)) //nolint:gosec // G401: the compact index's own checksum.
+	return hex.EncodeToString(sum[:])
+}
+
+func mustB64(t *testing.T, s string) string {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	return string(b)
+}
+
+// gemProfileRegistry is the gem fixture with a third gem, a second nokogiri
+// release, real checksums in versions and real Marshal in the full index and
+// the dependency API.
+func gemProfileRegistry(t *testing.T) (*gemRegistry, string) {
+	t.Helper()
+	g := newGemRegistry(t)
+	versions := "created_at: 2026-10-01T00:00:00Z\n---\n" +
+		"concurrent-ruby 1.3.4 " + md5Hex(gemProfileInfoConcurrent) + "\n" +
+		"nokogiri 1.15.0 0000000000000000000000000000000f\n" +
+		"rails 7.1.0 " + md5Hex(gemProfileInfoRails) + "\n" +
+		"nokogiri 1.16.7,1.16.7-x86_64-linux " + md5Hex(gemProfileInfoNokogiri) + "\n"
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.routes["/versions"] = versions
+	g.routes["/info/concurrent-ruby"] = gemProfileInfoConcurrent
+	g.routes["/info/nokogiri"] = gemProfileInfoNokogiri
+	g.routes["/info/rails"] = gemProfileInfoRails
+	g.routes["/gems/nokogiri-1.15.0.gem"] = "\x00nokogiri 1.15.0 gem bytes"
+	g.routes["/gems/rails-7.1.0.gem"] = "\x00rails gem bytes"
+	g.routes["/quick/Marshal.4.8/rails-7.1.0.gemspec.rz"] = "\x78\x9crails gemspec"
+	g.routes["/specs.4.8.gz"] = mustB64(t, gemProfileSpecsB64)
+	g.routes["/api/v1/dependencies"] = mustB64(t, gemProfileDepsB64)
+	return g, versions
+}
+
+// versionsLine is the line Bundler takes a gem's checksum from: the last one
+// naming it.
+func versionsLine(body, gem string) (versions, checksum string, ok bool) {
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 3 && f[0] == gem {
+			versions, checksum, ok = f[1], f[2], true
+		}
+	}
+	return versions, checksum, ok
+}
+
+// specsTuples reads a served full index back into "name version" pairs.
+func specsTuples(t *testing.T, body string) []string {
+	t.Helper()
+	zr, err := gzip.NewReader(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("the full index is not gzip: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gunzip the full index: %v", err)
+	}
+	doc, err := rbUnmarshal(raw)
+	if err != nil {
+		t.Fatalf("the full index is not Marshal: %v", err)
+	}
+	var out []string
+	for _, el := range doc.items {
+		name, _ := rbString(el.items[0])
+		version, _ := rbGemVersion(el.items[1])
+		platform, _ := rbString(el.items[2])
+		out = append(out, name+" "+version+" "+platform)
+	}
+	return out
+}
+
+func depsEntries(t *testing.T, body string) []string {
+	t.Helper()
+	doc, err := rbUnmarshal([]byte(body))
+	if err != nil {
+		t.Fatalf("the dependency answer is not Marshal: %v", err)
+	}
+	var out []string
+	for _, el := range doc.items {
+		name, _ := rbHashString(el, "name")
+		number, _ := rbHashString(el, "number")
+		out = append(out, name+" "+number)
+	}
+	return out
+}
+
+func TestRubygemsClosedProfileAtBlock(t *testing.T) {
+	g, upstreamVersions := gemProfileRegistry(t)
+	s := gemServer(t, g)
+	f := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRubygems, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{
+			{Type: manifest.TypeRubygems, Name: "concurrent-ruby"},
+			{Type: manifest.TypeRubygems, Name: "nokogiri"},
+		})
+
+	t.Run("an unlisted gem is refused", func(t *testing.T) {
+		for _, p := range []string{"/rubygems/gems/rails-7.1.0.gem", "/rubygems/quick/Marshal.4.8/rails-7.1.0.gemspec.rz"} {
+			if status, body := f.get(t, p); status != http.StatusForbidden || !strings.Contains(body, "membership") {
+				t.Errorf("GET %s = %d, want a 403 naming membership: %s", p, status, body)
+			}
+		}
+		if n := g.hitsFor("/gems/rails-7.1.0.gem"); n != 0 {
+			t.Errorf("the refused gem reached the upstream %d times", n)
+		}
+		rows := waitForDecision(t, s, audit.DecisionDenied, 1)
+		if rows[0].PatternHint != "bodega profile add web rubygems rails" {
+			t.Errorf("the denied row's pattern_hint = %q, want the command that closes it", rows[0].PatternHint)
+		}
+		if row := profileDenial(t, s, audit.DenialProfileMembership); row.PkgName != "rails" {
+			t.Errorf("the denial row names %q, want rails", row.PkgName)
+		}
+	})
+
+	t.Run("a listed gem is served", func(t *testing.T) {
+		if status, body := f.get(t, "/rubygems/gems/concurrent-ruby-1.3.4.gem"); status != http.StatusOK || body != "\x00concurrent-ruby gem bytes" {
+			t.Errorf("the listed gem answered %d: %q", status, body)
+		}
+	})
+
+	t.Run("info answers 404 for an excluded gem", func(t *testing.T) {
+		if status, body := f.get(t, "/rubygems/info/rails"); status != http.StatusNotFound {
+			t.Errorf("info/rails = %d, want 404: %s", status, body)
+		}
+		if status, body := f.get(t, "/rubygems/info/nokogiri"); status != http.StatusOK || body != gemProfileInfoNokogiri {
+			t.Errorf("info/nokogiri, which floats, = %d and was changed:\n%s", status, body)
+		}
+	})
+
+	t.Run("versions lists only covered gems", func(t *testing.T) {
+		status, body := f.get(t, "/rubygems/versions")
+		if status != http.StatusOK {
+			t.Fatalf("versions = %d: %s", status, body)
+		}
+		if _, _, ok := versionsLine(body, "rails"); ok {
+			t.Errorf("versions lists rails, which the profile excludes:\n%s", body)
+		}
+		if !strings.HasPrefix(body, "created_at: 2026-10-01T00:00:00Z\n---\n") {
+			t.Errorf("versions lost its header:\n%s", body)
+		}
+		// A floating gem's info goes out unfiltered, so its line, and the
+		// upstream's checksum on it, go out as they came.
+		_, sum, _ := versionsLine(body, "nokogiri")
+		_, info := f.get(t, "/rubygems/info/nokogiri")
+		if sum != md5Hex(info) {
+			t.Errorf("versions gives nokogiri checksum %s, and the info file served hashes to %s", sum, md5Hex(info))
+		}
+		if !strings.Contains(upstreamVersions, "nokogiri 1.15.0 0000000000000000000000000000000f\n") ||
+			!strings.Contains(body, "nokogiri 1.15.0 0000000000000000000000000000000f\n") {
+			t.Errorf("an unfiltered gem's earlier line was rewritten:\n%s", body)
+		}
+	})
+
+	t.Run("the full index and the dependency API are filtered", func(t *testing.T) {
+		_, specs := f.get(t, "/rubygems/specs.4.8.gz")
+		got := strings.Join(specsTuples(t, specs), "; ")
+		want := "concurrent-ruby 1.3.4 ruby; nokogiri 1.15.0 ruby; nokogiri 1.16.7 ruby; nokogiri 1.16.7 x86_64-linux"
+		if got != want {
+			t.Errorf("specs.4.8.gz holds %q, want %q", got, want)
+		}
+		_, deps := f.get(t, "/rubygems/api/v1/dependencies")
+		if got := strings.Join(depsEntries(t, deps), "; "); got != "nokogiri 1.15.0; nokogiri 1.16.7" {
+			t.Errorf("the dependency API answered %q", got)
+		}
+	})
+
+	t.Run("the cache holds the upstream documents", func(t *testing.T) {
+		if got := storedObject(t, s, manifest.TypeRubygems, manifest.RubygemsIndexKey("versions")); got != upstreamVersions {
+			t.Errorf("the cached versions file is a filtered document:\n%s", got)
+		}
+		if got := storedObject(t, s, manifest.TypeRubygems, manifest.RubygemsIndexKey("specs.4.8.gz")); got != mustB64(t, gemProfileSpecsB64) {
+			t.Error("the cached specs.4.8.gz is a filtered document")
+		}
+		for _, p := range []string{"/rubygems/versions", "/rubygems/specs.4.8.gz", "/rubygems/api/v1/dependencies", "/rubygems/info/nokogiri"} {
+			if _, hdr := getHeaderWithToken(t, s, f.token, p); hdr.Get("Cache-Control") != cacheNoStore {
+				t.Errorf("GET %s Cache-Control = %q, want %q", p, hdr.Get("Cache-Control"), cacheNoStore)
+			}
+		}
+		if _, body := getWithToken(t, s, "", "/rubygems/versions"); body != upstreamVersions {
+			t.Errorf("an unidentified request was filtered:\n%s", body)
+		}
+	})
+}
+
+func TestRubygemsWarnServesAndRecordsTheReach(t *testing.T) {
+	g, upstreamVersions := gemProfileRegistry(t)
+	s := gemServer(t, g)
+	f := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRubygems, audit.VersionFloating, audit.ExpansionWarn)},
+		[]audit.ProfileEntry{{Type: manifest.TypeRubygems, Name: "nokogiri"}})
+
+	if status, body := f.get(t, "/rubygems/gems/rails-7.1.0.gem"); status != http.StatusOK || body != "\x00rails gem bytes" {
+		t.Fatalf("warn refused an unlisted gem: %d %q", status, body)
+	}
+	rows := waitForDecision(t, s, audit.DecisionDenied, 1)
+	if rows[0].PkgName != "rails" || rows[0].PatternHint != "bodega profile add web rubygems rails" {
+		t.Errorf("the reach row = %s with hint %q", rows[0].PkgName, rows[0].PatternHint)
+	}
+	if _, body := f.get(t, "/rubygems/versions"); body != upstreamVersions {
+		t.Errorf("warn filtered the versions file, which keeps every gem it permits:\n%s", body)
+	}
+}
+
+func TestRubygemsPinnedVersion(t *testing.T) {
+	g, _ := gemProfileRegistry(t)
+	s := gemServer(t, g)
+	f := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRubygems, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypeRubygems, Name: "nokogiri",
+			Constraint: manifest.ConstraintExact, Version: "1.16.7",
+		}})
+
+	status, info := f.get(t, "/rubygems/info/nokogiri")
+	if status != http.StatusOK {
+		t.Fatalf("info/nokogiri = %d: %s", status, info)
+	}
+	want := "---\n" +
+		"1.16.7 mini_portile2:~> 2.8.2,racc:~> 1.4|checksum:bbbb\n" +
+		"1.16.7-x86_64-linux racc:~> 1.4|checksum:cccc\n"
+	if info != want {
+		t.Errorf("info/nokogiri under the pin =\n%s\nwant\n%s", info, want)
+	}
+
+	// Bundler's check: the MD5 of the info file it was served against the
+	// checksum the versions file gives that gem.
+	_, versions := f.get(t, "/rubygems/versions")
+	list, sum, ok := versionsLine(versions, "nokogiri")
+	if !ok || sum != md5Hex(info) {
+		t.Errorf("versions gives nokogiri checksum %q; Bundler hashes the info file it was served to %s:\n%s",
+			sum, md5Hex(info), versions)
+	}
+	if strings.Contains(versions, "1.15.0") || list != "1.16.7,1.16.7-x86_64-linux" {
+		t.Errorf("versions lists a version the pin refuses:\n%s", versions)
+	}
+	if strings.Contains(versions, "concurrent-ruby") || strings.Contains(versions, "rails") {
+		t.Errorf("versions lists a gem the profile does not:\n%s", versions)
+	}
+
+	if status, body := f.get(t, "/rubygems/gems/nokogiri-1.15.0.gem"); status != http.StatusForbidden || !strings.Contains(body, "constraint") {
+		t.Errorf("a gem file outside the pin = %d, want a 403 naming the constraint: %s", status, body)
+	}
+	if status, body := f.get(t, "/rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem"); status != http.StatusOK {
+		t.Errorf("a platform build of the pinned release = %d: %s", status, body)
+	}
+
+	_, specs := f.get(t, "/rubygems/specs.4.8.gz")
+	if got := strings.Join(specsTuples(t, specs), "; "); got != "nokogiri 1.16.7 ruby; nokogiri 1.16.7 x86_64-linux" {
+		t.Errorf("specs.4.8.gz under the pin holds %q", got)
+	}
+	_, deps := f.get(t, "/rubygems/api/v1/dependencies")
+	if got := strings.Join(depsEntries(t, deps), "; "); got != "nokogiri 1.16.7" {
+		t.Errorf("the dependency API under the pin answered %q", got)
+	}
+}
+
+// The writer rebuilds the link and symbol tables, so a document re-read from
+// its own output has to come back as the same tree Ruby wrote.
+func TestRubygemsMarshalRoundTripsRubyOutput(t *testing.T) {
+	raw := []byte(mustB64(t, gemProfileDepsB64))
+	doc, err := rbUnmarshal(raw)
+	if err != nil {
+		t.Fatalf("decode Ruby's output: %v", err)
+	}
+	if out := rbMarshal(doc); !bytes.Equal(out, raw) {
+		t.Errorf("re-encoding Ruby's output changed it:\n got %x\nwant %x", out, raw)
+	}
+	if _, err := rbUnmarshal([]byte{4, 8, '[', 0x7f}); err == nil {
+		t.Error("an array claiming 122 elements in a 4-byte stream decoded")
+	}
+}

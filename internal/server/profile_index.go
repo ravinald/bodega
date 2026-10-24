@@ -2,12 +2,17 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // The index filters. Each takes the document one ecosystem's resolver reads
@@ -297,9 +302,13 @@ type indexFilterWriter struct {
 	http.ResponseWriter
 	subject string // what the refusal names when the body is too large
 	filter  func([]byte) []byte
-	status  int
-	body    bytes.Buffer
-	tooBig  bool
+	// parse replaces filter for a document that is decoded whole, where a
+	// body bodega cannot read has no line to pass through and is refused like
+	// one too large to buffer.
+	parse  func([]byte) ([]byte, error)
+	status int
+	body   bytes.Buffer
+	tooBig bool
 }
 
 func (p *indexFilterWriter) WriteHeader(code int) {
@@ -334,7 +343,17 @@ func (p *indexFilterWriter) flush() error {
 			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 			return err
 		}
-		body = p.filter(body)
+		if p.parse != nil {
+			filtered, err := p.parse(body)
+			if err != nil {
+				err = fmt.Errorf("%s could not be filtered for this host's profile, and serving it unfiltered would list packages this host is refused: %w", p.subject, err)
+				http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
+				return err
+			}
+			body = filtered
+		} else {
+			body = p.filter(body)
+		}
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
 		// filtered body with a validator for different bytes.
@@ -345,4 +364,238 @@ func (p *indexFilterWriter) flush() error {
 	//nolint:gosec // G705: body is the filtered index; Content-Type is set by the handler or by proxyOrCache.
 	_, err := p.ResponseWriter.Write(body)
 	return err
+}
+
+// filterRubygemsInfo drops the versions a profile does not permit from a
+// compact index info/<gem> file: a header, a "---" line, then one line per
+// version and platform, opening with the version and a space.
+//
+// The version is compared with its platform suffix cut, as the gem route
+// compares it, so a pin on 1.16.7 keeps 1.16.7-x86_64-linux. A line with no
+// version on it passes through, for the reason filterCargoIndex gives.
+func filterRubygemsInfo(body []byte, permit func(string) bool) []byte {
+	if permit == nil {
+		return body
+	}
+	var out bytes.Buffer
+	inBody := false
+	for _, line := range strings.SplitAfter(string(body), "\n") {
+		if line == "" {
+			continue
+		}
+		if !inBody {
+			out.WriteString(line)
+			inBody = strings.TrimRight(line, "\r\n") == "---"
+			continue
+		}
+		if version, _, ok := strings.Cut(line, " "); ok && version != "" && !permit(rubygemsRelease(version)) {
+			continue
+		}
+		out.WriteString(line)
+	}
+	return out.Bytes()
+}
+
+// rubygemsGemRule is one profile's reading of one gem: whether it appears at
+// all, and the per-version predicate when its versions are filtered.
+type rubygemsGemRule func(gem string) (listed bool, permit func(string) bool)
+
+// rubygemsRuleFor binds a profile to the gem registry, and is nil when the
+// profile states no rubygems rule, which is the signal to filter nothing.
+func rubygemsRuleFor(p *entitle.Profile) rubygemsGemRule {
+	if !p.Governs(manifest.TypeRubygems) {
+		return nil
+	}
+	return func(gem string) (bool, func(string) bool) {
+		if !p.Covers(manifest.TypeRubygems, gem).Permitted {
+			return false, nil
+		}
+		return true, profileVersionFilter(p, manifest.TypeRubygems, gem)
+	}
+}
+
+// filterRubygemsVersions rebuilds the compact index versions file for a
+// profile: a header, "---", then "<gem> <v>[,<v>...] <md5 of info/<gem>>"
+// lines, where a gem may appear on several lines as versions are appended and
+// the last line's checksum is the current one.
+//
+// A gem the profile excludes loses every line. A gem whose versions it filters
+// keeps the permitted versions, and every line it keeps carries the MD5 of the
+// filtered info file infoSum returns: Bundler compares that checksum with the
+// info file it holds and refuses one that disagrees, so the upstream's
+// checksum next to a filtered info file fails every install of the gem. A gem
+// whose listed versions all pass keeps its lines byte for byte, because its
+// info file goes out unfiltered and the upstream checksum is still the true
+// one; that is what keeps a profile pinning three gems from costing an info
+// read for every gem in the registry.
+//
+// "-" before a version marks a yank, and the version is judged without it.
+func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem string, permit func(string) bool) (string, error)) ([]byte, error) {
+	if rule == nil {
+		return body, nil
+	}
+	type gemLine struct {
+		line, gem string
+		versions  []string
+	}
+	var header []string
+	var lines []gemLine
+	inBody := false
+	for _, line := range strings.SplitAfter(string(body), "\n") {
+		if line == "" {
+			continue
+		}
+		if !inBody {
+			header = append(header, line)
+			inBody = strings.TrimRight(line, "\r\n") == "---"
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			lines = append(lines, gemLine{line: line})
+			continue
+		}
+		lines = append(lines, gemLine{line: line, gem: parts[0], versions: strings.Split(parts[1], ",")})
+	}
+
+	type gemView struct {
+		listed bool
+		permit func(string) bool
+		cut    bool
+		sum    string
+	}
+	views := map[string]*gemView{}
+	for _, l := range lines {
+		if l.gem == "" {
+			continue
+		}
+		v, seen := views[l.gem]
+		if !seen {
+			v = &gemView{}
+			v.listed, v.permit = rule(l.gem)
+			views[l.gem] = v
+		}
+		if !v.listed || v.permit == nil {
+			continue
+		}
+		for _, ver := range l.versions {
+			if !v.permit(rubygemsRelease(strings.TrimPrefix(ver, "-"))) {
+				v.cut = true
+			}
+		}
+	}
+
+	var out bytes.Buffer
+	for _, h := range header {
+		out.WriteString(h)
+	}
+	for _, l := range lines {
+		v := views[l.gem]
+		if l.gem == "" || (v.listed && !v.cut) {
+			out.WriteString(l.line)
+			continue
+		}
+		if !v.listed {
+			continue
+		}
+		var kept []string
+		for _, ver := range l.versions {
+			if v.permit(rubygemsRelease(strings.TrimPrefix(ver, "-"))) {
+				kept = append(kept, ver)
+			}
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		if v.sum == "" {
+			sum, err := infoSum(l.gem, v.permit)
+			if err != nil {
+				return nil, fmt.Errorf("checksum the filtered info file for %s: %w", l.gem, err)
+			}
+			v.sum = sum
+		}
+		fmt.Fprintf(&out, "%s %s %s\n", l.gem, strings.Join(kept, ","), v.sum)
+	}
+	return out.Bytes(), nil
+}
+
+// filterRubygemsSpecs drops the tuples a profile does not permit from a full
+// index file (specs.4.8.gz and its latest_ and prerelease_ siblings): a gzipped
+// Marshal array of [name, Gem::Version, platform]. A tuple bodega cannot read
+// is kept, for the reason filterCargoIndex keeps a line.
+func filterRubygemsSpecs(body []byte, rule rubygemsGemRule) ([]byte, error) {
+	if rule == nil {
+		return body, nil
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("gunzip: %w", err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(zr, maxUpstreamBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("gunzip: %w", err)
+	}
+	if int64(len(raw)) > maxUpstreamBody {
+		return nil, fmt.Errorf("unpacks past bodega's %d-byte filter buffer", maxUpstreamBody)
+	}
+	filtered, err := filterRubygemsMarshalList(raw, func(el *rbValue) (string, string, bool) {
+		if el.tag != '[' || len(el.items) != 3 {
+			return "", "", false
+		}
+		name, ok := rbString(el.items[0])
+		version, vok := rbGemVersion(el.items[1])
+		return name, version, ok && vok
+	}, rule)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	zw := gzip.NewWriter(&out)
+	if _, err := zw.Write(filtered); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// filterRubygemsDependencies drops the entries a profile does not permit from
+// a dependency API answer: a Marshal array of hashes carrying :name and
+// :number. An empty body is the upstream's answer to an empty gem list and
+// passes as it came.
+func filterRubygemsDependencies(body []byte, rule rubygemsGemRule) ([]byte, error) {
+	if rule == nil || len(body) == 0 {
+		return body, nil
+	}
+	return filterRubygemsMarshalList(body, func(el *rbValue) (string, string, bool) {
+		name, ok := rbHashString(el, "name")
+		number, nok := rbHashString(el, "number")
+		return name, number, ok && nok
+	}, rule)
+}
+
+// filterRubygemsMarshalList keeps the elements of a top-level Marshal array
+// whose gem and version rule permits, as identify reads them.
+func filterRubygemsMarshalList(raw []byte, identify func(*rbValue) (gem, version string, ok bool), rule rubygemsGemRule) ([]byte, error) {
+	doc, err := rbUnmarshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	if doc.tag != '[' {
+		return nil, fmt.Errorf("%w: the top-level object is not an array", errRbShape)
+	}
+	kept := doc.items[:0:0]
+	for _, el := range doc.items {
+		gem, version, ok := identify(el)
+		if ok {
+			listed, permit := rule(gem)
+			if !listed || (permit != nil && !permit(rubygemsRelease(version))) {
+				continue
+			}
+		}
+		kept = append(kept, el)
+	}
+	doc.items = kept
+	return rbMarshal(doc), nil
 }
