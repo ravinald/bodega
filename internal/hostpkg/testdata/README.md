@@ -18,6 +18,8 @@ cannot occur.
 | `gomod-go-list-m-all.txt` | `go list -m all` | this repository |
 | `helm-repo-list.json` | `helm repo list -o json` | `alpine/helm:3.16.3` container, two public repos added |
 | `helm-list.json` | `helm list -o json` | **synthesized**, see below |
+| `rubygems-gem-list-local-ruby33.txt` | `gem list --local` | `ruby:3.3-slim` container, amd64, after `gem install nokogiri -v 1.16.7` and `gem install rake -v 13.2.1` |
+| `rubygems-specifications-ruby33.txt` | `ls $(gem environment gemdir)/specifications` | the same container, same moment |
 | `freebsd-pkg-query.txt` | `pkg query '%R\t%q'` | FreeBSD 15.1-RELEASE, aarch64, 34 packages from three repositories, 7 of them noarch |
 
 ## The two apt hosts earn their places separately

@@ -28,6 +28,7 @@ been completed yet.
   npm     No-op (the server generates the packument from the manifest entry)
   gomod   No-op (the downloaded module zip is already the artifact)
   cargo   No-op (the downloaded crate tarball is already the artifact)
+  rubygems No-op (the downloaded gem file is already the artifact)
   freebsd No-op (fetch mirrors the repository; nothing here may touch its bytes)
 
 helm packages across the whole type rather than per entry, because index.yaml
@@ -144,7 +145,11 @@ When a name is given after the type, only that entry is packaged.`,
 					)
 
 				case manifest.TypeRubygems:
-					fmt.Fprintf(os.Stdout, "\n>>> [rubygems] nothing to %s: gems are pulled through /rubygems/ on first request\n", "package")
+					// A gem file is already the artifact; the compact index
+					// is the upstream's, proxied.
+					allSummaries = append(allSummaries,
+						ensureFetchedRubygems(bcfg, store, entryFilter),
+					)
 				}
 			}
 

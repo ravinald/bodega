@@ -500,6 +500,8 @@ func servedPath(typ, name, version, key string) (string, error) {
 		return "/npm/" + name + "/-/" + path.Base(name) + "-" + url.PathEscape(version) + ".tgz", nil
 	case manifest.TypeCargo:
 		return "/cargo/" + url.PathEscape(name) + "/" + url.PathEscape(version) + "/download", nil
+	case manifest.TypeRubygems:
+		return "/rubygems/gems/" + url.PathEscape(name+"-"+version+".gem"), nil
 	}
 	for _, m := range []struct{ key, route string }{
 		{manifest.AptPrefix, "/apt/"},

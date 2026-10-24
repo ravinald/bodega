@@ -11,7 +11,7 @@ import (
 // for pypi, where one release is several files and the purl spec's file_name
 // qualifier says which one this digest is over.
 //
-// Ecosystems with a registered purl type use it. The rest (apt, binary, git,
+// Ecosystems with a registered purl type use it, rubygems as pkg:gem. The rest (apt, binary, git,
 // helm, freebsd, distfiles) are named pkg:generic/<bodega type>/<name>: a deb
 // purl needs the distribution vendor as its namespace, which a bodega apt
 // entry does not record, and a guessed vendor would name a package somebody
@@ -37,11 +37,22 @@ func PURL(typ, name, version, objectKey string) string {
 		b.WriteString("golang/" + strings.Join(segs, "/"))
 	case manifest.TypeCargo:
 		b.WriteString("cargo/" + purlEscape(name))
+	case manifest.TypeRubygems:
+		b.WriteString("gem/" + purlEscape(name))
 	default:
 		b.WriteString("generic/" + purlEscape(typ) + "/" + purlEscape(name))
 	}
+	// A platform gem's version as bodega records it carries the build
+	// ("1.16.7-x86_64-linux"); the gem purl type moves it to a qualifier.
+	var platform string
+	if typ == manifest.TypeRubygems {
+		version, platform = manifest.RubygemsPlatform(version)
+	}
 	if version != "" {
 		b.WriteString("@" + purlEscape(version))
+	}
+	if platform != "" {
+		b.WriteString("?platform=" + purlEscape(platform))
 	}
 	if typ == manifest.TypePypi && strings.HasPrefix(objectKey, manifest.PypiWheelPrefix) {
 		b.WriteString("?file_name=" + purlEscape(path.Base(objectKey)))

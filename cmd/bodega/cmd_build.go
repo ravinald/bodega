@@ -155,7 +155,10 @@ When a name is given after the type, only that entry is built.`,
 					)
 
 				case manifest.TypeRubygems:
-					fmt.Fprintf(buildOut, "\n>>> [rubygems] nothing to %s: gems are pulled through /rubygems/ on first request\n", "build")
+					// rubygems has no build step; FetchRubygems skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchRubygems(bcfg, store, entryFilter),
+					)
 				}
 			}
 

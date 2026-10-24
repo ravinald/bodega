@@ -257,6 +257,8 @@ func (c *Config) fetchedArtifact(typ, name string, ve manifest.VersionEntry) str
 		return path
 	case manifest.TypeCargo:
 		return cargoCratePath(d, name, ve)
+	case manifest.TypeRubygems:
+		return rubygemsGemPath(d, name, ve)
 	case manifest.TypeHelm:
 		return helmLocalPath(d, name, ve)
 	case manifest.TypeNpm:

@@ -1,6 +1,8 @@
 package lockfile
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,6 +15,8 @@ func TestDetect(t *testing.T) {
 		"deps/requirements-ci.txt": Requirements,
 		"go.sum":                   GoSum,
 		"Cargo.lock":               CargoLock,
+		"app/Gemfile.lock":         GemfileLock,
+		"gems.locked":              GemfileLock,
 	} {
 		got, err := Detect(path)
 		if err != nil || got != want {
@@ -156,5 +160,160 @@ source = "git+https://github.com/x/forked?rev=abc#abc"
 	}
 	if got[1].Unsupported == "" {
 		t.Errorf("a git source must be unsupported: %+v", got[1])
+	}
+}
+
+// The two fixtures are one Bundler 2.6.2 resolution of rack 3.1.8 and
+// nokogiri 1.16.7 across six platforms, written before and after
+// `bundle lock --add-checksums`. The second is the CHECKSUMS section Bundler
+// 2.5 and later writes; the first is every lockfile older than that.
+func readGemfileLock(t *testing.T, name string) []Entry {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Parse(GemfileLock, data)
+	if err != nil {
+		t.Fatalf("Parse(%s): %v", name, err)
+	}
+	return got
+}
+
+func TestParseGemfileLock(t *testing.T) {
+	for _, tc := range []struct {
+		file      string
+		checksums bool
+	}{{"Gemfile.lock", false}, {"Gemfile-checksums.lock", true}} {
+		t.Run(tc.file, func(t *testing.T) {
+			got := readGemfileLock(t, tc.file)
+			byKey := map[string]Entry{}
+			for _, e := range got {
+				if e.Type != "rubygems" || e.Unsupported != "" {
+					t.Errorf("%s@%s = %+v; want a supported rubygems entry", e.Name, e.Version, e)
+				}
+				byKey[e.Name+"@"+e.Version] = e
+			}
+			// Six nokogiri builds, racc pulled in by them, and rack. The
+			// dependency lines under each nokogiri spec name no pins.
+			if len(got) != 8 {
+				t.Fatalf("got %d entries %+v; want six nokogiri platform builds, racc and rack", len(got), got)
+			}
+			linux, ok := byKey["nokogiri@1.16.7-x86_64-linux"]
+			if !ok {
+				t.Fatalf("no nokogiri x86_64-linux build in %v; the platform belongs on the version, as the gem file names it", got)
+			}
+			if linux.Line != 14 {
+				t.Errorf("nokogiri x86_64-linux on line %d, want 14", linux.Line)
+			}
+			rack := byKey["rack@3.1.8"]
+			if !tc.checksums {
+				for _, e := range got {
+					if len(e.Digests) != 0 {
+						t.Errorf("%s@%s carries %v from a lockfile with no CHECKSUMS", e.Name, e.Version, e.Digests)
+					}
+				}
+				return
+			}
+			want := map[string]string{
+				"rack@3.1.8":                   "d3fbcbca43dc2b43c9c6d7dfbac01667ae58643c42cea10013d0da970218a1b1",
+				"nokogiri@1.16.7-x86_64-linux": "9e1e428641d5942af877c60b418c71163560e9feb4a5c4015f3230a8b86a40f6",
+			}
+			for key, sum := range want {
+				e := byKey[key]
+				if len(e.Digests) != 1 || e.Digests[0] != (Digest{Algorithm: "sha256", Value: sum}) {
+					t.Errorf("%s digests = %v, want sha256:%s", key, e.Digests, sum)
+				}
+			}
+			if rack.Digests[0].String() != "sha256:"+want["rack@3.1.8"] {
+				t.Errorf("rack digest renders %q", rack.Digests[0].String())
+			}
+			for _, e := range got {
+				if len(e.Digests) != 1 {
+					t.Errorf("%s@%s has %d digests; every spec in this lockfile has one", e.Name, e.Version, len(e.Digests))
+				}
+			}
+		})
+	}
+}
+
+func TestParseGemfileLockMixedRemotes(t *testing.T) {
+	mixed := "GEM\n  remote: https://gems.acme.internal/\n  remote: https://rubygems.org/\n  specs:\n    acme-internal (1.0.0)\n    rack (3.1.8)\n\nPLATFORMS\n  ruby\n"
+	got, err := Parse(GemfileLock, []byte(mixed))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %+v; want acme-internal and rack", got)
+	}
+	for _, e := range got {
+		if !strings.Contains(e.Unsupported, "https://gems.acme.internal/ is not rubygems.org") || strings.Contains(e.Unsupported, "https://rubygems.org/") {
+			t.Errorf("%s = %q; want unsupported naming only the private remote, since the lockfile cannot attribute a spec to one remote", e.Name, e.Unsupported)
+		}
+	}
+
+	for name, data := range map[string]string{
+		"no remote":    "GEM\n  specs:\n    rack (3.1.8)\n",
+		"rubygems.org": "GEM\n  remote: https://rubygems.org/\n  remote: http://rubygems.org\n  specs:\n    rack (3.1.8)\n",
+	} {
+		got, err := Parse(GemfileLock, []byte(data))
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%s: Parse = %+v, %v", name, got, err)
+		}
+		if want := name == "no remote"; (got[0].Unsupported != "") != want {
+			t.Errorf("%s: unsupported = %q; want unsupported=%v", name, got[0].Unsupported, want)
+		}
+	}
+}
+
+func TestParseGemfileLockSources(t *testing.T) {
+	data := `GIT
+  remote: https://github.com/example/widget.git
+  revision: 0123456789abcdef0123456789abcdef01234567
+  specs:
+    widget (0.1.0)
+
+PATH
+  remote: engines/billing
+  specs:
+    billing (1.0.0)
+
+GEM
+  remote: https://gems.example.com/
+  specs:
+    private-gem (2.0.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rack (3.1.8)
+
+CHECKSUMS
+  billing (1.0.0)
+  rack (3.1.8) sha256=D3FBCBCA43DC2B43C9C6D7DFBAC01667AE58643C42CEA10013D0DA970218A1B1
+`
+	got, err := Parse(GemfileLock, []byte(data))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	byName := map[string]Entry{}
+	for _, e := range got {
+		byName[e.Name] = e
+	}
+	if _, ok := byName["billing"]; ok || len(got) != 3 {
+		t.Fatalf("got %+v; want widget, private-gem and rack, and no PATH gem", got)
+	}
+	if !strings.Contains(byName["widget"].Unsupported, "git source https://github.com/example/widget.git") {
+		t.Errorf("widget = %+v; want a git source reported unsupported", byName["widget"])
+	}
+	if !strings.Contains(byName["private-gem"].Unsupported, "https://gems.example.com/ is not rubygems.org") {
+		t.Errorf("private-gem = %+v; want another registry reported unsupported", byName["private-gem"])
+	}
+	if r := byName["rack"]; r.Unsupported != "" || len(r.Digests) != 1 || r.Digests[0].Value != strings.ToLower(r.Digests[0].Value) {
+		t.Errorf("rack = %+v; want supported with its digest in lowercase hex", r)
+	}
+
+	if _, err := Parse(GemfileLock, []byte("CHECKSUMS\n  rack 3.1.8 sha256=ab\n")); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("a malformed CHECKSUMS line = %v; want an error naming its line", err)
 	}
 }

@@ -93,6 +93,9 @@ Formats, detected from the file name or named with --format:
   requirements   requirements*.txt, every line pinned with ==, hashes optional
   go.sum         every module zip line; /go.mod lines pin no download
   cargo.lock     every [[package]] from crates.io
+  gemfile.lock   Gemfile.lock or gems.locked: every GEM spec from rubygems.org,
+                 its platform kept on the version, checked against CHECKSUMS
+                 when Bundler 2.5 or later wrote one
 
 The digest the lockfile records is compared with the one bodega pinned. A
 sha256 in the lockfile is compared with the pin itself; any other algorithm
@@ -134,7 +137,7 @@ record, and writes nothing: no manifest, no admission row, no fetch.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&format, "format", "", "Lockfile format for every file named: package-lock, requirements, go.sum, cargo.lock")
+	cmd.Flags().StringVar(&format, "format", "", "Lockfile format for every file named: package-lock, requirements, go.sum, cargo.lock, gemfile.lock")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Evaluate and compare without fetching or writing anything")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Print the results as a JSON array")
 	return cmd
@@ -257,8 +260,9 @@ func prefetchFormat(path, flag string) (lockfile.Format, error) {
 
 // prefetchManifest is the single-version manifest an entry becomes. npm and
 // gomod name the configured upstream so the fetch reads where the proxy would;
-// cargo's fetch reads cargo_dl_upstream itself, and pypi resolves through the
-// index the store's pypi entries name.
+// cargo's and rubygems' fetches read cargo_dl_upstream and rubygems_upstream
+// themselves, and pypi resolves through the index the store's pypi entries
+// name.
 func prefetchManifest(cfg *config.Config, e lockfile.Entry) *manifest.PackageManifest {
 	ve := manifest.VersionEntry{Version: e.Version, Mode: manifest.ModeProxy}
 	switch e.Type {
@@ -342,9 +346,10 @@ func admitPrefetched(ctx context.Context, cfg *config.Config, checker *policy.Ch
 // resolves its closure across the whole type, so it runs once.
 func fetchPrefetched(bcfg *builder.Config, store *manifest.Store, results []*prefetchResult) {
 	fetchers := map[string]func(*builder.Config, *manifest.Store, string) *builder.Summary{
-		manifest.TypeNpm:   builder.FetchNpm,
-		manifest.TypeGomod: builder.FetchGomod,
-		manifest.TypeCargo: builder.FetchCargo,
+		manifest.TypeNpm:      builder.FetchNpm,
+		manifest.TypeGomod:    builder.FetchGomod,
+		manifest.TypeCargo:    builder.FetchCargo,
+		manifest.TypeRubygems: builder.FetchRubygems,
 	}
 	failed := map[string]string{}
 	done := map[string]bool{}

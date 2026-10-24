@@ -535,7 +535,10 @@ bodega pkg import packages/*.json                  # import multiple files
 cat manifest.json | bodega pkg import -            # import from stdin
 bodega pkg import --merge updated.json             # add versions to existing package
 bodega pkg import --origin db01 catalog.json       # stamp a payload that carries none
+bodega pkg import --lockfile Gemfile.lock          # admit, fetch and pin what a lockfile names
 ```
+
+`--lockfile` reads a lockfile a package manager wrote instead of JSON, and runs it through [`bodega pkg prefetch`](#bodega-pkg-prefetch-lockfile-lockfile): each pinned version is admitted, merged into its package, fetched, and its digest compared with the one the lockfile records, with prefetch's exit status. It takes every format prefetch does and is repeatable. It refuses JSON files and `--merge`, `--origin`, `--server` and `--baseline` beside it: a lockfile import always merges, writes the local store, and carries no origin or baseline mark.
 
 The JSON format is the same `PackageManifest` used internally:
 
@@ -657,10 +660,13 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
 | `npm`     | `npm ls --global --json --depth=0`                                                                                      |
 | `gomod`   | `go list -m all`, or `go version -m <binary>`                                                                           |
 | `cargo`   | `cargo install --list`                                                                                                  |
+| `rubygems` | `gem list --local`, or a listing of the gem directory's `specifications/` (`ls $(gem environment gemdir)/specifications`) |
 | `helm`    | `helm list -o json`                                                                                                     |
 | `freebsd` | `pkg query '%R\t%q'`                                                                                                    |
 
 **`git` and `binary` have no importer.** Nothing on a host records a `git clone` or a downloaded binary, so there is no inventory to read. Catalog those with `bodega pkg create`, or run the server with `discover_mode` set to `"observe"` and promote what clients reach for.
+
+**`rubygems` skips default gems.** `gem list --local` marks the gems Ruby ships with as `default:`; no registry download put them there, so they are counted in a warning rather than cataloged. A platform build listed as `nokogiri (1.16.7 x86_64-linux)` is recorded at `1.16.7-x86_64-linux`, the version its gem file names, and a gem installed at several versions becomes one package with each of them.
 
 **`freebsd` imports repositories, not packages.** A `freebsd` entry is one repository with a version per ABI, so convert reads the repository each installed package came from (`%R`) and the ABI it was built for (`%q`), and collapses the host to the repositories it installed from. On a FreeBSD 15.1 host with 34 packages that is 3 entries.
 
@@ -749,6 +755,7 @@ bodega pkg prefetch --dry-run --json package-lock.json
 | `requirements` | `requirements*.txt`                        | every requirement pinned with `==`, its `--hash` values, extras and markers stripped                     |
 | `go.sum`       | `go.sum`                                   | every module zip line; a `/go.mod` line pins no download and is skipped                                  |
 | `cargo.lock`   | `Cargo.lock`                               | every `[[package]]` with a crates.io source; workspace members have none and are skipped                 |
+| `gemfile.lock` | `Gemfile.lock`, `gems.locked`              | every spec under a `GEM` section's `specs:`, and the `CHECKSUMS` section Bundler 2.5 and later writes    |
 
 `--format` names the format for every file on the command line when a name says nothing. A lockfileVersion 1 `package-lock.json`, an unpinned requirement, and a `-r`, `-c` or `-e` line are refused: the first holds no flat list to read, and the other two would make a partial answer look like a complete one.
 
@@ -756,15 +763,15 @@ bodega pkg prefetch --dry-run --json package-lock.json
 
 The version keeps the [baseline mark](#--baseline) the store already holds for it, as `pkg import --merge` does, and an active [override](#bodega-override-requestapproverejectlist) applies as it does in every admission: either one admits the version past a failing check, recorded as `baseline` or `overridden`. A mark the lockfile could carry is not read, since only `pkg import --baseline` sets one, and neither admits known malware or provenance that fails to verify.
 
-A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
+A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`, and rubygems from `rubygems_upstream`. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
 
-An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io.
+An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io, a gem from a `GIT` section or from a `GEM` section listing any remote other than rubygems.org (Bundler records no remote per spec, so one foreign remote makes every spec in its section unsupported). A `PATH` gem is the project's own tree and is skipped, as a Cargo workspace member is.
 
 **Digest comparison.** The digest a lockfile records is held against the one bodega pinned for the same version:
 
 | Lockfile records                         | Compared with                                                                                                                        |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| sha256 (`Cargo.lock`)                    | the pin itself, so `--dry-run` compares against a pin already on record                                                              |
+| sha256 (`Cargo.lock`, `Gemfile.lock`)    | the pin itself, so `--dry-run` compares against a pin already on record                                                              |
 | sha512, sha384 or sha1 (npm `integrity`) | the same algorithm over the tarball in the build root, once its sha256 matches the pin                                               |
 | `h1:` (`go.sum`)                         | the Go dirhash over the module zip in the build root, once its sha256 matches the pin                                                |
 | sha256 list (`requirements.txt`)         | every file bodega pinned for the version; each must be one of the listed hashes, because pip refuses a file whose hash is not listed |
@@ -795,7 +802,7 @@ A definite no outranks an unanswered entry, so a run with both exits `2`.
 # .github/workflows/deps.yml
 on:
   pull_request:
-    paths: [package-lock.json, go.sum, Cargo.lock, requirements.txt]
+    paths: [package-lock.json, go.sum, Cargo.lock, Gemfile.lock, requirements.txt]
 jobs:
   prefetch:
     runs-on: [self-hosted, bodega]
@@ -4326,7 +4333,7 @@ Each type can build under its own directory instead of `build_root`, which is wh
 | `npm_root`       | npm       | `<root>/npm`                                                                          |
 | `cargo_root`     | cargo     | `<root>/cargo`                                                                        |
 | `maven_root`     | maven     | `<root>/maven`, which no stage writes yet: the route proxies every request            |
-| `rubygems_root`  | rubygems  | `<root>/rubygems`, which nothing writes yet: every gem is pulled through `/rubygems/` |
+| `rubygems_root`  | rubygems  | `<root>/rubygems`, one `<name>/<version>/<name>-<version>.gem` per fetched gem         |
 | `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                      |
 | `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>`      |
 
@@ -5133,7 +5140,20 @@ Bundler updates `versions` by asking for the bytes past the copy it holds, with 
 
 A gem file passes the same gates as a cargo crate download: the [upstream allow-list](#upstream-allow-list) on the gem name (`bodega policy add rubygems <gem>`, matched exactly, since RubyGems names are case-sensitive and `-` and `_` are distinct), a discovery row, the hidden-package and hidden-version checks, and the entry's `version_constraint`. The version is the one the file name carries, so a platform build's discovery row reads `nokogiri` at `1.16.7-x86_64-linux`. Hiding `1.16.7` withholds every build of that release, and a constraint compares releases with the platform cut off on both sides, so an exact pin on `1.16.7` or on `1.16.7-x86_64-linux` admits every build of 1.16.7, `nokogiri-1.16.7-x86_64-linux.gem` included. A gem name may hold `-` and digits (`concurrent-ruby`, `net-http2`), so the name ends at the first `-` that opens a version followed by nothing or by a platform, which always opens with a letter. A name whose own tail is a dotted version (`foo-2.0`) is the one form no rule can split correctly.
 
-**Gap:** the age, OSV and similarity checks do not run on a gem yet, and a host's profile does not filter `versions` or `info/<gem>`.
+**Catalog path.** A gem entry in `hosted` mode is served from storage, with no upstream request at all. Catalog one the way any other type is cataloged:
+
+```bash
+bodega pkg import --lockfile Gemfile.lock        # every gem the lockfile pins, checked against its CHECKSUMS
+gem list --local | bodega pkg convert rubygems | bodega pkg import --merge -
+bodega build fetch rubygems                     # or: bodega build fetch rubygems nokogiri
+bodega build upload rubygems
+```
+
+`bodega build fetch rubygems` downloads `<registry>/gems/<name>-<version>.gem` for every version of every entry, from the entry's `url` when it names a registry root and from `rubygems_upstream` otherwise, into `rubygems_root`. A platform build is its own version (`1.16.7-x86_64-linux`), so each build a fleet runs is listed and fetched separately; its `platform` is recorded as that build. The gem's sha256 is recorded on the version entry and pinned under `rubygems/gems/<name>-<version>.gem`, the key the route reads. A gem whose bytes disagree with the checksum the entry declares or with the digest already pinned is refused, and the file is removed so no upload can publish it. `build package` has nothing to do for a gem beyond fetching what is missing, and `build upload` places each fetched gem under that key. The compact index and the full index stay the upstream's, proxied, so a client still resolves through them; only the gem file is answered from storage.
+
+`--lockfile` reads a `Gemfile.lock`'s `GEM` specs, with the platform kept on the version, and when Bundler 2.5 or later wrote a `CHECKSUMS` section, compares each sha256 there with the pin the fetch took. A disagreement fails the entry as `mismatch` and the command exits `2`. A lockfile with no `CHECKSUMS` is fetched and pinned, and each entry reports its digest `not_compared`. New entries are recorded in `proxy` mode, as every prefetch records them; switch one to `hosted` with `bodega pkg edit` to serve it from storage alone.
+
+Attestations and SBOMs name a gem `pkg:gem/<name>@<version>`, with a platform build's suffix moved to a qualifier: `pkg:gem/nokogiri@1.16.7?platform=x86_64-linux`. A CycloneDX document pushed to the [`cyclonedx` inventory source](#the-cyclonedx-source) reports a `pkg:gem` component under `rubygems`, at the version bodega records.
 
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 
@@ -7681,7 +7701,7 @@ curl --fail -H "Authorization: Bearer $BODEGA_INVENTORY_TOKEN" \
   --data-binary @bom.json https://bodega.example.com/api/v1/inventory/sources/hosts/bom
 ```
 
-A component's ecosystem comes from its purl type (`deb` is `apt`, `golang` is `gomod`, `pypi`, `npm`, `cargo`, `helm`, `freebsd`); anything else is `other`. The digest is the strongest hash the component lists. The path is the first `evidence.occurrences` location, and the origin is the purl's `repository_url` or `download_url` qualifier, or a `distribution` external reference. `metadata.timestamp` is the observed time.
+A component's ecosystem comes from its purl type (`deb` is `apt`, `golang` is `gomod`, `gem` is `rubygems`, `pypi`, `npm`, `cargo`, `helm`, `freebsd`); anything else is `other`. A `gem` component's `platform` qualifier goes back onto its version, `1.16.7` becoming `1.16.7-x86_64-linux`, which is how a gem entry names a platform build. The digest is the strongest hash the component lists. The path is the first `evidence.occurrences` location, and the origin is the purl's `repository_url` or `download_url` qualifier, or a `distribution` external reference. `metadata.timestamp` is the observed time.
 
 | Status | Cause                                                                 |
 | ------ | --------------------------------------------------------------------- |

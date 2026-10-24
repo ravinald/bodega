@@ -56,6 +56,7 @@ Sources per type:
   npm     npm ls --global --json --depth=0
   gomod   go list -m all   |   go version -m <binary>
   cargo   cargo install --list
+  rubygems gem list --local   |   ls $(gem environment gemdir)/specifications
   helm    helm list -o json
   freebsd pkg query '%R\t%q'
 
