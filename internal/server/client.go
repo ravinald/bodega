@@ -106,13 +106,18 @@ type clientQuery struct {
 	// a per-user one would otherwise go: npm's node-gyp mirror.
 	Root bool
 	// File selects a system's companion file on /client/{system}, which is
-	// the URL a plan's companion record names. clientFileNodeMirror is the
-	// one value.
+	// the URL a plan's companion record names: clientFileNodeMirror or
+	// clientFileBundler.
 	File string
 }
 
-// clientFileNodeMirror is npm's NODEJS_ORG_MIRROR file on /client/npm.
-const clientFileNodeMirror = "node-mirror"
+// Companion files, each served on its own system's route alone.
+const (
+	// clientFileNodeMirror is npm's NODEJS_ORG_MIRROR file on /client/npm.
+	clientFileNodeMirror = "node-mirror"
+	// clientFileBundler is Bundler's mirror file on /client/rubygems.
+	clientFileBundler = "bundler"
+)
 
 var (
 	clientABIRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$`)
@@ -163,8 +168,10 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	default:
 		return q, fmt.Errorf("root=%q is not 0 or 1. Pass root=1 when the plan is applied as root", raw)
 	}
-	if q.File = v.Get("file"); q.File != "" && q.File != clientFileNodeMirror {
-		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s", q.File, clientFileNodeMirror)
+	switch q.File = v.Get("file"); q.File {
+	case "", clientFileNodeMirror, clientFileBundler:
+	default:
+		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s, %s", q.File, clientFileNodeMirror, clientFileBundler)
 	}
 	return q, nil
 }
@@ -350,6 +357,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return one(clientconf.ForType(sys, clientconf.Inputs{Base: h.base})[0])
 	case manifest.TypeNpm:
 		return s.planNpm(h, one)
+	case manifest.TypeRubygems:
+		return planRubygems(h, one)
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:
@@ -412,6 +421,21 @@ func (s *Server) planNpm(h *clientHost, one func(clientconf.File) []planFile) []
 		out[0].reason = strings.Join(notes, ". ")
 	}
 	return out
+}
+
+// planRubygems renders ~/.gemrc and Bundler's mirror. Both, because gem
+// reads only the first and Bundler only the second, so a host handed one
+// still installs from rubygems.org through the other.
+func planRubygems(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	files := clientconf.Rubygems(h.base)
+	out := one(files[0])
+	bundler := one(files[1])
+	if bundler[0].action == planInstall {
+		v, _ := url.ParseQuery(h.q.encode())
+		v.Set("file", clientFileBundler)
+		bundler[0].url = h.base + "/client/" + manifest.TypeRubygems + "?" + v.Encode()
+	}
+	return append(out, bundler...)
 }
 
 // planDistfiles renders make.conf and the client check it includes. The two
@@ -850,8 +874,12 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 		s.serveClientAptArchive(w, r, h, sys)
 		return
 	}
-	if h.q.File != "" {
+	switch h.q.File {
+	case clientFileNodeMirror:
 		s.serveClientNodeMirror(w, r, h, sys)
+		return
+	case clientFileBundler:
+		s.serveClientBundler(w, r, h, sys)
 		return
 	}
 	files := s.planSystem(r, h, sys)
@@ -911,6 +939,25 @@ func (s *Server) serveClientNodeMirror(w http.ResponseWriter, r *http.Request, h
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(f.Content))
+	noteClient(r, sys, h, "", "")
+}
+
+// serveClientBundler serves the Bundler mirror file a plan's rubygems
+// companion record names, asking the profile first as planSystem does.
+func (s *Server) serveClientBundler(w http.ResponseWriter, r *http.Request, h *clientHost, sys string) {
+	if sys != manifest.TypeRubygems {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusBadRequest, "", "file="+clientFileBundler+" selects Bundler's mirror file, and applies to /client/rubygems alone\n")
+		return
+	}
+	if reason := h.profile.Excludes(sys); reason != "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusForbidden, audit.DenialClientExcluded, reason+"\n")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: a YAML file served as text/plain, never HTML; the one interpolated value is this server's own base URL.
+	_, _ = w.Write([]byte(clientconf.Rubygems(h.base)[1].Content))
 	noteClient(r, sys, h, "", "")
 }
 
