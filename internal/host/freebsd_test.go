@@ -497,8 +497,10 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 		start := time.Now()
 		_, err := runToolWaiting(time.Second, testWaitDelay, "", "sh", "-c", `sleep 40 & echo $! >"$1"; sleep 40; true`, "sh", pidfile)
 		// Expected: the 1s timeout, then the end of the group closes the
-		// pipes. The bound allows the whole wait delay as well, plus 5s.
-		if elapsed := time.Since(start); elapsed > time.Second+testWaitDelay+5*time.Second {
+		// pipes. The bound only guards against a hang: a tree left running
+		// holds the pipes until the 40s sleep exits, past it. Anything
+		// tighter fails on a loaded CI VM rather than on a defect.
+		if elapsed := time.Since(start); elapsed > testWaitDelay+30*time.Second {
 			t.Errorf("returned after %s", elapsed)
 		}
 		if err == nil || !strings.Contains(err.Error(), "sh did not answer within 1s") {
@@ -510,9 +512,12 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 		start := time.Now()
 		out, _ := runToolWaiting(time.Minute, testWaitDelay, "", "sh", "-c", `echo answer; sleep 40 & echo $! >"$1"`, "sh", pidfile)
 		// Expected: the wait delay, since the background sleep holds
-		// stdout. The upper bound leaves 5s of headroom over it.
-		if elapsed := time.Since(start); elapsed < testWaitDelay || elapsed > testWaitDelay+5*time.Second {
-			t.Errorf("returned after %s, want between %s and %s", elapsed, testWaitDelay, testWaitDelay+5*time.Second)
+		// stdout. The lower bound proves the delay applied. The upper bound
+		// only guards against a hang to the one-minute timeout, or to the
+		// 40s sleep's exit, both past it; anything tighter fails on a
+		// loaded CI VM rather than on a defect.
+		if elapsed := time.Since(start); elapsed < testWaitDelay || elapsed > testWaitDelay+30*time.Second {
+			t.Errorf("returned after %s, want between %s and %s", elapsed, testWaitDelay, testWaitDelay+30*time.Second)
 		}
 		if string(out) != "answer\n" {
 			t.Errorf("stdout = %q", out)
