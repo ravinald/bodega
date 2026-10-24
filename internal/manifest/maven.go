@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -151,4 +152,37 @@ func MavenArtifactPath(name, version string) (string, bool) {
 		return "", false
 	}
 	return strings.ReplaceAll(group, ".", "/") + "/" + artifact + "/" + version + "/" + artifact + "-" + version + ".pom", true
+}
+
+// MavenGroupWildcard is the artifactId that makes a <groupId>:* entry: every
+// artifact under that one groupId, and none under a groupId nested in it.
+const MavenGroupWildcard = "*"
+
+// ValidateMavenName refuses a name that is not <groupId>:<artifactId> or
+// <groupId>:*, judged by the segment rule ParseMavenPath applies to a request,
+// so no entry is accepted that no request could ever name.
+func ValidateMavenName(name string) error {
+	group, artifact, ok := strings.Cut(name, ":")
+	if !ok || strings.Contains(artifact, ":") {
+		return fmt.Errorf("maven %q is not a coordinate; write <groupId>:<artifactId> (org.springframework.boot:spring-boot) or <groupId>:* for every artifact of one groupId", name)
+	}
+	for _, seg := range strings.Split(group, ".") {
+		if !mavenSegmentPattern.MatchString(seg) {
+			return fmt.Errorf("maven %q: groupId %q is not dotted segments of letters, digits, '_', '-' or '+'", name, group)
+		}
+	}
+	if artifact != MavenGroupWildcard && (strings.HasPrefix(artifact, ".") || !mavenSegmentPattern.MatchString(artifact)) {
+		return fmt.Errorf("maven %q: artifactId %q is not letters, digits, '.', '_', '-' or '+', or the groupId-wide '*'", name, artifact)
+	}
+	return nil
+}
+
+// MavenGroupEntry is the <groupId>:* entry that covers name, and false when
+// name is not a coordinate.
+func MavenGroupEntry(name string) (string, bool) {
+	group, _, ok := strings.Cut(name, ":")
+	if !ok || group == "" {
+		return "", false
+	}
+	return group + ":" + MavenGroupWildcard, true
 }
