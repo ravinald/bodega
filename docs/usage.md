@@ -5258,9 +5258,9 @@ Every route takes the same query parameters:
 | `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                             |
 | `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`               |
 
-The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
+The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
-**Records.** The plan lists all eleven systems, one record per file, in this column order:
+**Records.** The plan lists all thirteen systems, one record per file, in this column order:
 
 | Column     | Value                                                                                                 |
 | ---------- | ----------------------------------------------------------------------------------------------------- |
