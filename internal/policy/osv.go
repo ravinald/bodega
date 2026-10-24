@@ -32,10 +32,11 @@ type OSVStore interface {
 // that settle a version live in the export for its own release. See
 // osvLookupFor and OSVExportsFor.
 var osvEcosystemFor = map[string]string{
-	manifest.TypeNpm:   "npm",
-	manifest.TypePypi:  "PyPI",
-	manifest.TypeGomod: "Go",
-	manifest.TypeCargo: "crates.io",
+	manifest.TypeNpm:      "npm",
+	manifest.TypePypi:     "PyPI",
+	manifest.TypeGomod:    "Go",
+	manifest.TypeCargo:    "crates.io",
+	manifest.TypeRubygems: "RubyGems",
 }
 
 // OSVEcosystemFor returns OSV's identifier for a registry type, or "" when
@@ -400,8 +401,9 @@ func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.V
 	}
 	for _, t := range lk.targets {
 		eco, name := t.ecosystem, t.name
-		ans := SharedLookup(ctx, "osv\x00"+eco+"\x00"+name+"\x00"+ve.Version, func() osvAnswer {
-			return c.lookup(ctx, eco, name, ve.Version)
+		version := osvQueryVersion(eco, ve.Version)
+		ans := SharedLookup(ctx, "osv\x00"+eco+"\x00"+name+"\x00"+version, func() osvAnswer {
+			return c.lookup(ctx, eco, name, version)
 		})
 		if ans.err != nil {
 			// Whole, not just the error: a caller reads the ids off an
@@ -428,6 +430,18 @@ func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.V
 	}
 	out.degraded = strings.Join(degraded, "; ")
 	return out
+}
+
+// osvQueryVersion is the version an advisory is matched against. A platform
+// gem's version carries its platform ("1.16.7-x86_64-linux"), and RubyGems
+// advisories are issued against the release, which every platform build of it
+// shares.
+func osvQueryVersion(ecosystem, version string) string {
+	if ecosystem == "RubyGems" {
+		release, _, _ := strings.Cut(version, "-")
+		return release
+	}
+	return version
 }
 
 // queryName is the name the entry was looked up under, for a reason that has

@@ -12,9 +12,10 @@ import (
 // SEMVER or ECOSYSTEM; ECOSYSTEM means "whatever this ecosystem orders by", so
 // the ordering is chosen from the ecosystem when the range does not pin it.
 const (
-	orderSemver = "semver"
-	orderPEP440 = "pep440"
-	orderDebian = "debian"
+	orderSemver   = "semver"
+	orderPEP440   = "pep440"
+	orderDebian   = "debian"
+	orderRubyGems = "rubygems"
 )
 
 // osvAffected is the subset of an OSV record's `affected` entry the matcher
@@ -108,13 +109,15 @@ func (e *osvEvent) UnmarshalJSON(b []byte) error {
 }
 
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
-// ecosystem. PyPI orders by PEP 440, Ubuntu and Debian by dpkg's ordering, and
-// the rest of what bodega maps order by semver, so an unknown ecosystem gets
-// semver rather than an error.
+// ecosystem. PyPI orders by PEP 440, RubyGems by Gem::Version, Ubuntu and
+// Debian by dpkg's ordering, and the rest of what bodega maps order by semver,
+// so an unknown ecosystem gets semver rather than an error.
 func osvVersionOrder(ecosystem string) string {
 	switch {
 	case ecosystem == "PyPI":
 		return orderPEP440
+	case ecosystem == "RubyGems":
+		return orderRubyGems
 	case isDistroEcosystem(ecosystem):
 		return orderDebian
 	}
@@ -302,6 +305,8 @@ func compareVersions(order, a, b string) (int, bool) {
 		return comparePEP440(a, b)
 	case orderDebian:
 		return compareDebian(a, b)
+	case orderRubyGems:
+		return compareGemVersions(a, b)
 	}
 	return compareSemver(a, b)
 }
@@ -313,8 +318,91 @@ func orderable(order, v string) bool {
 		return parsePEP440(v).ok
 	case orderDebian:
 		return parseDebian(v).ok
+	case orderRubyGems:
+		_, ok := parseGemVersion(v)
+		return ok
 	}
 	return parseSemver(v).ok
+}
+
+// gemVersionPattern is Gem::Version's ANCHORED_VERSION_PATTERN.
+var gemVersionPattern = regexp.MustCompile(`^\s*([0-9]+(\.[0-9a-zA-Z]+)*(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?)?\s*$`)
+
+var gemSegmentPattern = regexp.MustCompile(`[0-9]+|[a-zA-Z]+`)
+
+// gemSegment is one segment of a Gem::Version: a number, or the letters of a
+// prerelease marker when str is set.
+type gemSegment struct {
+	num int
+	str string
+}
+
+// parseGemVersion returns Gem::Version#canonical_segments. A letter segment
+// makes the version a prerelease of the numbers before it, so "1.0.0.rc1"
+// sorts below "1.0.0", and a "-" reads as ".pre.", as Gem::Version rewrites
+// it. Trailing zeros are dropped from the release and from the prerelease
+// part, so "1.0" equals "1" and "1.0.a" equals "1.a".
+func parseGemVersion(v string) ([]gemSegment, bool) {
+	if !gemVersionPattern.MatchString(v) {
+		return nil, false
+	}
+	v = strings.ReplaceAll(strings.TrimSpace(v), "-", ".pre.")
+	var segs []gemSegment
+	for _, m := range gemSegmentPattern.FindAllString(v, -1) {
+		if n, err := strconv.Atoi(m); err == nil {
+			segs = append(segs, gemSegment{num: n})
+		} else if m[0] >= '0' && m[0] <= '9' {
+			return nil, false
+		} else {
+			segs = append(segs, gemSegment{str: m})
+		}
+	}
+	split := len(segs)
+	for i, s := range segs {
+		if s.str != "" {
+			split = i
+			break
+		}
+	}
+	trim := func(part []gemSegment) []gemSegment {
+		for len(part) > 0 && part[len(part)-1] == (gemSegment{}) {
+			part = part[:len(part)-1]
+		}
+		return part
+	}
+	return append(trim(segs[:split:split]), trim(segs[split:])...), true
+}
+
+// compareGemVersions is Gem::Version#<=>: segment by segment, a missing one
+// reading as 0, a letter segment below any number, two letter segments by
+// byte order.
+func compareGemVersions(a, b string) (int, bool) {
+	sa, oka := parseGemVersion(a)
+	sb, okb := parseGemVersion(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	for i := 0; i < len(sa) || i < len(sb); i++ {
+		var x, y gemSegment
+		if i < len(sa) {
+			x = sa[i]
+		}
+		if i < len(sb) {
+			y = sb[i]
+		}
+		switch {
+		case x == y:
+			continue
+		case x.str != "" && y.str == "":
+			return -1, true
+		case x.str == "" && y.str != "":
+			return 1, true
+		case x.str != "":
+			return strings.Compare(x.str, y.str), true
+		}
+		return compareInt(x.num, y.num), true
+	}
+	return 0, true
 }
 
 type semverVersion struct {
