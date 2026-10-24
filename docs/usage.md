@@ -2447,6 +2447,7 @@ Adds an allow-list rule. The rule kind is determined by type:
 | helm      | prefix       | `https://kubernetes.github.io/ingress-nginx/` |
 | binary    | prefix       | `https://downloads.example.com/`              |
 | cargo     | package      | `serde`                                       |
+| maven     | package      | `org.slf4j:slf4j-api` or `org.slf4j:*`        |
 | freebsd   | host         | `pkg.freebsd.org`                             |
 | distfiles | host         | `distcache.FreeBSD.org`                       |
 
@@ -4316,6 +4317,7 @@ Each type can build under its own directory instead of `build_root`, which is wh
 | `helm_root`      | helm      | `<root>/charts`                                                                       |
 | `npm_root`       | npm       | `<root>/npm`                                                                          |
 | `cargo_root`     | cargo     | `<root>/cargo`                                                                        |
+| `maven_root`     | maven     | `<root>/maven`, which no stage writes yet: the route proxies every request            |
 | `rubygems_root`  | rubygems  | `<root>/rubygems`, which nothing writes yet: every gem is pulled through `/rubygems/` |
 | `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                      |
 | `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>`      |
@@ -4341,7 +4343,7 @@ Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`,
 
 `custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
 
-**Gap:** the TUI's config form shows four of the eleven roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `rubygems_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
+**Gap:** the TUI's config form shows four of the twelve roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `maven_root`, `rubygems_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -5044,6 +5046,50 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 `deps` is the dependency list `bodega build fetch` recorded from the upstream sparse index for that version, and `[]` where it recorded none: cargo refuses to deserialize a line missing the member, before it reaches the crate the line describes. The record comes from the index rather than from the `Cargo.toml` inside the `.crate`, because a registry dependency carries `name`, `req`, `features`, `optional`, `default_features`, `target` and `kind`, and `Cargo.toml`'s workspace inheritance, `path` dependencies and `git` dependencies map onto none of that. The registry resolved them when the crate was published, and the index line is where that resolution is written down. An index host that cannot be reached during a fetch logs a warning and records nothing; the crate's own bytes are unaffected and a later `--force` fetch fills the record in.
 
 **Gap:** a generated index line declares `features: {}`. bodega records no cargo feature table, so a crate whose dependency needs a named feature resolves and downloads but may not compile. Recording the feature map is the same mechanism as `deps` and waits on nothing but the work.
+
+**Maven and Gradle** (`~/.m2/settings.xml` for Maven; the project's `settings.gradle.kts` for Gradle). The plan does not install either yet: a `settings.xml` usually holds an operator's servers and profiles, and one written whole would drop them, so the plan lists `maven` as a skip and these are set by hand. The TUI and the web UI show the Maven file. A whole `settings.xml` for a host that has none:
+
+```xml
+<settings>
+  <mirrors>
+    <mirror>
+      <id>bodega</id>
+      <mirrorOf>*</mirrorOf>
+      <url>https://bodega-host:8080/maven/</url>
+    </mirror>
+  </mirrors>
+</settings>
+```
+
+An existing file takes the `<mirror>` element inside its own `<mirrors>`. `mirrorOf` `*` sends every repository a POM or a parent POM names through bodega, not only Maven Central, so a build that declares a second repository fails on its first artifact from it rather than reaching around bodega. For Gradle, in the project's `settings.gradle.kts`:
+
+```kotlin
+pluginManagement {
+    repositories { maven("https://bodega-host:8080/maven/") }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories { maven("https://bodega-host:8080/maven/") }
+}
+```
+
+`PREFER_SETTINGS` makes Gradle ignore the `repositories {}` block each `build.gradle` declares, which is where `mavenCentral()` usually sits. A Groovy `settings.gradle` spells each line `maven { url 'https://bodega-host:8080/maven/' }`. sbt and Leiningen take the same URL as their only resolver.
+
+`GET /maven/<path>` serves Maven Central's repository layout byte for byte from [`maven_upstream`](#upstream-hosts). Three path forms are answered and anything else is a 404 the upstream never sees:
+
+| Path                                                                              | Identity                                | Cached         |
+| --------------------------------------------------------------------------------- | --------------------------------------- | -------------- |
+| `<group dirs>/<artifactId>/<version>/<artifactId>-<version>[-<classifier>].<ext>` | `<groupId>:<artifactId>` at `<version>` | forever        |
+| the same under a `<version>-SNAPSHOT` directory, timestamped or not               | the same, at the SNAPSHOT version       | `metadata_ttl` |
+| `<group dirs>/<artifactId>/maven-metadata.xml`, and a SNAPSHOT's own              | `<groupId>:<artifactId>`                | `metadata_ttl` |
+
+`<ext>` is `jar`, `pom`, `module`, `aar` or `war`, and each of those and `maven-metadata.xml` may carry a `.sha1`, `.md5`, `.sha256`, `.sha512` or `.asc` companion, which shares the identity and the caching of the file it sits beside. The groupId is written with dots: `org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar` is `org.apache.commons:commons-lang3` at `3.14.0`. Every file of one version is judged and recorded under that identity, so a resolver's jar, POM, Gradle module and checksums land on one discovery row rather than six. The allow-list rules on it: `bodega policy add maven org.slf4j:slf4j-api` admits one artifact and `bodega policy add maven org.springframework.boot:*` every artifact of that groupId, and no groupId nested under it. A hidden version, a hidden package and an entry's `version_constraint` refuse the request before the upstream is asked, as they do for npm. `maven-metadata.xml` keeps a copy through an outage on the same terms as every mutable document: see [During an upstream outage](#proxycache).
+
+**Gaps:**
+
+- A groupId-level `maven-metadata.xml`, which Maven reads to resolve a plugin prefix such as `spring-boot:run`, is read as an artifact one directory up: `org/springframework/boot/maven-metadata.xml` is judged as `org.springframework:boot`. It proxies, but under an allow-list in `listed` mode it needs a rule naming that identity.
+- `maven_upstream` names one repository. A Gradle plugin published only to the Gradle Plugin Portal does not resolve; plugins Maven Central also carries do.
+- The Maven and Gradle wrappers download their own distributions from `distributionUrl` before any repository setting applies, and a `.zip` is not a path this route answers.
 
 **RubyGems** (`~/.gemrc` for `gem`, `~/.bundle/config` for Bundler):
 
@@ -7139,7 +7185,7 @@ Configure the TTL and the two bounds on waiting for an upstream:
 
 **During an upstream outage.** A request for a mutable document bodega holds a copy of is answered within `stale_grace`: if the upstream has not answered by then, the client gets the cached copy (recorded as a cache hit, the same as when the upstream fetch fails outright) and the refresh carries on in the background, bounded by the 90s upstream timeout, even after the client hangs up. A refresh that succeeds replaces the cached copy, so the next request gets the fresh one. Only one refresh per document runs at a time, and a request arriving during it is served the cached copy at once. A request bodega holds no copy for waits on the upstream: against an unreachable host it gets `502 upstream fetch failed` after `upstream_connect_timeout`, and against a host that accepts the connection and never answers, it waits until the client gives up or the 90s upstream timeout fires. An immutable artifact already cached is never refetched, so an outage does not touch it.
 
-**A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. For `npm` it covers the packument and the tarball together, for the same reason at one remove: the proxied packument has every `dist.tarball` rewritten onto this server's own `/npm/{pkg}/-/{tarball}`, so a tarball route that refused what the packument published would fail `npm install` on a URL bodega itself named.
+**A name no manifest holds still proxies.** `gomod`, `npm`, `cargo` and `maven` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. For `npm` it covers the packument and the tarball together, for the same reason at one remove: the proxied packument has every `dist.tarball` rewritten onto this server's own `/npm/{pkg}/-/{tarball}`, so a tarball route that refused what the packument published would fail `npm install` on a URL bodega itself named.
 
 **`pypi` wheels and `helm` charts stay catalog-only, for different reasons.** A wheel URL is read out of the simple index rather than composed from a filename, and nothing publishes one for a distribution no entry names: `/pypi/simple/{dist}/` republishes the upstream index for a `proxy`-mode distribution only and lists stored wheels otherwise. Opening the wheel route would pay a simple-index fetch per request for addresses only a guess produces. A chart repository URL is recorded per version entry rather than in config, so an uncatalogued chart names no host to reach at all, and composing one from the chart name is the guess [`pkg import`](#bodega-pkg-import-file-file) already refuses. Both routes answer the missing entry rather than a bare 404: the response names the distribution or chart, what bodega would have needed to fetch it, and the `bodega pkg create` line that supplies it. A `no_manifest` discovery row is written either way, as before.
 
@@ -7157,6 +7203,7 @@ Eight flat keys name the registries a proxying instance fetches from. They are n
 | `pypi_upstream`      | `https://pypi.org`                              | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404, and the log line beside it names the index that was read. The body does not, because the route takes no token and the URL may carry credentials. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
 | `cargo_upstream`     | `https://index.crates.io`                       | The sparse index, and nothing else. A crate tarball request to this host is a 404                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `cargo_dl_upstream`  | `https://static.crates.io/crates`               | Crate tarballs. bodega appends `/{crate}/{version}/download`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `maven_upstream`     | `https://repo.maven.apache.org/maven2`          | The repository root in the Maven layout. bodega appends the request path below `/maven/`. Load refuses anything but an https URL                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `rubygems_upstream`  | `https://rubygems.org`                          | Gem files, gemspecs, Bundler's compact index, the full index files and the dependency API, all under one root. Load refuses anything but an https URL with no userinfo, query or fragment                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `distfiles_upstream` | `http://distcache.FreeBSD.org/ports-distfiles/` | Ports distfiles, by distinfo name. Plain `http` on purpose; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
@@ -8300,6 +8347,7 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 | npm       | `npm/`            | `npm/lodash/lodash-4.17.21.tgz`                                                   |
 | cargo     | `cargo/crates/`   | `cargo/crates/serde-1.0.200.crate`                                                |
 | cargo     | `cargo/index/`    | `cargo/index/se/rd/serde`                                                         |
+| maven     | `maven/`          | `maven/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar`                           |
 | rubygems  | `rubygems/gems/`  | `rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem`                                  |
 | rubygems  | `rubygems/quick/` | `rubygems/quick/Marshal.4.8/rack-3.1.8.gemspec.rz`                                |
 | rubygems  | `rubygems/index/` | `rubygems/index/info/rack`                                                        |

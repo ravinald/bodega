@@ -257,7 +257,7 @@ func observeHijack(w http.ResponseWriter, status int) {
 func allowListRefusal(regType, candidate, name, version string) *refusal {
 	f := newRefusal(checkAllowList, regType, name, version, http.StatusForbidden)
 	switch regType {
-	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeRubygems:
+	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems:
 		if f.name == "" {
 			f.name = candidate
 		}

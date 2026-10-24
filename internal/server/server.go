@@ -1014,6 +1014,9 @@ func (s *Server) registerRoutes() {
 	// cargo sparse registry (sparse+https://bodega/cargo/)
 	m.HandleFunc("GET /cargo/{path...}", s.handleCargo)
 
+	// Maven repository layout (Maven, Gradle, sbt: <base>/maven/)
+	m.HandleFunc("GET /maven/{path...}", s.handleMaven)
+
 	// RubyGems registry (gem sources / Bundler source https://bodega/rubygems/)
 	m.HandleFunc("GET /rubygems/{path...}", s.handleRubygems)
 

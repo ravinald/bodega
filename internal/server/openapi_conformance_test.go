@@ -38,6 +38,7 @@ var specPathsNotDocumented = map[string]string{
 	"/helm/":            "helm chart repository protocol",
 	"/npm/":             "npm registry API",
 	"/cargo/":           "cargo sparse index protocol",
+	"/maven/":           "Maven repository layout, consumed by Maven and Gradle",
 	"/rubygems/":        "RubyGems registry layout and Bundler's compact index",
 	"/freebsd/":         "FreeBSD pkg repository layout, consumed by pkg rather than by a generated client",
 	"/freebsd-profile/": "the same pkg repository layout, filtered for one profile",

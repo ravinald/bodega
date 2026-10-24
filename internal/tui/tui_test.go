@@ -1388,6 +1388,7 @@ var clientURLSeeds = map[string]struct {
 	manifest.TypeGit:      {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
 	manifest.TypeBinary:   {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
 	manifest.TypeCargo:    {"time", manifest.VersionEntry{Version: "0.3.36"}},
+	manifest.TypeMaven:    {"org.slf4j:slf4j-api", manifest.VersionEntry{Version: "2.0.13"}},
 	manifest.TypeRubygems: {"rack", manifest.VersionEntry{Version: "3.1.8"}},
 	// The version is the ABI, which is what the pkg.conf stanza leaves as a
 	// literal ${ABI} and what the route carries.

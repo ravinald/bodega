@@ -1407,6 +1407,7 @@ var createTypeOptions = []string{
 	manifest.TypeGit,
 	manifest.TypeGomod,
 	manifest.TypeHelm,
+	manifest.TypeMaven,
 	manifest.TypeNpm,
 	manifest.TypePypi,
 	manifest.TypeRubygems,
@@ -1846,6 +1847,28 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
+	case manifest.TypeMaven:
+		// No Source URL: every maven entry resolves through maven_upstream,
+		// and the route composes the path from the coordinate.
+		modeVal := restore("Mode", "proxy")
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "<groupId>:<artifactId>, e.g. org.slf4j:slf4j-api"},
+			{Label: "Version", Value: restore("Version", ""),
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "Checksum", Value: restore("Checksum", ""),
+				Hint: checksumHint(restore("Checksum", ""))},
+		})
+
 	case manifest.TypeFreeBSD:
 		// A freebsd entry is a repository, not a package, so the form asks
 		// for the two halves of the path a pkg client composes: the
@@ -2093,6 +2116,13 @@ func validateCreateFields(fields []formField) string {
 	case manifest.TypeCargo, manifest.TypeRubygems:
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for " + entryType + " entries"
+		}
+	case manifest.TypeMaven:
+		if group, artifact, ok := strings.Cut(fieldValueFromSlice(fields, "Name"), ":"); !ok || group == "" || artifact == "" {
+			return "Name must be <groupId>:<artifactId> for maven entries, e.g. org.slf4j:slf4j-api"
+		}
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for maven entries"
 		}
 	case manifest.TypeFreeBSD:
 		// Both halves of the path a pkg client composes, checked against what
@@ -2370,7 +2400,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeHelm:
 		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeRubygems:
+	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		// nothing extra
 
 	case manifest.TypeFreeBSD:
@@ -2536,9 +2566,9 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
-	case manifest.TypeCargo, manifest.TypeRubygems:
-		// The Source URL is the registry root, which names no package, so
-		// there is nothing to derive a name from. The Name field is required.
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
+		// No Source URL here names a package: cargo's and rubygems' are the
+		// registry root and maven's form has none. The Name field is required.
 		return ""
 	default:
 		seg := lastURLSegment(rawURL)

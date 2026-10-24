@@ -209,6 +209,21 @@ func Cargo(base string) File {
 	}
 }
 
+// Maven renders a settings.xml whose one mirror sends every repository a POM
+// names through bodega. It is displayed, not installed: the plan has no maven
+// system yet, because a settings.xml usually holds an operator's credentials
+// and profiles, and one written whole would drop them.
+func Maven(base string) File {
+	return File{
+		System: manifest.TypeMaven,
+		Label:  "Maven settings.xml",
+		Paths:  everywhere("~/.m2/settings.xml"),
+		Content: fmt.Sprintf("<settings>\n  <mirrors>\n    <mirror>\n      <id>bodega</id>\n      <mirrorOf>*</mirrorOf>\n      <url>%s/maven/</url>\n    </mirror>\n  </mirrors>\n</settings>\n",
+			trim(base)),
+		Notes: []string{"An existing settings.xml takes the <mirror> element inside its own <mirrors>; replacing the file drops its servers and profiles"},
+	}
+}
+
 // Rubygems renders the two files that send gem and Bundler to bodega's
 // registry. ~/.gemrc replaces gem's source list outright, since a list that
 // kept rubygems.org beside bodega would let a miss here go straight there.
@@ -619,6 +634,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Npm(in.Base, in.BinaryUpstreams), mirror)
 	case manifest.TypeCargo:
 		out = append(out, Cargo(in.Base))
+	case manifest.TypeMaven:
+		out = append(out, Maven(in.Base))
 	case manifest.TypeRubygems:
 		out = append(out, Rubygems(in.Base)...)
 	case manifest.TypeGomod:

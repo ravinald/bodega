@@ -820,7 +820,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, rubygems, freebsd, distfiles, osquery]
+            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, freebsd, distfiles, osquery]
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
@@ -1672,7 +1672,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, rubygems, freebsd, distfiles]
+        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, freebsd, distfiles]
     PackageName:
       name: name
       in: path
@@ -1821,6 +1821,10 @@ components:
           items:
             $ref: "#/components/schemas/PackageManifest"
         cargo:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        maven:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
@@ -2135,7 +2139,7 @@ components:
           description: Package name
         type:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, rubygems, freebsd, distfiles]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, freebsd, distfiles]
         description:
           type: string
         dep_policy:
@@ -2974,7 +2978,7 @@ components:
           description: The binding that resolved it, "token:<id>" or "cidr:<prefix>"
         system:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, rubygems, freebsd, distfiles, osquery]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, freebsd, distfiles, osquery]
         action:
           type: string
           enum: [install, refuse, skip]

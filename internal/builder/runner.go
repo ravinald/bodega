@@ -44,6 +44,7 @@ type Config struct {
 	HelmRoot    string
 	NpmRoot     string
 	CargoRoot   string
+	MavenRoot   string
 	FreeBSDRoot string
 
 	// RubygemsRoot roots the gem files upload reads. No stage writes one
@@ -370,6 +371,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.CargoRoot != "" {
 			return c.CargoRoot
 		}
+	case "maven":
+		if c.MavenRoot != "" {
+			return c.MavenRoot
+		}
 	case "rubygems":
 		if c.RubygemsRoot != "" {
 			return c.RubygemsRoot
@@ -427,6 +432,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		HelmRoot:       app.HelmRoot,
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
+		MavenRoot:      app.MavenRoot,
 		RubygemsRoot:   app.RubygemsRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
 		DistfilesRoot:  app.DistfilesRoot,
@@ -468,6 +474,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.npm
 	case manifest.TypeCargo:
 		return d.cargo
+	case manifest.TypeMaven:
+		return d.maven
 	case manifest.TypeRubygems:
 		return d.rubygems
 	case manifest.TypeFreeBSD:
@@ -515,6 +523,8 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.npm}
 	case manifest.TypeCargo:
 		return []string{d.cargo}
+	case manifest.TypeMaven:
+		return []string{d.maven}
 	case manifest.TypeRubygems:
 		return []string{d.rubygems}
 	case manifest.TypeFreeBSD:
@@ -706,6 +716,7 @@ type dirs struct {
 	charts   string
 	npm      string
 	cargo    string
+	maven    string
 	rubygems string
 	freebsd  string
 
@@ -726,6 +737,7 @@ func buildDirs(root string) dirs {
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
 		cargo:    filepath.Join(root, "cargo"),
+		maven:    filepath.Join(root, "maven"),
 		rubygems: filepath.Join(root, "rubygems"),
 		freebsd:  filepath.Join(root, "freebsd"),
 

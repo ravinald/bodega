@@ -26,6 +26,7 @@ const (
 	TypeHelm   = "helm"
 	TypeNpm    = "npm"
 	TypeCargo  = "cargo"
+	TypeMaven  = "maven"
 
 	// TypeRubygems is a RubyGems registry: gem files, Bundler's compact
 	// index and the legacy full index, under one upstream.
@@ -59,7 +60,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeRubygems, TypeFreeBSD, TypeDistfiles}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeRubygems, TypeFreeBSD, TypeDistfiles}
 
 // Dependency is one dependency a version declares, recorded in the shape the
 // registry protocol publishes rather than the shape the ecosystem's build file

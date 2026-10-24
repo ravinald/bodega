@@ -48,7 +48,7 @@ func (s *Server) queueResult(r *http.Request, typ, name, version string, res pol
 // artifact URL, and a rule that exact admits one file.
 func queuePattern(regType, upstreamURL, candidate, name string) string {
 	switch regType {
-	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeRubygems:
+	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems:
 		return candidate
 	}
 	u := upstreamURL

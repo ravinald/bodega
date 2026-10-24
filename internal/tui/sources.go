@@ -293,6 +293,10 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 	cargoEntries := collectEntries(manifest.TypeCargo, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeCargo, cargoEntries))
 
+	// maven
+	mavenEntries := collectEntries(manifest.TypeMaven, func(ve manifest.VersionEntry) string { return ve.Version })
+	roots = append(roots, buildGroup(manifest.TypeMaven, mavenEntries))
+
 	// rubygems — a platform build's suffix is part of the version.
 	rubygemsEntries := collectEntries(manifest.TypeRubygems, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeRubygems, rubygemsEntries))
