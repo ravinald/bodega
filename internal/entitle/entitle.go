@@ -297,7 +297,7 @@ func (p *Profile) Covers(typ, name string) Decision {
 		}
 	}
 
-	if _, listed := p.entries[typ][Key(typ, name)]; listed || rule.Membership != audit.MembershipClosed {
+	if _, listed := p.entry(typ, name); listed || rule.Membership != audit.MembershipClosed {
 		return Decision{Permitted: true, Governed: true, Rule: &rule}
 	}
 
@@ -342,7 +342,7 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	}
 
 	rule := *d.Rule
-	entry, listed := p.entries[typ][Key(typ, name)]
+	entry, listed := p.entry(typ, name)
 
 	kind, base := versionRule(rule, entry, listed)
 	if kind == audit.VersionPinned {
@@ -370,6 +370,23 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 		out.Reason = fmt.Sprintf("profile %q does not permit %s/%s at %s: %s", p.name, typ, name, version, out.Reason)
 	}
 	return out
+}
+
+// entry is the profile's entry for typ/name. A maven coordinate the profile
+// does not name falls back to its <groupId>:* entry, so a groupId-wide entry
+// lists every artifact of that groupId and an entry naming one artifact still
+// overrides it for that artifact alone.
+func (p *Profile) entry(typ, name string) (audit.ProfileEntry, bool) {
+	if e, ok := p.entries[typ][Key(typ, name)]; ok {
+		return e, true
+	}
+	if typ == manifest.TypeMaven {
+		if group, ok := manifest.MavenGroupEntry(name); ok {
+			e, ok := p.entries[typ][group]
+			return e, ok
+		}
+	}
+	return audit.ProfileEntry{}, false
 }
 
 // versionRule resolves the third level against the first. It returns a

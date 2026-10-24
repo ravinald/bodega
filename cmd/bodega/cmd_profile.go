@@ -561,10 +561,8 @@ func validateDoc(doc *profileDoc) error {
 		if strings.TrimSpace(e.Name) == "" {
 			return fmt.Errorf("entries[%d]: an entry needs a package name", i)
 		}
-		if e.Type == manifest.TypeGomod {
-			if err := manifest.ValidateGomodName(e.Name); err != nil {
-				return fmt.Errorf("entries[%d]: %w", i, err)
-			}
+		if err := requireEntryNameForm(e.Type, e.Name); err != nil {
+			return fmt.Errorf("entries[%d]: %w", i, err)
 		}
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
@@ -1678,6 +1676,9 @@ that is a different decision: the package stops being permitted at all.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			profile, typ, name := args[0], args[1], args[2]
+			if err := requireEntryNameForm(typ, name); err != nil {
+				return err
+			}
 			ctx := backgroundCtx()
 			adb, err := openProfileStore(gf)
 			if err != nil {
@@ -1746,10 +1747,8 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	if err := requirePackageType(typ); err != nil {
 		return err
 	}
-	if typ == manifest.TypeGomod {
-		if err := manifest.ValidateGomodName(name); err != nil {
-			return err
-		}
+	if err := requireEntryNameForm(typ, name); err != nil {
+		return err
 	}
 	ctx := backgroundCtx()
 	cfg, adb, err := openACLStore(gf)
@@ -1890,6 +1889,9 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			profile, typ, name := args[0], args[1], args[2]
+			if err := requireEntryNameForm(typ, name); err != nil {
+				return err
+			}
 			ctx := backgroundCtx()
 			adb, err := openProfileStore(gf)
 			if err != nil {
@@ -2142,7 +2144,7 @@ version it holds is one nothing can serve.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			var violations, unchecked int
+			var violations, unchecked, groupWide int
 			var notes []string
 			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -2161,6 +2163,10 @@ version it holds is one nothing can serve.`,
 				for _, e := range d.Entries {
 					if e.Type == manifest.TypeFreeBSD {
 						unchecked++
+						continue
+					}
+					if e.Type == manifest.TypeMaven && strings.HasSuffix(e.Name, ":"+manifest.MavenGroupWildcard) {
+						groupWide++
 						continue
 					}
 					reason, note, err := entryResolves(ctx, store, resolved, e, srcIndex)
@@ -2196,6 +2202,10 @@ version it holds is one nothing can serve.`,
 				// the reason the apt note above is.
 				fmt.Printf("%d freebsd entr%s not checked: each names a package inside a pkg repository's catalogue, which the manifest store does not hold. "+
 					"On a bound host, pkg search lists what resolves.\n", unchecked, plural(unchecked, "y", "ies"))
+			}
+			if groupWide > 0 {
+				fmt.Printf("%d maven groupId-wide entr%s not checked: <groupId>:* names every artifact of a groupId rather than one package the catalog holds.\n",
+					groupWide, plural(groupWide, "y", "ies"))
 			}
 			if violations == 0 {
 				fmt.Printf("OK: every entry in %d profile(s) resolves in the catalog.\n", len(names))
@@ -2540,6 +2550,18 @@ func requirePackageType(typ string) error {
 	}
 	return fmt.Errorf("no package type named %q; bodega serves: %s",
 		typ, strings.Join(manifest.AllTypes, ", "))
+}
+
+// requireEntryNameForm refuses an entry name written in a form the gate never
+// compares against, for the types whose names have a grammar of their own.
+func requireEntryNameForm(typ, name string) error {
+	switch typ {
+	case manifest.TypeGomod:
+		return manifest.ValidateGomodName(name)
+	case manifest.TypeMaven:
+		return manifest.ValidateMavenName(name)
+	}
+	return nil
 }
 
 // requireGitEntryName refuses a git entry the gate could never match. How

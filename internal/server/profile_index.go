@@ -608,3 +608,71 @@ func filterRubygemsMarshalList(raw []byte, identify func(*rbValue) (gem, version
 	doc.items = kept
 	return rbMarshal(doc), nil
 }
+
+// mavenVersionsBlock, mavenVersionElement and mavenLatestRelease read the
+// three parts of a maven-metadata.xml a profile changes. The document is
+// edited in place rather than decoded and re-encoded: it carries elements a
+// filter has no reason to understand (plugins, snapshotVersions, lastUpdated),
+// and encoding/xml would rewrite every one of them.
+var (
+	mavenVersionsBlock  = regexp.MustCompile(`(?s)<versions>.*?</versions>`)
+	mavenVersionElement = regexp.MustCompile(`[ \t]*<version>\s*([^<]*?)\s*</version>[ \t]*(\r?\n)?`)
+	mavenLatestRelease  = regexp.MustCompile(`([ \t]*)<(latest|release)>\s*([^<]*?)\s*</(?:latest|release)>([ \t]*\r?\n?)`)
+)
+
+// filterMavenMetadata drops the versions a profile does not permit from an
+// artifact-level maven-metadata.xml and recomputes <latest> and <release>
+// from what remains. Both are what a resolver asked for LATEST, RELEASE or a
+// dynamic Gradle version reads first, so leaving the upstream's values would
+// send it to a version this host is refused.
+//
+// Maven appends each deployed version to the list, so the last one left is
+// latest and the last one left that is not a -SNAPSHOT is release. An element
+// with nothing left to name is removed rather than emptied, which a resolver
+// reads as metadata that names none, the same answer as no versions at all.
+//
+// A document with no <versions> list has nothing to recompute from, and its
+// <latest> and <release> are dropped only when they name a refused version.
+func filterMavenMetadata(body []byte, permit func(string) bool) []byte {
+	if permit == nil {
+		return body
+	}
+	var kept []string
+	listed := false
+	body = mavenVersionsBlock.ReplaceAllFunc(body, func(block []byte) []byte {
+		listed = true
+		return mavenVersionElement.ReplaceAllFunc(block, func(el []byte) []byte {
+			v := string(mavenVersionElement.FindSubmatch(el)[1])
+			if !permit(v) {
+				return nil
+			}
+			kept = append(kept, v)
+			return el
+		})
+	})
+	latest, release := "", ""
+	for _, v := range kept {
+		latest = v
+		if !strings.HasSuffix(v, "-SNAPSHOT") {
+			release = v
+		}
+	}
+	return mavenLatestRelease.ReplaceAllFunc(body, func(el []byte) []byte {
+		m := mavenLatestRelease.FindSubmatch(el)
+		tag, current := string(m[2]), string(m[3])
+		want := release
+		if tag == "latest" {
+			want = latest
+		}
+		if !listed {
+			if permit(current) {
+				return el
+			}
+			want = ""
+		}
+		if want == "" {
+			return nil
+		}
+		return fmt.Appendf(nil, "%s<%s>%s</%s>%s", m[1], tag, want, tag, m[4])
+	})
+}
