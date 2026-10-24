@@ -184,8 +184,87 @@ func TestAgePolicy_CargoDatedFromCratesIO(t *testing.T) {
 	}
 }
 
+// A gem is dated from the versions API, which lists every build of every
+// version in one document: the build the gem file names is the one whose
+// number and platform both match, and a build the document does not list is
+// not dated at all.
+func TestAgePolicy_GemDatedFromVersionsAPI(t *testing.T) {
+	now := time.Now()
+	stamp := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339Nano) }
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/api/v1/versions/nokogiri.json" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintf(w, `[
+			{"number":"1.16.7","platform":"x86_64-linux","created_at":%q},
+			{"number":"1.16.7","platform":"ruby","created_at":%q},
+			{"number":"1.16.6","platform":"ruby","created_at":%q}
+		]`, stamp(2*time.Hour), stamp(30*24*time.Hour), stamp(60*24*time.Hour))
+	}))
+	defer srv.Close()
+
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeRubygems: {Ecosystem: manifest.TypeRubygems, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	for _, tc := range []struct {
+		version string
+		action  string
+		reason  string
+	}{
+		{"1.16.7-x86_64-linux", ActionBlock, "nokogiri@1.16.7-x86_64-linux is 2h old"},
+		{"1.16.7", ActionPass, ""},
+		{"1.16.5", ActionWarn, "does not list nokogiri 1.16.5 for platform ruby"},
+		{"1.16.6-java", ActionWarn, "does not list nokogiri 1.16.6 for platform java"},
+	} {
+		ck := NewAgeChecker(store)
+		ck.RubygemsBase = srv.URL
+		ck.HTTP = srv.Client()
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: "nokogiri", Type: manifest.TypeRubygems},
+			&manifest.VersionEntry{Version: tc.version})
+		if r.Action != tc.action || !strings.Contains(r.Reason, tc.reason) {
+			t.Errorf("%s: got %s %q, want %s containing %q", tc.version, r.Action, r.Reason, tc.action, tc.reason)
+		}
+	}
+	for _, p := range paths {
+		if p != "/api/v1/versions/nokogiri.json" {
+			t.Errorf("versions API path, got %q", p)
+		}
+	}
+}
+
+// Two checks of one gem version under one ShareLookups context read the versions API
+// once, as two checks of one crate version read crates.io once.
+func TestAgePolicy_GemLookupIsShared(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		fmt.Fprintf(w, `[{"number":"3.1.0","platform":"ruby","created_at":%q}]`,
+			time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano))
+	}))
+	defer srv.Close()
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeRubygems: {Ecosystem: manifest.TypeRubygems, MinAgeSeconds: 86400, Action: ActionBlock},
+	}}
+	ctx := ShareLookups(context.Background())
+	for range 2 {
+		ck := NewAgeChecker(store)
+		ck.RubygemsBase = srv.URL
+		if r := ck.Check(ctx, &manifest.PackageManifest{Name: "rack", Type: manifest.TypeRubygems},
+			&manifest.VersionEntry{Version: "3.1.0"}); r.Action != ActionBlock {
+			t.Fatalf("1h-old gem under a 1d policy blocks; got %+v", r)
+		}
+	}
+	if hits != 1 {
+		t.Errorf("versions API read %d times, want 1", hits)
+	}
+}
+
 func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
+	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 	got := AgeEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
@@ -222,7 +301,7 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 				eco: {Ecosystem: eco, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
 			}}
 			ck := NewAgeChecker(store)
-			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase = srv.URL, srv.URL, srv.URL, srv.URL
+			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL
 
 			r := ck.Check(context.Background(),
 				&manifest.PackageManifest{Name: "thing", Type: eco},

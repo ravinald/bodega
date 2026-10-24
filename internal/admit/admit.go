@@ -602,7 +602,7 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 		similarity = adb
 		store = adb
 	}
-	out := []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
+	out := []policy.VersionChecker{ageChecker(cfg, adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
 		policy.NewNameSimilarityChecker(similarity)}
 	return appendIntegrations(out, cfg, store)
 }
@@ -632,9 +632,19 @@ type PolicyStore interface {
 // and passes integrations through readOnlyIntegrations, since an integration
 // records its lookup errors as it checks.
 func VersionCheckersFrom(cfg *config.Config, store PolicyStore, integrations integration.Store) []policy.VersionChecker {
-	out := []policy.VersionChecker{policy.NewAgeChecker(store), osvCheckerFrom(cfg, store),
+	out := []policy.VersionChecker{ageChecker(cfg, store), osvCheckerFrom(cfg, store),
 		provenanceCheckerFrom(cfg, store), policy.NewNameSimilarityChecker(store)}
 	return appendIntegrations(out, cfg, integrations)
+}
+
+// ageChecker is the age gate, dating gems against rubygems_upstream. The other
+// registries are dated at their public hosts whatever upstream serves them.
+func ageChecker(cfg *config.Config, store policy.AgeStore) *policy.AgeChecker {
+	c := policy.NewAgeChecker(store)
+	if cfg != nil && cfg.RubygemsUpstream != "" {
+		c.RubygemsBase = strings.TrimRight(cfg.RubygemsUpstream, "/")
+	}
+	return c
 }
 
 // readOnlyIntegrations reads integration policy from store and drops the

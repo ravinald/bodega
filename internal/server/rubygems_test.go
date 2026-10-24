@@ -1,8 +1,12 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -430,5 +435,92 @@ func TestRubygemsDependenciesRefusesANonGemName(t *testing.T) {
 	}
 	if n := g.total(); n != 0 {
 		t.Errorf("upstream contacted %d times", n)
+	}
+}
+
+// gateGems runs the proxy fill's real admission checks with the rubygems OSV
+// gate blocking, answered from a database holding one advisory against
+// nokogiri releases before 1.16.8.
+func gateGems(t *testing.T, s *Server) {
+	t.Helper()
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
+	rec := map[string]any{
+		"id": "GHSA-test-gem1",
+		"affected": []map[string]any{{
+			"package": map[string]string{"name": "nokogiri", "ecosystem": "RubyGems"},
+			"ranges": []map[string]any{{"type": "ECOSYSTEM",
+				"events": []map[string]string{{"introduced": "0"}, {"fixed": "1.16.8"}}}},
+		}},
+	}
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("GHSA-test-gem1.json")
+		_ = json.NewEncoder(f).Encode(rec)
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+	s.cfg.OSVDBDir = t.TempDir()
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(t.Context(), "RubyGems"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := s.auditDB.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeRubygems, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set osv policy: %v", err)
+	}
+}
+
+// A vulnerable release is refused at the gem file route before upstream is
+// asked for it, whichever platform build is requested, and the refusal names
+// the advisory.
+func TestRubygemsGemRefusedByOSV(t *testing.T) {
+	g := newGemRegistry(t)
+	s := gemServer(t, g)
+	gateGems(t, s)
+	for _, p := range []string{"/gems/nokogiri-1.16.7-x86_64-linux.gem", "/gems/nokogiri-1.16.7.gem", "/quick/Marshal.4.8/nokogiri-1.16.7.gemspec.rz"} {
+		rec := doRequest(s, http.MethodGet, "/rubygems"+p, nil)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: status %d, want 403 (%s)", p, rec.Code, rec.Body.String())
+		}
+		refusalIncident(t, rec.Header(), checkOSV)
+		if !strings.Contains(rec.Body.String(), "GHSA-test-gem1") {
+			t.Errorf("%s: refusal does not name the advisory:\n%s", p, rec.Body.String())
+		}
+		if n := g.hitsFor(p); n != 0 {
+			t.Errorf("%s: upstream asked %d times for a refused gem", p, n)
+		}
+	}
+	if rec := doRequest(s, http.MethodGet, "/rubygems/gems/concurrent-ruby-1.3.4.gem", nil); rec.Code != http.StatusOK {
+		t.Errorf("a gem no advisory names: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The age gate dates a gem at rubygems_upstream, the host the gem itself is
+// fetched from, and refuses one too new before fetching it.
+func TestRubygemsGemRefusedByAge(t *testing.T) {
+	g := newGemRegistry(t)
+	g.mu.Lock()
+	g.routes["/api/v1/versions/concurrent-ruby.json"] = fmt.Sprintf(`[{"number":"1.3.4","platform":"ruby","created_at":%q}]`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339))
+	g.mu.Unlock()
+	s := gemServer(t, g)
+	gateGems(t, s)
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeRubygems, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+	rec := doRequest(s, http.MethodGet, "/rubygems/gems/concurrent-ruby-1.3.4.gem", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkAge)
+	if n := g.hitsFor("/api/v1/versions/concurrent-ruby.json"); n != 1 {
+		t.Errorf("versions API read %d times at rubygems_upstream, want 1", n)
+	}
+	if n := g.hitsFor("/gems/concurrent-ruby-1.3.4.gem"); n != 0 {
+		t.Errorf("upstream asked %d times for a gem the age gate refused", n)
 	}
 }

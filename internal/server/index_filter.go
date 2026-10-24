@@ -94,12 +94,14 @@ var publishTimeClient = &http.Client{Timeout: 10 * time.Second, Transport: guard
 // publishClock is the age checker's own date sources, pointed at the
 // upstreams this server proxies rather than at the public registries
 // admission reads. The filter has to date the versions the client is shown,
-// and those come from npm_upstream, pypi_upstream and gomod_upstream.
+// and those come from npm_upstream, pypi_upstream, gomod_upstream and
+// rubygems_upstream.
 func (s *Server) publishClock() *policy.AgeChecker {
 	c := policy.NewAgeChecker(nil)
 	c.NpmRegistry = strings.TrimRight(s.cfg.NpmUpstream, "/")
 	c.PypiBase = strings.TrimRight(s.cfg.PypiUpstream, "/")
 	c.GoProxy = strings.TrimRight(s.cfg.GomodUpstream, "/")
+	c.RubygemsBase = strings.TrimRight(s.cfg.RubygemsUpstream, "/")
 	c.HTTP = publishTimeClient
 	return c
 }
