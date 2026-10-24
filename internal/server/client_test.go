@@ -792,6 +792,12 @@ var redactCases = []struct{ in, want string }{ //nolint:gosec // G101: fixture s
 	{"monkey: business", ""},
 	{"keys = a,b", ""},
 	{"apikeys = a", ""},
+
+	{"      <password>SECRETXML</password>", "      <password><redacted></password>"},
+	{"<server><id>corp</id><Passphrase>k</Passphrase></server>", "<server><id>corp</id><Passphrase><redacted></Passphrase></server>"},
+	{"<s:password>p</s:password> <apiKey>k</apiKey>", "<s:password><redacted></s:password> <apiKey><redacted></apiKey>"},
+	{"<password>a</passwd>", ""},
+	{"<id>password</id> <url>https://h/maven/</url> <password/>", ""},
 }
 
 // Every row must come out of Redact and of the script's redact() the same,
@@ -882,17 +888,18 @@ func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
 		}
 	}
 	files := map[string]string{
-		"npm":  clientconf.Npm("https://h", nil).Content,
-		"helm": clientconf.Helm("https://h").Content,
-		"pypi": clientconf.Pip("https://h").Content,
+		"npm":   clientconf.Npm("https://h", nil).Content,
+		"helm":  clientconf.Helm("https://h").Content,
+		"pypi":  clientconf.Pip("https://h").Content,
+		"maven": clientconf.Maven("https://h", nil)[0].Content,
 	}
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	var records []planRecord
-	for _, sys := range []string{"npm", "helm", "pypi"} {
+	for _, sys := range []string{"npm", "helm", "pypi", "maven"} {
 		sum := sha256.Sum256([]byte(files[sys]))
-		path := map[string]string{"npm": "~/.npmrc", "helm": "~/.config/helm/repositories.yaml", "pypi": "~/pip.conf"}[sys]
+		path := map[string]string{"npm": "~/.npmrc", "helm": "~/.config/helm/repositories.yaml", "pypi": "~/pip.conf", "maven": clientconf.MavenSettingsPath}[sys]
 		records = append(records, planRecord{Identity: "t", Match: "cidr:127.0.0.1/32", System: sys, Action: clientconf.PlanInstall,
 			Path: path, URL: srv.URL + "/client/" + sys, SHA256: hex.EncodeToString(sum[:])})
 		body := files[sys]
@@ -908,6 +915,10 @@ func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
 		".config/helm/repositories.yaml": clientconf.HelmDocument("- name: other\n  url: https://o\n  password: bodega_ak_otherhelm\n" +
 			fence("- name: bodega\n  url: https://h/helm\n  username: bodega\n  password: bodega_ak_helm")),
 		"pip.conf": "[global]\nindex-url = https://op:bodega_ak_pip@pypi.internal/simple/\n",
+		".m2/settings.xml": "<?xml version=\"1.0\"?>\n<settings>\n  <!-- <mirrors></mirrors> — an example -->\n" +
+			"  <servers>\n    <server>\n      <id>corp</id>\n      <password>bodega_ak_maven</password>\n    </server>\n  </servers>\n" +
+			"  <mirrors>\n    <mirror><id>nexus</id><mirrorOf>central</mirrorOf><url>https://n/</url></mirror>\n  </mirrors>\n" +
+			"  <profiles><profile><id>extra</id></profile></profiles>\n</settings>",
 	}
 	newHome := func() string {
 		home := t.TempDir()
@@ -982,7 +993,8 @@ func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
 			t.Errorf("%s differs between the script and clientconf:\nscript:\n%s\nclientconf:\n%s", rel, fromScript, fromGo)
 		}
 	}
-	for rel, want := range map[string]string{".npmrc": "_authToken=bodega_ak_npm", ".config/helm/repositories.yaml": "password: bodega_ak_helm"} {
+	for rel, want := range map[string]string{".npmrc": "_authToken=bodega_ak_npm", ".config/helm/repositories.yaml": "password: bodega_ak_helm",
+		".m2/settings.xml": "<password>bodega_ak_maven</password>"} {
 		if got, _ := os.ReadFile(scriptHome + "/" + rel); !strings.Contains(string(got), want) {
 			t.Errorf("%s lost bodega's credential after --apply:\n%s", rel, got)
 		}
@@ -1431,5 +1443,103 @@ func TestSetupScriptConfiguresRubygems(t *testing.T) {
 	}
 	if backups, _ := filepath.Glob(home + "/.gemrc.bodega-*"); len(backups) != 1 {
 		t.Errorf("gemrc backups = %v, want one\n%s", backups, out)
+	}
+}
+
+// F87: maven installs Maven's settings.xml and Gradle's init script, each at a
+// URL serving the bytes the plan's digest names. The settings.xml record
+// carries the wrapper note, and an apply merges into an existing settings.xml
+// and replaces the init script, backing up both.
+func TestClientPlanMavenInstallsSettingsAndGradleInit(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	files := clientconf.Maven("https://bodega.internal", nil)
+	want := map[string]string{"~/.m2/settings.xml": files[0].Content, "~/.gradle/init.d/bodega.gradle": files[1].Content}
+	wantURL := map[string]string{
+		"~/.m2/settings.xml":             "https://bodega.internal/client/maven?os=linux",
+		"~/.gradle/init.d/bodega.gradle": "https://bodega.internal/client/maven?file=gradle&os=linux",
+	}
+	home := t.TempDir()
+	existing := "<settings>\n  <servers><server><id>corp</id></server></servers>\n" +
+		"  <mirrors>\n    <mirror><id>nexus</id><mirrorOf>central</mirrorOf><url>https://n/</url></mirror>\n  </mirrors>\n" +
+		"  <profiles><profile><id>extra</id></profile></profiles>\n</settings>\n"
+	for rel, content := range map[string]string{".m2/settings.xml": existing, ".gradle/init.d/bodega.gradle": "// an older bodega.gradle\n"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(home, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeMaven)
+	if len(recs) != len(want) {
+		t.Fatalf("maven records = %+v, want settings.xml and the init script", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "distributionUrl=https://bodega.internal/binaries/") || !strings.Contains(recs[0].Reason, "gradle-wrapper.properties") {
+		t.Errorf("settings.xml record reason = %q, want the wrapper note", recs[0].Reason)
+	}
+	var changes []clientconf.Change
+	for _, rec := range recs {
+		if rec.Action != clientconf.PlanInstall || want[rec.Path] == "" || rec.URL != wantURL[rec.Path] {
+			t.Fatalf("record %+v, want an install at one of %v from %v", rec, want, wantURL)
+		}
+		u, _ := url.Parse(rec.URL)
+		code, body := clientGet(t, s, f.token, u.RequestURI())
+		if code != http.StatusOK || body != want[rec.Path] {
+			t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, want[rec.Path])
+		}
+		c, err := clientconf.NewChange(rec, []byte(body), home)
+		if err != nil {
+			t.Fatalf("NewChange refused the served file: %v", err)
+		}
+		changes = append(changes, c)
+	}
+	if _, err := clientconf.Apply(changes, ".bodega-test"); err != nil {
+		t.Fatal(err)
+	}
+	settings, _ := os.ReadFile(filepath.Join(home, ".m2/settings.xml"))
+	for _, keep := range []string{"<id>corp</id>", "<id>extra</id>", "<mirrorOf>*</mirrorOf>", "<url>https://bodega.internal/maven/</url>"} {
+		if !strings.Contains(string(settings), keep) {
+			t.Errorf("merged settings.xml lacks %s:\n%s", keep, settings)
+		}
+	}
+	if strings.Contains(string(settings), "nexus") {
+		t.Errorf("merged settings.xml keeps the second mirror, which takes central around bodega:\n%s", settings)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, ".gradle/init.d/bodega.gradle")); string(got) != files[1].Content {
+		t.Errorf("init script after apply = %q, want the planned file whole", got)
+	}
+	for rel, old := range map[string]string{".m2/settings.xml": existing, ".gradle/init.d/bodega.gradle": "// an older bodega.gradle\n"} {
+		if got, _ := os.ReadFile(filepath.Join(home, rel+".bodega-test")); string(got) != old {
+			t.Errorf("backup of %s = %q, want the file it replaced", rel, got)
+		}
+	}
+}
+
+// file=gradle is maven's alone, and a profile excluding maven refuses the
+// init script as it refuses settings.xml.
+func TestClientGradleRouteRefusals(t *testing.T) {
+	s := hostedServer(t)
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	for path, want := range map[string]int{
+		"/client/npm?os=linux&file=gradle":     http.StatusBadRequest,
+		"/client/maven?os=linux&file=bundler":  http.StatusBadRequest,
+		"/client/maven?os=freebsd&file=gradle": http.StatusOK,
+		"/client/maven?os=linux":               http.StatusOK,
+	} {
+		if code, body := clientGet(t, s, f.token, path); code != want {
+			t.Errorf("GET %s = %d %q, want %d", path, code, body, want)
+		}
+	}
+
+	closed := bindProfile(t, s, "closed", "closed-host",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeMaven, audit.VersionFloating, audit.ExpansionBlock)}, nil)
+	recs := planRecordFor(planJSON(t, s, closed.token, "os=linux"), manifest.TypeMaven)
+	if len(recs) != 1 || recs[0].Action != planRefuse {
+		t.Errorf("maven under a closed profile = %+v, want one refusal", recs)
+	}
+	if code, _ := clientGet(t, s, closed.token, "/client/maven?os=linux&file=gradle"); code != http.StatusForbidden {
+		t.Errorf("GET the init script under a closed profile = %d, want 403", code)
 	}
 }

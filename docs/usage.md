@@ -4391,20 +4391,20 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 
 bodega treats Linux and FreeBSD as peers. Both run the server, both are clients of it, and each package type serves the same way whichever operating system the server runs on. They differ in how bodega ships to them in one place, the distribution package, and the following table states where each stands today:
 
-|                                                 | Linux                                                          | FreeBSD                                                                                                                         |
-| ----------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Run the server                                  | yes                                                            | yes                                                                                                                             |
-| Storage permissions and extended attributes     | POSIX ACLs, carried in extended attributes                     | NFSv4 ACLs on ZFS, POSIX.1e ACLs on UFS mounted with `acls`, and `extattr`                                                      |
-| Client of the server                            | apt, and every language client                                 | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
-| Client configuration written by `bodega doctor` | apt sources and keyring, credentials                           | `pkg` repository configuration, credentials                                                                                     |
-| Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, rubygems, GOPROXY | pkg repositories, `make.conf`, pip, npm, cargo, rubygems, GOPROXY                                                               |
-| Profile rules                                   | per package; apt hosts read a filtered codename                | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))           |
-| Release archive                                 | amd64, arm64                                                   | amd64, arm64                                                                                                                    |
-| Distribution package                            | `.deb` and `.rpm`, with the systemd unit                       | not yet                                                                                                                         |
-| Service definition                              | [bodega.service](bodega.service) (systemd)                     | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
-| `make cross` default targets                    | amd64, arm64                                                   | amd64, arm64                                                                                                                    |
-| CI                                              | builds, vets, lints and runs every unit test                   | runs every unit test on amd64 in a FreeBSD 15.1 VM (`test-freebsd`), and compiles arm64                                         |
-| End-to-end suite                                | a server and a client guest                                    | a client guest (`pkg`, ports, distfiles) and a server guest that runs `internal/storage`'s FreeBSD syscall tests on ZFS and UFS |
+|                                                 | Linux                                                                 | FreeBSD                                                                                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Run the server                                  | yes                                                                   | yes                                                                                                                             |
+| Storage permissions and extended attributes     | POSIX ACLs, carried in extended attributes                            | NFSv4 ACLs on ZFS, POSIX.1e ACLs on UFS mounted with `acls`, and `extattr`                                                      |
+| Client of the server                            | apt, and every language client                                        | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
+| Client configuration written by `bodega doctor` | apt sources and keyring, credentials                                  | `pkg` repository configuration, credentials                                                                                     |
+| Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, rubygems, maven, GOPROXY | pkg repositories, `make.conf`, pip, npm, cargo, rubygems, maven, GOPROXY                                                        |
+| Profile rules                                   | per package; apt hosts read a filtered codename                       | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))           |
+| Release archive                                 | amd64, arm64                                                          | amd64, arm64                                                                                                                    |
+| Distribution package                            | `.deb` and `.rpm`, with the systemd unit                              | not yet                                                                                                                         |
+| Service definition                              | [bodega.service](bodega.service) (systemd)                            | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
+| `make cross` default targets                    | amd64, arm64                                                          | amd64, arm64                                                                                                                    |
+| CI                                              | builds, vets, lints and runs every unit test                          | runs every unit test on amd64 in a FreeBSD 15.1 VM (`test-freebsd`), and compiles arm64                                         |
+| End-to-end suite                                | a server and a client guest                                           | a client guest (`pkg`, ports, distfiles) and a server guest that runs `internal/storage`'s FreeBSD syscall tests on ZFS and UFS |
 
 macOS builds and has release archives for amd64 and arm64. It is supported for development and for running the CLI against a remote server, and has no service definition.
 
@@ -4846,7 +4846,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `79cf11562d282f83140ae2dc0101fa4691229de659cdc652a9cbc3b4a435924e`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `b6c33aeaefafcde87c79e09f15fbac381994aab896b34a325f8d2192a469a995`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4885,7 +4885,7 @@ read -r BODEGA_OSQUERY_SECRET && export BODEGA_OSQUERY_SECRET   # paste it; it n
 sh setup.sh --url https://bodega-host:8443 --systems osquery --apply
 ```
 
-The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, `~/.gemrc`, `~/.bundle/config`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first.
+The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, `~/.gemrc`, `~/.bundle/config`, `~/.m2/settings.xml`, `~/.gradle/init.d/bodega.gradle`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file but `~/.m2/settings.xml` is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first. `settings.xml` keeps everything but its mirrors, as the Maven and Gradle paragraphs below describe.
 
 The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
 
@@ -4894,6 +4894,7 @@ The diff redacts before it prints:
 - the whole userinfo of an `http` or `https` URL, user and password, empty or not: `https://user:pass@`, `https://<token>:x-oauth-basic@`, `https://<token>:@`, `https://:<token>@` and `https://<token>@` all print `https://<redacted>@` followed by the host and path. A token can be either half, and the user is not needed to read the diff;
 - the password in a `user:pass@` URL of any other scheme, keeping the user. An `ssh://git@host/` or `git@host:path` user is an account name and prints as written;
 - everything after an `Authorization:` header name except the scheme, wherever it sits in the line, as in git's `http.<url>.extraHeader`;
+- the text of an XML element opened and closed on one line whose name, in any case, ends in `password`, `passwd`, `passphrase`, `token`, `secret`, `_auth` or `_key`, or is `apikey`, as a `settings.xml` server's `<password>` and `<passphrase>` are;
 - the value of any `key = value` or `key: value` whose key, in any case, ends in `password`, `passwd`, `token`, `secret`, `_auth` or `_key`, or is `apikey`.
 
 The files themselves are written unredacted, and a backup of a file that held a secret carries it too, with the original's mode.
@@ -5062,7 +5063,7 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 
 **Gap:** a generated index line declares `features: {}`. bodega records no cargo feature table, so a crate whose dependency needs a named feature resolves and downloads but may not compile. Recording the feature map is the same mechanism as `deps` and waits on nothing but the work.
 
-**Maven and Gradle** (`~/.m2/settings.xml` for Maven; the project's `settings.gradle.kts` for Gradle). The plan does not install either yet: a `settings.xml` usually holds an operator's servers and profiles, and one written whole would drop them, so the plan lists `maven` as a skip and these are set by hand. The TUI and the web UI show the Maven file. A whole `settings.xml` for a host that has none:
+**Maven and Gradle** (`~/.m2/settings.xml` for Maven, `~/.gradle/init.d/bodega.gradle` for Gradle). `bodega doctor --configure maven --apply --url https://bodega-host:8080`, or the [setup script](#setup-script) with `--systems maven`, writes both as the user whose builds they are, backing up each file it replaces. Both are needed: Maven reads no init script, and Gradle reads `settings.xml`'s mirrors only when a build opts in with `org.gradle.mirror.maven.settings=true` (Gradle 9.8 and later). The `settings.xml` for a host that has none:
 
 ```xml
 <settings>
@@ -5076,19 +5077,31 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 </settings>
 ```
 
-An existing file takes the `<mirror>` element inside its own `<mirrors>`. `mirrorOf` `*` sends every repository a POM or a parent POM names through bodega, not only Maven Central, so a build that declares a second repository fails on its first artifact from it rather than reaching around bodega. For Gradle, in the project's `settings.gradle.kts`:
+`mirrorOf` `*` sends every repository a POM, a parent POM or an active profile names through bodega, not only Maven Central, so a build that declares a second repository fails on its first artifact from it rather than reaching around bodega. An existing `settings.xml` is merged rather than replaced: its `<mirrors>` element becomes the one above, or is added before `</settings>` when the file has none, and every other byte stays as it was, servers, profiles, proxies, comments and the XML declaration included. Any other mirror goes, since Maven prefers a mirror naming a repository's id over a `*` pattern, so a `<mirrorOf>central</mirrorOf>` left beside bodega's would take Maven Central back around it; the backup and the dry run's diff both show it. A `<mirrors>` inside an XML comment, as in the commented examples Maven's own `settings.xml` ships with, is not taken for the live one. A file with no `<mirrors>` and no `</settings>`, or an unclosed `<mirrors>`, is not one Maven reads, and the plan's file replaces it.
 
-```kotlin
-pluginManagement {
-    repositories { maven("https://bodega-host:8080/maven/") }
-}
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
-    repositories { maven("https://bodega-host:8080/maven/") }
+The init script is bodega's own file and is replaced whole. It runs before every build the user starts and removes each network repository the build names as the build adds it, in `settings.gradle`'s `pluginManagement` and `dependencyResolutionManagement`, in every `buildscript` block and in every project, then adds bodega's in its place. An empty `pluginManagement` list is what sends Gradle to the Gradle Plugin Portal, so adding bodega there replaces the portal too. `mavenLocal()` and `flatDir` repositories stay, since they reach no host. A build in `FAIL_ON_PROJECT_REPOS` mode gets no project repository added, because Gradle fails a build when anything adds one, and neither does one in `PREFER_SETTINGS`, which reads the settings' list. Over plain `http` the script sets `allowInsecureProtocol`, which Gradle 7 and later require. `GRADLE_USER_HOME` moves `init.d` away from `~/.gradle`, and the script must then be copied there. The script needs Gradle 6.0 or later, and was run against Gradle 9.8.2 in all three repository modes.
+
+The [Maven wrapper](https://maven.apache.org/wrapper/) and the [Gradle wrapper](https://docs.gradle.org/current/userguide/gradle_wrapper.html) download Maven or Gradle itself from `distributionUrl` before reading either file, so `mvnw` and `gradlew` on a host whose egress reaches only bodega fail before the build starts. The distributions are served through a [`binary_upstreams`](#upstream-hosts) namespace, one per host they come from, in `open` mode or cataloging each distribution:
+
+```json
+"binary_upstreams": {
+  "maven-dist": { "url": "https://repo.maven.apache.org/maven2/", "mode": "open" },
+  "gradle-dist": { "url": "https://services.gradle.org/", "mode": "open" }
 }
 ```
 
-`PREFER_SETTINGS` makes Gradle ignore the `repositories {}` block each `build.gradle` declares, which is where `mavenCentral()` usually sits. A Groovy `settings.gradle` spells each line `maven { url 'https://bodega-host:8080/maven/' }`. sbt and Leiningen take the same URL as their only resolver.
+Each project then names bodega in its own wrapper properties. doctor does not edit project files: the plan's `settings.xml` record carries these two lines as a note, with the namespaces the server has configured filled in, and `--configure maven` and the setup script print it.
+
+```properties
+# .mvn/wrapper/maven-wrapper.properties
+distributionUrl=https://bodega-host:8080/binaries/maven-dist/org/apache/maven/apache-maven/3.9.11/apache-maven-3.9.11-bin.zip
+# gradle/wrapper/gradle-wrapper.properties
+distributionUrl=https\://bodega-host\:8080/binaries/gradle-dist/distributions/gradle-9.8.2-bin.zip
+```
+
+A `wrapperUrl` in `maven-wrapper.properties`, where a project has one, takes `https://bodega-host:8080/maven/` in place of `https://repo.maven.apache.org/maven2/`. `distributionSha256Sum` still matches, since bodega serves the bytes unchanged. sbt and Leiningen take `https://bodega-host:8080/maven/` as their only resolver, set by hand.
+
+`bodega doctor` reports a `maven` row on a host with `mvn` or `gradle` on `PATH`, or with a distribution a wrapper downloaded under `~/.m2/wrapper/dists` or `$GRADLE_USER_HOME/wrapper/dists`, and none on a host with neither. It warns when `~/.m2/settings.xml` has no mirror with id `bodega` and `mirrorOf` `*`, or lists another mirror beside it, and when `$GRADLE_USER_HOME/init.d/bodega.gradle` (`~/.gradle/init.d/` by default) is missing or sets no repository. Each tool's file is checked only when that tool is there. A `-s` on the command line, `MAVEN_ARGS` and a project's `.mvn/maven.config` can each name another `settings.xml`, and doctor reads none of them.
 
 `GET /maven/<path>` serves Maven Central's repository layout byte for byte from [`maven_upstream`](#upstream-hosts). Three path forms are answered and anything else is a 404 the upstream never sees:
 
@@ -5104,7 +5117,7 @@ dependencyResolutionManagement {
 
 - A groupId-level `maven-metadata.xml`, which Maven reads to resolve a plugin prefix such as `spring-boot:run`, is read as an artifact one directory up: `org/springframework/boot/maven-metadata.xml` is judged as `org.springframework:boot`. It proxies, but under an allow-list in `listed` mode it needs a rule naming that identity.
 - `maven_upstream` names one repository. A Gradle plugin published only to the Gradle Plugin Portal does not resolve; plugins Maven Central also carries do.
-- The Maven and Gradle wrappers download their own distributions from `distributionUrl` before any repository setting applies, and a `.zip` is not a path this route answers.
+- `/maven/` does not answer for a `.zip`, so the wrappers' distributions come through a `binary_upstreams` namespace, as above, rather than through this route.
 
 **RubyGems** (`~/.gemrc` for `gem`, `~/.bundle/config` for Bundler):
 
@@ -5284,7 +5297,7 @@ Every route takes the same query parameters:
 | `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`             |
 | `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives) |
 | `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                             |
-| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`               |
+| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven` |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
@@ -5302,7 +5315,7 @@ The host resolves the way a package route resolves it: a bound token, then the l
 | `sha256`   | hex SHA-256 of what `url` serves                                                                      |
 | `reason`   | why a `refuse` or `skip` record has no file                                                           |
 
-- **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. Each codename in `archives=` adds two more: its stanza, and the vendor key that stanza names, fetched from `/apt/keys/<codename>.asc`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together. `rubygems` has two: `~/.gemrc`, and Bundler's `~/.bundle/config`, fetched from `/client/rubygems?file=bundler`, since `gem` reads only the first and Bundler only the second.
+- **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. Each codename in `archives=` adds two more: its stanza, and the vendor key that stanza names, fetched from `/apt/keys/<codename>.asc`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together. `rubygems` has two: `~/.gemrc`, and Bundler's `~/.bundle/config`, fetched from `/client/rubygems?file=bundler`, since `gem` reads only the first and Bundler only the second. `maven` has two: `~/.m2/settings.xml`, which the client merges into an existing one rather than replacing, and Gradle's `~/.gradle/init.d/bodega.gradle`, fetched from `/client/maven?file=gradle`. The first record's `reason` is the wrapper note described under [Setup script](#setup-script).
 - **`refuse`** is a system the host's profile excludes: closed, listing nothing of that type, and blocking the rest. It also covers a profile that scopes apt to a codename other than the one the host states, and a git profile covering none of the served namespaces. A refusal is a record rather than an absence, so a host can tell "not for you" from "not configured".
 - **`skip`** is a system with nothing to install here for a reason that is not the profile's: the wrong operating system (apt on FreeBSD, pkg and distfiles on Linux), nothing configured on the server, a fact the host did not state, or a choice only the operator can make, such as two pkg repositories serving the same ABI. `binary` is always a skip: a binary is downloaded by URL, not configured. `osquery` is a skip when no enabled `osquery` source runs in `server` mode, when more than one does (osqueryd takes its config from one server), and when the host reaches bodega over `http://`, since osqueryd speaks only https to its server.
 

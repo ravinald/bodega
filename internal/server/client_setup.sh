@@ -244,6 +244,13 @@ dec() {
 keep() {
 	case $1 in
 	npm | helm) ;;
+	maven)
+		case $2 in
+		*/.m2/settings.xml) mvn_merge "$2" "$3" "$4" ;;
+		*) cat "$3" >"$4" ;;
+		esac
+		return
+		;;
 	*)
 		cat "$3" >"$4"
 		return
@@ -321,6 +328,67 @@ keep() {
 	0) ;;
 	3) cat "$3" >"$4" ;;
 	*) die "could not read $2 to carry its credential over; nothing was written" ;;
+	esac
+}
+
+# mvn_merge <existing> <planned> <out> writes existing with its <mirrors>
+# element replaced by the planned file's, or that element added before
+# </settings> when existing has none, keeping every other byte. The tags are
+# found with <!-- --> comments masked out, so the commented examples Maven's
+# own settings.xml ships with are not taken for the live element. An empty
+# file, an unclosed <mirrors>, or one with neither <mirrors> nor </settings>
+# gets the planned file. internal/clientconf MergeMavenSettings is the same
+# rule, held to it by a test.
+mvn_merge() {
+	rc=0
+	awk '
+	function spaces(n,    r) { r = ""; while (n-- > 0) r = r " "; return r }
+	function mask(s,    out, i, j, n, rest) {
+		out = ""
+		while ((i = index(s, "<!--")) > 0) {
+			out = out substr(s, 1, i - 1)
+			rest = substr(s, i)
+			j = index(substr(rest, 5), "-->")
+			n = j > 0 ? j + 6 : length(rest)
+			out = out spaces(n)
+			s = substr(rest, n + 1)
+		}
+		return out s
+	}
+	function lastindex(s, t,    i, p) {
+		p = 0
+		while ((i = index(substr(s, p + 1), t)) > 0) p += i
+		return p
+	}
+	FILENAME == ARGV[1] { old = (no++ ? old "\n" : "") $0; next }
+	{ plan = (np++ ? plan "\n" : "") $0 }
+	END {
+		if (old ~ /^[ \t\r\n]*$/) exit 3
+		pi = index(plan, "<mirrors>")
+		if (!pi) exit 3
+		pj = index(substr(plan, pi), "</mirrors>")
+		if (!pj) exit 3
+		block = substr(plan, pi, pj + 9)
+		m = mask(old)
+		i = index(m, "<mirrors>")
+		j = index(m, "<mirrors/>")
+		if (i) {
+			k = index(substr(m, i), "</mirrors>")
+			if (!k) exit 3
+			out = substr(old, 1, i - 1) block substr(old, i + k + 9)
+		} else if (j) {
+			out = substr(old, 1, j - 1) block substr(old, j + 10)
+		} else {
+			k = lastindex(m, "</settings>")
+			if (!k) exit 3
+			out = substr(old, 1, k - 1) "  " block "\n" substr(old, k)
+		}
+		print out
+	}' "$1" "$2" >"$3" || rc=$?
+	case $rc in
+	0) ;;
+	3) cat "$2" >"$3" ;;
+	*) die "could not read $1 to merge bodega's mirror into it; nothing was written" ;;
 	esac
 }
 
@@ -417,7 +485,10 @@ osq_flagfile() {
 # guess at which is a token prints the ones it misses; the password of a
 # user:pass@ URL of any other scheme, keeping the user (an ssh:// or scp-style
 # git@host: user is an account name and stays); everything after an
-# Authorization: header name but the scheme, anywhere in the line; and the
+# Authorization: header name but the scheme, anywhere in the line; the text
+# of an XML element opened and closed on one line whose name, case folded,
+# ends in password, passwd, passphrase, token, secret, _auth or _key, or is
+# apikey, as settings.xml's <password> does; and the
 # value of a YAML `key: value` or an ini `key = value` whose key, case folded,
 # ends in password, passwd, token, secret, _auth or _key, or is apikey. The
 # diff lands in a terminal and often a CI log, and the host's file can hold a
@@ -452,6 +523,20 @@ redact() {
 			}
 			if (rest ~ /^[^ \t]/) line = head "<redacted>"
 		}
+		out = ""
+		while (match(line, /<[A-Za-z_][A-Za-z0-9_.:-]*>[^<]+<\/[A-Za-z_][A-Za-z0-9_.:-]*>/)) {
+			seg = substr(line, RSTART, RLENGTH)
+			gt = index(seg, ">")
+			op = substr(seg, 2, gt - 2)
+			body = substr(seg, gt + 1)
+			cl = substr(body, index(body, "</") + 2)
+			cl = substr(cl, 1, length(cl) - 1)
+			name = tolower(op)
+			if (name == tolower(cl) && (secret(name) || name ~ /passphrase$/)) seg = "<" op "><redacted></" cl ">"
+			out = out substr(line, 1, RSTART - 1) seg
+			line = substr(line, RSTART + RLENGTH)
+		}
+		line = out line
 		head = ""
 		if (match(line, /^[ \t]*(-[ \t]+)?[A-Za-z0-9_.-]+[ \t]*:([ \t]|$)/)) {
 			head = substr(line, 1, RLENGTH); key = head
