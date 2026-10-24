@@ -1,13 +1,19 @@
 package host
 
 import (
+	"bufio"
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 )
@@ -173,6 +179,162 @@ func checkNpmConfig(root, goos, home string) Finding {
 	f.Detail = "npm configured to fetch from " + hit.marker + " (in " + hit.path + "); bypasses bodega's npm proxy"
 	f.Remediation = "set registry= in " + hit.path + " to the bodega /npm endpoint"
 	return f
+}
+
+// rubyTools is what the rubygems check reads from the host, so a test can
+// stand in for gem and for the environment Bundler resolves its config from.
+type rubyTools struct {
+	lookPath   func(string) (string, error)
+	gemSources func(gem string) (string, error)
+	getenv     func(string) string
+	home       string
+}
+
+// CheckRubygems reports whether gem or Bundler still fetch from
+// rubygems.org. ok is false on a host with neither installed, where the row
+// would describe a client nobody runs.
+func CheckRubygems() (f Finding, ok bool) {
+	home, _ := os.UserHomeDir()
+	return checkRubygems(rubyTools{lookPath: exec.LookPath, gemSources: runGemSources, getenv: os.Getenv, home: home})
+}
+
+// runGemSources asks gem itself, because the list it uses merges the system
+// gemrc, ~/.gemrc (or its XDG location) and every file $GEMRC names, and
+// falls back to rubygems.org when none of them sets :sources:.
+func runGemSources(gem string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, gem, "sources", "--list").Output()
+	if err != nil {
+		return "", fmt.Errorf("%s sources --list: %w", gem, err)
+	}
+	return string(out), nil
+}
+
+func checkRubygems(t rubyTools) (Finding, bool) {
+	gem, gemErr := t.lookPath("gem")
+	_, bundleErr := t.lookPath("bundle")
+	if gemErr != nil && bundleErr != nil {
+		return Finding{}, false
+	}
+	f := Finding{Check: "rubygems"}
+	var found, unread, clean []string
+	if gemErr == nil {
+		switch out, err := t.gemSources(gem); {
+		case err != nil:
+			unread = append(unread, "gem's sources could not be listed: "+err.Error())
+		case rubygemsOrgSource(out) != "":
+			found = append(found, "gem sources lists "+rubygemsOrgSource(out))
+		default:
+			clean = append(clean, "gem sources")
+		}
+	}
+	if bundleErr == nil {
+		switch mirror, from, err := bundlerMirror(t.getenv, t.home); {
+		case err != nil:
+			unread = append(unread, "Bundler's config could not be read: "+err.Error())
+		case mirror == "":
+			found = append(found, "Bundler has no mirror for https://rubygems.org, so a Gemfile naming it fetches from rubygems.org")
+		case isRubygemsOrg(mirror):
+			found = append(found, "Bundler's mirror for https://rubygems.org is "+mirror+" (in "+from+")")
+		default:
+			clean = append(clean, "Bundler's mirror ("+mirror+")")
+		}
+	}
+	switch {
+	case len(found) > 0:
+		f.Status = StatusWarn
+		f.Detail = strings.Join(append(found, unread...), "; ") + "; bypasses bodega's rubygems proxy"
+		f.Remediation = "bodega doctor --configure rubygems --apply --url <bodega base URL>"
+	case len(unread) > 0:
+		f.Status = StatusSkip
+		f.Detail = strings.Join(unread, "; ")
+		f.Remediation = "run doctor as the user whose gem and Bundler config these are, or repair what the error names"
+	default:
+		f.Status = StatusOK
+		f.Detail = strings.Join(clean, " and ") + " name no rubygems.org"
+	}
+	return f, true
+}
+
+// rubygemsOrgSource is the first source `gem sources --list` prints on
+// rubygems.org, or "". The list is one URL per line under a banner.
+func rubygemsOrgSource(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if src := strings.TrimSpace(line); isRubygemsOrg(src) {
+			return src
+		}
+	}
+	return ""
+}
+
+func isRubygemsOrg(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "rubygems.org" || strings.HasSuffix(host, ".rubygems.org")
+}
+
+// Bundler's keys for a mirror of https://rubygems.org, and for one of every
+// source. Bundler writes the first with the trailing slash it normalizes a
+// source URL to; the second form is what a hand-edited file may hold.
+var bundlerMirrorKeys = []string{
+	"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/",
+	"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG",
+	"BUNDLE_MIRROR__ALL",
+}
+
+// bundlerMirror resolves Bundler's mirror for https://rubygems.org the way
+// Bundler does outside an application: the environment first, then the user
+// config file, which $BUNDLE_USER_CONFIG or $BUNDLE_USER_HOME relocates. An
+// application's own .bundle/config can override both, and doctor runs in no
+// application. from names where the value came from.
+func bundlerMirror(getenv func(string) string, home string) (mirror, from string, err error) {
+	for _, k := range bundlerMirrorKeys {
+		if v := getenv(k); v != "" {
+			return v, "the environment", nil
+		}
+	}
+	path := getenv("BUNDLE_USER_CONFIG")
+	switch {
+	case path != "":
+	case getenv("BUNDLE_USER_HOME") != "":
+		path = filepath.Join(getenv("BUNDLE_USER_HOME"), "config")
+	case home != "":
+		path = filepath.Join(home, ".bundle", "config")
+	default:
+		return "", "", nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	values := map[string]string{}
+	sc := bufio.NewScanner(strings.NewReader(string(data)))
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), ": ")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if uq, err := strconv.Unquote(v); err == nil {
+			v = uq
+		} else {
+			v = strings.Trim(v, "'")
+		}
+		values[strings.TrimSpace(k)] = v
+	}
+	for _, k := range bundlerMirrorKeys {
+		if v := values[k]; v != "" {
+			return v, path, nil
+		}
+	}
+	return "", "", nil
 }
 
 // rooted prefixes each path with root, and returns paths unchanged when root

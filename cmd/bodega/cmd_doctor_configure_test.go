@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -324,5 +325,58 @@ func TestDoctorConfigurePrintsAnInstallRecordsNote(t *testing.T) {
 	out, err := runDoctor(t, "--configure", "npm", "--url", srv.URL, "--allow-plaintext")
 	if err != nil || !strings.Contains(out, "note       npm        node-gyp is left pointing at nodejs.org") {
 		t.Errorf("--configure npm = %v:\n%s", err, out)
+	}
+}
+
+// F82 R2: --configure rubygems --apply writes ~/.gemrc and Bundler's config
+// under the running user's home, and backs up each file it replaces.
+func TestDoctorConfigureRubygemsWritesBothFilesWithBackups(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	files := clientconf.Rubygems(srv.URL)
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		var plan clientconf.Plan
+		for i, f := range files {
+			sum := sha256.Sum256([]byte(f.Content))
+			plan.Records = append(plan.Records, clientconf.PlanRecord{
+				Identity: "web-host", Profile: "web", Match: "cidr:192.0.2.1/32",
+				System: "rubygems", Action: clientconf.PlanInstall, Path: f.Path(clientconf.OSLinux),
+				URL: srv.URL + "/client/rubygems?n=" + strconv.Itoa(i), SHA256: hex.EncodeToString(sum[:]),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /client/rubygems", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+		_, _ = io.WriteString(w, files[n].Content)
+	})
+	for _, old := range []struct{ path, content string }{
+		{".gemrc", "---\n:sources:\n- https://rubygems.org/\n"},
+		{".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n"},
+	} {
+		p := filepath.Join(home, old.path)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(old.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := runDoctor(t, "--configure", "rubygems", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil {
+		t.Fatalf("--configure rubygems --apply = %v:\n%s", err, out)
+	}
+	for _, f := range files {
+		target := filepath.Join(home, strings.TrimPrefix(f.Path(clientconf.OSLinux), "~/"))
+		if got, _ := os.ReadFile(target); string(got) != f.Content {
+			t.Errorf("%s = %q, want %q", target, got, f.Content)
+		}
+		if backups, _ := filepath.Glob(target + ".bodega-*"); len(backups) != 1 {
+			t.Errorf("backups of %s = %v, want one", target, backups)
+		}
 	}
 }

@@ -224,3 +224,85 @@ func TestAllChecksRunCleanly(t *testing.T) {
 		}
 	}
 }
+
+// rubyFixture stands in for a host's gem and bundle: which are on PATH, what
+// `gem sources --list` prints, and the home Bundler's user config sits in.
+func rubyFixture(t *testing.T, tools []string, sources string, env map[string]string) rubyTools {
+	t.Helper()
+	return rubyTools{
+		lookPath: func(name string) (string, error) {
+			for _, tool := range tools {
+				if tool == name {
+					return "/usr/bin/" + name, nil
+				}
+			}
+			return "", exec.ErrNotFound
+		},
+		gemSources: func(string) (string, error) { return sources, nil },
+		getenv:     func(k string) string { return env[k] },
+		home:       t.TempDir(),
+	}
+}
+
+const bodegaGemSources = "*** CURRENT SOURCES ***\n\nhttps://bodega.internal/rubygems/\n"
+
+func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
+	if f, ok := checkRubygems(rubyFixture(t, nil, "", nil)); ok {
+		t.Errorf("no gem and no bundle gave a row: %+v", f)
+	}
+}
+
+func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
+	both := []string{"gem", "bundle"}
+	configured := func(t *testing.T) rubyTools {
+		r := rubyFixture(t, both, bodegaGemSources, nil)
+		r.home = t.TempDir()
+		for _, c := range clientconf.Rubygems("https://bodega.internal") {
+			if c.Label != "Bundler mirror" {
+				continue
+			}
+			path := filepath.Join(r.home, strings.TrimPrefix(c.Path(clientconf.OSLinux), "~/"))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(c.Content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return r
+	}
+
+	f, ok := checkRubygems(configured(t))
+	if !ok || f.Status != StatusOK {
+		t.Fatalf("the files clientconf renders = %+v, want OK", f)
+	}
+
+	r := configured(t)
+	r.gemSources = func(string) (string, error) { return "*** CURRENT SOURCES ***\n\nhttps://rubygems.org/\n", nil }
+	f, _ = checkRubygems(r)
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "gem sources lists https://rubygems.org/") || !strings.Contains(f.Remediation, "--configure rubygems") {
+		t.Errorf("gem sources on rubygems.org = %+v, want a warning naming the source and --configure rubygems", f)
+	}
+
+	f, _ = checkRubygems(rubyFixture(t, []string{"bundle"}, "", nil))
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "Bundler has no mirror") || strings.Contains(f.Detail, "gem sources") {
+		t.Errorf("bundle alone with no mirror = %+v, want a warning about Bundler alone", f)
+	}
+
+	f, _ = checkRubygems(rubyFixture(t, []string{"bundle"}, "", map[string]string{"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/": "https://index.rubygems.org/"}))
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "the environment") {
+		t.Errorf("a mirror back onto rubygems.org = %+v, want a warning naming the environment", f)
+	}
+
+	f, _ = checkRubygems(rubyFixture(t, []string{"bundle"}, "", map[string]string{"BUNDLE_MIRROR__ALL": "https://bodega.internal/rubygems/"}))
+	if f.Status != StatusOK {
+		t.Errorf("BUNDLE_MIRROR__ALL on bodega = %+v, want OK", f)
+	}
+
+	r = rubyFixture(t, []string{"gem"}, "", nil)
+	r.gemSources = func(string) (string, error) { return "", errors.New("exit status 1") }
+	f, _ = checkRubygems(r)
+	if f.Status != StatusSkip || !strings.Contains(f.Detail, "exit status 1") {
+		t.Errorf("gem sources failing = %+v, want SKIPPED with the error", f)
+	}
+}
