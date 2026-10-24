@@ -223,6 +223,9 @@ func (s *Server) recordSpoolRefusal(r *http.Request, pkgType, pkgName, s3Key, re
 		"key", s3Key, "reason", reason, "error", err,
 		"spool_dir", st.Dir, "spool_used_bytes", st.UsedBytes, "spool_in_flight", st.InFlight,
 		"spool_max_total_bytes", st.BudgetBytes, "spool_max_artifact_bytes", st.MaxArtifactBytes)
+	if isOwnRead(r) {
+		return
+	}
 	recordDenialFor(s.auditDB, r, pkgType, pkgName, "", reason, map[string]string{
 		"key":                   s3Key,
 		"spool_used_bytes":      strconv.FormatInt(st.UsedBytes, 10),

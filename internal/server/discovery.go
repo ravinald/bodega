@@ -312,7 +312,7 @@ func (s *Server) recordCacheHitDiscovery(ctx context.Context, r *http.Request, r
 // and hands off to the same channel: a synchronous SQLite write on the miss
 // path would put the request hot path behind the database.
 func (s *Server) recordDiscoveryRaw(_ context.Context, r *http.Request, regType, host, hint, pkgName, pkgVersion, decision, upstreamURL string) {
-	if s.discovery == nil || s.discoverMode == "" {
+	if s.discovery == nil || s.discoverMode == "" || isOwnRead(r) {
 		return
 	}
 	s.discovery.Record(audit.DiscoveryRow{

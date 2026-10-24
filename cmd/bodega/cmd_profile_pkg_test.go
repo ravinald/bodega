@@ -136,3 +136,35 @@ func TestProfileCheckDoesNotFailOnFreeBSDEntries(t *testing.T) {
 		t.Errorf("profile check does not say the freebsd entry went unchecked:\n%s", out)
 	}
 }
+
+// RubyGems names are case-sensitive and never normalized, so the stored
+// profile answers for the spelling the operator wrote and no other: RedCloth
+// and redcloth are two gems on rubygems.org.
+func TestRubygemsProfileTakesSetAddPinAndRemove(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "rubygems", "RedCloth")
+	mustRunProfile(t, "add", "web", "rubygems", "concurrent-ruby")
+	mustRunProfile(t, "pin", "web", "rubygems", "nokogiri", "1.16.7", "--reason", "1.17 drops the system libxml2 build")
+	mustRunProfile(t, "set", "web", "rubygems", "--membership", "closed", "--expansion", "block")
+
+	p := storedProfile(t, env, "web")
+	if !p.Governs(manifest.TypeRubygems) {
+		t.Fatal("set web rubygems stored no rubygems rule")
+	}
+	if !p.Covers(manifest.TypeRubygems, "RedCloth").Permitted {
+		t.Error("the listed RedCloth is refused")
+	}
+	if p.Covers(manifest.TypeRubygems, "redcloth").Permitted {
+		t.Error("redcloth matched the RedCloth entry; gem names are case-sensitive")
+	}
+	if !p.Permits(manifest.TypeRubygems, "nokogiri", "1.16.7").Permitted ||
+		p.Permits(manifest.TypeRubygems, "nokogiri", "1.15.0").Permitted {
+		t.Error("the nokogiri pin does not hold 1.16.7 and refuse 1.15.0")
+	}
+
+	mustRunProfile(t, "remove", "web", "rubygems", "concurrent-ruby")
+	if storedProfile(t, env, "web").Covers(manifest.TypeRubygems, "concurrent-ruby").Permitted {
+		t.Error("concurrent-ruby is still covered after remove")
+	}
+}
