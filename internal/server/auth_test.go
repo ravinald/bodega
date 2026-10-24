@@ -776,3 +776,31 @@ func TestCallerNamePrecedence(t *testing.T) {
 		})
 	}
 }
+
+// Every package-serving route narrows a read token to its own type. A route
+// whose path parsePackagePath does not recognize reads as typeless, which
+// audit.Scopes treats as governed by no type: a read:npm token then reads it.
+func TestEveryServingRouteHasAScopeType(t *testing.T) {
+	t.Parallel()
+	for path, want := range map[string]string{
+		"/apt/pool/main/c/curl/curl_8.5.0_amd64.deb":            manifest.TypeApt,
+		"/pypi/simple/requests/":                                manifest.TypePypi,
+		"/pypi/wheels/requests-2.31.0-py3-none-any.whl":         manifest.TypePypi,
+		"/git/widget/widget.bundle":                             manifest.TypeGit,
+		"/binaries/kubectl/1.30.0/kubectl":                      manifest.TypeBinary,
+		"/go/golang.org/x/mod/@v/v0.17.0.zip":                   manifest.TypeGomod,
+		"/helm/charts/cert-manager-1.14.0.tgz":                  manifest.TypeHelm,
+		"/npm/left-pad/-/left-pad-1.3.0.tgz":                    manifest.TypeNpm,
+		"/cargo/serde/1.0.0/download":                           manifest.TypeCargo,
+		"/maven/org/example/core/widget/1.2.0/widget-1.2.0.jar": manifest.TypeMaven,
+		"/maven/not-a-layout":                                   manifest.TypeMaven,
+		"/rubygems/gems/rake-13.0.0.gem":                        manifest.TypeRubygems,
+		"/freebsd/FreeBSD:15:amd64/latest/packagesite.pkg":      manifest.TypeFreeBSD,
+		"/freebsd-profile/web/FreeBSD:15:amd64/latest/x.pkg":    manifest.TypeFreeBSD,
+		"/distfiles/curl-8.5.0.tar.xz":                          manifest.TypeDistfiles,
+	} {
+		if _, got := routeScope(httptest.NewRequest(http.MethodGet, path, nil)); got != want {
+			t.Errorf("routeScope(GET %s) type = %q, want %q", path, got, want)
+		}
+	}
+}

@@ -821,6 +821,13 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 			return "rubygems", strings.TrimPrefix(full, "info/"), ""
 		}
 		return "rubygems", "", ""
+	case strings.HasPrefix(path, "/maven/"):
+		// A path the layout rejects still names the type, so a read token
+		// scoped to another type is refused before the handler 404s it.
+		if mp, ok := manifest.ParseMavenPath(strings.TrimPrefix(path, "/maven/")); ok {
+			return manifest.TypeMaven, mp.Name(), mp.Version
+		}
+		return manifest.TypeMaven, "", ""
 	case strings.HasPrefix(path, "/freebsd-profile/"):
 		// The profile's filtered view of the same tree, one segment deeper.
 		if _, rest, ok := strings.Cut(strings.TrimPrefix(path, "/freebsd-profile/"), "/"); ok {

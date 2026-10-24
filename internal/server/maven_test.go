@@ -374,3 +374,46 @@ func TestMavenMetadataStaleCopyDuringOutage(t *testing.T) {
 	silent.release()
 	waitFor(t, refreshIdle(s, manifest.MavenKey(meta)))
 }
+
+// A typed read token reaches Maven only when its type is maven: before the
+// route had a scope type, read:npm read every artifact.
+func TestMavenReadScope(t *testing.T) {
+	s, _ := mavenServer(t)
+	if s.pepper == "" {
+		s.pepper = "maven-scope-pepper"
+	}
+	//nolint:gosec // G101: test fixtures, not credentials.
+	const npmToken, mavenToken = "bodega_ak_readnpm", "bodega_ak_readmaven"
+	for id, tok := range map[string]struct{ secret, scope string }{
+		"npm":   {npmToken, "read:npm"},
+		"maven": {mavenToken, "read:maven"},
+	} {
+		if err := s.auditDB.InsertScopedToken(t.Context(), id, id, audit.HashToken(tok.secret, s.pepper), "", tok.scope, "test", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const p = "/maven/org/example/core/widget/1.2.0/widget-1.2.0.jar"
+	bearer := func(tok string) map[string]string { return map[string]string{"Authorization": "Bearer " + tok} }
+	if rec := doRequest(s, http.MethodGet, p, bearer(npmToken)); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "read:maven") {
+		t.Errorf("read:npm on a Maven artifact = %d %q, want 403 naming read:maven", rec.Code, rec.Body)
+	}
+	if rec := doRequest(s, http.MethodGet, p, bearer(mavenToken)); rec.Code != http.StatusOK {
+		t.Errorf("read:maven on a Maven artifact = %d %q, want 200", rec.Code, rec.Body)
+	}
+}
+
+// A served artifact writes the serve_fetch event every package route writes,
+// under the same identity as its discovery row.
+func TestMavenFetchWritesServeFetch(t *testing.T) {
+	s, _ := mavenServer(t)
+	if code, body, _ := getMaven(t, s, "org/example/core/widget/1.2.0/widget-1.2.0.pom"); code != http.StatusOK {
+		t.Fatalf("GET pom = %d %q", code, body)
+	}
+	events := waitForServeFetch(t, s, 1)
+	for _, ev := range events {
+		if ev.PkgType == manifest.TypeMaven && ev.PkgName == mavenWidgetName && ev.PkgVersion == "1.2.0" {
+			return
+		}
+	}
+	t.Errorf("no serve_fetch event for maven %s at 1.2.0; events carry %v", mavenWidgetName, eventIdentities(events))
+}
