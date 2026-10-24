@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,10 +28,11 @@ type AgeStore interface {
 // `bodega policy age set` validation, so an ecosystem gains age coverage and
 // becomes settable in the same edit.
 var agePublishers = map[string]func(*AgeChecker, context.Context, string, string) (time.Time, error){
-	manifest.TypeNpm:   (*AgeChecker).npmPublishedAt,
-	manifest.TypePypi:  (*AgeChecker).pypiPublishedAt,
-	manifest.TypeGomod: (*AgeChecker).gomodPublishedAt,
-	manifest.TypeCargo: (*AgeChecker).cratesPublishedAt,
+	manifest.TypeNpm:      (*AgeChecker).npmPublishedAt,
+	manifest.TypePypi:     (*AgeChecker).pypiPublishedAt,
+	manifest.TypeGomod:    (*AgeChecker).gomodPublishedAt,
+	manifest.TypeCargo:    (*AgeChecker).cratesPublishedAt,
+	manifest.TypeRubygems: (*AgeChecker).gemPublishedAt,
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -55,6 +57,9 @@ type AgeChecker struct {
 	PypiBase    string
 	GoProxy     string
 	CratesBase  string
+	// RubygemsBase is rubygems_upstream: the versions API is served from the
+	// same root as the gem files.
+	RubygemsBase string
 
 	// HTTP gets a conservative timeout so a slow upstream doesn't stall
 	// admission.
@@ -64,13 +69,14 @@ type AgeChecker struct {
 
 func NewAgeChecker(store AgeStore) *AgeChecker {
 	return &AgeChecker{
-		store:       store,
-		NpmRegistry: "https://registry.npmjs.org",
-		PypiBase:    "https://pypi.org",
-		GoProxy:     "https://proxy.golang.org",
-		CratesBase:  "https://crates.io",
-		HTTP:        &http.Client{Timeout: 10 * time.Second},
-		Now:         time.Now,
+		store:        store,
+		NpmRegistry:  "https://registry.npmjs.org",
+		PypiBase:     "https://pypi.org",
+		GoProxy:      "https://proxy.golang.org",
+		CratesBase:   "https://crates.io",
+		RubygemsBase: "https://rubygems.org",
+		HTTP:         &http.Client{Timeout: 10 * time.Second},
+		Now:          time.Now,
 	}
 }
 
@@ -271,6 +277,38 @@ func (c *AgeChecker) cratesPublishedAt(ctx context.Context, name, version string
 		return time.Time{}, fmt.Errorf("crates.io response has no version.created_at for %s@%s", name, version)
 	}
 	return time.Parse(time.RFC3339Nano, doc.Version.CreatedAt)
+}
+
+// gemPublishedAt reads created_at for one build from the versions API, which
+// lists every version and platform of a gem in one document. version is the
+// form a gem file names, "1.16.7-x86_64-linux" for a platform build and
+// "1.16.7" for the "ruby" one: a Gem::Version never holds "-", so the first
+// one opens the platform. A build the document does not list is an error, as
+// crates.io's 404 for an unknown crate version is.
+func (c *AgeChecker) gemPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
+	number, platform, ok := strings.Cut(version, "-")
+	if !ok {
+		platform = "ruby"
+	}
+	endpoint := c.RubygemsBase + "/api/v1/versions/" + neturl.PathEscape(name) + ".json"
+	var doc []struct {
+		Number    string `json:"number"`
+		Platform  string `json:"platform"`
+		CreatedAt string `json:"created_at"`
+	}
+	if err := c.getJSON(ctx, endpoint, &doc); err != nil {
+		return time.Time{}, err
+	}
+	for _, v := range doc {
+		if v.Number != number || v.Platform != platform {
+			continue
+		}
+		if v.CreatedAt == "" {
+			return time.Time{}, fmt.Errorf("rubygems versions API lists %s %s (%s) with no created_at", name, number, platform)
+		}
+		return time.Parse(time.RFC3339Nano, v.CreatedAt)
+	}
+	return time.Time{}, fmt.Errorf("rubygems versions API does not list %s %s for platform %s", name, number, platform)
 }
 
 func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {

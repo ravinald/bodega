@@ -1011,17 +1011,30 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 // names the version being fetched. A freebsd key's version slot holds the ABI,
 // and checking an advisory against that would answer for the wrong thing.
 var fetchGatedTypes = map[string]bool{
-	manifest.TypeNpm:   true,
-	manifest.TypePypi:  true,
-	manifest.TypeGomod: true,
-	manifest.TypeCargo: true,
-	manifest.TypeMaven: true,
+	manifest.TypeNpm:      true,
+	manifest.TypePypi:     true,
+	manifest.TypeGomod:    true,
+	manifest.TypeCargo:    true,
+	manifest.TypeMaven:    true,
+	manifest.TypeRubygems: true,
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age
 // gate dates a version against the public registries: a test points it at
 // checkers it controls rather than reaching the internet.
 var fetchCheckers = admit.VersionCheckers
+
+// datedThroughUpstream sends the age gate's reads through the proxy's own
+// transport and guard. A gem is dated at rubygems_upstream, the host its bytes
+// come from, so that read is held to upstream_connect_timeout and the redirect
+// guard as the fetch it gates is.
+func datedThroughUpstream(checkers []policy.VersionChecker) {
+	for _, c := range checkers {
+		if ac, ok := c.(*policy.AgeChecker); ok {
+			ac.HTTP = publishTimeClient
+		}
+	}
+}
 
 // fillAdmission is the version a proxy fill was admitted as, carried from the
 // gate to the pin so both name it the same way. Zero when no row was written.
@@ -1081,6 +1094,9 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	switch {
 	case fetchGatedTypes[fill.typ] && fill.version != "":
 		checkers = fetchCheckers(s.cfg, s.auditDB)
+		if fill.typ == manifest.TypeRubygems {
+			datedThroughUpstream(checkers)
+		}
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool
 		// is served from storage, and a dists/ key names none.

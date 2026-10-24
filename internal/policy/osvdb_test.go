@@ -61,6 +61,14 @@ var osvAgreementCases = []osvAgreementCase{
 		ids:          []string{"GHSA-wcg3-cvx6-7396", "RUSTSEC-2020-0071"},
 		clean:        "0.2.23",
 	},
+	{
+		registryType: manifest.TypeRubygems,
+		ecosystem:    "RubyGems",
+		pkg:          "jmespath",
+		vulnerable:   "1.6.0",
+		ids:          []string{"GHSA-5c5f-7vfq-3732"},
+		clean:        "1.6.1",
+	},
 }
 
 // osvAgreementCase is one (ecosystem, package, version) pair the local matcher
@@ -590,5 +598,57 @@ func TestOSVDatabase_SyncRefusesEmptyExport(t *testing.T) {
 		&manifest.VersionEntry{Version: "1.2.0"})
 	if r.Action != ActionWarn {
 		t.Fatalf("a refused sync must leave the gate warning, not %q: %+v", r.Action, r)
+	}
+}
+
+// A platform gem's version carries its platform, and RubyGems advisories are
+// issued against the release: jmespath 1.6.0 built for java is jmespath 1.6.0.
+func TestOSVChecker_RubygemsPlatformBuildMatchesItsRelease(t *testing.T) {
+	db := syncedDB(t)
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRubygems: {Ecosystem: manifest.TypeRubygems, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	r := ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "jmespath", Type: manifest.TypeRubygems},
+		&manifest.VersionEntry{Version: "1.6.0-java"})
+	if r.Action != ActionBlock || !strings.Contains(r.Reason, "GHSA-5c5f-7vfq-3732") {
+		t.Errorf("jmespath 1.6.0-java = %+v, want a block naming GHSA-5c5f-7vfq-3732", r)
+	}
+	r = ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "jmespath", Type: manifest.TypeRubygems},
+		&manifest.VersionEntry{Version: "1.6.1-java"})
+	if r.Action != ActionPass {
+		t.Errorf("jmespath 1.6.1-java = %+v, want a pass", r)
+	}
+}
+
+// A RubyGems range is walked in Gem::Version order, where a letter segment
+// opens a prerelease: 1.6.1.rc1 is below a fix landing in 1.6.1, which semver
+// cannot place at all.
+func TestOSVRange_RubyGemsOrder(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want int
+	}{
+		{"1.6.1.rc1", "1.6.1", -1},
+		{"1.6.1.rc1", "1.6.0", 1},
+		{"1.0", "1", 0},
+		{"1.0.a", "1.a", 0},
+		{"1.0.0.beta2", "1.0.0.beta10", -1},
+		{"1.0.0-pre", "1.0.0.pre.pre", 0},
+		{"2.10", "2.9", 1},
+	} {
+		if got, ok := compareGemVersions(tc.a, tc.b); !ok || got != tc.want {
+			t.Errorf("compare(%q, %q) = %d, %v; want %d", tc.a, tc.b, got, ok, tc.want)
+		}
+	}
+	if _, ok := compareGemVersions("1.0 junk", "1.0"); ok {
+		t.Error("a version Gem::Version refuses was ordered")
+	}
+	fixed := osvRange{Type: "ECOSYSTEM", Events: []osvEvent{{Introduced: "0"}, {Fixed: "1.6.1"}}}
+	if hit, bad := fixed.affects(osvVersionOrder("RubyGems"), "1.6.1.rc1"); !hit || bad != "" {
+		t.Errorf("1.6.1.rc1 under fixed 1.6.1: hit=%v unorderable=%q, want a hit", hit, bad)
 	}
 }

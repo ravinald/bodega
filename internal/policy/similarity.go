@@ -31,13 +31,16 @@ var popularFS embed.FS
 // the ones whose packages are named by whoever publishes them, on a registry
 // anyone can publish to.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeNpm, manifest.TypePypi}
+	return []string{manifest.TypeCargo, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 }
 
 // NormalizeName is the form two names are compared in. pypi applies PEP 503,
 // so `Py_Yaml` and `py-yaml` are one name; cargo lowercases and treats `_` as
 // `-`, because crates.io refuses a crate differing from an existing one only
-// in those ways; every other type lowercases.
+// in those ways; every other type lowercases. rubygems lowercases and folds
+// nothing else: rubygems.org refuses a name differing from an existing one
+// only in case, but `rest_client` and `rest-client` are two gems, so the
+// separator is an edit the distance counts.
 func NormalizeName(typ, name string) string {
 	name = strings.TrimSpace(name)
 	switch typ {
@@ -323,12 +326,12 @@ func LoadPopularNames(ctx context.Context, store SimilarityStore, ecosystem stri
 }
 
 // ExactRule reports whether an allow-list rule names one package rather than
-// a family of them. pypi and cargo rules are always exact; an npm rule is
+// a family of them. pypi, cargo and rubygems rules are always exact; an npm rule is
 // unless it is the `@scope/*` wildcard. Every other kind is a host or a
 // prefix, which names no package at all.
 func ExactRule(typ, pattern string) bool {
 	switch typ {
-	case manifest.TypePypi, manifest.TypeCargo:
+	case manifest.TypePypi, manifest.TypeCargo, manifest.TypeRubygems:
 		return true
 	case manifest.TypeNpm:
 		return !strings.HasSuffix(pattern, "/*")

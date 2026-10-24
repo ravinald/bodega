@@ -363,3 +363,27 @@ func TestTakeNameBaselineOnce(t *testing.T) {
 		t.Errorf("NameBaseline = %+v", st)
 	}
 }
+
+// RubyGems keeps `-` and `_` apart: `rest_client` is its own gem, one edit
+// from `rest-client`, which is the shape the 2020 atlas-client/atlas_client
+// squat took. Folding the separator, as pypi and cargo do, would read it as
+// the popular gem itself and pass it.
+func TestNameSimilarityRubygemsSeparatorIsAnEdit(t *testing.T) {
+	if NormalizeName(manifest.TypeRubygems, "rest_client") == NormalizeName(manifest.TypeRubygems, "rest-client") {
+		t.Fatal("rubygems folds _ into -; the two are distinct gems")
+	}
+	if NormalizeName(manifest.TypeRubygems, "Rails") != "rails" {
+		t.Error("rubygems.org refuses a name differing only in case, so case is folded")
+	}
+	r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeRubygems, "rest_client")
+	if r.Action != ActionBlock || r.Details["nearest"] != "rest-client" || r.Details["distance"] != 1 {
+		t.Errorf("rest_client = %+v, want a block naming rest-client at distance 1", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeRubygems, "rest-client"); r.Action != ActionPass {
+		t.Errorf("the popular gem itself = %+v, want a pass", r)
+	}
+	exact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeRubygems, Pattern: "rest_client"}}}
+	if r := checkName(t, exact, manifest.TypeRubygems, "rest_client"); r.Action != ActionPass {
+		t.Errorf("an exact rubygems rule exempts its own name; got %+v", r)
+	}
+}
