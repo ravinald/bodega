@@ -29,6 +29,7 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   helm    Download chart archives to charts/
   npm     Download package tarballs to npm/
   cargo   Download crate tarballs to cargo/
+  rubygems Download gem files to rubygems/
   freebsd Mirror a pkg repository byte for byte to freebsd/
   distfiles Download ports distfiles matching the ports tree's distinfo to distfiles/
 
@@ -153,7 +154,9 @@ it once before a hosted index can date them.`,
 						builder.FetchDistfiles(bcfg, store, entryFilter),
 					)
 				case manifest.TypeRubygems:
-					fmt.Fprintf(os.Stdout, "\n>>> [rubygems] nothing to %s: gems are pulled through /rubygems/ on first request\n", "fetch")
+					allSummaries = append(allSummaries,
+						builder.FetchRubygems(bcfg, store, entryFilter),
+					)
 				}
 			}
 

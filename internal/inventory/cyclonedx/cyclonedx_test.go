@@ -24,6 +24,8 @@ const doc16 = `{
      "components": [{"name": "urllib3", "version": "2.2.2", "purl": "pkg:pypi/urllib3@2.2.2"}]},
     {"name": "lodash", "version": "4.17.21", "purl": "pkg:npm/lodash@4.17.21",
      "externalReferences": [{"type": "distribution", "url": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"}]},
+    {"name": "nokogiri", "version": "1.16.7", "purl": "pkg:gem/nokogiri@1.16.7?platform=x86_64-linux"},
+    {"name": "rake", "version": "13.2.1", "purl": "pkg:gem/rake@13.2.1"},
     {"name": "spring-core", "version": "6.1.0", "purl": "pkg:maven/org.springframework/spring-core@6.1.0"},
     {"name": "mystery"}
   ]
@@ -45,11 +47,11 @@ func TestNormalizeMapsTheCommonModel(t *testing.T) {
 	for _, c := range r.Components {
 		got[c.Name] = c
 	}
-	if len(got) != 6 {
-		t.Fatalf("components = %d (%v), want 6 with the nested urllib3 and without the metadata subject", len(got), r.Components)
+	if len(got) != 8 {
+		t.Fatalf("components = %d (%v), want 8 with the nested urllib3 and without the metadata subject", len(got), r.Components)
 	}
 	for name, eco := range map[string]string{
-		"curl": "apt", "requests": "pypi", "urllib3": "pypi", "lodash": "npm",
+		"curl": "apt", "requests": "pypi", "urllib3": "pypi", "lodash": "npm", "nokogiri": "rubygems", "rake": "rubygems",
 		"spring-core": inventory.EcosystemOther, "mystery": inventory.EcosystemOther,
 	} {
 		if got[name].Ecosystem != eco {
@@ -58,6 +60,10 @@ func TestNormalizeMapsTheCommonModel(t *testing.T) {
 	}
 	if c := got["curl"]; c.DigestAlgorithm != "sha256" || c.DigestValue != "beef" || c.Origin != "http://archive.ubuntu.com/ubuntu" {
 		t.Errorf("curl = %+v, want the SHA-256 digest and the repository_url origin", c)
+	}
+	// bodega records a platform gem under the version its gem file names.
+	if got["nokogiri"].Version != "1.16.7-x86_64-linux" || got["rake"].Version != "13.2.1" {
+		t.Errorf("gem versions = %q, %q; want the platform build on nokogiri and none on rake", got["nokogiri"].Version, got["rake"].Version)
 	}
 	if got["requests"].Path != "/usr/lib/python3/dist-packages/requests" {
 		t.Errorf("requests path = %q", got["requests"].Path)

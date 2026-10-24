@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 
@@ -181,6 +182,77 @@ func ParseCargo(r io.Reader) (Result, error) {
 	if gitSourced > 0 {
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
 			"skipped %d crate(s) installed from a git or path source; the registry has no such version to serve", gitSourced))
+	}
+	sortPackages(res.Packages)
+	return res, nil
+}
+
+// ParseRubygems converts either of the two places a host records its gems:
+// 'gem list --local', one line per gem with every installed version in
+// parentheses, or a listing of the gem directory's specifications/, one
+// <name>-<version>[-<platform>].gemspec per installed version. A line ending
+// in .gemspec is read as the second; the two can be concatenated.
+//
+// A platform build is listed as "1.16.7 x86_64-linux" and recorded as
+// "1.16.7-x86_64-linux", the version its gem file names. A default gem ships
+// inside Ruby itself rather than being installed from a registry, so it is
+// skipped and counted: cataloging one fetches a gem no host ever downloaded.
+func ParseRubygems(r io.Reader) (Result, error) {
+	var (
+		pms        []manifest.PackageManifest
+		defaults   int
+		unreadable []string
+	)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "***") {
+			continue
+		}
+		if strings.HasSuffix(line, ".gemspec") {
+			name, version := manifest.RubygemsGemIdentity(strings.TrimSuffix(path.Base(line), ".gemspec") + ".gem")
+			if name == "" {
+				unreadable = append(unreadable, line)
+				continue
+			}
+			pms = append(pms, pkg(manifest.TypeRubygems, name, version, "", registryMode))
+			continue
+		}
+		name, list, ok := strings.Cut(line, " (")
+		list, closed := strings.CutSuffix(list, ")")
+		if !ok || !closed || name == "" {
+			unreadable = append(unreadable, line)
+			continue
+		}
+		for _, v := range strings.Split(list, ",") {
+			v = strings.TrimSpace(v)
+			if strings.HasPrefix(v, "default:") {
+				defaults++
+				continue
+			}
+			release, platform, hasPlatform := strings.Cut(v, " ")
+			if release == "" {
+				continue
+			}
+			if hasPlatform && platform != "ruby" {
+				release += "-" + strings.TrimSpace(platform)
+			}
+			pms = append(pms, pkg(manifest.TypeRubygems, name, release, "", registryMode))
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("scan gem list output: %w", err)
+	}
+	var res Result
+	res.Packages = mergeSameName(pms)
+	if defaults > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d default gem version(s): they ship inside Ruby, so no host downloaded them from a registry", defaults))
+	}
+	if len(unreadable) > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d line(s) that are neither 'gem list' output nor a .gemspec file name, first: %q", len(unreadable), unreadable[0]))
 	}
 	sortPackages(res.Packages)
 	return res, nil
