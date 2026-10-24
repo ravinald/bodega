@@ -268,6 +268,38 @@ func ensureFetchedCargo(bcfg *builder.Config, store *manifest.Store, entryFilter
 	return builder.MergeSummaries(ss...)
 }
 
+// ensureFetchedRubygems runs FetchRubygems for any unfetched entries. A gem
+// file is the artifact, and the compact index stays the upstream's, proxied.
+// A proxy-mode entry is skipped like freebsd's: the route pulls it through on
+// first request, so staging it here would fetch what nobody pinned to serve.
+func ensureFetchedRubygems(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeRubygems)) == 0 {
+		fmt.Println("    No rubygems entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeRubygems) {
+		pm, err := store.GetPackage(ctx, manifest.TypeRubygems, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen || ve.EffectiveMode() == manifest.ModeProxy {
+				continue
+			}
+			if !builder.CheckRubygemsStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchRubygems(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	return builder.MergeSummaries(ss...)
+}
+
 // ensureFetchedNpm fetches any missing tarballs. npm has no package stage:
 // the server generates the packument from the manifest entry per request, so
 // there is nothing between a fetched tarball and an upload.
@@ -409,9 +441,7 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 		// every request, so there is nothing to make uploadable.
 		s = &builder.Summary{}
 	case manifest.TypeRubygems:
-		// No stage writes a gem to disk, so there is nothing to stage. A gem
-		// file already under rubygems_root still uploads.
-		s = &builder.Summary{}
+		s = ensureFetchedRubygems(bcfg, store, "")
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

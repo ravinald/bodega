@@ -157,6 +157,12 @@ func toComponent(c component) inventory.Component {
 			out.Ecosystem = eco
 		}
 		out.Origin = firstNonEmpty(qualifiers.Get("repository_url"), qualifiers.Get("download_url"))
+		// bodega records a platform gem's version with the build on it, as
+		// the gem file names it; the purl carries the build as a qualifier.
+		if p := qualifiers.Get("platform"); out.Ecosystem == manifest.TypeRubygems && p != "" && p != "ruby" &&
+			!strings.HasSuffix(out.Version, "-"+p) {
+			out.Version += "-" + p
+		}
 	}
 	if out.Origin == "" {
 		for _, ref := range c.ExternalReferences {
@@ -180,6 +186,7 @@ var purlEcosystems = map[string]string{
 	"pypi":    manifest.TypePypi,
 	"npm":     manifest.TypeNpm,
 	"cargo":   manifest.TypeCargo,
+	"gem":     manifest.TypeRubygems,
 	"golang":  manifest.TypeGomod,
 	"helm":    manifest.TypeHelm,
 	"freebsd": manifest.TypeFreeBSD,

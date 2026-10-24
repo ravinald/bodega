@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -237,6 +238,73 @@ func TestParseCargoSkipsGitSources(t *testing.T) {
 	}
 	if len(res.Warnings) == 0 {
 		t.Error("a crate was skipped and nothing said so")
+	}
+}
+
+// TestParseRubygemsBothForms reads one container's gems both ways. The
+// gem list capture holds the three cases a line can carry: a platform build
+// (nokogiri 1.16.7 x86_64-linux), two versions of one gem (rake 13.2.1 and
+// 13.1.0), and the default gems Ruby ships, which no registry download put
+// there. The specifications listing names the two gems installed by hand.
+func TestParseRubygemsBothForms(t *testing.T) {
+	list, err := ParseRubygems(fixture(t, "rubygems-gem-list-local-ruby33.txt"))
+	if err != nil {
+		t.Fatalf("ParseRubygems(gem list): %v", err)
+	}
+	got := map[string][]string{}
+	for _, pm := range list.Packages {
+		if pm.Type != manifest.TypeRubygems {
+			t.Errorf("%s typed %q", pm.Name, pm.Type)
+		}
+		for _, ve := range pm.Versions {
+			got[pm.Name] = append(got[pm.Name], ve.Version)
+			if ve.Mode != manifest.ModeProxy {
+				t.Errorf("%s@%s mode %q, want proxy like every registry import", pm.Name, ve.Version, ve.Mode)
+			}
+		}
+	}
+	if v := got["nokogiri"]; len(v) != 1 || v[0] != "1.16.7-x86_64-linux" {
+		t.Errorf("nokogiri = %v, want the platform build as its gem file names it", v)
+	}
+	if v := got["rake"]; len(v) != 2 || !slices.Contains(v, "13.2.1") || !slices.Contains(v, "13.1.0") {
+		t.Errorf("rake = %v, want both installed versions on one package", v)
+	}
+	if _, ok := got["json"]; ok {
+		t.Error("json is a default gem in the capture and was imported")
+	}
+	if len(list.Packages) != 17 {
+		t.Errorf("imported %d gems, want the 17 the capture lists without a default: version", len(list.Packages))
+	}
+	if len(list.Warnings) != 1 || !strings.Contains(list.Warnings[0], "70 default gem") {
+		t.Errorf("warnings = %v, want one naming the 70 default gems skipped", list.Warnings)
+	}
+
+	specs, err := ParseRubygems(fixture(t, "rubygems-specifications-ruby33.txt"))
+	if err != nil {
+		t.Fatalf("ParseRubygems(specifications): %v", err)
+	}
+	var fromSpecs []string
+	for _, pm := range specs.Packages {
+		fromSpecs = append(fromSpecs, pm.Name+"@"+pm.Versions[0].Version)
+	}
+	if want := []string{"nokogiri@1.16.7-x86_64-linux", "rake@13.2.1"}; !slices.Equal(fromSpecs, want) {
+		t.Errorf("specifications = %v, want %v", fromSpecs, want)
+	}
+	if len(specs.Warnings) != 0 {
+		t.Errorf("warnings on a clean listing: %v", specs.Warnings)
+	}
+}
+
+func TestParseRubygemsReportsWhatItCannotRead(t *testing.T) {
+	res, err := ParseRubygems(strings.NewReader("*** LOCAL GEMS ***\n\nrack (3.1.8)\nnot a gem line\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Packages) != 1 || res.Packages[0].Name != "rack" {
+		t.Errorf("packages = %+v, want rack alone", res.Packages)
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "not a gem line") {
+		t.Errorf("warnings = %v, want the unreadable line named", res.Warnings)
 	}
 }
 

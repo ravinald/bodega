@@ -27,6 +27,7 @@ func newImportCmd(gf *globalFlags) *cobra.Command {
 	var serverURL string
 	var allowPlaintext bool
 	var baseline bool
+	var lockfiles []string
 
 	cmd := &cobra.Command{
 		Use:   "import <file> [file...]",
@@ -70,9 +71,38 @@ refused with --server: a host pushing its own catalog cannot exempt it from
 the gates.
 
   bodega pkg convert npm < installed.txt > baseline.json
-  bodega pkg import --baseline --merge baseline.json`,
-		Args: cobra.MinimumNArgs(1),
+  bodega pkg import --baseline --merge baseline.json
+
+--lockfile reads a lockfile a package manager wrote instead of JSON, and is
+'bodega pkg prefetch' under the name an importer looks for: every pinned
+version is admitted, merged into its package, fetched and compared with the
+digest the lockfile records, and the exit status is prefetch's. It takes the
+formats prefetch does, Gemfile.lock among them, and none of the flags above.
+
+  bodega pkg import --lockfile Gemfile.lock`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(lockfiles) > 0 {
+				return nil
+			}
+			return cobra.MinimumNArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(lockfiles) > 0 {
+				if len(args) > 0 || merge || origin != "" || serverURL != "" || baseline {
+					return fmt.Errorf("--lockfile imports lockfiles alone: it always merges, writes the local store and records no origin or baseline; run the JSON files and the other flags as a separate 'bodega pkg import'")
+				}
+				code, err := runPrefetch(cmd.Context(), gf, lockfiles, "", false, false, os.Stdout)
+				if err != nil || code != 0 {
+					signalReloadNow(cmd, gf)
+				}
+				if err != nil {
+					return err
+				}
+				if code != 0 {
+					os.Exit(code) //nolint:revive // prefetch's CI-gating exit status
+				}
+				return nil
+			}
 			cfg, err := loadConfig(gf)
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -205,6 +235,7 @@ the gates.
 	cmd.Flags().StringVar(&origin, "origin", "", "Host these manifests were cataloged from; refused when the payload already names a different one")
 	cmd.Flags().StringVar(&serverURL, "server", "", "Push to this bodega server instead of writing the local manifest store")
 	cmd.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false, "Permit --server over http; refused by default because a bearer token would travel in the clear")
+	cmd.Flags().StringArrayVar(&lockfiles, "lockfile", nil, "Import the versions a lockfile pins (Gemfile.lock, Cargo.lock, package-lock.json, go.sum, requirements.txt), as 'bodega pkg prefetch' does; repeatable")
 	cmd.Flags().BoolVar(&baseline, "baseline", false, "Mark every imported version as baseline: admitted past a failing gate, with the finding recorded")
 	return cmd
 }

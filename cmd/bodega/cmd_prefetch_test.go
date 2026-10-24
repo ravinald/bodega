@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -460,4 +461,159 @@ func failingCheck(r prefetchResult, check string) audit.AdmissionCheck {
 		}
 	}
 	return audit.AdmissionCheck{}
+}
+
+// gemPrefetchFixture is newPrefetchFixture with rubygems_upstream pointed at
+// a stub serving gem files under /gems/. rubygems_upstream must be https, so
+// the stub is a TLS server and the default transport, which the builder's
+// download goes through, trusts it for the length of the test.
+func gemPrefetchFixture(t *testing.T, gems map[string][]byte) *prefetchFixture {
+	t.Helper()
+	f := newPrefetchFixture(t, policy.ActionBlock)
+	stub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := gems[strings.TrimPrefix(r.URL.Path, "/gems/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(stub.Close)
+	orig := http.DefaultTransport
+	http.DefaultTransport = stub.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = orig })
+
+	path := os.Getenv(config.EnvConfigFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg["rubygems_upstream"] = stub.URL
+	raw, _ = json.Marshal(cfg)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func gemfileLock(checksums string) string {
+	return `GEM
+  remote: https://rubygems.org/
+  specs:
+    nokogiri (1.16.7-x86_64-linux)
+      racc (~> 1.4)
+    rack (3.1.8)
+
+PLATFORMS
+  x86_64-linux
+
+DEPENDENCIES
+  nokogiri
+  rack
+` + checksums + `
+BUNDLED WITH
+   2.6.2
+`
+}
+
+func gemChecksums(rack, nokogiri []byte) string {
+	return "\nCHECKSUMS\n  nokogiri (1.16.7-x86_64-linux) sha256=" + sha256Hex(nokogiri) + "\n  rack (3.1.8) sha256=" + sha256Hex(rack) + "\n"
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// TestImportLockfileGemfileFetchesAndPins drives `bodega pkg import --lockfile`
+// end to end: the lockfile's specs become entries, each gem is fetched from
+// rubygems_upstream and pinned under the key the /rubygems/gems/ route reads,
+// and the CHECKSUMS digest agrees with the pin.
+func TestImportLockfileGemfileFetchesAndPins(t *testing.T) {
+	rack, nokogiri := []byte("rack 3.1.8 gem"), []byte("nokogiri 1.16.7 x86_64-linux gem")
+	f := gemPrefetchFixture(t, map[string][]byte{"rack-3.1.8.gem": rack, "nokogiri-1.16.7-x86_64-linux.gem": nokogiri})
+	lock := f.write(t, "Gemfile.lock", gemfileLock(gemChecksums(rack, nokogiri)))
+
+	cmd := newImportCmd(&globalFlags{})
+	cmd.SetArgs([]string{"--lockfile", lock})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("pkg import --lockfile: %v", err)
+	}
+
+	store := manifest.NewLocalStore(f.manifests)
+	adb := f.open(t)
+	defer adb.Close()
+	for name, want := range map[string]struct {
+		version string
+		body    []byte
+	}{"rack": {"3.1.8", rack}, "nokogiri": {"1.16.7-x86_64-linux", nokogiri}} {
+		pm, err := store.GetPackage(t.Context(), manifest.TypeRubygems, name)
+		if err != nil || pm == nil || len(pm.Versions) != 1 || pm.Versions[0].Version != want.version {
+			t.Fatalf("stored %s = %+v, %v; want %s", name, pm, err, want.version)
+		}
+		if cs := pm.Versions[0].Checksum; cs == nil || cs.Value != sha256Hex(want.body) {
+			t.Errorf("%s checksum = %+v; want the fetched gem's sha256", name, cs)
+		}
+		pin, err := adb.GetChecksum(t.Context(), manifest.RubygemsGemKey(name, want.version))
+		if err != nil || pin == nil || pin.Value != sha256Hex(want.body) {
+			t.Errorf("%s pin = %+v, %v", name, pin, err)
+		}
+	}
+
+	cmd = newImportCmd(&globalFlags{})
+	cmd.SetArgs([]string{"--lockfile", lock, "--merge"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--lockfile") {
+		t.Errorf("--lockfile with --merge = %v; want a refusal naming --lockfile", err)
+	}
+}
+
+// TestPrefetchGemfileLockRefusesADisagreeingChecksum is requirement 2's
+// refusal: the gem fetched cleanly, and the lockfile's CHECKSUMS names other
+// bytes, so the run answers no.
+func TestPrefetchGemfileLockRefusesADisagreeingChecksum(t *testing.T) {
+	rack, nokogiri := []byte("rack 3.1.8 gem"), []byte("nokogiri 1.16.7 x86_64-linux gem")
+	f := gemPrefetchFixture(t, map[string][]byte{"rack-3.1.8.gem": rack, "nokogiri-1.16.7-x86_64-linux.gem": nokogiri})
+	lock := f.write(t, "Gemfile.lock", gemfileLock(gemChecksums([]byte("other bytes"), nokogiri)))
+
+	code, rows, err := f.prefetch(t, false, lock)
+	if err != nil || code != exitBlocked {
+		t.Fatalf("prefetch = %d, %v; want %d (rows %+v)", code, err, exitBlocked, rows)
+	}
+	byName := map[string]prefetchResult{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	r := byName["rack"]
+	if r.Decision != prefetchMismatch || r.Digest == nil || r.Digest.Bodega != "sha256:"+sha256Hex(rack) ||
+		!strings.Contains(r.Reason, manifest.RubygemsGemKey("rack", "3.1.8")) {
+		t.Errorf("rack = %+v digest %+v; want a mismatch naming the fetched digest and its key", r, r.Digest)
+	}
+	if n := byName["nokogiri"]; n.Decision != audit.AdmissionAdmitted || n.Digest == nil || n.Digest.Status != digestMatch {
+		t.Errorf("nokogiri = %+v digest %+v; want its matching checksum admitted", n, n.Digest)
+	}
+}
+
+// A lockfile Bundler wrote before 2.5 has no CHECKSUMS, so nothing is
+// compared, and the result says so rather than reporting a match.
+func TestPrefetchGemfileLockWithoutChecksums(t *testing.T) {
+	f := gemPrefetchFixture(t, map[string][]byte{"rack-3.1.8.gem": []byte("r"), "nokogiri-1.16.7-x86_64-linux.gem": []byte("n")})
+	lock := f.write(t, "Gemfile.lock", gemfileLock(""))
+
+	code, rows, err := f.prefetch(t, false, lock)
+	if err != nil || code != 0 || len(rows) != 2 {
+		t.Fatalf("prefetch = %d, %v, %d rows; want 0 and two admitted gems", code, err, len(rows))
+	}
+	for _, r := range rows {
+		if r.Fetch != "fetched" || r.Digest == nil || r.Digest.Status != digestNotCompared {
+			t.Errorf("%s = %+v digest %+v; want fetched and not compared", r.Name, r, r.Digest)
+		}
+	}
 }

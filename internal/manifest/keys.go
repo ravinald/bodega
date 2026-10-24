@@ -800,6 +800,15 @@ func RubygemsGemIdentity(filename string) (name, version string) {
 	return "", ""
 }
 
+// RubygemsPlatform splits a gem version as bodega records it into the release
+// and the platform build: "1.16.7-x86_64-linux" is "1.16.7" for
+// "x86_64-linux", and a pure-Ruby "7.1.3" has no platform. A RubyGems version
+// never holds "-", so the first one opens the platform.
+func RubygemsPlatform(version string) (release, platform string) {
+	release, platform, _ = strings.Cut(version, "-")
+	return release, platform
+}
+
 // isGemVersion reports whether s reads as a RubyGems version: dot-separated
 // alphanumeric segments, the first of them all digits.
 func isGemVersion(s string) bool {

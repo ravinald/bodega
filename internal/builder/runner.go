@@ -118,6 +118,9 @@ type Config struct {
 	// crates.io host beside the index and the download one. Empty means
 	// crates.io; tests point it at a local server.
 	CratesAPI string
+	// RubygemsUpstream is the registry root gem files are fetched from, the
+	// one the server's /rubygems/ route proxies. An entry's own URL wins.
+	RubygemsUpstream string
 }
 
 // PolicyDisabledNotice is what a fetch prints, once per run, when it holds no
@@ -443,6 +446,8 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 
 		CargoDLUpstream: app.CargoDLUpstream,
 		CargoUpstream:   app.CargoUpstream,
+
+		RubygemsUpstream: app.RubygemsUpstream,
 
 		DistfilesPortsTree:   app.DistfilesPortsTree,
 		DistfilesUpstream:    app.DistfilesUpstream,

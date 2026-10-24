@@ -45,12 +45,17 @@ func TestPURL(t *testing.T) {
 			"pkg:pypi/example-sdk@1.35.0?file_name=example_sdk-1.35.0-py3-none-any.whl"},
 		{manifest.TypeGomod, "example.com/example-corp/sdk", "v1.30.0", "", "pkg:golang/example.com/example-corp/sdk@v1.30.0"},
 		{manifest.TypeCargo, "serde", "1.0.200", "", "pkg:cargo/serde@1.0.200"},
+		{manifest.TypeRubygems, "concurrent-ruby", "1.3.4", "", "pkg:gem/concurrent-ruby@1.3.4"},
+		{manifest.TypeRubygems, "nokogiri", "1.16.7-x86_64-linux", "", "pkg:gem/nokogiri@1.16.7?platform=x86_64-linux"},
 		{manifest.TypeApt, "hello", "2.10-3build1+x", "", "pkg:generic/apt/hello@2.10-3build1%2Bx"},
 		{manifest.TypeDistfiles, "sub/zsh-5.9.tar.xz", "", "", "pkg:generic/distfiles/sub%2Fzsh-5.9.tar.xz"},
 	} {
 		if got := PURL(tc.typ, tc.name, tc.version, tc.key); got != tc.want {
 			t.Errorf("PURL(%s, %s, %s) = %s, want %s", tc.typ, tc.name, tc.version, got, tc.want)
 		}
+	}
+	if got := PURLBase(PURL(manifest.TypeRubygems, "nokogiri", "1.16.7-java", "")); got != "pkg:gem/nokogiri@1.16.7" {
+		t.Errorf("PURLBase of a platform gem = %s, want the release without the build", got)
 	}
 	if got := PURLBase("pkg:pypi/x@1?file_name=x.whl"); got != "pkg:pypi/x@1" {
 		t.Errorf("PURLBase = %s", got)

@@ -26,16 +26,18 @@ import (
 type Format string
 
 // The formats prefetch reads: npm's package-lock.json (v2 and v3), a pip
-// requirements file pinned with ==, go.sum, and Cargo.lock.
+// requirements file pinned with ==, go.sum, Cargo.lock, and Bundler's
+// Gemfile.lock.
 const (
 	NpmLock      Format = "package-lock"
 	Requirements Format = "requirements"
 	GoSum        Format = "go.sum"
 	CargoLock    Format = "cargo.lock"
+	GemfileLock  Format = "gemfile.lock"
 )
 
 // Formats lists every format, in the order --format's help names them.
-func Formats() []Format { return []Format{NpmLock, Requirements, GoSum, CargoLock} }
+func Formats() []Format { return []Format{NpmLock, Requirements, GoSum, CargoLock, GemfileLock} }
 
 // Digest is one hash a lockfile records. Value is lowercase hex for the sha
 // family and the whole "h1:<base64>" string for a Go module hash, which is a
@@ -78,6 +80,8 @@ func Detect(path string) (Format, error) {
 		return GoSum, nil
 	case base == "cargo.lock":
 		return CargoLock, nil
+	case base == "gemfile.lock" || base == "gems.locked":
+		return GemfileLock, nil
 	case strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt"):
 		return Requirements, nil
 	}
@@ -118,6 +122,8 @@ func Parse(format Format, data []byte) ([]Entry, error) {
 		entries, err = parseGoSum(data)
 	case CargoLock:
 		entries, err = parseCargo(data)
+	case GemfileLock:
+		entries, err = parseGemfileLock(data)
 	default:
 		return nil, fmt.Errorf("unknown lockfile format %q", format)
 	}
@@ -408,6 +414,124 @@ func parseCargo(data []byte) ([]Entry, error) {
 		if e.Name == "" || e.Version == "" {
 			return nil, fmt.Errorf("line %d of Cargo.lock: a [[package]] with a source has no name or version", e.Line)
 		}
+	}
+	return out, nil
+}
+
+// rubygemsOrg are the spellings of rubygems.org a Gemfile.lock GEM remote may
+// carry. bodega fetches every gem from its one configured registry, so a gem
+// locked against any other source would be fetched from the wrong place.
+var rubygemsOrg = []string{"https://rubygems.org", "http://rubygems.org"}
+
+// foreignGemRemotes returns the remotes that are not rubygems.org. Bundler
+// writes every global source of a Gemfile into one GEM section and records no
+// remote per spec, so a single foreign remote taints the whole section: a
+// private gem whose name is also taken on rubygems.org would otherwise be
+// fetched and pinned from the public registry.
+func foreignGemRemotes(remotes []string) []string {
+	var foreign []string
+	for _, r := range remotes {
+		if !slices.Contains(rubygemsOrg, strings.TrimRight(r, "/")) {
+			foreign = append(foreign, r)
+		}
+	}
+	return foreign
+}
+
+var (
+	gemSpecLine     = regexp.MustCompile(`^    ([^\s(]+) \(([^)\s]+)\)$`)
+	gemChecksumLine = regexp.MustCompile(`^  ([^\s(]+) \(([^)\s]+)\)(?: (\S+))?$`)
+)
+
+// parseGemfileLock reads the specs: of each GEM section and the CHECKSUMS
+// section Bundler 2.5 and later writes. A spec's version keeps its platform
+// suffix ("1.16.7-x86_64-linux"), because that is the gem file bodega fetches
+// and the version a manifest entry records.
+//
+// A GIT spec is reported unsupported, since bodega fetches gems and not
+// checkouts. A PATH spec is the project's own tree, never fetched, and is
+// left out the way Cargo.lock's workspace members are.
+func parseGemfileLock(data []byte) ([]Entry, error) {
+	var (
+		out     []Entry
+		section string
+		remotes []string
+		inSpecs bool
+		start   int
+		sums    = map[string][]Digest{}
+	)
+	flush := func() {
+		if section != "GEM" && section != "GIT" {
+			return
+		}
+		reason := ""
+		if section == "GIT" {
+			reason = "git source " + strings.Join(remotes, ", ") + " is a checkout, not a published gem"
+		} else if foreign := foreignGemRemotes(remotes); len(foreign) > 0 {
+			reason = "source " + strings.Join(foreign, ", ") + " is not rubygems.org, and Gemfile.lock does not say which of the GEM section's remotes each spec came from"
+		} else if len(remotes) == 0 {
+			reason = "GEM section names no remote, so its source cannot be confirmed as rubygems.org"
+		}
+		for i := start; i < len(out); i++ {
+			out[i].Unsupported = reason
+		}
+	}
+
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	n := 0
+	for sc.Scan() {
+		n++
+		raw := strings.TrimRight(sc.Text(), "\r")
+		if raw == "" {
+			continue
+		}
+		if raw[0] != ' ' {
+			flush()
+			section, remotes, inSpecs, start = strings.TrimSpace(raw), nil, false, len(out)
+			continue
+		}
+		switch section {
+		case "GEM", "GIT", "PATH":
+			if r, ok := strings.CutPrefix(raw, "  remote: "); ok {
+				remotes = append(remotes, strings.TrimSpace(r))
+				continue
+			}
+			if raw == "  specs:" {
+				inSpecs = true
+				continue
+			}
+			if !inSpecs || section == "PATH" {
+				continue
+			}
+			m := gemSpecLine.FindStringSubmatch(raw)
+			if m == nil {
+				continue // a dependency line, indented six, names no pin
+			}
+			out = append(out, Entry{Type: manifest.TypeRubygems, Name: m[1], Version: m[2], Line: n})
+		case "CHECKSUMS":
+			m := gemChecksumLine.FindStringSubmatch(raw)
+			if m == nil {
+				return nil, fmt.Errorf("line %d of Gemfile.lock: CHECKSUMS entry %q is not <name> (<version>) <algorithm>=<digest>", n, strings.TrimSpace(raw))
+			}
+			if m[3] == "" {
+				continue // Bundler writes none for a gem it did not download
+			}
+			key := m[1] + "\x00" + m[2]
+			for _, item := range strings.Split(m[3], ",") {
+				alg, val, ok := strings.Cut(item, "=")
+				if !ok || alg == "" || val == "" {
+					return nil, fmt.Errorf("line %d of Gemfile.lock: checksum %q is not <algorithm>=<digest>", n, item)
+				}
+				sums[key] = append(sums[key], Digest{Algorithm: strings.ToLower(alg), Value: strings.ToLower(val)})
+			}
+		}
+	}
+	flush()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Digests = sums[out[i].Name+"\x00"+out[i].Version]
 	}
 	return out, nil
 }
