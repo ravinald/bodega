@@ -1548,7 +1548,7 @@ Declares what one class of host may fetch, and the version rule each package car
 
 A profile is a view over one catalog, never a second catalog. Storage, object keys, the checksum table and the manifests do not change: an artifact reached through two profiles is one artifact with one checksum.
 
-The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is the deliberate exception: the index a profiled host reads is the control and the fetch is only the backstop behind it; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
+The read path enforces this for pypi, npm, gomod, cargo, rubygems, helm, git and binary. apt is the deliberate exception: the index a profiled host reads is the control and the fetch is only the backstop behind it; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
 
 Three levels:
 
@@ -1884,9 +1884,9 @@ Error: load pypi/requests: parse package pypi/requests: invalid character 'o' in
 
 Two enforcement points, and the order matters.
 
-**The request predicate is the control.** It runs on every package route for pypi, npm, gomod, cargo, helm, git and binary, and answers 403. A client that already holds a tarball URL fetches it without reading any index, so an implementation that only filtered indexes would enforce nothing.
+**The request predicate is the control.** It runs on every package route for pypi, npm, gomod, cargo, rubygems, helm, git and binary, and answers 403. A client that already holds a tarball URL fetches it without reading any index, so an implementation that only filtered indexes would enforce nothing.
 
-**The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
+**The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Seven documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, the RubyGems indexes (the compact index `versions` and `info/<gem>`, the `specs.4.8.gz` full index files and `api/v1/dependencies`), and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
 
 **apt inverts the two.** For apt the filtered index is the control and the request predicate is the backstop, because refusing an apt fetch at the pool is worse than having no control at all: apt has already resolved the transaction by then, takes the 403 mid-run and aborts everything, including the security updates in the same invocation. Filtered out of the index instead, apt reports the package kept back and upgrades the rest. See [apt under a profile](#apt-under-a-profile). pkg reads a catalogue the same way and gets the same arrangement: see [pkg under a profile](#pkg-under-a-profile).
 
@@ -1920,7 +1920,7 @@ bodega refused gomod/example.com/mod@v1.0.0 (profile, incident 3f9c0a1b2d4e): me
 Next step: ask an operator to add it with `bodega profile add web gomod example.com/mod`, or to open the type with `bodega profile set web gomod --membership open`.
 ```
 
-Four cases are particular to profiles.
+Five cases are particular to profiles.
 
 **pypi.** A filtered index reads to `pip` as a distribution that publishes nothing, so it resolves against what is left rather than failing on what is gone:
 
@@ -1966,6 +1966,8 @@ HTTP request sent, awaiting response... 403 Forbidden
 ```
 
 `-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both. The `X-Bodega-Refusal` header survives `-f`: `curl -fsS -D - -o /dev/null` prints it.
+
+**rubygems.** Bundler reads a gem the profile excludes as one that does not exist, because `info/<gem>` answers 404 for it rather than 403, and the gem drops out of `versions` and the full index. A version outside the profile's rule is missing from `info/<gem>`, so Bundler resolves against what is left. Each gem whose versions were filtered gets its `versions` line rebuilt with the MD5 of the filtered `info` file, which is the checksum Bundler compares before it trusts an `info` file. To compute it, bodega reads that gem's `info` file itself, through the cache and the allow-list, and writes no audit, discovery or review-queue row for the read, because every such row names the requesting host and the host never asked for that file. A gem whose `info` file that read cannot get (the upstream answers an error, or the allow-list has not approved the gem yet) is left out of the host's `versions` and logged at warn level with the gem and the cause; the rest of `versions` is served. The `.gem` and `.gemspec.rz` downloads answer 403, and the denied row carries `bodega profile add <profile> rubygems <gem>`. Gem names are matched exactly as written: RubyGems names are case-sensitive, so `RedCloth` and `redcloth` are two entries.
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
 

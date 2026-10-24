@@ -395,6 +395,26 @@ func auditContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(r.Context()), auditWriteTimeout)
 }
 
+// ownReadKey marks a request bodega issues on its own behalf while answering
+// another one, such as the info/<gem> read the rubygems versions filter makes
+// to checksum a filtered info file.
+type ownReadKey struct{}
+
+// withOwnRead marks ctx as bodega's own read. The audit and discovery
+// recorders on the proxy path write nothing for it: every row they write names
+// the requesting client and identity, and this client never asked for the
+// object, so a row would tell whoever reconstructs a host's activity that it
+// reached for something it did not. The gates still decide: a read the
+// allow-list refuses fails, it is only not recorded as the host's refusal.
+func withOwnRead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ownReadKey{}, true)
+}
+
+func isOwnRead(r *http.Request) bool {
+	own, _ := r.Context().Value(ownReadKey{}).(bool)
+	return own
+}
+
 // hashPrefix is the leading bytes of a peppered token hash, enough to tell two
 // rejected credentials apart in the audit trail and far too little to attack
 // the hash with.

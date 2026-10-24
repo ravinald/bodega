@@ -270,6 +270,15 @@ func (s *Server) profileFor(r *http.Request) *entitle.Profile {
 // under and aptPoolGate catches a client that composed a URL without reading
 // one. See internal/server/apt_profile.go and docs/design.md.
 func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, version string) bool {
+	return s.entitleGateAnswering(w, r, typ, name, version, http.StatusForbidden)
+}
+
+// entitleGateAnswering is entitleGate with the refusal's status chosen by the
+// route. A RubyGems compact index answers an excluded gem 404, because Bundler
+// reads a 404 on info/<gem> as a gem that does not exist and reports it from
+// its resolver, and reads a 403 as a broken source and stops. The rows written
+// are the same either way.
+func (s *Server) entitleGateAnswering(w http.ResponseWriter, r *http.Request, typ, name, version string, status int) bool {
 	p := s.profileFor(r)
 	if p == nil {
 		return true
@@ -287,6 +296,7 @@ func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, 
 		return true
 	}
 	f := profileRefusal(p, typ, name, version, d)
+	f.status = status
 	s.recordProfileRefusal(r, p, typ, name, version, d, f.incident)
 	s.queueRefusal(r, audit.QueueRefusal{PkgType: typ, PkgName: name, PkgVersion: version, Check: admit.QueueProfile,
 		Profile: p.Name(), Detail: f.reason, Incident: f.incident})

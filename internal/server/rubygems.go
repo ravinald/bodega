@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/md5" //nolint:gosec // G501: the compact index's own checksum, which Bundler compares; it guards nothing here.
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -57,8 +59,7 @@ func (s *Server) handleRubygems(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleRubygemsCompactIndex(w, r, p, gem)
 	case rubygemsFullIndexFiles[p]:
-		s.proxyOrCache(w, r, s.typeStore(manifest.TypeRubygems), manifest.RubygemsIndexKey(p),
-			s.cfg.RubygemsUpstream+"/"+p, manifest.TypeRubygems, "", "", false, false)
+		s.handleRubygemsFullIndex(w, r, p)
 	case p == "api/v1/dependencies":
 		s.handleRubygemsDependencies(w, r)
 	case strings.HasPrefix(p, "gems/"):
@@ -126,7 +127,9 @@ func (s *Server) handleRubygemsVersioned(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	if !s.entitleGate(w, r, manifest.TypeRubygems, name, version) {
+	// The release, not the build: a profile pins 1.16.7, and every platform
+	// build of 1.16.7 is that release, as it is to the constraint above.
+	if !s.entitleGate(w, r, manifest.TypeRubygems, name, release) {
 		return
 	}
 
@@ -145,20 +148,131 @@ func (s *Server) handleRubygemsVersioned(w http.ResponseWriter, r *http.Request,
 
 // handleRubygemsCompactIndex serves versions or info/<gem>. gem is empty for
 // versions, which lists every gem and so is no one gem's to refuse.
+//
+// Under a profile that governs rubygems both are filtered on the way out, as
+// every profile filter is (see profileVersionFilter): the cache holds the
+// upstream's document and each host class gets its own reading of it.
 func (s *Server) handleRubygemsCompactIndex(w http.ResponseWriter, r *http.Request, p, gem string) {
 	noSharedCache(w)
+	prof := s.profileFor(r)
+	rw := &compactIndexWriter{ResponseWriter: w, r: r, subject: p}
 	if gem != "" {
 		pm, _ := s.store.GetPackage(r.Context(), manifest.TypeRubygems, gem)
 		if pm != nil && isPackageHidden(pm) {
 			s.refuseHidden(w, r, manifest.TypeRubygems, gem, "")
 			return
 		}
+		if !s.entitleGateAnswering(w, r, manifest.TypeRubygems, gem, "", http.StatusNotFound) {
+			return
+		}
+		if permit := rubygemsReleaseFilter(prof, gem); permit != nil {
+			rw.filter = func(b []byte) ([]byte, error) { return filterRubygemsInfo(b, permit), nil }
+		}
+	} else if rule := rubygemsRuleFor(prof); rule != nil {
+		rw.filter = func(b []byte) ([]byte, error) {
+			return filterRubygemsVersions(b, rule, func(gem string, permit func(string) bool) (string, error) {
+				info, err := s.rubygemsInfo(r, gem)
+				if err != nil {
+					s.logger.Warn("rubygems versions: dropped a gem this host's profile filters, because its info file could not be read to checksum",
+						"gem", gem, "profile", prof.Name(), "error", err)
+					return "", err
+				}
+				//nolint:gosec // G401: MD5 is the compact index's own checksum, which Bundler compares; it guards nothing here.
+				sum := md5.Sum(filterRubygemsInfo(info, permit))
+				return hex.EncodeToString(sum[:]), nil
+			}), nil
+		}
 	}
-	rw := &compactIndexWriter{ResponseWriter: w, r: r, subject: p}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeRubygems), manifest.RubygemsIndexKey(p),
 		s.cfg.RubygemsUpstream+"/"+p, manifest.TypeRubygems, gem, gem, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("rubygems compact index response failed", "path", p, "error", err)
+	}
+}
+
+// rubygemsReleaseFilter is profileVersionFilter for a gem, judging each
+// version with its platform suffix cut.
+func rubygemsReleaseFilter(p *entitle.Profile, gem string) func(string) bool {
+	permit := profileVersionFilter(p, manifest.TypeRubygems, gem)
+	if permit == nil {
+		return nil
+	}
+	return func(v string) bool { return permit(rubygemsRelease(v)) }
+}
+
+// rubygemsInfo reads info/<gem> as the info route would serve it to this
+// request, through the same cache and with the same freshness rule, so the
+// checksum the filtered versions file names is the one of the info file the
+// client is handed next. The request's own conditional and range headers are
+// dropped: they describe the versions file the client holds. The read is
+// marked as bodega's own (withOwnRead), so it writes no audit or discovery row
+// in the client's name.
+func (s *Server) rubygemsInfo(r *http.Request, gem string) ([]byte, error) {
+	p := "info/" + gem
+	req := r.Clone(withOwnRead(r.Context()))
+	req.URL.Path = "/rubygems/" + p
+	req.URL.RawQuery = ""
+	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		req.Header.Del(h)
+	}
+	cw := &capturedResponse{header: http.Header{}}
+	s.proxyOrCache(cw, req, s.typeStore(manifest.TypeRubygems), manifest.RubygemsIndexKey(p),
+		s.cfg.RubygemsUpstream+"/"+p, manifest.TypeRubygems, gem, gem, false, false)
+	switch {
+	case cw.tooBig:
+		return nil, fmt.Errorf("info/%s exceeds bodega's %d-byte buffer", gem, maxUpstreamBody)
+	case cw.status != 0 && cw.status != http.StatusOK:
+		return nil, fmt.Errorf("info/%s answered HTTP %d", gem, cw.status)
+	}
+	return cw.body.Bytes(), nil
+}
+
+// capturedResponse is a ResponseWriter that keeps what it is handed, for a
+// document the server reads on its own behalf.
+type capturedResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+	tooBig bool
+}
+
+func (c *capturedResponse) Header() http.Header { return c.header }
+
+func (c *capturedResponse) WriteHeader(code int) {
+	if c.status == 0 {
+		c.status = code
+	}
+}
+
+func (c *capturedResponse) Write(b []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	if int64(c.body.Len()+len(b)) > maxUpstreamBody {
+		c.tooBig = true
+		return 0, fmt.Errorf("response exceeds bodega's %d-byte buffer", maxUpstreamBody)
+	}
+	return c.body.Write(b)
+}
+
+// handleRubygemsFullIndex serves specs.4.8.gz and its latest_ and prerelease_
+// siblings, filtered for a host whose profile governs rubygems.
+func (s *Server) handleRubygemsFullIndex(w http.ResponseWriter, r *http.Request, p string) {
+	noSharedCache(w)
+	store, key, upstream := s.typeStore(manifest.TypeRubygems), manifest.RubygemsIndexKey(p), s.cfg.RubygemsUpstream+"/"+p
+	rule := rubygemsRuleFor(s.profileFor(r))
+	if rule == nil {
+		s.proxyOrCache(w, r, store, key, upstream, manifest.TypeRubygems, "", "", false, false)
+		return
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the rubygems " + p,
+		parse:          func(b []byte) ([]byte, error) { return filterRubygemsSpecs(b, rule) },
+	}
+	s.proxyOrCache(rw, r, store, key, upstream, manifest.TypeRubygems, "", "", false, false)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("rubygems full index response failed", "path", p, "error", err)
 	}
 }
 
@@ -180,7 +294,21 @@ func (s *Server) handleRubygemsDependencies(w http.ResponseWriter, r *http.Reque
 	}
 	sum := sha256.Sum256([]byte(gems))
 	key := manifest.RubygemsIndexKey("api/v1/dependencies/" + hex.EncodeToString(sum[:]))
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeRubygems), key, upstream, manifest.TypeRubygems, "", "", false, false)
+	noSharedCache(w)
+	rule := rubygemsRuleFor(s.profileFor(r))
+	if rule == nil {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeRubygems), key, upstream, manifest.TypeRubygems, "", "", false, false)
+		return
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the rubygems dependency API answer",
+		parse:          func(b []byte) ([]byte, error) { return filterRubygemsDependencies(b, rule) },
+	}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeRubygems), key, upstream, manifest.TypeRubygems, "", "", false, false)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("rubygems dependency API response failed", "gems", gems, "error", err)
+	}
 }
 
 // compactIndexWriter holds a compact index document until it is whole, then
@@ -200,9 +328,12 @@ type compactIndexWriter struct {
 	http.ResponseWriter
 	r       *http.Request
 	subject string
-	status  int
-	body    bytes.Buffer
-	tooBig  bool
+	// filter is the profile's reading of the document, run before the
+	// validators are computed so they describe the bytes the client gets.
+	filter func([]byte) ([]byte, error)
+	status int
+	body   bytes.Buffer
+	tooBig bool
 }
 
 func (c *compactIndexWriter) WriteHeader(code int) {
@@ -238,6 +369,15 @@ func (c *compactIndexWriter) flush() error {
 		return err
 	}
 	body := c.body.Bytes()
+	if c.filter != nil {
+		filtered, err := c.filter(body)
+		if err != nil {
+			err = fmt.Errorf("rubygems %s could not be filtered for this host's profile, and serving it unfiltered would list gems this host is refused: %w", c.subject, err)
+			http.Error(c.ResponseWriter, err.Error(), http.StatusBadGateway)
+			return err
+		}
+		body = filtered
+	}
 	sum := sha256.Sum256(body)
 	h := c.Header()
 	h.Set("Content-Type", "text/plain; charset=utf-8")

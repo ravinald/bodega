@@ -22,7 +22,7 @@ import (
 // denial row every refusal already writes, on a context detached from the
 // request so a client that hangs up still leaves its row.
 func (s *Server) queueRefusal(r *http.Request, q audit.QueueRefusal) {
-	if s.auditDB == nil || q.PkgType == "" || q.PkgName == "" {
+	if s.auditDB == nil || q.PkgType == "" || q.PkgName == "" || isOwnRead(r) {
 		return
 	}
 	q.Identity, q.ClientIP = callerName(r), ClientIP(r)
