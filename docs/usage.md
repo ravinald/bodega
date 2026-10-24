@@ -5155,8 +5155,6 @@ bodega build upload rubygems
 
 Attestations and SBOMs name a gem `pkg:gem/<name>@<version>`, with a platform build's suffix moved to a qualifier: `pkg:gem/nokogiri@1.16.7?platform=x86_64-linux`. A CycloneDX document pushed to the [`cyclonedx` inventory source](#the-cyclonedx-source) reports a `pkg:gem` component under `rubygems`, at the version bodega records.
 
-**Gap:** the age, OSV and similarity checks do not run on a gem yet, and a host's profile does not filter `versions` or `info/<gem>`.
-
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 
 ```ini
