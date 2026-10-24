@@ -9,11 +9,14 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // Fixtures written by Ruby 2.6's own Marshal, not by rbMarshal, so the reader
@@ -308,6 +311,143 @@ func TestRubygemsPinnedVersion(t *testing.T) {
 	_, deps := f.get(t, "/rubygems/api/v1/dependencies")
 	if got := strings.Join(depsEntries(t, deps), "; "); got != "nokogiri 1.16.7" {
 		t.Errorf("the dependency API under the pin answered %q", got)
+	}
+}
+
+// gemPinnedPlusUncut is TestRubygemsPinnedVersion's profile with a second
+// gem whose listed versions all pass, so its line goes out byte for byte and
+// costs no info read.
+func gemPinnedPlusUncut(t *testing.T, s *Server) *profileFixture {
+	t.Helper()
+	return bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRubygems, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{
+			{Type: manifest.TypeRubygems, Name: "nokogiri", Constraint: manifest.ConstraintExact, Version: "1.16.7"},
+			{Type: manifest.TypeRubygems, Name: "concurrent-ruby", Constraint: manifest.ConstraintExact, Version: "1.3.4"},
+		})
+}
+
+// One gem whose info the filter cannot read costs that gem, not the versions
+// file: a 502 there fails every bundle install on every host the profile binds.
+func TestRubygemsVersionsDropsAGemWhoseInfoCannotBeRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakIt func(t *testing.T, g *gemRegistry, s *Server)
+	}{
+		{"its upstream info answers 404", func(_ *testing.T, g *gemRegistry, _ *Server) {
+			g.mu.Lock()
+			delete(g.routes, "/info/nokogiri")
+			g.mu.Unlock()
+		}},
+		// The profile lists the gem before the allow-list approves it, which is
+		// the order an operator adds the two in.
+		{"the allow-list has not approved it", func(t *testing.T, _ *gemRegistry, s *Server) {
+			if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+				ID: "gems", RegistryType: manifest.TypeRubygems, RuleKind: policy.KindPackage, Pattern: "concurrent-ruby",
+			}); err != nil {
+				t.Fatalf("insert policy: %v", err)
+			}
+			s.policy.Invalidate()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, _ := gemProfileRegistry(t)
+			s := gemServer(t, g)
+			f := gemPinnedPlusUncut(t, s)
+			tc.breakIt(t, g, s)
+
+			status, body := f.get(t, "/rubygems/versions")
+			if status != http.StatusOK {
+				t.Fatalf("versions = %d, want 200 with nokogiri dropped: %s", status, body)
+			}
+			if _, _, ok := versionsLine(body, "nokogiri"); ok {
+				t.Errorf("versions lists nokogiri, whose filtered info nobody could checksum:\n%s", body)
+			}
+			want := "concurrent-ruby 1.3.4 " + md5Hex(gemProfileInfoConcurrent) + "\n"
+			if !strings.HasPrefix(body, "created_at: 2026-10-01T00:00:00Z\n---\n") || !strings.Contains(body, want) {
+				t.Errorf("versions lost its header or the uncut gem's line %q:\n%s", want, body)
+			}
+		})
+	}
+}
+
+// The versions filter reads info/<gem> to checksum it, and that read is
+// bodega's, not the host's: a row naming web01 for it says the host reached
+// for a document it never asked for.
+func TestRubygemsVersionsSideReadWritesNoRowsForTheHost(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy bool
+	}{
+		{"filled from upstream and then from the cache", false},
+		{"refused by the allow-list", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, _ := gemProfileRegistry(t)
+			s := gemServer(t, g)
+			f := gemPinnedPlusUncut(t, s)
+			if tc.policy {
+				if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+					ID: "gems", RegistryType: manifest.TypeRubygems, RuleKind: policy.KindPackage, Pattern: "concurrent-ruby",
+				}); err != nil {
+					t.Fatalf("insert policy: %v", err)
+				}
+				s.policy.Invalidate()
+			}
+
+			// Stale on every request: three upstream fills.
+			for range 3 {
+				if status, body := f.get(t, "/rubygems/versions"); status != http.StatusOK {
+					t.Fatalf("versions = %d: %s", status, body)
+				}
+			}
+			if !tc.policy && g.hitsFor("/info/nokogiri") != 3 {
+				t.Fatalf("the filter read info/nokogiri upstream %d times, want 3; the test asserts nothing", g.hitsFor("/info/nokogiri"))
+			}
+			// Fresh: the side read is a cache hit.
+			s.cache.MetadataTTL = time.Hour
+			f.get(t, "/rubygems/versions")
+
+			// The recorder writes off the request goroutine and in order, so
+			// a row the host did cause, landing, means every earlier one has.
+			f.get(t, "/rubygems/gems/concurrent-ruby-1.3.4.gem")
+			deadline := time.Now().Add(3 * time.Second)
+			var rows []audit.DiscoveryRow
+			for {
+				var err error
+				rows, err = s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{})
+				if err != nil {
+					t.Fatalf("list discovery: %v", err)
+				}
+				if slices.ContainsFunc(rows, func(r audit.DiscoveryRow) bool { return strings.Contains(r.UpstreamURL, "/gems/") }) ||
+					time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			for _, row := range rows {
+				if strings.Contains(row.UpstreamURL, "/info/") {
+					t.Errorf("discovery row for bodega's own read: %+v", row)
+				}
+			}
+
+			events, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+			if err != nil {
+				t.Fatalf("query cache events: %v", err)
+			}
+			for _, ev := range events {
+				if strings.Contains(ev.Details, "info/") {
+					t.Errorf("cache event for bodega's own read: status=%s pkg=%s details=%s", ev.Status, ev.PkgName, ev.Details)
+				}
+			}
+			queued, err := s.auditDB.ListQueue(t.Context(), audit.QueueFilter{})
+			if err != nil {
+				t.Fatalf("list queue: %v", err)
+			}
+			for _, q := range queued {
+				t.Errorf("review queue row for bodega's own read: %+v", q)
+			}
+		})
 	}
 }
 

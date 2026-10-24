@@ -173,12 +173,14 @@ func (s *Server) handleRubygemsCompactIndex(w http.ResponseWriter, r *http.Reque
 			return filterRubygemsVersions(b, rule, func(gem string, permit func(string) bool) (string, error) {
 				info, err := s.rubygemsInfo(r, gem)
 				if err != nil {
+					s.logger.Warn("rubygems versions: dropped a gem this host's profile filters, because its info file could not be read to checksum",
+						"gem", gem, "profile", prof.Name(), "error", err)
 					return "", err
 				}
 				//nolint:gosec // G401: MD5 is the compact index's own checksum, which Bundler compares; it guards nothing here.
 				sum := md5.Sum(filterRubygemsInfo(info, permit))
 				return hex.EncodeToString(sum[:]), nil
-			})
+			}), nil
 		}
 	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeRubygems), manifest.RubygemsIndexKey(p),
@@ -202,10 +204,12 @@ func rubygemsReleaseFilter(p *entitle.Profile, gem string) func(string) bool {
 // request, through the same cache and with the same freshness rule, so the
 // checksum the filtered versions file names is the one of the info file the
 // client is handed next. The request's own conditional and range headers are
-// dropped: they describe the versions file the client holds.
+// dropped: they describe the versions file the client holds. The read is
+// marked as bodega's own (withOwnRead), so it writes no audit or discovery row
+// in the client's name.
 func (s *Server) rubygemsInfo(r *http.Request, gem string) ([]byte, error) {
 	p := "info/" + gem
-	req := r.Clone(r.Context())
+	req := r.Clone(withOwnRead(r.Context()))
 	req.URL.Path = "/rubygems/" + p
 	req.URL.RawQuery = ""
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {

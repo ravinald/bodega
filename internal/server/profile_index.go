@@ -429,10 +429,17 @@ func rubygemsRuleFor(p *entitle.Profile) rubygemsGemRule {
 // one; that is what keeps a profile pinning three gems from costing an info
 // read for every gem in the registry.
 //
+// A gem whose filtered info file infoSum cannot checksum (its upstream info
+// answers an error, or the allow-list has not approved it yet) loses every
+// line rather than failing the document. The host could neither read that
+// gem's info nor install it, so leaving it out is the answer Bundler would
+// reach on its own; a 502 would turn one gem's outage into every install on
+// every host bound to the profile.
+//
 // "-" before a version marks a yank, and the version is judged without it.
-func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem string, permit func(string) bool) (string, error)) ([]byte, error) {
+func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem string, permit func(string) bool) (string, error)) []byte {
 	if rule == nil {
-		return body, nil
+		return body
 	}
 	type gemLine struct {
 		line, gem string
@@ -463,6 +470,7 @@ func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem 
 		permit func(string) bool
 		cut    bool
 		sum    string
+		failed bool
 	}
 	views := map[string]*gemView{}
 	for _, l := range lines {
@@ -495,7 +503,7 @@ func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem 
 			out.WriteString(l.line)
 			continue
 		}
-		if !v.listed {
+		if !v.listed || v.failed {
 			continue
 		}
 		var kept []string
@@ -510,13 +518,14 @@ func filterRubygemsVersions(body []byte, rule rubygemsGemRule, infoSum func(gem 
 		if v.sum == "" {
 			sum, err := infoSum(l.gem, v.permit)
 			if err != nil {
-				return nil, fmt.Errorf("checksum the filtered info file for %s: %w", l.gem, err)
+				v.failed = true
+				continue
 			}
 			v.sum = sum
 		}
 		fmt.Fprintf(&out, "%s %s %s\n", l.gem, strings.Join(kept, ","), v.sum)
 	}
-	return out.Bytes(), nil
+	return out.Bytes()
 }
 
 // filterRubygemsSpecs drops the tuples a profile does not permit from a full

@@ -1415,7 +1415,7 @@ func (s *Server) recordUpstreamAttempt(r *http.Request, regType, upstreamURL, po
 // reason to say so loudly, naming the event, so a reconstruction from the log
 // is possible when the table is missing the row.
 func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL, incident string) {
-	if s.auditDB == nil {
+	if s.auditDB == nil || isOwnRead(r) {
 		return
 	}
 	ctx, cancel := auditContext(r)
@@ -1448,7 +1448,7 @@ func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate
 // host, and an operator reading a cache_miss row needs to know which registry
 // answered before anything else in the row is actionable.
 func (s *Server) recordCacheEvent(r *http.Request, status, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) {
-	if s.auditDB == nil || !s.auditDB.ShouldRecord(audit.EventCache) {
+	if s.auditDB == nil || !s.auditDB.ShouldRecord(audit.EventCache) || isOwnRead(r) {
 		return
 	}
 	// The key names all three, and it is the only source that agrees with what
