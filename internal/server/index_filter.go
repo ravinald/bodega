@@ -433,19 +433,44 @@ func (s *Server) refuseWithheld(w http.ResponseWriter, r *http.Request, eco, nam
 	if iw == nil {
 		return false
 	}
-	why := iw.decide([]string{version}, s.publishTimesFor(r.Context(), eco, name, []string{version}))[version]
+	var times map[string]time.Time
+	if iw.gate.Dates() {
+		times = s.publishTimesFor(r.Context(), eco, name, []string{version})
+	}
+	why := iw.decide([]string{version}, times)[version]
 	if why == "" {
 		return false
 	}
-	reason := fmt.Sprintf("%s %s@%s has an OSV record and the %s OSV gate blocks it", eco, name, version, eco)
+	var reason, next string
 	if why == policy.WithheldAge {
 		reason = fmt.Sprintf("%s %s@%s is newer than the %s minimum publish age the %s age gate blocks on",
 			eco, name, version, policy.ShortDuration(iw.gate.MinAge), eco)
+		next = "resolve against the index or wait out the window"
+	} else {
+		reason, next = withheldOSVReason(r.Context(), iw.gate, eco, name, version)
 	}
 	recordDenialFor(s.auditDB, r, eco, name, version, audit.DenialWithheldVersion,
 		map[string]string{"check": why, "reason": reason})
-	http.Error(w, reason+"; bodega's index for this package omits it, so resolve against the index or wait out the window", http.StatusForbidden)
+	http.Error(w, reason+"; bodega's index for this package omits it, so "+next, http.StatusForbidden)
 	return true
+}
+
+// withheldOSVReason words an OSV withhold with the records behind it. The
+// age gate's advice does not apply: waiting admits nothing an advisory
+// blocks.
+func withheldOSVReason(ctx context.Context, gate *policy.IndexGate, eco, name, version string) (reason, next string) {
+	malware, advisories := gate.OSVRecords(ctx, name, version)
+	switch {
+	case len(malware) > 0:
+		return fmt.Sprintf("%s %s@%s is known malware: %s", eco, name, version, strings.Join(malware, ", ")),
+			"pick another release and remove this one from any lockfile that names it"
+	case len(advisories) > 0:
+		return fmt.Sprintf("%s %s@%s has OSV records the %s OSV gate blocks: %s",
+				eco, name, version, eco, strings.Join(advisories, ", ")),
+			"resolve against the index or pick a version without those records"
+	}
+	return fmt.Sprintf("%s %s@%s has an OSV record and the %s OSV gate blocks it", eco, name, version, eco),
+		"resolve against the index or pick a version without that record"
 }
 
 // publishTimesFor dates versions of one package, from the cache where it can

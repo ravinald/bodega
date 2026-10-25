@@ -488,6 +488,32 @@ func TestMavenArtifactRefusedByOSV(t *testing.T) {
 	}
 }
 
+// With the index filter on, the filter's own refusal answers the artifact
+// route before the version gate does, and it still has to name the advisory.
+// The age gate's "wait out the window" advice is wrong for an OSV block.
+func TestMavenArtifactRefusedByOSVWithIndexFilter(t *testing.T) {
+	s, up := mavenServer(t)
+	gateMaven(t, s)
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeMaven, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"widget-1.1.0.jar", "widget-1.1.0.pom"} {
+		code, body, _ := getMaven(t, s, "org/example/core/widget/1.1.0/"+p)
+		if code != http.StatusForbidden {
+			t.Fatalf("%s: status %d, want 403 (%s)", p, code, body)
+		}
+		if !strings.Contains(body, "GHSA-test-mvn1") {
+			t.Errorf("%s: refusal does not name the advisory:\n%s", p, body)
+		}
+		if strings.Contains(body, "wait out the window") {
+			t.Errorf("%s: OSV refusal gives the age gate's advice:\n%s", p, body)
+		}
+		if n := upstreamSaw(up, "/1.1.0/"+p); n != 0 {
+			t.Errorf("%s: upstream asked %d times for a refused artifact", p, n)
+		}
+	}
+}
+
 // With the index filter on, the vulnerable version is absent from the
 // artifact's maven-metadata.xml, and <latest> and <release> are recomputed
 // when they named it. The checksum served beside the document is the one of
