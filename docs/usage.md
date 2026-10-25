@@ -2333,7 +2333,7 @@ Next step: ask an operator to run `bodega policy add npm left-pad` if it should 
 | `integration` | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
 | `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                                   |
 | `profile`     | 403    | any package route on a host whose profile governs the type                                                                         |
-| `constraint`  | 403    | an npm or gomod version outside the entry's `version_constraint`                                                                   |
+| `constraint`  | 403    | an npm, gomod, maven or rubygems version outside the entry's `version_constraint`                                                  |
 | `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                               |
 | `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                          |
 | `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest                                                         |
@@ -4664,7 +4664,17 @@ All version entries support:
 
 #### Version constraints on the serving routes
 
-The npm, cargo, gomod, maven and rubygems routes refuse a version outside the entry's `version_constraint` with a 403, and drop it from the documents they generate (the npm packument, the cargo sparse index). Versions compare under the ecosystem's own ordering, never as strings:
+Each route enforces an entry's `version_constraint` in its own way:
+
+| Type       | Where the constraint applies                                                                                                                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm`      | A tarball or version-document request outside the range gets a 403, and the version is dropped from the packument                                                                                                                                         |
+| `gomod`    | A `.info`, `.mod` or `.zip` request outside the range gets a 403 when the entry is in `proxy` mode. A mirrored module is answered from what bodega stored, with no constraint check, and `@v/list` is not filtered                                        |
+| `maven`    | A request naming a version outside the range gets a 403                                                                                                                                                                                                   |
+| `rubygems` | A `.gem` or gemspec request outside the range gets a 403                                                                                                                                                                                                  |
+| `cargo`    | The version is dropped from the sparse index bodega generates from the entry, so `cargo` never resolves it. There is no 403: `/cargo/<crate>/<version>/download` does not check the constraint, and a client that names the version directly is served it |
+
+Versions compare under the ecosystem's own ordering, never as strings:
 
 | Type           | Ordering                                                                                                                                                                                                                                                                                                                |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -4684,7 +4694,7 @@ What each constraint admits, against an entry naming `1.9.0`:
 
 A release segment is one of the numbers a version opens with, so a prerelease of the next major (`2.0.0-rc.1`) is outside `compatible` on `1.9.0`. Neither constraint follows the caret rule Cargo and npm apply below `1.0`: `compatible` on `0.2.0` admits `0.3.0`.
 
-A version the type's ordering cannot place is refused under every constraint but `any`, `exact` included and even when the two strings match. The 403 body says the version "could not be ordered as a `<type>` version" and names both versions, and the `denied` row carries the same text under `reason`, which tells a version bodega cannot compare apart from one outside the range.
+A version the type's ordering cannot place is refused under every constraint but `any`, `exact` included and even when the two strings match. On the routes that answer 403, the body says the version "could not be ordered as a `<type>` version" and names both versions, and the `denied` row carries the same text under `reason`, which tells a version bodega cannot compare apart from one outside the range. The npm packument and the cargo sparse index drop an unorderable version the way they drop one outside the range, with no 403 and no `denied` row.
 
 `build_env` is written by the build, never by the operator, and `bodega show pkg <type> <name> all` prints it:
 
