@@ -26,18 +26,23 @@ import (
 type Format string
 
 // The formats prefetch reads: npm's package-lock.json (v2 and v3), a pip
-// requirements file pinned with ==, go.sum, Cargo.lock, and Bundler's
-// Gemfile.lock.
+// requirements file pinned with ==, go.sum, Cargo.lock, Bundler's
+// Gemfile.lock, Gradle's gradle.lockfile, and the file Maven's
+// dependency:list goal writes.
 const (
-	NpmLock      Format = "package-lock"
-	Requirements Format = "requirements"
-	GoSum        Format = "go.sum"
-	CargoLock    Format = "cargo.lock"
-	GemfileLock  Format = "gemfile.lock"
+	NpmLock             Format = "package-lock"
+	Requirements        Format = "requirements"
+	GoSum               Format = "go.sum"
+	CargoLock           Format = "cargo.lock"
+	GemfileLock         Format = "gemfile.lock"
+	GradleLock          Format = "gradle.lockfile"
+	MavenDependencyList Format = "dependency-list"
 )
 
 // Formats lists every format, in the order --format's help names them.
-func Formats() []Format { return []Format{NpmLock, Requirements, GoSum, CargoLock, GemfileLock} }
+func Formats() []Format {
+	return []Format{NpmLock, Requirements, GoSum, CargoLock, GemfileLock, GradleLock, MavenDependencyList}
+}
 
 // Digest is one hash a lockfile records. Value is lowercase hex for the sha
 // family and the whole "h1:<base64>" string for a Go module hash, which is a
@@ -60,10 +65,13 @@ func (d Digest) String() string {
 // the lockfile accepts for it; pip lists one per distribution file, so any one
 // matching is a match. Unsupported is set when the entry names a source bodega
 // cannot fetch from, such as a git checkout or a local path, and says why.
+// Classifiers is maven's: the classified files of the version the build
+// resolved, in manifest.VersionEntry's notation.
 type Entry struct {
 	Type        string   `json:"type"`
 	Name        string   `json:"name"`
 	Version     string   `json:"version"`
+	Classifiers []string `json:"classifiers,omitempty"`
 	Digests     []Digest `json:"digests,omitempty"`
 	Line        int      `json:"line,omitempty"`
 	Unsupported string   `json:"unsupported,omitempty"`
@@ -82,10 +90,23 @@ func Detect(path string) (Format, error) {
 		return CargoLock, nil
 	case base == "gemfile.lock" || base == "gems.locked":
 		return GemfileLock, nil
+	case base == "gradle.lockfile" || base == "buildscript-gradle.lockfile" ||
+		strings.HasSuffix(base, ".lockfile") && filepath.Base(filepath.Dir(path)) == "dependency-locks":
+		return GradleLock, nil
 	case strings.HasPrefix(base, "requirements") && strings.HasSuffix(base, ".txt"):
 		return Requirements, nil
 	}
 	return "", fmt.Errorf("cannot tell the lockfile format of %s from its name; pass --format (%s)", path, formatList())
+}
+
+// Sniff names a format a file's contents give away when its name does not.
+// The output of Maven's dependency:list goes wherever -DoutputFile says, so
+// no name identifies it, but its header line does.
+func Sniff(data []byte) (Format, bool) {
+	if bytes.Contains(data, []byte(mavenListHeader)) {
+		return MavenDependencyList, true
+	}
+	return "", false
 }
 
 // ParseFormat accepts a --format value.
@@ -124,6 +145,10 @@ func Parse(format Format, data []byte) ([]Entry, error) {
 		entries, err = parseCargo(data)
 	case GemfileLock:
 		entries, err = parseGemfileLock(data)
+	case GradleLock:
+		entries, err = parseGradleLock(data)
+	case MavenDependencyList:
+		entries, err = parseMavenDependencyList(data)
 	default:
 		return nil, fmt.Errorf("unknown lockfile format %q", format)
 	}
@@ -142,6 +167,11 @@ func dedupe(in []Entry) []Entry {
 			for _, d := range e.Digests {
 				if !slices.Contains(out[i].Digests, d) {
 					out[i].Digests = append(out[i].Digests, d)
+				}
+			}
+			for _, c := range e.Classifiers {
+				if !slices.Contains(out[i].Classifiers, c) {
+					out[i].Classifiers = append(out[i].Classifiers, c)
 				}
 			}
 			continue
@@ -532,6 +562,154 @@ func parseGemfileLock(data []byte) ([]Entry, error) {
 	}
 	for i := range out {
 		out[i].Digests = sums[out[i].Name+"\x00"+out[i].Version]
+	}
+	return out, nil
+}
+
+// mavenSnapshotReason marks a -SNAPSHOT pin. Its files are redeployed under
+// the same name, so a digest pinned today describes nothing tomorrow.
+const mavenSnapshotReason = "a -SNAPSHOT is redeployed under the same name, so no digest can be pinned; serve it in proxy mode"
+
+// mavenEntry builds one maven pin, refusing a coordinate no repository path
+// could carry with the line it came from.
+func mavenEntry(file string, n int, group, artifact, version string) (Entry, error) {
+	name := group + ":" + artifact
+	e := Entry{Type: manifest.TypeMaven, Name: name, Version: version, Line: n}
+	if strings.HasSuffix(version, "-SNAPSHOT") {
+		e.Unsupported = mavenSnapshotReason
+		return e, nil
+	}
+	if err := manifest.ValidateMavenName(name); err != nil || strings.HasSuffix(name, ":"+manifest.MavenGroupWildcard) {
+		return Entry{}, fmt.Errorf("line %d of %s: %q is not a <groupId>:<artifactId> coordinate", n, file, name)
+	}
+	if err := manifest.ValidateMavenVersion(name, manifest.VersionEntry{Version: version}); err != nil {
+		return Entry{}, fmt.Errorf("line %d of %s: %w", n, file, err)
+	}
+	return e, nil
+}
+
+// gradleLockLine is one dependency gradle.lockfile pins:
+// <group>:<artifact>:<version>=<configurations>. The per-configuration
+// lockfiles Gradle wrote before 6.0 carry the coordinate alone.
+var gradleLockLine = regexp.MustCompile(`^([^:=\s]+):([^:=\s]+):([^:=\s]+)(?:=(\S*))?$`)
+
+// parseGradleLock reads gradle.lockfile. Gradle records no digest in it (that
+// is verification-metadata.xml's job), so every entry is compared with
+// nothing and pinned by the fetch.
+func parseGradleLock(data []byte) ([]Entry, error) {
+	var out []Entry
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	n := 0
+	for sc.Scan() {
+		n++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "empty=") {
+			continue
+		}
+		m := gradleLockLine.FindStringSubmatch(line)
+		if m == nil {
+			return nil, fmt.Errorf("line %d of gradle.lockfile: %q is not <group>:<artifact>:<version>=<configurations>", n, line)
+		}
+		e, err := mavenEntry("gradle.lockfile", n, m[1], m[2], m[3])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// mavenListHeader opens each module's list in dependency:list output.
+const mavenListHeader = "The following files have been resolved:"
+
+// mavenScopes are the scopes dependency:list appends to a coordinate. A field
+// matching one ends the coordinate; anything after it is the artifact's file
+// name, which -DoutputAbsoluteArtifactFilename adds.
+var mavenScopes = []string{"compile", "provided", "runtime", "test", "system", "import"}
+
+// parseMavenDependencyList reads what 'mvn dependency:list -DoutputFile=<f>'
+// writes, or the same list copied from a console log with its [INFO]
+// prefixes. Each line under the header is
+//
+//	<groupId>:<artifactId>:<type>[:<classifier>]:<version>[:<scope>]
+//
+// optionally followed by " -- module <name>" (Maven 3.9 and plugin 3.x) and
+// " (optional)". A blank line ends a module's list; a multi-module build
+// appends one list per module.
+func parseMavenDependencyList(data []byte) ([]Entry, error) {
+	const file = "the dependency:list output"
+	var (
+		out     []Entry
+		inList  bool
+		sawList bool
+	)
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	n := 0
+	for sc.Scan() {
+		n++
+		line := strings.TrimSpace(sc.Text())
+		line = strings.TrimSpace(strings.TrimPrefix(line, "[INFO]"))
+		if line == mavenListHeader {
+			inList, sawList = true, true
+			continue
+		}
+		if !inList {
+			continue
+		}
+		if line == "" {
+			inList = false
+			continue
+		}
+		if line == "none" {
+			continue
+		}
+		coord, _, _ := strings.Cut(line, " -- ")
+		fields := strings.Fields(coord)
+		parts := strings.Split(fields[0], ":")
+		for i := 4; i < len(parts) && i <= 5; i++ {
+			if slices.Contains(mavenScopes, parts[i]) {
+				parts = parts[:i]
+				break
+			}
+		}
+		var group, artifact, typ, classifier, version string
+		switch len(parts) {
+		case 4:
+			group, artifact, typ, version = parts[0], parts[1], parts[2], parts[3]
+		case 5:
+			group, artifact, typ, classifier, version = parts[0], parts[1], parts[2], parts[3], parts[4]
+		default:
+			return nil, fmt.Errorf("line %d of %s: %q is not <groupId>:<artifactId>:<type>[:<classifier>]:<version>[:<scope>]", n, file, fields[0])
+		}
+		e, err := mavenEntry(file, n, group, artifact, version)
+		if err != nil {
+			return nil, err
+		}
+		ext := manifest.MavenPackagingExtension(typ)
+		if typ == "test-jar" && classifier == "" {
+			classifier = "tests"
+		}
+		if classifier != "" && e.Unsupported == "" {
+			spec := classifier
+			if ext != "jar" {
+				spec += "@" + ext
+			}
+			if _, _, err := manifest.ParseMavenClassifier(spec); err != nil {
+				return nil, fmt.Errorf("line %d of %s: %w", n, file, err)
+			}
+			e.Classifiers = []string{spec}
+		}
+		out = append(out, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if !sawList {
+		return nil, fmt.Errorf("%s has no %q line; write it with mvn dependency:list -DoutputFile=<file>", file, mavenListHeader)
 	}
 	return out, nil
 }

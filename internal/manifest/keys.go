@@ -891,14 +891,24 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 		return []string{CargoCrateKey(pm.Name, ve.Version)}, nil
 
 	case TypeMaven:
-		// The POM alone: it is the one file every version publishes, and the
-		// rest (jar, aar, classifiers, companions) depends on a packaging the
-		// entry does not record.
-		p, ok := MavenArtifactPath(pm.Name, ve.Version)
-		if !ok {
-			return nil, fmt.Errorf("maven %s@%s: want a <groupId>:<artifactId> name and a version", pm.Name, ve.Version)
+		// Every file a fetch recorded, each followed by its checksum
+		// companions, so a delete or a move takes the .sha1 a client asks for
+		// along with the jar it describes. Before a fetch records the
+		// packaging, the POM is the one file every version publishes.
+		files, err := MavenVersionFiles(pm.Name, ve)
+		if err != nil {
+			return nil, err
 		}
-		return []string{MavenKey(p)}, nil
+		keys := make([]string, 0, len(files)*(1+len(MavenChecksumCompanions)))
+		for _, f := range files {
+			keys = append(keys, MavenKey(f))
+		}
+		for _, f := range files {
+			for _, c := range MavenChecksumCompanions {
+				keys = append(keys, MavenKey(f+"."+c))
+			}
+		}
+		return keys, nil
 
 	case TypeRubygems:
 		return []string{RubygemsGemKey(pm.Name, ve.Version)}, nil

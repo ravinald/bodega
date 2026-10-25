@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -300,6 +301,41 @@ func ensureFetchedRubygems(bcfg *builder.Config, store *manifest.Store, entryFil
 	return builder.MergeSummaries(ss...)
 }
 
+// ensureFetchedMaven runs FetchMaven for any unfetched entries. The fetched
+// files are the artifacts, and maven-metadata.xml stays the upstream's,
+// proxied. A proxy-mode entry is skipped as rubygems' is: the route pulls it
+// through on first request.
+func ensureFetchedMaven(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeMaven)) == 0 {
+		fmt.Println("    No maven entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeMaven) {
+		pm, err := store.GetPackage(ctx, manifest.TypeMaven, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		if strings.HasSuffix(pm.Name, ":"+manifest.MavenGroupWildcard) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen || ve.EffectiveMode() == manifest.ModeProxy {
+				continue
+			}
+			if !builder.CheckMavenStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchMaven(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	return builder.MergeSummaries(ss...)
+}
+
 // ensureFetchedNpm fetches any missing tarballs. npm has no package stage:
 // the server generates the packument from the manifest entry per request, so
 // there is nothing between a fetched tarball and an upload.
@@ -437,9 +473,7 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 	case manifest.TypeDistfiles:
 		s = ensureFetchedDistfiles(bcfg, store, "")
 	case manifest.TypeMaven:
-		// No stage writes a maven artifact locally yet: the route proxies
-		// every request, so there is nothing to make uploadable.
-		s = &builder.Summary{}
+		s = ensureFetchedMaven(bcfg, store, "")
 	case manifest.TypeRubygems:
 		s = ensureFetchedRubygems(bcfg, store, "")
 	default:

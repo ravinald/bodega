@@ -30,6 +30,8 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   npm     Download package tarballs to npm/
   cargo   Download crate tarballs to cargo/
   rubygems Download gem files to rubygems/
+  maven   Download POMs, artifacts and named classifiers, checked against the
+          upstream's .sha256 or .sha1, to maven/ in the repository layout
   freebsd Mirror a pkg repository byte for byte to freebsd/
   distfiles Download ports distfiles matching the ports tree's distinfo to distfiles/
 
@@ -156,6 +158,10 @@ it once before a hosted index can date them.`,
 				case manifest.TypeRubygems:
 					allSummaries = append(allSummaries,
 						builder.FetchRubygems(bcfg, store, entryFilter),
+					)
+				case manifest.TypeMaven:
+					allSummaries = append(allSummaries,
+						builder.FetchMaven(bcfg, store, entryFilter),
 					)
 				}
 			}

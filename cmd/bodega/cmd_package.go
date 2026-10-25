@@ -29,6 +29,7 @@ been completed yet.
   gomod   No-op (the downloaded module zip is already the artifact)
   cargo   No-op (the downloaded crate tarball is already the artifact)
   rubygems No-op (the downloaded gem file is already the artifact)
+  maven   No-op (the downloaded POM, jar and classifiers are already the artifacts)
   freebsd No-op (fetch mirrors the repository; nothing here may touch its bytes)
 
 helm packages across the whole type rather than per entry, because index.yaml
@@ -149,6 +150,13 @@ When a name is given after the type, only that entry is packaged.`,
 					// is the upstream's, proxied.
 					allSummaries = append(allSummaries,
 						ensureFetchedRubygems(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeMaven:
+					// The fetched files are the artifacts; maven-metadata.xml
+					// is the upstream's, proxied.
+					allSummaries = append(allSummaries,
+						ensureFetchedMaven(bcfg, store, entryFilter),
 					)
 				}
 			}

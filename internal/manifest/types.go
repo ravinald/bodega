@@ -247,6 +247,15 @@ type VersionEntry struct {
 	// every listed suite: a flat pool/ is correct Debian layout.
 	Suites []string `json:"suites,omitempty"`
 
+	// --- maven-specific fields ---
+
+	// Classifiers names the classified files fetched beside the main
+	// artifact and POM: "sources", or "<classifier>@<extension>" for one that
+	// is not a jar ("natives-linux@jar" is the same as "natives-linux"). A
+	// Maven version publishes any number of them and nothing lists them, so
+	// only the ones named here reach the catalog.
+	Classifiers []string `json:"classifiers,omitempty"`
+
 	// --- freebsd-specific fields ---
 
 	// Generated marks a pkg repository whose catalogue bodega builds and

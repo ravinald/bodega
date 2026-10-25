@@ -511,6 +511,7 @@ func servedPath(typ, name, version, key string) (string, error) {
 		{"gomod/", "/go/"},
 		{"charts/", "/helm/charts/"},
 		{manifest.FreeBSDPrefix, "/freebsd/"},
+		{manifest.MavenKey(""), "/maven/"},
 	} {
 		if rest, ok := strings.CutPrefix(key, m.key); ok && rest != "" {
 			segs := strings.Split(rest, "/")

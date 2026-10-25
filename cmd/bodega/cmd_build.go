@@ -27,6 +27,7 @@ fetches sources first if they have not already been fetched.
   pypi         Resolve requirements (if needed), then run pip wheel
   gomod, helm  No build step: what fetch downloads is the artifact
   npm, cargo   No build step: what fetch downloads is the artifact
+  rubygems, maven  No build step: what fetch downloads is the artifact
 
 ` + typeOrderSentence("processed") + `
 
@@ -158,6 +159,12 @@ When a name is given after the type, only that entry is built.`,
 					// rubygems has no build step; FetchRubygems skips already-fetched.
 					allSummaries = append(allSummaries,
 						builder.FetchRubygems(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeMaven:
+					// maven has no build step; FetchMaven skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchMaven(bcfg, store, entryFilter),
 					)
 				}
 			}

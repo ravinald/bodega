@@ -3,6 +3,7 @@ package manifest
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -185,4 +186,125 @@ func MavenGroupEntry(name string) (string, bool) {
 		return "", false
 	}
 	return group + ":" + MavenGroupWildcard, true
+}
+
+// The metadata keys a maven fetch records, read back by MavenVersionFiles so
+// every later stage names the same files. MetaMavenExtension is the main
+// artifact's extension as the POM's <packaging> decides it, or "pom" for a
+// version that publishes its POM alone (a BOM, a parent). MetaMavenModule is
+// "true" when the upstream published Gradle module metadata beside the POM.
+const (
+	MetaMavenExtension = "maven_extension"
+	MetaMavenModule    = "maven_module"
+)
+
+// MavenChecksumCompanions are the checksum files written beside each fetched
+// file. Maven asks for .sha1 and .md5 and Gradle for .sha512 and .sha256, so
+// a catalog-mode version holding fewer sends one of them to the upstream.
+var MavenChecksumCompanions = []string{"sha1", "md5", "sha256", "sha512"}
+
+// MavenPackagingExtension maps a POM's <packaging> to the extension its main
+// artifact is published under. Every packaging a plugin defines that is not
+// war or aar (bundle, maven-plugin, ejb, eclipse-plugin) publishes a jar.
+func MavenPackagingExtension(packaging string) string {
+	switch p := strings.TrimSpace(packaging); p {
+	case "pom", "war", "aar":
+		return p
+	}
+	return "jar"
+}
+
+// ParseMavenClassifier reads one entry of a version's classifiers list:
+// "sources", or "<classifier>@<extension>" for a classified file that is not
+// a jar, the notation Gradle writes.
+func ParseMavenClassifier(s string) (classifier, extension string, err error) {
+	classifier, extension, found := strings.Cut(s, "@")
+	if !found {
+		extension = "jar"
+	}
+	if !mavenSegmentPattern.MatchString(classifier) {
+		return "", "", fmt.Errorf("maven classifier %q is not letters, digits, '.', '_', '-' or '+'", s)
+	}
+	if !slices.Contains(mavenExtensions, extension) || extension == "pom" || extension == "module" {
+		return "", "", fmt.Errorf("maven classifier %q: extension %q is not one the /maven/ route serves (jar, aar, war)", s, extension)
+	}
+	return classifier, extension, nil
+}
+
+// MavenFilePath is the repository path of one release file of a version.
+func MavenFilePath(name, version, classifier, extension string) (string, bool) {
+	group, artifact, ok := strings.Cut(name, ":")
+	if !ok || group == "" || artifact == "" || artifact == MavenGroupWildcard || version == "" {
+		return "", false
+	}
+	file := artifact + "-" + version
+	if classifier != "" {
+		file += "-" + classifier
+	}
+	p := strings.ReplaceAll(group, ".", "/") + "/" + artifact + "/" + version + "/" + file + "." + extension
+	if mp, ok := ParseMavenPath(p); !ok || mp.Name() != name || mp.Version != version || mp.Classifier != classifier {
+		return "", false
+	}
+	return p, true
+}
+
+// ValidateMavenVersion refuses a version and classifiers no repository path
+// could carry, so an entry the fetch cannot address is refused at import.
+func ValidateMavenVersion(name string, ve VersionEntry) error {
+	if _, artifact, _ := strings.Cut(name, ":"); artifact == MavenGroupWildcard {
+		if len(ve.Classifiers) > 0 {
+			return fmt.Errorf("maven %s names every artifact of a groupId, so it has no files for classifiers %v to select", name, ve.Classifiers)
+		}
+		return nil
+	}
+	if _, ok := MavenArtifactPath(name, ve.Version); !ok || !mavenSegmentPattern.MatchString(ve.Version) {
+		return fmt.Errorf("maven %s: version %q is not a repository directory name (letters, digits, '.', '_', '-' or '+')", name, ve.Version)
+	}
+	for _, c := range ve.Classifiers {
+		cls, ext, err := ParseMavenClassifier(c)
+		if err != nil {
+			return fmt.Errorf("maven %s@%s: %w", name, ve.Version, err)
+		}
+		if _, ok := MavenFilePath(name, ve.Version, cls, ext); !ok {
+			return fmt.Errorf("maven %s@%s: classifier %q names no file the repository layout can hold", name, ve.Version, c)
+		}
+	}
+	return nil
+}
+
+// MavenVersionFiles returns the repository paths a fetched version holds,
+// its main artifact first: that is the file a version's checksum, purl and
+// attestation describe. Before a fetch has recorded the packaging only the
+// POM is known, and it comes first instead. Checksum companions are not
+// listed; MavenChecksumCompanions names them.
+func MavenVersionFiles(name string, ve VersionEntry) ([]string, error) {
+	pom, ok := MavenArtifactPath(name, ve.Version)
+	if !ok {
+		return nil, fmt.Errorf("maven %s@%s: want a <groupId>:<artifactId> name and a version", name, ve.Version)
+	}
+	var files []string
+	if ext := ve.Metadata[MetaMavenExtension]; ext != "" && ext != "pom" {
+		main, ok := MavenFilePath(name, ve.Version, "", ext)
+		if !ok {
+			return nil, fmt.Errorf("maven %s@%s: recorded extension %q names no file the repository layout can hold", name, ve.Version, ext)
+		}
+		files = append(files, main)
+	}
+	files = append(files, pom)
+	if ve.Metadata[MetaMavenModule] == "true" {
+		module, _ := MavenFilePath(name, ve.Version, "", "module")
+		files = append(files, module)
+	}
+	for _, c := range ve.Classifiers {
+		cls, ext, err := ParseMavenClassifier(c)
+		if err != nil {
+			return nil, fmt.Errorf("maven %s@%s: %w", name, ve.Version, err)
+		}
+		p, ok := MavenFilePath(name, ve.Version, cls, ext)
+		if !ok {
+			return nil, fmt.Errorf("maven %s@%s: classifier %q names no file the repository layout can hold", name, ve.Version, c)
+		}
+		files = append(files, p)
+	}
+	return files, nil
 }
