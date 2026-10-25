@@ -380,3 +380,58 @@ func TestDoctorConfigureRubygemsWritesBothFilesWithBackups(t *testing.T) {
 		}
 	}
 }
+
+// F87 R2/R3: --configure maven --apply merges bodega's mirror into an
+// existing settings.xml, keeping its profile, writes the init script, backs
+// up the file it replaces, and prints the wrapper note.
+func TestDoctorConfigureMavenMergesSettingsAndPrintsTheWrapperNote(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	files := clientconf.Maven(srv.URL, nil)
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		var plan clientconf.Plan
+		for i, f := range files {
+			sum := sha256.Sum256([]byte(f.Content))
+			plan.Records = append(plan.Records, clientconf.PlanRecord{
+				Identity: "ci-host", System: "maven", Action: clientconf.PlanInstall, Path: f.Path(clientconf.OSLinux),
+				URL: srv.URL + "/client/maven?n=" + strconv.Itoa(i), SHA256: hex.EncodeToString(sum[:]),
+				Reason: strings.Join(f.Notes, ". "),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /client/maven", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+		_, _ = io.WriteString(w, files[n].Content)
+	})
+	settings := filepath.Join(home, ".m2", "settings.xml")
+	const existing = "<settings>\n  <mirrors>\n    <mirror><id>old</id><mirrorOf>*</mirrorOf><url>https://old/</url></mirror>\n  </mirrors>\n" +
+		"  <profiles><profile><id>keep-me</id></profile></profiles>\n</settings>\n"
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runDoctor(t, "--configure", "maven", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil {
+		t.Fatalf("--configure maven --apply = %v:\n%s", err, out)
+	}
+	if !strings.Contains(out, "gradle/wrapper/gradle-wrapper.properties") || !strings.Contains(out, "distributionUrl="+srv.URL+"/binaries/") {
+		t.Errorf("output lacks the wrapper note:\n%s", out)
+	}
+	got, _ := os.ReadFile(settings)
+	if !strings.Contains(string(got), "<id>keep-me</id>") || !strings.Contains(string(got), "<url>"+srv.URL+"/maven/</url>") || strings.Contains(string(got), "https://old/") {
+		t.Errorf("settings.xml after apply:\n%s", got)
+	}
+	if backups, _ := filepath.Glob(settings + ".bodega-*"); len(backups) != 1 {
+		t.Errorf("backups of %s = %v, want one", settings, backups)
+	}
+	if init, _ := os.ReadFile(filepath.Join(home, ".gradle", "init.d", "bodega.gradle")); string(init) != files[1].Content {
+		t.Errorf("init script = %q, want the planned file", init)
+	}
+}

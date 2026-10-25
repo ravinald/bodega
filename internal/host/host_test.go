@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -304,5 +305,106 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	f, _ = checkRubygems(r)
 	if f.Status != StatusSkip || !strings.Contains(f.Detail, "exit status 1") {
 		t.Errorf("gem sources failing = %+v, want SKIPPED with the error", f)
+	}
+}
+
+// mavenFixture stands in for a host's mvn and gradle: which are on PATH, and
+// a home holding whatever files the case writes.
+func mavenFixture(t *testing.T, tools []string, env map[string]string) mavenTools {
+	t.Helper()
+	return mavenTools{
+		lookPath: func(name string) (string, error) {
+			if slices.Contains(tools, name) {
+				return "/usr/bin/" + name, nil
+			}
+			return "", exec.ErrNotFound
+		},
+		getenv: func(k string) string { return env[k] },
+		home:   t.TempDir(),
+	}
+}
+
+func writeUnder(t *testing.T, root, rel, content string) {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// F87 R4: no mvn and no gradle, and no distribution a wrapper downloaded,
+// gives no row.
+func TestCheckMavenGivesNoRowWithoutMvnOrGradle(t *testing.T) {
+	m := mavenFixture(t, nil, nil)
+	writeUnder(t, m.home, ".m2/settings.xml", "<settings/>")
+	if f, ok := checkMaven(m); ok {
+		t.Errorf("no mvn and no gradle gave a row: %+v", f)
+	}
+}
+
+// F87 R4: the row warns while either tool's file is missing or does not
+// point at bodega, and is OK with the files clientconf renders.
+func TestCheckMavenWarnsUntilBothFilesPointAtBodega(t *testing.T) {
+	configured := func(t *testing.T, tools []string) mavenTools {
+		m := mavenFixture(t, tools, nil)
+		for _, f := range clientconf.Maven("https://bodega.internal", nil) {
+			writeUnder(t, m.home, strings.TrimPrefix(f.Path(clientconf.OSLinux), "~/"), f.Content)
+		}
+		return m
+	}
+	both := []string{"mvn", "gradle"}
+
+	f, ok := checkMaven(configured(t, both))
+	if !ok || f.Status != StatusOK || !strings.Contains(f.Detail, "https://bodega.internal/maven/") {
+		t.Fatalf("the files clientconf renders = %+v, want OK naming the URL", f)
+	}
+
+	f, ok = checkMaven(mavenFixture(t, both, nil))
+	if !ok || f.Status != StatusWarn || !strings.Contains(f.Detail, "settings.xml has no bodega mirror") ||
+		!strings.Contains(f.Detail, "bodega.gradle, so Gradle") || !strings.Contains(f.Remediation, "--configure maven") {
+		t.Errorf("neither file = %+v, want a warning naming both and --configure maven", f)
+	}
+
+	m := configured(t, both)
+	writeUnder(t, m.home, ".m2/settings.xml", "<settings><mirrors>"+
+		"<mirror><id>bodega</id><mirrorOf>*</mirrorOf><url>https://bodega.internal/maven/</url></mirror>"+
+		"<mirror><id>nexus</id><mirrorOf>central</mirrorOf><url>https://n/</url></mirror></mirrors></settings>")
+	if f, _ = checkMaven(m); f.Status != StatusWarn || !strings.Contains(f.Detail, `mirror "nexus" (mirrorOf central)`) {
+		t.Errorf("a second mirror beside bodega's = %+v, want a warning naming it", f)
+	}
+
+	m = configured(t, []string{"gradle"})
+	writeUnder(t, m.home, ".gradle/init.d/bodega.gradle", "// emptied by hand\n")
+	if f, _ = checkMaven(m); f.Status != StatusWarn || !strings.Contains(f.Detail, "sets no bodega repository") || strings.Contains(f.Detail, "settings.xml") {
+		t.Errorf("gradle alone with a hollow init script = %+v, want a warning about Gradle alone", f)
+	}
+
+	m = mavenFixture(t, []string{"gradle"}, nil)
+	m.getenv = func(k string) string {
+		if k == "GRADLE_USER_HOME" {
+			return filepath.Join(m.home, "gh")
+		}
+		return ""
+	}
+	for _, f := range clientconf.Maven("https://bodega.internal", nil) {
+		writeUnder(t, m.home, strings.TrimPrefix(f.Path(clientconf.OSLinux), "~/"), f.Content)
+	}
+	if f, _ = checkMaven(m); f.Status != StatusWarn || !strings.Contains(f.Detail, "GRADLE_USER_HOME") {
+		t.Errorf("an init script ~/.gradle under a moved GRADLE_USER_HOME = %+v, want a warning naming the variable", f)
+	}
+
+	m = mavenFixture(t, nil, nil)
+	writeUnder(t, m.home, ".m2/wrapper/dists/apache-maven-3.9.9-bin/x/README", "")
+	if f, ok = checkMaven(m); !ok || f.Status != StatusWarn || !strings.Contains(f.Detail, "Maven fetches") {
+		t.Errorf("a Maven a wrapper downloaded, with no settings.xml = %+v, want a warning", f)
+	}
+
+	m = mavenFixture(t, []string{"mvn"}, nil)
+	writeUnder(t, m.home, ".m2/settings.xml", "<settings><mirrors>")
+	if f, _ = checkMaven(m); f.Status != StatusSkip || !strings.Contains(f.Detail, "not XML Maven can read") {
+		t.Errorf("an unreadable settings.xml = %+v, want SKIPPED naming the parse", f)
 	}
 }

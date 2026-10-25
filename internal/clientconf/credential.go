@@ -188,6 +188,7 @@ var (
 	authHeader   = regexp.MustCompile(`(?i)(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+-]*[ \t]+)?)[^ \t].*$`)
 	yamlKey      = regexp.MustCompile(`^[ \t]*(-[ \t]+)?([A-Za-z0-9_.-]+)[ \t]*:([ \t]|$)`)
 	secretKey    = regexp.MustCompile(`(password|passwd|token|secret|_auth|_key)$|^apikey$`)
+	xmlElement   = regexp.MustCompile(`<([A-Za-z_][A-Za-z0-9_.:-]*)>([^<]+)</([A-Za-z_][A-Za-z0-9_.:-]*)>`)
 )
 
 // Redact replaces every secret in a configuration file's text with Redacted,
@@ -203,6 +204,9 @@ var (
 //   - everything after an Authorization: header name except the scheme
 //     (Bearer, Basic), wherever the header sits in the line, as in git's
 //     http.<url>.extraHeader;
+//   - the text of an XML element opened and closed on one line, such as
+//     settings.xml's <password>, whose name, case folded, ends in password,
+//     passwd, passphrase, token, secret, _auth or _key, or is apikey;
 //   - the value of a YAML `key: value` or an ini `key = value` whose key, case
 //     folded, ends in password, passwd, token, secret, _auth or _key, or is
 //     apikey.
@@ -225,6 +229,7 @@ func redactLine(l string) string {
 	l = httpUserinfo.ReplaceAllString(l, "${1}"+Redacted+"@")
 	l = urlUserinfo.ReplaceAllString(l, "://$1:"+Redacted+"@")
 	l = authHeader.ReplaceAllString(l, "${1}"+Redacted)
+	l = redactXMLElements(l)
 	var head, key, rest string
 	if m := yamlKey.FindStringSubmatchIndex(l); m != nil {
 		head, key, rest = l[:m[1]], l[m[4]:m[5]], l[m[1]:]
@@ -239,4 +244,22 @@ func redactLine(l string) string {
 		return l
 	}
 	return head + rest[:len(rest)-len(value)] + Redacted
+}
+
+// redactXMLElements replaces the text of each secret-named element in l.
+func redactXMLElements(l string) string {
+	var sb strings.Builder
+	last := 0
+	for _, m := range xmlElement.FindAllStringSubmatchIndex(l, -1) {
+		name := strings.ToLower(l[m[2]:m[3]])
+		if name != strings.ToLower(l[m[6]:m[7]]) {
+			continue
+		}
+		if !secretKey.MatchString(name) && !strings.HasSuffix(name, "passphrase") {
+			continue
+		}
+		sb.WriteString(l[last:m[4]] + Redacted)
+		last = m[5]
+	}
+	return sb.String() + l[last:]
 }
