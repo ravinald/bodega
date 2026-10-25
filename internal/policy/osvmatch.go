@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // Version orderings an OSV range is evaluated under. OSV declares a range as
@@ -316,6 +318,82 @@ func compareVersions(order, a, b string) (int, bool) {
 	return compareSemver(a, b)
 }
 
+// CompareVersions orders two versions of a bodega package type: semver for
+// npm, cargo and gomod, Maven's ComparableVersion for maven, and Gem::Version
+// for rubygems. A false second return means one of them cannot be ordered
+// under that type's ordering, or that bodega has no ordering for the type, and
+// a caller gating on a range has to refuse rather than guess.
+func CompareVersions(typ, a, b string) (int, bool) {
+	order, ok := packageVersionOrder(typ)
+	if !ok {
+		return 0, false
+	}
+	return compareVersions(order, a, b)
+}
+
+// ReleaseSegments returns the numeric release a version of typ opens with,
+// which is what a range bounded by major or major.minor compares: [1 2 3] for
+// semver 1.2.3, [2 0] for Maven 2.0-beta9, [1 0 0] for the gem 1.0.0.pre.
+// Trailing zeros may be absent, so a caller compares a missing segment as 0.
+func ReleaseSegments(typ, v string) ([]int, bool) {
+	order, ok := packageVersionOrder(typ)
+	if !ok {
+		return nil, false
+	}
+	switch order {
+	case orderMaven:
+		root, ok := parseMavenVersion(v)
+		if !ok {
+			return nil, false
+		}
+		var out []int
+		for _, it := range root.list {
+			if it.kind != mavenNumber {
+				break
+			}
+			n := 0
+			if it.num != "" {
+				var err error
+				if n, err = strconv.Atoi(it.num); err != nil {
+					return nil, false
+				}
+			}
+			out = append(out, n)
+		}
+		return out, true
+	case orderRubyGems:
+		segs, ok := parseGemVersion(v)
+		if !ok {
+			return nil, false
+		}
+		var out []int
+		for _, s := range segs {
+			if s.str != "" {
+				break
+			}
+			out = append(out, s.num)
+		}
+		return out, true
+	}
+	sv := parseSemver(v)
+	return sv.release, sv.ok
+}
+
+// packageVersionOrder maps a bodega package type to its ordering. The types
+// absent here have no route that gates on a range, and answering semver for
+// them would order a Debian or PEP 440 version by the wrong rules.
+func packageVersionOrder(typ string) (string, bool) {
+	switch typ {
+	case manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod:
+		return orderSemver, true
+	case manifest.TypeMaven:
+		return orderMaven, true
+	case manifest.TypeRubygems:
+		return orderRubyGems, true
+	}
+	return "", false
+}
+
 // orderable reports whether an ordering can place a version.
 func orderable(order, v string) bool {
 	switch order {
@@ -477,6 +555,11 @@ func parseMavenVersion(v string) (*mavenItem, bool) {
 			}
 		case c >= '0' && c <= '9':
 			if !digits && i > start {
+				// A qualifier after a '.' opens a sublist as a '-' does, which
+				// is what places 2.0.a below 2-1.
+				if len(list.list) > 0 {
+					open()
+				}
 				add(mavenQualifierItem(v[start:i], true))
 				start = i
 				open()
@@ -492,6 +575,9 @@ func parseMavenVersion(v string) (*mavenItem, bool) {
 		}
 	}
 	if len(v) > start {
+		if !digits && len(list.list) > 0 {
+			open()
+		}
 		add(token(digits, v[start:]))
 	}
 	for i := len(stack) - 1; i >= 0; i-- {

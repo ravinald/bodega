@@ -2333,7 +2333,7 @@ Next step: ask an operator to run `bodega policy add npm left-pad` if it should 
 | `integration` | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
 | `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                                   |
 | `profile`     | 403    | any package route on a host whose profile governs the type                                                                         |
-| `constraint`  | 403    | an npm or gomod version outside the entry's `version_constraint`                                                                   |
+| `constraint`  | 403    | an npm, gomod, maven or rubygems version outside the entry's `version_constraint`                                                  |
 | `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                               |
 | `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                          |
 | `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest                                                         |
@@ -4645,7 +4645,7 @@ All version entries support:
 | `version`            | string | Version identifier (semver, git ref, chart version, etc.)                                                                             |
 | `url`                | string | Download, repository, or registry URL (labeled "Source URL" in UI)                                                                    |
 | `mode`               | string | `hosted` (default when absent) or `proxy`: whether bodega serves stored bytes or fetches from `url` on demand and caches what it gets |
-| `version_constraint` | string | One of: exact, compatible, patch, any                                                                                                 |
+| `version_constraint` | string | One of: exact, compatible, patch, any. See [Version constraints on the serving routes](#version-constraints-on-the-serving-routes)    |
 | `checksum`           | object | `{"algorithm": "sha256", "value": "hex..."}`                                                                                          |
 | `checksum_verified`  | bool   | Whether checksum matches upstream publisher                                                                                           |
 | `artifact_digest`    | string | SHA-256 of the bytes the fetch stored, set by fetch and never by the operator. Can differ from `checksum`, which is what was declared |
@@ -4661,6 +4661,40 @@ All version entries support:
 | `description`        | string | Overrides the package-level description for this version                                                                              |
 | `metadata`           | object | Ecosystem-specific key-value pairs                                                                                                    |
 | `build_env`          | object | Build server's environment at artifact creation time                                                                                  |
+
+#### Version constraints on the serving routes
+
+Each route enforces an entry's `version_constraint` in its own way:
+
+| Type       | Where the constraint applies                                                                                                                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm`      | A tarball or version-document request outside the range gets a 403, and the version is dropped from the packument                                                                                                                                         |
+| `gomod`    | A `.info`, `.mod` or `.zip` request outside the range gets a 403 when the entry is in `proxy` mode. A mirrored module is answered from what bodega stored, with no constraint check, and `@v/list` is not filtered                                        |
+| `maven`    | A request naming a version outside the range gets a 403                                                                                                                                                                                                   |
+| `rubygems` | A `.gem` or gemspec request outside the range gets a 403                                                                                                                                                                                                  |
+| `cargo`    | The version is dropped from the sparse index bodega generates from the entry, so `cargo` never resolves it. There is no 403: `/cargo/<crate>/<version>/download` does not check the constraint, and a client that names the version directly is served it |
+
+Versions compare under the ecosystem's own ordering, never as strings:
+
+| Type           | Ordering                                                                                                                                                                                                                                                                                                                |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm`, `cargo` | semver: release numbers compare as integers, and a prerelease (`1.0.0-rc.1`) orders below its release                                                                                                                                                                                                                   |
+| `gomod`        | semver, with the `v` prefix and a `+incompatible` suffix accepted: `v2.0.0+incompatible` is major 2                                                                                                                                                                                                                     |
+| `maven`        | Maven's ComparableVersion: `.` and `-` split segments and trailing zeros drop, so `1.0` equals `1.0.0`. Qualifiers order `alpha` < `beta` < `milestone` < `rc` (also `cr`) < `snapshot` < a release (also `ga`, `final`, `release`) < `sp`, and an unknown qualifier orders after all of them. `1.0-rc1` is below `1.0` |
+| `rubygems`     | `Gem::Version`: a segment holding a letter marks a prerelease, so `2.0.0.pre` is below `2.0.0`. A platform build such as `1.16.7-x86_64-linux` is judged as its release, `1.16.7`                                                                                                                                       |
+
+What each constraint admits, against an entry naming `1.9.0`:
+
+| `version_constraint` | Admits                                                                                | Under `1.9.0`                               |
+| -------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `exact`, or absent   | Only a version equal to the named one under the type's ordering                       | `1.9.0`                                     |
+| `compatible`         | A version at or above the named one that shares its first release segment (the major) | `1.9.0`, `1.10.0`; not `2.0.0`, not `1.8.9` |
+| `patch`              | A version at or above the named one that shares its first two release segments        | `1.9.0`, `1.9.5`; not `1.10.0`              |
+| `any`                | Every version                                                                         | all                                         |
+
+A release segment is one of the numbers a version opens with, so a prerelease of the next major (`2.0.0-rc.1`) is outside `compatible` on `1.9.0`. Neither constraint follows the caret rule Cargo and npm apply below `1.0`: `compatible` on `0.2.0` admits `0.3.0`.
+
+A version the type's ordering cannot place is refused under every constraint but `any`, `exact` included and even when the two strings match. On the routes that answer 403, the body says the version "could not be ordered as a `<type>` version" and names both versions, and the `denied` row carries the same text under `reason`, which tells a version bodega cannot compare apart from one outside the range. The npm packument and the cargo sparse index drop an unorderable version the way they drop one outside the range, with no 403 and no `denied` row.
 
 `build_env` is written by the build, never by the operator, and `bodega show pkg <type> <name> all` prints it:
 

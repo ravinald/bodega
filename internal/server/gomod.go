@@ -11,6 +11,7 @@ import (
 	modulepath "golang.org/x/mod/module"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // ---- Go module proxy -------------------------------------------------------
@@ -141,8 +142,8 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 				if dot := strings.LastIndex(file, "."); dot > 0 {
 					reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
 				}
-				if !versionAllowed(ver, reqVersion, vc) {
-					s.refuseVersionConstraint(w, r, manifest.TypeGomod, module, ver, reqVersion, vc)
+				if ok, ordered := versionAllowed(manifest.TypeGomod, ver, reqVersion, vc); !ok {
+					s.refuseVersionConstraint(w, r, manifest.TypeGomod, module, ver, reqVersion, vc, ordered)
 					return
 				}
 			}
@@ -290,19 +291,49 @@ func gomodVersionFromFile(file string) string {
 	return ""
 }
 
-// versionAllowed checks whether reqVersion satisfies the constraint relative to entryVersion.
-func versionAllowed(entryVersion, reqVersion, constraint string) bool {
+// versionAllowed reports whether reqVersion satisfies the constraint relative
+// to entryVersion under typ's version ordering, and whether both versions
+// could be ordered at all. An unorderable pair is refused under every
+// constraint but any: a range nobody can place a version in admits nothing,
+// and the second return lets the refusal say so rather than call the version
+// out of range.
+func versionAllowed(typ, entryVersion, reqVersion, constraint string) (allowed, ordered bool) {
+	if constraint == manifest.ConstraintAny {
+		return true, true
+	}
+	c, ok := policy.CompareVersions(typ, reqVersion, entryVersion)
+	if !ok {
+		return false, false
+	}
 	switch constraint {
 	case manifest.ConstraintExact, "":
-		return reqVersion == entryVersion
-	case manifest.ConstraintAny:
-		return true
+		return c == 0, true
 	case manifest.ConstraintCompatible:
-		// Same major version, any minor/patch.
-		return reqVersion >= entryVersion
+		return c >= 0 && sharesRelease(typ, entryVersion, reqVersion, 1), true
 	case manifest.ConstraintPatch:
-		// Same major.minor, any patch.
-		return reqVersion >= entryVersion
+		return c >= 0 && sharesRelease(typ, entryVersion, reqVersion, 2), true
 	}
-	return false
+	return false, true
+}
+
+// sharesRelease reports whether two versions agree on their first n release
+// segments, a missing segment reading as 0 so that Maven's 2 is 2.0.
+func sharesRelease(typ, a, b string, n int) bool {
+	ra, oka := policy.ReleaseSegments(typ, a)
+	rb, okb := policy.ReleaseSegments(typ, b)
+	if !oka || !okb {
+		return false
+	}
+	at := func(r []int, i int) int {
+		if i < len(r) {
+			return r[i]
+		}
+		return 0
+	}
+	for i := range n {
+		if at(ra, i) != at(rb, i) {
+			return false
+		}
+	}
+	return true
 }
