@@ -591,6 +591,57 @@ func validateRootURL(key, raw, def string) error {
 	return nil
 }
 
+// validateProxyUpstream holds an upstream key the fetch path appends request
+// paths to but that may carry a private index's credential in its userinfo,
+// which validateRootURL refuses. Every error names the value with the
+// password masked, because it reaches the serve log.
+func validateProxyUpstream(key, raw, def string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return fmt.Errorf("%s %q does not parse: %v (default %s)", key, redactUserinfo(raw), err, def)
+	}
+	shown := raw
+	if u.User != nil {
+		shown = u.Redacted()
+	}
+	switch {
+	case u.Scheme != "https":
+		return fmt.Errorf("%s %q must be an https URL (default %s)", key, shown, def)
+	case u.Host == "":
+		return fmt.Errorf("%s %q names no host (default %s)", key, shown, def)
+	case u.RawQuery != "", u.Fragment != "":
+		return fmt.Errorf("%s %q carries a query or a fragment — the request path is appended to it (default %s)", key, shown, def)
+	}
+	return nil
+}
+
+// redactUserinfo masks the password in a URL url.Parse refused, which
+// Redacted cannot reach: everything between the first ':' and the last '@'
+// of the authority.
+func redactUserinfo(raw string) string {
+	rest, scheme := raw, ""
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme, rest = raw[:i+3], raw[i+3:]
+	}
+	auth, path := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		auth, path = rest[:i], rest[i:]
+	}
+	at := strings.LastIndex(auth, "@")
+	if at < 0 {
+		return raw
+	}
+	user := auth[:at]
+	if c := strings.Index(user, ":"); c >= 0 {
+		user = user[:c] + ":xxxxx"
+	}
+	return scheme + user + auth[at:] + path
+}
+
 // CanonicalHost is the form private_upstream_hosts is matched in: lower case,
 // and an IP literal in its shortest spelling so "FD00:0::5" and "fd00::5" name
 // one host.
@@ -1319,7 +1370,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		{"cargo_upstream", cfg.CargoUpstream, "https://index.crates.io"},
 		{"cargo_dl_upstream", cfg.CargoDLUpstream, "https://static.crates.io/crates"},
 	} {
-		if err := validateRootURL(u.key, u.val, u.def); err != nil {
+		if err := validateProxyUpstream(u.key, u.val, u.def); err != nil {
 			return nil, err
 		}
 	}
