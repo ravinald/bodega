@@ -648,6 +648,115 @@ func TestAptSourcesNAWithoutApt(t *testing.T) {
 	assertFinding(t, checkAptSources(public, "darwin"), StatusNA)
 }
 
+// debianSources is Debian 13's cloud-image debian.sources, whose URIs name
+// no host: apt reads the hosts from the mirror lists they point at.
+const debianSources = `Types: deb deb-src
+URIs: mirror+file:///etc/apt/mirrors/debian.list
+Suites: trixie trixie-updates trixie-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb deb-src
+URIs: mirror+file:///etc/apt/mirrors/debian-security.list
+Suites: trixie-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+`
+
+// ubuntuSources is Ubuntu 24.04's ubuntu.sources as the cloud image ships it.
+const ubuntuSources = `## See the sources.list(5) manual page for further settings.
+Types: deb
+URIs: http://us.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+`
+
+func TestAptSourcesReadsSourcesAsApt(t *testing.T) {
+	mirrors := map[string]string{
+		"/etc/apt/mirrors/debian.list":          "https://deb.debian.org/debian\n",
+		"/etc/apt/mirrors/debian-security.list": "# security archive\nhttps://security.debian.org/debian-security\tpriority:1\n",
+	}
+	tree := func(files map[string]string) string {
+		all := map[string]string{}
+		for k, v := range mirrors {
+			all[k] = v
+		}
+		for k, v := range files {
+			all[k] = v
+		}
+		return writeTree(t, all)
+	}
+
+	debian := tree(map[string]string{"/etc/apt/sources.list.d/debian.sources": debianSources})
+	assertFinding(t, checkAptSources(debian, "linux"), StatusWarn, "deb.debian.org", "/etc/apt/mirrors/debian.list", "debian.sources")
+
+	disabled := strings.ReplaceAll(debianSources, "Components: main\n", "Components: main\nEnabled: no\n")
+	assertFinding(t, checkAptSources(tree(map[string]string{"/etc/apt/sources.list.d/debian.sources": disabled}), "linux"), StatusOK)
+
+	security := tree(map[string]string{
+		"/etc/apt/sources.list.d/debian.sources": strings.Replace(debianSources, "Components: main\n", "Components: main\nEnabled: no\n", 1),
+	})
+	assertFinding(t, checkAptSources(security, "linux"), StatusWarn, "security.debian.org", "debian-security.list")
+
+	missing := writeTree(t, map[string]string{"/etc/apt/sources.list.d/debian.sources": debianSources})
+	skipped := checkAptSources(missing, "linux")
+	assertFinding(t, skipped, StatusSkip, "/etc/apt/mirrors/debian.list", "no such file")
+	if skipped.Remediation == "" {
+		t.Error("a SKIPPED apt-sources row carries no remediation")
+	}
+
+	oneLine := writeTree(t, map[string]string{
+		"/etc/apt/sources.list.d/security.list": "deb http://security.debian.org/debian-security trixie-security main\n",
+	})
+	assertFinding(t, checkAptSources(oneLine, "linux"), StatusWarn, "security.debian.org", "security.list")
+
+	oneLineMirror := tree(map[string]string{
+		"/etc/apt/sources.list": "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] mirror+file:/etc/apt/mirrors/debian.list trixie main\n",
+	})
+	assertFinding(t, checkAptSources(oneLineMirror, "linux"), StatusWarn, "deb.debian.org", "debian.list")
+
+	commented := writeTree(t, map[string]string{
+		"/etc/apt/sources.list": "# deb http://archive.ubuntu.com/ubuntu noble main\n" +
+			"deb [ arch=amd64 ] https://bodega.internal/apt/ubuntu noble main # was archive.ubuntu.com\n",
+		"/etc/apt/sources.list.d/ubuntu.sources": "# URIs: http://archive.ubuntu.com/ubuntu\nTypes: deb\nURIs: https://bodega.internal/apt/ubuntu\nSuites: noble\n",
+	})
+	assertFinding(t, checkAptSources(commented, "linux"), StatusOK)
+
+	ubuntu := writeTree(t, map[string]string{"/etc/apt/sources.list.d/ubuntu.sources": ubuntuSources})
+	assertFinding(t, checkAptSources(ubuntu, "linux"), StatusWarn, "archive.ubuntu.com", "ubuntu.sources")
+
+	off := writeTree(t, map[string]string{
+		"/etc/apt/sources.list.d/ubuntu.sources": strings.ReplaceAll(ubuntuSources, "Types: deb\n", "Types: deb\nEnabled: no\n"),
+	})
+	assertFinding(t, checkAptSources(off, "linux"), StatusOK)
+}
+
+func TestPublicHostMatchesHostNotSubstring(t *testing.T) {
+	markers := publicUpstreams["apt"]
+	for uri, want := range map[string]string{
+		"http://archive.ubuntu.com/ubuntu":            "archive.ubuntu.com",
+		"http://us.archive.ubuntu.com/ubuntu":         "archive.ubuntu.com",
+		"https://DEB.Debian.org./debian":              "deb.debian.org",
+		"https://security.debian.org/debian-security": "security.debian.org",
+		"http://notarchive.ubuntu.com.example/ubuntu": "",
+		"https://mirror.example/archive.ubuntu.com/":  "",
+		"https://bodega.internal/apt/deb.debian.org":  "",
+		"cdrom:[Debian GNU/Linux 13]/":                "",
+		"tor+https://deb.debian.org/debian":           "deb.debian.org",
+	} {
+		if got := publicHost(uri, markers); got != want {
+			t.Errorf("publicHost(%q) = %q, want %q", uri, got, want)
+		}
+	}
+}
+
 func TestChecksAgainstFixtureRootPerOS(t *testing.T) {
 	tree := map[string]string{
 		"/etc/apt/sources.list.d/ubuntu.sources": "URIs: http://archive.ubuntu.com/ubuntu\n",
