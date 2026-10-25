@@ -91,7 +91,7 @@ func TestMavenPathIdentity(t *testing.T) {
 		{"junit/junit/4.13.2/junit-4.13.2-sources.jar",
 			manifest.MavenPath{GroupID: "junit", ArtifactID: "junit", Version: "4.13.2", Classifier: "sources", Extension: "jar"}},
 		{"org/example/core/widget/maven-metadata.xml.md5",
-			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Companion: "md5", Metadata: true}},
+			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Companion: "md5", Metadata: true, GroupLevelID: "org.example.core.widget"}},
 		{"org/example/core/widget/1.3.0-SNAPSHOT/maven-metadata.xml",
 			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Version: "1.3.0-SNAPSHOT", Metadata: true}},
 		{"org/example/core/widget/1.3.0-SNAPSHOT/widget-1.3.0-20261001.120000-1.jar",
@@ -206,6 +206,12 @@ func TestMavenCachingClasses(t *testing.T) {
 
 func mavenDiscoveryRows(t *testing.T, s *Server) []audit.DiscoveryRow {
 	t.Helper()
+	return mavenDiscoveryRowsCounting(t, s, 3)
+}
+
+// mavenDiscoveryRowsCounting waits until the rows count at least want requests.
+func mavenDiscoveryRowsCounting(t *testing.T, s *Server, want int64) []audit.DiscoveryRow {
+	t.Helper()
 	var rows []audit.DiscoveryRow
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -218,7 +224,7 @@ func mavenDiscoveryRows(t *testing.T, s *Server) []audit.DiscoveryRow {
 		for _, r := range rows {
 			total += r.RequestCount
 		}
-		if total >= 3 {
+		if total >= want {
 			return rows
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -597,5 +603,162 @@ func TestMavenArtifactRefusedByAge(t *testing.T) {
 	defer mu.Unlock()
 	if strings.Join(seen, ",") != "HEAD /maven2/org/example/core/widget/1.2.0/widget-1.2.0.pom" {
 		t.Errorf("upstream saw %v, want the one HEAD of the POM and no fetch", seen)
+	}
+}
+
+// mavenPluginGroupMetadata is the groupId-level file Maven reads to resolve
+// the prefix in `mvn dependency:tree`.
+const mavenPluginGroupMetadata = `<metadata><plugins><plugin><name>Apache Maven Dependency Plugin</name>` +
+	`<prefix>dependency</prefix><artifactId>maven-dependency-plugin</artifactId></plugin></plugins></metadata>`
+
+const mavenPluginGroupPath = "org/apache/maven/plugins/maven-metadata.xml"
+
+func mavenPluginGroupServer(t *testing.T) (*Server, *recordingUpstream) {
+	t.Helper()
+	s, up := mavenServer(t)
+	up.route("/maven2/"+mavenPluginGroupPath, mavenPluginGroupMetadata)
+	up.route("/maven2/"+mavenPluginGroupPath+".sha1", "plugin group sha1")
+	up.route("/maven2/com/example/maven-metadata.xml", "<metadata><plugins/></metadata>")
+	return s, up
+}
+
+// A groupId-level maven-metadata.xml is admitted on its group-level reading,
+// which the artifact reading one directory up (org.apache.maven:plugins) would
+// never be.
+func TestMavenGroupLevelMetadataAllowList(t *testing.T) {
+	for _, rule := range []string{"org.apache.maven.plugins:*", "org.apache.maven.plugins:maven-dependency-plugin"} {
+		t.Run(rule, func(t *testing.T) {
+			s, up := mavenPluginGroupServer(t)
+			allowMaven(t, s, rule)
+			if code, body, _ := getMaven(t, s, mavenPluginGroupPath); code != http.StatusOK || body != mavenPluginGroupMetadata {
+				t.Errorf("plugin group metadata under %s = %d %q, want the upstream document", rule, code, body)
+			}
+			if code, body, _ := getMaven(t, s, mavenPluginGroupPath+".sha1"); code != http.StatusOK || body != "plugin group sha1" {
+				t.Errorf("its .sha1 under %s = %d %q, want 200", rule, code, body)
+			}
+
+			code, body, h := getMaven(t, s, "com/example/maven-metadata.xml")
+			if code != http.StatusForbidden {
+				t.Fatalf("unrelated metadata = %d %q, want the allow-list's 403", code, body)
+			}
+			refusalIncident(t, h, checkAllowList)
+			for _, want := range []string{"com/example/maven-metadata.xml", "com:example", "com.example", "bodega policy add maven com.example:*"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("refusal %q does not name %q", body, want)
+				}
+			}
+			if n := upstreamSaw(up, "/com/example/maven-metadata.xml"); n != 0 {
+				t.Errorf("upstream saw the refused metadata %d times", n)
+			}
+		})
+	}
+}
+
+// Metadata is recorded under the reading that names something real: the
+// plugin group under <groupId>:*, never under the artifact one directory up,
+// and a real artifact's metadata on that artifact's own row, never under a
+// groupId made of its directories.
+func TestMavenGroupLevelMetadataDiscoveryRow(t *testing.T) {
+	s, _ := mavenPluginGroupServer(t)
+	for _, p := range []string{mavenPluginGroupPath, mavenPluginGroupPath + ".sha1",
+		"org/example/core/widget/1.2.0/widget-1.2.0.pom", "org/example/core/widget/1.2.0/widget-1.2.0.jar",
+		"org/example/core/widget/maven-metadata.xml"} {
+		if code, body, _ := getMaven(t, s, p); code != http.StatusOK {
+			t.Fatalf("GET /maven/%s = %d %q", p, code, body)
+		}
+	}
+	rows := mavenDiscoveryRowsCounting(t, s, 5)
+	var widget int64
+	for _, r := range rows {
+		switch r.PkgName {
+		case "org.apache.maven:plugins", "org.example.core.widget:*":
+			t.Errorf("discovery recorded a reading nothing depends on: %+v", r)
+		case "org.apache.maven.plugins:*":
+			if r.PatternHint != "org.apache.maven.plugins:*" || r.RequestCount != 2 {
+				t.Errorf("group row = %+v, want org.apache.maven.plugins:* hinted as itself, counted twice", r)
+			}
+		case mavenWidgetName:
+			if r.PatternHint != mavenWidgetName {
+				t.Errorf("artifact row = %+v, want hinted as %s", r, mavenWidgetName)
+			}
+			widget += r.RequestCount
+		default:
+			t.Errorf("unexpected discovery row %+v", r)
+		}
+	}
+	if widget != 3 {
+		t.Errorf("%s rows count %d requests, want the pom, the jar and the metadata: %+v", mavenWidgetName, widget, rows)
+	}
+
+	// A restarted process has seen no jar request, and the table answers.
+	s.mavenArtifacts = mavenArtifactSet{}
+	if code, body, _ := getMaven(t, s, "org/example/core/widget/maven-metadata.xml"); code != http.StatusOK {
+		t.Fatalf("metadata after restart = %d %q", code, body)
+	}
+	for _, r := range mavenDiscoveryRowsCounting(t, s, 6) {
+		if r.PkgName == "org.example.core.widget:*" {
+			t.Errorf("metadata after restart recorded under the group reading: %+v", r)
+		}
+	}
+}
+
+// Under listed mode the artifact reading is the one a rule admits, so the
+// metadata row names it and says allowed; the group reading matched no rule.
+func TestMavenArtifactMetadataRowUnderListedMode(t *testing.T) {
+	s, _ := mavenServer(t)
+	allowMaven(t, s, mavenWidgetName)
+	for _, p := range []string{"org/example/core/widget/maven-metadata.xml",
+		"org/example/core/widget/maven-metadata.xml.sha1", "org/example/core/widget/1.2.0/widget-1.2.0.pom"} {
+		if code, body, _ := getMaven(t, s, p); code != http.StatusOK {
+			t.Fatalf("GET /maven/%s = %d %q", p, code, body)
+		}
+	}
+	for _, r := range mavenDiscoveryRows(t, s) {
+		if r.PkgName != mavenWidgetName || r.Decision != audit.DecisionAllowed {
+			t.Errorf("row = %+v, want %s allowed", r, mavenWidgetName)
+		}
+	}
+}
+
+// A refused metadata path whose artifact a jar request named is refused,
+// recorded and queued under that artifact, so approving it adds the rule that
+// admits the jar too. With no such request it falls to the group reading.
+func TestMavenMetadataRefusalNamesKnownArtifact(t *testing.T) {
+	s, _ := mavenPluginGroupServer(t)
+	allowMaven(t, s, "org.example:*")
+	if code, _, _ := getMaven(t, s, "org/other/thing/1.0/thing-1.0.jar"); code != http.StatusForbidden {
+		t.Fatalf("unlisted jar = %d, want 403", code)
+	}
+	code, body, _ := getMaven(t, s, "org/other/thing/maven-metadata.xml")
+	if code != http.StatusForbidden {
+		t.Fatalf("unlisted metadata = %d %q, want 403", code, body)
+	}
+	for _, want := range []string{"maven/org.other:thing", "org.other.thing"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("refusal %q does not name %q", body, want)
+		}
+	}
+	if code, _, _ := getMaven(t, s, "com/example/maven-metadata.xml"); code != http.StatusForbidden {
+		t.Fatalf("unrelated metadata = %d, want 403", code)
+	}
+
+	queued, err := s.auditDB.ListQueue(t.Context(), audit.QueueFilter{State: audit.QueueOpen})
+	if err != nil {
+		t.Fatalf("ListQueue: %v", err)
+	}
+	patterns := map[string]bool{}
+	for _, q := range queued {
+		if q.PkgName != q.Pattern {
+			t.Errorf("queue row %+v names %s but proposes %s", q, q.PkgName, q.Pattern)
+		}
+		patterns[q.Pattern] = true
+	}
+	if !patterns["org.other:thing"] || !patterns["com.example:*"] || patterns["org.other.thing:*"] || len(patterns) != 2 {
+		t.Errorf("queued patterns = %v, want org.other:thing and com.example:*", patterns)
+	}
+	for _, r := range mavenDiscoveryRowsCounting(t, s, 3) {
+		if r.PkgName == "org.other.thing:*" || r.PkgName == "com:example" {
+			t.Errorf("discovery recorded a reading nothing depends on: %+v", r)
+		}
 	}
 }

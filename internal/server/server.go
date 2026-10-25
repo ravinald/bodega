@@ -106,6 +106,10 @@ type Server struct {
 	// from upstream, so a second request for one serves the copy rather than
 	// starting a second fetch. See claimStaleRefresh.
 	staleRefreshes sync.Map
+	// mavenArtifacts names the Maven artifacts a version's own file was asked
+	// for, which is what tells mavenMetadataGate a metadata path's artifact
+	// reading is a real artifact. See mavenArtifactKnown.
+	mavenArtifacts mavenArtifactSet
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
