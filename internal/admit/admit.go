@@ -397,6 +397,19 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 			return err
 		}
 	}
+	// The fetch and the route both read the repository layout off the name,
+	// version and classifiers, so an entry no path can carry would be stored
+	// and then never fetched or served.
+	if pm.Type == manifest.TypeMaven {
+		if err := manifest.ValidateMavenName(pm.Name); err != nil {
+			return err
+		}
+		for _, ve := range pm.Versions {
+			if err := manifest.ValidateMavenVersion(pm.Name, ve); err != nil {
+				return err
+			}
+		}
+	}
 	if err := manifest.ValidateBinaryFilenames(pm); err != nil {
 		return err
 	}

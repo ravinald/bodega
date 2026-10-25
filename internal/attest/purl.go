@@ -8,10 +8,11 @@ import (
 )
 
 // PURL returns the package URL a subject is named by. objectKey only matters
-// for pypi, where one release is several files and the purl spec's file_name
-// qualifier says which one this digest is over.
+// for pypi and maven, where one release is several files: pypi's file_name
+// qualifier and maven's classifier and type say which one this digest is over.
 //
-// Ecosystems with a registered purl type use it, rubygems as pkg:gem. The rest (apt, binary, git,
+// Ecosystems with a registered purl type use it, rubygems as pkg:gem and
+// maven as pkg:maven/<groupId>/<artifactId>. The rest (apt, binary, git,
 // helm, freebsd, distfiles) are named pkg:generic/<bodega type>/<name>: a deb
 // purl needs the distribution vendor as its namespace, which a bodega apt
 // entry does not record, and a guessed vendor would name a package somebody
@@ -39,6 +40,12 @@ func PURL(typ, name, version, objectKey string) string {
 		b.WriteString("cargo/" + purlEscape(name))
 	case manifest.TypeRubygems:
 		b.WriteString("gem/" + purlEscape(name))
+	case manifest.TypeMaven:
+		if group, artifact, ok := strings.Cut(name, ":"); ok {
+			b.WriteString("maven/" + purlEscape(group) + "/" + purlEscape(artifact))
+		} else {
+			b.WriteString("maven/" + purlEscape(name))
+		}
 	default:
 		b.WriteString("generic/" + purlEscape(typ) + "/" + purlEscape(name))
 	}
@@ -56,6 +63,9 @@ func PURL(typ, name, version, objectKey string) string {
 	}
 	if typ == manifest.TypePypi && strings.HasPrefix(objectKey, manifest.PypiWheelPrefix) {
 		b.WriteString("?file_name=" + purlEscape(path.Base(objectKey)))
+	}
+	if typ == manifest.TypeMaven {
+		b.WriteString(mavenQualifiers(objectKey))
 	}
 	return b.String()
 }
@@ -88,4 +98,30 @@ func purlEscape(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// mavenQualifiers names which file of a version objectKey is, in the
+// qualifiers' sorted order. The maven purl type's type defaults to jar, so a
+// jar without a classifier, the file most versions are known by, carries
+// none.
+func mavenQualifiers(objectKey string) string {
+	rel, ok := strings.CutPrefix(objectKey, manifest.MavenKey(""))
+	if !ok {
+		return ""
+	}
+	mp, ok := manifest.ParseMavenPath(rel)
+	if !ok || mp.Metadata {
+		return ""
+	}
+	var q []string
+	if mp.Classifier != "" {
+		q = append(q, "classifier="+purlEscape(mp.Classifier))
+	}
+	if mp.Extension != "jar" {
+		q = append(q, "type="+purlEscape(mp.Extension))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "?" + strings.Join(q, "&")
 }

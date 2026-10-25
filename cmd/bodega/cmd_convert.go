@@ -57,6 +57,7 @@ Sources per type:
   gomod   go list -m all   |   go version -m <binary>
   cargo   cargo install --list
   rubygems gem list --local   |   ls $(gem environment gemdir)/specifications
+  maven   find ~/.m2/repository -name '*.pom'
   helm    helm list -o json
   freebsd pkg query '%R\t%q'
 

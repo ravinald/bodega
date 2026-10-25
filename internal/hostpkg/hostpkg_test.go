@@ -639,3 +639,66 @@ func TestParseFreeBSDReportsWhatItSkips(t *testing.T) {
 		t.Error("a line with no tab parsed; a capture taken with the wrong format would import nothing and say nothing")
 	}
 }
+
+// The capture is every POM a fresh Maven 3.9.9 left in its local repository
+// after one dependency:list: the project's own dependencies and the plugins
+// Maven itself resolved to run it, three versions of slf4j-api among them.
+func TestParseMavenLocalRepository(t *testing.T) {
+	res, err := ParseMaven(fixture(t, "maven-m2-poms-maven399.txt"))
+	if err != nil {
+		t.Fatalf("ParseMaven: %v", err)
+	}
+	got := map[string][]string{}
+	versions := 0
+	for _, pm := range res.Packages {
+		if pm.Type != manifest.TypeMaven {
+			t.Errorf("%s typed %q", pm.Name, pm.Type)
+		}
+		for _, ve := range pm.Versions {
+			got[pm.Name] = append(got[pm.Name], ve.Version)
+			versions++
+			if ve.Mode != manifest.ModeProxy {
+				t.Errorf("%s@%s mode %q, want proxy like every registry import", pm.Name, ve.Version, ve.Mode)
+			}
+		}
+	}
+	if len(res.Packages) != 163 || versions != 260 {
+		t.Errorf("imported %d artifacts with %d versions, want the 163 and 260 the capture lists", len(res.Packages), versions)
+	}
+	if v := got["org.slf4j:slf4j-api"]; len(v) != 3 || !slices.Contains(v, "2.0.13") || !slices.Contains(v, "1.7.5") {
+		t.Errorf("slf4j-api = %v, want all three versions on one package", v)
+	}
+	if v := got["io.netty:netty-transport-native-epoll"]; len(v) != 1 || v[0] != "4.1.110.Final" {
+		t.Errorf("netty-transport-native-epoll = %v, want the one version whose classified jar the build resolved", v)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none for a clean capture", res.Warnings)
+	}
+}
+
+func TestParseMavenReportsWhatItCannotRead(t *testing.T) {
+	in := strings.Join([]string{
+		"/home/ci/.m2/repository/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.pom",
+		`C:\Users\ci\.m2\repository\com\google\guava\guava\33.2.0-jre\guava-33.2.0-jre.pom`,
+		"org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.pom",
+		"/home/ci/.m2/repository/com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.pom",
+		"/home/ci/.m2/repository/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar",
+		"/home/ci/.m2/repository/org/slf4j/slf4j-api/maven-metadata-central.xml",
+		"",
+	}, "\n")
+	res, err := ParseMaven(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, pm := range res.Packages {
+		names = append(names, pm.Name+"@"+pm.Versions[0].Version)
+	}
+	want := "com.google.guava:guava@33.2.0-jre,org.apache.commons:commons-lang3@3.14.0,org.slf4j:slf4j-api@2.0.13"
+	if strings.Join(names, ",") != want {
+		t.Errorf("packages = %v, want %s", names, want)
+	}
+	if len(res.Warnings) != 2 || !strings.Contains(res.Warnings[0], "1 SNAPSHOT") || !strings.Contains(res.Warnings[1], "skipped 2 line(s)") {
+		t.Errorf("warnings = %v, want the SNAPSHOT and the two non-POM lines counted", res.Warnings)
+	}
+}

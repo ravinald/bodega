@@ -9,14 +9,17 @@ import (
 
 func TestDetect(t *testing.T) {
 	for path, want := range map[string]Format{
-		"web/package-lock.json":    NpmLock,
-		"npm-shrinkwrap.json":      NpmLock,
-		"requirements.txt":         Requirements,
-		"deps/requirements-ci.txt": Requirements,
-		"go.sum":                   GoSum,
-		"Cargo.lock":               CargoLock,
-		"app/Gemfile.lock":         GemfileLock,
-		"gems.locked":              GemfileLock,
+		"web/package-lock.json":       NpmLock,
+		"npm-shrinkwrap.json":         NpmLock,
+		"requirements.txt":            Requirements,
+		"deps/requirements-ci.txt":    Requirements,
+		"go.sum":                      GoSum,
+		"Cargo.lock":                  CargoLock,
+		"app/Gemfile.lock":            GemfileLock,
+		"gems.locked":                 GemfileLock,
+		"app/gradle.lockfile":         GradleLock,
+		"buildscript-gradle.lockfile": GradleLock,
+		"gradle/dependency-locks/compileClasspath.lockfile": GradleLock,
 	} {
 		got, err := Detect(path)
 		if err != nil || got != want {
@@ -315,5 +318,134 @@ CHECKSUMS
 
 	if _, err := Parse(GemfileLock, []byte("CHECKSUMS\n  rack 3.1.8 sha256=ab\n")); err == nil || !strings.Contains(err.Error(), "line 2") {
 		t.Errorf("a malformed CHECKSUMS line = %v; want an error naming its line", err)
+	}
+}
+
+func readFixture(t *testing.T, format Format, name string) []Entry {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Parse(format, data)
+	if err != nil {
+		t.Fatalf("Parse(%s): %v", name, err)
+	}
+	return got
+}
+
+// gradle.lockfile is what Gradle 8.10.2 wrote for a java project locking all
+// configurations (spring-boot-dependencies as a platform, slf4j-api,
+// caffeine, h2, junit-jupiter-api): one line per resolved module, the
+// configurations after "=", and an "empty=" line naming the configurations
+// that resolved nothing.
+func TestParseGradleLock(t *testing.T) {
+	got := readFixture(t, GradleLock, "gradle.lockfile")
+	if len(got) != 11 {
+		t.Fatalf("got %d entries %+v; want the eleven module lines and neither the comments nor empty=", len(got), got)
+	}
+	first, last := got[0], got[len(got)-1]
+	if first.Type != "maven" || first.Name != "com.github.ben-manes.caffeine:caffeine" || first.Version != "3.1.8" || first.Line != 4 {
+		t.Errorf("first = %+v; want com.github.ben-manes.caffeine:caffeine@3.1.8 from line 4", first)
+	}
+	if last.Name != "org.springframework.boot:spring-boot-dependencies" || last.Version != "3.3.0" || last.Line != 14 {
+		t.Errorf("last = %+v; want the platform BOM at 3.3.0 from line 14", last)
+	}
+	for _, e := range got {
+		if e.Unsupported != "" || len(e.Digests) != 0 || len(e.Classifiers) != 0 {
+			t.Errorf("%s@%s = %+v; gradle.lockfile records neither digests nor classifiers", e.Name, e.Version, e)
+		}
+	}
+
+	snap, err := Parse(GradleLock, []byte("com.example:lib:1.0-SNAPSHOT=runtimeClasspath\n"))
+	if err != nil || len(snap) != 1 || !strings.Contains(snap[0].Unsupported, "SNAPSHOT") {
+		t.Errorf("SNAPSHOT = %+v, %v; want it reported unsupported", snap, err)
+	}
+
+	for _, tc := range []struct{ body, want string }{
+		{"# header\norg.slf4j:slf4j-api=compileClasspath\n", "line 2 of gradle.lockfile"},
+		{"org.slf4j:slf4j-api:2.0.13:extra=compileClasspath\n", "line 1 of gradle.lockfile"},
+		{"\n\norg/slf4j:slf4j-api:2.0.13=compileClasspath\n", "line 3 of gradle.lockfile"},
+		{"org.slf4j:*:2.0.13=compileClasspath\n", "line 1 of gradle.lockfile"},
+	} {
+		if _, err := Parse(GradleLock, []byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Parse(%q) = %v; want a refusal naming %q", tc.body, err, tc.want)
+		}
+	}
+}
+
+// dependency-list.txt is what 'mvn -q dependency:list -DoutputFile' wrote
+// under Maven 3.9.9 and maven-dependency-plugin 3.7.0 for a project
+// importing spring-boot-dependencies: the module suffix, an optional
+// dependency, a classifier, and the test scope.
+func TestParseMavenDependencyList(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "dependency-list.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, ok := Sniff(data); !ok || f != MavenDependencyList {
+		t.Errorf("Sniff = %q, %v; want the header line to name dependency-list", f, ok)
+	}
+	got := readFixture(t, MavenDependencyList, "dependency-list.txt")
+	if len(got) != 13 {
+		t.Fatalf("got %d entries %+v; want the thirteen resolved coordinates", len(got), got)
+	}
+	byName := map[string]Entry{}
+	for _, e := range got {
+		if e.Type != "maven" || e.Unsupported != "" {
+			t.Errorf("%s@%s = %+v; want a supported maven entry", e.Name, e.Version, e)
+		}
+		byName[e.Name] = e
+	}
+	for name, want := range map[string]struct {
+		version     string
+		line        int
+		classifiers string
+	}{
+		"org.slf4j:slf4j-api":                   {"2.0.13", 3, ""},
+		"com.h2database:h2":                     {"2.2.224", 4, ""},
+		"io.netty:netty-transport-native-epoll": {"4.1.110.Final", 5, "linux-x86_64"},
+		"org.apiguardian:apiguardian-api":       {"1.1.2", 15, ""},
+	} {
+		e := byName[name]
+		if e.Version != want.version || e.Line != want.line || strings.Join(e.Classifiers, ",") != want.classifiers {
+			t.Errorf("%s = %+v; want %s from line %d with classifiers %q", name, e, want.version, want.line, want.classifiers)
+		}
+	}
+
+	// The shapes the capture does not show: a second module's list after a
+	// blank line, a test-jar, a classified aar, an import-scoped BOM, a
+	// module with no dependencies, and a coordinate both lists name.
+	multi := "\nThe following files have been resolved:\n   com.example:model:test-jar:tests:3.3.0:test\n" +
+		"   org.springframework.boot:spring-boot-dependencies:pom:3.3.0:import\n\n" +
+		"The following files have been resolved:\n   com.example:native-libs:aar:arm64:2.0:runtime\n" +
+		"   com.example:model:test-jar:tests:3.3.0:test\n\nThe following files have been resolved:\n   none\n"
+	got, err = Parse(MavenDependencyList, []byte(multi))
+	if err != nil || len(got) != 3 {
+		t.Fatalf("multi-module = %+v, %v; want three distinct coordinates", got, err)
+	}
+	if got[0].Name != "com.example:model" || strings.Join(got[0].Classifiers, ",") != "tests" ||
+		got[1].Name != "org.springframework.boot:spring-boot-dependencies" || len(got[1].Classifiers) != 0 ||
+		got[2].Name != "com.example:native-libs" || strings.Join(got[2].Classifiers, ",") != "arm64@aar" || got[2].Line != 7 {
+		t.Errorf("multi-module = %+v; want the test-jar as tests, the BOM unclassified, and the aar as arm64@aar from line 7", got)
+	}
+
+	console := "[INFO] --- dependency:3.6.1:list (default-cli) @ app ---\n[INFO] \n[INFO] The following files have been resolved:\n" +
+		"[INFO]    org.slf4j:slf4j-api:jar:2.0.13:compile:/home/ci/.m2/repository/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar\n" +
+		"[INFO]    com.example:lib:jar:1.0\n[INFO] \n[INFO] BUILD SUCCESS\n"
+	if got, err := Parse(MavenDependencyList, []byte(console)); err != nil || len(got) != 2 ||
+		got[0].Name != "org.slf4j:slf4j-api" || got[0].Version != "2.0.13" || got[1].Version != "1.0" {
+		t.Errorf("console copy = %+v, %v; want slf4j-api 2.0.13 past its file name and lib 1.0 with no scope", got, err)
+	}
+
+	for _, tc := range []struct{ body, want string }{
+		{"\nThe following files have been resolved:\n   org.slf4j:slf4j-api:2.0.13\n", "line 3 of the dependency:list output"},
+		{"\nThe following files have been resolved:\n   ok:fine:jar:1.0:compile\n   a:b:c:d:e:f:g:h\n", "line 4 of the dependency:list output"},
+		{"\nThe following files have been resolved:\n   org/x:y:jar:1.0:compile\n", "line 3 of the dependency:list output"},
+		{"[INFO] BUILD SUCCESS\n", "has no \"The following files have been resolved:\" line"},
+	} {
+		if _, err := Parse(MavenDependencyList, []byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Parse(%q) = %v; want a refusal naming %q", tc.body, err, tc.want)
+		}
 	}
 }

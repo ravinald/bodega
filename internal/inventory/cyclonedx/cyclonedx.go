@@ -163,6 +163,13 @@ func toComponent(c component) inventory.Component {
 			!strings.HasSuffix(out.Version, "-"+p) {
 			out.Version += "-" + p
 		}
+		// A maven component's name is its artifactId alone, which names
+		// nothing in a catalog keyed by <groupId>:<artifactId>.
+		if out.Ecosystem == manifest.TypeMaven {
+			if coord, ok := mavenPURLName(c.PURL); ok {
+				out.Name = coord
+			}
+		}
 	}
 	if out.Origin == "" {
 		for _, ref := range c.ExternalReferences {
@@ -187,6 +194,7 @@ var purlEcosystems = map[string]string{
 	"npm":     manifest.TypeNpm,
 	"cargo":   manifest.TypeCargo,
 	"gem":     manifest.TypeRubygems,
+	"maven":   manifest.TypeMaven,
 	"golang":  manifest.TypeGomod,
 	"helm":    manifest.TypeHelm,
 	"freebsd": manifest.TypeFreeBSD,
@@ -235,4 +243,26 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// mavenPURLName reads pkg:maven/<groupId>/<artifactId>@... into the
+// <groupId>:<artifactId> bodega catalogs it under.
+func mavenPURLName(p string) (string, bool) {
+	rest, ok := strings.CutPrefix(p, "pkg:")
+	if !ok {
+		return "", false
+	}
+	if i := strings.IndexAny(rest, "@?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	segs := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(segs) != 3 || !strings.EqualFold(segs[0], "maven") {
+		return "", false
+	}
+	group, err1 := url.PathUnescape(segs[1])
+	artifact, err2 := url.PathUnescape(segs[2])
+	if err1 != nil || err2 != nil || group == "" || artifact == "" {
+		return "", false
+	}
+	return group + ":" + artifact, true
 }

@@ -96,6 +96,11 @@ Formats, detected from the file name or named with --format:
   gemfile.lock   Gemfile.lock or gems.locked: every GEM spec from rubygems.org,
                  its platform kept on the version, checked against CHECKSUMS
                  when Bundler 2.5 or later wrote one
+  gradle.lockfile  gradle.lockfile, buildscript-gradle.lockfile, or a
+                 dependency-locks/*.lockfile: every <group>:<artifact>:<version>
+  dependency-list  what 'mvn dependency:list -DoutputFile=<file>' writes,
+                 recognized by its "The following files have been resolved:"
+                 line whatever the file is named; classifiers kept
 
 The digest the lockfile records is compared with the one bodega pinned. A
 sha256 in the lockfile is compared with the pin itself; any other algorithm
@@ -137,7 +142,7 @@ record, and writes nothing: no manifest, no admission row, no fetch.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&format, "format", "", "Lockfile format for every file named: package-lock, requirements, go.sum, cargo.lock, gemfile.lock")
+	cmd.Flags().StringVar(&format, "format", "", "Lockfile format for every file named: package-lock, requirements, go.sum, cargo.lock, gemfile.lock, gradle.lockfile, dependency-list")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Evaluate and compare without fetching or writing anything")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Print the results as a JSON array")
 	return cmd
@@ -156,13 +161,13 @@ func runPrefetch(ctx context.Context, gf *globalFlags, paths []string, format st
 	}
 	var files []parsed
 	for _, path := range paths {
-		f, err := prefetchFormat(path, format)
-		if err != nil {
-			return 0, err
-		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return 0, fmt.Errorf("read %s: %w", path, err)
+		}
+		f, err := prefetchFormat(path, format, data)
+		if err != nil {
+			return 0, err
 		}
 		entries, err := lockfile.Parse(f, data)
 		if err != nil {
@@ -251,11 +256,17 @@ func runPrefetch(ctx context.Context, gf *globalFlags, paths []string, format st
 	return prefetchExit(results)
 }
 
-func prefetchFormat(path, flag string) (lockfile.Format, error) {
+func prefetchFormat(path, flag string, data []byte) (lockfile.Format, error) {
 	if flag != "" {
 		return lockfile.ParseFormat(flag)
 	}
-	return lockfile.Detect(path)
+	f, err := lockfile.Detect(path)
+	if err != nil {
+		if sniffed, ok := lockfile.Sniff(data); ok {
+			return sniffed, nil
+		}
+	}
+	return f, err
 }
 
 // prefetchManifest is the single-version manifest an entry becomes. npm and
@@ -264,7 +275,7 @@ func prefetchFormat(path, flag string) (lockfile.Format, error) {
 // themselves, and pypi resolves through the index the store's pypi entries
 // name.
 func prefetchManifest(cfg *config.Config, e lockfile.Entry) *manifest.PackageManifest {
-	ve := manifest.VersionEntry{Version: e.Version, Mode: manifest.ModeProxy}
+	ve := manifest.VersionEntry{Version: e.Version, Mode: manifest.ModeProxy, Classifiers: e.Classifiers}
 	switch e.Type {
 	case manifest.TypeNpm:
 		ve.URL = strings.TrimRight(cfg.NpmUpstream, "/")
@@ -314,6 +325,7 @@ func admitPrefetched(ctx context.Context, cfg *config.Config, checker *policy.Ch
 		return
 	}
 	if existing != nil && slices.ContainsFunc(existing.Versions, func(ve manifest.VersionEntry) bool { return ve.Version == pm.Versions[0].Version }) {
+		foldClassifiers(ctx, store, existing, pm.Versions[0], r)
 		return
 	}
 	dated := admit.Result{}
@@ -341,6 +353,36 @@ func admitPrefetched(ctx context.Context, cfg *config.Config, checker *policy.Ch
 		Actor: audit.CurrentActor(), Status: "success", Details: audit.FormatDiff(nil, afterJSON)})
 }
 
+// foldClassifiers adds the classifiers a lockfile names to the maven version
+// the store already holds, so a dependency:list resolving a version's
+// sources jar after its main jar was cataloged fetches the sources too. The
+// merge alone skips a held version and would drop them.
+func foldClassifiers(ctx context.Context, store *manifest.Store, existing *manifest.PackageManifest, ve manifest.VersionEntry, r *prefetchResult) {
+	if existing.Type != manifest.TypeMaven || len(ve.Classifiers) == 0 {
+		return
+	}
+	for i := range existing.Versions {
+		held := &existing.Versions[i]
+		if held.Version != ve.Version {
+			continue
+		}
+		added := false
+		for _, c := range ve.Classifiers {
+			if !slices.Contains(held.Classifiers, c) {
+				held.Classifiers = append(held.Classifiers, c)
+				added = true
+			}
+		}
+		if !added {
+			return
+		}
+		if err := store.SavePackage(ctx, existing); err != nil {
+			r.Decision, r.Reason = prefetchError, fmt.Sprintf("save %s/%s: %v", existing.Type, existing.Name, err)
+		}
+		return
+	}
+}
+
 // fetchPrefetched runs the builder's own fetch for every admitted package, so
 // the digest is pinned by the code that pins it for every other fetch. pypi
 // resolves its closure across the whole type, so it runs once.
@@ -350,6 +392,7 @@ func fetchPrefetched(bcfg *builder.Config, store *manifest.Store, results []*pre
 		manifest.TypeGomod:    builder.FetchGomod,
 		manifest.TypeCargo:    builder.FetchCargo,
 		manifest.TypeRubygems: builder.FetchRubygems,
+		manifest.TypeMaven:    builder.FetchMaven,
 	}
 	failed := map[string]string{}
 	done := map[string]bool{}
