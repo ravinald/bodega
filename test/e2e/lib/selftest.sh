@@ -17,6 +17,8 @@ E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$E2E_DIR/lib/remote.sh"
 # shellcheck source=report.sh
 . "$E2E_DIR/lib/report.sh"
+# shellcheck source=bodega.sh
+. "$E2E_DIR/lib/bodega.sh"
 
 fails=0
 cases=0
@@ -788,6 +790,45 @@ t_ok "issue filing dry-run names each failure" yes \
 	"$(case "$dryrun" in *'would file: [SELF-02]'*) echo yes ;; *) echo no ;; esac)"
 t_ok "issue filing dry-run skips mapped failures" yes \
 	"$(case "$dryrun" in *SELF-20*) echo no ;; *) echo yes ;; esac)"
+
+# ---- mirrored apt stanzas -------------------------------------------------
+#
+# SHIP-APT-01 and -02 build their expectation from these two helpers, so a
+# grouping that disagreed with mirroredStanzas would fail a server serving
+# correctly, or pass one that is not.
+
+# stanza_lines <apt_upstreams JSON> — the Suites:/Components: pairs the banner
+# should print, one pair per line.
+stanza_lines() {
+	e2e_apt_mirror_groups "$1" | while IFS=$'\t' read -r suites comps; do
+		printf 'Suites: %s / Components: %s\n' "$suites" "$comps"
+	done
+}
+ubuntu='{"resolute-updates":[{"url":"u"}],"resolute":[{"url":"u"}],"resolute-security":[{"url":"u"}],"resolute-backports":[{"url":"u"}]}'
+t_ok "mirror groups: four Ubuntu codenames are one stanza" \
+	"Suites: resolute resolute-backports resolute-security resolute-updates / Components: main restricted universe multiverse" \
+	"$(stanza_lines "$ubuntu")"
+debian='{"trixie-updates":[{"url":"d","components":["main","contrib","non-free","non-free-firmware"]}],
+	"trixie":[{"url":"d","components":["main","contrib","non-free","non-free-firmware"]}],
+	"trixie-security":[{"url":"s","components":["main","contrib","non-free","non-free-firmware"]}]}'
+both="$(jq -cn --argjson a "$ubuntu" --argjson b "$debian" '$b + $a')"
+t_ok "mirror groups: Ubuntu beside trixie is two stanzas" \
+	"Suites: resolute resolute-backports resolute-security resolute-updates / Components: main restricted universe multiverse
+Suites: trixie trixie-security trixie-updates / Components: main contrib non-free non-free-firmware" \
+	"$(stanza_lines "$both")"
+t_ok "mirror groups: an empty component name takes the default" \
+	"Suites: noble resolute / Components: main restricted universe multiverse" \
+	"$(stanza_lines '{"resolute":[{"url":"u","components":[""]}],"noble":[{"url":"u"}]}')"
+
+banner='Oct 24 bodega[1]: bodega.sources
+Oct 24 bodega[1]: Suites: resolute resolute-backports resolute-security resolute-updates trixie
+Oct 24 bodega[1]: Components: main
+Oct 24 bodega[1]: Suites: trixie trixie-security trixie-updates
+Oct 24 bodega[1]: Components: main contrib non-free non-free-firmware'
+t_ok "stanza components: read under a journal prefix" "main contrib non-free non-free-firmware" \
+	"$(e2e_apt_stanza_components "$banner" "trixie trixie-security trixie-updates")"
+t_ok "stanza components: a Suites: line naming one more codename is not this stanza" 1 \
+	"$(e2e_apt_stanza_components "$banner" "resolute resolute-backports resolute-security resolute-updates" >/dev/null && echo 0 || echo 1)"
 
 # ---- verdict ---------------------------------------------------------------
 
