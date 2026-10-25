@@ -41,10 +41,24 @@ type MavenPath struct {
 	Extension  string // empty for metadata
 	Companion  string // empty for the file itself
 	Metadata   bool
+	// GroupLevelID is the second reading of a maven-metadata.xml outside a
+	// SNAPSHOT version: every directory as the groupId, which is the file
+	// Maven reads to resolve a plugin prefix. The path cannot tell the two
+	// readings apart, so a request names both. Empty for every other path.
+	GroupLevelID string
 }
 
 // Name is the package identity bodega records: <groupId>:<artifactId>.
 func (p MavenPath) Name() string { return p.GroupID + ":" + p.ArtifactID }
+
+// GroupLevelName is the group-level reading as an entry names it,
+// <GroupLevelID>:*, and empty when the path has no such reading.
+func (p MavenPath) GroupLevelName() string {
+	if p.GroupLevelID == "" {
+		return ""
+	}
+	return p.GroupLevelID + ":" + MavenGroupWildcard
+}
 
 // Snapshot reports whether the path sits under a -SNAPSHOT version, whose
 // files are redeployed under the same name.
@@ -57,7 +71,7 @@ func (p MavenPath) Immutable() bool { return !p.Metadata && !p.Snapshot() }
 
 // ParseMavenPath reads a path relative to a repository root. It accepts
 //
-//	<group dirs>/<artifactId>/maven-metadata.xml[.<companion>]
+//	<group dirs>/<artifactId>/maven-metadata.xml[.<companion>]  (or <group dirs>/maven-metadata.xml)
 //	<group dirs>/<artifactId>/<version>-SNAPSHOT/maven-metadata.xml[.<companion>]
 //	<group dirs>/<artifactId>/<version>/<artifactId>-<version>[-<classifier>].<ext>[.<companion>]
 //
@@ -92,6 +106,9 @@ func ParseMavenPath(p string) (MavenPath, bool) {
 		}
 		out.ArtifactID = dirs[len(dirs)-1]
 		out.GroupID = strings.Join(dirs[:len(dirs)-1], ".")
+		if out.Version == "" {
+			out.GroupLevelID = strings.Join(dirs, ".")
+		}
 		return out, true
 	}
 
