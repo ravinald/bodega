@@ -34,6 +34,7 @@ import (
 // evil-pkg 1.0.0 in an advisory and a malware record.
 type prefetchFixture struct {
 	dir, adbPath, manifests string
+	upstream                string
 	tarball, modZip         []byte
 	h1                      string
 }
@@ -55,8 +56,14 @@ func newPrefetchFixture(t *testing.T, osvAction string) *prefetchFixture {
 		_, _ = w.Write([]byte("module example.com/mod\n"))
 	})
 	mux.HandleFunc("/example.com/mod/@v/v1.0.0.zip", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(f.modZip) })
-	stub := httptest.NewServer(mux)
+	// Load holds npm_upstream and gomod_upstream to https, so the stub is a
+	// TLS server and the default transport trusts it for the test.
+	stub := httptest.NewTLSServer(mux)
 	t.Cleanup(stub.Close)
+	f.upstream = stub.URL
+	orig := http.DefaultTransport
+	http.DefaultTransport = stub.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = orig })
 
 	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var buf bytes.Buffer
@@ -400,7 +407,7 @@ func storeBaseline(t *testing.T, f *prefetchFixture, name, version string) {
 	t.Helper()
 	store := manifest.NewLocalStore(f.manifests)
 	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Type: manifest.TypeNpm, Name: name,
-		Versions: []manifest.VersionEntry{{Version: version, Mode: manifest.ModeProxy, Baseline: true, BaselineAt: "2026-10-01T00:00:00Z"}}}
+		Versions: []manifest.VersionEntry{{Version: version, URL: f.upstream, Mode: manifest.ModeProxy, Baseline: true, BaselineAt: "2026-10-01T00:00:00Z"}}}
 	if err := store.SavePackage(t.Context(), pm); err != nil {
 		t.Fatal(err)
 	}
