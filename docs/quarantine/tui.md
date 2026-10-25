@@ -37,9 +37,9 @@ Useful keys you'll need throughout:
 Navigate: expand `npm/`, expand `@example-corp/widget-cli`. You should see a single version leaf labelled `latest`:
 
 ```text
-▼ npm/
-  ▼ @example-corp/widget-cli (1)
-      latest
+v N npm/
+  v @example-corp/widget-cli
+     - latest
 ```
 
 Cursor on the `latest` leaf shows the version entry in the Details pane. The JSON blob on the right shows the full manifest.
