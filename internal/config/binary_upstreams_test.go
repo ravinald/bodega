@@ -136,3 +136,79 @@ func TestLoad_RubygemsUpstream(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_ProxyUpstreamsRequireHTTPS(t *testing.T) {
+	defaults := map[string]string{
+		"gomod_upstream":    "https://proxy.golang.org",
+		"npm_upstream":      "https://registry.npmjs.org",
+		"pypi_upstream":     "https://pypi.org",
+		"cargo_upstream":    "https://index.crates.io",
+		"cargo_dl_upstream": "https://static.crates.io/crates",
+	}
+	for key, def := range defaults {
+		for _, bad := range []string{"http://registry.example.com", "registry.example.com", "https://", "https://registry.example.com/?x=1", "https://registry.example.com/#f"} {
+			writeConfig(t, `{"`+key+`":"`+bad+`"}`)
+			_, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if err == nil {
+				t.Errorf("Load accepted %s %q", key, bad)
+				continue
+			}
+			for _, want := range []string{key + ` "` + bad + `"`, "(default " + def + ")"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("%s %q: error %q does not contain %q", key, bad, err, want)
+				}
+			}
+		}
+	}
+
+	writeConfig(t, `{"distfiles_upstream":"http://distfiles.example.com/"}`)
+	if _, err := config.Load(t.TempDir(), "", "", "", false, false); err != nil {
+		t.Errorf("Load refused an http distfiles_upstream: %v", err)
+	}
+}
+
+func TestLoad_ProxyUpstreamsAdmitCredentials(t *testing.T) {
+	for _, key := range []string{"gomod_upstream", "npm_upstream", "pypi_upstream", "cargo_upstream", "cargo_dl_upstream"} {
+		good := "https://ci:s3cret@registry.corp.example/repository/" + key
+		writeConfig(t, `{"`+key+`":"`+good+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err != nil {
+			t.Errorf("Load refused a credentialed %s: %v", key, err)
+		}
+
+		for _, bad := range []string{"http://ci:s3cret@registry.corp.example/", "https://ci:s3cret@", "https://ci:s3cret@registry.corp.example/?x=1", "https://ci:s3cret@registry.corp.example:bad/"} {
+			writeConfig(t, `{"`+key+`":"`+bad+`"}`)
+			_, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if err == nil {
+				t.Errorf("Load accepted %s %q", key, bad)
+				continue
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "ci:") {
+				t.Errorf("%s %q: error %q does not name the key and the value", key, bad, err)
+			}
+			if strings.Contains(err.Error(), "s3cret") {
+				t.Errorf("%s %q: error %q prints the password", key, bad, err)
+			}
+		}
+	}
+}
+
+func TestLoad_PrivateUpstreamHosts(t *testing.T) {
+	writeConfig(t, `{"private_upstream_hosts":["Registry.Corp.Example","10.0.0.5","FD00:0::5"]}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"registry.corp.example", "10.0.0.5", "fd00::5"}
+	if strings.Join(cfg.PrivateUpstreamHosts, ",") != strings.Join(want, ",") {
+		t.Errorf("private_upstream_hosts = %q, want %q", cfg.PrivateUpstreamHosts, want)
+	}
+
+	for _, bad := range []string{"", "https://registry.corp.example", "registry.corp.example:4873", "registry.corp.example/npm", "[fd00::5]", "fe80::1%eth0", "bad host", "-lead.example"} {
+		writeConfig(t, `{"private_upstream_hosts":["`+bad+`"]}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted private_upstream_hosts entry %q", bad)
+		} else if !strings.Contains(err.Error(), "private_upstream_hosts") || !strings.Contains(err.Error(), `"`+bad+`"`) {
+			t.Errorf("entry %q: error %q does not name the entry", bad, err)
+		}
+	}
+}

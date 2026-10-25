@@ -514,21 +514,56 @@ func validateUpstreamURL(rawURL string) error {
 	return checkUpstreamHost(u.Hostname())
 }
 
+// upstreamLookupHost is the resolver checkUpstreamHost asks. A variable so a
+// test can answer for a hostname without real DNS.
+var upstreamLookupHost = net.LookupHost
+
+// privateUpstreamHosts is private_upstream_hosts, canonicalized, set by
+// newServer. Like upstreamConnectTimeout it is process-wide because the
+// redirect check on the shared upstreamClient has no Server to read.
+var privateUpstreamHosts atomic.Pointer[map[string]struct{}]
+
+func setPrivateUpstreamHosts(hosts []string) {
+	m := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		m[config.CanonicalHost(h)] = struct{}{}
+	}
+	privateUpstreamHosts.Store(&m)
+}
+
+func privateUpstreamListed(host string) bool {
+	m := privateUpstreamHosts.Load()
+	if m == nil {
+		return false
+	}
+	_, ok := (*m)[config.CanonicalHost(host)]
+	return ok
+}
+
 // checkUpstreamHost is the address half of validateUpstreamURL: it refuses a
-// host that resolves to a loopback, private or link-local address.
+// host that resolves to a loopback, link-local, multicast-link-local,
+// unspecified or private address.
+//
+// A host named in private_upstream_hosts may resolve privately, and nothing
+// else is relaxed for it. The list is of names rather than CIDRs because a
+// range trusts whatever a public upstream's DNS chooses to point into it.
 func checkUpstreamHost(host string) error {
 	//nolint:gosec // G704: this lookup IS the SSRF defense — we resolve the host to inspect IPs and reject loopback / private / link-local before returning.
-	ips, err := net.LookupHost(host)
+	ips, err := upstreamLookupHost(host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve upstream host %q: %w", host, err)
 	}
+	listed := privateUpstreamListed(host)
 	for _, ipStr := range ips {
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
 			continue
 		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 			return fmt.Errorf("upstream resolves to non-routable IP %s", ipStr)
+		}
+		if ip.IsPrivate() && !listed {
+			return fmt.Errorf("upstream resolves to non-routable IP %s; add %q to private_upstream_hosts if it is an internal registry you trust", ipStr, config.CanonicalHost(host))
 		}
 	}
 	return nil

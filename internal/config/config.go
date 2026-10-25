@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -137,9 +138,10 @@ type Config struct {
 	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
 	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
-	MavenUpstream          string   `json:"maven_upstream,omitempty"`    // repository root in the Maven layout; /maven/<path> is appended to it
-	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"` // serves gem files, the compact index and the full index from one root
-	DiscoverMode           string   `json:"discover_mode,omitempty"`     // "" or "observe" — see internal/server/discovery.go
+	MavenUpstream          string   `json:"maven_upstream,omitempty"`         // repository root in the Maven layout; /maven/<path> is appended to it
+	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
+	PrivateUpstreamHosts   []string `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
+	DiscoverMode           string   `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string   `json:"gomod_root,omitempty"`
 	HelmRoot               string   `json:"helm_root,omitempty"`
 	NpmRoot                string   `json:"npm_root,omitempty"`
@@ -585,6 +587,96 @@ func validateRootURL(key, raw, def string) error {
 		return fmt.Errorf("%s %q names no host", key, raw)
 	case u.User != nil, u.RawQuery != "", u.Fragment != "":
 		return fmt.Errorf("%s %q carries userinfo, a query or a fragment — the request path is appended to it", key, raw)
+	}
+	return nil
+}
+
+// validateProxyUpstream holds an upstream key the fetch path appends request
+// paths to but that may carry a private index's credential in its userinfo,
+// which validateRootURL refuses. Every error names the value with the
+// password masked, because it reaches the serve log.
+func validateProxyUpstream(key, raw, def string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return fmt.Errorf("%s %q does not parse: %v (default %s)", key, redactUserinfo(raw), err, def)
+	}
+	shown := raw
+	if u.User != nil {
+		shown = u.Redacted()
+	}
+	switch {
+	case u.Scheme != "https":
+		return fmt.Errorf("%s %q must be an https URL (default %s)", key, shown, def)
+	case u.Host == "":
+		return fmt.Errorf("%s %q names no host (default %s)", key, shown, def)
+	case u.RawQuery != "", u.Fragment != "":
+		return fmt.Errorf("%s %q carries a query or a fragment — the request path is appended to it (default %s)", key, shown, def)
+	}
+	return nil
+}
+
+// redactUserinfo masks the password in a URL url.Parse refused, which
+// Redacted cannot reach: everything between the first ':' and the last '@'
+// of the authority.
+func redactUserinfo(raw string) string {
+	rest, scheme := raw, ""
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme, rest = raw[:i+3], raw[i+3:]
+	}
+	auth, path := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		auth, path = rest[:i], rest[i:]
+	}
+	at := strings.LastIndex(auth, "@")
+	if at < 0 {
+		return raw
+	}
+	user := auth[:at]
+	if c := strings.Index(user, ":"); c >= 0 {
+		user = user[:c] + ":xxxxx"
+	}
+	return scheme + user + auth[at:] + path
+}
+
+// CanonicalHost is the form private_upstream_hosts is matched in: lower case,
+// and an IP literal in its shortest spelling so "FD00:0::5" and "fd00::5" name
+// one host.
+func CanonicalHost(h string) string {
+	h = strings.ToLower(h)
+	if a, err := netip.ParseAddr(h); err == nil && a.Zone() == "" {
+		return a.String()
+	}
+	return h
+}
+
+var hostLabelRE = regexp.MustCompile(`^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$`)
+
+// validatePrivateUpstreamHosts canonicalizes each entry in place and refuses
+// one that is not a bare hostname or IP literal. A URL, a port or a path here
+// would match no upstream, and the operator would see the private-address
+// refusal they listed the host to clear.
+func validatePrivateUpstreamHosts(hosts []string) error {
+	for i, raw := range hosts {
+		h := CanonicalHost(strings.TrimSpace(raw))
+		if a, err := netip.ParseAddr(h); err == nil {
+			if a.Zone() != "" {
+				return fmt.Errorf("private_upstream_hosts entry %q carries an IPv6 zone; name the address alone", raw)
+			}
+			hosts[i] = h
+			continue
+		}
+		ok := h != "" && len(h) <= 253
+		for _, label := range strings.Split(h, ".") {
+			ok = ok && hostLabelRE.MatchString(label)
+		}
+		if !ok {
+			return fmt.Errorf("private_upstream_hosts entry %q is not a hostname or IP literal (no scheme, port or path), e.g. \"registry.internal.example\"", raw)
+		}
+		hosts[i] = h
 	}
 	return nil
 }
@@ -1268,6 +1360,23 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// that document says today. An operator mirroring the index is not thereby
 	// mirroring the downloads, and needs to name both.
 	cfg.CargoDLUpstream = firstNonEmpty(cfg.CargoDLUpstream, "https://static.crates.io/crates")
+
+	// The fetch path refuses anything but https on every request, so a scheme
+	// typo left to it is found by the first client rather than by serve.
+	for _, u := range []struct{ key, val, def string }{
+		{"gomod_upstream", cfg.GomodUpstream, "https://proxy.golang.org"},
+		{"npm_upstream", cfg.NpmUpstream, "https://registry.npmjs.org"},
+		{"pypi_upstream", cfg.PypiUpstream, "https://pypi.org"},
+		{"cargo_upstream", cfg.CargoUpstream, "https://index.crates.io"},
+		{"cargo_dl_upstream", cfg.CargoDLUpstream, "https://static.crates.io/crates"},
+	} {
+		if err := validateProxyUpstream(u.key, u.val, u.def); err != nil {
+			return nil, err
+		}
+	}
+	if err := validatePrivateUpstreamHosts(cfg.PrivateUpstreamHosts); err != nil {
+		return nil, err
+	}
 
 	// Proxy spool ceilings.
 	if cfg.SpoolMaxArtifactBytes, err = spoolCeiling(snap, "spool_max_artifact_bytes", cfg.SpoolMaxArtifactBytes, DefaultSpoolMaxArtifactBytes); err != nil {
@@ -2270,6 +2379,9 @@ func defaultConfigContent() []byte {
   "cargo_dl_upstream": "https://static.crates.io/crates",
   "maven_upstream": "https://repo.maven.apache.org/maven2",
   "rubygems_upstream": "https://rubygems.org",
+
+  "_comment_private_upstream_hosts": "private_upstream_hosts: hostnames or IP literals (no scheme, port or path) the upstream guard lets resolve to a private address (RFC 1918, fc00::/7), for fronting an internal registry such as Artifactory, Nexus or Verdaccio, e.g. [\"registry.corp.example\"]. Listing a host trusts it as a public upstream is trusted: any client that can reach bodega can make it fetch any path under that ecosystem's route from the host. Loopback, link-local (including 169.254.169.254) and unspecified addresses stay refused for every host, listed or not, and each redirect hop is judged again, so a listed host cannot hand the fetch to an unlisted one. Names, not CIDRs: a range would trust whatever a public upstream's DNS points into it.",
+  "private_upstream_hosts": [],
 
   "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter, and folded to lower case before the reserved-name check so \"Repos\" is refused with \"repos\". The url must be https, end in \"/\", and carry no userinfo, no query, no fragment and no uncleaned path. A key may share a name with an uploaded git package: /git/{name}/{file} serves the bundle and /git/{ns}/{org}/{repo}.git/... resolves the upstream.",
   "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",

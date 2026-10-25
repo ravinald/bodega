@@ -239,6 +239,13 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"gomod_sumdb_url":   "https://sum.example.com",
 		"maven_upstream":    "https://maven.example.com/maven2",
 		"rubygems_upstream": "https://gems.example.com",
+		"gomod_upstream":    "https://goproxy.example.com",
+		"npm_upstream":      "https://npm.example.com",
+		"pypi_upstream":     "https://pypi.example.com",
+		"cargo_upstream":    "https://index.example.com",
+		"cargo_dl_upstream": "https://crates.example.com/crates",
+		// Load requires a bare hostname and stores it lowercased.
+		"private_upstream_hosts": []string{"registry.example.internal", "10.0.0.5"},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()
