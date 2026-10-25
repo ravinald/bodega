@@ -8351,6 +8351,8 @@ The form edits the first instance of the type, or a new one named after the type
 
 `Tab` moves focus from Sources to Details to Log and back, and the focused pane has a highlighted border. A popup (help, a form, a confirmation, the token manager, the JSON editor, the audit table) replaces the whole screen until it closes, rather than floating over the panes.
 
+![The TUI's three panes: the Sources tree with npm/@example-corp/widget-cli expanded and its latest version selected, the Details pane showing the package, version, sha256 checksum, storage object and .npmrc registry line above the raw JSON, and the Log pane across the bottom](images/tui-main-view.png)
+
 ### Keybindings
 
 With the Sources pane focused:
@@ -8385,6 +8387,10 @@ With the Sources pane focused:
 
 An action on "the marked entries" acts on the entry under the cursor when nothing is marked.
 
+`c` opens the create form with only the type to choose; picking one replaces the form with that type's fields.
+
+![The Create Entry form with its Type dropdown open, listing apt through rubygems with the cursor on npm](images/tui-create-form-dropdown.png)
+
 With the Log pane focused:
 
 | Key       | Action                                                   |
@@ -8397,6 +8403,8 @@ With the Log pane focused:
 Both queries are case-insensitive substring matches, applied on every keystroke, and they match the text a line prints rather than the escape sequences that color it. The pane title carries the query and the match position, `/apt (2/17)` for a find and `filter:apt (17)` for a filter. `n` and `N` wrap at the ends. The current match is highlighted, which is also how you spot a query with no hits: the count reads `(0/0)` and nothing is marked.
 
 The `?` help lays its sections into as many columns as the terminal is wide enough to hold, fewest first, because the full list is 55 rows and a popup cannot scroll. Sections are never split across a column break, and the reading order runs down a column then across. A terminal too narrow for two columns gets the single-column list back, taller than the screen.
+
+![The ? help popup in a single column: navigation, entry management, build pipeline, storage operations, audit, integrations, Log pane, audit results table and form editor keys](images/tui-help.png)
 
 ### Config editor
 
@@ -8427,6 +8435,8 @@ The **Sources** field for an apt entry is the deb822 stanza an operator installs
 
 `L` opens a query form over the audit trail (event type, package type, package name, client IP, limit). Results open in a scrollable table: `Up`/`Down` move, `Esc` or `q` closes it, and the Log pane keeps a line recording how many events the query returned.
 
+![The audit results table for package name @example-corp/widget-cli: three edit rows and two create rows with timestamp, event, type, name and status columns](images/tui-audit-table.png)
+
 The table sizes its columns from the rows it is showing, not from a fixed width, because the values that overflow a guessed width are the common case rather than the exception: `serve_fetch` is 11 characters and `dists/jammy-backports/InRelease` is 31. Two things follow from that:
 
 - **A column no event filled in is dropped.** Served requests carry no `DURATION`, so querying them gives that width back to `NAME` instead of printing a column of nothing.
@@ -8444,12 +8454,22 @@ The build menu dispatches every entry type. Only `apt` and `pypi` have a build s
 
 Access the dashboard at `https://bodega-host:8080/` when the server is running.
 
+![The web dashboard in the light theme: the type tree on the left, and tiles for 5 packages, 5 versions and zero frozen, hidden, dependencies and orphans above a packages-by-type bar chart and an empty refusal queue](images/web-dashboard-light.png)
+
+![The web dashboard in the dark theme: the same type tree, count tiles, packages-by-type bar chart and refusal queue](images/web-dashboard-dark.png)
+
 **Features:**
 
 - **Live metrics**: package counts by type, total artifact size, version statistics
 - **Status view**: per-package build and upload status
 - **Copy utilities**: one-click copy for each client configuration file the server renders for the package (`client_config` on `GET /api/v1/packages/{type}/{name}`) and for the Package JSON Config, which leaves `client_config` out so it stays a manifest `bodega pkg import` accepts
 - **Browser-based browsing**: explore packages by type and version
+
+An entry's detail view, reached from the tree or a `#type/name/version` permalink, puts a copy link beside each client line:
+
+![The detail view for npm/@example-corp/widget-cli at latest in the light theme: version, sha256 checksum, verified, frozen, the .npmrc registry line with its copy link, and the Package JSON Config below](images/web-entry-detail-light.png)
+
+![The npm/@example-corp/widget-cli detail view in the dark theme, with the .npmrc registry line and its copy link above the Package JSON Config](images/web-entry-detail-dark.png)
 
 The type list is the server's, not the page's. The tree, the per-type bars and both expand-all loops render one group per key in the `/api/v1/packages` envelope, which carries every ecosystem the server knows with an empty array for the ones holding nothing. The page keeps a preferred order (apt first, then git, pypi, binary, gomod, helm, npm) and anything outside it renders after, sorted. So an ecosystem added to the server shows up in a browser with no change to the page, and a stored package can never be missing from the tree while the header counts it.
 

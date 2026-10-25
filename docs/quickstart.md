@@ -222,6 +222,8 @@ sudo sh setup.sh --url https://bodega-host:8080 --apply
 bodega shell
 ```
 
+![The bodega shell TUI: the Sources tree with npm/@example-corp/widget-cli expanded and its latest version selected, the Details pane showing its checksum and .npmrc registry line, and the empty Log pane below](images/tui-main-view.png)
+
 Three-pane interface:
 
 - **Sources** (left): tree of every package, grouped by type, then name, then version

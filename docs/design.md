@@ -861,6 +861,8 @@ Actions open as full-screen popups: `c` creates an entry through a form with inl
 
 `bodega serve` serves a single-page web UI at `/`, the same listener and port as the package routes. It reads only the public `GET` endpoints (`/api/v1/packages`, `/api/v1/status`, `/api/v1/metrics`), so it needs no token and can change nothing.
 
+![The web dashboard: the type tree on the left, and package, version, frozen, hidden, dependency and orphan counts above a packages-by-type bar chart](images/web-dashboard-light.png)
+
 - **Dashboard:** package, version, storage, frozen, hidden, dependency and orphan counts, and packages by type.
 - **Browser:** the type tree with a filter, per-type metrics, and a detail view per entry with permalinks of the form `#type/name/version`.
 - **Copy buttons:** the client line for each entry's type and its package JSON.
