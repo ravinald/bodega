@@ -23,9 +23,10 @@ import (
 // present in its config file, indicate the host is configured to fetch from
 // the public registry rather than a bodega instance. These are textual
 // markers — not URL parsing — so the check is robust against TOML/YAML/INI
-// quoting differences.
+// quoting differences. apt is the exception: its sources are parsed, and each
+// marker is matched against a URI's host and that host's subdomains.
 var publicUpstreams = map[string][]string{
-	"apt":   {"archive.ubuntu.com", "security.ubuntu.com", "deb.debian.org", "packages.debian.org", "ports.ubuntu.com"},
+	"apt":   {"archive.ubuntu.com", "security.ubuntu.com", "deb.debian.org", "security.debian.org", "packages.debian.org", "ports.ubuntu.com"},
 	"pip":   {"pypi.org", "files.pythonhosted.org"},
 	"cargo": {"crates.io", "static.crates.io"},
 	"npm":   {"registry.npmjs.org", "registry.npmjs.com"},
@@ -72,16 +73,194 @@ func checkAptSources(root, goos string) Finding {
 		}
 	}
 
-	hit := firstHit(paths, publicUpstreams["apt"])
-	if hit.path == "" {
-		f.Status = StatusOK
-		f.Detail = "no public apt mirrors referenced in /etc/apt/sources.list[.d]"
+	var unread *aptMirrorError
+	for _, p := range paths {
+		uris, err := aptSourceURIs(p)
+		if err != nil {
+			continue
+		}
+		for _, uri := range uris {
+			mirror, ok := aptMirrorFile(uri)
+			if !ok {
+				if m := publicHost(uri, publicUpstreams["apt"]); m != "" {
+					return aptWarn(f, m, p)
+				}
+				continue
+			}
+			mpath := filepath.Join(root, mirror)
+			mirrors, err := aptMirrorURIs(mpath)
+			if err != nil {
+				if unread == nil {
+					unread = &aptMirrorError{path: mpath, source: p, err: err}
+				}
+				continue
+			}
+			for _, m := range mirrors {
+				if host := publicHost(m, publicUpstreams["apt"]); host != "" {
+					return aptWarn(f, host, mpath+", the mirror list "+p+" names")
+				}
+			}
+		}
+	}
+	// A public host found anywhere is a measured bypass, so it outranks a
+	// mirror list that could not be read.
+	if unread != nil {
+		f.Status = StatusSkip
+		f.Detail = "could not read apt mirror list " + unread.path + " (named by mirror+file in " + unread.source + "): " + unread.err.Error()
+		f.Remediation = "run doctor as a user that can read " + unread.path + ", or correct the mirror+file URI in " + unread.source
 		return f
 	}
+	f.Status = StatusOK
+	f.Detail = "no public apt mirrors referenced in /etc/apt/sources.list[.d]"
+	return f
+}
+
+func aptWarn(f Finding, marker, where string) Finding {
 	f.Status = StatusWarn
-	f.Detail = "apt configured to fetch from " + hit.marker + " (in " + hit.path + "); bypasses bodega's apt proxy"
+	f.Detail = "apt configured to fetch from " + marker + " (in " + where + "); bypasses bodega's apt proxy"
 	f.Remediation = "rewrite sources to point at the bodega apt endpoint"
 	return f
+}
+
+type aptMirrorError struct {
+	path, source string
+	err          error
+}
+
+// aptSourceURIs returns the URIs apt would fetch from in one sources file:
+// deb822 stanzas for a .sources file, one-line entries for anything else.
+// Comments and stanzas with Enabled: no are dropped, as apt drops them.
+func aptSourceURIs(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(path, ".sources") {
+		return deb822URIs(string(data)), nil
+	}
+	return oneLineURIs(string(data)), nil
+}
+
+func deb822URIs(text string) []string {
+	var out, uris []string
+	enabled := true
+	field := ""
+	flush := func() {
+		if enabled {
+			out = append(out, uris...)
+		}
+		uris, enabled, field = nil, true, ""
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case strings.TrimSpace(line) == "":
+			flush()
+			continue
+		case strings.HasPrefix(line, "#"):
+			continue
+		case line[0] == ' ' || line[0] == '\t':
+			if field == "uris" {
+				uris = append(uris, strings.Fields(line)...)
+			}
+			continue
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			field = ""
+			continue
+		}
+		field = strings.ToLower(strings.TrimSpace(name))
+		switch field {
+		case "uris":
+			uris = append(uris, strings.Fields(value)...)
+		case "enabled":
+			enabled = !aptFalse(strings.TrimSpace(value))
+		}
+	}
+	flush()
+	return out
+}
+
+// aptFalse mirrors apt's StringToBool for the spellings that mean no.
+func aptFalse(v string) bool {
+	switch strings.ToLower(v) {
+	case "no", "false", "without", "off", "disable":
+		return true
+	}
+	return false
+}
+
+// oneLineURIs reads "deb [options] uri suite [component...]" entries. apt
+// cuts each line at its first '#'.
+func oneLineURIs(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		line, _, _ = strings.Cut(line, "#")
+		fields := strings.Fields(line)
+		if len(fields) < 2 || (fields[0] != "deb" && fields[0] != "deb-src") {
+			continue
+		}
+		rest := fields[1:]
+		if strings.HasPrefix(rest[0], "[") {
+			for len(rest) > 0 && !strings.HasSuffix(rest[0], "]") {
+				rest = rest[1:]
+			}
+			if len(rest) > 0 {
+				rest = rest[1:]
+			}
+		}
+		if len(rest) > 0 {
+			out = append(out, rest[0])
+		}
+	}
+	return out
+}
+
+// aptMirrorFile returns the path a mirror+file URI names, which apt reads
+// for the list of URIs it actually fetches from.
+func aptMirrorFile(uri string) (string, bool) {
+	u, err := url.Parse(uri)
+	if err != nil || !strings.EqualFold(u.Scheme, "mirror+file") {
+		return "", false
+	}
+	return u.Path, true
+}
+
+// aptMirrorURIs reads a mirror list: one URI per line, optionally followed by
+// tab-separated metadata, with '#' lines as comments.
+func aptMirrorURIs(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, strings.Fields(line)[0])
+	}
+	return out, nil
+}
+
+// publicHost returns the marker that uri's host is, or is a subdomain of.
+func publicHost(uri string, markers []string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" {
+		return ""
+	}
+	for _, m := range markers {
+		if host == m || strings.HasSuffix(host, "."+m) {
+			return m
+		}
+	}
+	return ""
 }
 
 // CheckPipConfig scans pip's config files for direct PyPI references.
