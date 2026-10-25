@@ -129,3 +129,49 @@ e2e_wait_for_health() {
 	done
 	return 1
 }
+
+# e2e_apt_mirror_groups <apt_upstreams JSON> — one line per stanza the banner
+# prints for mirrored codenames: the codenames, a tab, the Components: value.
+#
+# The grouping is mirroredStanzas' (internal/server/apt.go): codenames sorted,
+# components the union of every upstream's in config order with empty names
+# dropped, Ubuntu's four when none remain, grouped on the set rather than the
+# spelling. A stanza has one Components: line, so a server mirroring Ubuntu and
+# Debian together prints two stanzas, and an expectation that wants one fails a
+# server that serves both correctly.
+#
+# Codenames bodega rewrites to drop a hidden version are not modeled: their
+# stanza depends on the loaded snapshot, which this config read cannot see.
+e2e_apt_mirror_groups() {
+	printf '%s' "$1" | jq -r --arg default "main restricted universe multiverse" '
+		to_entries | sort_by(.key)
+		| map({
+			codename: .key,
+			comps: (reduce ([.value[]? | .components[]? | select(. != "")][]) as $c
+				([]; if any(.[]; . == $c) then . else . + [$c] end))
+		})
+		| map(if (.comps | length) == 0 then .comps = ($default | split(" ")) else . end)
+		| reduce .[] as $e ({order: [], g: {}};
+			($e.comps | unique | join(" ")) as $k
+			| if .g[$k] then .g[$k].suites += [$e.codename]
+			  else .order += [$k] | .g[$k] = {suites: [$e.codename], comps: $e.comps} end)
+		| .order[] as $k | .g[$k]
+		| "\(.suites | join(" "))\t\(.comps | join(" "))"'
+}
+
+# e2e_apt_stanza_components <banner> <suites> — the Components: value of the
+# stanza whose Suites: line names exactly <suites>. Exits 1 when no line does.
+#
+# Matched from "Suites: " to the end of the line, so a journal prefix is
+# ignored and a stanza naming one more codename is not taken for this one.
+e2e_apt_stanza_components() {
+	printf '%s\n' "$1" | awk -v want="Suites: $2" '
+		{ sub(/[ \t\r]+$/, "") }
+		found {
+			i = index($0, "Components: ")
+			if (i) print substr($0, i + 12)
+			exit
+		}
+		{ i = index($0, "Suites: "); if (i && substr($0, i) == want) found = 1 }
+		END { exit !found }'
+}
