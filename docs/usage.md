@@ -536,6 +536,7 @@ cat manifest.json | bodega pkg import -            # import from stdin
 bodega pkg import --merge updated.json             # add versions to existing package
 bodega pkg import --origin db01 catalog.json       # stamp a payload that carries none
 bodega pkg import --lockfile Gemfile.lock          # admit, fetch and pin what a lockfile names
+bodega pkg import --lockfile gradle.lockfile       # the same for a Gradle build
 ```
 
 `--lockfile` reads a lockfile a package manager wrote instead of JSON, and runs it through [`bodega pkg prefetch`](#bodega-pkg-prefetch-lockfile-lockfile): each pinned version is admitted, merged into its package, fetched, and its digest compared with the one the lockfile records, with prefetch's exit status. It takes every format prefetch does and is repeatable. It refuses JSON files and `--merge`, `--origin`, `--server` and `--baseline` beside it: a lockfile import always merges, writes the local store, and carries no origin or baseline mark.
@@ -653,20 +654,23 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
   guessing one. Re-run with --suite <codename> to record it.
 ```
 
-| Type      | Source command                                                                                                          |
-| --------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `apt`     | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'`, or `apt list --installed` |
-| `pypi`    | `pip list --format=json`                                                                                                |
-| `npm`     | `npm ls --global --json --depth=0`                                                                                      |
-| `gomod`   | `go list -m all`, or `go version -m <binary>`                                                                           |
-| `cargo`   | `cargo install --list`                                                                                                  |
+| Type       | Source command                                                                                                            |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `apt`      | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'`, or `apt list --installed`   |
+| `pypi`     | `pip list --format=json`                                                                                                  |
+| `npm`      | `npm ls --global --json --depth=0`                                                                                        |
+| `gomod`    | `go list -m all`, or `go version -m <binary>`                                                                             |
+| `cargo`    | `cargo install --list`                                                                                                    |
 | `rubygems` | `gem list --local`, or a listing of the gem directory's `specifications/` (`ls $(gem environment gemdir)/specifications`) |
-| `helm`    | `helm list -o json`                                                                                                     |
-| `freebsd` | `pkg query '%R\t%q'`                                                                                                    |
+| `maven`    | a listing of the POMs in the local repository: `find ~/.m2/repository -name '*.pom'`                                      |
+| `helm`     | `helm list -o json`                                                                                                       |
+| `freebsd`  | `pkg query '%R\t%q'`                                                                                                      |
 
 **`git` and `binary` have no importer.** Nothing on a host records a `git clone` or a downloaded binary, so there is no inventory to read. Catalog those with `bodega pkg create`, or run the server with `discover_mode` set to `"observe"` and promote what clients reach for.
 
 **`rubygems` skips default gems.** `gem list --local` marks the gems Ruby ships with as `default:`; no registry download put them there, so they are counted in a warning rather than cataloged. A platform build listed as `nokogiri (1.16.7 x86_64-linux)` is recorded at `1.16.7-x86_64-linux`, the version its gem file names, and a gem installed at several versions becomes one package with each of them.
+
+**`maven` reads the local repository, not a build.** Each `<groupId dirs>/<artifactId>/<version>/<artifactId>-<version>.pom` becomes a version of `<groupId>:<artifactId>`, read relative to the path's last `/repository/`, so a listing from `~/.m2/repository` or from a `maven.repo.local` elsewhere both parse. The local repository holds what every Maven build on the host resolved, Maven's own plugins included: a fresh Maven 3.9.9 that ran one `dependency:list` leaves 260 POMs of 163 artifacts. A SNAPSHOT is skipped and counted in a warning, as is any line that is not a release POM. Gradle keeps its own cache (`~/.gradle/caches/modules-2`) in a hashed layout that is not read; catalog a Gradle build from its `gradle.lockfile` with `bodega pkg import --lockfile`.
 
 **`freebsd` imports repositories, not packages.** A `freebsd` entry is one repository with a version per ABI, so convert reads the repository each installed package came from (`%R`) and the ABI it was built for (`%q`), and collapses the host to the repositories it installed from. On a FreeBSD 15.1 host with 34 packages that is 3 entries.
 
@@ -749,23 +753,25 @@ bodega pkg prefetch --format requirements deps/prod.lock
 bodega pkg prefetch --dry-run --json package-lock.json
 ```
 
-| Format         | Detected from                              | Reads                                                                                                    |
-| -------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `package-lock` | `package-lock.json`, `npm-shrinkwrap.json` | the `packages` map of lockfileVersion 2 or 3; the project root, workspace links and bundled deps skipped |
-| `requirements` | `requirements*.txt`                        | every requirement pinned with `==`, its `--hash` values, extras and markers stripped                     |
-| `go.sum`       | `go.sum`                                   | every module zip line; a `/go.mod` line pins no download and is skipped                                  |
-| `cargo.lock`   | `Cargo.lock`                               | every `[[package]]` with a crates.io source; workspace members have none and are skipped                 |
-| `gemfile.lock` | `Gemfile.lock`, `gems.locked`              | every spec under a `GEM` section's `specs:`, and the `CHECKSUMS` section Bundler 2.5 and later writes    |
+| Format            | Detected from                                                                   | Reads                                                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `package-lock`    | `package-lock.json`, `npm-shrinkwrap.json`                                      | the `packages` map of lockfileVersion 2 or 3; the project root, workspace links and bundled deps skipped                       |
+| `requirements`    | `requirements*.txt`                                                             | every requirement pinned with `==`, its `--hash` values, extras and markers stripped                                           |
+| `go.sum`          | `go.sum`                                                                        | every module zip line; a `/go.mod` line pins no download and is skipped                                                        |
+| `cargo.lock`      | `Cargo.lock`                                                                    | every `[[package]]` with a crates.io source; workspace members have none and are skipped                                       |
+| `gemfile.lock`    | `Gemfile.lock`, `gems.locked`                                                   | every spec under a `GEM` section's `specs:`, and the `CHECKSUMS` section Bundler 2.5 and later writes                          |
+| `gradle.lockfile` | `gradle.lockfile`, `buildscript-gradle.lockfile`, `dependency-locks/*.lockfile` | every `<group>:<artifact>:<version>=<configurations>` line; comments and `empty=` skipped                                      |
+| `dependency-list` | any name, from its `The following files have been resolved:` line               | every coordinate `mvn dependency:list -DoutputFile=<file>` lists, its classifier kept, its scope, module and file name ignored |
 
-`--format` names the format for every file on the command line when a name says nothing. A lockfileVersion 1 `package-lock.json`, an unpinned requirement, and a `-r`, `-c` or `-e` line are refused: the first holds no flat list to read, and the other two would make a partial answer look like a complete one.
+`--format` names the format for every file on the command line when a name says nothing. A file whose name matches no format is still read as `dependency-list` when it holds that goal's header line, which is how `bodega pkg import --lockfile`, which has no `--format`, takes one. A `gradle.lockfile` or `dependency-list` line that is not a coordinate is refused with its line number, and the whole file with it. A lockfileVersion 1 `package-lock.json`, an unpinned requirement, and a `-r`, `-c` or `-e` line are refused: the first holds no flat list to read, and the other two would make a partial answer look like a complete one.
 
 **What each entry goes through.** Each (type, name, version) runs through `admit.Admit`, the admission `bodega pkg import` runs, and writes its admission row. An admitted version is then written to the manifest store, merged into the package when one exists, and fetched by the builder's own fetch for the type, which is where its digest is pinned (see [Checksum Verification](#checksum-verification)). A version the package already holds is admitted again, so the row cites the policy in force today, and is not written twice. A blocked version is written nowhere.
 
 The version keeps the [baseline mark](#--baseline) the store already holds for it, as `pkg import --merge` does, and an active [override](#bodega-override-requestapproverejectlist) applies as it does in every admission: either one admits the version past a failing check, recorded as `baseline` or `overridden`. A mark the lockfile could carry is not read, since only `pkg import --baseline` sets one, and neither admits known malware or provenance that fails to verify.
 
-A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`, and rubygems from `rubygems_upstream`. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
+A new package is recorded in `proxy` mode, as `bodega pkg convert` records a registry inventory, so a client's first request is served through the proxy and checked against the pin this run took. A version added to an existing package takes that package's mode. npm and gomod entries name `npm_upstream` and `gomod_upstream`; cargo fetches from `cargo_dl_upstream`, rubygems from `rubygems_upstream`, and maven from `maven_upstream`. A maven classifier the lockfile names is added to the version even when the package already holds it, so a later `dependency:list` resolving a `sources` jar fetches it beside the main one. pypi resolves its whole closure in one `bodega build fetch pypi` pass, which needs the same pip and index setup a build does. The fetch is the package's fetch, not the version's, so other versions already in the manifest are fetched or re-verified alongside it.
 
-An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io, a gem from a `GIT` section or from a `GEM` section listing any remote other than rubygems.org (Bundler records no remote per spec, so one foreign remote makes every spec in its section unsupported). A `PATH` gem is the project's own tree and is skipped, as a Cargo workspace member is.
+An entry bodega cannot fetch is reported as `unsupported` and not admitted: an npm dependency resolved from git or a local path, a requirement given as a direct URL, a crate from a registry other than crates.io, a gem from a `GIT` section or from a `GEM` section listing any remote other than rubygems.org (Bundler records no remote per spec, so one foreign remote makes every spec in its section unsupported). A `PATH` gem is the project's own tree and is skipped, as a Cargo workspace member is. A maven `-SNAPSHOT` is unsupported too: it is redeployed under the same name, so no digest pinned for it describes tomorrow's bytes. Neither Gradle nor Maven records a digest in these files, so every maven entry reports `not_compared`; the fetch still checks each file against the upstream's own checksum.
 
 **Digest comparison.** The digest a lockfile records is held against the one bodega pinned for the same version:
 
@@ -802,7 +808,7 @@ A definite no outranks an unanswered entry, so a run with both exits `2`.
 # .github/workflows/deps.yml
 on:
   pull_request:
-    paths: [package-lock.json, go.sum, Cargo.lock, Gemfile.lock, requirements.txt]
+    paths: [package-lock.json, go.sum, Cargo.lock, Gemfile.lock, gradle.lockfile, requirements.txt]
 jobs:
   prefetch:
     runs-on: [self-hosted, bodega]
@@ -1248,6 +1254,7 @@ What it keeps: the config file, and every artifact in storage. Stored artifacts 
 | `helm`      | `helm_root`      | `charts`                                                                                                                   |
 | `npm`       | `npm_root`       | `npm`                                                                                                                      |
 | `cargo`     | `cargo_root`     | `cargo`                                                                                                                    |
+| `maven`     | `maven_root`     | `maven`                                                                                                                    |
 | `rubygems`  | `rubygems_root`  | `rubygems`                                                                                                                 |
 | `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
 | `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
@@ -4324,20 +4331,20 @@ S3 uploads go through the multipart uploader, so an artifact larger than 5 GB re
 
 Each type can build under its own directory instead of `build_root`, which is what puts wheels on a large volume and binaries on fast SSD. One key per type, empty meaning `build_root`:
 
-| Key              | Type      | Directory it roots                                                                    |
-| ---------------- | --------- | ------------------------------------------------------------------------------------- |
-| `apt_root`       | apt       | `<root>/apt-repo`                                                                     |
-| `git_root`       | git       | `<root>/bundles`                                                                      |
-| `pypi_root`      | pypi      | `<root>/wheels`                                                                       |
-| `binary_root`    | binary    | `<root>/binaries`                                                                     |
-| `gomod_root`     | gomod     | `<root>/gomod`                                                                        |
-| `helm_root`      | helm      | `<root>/charts`                                                                       |
-| `npm_root`       | npm       | `<root>/npm`                                                                          |
-| `cargo_root`     | cargo     | `<root>/cargo`                                                                        |
-| `maven_root`     | maven     | `<root>/maven`, which no stage writes yet: the route proxies every request            |
-| `rubygems_root`  | rubygems  | `<root>/rubygems`, one `<name>/<version>/<name>-<version>.gem` per fetched gem         |
-| `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                      |
-| `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>`      |
+| Key              | Type      | Directory it roots                                                               |
+| ---------------- | --------- | -------------------------------------------------------------------------------- |
+| `apt_root`       | apt       | `<root>/apt-repo`                                                                |
+| `git_root`       | git       | `<root>/bundles`                                                                 |
+| `pypi_root`      | pypi      | `<root>/wheels`                                                                  |
+| `binary_root`    | binary    | `<root>/binaries`                                                                |
+| `gomod_root`     | gomod     | `<root>/gomod`                                                                   |
+| `helm_root`      | helm      | `<root>/charts`                                                                  |
+| `npm_root`       | npm       | `<root>/npm`                                                                     |
+| `cargo_root`     | cargo     | `<root>/cargo`                                                                   |
+| `maven_root`     | maven     | `<root>/maven`, the repository layout, with each file's checksum companions      |
+| `rubygems_root`  | rubygems  | `<root>/rubygems`, one `<name>/<version>/<name>-<version>.gem` per fetched gem   |
+| `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                 |
+| `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>` |
 
 Every command that reads or writes an artifact resolves through the same root: `bodega build run`, `fetch`, `package`, `upload`, `sync`, `repair` and the TUI. An upload that finds nothing names the directory it walked, so a root one command resolved differently from the build is visible in the skip line rather than reported as an empty build:
 
@@ -4770,6 +4777,19 @@ The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its roo
 
 - **npm_bin**: map from command name to its path inside the package, recorded at fetch from the `bin` in the tarball's root `package.json` and published as the version's `bin` in the generated packument. npm links `node_modules/.bin` from the packument alone, so a version without it installs with no command to run. The string form of `bin` is recorded as one command named for the package's unscoped basename (`@acme/cli` with `"bin": "./cli.js"` records `cli`); the object form is kept as written. An entry whose command name contains `/` or `\`, or whose path is absolute or contains a `..` segment, is dropped with a warning naming the package, version and entry, and the rest are kept. A version fetched before the field existed is filled from its stored tarball on the next `bodega build fetch`; a recorded map is never overwritten.
 
+### Maven-specific fields
+
+```json
+{
+  "version": "4.1.110.Final",
+  "classifiers": ["linux-x86_64", "sources"]
+}
+```
+
+- **classifiers**: the classified files fetched beside the main artifact and POM. A Maven version publishes any number of them (`sources`, `javadoc`, a native build per platform) and no index lists them, so only the ones named here are cataloged. A classifier names a jar; `<classifier>@aar` or `<classifier>@war` names another extension, as Gradle writes it. Import refuses a classifier no repository path can carry.
+
+The fetch records two keys under `metadata`: `maven_extension`, the main artifact's extension as the POM's `<packaging>` decides it (`jar`, `war`, `aar`, or `pom` for a BOM or parent that publishes its POM alone), and `maven_module`, `true` when the upstream published Gradle module metadata beside the POM. Both are bodega's to write; an edit changes which files the next upload and delete name.
+
 ### Pypi-specific fields
 
 ```json
@@ -5120,6 +5140,22 @@ A `wrapperUrl` in `maven-wrapper.properties`, where a project has one, takes `ht
 - A groupId-level `maven-metadata.xml`, which Maven reads to resolve a plugin prefix such as `spring-boot:run`, is read as an artifact one directory up: `org/springframework/boot/maven-metadata.xml` is judged as `org.springframework:boot`. It proxies, but under an allow-list in `listed` mode it needs a rule naming that identity.
 - `maven_upstream` names one repository. A Gradle plugin published only to the Gradle Plugin Portal does not resolve; plugins Maven Central also carries do.
 - `/maven/` does not answer for a `.zip`, so the wrappers' distributions come through a `binary_upstreams` namespace, as above, rather than through this route.
+
+**Catalog path.** A maven entry in `hosted` mode is served from storage, with no upstream request for any file the fetch stored. Catalog one the way any other type is cataloged:
+
+```bash
+bodega pkg import --lockfile gradle.lockfile     # every module a Gradle build locked
+mvn dependency:list -DoutputFile=deps.txt && bodega pkg import --lockfile deps.txt
+find ~/.m2/repository -name '*.pom' | bodega pkg convert maven | bodega pkg import --merge -
+bodega build fetch maven                        # or: bodega build fetch maven org.slf4j:slf4j-api
+bodega build upload maven
+```
+
+`bodega build fetch maven` reads each version's POM from [`maven_upstream`](#upstream-hosts), then the main artifact its `<packaging>` names (a jar for `jar`, `bundle`, `maven-plugin` and the rest, the `.war` or `.aar` for those, nothing more for `pom`), the Gradle `.module` when the upstream publishes one, and every classifier the entry lists. Each file is checked against the upstream's `.sha256`, or its `.sha1` where it publishes no SHA-256, as Central does for older artifacts; a file with neither, or whose bytes disagree, is refused, and nothing of that version is kept in `maven_root` for an upload to publish. The files land in `maven_root` in the repository layout with a `.sha1`, `.md5`, `.sha256` and `.sha512` beside each, computed from the verified bytes, since Maven asks for the first two and Gradle for the others. The main file's sha256 is recorded on the version entry, and every file's is pinned under its own key (`maven/<repository path>`), the key the route reads; a later fetch whose bytes disagree with a pin is refused. A `-SNAPSHOT` version is refused, since its files are redeployed under one name, and a `<groupId>:*` entry names no files and is skipped. `build package` has nothing to do beyond fetching what is missing, and `build upload` places every file and companion under its key. `maven-metadata.xml` stays the upstream's, proxied: a build naming fixed versions never reads it, while a version range or a plugin prefix still does.
+
+`--lockfile` reads a `gradle.lockfile` or `dependency:list` output, as [`bodega pkg prefetch`](#bodega-pkg-prefetch-lockfile-lockfile) describes. New entries are recorded in `proxy` mode; switch one to `hosted` with `bodega pkg edit` to serve it from storage alone.
+
+Attestations and SBOMs name a version `pkg:maven/<groupId>/<artifactId>@<version>`, and a file other than a version's jar adds the qualifiers that say which: `pkg:maven/io.netty/netty-transport-native-epoll@4.1.110.Final?classifier=linux-x86_64`, `pkg:maven/org.springframework.boot/spring-boot-dependencies@3.3.0?type=pom`. A CycloneDX document pushed to the [`cyclonedx` inventory source](#the-cyclonedx-source) reports a `pkg:maven` component under `maven`, named `<groupId>:<artifactId>` as the catalog names it.
 
 **RubyGems** (`~/.gemrc` for `gem`, `~/.bundle/config` for Bundler):
 

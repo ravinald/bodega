@@ -352,3 +352,68 @@ func ParseFreeBSD(r io.Reader) (Result, error) {
 	}
 	return res, nil
 }
+
+// mavenRepositoryDir is the directory name the local repository's layout
+// starts under: ~/.m2/repository, or whatever maven.repo.local names, which
+// ends in it by convention.
+const mavenRepositoryDir = "/repository/"
+
+// ParseMaven converts a listing of the POMs in a local Maven repository,
+// 'find ~/.m2/repository -name "*.pom"', one path per line: every version a
+// Maven build on the host resolved. Gradle keeps its own cache
+// (~/.gradle/caches/modules-2) in a hashed layout, so it is not read here.
+//
+// A path is read relative to its last "/repository/", or as already relative
+// when it has none. One that is not <groupId dirs>/<artifactId>/<version>/
+// <artifactId>-<version>.pom (a timestamped SNAPSHOT, a stray file) is
+// skipped and counted. A SNAPSHOT is skipped as well: it was built on this
+// host or redeployed upstream, and either way no registry version names it.
+func ParseMaven(r io.Reader) (Result, error) {
+	var (
+		pms        []manifest.PackageManifest
+		snapshots  int
+		unreadable []string
+	)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		rel := filepathToSlash(line)
+		if i := strings.LastIndex(rel, mavenRepositoryDir); i >= 0 {
+			rel = rel[i+len(mavenRepositoryDir):]
+		}
+		rel = strings.TrimPrefix(rel, "./")
+		mp, ok := manifest.ParseMavenPath(rel)
+		if !ok || mp.Metadata || mp.Extension != "pom" || mp.Classifier != "" || mp.Companion != "" {
+			unreadable = append(unreadable, line)
+			continue
+		}
+		if mp.Snapshot() {
+			snapshots++
+			continue
+		}
+		pms = append(pms, pkg(manifest.TypeMaven, mp.Name(), mp.Version, "", registryMode))
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("scan the local repository listing: %w", err)
+	}
+	var res Result
+	res.Packages = mergeSameName(pms)
+	if snapshots > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d SNAPSHOT version(s): they are rebuilt under the same name, so no registry version describes them", snapshots))
+	}
+	if len(unreadable) > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d line(s) that are not <groupId dirs>/<artifactId>/<version>/<artifactId>-<version>.pom under a local repository, first: %q; list it with: find ~/.m2/repository -name '*.pom'",
+			len(unreadable), unreadable[0]))
+	}
+	sortPackages(res.Packages)
+	return res, nil
+}
+
+// filepathToSlash reads a Windows path listing the way the layout is written.
+func filepathToSlash(p string) string { return strings.ReplaceAll(p, `\`, "/") }

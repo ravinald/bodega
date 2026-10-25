@@ -22,7 +22,7 @@ func TestMutationAPIAdmitsEveryKnownType(t *testing.T) {
 	for _, typ := range manifest.AllTypes {
 		t.Run(typ, func(t *testing.T) {
 			s, _, _ := refreshTestServer(t)
-			body := fmt.Sprintf(`{"name":"parity","type":%q,"versions":[{"version":"1.0.0"}]}`, typ)
+			body := fmt.Sprintf(`{"name":%q,"type":%q,"versions":[{"version":"1.0.0"}]}`, parityName(typ), typ)
 			r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/"+typ, strings.NewReader(body))
 			r.SetPathValue("type", typ)
 			w := httptest.NewRecorder()
@@ -35,11 +35,21 @@ func TestMutationAPIAdmitsEveryKnownType(t *testing.T) {
 			if w.Code != http.StatusCreated {
 				t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
 			}
-			if pm, _ := s.store.GetPackage(t.Context(), typ, "parity"); pm == nil {
+			if pm, _ := s.store.GetPackage(t.Context(), typ, parityName(typ)); pm == nil {
 				t.Errorf("type %q returned 201 but stored nothing", typ)
 			}
 		})
 	}
+}
+
+// parityName is a name every type's own rule accepts. Maven's names are
+// <groupId>:<artifactId> coordinates, which admission checks, and a bare name
+// would test the name rule rather than the type gate.
+func parityName(typ string) string {
+	if typ == manifest.TypeMaven {
+		return "com.example:parity"
+	}
+	return "parity"
 }
 
 // TestAdmitAndMutationAPIAgreeOnTypes is the other half: the shared admit path
@@ -49,7 +59,7 @@ func TestAdmitAndMutationAPIAgreeOnTypes(t *testing.T) {
 	cfg := &config.Config{}
 	for _, typ := range manifest.AllTypes {
 		pm := &manifest.PackageManifest{
-			Name:     "parity",
+			Name:     parityName(typ),
 			Type:     typ,
 			Versions: []manifest.VersionEntry{{Version: "1.0.0"}},
 		}

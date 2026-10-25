@@ -617,3 +617,145 @@ func TestPrefetchGemfileLockWithoutChecksums(t *testing.T) {
 		}
 	}
 }
+
+// mavenPrefetchFixture is gemPrefetchFixture for maven_upstream: a TLS stub
+// in the repository layout, answering each file's .sha256 from its bytes.
+func mavenPrefetchFixture(t *testing.T, files map[string][]byte) *prefetchFixture {
+	t.Helper()
+	f := newPrefetchFixture(t, policy.ActionBlock)
+	stub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if base, ok := strings.CutSuffix(p, ".sha256"); ok {
+			if body, found := files[base]; found {
+				_, _ = w.Write([]byte(sha256Hex(body)))
+				return
+			}
+		}
+		body, ok := files[p]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(stub.Close)
+	orig := http.DefaultTransport
+	http.DefaultTransport = stub.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = orig })
+
+	path := os.Getenv(config.EnvConfigFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg["maven_upstream"] = stub.URL
+	raw, _ = json.Marshal(cfg)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+const (
+	slf4jPOM = "org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.pom"
+	slf4jJar = "org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar"
+	bomPOM   = "org/springframework/boot/spring-boot-dependencies/3.3.0/spring-boot-dependencies-3.3.0.pom"
+	epollPOM = "io/netty/netty-transport-native-epoll/4.1.110.Final/netty-transport-native-epoll-4.1.110.Final.pom"
+	epollJar = "io/netty/netty-transport-native-epoll/4.1.110.Final/netty-transport-native-epoll-4.1.110.Final.jar"
+	epollX86 = "io/netty/netty-transport-native-epoll/4.1.110.Final/netty-transport-native-epoll-4.1.110.Final-linux-x86_64.jar"
+)
+
+func mavenPrefetchFiles() map[string][]byte {
+	return map[string][]byte{
+		slf4jPOM: []byte(`<project><artifactId>slf4j-api</artifactId></project>`),
+		slf4jJar: []byte("slf4j-api 2.0.13 jar"),
+		bomPOM:   []byte(`<project><artifactId>spring-boot-dependencies</artifactId><packaging>pom</packaging></project>`),
+		epollPOM: []byte(`<project><artifactId>netty-transport-native-epoll</artifactId></project>`),
+		epollJar: []byte("epoll jar"),
+		epollX86: []byte("epoll linux-x86_64 jar"),
+	}
+}
+
+// TestImportLockfileGradleFetchesAndPins drives `bodega pkg import --lockfile`
+// over a gradle.lockfile end to end: each pin becomes a proxy-mode entry, its
+// files are fetched from maven_upstream and checked against the upstream's
+// .sha256, and every file is pinned under the key the /maven/ route reads.
+func TestImportLockfileGradleFetchesAndPins(t *testing.T) {
+	files := mavenPrefetchFiles()
+	f := mavenPrefetchFixture(t, files)
+	lock := f.write(t, "gradle.lockfile", "# This is a Gradle generated file for dependency locking.\n"+
+		"org.slf4j:slf4j-api:2.0.13=compileClasspath,runtimeClasspath\n"+
+		"org.springframework.boot:spring-boot-dependencies:3.3.0=compileClasspath,runtimeClasspath\n"+
+		"empty=annotationProcessor\n")
+
+	cmd := newImportCmd(&globalFlags{})
+	cmd.SetArgs([]string{"--lockfile", lock})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("pkg import --lockfile: %v", err)
+	}
+
+	store := manifest.NewLocalStore(f.manifests)
+	adb := f.open(t)
+	defer adb.Close()
+	for name, want := range map[string]struct{ main, ext string }{
+		"org.slf4j:slf4j-api":                               {slf4jJar, "jar"},
+		"org.springframework.boot:spring-boot-dependencies": {bomPOM, "pom"},
+	} {
+		pm, err := store.GetPackage(t.Context(), manifest.TypeMaven, name)
+		if err != nil || pm == nil || len(pm.Versions) != 1 {
+			t.Fatalf("stored %s = %+v, %v", name, pm, err)
+		}
+		ve := pm.Versions[0]
+		if ve.Mode != manifest.ModeProxy || ve.Metadata[manifest.MetaMavenExtension] != want.ext {
+			t.Errorf("%s entry = %+v; want proxy mode and the %s packaging recorded", name, ve, want.ext)
+		}
+		if cs := ve.Checksum; cs == nil || cs.Value != sha256Hex(files[want.main]) {
+			t.Errorf("%s checksum = %+v; want the sha256 of %s", name, cs, want.main)
+		}
+		pin, err := adb.GetChecksum(t.Context(), manifest.MavenKey(want.main))
+		if err != nil || pin == nil || pin.Value != sha256Hex(files[want.main]) {
+			t.Errorf("%s pin = %+v, %v; want it under %s", name, pin, err, manifest.MavenKey(want.main))
+		}
+	}
+}
+
+// A dependency:list output file carries no name prefetch recognizes, so its
+// header identifies it; the classifier it resolved is fetched beside the jar.
+// A second list naming the same version with another classifier folds it in
+// rather than being dropped as a version already held.
+func TestPrefetchMavenDependencyListFetchesClassifiers(t *testing.T) {
+	files := mavenPrefetchFiles()
+	f := mavenPrefetchFixture(t, files)
+	first := f.write(t, "deps.txt", "\nThe following files have been resolved:\n"+
+		"   io.netty:netty-transport-native-epoll:jar:4.1.110.Final:runtime -- module io.netty.transport.epoll [auto]\n")
+	code, rows, err := f.prefetch(t, false, first)
+	if err != nil || code != 0 || len(rows) != 1 || rows[0].Fetch != "fetched" {
+		t.Fatalf("prefetch = %d, %v, %+v; want epoll admitted and fetched", code, err, rows)
+	}
+	second := f.write(t, "runtime-deps.txt", "\nThe following files have been resolved:\n"+
+		"   io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.110.Final:runtime\n")
+	if code, rows, err := f.prefetch(t, false, second); err != nil || code != 0 || len(rows) != 1 {
+		t.Fatalf("second prefetch = %d, %v, %+v", code, err, rows)
+	}
+
+	store := manifest.NewLocalStore(f.manifests)
+	pm, err := store.GetPackage(t.Context(), manifest.TypeMaven, "io.netty:netty-transport-native-epoll")
+	if err != nil || pm == nil || len(pm.Versions) != 1 {
+		t.Fatalf("stored epoll = %+v, %v", pm, err)
+	}
+	if got := pm.Versions[0].Classifiers; len(got) != 1 || got[0] != "linux-x86_64" {
+		t.Errorf("classifiers = %v; want the second list's linux-x86_64 folded into the held version", got)
+	}
+	adb := f.open(t)
+	defer adb.Close()
+	pin, err := adb.GetChecksum(t.Context(), manifest.MavenKey(epollX86))
+	if err != nil || pin == nil || pin.Value != sha256Hex(files[epollX86]) {
+		t.Errorf("classifier pin = %+v, %v; want the linux-x86_64 jar pinned under its own key", pin, err)
+	}
+}

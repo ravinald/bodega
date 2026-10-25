@@ -2261,6 +2261,14 @@ components:
             packument's bin.
           additionalProperties:
             type: string
+        classifiers:
+          type: array
+          description: >-
+            maven only. The classified files fetched beside the main artifact
+            and POM: "sources", or "<classifier>@<extension>" for one that is
+            not a jar.
+          items:
+            type: string
         published_at:
           type: string
           format: date-time
