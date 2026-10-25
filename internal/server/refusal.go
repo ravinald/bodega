@@ -504,6 +504,16 @@ func constraintRefusal(typ, name, version, constraint string) *refusal {
 	return f
 }
 
+// unorderableConstraintRefusal is constraintRefusal for a pair of versions
+// typ's ordering cannot compare, where "outside the constraint" would send
+// the operator widening a range that was never the problem.
+func unorderableConstraintRefusal(typ, name, entryVersion, version, constraint string) *refusal {
+	f := newRefusal(checkConstraint, typ, name, version, http.StatusForbidden)
+	f.reason = fmt.Sprintf("%s could not be ordered as a %s version against %s, the version the %q version_constraint on %s names, so the constraint cannot admit it.", version, typ, entryVersion, constraint, name)
+	f.next = fmt.Sprintf("request a version in the form %s orders, or ask an operator to correct the entry with `bodega pkg edit %s %s`.", typ, typ, name)
+	return f
+}
+
 func frozenRefusal(typ, name string) *refusal {
 	f := newRefusal(checkFrozen, typ, name, "", http.StatusForbidden)
 	f.reason = "every version of this package is frozen, so it cannot be deleted."

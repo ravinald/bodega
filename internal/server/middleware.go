@@ -343,15 +343,25 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 // because the version exists upstream and policy declines to serve it, which
 // is a refusal in the same sense the middleware gates are — and, unlike them,
 // one an operator will read as a broken client until the row names the
-// constraint.
-func (s *Server) refuseVersionConstraint(w http.ResponseWriter, r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string) {
-	f := constraintRefusal(pkgType, pkgName, reqVersion, constraint)
-	recordDenialFor(s.auditDB, r, pkgType, pkgName, reqVersion,
-		audit.DenialVersionConstraint, map[string]string{
-			"constraint":    constraint,
-			"entry_version": entryVersion,
-			"incident":      f.incident,
-		})
+// constraint. ordered is versionAllowed's second return: false says the
+// versions could not be compared at all, which the body and the row's reason
+// tell apart from a version outside the range.
+func (s *Server) refuseVersionConstraint(w http.ResponseWriter, r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string, ordered bool) {
+	var f *refusal
+	if ordered {
+		f = constraintRefusal(pkgType, pkgName, reqVersion, constraint)
+	} else {
+		f = unorderableConstraintRefusal(pkgType, pkgName, entryVersion, reqVersion, constraint)
+	}
+	details := map[string]string{
+		"constraint":    constraint,
+		"entry_version": entryVersion,
+		"incident":      f.incident,
+	}
+	if !ordered {
+		details["reason"] = f.reason
+	}
+	recordDenialFor(s.auditDB, r, pkgType, pkgName, reqVersion, audit.DenialVersionConstraint, details)
 	f.write(w, r)
 }
 
