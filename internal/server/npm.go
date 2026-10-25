@@ -53,8 +53,8 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			// refusing by policy. Mirrors the gomod path in versionAllowed.
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
-				if !versionAllowed(baseVer, reqVersion, vc) {
-					s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
+				if ok, ordered := versionAllowed(manifest.TypeNpm, baseVer, reqVersion, vc); !ok {
+					s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc, ordered)
 					return
 				}
 			}
@@ -123,9 +123,11 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			vc, baseVer := packageVersionConstraint(pm)
-			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, reqVersion, vc) {
-				s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
-				return
+			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+				if ok, ordered := versionAllowed(manifest.TypeNpm, baseVer, reqVersion, vc); !ok {
+					s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc, ordered)
+					return
+				}
 			}
 		}
 	}
@@ -500,7 +502,11 @@ func filterPackumentByManifest(body []byte, pm *manifest.PackageManifest) ([]byt
 		if hidden[v] {
 			return true
 		}
-		return hasConstraint && !versionAllowed(baseVer, v, vc)
+		if !hasConstraint {
+			return false
+		}
+		ok, _ := versionAllowed(manifest.TypeNpm, baseVer, v, vc)
+		return !ok
 	})
 }
 

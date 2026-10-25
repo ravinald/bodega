@@ -221,8 +221,10 @@ func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request,
 		if ve.Version == "" || ve.Hidden {
 			continue
 		}
-		if hasConstraint && !versionAllowed(baseVer, ve.Version, vc) {
-			continue
+		if hasConstraint {
+			if ok, _ := versionAllowed(manifest.TypeCargo, baseVer, ve.Version, vc); !ok {
+				continue
+			}
 		}
 		cksum := s.cargoCksum(ctx, crate, ve)
 		if cksum == "" {

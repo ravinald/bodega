@@ -121,9 +121,11 @@ func (s *Server) handleRubygemsVersioned(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		vc, baseVer := packageVersionConstraint(pm)
-		if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(rubygemsRelease(baseVer), release, vc) {
-			s.refuseVersionConstraint(w, r, manifest.TypeRubygems, name, baseVer, version, vc)
-			return
+		if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+			if ok, ordered := versionAllowed(manifest.TypeRubygems, rubygemsRelease(baseVer), release, vc); !ok {
+				s.refuseVersionConstraint(w, r, manifest.TypeRubygems, name, baseVer, version, vc, ordered)
+				return
+			}
 		}
 	}
 

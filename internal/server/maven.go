@@ -50,9 +50,11 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			vc, baseVer := packageVersionConstraint(pm)
-			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, mp.Version, vc) {
-				s.refuseVersionConstraint(w, r, manifest.TypeMaven, name, baseVer, mp.Version, vc)
-				return
+			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+				if ok, ordered := versionAllowed(manifest.TypeMaven, baseVer, mp.Version, vc); !ok {
+					s.refuseVersionConstraint(w, r, manifest.TypeMaven, name, baseVer, mp.Version, vc, ordered)
+					return
+				}
 			}
 		}
 	}
