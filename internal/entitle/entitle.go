@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
@@ -321,6 +322,24 @@ func (p *Profile) Covers(typ, name string) Decision {
 			p.name, typ, name, typ, audit.ExpansionWarn)
 	}
 	return d
+}
+
+// CoversMavenGroup is Covers for a groupId-level maven-metadata.xml, which
+// names a groupId and no artifact. The groupId is inside the set when the
+// profile lists any artifact of it or its <groupId>:* entry, so a profile
+// listing one plugin can resolve that plugin by prefix; otherwise the answer
+// is Covers' for <groupId>:*, which an open type or the expansion action
+// decides.
+func (p *Profile) CoversMavenGroup(group string) Decision {
+	if p != nil {
+		prefix := group + ":"
+		for k := range p.entries[manifest.TypeMaven] {
+			if strings.HasPrefix(k, prefix) {
+				return p.Covers(manifest.TypeMaven, k)
+			}
+		}
+	}
+	return p.Covers(manifest.TypeMaven, group+":"+manifest.MavenGroupWildcard)
 }
 
 // Permits reports whether p allows typ/name at version.
