@@ -91,7 +91,7 @@ func TestMavenPathIdentity(t *testing.T) {
 		{"junit/junit/4.13.2/junit-4.13.2-sources.jar",
 			manifest.MavenPath{GroupID: "junit", ArtifactID: "junit", Version: "4.13.2", Classifier: "sources", Extension: "jar"}},
 		{"org/example/core/widget/maven-metadata.xml.md5",
-			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Companion: "md5", Metadata: true}},
+			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Companion: "md5", Metadata: true, GroupLevelID: "org.example.core.widget"}},
 		{"org/example/core/widget/1.3.0-SNAPSHOT/maven-metadata.xml",
 			manifest.MavenPath{GroupID: "org.example.core", ArtifactID: "widget", Version: "1.3.0-SNAPSHOT", Metadata: true}},
 		{"org/example/core/widget/1.3.0-SNAPSHOT/widget-1.3.0-20261001.120000-1.jar",
@@ -597,5 +597,77 @@ func TestMavenArtifactRefusedByAge(t *testing.T) {
 	defer mu.Unlock()
 	if strings.Join(seen, ",") != "HEAD /maven2/org/example/core/widget/1.2.0/widget-1.2.0.pom" {
 		t.Errorf("upstream saw %v, want the one HEAD of the POM and no fetch", seen)
+	}
+}
+
+// mavenPluginGroupMetadata is the groupId-level file Maven reads to resolve
+// the prefix in `mvn dependency:tree`.
+const mavenPluginGroupMetadata = `<metadata><plugins><plugin><name>Apache Maven Dependency Plugin</name>` +
+	`<prefix>dependency</prefix><artifactId>maven-dependency-plugin</artifactId></plugin></plugins></metadata>`
+
+const mavenPluginGroupPath = "org/apache/maven/plugins/maven-metadata.xml"
+
+func mavenPluginGroupServer(t *testing.T) (*Server, *recordingUpstream) {
+	t.Helper()
+	s, up := mavenServer(t)
+	up.route("/maven2/"+mavenPluginGroupPath, mavenPluginGroupMetadata)
+	up.route("/maven2/"+mavenPluginGroupPath+".sha1", "plugin group sha1")
+	up.route("/maven2/com/example/maven-metadata.xml", "<metadata><plugins/></metadata>")
+	return s, up
+}
+
+// A groupId-level maven-metadata.xml is admitted on its group-level reading,
+// which the artifact reading one directory up (org.apache.maven:plugins) would
+// never be.
+func TestMavenGroupLevelMetadataAllowList(t *testing.T) {
+	for _, rule := range []string{"org.apache.maven.plugins:*", "org.apache.maven.plugins:maven-dependency-plugin"} {
+		t.Run(rule, func(t *testing.T) {
+			s, up := mavenPluginGroupServer(t)
+			allowMaven(t, s, rule)
+			if code, body, _ := getMaven(t, s, mavenPluginGroupPath); code != http.StatusOK || body != mavenPluginGroupMetadata {
+				t.Errorf("plugin group metadata under %s = %d %q, want the upstream document", rule, code, body)
+			}
+			if code, body, _ := getMaven(t, s, mavenPluginGroupPath+".sha1"); code != http.StatusOK || body != "plugin group sha1" {
+				t.Errorf("its .sha1 under %s = %d %q, want 200", rule, code, body)
+			}
+
+			code, body, h := getMaven(t, s, "com/example/maven-metadata.xml")
+			if code != http.StatusForbidden {
+				t.Fatalf("unrelated metadata = %d %q, want the allow-list's 403", code, body)
+			}
+			refusalIncident(t, h, checkAllowList)
+			for _, want := range []string{"com/example/maven-metadata.xml", "com:example", "com.example", "bodega policy add maven com.example:*"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("refusal %q does not name %q", body, want)
+				}
+			}
+			if n := upstreamSaw(up, "/com/example/maven-metadata.xml"); n != 0 {
+				t.Errorf("upstream saw the refused metadata %d times", n)
+			}
+		})
+	}
+}
+
+// Group-level metadata is recorded under <groupId>:*, never under the artifact
+// one directory up, while a version's own files keep their artifact row.
+func TestMavenGroupLevelMetadataDiscoveryRow(t *testing.T) {
+	s, _ := mavenPluginGroupServer(t)
+	for _, p := range []string{mavenPluginGroupPath, mavenPluginGroupPath + ".sha1", "org/example/core/widget/1.2.0/widget-1.2.0.pom"} {
+		if code, body, _ := getMaven(t, s, p); code != http.StatusOK {
+			t.Fatalf("GET /maven/%s = %d %q", p, code, body)
+		}
+	}
+	byName := map[string]audit.DiscoveryRow{}
+	for _, r := range mavenDiscoveryRows(t, s) {
+		byName[r.PkgName] = r
+	}
+	if _, phantom := byName["org.apache.maven:plugins"]; phantom {
+		t.Errorf("discovery recorded the phantom artifact org.apache.maven:plugins: %+v", byName)
+	}
+	if r, ok := byName["org.apache.maven.plugins:*"]; !ok || r.PatternHint != "org.apache.maven.plugins:*" || r.RequestCount != 2 {
+		t.Errorf("group row = %+v (present %v), want org.apache.maven.plugins:* hinted as itself, counted twice", r, ok)
+	}
+	if r, ok := byName[mavenWidgetName]; !ok || r.PkgVersion != "1.2.0" || r.PatternHint != mavenWidgetName {
+		t.Errorf("artifact row = %+v (present %v), want %s@1.2.0", r, ok, mavenWidgetName)
 	}
 }

@@ -174,6 +174,32 @@ func (c *Checker) Check(ctx context.Context, registryType, candidate string) err
 	}
 }
 
+// CheckMavenGroup is Check for a groupId-level maven-metadata.xml, which names
+// a groupId and no artifact. Any rule under that one groupId admits it, an
+// exact <groupId>:<artifactId> as well as <groupId>:*: the file lists plugin
+// prefixes, never an artifact a resolver can install, and a host allowed one
+// plugin of the group needs the listing to find it by prefix. It is not a
+// widening of matchMaven, which a manifest entry's <groupId>:* candidate also
+// reaches and which must keep refusing that entry on one artifact's rule.
+func (c *Checker) CheckMavenGroup(ctx context.Context, group string) error {
+	if c == nil {
+		return nil
+	}
+	rules, mode, err := c.load(ctx, manifest.TypeMaven)
+	if err != nil {
+		return fmt.Errorf("load policies: %w", err)
+	}
+	if mode.Mode == audit.ModeOpen {
+		return nil
+	}
+	for _, r := range rules {
+		if g, _, ok := strings.Cut(r.Pattern, ":"); ok && g == group {
+			return nil
+		}
+	}
+	return &ViolationError{RegistryType: manifest.TypeMaven, Candidate: group + ":" + manifest.MavenGroupWildcard}
+}
+
 // load returns the type's rules and its mode, through the cache.
 func (c *Checker) load(ctx context.Context, registryType string) ([]Rule, Mode, error) {
 	c.mu.RLock()

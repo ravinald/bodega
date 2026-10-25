@@ -270,3 +270,30 @@ func TestFilterMavenMetadata(t *testing.T) {
 		t.Errorf("with no versions list, only a refused latest/release is dropped: %s", got)
 	}
 }
+
+// A closed profile listing one plugin serves its groupId's prefix metadata
+// unfiltered, and refuses a groupId it lists nothing of, naming both readings.
+func TestMavenProfileGroupLevelMetadata(t *testing.T) {
+	s, up := mavenServer(t)
+	up.route("/maven2/"+mavenPluginGroupPath, mavenPluginGroupMetadata)
+	up.route("/maven2/org/unrelated/maven-metadata.xml", "<metadata><plugins/></metadata>")
+	f := bindProfile(t, s, "ci", "ci01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeMaven, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeMaven, Name: "org.apache.maven.plugins:maven-dependency-plugin", Version: "3.8.1"}})
+
+	if status, body := f.get(t, "/maven/"+mavenPluginGroupPath); status != http.StatusOK || body != mavenPluginGroupMetadata {
+		t.Errorf("plugin group metadata = %d %q, want the upstream document", status, body)
+	}
+	status, body := f.get(t, "/maven/org/unrelated/maven-metadata.xml")
+	if status != http.StatusNotFound {
+		t.Fatalf("metadata of an unlisted groupId = %d, want 404: %s", status, body)
+	}
+	for _, want := range []string{"org/unrelated/maven-metadata.xml", "org:unrelated", "org.unrelated"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("refusal %q does not name %q", body, want)
+		}
+	}
+	if n := upstreamSaw(up, "/org/unrelated/maven-metadata.xml"); n != 0 {
+		t.Errorf("upstream saw the refused metadata %d times", n)
+	}
+}
