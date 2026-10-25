@@ -1025,9 +1025,10 @@ var fetchGatedTypes = map[string]bool{
 var fetchCheckers = admit.VersionCheckers
 
 // datedThroughUpstream sends the age gate's reads through the proxy's own
-// transport and guard. A gem is dated at rubygems_upstream, the host its bytes
-// come from, so that read is held to upstream_connect_timeout and the redirect
-// guard as the fetch it gates is.
+// transport and guard. A gem is dated at rubygems_upstream and a Maven
+// artifact at maven_upstream, the hosts their bytes come from, so that read is
+// held to upstream_connect_timeout and the redirect guard as the fetch it
+// gates is.
 func datedThroughUpstream(checkers []policy.VersionChecker) {
 	for _, c := range checkers {
 		if ac, ok := c.(*policy.AgeChecker); ok {
@@ -1094,7 +1095,7 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	switch {
 	case fetchGatedTypes[fill.typ] && fill.version != "":
 		checkers = fetchCheckers(s.cfg, s.auditDB)
-		if fill.typ == manifest.TypeRubygems {
+		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven {
 			datedThroughUpstream(checkers)
 		}
 	case fill.typ == manifest.TypeApt && fill.version != "":

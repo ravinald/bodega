@@ -33,6 +33,7 @@ var agePublishers = map[string]func(*AgeChecker, context.Context, string, string
 	manifest.TypeGomod:    (*AgeChecker).gomodPublishedAt,
 	manifest.TypeCargo:    (*AgeChecker).cratesPublishedAt,
 	manifest.TypeRubygems: (*AgeChecker).gemPublishedAt,
+	manifest.TypeMaven:    (*AgeChecker).mavenPublishedAt,
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -60,6 +61,10 @@ type AgeChecker struct {
 	// RubygemsBase is rubygems_upstream: the versions API is served from the
 	// same root as the gem files.
 	RubygemsBase string
+	// MavenBase is maven_upstream, the repository root the artifacts come
+	// from: a POM's response headers are the only place a Maven repository
+	// dates a release.
+	MavenBase string
 
 	// HTTP gets a conservative timeout so a slow upstream doesn't stall
 	// admission.
@@ -75,6 +80,7 @@ func NewAgeChecker(store AgeStore) *AgeChecker {
 		GoProxy:      "https://proxy.golang.org",
 		CratesBase:   "https://crates.io",
 		RubygemsBase: "https://rubygems.org",
+		MavenBase:    "https://repo.maven.apache.org/maven2",
 		HTTP:         &http.Client{Timeout: 10 * time.Second},
 		Now:          time.Now,
 	}
@@ -309,6 +315,46 @@ func (c *AgeChecker) gemPublishedAt(ctx context.Context, name, version string) (
 		return time.Parse(time.RFC3339Nano, v.CreatedAt)
 	}
 	return time.Time{}, fmt.Errorf("rubygems versions API does not list %s %s for platform %s", name, number, platform)
+}
+
+// mavenPublishedAt reads the Last-Modified header of a version's POM. No
+// document in a Maven repository dates a single release: maven-metadata.xml
+// carries one lastUpdated for the whole artifact. Maven Central sets a POM's
+// Last-Modified to the moment it was deployed, and a release path is never
+// rewritten there, so the header is the deploy time. A POM answered without
+// one cannot be dated and is an error, as crates.io's 404 for an unknown crate
+// version is.
+func (c *AgeChecker) mavenPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
+	p, ok := manifest.MavenArtifactPath(name, version)
+	if ok {
+		_, ok = manifest.ParseMavenPath(p)
+	}
+	if !ok {
+		return time.Time{}, fmt.Errorf("maven %q at %q names no POM in the repository layout", name, version)
+	}
+	endpoint := c.MavenBase + "/" + p
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	req.Header.Set("User-Agent", "bodega")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return time.Time{}, err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("HEAD %s: HTTP %d", endpoint, resp.StatusCode)
+	}
+	lm := resp.Header.Get("Last-Modified")
+	if lm == "" {
+		return time.Time{}, fmt.Errorf("HEAD %s answered with no Last-Modified, so %s %s has no deploy time", endpoint, name, version)
+	}
+	t, err := http.ParseTime(lm)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("HEAD %s: Last-Modified %q: %w", endpoint, lm, err)
+	}
+	return t, nil
 }
 
 func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {

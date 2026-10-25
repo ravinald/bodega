@@ -1,12 +1,20 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // G505: the checksum Maven compares, recomputed to check the one served.
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -416,4 +424,178 @@ func TestMavenFetchWritesServeFetch(t *testing.T) {
 		}
 	}
 	t.Errorf("no serve_fetch event for maven %s at 1.2.0; events carry %v", mavenWidgetName, eventIdentities(events))
+}
+
+// gateMaven runs the proxy fill's real admission checks with the maven OSV
+// gate blocking, answered from a database holding one advisory against
+// org.example.core:widget releases before 1.2.0. The index filter is rebuilt
+// so it reads the same database.
+func gateMaven(t *testing.T, s *Server) {
+	t.Helper()
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
+	rec := map[string]any{
+		"id": "GHSA-test-mvn1",
+		"affected": []map[string]any{{
+			"package": map[string]string{"name": mavenWidgetName, "ecosystem": "Maven"},
+			"ranges": []map[string]any{{"type": "ECOSYSTEM",
+				"events": []map[string]string{{"introduced": "0"}, {"fixed": "1.2.0"}}}},
+		}},
+	}
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("GHSA-test-mvn1.json")
+		_ = json.NewEncoder(f).Encode(rec)
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+	s.cfg.OSVDBDir = t.TempDir()
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(t.Context(), "Maven"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := s.auditDB.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeMaven, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set osv policy: %v", err)
+	}
+	s.indexFilter = policy.NewIndexFilter(s.auditDB, admit.OSVChecker(s.cfg, s.auditDB))
+}
+
+// A vulnerable version is refused at the artifact route before upstream is
+// asked for it, for its jar and its POM alike, and the refusal names the
+// advisory.
+func TestMavenArtifactRefusedByOSV(t *testing.T) {
+	s, up := mavenServer(t)
+	gateMaven(t, s)
+	for _, p := range []string{"widget-1.1.0.jar", "widget-1.1.0.pom"} {
+		code, body, hdr := getMaven(t, s, "org/example/core/widget/1.1.0/"+p)
+		if code != http.StatusForbidden {
+			t.Fatalf("%s: status %d, want 403 (%s)", p, code, body)
+		}
+		refusalIncident(t, hdr, checkOSV)
+		if !strings.Contains(body, "GHSA-test-mvn1") {
+			t.Errorf("%s: refusal does not name the advisory:\n%s", p, body)
+		}
+		if n := upstreamSaw(up, "/1.1.0/"+p); n != 0 {
+			t.Errorf("%s: upstream asked %d times for a refused artifact", p, n)
+		}
+	}
+	if code, body, _ := getMaven(t, s, "org/example/core/widget/1.2.0/widget-1.2.0.jar"); code != http.StatusOK {
+		t.Errorf("the fixed version: %d %s", code, body)
+	}
+}
+
+// With the index filter on, the filter's own refusal answers the artifact
+// route before the version gate does, and it still has to name the advisory.
+// The age gate's "wait out the window" advice is wrong for an OSV block.
+func TestMavenArtifactRefusedByOSVWithIndexFilter(t *testing.T) {
+	s, up := mavenServer(t)
+	gateMaven(t, s)
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeMaven, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"widget-1.1.0.jar", "widget-1.1.0.pom"} {
+		code, body, _ := getMaven(t, s, "org/example/core/widget/1.1.0/"+p)
+		if code != http.StatusForbidden {
+			t.Fatalf("%s: status %d, want 403 (%s)", p, code, body)
+		}
+		if !strings.Contains(body, "GHSA-test-mvn1") {
+			t.Errorf("%s: refusal does not name the advisory:\n%s", p, body)
+		}
+		if strings.Contains(body, "wait out the window") {
+			t.Errorf("%s: OSV refusal gives the age gate's advice:\n%s", p, body)
+		}
+		if n := upstreamSaw(up, "/1.1.0/"+p); n != 0 {
+			t.Errorf("%s: upstream asked %d times for a refused artifact", p, n)
+		}
+	}
+}
+
+// With the index filter on, the vulnerable version is absent from the
+// artifact's maven-metadata.xml, and <latest> and <release> are recomputed
+// when they named it. The checksum served beside the document is the one of
+// the filtered bytes, which is what Maven and Gradle verify.
+func TestMavenMetadataWithholdsOSVBlockedVersion(t *testing.T) {
+	s, up := mavenServer(t)
+	up.route(mavenWidgetDir+"maven-metadata.xml", `<metadata>
+  <groupId>org.example.core</groupId>
+  <artifactId>widget</artifactId>
+  <versioning>
+    <latest>1.1.0</latest>
+    <release>1.1.0</release>
+    <versions>
+      <version>1.2.0</version>
+      <version>1.1.0</version>
+    </versions>
+  </versioning>
+</metadata>
+`)
+	gateMaven(t, s)
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeMaven, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	code, body, hdr := getMaven(t, s, "org/example/core/widget/maven-metadata.xml")
+	if code != http.StatusOK {
+		t.Fatalf("status %d (%s)", code, body)
+	}
+	if strings.Contains(body, "1.1.0") || !strings.Contains(body, "<version>1.2.0</version>") ||
+		!strings.Contains(body, "<latest>1.2.0</latest>") || !strings.Contains(body, "<release>1.2.0</release>") {
+		t.Errorf("filtered metadata:\n%s", body)
+	}
+	if got := hdr.Get(filteredHeader); got != "1; osv=1" {
+		t.Errorf("%s = %q, want \"1; osv=1\"", filteredHeader, got)
+	}
+	if n := len(filterRows(t, s, manifest.TypeMaven, mavenWidgetName)); n != 1 {
+		t.Errorf("index_filtered rows = %d, want 1", n)
+	}
+	sum := sha1.Sum([]byte(body)) //nolint:gosec // G401: see the import.
+	if code, got, _ := getMaven(t, s, "org/example/core/widget/maven-metadata.xml.sha1"); code != http.StatusOK || got != hex.EncodeToString(sum[:]) {
+		t.Errorf("metadata sha1 = %d %q, want the filtered document's %s", code, got, hex.EncodeToString(sum[:]))
+	}
+
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeMaven, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, body, _ := getMaven(t, s, "org/example/core/widget/maven-metadata.xml"); !strings.Contains(body, "<version>1.1.0</version>") {
+		t.Errorf("the filter off serves the upstream's document; got\n%s", body)
+	}
+}
+
+// The age gate dates a Maven artifact by its POM's Last-Modified at
+// maven_upstream, the host the artifact is fetched from, and refuses one too
+// new before fetching it.
+func TestMavenArtifactRefusedByAge(t *testing.T) {
+	s := proxyingServer(t)
+	var mu sync.Mutex
+	var seen []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/maven2/org/example/core/widget/1.2.0/widget-1.2.0.pom" {
+			w.Header().Set("Last-Modified", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
+			_, _ = w.Write([]byte("<project/>"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(up.Close)
+	s.cfg.MavenUpstream = up.URL + "/maven2"
+	gateMaven(t, s)
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeMaven, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+	code, body, hdr := getMaven(t, s, "org/example/core/widget/1.2.0/widget-1.2.0.jar")
+	if code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 (%s)", code, body)
+	}
+	refusalIncident(t, hdr, checkAge)
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(seen, ",") != "HEAD /maven2/org/example/core/widget/1.2.0/widget-1.2.0.pom" {
+		t.Errorf("upstream saw %v, want the one HEAD of the POM and no fetch", seen)
+	}
 }

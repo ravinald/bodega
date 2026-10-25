@@ -620,6 +620,29 @@ var (
 	mavenLatestRelease  = regexp.MustCompile(`([ \t]*)<(latest|release)>\s*([^<]*?)\s*</(?:latest|release)>([ \t]*\r?\n?)`)
 )
 
+// mavenMetadataVersions lists the versions a maven-metadata.xml names, in
+// document order: its <versions> list, and <latest> and <release>, which
+// filterMavenMetadata also judges when there is no list.
+func mavenMetadataVersions(body []byte) []string {
+	seen := map[string]bool{}
+	var out []string
+	note := func(v string) {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	for _, block := range mavenVersionsBlock.FindAll(body, -1) {
+		for _, m := range mavenVersionElement.FindAllSubmatch(block, -1) {
+			note(string(m[1]))
+		}
+	}
+	for _, m := range mavenLatestRelease.FindAllSubmatch(body, -1) {
+		note(string(m[3]))
+	}
+	return out
+}
+
 // filterMavenMetadata drops the versions a profile does not permit from an
 // artifact-level maven-metadata.xml and recomputes <latest> and <release>
 // from what remains. Both are what a resolver asked for LATEST, RELEASE or a

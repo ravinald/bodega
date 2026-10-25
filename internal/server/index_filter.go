@@ -94,14 +94,15 @@ var publishTimeClient = &http.Client{Timeout: 10 * time.Second, Transport: guard
 // publishClock is the age checker's own date sources, pointed at the
 // upstreams this server proxies rather than at the public registries
 // admission reads. The filter has to date the versions the client is shown,
-// and those come from npm_upstream, pypi_upstream, gomod_upstream and
-// rubygems_upstream.
+// and those come from npm_upstream, pypi_upstream, gomod_upstream,
+// rubygems_upstream and maven_upstream.
 func (s *Server) publishClock() *policy.AgeChecker {
 	c := policy.NewAgeChecker(nil)
 	c.NpmRegistry = strings.TrimRight(s.cfg.NpmUpstream, "/")
 	c.PypiBase = strings.TrimRight(s.cfg.PypiUpstream, "/")
 	c.GoProxy = strings.TrimRight(s.cfg.GomodUpstream, "/")
 	c.RubygemsBase = strings.TrimRight(s.cfg.RubygemsUpstream, "/")
+	c.MavenBase = strings.TrimRight(s.cfg.MavenUpstream, "/")
 	c.HTTP = publishTimeClient
 	return c
 }
@@ -383,6 +384,23 @@ func (iw *indexWithhold) pypiJSON(listed []string, uploaded map[string]time.Time
 	return iw.decide(listed, times)
 }
 
+// mavenMetadata withholds from a proxied artifact-level maven-metadata.xml.
+// A version is dated only when the age gate blocks, because each date is a
+// read of that version's POM: a metadata file lists every release an artifact
+// ever had, and the OSV half needs no date at all.
+func (iw *indexWithhold) mavenMetadata(body []byte) []byte {
+	listed := mavenMetadataVersions(body)
+	var times map[string]time.Time
+	if iw.gate.Dates() {
+		times = iw.s.publishTimesFor(iw.r.Context(), iw.eco, iw.name, listed)
+	}
+	withheld := iw.decide(listed, times)
+	if len(withheld) == 0 {
+		return body
+	}
+	return filterMavenMetadata(body, func(v string) bool { _, ok := withheld[v]; return !ok })
+}
+
 // gomodList withholds from a proxied @v/list.
 func (iw *indexWithhold) gomodList(body []byte) []byte {
 	var listed []string
@@ -415,19 +433,44 @@ func (s *Server) refuseWithheld(w http.ResponseWriter, r *http.Request, eco, nam
 	if iw == nil {
 		return false
 	}
-	why := iw.decide([]string{version}, s.publishTimesFor(r.Context(), eco, name, []string{version}))[version]
+	var times map[string]time.Time
+	if iw.gate.Dates() {
+		times = s.publishTimesFor(r.Context(), eco, name, []string{version})
+	}
+	why := iw.decide([]string{version}, times)[version]
 	if why == "" {
 		return false
 	}
-	reason := fmt.Sprintf("%s %s@%s has an OSV record and the %s OSV gate blocks it", eco, name, version, eco)
+	var reason, next string
 	if why == policy.WithheldAge {
 		reason = fmt.Sprintf("%s %s@%s is newer than the %s minimum publish age the %s age gate blocks on",
 			eco, name, version, policy.ShortDuration(iw.gate.MinAge), eco)
+		next = "resolve against the index or wait out the window"
+	} else {
+		reason, next = withheldOSVReason(r.Context(), iw.gate, eco, name, version)
 	}
 	recordDenialFor(s.auditDB, r, eco, name, version, audit.DenialWithheldVersion,
 		map[string]string{"check": why, "reason": reason})
-	http.Error(w, reason+"; bodega's index for this package omits it, so resolve against the index or wait out the window", http.StatusForbidden)
+	http.Error(w, reason+"; bodega's index for this package omits it, so "+next, http.StatusForbidden)
 	return true
+}
+
+// withheldOSVReason words an OSV withhold with the records behind it. The
+// age gate's advice does not apply: waiting admits nothing an advisory
+// blocks.
+func withheldOSVReason(ctx context.Context, gate *policy.IndexGate, eco, name, version string) (reason, next string) {
+	malware, advisories := gate.OSVRecords(ctx, name, version)
+	switch {
+	case len(malware) > 0:
+		return fmt.Sprintf("%s %s@%s is known malware: %s", eco, name, version, strings.Join(malware, ", ")),
+			"pick another release and remove this one from any lockfile that names it"
+	case len(advisories) > 0:
+		return fmt.Sprintf("%s %s@%s has OSV records the %s OSV gate blocks: %s",
+				eco, name, version, eco, strings.Join(advisories, ", ")),
+			"resolve against the index or pick a version without those records"
+	}
+	return fmt.Sprintf("%s %s@%s has an OSV record and the %s OSV gate blocks it", eco, name, version, eco),
+		"resolve against the index or pick a version without that record"
 }
 
 // publishTimesFor dates versions of one package, from the cache where it can

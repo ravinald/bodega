@@ -31,7 +31,7 @@ var popularFS embed.FS
 // the ones whose packages are named by whoever publishes them, on a registry
 // anyone can publish to.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 }
 
 // NormalizeName is the form two names are compared in. pypi applies PEP 503,
@@ -191,13 +191,41 @@ func (p PopularNames) Label() string {
 // and the two distances added, so an edit never pairs a character of the
 // scope with one of the name, and `@types/node` is 1 from `@typess/node` and
 // 1 from `@types/nodes`.
+//
+// A maven name is split at the colon the same way, and one more case is
+// counted: a popular artifactId under any other groupId is distance 1, the
+// groupId replaced whole. That is the squat Maven Central sees, because
+// Central verifies who owns a groupId and not what artifactIds it publishes:
+// org.fasterxml.jackson.core:jackson-databind is three edits from the real
+// com.fasterxml.jackson.core groupId, past the reach of the summed distance,
+// and still the name a hurried reader takes for Jackson.
 func nameDistance(ecosystem, a, b string) int {
-	if ecosystem == manifest.TypeNpm {
+	switch ecosystem {
+	case manifest.TypeNpm:
 		as, an := splitNpmScope(a)
 		bs, bn := splitNpmScope(b)
 		return damerauLevenshtein(as, bs) + damerauLevenshtein(an, bn)
+	case manifest.TypeMaven:
+		ag, aa := splitMavenName(a)
+		bg, ba := splitMavenName(b)
+		if aa == ba {
+			if ag == bg {
+				return 0
+			}
+			return 1
+		}
+		return damerauLevenshtein(ag, bg) + damerauLevenshtein(aa, ba)
 	}
 	return damerauLevenshtein(a, b)
+}
+
+// splitMavenName splits "<groupId>:<artifactId>"; a name with no colon is
+// all artifactId.
+func splitMavenName(name string) (group, artifact string) {
+	if g, a, ok := strings.Cut(name, ":"); ok {
+		return g, a
+	}
+	return "", name
 }
 
 // splitNpmScope splits "@scope/name" into "scope" and "name"; an unscoped
@@ -217,10 +245,18 @@ func splitNpmScope(name string) (scope, bare string) {
 // `/` of a scope the other name lacks, so it can exceed the summed distance
 // and prune the true nearest name.
 func distanceFloor(ecosystem, a, b string) int {
-	if ecosystem == manifest.TypeNpm {
+	switch ecosystem {
+	case manifest.TypeNpm:
 		as, an := splitNpmScope(a)
 		bs, bn := splitNpmScope(b)
 		return lengthGap(as, bs) + lengthGap(an, bn)
+	case manifest.TypeMaven:
+		ag, aa := splitMavenName(a)
+		bg, ba := splitMavenName(b)
+		if aa == ba {
+			return 0
+		}
+		return lengthGap(ag, bg) + lengthGap(aa, ba)
 	}
 	return lengthGap(a, b)
 }
@@ -327,7 +363,8 @@ func LoadPopularNames(ctx context.Context, store SimilarityStore, ecosystem stri
 
 // ExactRule reports whether an allow-list rule names one package rather than
 // a family of them. pypi, cargo and rubygems rules are always exact; an npm rule is
-// unless it is the `@scope/*` wildcard. Every other kind is a host or a
+// unless it is the `@scope/*` wildcard, and a maven rule unless it is the
+// `<groupId>:*` one. Every other kind is a host or a
 // prefix, which names no package at all.
 func ExactRule(typ, pattern string) bool {
 	switch typ {
@@ -335,6 +372,8 @@ func ExactRule(typ, pattern string) bool {
 		return true
 	case manifest.TypeNpm:
 		return !strings.HasSuffix(pattern, "/*")
+	case manifest.TypeMaven:
+		return !strings.HasSuffix(pattern, ":"+manifest.MavenGroupWildcard)
 	}
 	return false
 }

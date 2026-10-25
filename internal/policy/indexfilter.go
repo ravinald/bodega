@@ -27,9 +27,11 @@ type IndexFilterStore interface {
 
 // IndexFilterEcosystems returns the registry types whose proxied index the
 // filter can rewrite, sorted. cargo has an age gate and a sparse index too,
-// and is not here because nothing in its index dates a release.
+// and is not here because nothing in its index dates a release. Nothing in a
+// maven-metadata.xml does either; it is here because, as with a gomod list,
+// each version it names can be dated by a read of its own.
 func IndexFilterEcosystems() []string {
-	return []string{manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
+	return []string{manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi}
 }
 
 // IndexFilter decides which versions a proxied index omits so a client's
@@ -160,6 +162,21 @@ func (g *IndexGate) Malicious(ctx context.Context, name, version string) bool {
 	r := g.osv.Check(ctx, &manifest.PackageManifest{Type: g.Ecosystem, Name: name},
 		&manifest.VersionEntry{Version: version})
 	return r.Action == ActionBlock && r.Details["malware"] != nil
+}
+
+// OSVRecords names the records behind an OSV withhold: the malware ids when
+// OSV records the version as malicious, otherwise the advisory ids. A refusal
+// quotes them so the client learns which record to look up, which the bare
+// fact of a withhold does not tell it.
+func (g *IndexGate) OSVRecords(ctx context.Context, name, version string) (malware, advisories []string) {
+	if g.osv == nil {
+		return nil, nil
+	}
+	r := g.osv.Check(ctx, &manifest.PackageManifest{Type: g.Ecosystem, Name: name},
+		&manifest.VersionEntry{Version: version})
+	malware, _ = r.Details["malware"].([]string)
+	advisories, _ = r.Details["vulns"].([]string)
+	return malware, advisories
 }
 
 // fixedOSVPolicy answers an OSVChecker from rows already read. advisory is
