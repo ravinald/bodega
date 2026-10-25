@@ -14,6 +14,8 @@
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
 # shellcheck source=../lib/remote.sh
 . "${E2E_DIR:?}/lib/remote.sh"
+# shellcheck source=../lib/bodega.sh
+. "${E2E_DIR:?}/lib/bodega.sh"
 
 E2E_BASE_URL=""
 E2E_SERVICE_USER="bodega"
@@ -222,15 +224,14 @@ check_eq SHIP-11 "the client reaches the server over the network" "200" "$E2E_OU
 # first package outside it, and "apt-get install redis-server" then 404s at the
 # pool after apt update reported success.
 
-# jq through e2e_on rather than e2e_config_get: this suite sources assert.sh and
-# remote.sh only, and a call to a function lib/bodega.sh defines is swallowed by
-# the "|| true" every read here carries, leaving the previous command's E2E_OUT
-# to be asserted against.
+# Read once and grouped locally by e2e_apt_mirror_groups, which follows
+# mirroredStanzas: one stanza per distinct component set, so Ubuntu and Debian
+# codenames mirrored together are two stanzas rather than one.
 E2E_HOST=server
-e2e_on server "sudo jq -r '.apt_upstreams // {} | keys | length' /etc/bodega/config.json" || true
-mirrored_n="${E2E_OUT:-0}"
-e2e_on server "sudo jq -r '.apt_upstreams // {} | keys | join(\" \")' /etc/bodega/config.json" || true
-mirrored_suites="$E2E_OUT"
+e2e_on server "sudo jq -c '.apt_upstreams // {}' /etc/bodega/config.json" || true
+mirrored_upstreams="${E2E_OUT:-}"
+mirrored_n="$(printf '%s' "$mirrored_upstreams" | jq -r 'length' 2>/dev/null || true)"
+mirrored_groups="$(e2e_apt_mirror_groups "$mirrored_upstreams" 2>/dev/null || true)"
 # The last banner in the window, not the first: the journal or log holds every
 # restart this guest has ever done, and an assertion over all of them measures
 # history.
@@ -243,16 +244,37 @@ if [ "${mirrored_n:-0}" -lt 2 ]; then
 	e2e_skip SHIP-APT-02 "the mirrored stanza names the components its codename serves" \
 		"this guest mirrors no codename" "internal/aptsources/aptsources.go:189"
 else
-	check_contains SHIP-APT-01 "the banner collapses the mirrored codenames onto one stanza" \
-		"Suites: $mirrored_suites" "$banner" \
-		"internal/server/apt.go:1692; every mirrored codename on one Suites: line, as the generated half already prints; four printed as four stanzas is four sources entries where apt wants one" \
-		"$svc_log | the last startup banner"
-	check_contains SHIP-APT-02 "the mirrored stanza names the components its codename serves" \
-		"Components: main restricted universe multiverse" "$banner" \
-		"internal/aptsources/aptsources.go:189; the same line docs/usage.md prints under Mirroring an upstream archive, against Components: main which drops universe and multiverse" \
-		"$svc_log | the last startup banner"
+	want_suites="" missing_suites="" want_comps="" wrong_comps=""
+	while IFS=$'\t' read -r group_suites group_comps; do
+		[ -n "$group_suites" ] || continue
+		want_suites="${want_suites:+$want_suites | }Suites: $group_suites"
+		want_comps="${want_comps:+$want_comps | }Components: $group_comps under Suites: $group_suites"
+		if ! got_comps="$(e2e_apt_stanza_components "$banner" "$group_suites")"; then
+			missing_suites="${missing_suites:-Suites: $group_suites}"
+			wrong_comps="${wrong_comps:-Suites: $group_suites (no such stanza)}"
+		elif [ "$got_comps" != "$group_comps" ]; then
+			wrong_comps="${wrong_comps:-Components: $group_comps under Suites: $group_suites (got: ${got_comps:-none})}"
+		fi
+	done <<<"$mirrored_groups"
+	apt01_ref="internal/server/apt.go:1847; one Suites: line per component set, as mirroredStanzas prints; four codenames printed as four stanzas is four sources entries where apt wants one"
+	apt02_ref="internal/aptsources/aptsources.go:189; each stanza names its own codenames' components, against Components: main which drops universe and multiverse"
+	if [ -z "$missing_suites" ]; then
+		e2e_record SHIP-APT-01 PASS "the banner collapses the mirrored codenames onto one stanza" \
+			"contains: $want_suites" "$(e2e_excerpt "$banner")" "$svc_log | the last startup banner" 0 "$apt01_ref"
+	else
+		e2e_record SHIP-APT-01 FAIL "the banner collapses the mirrored codenames onto one stanza" \
+			"contains: $missing_suites" "$(e2e_excerpt "$banner")" "$svc_log | the last startup banner" 0 "$apt01_ref"
+	fi
+	if [ -z "$wrong_comps" ]; then
+		e2e_record SHIP-APT-02 PASS "the mirrored stanza names the components its codename serves" \
+			"$want_comps" "$(e2e_excerpt "$banner")" "$svc_log | the last startup banner" 0 "$apt02_ref"
+	else
+		e2e_record SHIP-APT-02 FAIL "the mirrored stanza names the components its codename serves" \
+			"$wrong_comps" "$(e2e_excerpt "$banner")" "$svc_log | the last startup banner" 0 "$apt02_ref"
+	fi
+	unset want_suites missing_suites want_comps wrong_comps group_suites group_comps got_comps apt01_ref apt02_ref
 fi
-unset mirrored_n mirrored_suites banner
+unset mirrored_upstreams mirrored_n mirrored_groups banner
 
 # ---- ownership -------------------------------------------------------------
 #
