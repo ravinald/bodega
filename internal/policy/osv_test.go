@@ -346,7 +346,7 @@ func TestOSVPolicy_CargoVulnerableVersion(t *testing.T) {
 }
 
 func TestOSVEcosystems_CoversCargo(t *testing.T) {
-	want := []string{manifest.TypeApt, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	want := []string{manifest.TypeApt, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 	got := OSVEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("OSVEcosystems() = %v, want %v", got, want)

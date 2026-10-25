@@ -94,14 +94,15 @@ var publishTimeClient = &http.Client{Timeout: 10 * time.Second, Transport: guard
 // publishClock is the age checker's own date sources, pointed at the
 // upstreams this server proxies rather than at the public registries
 // admission reads. The filter has to date the versions the client is shown,
-// and those come from npm_upstream, pypi_upstream, gomod_upstream and
-// rubygems_upstream.
+// and those come from npm_upstream, pypi_upstream, gomod_upstream,
+// rubygems_upstream and maven_upstream.
 func (s *Server) publishClock() *policy.AgeChecker {
 	c := policy.NewAgeChecker(nil)
 	c.NpmRegistry = strings.TrimRight(s.cfg.NpmUpstream, "/")
 	c.PypiBase = strings.TrimRight(s.cfg.PypiUpstream, "/")
 	c.GoProxy = strings.TrimRight(s.cfg.GomodUpstream, "/")
 	c.RubygemsBase = strings.TrimRight(s.cfg.RubygemsUpstream, "/")
+	c.MavenBase = strings.TrimRight(s.cfg.MavenUpstream, "/")
 	c.HTTP = publishTimeClient
 	return c
 }
@@ -381,6 +382,23 @@ func (iw *indexWithhold) pypiJSON(listed []string, uploaded map[string]time.Time
 		}
 	}
 	return iw.decide(listed, times)
+}
+
+// mavenMetadata withholds from a proxied artifact-level maven-metadata.xml.
+// A version is dated only when the age gate blocks, because each date is a
+// read of that version's POM: a metadata file lists every release an artifact
+// ever had, and the OSV half needs no date at all.
+func (iw *indexWithhold) mavenMetadata(body []byte) []byte {
+	listed := mavenMetadataVersions(body)
+	var times map[string]time.Time
+	if iw.gate.Dates() {
+		times = iw.s.publishTimesFor(iw.r.Context(), iw.eco, iw.name, listed)
+	}
+	withheld := iw.decide(listed, times)
+	if len(withheld) == 0 {
+		return body
+	}
+	return filterMavenMetadata(body, func(v string) bool { _, ok := withheld[v]; return !ok })
 }
 
 // gomodList withholds from a proxied @v/list.

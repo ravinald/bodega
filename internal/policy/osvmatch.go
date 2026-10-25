@@ -16,6 +16,7 @@ const (
 	orderPEP440   = "pep440"
 	orderDebian   = "debian"
 	orderRubyGems = "rubygems"
+	orderMaven    = "maven"
 )
 
 // osvAffected is the subset of an OSV record's `affected` entry the matcher
@@ -109,8 +110,8 @@ func (e *osvEvent) UnmarshalJSON(b []byte) error {
 }
 
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
-// ecosystem. PyPI orders by PEP 440, RubyGems by Gem::Version, Ubuntu and
-// Debian by dpkg's ordering, and the rest of what bodega maps order by semver,
+// ecosystem. PyPI orders by PEP 440, RubyGems by Gem::Version, Maven by
+// Maven's ComparableVersion, Ubuntu and Debian by dpkg's ordering, and the rest of what bodega maps order by semver,
 // so an unknown ecosystem gets semver rather than an error.
 func osvVersionOrder(ecosystem string) string {
 	switch {
@@ -118,6 +119,8 @@ func osvVersionOrder(ecosystem string) string {
 		return orderPEP440
 	case ecosystem == "RubyGems":
 		return orderRubyGems
+	case ecosystem == "Maven":
+		return orderMaven
 	case isDistroEcosystem(ecosystem):
 		return orderDebian
 	}
@@ -307,6 +310,8 @@ func compareVersions(order, a, b string) (int, bool) {
 		return compareDebian(a, b)
 	case orderRubyGems:
 		return compareGemVersions(a, b)
+	case orderMaven:
+		return compareMavenVersions(a, b)
 	}
 	return compareSemver(a, b)
 }
@@ -320,6 +325,9 @@ func orderable(order, v string) bool {
 		return parseDebian(v).ok
 	case orderRubyGems:
 		_, ok := parseGemVersion(v)
+		return ok
+	case orderMaven:
+		_, ok := parseMavenVersion(v)
 		return ok
 	}
 	return parseSemver(v).ok
@@ -403,6 +411,222 @@ func compareGemVersions(a, b string) (int, bool) {
 		return compareInt(x.num, y.num), true
 	}
 	return 0, true
+}
+
+// mavenItem is one item of a version as Maven's ComparableVersion parses it:
+// a number, a qualifier, or a sublist. A '-', and a change between digits and
+// letters, open a sublist, which is what places 1.0-alpha1 below 1.0 and
+// 31.1-jre above it.
+type mavenItem struct {
+	kind mavenKind
+	num  string // decimal digits without leading zeros; "" is zero
+	str  string // qualifier with its aliases resolved; "" is a release
+	list []*mavenItem
+}
+
+type mavenKind int
+
+const (
+	mavenNumber mavenKind = iota
+	mavenQualifier
+	mavenList
+)
+
+// mavenQualifiers are the qualifiers Maven knows, in order; "" is a release.
+// An unknown qualifier sorts after all of them, among its kind by spelling.
+var mavenQualifiers = []string{"alpha", "beta", "milestone", "rc", "snapshot", "", "sp"}
+
+const mavenReleaseRank = "5"
+
+// parseMavenVersion builds ComparableVersion's item tree. Maven orders any
+// string, so only an empty one or one holding whitespace is refused: neither
+// names a version a repository path can carry.
+func parseMavenVersion(v string) (*mavenItem, bool) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || strings.ContainsAny(v, " \t\r\n") {
+		return nil, false
+	}
+	root := &mavenItem{kind: mavenList}
+	list, stack := root, []*mavenItem{root}
+	add := func(it *mavenItem) { list.list = append(list.list, it) }
+	open := func() {
+		child := &mavenItem{kind: mavenList}
+		add(child)
+		list = child
+		stack = append(stack, child)
+	}
+	token := func(digits bool, s string) *mavenItem {
+		if digits {
+			return &mavenItem{kind: mavenNumber, num: strings.TrimLeft(s, "0")}
+		}
+		return mavenQualifierItem(s, false)
+	}
+	digits, start := false, 0
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == '.' || c == '-':
+			if i == start {
+				add(&mavenItem{kind: mavenNumber})
+			} else {
+				add(token(digits, v[start:i]))
+			}
+			start = i + 1
+			if c == '-' {
+				open()
+			}
+		case c >= '0' && c <= '9':
+			if !digits && i > start {
+				add(mavenQualifierItem(v[start:i], true))
+				start = i
+				open()
+			}
+			digits = true
+		default:
+			if digits && i > start {
+				add(token(true, v[start:i]))
+				start = i
+				open()
+			}
+			digits = false
+		}
+	}
+	if len(v) > start {
+		add(token(digits, v[start:]))
+	}
+	for i := len(stack) - 1; i >= 0; i-- {
+		stack[i].trimNull()
+	}
+	return root, true
+}
+
+// mavenQualifierItem resolves Maven's aliases: a, b and m directly before a
+// digit are alpha, beta and milestone; ga, final and release are a release;
+// cr is rc.
+func mavenQualifierItem(s string, beforeDigit bool) *mavenItem {
+	if beforeDigit && len(s) == 1 {
+		switch s {
+		case "a":
+			s = "alpha"
+		case "b":
+			s = "beta"
+		case "m":
+			s = "milestone"
+		}
+	}
+	switch s {
+	case "ga", "final", "release":
+		s = ""
+	case "cr":
+		s = "rc"
+	}
+	return &mavenItem{kind: mavenQualifier, str: s}
+}
+
+func (it *mavenItem) null() bool {
+	switch it.kind {
+	case mavenNumber:
+		return it.num == ""
+	case mavenQualifier:
+		return it.str == ""
+	}
+	return len(it.list) == 0
+}
+
+// trimNull drops trailing zeros, release qualifiers and empty sublists,
+// stopping at the first other number or qualifier, so 1.0.0 is 1 and
+// 5.3.18.RELEASE is 5.3.18.
+func (it *mavenItem) trimNull() {
+	for i := len(it.list) - 1; i >= 0; i-- {
+		switch x := it.list[i]; {
+		case x.null():
+			it.list = append(it.list[:i], it.list[i+1:]...)
+		case x.kind != mavenList:
+			return
+		}
+	}
+}
+
+func (it *mavenItem) rank() string {
+	for i, q := range mavenQualifiers {
+		if q == it.str {
+			return strconv.Itoa(i)
+		}
+	}
+	return strconv.Itoa(len(mavenQualifiers)) + "-" + it.str
+}
+
+// compare is ComparableVersion's Item.compareTo. A nil o is the padding a
+// shorter list compares against.
+func (it *mavenItem) compare(o *mavenItem) int {
+	switch it.kind {
+	case mavenNumber:
+		switch {
+		case o == nil:
+			if it.num == "" {
+				return 0
+			}
+			return 1
+		case o.kind == mavenNumber:
+			if c := compareInt(len(it.num), len(o.num)); c != 0 {
+				return c
+			}
+			return strings.Compare(it.num, o.num)
+		}
+		return 1
+	case mavenQualifier:
+		switch {
+		case o == nil:
+			return strings.Compare(it.rank(), mavenReleaseRank)
+		case o.kind == mavenQualifier:
+			return strings.Compare(it.rank(), o.rank())
+		}
+		return -1
+	}
+	switch {
+	case o == nil:
+		for _, x := range it.list {
+			if c := x.compare(nil); c != 0 {
+				return c
+			}
+		}
+		return 0
+	case o.kind == mavenNumber:
+		return -1
+	case o.kind == mavenQualifier:
+		return 1
+	}
+	for i := 0; i < len(it.list) || i < len(o.list); i++ {
+		var l, r *mavenItem
+		if i < len(it.list) {
+			l = it.list[i]
+		}
+		if i < len(o.list) {
+			r = o.list[i]
+		}
+		c := 0
+		switch {
+		case l != nil:
+			c = l.compare(r)
+		case r != nil:
+			c = -r.compare(nil)
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// compareMavenVersions orders two versions as Maven's ComparableVersion does,
+// which is the ordering OSV's Maven ECOSYSTEM ranges are written in.
+func compareMavenVersions(a, b string) (int, bool) {
+	pa, oka := parseMavenVersion(a)
+	pb, okb := parseMavenVersion(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	return pa.compare(pb), true
 }
 
 type semverVersion struct {

@@ -2319,11 +2319,11 @@ Next step: ask an operator to run `bodega policy add npm left-pad` if it should 
 | Check         | Status | Where it refuses                                                                                                                   |
 | ------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `allow-list`  | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                                                                       |
-| `age`         | 403    | a proxied npm, pypi, gomod, cargo or rubygems download, and `POST /api/v1/packages`                                                |
-| `osv`         | 403    | a proxied npm, pypi, gomod, cargo or rubygems download, and `POST /api/v1/packages`                                                |
-| `provenance`  | 403    | a proxied npm, pypi, gomod, cargo or rubygems download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks   |
-| `similarity`  | 403    | a proxied npm, pypi, gomod, cargo or rubygems download, and `POST /api/v1/packages`, when the `name_similarity` check blocks       |
-| `integration` | 403    | a proxied npm, pypi, gomod, cargo or rubygems download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
+| `age`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                |
+| `osv`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                |
+| `provenance`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks   |
+| `similarity`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `name_similarity` check blocks       |
+| `integration` | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
 | `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                                   |
 | `profile`     | 403    | any package route on a host whose profile governs the type                                                                         |
 | `constraint`  | 403    | an npm or gomod version outside the entry's `version_constraint`                                                                   |
@@ -2436,7 +2436,7 @@ The mutation API answers its own JSON, `{"error": "<summary> Next step: <next st
 
 #### Limits
 
-- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod, cargo or rubygems version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. A `.deb` served from a mirrored apt codename is the exception: the OSV gate checks it on the miss and on every cache hit, against the release the mirrored codename belongs to, because no manifest entry holds it for `bodega policy osv rescan` to revisit. A release with no synced export is served unchecked and logged once; see [apt](#apt) under the OSV gate. The age gate does not run on apt, and proxied helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
+- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod, cargo, rubygems or maven version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. A `.deb` served from a mirrored apt codename is the exception: the OSV gate checks it on the miss and on every cache hit, against the release the mirrored codename belongs to, because no manifest entry holds it for `bodega policy osv rescan` to revisit. A release with no synced export is served unchecked and logged once; see [apt](#apt) under the OSV gate. The age gate does not run on apt, and proxied helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
 - **The reason phrase is HTTP/1.1's.** HTTP/2 has none, so a pip, helm or apt client that negotiates HTTP/2 with bodega's TLS listener, or a reverse proxy that rewrites the status line, shows the bare `403 Forbidden`. The header and body still carry the refusal.
 - **Other refusals keep their own text.** The middleware gates (deny list, admin network, tokens), the `/client/` routes, a git push, the spool bounds and the distfiles license and environment refusals are not package checks and answer as they did.
 
@@ -2470,7 +2470,7 @@ bodega policy add npm @example-cloud/*
 
 An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on, or set the type's [admission mode](#bodega-policy-mode-setlist) to `listed` or `open` explicitly. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
 
-An exact npm, pypi, cargo or rubygems name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
+An exact npm, pypi, cargo, rubygems or maven name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
 
 ```text
 $ bodega policy add pypi reqeusts
@@ -2647,16 +2647,19 @@ Coverage is the set of registry types the gate can query, which is also the set 
 | gomod    | `Go`                                                               |
 | cargo    | `crates.io`                                                        |
 | rubygems | `RubyGems`                                                         |
+| maven    | `Maven`, the package named `<groupId>:<artifactId>`                |
 | apt      | one per release (`Ubuntu:22.04:LTS`, `Debian:12`); see [apt](#apt) |
 
 `binary`, `git`, `helm`, `freebsd` and `distfiles` have no OSV identifier. `set` refuses them:
 
 ```bash
 $ bodega policy osv set helm block
-Error: the OSV gate does not cover ecosystem "helm": the row would be stored and never read, leaving the gate silently off; set one of apt, cargo, gomod, npm, pypi, rubygems instead
+Error: the OSV gate does not cover ecosystem "helm": the row would be stored and never read, leaving the gate silently off; set one of apt, cargo, gomod, maven, npm, pypi, rubygems instead
 ```
 
 A gem is matched on its release: `nokogiri-1.16.7-x86_64-linux.gem` is checked as `nokogiri` `1.16.7`, because RubyGems advisories name releases and every platform build of one shares its code. A vulnerable release is refused at `/rubygems/gems/<file>` and at its gemspec under `/rubygems/quick/Marshal.4.8/`, for every platform, and the refusal names the advisory ids.
+
+A Maven artifact is matched as `<groupId>:<artifactId>` at its version directory, the name OSV's Maven records use, so `org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.jar` is checked as `org.apache.logging.log4j:log4j-core` `2.14.1` and refused, naming `GHSA-jfh8-c2jp-5v3q`. The jar, POM, Gradle module and classifiers of that version share the verdict. With the [index filter](#bodega-policy-filter-setlist) on for maven, the version is also absent from the artifact's `maven-metadata.xml`.
 
 Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the form shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
 
@@ -2743,7 +2746,7 @@ A mirrored fetch the gate cannot answer is served, never refused, and never coun
 
 #### Matching
 
-The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io, PEP 440 for PyPI, `Gem::Version`'s ordering for RubyGems (a letter segment opens a prerelease, so `1.6.1.rc1` sorts below `1.6.1`), and dpkg's ordering for the Ubuntu and Debian releases. Measured against `api.osv.dev` over 240 range-boundary `(package, version)` pairs drawn across the four language ecosystems, it agrees on all 240.
+The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io, PEP 440 for PyPI, `Gem::Version`'s ordering for RubyGems (a letter segment opens a prerelease, so `1.6.1.rc1` sorts below `1.6.1`), Maven's `ComparableVersion` for Maven (`2.0-beta9` sorts below `2.0`, `5.3.18.RELEASE` equals `5.3.18`, and an unknown qualifier sorts above the release, so `31.1-jre` is above `31.1`), and dpkg's ordering for the Ubuntu and Debian releases. Measured against `api.osv.dev` over 240 range-boundary `(package, version)` pairs drawn across the four language ecosystems, it agrees on all 240.
 
 An ecosystem is decompressed on the first version checked against it and held until `sync` replaces the archive, so a bulk import pays one decompression rather than one round trip per version. One process shares that copy across every package it admits: importing 100 npm packages at 4 versions each against the 2026-09 export takes 0.5s. What it holds, measured on the 2026-09-13 exports: npm 58 MB, PyPI 9 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
 
@@ -2900,12 +2903,13 @@ Coverage is the set of registry types with an upstream endpoint that carries a p
 | gomod    | `Time` in the proxy's `@v/<version>.info`                                                                                    |
 | cargo    | `version.created_at` on `crates.io/api/v1/crates/<name>/<version>`                                                           |
 | rubygems | `created_at` of the entry matching the version's `number` and `platform` on `<rubygems_upstream>/api/v1/versions/<gem>.json` |
+| maven    | the `Last-Modified` header of a `HEAD` on the version's POM at `<maven_upstream>`, which Maven Central sets to the deploy time |
 
 `apt`, `binary`, `git`, `helm`, `freebsd` and `distfiles` have no such source. `set` refuses them:
 
 ```bash
 $ bodega policy age set apt 7d warn
-Error: the age gate does not cover ecosystem "apt": there is no upstream publish timestamp to date a version against, so every version would warn; set one of cargo, gomod, npm, pypi, rubygems instead
+Error: the age gate does not cover ecosystem "apt": there is no upstream publish timestamp to date a version against, so every version would warn; set one of cargo, gomod, maven, npm, pypi, rubygems instead
 ```
 
 The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
@@ -2928,13 +2932,13 @@ Nothing else counts such a row as enforcement. The `bodega serve` startup banner
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
-The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod, cargo or rubygems artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from, except for rubygems: a gem is dated at `rubygems_upstream`, the host it is fetched from, through the proxy's own upstream client, so `upstream_connect_timeout` bounds the read. A registry bodega cannot reach makes every miss warn rather than block, and so does a gem version or platform build the versions API does not list. A cache hit is not checked again. The OSV gate runs at the same points.
+The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod, cargo, rubygems or maven artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from, except for rubygems and maven: a gem is dated at `rubygems_upstream` and a Maven artifact at `maven_upstream`, the hosts they are fetched from, through the proxy's own upstream client, so `upstream_connect_timeout` bounds the read. A registry bodega cannot reach makes every miss warn rather than block, and so does a gem version or platform build the versions API does not list, and a Maven POM that is missing or answers with no `Last-Modified`. A cache hit is not checked again. The OSV gate runs at the same points.
 
 #### Publish times in the hosted indexes
 
 The age gate runs on the bodega host, at admission and on a proxy cache miss. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
 
-A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API, and rubygems `rubygems.org`. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
+A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API, rubygems `rubygems.org`, and maven Maven Central. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
 
 | Type  | Route                            | Where the time appears                                                                                       |
 | ----- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -3039,7 +3043,7 @@ bodega policy similarity list
 bodega policy similarity load npm ./top-npm.txt
 ```
 
-The check runs at the same points as the age, OSV and upstream provenance checks: import (`bodega pkg import`, `bodega pkg edit`, `bodega pkg create`, `POST /api/v1/packages`), a build's fetch, and every proxy cache miss for a versioned npm, pypi, cargo or rubygems artifact. Its verdict is the admission row's `name_similarity` check.
+The check runs at the same points as the age, OSV and upstream provenance checks: import (`bodega pkg import`, `bodega pkg edit`, `bodega pkg create`, `POST /api/v1/packages`), a build's fetch, and every proxy cache miss for a versioned npm, pypi, cargo, rubygems or maven artifact. Its verdict is the admission row's `name_similarity` check.
 
 **The comparison.** Damerau-Levenshtein distance (insert, delete, substitute, or swap two adjacent characters, each one edit) between the candidate and each popular name, after normalization:
 
@@ -3049,6 +3053,7 @@ The check runs at the same points as the age, OSV and upstream provenance checks
 | `npm`      | lowercase; the scope is compared with the other name's scope and the bare name with its bare name, and the two distances added                                                   |
 | `cargo`    | lowercase, and `_` equals `-`, because crates.io refuses a crate that differs from an existing one only in those ways                                                            |
 | `rubygems` | lowercase only, because rubygems.org refuses a gem that differs from an existing one only in case; `-` and `_` stay distinct, so `rest_client` is 1 from `rest-client` and fails |
+| `maven`    | lowercase; the groupId is compared with the other name's groupId and the artifactId with its artifactId, and the two distances added. A popular artifactId under any other groupId is distance 1 |
 
 A distance of 1 or 2 to a popular name the candidate is not equal to fails, and the detail names the nearest popular name and the distance:
 
@@ -3056,18 +3061,22 @@ A distance of 1 or 2 to a popular name the candidate is not equal to fails, and 
 reqeusts is distance 1 from the popular pypi name requests (embedded list of 1000, 2026-10-01)
 ```
 
-A name equal to a popular one after normalization passes, as does one three or more edits from all of them. Splitting the npm scope means `@typse/node` is 1 from `@types/node`. A scope the popular name lacks costs its length and the `@` and `/` cost nothing, so `@a/lodash` is 1 from `lodash` and fails, while `@evil/lodash` is 4 and passes. gomod, git, helm, binary, apt, freebsd and distfiles record `not_evaluated`, because no list ships for them and `set` and `load` refuse them.
+A name equal to a popular one after normalization passes, as does one three or more edits from all of them. Splitting the npm scope means `@typse/node` is 1 from `@types/node`. A scope the popular name lacks costs its length and the `@` and `/` cost nothing, so `@a/lodash` is 1 from `lodash` and fails, while `@evil/lodash` is 4 and passes.
+
+A Maven squat is a lookalike groupId over the real artifactId, because Maven Central verifies who owns a groupId and not what its artifactIds are called: `org.fasterxml.jackson.core:jackson-databind`, reported in 2025 posing as `com.fasterxml.jackson.core:jackson-databind`, is three edits away by groupId and still the name a reader takes for Jackson. So the artifactId is compared across groupIds as well as within one: `org.fasterxml.jackson.core:jackson-databind` and `io.github.someone:jackson-databind` are each 1 from the popular name and fail, and `com.google.guava:guawa` is 1 within its groupId. An artifact sharing a popular artifactId under its own groupId is near too, whoever published it: `io.cucumber:core` is 1 from `com.google.zxing:core`. Allow-list such a name exactly. A Scala cross-build the list does not carry, differing from one it does only in its `_2.12` or `_2.13` suffix, is 1 from it on the same terms.
+
+gomod, git, helm, binary, apt, freebsd and distfiles record `not_evaluated`, because no list ships for them and `set` and `load` refuse them.
 
 **Exemptions.** So that turning the check on refuses nothing already in use, a near name passes, with the reason in the detail, when:
 
-- an exact allow-list rule names it (a pypi, cargo or rubygems rule, or an npm rule that is not `@scope/*`), compared under the same normalization; or
+- an exact allow-list rule names it (a pypi, cargo or rubygems rule, an npm rule that is not `@scope/*`, or a maven rule that is not `<groupId>:*`), compared under the same normalization; or
 - it was in use when the name baseline was taken: the manifest store held it, or the `admissions` table held an `admitted` row for it.
 
 The admissions source covers the pass-through proxy, whose fills write an admission row and no manifest, so a name clients have been pulling through the proxy is in use even though the store has never listed it. A name whose only rows are refusals is not in use, and neither is one whose admitted rows all carry a `name_similarity` warning: the check had already run and flagged it.
 
 The baseline is taken once per audit database, by the first process to hold both it and the manifest store: `bodega serve` before it listens, and `pkg import`, `pkg edit`, `pkg create`, `build run`, `build fetch`, `build package`, `build upload`, `pkg prefetch` (unless `--dry-run` is set) and `policy similarity set` and `load` before they admit or write anything. It records every package name the store lists and every name with an admitted row, and `list` prints how many came from each source and when. It is never retaken: a name admitted after it is judged like any other, including a squat admitted under `warn`, so the baseline cannot launder one in.
 
-**Actions.** One row per ecosystem in `name_similarity_policy`; `set` overwrites, and `list` prints all four, with the unset ones at their default:
+**Actions.** One row per ecosystem in `name_similarity_policy`; `set` overwrites, and `list` prints all five, with the unset ones at their default:
 
 | Action           | A near name                                         |
 | ---------------- | --------------------------------------------------- |
@@ -3085,6 +3094,7 @@ A block answers the importer, the build or the proxied client the way an age or 
 | `pypi`     | [top-pypi-packages](https://hugovk.github.io/top-pypi-packages/)                         | 30 days  |
 | `cargo`    | [crates.io](https://crates.io/crates?sort=recent-downloads), recent sort                 | 90 days  |
 | `rubygems` | [ecosyste.ms](https://packages.ecosyste.ms/registries/rubygems.org), sorted by downloads | all time |
+| `maven`    | [ecosyste.ms](https://packages.ecosyste.ms/registries/repo1.maven.org), sorted by dependent packages, since Maven Central publishes no download counts | all time |
 
 `load` replaces one ecosystem's list whole with a file in the same format: one name per line, most popular first, `#` comments, and optional `# source:` and `# date:` header lines that `list` shows. Load a longer list, or one built from your own registry's traffic, when the defaults miss what your builds pull. The SHA-256 of each list in force is part of the [policy digest](#audit-trail), so a load changes the digest every later admission row cites.
 
@@ -3548,7 +3558,7 @@ bodega queue dismiss 14 --reason "typo of lodash"
 
 | Check                    | Written by                                                                                      | `approve` does                                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest. An exact npm, pypi, cargo or rubygems name within two edits of a popular one is refused and the row left open, naming the popular package; rerun with `--confirm-near-popular <that name>` to add the rule. |
+| `allow-list`             | The proxy's upstream allow-list gate, and the apt pool when every configured archive is refused | Adds an allow-list rule. For npm, pypi, cargo and gomod it is the exact name refused; for the host and URL-prefix types it is the host or prefix `bodega discover` would suggest. An exact npm, pypi, cargo, rubygems or maven name within two edits of a popular one is refused and the row left open, naming the popular package; rerun with `--confirm-near-popular <that name>` to add the rule. |
 | `age`                    | The proxy fill's age gate                                                                       | Requests an override (below)                                                                                                                                                                                                                                                                                                                                                                  |
 | `osv`                    | The proxy fill's OSV gate, for an advisory                                                      | Requests an override                                                                                                                                                                                                                                                                                                                                                                          |
 | `malware`                | The proxy's malware gate, and the OSV gate when the record is `MAL-`                            | Refused; dismiss it                                                                                                                                                                                                                                                                                                                                                                           |
@@ -3644,7 +3654,7 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 
 #### `bodega discover promote <type> <pattern> [comment] [--as policy|manifest]`
 
-`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`, and records the same `create` audit event. An exact npm, pypi, cargo or rubygems name within two edits of a popular package asks before writing, with the [`policy add` prompt](#bodega-policy-add-type-pattern-comment): anything but `y` or `yes`, or a stdin that ends first, writes nothing and exits non-zero.
+`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`, and records the same `create` audit event. An exact npm, pypi, cargo, rubygems or maven name within two edits of a popular package asks before writing, with the [`policy add` prompt](#bodega-policy-add-type-pattern-comment): anything but `y` or `yes`, or a stdin that ends first, writes nothing and exits non-zero.
 
 `--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
 
@@ -6989,7 +6999,7 @@ Every token route needs a bearer token holding `superadmin` and an address in `a
 | Method | Path                           | Description                                                                                                                                                                                                                                                                                                                                            |
 | ------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | GET    | `/api/v1/policies[?type=TYPE]` | List allow-list rules (optionally scoped to one registry type)                                                                                                                                                                                                                                                                                         |
-| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi, cargo or rubygems name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular`. A rule that already exists answers 409 with its `id` |
+| POST   | `/api/v1/policies`             | Add a rule (JSON body: `{registry_type, pattern, comment, confirm_near_popular}`). An exact npm, pypi, cargo, rubygems or maven name within two edits of a popular one answers 409 with `near_popular` and `distance` and writes nothing; resend with `confirm_near_popular` set to that `near_popular`. A rule that already exists answers 409 with its `id` |
 | DELETE | `/api/v1/policies/{id}`        | Remove a rule by ID                                                                                                                                                                                                                                                                                                                                    |
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.

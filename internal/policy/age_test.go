@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -263,8 +264,91 @@ func TestAgePolicy_GemLookupIsShared(t *testing.T) {
 	}
 }
 
+// A Maven version is dated by its POM's Last-Modified, read with a HEAD at the
+// repository path the coordinate names. A POM answered with no such header is
+// not dated, and neither is one the repository does not hold: both warn, as an
+// unknown crate version does.
+func TestAgePolicy_MavenDatedFromPOMLastModified(t *testing.T) {
+	now := time.Now()
+	stamp := func(d time.Duration) string { return now.Add(-d).UTC().Format(http.TimeFormat) }
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/org/apache/logging/log4j/log4j-core/2.24.3/log4j-core-2.24.3.pom":
+			w.Header().Set("Last-Modified", stamp(30*24*time.Hour))
+		case "/org/apache/logging/log4j/log4j-core/2.25.0/log4j-core-2.25.0.pom":
+			w.Header().Set("Last-Modified", stamp(2*time.Hour))
+		case "/org/apache/logging/log4j/log4j-core/2.25.1/log4j-core-2.25.1.pom":
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeMaven: {Ecosystem: manifest.TypeMaven, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	for _, tc := range []struct {
+		name, version string
+		action        string
+		reason        string
+	}{
+		{"org.apache.logging.log4j:log4j-core", "2.24.3", ActionPass, ""},
+		{"org.apache.logging.log4j:log4j-core", "2.25.0", ActionBlock, "org.apache.logging.log4j:log4j-core@2.25.0 is 2h old"},
+		{"org.apache.logging.log4j:log4j-core", "2.25.1", ActionWarn, "no Last-Modified"},
+		{"org.apache.logging.log4j:log4j-core", "9.9.9", ActionWarn, "HTTP 404"},
+		{"log4j-core", "2.24.3", ActionWarn, "names no POM"},
+		{"org.apache..log4j:log4j-core", "2.24.3", ActionWarn, "names no POM"},
+	} {
+		ck := NewAgeChecker(store)
+		ck.MavenBase = srv.URL
+		ck.HTTP = srv.Client()
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: tc.name, Type: manifest.TypeMaven},
+			&manifest.VersionEntry{Version: tc.version})
+		if r.Action != tc.action || !strings.Contains(r.Reason, tc.reason) {
+			t.Errorf("%s@%s: got %s %q, want %s containing %q", tc.name, tc.version, r.Action, r.Reason, tc.action, tc.reason)
+		}
+	}
+	for _, s := range seen {
+		if !strings.HasPrefix(s, "HEAD /org/apache/logging/log4j/log4j-core/") {
+			t.Errorf("a POM is read with HEAD at its repository path; got %q", s)
+		}
+	}
+}
+
+// Two checks of one Maven version under one ShareLookups context read its POM
+// once, as two checks of one crate version read crates.io once.
+func TestAgePolicy_MavenLookupIsShared(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Last-Modified", time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat))
+	}))
+	defer srv.Close()
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeMaven: {Ecosystem: manifest.TypeMaven, MinAgeSeconds: 86400, Action: ActionBlock},
+	}}
+	ctx := ShareLookups(context.Background())
+	for range 2 {
+		ck := NewAgeChecker(store)
+		ck.MavenBase = srv.URL
+		if r := ck.Check(ctx, &manifest.PackageManifest{Name: "com.google.guava:guava", Type: manifest.TypeMaven},
+			&manifest.VersionEntry{Version: "33.4.0-jre"}); r.Action != ActionBlock {
+			t.Fatalf("1h-old artifact under a 1d policy blocks; got %+v", r)
+		}
+	}
+	if hits != 1 {
+		t.Errorf("POM read %d times, want 1", hits)
+	}
+}
+
 func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 	got := AgeEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
@@ -301,7 +385,7 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 				eco: {Ecosystem: eco, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
 			}}
 			ck := NewAgeChecker(store)
-			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL
+			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase, ck.MavenBase = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL, srv.URL
 
 			r := ck.Check(context.Background(),
 				&manifest.PackageManifest{Name: "thing", Type: eco},

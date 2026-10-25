@@ -37,6 +37,7 @@ var osvEcosystemFor = map[string]string{
 	manifest.TypeGomod:    "Go",
 	manifest.TypeCargo:    "crates.io",
 	manifest.TypeRubygems: "RubyGems",
+	manifest.TypeMaven:    "Maven",
 }
 
 // OSVEcosystemFor returns OSV's identifier for a registry type, or "" when

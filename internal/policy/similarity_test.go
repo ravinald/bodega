@@ -134,6 +134,11 @@ func TestNearestMatchesBruteForce(t *testing.T) {
 				continue
 			}
 			cands = append(cands, n, n+"x", n[1:])
+			if eco == manifest.TypeMaven {
+				group, artifact := splitMavenName(n)
+				cands = append(cands, "io.github.someone:"+artifact, group+"x:"+artifact, group+":"+artifact[1:])
+				continue
+			}
 			if eco != manifest.TypeNpm {
 				continue
 			}
@@ -385,5 +390,41 @@ func TestNameSimilarityRubygemsSeparatorIsAnEdit(t *testing.T) {
 	exact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeRubygems, Pattern: "rest_client"}}}
 	if r := checkName(t, exact, manifest.TypeRubygems, "rest_client"); r.Action != ActionPass {
 		t.Errorf("an exact rubygems rule exempts its own name; got %+v", r)
+	}
+}
+
+// Maven's squat is a lookalike groupId over the real artifactId:
+// org.fasterxml.jackson.core:jackson-databind, reported by Socket in March
+// 2025 posing as com.fasterxml.jackson.core:jackson-databind. com to org is
+// three edits, so it is caught by the artifactId alone, compared across
+// groupIds. Within one groupId the artifactId is compared by edits, and a
+// near groupId with a near artifactId by their sum.
+func TestNameSimilarityMavenLookalikeGroupID(t *testing.T) {
+	for _, tc := range []struct {
+		name, nearest string
+		distance      int
+	}{
+		{"org.fasterxml.jackson.core:jackson-databind", "com.fasterxml.jackson.core:jackson-databind", 1},
+		{"io.github.someone:jackson-databind", "com.fasterxml.jackson.core:jackson-databind", 1},
+		{"com.google.guava:guawa", "com.google.guava:guava", 1},
+		{"com.googie.guava:guavaa", "com.google.guava:guava", 2},
+	} {
+		r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeMaven, tc.name)
+		if r.Action != ActionBlock || r.Details["nearest"] != tc.nearest || r.Details["distance"] != tc.distance {
+			t.Errorf("%s = %+v, want a block naming %s at distance %d", tc.name, r, tc.nearest, tc.distance)
+		}
+	}
+	for _, name := range []string{"com.fasterxml.jackson.core:jackson-databind", "com.example.internal:billing-service"} {
+		if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeMaven, name); r.Action != ActionPass {
+			t.Errorf("%s = %+v, want a pass", name, r)
+		}
+	}
+	exact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeMaven, Pattern: "org.fasterxml.jackson.core:jackson-databind"}}}
+	if r := checkName(t, exact, manifest.TypeMaven, "org.fasterxml.jackson.core:jackson-databind"); r.Action != ActionPass {
+		t.Errorf("an exact maven rule exempts its own name; got %+v", r)
+	}
+	group := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeMaven, Pattern: "org.fasterxml.jackson.core:*"}}}
+	if r := checkName(t, group, manifest.TypeMaven, "org.fasterxml.jackson.core:jackson-databind"); r.Action != ActionBlock {
+		t.Errorf("a <groupId>:* rule names no one artifact and exempts none; got %+v", r)
 	}
 }
