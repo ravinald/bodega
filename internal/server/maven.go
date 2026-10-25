@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
@@ -43,6 +44,9 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 	}
 	name := mp.Name()
 	ctx := r.Context()
+	if mp.Version != "" && !mp.Metadata {
+		s.mavenArtifacts.add(name)
+	}
 
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeMaven, name)
 	if pm != nil {
@@ -76,7 +80,7 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 	candidate := name
 	if mp.GroupLevelID != "" {
 		candidate = ""
-		artifact, ok := s.mavenMetadataGate(w, r, mp, p)
+		artifact, ok := s.mavenMetadataGate(w, r, mp, p, pm != nil)
 		if !ok {
 			return
 		}
@@ -240,35 +244,55 @@ func (s *Server) mavenMetadataRead(r *http.Request, metaPath, name string, force
 // the artifact reading was the one admitted, which is the one whose versions a
 // profile filters.
 //
-// Discovery and the refusal queue record the group-level reading,
-// <GroupLevelID>:*, so a promote proposes a rule for a groupId rather than for
-// the artifact one directory up, which for a plugin prefix lookup does not
-// exist. The refusal answers 404 for a profile, as Maven and Gradle read a 404
-// on metadata as an artifact with no versions and a 403 as a broken
-// repository, and 403 for the allow-list, as every route answers it.
-func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp manifest.MavenPath, p string) (artifact, ok bool) {
+// Discovery, the refusal queue and the profile reach row record one reading,
+// so a promote or an approval proposes a rule for something that exists: the
+// one reading that was admitted, and otherwise (both admitted, as in open
+// mode, or neither) the artifact reading when that artifact is known from a
+// request for one of its versions, and the group-level reading,
+// <GroupLevelID>:*, when it is not. Recording the group reading for a real
+// artifact's metadata would put a groupId nothing depends on beside the
+// artifact's own row; recording the artifact reading for a plugin prefix
+// lookup would propose org.apache.maven:plugins.
+//
+// The refusal answers 404 for a profile, as Maven and Gradle read a 404 on
+// metadata as an artifact with no versions and a 403 as a broken repository,
+// and 403 for the allow-list, as every route answers it.
+func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp manifest.MavenPath, p string, known bool) (artifact, ok bool) {
 	name, group := mp.Name(), mp.GroupLevelName()
 	prof := s.profileFor(r)
 	artProf, grpProf := prof.Covers(manifest.TypeMaven, name), prof.CoversMavenGroup(mp.GroupLevelID)
+	recordArtifact := func(artAdmitted, grpAdmitted bool) bool {
+		if artAdmitted != grpAdmitted {
+			return artAdmitted
+		}
+		return known || s.mavenArtifactKnown(r, name)
+	}
 
 	if !artProf.Permitted && !grpProf.Permitted {
-		if grpProf.Reportable() {
-			s.recordProfileReach(r, prof, manifest.TypeMaven, group, "")
+		rec, cov := group, grpProf
+		if recordArtifact(false, false) {
+			rec, cov = name, artProf
 		}
-		f := profileRefusal(prof, manifest.TypeMaven, group, "", grpProf)
+		if cov.Reportable() {
+			s.recordProfileReach(r, prof, manifest.TypeMaven, rec, "")
+		}
+		f := profileRefusal(prof, manifest.TypeMaven, rec, "", cov)
 		f.status = http.StatusNotFound
 		f.reason = fmt.Sprintf("%s: profile %q admits neither reading of %s: the artifact %s, nor any artifact of the groupId %s.",
 			entitle.RefusalMembership, prof.Name(), p, name, mp.GroupLevelID)
 		f.next = fmt.Sprintf("ask an operator to add one with `bodega profile add %s %s %s` or `bodega profile add %s %s %s`.",
 			prof.Name(), manifest.TypeMaven, group, prof.Name(), manifest.TypeMaven, name)
-		s.recordProfileRefusal(r, prof, manifest.TypeMaven, name, "", artProf, f.incident)
-		s.queueRefusal(r, audit.QueueRefusal{PkgType: manifest.TypeMaven, PkgName: group, Check: admit.QueueProfile,
+		s.recordProfileRefusal(r, prof, manifest.TypeMaven, rec, "", cov, f.incident)
+		s.queueRefusal(r, audit.QueueRefusal{PkgType: manifest.TypeMaven, PkgName: rec, Check: admit.QueueProfile,
 			Profile: prof.Name(), Detail: f.reason, Incident: f.incident})
 		f.write(w, r)
 		return false, false
 	}
 
-	artPolicy, grpPolicy, listed := true, true, false
+	// artRule and grpRule are each reading's rule verdict alone, which is what
+	// a discovery row's decision reports; artPolicy and grpPolicy also count an
+	// override or a baseline, which admit the request but match no rule.
+	artPolicy, grpPolicy, artRule, grpRule, listed := true, true, true, true, false
 	if s.policy != nil {
 		ctx, cancel := auditContext(r)
 		defer cancel()
@@ -277,8 +301,10 @@ func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp ma
 			s.logger.Error("policy rules lookup failed", "error", err)
 		}
 		key := manifest.MavenKey(p)
-		if artPolicy, err = s.mavenReadingAllowed(ctx, name, key, s.policy.Check(ctx, manifest.TypeMaven, name)); err == nil {
-			grpPolicy, err = s.mavenReadingAllowed(ctx, group, key, s.policy.CheckMavenGroup(ctx, mp.GroupLevelID))
+		artErr, grpErr := s.policy.Check(ctx, manifest.TypeMaven, name), s.policy.CheckMavenGroup(ctx, mp.GroupLevelID)
+		artRule, grpRule = artErr == nil, grpErr == nil
+		if artPolicy, err = s.mavenReadingAllowed(ctx, name, key, artErr); err == nil {
+			grpPolicy, err = s.mavenReadingAllowed(ctx, group, key, grpErr)
 		}
 		if err != nil {
 			s.logger.Error("policy check failed", "error", err)
@@ -288,9 +314,13 @@ func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp ma
 	}
 	artOK, grpOK := artProf.Permitted && artPolicy, grpProf.Permitted && grpPolicy
 	upstream := s.mavenUpstreamURL(p)
+	rec, cov, rule := group, grpProf, grpRule
+	if recordArtifact(artOK, grpOK) {
+		rec, cov, rule = name, artProf, artRule
+	}
 
 	if !artOK && !grpOK {
-		f := allowListRefusal(manifest.TypeMaven, group, group, "")
+		f := allowListRefusal(manifest.TypeMaven, rec, rec, "")
 		f.reason = fmt.Sprintf("%s reads as the artifact %s (%s) or as the groupId %s (%s), and neither reading is admitted.",
 			p, name, mavenReadingVerdict(prof, artProf.Permitted, artPolicy), mp.GroupLevelID, mavenReadingVerdict(prof, grpProf.Permitted, grpPolicy))
 		f.next = fmt.Sprintf("ask an operator to run `bodega policy add %s %s` or `bodega policy add %s %s` if it should be.",
@@ -299,25 +329,21 @@ func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp ma
 			"artifact", name, "group", group, "url", upstream, "incident", f.incident)
 		ctx, cancel := auditContext(r)
 		defer cancel()
-		s.recordDiscovery(ctx, r, manifest.TypeMaven, upstream, group, group, manifest.MavenKey(p), audit.DecisionDenied)
-		s.recordPolicyViolation(r, manifest.TypeMaven, name, upstream, f.incident)
-		s.queueRefusal(r, audit.QueueRefusal{PkgType: manifest.TypeMaven, PkgName: group,
-			Check: admit.QueueAllowList, Pattern: group, Detail: f.reason, Incident: f.incident})
+		s.recordDiscovery(ctx, r, manifest.TypeMaven, upstream, rec, rec, manifest.MavenKey(p), audit.DecisionDenied)
+		s.recordPolicyViolation(r, manifest.TypeMaven, rec, upstream, f.incident)
+		s.queueRefusal(r, audit.QueueRefusal{PkgType: manifest.TypeMaven, PkgName: rec,
+			Check: admit.QueueAllowList, Pattern: rec, Detail: f.reason, Incident: f.incident})
 		f.write(w, r)
 		return false, false
 	}
 
-	chosen := grpProf
-	if artOK {
-		chosen = artProf
-	}
-	if chosen.Reportable() {
-		s.recordProfileReach(r, prof, manifest.TypeMaven, group, "")
+	if cov.Reportable() {
+		s.recordProfileReach(r, prof, manifest.TypeMaven, rec, "")
 	}
 	if s.policy != nil {
 		ctx, cancel := auditContext(r)
 		defer cancel()
-		s.recordDiscovery(ctx, r, manifest.TypeMaven, upstream, group, group, manifest.MavenKey(p), classifyDecision(listed, false))
+		s.recordDiscovery(ctx, r, manifest.TypeMaven, upstream, rec, rec, manifest.MavenKey(p), classifyDecision(listed, !rule))
 	}
 	return artOK, true
 }
@@ -343,6 +369,64 @@ func (s *Server) mavenReadingAllowed(ctx context.Context, name, key string, err 
 		return true, nil
 	}
 	return false, nil
+}
+
+// mavenArtifactSetCap bounds mavenArtifactSet. Any client can name any
+// coordinate, so an unbounded set is memory a scanner decides; a set that
+// forgets falls back to the discovery table, which is the record it caches.
+const mavenArtifactSetCap = 8192
+
+// mavenArtifactSet is the Maven artifacts this process has seen a version's
+// own file requested for. It answers the request that follows within the
+// discovery recorder's batch window, before the row naming the artifact has
+// reached the table. The zero value is ready to use.
+type mavenArtifactSet struct {
+	mu    sync.Mutex
+	names map[string]struct{}
+}
+
+func (m *mavenArtifactSet) add(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.names == nil || len(m.names) >= mavenArtifactSetCap {
+		m.names = make(map[string]struct{})
+	}
+	m.names[name] = struct{}{}
+}
+
+func (m *mavenArtifactSet) has(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.names[name]
+	return ok
+}
+
+// mavenArtifactKnown reports whether name is an artifact something asked for
+// a version of: in this process, or in a discovery row hinted with name that
+// carries a version, which only a version's own file (pom, jar, module,
+// classifier) writes. A sink that cannot be read answers no, and the caller
+// records the group-level reading as it would for an artifact nobody named.
+func (s *Server) mavenArtifactKnown(r *http.Request, name string) bool {
+	if s.mavenArtifacts.has(name) {
+		return true
+	}
+	if s.auditDB == nil {
+		return false
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	rows, err := s.auditDB.ListDiscovery(ctx, audit.DiscoveryFilter{RegistryType: manifest.TypeMaven, PatternHint: name, Limit: 64})
+	if err != nil {
+		s.logger.Debug("maven metadata: discovery unreadable, artifact treated as unknown", "artifact", name, "error", err)
+		return false
+	}
+	for _, row := range rows {
+		if row.PkgName == name && row.PkgVersion != "" {
+			s.mavenArtifacts.add(name)
+			return true
+		}
+	}
+	return false
 }
 
 // mavenReadingVerdict says which check refused one reading of a metadata path.
