@@ -69,6 +69,14 @@ var osvAgreementCases = []osvAgreementCase{
 		ids:          []string{"GHSA-5c5f-7vfq-3732"},
 		clean:        "1.6.1",
 	},
+	{
+		registryType: manifest.TypeMaven,
+		ecosystem:    "Maven",
+		pkg:          "org.apache.logging.log4j:log4j-core",
+		vulnerable:   "2.14.1",
+		ids:          []string{"GHSA-jfh8-c2jp-5v3q"},
+		clean:        "2.15.0",
+	},
 }
 
 // osvAgreementCase is one (ecosystem, package, version) pair the local matcher
@@ -650,5 +658,85 @@ func TestOSVRange_RubyGemsOrder(t *testing.T) {
 	fixed := osvRange{Type: "ECOSYSTEM", Events: []osvEvent{{Introduced: "0"}, {Fixed: "1.6.1"}}}
 	if hit, bad := fixed.affects(osvVersionOrder("RubyGems"), "1.6.1.rc1"); !hit || bad != "" {
 		t.Errorf("1.6.1.rc1 under fixed 1.6.1: hit=%v unorderable=%q, want a hit", hit, bad)
+	}
+}
+
+// A Maven advisory is keyed <groupId>:<artifactId> and its ranges are walked
+// in ComparableVersion order. Log4Shell's ranges start at 2.0-beta9, which
+// sorts below 2.0, and a Spring-style 2.3.0.RELEASE is the release 2.3.0.
+func TestOSVChecker_MavenLog4Shell(t *testing.T) {
+	db := syncedDB(t)
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeMaven: {Ecosystem: manifest.TypeMaven, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	for _, tc := range []struct {
+		name, version string
+		action        string
+	}{
+		{"org.apache.logging.log4j:log4j-core", "2.14.1", ActionBlock},
+		{"org.apache.logging.log4j:log4j-core", "2.0-beta9", ActionBlock},
+		{"org.apache.logging.log4j:log4j-core", "2.3.0.RELEASE", ActionBlock},
+		{"org.apache.logging.log4j:log4j-core", "2.0-beta8", ActionPass},
+		{"org.apache.logging.log4j:log4j-core", "2.12.2", ActionPass},
+		{"org.apache.logging.log4j:log4j-core", "2.17.1", ActionPass},
+		{"org.apache.logging.log4j:log4j-api", "2.14.1", ActionPass},
+	} {
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: tc.name, Type: manifest.TypeMaven},
+			&manifest.VersionEntry{Version: tc.version})
+		if r.Action != tc.action {
+			t.Errorf("%s %s = %+v, want %s", tc.name, tc.version, r, tc.action)
+		}
+		if tc.action == ActionBlock && !strings.Contains(r.Reason, "GHSA-jfh8-c2jp-5v3q") {
+			t.Errorf("%s %s: reason %q does not name the advisory", tc.name, tc.version, r.Reason)
+		}
+	}
+}
+
+// Maven's ComparableVersion: qualifiers order alpha < beta < milestone < rc <
+// snapshot < release < sp, an unknown one sorts after a release, trailing
+// zeros and release aliases vanish, and a letter-digit change opens a sublist
+// as a '-' does.
+func TestOSVRange_MavenOrder(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want int
+	}{
+		{"1", "1.0.0", 0},
+		{"5.3.18.RELEASE", "5.3.18", 0},
+		{"5.6.5.Final", "5.6.5", 0},
+		{"1.0-ga", "1.0", 0},
+		{"1.0-alpha1", "1.0-beta1", -1},
+		{"1.0-beta1", "1.0-milestone1", -1},
+		{"1.0-milestone1", "1.0-rc1", -1},
+		{"1.0-rc1", "1.0-SNAPSHOT", -1},
+		{"1.0-SNAPSHOT", "1.0", -1},
+		{"1.0", "1.0-sp1", -1},
+		{"1.0-a1", "1.0-alpha1", 0},
+		{"1.0-cr1", "1.0-rc1", 0},
+		{"2.0-beta9", "2.0", -1},
+		{"2.0-beta9", "2.0-beta10", -1},
+		{"31.1-jre", "31.1", 1},
+		{"31.1-jre", "31.2", -1},
+		{"1.10", "1.9", 1},
+		{"1-1", "1.1", -1},
+		{"1.0.0.1", "1.0.0", 1},
+		{"007", "7", 0},
+	} {
+		if got, ok := compareMavenVersions(tc.a, tc.b); !ok || got != tc.want {
+			t.Errorf("compare(%q, %q) = %d, %v; want %d", tc.a, tc.b, got, ok, tc.want)
+		}
+		if got, _ := compareMavenVersions(tc.b, tc.a); got != -tc.want {
+			t.Errorf("compare(%q, %q) = %d; want %d", tc.b, tc.a, got, -tc.want)
+		}
+	}
+	if _, ok := compareMavenVersions("1.0 junk", "1.0"); ok {
+		t.Error("a version holding whitespace was ordered")
+	}
+	fixed := osvRange{Type: "ECOSYSTEM", Events: []osvEvent{{Introduced: "2.0-beta9"}, {Fixed: "2.3.1"}}}
+	if hit, bad := fixed.affects(osvVersionOrder("Maven"), "2.3.0.RELEASE"); !hit || bad != "" {
+		t.Errorf("2.3.0.RELEASE under [2.0-beta9, 2.3.1): hit=%v unorderable=%q, want a hit", hit, bad)
 	}
 }

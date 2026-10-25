@@ -58,6 +58,10 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 	}
 
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
+	// The index filter rewrites only metadata answered from upstream, and the
+	// artifact route refuses only what such metadata would have withheld, as
+	// the gomod route does.
+	proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
 	if mp.Metadata && mp.Version == "" {
 		// Artifact-level metadata names no version, so membership decides it
 		// here and the version rule decides each version listed in it. 404
@@ -67,12 +71,22 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 		if !s.entitleGateAnswering(w, r, manifest.TypeMaven, name, "", http.StatusNotFound) {
 			return
 		}
-		if permit := profileVersionFilter(s.profileFor(r), manifest.TypeMaven, name); permit != nil {
-			s.serveProfiledMavenMetadata(w, r, mp, p, permit, forceProxy)
+		permit := profileVersionFilter(s.profileFor(r), manifest.TypeMaven, name)
+		var withhold *indexWithhold
+		if proxied {
+			withhold = s.indexWithholdFor(r, manifest.TypeMaven, name)
+		}
+		if permit != nil || withhold != nil {
+			s.serveFilteredMavenMetadata(w, r, mp, p, permit, withhold, forceProxy)
 			return
 		}
-	} else if !s.entitleGate(w, r, manifest.TypeMaven, name, mp.Version) {
-		return
+	} else {
+		if !s.entitleGate(w, r, manifest.TypeMaven, name, mp.Version) {
+			return
+		}
+		if proxied && s.refuseWithheld(w, r, manifest.TypeMaven, name, mp.Version) {
+			return
+		}
 	}
 
 	immutable := mp.Immutable()
@@ -101,28 +115,42 @@ func (s *Server) mavenUpstreamURL(p string) string {
 	return strings.TrimRight(s.cfg.MavenUpstream, "/") + "/" + p
 }
 
-// serveProfiledMavenMetadata answers an artifact-level maven-metadata.xml, or
+// serveFilteredMavenMetadata answers an artifact-level maven-metadata.xml, or
 // one of its companions, filtered for a profile that rules on the artifact's
-// versions. The cache keeps the upstream's document and every host class
-// filters its own copy on the way out, so one profile's reading is never
-// stored where another's request can be answered from it.
+// versions, by the index filter, or both; either may be nil. The cache keeps
+// the upstream's document and every host class filters its own copy on the
+// way out, so one profile's reading is never stored where another's request
+// can be answered from it.
 //
 // The checksum companions are computed from the filtered bytes. The upstream's
 // describe a document this host is not handed, and Maven and Gradle both
 // refuse metadata whose checksum disagrees. The .asc signature cannot be
 // recomputed, so it is answered 404: Maven does not ask for one on metadata,
 // and a signature over other bytes would be a false claim.
-func (s *Server) serveProfiledMavenMetadata(w http.ResponseWriter, r *http.Request, mp manifest.MavenPath, p string, permit func(string) bool, forceProxy bool) {
+func (s *Server) serveFilteredMavenMetadata(w http.ResponseWriter, r *http.Request, mp manifest.MavenPath, p string, permit func(string) bool, withhold *indexWithhold, forceProxy bool) {
 	noSharedCache(w)
 	name := mp.Name()
 	metaPath := strings.TrimSuffix(p, "."+mp.Companion)
 	store := s.typeStore(manifest.TypeMaven)
+	filter := func(b []byte) []byte {
+		b = filterMavenMetadata(b, permit)
+		if withhold != nil {
+			b = withhold.mavenMetadata(b)
+		}
+		return b
+	}
 
 	if mp.Companion == "" {
 		rw := &indexFilterWriter{
 			ResponseWriter: w,
 			subject:        "the maven-metadata.xml for " + name,
-			filter:         func(b []byte) []byte { return filterMavenMetadata(b, permit) },
+			filter: func(b []byte) []byte {
+				b = filter(b)
+				if withhold != nil {
+					withhold.finish(w.Header())
+				}
+				return b
+			},
 		}
 		s.proxyOrCache(rw, r, store, manifest.MavenKey(p), s.mavenUpstreamURL(p), manifest.TypeMaven, name, name, false, forceProxy)
 		if err := rw.flush(); err != nil {
@@ -133,7 +161,7 @@ func (s *Server) serveProfiledMavenMetadata(w http.ResponseWriter, r *http.Reque
 
 	newHash, ok := mavenChecksums[mp.Companion]
 	if !ok {
-		http.Error(w, fmt.Sprintf("%s: this host's profile filters the versions of %s, so the upstream's %s signature covers a different document and is not served",
+		http.Error(w, fmt.Sprintf("%s: this host is served a filtered list of the versions of %s, so the upstream's %s signature covers a different document and is not served",
 			p, name, mp.Companion), http.StatusNotFound)
 		return
 	}
@@ -148,7 +176,7 @@ func (s *Server) serveProfiledMavenMetadata(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	h := newHash()
-	h.Write(filterMavenMetadata(body, permit))
+	h.Write(filter(body))
 	sum := hex.EncodeToString(h.Sum(nil))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(sum)))
