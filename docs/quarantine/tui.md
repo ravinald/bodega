@@ -37,12 +37,14 @@ Useful keys you'll need throughout:
 Navigate: expand `npm/`, expand `@example-corp/widget-cli`. You should see a single version leaf labelled `latest`:
 
 ```text
-▼ npm/
-  ▼ @example-corp/widget-cli (1)
-      latest
+v N npm/
+  v @example-corp/widget-cli
+     - latest
 ```
 
 Cursor on the `latest` leaf shows the version entry in the Details pane. The JSON blob on the right shows the full manifest.
+
+![The Sources tree with npm/ and @example-corp/widget-cli expanded and the latest leaf selected, beside the Details pane showing that version and the package's full manifest](../images/tui-main-view.png)
 
 ## Scenario 1: quarantine 1.5.0, pin to 1.4.2
 
@@ -68,6 +70,8 @@ Cursor on the `latest` leaf shows the version entry in the Details pane. The JSO
   ]
 }
 ```
+
+![The raw-JSON editor titled Edit: npm/@example-corp/widget-cli, holding the Scenario 1 manifest with 1.4.2 frozen and 1.5.0 hidden and frozen, with Ctrl+S to apply and Esc to discard](../images/tui-json-editor.png)
 
 1. `Ctrl+S` to save. The editor closes; the tree rebuilds. `@example-corp/widget-cli` now shows two version leaves: `1.4.2` and `1.5.0`. The tombstoned version renders with the Hidden indicator in Details.
 
@@ -176,9 +180,13 @@ Both operations record audit events with actor attribution the same way the JSON
 
 ## Watching the audit log
 
-The TUI has a dedicated audit-query view. Press `L` to open it, fill in the filter (event type, package name, actor), submit, and the results stream into the Log pane at the bottom. For the scenarios in this walkthrough, filter `type=edit`, `name=@example-corp/widget-cli` and you'll see every save with its JSON diff.
+The TUI has a dedicated audit-query view. Press `L` to open the query form (event type, package type, package name, client IP, limit), fill it in and press `Enter`. The results open in a table that replaces the screen; `Up`/`Down` scroll it and `Esc` or `q` closes it. The Log pane records only how many events the query returned.
 
-You can also keep `bodega audit events --type edit -f` running in a separate terminal if you prefer a follow-style tail.
+For the scenarios in this walkthrough, set the package name to `@example-corp/widget-cli` and leave the event type empty: the form's event-type list does not offer `edit`. Each save shows as one `edit` row. The table does not show the JSON diff each save recorded.
+
+![The audit results table for @example-corp/widget-cli: three edit rows, one per scenario save, above two create rows, with timestamp, event, type, name and status columns](../images/tui-audit-table.png)
+
+From a shell, `bodega audit events --type edit --name @example-corp/widget-cli` lists the same rows.
 
 ## What the TUI doesn't do (yet)
 

@@ -8,6 +8,8 @@
 
 bodega is a self-hosted package repository for the hosts you run. It mirrors, builds, and serves twelve package types to their native clients, so `apt-get`, `pip`, `npm`, `go`, `cargo`, `gem`, `helm`, Maven, Gradle, and FreeBSD's `pkg` all fetch from one server on your network instead of from the internet. Your hosts keep working when an upstream registry is down, compromised, or somewhere they aren't allowed to reach.
 
+![The bodega shell TUI: the Sources tree with npm/@example-corp/widget-cli expanded and its latest version selected, and the Details pane showing its verified sha256 checksum and the .npmrc registry line a client uses](docs/images/tui-main-view.png)
+
 Every package is a manifest: a name, a type, and the versions you allow. bodega pins each version's checksum on first fetch, decides at request time whether a version may be served, and records every fetch, change, and refusal in an audit trail. Artifacts live on local disk, in S3, or across several named backends.
 
 ## Features
