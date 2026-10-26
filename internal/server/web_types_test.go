@@ -542,6 +542,7 @@ func TestPackageRouteRendersClientConfigForEveryKnownType(t *testing.T) {
 		manifest.TypeCargo:     {Version: "0.3.36"},
 		manifest.TypeMaven:     {Version: "1.0.0"},
 		manifest.TypeRubygems:  {Version: "3.1.8"},
+		manifest.TypeComposer:  {Version: "v7.1.5"},
 		manifest.TypeFreeBSD:   {Version: "FreeBSD:14:amd64", URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
 		manifest.TypeDistfiles: {},
 	}

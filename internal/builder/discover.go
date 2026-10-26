@@ -148,6 +148,7 @@ func ScanDeps(cfg *Config, store *manifest.Store, name string, ve manifest.Versi
 		{"build.gradle", manifest.TypeMaven},
 		{"build.gradle.kts", manifest.TypeMaven},
 		{"Gemfile", manifest.TypeRubygems},
+		{"composer.json", manifest.TypeComposer},
 	} {
 		if _, err := os.Stat(filepath.Join(worktree, f.name)); err == nil {
 			result.FilesFound = append(result.FilesFound, fmt.Sprintf("%s (%s, not read)", f.name, f.typ))

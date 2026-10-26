@@ -28,6 +28,7 @@ const doc16 = `{
     {"name": "rake", "version": "13.2.1", "purl": "pkg:gem/rake@13.2.1"},
     {"name": "spring-core", "version": "6.1.0", "purl": "pkg:maven/org.springframework/spring-core@6.1.0"},
     {"name": "netty-transport-native-epoll", "version": "4.1.100.Final", "purl": "pkg:maven/io.netty/netty-transport-native-epoll@4.1.100.Final?classifier=linux-x86_64"},
+    {"group": "symfony", "name": "console", "version": "v7.1.5", "purl": "pkg:composer/symfony/console@v7.1.5"},
     {"name": "sbom-tool", "purl": "pkg:swift/example/sbom-tool@1.0"},
     {"name": "mystery"}
   ]
@@ -49,13 +50,14 @@ func TestNormalizeMapsTheCommonModel(t *testing.T) {
 	for _, c := range r.Components {
 		got[c.Name] = c
 	}
-	if len(got) != 10 {
-		t.Fatalf("components = %d (%v), want 10 with the nested urllib3 and without the metadata subject", len(got), r.Components)
+	if len(got) != 11 {
+		t.Fatalf("components = %d (%v), want 11 with the nested urllib3 and without the metadata subject", len(got), r.Components)
 	}
 	for name, eco := range map[string]string{
 		"curl": "apt", "requests": "pypi", "urllib3": "pypi", "lodash": "npm", "nokogiri": "rubygems", "rake": "rubygems",
 		"org.springframework:spring-core": "maven", "io.netty:netty-transport-native-epoll": "maven",
-		"sbom-tool": inventory.EcosystemOther, "mystery": inventory.EcosystemOther,
+		"symfony/console": "composer",
+		"sbom-tool":       inventory.EcosystemOther, "mystery": inventory.EcosystemOther,
 	} {
 		if got[name].Ecosystem != eco {
 			t.Errorf("%s ecosystem = %q, want %q", name, got[name].Ecosystem, eco)

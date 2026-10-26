@@ -51,6 +51,10 @@ type Config struct {
 	// yet; a gem is pulled through the server's /rubygems/ route instead.
 	RubygemsRoot string
 
+	// ComposerRoot roots the Composer dist archives upload reads. No stage
+	// writes one; an archive is pulled through the server's /composer/ route.
+	ComposerRoot string
+
 	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
 	// <root>/distfiles/@<environment digest>/. DistfilesPortsTree is the ports
 	// tree whose distinfo admits each file, and DistfilesUpstream is where a
@@ -385,6 +389,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.RubygemsRoot != "" {
 			return c.RubygemsRoot
 		}
+	case "composer":
+		if c.ComposerRoot != "" {
+			return c.ComposerRoot
+		}
 	case "freebsd":
 		if c.FreeBSDRoot != "" {
 			return c.FreeBSDRoot
@@ -440,6 +448,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		CargoRoot:      app.CargoRoot,
 		MavenRoot:      app.MavenRoot,
 		RubygemsRoot:   app.RubygemsRoot,
+		ComposerRoot:   app.ComposerRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
 		DistfilesRoot:  app.DistfilesRoot,
 		AutoImportDeps: true,
@@ -487,6 +496,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.maven
 	case manifest.TypeRubygems:
 		return d.rubygems
+	case manifest.TypeComposer:
+		return d.composer
 	case manifest.TypeFreeBSD:
 		return d.freebsd
 	case manifest.TypeDistfiles:
@@ -536,6 +547,8 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.maven}
 	case manifest.TypeRubygems:
 		return []string{d.rubygems}
+	case manifest.TypeComposer:
+		return []string{d.composer}
 	case manifest.TypeFreeBSD:
 		return []string{d.freebsd}
 	case manifest.TypeDistfiles:
@@ -727,6 +740,7 @@ type dirs struct {
 	cargo    string
 	maven    string
 	rubygems string
+	composer string
 	freebsd  string
 
 	// distfiles is a DISTDIR: <DIST_SUBDIR>/<file> beneath it, exactly as
@@ -748,6 +762,7 @@ func buildDirs(root string) dirs {
 		cargo:    filepath.Join(root, "cargo"),
 		maven:    filepath.Join(root, "maven"),
 		rubygems: filepath.Join(root, "rubygems"),
+		composer: filepath.Join(root, "composer"),
 		freebsd:  filepath.Join(root, "freebsd"),
 
 		distfiles: filepath.Join(root, "distfiles"),

@@ -233,6 +233,28 @@ func Rubygems(base string) []File {
 	}
 }
 
+// Composer renders Composer's global config.json with bodega as its one
+// repository. "packagist.org": false is what turns off the default
+// repository; without it a package bodega refuses resolves from Packagist
+// instead. The file is the one `composer config -g` writes: under
+// $XDG_CONFIG_HOME on Linux, where Composer finds /etc/xdg, and ~/.composer
+// elsewhere.
+func Composer(base string) File {
+	return File{
+		System: manifest.TypeComposer,
+		Label:  "Composer global config",
+		Paths: map[string]string{
+			OSLinux:   "~/.config/composer/config.json",
+			OSFreeBSD: "~/.composer/config.json",
+			OSDarwin:  "~/.composer/config.json",
+		},
+		Content: fmt.Sprintf("{\n    \"repositories\": {\n        \"bodega\": {\n            \"type\": \"composer\",\n            \"url\": %q\n        },\n        \"packagist.org\": false\n    }\n}\n",
+			trim(base)+"/composer"),
+		Notes: []string{"Replaces the file; to keep other settings, run `composer config -g repositories.bodega composer " +
+			trim(base) + "/composer` and `composer config -g repo.packagist false` instead"},
+	}
+}
+
 // Gomod renders the go env file `go env -w` writes, which the toolchain reads
 // on every invocation, so no shell profile has to export anything.
 func Gomod(base string) File {
@@ -624,6 +646,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Maven(in.Base, in.BinaryUpstreams)...)
 	case manifest.TypeRubygems:
 		out = append(out, Rubygems(in.Base)...)
+	case manifest.TypeComposer:
+		out = append(out, Composer(in.Base))
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:

@@ -98,6 +98,22 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "1.2.3",
 		},
 	},
+	TypeComposer: {
+		{
+			key:     ComposerDistKey("symfony/console", "v7.1.5", "0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c"),
+			name:    "symfony/console",
+			version: "v7.1.5",
+		},
+		// A branch version holds a "/", which the key escapes so the four
+		// segments stay four.
+		{
+			key:     ComposerDistKey("monolog/monolog", "dev-feature/x", "abc123"),
+			name:    "monolog/monolog",
+			version: "dev-feature/x",
+		},
+		{key: ComposerMetadataKey("symfony/console", false), name: "symfony/console"},
+		{key: ComposerMetadataKey("symfony/console", true), name: "symfony/console"},
+	},
 	TypeRubygems: {
 		{
 			key:     RubygemsGemKey("concurrent-ruby", "1.3.4"),

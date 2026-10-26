@@ -33,3 +33,41 @@ func TestParseMavenPathGroupLevelID(t *testing.T) {
 		}
 	}
 }
+
+// A version publishes whatever extension its packaging names, so the parse
+// takes the extension from the file name rather than from a list.
+func TestParseMavenPathAnyExtension(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		path string
+		want MavenPath
+	}{
+		{"org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.tar.gz",
+			MavenPath{GroupID: "org.apache.maven", ArtifactID: "apache-maven", Version: "3.9.16", Classifier: "bin", Extension: "tar.gz"}},
+		{"org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.zip",
+			MavenPath{GroupID: "org.apache.maven", ArtifactID: "apache-maven", Version: "3.9.16", Classifier: "bin", Extension: "zip"}},
+		{"org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.tar.gz.sha512",
+			MavenPath{GroupID: "org.apache.maven", ArtifactID: "apache-maven", Version: "3.9.16", Classifier: "bin", Extension: "tar.gz", Companion: "sha512"}},
+		{"com/google/protobuf/protoc/4.31.1/protoc-4.31.1-linux-x86_64.exe",
+			MavenPath{GroupID: "com.google.protobuf", ArtifactID: "protoc", Version: "4.31.1", Classifier: "linux-x86_64", Extension: "exe"}},
+	}
+	for _, c := range cases {
+		got, ok := ParseMavenPath(c.path)
+		if !ok || got != c.want {
+			t.Errorf("ParseMavenPath(%q) = %+v, %v; want %+v", c.path, got, ok, c.want)
+		}
+	}
+	for _, p := range []string{
+		"org/example/widget/1.0/widget-1.0",               // no extension
+		"org/example/widget/1.0/widget-1.0-bin",           // no dot after the classifier
+		"org/example/widget/1.0/widget-1.0-.zip",          // empty classifier
+		"org/example/widget/1.0/widget-1.0-bin.",          // empty extension
+		"org/example/widget/1.0/widget-1.0.tar..gz",       // empty extension part
+		"org/example/widget/1.0/widget-1.0.jar.sha1.sha1", // companion of a companion
+		"org/example/widget/1.0/widget-1.0x.jar",          // version runs on past its directory
+	} {
+		if got, ok := ParseMavenPath(p); ok {
+			t.Errorf("ParseMavenPath(%q) = %+v, want refused", p, got)
+		}
+	}
+}

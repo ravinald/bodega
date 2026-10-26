@@ -121,7 +121,6 @@ func TestMavenMalformedPath404sOffline(t *testing.T) {
 		"widget/maven-metadata.xml",                      // no groupId
 		"org/example/core/widget/1.2.0/other-1.2.0.jar",  // file names another artifact
 		"org/example/core/widget/1.2.0/widget-1.2.1.jar", // file names another version
-		"org/example/core/widget/1.2.0/widget-1.2.0.exe", // not an artifact extension
 		"org/example/core/widget/1.2.0/widget-1.2.0",     // no extension
 		"org/example/core/widget/1.2.0/widget-1.2.0.jar.sha1.sha1",
 		"org/example/core/widget/1.3.0-SNAPSHOT/widget-1.3.0-latest.jar",
@@ -201,6 +200,42 @@ func TestMavenCachingClasses(t *testing.T) {
 	}
 	if n := upstreamSaw(up, "/1.2.0/widget-1.2.0.jar"); n != 1 {
 		t.Errorf("upstream fetched the release jar %d times, want 1", n)
+	}
+}
+
+// The wrapper downloads the Maven distribution from the repository layout, so
+// an extension outside jar and pom is served, cached as immutable and
+// recorded under its coordinate like any other release file.
+func TestMavenServesEveryReleaseExtension(t *testing.T) {
+	s, up := mavenServer(t)
+	const (
+		dir     = "org/apache/maven/apache-maven/3.9.16/"
+		tarball = dir + "apache-maven-3.9.16-bin.tar.gz"
+		sha512  = tarball + ".sha512"
+	)
+	up.route("/maven2/"+tarball, "maven distribution")
+	up.route("/maven2/"+sha512, "distribution sha512")
+	for p, want := range map[string]string{tarball: "maven distribution", sha512: "distribution sha512"} {
+		code, body, h := getMaven(t, s, p)
+		if code != http.StatusOK || body != want {
+			t.Fatalf("GET /maven/%s = %d %q, want 200 %q", p, code, body, want)
+		}
+		if cc := h.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+			t.Errorf("%s Cache-Control = %q, want immutable", p, cc)
+		}
+		up.route("/maven2/"+p, "redeployed "+p)
+	}
+	s.cache.MetadataTTL = time.Nanosecond
+	time.Sleep(time.Millisecond)
+	if _, body, _ := getMaven(t, s, tarball); body != "maven distribution" {
+		t.Errorf("release distribution refetched after metadata_ttl: %q, want the cached copy", body)
+	}
+	if n := upstreamSaw(up, "-bin.tar.gz"); n != 1 {
+		t.Errorf("upstream fetched the distribution %d times, want 1", n)
+	}
+	rows := mavenDiscoveryRowsCounting(t, s, 3)
+	if len(rows) != 1 || rows[0].PkgName != "org.apache.maven:apache-maven" || rows[0].PkgVersion != "3.9.16" {
+		t.Errorf("discovery rows = %+v, want one for org.apache.maven:apache-maven@3.9.16", rows)
 	}
 }
 

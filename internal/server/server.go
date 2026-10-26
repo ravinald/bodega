@@ -1029,6 +1029,9 @@ func (s *Server) registerRoutes() {
 	// RubyGems registry (gem sources / Bundler source https://bodega/rubygems/)
 	m.HandleFunc("GET /rubygems/{path...}", s.handleRubygems)
 
+	// Composer repository (composer config repositories.bodega composer https://bodega/composer)
+	m.HandleFunc("GET /composer/{path...}", s.handleComposer)
+
 	// FreeBSD pkg repository mirror. One route for the whole tree: the path a
 	// pkg client composes is <abi>/<repo>/<rest>, and rest is a repository
 	// root file or a catalogue record's own repopath, which carries any

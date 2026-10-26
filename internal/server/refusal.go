@@ -32,6 +32,7 @@ const (
 	checkSimilarity = "similarity"
 	checkIntegrate  = "integration"
 	checkPolicy     = "policy"
+	checkDistHost   = "dist-host"
 )
 
 // refusalHeader carries the check and the incident on every refusal, so a
@@ -41,12 +42,13 @@ const refusalHeader = "X-Bodega-Refusal"
 
 // statusLineClients are the types whose client shows the status line of a
 // failed fetch and never its body: pip prints "403 Client Error: <phrase> for
-// url", helm "failed to fetch <url> : 403 <phrase>", and apt "403 <phrase>
-// [IP: ...]".
+// url", helm "failed to fetch <url> : 403 <phrase>", apt "403 <phrase>
+// [IP: ...]", and composer "could not be downloaded (HTTP/1.1 403 <phrase>)".
 var statusLineClients = map[string]bool{
-	manifest.TypePypi: true,
-	manifest.TypeHelm: true,
-	manifest.TypeApt:  true,
+	manifest.TypePypi:     true,
+	manifest.TypeHelm:     true,
+	manifest.TypeApt:      true,
+	manifest.TypeComposer: true,
 }
 
 // refusalClientAPI selects the mutation API's own {"error": ...} body.
@@ -257,7 +259,7 @@ func observeHijack(w http.ResponseWriter, status int) {
 func allowListRefusal(regType, candidate, name, version string) *refusal {
 	f := newRefusal(checkAllowList, regType, name, version, http.StatusForbidden)
 	switch regType {
-	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems:
+	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
 		if f.name == "" {
 			f.name = candidate
 		}
