@@ -479,6 +479,9 @@ func (v *verifyRequest) artifactDigest(st *attest.Statement) (string, error) {
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound && v.typ == manifest.TypeComposer {
+		return "", fmt.Errorf("GET %s: %s: composer %s %s has no zip dist there, and its dist may not be a zip; download the archive and pass --artifact with a local copy", route, resp.Status, v.name, v.version)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GET %s: %s; pass --artifact with a local copy instead", route, resp.Status)
 	}
@@ -502,6 +505,8 @@ func servedPath(typ, name, version, key string) (string, error) {
 		return "/cargo/" + url.PathEscape(name) + "/" + url.PathEscape(version) + "/download", nil
 	case manifest.TypeRubygems:
 		return "/rubygems/gems/" + url.PathEscape(name+"-"+version+".gem"), nil
+	case manifest.TypeComposer:
+		return composerServedPath(key)
 	}
 	for _, m := range []struct{ key, route string }{
 		{manifest.AptPrefix, "/apt/"},
@@ -522,6 +527,31 @@ func servedPath(typ, name, version, key string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no served route for %s object %q; pass --artifact with a local copy", typ, key)
+}
+
+// composerServedPath rebuilds the dist route from a ComposerDistKey. The key
+// carries no archive type, and the route needs one or an uncached fetch 404s.
+// Packagist lists every GitHub, GitLab and Bitbucket dist as a zip, so zip is
+// assumed and a 404 names --artifact for the rest. The version segment is
+// stored escaped, so each segment is unescaped and escaped again rather than
+// escaped twice.
+func composerServedPath(key string) (string, error) {
+	rest, ok := strings.CutPrefix(key, "composer/dist/")
+	segs := strings.Split(rest, "/")
+	if ok && len(segs) == 4 {
+		for i, s := range segs {
+			u, err := url.PathUnescape(s)
+			if err != nil || u == "" {
+				ok = false
+				break
+			}
+			segs[i] = url.PathEscape(u)
+		}
+		if ok {
+			return "/composer/dist/" + strings.Join(segs, "/") + ".zip", nil
+		}
+	}
+	return "", fmt.Errorf("no served route for %s object %q: not a composer dist key with a reference; pass --artifact with a local copy", manifest.TypeComposer, key)
 }
 
 func (v *verifyRequest) connect() error {

@@ -7518,6 +7518,7 @@ curl -s https://bodega.example/api/v1/packages/npm/lodash/4.17.21/attestation | 
 ```bash
 bodega attest verify npm/lodash/4.17.21 --key 3db5a03ef0a8f221f36781ab6541e4e9b395599d53cdc848c580b9545b6e7c09
 bodega attest verify pypi/requests/2.31.0 --artifact requests-2.31.0-py3-none-any.whl
+bodega attest verify composer/symfony/console/v7.1.5 --key 3db5a03ef0a8f221f36781ab6541e4e9b395599d53cdc848c580b9545b6e7c09
 bodega attest verify ./lodash.dsse.json --package npm/lodash/4.17.21 --artifact lodash-4.17.21.tgz --public-key attest.pub
 ```
 
@@ -7543,7 +7544,7 @@ Error: attestation for npm/lodash@4.17.21 failed 1 of 5 checks
 
 The trusted key IDs come from `--key` (repeatable) or `attestation_keyids` in the config file, and verify refuses to run with neither. Learn them the way [Pinning the key ID](#pinning-the-key-id) describes, not from the server being checked: verify fetches the public keys from `/api/v1/attestation/keys`, or reads them from `--public-key`, and accepts a key only when it hashes to an ID you pinned.
 
-Given `type/name/version`, verify fetches the envelope from the server (`--server`, `$BODEGA_SERVER`, `server_url`, then `public_url`) and the artifact bytes from the route a client would download them from, unless `--artifact` names a local copy. Given an envelope file, it needs `--package type/name/version`, because nothing else says which package the envelope should be about. distfiles are not fetched; pass `--artifact`.
+Given `type/name/version`, verify fetches the envelope from the server (`--server`, `$BODEGA_SERVER`, `server_url`, then `public_url`) and the artifact bytes from the route a client would download them from, unless `--artifact` names a local copy. Given an envelope file, it needs `--package type/name/version`, because nothing else says which package the envelope should be about. distfiles are not fetched; pass `--artifact`. A composer dist is fetched from its route rebuilt as a `.zip`, because the stored key records no archive type and Packagist lists GitHub, GitLab and Bitbucket dists as zips; a dist of any other type answers 404, and `--artifact` with a local copy verifies it.
 
 After the checks, verify prints what the statement says about the publisher's own provenance: `upstream-provenance` and `publisher-signature`, each with its status (`verified`, `unavailable`, `invalid`, `unknown` or `mismatch`, as the [upstream provenance check](#bodega-policy-provenance-setlist) recorded it at admission) and, when a signature verified, the source repository, workflow, builder and bundle digest. Neither line fails verify. An envelope signed before bodega verified provenance carries `unavailable` and nothing else, and verifies as it always did.
 
