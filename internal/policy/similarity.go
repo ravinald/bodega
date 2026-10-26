@@ -60,6 +60,9 @@ type PopularNames struct {
 	Names []string
 	keys  []string
 	set   map[string]bool
+	// sharedArtifacts are the maven artifactIds the list carries under more
+	// than one groupId, which the cross-groupId case of nameDistance skips.
+	sharedArtifacts map[string]bool
 	// Source and Date come from the list's header; Loaded says an operator
 	// replaced the embedded list.
 	Source string
@@ -109,7 +112,26 @@ func ParsePopularNames(ecosystem string, data []byte) (PopularNames, error) {
 	if len(p.Names) == 0 {
 		return PopularNames{}, errors.New("the list names no package")
 	}
+	if ecosystem == manifest.TypeMaven {
+		p.sharedArtifacts = sharedMavenArtifacts(p.keys)
+	}
 	return p, nil
+}
+
+// sharedMavenArtifacts returns the artifactIds keys carry under more than one
+// groupId.
+func sharedMavenArtifacts(keys []string) map[string]bool {
+	groups := map[string]string{}
+	shared := map[string]bool{}
+	for _, k := range keys {
+		g, a := splitMavenName(k)
+		if first, seen := groups[a]; !seen {
+			groups[a] = g
+		} else if first != g {
+			shared[a] = true
+		}
+	}
+	return shared
 }
 
 var (
@@ -152,7 +174,7 @@ func (p PopularNames) Nearest(name string) (popular string, distance int, ok boo
 		if best >= 0 && distanceFloor(p.Ecosystem, key, k) >= best {
 			continue
 		}
-		d := nameDistance(p.Ecosystem, key, k)
+		d := nameDistance(p.Ecosystem, key, k, p.sharedArtifacts)
 		if best < 0 || d < best {
 			best, popular = d, p.Names[i]
 		}
@@ -198,8 +220,11 @@ func (p PopularNames) Label() string {
 // Central verifies who owns a groupId and not what artifactIds it publishes:
 // org.fasterxml.jackson.core:jackson-databind is three edits from the real
 // com.fasterxml.jackson.core groupId, past the reach of the summed distance,
-// and still the name a hurried reader takes for Jackson.
-func nameDistance(ecosystem, a, b string) int {
+// and still the name a hurried reader takes for Jackson. An artifactId in
+// shared, one the popular list itself carries under more than one groupId,
+// skips that case: `annotations` and `core` name nothing in particular, and
+// software.amazon.awssdk:annotations is no squat on org.jetbrains:annotations.
+func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 	switch ecosystem {
 	case manifest.TypeNpm:
 		as, an := splitNpmScope(a)
@@ -208,10 +233,10 @@ func nameDistance(ecosystem, a, b string) int {
 	case manifest.TypeMaven:
 		ag, aa := splitMavenName(a)
 		bg, ba := splitMavenName(b)
-		if aa == ba {
-			if ag == bg {
-				return 0
-			}
+		if aa == ba && ag == bg {
+			return 0
+		}
+		if aa == ba && !shared[aa] {
 			return 1
 		}
 		return damerauLevenshtein(ag, bg) + damerauLevenshtein(aa, ba)

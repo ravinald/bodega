@@ -152,7 +152,7 @@ func TestNearestMatchesBruteForce(t *testing.T) {
 			key := NormalizeName(eco, c)
 			want, wantD := "", -1
 			for i, k := range p.keys {
-				if d := nameDistance(eco, key, k); wantD < 0 || d < wantD {
+				if d := nameDistance(eco, key, k, p.sharedArtifacts); wantD < 0 || d < wantD {
 					want, wantD = p.Names[i], d
 				}
 			}
@@ -426,5 +426,33 @@ func TestNameSimilarityMavenLookalikeGroupID(t *testing.T) {
 	group := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeMaven, Pattern: "org.fasterxml.jackson.core:*"}}}
 	if r := checkName(t, group, manifest.TypeMaven, "org.fasterxml.jackson.core:jackson-databind"); r.Action != ActionBlock {
 		t.Errorf("a <groupId>:* rule names no one artifact and exempts none; got %+v", r)
+	}
+}
+
+// An artifactId the popular list carries under more than one groupId names
+// nothing in particular, so the cross-groupId case skips it: every AWS SDK v2
+// module depends on software.amazon.awssdk:annotations, and that is no squat
+// on org.jetbrains:annotations.
+func TestNameSimilarityMavenSharedArtifactID(t *testing.T) {
+	for _, name := range []string{"software.amazon.awssdk:annotations", "com.android.tools:annotations", "com.example:core"} {
+		if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeMaven, name); r.Action != ActionPass {
+			t.Errorf("%s = %+v, want a pass", name, r)
+		}
+	}
+}
+
+func TestSharedMavenArtifactsFromList(t *testing.T) {
+	p, err := ParsePopularNames(manifest.TypeMaven, []byte("org.jetbrains:annotations\ncom.google.code.findbugs:annotations\ncom.fasterxml.jackson.core:jackson-databind\n"))
+	if err != nil {
+		t.Fatalf("ParsePopularNames: %v", err)
+	}
+	if !p.sharedArtifacts["annotations"] || p.sharedArtifacts["jackson-databind"] || len(p.sharedArtifacts) != 1 {
+		t.Errorf("shared = %v, want annotations alone", p.sharedArtifacts)
+	}
+	if _, d, _ := p.Nearest("software.amazon.awssdk:annotations"); d <= MaxSimilarityDistance {
+		t.Errorf("a shared artifactId under another groupId is %d away, want the summed distance", d)
+	}
+	if got, d, _ := p.Nearest("org.fasterxml.jackson.core:jackson-databind"); got != "com.fasterxml.jackson.core:jackson-databind" || d != 1 {
+		t.Errorf("a distinctive artifactId under another groupId = %s at %d, want jackson-databind at 1", got, d)
 	}
 }
