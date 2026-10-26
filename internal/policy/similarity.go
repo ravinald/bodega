@@ -31,7 +31,7 @@ var popularFS embed.FS
 // the ones whose packages are named by whoever publishes them, on a registry
 // anyone can publish to.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 }
 
 // NormalizeName is the form two names are compared in. pypi applies PEP 503,
@@ -61,8 +61,9 @@ type PopularNames struct {
 	keys  []string
 	set   map[string]bool
 	// sharedArtifacts are the maven artifactIds the list carries under more
-	// than one groupId, none of which names them, and which the cross-groupId
-	// case of nameDistance skips.
+	// than one groupId, or the composer package names it carries under more
+	// than one vendor, that none of those carriers names, and which the
+	// cross-owner case of nameDistance skips.
 	sharedArtifacts map[string]bool
 	// Source and Date come from the list's header; Loaded says an operator
 	// replaced the embedded list.
@@ -113,8 +114,11 @@ func ParsePopularNames(ecosystem string, data []byte) (PopularNames, error) {
 	if len(p.Names) == 0 {
 		return PopularNames{}, errors.New("the list names no package")
 	}
-	if ecosystem == manifest.TypeMaven {
+	switch ecosystem {
+	case manifest.TypeMaven:
 		p.sharedArtifacts = sharedMavenArtifacts(p.keys)
+	case manifest.TypeComposer:
+		p.sharedArtifacts = sharedComposerPackages(p.keys)
 	}
 	return p, nil
 }
@@ -147,6 +151,39 @@ func sharedMavenArtifacts(keys []string) map[string]bool {
 func groupNamesArtifact(group, artifact string) bool {
 	for label := range strings.SplitSeq(group, ".") {
 		if strings.HasPrefix(label, artifact) {
+			return true
+		}
+	}
+	return false
+}
+
+// sharedComposerPackages is sharedMavenArtifacts for Packagist: the package
+// names keys carry under more than one vendor where no carrier's vendor names
+// the package. A vendor's labels are split at "-", "_" and ".", so psr7
+// under guzzlehttp, nyholm and slim names nothing and is returned, while
+// parsedown under erusev and parsedown is named by its own vendor and is not.
+func sharedComposerPackages(keys []string) map[string]bool {
+	carriers := map[string][]string{}
+	for _, k := range keys {
+		v, pkg := splitComposerName(k)
+		if !slices.Contains(carriers[pkg], v) {
+			carriers[pkg] = append(carriers[pkg], v)
+		}
+	}
+	shared := map[string]bool{}
+	for pkg, vendors := range carriers {
+		if len(vendors) > 1 && !slices.ContainsFunc(vendors, func(v string) bool { return vendorNamesPackage(v, pkg) }) {
+			shared[pkg] = true
+		}
+	}
+	return shared
+}
+
+// vendorNamesPackage reports whether some label of vendor, split at "-", "_"
+// and ".", equals pkg or begins with it.
+func vendorNamesPackage(vendor, pkg string) bool {
+	for _, label := range strings.FieldsFunc(vendor, func(r rune) bool { return r == '-' || r == '_' || r == '.' }) {
+		if strings.HasPrefix(label, pkg) {
 			return true
 		}
 	}
@@ -244,6 +281,12 @@ func (p PopularNames) Label() string {
 // that none of those groupIds names, skips that case: `annotations` and `core`
 // name nothing in particular, and software.amazon.awssdk:annotations is no
 // squat on org.jetbrains:annotations.
+//
+// A composer name is split at the slash and counted the same way, vendor for
+// groupId and package for artifactId. Packagist lets anyone claim an unused
+// vendor, so the common squat is a lookalike vendor over a real package name:
+// symfont/console is 1 from symfony/console by spelling, and acme/guzzle is 1
+// from guzzlehttp/guzzle by the vendor replaced whole.
 func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 	switch ecosystem {
 	case manifest.TypeNpm:
@@ -260,8 +303,24 @@ func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 			return 1
 		}
 		return damerauLevenshtein(ag, bg) + damerauLevenshtein(aa, ba)
+	case manifest.TypeComposer:
+		av, ap := splitComposerName(a)
+		bv, bp := splitComposerName(b)
+		if ap == bp && av != bv && !shared[ap] {
+			return 1
+		}
+		return damerauLevenshtein(av, bv) + damerauLevenshtein(ap, bp)
 	}
 	return damerauLevenshtein(a, b)
+}
+
+// splitComposerName splits "<vendor>/<package>"; a name with no slash is all
+// package.
+func splitComposerName(name string) (vendor, pkg string) {
+	if v, p, ok := strings.Cut(name, "/"); ok {
+		return v, p
+	}
+	return "", name
 }
 
 // splitMavenName splits "<groupId>:<artifactId>"; a name with no colon is
@@ -302,6 +361,13 @@ func distanceFloor(ecosystem, a, b string) int {
 			return 0
 		}
 		return lengthGap(ag, bg) + lengthGap(aa, ba)
+	case manifest.TypeComposer:
+		av, ap := splitComposerName(a)
+		bv, bp := splitComposerName(b)
+		if ap == bp {
+			return 0
+		}
+		return lengthGap(av, bv) + lengthGap(ap, bp)
 	}
 	return lengthGap(a, b)
 }

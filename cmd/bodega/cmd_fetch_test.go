@@ -16,7 +16,7 @@ func TestPublishedTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("all types: %v", err)
 	}
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	want := []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 	slices.Sort(got)
 	if !slices.Equal(got, want) {
 		t.Errorf("publishedTypes(all) = %v, want %v", got, want)

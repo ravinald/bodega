@@ -1,6 +1,8 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -551,5 +554,133 @@ func TestComposerMetadataRewriteFailureNamesTheRewrite(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "dist URL rewrite") || !strings.Contains(body, "around bodega") || strings.Contains(body, "profile") {
 		t.Errorf("502 body = %q, want it to name the dist URL rewrite and not a profile filter", body)
+	}
+}
+
+// gateComposer runs the proxy fill's real admission checks with the composer
+// OSV gate blocking, answered from a database holding one advisory against
+// symfony/console 7.1.4 alone. The range is written without the "v" Packagist
+// tags carry. The index filter is rebuilt so it reads the same database.
+func gateComposer(t *testing.T, s *Server) {
+	t.Helper()
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
+	rec := map[string]any{
+		"id": "GHSA-test-cmp1",
+		"affected": []map[string]any{{
+			"package": map[string]string{"name": "symfony/console", "ecosystem": "Packagist"},
+			"ranges": []map[string]any{{"type": "ECOSYSTEM",
+				"events": []map[string]string{{"introduced": "7.1.4"}, {"fixed": "7.1.5"}}}},
+		}},
+	}
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("GHSA-test-cmp1.json")
+		_ = json.NewEncoder(f).Encode(rec)
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+	s.cfg.OSVDBDir = t.TempDir()
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(t.Context(), "Packagist"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := s.auditDB.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeComposer, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set osv policy: %v", err)
+	}
+	s.indexFilter = policy.NewIndexFilter(s.auditDB, admit.OSVChecker(s.cfg, s.auditDB))
+}
+
+// A vulnerable version is refused at the dist route before its archive is
+// fetched, and the refusal names the advisory. The fixed release is served.
+func TestComposerDistRefusedByOSV(t *testing.T) {
+	f := newPackagistFixture(t)
+	s := composerServer(t, f)
+	gateComposer(t, s)
+	rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.4", consoleRef514), nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("v7.1.4: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkOSV)
+	if !strings.Contains(rec.Body.String(), "GHSA-test-cmp1") {
+		t.Errorf("refusal does not name the advisory:\n%s", rec.Body.String())
+	}
+	if n := f.archives.hitsFor("/archives/symfony/console/" + consoleRef514); n != 0 {
+		t.Errorf("archive host asked %d times for a refused version", n)
+	}
+	if rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.5", consoleRef515), nil); rec.Code != http.StatusOK {
+		t.Errorf("the fixed version: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// With the index filter on, the vulnerable version is absent from the p2
+// document, the versions after it still expand to their own keys, and the
+// dist route's refusal still names the advisory rather than the age gate's
+// advice.
+func TestComposerMetadataWithholdsOSVBlockedVersion(t *testing.T) {
+	f := newPackagistFixture(t)
+	s := composerServer(t, f)
+	gateComposer(t, s)
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeComposer, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := doRequest(s, http.MethodGet, "/composer/p2/symfony/console.json", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d (%s)", rec.Code, rec.Body.String())
+	}
+	versions := composerExpand(t, rec.Body.String(), "symfony/console")
+	if got := expandedVersions(versions); got != "v7.1.5,v7.1.3" {
+		t.Errorf("filtered versions = %s, want v7.1.5,v7.1.3", got)
+	}
+	if _, ok := versions[1]["dist"]; ok {
+		t.Errorf("v7.1.3 is source-only and must not inherit a dist once v7.1.4 is gone: %v", versions[1])
+	}
+	if got := rec.Header().Get(filteredHeader); got != "1; osv=1" {
+		t.Errorf("%s = %q, want \"1; osv=1\"", filteredHeader, got)
+	}
+	if n := len(filterRows(t, s, manifest.TypeComposer, "symfony/console")); n != 1 {
+		t.Errorf("index_filtered rows = %d, want 1", n)
+	}
+
+	rec = doRequest(s, http.MethodGet, consoleDistPath("v7.1.4", consoleRef514), nil)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "GHSA-test-cmp1") ||
+		strings.Contains(rec.Body.String(), "wait out the window") {
+		t.Errorf("dist under the filter: %d %s", rec.Code, rec.Body.String())
+	}
+
+	if err := s.auditDB.SetIndexFilter(t.Context(), audit.IndexFilter{Ecosystem: manifest.TypeComposer, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	rec = doRequest(s, http.MethodGet, "/composer/p2/symfony/console.json", nil)
+	if got := expandedVersions(composerExpand(t, rec.Body.String(), "symfony/console")); got != "v7.1.5,v7.1.4,v7.1.3" {
+		t.Errorf("the filter off serves every version; got %s", got)
+	}
+}
+
+// The age gate dates a version by the time composer_upstream's p2 document
+// lists for it, and refuses one too new before its archive is fetched.
+func TestComposerDistRefusedByAge(t *testing.T) {
+	f := newPackagistFixture(t)
+	stamp := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	f.packagist.set("/p2/symfony/console.json",
+		strings.Replace(f.console, `"version":"v7.1.5",`, `"version":"v7.1.5","time":"`+stamp+`",`, 1))
+	s := composerServer(t, f)
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeComposer, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+	rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.5", consoleRef515), nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkAge)
+	if n := f.archives.hitsFor("/archives/symfony/console/" + consoleRef515); n != 0 {
+		t.Errorf("archive host asked %d times for a refused version", n)
 	}
 }

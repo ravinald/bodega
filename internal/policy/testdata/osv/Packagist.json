@@ -1,0 +1,134 @@
+[
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "Packagist",
+     "name": "firebase/php-jwt",
+     "purl": "pkg:composer/firebase/php-jwt"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "7.0.0"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "1.0.0",
+     "2.0.0",
+     "v2.1.0",
+     "v2.2.0",
+     "v3.0.0",
+     "v4.0.0",
+     "v5.0.0",
+     "v5.1.0",
+     "v5.2.0",
+     "v5.2.1",
+     "v5.3.0",
+     "v5.4.0",
+     "v5.5.0",
+     "v5.5.1",
+     "v6.0.0",
+     "v6.1.0",
+     "v6.1.1",
+     "v6.1.2",
+     "v6.10.0",
+     "v6.10.1",
+     "v6.10.2",
+     "v6.11.0",
+     "v6.11.1",
+     "v6.2.0",
+     "v6.3.0",
+     "v6.3.1",
+     "v6.3.2",
+     "v6.4.0",
+     "v6.5.0",
+     "v6.6.0",
+     "v6.7.0",
+     "v6.8.0",
+     "v6.8.1",
+     "v6.9.0"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2025-45769"
+  ],
+  "id": "GHSA-2x45-7fc3-mxwq",
+  "modified": "2026-09-10T03:50:25.716459904Z",
+  "published": "2025-07-31T21:31:53Z",
+  "schema_version": "1.9.0",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+    "type": "CVSS_V3"
+   },
+   {
+    "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N/E:U",
+    "type": "CVSS_V4"
+   }
+  ],
+  "summary": "php-jwt contains weak encryption"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "Packagist",
+     "name": "firebase/php-jwt",
+     "purl": "pkg:composer/firebase/php-jwt"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "6.0.0"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "1.0.0",
+     "2.0.0",
+     "v2.1.0",
+     "v2.2.0",
+     "v3.0.0",
+     "v4.0.0",
+     "v5.0.0",
+     "v5.1.0",
+     "v5.2.0",
+     "v5.2.1",
+     "v5.3.0",
+     "v5.4.0",
+     "v5.5.0",
+     "v5.5.1"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2021-46743"
+  ],
+  "id": "GHSA-8xf4-w7qw-pjjw",
+  "modified": "2023-11-08T04:07:27.311791Z",
+  "published": "2022-03-30T00:00:27Z",
+  "schema_version": "1.9.0",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "Firebase PHP-JWT key/algorithm type confusion"
+ }
+]
