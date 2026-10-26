@@ -5201,7 +5201,7 @@ A `maven-metadata.xml` outside a SNAPSHOT directory has two readings, because th
 **Gaps:**
 
 - `maven-metadata.xml` comes from one repository, the first in `maven_upstreams` that publishes it, and is not merged across them. A version range or a `latest` lookup sees only that repository's versions of an artifact two repositories both publish.
-- A companion whose file was cached before a restart, and is not itself cached, is asked of the repositories in order rather than of the one that served the file. The two differ only when the first repository publishes the coordinate with other bytes.
+- A companion whose file this process no longer remembers serving, because the file was fetched before a restart or the process has since fetched up to 8192 other Maven files, is asked of the repositories in order rather than of the one that served the file, unless the companion is itself cached. The two differ only when the first repository publishes the coordinate with other bytes.
 - `/maven/` does not answer for a `.zip`, so the wrappers' distributions come through a `binary_upstreams` namespace, as above, rather than through this route.
 
 **Catalog path.** A maven entry in `hosted` mode is served from storage, with no upstream request for any file the fetch stored. Catalog one the way any other type is cataloged:
