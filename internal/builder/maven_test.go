@@ -116,7 +116,7 @@ func TestFetchMavenPlacesEveryFileWhereTheRouteReadsIt(t *testing.T) {
 	pm := &manifest.PackageManifest{Type: manifest.TypeMaven, Name: "org.slf4j:slf4j-api",
 		Versions: []manifest.VersionEntry{{Version: "2.0.13", Classifiers: []string{"sources"}}}}
 	cfg, store, db := pinEnv(t, pm)
-	cfg.MavenUpstream = repo.srv.URL
+	cfg.MavenUpstreams = []string{repo.srv.URL}
 	for _, extra := range []*manifest.PackageManifest{
 		{Type: manifest.TypeMaven, Name: "org.springframework.boot:spring-boot-dependencies", Versions: []manifest.VersionEntry{{Version: "3.3.0"}}},
 		{Type: manifest.TypeMaven, Name: "commons-lang:commons-lang", Versions: []manifest.VersionEntry{{Version: "2.6"}}},
@@ -212,7 +212,7 @@ func TestFetchMavenRefusesAChecksumMismatch(t *testing.T) {
 		pm := &manifest.PackageManifest{Type: manifest.TypeMaven, Name: "org.slf4j:slf4j-api",
 			Versions: []manifest.VersionEntry{{Version: "2.0.13"}}}
 		cfg, store, _ := pinEnv(t, pm)
-		cfg.MavenUpstream = repo.srv.URL
+		cfg.MavenUpstreams = []string{repo.srv.URL}
 		return repo, cfg, store
 	}
 	assertNothingKept := func(t *testing.T, cfg *Config, store *manifest.Store) {
@@ -293,7 +293,7 @@ func TestFetchMavenRefusesASnapshot(t *testing.T) {
 	pm := &manifest.PackageManifest{Type: manifest.TypeMaven, Name: "com.example:app",
 		Versions: []manifest.VersionEntry{{Version: "1.0-SNAPSHOT"}}}
 	cfg, store, _ := pinEnv(t, pm)
-	cfg.MavenUpstream = repo.srv.URL
+	cfg.MavenUpstreams = []string{repo.srv.URL}
 	s := FetchMaven(cfg, store, "")
 	if s.Failures != 1 || !strings.Contains(s.FirstError().Error(), "SNAPSHOT") {
 		t.Fatalf("fetch = %d failure(s), %v; want the SNAPSHOT refused", s.Failures, s.FirstError())

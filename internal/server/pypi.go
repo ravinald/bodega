@@ -374,7 +374,7 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			resolve := func(ctx context.Context) (string, error) {
 				return s.resolvePypiWheel(ctx, normalized, file)
 			}
-			s.proxyOrResolve(w, r, s.typeStore(manifest.TypePypi), key, resolve, "", manifest.TypePypi, normalized, normalized, true, true)
+			s.proxyOrResolve(w, r, s.typeStore(manifest.TypePypi), key, resolve, "", nil, manifest.TypePypi, normalized, normalized, true, true)
 			return
 		}
 		if pkg == nil {

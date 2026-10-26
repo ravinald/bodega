@@ -73,7 +73,32 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 	if upstreamURL != "" {
 		resolve = func(context.Context) (string, error) { return upstreamURL, nil }
 	}
-	s.proxyOrResolve(w, r, store, s3Key, resolve, upstreamURL, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+	s.proxyOrResolve(w, r, store, s3Key, resolve, upstreamURL, nil, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+}
+
+// upstreamOrder is the further URLs a miss asks, in order, after the first
+// one answers anything but its bytes, and what to tell once one has answered.
+type upstreamOrder struct {
+	fallbacks []string
+	// served is told which URL supplied the bytes: 0 for the first, i+1 for
+	// fallbacks[i]. Nil tells nobody.
+	served func(i int)
+}
+
+// proxyOrCacheOrdered is proxyOrCache over an ordered list of upstream URLs
+// for one object, as a repository list behind one route reads it: a miss asks
+// each in turn until one answers 2xx, and a 404 or a failure passes to the
+// next. Every URL answering 404 is a 404; otherwise the first failure that was
+// not a 404 is reported as a single-upstream fetch would report it.
+func (s *Server) proxyOrCacheOrdered(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, upstreams []string, served func(int), regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+	if len(upstreams) == 0 {
+		s.proxyOrCache(w, r, store, s3Key, "", regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+		return
+	}
+	first := upstreams[0]
+	resolve := func(context.Context) (string, error) { return first, nil }
+	order := &upstreamOrder{fallbacks: upstreams[1:], served: served}
+	s.proxyOrResolve(w, r, store, s3Key, resolve, first, order, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
 }
 
 // upstreamResolver produces the URL a cache miss should fetch. It runs only
@@ -91,7 +116,10 @@ type upstreamResolver func(ctx context.Context) (string, error)
 // path, which records a discovery row and must not pay for a resolution it will
 // never use: for pypi the row's pattern hint is the package name and the host
 // column is preserved by the upsert, so "" costs the row nothing.
-func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, knownUpstream, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+//
+// order, when not nil, is the URLs the fetch falls back to after the resolved
+// one; see proxyOrCacheOrdered.
+func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, knownUpstream string, order *upstreamOrder, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
 	if !s.requireStorage(w, store) {
 		return
 	}
@@ -267,7 +295,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		// is waiting on; upstreamClient's Timeout is what bounds it instead.
 		fetchCtx := context.WithoutCancel(ctx)
 		results := make(chan upstreamFetch, 1)
-		go func() { results <- s.fetchUpstream(fetchCtx, upstreamURL, regType) }()
+		go func() { results <- s.fetchUpstreamInOrder(fetchCtx, upstreamURL, order, regType) }()
 		timer := time.NewTimer(s.cache.StaleGrace)
 		defer timer.Stop()
 		answered := false
@@ -290,7 +318,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			return
 		}
 	} else {
-		fetched = s.fetchUpstream(ctx, upstreamURL, regType)
+		fetched = s.fetchUpstreamInOrder(ctx, upstreamURL, order, regType)
 	}
 	up, spool, err := fetched.up, fetched.spool, fetched.err
 	if err != nil {
@@ -404,6 +432,48 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		return upstreamFetch{err: err}
 	}
 	return upstreamFetch{up: up, spool: spool}
+}
+
+// fetchUpstreamInOrder fetches first and, while nothing has answered with its
+// bytes, each of order's fallbacks in turn. A spool refusal ends the walk at
+// once: it is this host's bound, and the next upstream would meet it too. So
+// does a canceled context, which every later fetch would fail on.
+//
+// The result is the first fetch that succeeded; failing that, the first
+// failure that was not a 404, because "one repository is down" is the
+// answer that tells the operator something when the rest merely lack the
+// file; and failing that, the last 404.
+func (s *Server) fetchUpstreamInOrder(ctx context.Context, first string, order *upstreamOrder, regType string) upstreamFetch {
+	fetched := s.fetchUpstream(ctx, first, regType)
+	if order == nil {
+		return fetched
+	}
+	var failed *upstreamFetch
+	for i := 0; ; i++ {
+		if fetched.err == nil {
+			if order.served != nil {
+				order.served(i)
+			}
+			return fetched
+		}
+		if spoolDenialReason(fetched.err) != "" || ctx.Err() != nil {
+			return fetched
+		}
+		if failed == nil && !errors.Is(fetched.err, errUpstreamNotFound) {
+			f := fetched
+			failed = &f
+		}
+		if i >= len(order.fallbacks) {
+			break
+		}
+		next := order.fallbacks[i]
+		s.logger.Info("upstream did not answer with the object, asking the next in order", "error", fetched.err, "next", next)
+		fetched = s.fetchUpstream(ctx, next, regType)
+	}
+	if failed != nil {
+		return *failed
+	}
+	return fetched
 }
 
 // claimStaleRefresh takes the one refresh slot for s3Key. It reports false
@@ -1061,7 +1131,7 @@ var fetchCheckers = admit.VersionCheckers
 
 // datedThroughUpstream sends the age gate's reads through the proxy's own
 // transport and guard. A gem is dated at rubygems_upstream and a Maven
-// artifact at maven_upstream, the hosts their bytes come from, so that read is
+// artifact at maven_upstreams, the hosts their bytes come from, so that read is
 // held to upstream_connect_timeout and the redirect guard as the fetch it
 // gates is.
 func datedThroughUpstream(checkers []policy.VersionChecker) {

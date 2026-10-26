@@ -121,9 +121,9 @@ type Config struct {
 	// RubygemsUpstream is the registry root gem files are fetched from, the
 	// one the server's /rubygems/ route proxies. An entry's own URL wins.
 	RubygemsUpstream string
-	// MavenUpstream is the repository root maven files are fetched from, the
-	// one the server's /maven/ route proxies.
-	MavenUpstream string
+	// MavenUpstreams are the repository roots maven files are fetched from,
+	// in the order the server's /maven/ route asks them.
+	MavenUpstreams []string
 }
 
 // PolicyDisabledNotice is what a fetch prints, once per run, when it holds no
@@ -451,7 +451,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		CargoUpstream:   app.CargoUpstream,
 
 		RubygemsUpstream: app.RubygemsUpstream,
-		MavenUpstream:    app.MavenUpstream,
+		MavenUpstreams:   app.MavenUpstreams,
 
 		DistfilesPortsTree:   app.DistfilesPortsTree,
 		DistfilesUpstream:    app.DistfilesUpstream,

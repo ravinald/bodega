@@ -332,7 +332,7 @@ func TestSpoolRefusalAnswers503AndWritesItsRow(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.proxyOrResolve(rec, req, storage.NewMemory(), key,
 		func(context.Context) (string, error) { return ts.URL + "/1/leftpad.tgz", nil },
-		"", manifest.TypeNpm, pkg, pkg, false, true)
+		"", nil, manifest.TypeNpm, pkg, pkg, false, true)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body.String())

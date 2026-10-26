@@ -74,7 +74,7 @@ func serveStale(s *Server, ctx context.Context, store storage.ObjectStore, key, 
 	req.RemoteAddr = "127.0.0.1:33333"
 	rec := httptest.NewRecorder()
 	resolve := func(context.Context) (string, error) { return upstream, nil }
-	s.proxyOrResolve(rec, req, store, key, resolve, upstream, manifest.TypeNpm, "colorama", "colorama", false, true)
+	s.proxyOrResolve(rec, req, store, key, resolve, upstream, nil, manifest.TypeNpm, "colorama", "colorama", false, true)
 	return rec
 }
 

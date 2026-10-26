@@ -110,6 +110,10 @@ type Server struct {
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.
 	mavenArtifacts mavenArtifactSet
+	// mavenOrigins is the maven_upstreams root each Maven file this process
+	// fetched came from, so its companions are asked of the same one. See
+	// mavenUpstreamOrder.
+	mavenOrigins mavenOriginSet
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
