@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1541,5 +1543,133 @@ func TestClientGradleRouteRefusals(t *testing.T) {
 	}
 	if code, _ := clientGet(t, s, closed.token, "/client/maven?os=linux&file=gradle"); code != http.StatusForbidden {
 		t.Errorf("GET the init script under a closed profile = %d, want 403", code)
+	}
+}
+
+// F95 R1, R2: composer installs Composer's global config.json at a URL
+// serving the bytes the plan's digest names, the record says it is merged,
+// and an apply over a config.json holding an auth key keeps the key and backs
+// the file up.
+func TestClientPlanComposerInstallsGlobalConfig(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	want := clientconf.Composer("https://bodega.internal")
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeComposer)
+	if len(recs) != 1 || recs[0].Action != clientconf.PlanInstall || recs[0].Path != "~/.config/composer/config.json" ||
+		recs[0].URL != "https://bodega.internal/client/composer?os=linux" {
+		t.Fatalf("composer records = %+v, want one install of ~/.config/composer/config.json from /client/composer", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "keeps its auth") || !strings.Contains(recs[0].Reason, "COMPOSER_HOME") {
+		t.Errorf("reason = %q, want the merge and COMPOSER_HOME notes", recs[0].Reason)
+	}
+	u, _ := url.Parse(recs[0].URL)
+	code, body := clientGet(t, s, f.token, u.RequestURI())
+	if code != http.StatusOK || body != want.Content {
+		t.Fatalf("GET %s = %d %q, want %q", u.RequestURI(), code, body, want.Content)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".config/composer/config.json")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(`{"config":{"github-oauth":{"github.com":"ghp_operator"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := clientconf.NewChange(recs[0], []byte(body), home)
+	if err != nil {
+		t.Fatalf("NewChange refused the served file: %v", err)
+	}
+	if _, err := clientconf.Apply([]clientconf.Change{c}, ".bodega-test"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(target)
+	repos, err := clientconf.ReadComposerRepos(got)
+	if err != nil || repos.Bodega != "https://bodega.internal/composer" || !repos.PackagistOff || !strings.Contains(string(got), "ghp_operator") {
+		t.Errorf("config.json after apply =\n%s\nwant bodega's repository, packagist.org off and the github-oauth key kept (err %v)", got, err)
+	}
+	if _, err := os.Stat(target + ".bodega-test"); err != nil {
+		t.Errorf("no backup beside %s: %v", target, err)
+	}
+}
+
+// F95: the setup script writes config.json where none exists, in the
+// directory Composer reads (COMPOSER_HOME, else an existing XDG or ~/.composer
+// home), and leaves an existing one to doctor rather than replace the
+// operator's settings with the plan's.
+func TestSetupScriptConfiguresComposerWithoutReplacingAConfig(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp", "curl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	s := hostedServer(t)
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	composerHome := t.TempDir()
+	out, _, err := setupScriptAgainst(t, s, f.token, []string{"COMPOSER_HOME=" + composerHome}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh --systems composer --apply: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(composerHome + "/config.json"); string(got) != clientconf.Composer(s.cfg.PublicURL).Content {
+		t.Errorf("$COMPOSER_HOME/config.json = %q, want the planned file\n%s", got, out)
+	}
+
+	home := t.TempDir()
+	existing := `{"config":{"github-oauth":{"github.com":"ghp_operator"}}}`
+	target := home + "/.config/composer/config.json"
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh over an existing config.json: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(target); string(got) != existing {
+		t.Errorf("%s = %q, want it untouched", target, got)
+	}
+	if !strings.Contains(out, "skipped    composer") || !strings.Contains(out, "bodega doctor --configure composer") ||
+		strings.Contains(out, "every file already matches") {
+		t.Errorf("output does not say the file was left to doctor:\n%s", out)
+	}
+
+	// An XDG_ variable puts ~/.config/composer first, but Composer reads an
+	// existing ~/.composer over a missing XDG directory, so that is the file
+	// the script finds and leaves alone.
+	home = t.TempDir()
+	target = home + "/.composer/config.json"
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh over an existing ~/.composer: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(target); string(got) != existing {
+		t.Errorf("%s = %q, want it untouched", target, got)
+	}
+	if _, err := os.Stat(home + "/.config/composer"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("~/.config/composer exists beside ~/.composer (%v), which moves Composer's home away from it\n%s", err, out)
+	}
+	if !strings.Contains(out, "skipped    composer   "+target) {
+		t.Errorf("output does not say %s was left to doctor:\n%s", target, out)
+	}
+
+	// With neither directory, Composer creates its first candidate.
+	home = t.TempDir()
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh on a host with no Composer home: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(home + "/.config/composer/config.json"); string(got) != clientconf.Composer(s.cfg.PublicURL).Content {
+		t.Errorf("~/.config/composer/config.json = %q, want the planned file\n%s", got, out)
+	}
+	if _, err := os.Stat(home + "/.composer"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("~/.composer was created (%v), want only the XDG directory\n%s", err, out)
 	}
 }

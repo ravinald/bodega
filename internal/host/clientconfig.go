@@ -659,6 +659,85 @@ func gradleInitURL(path string) (string, error) {
 	return "", nil
 }
 
+// composerTools is what the composer check reads from the host, so a test
+// can stand in for whether composer is on PATH and where its home resolves.
+type composerTools struct {
+	lookPath func(string) (string, error)
+	home     func() string
+}
+
+// CheckComposer reports whether Composer's global config.json sends every
+// project to bodega: a composer repository at a /composer route, with
+// packagist.org disabled. ok is false on a host with no composer on PATH,
+// where the row would describe a client nobody runs.
+func CheckComposer() (f Finding, ok bool) {
+	home, _ := os.UserHomeDir()
+	return checkComposer(composerTools{lookPath: exec.LookPath, home: func() string { return clientconf.HostComposerHome(home) }})
+}
+
+func checkComposer(t composerTools) (Finding, bool) {
+	if _, err := t.lookPath("composer"); err != nil {
+		return Finding{}, false
+	}
+	f := Finding{Check: "composer"}
+	dir := t.home()
+	if dir == "" {
+		f.Status = StatusSkip
+		f.Detail = "neither COMPOSER_HOME nor HOME is set, so Composer's global config.json could not be located"
+		f.Remediation = "run doctor with HOME set to the account whose Composer config this is"
+		return f, true
+	}
+	path := filepath.Join(dir, "config.json")
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		f.Status = StatusWarn
+		f.Detail = "no " + path + ", so Composer fetches every package from packagist.org; bypasses bodega's composer proxy"
+		f.Remediation = "bodega doctor --configure composer --apply --url <bodega base URL>"
+		return f, true
+	case err != nil:
+		f.Status = StatusSkip
+		f.Detail = path + " could not be read: " + err.Error()
+		f.Remediation = "run doctor as the user whose Composer config this is, or repair what the error names"
+		return f, true
+	}
+	repos, err := clientconf.ReadComposerRepos(data)
+	if err != nil {
+		f.Status = StatusSkip
+		f.Detail = path + " is not JSON Composer can read: " + err.Error()
+		f.Remediation = "repair " + path + ", then run doctor again; composer itself refuses to run with it"
+		return f, true
+	}
+	var found []string
+	if repos.Bodega == "" {
+		found = append(found, path+" names no composer repository at a bodega /composer route")
+	}
+	if !repos.PackagistOff {
+		found = append(found, path+" leaves packagist.org enabled, so a package bodega does not answer for resolves from Packagist")
+	}
+	var steps []string
+	if len(found) > 0 {
+		steps = append(steps, "bodega doctor --configure composer --apply --url <bodega base URL>")
+	}
+	for _, u := range repos.OnPackagist {
+		found = append(found, path+" lists a composer repository at "+u+", which is Packagist under another name")
+	}
+	// --configure keeps every repository the operator added, so it cannot
+	// clear these; only removing the entry does.
+	if len(repos.OnPackagist) > 0 {
+		steps = append(steps, "remove the composer repository at "+strings.Join(repos.OnPackagist, " and at ")+" from "+path)
+	}
+	if len(found) > 0 {
+		f.Status = StatusWarn
+		f.Detail = strings.Join(found, "; ") + "; bypasses bodega's composer proxy"
+		f.Remediation = strings.Join(steps, ", then ")
+		return f, true
+	}
+	f.Status = StatusOK
+	f.Detail = path + " sends Composer to " + repos.Bodega + " with packagist.org disabled"
+	return f, true
+}
+
 // rooted prefixes each path with root, and returns paths unchanged when root
 // is empty.
 func rooted(root string, paths []string) []string {

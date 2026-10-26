@@ -363,6 +363,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return planRubygems(h, one)
 	case manifest.TypeMaven:
 		return s.planMaven(h, one)
+	case manifest.TypeComposer:
+		return planComposer(h, one)
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:
@@ -460,6 +462,18 @@ func (s *Server) planMaven(h *clientHost, one func(clientconf.File) []planFile) 
 		gradle[0].url = h.base + "/client/" + manifest.TypeMaven + "?" + v.Encode()
 	}
 	return append(out, gradle...)
+}
+
+// planComposer renders Composer's global config.json. Where it lands and
+// that it is merged ride on the record's reason, since the path is the
+// default Composer picks and a host's COMPOSER_HOME moves it.
+func planComposer(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	f := clientconf.Composer(h.base)
+	out := one(f)
+	if out[0].action == planInstall {
+		out[0].reason = strings.Join(f.Notes, ". ")
+	}
+	return out
 }
 
 // planDistfiles renders make.conf and the client check it includes. The two

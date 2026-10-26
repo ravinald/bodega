@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -64,6 +65,8 @@ outside bodega's allow-list. Common findings:
   - pip / cargo / npm / apt configured to talk to public registries directly
   - gem sources or Bundler's mirror still naming rubygems.org
   - Maven or Gradle with no bodega mirror or init script
+  - Composer's global config naming no bodega repository, or leaving
+    packagist.org enabled
   - GOPROXY unset or falling through to proxy.golang.org
   - on FreeBSD, a pkg repository still enabled at pkg.FreeBSD.org, or a
     make.conf that does not send distfiles through bodega
@@ -234,6 +237,9 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, f)
 			}
 			if f, ok := host.CheckMaven(); ok {
+				findings = append(findings, f)
+			}
+			if f, ok := host.CheckComposer(); ok {
 				findings = append(findings, f)
 			}
 			if f, ok := ubuntuPro.finding(); ok {
@@ -543,6 +549,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		body, err := getPlanFile(client, rec.URL, req.allowPlaintext)
 		if err != nil {
 			return fmt.Errorf("%s: %w", rec.System, err)
+		}
+		if rec.System == manifest.TypeComposer {
+			if dir := clientconf.HostComposerHome(home); dir != "" {
+				rec.Path = filepath.Join(dir, "config.json")
+			}
 		}
 		c, err := clientconf.NewChange(rec, body, home)
 		if err != nil {

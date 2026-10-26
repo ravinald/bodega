@@ -191,7 +191,8 @@ type Change struct {
 	Existed bool
 	// New is what Apply writes: the fetched file, which matched the plan's
 	// digest, plus any credential KeepCredential carried over from Old, or
-	// for Maven's settings.xml, Old with the fetched file's mirrors merged in.
+	// for Maven's settings.xml and Composer's config.json, Old with the fetched
+	// file's mirrors or repositories merged in.
 	New []byte
 }
 
@@ -234,6 +235,11 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	c.New = KeepCredential(rec.System, c.Old, content)
 	if rec.System == manifest.TypeMaven && rec.Path == MavenSettingsPath {
 		c.New = MergeMavenSettings(c.Old, content)
+	}
+	if rec.System == manifest.TypeComposer {
+		if c.New, err = MergeComposerConfig(c.Old, content); err != nil {
+			return Change{}, fmt.Errorf("%s: cannot merge bodega's repository into %s: %w", rec.System, target, err)
+		}
 	}
 	return c, nil
 }

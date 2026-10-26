@@ -663,6 +663,7 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
 | `cargo`    | `cargo install --list`                                                                                                    |
 | `rubygems` | `gem list --local`, or a listing of the gem directory's `specifications/` (`ls $(gem environment gemdir)/specifications`) |
 | `maven`    | a listing of the POMs in the local repository: `find ~/.m2/repository -name '*.pom'`                                      |
+| `composer` | `composer global show --format=json`                                                                                      |
 | `helm`     | `helm list -o json`                                                                                                       |
 | `freebsd`  | `pkg query '%R\t%q'`                                                                                                      |
 
@@ -671,6 +672,8 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
 **`rubygems` skips default gems.** `gem list --local` marks the gems Ruby ships with as `default:`; no registry download put them there, so they are counted in a warning rather than cataloged. A platform build listed as `nokogiri (1.16.7 x86_64-linux)` is recorded at `1.16.7-x86_64-linux`, the version its gem file names, and a gem installed at several versions becomes one package with each of them.
 
 **`maven` reads the local repository, not a build.** Each `<groupId dirs>/<artifactId>/<version>/<artifactId>-<version>.pom` becomes a version of `<groupId>:<artifactId>`, read relative to the path's last `/repository/`, so a listing from `~/.m2/repository` or from a `maven.repo.local` elsewhere both parse. The local repository holds what every Maven build on the host resolved, Maven's own plugins included: a fresh Maven 3.9.9 that ran one `dependency:list` leaves 260 POMs of 163 artifacts. A SNAPSHOT is skipped and counted in a warning, as is any line that is not a release POM. Gradle keeps its own cache (`~/.gradle/caches/modules-2`) in a hashed layout that is not read; catalog a Gradle build from its `gradle.lockfile` with `bodega pkg import --lockfile`.
+
+**`composer` reads the global project.** `composer global show --format=json` lists the packages in Composer's home, where a host's PHP tools live; run `composer show --format=json` in a project to read its `vendor/` the same way. Each package is recorded at the version Packagist lists (`v7.4.21`, `2.0.2`). A branch install (`dev-master f16e1d5`) is skipped and counted in a warning, since the branch moves and no published version describes it. The listing carries no dist reference, so the entries have no `ref`.
 
 **`freebsd` imports repositories, not packages.** A `freebsd` entry is one repository with a version per ABI, so convert reads the repository each installed package came from (`%R`) and the ABI it was built for (`%q`), and collapses the host to the repositories it installed from. On a FreeBSD 15.1 host with 34 packages that is 3 entries.
 
@@ -4923,7 +4926,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `b6c33aeaefafcde87c79e09f15fbac381994aab896b34a325f8d2192a469a995`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `a6482f1c377ea3fe8cf56d6a52ecad304ae3ba4c5e57a1d9b0c53007cbf5d9cf`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -5278,14 +5281,29 @@ bodega build upload rubygems
 
 Attestations and SBOMs name a gem `pkg:gem/<name>@<version>`, with a platform build's suffix moved to a qualifier: `pkg:gem/nokogiri@1.16.7?platform=x86_64-linux`. A CycloneDX document pushed to the [`cyclonedx` inventory source](#the-cyclonedx-source) reports a `pkg:gem` component under `rubygems`, at the version bodega records.
 
-**Composer** (`composer config -g`, which writes `~/.config/composer/config.json` on Linux and `~/.composer/config.json` elsewhere):
+**Composer** (`config.json` in Composer's home: `$COMPOSER_HOME/config.json`, else `~/.config/composer/config.json` on Linux and `~/.composer/config.json` elsewhere):
 
-```bash
-composer config -g repositories.bodega composer https://bodega-host:8080/composer
-composer config -g repo.packagist false
+```json
+{
+    "repositories": {
+        "bodega": {
+            "type": "composer",
+            "url": "https://bodega-host:8080/composer"
+        },
+        "packagist.org": false
+    }
+}
 ```
 
-Both are needed. The first adds bodega as a repository; the second turns off Packagist, which Composer otherwise keeps beside it, so a package bodega refuses would resolve from Packagist instead. A project's own `composer.json` can name repositories of its own, and those still reach their hosts directly. The setup script and `bodega doctor` do not configure Composer yet; until they do, these two commands are the whole client setup.
+`bodega doctor --configure composer --apply --url https://bodega-host:8080` writes it as the user whose projects resolve through it, backing up the file it replaces. Composer merges its global `config.json` under every project's `composer.json`, so each project's `composer install` resolves through bodega with no change to the project. Both entries are needed: the first adds bodega as a repository, and `"packagist.org": false` turns off Packagist, which Composer otherwise keeps beside it, so a package bodega refuses would resolve from Packagist instead.
+
+An existing `config.json` is merged, not replaced. bodega's repository is added first (Composer asks repositories in order) or updated in place, `packagist.org` is set `false`, and every other key keeps its value and its place: auth (`github-oauth`, `http-basic`), `platform`, cache settings and the operator's own repositories. A `repositories` list, the other form Composer reads, gets bodega's entry first and `{"packagist.org": false}` last. The file is re-indented the way Composer writes it, four spaces. A `config.json` that is not JSON Composer can read is refused with nothing written, since `composer` refuses it too and it may hold the only copy of a credential.
+
+doctor writes the file in the directory Composer reads it from, resolved as Composer does: `$COMPOSER_HOME`; otherwise `$XDG_CONFIG_HOME/composer` (`~/.config/composer` without it) or `~/.composer`, whichever exists, where the first is a candidate only when an `XDG_` variable is set or `/etc/xdg` exists. That is why a macOS host gets `~/.composer`: with no `XDG_` variable Composer never reads `~/.config/composer`. The plan's record names the default path, and its note says the file is merged.
+
+The [setup script](#setup-script) with `--systems composer` writes the file where none exists, in the directory doctor resolves by the same rule, so a host whose Composer home is an existing `~/.composer` keeps it rather than gaining a `~/.config/composer` that Composer would read instead. An existing `config.json` it leaves untouched and says so, because merging one takes a JSON parser the script does not carry; run `bodega doctor --configure composer` there instead.
+
+`bodega doctor` reports a `composer` row on a host with `composer` on `PATH`, and none on a host without it. It warns when the global `config.json` is missing, names no composer repository at a bodega `/composer` route, leaves `packagist.org` enabled, or lists a composer repository on `packagist.org` under another name, which Composer reads as Packagist itself. `--configure composer` clears the first three; it keeps every repository the operator added, so the row names a Packagist alias for removal by hand. A project's own `composer.json` can still name repositories of its own, Packagist's URL included, and those reach their hosts directly; doctor reads no project.
 
 bodega serves a Composer v2 repository under `/composer/`, proxied from [`composer_upstream`](#upstream-hosts):
 
@@ -5306,7 +5324,7 @@ An archive passes the same gates as a gem file: the [upstream allow-list](#upstr
 
 A composer entry records the dist reference in `ref`, which is what names the archive it holds under `composer/dist/` and `composer_root`; an entry with no `ref` is a statement about versions alone, enough for hiding and constraints. Nothing fetches an archive ahead of a client: `bodega build fetch composer` has nothing to do, and an archive arrives in storage when a client first requests it.
 
-**Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. The client plan and the age, OSV and similarity gates for Composer are not built yet; a profile governs Composer as it does the other package types.
+**Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. The age, OSV and similarity gates for Composer are not built yet; a profile governs Composer as it does the other package types.
 
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 

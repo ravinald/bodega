@@ -58,6 +58,7 @@ Sources per type:
   cargo   cargo install --list
   rubygems gem list --local   |   ls $(gem environment gemdir)/specifications
   maven   find ~/.m2/repository -name '*.pom'
+  composer composer global show --format=json
   helm    helm list -o json
   freebsd pkg query '%R\t%q'
 
