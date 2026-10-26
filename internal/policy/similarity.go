@@ -61,7 +61,8 @@ type PopularNames struct {
 	keys  []string
 	set   map[string]bool
 	// sharedArtifacts are the maven artifactIds the list carries under more
-	// than one groupId, which the cross-groupId case of nameDistance skips.
+	// than one groupId, none of which names them, and which the cross-groupId
+	// case of nameDistance skips.
 	sharedArtifacts map[string]bool
 	// Source and Date come from the list's header; Loaded says an operator
 	// replaced the embedded list.
@@ -119,19 +120,37 @@ func ParsePopularNames(ecosystem string, data []byte) (PopularNames, error) {
 }
 
 // sharedMavenArtifacts returns the artifactIds keys carry under more than one
-// groupId.
+// groupId where no carrier's groupId names the artifactId: equal to, or
+// extended from, one of its dot-separated labels. guava under
+// com.google.guava and okhttp under com.squareup.okhttp3 point at one project
+// however many groupIds republish them, so they are not returned; annotations
+// under org.jetbrains and com.google.code.findbugs points at none.
 func sharedMavenArtifacts(keys []string) map[string]bool {
-	groups := map[string]string{}
-	shared := map[string]bool{}
+	carriers := map[string][]string{}
 	for _, k := range keys {
 		g, a := splitMavenName(k)
-		if first, seen := groups[a]; !seen {
-			groups[a] = g
-		} else if first != g {
+		if !slices.Contains(carriers[a], g) {
+			carriers[a] = append(carriers[a], g)
+		}
+	}
+	shared := map[string]bool{}
+	for a, groups := range carriers {
+		if len(groups) > 1 && !slices.ContainsFunc(groups, func(g string) bool { return groupNamesArtifact(g, a) }) {
 			shared[a] = true
 		}
 	}
 	return shared
+}
+
+// groupNamesArtifact reports whether some dot-separated label of group equals
+// artifact or begins with it.
+func groupNamesArtifact(group, artifact string) bool {
+	for label := range strings.SplitSeq(group, ".") {
+		if strings.HasPrefix(label, artifact) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -221,9 +240,10 @@ func (p PopularNames) Label() string {
 // org.fasterxml.jackson.core:jackson-databind is three edits from the real
 // com.fasterxml.jackson.core groupId, past the reach of the summed distance,
 // and still the name a hurried reader takes for Jackson. An artifactId in
-// shared, one the popular list itself carries under more than one groupId,
-// skips that case: `annotations` and `core` name nothing in particular, and
-// software.amazon.awssdk:annotations is no squat on org.jetbrains:annotations.
+// shared, one the popular list itself carries under more than one groupId and
+// that none of those groupIds names, skips that case: `annotations` and `core`
+// name nothing in particular, and software.amazon.awssdk:annotations is no
+// squat on org.jetbrains:annotations.
 func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 	switch ecosystem {
 	case manifest.TypeNpm:
