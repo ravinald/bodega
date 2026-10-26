@@ -1991,3 +1991,72 @@ func TestDetailsPaneNamesBackendNotS3OnLocalInstall(t *testing.T) {
 		t.Errorf("details pane does not print a file:// object URI:\n%s", v)
 	}
 }
+
+func TestAuditEventOptionsOfferTUIEvents(t *testing.T) {
+	opts := auditEventOptions()
+	if len(opts) == 0 || opts[0] != "" {
+		t.Fatalf("first option = %q, want the empty \"any\" option", opts)
+	}
+	for _, want := range []audit.EventType{audit.EventEdit, audit.EventHide, audit.EventFreeze} {
+		if !contains(opts, string(want)) {
+			t.Errorf("Event type options %v lack %q, which the TUI records", opts, want)
+		}
+	}
+}
+
+func TestHelpTextDescribesEditAndTab(t *testing.T) {
+	for _, want := range []string{"E          Edit selected entry (raw JSON)", "Tab          Cycle focus: Sources > Details > Log"} {
+		if !strings.Contains(helpText, want) {
+			t.Errorf("helpText lacks %q", want)
+		}
+	}
+}
+
+// TestJSONEditSaveKeepsCursorOnPackage drives E and Ctrl+S on a package
+// header below an expanded type group: the rebuilt tree must land the cursor
+// back on that package, not on whatever row now holds the old index.
+func TestJSONEditSaveKeepsCursorOnPackage(t *testing.T) {
+	const pkgName = "@example-corp/widget-cli"
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeCargo, "serde", manifest.VersionEntry{Version: "1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{Version: "4.17.21"})
+	_ = store.AddVersion(ctx, manifest.TypeNpm, pkgName, manifest.VersionEntry{Version: "1.0.0"})
+
+	m := appModel{store: store, log: &logPaneModel{}, focus: focusSources}
+	m.sources = newSourcesModel(BuildTree(store, nil))
+	m.details = newDetailsModel(store, &config.Config{})
+	if !m.sources.CursorToNode(manifest.TypeNpm, pkgName, "") {
+		t.Fatalf("%s header not in the tree", pkgName)
+	}
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+	m = next.(appModel)
+	if m.popup.kind != popupJSONEdit {
+		t.Fatalf("E opened popup kind %v, want the JSON editor", m.popup.kind)
+	}
+	m.popup.jsonTextarea.SetValue(`{
+		"config_version": 1,
+		"name": "` + pkgName + `",
+		"type": "npm",
+		"versions": [{"version": "1.0.0"}, {"version": "1.1.0"}]
+	}`)
+	next, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = next.(appModel)
+	if m.popup.Active() {
+		t.Fatalf("Ctrl+S left the editor open: %s", m.popup.jsonError)
+	}
+
+	sel := m.sources.Selected()
+	if sel == nil || sel.EntryType != manifest.TypeNpm || sel.Name != pkgName || sel.Version != "" {
+		t.Fatalf("cursor after save on %+v, want the %s package header", sel, pkgName)
+	}
+	if len(sel.Children) != 2 {
+		t.Errorf("edited package has %d versions, want 2", len(sel.Children))
+	}
+	for _, row := range m.sources.flatList {
+		if row.depth == 0 && row.node.EntryType == manifest.TypeNpm && !row.node.Expanded {
+			t.Error("npm/ group collapsed after save")
+		}
+	}
+}

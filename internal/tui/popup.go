@@ -209,7 +209,7 @@ const helpText = `Navigation:
   Ctrl+A       Select / deselect all
   /            Filter / search
   Ctrl+R       Reload manifests from backend
-  Tab          Switch focus: Sources <-> Log
+  Tab          Cycle focus: Sources > Details > Log
   ?            Toggle this help
   q            Quit
 
@@ -217,7 +217,7 @@ Entry management:
   c          Create new entry (form)
   C          Configure application settings
   d/D        Delete selected entries
-  E          Edit selected entry (form)
+  E          Edit selected entry (raw JSON)
   F          Toggle freeze on selected entries
   H          Toggle hidden on selected entries
 

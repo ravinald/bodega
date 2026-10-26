@@ -21,7 +21,7 @@ func newShellCmd(gf *globalFlags) *cobra.Command {
   Top-right: Details for the selected entry
   Bottom:    Command shell with scrolling output
 
-Tab switches focus between the Sources tree and the command shell.
+Tab cycles focus: Sources tree > Details > command shell.
 Press ? for keybinding help, q to quit.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)

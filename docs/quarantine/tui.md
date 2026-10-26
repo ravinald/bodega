@@ -182,7 +182,7 @@ Both operations record audit events with actor attribution the same way the JSON
 
 The TUI has a dedicated audit-query view. Press `L` to open the query form (event type, package type, package name, client IP, limit), fill it in and press `Enter`. The results open in a table that replaces the screen; `Up`/`Down` scroll it and `Esc` or `q` closes it. The Log pane records only how many events the query returned.
 
-For the scenarios in this walkthrough, set the package name to `@example-corp/widget-cli` and leave the event type empty: the form's event-type list does not offer `edit`. Each save shows as one `edit` row. The table does not show the JSON diff each save recorded.
+For the scenarios in this walkthrough, set the package name to `@example-corp/widget-cli`. Each save shows as one `edit` row; pick `edit` as the event type to hide the `create` rows the import wrote. The table does not show the JSON diff each save recorded.
 
 ![The audit results table for @example-corp/widget-cli: three edit rows, one per scenario save, above two create rows, with timestamp, event, type, name and status columns](../images/tui-audit-table.png)
 

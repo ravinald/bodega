@@ -3,8 +3,12 @@ package audit
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -647,5 +651,56 @@ func TestServedObjectColumns(t *testing.T) {
 func TestServedRefusesAnEmptyIdentity(t *testing.T) {
 	if _, err := tempDB(t).Served(context.Background(), "", time.Time{}); err == nil {
 		t.Error("Served with no identity returned no error; it would answer for every unbound request at once")
+	}
+}
+
+// TestEventTypesListsEveryConstant parses the package source so a constant
+// declared and left out of EventTypes fails here rather than going missing
+// from the TUI audit query form.
+func TestEventTypesListsEveryConstant(t *testing.T) {
+	listed := make(map[EventType]bool)
+	for _, et := range EventTypes() {
+		listed[et] = true
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	declared := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		for _, decl := range file.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs := spec.(*ast.ValueSpec)
+				if id, ok := vs.Type.(*ast.Ident); !ok || id.Name != "EventType" {
+					continue
+				}
+				for i := range vs.Names {
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok {
+						continue
+					}
+					declared++
+					v, _ := strconv.Unquote(lit.Value)
+					if !listed[EventType(v)] {
+						t.Errorf("%s: %s = %q is missing from EventTypes()", f, vs.Names[i].Name, v)
+					}
+				}
+			}
+		}
+	}
+	if declared != len(listed) {
+		t.Errorf("source declares %d EventType constants, EventTypes() lists %d distinct", declared, len(listed))
 	}
 }
