@@ -470,6 +470,41 @@ func TestRunToolReportsWhatFailed(t *testing.T) {
 // a slow process start on a shared CI VM cannot close.
 const testWaitDelay = 10 * time.Second
 
+// The upper bounds in the runTool timing tests only guard against a hang.
+// testHeadroom is what a loaded CI VM gets over the expected return; 5s
+// failed a clean exit there at 17.89s. testTimeoutBound covers a call that
+// times out after testTimeout and then waits out testWaitDelay,
+// testDelayBound one that only waits out testWaitDelay.
+//
+// A hung runTool returns when the sleep holding its pipes exits, so the
+// bounds catch a hang only while testHold outlasts every one of them.
+// testHold derives from the largest bound plus testHoldMargin, so raising
+// testWaitDelay or testHeadroom raises the hold with them, and
+// TestRunToolHoldOutlastsTheBounds fails if an edit breaks that.
+const (
+	testTimeout      = time.Second
+	testHeadroom     = 30 * time.Second
+	testDelayBound   = testWaitDelay + testHeadroom
+	testTimeoutBound = testTimeout + testWaitDelay + testHeadroom
+	testHoldMargin   = 10 * time.Second
+	testHold         = testTimeoutBound + testHoldMargin
+)
+
+// testHoldArg is testHold as sleep(1) takes it, rounded up to whole seconds
+// so the conversion never shortens the hold.
+var testHoldArg = strconv.FormatInt(int64((testHold+time.Second-1)/time.Second), 10)
+
+func TestRunToolHoldOutlastsTheBounds(t *testing.T) {
+	for _, bound := range []time.Duration{testDelayBound, testTimeoutBound, testWaitDelay / 2} {
+		if testHold < bound+testHoldMargin {
+			t.Errorf("testHold %s is not %s past the bound %s: a hang would return within it", testHold, testHoldMargin, bound)
+		}
+	}
+	if testHoldMargin < 10*time.Second {
+		t.Errorf("testHoldMargin %s is under 10s", testHoldMargin)
+	}
+}
+
 // A makefile's != assignment runs under sh, whose children hold make's
 // pipes. The timeout has to end the whole tree and return on time, and a
 // child left running after a clean exit is ended too.
@@ -495,29 +530,30 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		start := time.Now()
-		_, err := runToolWaiting(time.Second, testWaitDelay, "", "sh", "-c", `sleep 40 & echo $! >"$1"; sleep 40; true`, "sh", pidfile)
-		// Expected: the 1s timeout, then the end of the group closes the
-		// pipes. The bound only guards against a hang: a tree left running
-		// holds the pipes until the 40s sleep exits, past it. Anything
-		// tighter fails on a loaded CI VM rather than on a defect.
-		if elapsed := time.Since(start); elapsed > testWaitDelay+30*time.Second {
-			t.Errorf("returned after %s", elapsed)
+		_, err := runToolWaiting(testTimeout, testWaitDelay, "", "sh", "-c", `sleep "$2" & echo $! >"$1"; sleep "$2"; true`, "sh", pidfile, testHoldArg)
+		// Expected: testTimeout, then the end of the group closes the
+		// pipes. testTimeoutBound allows testWaitDelay as well, plus
+		// testHeadroom. A tree left running holds the pipes until the
+		// testHold sleep exits, and testHold outlasting the bound is what
+		// lets the bound catch that hang.
+		if elapsed := time.Since(start); elapsed > testTimeoutBound {
+			t.Errorf("returned after %s, want at most %s", elapsed, testTimeoutBound)
 		}
-		if err == nil || !strings.Contains(err.Error(), "sh did not answer within 1s") {
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("sh did not answer within %s", testTimeout)) {
 			t.Errorf("err = %v", err)
 		}
 		gone(t)
 	})
 	t.Run("clean exit", func(t *testing.T) {
 		start := time.Now()
-		out, _ := runToolWaiting(time.Minute, testWaitDelay, "", "sh", "-c", `echo answer; sleep 40 & echo $! >"$1"`, "sh", pidfile)
-		// Expected: the wait delay, since the background sleep holds
-		// stdout. The lower bound proves the delay applied. The upper bound
-		// only guards against a hang to the one-minute timeout, or to the
-		// 40s sleep's exit, both past it; anything tighter fails on a
-		// loaded CI VM rather than on a defect.
-		if elapsed := time.Since(start); elapsed < testWaitDelay || elapsed > testWaitDelay+30*time.Second {
-			t.Errorf("returned after %s, want between %s and %s", elapsed, testWaitDelay, testWaitDelay+30*time.Second)
+		out, _ := runToolWaiting(time.Minute, testWaitDelay, "", "sh", "-c", `echo answer; sleep "$2" & echo $! >"$1"`, "sh", pidfile, testHoldArg)
+		// Expected: testWaitDelay, since the background sleep holds stdout.
+		// The lower bound proves the delay applied. testDelayBound adds
+		// testHeadroom over it. A hang returns at the testHold sleep's exit
+		// or the one-minute timeout, whichever comes first, and testHold
+		// outlasting the bound is what lets the bound catch it.
+		if elapsed := time.Since(start); elapsed < testWaitDelay || elapsed > testDelayBound {
+			t.Errorf("returned after %s, want between %s and %s", elapsed, testWaitDelay, testDelayBound)
 		}
 		if string(out) != "answer\n" {
 			t.Errorf("stdout = %q", out)
@@ -536,7 +572,7 @@ func TestDetachHelper(t *testing.T) {
 	if mode == "" {
 		return
 	}
-	child := exec.Command("sleep", "40")
+	child := exec.Command("sleep", testHoldArg)
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if mode != "closed" {
 		child.Stdout, child.Stderr = os.Stdout, os.Stderr
@@ -561,7 +597,7 @@ func TestRunToolEndsDetachedDescendants(t *testing.T) {
 	if runtime.GOOS != "freebsd" {
 		t.Skip("descendants that call setsid are owned through procctl(2) reaping, which is FreeBSD's")
 	}
-	bystander := exec.Command("sleep", "40")
+	bystander := exec.Command("sleep", testHoldArg)
 	bystander.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := bystander.Start(); err != nil {
 		t.Fatal(err)
@@ -574,12 +610,15 @@ func TestRunToolEndsDetachedDescendants(t *testing.T) {
 		min, max time.Duration
 		timeOut  bool
 	}{
-		// Expected: the 1s timeout, then ending the subtree closes the
-		// pipes. The bound allows the whole wait delay as well, plus 5s.
-		{"wait", time.Second, 0, time.Second + testWaitDelay + 5*time.Second, true},
-		// Expected: the wait delay, since the detached sleep holds stdout.
-		// The upper bound leaves 5s of headroom over it.
-		{"hold", time.Minute, testWaitDelay, testWaitDelay + 5*time.Second, false},
+		// Expected: testTimeout, then ending the subtree closes the pipes.
+		// testTimeoutBound allows testWaitDelay as well, plus testHeadroom.
+		// The detached sleep runs for testHold, and testHold outlasting the
+		// bound is what lets the bound catch a hang.
+		{"wait", testTimeout, 0, testTimeoutBound, true},
+		// Expected: testWaitDelay, since the detached sleep holds stdout.
+		// testDelayBound adds testHeadroom over it, and testHold outlasting
+		// the bound is what lets the bound catch a hang.
+		{"hold", time.Minute, testWaitDelay, testDelayBound, false},
 		// Expected: near zero, since nothing holds the pipes. Half the wait
 		// delay leaves 5s of headroom and still fails a run that waits it out.
 		{"closed", time.Minute, 0, testWaitDelay / 2, false},
