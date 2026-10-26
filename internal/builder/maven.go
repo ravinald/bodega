@@ -35,14 +35,20 @@ const mavenChecksumMaxBytes = 1024
 // Central run to a few hundred kilobytes.
 const mavenPOMMaxBytes = 8 * 1024 * 1024
 
-// mavenRepoRoot is the repository a fetch reads: maven_upstream, the root the
-// /maven/ route proxies, so a catalog-mode version holds the bytes a proxied
-// one would have been handed.
-func mavenRepoRoot(cfg *Config) string {
-	if root := strings.TrimRight(cfg.MavenUpstream, "/"); root != "" {
-		return root
+// mavenRepoRoots are the repositories a fetch reads: maven_upstreams, the
+// roots the /maven/ route proxies in the order it asks them, so a
+// catalog-mode version holds the bytes a proxied one would have been handed.
+func mavenRepoRoots(cfg *Config) []string {
+	var roots []string
+	for _, r := range cfg.MavenUpstreams {
+		if r = strings.TrimRight(r, "/"); r != "" {
+			roots = append(roots, r)
+		}
 	}
-	return config.DefaultMavenUpstream
+	if len(roots) == 0 {
+		return config.DefaultMavenUpstreams()
+	}
+	return roots
 }
 
 // mavenLocalPath is where one repository path is kept under maven_root: the
@@ -255,7 +261,38 @@ func fetchMavenVersion(ctx context.Context, cfg *Config, store *manifest.Store, 
 	if !ok || manifest.ValidateMavenVersion(pm.Name, ve) != nil {
 		return fmt.Errorf("maven %q@%q: the name or version names no repository path; want <groupId>:<artifactId> and a release version", pm.Name, ve.Version)
 	}
-	root := mavenRepoRoot(cfg)
+	// The repository that publishes the POM supplies every other file of the
+	// version, as the route serves each file from the first repository that
+	// has it and those are one repository for one version.
+	var root string
+	var failed, notFound error
+	for _, r := range mavenRepoRoots(cfg) {
+		f, _, err := fetchMavenFile(r, d, pomRel, false, out)
+		if err == nil {
+			root, got = r, append(got, f)
+			break
+		}
+		switch {
+		case errors.Is(err, errMavenNotPublished):
+			if notFound == nil {
+				notFound = err
+			}
+		case errors.Is(err, errMavenUnreachable):
+			if failed == nil {
+				failed = err
+			}
+		default:
+			// The repository answered with the POM and its bytes failed a
+			// check: another repository's copy is not an answer to that.
+			return err
+		}
+	}
+	if root == "" {
+		if failed != nil {
+			return failed
+		}
+		return notFound
+	}
 
 	fetch := func(rel string, optional bool) (bool, error) {
 		f, found, err := fetchMavenFile(root, d, rel, optional, out)
@@ -263,10 +300,6 @@ func fetchMavenVersion(ctx context.Context, cfg *Config, store *manifest.Store, 
 			got = append(got, f)
 		}
 		return found, err
-	}
-
-	if _, err := fetch(pomRel, false); err != nil {
-		return err
 	}
 	ext, err := readPOMExtension(got[0].part)
 	if err != nil {
@@ -404,6 +437,11 @@ func mergeMetadata(base, add map[string]string) map[string]string {
 // errMavenNotPublished is an optional file the upstream answered 404 for.
 var errMavenNotPublished = errors.New("not published")
 
+// errMavenUnreachable is a repository that answered neither the file nor 404:
+// a transport failure or another status. The POM walk asks the next
+// repository past it, as the route does.
+var errMavenUnreachable = errors.New("did not answer")
+
 // fetchMavenFile downloads one repository path beside its final place and
 // checks it against the upstream's checksum. found is false only for an
 // optional file the upstream does not publish.
@@ -444,16 +482,16 @@ func fetchMavenFile(root string, d dirs, rel string, optional bool, out io.Write
 // mavenDownload writes url to dest. A 404 is errMavenNotPublished, which a
 // caller fetching an optional file reads as absence.
 func mavenDownload(url, dest string) error {
-	resp, err := mavenHTTP.Get(url) //nolint:noctx // bounded by mavenHTTP's timeout; the host is maven_upstream
+	resp, err := mavenHTTP.Get(url) //nolint:noctx // bounded by mavenHTTP's timeout; the host is one of maven_upstreams
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
+		return fmt.Errorf("GET %s: %w: %w", url, errMavenUnreachable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("GET %s: %w by the upstream (HTTP 404)", url, errMavenNotPublished)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		return fmt.Errorf("GET %s: HTTP %d (%w with the file)", url, resp.StatusCode, errMavenUnreachable)
 	}
 	f, err := os.Create(dest)
 	if err != nil {

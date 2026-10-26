@@ -23,8 +23,10 @@ import (
 )
 
 // handleMaven serves a Maven repository: Maven Central's layout, proxied byte
-// for byte from maven_upstream, so one URL (<base>/maven/) answers Maven,
-// Gradle, sbt and every other JVM resolver.
+// for byte from maven_upstreams, so one URL (<base>/maven/) answers Maven,
+// Gradle, sbt and every other JVM resolver. Each file comes from the first
+// repository in the list that publishes it; the identity does not depend on
+// which one that was.
 //
 // The identity is <groupId>:<artifactId> at the path's version directory.
 // Every file of one version (jar, pom, module, classifiers and their
@@ -115,7 +117,7 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 	}
 	w = &cacheDirectiveWriter{ResponseWriter: w, directive: directive}
 
-	upstream := s.mavenUpstreamURL(p)
+	upstreams, served := s.mavenUpstreamOrder(mp, p)
 	s3Key := manifest.MavenKey(p)
 	store := s.typeStore(manifest.TypeMaven)
 	if mp.Version != "" && !mp.Metadata {
@@ -127,11 +129,76 @@ func (s *Server) handleMaven(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.proxyOrCache(w, r, store, s3Key, upstream, manifest.TypeMaven, candidate, name, immutable, forceProxy)
+	s.proxyOrCacheOrdered(w, r, store, s3Key, upstreams, served, manifest.TypeMaven, candidate, name, immutable, forceProxy)
 }
 
-func (s *Server) mavenUpstreamURL(p string) string {
-	return strings.TrimRight(s.cfg.MavenUpstream, "/") + "/" + p
+// mavenUpstreamURLs are the URLs repository path p is fetched from, one per
+// maven_upstreams root in its order.
+func (s *Server) mavenUpstreamURLs(p string) []string {
+	urls := make([]string, 0, len(s.cfg.MavenUpstreams))
+	for _, root := range s.cfg.MavenUpstreams {
+		urls = append(urls, strings.TrimRight(root, "/")+"/"+p)
+	}
+	return urls
+}
+
+// mavenFirstUpstreamURL is the URL a row or a log line names for p before
+// anything is fetched: the first repository the fetch would ask.
+func (s *Server) mavenFirstUpstreamURL(p string) string {
+	if urls := s.mavenUpstreamURLs(p); len(urls) > 0 {
+		return urls[0]
+	}
+	return ""
+}
+
+// mavenUpstreamOrder is what a miss for p asks, and what it remembers once
+// one has answered. A companion (a checksum or a signature) is asked only of
+// the repository that served the file it describes, when this process
+// fetched that file: two repositories publishing one coordinate need not
+// publish the same bytes, and a .sha1 taken from the other would fail the
+// client's check of the jar it was handed. A companion whose file this
+// process never fetched walks the list like any other file.
+func (s *Server) mavenUpstreamOrder(mp manifest.MavenPath, p string) ([]string, func(int)) {
+	if mp.Companion != "" {
+		if root, ok := s.mavenOrigins.get(strings.TrimSuffix(p, "."+mp.Companion)); ok {
+			return []string{root + "/" + p}, nil
+		}
+		return s.mavenUpstreamURLs(p), nil
+	}
+	roots := s.cfg.MavenUpstreams
+	return s.mavenUpstreamURLs(p), func(i int) {
+		if i < len(roots) {
+			s.mavenOrigins.put(p, strings.TrimRight(roots[i], "/"))
+		}
+	}
+}
+
+// mavenOriginCap bounds mavenOriginSet for the reason mavenArtifactSetCap
+// bounds its set. A path it forgot sends its companion through the list.
+const mavenOriginCap = 8192
+
+// mavenOriginSet is the repository root each file fetched through /maven/ in
+// this process came from, keyed by its repository path. The zero value is
+// ready to use.
+type mavenOriginSet struct {
+	mu    sync.Mutex
+	roots map[string]string
+}
+
+func (m *mavenOriginSet) put(p, root string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.roots == nil || len(m.roots) >= mavenOriginCap {
+		m.roots = make(map[string]string)
+	}
+	m.roots[p] = root
+}
+
+func (m *mavenOriginSet) get(p string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	root, ok := m.roots[p]
+	return root, ok
 }
 
 // serveFilteredMavenMetadata answers an artifact-level maven-metadata.xml, or
@@ -172,7 +239,8 @@ func (s *Server) serveFilteredMavenMetadata(w http.ResponseWriter, r *http.Reque
 				return b
 			},
 		}
-		s.proxyOrCache(rw, r, store, manifest.MavenKey(p), s.mavenUpstreamURL(p), manifest.TypeMaven, "", name, false, forceProxy)
+		upstreams, served := s.mavenUpstreamOrder(mp, p)
+		s.proxyOrCacheOrdered(rw, r, store, manifest.MavenKey(p), upstreams, served, manifest.TypeMaven, "", name, false, forceProxy)
 		if err := rw.flush(); err != nil {
 			s.logger.Error("maven metadata response failed", "artifact", name, "error", err)
 		}
@@ -224,7 +292,8 @@ func (s *Server) mavenMetadataRead(r *http.Request, metaPath, name string, force
 		req.Header.Del(h)
 	}
 	cw := &capturedResponse{header: http.Header{}}
-	s.proxyOrCache(cw, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(metaPath), s.mavenUpstreamURL(metaPath),
+	upstreams, served := s.mavenUpstreamOrder(manifest.MavenPath{}, metaPath)
+	s.proxyOrCacheOrdered(cw, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(metaPath), upstreams, served,
 		manifest.TypeMaven, "", name, false, forceProxy)
 	switch {
 	case cw.tooBig:
@@ -313,7 +382,7 @@ func (s *Server) mavenMetadataGate(w http.ResponseWriter, r *http.Request, mp ma
 		}
 	}
 	artOK, grpOK := artProf.Permitted && artPolicy, grpProf.Permitted && grpPolicy
-	upstream := s.mavenUpstreamURL(p)
+	upstream := s.mavenFirstUpstreamURL(p)
 	rec, cov, rule := group, grpProf, grpRule
 	if recordArtifact(artOK, grpOK) {
 		rec, cov, rule = name, artProf, artRule

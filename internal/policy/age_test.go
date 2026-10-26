@@ -305,7 +305,7 @@ func TestAgePolicy_MavenDatedFromPOMLastModified(t *testing.T) {
 		{"org.apache..log4j:log4j-core", "2.24.3", ActionWarn, "names no POM"},
 	} {
 		ck := NewAgeChecker(store)
-		ck.MavenBase = srv.URL
+		ck.MavenBases = []string{srv.URL}
 		ck.HTTP = srv.Client()
 		r := ck.Check(context.Background(),
 			&manifest.PackageManifest{Name: tc.name, Type: manifest.TypeMaven},
@@ -318,6 +318,49 @@ func TestAgePolicy_MavenDatedFromPOMLastModified(t *testing.T) {
 		if !strings.HasPrefix(s, "HEAD /org/apache/logging/log4j/log4j-core/") {
 			t.Errorf("a POM is read with HEAD at its repository path; got %q", s)
 		}
+	}
+}
+
+// The POM is dated by the repository /maven/ would serve it from: a 404 passes
+// to the next, the first 200 ends the walk, and a failure ahead of a 404 is
+// the reason reported.
+func TestAgePolicy_MavenDatedAcrossUpstreamsInOrder(t *testing.T) {
+	const pom = "/com/example/plugin/1.0/plugin-1.0.pom"
+	repo := func(status int, modified time.Duration) (*httptest.Server, *int) {
+		hits := new(int)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != pom {
+				http.NotFound(w, r)
+				return
+			}
+			*hits++
+			if status == http.StatusOK {
+				w.Header().Set("Last-Modified", time.Now().Add(-modified).UTC().Format(http.TimeFormat))
+			}
+			w.WriteHeader(status)
+		}))
+		t.Cleanup(srv.Close)
+		return srv, hits
+	}
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeMaven: {Ecosystem: manifest.TypeMaven, MinAgeSeconds: 86400, Action: ActionBlock},
+	}}
+	check := func(bases ...string) Result {
+		ck := NewAgeChecker(store)
+		ck.MavenBases = bases
+		return ck.Check(context.Background(), &manifest.PackageManifest{Name: "com.example:plugin", Type: manifest.TypeMaven},
+			&manifest.VersionEntry{Version: "1.0"})
+	}
+
+	missing, _ := repo(http.StatusNotFound, 0)
+	fresh, freshHits := repo(http.StatusOK, time.Hour)
+	old, oldHits := repo(http.StatusOK, 30*24*time.Hour)
+	if r := check(missing.URL, fresh.URL, old.URL); r.Action != ActionBlock || *freshHits != 1 || *oldHits != 0 {
+		t.Errorf("404 then a 1h-old POM: %+v, asked second %d third %d; want a block from the second alone", r, *freshHits, *oldHits)
+	}
+	down, _ := repo(http.StatusBadGateway, 0)
+	if r := check(down.URL, missing.URL); r.Action != ActionWarn || !strings.Contains(r.Reason, "HTTP 502") {
+		t.Errorf("502 then 404: %+v; want the 502 reported", r)
 	}
 }
 
@@ -336,7 +379,7 @@ func TestAgePolicy_MavenLookupIsShared(t *testing.T) {
 	ctx := ShareLookups(context.Background())
 	for range 2 {
 		ck := NewAgeChecker(store)
-		ck.MavenBase = srv.URL
+		ck.MavenBases = []string{srv.URL}
 		if r := ck.Check(ctx, &manifest.PackageManifest{Name: "com.google.guava:guava", Type: manifest.TypeMaven},
 			&manifest.VersionEntry{Version: "33.4.0-jre"}); r.Action != ActionBlock {
 			t.Fatalf("1h-old artifact under a 1d policy blocks; got %+v", r)
@@ -385,7 +428,7 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 				eco: {Ecosystem: eco, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
 			}}
 			ck := NewAgeChecker(store)
-			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase, ck.MavenBase = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL, srv.URL
+			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase, ck.MavenBases = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL, []string{srv.URL}
 
 			r := ck.Check(context.Background(),
 				&manifest.PackageManifest{Name: "thing", Type: eco},

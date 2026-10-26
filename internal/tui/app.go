@@ -1868,7 +1868,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 		})
 
 	case manifest.TypeMaven:
-		// No Source URL: every maven entry resolves through maven_upstream,
+		// No Source URL: every maven entry resolves through maven_upstreams,
 		// and the route composes the path from the coordinate.
 		modeVal := restore("Mode", "proxy")
 		constraintVal := prevLabelSelect["Version"]

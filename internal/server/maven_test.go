@@ -48,7 +48,7 @@ func mavenUpstream(t *testing.T, s *Server) *recordingUpstream {
 	} {
 		up.route(p, body)
 	}
-	s.cfg.MavenUpstream = up.ts.URL + "/maven2"
+	s.cfg.MavenUpstreams = []string{up.ts.URL + "/maven2"}
 	return up
 }
 
@@ -406,7 +406,7 @@ func TestMavenMetadataStaleCopyDuringOutage(t *testing.T) {
 	}
 
 	silent := newSilentUpstream(t)
-	s.cfg.MavenUpstream = strings.TrimSuffix(silent.url, "/simple/colorama/")
+	s.cfg.MavenUpstreams = []string{strings.TrimSuffix(silent.url, "/simple/colorama/")}
 	s.cache = CacheConfig{Enabled: true, MetadataTTL: time.Nanosecond, StaleGrace: staleGraceForTest}
 	time.Sleep(time.Millisecond)
 
@@ -624,7 +624,7 @@ func TestMavenArtifactRefusedByAge(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(up.Close)
-	s.cfg.MavenUpstream = up.URL + "/maven2"
+	s.cfg.MavenUpstreams = []string{up.URL + "/maven2"}
 	gateMaven(t, s)
 	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeMaven, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
 		t.Fatalf("set age policy: %v", err)
@@ -795,5 +795,147 @@ func TestMavenMetadataRefusalNamesKnownArtifact(t *testing.T) {
 		if r.PkgName == "org.other.thing:*" || r.PkgName == "com:example" {
 			t.Errorf("discovery recorded a reading nothing depends on: %+v", r)
 		}
+	}
+}
+
+// orderedRepo is one entry of maven_upstreams for the ordering tests: it
+// serves files, answers fail with a status of its own, and 404s the rest.
+type orderedRepo struct {
+	*recordingUpstream
+	failMu sync.Mutex
+	fail   map[string]int
+}
+
+func newOrderedRepo(t *testing.T, files map[string]string) *orderedRepo {
+	t.Helper()
+	o := &orderedRepo{recordingUpstream: &recordingUpstream{routes: map[string]string{}}, fail: map[string]int{}}
+	o.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o.mu.Lock()
+		o.seen = append(o.seen, r.URL.Path)
+		body, ok := o.routes[r.URL.Path]
+		o.mu.Unlock()
+		o.failMu.Lock()
+		status := o.fail[r.URL.Path]
+		o.failMu.Unlock()
+		switch {
+		case status != 0:
+			http.Error(w, "upstream fault", status)
+		case !ok:
+			http.NotFound(w, r)
+		default:
+			_, _ = w.Write([]byte(body))
+		}
+	}))
+	t.Cleanup(o.ts.Close)
+	for p, body := range files {
+		o.route("/m2/"+p, body)
+	}
+	return o
+}
+
+func (o *orderedRepo) failWith(p string, status int) {
+	o.failMu.Lock()
+	defer o.failMu.Unlock()
+	o.fail["/m2/"+p] = status
+}
+
+func (o *orderedRepo) asked(p string) int { return upstreamSaw(o.recordingUpstream, "/m2/"+p) }
+
+func orderedMavenServer(t *testing.T, repos ...*orderedRepo) *Server {
+	t.Helper()
+	s := proxyingServer(t)
+	s.cfg.MavenUpstreams = nil
+	for _, r := range repos {
+		s.cfg.MavenUpstreams = append(s.cfg.MavenUpstreams, r.ts.URL+"/m2")
+	}
+	return s
+}
+
+const (
+	orderedJar  = "org/example/core/widget/1.2.0/widget-1.2.0.jar"
+	orderedSha1 = orderedJar + ".sha1"
+)
+
+// The artifact only the second repository publishes is served from it and
+// cached under the key a single repository would have used, so the next
+// request asks neither.
+func TestMavenUpstreamsFallThroughA404(t *testing.T) {
+	first := newOrderedRepo(t, nil)
+	second := newOrderedRepo(t, map[string]string{orderedJar: "second's jar"})
+	s := orderedMavenServer(t, first, second)
+
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusOK || body != "second's jar" {
+		t.Fatalf("GET %s = %d %q, want 200 from the second repository", orderedJar, code, body)
+	}
+	if first.asked(orderedJar) != 1 || second.asked(orderedJar) != 1 {
+		t.Errorf("asked first %d, second %d times; want each once", first.asked(orderedJar), second.asked(orderedJar))
+	}
+	st, err := s.typeStore(manifest.TypeMaven).Head(context.Background(), manifest.MavenKey(orderedJar))
+	if err != nil || st == nil || !st.Exists {
+		t.Fatalf("cache at %s = %+v, %v; want the served jar stored", manifest.MavenKey(orderedJar), st, err)
+	}
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusOK || body != "second's jar" {
+		t.Errorf("second GET = %d %q, want the cached jar", code, body)
+	}
+	if first.asked(orderedJar) != 1 || second.asked(orderedJar) != 1 {
+		t.Errorf("a cached jar reached upstream again: first %d, second %d", first.asked(orderedJar), second.asked(orderedJar))
+	}
+}
+
+func TestMavenUpstreamsAll404Is404(t *testing.T) {
+	first, second := newOrderedRepo(t, nil), newOrderedRepo(t, nil)
+	s := orderedMavenServer(t, first, second)
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusNotFound {
+		t.Errorf("GET %s = %d %q, want 404", orderedJar, code, body)
+	}
+	if first.asked(orderedJar) != 1 || second.asked(orderedJar) != 1 {
+		t.Errorf("asked first %d, second %d times; want both asked once", first.asked(orderedJar), second.asked(orderedJar))
+	}
+}
+
+func TestMavenUpstreamsFirstAnswerEndsTheWalk(t *testing.T) {
+	first := newOrderedRepo(t, map[string]string{orderedJar: "first's jar"})
+	second := newOrderedRepo(t, map[string]string{orderedJar: "second's jar"})
+	s := orderedMavenServer(t, first, second)
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusOK || body != "first's jar" {
+		t.Errorf("GET %s = %d %q, want 200 from the first repository", orderedJar, code, body)
+	}
+	if seen := second.paths(); len(seen) != 0 {
+		t.Errorf("second repository saw %v; the first answered", seen)
+	}
+}
+
+// The first repository fails the jar and publishes a checksum of other bytes;
+// the second serves the jar. Its .sha1 has to come from the second, or the
+// client's check of the jar it holds fails.
+func TestMavenUpstreamsCompanionFollowsItsArtifact(t *testing.T) {
+	first := newOrderedRepo(t, map[string]string{orderedJar: "first's jar", orderedSha1: "first's sha1"})
+	first.failWith(orderedJar, http.StatusServiceUnavailable)
+	second := newOrderedRepo(t, map[string]string{orderedJar: "second's jar", orderedSha1: "second's sha1"})
+	s := orderedMavenServer(t, first, second)
+
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusOK || body != "second's jar" {
+		t.Fatalf("GET %s = %d %q, want 200 from the second repository", orderedJar, code, body)
+	}
+	if code, body, _ := getMaven(t, s, orderedSha1); code != http.StatusOK || body != "second's sha1" {
+		t.Errorf("GET %s = %d %q, want the second repository's checksum", orderedSha1, code, body)
+	}
+	if n := first.asked(orderedSha1); n != 0 {
+		t.Errorf("first repository asked for the companion %d times; it did not serve the jar", n)
+	}
+}
+
+// A 5xx is the answer that tells the operator something, so a later 404 does
+// not replace it.
+func TestMavenUpstreamsFailureOutranksA404(t *testing.T) {
+	first := newOrderedRepo(t, nil)
+	first.failWith(orderedJar, http.StatusInternalServerError)
+	second := newOrderedRepo(t, nil)
+	s := orderedMavenServer(t, first, second)
+	if code, body, _ := getMaven(t, s, orderedJar); code != http.StatusBadGateway {
+		t.Errorf("GET %s = %d %q, want the 502 a failed single-repository fetch answers", orderedJar, code, body)
+	}
+	if second.asked(orderedJar) != 1 {
+		t.Errorf("second repository asked %d times, want 1", second.asked(orderedJar))
 	}
 }
