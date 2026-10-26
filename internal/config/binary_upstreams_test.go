@@ -90,21 +90,45 @@ func TestLoad_MavenUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MavenUpstream != config.DefaultMavenUpstream {
-		t.Errorf("maven_upstream default = %q, want %s", cfg.MavenUpstream, config.DefaultMavenUpstream)
+	want := []string{config.DefaultMavenUpstream, "https://plugins.gradle.org/m2"}
+	if strings.Join(cfg.MavenUpstreams, " ") != strings.Join(want, " ") || cfg.MavenUpstream != "" {
+		t.Errorf("unset: maven_upstreams = %q, maven_upstream = %q; want %q and the single key folded away", cfg.MavenUpstreams, cfg.MavenUpstream, want)
 	}
 
 	writeConfig(t, `{"maven_upstream":"https://maven.example/repo/"}`)
-	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil || cfg.MavenUpstream != "https://maven.example/repo" {
-		t.Errorf("maven_upstream with a trailing slash = %q, %v; want it trimmed", cfg.MavenUpstream, err)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil ||
+		len(cfg.MavenUpstreams) != 1 || cfg.MavenUpstreams[0] != "https://maven.example/repo" || cfg.MavenUpstream != "" {
+		t.Errorf("maven_upstream alone = %q (single key %q), %v; want the one trimmed entry", cfg.MavenUpstreams, cfg.MavenUpstream, err)
+	}
+
+	writeConfig(t, `{"maven_upstreams":["https://maven.google.com/","https://repo.maven.apache.org/maven2"]}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil ||
+		strings.Join(cfg.MavenUpstreams, " ") != "https://maven.google.com https://repo.maven.apache.org/maven2" {
+		t.Errorf("maven_upstreams = %q, %v; want the operator's order, trimmed", cfg.MavenUpstreams, err)
+	}
+
+	writeConfig(t, `{"maven_upstream":"https://maven.example/repo","maven_upstreams":["https://maven.google.com"]}`)
+	if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+		t.Error("Load accepted maven_upstream and maven_upstreams together")
+	} else if !strings.Contains(err.Error(), "maven_upstream and maven_upstreams") {
+		t.Errorf("both-keys error %q does not name both keys", err)
+	}
+
+	for _, body := range []string{`{"maven_upstreams":[]}`, `{"maven_upstreams":["https://a.example","https://a.example/"]}`} {
+		writeConfig(t, body)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil || !strings.Contains(err.Error(), "maven_upstreams") {
+			t.Errorf("Load(%s) = %v; want an error naming maven_upstreams", body, err)
+		}
 	}
 
 	for _, bad := range []string{"http://repo.maven.apache.org/maven2", "repo.maven.apache.org", "https://", "https://u:p@maven.example/", "https://maven.example/?x=1"} {
-		writeConfig(t, `{"maven_upstream":"`+bad+`"}`)
-		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
-			t.Errorf("Load accepted maven_upstream %q", bad)
-		} else if !strings.Contains(err.Error(), "maven_upstream") {
-			t.Errorf("error %q does not name maven_upstream", err)
+		for _, body := range []string{`{"maven_upstream":"` + bad + `"}`, `{"maven_upstreams":["https://maven.google.com","` + bad + `"]}`} {
+			writeConfig(t, body)
+			if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+				t.Errorf("Load accepted %s", body)
+			} else if key := body[2 : strings.Index(body[2:], `"`)+2]; !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q does not name %s", err, key)
+			}
 		}
 	}
 }

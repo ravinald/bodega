@@ -95,14 +95,14 @@ var publishTimeClient = &http.Client{Timeout: 10 * time.Second, Transport: guard
 // upstreams this server proxies rather than at the public registries
 // admission reads. The filter has to date the versions the client is shown,
 // and those come from npm_upstream, pypi_upstream, gomod_upstream,
-// rubygems_upstream and maven_upstream.
+// rubygems_upstream and maven_upstreams.
 func (s *Server) publishClock() *policy.AgeChecker {
 	c := policy.NewAgeChecker(nil)
 	c.NpmRegistry = strings.TrimRight(s.cfg.NpmUpstream, "/")
 	c.PypiBase = strings.TrimRight(s.cfg.PypiUpstream, "/")
 	c.GoProxy = strings.TrimRight(s.cfg.GomodUpstream, "/")
 	c.RubygemsBase = strings.TrimRight(s.cfg.RubygemsUpstream, "/")
-	c.MavenBase = strings.TrimRight(s.cfg.MavenUpstream, "/")
+	c.MavenBases = s.cfg.MavenUpstreams
 	c.HTTP = publishTimeClient
 	return c
 }

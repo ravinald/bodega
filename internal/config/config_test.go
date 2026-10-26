@@ -236,8 +236,11 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		}},
 		"oidc_token_ttl": "10m",
 		// Load requires an https URL.
-		"gomod_sumdb_url":   "https://sum.example.com",
-		"maven_upstream":    "https://maven.example.com/maven2",
+		"gomod_sumdb_url": "https://sum.example.com",
+		// Load refuses both Maven keys together and folds the single one
+		// into the list, so the round trip carries the list alone.
+		"maven_upstream":    "",
+		"maven_upstreams":   []string{"https://maven.example.com/maven2", "https://plugins.example.com/m2"},
 		"rubygems_upstream": "https://gems.example.com",
 		"composer_upstream": "https://packagist.example.com",
 		"gomod_upstream":    "https://goproxy.example.com",

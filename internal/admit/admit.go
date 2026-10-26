@@ -651,15 +651,15 @@ func VersionCheckersFrom(cfg *config.Config, store PolicyStore, integrations int
 }
 
 // ageChecker is the age gate, dating gems against rubygems_upstream and Maven
-// artifacts against maven_upstream. The other registries are dated at their
+// artifacts against maven_upstreams. The other registries are dated at their
 // public hosts whatever upstream serves them.
 func ageChecker(cfg *config.Config, store policy.AgeStore) *policy.AgeChecker {
 	c := policy.NewAgeChecker(store)
 	if cfg != nil && cfg.RubygemsUpstream != "" {
 		c.RubygemsBase = strings.TrimRight(cfg.RubygemsUpstream, "/")
 	}
-	if cfg != nil && cfg.MavenUpstream != "" {
-		c.MavenBase = strings.TrimRight(cfg.MavenUpstream, "/")
+	if cfg != nil && len(cfg.MavenUpstreams) > 0 {
+		c.MavenBases = cfg.MavenUpstreams
 	}
 	return c
 }

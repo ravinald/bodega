@@ -58,7 +58,7 @@ func TestStaleServeCountsTheRequest(t *testing.T) {
 			// immutable=false against an expired TTL: the object is present
 			// and stale, which is what puts every one of these branches on the
 			// serve-from-cache side.
-			s.proxyOrResolve(rec, req, store, key, tc.resolve, "", manifest.TypeNpm, pkg, pkg, false, tc.forceProxy)
+			s.proxyOrResolve(rec, req, store, key, tc.resolve, "", nil, manifest.TypeNpm, pkg, pkg, false, tc.forceProxy)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())

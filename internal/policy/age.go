@@ -61,10 +61,10 @@ type AgeChecker struct {
 	// RubygemsBase is rubygems_upstream: the versions API is served from the
 	// same root as the gem files.
 	RubygemsBase string
-	// MavenBase is maven_upstream, the repository root the artifacts come
-	// from: a POM's response headers are the only place a Maven repository
-	// dates a release.
-	MavenBase string
+	// MavenBases is maven_upstreams, the repository roots the artifacts come
+	// from in the order /maven/ asks them: a POM's response headers are the
+	// only place a Maven repository dates a release.
+	MavenBases []string
 
 	// HTTP gets a conservative timeout so a slow upstream doesn't stall
 	// admission.
@@ -80,7 +80,7 @@ func NewAgeChecker(store AgeStore) *AgeChecker {
 		GoProxy:      "https://proxy.golang.org",
 		CratesBase:   "https://crates.io",
 		RubygemsBase: "https://rubygems.org",
-		MavenBase:    "https://repo.maven.apache.org/maven2",
+		MavenBases:   []string{"https://repo.maven.apache.org/maven2", "https://plugins.gradle.org/m2"},
 		HTTP:         &http.Client{Timeout: 10 * time.Second},
 		Now:          time.Now,
 	}
@@ -332,29 +332,64 @@ func (c *AgeChecker) mavenPublishedAt(ctx context.Context, name, version string)
 	if !ok {
 		return time.Time{}, fmt.Errorf("maven %q at %q names no POM in the repository layout", name, version)
 	}
-	endpoint := c.MavenBase + "/" + p
+	// Dated by the repository /maven/ would serve the POM from: the first to
+	// answer it 200, whether or not its headers date it, a 404 passing to the
+	// next. Any other failure is reported only if no later repository answers,
+	// as the route reports it.
+	var notFound, failed error
+	for _, base := range c.MavenBases {
+		t, answered, err := c.mavenPOMModified(ctx, base+"/"+p, name, version)
+		switch {
+		case answered:
+			return t, err
+		case errors.Is(err, errMavenPOMNotFound):
+			if notFound == nil {
+				notFound = err
+			}
+		case failed == nil:
+			failed = err
+		}
+	}
+	switch {
+	case failed != nil:
+		return time.Time{}, failed
+	case notFound != nil:
+		return time.Time{}, notFound
+	}
+	return time.Time{}, fmt.Errorf("maven %s %s: no maven upstream is configured to date it", name, version)
+}
+
+// errMavenPOMNotFound is a repository answering 404 for a POM, which sends the
+// lookup to the next repository rather than ending it.
+var errMavenPOMNotFound = errors.New("the repository does not publish this POM")
+
+// mavenPOMModified reads one repository's Last-Modified for a POM. answered
+// reports a 200, after which no other repository is asked.
+func (c *AgeChecker) mavenPOMModified(ctx context.Context, endpoint, name, version string) (t time.Time, answered bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	req.Header.Set("User-Agent", "bodega")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return time.Time{}, false, fmt.Errorf("HEAD %s: HTTP 404: %w", endpoint, errMavenPOMNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return time.Time{}, fmt.Errorf("HEAD %s: HTTP %d", endpoint, resp.StatusCode)
+		return time.Time{}, false, fmt.Errorf("HEAD %s: HTTP %d", endpoint, resp.StatusCode)
 	}
 	lm := resp.Header.Get("Last-Modified")
 	if lm == "" {
-		return time.Time{}, fmt.Errorf("HEAD %s answered with no Last-Modified, so %s %s has no deploy time", endpoint, name, version)
+		return time.Time{}, true, fmt.Errorf("HEAD %s answered with no Last-Modified, so %s %s has no deploy time", endpoint, name, version)
 	}
-	t, err := http.ParseTime(lm)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("HEAD %s: Last-Modified %q: %w", endpoint, lm, err)
+	if t, err = http.ParseTime(lm); err != nil {
+		return time.Time{}, true, fmt.Errorf("HEAD %s: Last-Modified %q: %w", endpoint, lm, err)
 	}
-	return t, nil
+	return t, true, nil
 }
 
 func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {

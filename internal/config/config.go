@@ -138,7 +138,8 @@ type Config struct {
 	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
 	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
-	MavenUpstream          string   `json:"maven_upstream,omitempty"`         // repository root in the Maven layout; /maven/<path> is appended to it
+	MavenUpstream          string   `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
+	MavenUpstreams         []string `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
 	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
 	ComposerUpstream       string   `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
 	ComposerDistHosts      []string `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
@@ -703,22 +704,68 @@ func validateHostList(key string, hosts []string) error {
 // DefaultMavenUpstream is Maven Central's repository root.
 const DefaultMavenUpstream = "https://repo.maven.apache.org/maven2"
 
-// validateMavenUpstream refuses a maven_upstream the route could not append a
-// repository path to. https only: unlike a distfile, nothing downstream of
+// DefaultGradlePluginPortal is the Gradle Plugin Portal's Maven repository,
+// where every community plugin's marker artifact
+// (<id>:<id>.gradle.plugin) is published and Maven Central carries none.
+const DefaultGradlePluginPortal = "https://plugins.gradle.org/m2"
+
+// DefaultMavenUpstreams is the list /maven/ reads when neither maven_upstream
+// nor maven_upstreams is set: Central first, so the Portal is asked only for
+// what Central does not publish.
+func DefaultMavenUpstreams() []string {
+	return []string{DefaultMavenUpstream, DefaultGradlePluginPortal}
+}
+
+// resolveMavenUpstreams folds maven_upstream into maven_upstreams, applies the
+// default and validates each entry. Both keys set is refused rather than
+// merged: no order between them is one the operator wrote.
+func resolveMavenUpstreams(cfg *Config) error {
+	switch {
+	case cfg.MavenUpstream != "" && cfg.MavenUpstreams != nil:
+		return fmt.Errorf("maven_upstream and maven_upstreams are both set; keep maven_upstreams and add %q to it where it belongs in the order", cfg.MavenUpstream)
+	case cfg.MavenUpstream != "":
+		cfg.MavenUpstreams = []string{cfg.MavenUpstream}
+	case cfg.MavenUpstreams == nil:
+		cfg.MavenUpstreams = DefaultMavenUpstreams()
+	case len(cfg.MavenUpstreams) == 0:
+		return fmt.Errorf("maven_upstreams is an empty list, which leaves /maven/ no repository to read; remove the key for the default (%s)", strings.Join(DefaultMavenUpstreams(), ", "))
+	}
+	key := "maven_upstreams entry"
+	if cfg.MavenUpstream != "" {
+		key = "maven_upstream"
+	}
+	cfg.MavenUpstream = ""
+	seen := make(map[string]bool, len(cfg.MavenUpstreams))
+	for i, raw := range cfg.MavenUpstreams {
+		root := strings.TrimRight(strings.TrimSpace(raw), "/")
+		if err := validateMavenUpstream(key, root); err != nil {
+			return err
+		}
+		if seen[root] {
+			return fmt.Errorf("maven_upstreams names %q twice; a repository asked again after its 404 answers the same", root)
+		}
+		seen[root] = true
+		cfg.MavenUpstreams[i] = root
+	}
+	return nil
+}
+
+// validateMavenUpstream refuses a repository root the route could not append
+// a repository path to, naming key in the error. https only: unlike a distfile, nothing downstream of
 // the transport checks a jar against a digest bodega holds.
-func validateMavenUpstream(raw string) error {
+func validateMavenUpstream(key, raw string) error {
 	u, err := url.Parse(raw)
 	switch {
 	case err != nil:
-		return fmt.Errorf("maven_upstream %q does not parse: %v", raw, err)
+		return fmt.Errorf("%s %q does not parse: %v", key, raw, err)
 	case u.Scheme != "https":
-		return fmt.Errorf("maven_upstream %q must be an https URL (default %s)", raw, DefaultMavenUpstream)
+		return fmt.Errorf("%s %q must be an https URL (default %s)", key, raw, DefaultMavenUpstream)
 	case u.Host == "":
-		return fmt.Errorf("maven_upstream %q names no host", raw)
+		return fmt.Errorf("%s %q names no host", key, raw)
 	case u.User != nil:
-		return fmt.Errorf("maven_upstream carries userinfo before the host — bodega reads no credential from this file and would copy it into logs and error messages. Remove everything between \"//\" and %q", u.Host)
+		return fmt.Errorf("%s carries userinfo before the host — bodega reads no credential from this file and would copy it into logs and error messages. Remove everything between \"//\" and %q", key, u.Host)
 	case u.RawQuery != "" || u.Fragment != "":
-		return fmt.Errorf("maven_upstream %q carries a query or fragment — the repository path is appended to it, which would land after it", raw)
+		return fmt.Errorf("%s %q carries a query or fragment — the repository path is appended to it, which would land after it", key, raw)
 	}
 	return nil
 }
@@ -1362,8 +1409,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
-	cfg.MavenUpstream = strings.TrimRight(firstNonEmpty(cfg.MavenUpstream, DefaultMavenUpstream), "/")
-	if err := validateMavenUpstream(cfg.MavenUpstream); err != nil {
+	if err := resolveMavenUpstreams(cfg); err != nil {
 		return nil, err
 	}
 	cfg.RubygemsUpstream = strings.TrimRight(firstNonEmpty(cfg.RubygemsUpstream, DefaultRubygemsUpstream), "/")
@@ -2408,7 +2454,7 @@ func defaultConfigContent() []byte {
   "_comment_cargo_upstream": "cargo_upstream is the sparse index; cargo_dl_upstream is the separate host the crate tarballs come from. crates.io names the second in its own config.json — bodega does not fetch that at startup, so an instance mirroring the index must name both keys.",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
-  "maven_upstream": "https://repo.maven.apache.org/maven2",
+  "maven_upstreams": ["https://repo.maven.apache.org/maven2", "https://plugins.gradle.org/m2"],
   "rubygems_upstream": "https://rubygems.org",
 
   "_comment_composer": "composer_upstream is Packagist's metadata root, served under /composer/. Packagist serves metadata only, and each version's archive is fetched from the dist URL that metadata names, so composer_dist_hosts lists the hosts such a URL may name; a dist on any other host is refused with 403. A GitHub zipball is fetched from codeload.github.com, where the API redirects it. An empty list refuses every archive.",
