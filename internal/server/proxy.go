@@ -1055,6 +1055,10 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 // the ones the age gate can date, which are also the ones whose storage key
 // names the version being fetched. A freebsd key's version slot holds the ABI,
 // and checking an advisory against that would answer for the wrong thing.
+// composer is listed for the second reason alone: the age gate cannot date a
+// Packagist version and OSV is not queried for one, so both pass for want of
+// a rule, while the provenance, name-similarity and integration checks still
+// answer for the version its dist key names.
 var fetchGatedTypes = map[string]bool{
 	manifest.TypeNpm:      true,
 	manifest.TypePypi:     true,

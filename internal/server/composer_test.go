@@ -539,3 +539,17 @@ func TestParsePackagePathComposer(t *testing.T) {
 		}
 	}
 }
+
+func TestComposerMetadataRewriteFailureNamesTheRewrite(t *testing.T) {
+	f := newPackagistFixture(t)
+	f.packagist.set("/p2/symfony/console.json", `{"packages":`)
+	s := composerServer(t, f)
+	rec := doRequest(s, http.MethodGet, "/composer/p2/symfony/console.json", nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("truncated metadata: %d %s, want 502", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "dist URL rewrite") || !strings.Contains(body, "around bodega") || strings.Contains(body, "profile") {
+		t.Errorf("502 body = %q, want it to name the dist URL rewrite and not a profile filter", body)
+	}
+}

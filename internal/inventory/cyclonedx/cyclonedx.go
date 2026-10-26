@@ -165,9 +165,16 @@ func toComponent(c component) inventory.Component {
 		}
 		// A maven component's name is its artifactId alone, which names
 		// nothing in a catalog keyed by <groupId>:<artifactId>.
-		if out.Ecosystem == manifest.TypeMaven {
-			if coord, ok := mavenPURLName(c.PURL); ok {
-				out.Name = coord
+		// So is a composer component's, which an SBOM tool writes as the
+		// package with the vendor in group.
+		switch out.Ecosystem {
+		case manifest.TypeMaven:
+			if group, artifact, ok := namespacedPURLName(c.PURL, "maven"); ok {
+				out.Name = group + ":" + artifact
+			}
+		case manifest.TypeComposer:
+			if vendor, pkg, ok := namespacedPURLName(c.PURL, "composer"); ok {
+				out.Name = strings.ToLower(vendor + "/" + pkg)
 			}
 		}
 	}
@@ -189,15 +196,16 @@ func toComponent(c component) inventory.Component {
 // purlEcosystems maps a purl type to the bodega type that serves it. A purl
 // type bodega serves nothing for lands in "other".
 var purlEcosystems = map[string]string{
-	"deb":     manifest.TypeApt,
-	"pypi":    manifest.TypePypi,
-	"npm":     manifest.TypeNpm,
-	"cargo":   manifest.TypeCargo,
-	"gem":     manifest.TypeRubygems,
-	"maven":   manifest.TypeMaven,
-	"golang":  manifest.TypeGomod,
-	"helm":    manifest.TypeHelm,
-	"freebsd": manifest.TypeFreeBSD,
+	"deb":      manifest.TypeApt,
+	"pypi":     manifest.TypePypi,
+	"npm":      manifest.TypeNpm,
+	"cargo":    manifest.TypeCargo,
+	"gem":      manifest.TypeRubygems,
+	"composer": manifest.TypeComposer,
+	"maven":    manifest.TypeMaven,
+	"golang":   manifest.TypeGomod,
+	"helm":     manifest.TypeHelm,
+	"freebsd":  manifest.TypeFreeBSD,
 }
 
 // parsePURL returns a package URL's type and qualifiers. Name and version
@@ -245,24 +253,24 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-// mavenPURLName reads pkg:maven/<groupId>/<artifactId>@... into the
-// <groupId>:<artifactId> bodega catalogs it under.
-func mavenPURLName(p string) (string, bool) {
+// namespacedPURLName reads pkg:<typ>/<namespace>/<name>@... into its
+// namespace and name, unescaped.
+func namespacedPURLName(p, typ string) (namespace, name string, ok bool) {
 	rest, ok := strings.CutPrefix(p, "pkg:")
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	if i := strings.IndexAny(rest, "@?#"); i >= 0 {
 		rest = rest[:i]
 	}
 	segs := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(segs) != 3 || !strings.EqualFold(segs[0], "maven") {
-		return "", false
+	if len(segs) != 3 || !strings.EqualFold(segs[0], typ) {
+		return "", "", false
 	}
-	group, err1 := url.PathUnescape(segs[1])
-	artifact, err2 := url.PathUnescape(segs[2])
-	if err1 != nil || err2 != nil || group == "" || artifact == "" {
-		return "", false
+	namespace, err1 := url.PathUnescape(segs[1])
+	name, err2 := url.PathUnescape(segs[2])
+	if err1 != nil || err2 != nil || namespace == "" || name == "" {
+		return "", "", false
 	}
-	return group + ":" + artifact, true
+	return namespace, name, true
 }

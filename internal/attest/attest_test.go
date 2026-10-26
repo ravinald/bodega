@@ -60,6 +60,7 @@ func TestPURL(t *testing.T) {
 			"pkg:maven/com.example/webapp@1.0"},
 		{manifest.TypeMaven, "androidx.core:core", "1.13.1", manifest.MavenKey("androidx/core/core/1.13.1/core-1.13.1-sources.aar"),
 			"pkg:maven/androidx.core/core@1.13.1?classifier=sources&type=aar"},
+		{manifest.TypeComposer, "symfony/console", "v7.1.5", "composer/dist/symfony/console/v7.1.5/abc", "pkg:composer/symfony/console@v7.1.5"},
 		{manifest.TypeApt, "hello", "2.10-3build1+x", "", "pkg:generic/apt/hello@2.10-3build1%2Bx"},
 		{manifest.TypeDistfiles, "sub/zsh-5.9.tar.xz", "", "", "pkg:generic/distfiles/sub%2Fzsh-5.9.tar.xz"},
 	} {

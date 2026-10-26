@@ -145,6 +145,8 @@ func (s *Server) handleComposerMetadata(w http.ResponseWriter, r *http.Request, 
 		ResponseWriter: w,
 		subject:        "the composer metadata for " + name,
 		parse:          func(b []byte) ([]byte, error) { return rewriteComposerDists(b, base) },
+		rewrite:        "dist URL rewrite",
+		passThrough:    "hand the client the upstream's dist URLs and send its archive fetches around bodega",
 	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeComposer), manifest.ComposerMetadataKey(name, dev),
 		s.cfg.ComposerUpstream+composerMetadataPath(name, dev), manifest.TypeComposer, name, name, false, false)
