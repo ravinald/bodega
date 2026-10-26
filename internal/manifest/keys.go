@@ -850,6 +850,35 @@ var composerReferencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,
 // ComposerValidName reports whether name is a Composer package name.
 func ComposerValidName(name string) bool { return composerNamePattern.MatchString(name) }
 
+// ComposerVendorWildcard is the package half of a <vendor>/* profile entry:
+// every package under that one vendor.
+const ComposerVendorWildcard = "*"
+
+var composerVendorPattern = regexp.MustCompile(`^[a-z0-9]([_.-]?[a-z0-9]+)*$`)
+
+// ValidateComposerName refuses a profile entry that is neither a package name
+// a request can carry nor <vendor>/*, so no entry is stored that the gate
+// could never match.
+func ValidateComposerName(name string) error {
+	if ComposerValidName(name) {
+		return nil
+	}
+	if vendor, ok := strings.CutSuffix(name, "/"+ComposerVendorWildcard); ok && composerVendorPattern.MatchString(vendor) {
+		return nil
+	}
+	return fmt.Errorf("composer %q is not a package name; write <vendor>/<package> in lowercase (symfony/console) or <vendor>/* for every package of one vendor", name)
+}
+
+// ComposerVendorEntry is the <vendor>/* entry that covers name, and false
+// when name has no vendor.
+func ComposerVendorEntry(name string) (string, bool) {
+	vendor, _, ok := strings.Cut(name, "/")
+	if !ok || vendor == "" {
+		return "", false
+	}
+	return vendor + "/" + ComposerVendorWildcard, true
+}
+
 // ComposerValidReference reports whether ref can name a dist archive in a key.
 func ComposerValidReference(ref string) bool { return composerReferencePattern.MatchString(ref) }
 

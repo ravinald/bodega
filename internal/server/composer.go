@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/config"
@@ -147,6 +148,19 @@ func (s *Server) handleComposerMetadata(w http.ResponseWriter, r *http.Request, 
 		parse:          func(b []byte) ([]byte, error) { return rewriteComposerDists(b, base) },
 		rewrite:        "dist URL rewrite",
 		passThrough:    "hand the client the upstream's dist URLs and send its archive fetches around bodega",
+	}
+	if permit := profileVersionFilter(s.profileFor(r), manifest.TypeComposer, name); permit != nil {
+		// The filter runs on the upstream's bytes and the rewrite on what it
+		// leaves, so a dist a dropped version carried is never rewritten.
+		// Clearing rewrite makes a failure read as the profile's.
+		rw.rewrite, rw.passThrough = "", ""
+		rw.parse = func(b []byte) ([]byte, error) {
+			filtered, err := filterComposerMetadata(b, name, permit)
+			if err != nil {
+				return nil, err
+			}
+			return rewriteComposerDists(filtered, base)
+		}
 	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeComposer), manifest.ComposerMetadataKey(name, dev),
 		s.cfg.ComposerUpstream+composerMetadataPath(name, dev), manifest.TypeComposer, name, name, false, false)
@@ -554,4 +568,152 @@ func rewriteComposerDist(dist json.RawMessage, base, name, version string) ([]by
 	out = append(out, bytes.TrimRight(enc.Bytes(), "\n")...)
 	out = append(out, dist[sp.end:]...)
 	return out, nil
+}
+
+// ---- profile filter --------------------------------------------------------
+
+// jsonField is one member of a version object, its value as the upstream
+// wrote it.
+type jsonField struct {
+	key string
+	val []byte
+}
+
+// composerUnset is the minified format's marker for a key the version before
+// carried and this one does not.
+var composerUnset = []byte(`"__unset"`)
+
+// filterComposerMetadata drops the versions of name that permit refuses from
+// a p2 document.
+//
+// Dropping an element from a minified list is not enough. Under
+// "minified":"composer/2.0" each version carries only what differs from the
+// one before it, so the version after a dropped one would inherit the dropped
+// one's keys: its require list, its autoload, its dist. The list is expanded
+// the way Composer's MetadataMinifier::expand reads it, filtered, and
+// minified again from what remains. Every member outside the package's
+// version list, and every value inside it, keeps the upstream's bytes.
+//
+// Packagist answers only the package asked for, and Composer reads only that
+// key, so any other package in the document is left alone.
+func filterComposerMetadata(doc []byte, name string, permit func(string) bool) ([]byte, error) {
+	top, _, err := jsonObjectMembers(doc, jsonSpan{0, len(doc)})
+	if err != nil {
+		return nil, err
+	}
+	minified := false
+	if sp, ok := memberSpan(top, "minified"); ok {
+		var m string
+		_ = json.Unmarshal(doc[sp.start:sp.end], &m)
+		minified = m == "composer/2.0"
+	}
+	sp, ok := memberSpan(top, "packages")
+	if !ok || bytes.Equal(bytes.TrimSpace(doc[sp.start:sp.end]), []byte("[]")) {
+		return doc, nil
+	}
+	pkgs, _, err := jsonObjectMembers(doc, sp)
+	if err != nil {
+		return nil, fmt.Errorf("packages: %w", err)
+	}
+	list, ok := memberSpan(pkgs, name)
+	if !ok {
+		return doc, nil
+	}
+	elems, err := jsonArrayElements(doc, list)
+	if err != nil {
+		return nil, fmt.Errorf("packages[%q]: %w", name, err)
+	}
+
+	var kept [][]jsonField
+	var current []jsonField
+	for i, el := range elems {
+		ms, _, err := jsonObjectMembers(doc, el)
+		if err != nil {
+			return nil, fmt.Errorf("packages[%q][%d]: %w", name, i, err)
+		}
+		if !minified || i == 0 {
+			current = nil
+		}
+		current = slices.Clone(current)
+		for _, m := range ms {
+			val := bytes.TrimSpace(doc[m.val.start:m.val.end])
+			if minified && i > 0 && bytes.Equal(val, composerUnset) {
+				current = slices.DeleteFunc(current, func(f jsonField) bool { return f.key == m.key })
+				continue
+			}
+			if at := slices.IndexFunc(current, func(f jsonField) bool { return f.key == m.key }); at >= 0 {
+				current[at].val = val
+			} else {
+				current = append(current, jsonField{m.key, val})
+			}
+		}
+		var version string
+		if at := slices.IndexFunc(current, func(f jsonField) bool { return f.key == "version" }); at >= 0 {
+			_ = json.Unmarshal(current[at].val, &version)
+		}
+		if permit(version) {
+			kept = append(kept, current)
+		}
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(doc))
+	out.Write(doc[:list.start])
+	out.WriteByte('[')
+	var prev []jsonField
+	for i, v := range kept {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		emit := v
+		if minified && i > 0 {
+			emit = composerMinify(prev, v)
+		}
+		if err := writeJSONObject(&out, emit); err != nil {
+			return nil, err
+		}
+		prev = v
+	}
+	out.WriteByte(']')
+	out.Write(doc[list.end:])
+	return out.Bytes(), nil
+}
+
+// composerMinify is what MetadataMinifier::minify writes for v after prev:
+// each key that is new or changed, then "__unset" for each key prev carried
+// that v does not.
+func composerMinify(prev, v []jsonField) []jsonField {
+	var out []jsonField
+	for _, f := range v {
+		at := slices.IndexFunc(prev, func(p jsonField) bool { return p.key == f.key })
+		if at < 0 || !bytes.Equal(prev[at].val, f.val) {
+			out = append(out, f)
+		}
+	}
+	for _, p := range prev {
+		if !slices.ContainsFunc(v, func(f jsonField) bool { return f.key == p.key }) {
+			out = append(out, jsonField{p.key, composerUnset})
+		}
+	}
+	return out
+}
+
+func writeJSONObject(out *bytes.Buffer, fields []jsonField) error {
+	out.WriteByte('{')
+	for i, f := range fields {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		var key bytes.Buffer
+		e := json.NewEncoder(&key)
+		e.SetEscapeHTML(false)
+		if err := e.Encode(f.key); err != nil {
+			return err
+		}
+		out.Write(bytes.TrimRight(key.Bytes(), "\n"))
+		out.WriteByte(':')
+		out.Write(f.val)
+	}
+	out.WriteByte('}')
+	return nil
 }
