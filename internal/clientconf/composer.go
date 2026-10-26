@@ -31,16 +31,16 @@ const (
 //
 // The paths are where Composer puts its home with COMPOSER_HOME unset and no
 // home directory created yet: under ~/.config on Linux, where /etc/xdg exists,
-// and ~/.composer elsewhere. doctor writes wherever ComposerHome resolves on
-// the host instead, and MergeComposerConfig keeps an existing file's other
-// settings.
+// and ~/.composer elsewhere. doctor and the setup script write wherever
+// ComposerHome resolves on the host instead, and MergeComposerConfig keeps an
+// existing file's other settings.
 func Composer(base string) File {
 	root := trim(base) + "/composer"
 	repo := joinObject([]member{{"type", json.RawMessage(`"composer"`)}, {"url", json.RawMessage(jsonString(root))}})
 	doc := []member{{"repositories", joinObject([]member{{composerBodegaRepo, repo}, {composerPackagist, json.RawMessage("false")}})}}
 	notes := []string{
 		"An existing config.json keeps its auth, platform, cache and every other setting: bodega's repository is added or updated and packagist.org set false",
-		"bodega doctor writes the file in Composer's home on the host ($COMPOSER_HOME, or the directory Composer picks without it); the setup script honors COMPOSER_HOME, and leaves an existing file to doctor, since merging it takes a JSON parser",
+		"bodega doctor writes the file in Composer's home on the host ($COMPOSER_HOME, or the directory Composer picks without it); the setup script resolves the same directory, and leaves an existing file to doctor, since merging it takes a JSON parser",
 	}
 	if strings.HasPrefix(root, "http://") {
 		doc = append([]member{{"config", json.RawMessage(`{"` + composerSecureHTTP + `":false}`)}}, doc...)

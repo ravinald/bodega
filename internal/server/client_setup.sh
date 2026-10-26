@@ -479,6 +479,33 @@ osq_flagfile() {
 	printf '%s\n' "$found"
 }
 
+# composer_home prints the directory Composer reads its global config.json
+# from, as Composer 2's Factory::getHomeDir resolves it and as
+# internal/clientconf ComposerHome does for doctor: COMPOSER_HOME when set;
+# otherwise the first of ${XDG_CONFIG_HOME:-~/.config}/composer and
+# ~/.composer that is a directory, where the XDG one is a candidate only when
+# some XDG_ variable is set or /etc/xdg exists; else the first candidate.
+# Writing the XDG directory beside an existing ~/.composer moves Composer's
+# home there, and its auth.json and globally required tools drop out of view
+# with no error.
+composer_home() {
+	if [ -n "${COMPOSER_HOME:-}" ]; then
+		printf '%s\n' "$COMPOSER_HOME"
+		return
+	fi
+	set -- "${HOME%/}/.composer"
+	if awk 'BEGIN { for (k in ENVIRON) if (k ~ /^XDG_/) exit 0; exit 1 }' || [ -d /etc/xdg ]; then
+		set -- "${XDG_CONFIG_HOME:-${HOME%/}/.config}/composer" "$@"
+	fi
+	for d in "$@"; do
+		if [ -d "$d" ]; then
+			printf '%s\n' "$d"
+			return
+		fi
+	done
+	printf '%s\n' "$1"
+}
+
 # redact <file> prints it with every secret replaced by <redacted>: the
 # whole userinfo of an http or https URL, user and password, empty or not, up
 # to the last @ before the path, since a token can sit in either half and a
@@ -653,10 +680,10 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
 	/*) target=$path ;;
 	*) die "the plan puts $system at $path, which is not an absolute path; refusing to write it" ;;
 	esac
-	# Composer reads its global config from COMPOSER_HOME when it is set; the
-	# plan names the directory Composer picks without it.
-	if [ "$system" = composer ] && [ -n "${COMPOSER_HOME:-}" ]; then
-		target=$COMPOSER_HOME/config.json
+	# The plan's path is Composer's default for the OS; which directory
+	# Composer reads depends on what exists on this host.
+	if [ "$system" = composer ]; then
+		target=$(composer_home)/config.json
 	fi
 	if [ "$system" = osquery ]; then
 		case $os in

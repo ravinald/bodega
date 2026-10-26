@@ -715,13 +715,22 @@ func checkComposer(t composerTools) (Finding, bool) {
 	if !repos.PackagistOff {
 		found = append(found, path+" leaves packagist.org enabled, so a package bodega does not answer for resolves from Packagist")
 	}
+	var steps []string
+	if len(found) > 0 {
+		steps = append(steps, "bodega doctor --configure composer --apply --url <bodega base URL>")
+	}
 	for _, u := range repos.OnPackagist {
 		found = append(found, path+" lists a composer repository at "+u+", which is Packagist under another name")
+	}
+	// --configure keeps every repository the operator added, so it cannot
+	// clear these; only removing the entry does.
+	if len(repos.OnPackagist) > 0 {
+		steps = append(steps, "remove the composer repository at "+strings.Join(repos.OnPackagist, " and at ")+" from "+path)
 	}
 	if len(found) > 0 {
 		f.Status = StatusWarn
 		f.Detail = strings.Join(found, "; ") + "; bypasses bodega's composer proxy"
-		f.Remediation = "bodega doctor --configure composer --apply --url <bodega base URL>"
+		f.Remediation = strings.Join(steps, ", then ")
 		return f, true
 	}
 	f.Status = StatusOK

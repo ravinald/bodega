@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1591,8 +1593,9 @@ func TestClientPlanComposerInstallsGlobalConfig(t *testing.T) {
 	}
 }
 
-// F95: the setup script writes config.json where none exists, honoring
-// COMPOSER_HOME, and leaves an existing one to doctor rather than replace the
+// F95: the setup script writes config.json where none exists, in the
+// directory Composer reads (COMPOSER_HOME, else an existing XDG or ~/.composer
+// home), and leaves an existing one to doctor rather than replace the
 // operator's settings with the plan's.
 func TestSetupScriptConfiguresComposerWithoutReplacingAConfig(t *testing.T) {
 	for _, tool := range []string{"sh", "awk", "diff", "cmp", "curl"} {
@@ -1620,7 +1623,7 @@ func TestSetupScriptConfiguresComposerWithoutReplacingAConfig(t *testing.T) {
 	if err := os.WriteFile(target, []byte(existing), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home}, "--systems", "composer", "--apply")
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
 	if err != nil {
 		t.Fatalf("sh setup.sh over an existing config.json: %v\n%s", err, out)
 	}
@@ -1630,5 +1633,43 @@ func TestSetupScriptConfiguresComposerWithoutReplacingAConfig(t *testing.T) {
 	if !strings.Contains(out, "skipped    composer") || !strings.Contains(out, "bodega doctor --configure composer") ||
 		strings.Contains(out, "every file already matches") {
 		t.Errorf("output does not say the file was left to doctor:\n%s", out)
+	}
+
+	// An XDG_ variable puts ~/.config/composer first, but Composer reads an
+	// existing ~/.composer over a missing XDG directory, so that is the file
+	// the script finds and leaves alone.
+	home = t.TempDir()
+	target = home + "/.composer/config.json"
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh over an existing ~/.composer: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(target); string(got) != existing {
+		t.Errorf("%s = %q, want it untouched", target, got)
+	}
+	if _, err := os.Stat(home + "/.config/composer"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("~/.config/composer exists beside ~/.composer (%v), which moves Composer's home away from it\n%s", err, out)
+	}
+	if !strings.Contains(out, "skipped    composer   "+target) {
+		t.Errorf("output does not say %s was left to doctor:\n%s", target, out)
+	}
+
+	// With neither directory, Composer creates its first candidate.
+	home = t.TempDir()
+	out, _, err = setupScriptAgainst(t, s, f.token, []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home + "/.config"}, "--systems", "composer", "--apply")
+	if err != nil {
+		t.Fatalf("sh setup.sh on a host with no Composer home: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(home + "/.config/composer/config.json"); string(got) != clientconf.Composer(s.cfg.PublicURL).Content {
+		t.Errorf("~/.config/composer/config.json = %q, want the planned file\n%s", got, out)
+	}
+	if _, err := os.Stat(home + "/.composer"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("~/.composer was created (%v), want only the XDG directory\n%s", err, out)
 	}
 }

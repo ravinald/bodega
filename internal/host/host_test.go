@@ -432,20 +432,27 @@ func TestCheckComposerGivesNoRowWithoutComposer(t *testing.T) {
 
 // F95 R3: the row warns while the global config.json is missing, names no
 // bodega repository, leaves packagist.org on or lists Packagist under another
-// name, and is OK with the file clientconf renders.
+// name, and is OK with the file clientconf renders. Each warning's remediation
+// is one that clears it: --configure keeps the operator's repositories, so a
+// Packagist alias is named for removal instead.
 func TestCheckComposerWarnsUntilConfigPointsAtBodega(t *testing.T) {
 	planned := clientconf.Composer("https://bodega.internal").Content
+	const configure = "--configure composer"
+	const remove = "remove the composer repository at https://repo.packagist.org from "
 	for _, c := range []struct {
 		name, config string
 		status       Status
 		want         string
+		fix          []string
+		notFix       string
 	}{
-		{"missing", "", StatusWarn, "fetches every package from packagist.org"},
-		{"auth only", `{"config":{"github-oauth":{"github.com":"x"}}}`, StatusWarn, "names no composer repository at a bodega /composer route"},
-		{"packagist on", `{"repositories":{"bodega":{"type":"composer","url":"https://bodega.internal/composer"}}}`, StatusWarn, "leaves packagist.org enabled"},
-		{"packagist renamed", `{"repositories":[{"type":"composer","url":"https://bodega.internal/composer"},{"type":"composer","url":"https://repo.packagist.org"},{"packagist.org":false}]}`, StatusWarn, "Packagist under another name"},
-		{"unreadable", `{"repositories":`, StatusSkip, "not JSON Composer can read"},
-		{"configured", planned, StatusOK, "sends Composer to https://bodega.internal/composer with packagist.org disabled"},
+		{"missing", "", StatusWarn, "fetches every package from packagist.org", []string{configure}, ""},
+		{"auth only", `{"config":{"github-oauth":{"github.com":"x"}}}`, StatusWarn, "names no composer repository at a bodega /composer route", []string{configure}, "remove"},
+		{"packagist on", `{"repositories":{"bodega":{"type":"composer","url":"https://bodega.internal/composer"}}}`, StatusWarn, "leaves packagist.org enabled", []string{configure}, "remove"},
+		{"packagist renamed", `{"repositories":[{"type":"composer","url":"https://bodega.internal/composer"},{"type":"composer","url":"https://repo.packagist.org"},{"packagist.org":false}]}`, StatusWarn, "Packagist under another name", []string{remove}, configure},
+		{"packagist renamed and on", `{"repositories":[{"type":"composer","url":"https://repo.packagist.org"}]}`, StatusWarn, "Packagist under another name", []string{configure, ", then " + remove}, ""},
+		{"unreadable", `{"repositories":`, StatusSkip, "not JSON Composer can read", nil, ""},
+		{"configured", planned, StatusOK, "sends Composer to https://bodega.internal/composer with packagist.org disabled", nil, ""},
 	} {
 		dir := t.TempDir()
 		if c.config != "" {
@@ -455,8 +462,13 @@ func TestCheckComposerWarnsUntilConfigPointsAtBodega(t *testing.T) {
 		if !ok || f.Check != "composer" || f.Status != c.status || !strings.Contains(f.Detail, c.want) {
 			t.Errorf("%s: %+v (row %v), want %s naming %q", c.name, f, ok, c.status, c.want)
 		}
-		if c.status == StatusWarn && !strings.Contains(f.Remediation, "--configure composer") {
-			t.Errorf("%s: remediation %q, want --configure composer", c.name, f.Remediation)
+		for _, w := range c.fix {
+			if !strings.Contains(f.Remediation, w) {
+				t.Errorf("%s: remediation %q, want it to name %q", c.name, f.Remediation, w)
+			}
+		}
+		if c.notFix != "" && strings.Contains(f.Remediation, c.notFix) {
+			t.Errorf("%s: remediation %q names %q, which does not clear this warning", c.name, f.Remediation, c.notFix)
 		}
 	}
 }

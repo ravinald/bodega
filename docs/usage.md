@@ -4926,7 +4926,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `3dc60866db4cbb5f55d86f7ff46f44c96ff8998720792b9ac1fbe8a8d0909bb3`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `a6482f1c377ea3fe8cf56d6a52ecad304ae3ba4c5e57a1d9b0c53007cbf5d9cf`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -5301,9 +5301,9 @@ An existing `config.json` is merged, not replaced. bodega's repository is added 
 
 doctor writes the file in the directory Composer reads it from, resolved as Composer does: `$COMPOSER_HOME`; otherwise `$XDG_CONFIG_HOME/composer` (`~/.config/composer` without it) or `~/.composer`, whichever exists, where the first is a candidate only when an `XDG_` variable is set or `/etc/xdg` exists. That is why a macOS host gets `~/.composer`: with no `XDG_` variable Composer never reads `~/.config/composer`. The plan's record names the default path, and its note says the file is merged.
 
-The [setup script](#setup-script) with `--systems composer` writes the file where none exists, under `$COMPOSER_HOME` when that is set. An existing `config.json` it leaves untouched and says so, because merging one takes a JSON parser the script does not carry; run `bodega doctor --configure composer` there instead.
+The [setup script](#setup-script) with `--systems composer` writes the file where none exists, in the directory doctor resolves by the same rule, so a host whose Composer home is an existing `~/.composer` keeps it rather than gaining a `~/.config/composer` that Composer would read instead. An existing `config.json` it leaves untouched and says so, because merging one takes a JSON parser the script does not carry; run `bodega doctor --configure composer` there instead.
 
-`bodega doctor` reports a `composer` row on a host with `composer` on `PATH`, and none on a host without it. It warns when the global `config.json` is missing, names no composer repository at a bodega `/composer` route, leaves `packagist.org` enabled, or lists a composer repository on `packagist.org` under another name, which Composer reads as Packagist itself. A project's own `composer.json` can still name repositories of its own, Packagist's URL included, and those reach their hosts directly; doctor reads no project.
+`bodega doctor` reports a `composer` row on a host with `composer` on `PATH`, and none on a host without it. It warns when the global `config.json` is missing, names no composer repository at a bodega `/composer` route, leaves `packagist.org` enabled, or lists a composer repository on `packagist.org` under another name, which Composer reads as Packagist itself. `--configure composer` clears the first three; it keeps every repository the operator added, so the row names a Packagist alias for removal by hand. A project's own `composer.json` can still name repositories of its own, Packagist's URL included, and those reach their hosts directly; doctor reads no project.
 
 bodega serves a Composer v2 repository under `/composer/`, proxied from [`composer_upstream`](#upstream-hosts):
 
