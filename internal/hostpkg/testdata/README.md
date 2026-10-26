@@ -21,6 +21,7 @@ cannot occur.
 | `rubygems-gem-list-local-ruby33.txt` | `gem list --local` | `ruby:3.3-slim` container, amd64, after `gem install nokogiri -v 1.16.7` and `gem install rake -v 13.2.1` |
 | `rubygems-specifications-ruby33.txt` | `ls $(gem environment gemdir)/specifications` | the same container, same moment |
 | `maven-m2-poms-maven399.txt` | `find /root/.m2/repository -name '*.pom' \| sort` | `maven:3.9.9-eclipse-temurin-21` container, after `mvn dependency:list` on a project importing spring-boot-dependencies 3.3.0: 260 POMs of 163 artifacts, Maven's own plugins included |
+| `composer-global-show-composer210.json` | `composer global show --format=json` | `composer:2` container (Composer 2.10.3), after `composer global require symfony/console:^7.1 psr/log:dev-master` with `minimum-stability` dev and `prefer-stable` true |
 | `freebsd-pkg-query.txt` | `pkg query '%R\t%q'` | FreeBSD 15.1-RELEASE, aarch64, 34 packages from three repositories, 7 of them noarch |
 
 ## The two apt hosts earn their places separately

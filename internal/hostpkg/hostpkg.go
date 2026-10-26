@@ -47,6 +47,7 @@ var parsers = map[string]Parser{
 	manifest.TypeCargo:    ParseCargo,
 	manifest.TypeMaven:    ParseMaven,
 	manifest.TypeRubygems: ParseRubygems,
+	manifest.TypeComposer: ParseComposer,
 	manifest.TypeHelm:     ParseHelm,
 	manifest.TypeFreeBSD:  ParseFreeBSD,
 }

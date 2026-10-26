@@ -479,6 +479,33 @@ osq_flagfile() {
 	printf '%s\n' "$found"
 }
 
+# composer_home prints the directory Composer reads its global config.json
+# from, as Composer 2's Factory::getHomeDir resolves it and as
+# internal/clientconf ComposerHome does for doctor: COMPOSER_HOME when set;
+# otherwise the first of ${XDG_CONFIG_HOME:-~/.config}/composer and
+# ~/.composer that is a directory, where the XDG one is a candidate only when
+# some XDG_ variable is set or /etc/xdg exists; else the first candidate.
+# Writing the XDG directory beside an existing ~/.composer moves Composer's
+# home there, and its auth.json and globally required tools drop out of view
+# with no error.
+composer_home() {
+	if [ -n "${COMPOSER_HOME:-}" ]; then
+		printf '%s\n' "$COMPOSER_HOME"
+		return
+	fi
+	set -- "${HOME%/}/.composer"
+	if awk 'BEGIN { for (k in ENVIRON) if (k ~ /^XDG_/) exit 0; exit 1 }' || [ -d /etc/xdg ]; then
+		set -- "${XDG_CONFIG_HOME:-${HOME%/}/.config}/composer" "$@"
+	fi
+	for d in "$@"; do
+		if [ -d "$d" ]; then
+			printf '%s\n' "$d"
+			return
+		fi
+	done
+	printf '%s\n' "$1"
+}
+
 # redact <file> prints it with every secret replaced by <redacted>: the
 # whole userinfo of an http or https URL, user and password, empty or not, up
 # to the last @ before the path, since a token can sit in either half and a
@@ -653,6 +680,11 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
 	/*) target=$path ;;
 	*) die "the plan puts $system at $path, which is not an absolute path; refusing to write it" ;;
 	esac
+	# The plan's path is Composer's default for the OS; which directory
+	# Composer reads depends on what exists on this host.
+	if [ "$system" = composer ]; then
+		target=$(composer_home)/config.json
+	fi
 	if [ "$system" = osquery ]; then
 		case $os in
 		linux)
@@ -686,6 +718,7 @@ done 3<"$work/plan.txt"
 # ---- compare ---------------------------------------------------------------
 
 changed=0
+skipped=0
 : >"$work/writes"
 while IFS=$tab read -r n system target <&3; do
 	if [ -e "$target" ] && [ ! -f "$target" ]; then
@@ -700,6 +733,13 @@ while IFS=$tab read -r n system target <&3; do
 	fi
 	if [ -f "$target" ] && cmp -s "$target" "$work/$n.new"; then
 		printf 'unchanged  %-10s %s\n' "$system" "$target"
+		continue
+	fi
+	# Merging into an existing config.json, which can hold the operator's
+	# credentials, takes a JSON parser; replacing it whole would drop them.
+	if [ "$system" = composer ] && [ -s "$target" ]; then
+		skipped=$((skipped + 1))
+		printf 'skipped    %-10s %s already exists, and merging bodega'"'"'s repository into it needs a JSON parser this script does not carry. Run: bodega doctor --configure composer --apply --url %s\n' "$system" "$target" "$base"
 		continue
 	fi
 	shown=/dev/null
@@ -771,7 +811,11 @@ if [ -n "$osq_n" ]; then
 fi
 
 if [ "$changed" -eq 0 ] && [ "$osq_steps" -eq 0 ] && [ "$osq_secret_missing" = no ]; then
-	printf '\nNothing to change: every file already matches the plan.\n'
+	if [ "$skipped" -eq 0 ]; then
+		printf '\nNothing to change: every file already matches the plan.\n'
+	else
+		printf '\nNothing written: every file but the %s skipped above already matches the plan.\n' "$skipped"
+	fi
 	exit 0
 fi
 if [ "$apply" != yes ]; then
