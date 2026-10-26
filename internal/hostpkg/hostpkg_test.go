@@ -702,3 +702,33 @@ func TestParseMavenReportsWhatItCannotRead(t *testing.T) {
 		t.Errorf("warnings = %v, want the SNAPSHOT and the two non-POM lines counted", res.Warnings)
 	}
 }
+
+// F95 R3: the capture is composer global show --format=json after requiring
+// symfony/console ^7.1 and psr/log dev-master: ten packages, one of them a
+// branch install no Packagist version describes.
+func TestParseComposerGlobalShow(t *testing.T) {
+	res, err := ParseComposer(fixture(t, "composer-global-show-composer210.json"))
+	if err != nil {
+		t.Fatalf("ParseComposer: %v", err)
+	}
+	got := map[string]string{}
+	for _, pm := range res.Packages {
+		if pm.Type != manifest.TypeComposer || len(pm.Versions) != 1 || pm.Versions[0].Mode != manifest.ModeProxy {
+			t.Errorf("%s = %+v, want one proxy composer version", pm.Name, pm)
+			continue
+		}
+		got[pm.Name] = pm.Versions[0].Version
+	}
+	if len(got) != 9 || got["symfony/console"] != "v7.4.21" || got["psr/container"] != "2.0.2" {
+		t.Errorf("imported %v, want the nine tagged packages at the versions Packagist lists", got)
+	}
+	if _, ok := got["psr/log"]; ok {
+		t.Errorf("psr/log imported at %q, want the branch install skipped", got["psr/log"])
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], `"psr/log dev-master f16e1d5"`) {
+		t.Errorf("warnings = %v, want one naming the branch install", res.Warnings)
+	}
+	if _, err := ParseComposer(strings.NewReader("psr/log dev-master\n")); err == nil || !strings.Contains(err.Error(), "--format=json") {
+		t.Errorf("text input = %v, want a parse error naming the JSON form", err)
+	}
+}

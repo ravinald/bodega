@@ -1,0 +1,94 @@
+{
+    "installed": [
+        {
+            "name": "psr/container",
+            "direct-dependency": false,
+            "homepage": "https://github.com/php-fig/container",
+            "source": "https://github.com/php-fig/container/tree/2.0.2",
+            "version": "2.0.2",
+            "description": "Common Container Interface (PHP FIG PSR-11)",
+            "abandoned": false
+        },
+        {
+            "name": "psr/log",
+            "direct-dependency": true,
+            "homepage": "https://github.com/php-fig/log",
+            "source": "https://github.com/php-fig/log/tree/3.0.2",
+            "version": "dev-master f16e1d5",
+            "description": "Common interface for logging libraries",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/console",
+            "direct-dependency": true,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/console/tree/v7.4.21",
+            "version": "v7.4.21",
+            "description": "Eases the creation of beautiful and testable command line interfaces",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/deprecation-contracts",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/deprecation-contracts/tree/v3.7.1",
+            "version": "v3.7.1",
+            "description": "A generic function and convention to trigger deprecation notices",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/polyfill-ctype",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/polyfill-ctype/tree/v1.37.0",
+            "version": "v1.37.0",
+            "description": "Symfony polyfill for ctype functions",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/polyfill-intl-grapheme",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/polyfill-intl-grapheme/tree/v1.43.0",
+            "version": "v1.43.0",
+            "description": "Symfony polyfill for intl's grapheme_* functions",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/polyfill-intl-normalizer",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/polyfill-intl-normalizer/tree/v1.43.0",
+            "version": "v1.43.0",
+            "description": "Symfony polyfill for intl's Normalizer class and related functions",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/polyfill-mbstring",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/polyfill-mbstring/tree/v1.43.0",
+            "version": "v1.43.0",
+            "description": "Symfony polyfill for the Mbstring extension",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/service-contracts",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/service-contracts/tree/v3.7.3",
+            "version": "v3.7.3",
+            "description": "Generic abstractions related to writing services",
+            "abandoned": false
+        },
+        {
+            "name": "symfony/string",
+            "direct-dependency": false,
+            "homepage": "https://symfony.com",
+            "source": "https://github.com/symfony/string/tree/v8.1.9",
+            "version": "v8.1.9",
+            "description": "Provides an object-oriented API to strings and deals with bytes, UTF-8 code points and grapheme clusters in a unified way",
+            "abandoned": false
+        }
+    ]
+}

@@ -653,6 +653,11 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
 	/*) target=$path ;;
 	*) die "the plan puts $system at $path, which is not an absolute path; refusing to write it" ;;
 	esac
+	# Composer reads its global config from COMPOSER_HOME when it is set; the
+	# plan names the directory Composer picks without it.
+	if [ "$system" = composer ] && [ -n "${COMPOSER_HOME:-}" ]; then
+		target=$COMPOSER_HOME/config.json
+	fi
 	if [ "$system" = osquery ]; then
 		case $os in
 		linux)
@@ -686,6 +691,7 @@ done 3<"$work/plan.txt"
 # ---- compare ---------------------------------------------------------------
 
 changed=0
+skipped=0
 : >"$work/writes"
 while IFS=$tab read -r n system target <&3; do
 	if [ -e "$target" ] && [ ! -f "$target" ]; then
@@ -700,6 +706,13 @@ while IFS=$tab read -r n system target <&3; do
 	fi
 	if [ -f "$target" ] && cmp -s "$target" "$work/$n.new"; then
 		printf 'unchanged  %-10s %s\n' "$system" "$target"
+		continue
+	fi
+	# Merging into an existing config.json, which can hold the operator's
+	# credentials, takes a JSON parser; replacing it whole would drop them.
+	if [ "$system" = composer ] && [ -s "$target" ]; then
+		skipped=$((skipped + 1))
+		printf 'skipped    %-10s %s already exists, and merging bodega'"'"'s repository into it needs a JSON parser this script does not carry. Run: bodega doctor --configure composer --apply --url %s\n' "$system" "$target" "$base"
 		continue
 	fi
 	shown=/dev/null
@@ -771,7 +784,11 @@ if [ -n "$osq_n" ]; then
 fi
 
 if [ "$changed" -eq 0 ] && [ "$osq_steps" -eq 0 ] && [ "$osq_secret_missing" = no ]; then
-	printf '\nNothing to change: every file already matches the plan.\n'
+	if [ "$skipped" -eq 0 ]; then
+		printf '\nNothing to change: every file already matches the plan.\n'
+	else
+		printf '\nNothing written: every file but the %s skipped above already matches the plan.\n' "$skipped"
+	fi
 	exit 0
 fi
 if [ "$apply" != yes ]; then

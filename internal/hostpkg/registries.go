@@ -415,5 +415,49 @@ func ParseMaven(r io.Reader) (Result, error) {
 	return res, nil
 }
 
+// ParseComposer converts 'composer global show --format=json': the packages
+// installed in Composer's global project, which is where a host's PHP tools
+// live. A project's own vendor/ is listed by the same command run in it
+// without "global", and parses the same way.
+//
+// The version is the one Packagist lists, "v7.1.5" or "2.0.2", which is what
+// a composer entry is keyed by. A branch install reads "dev-master f16e1d5"
+// and is skipped and counted: the branch moves, so no version Packagist
+// publishes describes what the host has.
+func ParseComposer(r io.Reader) (Result, error) {
+	var doc struct {
+		Installed []struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"installed"`
+	}
+	if err := json.NewDecoder(r).Decode(&doc); err != nil {
+		return Result{}, fmt.Errorf("parse composer show: %w\nexpected JSON: composer global show --format=json", err)
+	}
+	var (
+		pms      []manifest.PackageManifest
+		branches []string
+	)
+	for _, row := range doc.Installed {
+		if row.Name == "" || row.Version == "" {
+			continue
+		}
+		if strings.HasPrefix(row.Version, "dev-") || strings.Contains(row.Version, " ") {
+			branches = append(branches, row.Name+" "+row.Version)
+			continue
+		}
+		pms = append(pms, pkg(manifest.TypeComposer, row.Name, row.Version, "", registryMode))
+	}
+	var res Result
+	res.Packages = mergeSameName(pms)
+	if len(branches) > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d branch install(s), first: %q; a branch moves, so no version Packagist publishes describes it. Require a tagged release, or catalog it with bodega pkg create",
+			len(branches), branches[0]))
+	}
+	sortPackages(res.Packages)
+	return res, nil
+}
+
 // filepathToSlash reads a Windows path listing the way the layout is written.
 func filepathToSlash(p string) string { return strings.ReplaceAll(p, `\`, "/") }
