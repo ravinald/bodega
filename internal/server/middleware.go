@@ -851,6 +851,23 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 			return "rubygems", strings.TrimPrefix(full, "info/"), ""
 		}
 		return "rubygems", "", ""
+	case strings.HasPrefix(path, "/composer/"):
+		full := strings.TrimPrefix(path, "/composer/")
+		switch {
+		case strings.HasPrefix(full, "dist/"):
+			// <vendor>/<package>/<version>/<reference>.<type>, decoded, so a
+			// branch version's "/" is back in it: the version is everything
+			// between the package and the last segment.
+			if parts := strings.SplitN(strings.TrimPrefix(full, "dist/"), "/", 3); len(parts) == 3 {
+				if i := strings.LastIndex(parts[2], "/"); i > 0 {
+					return manifest.TypeComposer, parts[0] + "/" + parts[1], parts[2][:i]
+				}
+			}
+		case strings.HasPrefix(full, "p2/"):
+			name := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(full, "p2/"), ".json"), "~dev")
+			return manifest.TypeComposer, name, ""
+		}
+		return manifest.TypeComposer, "", ""
 	case strings.HasPrefix(path, "/maven/"):
 		// A path the layout rejects still names the type, so a read token
 		// scoped to another type is refused before the handler 404s it.

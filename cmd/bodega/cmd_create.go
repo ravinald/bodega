@@ -125,6 +125,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeComposer:
+				name, ve, err = collectComposerVersion(r, name, "", "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypeFreeBSD:
 				name, ve, err = collectFreeBSDVersion(r, name, "", "")
 				if err != nil {
@@ -570,6 +576,30 @@ func collectRubygemsVersion(r *bufio.Reader, name, url, version string) (string,
 	}
 	url, _ = prompt(r, "Registry URL (leave blank for rubygems_upstream)", url)
 	return name, manifest.VersionEntry{Version: version, URL: url}, nil
+}
+
+// collectComposerVersion prompts for one Composer package version. The dist
+// reference is optional: the archive route reads it from Packagist's
+// metadata, and an entry records it only to name the archive it holds.
+func collectComposerVersion(r *bufio.Reader, name, version, ref string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Package name, <vendor>/<package> (e.g. symfony/console)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if !manifest.ComposerValidName(name) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("%q is not a Composer package name: lowercase <vendor>/<package>, e.g. symfony/console", name)
+	}
+	if version, err = prompt(r, "Version, as Packagist lists it (e.g. v7.1.5)", version); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if version == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
+	}
+	ref, _ = prompt(r, "Dist reference (leave blank unless an archive is uploaded for it)", ref)
+	if ref != "" && !manifest.ComposerValidReference(ref) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("dist reference %q is not a commit or tag name", ref)
+	}
+	return name, manifest.VersionEntry{Version: version, Ref: ref}, nil
 }
 
 // collectFreeBSDVersion prompts for one pkg repository.

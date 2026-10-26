@@ -140,6 +140,8 @@ type Config struct {
 	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
 	MavenUpstream          string   `json:"maven_upstream,omitempty"`         // repository root in the Maven layout; /maven/<path> is appended to it
 	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
+	ComposerUpstream       string   `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
+	ComposerDistHosts      []string `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
 	PrivateUpstreamHosts   []string `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
 	DiscoverMode           string   `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string   `json:"gomod_root,omitempty"`
@@ -148,6 +150,7 @@ type Config struct {
 	CargoRoot              string   `json:"cargo_root,omitempty"`
 	MavenRoot              string   `json:"maven_root,omitempty"`
 	RubygemsRoot           string   `json:"rubygems_root,omitempty"`
+	ComposerRoot           string   `json:"composer_root,omitempty"`
 	FreeBSDRoot            string   `json:"freebsd_root,omitempty"`
 	DistfilesRoot          string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
 	AuditDB                string   `json:"audit_db,omitempty"`
@@ -371,6 +374,15 @@ const DefaultDistfilesUpstream = "http://distcache.FreeBSD.org/ports-distfiles/"
 // one host, so one key names all three.
 const DefaultRubygemsUpstream = "https://rubygems.org"
 
+// DefaultComposerUpstream is Packagist's metadata root. Packagist serves
+// metadata only: each version's archive lives at a URL that metadata names.
+const DefaultComposerUpstream = "https://repo.packagist.org"
+
+// DefaultComposerDistHosts are the forges Packagist's dist URLs name. A dist
+// URL is chosen by whoever publishes the package, so the list is what keeps a
+// package's metadata from pointing bodega's fetch at any host it likes.
+var DefaultComposerDistHosts = []string{"api.github.com", "codeload.github.com", "gitlab.com", "bitbucket.org"}
+
 // DistfilesEnvironment is the declared client environment distfiles admission
 // reads ports against.
 func (cfg *Config) DistfilesEnvironment() distinfo.EnvironmentSpec {
@@ -476,6 +488,7 @@ var reservedPathElements = map[string]string{
 	"binaries":  "served route and binary storage root",
 	"cargo":     "served route and cargo storage root",
 	"rubygems":  "served route and rubygems storage root",
+	"composer":  "served route and composer storage root",
 	"git":       "served route",
 	"go":        "served route",
 	"healthz":   "served route",
@@ -660,11 +673,17 @@ var hostLabelRE = regexp.MustCompile(`^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$`)
 // would match no upstream, and the operator would see the private-address
 // refusal they listed the host to clear.
 func validatePrivateUpstreamHosts(hosts []string) error {
+	return validateHostList("private_upstream_hosts", hosts)
+}
+
+// validateHostList canonicalizes each entry of a host-list key in place and
+// refuses one that is not a bare hostname or IP literal.
+func validateHostList(key string, hosts []string) error {
 	for i, raw := range hosts {
 		h := CanonicalHost(strings.TrimSpace(raw))
 		if a, err := netip.ParseAddr(h); err == nil {
 			if a.Zone() != "" {
-				return fmt.Errorf("private_upstream_hosts entry %q carries an IPv6 zone; name the address alone", raw)
+				return fmt.Errorf("%s entry %q carries an IPv6 zone; name the address alone", key, raw)
 			}
 			hosts[i] = h
 			continue
@@ -674,7 +693,7 @@ func validatePrivateUpstreamHosts(hosts []string) error {
 			ok = ok && hostLabelRE.MatchString(label)
 		}
 		if !ok {
-			return fmt.Errorf("private_upstream_hosts entry %q is not a hostname or IP literal (no scheme, port or path), e.g. \"registry.internal.example\"", raw)
+			return fmt.Errorf("%s entry %q is not a hostname or IP literal (no scheme, port or path), e.g. \"registry.internal.example\"", key, raw)
 		}
 		hosts[i] = h
 	}
@@ -1349,6 +1368,18 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	}
 	cfg.RubygemsUpstream = strings.TrimRight(firstNonEmpty(cfg.RubygemsUpstream, DefaultRubygemsUpstream), "/")
 	if err := validateRootURL("rubygems_upstream", cfg.RubygemsUpstream, DefaultRubygemsUpstream); err != nil {
+		return nil, err
+	}
+	cfg.ComposerUpstream = strings.TrimRight(firstNonEmpty(cfg.ComposerUpstream, DefaultComposerUpstream), "/")
+	if err := validateRootURL("composer_upstream", cfg.ComposerUpstream, DefaultComposerUpstream); err != nil {
+		return nil, err
+	}
+	// Absent takes the default; an empty list is the operator refusing every
+	// dist host, which is a choice rather than an omission.
+	if cfg.ComposerDistHosts == nil {
+		cfg.ComposerDistHosts = append([]string(nil), DefaultComposerDistHosts...)
+	}
+	if err := validateHostList("composer_dist_hosts", cfg.ComposerDistHosts); err != nil {
 		return nil, err
 	}
 	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
@@ -2380,6 +2411,10 @@ func defaultConfigContent() []byte {
   "maven_upstream": "https://repo.maven.apache.org/maven2",
   "rubygems_upstream": "https://rubygems.org",
 
+  "_comment_composer": "composer_upstream is Packagist's metadata root, served under /composer/. Packagist serves metadata only, and each version's archive is fetched from the dist URL that metadata names, so composer_dist_hosts lists the hosts such a URL may name; a dist on any other host is refused with 403. A GitHub zipball is fetched from codeload.github.com, where the API redirects it. An empty list refuses every archive.",
+  "composer_upstream": "https://repo.packagist.org",
+  "composer_dist_hosts": ["api.github.com", "codeload.github.com", "gitlab.com", "bitbucket.org"],
+
   "_comment_private_upstream_hosts": "private_upstream_hosts: hostnames or IP literals (no scheme, port or path) the upstream guard lets resolve to a private address (RFC 1918, fc00::/7), for fronting an internal registry such as Artifactory, Nexus or Verdaccio, e.g. [\"registry.corp.example\"]. Listing a host trusts it as a public upstream is trusted: any client that can reach bodega can make it fetch any path under that ecosystem's route from the host. Loopback, link-local (including 169.254.169.254) and unspecified addresses stay refused for every host, listed or not, and each redirect hop is judged again, so a listed host cannot hand the fetch to an unlisted one. Names, not CIDRs: a range would trust whatever a public upstream's DNS points into it.",
   "private_upstream_hosts": [],
 
@@ -2406,6 +2441,7 @@ func defaultConfigContent() []byte {
   "npm_root": "",
   "cargo_root": "",
   "rubygems_root": "",
+  "composer_root": "",
 
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",

@@ -1,6 +1,7 @@
 package clientconf
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -475,6 +476,31 @@ func TestRubygemsRendersGemrcAndBundlerMirror(t *testing.T) {
 		var doc map[string]any
 		if err := yaml.Unmarshal([]byte(f.Content), &doc); err != nil {
 			t.Errorf("%s is not YAML: %v", want.path, err)
+		}
+	}
+}
+
+func TestComposerRendersAGlobalConfigWithPackagistOff(t *testing.T) {
+	f := Composer(testBase + "/")
+	if f.System != manifest.TypeComposer {
+		t.Errorf("system %q, want composer", f.System)
+	}
+	var doc struct {
+		Repositories map[string]any `json:"repositories"`
+	}
+	if err := json.Unmarshal([]byte(f.Content), &doc); err != nil {
+		t.Fatalf("config.json is not JSON: %v\n%s", err, f.Content)
+	}
+	bodega, _ := doc.Repositories["bodega"].(map[string]any)
+	if bodega["type"] != "composer" || bodega["url"] != "https://bodega.example.com/composer" {
+		t.Errorf("repositories.bodega = %v, want a composer repository at https://bodega.example.com/composer", bodega)
+	}
+	if v, ok := doc.Repositories["packagist.org"]; !ok || v != false {
+		t.Errorf("repositories[\"packagist.org\"] = %v, want false so Packagist is not read around bodega", v)
+	}
+	for os, want := range map[string]string{OSLinux: "~/.config/composer/config.json", OSDarwin: "~/.composer/config.json", OSFreeBSD: "~/.composer/config.json"} {
+		if got := f.Path(os); got != want {
+			t.Errorf("path on %s = %q, want %q", os, got, want)
 		}
 	}
 }

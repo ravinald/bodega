@@ -384,7 +384,9 @@ func ReleaseSegments(typ, v string) ([]int, bool) {
 // them would order a Debian or PEP 440 version by the wrong rules.
 func packageVersionOrder(typ string) (string, bool) {
 	switch typ {
-	case manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod:
+	case manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeComposer:
+		// A Packagist version is a tag, "v" prefix or not, which semver
+		// ordering reads; a dev branch orders against nothing.
 		return orderSemver, true
 	case manifest.TypeMaven:
 		return orderMaven, true

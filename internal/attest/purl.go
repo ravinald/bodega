@@ -11,8 +11,9 @@ import (
 // for pypi and maven, where one release is several files: pypi's file_name
 // qualifier and maven's classifier and type say which one this digest is over.
 //
-// Ecosystems with a registered purl type use it, rubygems as pkg:gem and
-// maven as pkg:maven/<groupId>/<artifactId>. The rest (apt, binary, git,
+// Ecosystems with a registered purl type use it, rubygems as pkg:gem, maven
+// as pkg:maven/<groupId>/<artifactId> and composer as
+// pkg:composer/<vendor>/<package>, lowercased as that type requires. The rest (apt, binary, git,
 // helm, freebsd, distfiles) are named pkg:generic/<bodega type>/<name>: a deb
 // purl needs the distribution vendor as its namespace, which a bodega apt
 // entry does not record, and a guessed vendor would name a package somebody
@@ -45,6 +46,13 @@ func PURL(typ, name, version, objectKey string) string {
 			b.WriteString("maven/" + purlEscape(group) + "/" + purlEscape(artifact))
 		} else {
 			b.WriteString("maven/" + purlEscape(name))
+		}
+	case manifest.TypeComposer:
+		b.WriteString("composer/")
+		if vendor, pkg, ok := strings.Cut(strings.ToLower(name), "/"); ok {
+			b.WriteString(purlEscape(vendor) + "/" + purlEscape(pkg))
+		} else {
+			b.WriteString(purlEscape(strings.ToLower(name)))
 		}
 	default:
 		b.WriteString("generic/" + purlEscape(typ) + "/" + purlEscape(name))

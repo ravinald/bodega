@@ -305,10 +305,14 @@ type indexFilterWriter struct {
 	// parse replaces filter for a document that is decoded whole, where a
 	// body bodega cannot read has no line to pass through and is refused like
 	// one too large to buffer.
-	parse  func([]byte) ([]byte, error)
-	status int
-	body   bytes.Buffer
-	tooBig bool
+	parse func([]byte) ([]byte, error)
+	// rewrite, when set, names a parse that is not a profile filter, and
+	// passThrough what serving the upstream's bytes in its place would do.
+	// The refusals then say that rather than blame the profile.
+	rewrite, passThrough string
+	status               int
+	body                 bytes.Buffer
+	tooBig               bool
 }
 
 func (p *indexFilterWriter) WriteHeader(code int) {
@@ -340,13 +344,20 @@ func (p *indexFilterWriter) flush() error {
 	if p.status == http.StatusOK {
 		if p.tooBig {
 			err := fmt.Errorf("index for %s exceeds bodega's %d-byte filter buffer: serving it unfiltered would list versions this host is refused", p.subject, maxUpstreamBody)
+			if p.rewrite != "" {
+				err = fmt.Errorf("%s exceeds bodega's %d-byte buffer for the %s, and serving it as the upstream sent it would %s", p.subject, maxUpstreamBody, p.rewrite, p.passThrough)
+			}
 			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 			return err
 		}
 		if p.parse != nil {
 			filtered, err := p.parse(body)
 			if err != nil {
-				err = fmt.Errorf("%s could not be filtered for this host's profile, and serving it unfiltered would list packages this host is refused: %w", p.subject, err)
+				if p.rewrite != "" {
+					err = fmt.Errorf("%s failed the %s, and serving it as the upstream sent it would %s: %w", p.subject, p.rewrite, p.passThrough, err)
+				} else {
+					err = fmt.Errorf("%s could not be filtered for this host's profile, and serving it unfiltered would list packages this host is refused: %w", p.subject, err)
+				}
 				http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 				return err
 			}

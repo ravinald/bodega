@@ -200,6 +200,16 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 
 	upstreamURL, err := resolve(ctx)
 	if err != nil {
+		var refused *resolveRefusal
+		if errors.As(err, &refused) {
+			// The resolver read what the request names and bodega refuses the
+			// upstream it found. The log keeps the incident beside the key,
+			// which the body leaves out.
+			s.recordUpstreamAttempt(r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, decision)
+			s.logger.Warn("upstream resolution refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			refused.f.write(w, r)
+			return
+		}
 		if status != nil && status.Exists {
 			s.logger.Error("upstream resolution failed, serving the stale cached copy", "key", s3Key, "error", err)
 			// An outage is the window an operator reads these columns in.
@@ -1045,6 +1055,10 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 // the ones the age gate can date, which are also the ones whose storage key
 // names the version being fetched. A freebsd key's version slot holds the ABI,
 // and checking an advisory against that would answer for the wrong thing.
+// composer is listed for the second reason alone: the age gate cannot date a
+// Packagist version and OSV is not queried for one, so both pass for want of
+// a rule, while the provenance, name-similarity and integration checks still
+// answer for the version its dist key names.
 var fetchGatedTypes = map[string]bool{
 	manifest.TypeNpm:      true,
 	manifest.TypePypi:     true,
@@ -1052,6 +1066,7 @@ var fetchGatedTypes = map[string]bool{
 	manifest.TypeCargo:    true,
 	manifest.TypeMaven:    true,
 	manifest.TypeRubygems: true,
+	manifest.TypeComposer: true,
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age

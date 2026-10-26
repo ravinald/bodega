@@ -32,6 +32,11 @@ const (
 	// index and the legacy full index, under one upstream.
 	TypeRubygems = "rubygems"
 
+	// TypeComposer is a Composer v2 repository proxied from Packagist. The
+	// metadata names each version's archive at its own URL, almost always a
+	// GitHub zipball, so the archives come from hosts other than the upstream.
+	TypeComposer = "composer"
+
 	// TypeFreeBSD is a mirrored FreeBSD pkg repository. Named for the OS
 	// rather than for pkg, because "pkg" is already bodega's own subcommand
 	// and `bodega pkg create pkg nginx` is a sentence nobody should have to
@@ -60,7 +65,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeRubygems, TypeFreeBSD, TypeDistfiles}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeRubygems, TypeComposer, TypeFreeBSD, TypeDistfiles}
 
 // Dependency is one dependency a version declares, recorded in the shape the
 // registry protocol publishes rather than the shape the ecosystem's build file
