@@ -149,6 +149,29 @@ func TestCompatibleConstraintBoundsTheMajorOnEveryRoute(t *testing.T) {
 		}
 	})
 
+	t.Run("cargo download", func(t *testing.T) {
+		s := proxyingServer(t)
+		up := newRecordingUpstream(t)
+		s.cfg.CargoDLUpstream = up.ts.URL
+		up.route("/itoa/1.9.5/download", "itoa 1.9.5")
+		up.route("/itoa/2.0.0/download", "itoa 2.0.0")
+		addVersion(t, s, manifest.TypeCargo, "itoa", compatible("1.9.0"))
+
+		rec := doRequest(s, http.MethodGet, "/cargo/itoa/2.0.0/download", nil)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("2.0.0 under compatible 1.9.0 = %d %q, want 403", rec.Code, rec.Body.String())
+		}
+		refusalIncident(t, rec.Header(), checkConstraint)
+		if up.sawPath("/itoa/2.0.0/download") {
+			t.Errorf("refused 2.0.0 download reached the upstream: %v", up.paths())
+		}
+		wantOneDenial(t, s, audit.DenialVersionConstraint, "127.0.0.1")
+
+		if rec := doRequest(s, http.MethodGet, "/cargo/itoa/1.9.5/download", nil); rec.Code != http.StatusOK {
+			t.Errorf("1.9.5 under compatible 1.9.0 = %d %q, want 200", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("gomod", func(t *testing.T) {
 		s := proxyingServer(t)
 		up := newRecordingUpstream(t)

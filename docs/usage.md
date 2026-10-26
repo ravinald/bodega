@@ -4669,13 +4669,13 @@ All version entries support:
 
 Each route enforces an entry's `version_constraint` in its own way:
 
-| Type       | Where the constraint applies                                                                                                                                                                                                                              |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm`      | A tarball or version-document request outside the range gets a 403, and the version is dropped from the packument                                                                                                                                         |
-| `gomod`    | A `.info`, `.mod` or `.zip` request outside the range gets a 403 when the entry is in `proxy` mode. A mirrored module is answered from what bodega stored, with no constraint check, and `@v/list` is not filtered                                        |
-| `maven`    | A request naming a version outside the range gets a 403                                                                                                                                                                                                   |
-| `rubygems` | A `.gem` or gemspec request outside the range gets a 403                                                                                                                                                                                                  |
-| `cargo`    | The version is dropped from the sparse index bodega generates from the entry, so `cargo` never resolves it. There is no 403: `/cargo/<crate>/<version>/download` does not check the constraint, and a client that names the version directly is served it |
+| Type       | Where the constraint applies                                                                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `npm`      | A tarball or version-document request outside the range gets a 403, and the version is dropped from the packument                                                                                                  |
+| `gomod`    | A `.info`, `.mod` or `.zip` request outside the range gets a 403 when the entry is in `proxy` mode. A mirrored module is answered from what bodega stored, with no constraint check, and `@v/list` is not filtered |
+| `maven`    | A request naming a version outside the range gets a 403                                                                                                                                                            |
+| `rubygems` | A `.gem` or gemspec request outside the range gets a 403                                                                                                                                                           |
+| `cargo`    | A `/cargo/<crate>/<version>/download` request outside the range gets a 403, and the version is dropped from the sparse index bodega generates from the entry                                                       |
 
 Versions compare under the ecosystem's own ordering, never as strings:
 

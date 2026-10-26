@@ -340,6 +340,13 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 			s.refuseHidden(w, r, manifest.TypeCargo, crate, version)
 			return
 		}
+		vc, baseVer := packageVersionConstraint(pm)
+		if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+			if ok, ordered := versionAllowed(manifest.TypeCargo, baseVer, version, vc); !ok {
+				s.refuseVersionConstraint(w, r, manifest.TypeCargo, crate, baseVer, version, vc, ordered)
+				return
+			}
+		}
 	}
 
 	if !s.entitleGate(w, r, manifest.TypeCargo, crate, version) {

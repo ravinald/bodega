@@ -103,8 +103,7 @@ func rubygemsRelease(version string) string {
 
 // handleRubygemsVersioned serves a gem file or a gemspec, both of which name
 // one version of one gem and never change under that name. The gates are the
-// ones a crate download passes, plus the manifest's version constraint, which
-// a crate download does not check.
+// ones a crate download passes, the manifest's version constraint included.
 func (s *Server) handleRubygemsVersioned(w http.ResponseWriter, r *http.Request, name, version, s3Key, p string) {
 	ctx := r.Context()
 	release := rubygemsRelease(version)
