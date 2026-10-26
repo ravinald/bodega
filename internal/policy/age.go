@@ -34,6 +34,7 @@ var agePublishers = map[string]func(*AgeChecker, context.Context, string, string
 	manifest.TypeCargo:    (*AgeChecker).cratesPublishedAt,
 	manifest.TypeRubygems: (*AgeChecker).gemPublishedAt,
 	manifest.TypeMaven:    (*AgeChecker).mavenPublishedAt,
+	manifest.TypeComposer: (*AgeChecker).composerPublishedAt,
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -65,6 +66,9 @@ type AgeChecker struct {
 	// from in the order /maven/ asks them: a POM's response headers are the
 	// only place a Maven repository dates a release.
 	MavenBases []string
+	// ComposerBase is composer_upstream: Packagist's p2 metadata dates every
+	// version it lists.
+	ComposerBase string
 
 	// HTTP gets a conservative timeout so a slow upstream doesn't stall
 	// admission.
@@ -81,6 +85,7 @@ func NewAgeChecker(store AgeStore) *AgeChecker {
 		CratesBase:   "https://crates.io",
 		RubygemsBase: "https://rubygems.org",
 		MavenBases:   []string{"https://repo.maven.apache.org/maven2", "https://plugins.gradle.org/m2"},
+		ComposerBase: "https://repo.packagist.org",
 		HTTP:         &http.Client{Timeout: 10 * time.Second},
 		Now:          time.Now,
 	}
@@ -357,6 +362,101 @@ func (c *AgeChecker) mavenPublishedAt(ctx context.Context, name, version string)
 		return time.Time{}, notFound
 	}
 	return time.Time{}, fmt.Errorf("maven %s %s: no maven upstream is configured to date it", name, version)
+}
+
+// composerPublishedAt reads a version's time from Packagist's p2 metadata,
+// which lists every tagged release of a package in one document and every
+// branch in a second, ~dev.json. A version is matched as listed, then with
+// the optional leading "v" Composer itself ignores, so a manifest naming
+// 5.4.0 finds Packagist's v5.4.0. A version the document does not list, or
+// lists with no time, is an error, as a gem build the versions API does not
+// list is.
+func (c *AgeChecker) composerPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
+	name = strings.ToLower(name)
+	file := name + ".json"
+	if strings.HasPrefix(version, "dev-") || strings.HasSuffix(version, "-dev") {
+		file = name + "~dev.json"
+	}
+	var doc json.RawMessage
+	if err := c.getJSON(ctx, c.ComposerBase+"/p2/"+file, &doc); err != nil {
+		return time.Time{}, err
+	}
+	listed, times, err := ComposerPublishTimes(doc, name)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("packagist metadata for %s: %w", name, err)
+	}
+	match := ""
+	for _, v := range listed {
+		if v == version {
+			match = v
+			break
+		}
+		if match == "" && composerBareVersion(v) == composerBareVersion(version) {
+			match = v
+		}
+	}
+	if match == "" {
+		return time.Time{}, fmt.Errorf("packagist metadata does not list %s %s", name, version)
+	}
+	t, ok := times[match]
+	if !ok {
+		return time.Time{}, fmt.Errorf("packagist metadata lists %s %s with no readable time", name, match)
+	}
+	return t, nil
+}
+
+// ComposerPublishTimes reads the versions a p2 document lists for name, in
+// document order, and the time each carries. A version with no time, or one
+// that does not parse, is listed and absent from times. Under
+// "minified":"composer/2.0" a version carries only the keys that differ from
+// the version before it and "__unset" removes one, so a time is inherited
+// until a later version replaces or unsets it.
+func ComposerPublishTimes(doc []byte, name string) (versions []string, times map[string]time.Time, err error) {
+	var p2 struct {
+		Minified string          `json:"minified"`
+		Packages json.RawMessage `json:"packages"`
+	}
+	if err := json.Unmarshal(doc, &p2); err != nil {
+		return nil, nil, err
+	}
+	var pkgs map[string][]map[string]json.RawMessage
+	// Packagist answers an unknown package with an empty "packages" array.
+	if len(p2.Packages) > 0 && p2.Packages[0] == '{' {
+		if err := json.Unmarshal(p2.Packages, &pkgs); err != nil {
+			return nil, nil, err
+		}
+	}
+	minified := p2.Minified == "composer/2.0"
+	times = map[string]time.Time{}
+	var stamp string
+	for _, v := range pkgs[name] {
+		if !minified {
+			stamp = ""
+		}
+		if raw, ok := v["time"]; ok {
+			stamp = ""
+			_ = json.Unmarshal(raw, &stamp)
+		}
+		var version string
+		if raw, ok := v["version"]; !ok || json.Unmarshal(raw, &version) != nil || version == "" {
+			continue
+		}
+		versions = append(versions, version)
+		if t, err := time.Parse(time.RFC3339Nano, stamp); err == nil {
+			times[version] = t
+		}
+	}
+	return versions, times, nil
+}
+
+// composerBareVersion drops the "v" a Packagist tag may open with. Composer
+// normalizes v1.2.3 and 1.2.3 to one version, and OSV's Packagist records and
+// a manifest entry may each use either spelling.
+func composerBareVersion(v string) string {
+	if len(v) > 1 && (v[0] == 'v' || v[0] == 'V') && v[1] >= '0' && v[1] <= '9' {
+		return v[1:]
+	}
+	return v
 }
 
 // errMavenPOMNotFound is a repository answering 404 for a POM, which sends the

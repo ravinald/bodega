@@ -485,3 +485,65 @@ func TestSharedMavenArtifactsFromList(t *testing.T) {
 		t.Errorf("a distinctive artifactId under another groupId = %s at %d, want jackson-databind at 1", got, d)
 	}
 }
+
+// Packagist's squat is a lookalike vendor over a real package name, since
+// anyone may claim an unused vendor. A popular package name under another
+// vendor is distance 1, the vendor replaced whole; within a vendor, and for a
+// near vendor with a near package, the edits are summed.
+func TestNameSimilarityComposerLookalikeVendor(t *testing.T) {
+	for _, tc := range []struct {
+		name, nearest string
+		distance      int
+	}{
+		{"guzzle-http/guzzle", "guzzlehttp/guzzle", 1},
+		{"acme/guzzle", "guzzlehttp/guzzle", 1},
+		{"symfont/console", "symfony/console", 1},
+		{"symfony/consoel", "symfony/console", 1},
+		{"monolog/monologg", "monolog/monolog", 1},
+	} {
+		r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeComposer, tc.name)
+		if r.Action != ActionBlock || r.Details["nearest"] != tc.nearest || r.Details["distance"] != tc.distance {
+			t.Errorf("%s = %+v, want a block naming %s at distance %d", tc.name, r, tc.nearest, tc.distance)
+		}
+	}
+	for _, name := range []string{"guzzlehttp/guzzle", "symfony/console", "acme/billing-service"} {
+		if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeComposer, name); r.Action != ActionPass {
+			t.Errorf("%s = %+v, want a pass", name, r)
+		}
+	}
+	exact := &similarityStore{action: ActionBlock, rules: []Rule{{RegistryType: manifest.TypeComposer, Pattern: "acme/guzzle"}}}
+	if r := checkName(t, exact, manifest.TypeComposer, "acme/guzzle"); r.Action != ActionPass {
+		t.Errorf("an exact composer rule exempts its own name; got %+v", r)
+	}
+}
+
+// A package name the list carries under more than one vendor skips the
+// cross-vendor case only when no carrier's vendor names it, by a label split
+// at "-", "_" and ".". psr7 (guzzlehttp, nyholm, slim) and console (symfony,
+// illuminate) name nothing in particular; parsedown is erusev's and
+// parsedown's, and laravel is laravel's, so a lookalike vendor over either is
+// still near.
+func TestNameSimilarityComposerSharedPackageNamedByVendor(t *testing.T) {
+	p, ok := EmbeddedPopularNames(manifest.TypeComposer)
+	if !ok {
+		t.Fatal("no embedded composer list")
+	}
+	for _, tc := range []struct {
+		name string
+		near bool
+	}{
+		{"acme/psr7", false},
+		{"acme/console", false},
+		{"acme/parsedown", true},
+		{"acme/laravel", true},
+	} {
+		if got, d, near := p.Near(tc.name); near != tc.near {
+			t.Errorf("%s: near = %v (%s at %d), want %v", tc.name, near, got, d, tc.near)
+		}
+	}
+	shared := sharedComposerPackages([]string{"erusev/parsedown", "parsedown/parsedown", "guzzlehttp/psr7", "nyholm/psr7",
+		"php-http/discovery", "acme/discovery", "php-http/http", "acme/http"})
+	if !shared["psr7"] || !shared["discovery"] || shared["parsedown"] || shared["http"] {
+		t.Errorf("shared = %v, want psr7 and discovery; parsedown and http (a label of php-http) are named", shared)
+	}
+}

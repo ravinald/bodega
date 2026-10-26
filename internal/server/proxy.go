@@ -1125,10 +1125,6 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 // the ones the age gate can date, which are also the ones whose storage key
 // names the version being fetched. A freebsd key's version slot holds the ABI,
 // and checking an advisory against that would answer for the wrong thing.
-// composer is listed for the second reason alone: the age gate cannot date a
-// Packagist version and OSV is not queried for one, so both pass for want of
-// a rule, while the provenance, name-similarity and integration checks still
-// answer for the version its dist key names.
 var fetchGatedTypes = map[string]bool{
 	manifest.TypeNpm:      true,
 	manifest.TypePypi:     true,
@@ -1145,10 +1141,10 @@ var fetchGatedTypes = map[string]bool{
 var fetchCheckers = admit.VersionCheckers
 
 // datedThroughUpstream sends the age gate's reads through the proxy's own
-// transport and guard. A gem is dated at rubygems_upstream and a Maven
-// artifact at maven_upstreams, the hosts their bytes come from, so that read is
-// held to upstream_connect_timeout and the redirect guard as the fetch it
-// gates is.
+// transport and guard. A gem is dated at rubygems_upstream, a Maven artifact
+// at maven_upstreams and a Composer archive at composer_upstream, the hosts
+// their bytes or metadata come from, so that read is held to
+// upstream_connect_timeout and the redirect guard as the fetch it gates is.
 func datedThroughUpstream(checkers []policy.VersionChecker) {
 	for _, c := range checkers {
 		if ac, ok := c.(*policy.AgeChecker); ok {
@@ -1215,7 +1211,7 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	switch {
 	case fetchGatedTypes[fill.typ] && fill.version != "":
 		checkers = fetchCheckers(s.cfg, s.auditDB)
-		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven {
+		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven || fill.typ == manifest.TypeComposer {
 			datedThroughUpstream(checkers)
 		}
 	case fill.typ == manifest.TypeApt && fill.version != "":

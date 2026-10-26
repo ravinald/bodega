@@ -77,6 +77,14 @@ var osvAgreementCases = []osvAgreementCase{
 		ids:          []string{"GHSA-jfh8-c2jp-5v3q"},
 		clean:        "2.15.0",
 	},
+	{
+		registryType: manifest.TypeComposer,
+		ecosystem:    "Packagist",
+		pkg:          "firebase/php-jwt",
+		vulnerable:   "5.4.0",
+		ids:          []string{"GHSA-2x45-7fc3-mxwq", "GHSA-8xf4-w7qw-pjjw"},
+		clean:        "7.0.0",
+	},
 }
 
 // osvAgreementCase is one (ecosystem, package, version) pair the local matcher
@@ -738,5 +746,45 @@ func TestOSVRange_MavenOrder(t *testing.T) {
 	fixed := osvRange{Type: "ECOSYSTEM", Events: []osvEvent{{Introduced: "2.0-beta9"}, {Fixed: "2.3.1"}}}
 	if hit, bad := fixed.affects(osvVersionOrder("Maven"), "2.3.0.RELEASE"); !hit || bad != "" {
 		t.Errorf("2.3.0.RELEASE under [2.0-beta9, 2.3.1): hit=%v unorderable=%q, want a hit", hit, bad)
+	}
+}
+
+// Packagist tags firebase/php-jwt as v5.4.0, and Composer reads that and
+// 5.4.0 as one version. The gate strips the "v" before walking OSV's ranges,
+// so either spelling is refused with both advisories named, and the fixed
+// release passes under either.
+func TestOSVChecker_ComposerVPrefixedVersion(t *testing.T) {
+	db := syncedDB(t)
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeComposer: {Ecosystem: manifest.TypeComposer, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	for _, v := range []string{"v5.4.0", "5.4.0", "V5.4.0"} {
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: "firebase/php-jwt", Type: manifest.TypeComposer},
+			&manifest.VersionEntry{Version: v})
+		if r.Action != ActionBlock || !strings.Contains(r.Reason, "GHSA-2x45-7fc3-mxwq") || !strings.Contains(r.Reason, "GHSA-8xf4-w7qw-pjjw") {
+			t.Errorf("firebase/php-jwt %s = %+v, want a block naming both advisories", v, r)
+		}
+	}
+	for _, v := range []string{"v7.0.0", "7.0.0"} {
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: "firebase/php-jwt", Type: manifest.TypeComposer},
+			&manifest.VersionEntry{Version: v})
+		if r.Action != ActionPass {
+			t.Errorf("firebase/php-jwt %s = %+v, want a pass", v, r)
+		}
+	}
+	if got := osvQueryVersion("Packagist", "v5.4.0"); got != "5.4.0" {
+		t.Errorf("osvQueryVersion(Packagist, v5.4.0) = %q, want 5.4.0", got)
+	}
+	for _, v := range []string{"dev-main", "v", "vendor-1.0"} {
+		if got := osvQueryVersion("Packagist", v); got != v {
+			t.Errorf("osvQueryVersion(Packagist, %q) = %q; only a v before a digit is a prefix", v, got)
+		}
+	}
+	if got := OSVEcosystemFor(manifest.TypeComposer); got != "Packagist" {
+		t.Errorf("OSVEcosystemFor(composer) = %q, want Packagist", got)
 	}
 }

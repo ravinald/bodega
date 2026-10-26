@@ -95,7 +95,7 @@ var publishTimeClient = &http.Client{Timeout: 10 * time.Second, Transport: guard
 // upstreams this server proxies rather than at the public registries
 // admission reads. The filter has to date the versions the client is shown,
 // and those come from npm_upstream, pypi_upstream, gomod_upstream,
-// rubygems_upstream and maven_upstreams.
+// rubygems_upstream, maven_upstreams and composer_upstream.
 func (s *Server) publishClock() *policy.AgeChecker {
 	c := policy.NewAgeChecker(nil)
 	c.NpmRegistry = strings.TrimRight(s.cfg.NpmUpstream, "/")
@@ -103,6 +103,7 @@ func (s *Server) publishClock() *policy.AgeChecker {
 	c.GoProxy = strings.TrimRight(s.cfg.GomodUpstream, "/")
 	c.RubygemsBase = strings.TrimRight(s.cfg.RubygemsUpstream, "/")
 	c.MavenBases = s.cfg.MavenUpstreams
+	c.ComposerBase = strings.TrimRight(s.cfg.ComposerUpstream, "/")
 	c.HTTP = publishTimeClient
 	return c
 }
@@ -399,6 +400,21 @@ func (iw *indexWithhold) mavenMetadata(body []byte) []byte {
 		return body
 	}
 	return filterMavenMetadata(body, func(v string) bool { _, ok := withheld[v]; return !ok })
+}
+
+// composerMetadata decides a proxied p2 document, dating each version by the
+// time the document itself carries. It returns the versions withheld; the
+// caller drops them in the same pass as the profile filter, because removing
+// one from a minified list rewrites the versions after it.
+func (iw *indexWithhold) composerMetadata(body []byte) (map[string]string, error) {
+	listed, times, err := policy.ComposerPublishTimes(body, iw.name)
+	if err != nil {
+		return nil, fmt.Errorf("parse composer metadata for %s: %w", iw.name, err)
+	}
+	for v, t := range times {
+		iw.s.publishTimes.put(iw.eco, iw.name, v, t)
+	}
+	return iw.decide(listed, times), nil
 }
 
 // gomodList withholds from a proxied @v/list.
