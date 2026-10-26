@@ -390,8 +390,97 @@ func TestAgePolicy_MavenLookupIsShared(t *testing.T) {
 	}
 }
 
+// A Composer version is dated by the time Packagist's p2 metadata lists for
+// it. The document is minified, so a version carrying no time key inherits
+// the one before it and "__unset" removes it; a branch is read from
+// ~dev.json; a version is found with or without its leading "v".
+func TestAgePolicy_ComposerDatedFromPackagistMetadata(t *testing.T) {
+	now := time.Now()
+	stamp := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/p2/firebase/php-jwt.json":
+			fmt.Fprintf(w, `{"minified":"composer/2.0","packages":{"firebase/php-jwt":[
+				{"name":"firebase/php-jwt","version":"v7.0.1","time":%q},
+				{"version":"v7.0.0","time":%q},
+				{"version":"v6.11.1"},
+				{"version":"v6.11.0","time":"__unset"}
+			]}}`, stamp(2*time.Hour), stamp(30*24*time.Hour))
+		case "/p2/firebase/php-jwt~dev.json":
+			fmt.Fprintf(w, `{"minified":"composer/2.0","packages":{"firebase/php-jwt":[
+				{"name":"firebase/php-jwt","version":"dev-main","time":%q}
+			]}}`, stamp(time.Hour))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeComposer: {Ecosystem: manifest.TypeComposer, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	for _, tc := range []struct {
+		version string
+		action  string
+		reason  string
+	}{
+		{"v7.0.1", ActionBlock, "firebase/php-jwt@v7.0.1 is 2h old"},
+		{"7.0.1", ActionBlock, "firebase/php-jwt@7.0.1 is 2h old"},
+		{"v7.0.0", ActionPass, ""},
+		{"6.11.1", ActionPass, ""},
+		{"v6.11.0", ActionWarn, "lists firebase/php-jwt v6.11.0 with no readable time"},
+		{"v5.0.0", ActionWarn, "does not list firebase/php-jwt v5.0.0"},
+		{"dev-main", ActionBlock, "firebase/php-jwt@dev-main is 1h old"},
+	} {
+		ck := NewAgeChecker(store)
+		ck.ComposerBase = srv.URL
+		ck.HTTP = srv.Client()
+		r := ck.Check(context.Background(),
+			&manifest.PackageManifest{Name: "firebase/php-jwt", Type: manifest.TypeComposer},
+			&manifest.VersionEntry{Version: tc.version})
+		if r.Action != tc.action || !strings.Contains(r.Reason, tc.reason) {
+			t.Errorf("%s: got %s %q, want %s containing %q", tc.version, r.Action, r.Reason, tc.action, tc.reason)
+		}
+	}
+	for _, p := range paths {
+		if p != "/p2/firebase/php-jwt.json" && p != "/p2/firebase/php-jwt~dev.json" {
+			t.Errorf("packagist metadata path, got %q", p)
+		}
+	}
+}
+
+// Two checks of one Composer version under one ShareLookups context read the
+// p2 document once, as two checks of one gem version read the versions API
+// once.
+func TestAgePolicy_ComposerLookupIsShared(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		fmt.Fprintf(w, `{"packages":{"monolog/monolog":[{"version":"3.8.0","time":%q}]}}`,
+			time.Now().Add(-time.Hour).UTC().Format(time.RFC3339))
+	}))
+	defer srv.Close()
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeComposer: {Ecosystem: manifest.TypeComposer, MinAgeSeconds: 86400, Action: ActionBlock},
+	}}
+	ctx := ShareLookups(context.Background())
+	for range 2 {
+		ck := NewAgeChecker(store)
+		ck.ComposerBase = srv.URL
+		if r := ck.Check(ctx, &manifest.PackageManifest{Name: "monolog/monolog", Type: manifest.TypeComposer},
+			&manifest.VersionEntry{Version: "3.8.0"}); r.Action != ActionBlock {
+			t.Fatalf("1h-old version under a 1d policy blocks; got %+v", r)
+		}
+	}
+	if hits != 1 {
+		t.Errorf("p2 metadata read %d times, want 1", hits)
+	}
+}
+
 func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	want := []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
 	got := AgeEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
@@ -429,6 +518,7 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 			}}
 			ck := NewAgeChecker(store)
 			ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase, ck.RubygemsBase, ck.MavenBases = srv.URL, srv.URL, srv.URL, srv.URL, srv.URL, []string{srv.URL}
+			ck.ComposerBase = srv.URL
 
 			r := ck.Check(context.Background(),
 				&manifest.PackageManifest{Name: "thing", Type: eco},

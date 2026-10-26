@@ -131,6 +131,9 @@ func composerMetadataPath(name string, dev bool) string {
 // handleComposerMetadata serves a package's p2 document with every dist URL
 // rewritten onto this server. The cache holds the upstream's bytes, so the
 // rewrite runs on every answer and follows this request's own base URL.
+//
+// The index filter rewrites only a document answered from upstream, as the
+// gomod route's does: a hosted package lists versions admitted on import.
 func (s *Server) handleComposerMetadata(w http.ResponseWriter, r *http.Request, name string, dev bool) {
 	noSharedCache(w)
 	pm, _ := s.store.GetPackage(r.Context(), manifest.TypeComposer, name)
@@ -149,13 +152,30 @@ func (s *Server) handleComposerMetadata(w http.ResponseWriter, r *http.Request, 
 		rewrite:        "dist URL rewrite",
 		passThrough:    "hand the client the upstream's dist URLs and send its archive fetches around bodega",
 	}
-	if permit := profileVersionFilter(s.profileFor(r), manifest.TypeComposer, name); permit != nil {
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypeComposer, name)
+	var withhold *indexWithhold
+	if (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy) {
+		withhold = s.indexWithholdFor(r, manifest.TypeComposer, name)
+	}
+	if permit != nil || withhold != nil {
 		// The filter runs on the upstream's bytes and the rewrite on what it
 		// leaves, so a dist a dropped version carried is never rewritten.
-		// Clearing rewrite makes a failure read as the profile's.
+		// Clearing rewrite makes a failure read as the filter's.
 		rw.rewrite, rw.passThrough = "", ""
 		rw.parse = func(b []byte) ([]byte, error) {
-			filtered, err := filterComposerMetadata(b, name, permit)
+			keep := permit
+			if withhold != nil {
+				withheld, err := withhold.composerMetadata(b)
+				if err != nil {
+					return nil, err
+				}
+				withhold.finish(w.Header())
+				keep = func(v string) bool {
+					_, gone := withheld[v]
+					return !gone && (permit == nil || permit(v))
+				}
+			}
+			filtered, err := filterComposerMetadata(b, name, keep)
 			if err != nil {
 				return nil, err
 			}
@@ -193,6 +213,10 @@ func (s *Server) handleComposerDist(w http.ResponseWriter, r *http.Request, d co
 		}
 	}
 	if !s.entitleGate(w, r, manifest.TypeComposer, d.name, d.version) {
+		return
+	}
+	proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+	if proxied && s.refuseWithheld(w, r, manifest.TypeComposer, d.name, d.version) {
 		return
 	}
 

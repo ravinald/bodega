@@ -38,6 +38,7 @@ var osvEcosystemFor = map[string]string{
 	manifest.TypeCargo:    "crates.io",
 	manifest.TypeRubygems: "RubyGems",
 	manifest.TypeMaven:    "Maven",
+	manifest.TypeComposer: "Packagist",
 }
 
 // OSVEcosystemFor returns OSV's identifier for a registry type, or "" when
@@ -436,11 +437,15 @@ func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.V
 // osvQueryVersion is the version an advisory is matched against. A platform
 // gem's version carries its platform ("1.16.7-x86_64-linux"), and RubyGems
 // advisories are issued against the release, which every platform build of it
-// shares.
+// shares. A Packagist tag may open with a "v" that Composer ignores, and
+// OSV's ranges are written without it.
 func osvQueryVersion(ecosystem, version string) string {
-	if ecosystem == "RubyGems" {
+	switch ecosystem {
+	case "RubyGems":
 		release, _, _ := strings.Cut(version, "-")
 		return release
+	case "Packagist":
+		return composerBareVersion(version)
 	}
 	return version
 }

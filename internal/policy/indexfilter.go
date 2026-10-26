@@ -29,9 +29,10 @@ type IndexFilterStore interface {
 // filter can rewrite, sorted. cargo has an age gate and a sparse index too,
 // and is not here because nothing in its index dates a release. Nothing in a
 // maven-metadata.xml does either; it is here because, as with a gomod list,
-// each version it names can be dated by a read of its own.
+// each version it names can be dated by a read of its own. A composer p2
+// document dates every version it lists, as an npm packument does.
 func IndexFilterEcosystems() []string {
-	return []string{manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi}
+	return []string{manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi}
 }
 
 // IndexFilter decides which versions a proxied index omits so a client's
