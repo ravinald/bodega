@@ -391,19 +391,25 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	return out
 }
 
-// entry is the profile's entry for typ/name. A maven coordinate the profile
-// does not name falls back to its <groupId>:* entry, so a groupId-wide entry
-// lists every artifact of that groupId and an entry naming one artifact still
-// overrides it for that artifact alone.
+// entry is the profile's entry for typ/name. A maven coordinate or a composer
+// package the profile does not name falls back to its <groupId>:* or
+// <vendor>/* entry, so a wide entry lists every package under it and an entry
+// naming one package still overrides it for that package alone.
 func (p *Profile) entry(typ, name string) (audit.ProfileEntry, bool) {
 	if e, ok := p.entries[typ][Key(typ, name)]; ok {
 		return e, true
 	}
-	if typ == manifest.TypeMaven {
-		if group, ok := manifest.MavenGroupEntry(name); ok {
-			e, ok := p.entries[typ][group]
-			return e, ok
-		}
+	var wide string
+	var ok bool
+	switch typ {
+	case manifest.TypeMaven:
+		wide, ok = manifest.MavenGroupEntry(name)
+	case manifest.TypeComposer:
+		wide, ok = manifest.ComposerVendorEntry(name)
+	}
+	if ok {
+		e, ok := p.entries[typ][wide]
+		return e, ok
 	}
 	return audit.ProfileEntry{}, false
 }

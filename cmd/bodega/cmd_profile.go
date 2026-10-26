@@ -2144,7 +2144,7 @@ version it holds is one nothing can serve.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			var violations, unchecked, groupWide int
+			var violations, unchecked, groupWide, vendorWide int
 			var notes []string
 			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -2167,6 +2167,10 @@ version it holds is one nothing can serve.`,
 					}
 					if e.Type == manifest.TypeMaven && strings.HasSuffix(e.Name, ":"+manifest.MavenGroupWildcard) {
 						groupWide++
+						continue
+					}
+					if e.Type == manifest.TypeComposer && strings.HasSuffix(e.Name, "/"+manifest.ComposerVendorWildcard) {
+						vendorWide++
 						continue
 					}
 					reason, note, err := entryResolves(ctx, store, resolved, e, srcIndex)
@@ -2206,6 +2210,10 @@ version it holds is one nothing can serve.`,
 			if groupWide > 0 {
 				fmt.Printf("%d maven groupId-wide entr%s not checked: <groupId>:* names every artifact of a groupId rather than one package the catalog holds.\n",
 					groupWide, plural(groupWide, "y", "ies"))
+			}
+			if vendorWide > 0 {
+				fmt.Printf("%d composer vendor-wide entr%s not checked: <vendor>/* names every package of a vendor rather than one package the catalog holds.\n",
+					vendorWide, plural(vendorWide, "y", "ies"))
 			}
 			if violations == 0 {
 				fmt.Printf("OK: every entry in %d profile(s) resolves in the catalog.\n", len(names))
@@ -2560,6 +2568,8 @@ func requireEntryNameForm(typ, name string) error {
 		return manifest.ValidateGomodName(name)
 	case manifest.TypeMaven:
 		return manifest.ValidateMavenName(name)
+	case manifest.TypeComposer:
+		return manifest.ValidateComposerName(name)
 	}
 	return nil
 }
