@@ -5168,7 +5168,7 @@ distributionUrl=https://bodega-host:8080/binaries/maven-dist/org/apache/maven/ap
 distributionUrl=https\://bodega-host\:8080/binaries/gradle-dist/distributions/gradle-9.8.2-bin.zip
 ```
 
-The Maven distribution is itself an artifact on Maven Central, so the Maven wrapper's `distributionUrl` may point at `/maven/` instead, with no namespace: `https://bodega-host:8080/maven/org/apache/maven/apache-maven/3.9.11/apache-maven-3.9.11-bin.zip`, judged and recorded as `org.apache.maven:apache-maven`. The wrapper swaps `-bin.zip` for `-bin.tar.gz` where `tar` is present, and the route serves both. Gradle's distributions are not in a Maven layout and still need `gradle-dist`.
+The Maven distribution is itself an artifact on Maven Central, so the Maven wrapper's `distributionUrl` may point at `/maven/` instead, with no namespace: `https://bodega-host:8080/maven/org/apache/maven/apache-maven/3.9.11/apache-maven-3.9.11-bin.zip`, judged and recorded as `org.apache.maven:apache-maven`. The wrapper swaps `-bin.zip` for `-bin.tar.gz` on a host without `unzip`, and the route serves both. Gradle's distributions are not in a Maven layout and still need `gradle-dist`.
 
 A `wrapperUrl` in `maven-wrapper.properties`, where a project has one, takes `https://bodega-host:8080/maven/` in place of `https://repo.maven.apache.org/maven2/`. `distributionSha256Sum` still matches, since bodega serves the bytes unchanged. sbt and Leiningen take `https://bodega-host:8080/maven/` as their only resolver, set by hand.
 
