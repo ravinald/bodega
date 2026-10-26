@@ -441,6 +441,35 @@ func TestNameSimilarityMavenSharedArtifactID(t *testing.T) {
 	}
 }
 
+// A shared artifactId that a carrier's groupId names keeps the cross-groupId
+// case: guava is com.google.guava's, whoever else republishes it. One that no
+// carrier's groupId names stays shared, which is where hibernate-validator
+// (org.hibernate, org.hibernate.validator) and jersey-server
+// (org.glassfish.jersey.core, com.sun.jersey) land.
+func TestNameSimilarityMavenSharedArtifactNamedByGroupID(t *testing.T) {
+	p, ok := EmbeddedPopularNames(manifest.TypeMaven)
+	if !ok {
+		t.Fatal("no embedded maven list")
+	}
+	for _, tc := range []struct {
+		name string
+		near bool
+	}{
+		{"io.github.someone:guava", true},
+		{"org.google.guava:guava", true},
+		{"io.evil:okhttp", true},
+		{"io.github.x:postgresql", true},
+		{"io.github.x:commons-io", true},
+		{"io.github.x:rxjava", true},
+		{"io.github.x:hibernate-validator", false},
+		{"io.github.x:jersey-server", false},
+	} {
+		if got, d, near := p.Near(tc.name); near != tc.near {
+			t.Errorf("%s: near = %v (%s at %d), want %v", tc.name, near, got, d, tc.near)
+		}
+	}
+}
+
 func TestSharedMavenArtifactsFromList(t *testing.T) {
 	p, err := ParsePopularNames(manifest.TypeMaven, []byte("org.jetbrains:annotations\ncom.google.code.findbugs:annotations\ncom.fasterxml.jackson.core:jackson-databind\n"))
 	if err != nil {
