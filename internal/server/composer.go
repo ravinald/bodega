@@ -192,7 +192,7 @@ func (s *Server) handleComposerDist(w http.ResponseWriter, r *http.Request, d co
 		return
 	}
 	resolve := func(context.Context) (string, error) { return s.composerDistUpstream(r, d) }
-	s.proxyOrResolve(w, r, store, manifest.ComposerDistKey(d.name, d.version, d.reference), resolve, "",
+	s.proxyOrResolve(w, r, store, manifest.ComposerDistKey(d.name, d.version, d.reference), resolve, "", nil,
 		manifest.TypeComposer, d.name, d.name, true, forceProxy)
 }
 
