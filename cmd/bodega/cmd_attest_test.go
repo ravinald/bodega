@@ -236,3 +236,82 @@ func trustedKeys(t *testing.T, ring *attestsign.KeyRing) map[string]ed25519.Publ
 	}
 	return map[string]ed25519.PublicKey{ring.Signer().KeyID(): pub}
 }
+
+// The composer dist key carries no archive type, so the route is rebuilt as a
+// zip; a branch version's "/" stays inside one escaped segment.
+func TestServedPathComposer(t *testing.T) {
+	for _, c := range []struct {
+		name, version, key, want, wantErr string
+	}{
+		{"symfony/console", "v7.1.5", manifest.ComposerDistKey("symfony/console", "v7.1.5", "abc123"),
+			"/composer/dist/symfony/console/v7.1.5/abc123.zip", ""},
+		{"acme/widget", "dev-feature/x", manifest.ComposerDistKey("acme/widget", "dev-feature/x", "def456"),
+			"/composer/dist/acme/widget/dev-feature%2Fx/def456.zip", ""},
+		{"symfony/console", "v7.1.5", manifest.NpmTarballKey("lodash", "4.17.21"), "", "--artifact"},
+		{"symfony/console", "v7.1.5", manifest.ComposerDistKey("symfony/console", "v7.1.5", ""), "", "--artifact"},
+	} {
+		got, err := servedPath(manifest.TypeComposer, c.name, c.version, c.key)
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) || !strings.Contains(err.Error(), c.key) ||
+				!strings.Contains(err.Error(), manifest.TypeComposer) {
+				t.Errorf("servedPath(%q) = %q, %v; want an error naming composer, the key and %s", c.key, got, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("servedPath(%q) = %q, %v; want %q", c.key, got, err, c.want)
+		}
+	}
+}
+
+// A composer statement verifies by name against the zip at the rebuilt route,
+// and a 404 there says the dist may not be a zip and names --artifact.
+func TestAttestVerifyComposerFromServer(t *testing.T) {
+	_, ring := attestInstall(t)
+	artifact := []byte("symfony console zip")
+	sum := sha256.Sum256(artifact)
+	st := attest.NewStatement(attest.Pin{Type: manifest.TypeComposer, Name: "symfony/console", Version: "v7.1.5",
+		ObjectKey: manifest.ComposerDistKey("symfony/console", "v7.1.5", "abc123"), SHA256: hex.EncodeToString(sum[:])},
+		audit.Admission{Decision: audit.AdmissionAdmitted, DecidedAt: time.Now(), PolicyDigest: "sha256:" + strings.Repeat("ab", 32)},
+		"https://bodega.example", time.Now())
+	env, err := attest.Sign(ring.Signer(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := json.Marshal([]map[string]string{{"public_key_pem": string(ring.Keys()[0].PublicKeyPEM)}})
+	serveZip := true
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/packages/composer/symfony/console/v7.1.5/attestation":
+			_, _ = w.Write(env)
+		case r.URL.Path == "/api/v1/attestation/keys":
+			_, _ = w.Write(keys)
+		case r.URL.Path == "/composer/dist/symfony/console/v7.1.5/abc123.zip" && serveZip:
+			_, _ = w.Write(artifact)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	out, err := runAttest(t, "verify", "composer/symfony/console/v7.1.5", "--server", ts.URL, "--key", ring.Signer().KeyID())
+	if err != nil {
+		t.Fatalf("verify composer from server: %v\n%s", err, out)
+	}
+	for _, check := range []string{"signature", "predicate-type", "subject-digest", "subject-name", "policy"} {
+		if !strings.Contains(out, "ok    "+check) {
+			t.Errorf("check %s did not pass:\n%s", check, out)
+		}
+	}
+
+	serveZip = false
+	out, err = runAttest(t, "verify", "composer/symfony/console/v7.1.5", "--server", ts.URL, "--key", ring.Signer().KeyID())
+	if err == nil {
+		t.Fatalf("verify with no zip served passed:\n%s", out)
+	}
+	for _, want := range []string{"symfony/console", "v7.1.5", "/composer/dist/symfony/console/v7.1.5/abc123.zip", "may not be a zip", "--artifact"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("404 error %q does not name %q", err, want)
+		}
+	}
+}
