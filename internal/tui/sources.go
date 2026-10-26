@@ -467,6 +467,49 @@ func (m *sourcesModel) CursorToEntry(entryType, name string) bool {
 	return false
 }
 
+// CursorToNode moves the cursor to the package header for entryType/name, or
+// to its version leaf when version is set, expanding the groups above it.
+// Returns false, leaving the cursor where it was, when no such row exists.
+func (m *sourcesModel) CursorToNode(entryType, name, version string) bool {
+	roots := m.roots()
+	var target *TreeNode
+	for i := range roots {
+		if roots[i].EntryType != entryType {
+			continue
+		}
+		for j := range roots[i].Children {
+			pkg := &roots[i].Children[j]
+			if version == "" {
+				if pkg.Name == name {
+					roots[i].Expanded = true
+					target = pkg
+				}
+				continue
+			}
+			for k := range pkg.Children {
+				leaf := &pkg.Children[k]
+				if leaf.Name == name && leaf.Version == version {
+					roots[i].Expanded = true
+					pkg.Expanded = true
+					target = leaf
+				}
+			}
+		}
+	}
+	if target == nil {
+		return false
+	}
+	m.flatList = flatten(roots, m.filter)
+	for i, row := range m.flatList {
+		if row.node == target {
+			m.cursor = i
+			m.ensureCursorVisible()
+			return true
+		}
+	}
+	return false
+}
+
 // ToggleExpand expands or collapses the selected group node.
 func (m *sourcesModel) ToggleExpand() {
 	row := m.flatList[m.cursor]

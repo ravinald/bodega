@@ -109,6 +109,22 @@ const (
 // EventOverride is an override requested, approved or rejected.
 const EventOverride EventType = "override"
 
+// EventTypes returns every EventType the package declares, so a caller
+// offering a choice of them (the TUI audit query form) lists a new type
+// without an edit of its own. TestEventTypesListsEveryConstant fails when a
+// constant is declared and left out of this list.
+func EventTypes() []EventType {
+	return []EventType{
+		EventInit, EventReset, EventStatus, EventFetch, EventBuild,
+		EventPackage, EventUpload, EventSync, EventCreate, EventDelete,
+		EventRepair, EventRefresh, EventHide, EventFreeze, EventEdit,
+		EventShow, EventPolicy, EventRevet,
+		EventServeStart, EventServeStop,
+		EventServeFetch, EventCache,
+		EventDenied, EventOverride, EventInventory, EventQueue,
+	}
+}
+
 // Status values for EventCache. They name the proxy outcome, so an operator
 // asking which artifacts came from upstream can tell that from an artifact the
 // cache answered and from the two refusals that write the same type.

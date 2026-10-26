@@ -497,6 +497,12 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		dismissed, cmd := m.popup.HandleJSONOverlayKey(msg, applyFn)
 		if dismissed {
 			m.sources.Refresh(m.store, m.statuses)
+			// Refresh rebuilds the tree collapsed and keeps only the row
+			// index, which then points at an unrelated row. A version-scoped
+			// save may have renamed its version, hence the header fallback.
+			if !m.sources.CursorToNode(m.popup.editType, m.popup.editName, m.popup.editVersion) {
+				m.sources.CursorToNode(m.popup.editType, m.popup.editName, "")
+			}
 			m.syncDetails()
 			// Unlike popupForm, where the overlay is a sub-mode the form
 			// returns to, this popup has nothing behind the textarea. Leaving
@@ -975,7 +981,7 @@ func (m appModel) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// toggleFocus switches keyboard focus between Sources and Log panes.
+// toggleFocus cycles keyboard focus Sources > Details > Log > Sources.
 func (m appModel) toggleFocus() appModel {
 	m.sources.focused = false
 	m.details.focused = false
@@ -1015,7 +1021,7 @@ func (m *appModel) buildAuditPopup() popupModel {
 		nextPopup: next,
 		formFields: []formField{
 			{Label: "Event type", Value: "", Select: true,
-				Options: []string{"", "fetch", "build", "create", "delete", "cache"}},
+				Options: auditEventOptions()},
 			{Label: "Pkg type", Value: "", Select: true,
 				Options: auditTypeOptions()},
 			{Label: "Pkg name", Value: ""},
@@ -1411,6 +1417,19 @@ var createTypeOptions = []string{
 	manifest.TypeNpm,
 	manifest.TypePypi,
 	manifest.TypeRubygems,
+}
+
+// auditEventOptions is the event-type filter for the audit query form, with
+// an empty first entry meaning "any event". audit.EventTypes supplies the
+// rest, so an event the TUI records is always one the form can select.
+func auditEventOptions() []string {
+	types := audit.EventTypes()
+	out := make([]string, 0, len(types)+1)
+	out = append(out, "")
+	for _, t := range types {
+		out = append(out, string(t))
+	}
+	return out
 }
 
 // auditTypeOptions is the package-type filter for the audit query form, with an
