@@ -224,3 +224,61 @@ func TestMavenProfileTakesSetAddPinAndRemove(t *testing.T) {
 		t.Error("org.springframework.boot:spring-boot is still covered after the groupId-wide entry was removed")
 	}
 }
+
+// A composer entry is a lowercase <vendor>/<package> or a vendor-wide
+// <vendor>/*, and a name in any other form is refused before it is stored:
+// Packagist names are lowercase, so a capitalized entry is one the gate never
+// matches.
+func TestComposerProfileTakesSetAddPinAndRemove(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "composer", "symfony/*")
+	mustRunProfile(t, "add", "web", "composer", "psr/log")
+	mustRunProfile(t, "pin", "web", "composer", "monolog/monolog", "3.7.0", "--reason", "3.8 needs PHP 8.3")
+	mustRunProfile(t, "set", "web", "composer", "--membership", "closed", "--expansion", "block")
+
+	for _, bad := range []string{"monolog", "Monolog/Monolog", "symfony/console/extra", "/console", "symfony/", "*/console", "symfony/con*", "sym*/console"} {
+		if _, err := runProfile(t, "add", "web", "composer", bad); err == nil || !strings.Contains(err.Error(), "composer") {
+			t.Errorf("add composer %q = %v, want a refusal naming the package form", bad, err)
+		}
+	}
+	if _, err := runProfile(t, "pin", "web", "composer", "Psr/Log", "3.0.2", "--reason", "x"); err == nil {
+		t.Error("pin took a composer name that is not lowercase")
+	}
+	if _, err := runProfile(t, "remove", "web", "composer", "monolog"); err == nil {
+		t.Error("remove took a composer name with no vendor")
+	}
+
+	p := storedProfile(t, env, "web")
+	if !p.Governs(manifest.TypeComposer) {
+		t.Fatal("set web composer stored no composer rule")
+	}
+	for name, want := range map[string]bool{
+		"psr/log":             true,
+		"symfony/console":     true,
+		"symfony/http-kernel": true,
+		"psr/container":       false,
+		"laravel/framework":   false,
+	} {
+		if got := p.Covers(manifest.TypeComposer, name).Permitted; got != want {
+			t.Errorf("Covers(composer, %s) = %v, want %v", name, got, want)
+		}
+	}
+	if !p.Permits(manifest.TypeComposer, "monolog/monolog", "3.7.0").Permitted ||
+		p.Permits(manifest.TypeComposer, "monolog/monolog", "3.8.0").Permitted {
+		t.Error("the monolog pin does not hold 3.7.0 and refuse 3.8.0")
+	}
+
+	out, err := runProfile(t, "check", "web")
+	if strings.Contains(out, "symfony/*") {
+		t.Errorf("profile check reported the vendor-wide entry as a package it could not find (%v):\n%s", err, out)
+	}
+	if !strings.Contains(out, "1 composer vendor-wide entry not checked") {
+		t.Errorf("profile check does not say the vendor-wide entry went unchecked:\n%s", out)
+	}
+
+	mustRunProfile(t, "remove", "web", "composer", "symfony/*")
+	if storedProfile(t, env, "web").Covers(manifest.TypeComposer, "symfony/console").Permitted {
+		t.Error("symfony/console is still covered after the vendor-wide entry was removed")
+	}
+}
