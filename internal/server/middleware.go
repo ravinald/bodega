@@ -339,7 +339,7 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 }
 
 // refuseVersionConstraint writes the row for, and answers, a request refused
-// by an entry's version_constraint. The gomod and npm handlers answer 403
+// by an entry's version_constraint. Every route that calls it answers 403
 // because the version exists upstream and policy declines to serve it, which
 // is a refusal in the same sense the middleware gates are — and, unlike them,
 // one an operator will read as a broken client until the row names the
