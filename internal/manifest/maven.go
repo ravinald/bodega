@@ -21,11 +21,6 @@ var mavenSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._+-]{0,127
 // carries in place of "SNAPSHOT": foo-1.0-20231010.123456-1.jar.
 var mavenSnapshotStamp = regexp.MustCompile(`^[0-9]{8}\.[0-9]{6}-[0-9]+`)
 
-// mavenExtensions are the artifact files the route serves. Anything else under
-// a version directory 404s, so widening this list is how a new packaging
-// becomes reachable.
-var mavenExtensions = []string{"jar", "pom", "module", "aar", "war"}
-
 // mavenCompanions are the files published beside an artifact or a metadata
 // file that describe it rather than add to it. They share the identity of the
 // file they sit beside.
@@ -139,22 +134,29 @@ func ParseMavenPath(p string) (MavenPath, bool) {
 		return MavenPath{}, false
 	}
 
-	for _, ext := range mavenExtensions {
-		cls, found := strings.CutSuffix(rest, "."+ext)
-		if !found {
-			continue
-		}
-		switch {
-		case cls == "":
-		case strings.HasPrefix(cls, "-") && len(cls) > 1:
-			out.Classifier = cls[1:]
-		default:
+	// The layout names no extension list: a version publishes whatever its
+	// packaging and assembly produce (tar.gz, exe, zip), so the extension is
+	// everything after the first dot of what follows <artifactId>-<version>.
+	// A companion is cut once, so one left inside the extension is a checksum
+	// of a checksum, which the layout never publishes.
+	cls, ext, found := strings.Cut(rest, ".")
+	if !found {
+		return MavenPath{}, false
+	}
+	for _, part := range strings.Split(ext, ".") {
+		if part == "" || slices.Contains(mavenCompanions, part) {
 			return MavenPath{}, false
 		}
-		out.Extension = ext
-		return out, true
 	}
-	return MavenPath{}, false
+	switch {
+	case cls == "":
+	case strings.HasPrefix(cls, "-") && len(cls) > 1:
+		out.Classifier = cls[1:]
+	default:
+		return MavenPath{}, false
+	}
+	out.Extension = ext
+	return out, true
 }
 
 // MavenKey returns the storage key for a repository-relative path. The layout
@@ -242,8 +244,10 @@ func ParseMavenClassifier(s string) (classifier, extension string, err error) {
 	if !mavenSegmentPattern.MatchString(classifier) {
 		return "", "", fmt.Errorf("maven classifier %q is not letters, digits, '.', '_', '-' or '+'", s)
 	}
-	if !slices.Contains(mavenExtensions, extension) || extension == "pom" || extension == "module" {
-		return "", "", fmt.Errorf("maven classifier %q: extension %q is not one the /maven/ route serves (jar, aar, war)", s, extension)
+	switch extension {
+	case "jar", "aar", "war":
+	default:
+		return "", "", fmt.Errorf("maven classifier %q: extension %q is not one a classifiers entry may name (jar, aar, war)", s, extension)
 	}
 	return classifier, extension, nil
 }
@@ -259,7 +263,9 @@ func MavenFilePath(name, version, classifier, extension string) (string, bool) {
 		file += "-" + classifier
 	}
 	p := strings.ReplaceAll(group, ".", "/") + "/" + artifact + "/" + version + "/" + file + "." + extension
-	if mp, ok := ParseMavenPath(p); !ok || mp.Name() != name || mp.Version != version || mp.Classifier != classifier {
+	// A classifier holding a dot parses back split at that dot, so the
+	// classifier and extension are compared together.
+	if mp, ok := ParseMavenPath(p); !ok || mp.Name() != name || mp.Version != version || mp.Classifier+"."+mp.Extension != classifier+"."+extension {
 		return "", false
 	}
 	return p, true
