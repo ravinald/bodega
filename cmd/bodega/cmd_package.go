@@ -145,6 +145,9 @@ When a name is given after the type, only that entry is packaged.`,
 						ensureFetchedDistfiles(bcfg, store, entryFilter),
 					)
 
+				case manifest.TypeComposer:
+					fmt.Fprintf(os.Stdout, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "package")
+
 				case manifest.TypeRubygems:
 					// A gem file is already the artifact; the compact index
 					// is the upstream's, proxied.

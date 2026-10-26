@@ -301,6 +301,9 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 	rubygemsEntries := collectEntries(manifest.TypeRubygems, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeRubygems, rubygemsEntries))
 
+	composerEntries := collectEntries(manifest.TypeComposer, func(ve manifest.VersionEntry) string { return ve.Version })
+	roots = append(roots, buildGroup(manifest.TypeComposer, composerEntries))
+
 	// freebsd — the version is the ABI, which is what a mirrored repository
 	// has one of per entry.
 	freebsdEntries := collectEntries(manifest.TypeFreeBSD, func(ve manifest.VersionEntry) string { return ve.Version })

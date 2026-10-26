@@ -159,6 +159,8 @@ it once before a hosted index can date them.`,
 					allSummaries = append(allSummaries,
 						builder.FetchRubygems(bcfg, store, entryFilter),
 					)
+				case manifest.TypeComposer:
+					fmt.Fprintf(os.Stdout, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "fetch")
 				case manifest.TypeMaven:
 					allSummaries = append(allSummaries,
 						builder.FetchMaven(bcfg, store, entryFilter),

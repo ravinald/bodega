@@ -280,6 +280,21 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem",
 		},
 		{
+			// The archive is keyed by the dist reference the entry records,
+			// and the route names it with the dist type after it.
+			typ:  manifest.TypeComposer,
+			pkg:  "symfony/console",
+			ve:   manifest.VersionEntry{Version: "v7.1.5", Ref: "0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c"},
+			body: "zip-bytes",
+			local: map[string]string{
+				"composer/symfony/console/v7.1.5/0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c": "zip-bytes",
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				return artifactPathUpload(builder.ComposerArtifactPaths(bcfg, store, ""), dst, t)
+			},
+			url: "/composer/dist/symfony/console/v7.1.5/0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c.zip",
+		},
+		{
 			// A mirrored repository: the name is the repository directory and
 			// the version is the ABI, so the local tree, the object key and
 			// the route are all the path a pkg client composes. The package

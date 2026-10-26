@@ -155,6 +155,9 @@ When a name is given after the type, only that entry is built.`,
 						ensureFetchedDistfiles(bcfg, store, entryFilter),
 					)
 
+				case manifest.TypeComposer:
+					fmt.Fprintf(buildOut, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "build")
+
 				case manifest.TypeRubygems:
 					// rubygems has no build step; FetchRubygems skips already-fetched.
 					allSummaries = append(allSummaries,

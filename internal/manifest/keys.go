@@ -90,6 +90,9 @@ const (
 	rubygemsGemPrefix   = "rubygems/gems/"
 	rubygemsSpecPrefix  = "rubygems/quick/"
 	rubygemsIndexPrefix = "rubygems/index/"
+
+	composerMetaPrefix = "composer/p2/"
+	composerDistPrefix = "composer/dist/"
 )
 
 // StoragePrefixes returns the top-level key prefixes documented in the
@@ -104,6 +107,8 @@ func StoragePrefixes() []string {
 		cargoCratePrefix,
 		cargoIndexPrefix,
 		helmPrefix,
+		composerDistPrefix,
+		composerMetaPrefix,
 		DistfilesPrefix,
 		FreeBSDPrefix,
 		gomodPrefix,
@@ -833,6 +838,38 @@ func isASCIILetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+// composerNamePattern is the package name Composer's own validator accepts:
+// a lowercase vendor and package, joined by one "/". Neither half can be "."
+// or "..", so a name is safe to place in a key or a path as two segments.
+var composerNamePattern = regexp.MustCompile(`^[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9](([_.]|-{1,2})?[a-z0-9]+)*$`)
+
+// composerReferencePattern is the dist reference a key carries: a commit SHA
+// or a tag, with no separator in it.
+var composerReferencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// ComposerValidName reports whether name is a Composer package name.
+func ComposerValidName(name string) bool { return composerNamePattern.MatchString(name) }
+
+// ComposerValidReference reports whether ref can name a dist archive in a key.
+func ComposerValidReference(ref string) bool { return composerReferencePattern.MatchString(ref) }
+
+// ComposerMetadataKey returns the key for a package's p2 metadata document,
+// the tagged releases or, under dev, the ~dev.json branches. Regenerable.
+func ComposerMetadataKey(name string, dev bool) string {
+	if dev {
+		return composerMetaPrefix + name + "~dev.json"
+	}
+	return composerMetaPrefix + name + ".json"
+}
+
+// ComposerDistKey returns the key for one version's dist archive. The
+// reference is part of it because a version names a commit, and a tag moved
+// to another commit is another archive. The version is path-escaped: a
+// branch version such as "dev-feature/x" holds a "/".
+func ComposerDistKey(name, version, reference string) string {
+	return composerDistPrefix + name + "/" + url.PathEscape(version) + "/" + reference
+}
+
 // ArtifactKeys returns every object key holding this version's bytes, primary
 // first.
 //
@@ -912,6 +949,14 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 
 	case TypeRubygems:
 		return []string{RubygemsGemKey(pm.Name, ve.Version)}, nil
+
+	case TypeComposer:
+		// The archive is keyed by the dist reference the metadata names, and
+		// only an entry that records it in Ref can say which one it holds.
+		if ve.Ref == "" {
+			return nil, fmt.Errorf("composer %s@%s records no dist reference in ref, so no archive key resolves for it", pm.Name, ve.Version)
+		}
+		return []string{ComposerDistKey(pm.Name, ve.Version, ve.Ref)}, nil
 
 	case TypeFreeBSD:
 		// The repository root, catalogue first: these are the keys this
@@ -1090,6 +1135,29 @@ func ParseKey(key string) (typ, name, version string) {
 		// info/<gem>, the full index files, a dependency API answer. None of
 		// them names a version.
 		return TypeRubygems, "", ""
+
+	case strings.HasPrefix(key, composerMetaPrefix):
+		// "<vendor>/<package>.json" or "~dev.json": the package, no version.
+		rest := strings.TrimPrefix(key, composerMetaPrefix)
+		n, found := strings.CutSuffix(rest, ".json")
+		n = strings.TrimSuffix(n, "~dev")
+		if !found || !ComposerValidName(n) {
+			return TypeComposer, "", ""
+		}
+		return TypeComposer, n, ""
+
+	case strings.HasPrefix(key, composerDistPrefix):
+		// "<vendor>/<package>/<version>/<reference>".
+		parts := strings.Split(strings.TrimPrefix(key, composerDistPrefix), "/")
+		if len(parts) != 4 {
+			return TypeComposer, "", ""
+		}
+		n := parts[0] + "/" + parts[1]
+		v, err := url.PathUnescape(parts[2])
+		if err != nil || !ComposerValidName(n) || v == "" {
+			return TypeComposer, "", ""
+		}
+		return TypeComposer, n, v
 
 	case strings.HasPrefix(key, helmPrefix):
 		if key == HelmIndexKey {

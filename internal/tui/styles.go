@@ -99,6 +99,8 @@ func typeIcon(t string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("161")).Render("V")
 	case "rubygems":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("160")).Render("R")
+	case "composer":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("104")).Render("O")
 	case "freebsd":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("124")).Render("F")
 	case "distfiles":

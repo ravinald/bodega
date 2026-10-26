@@ -413,7 +413,7 @@ func LoadPopularNames(ctx context.Context, store SimilarityStore, ecosystem stri
 // prefix, which names no package at all.
 func ExactRule(typ, pattern string) bool {
 	switch typ {
-	case manifest.TypePypi, manifest.TypeCargo, manifest.TypeRubygems:
+	case manifest.TypePypi, manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer:
 		return true
 	case manifest.TypeNpm:
 		return !strings.HasSuffix(pattern, "/*")

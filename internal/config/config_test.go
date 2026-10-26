@@ -239,6 +239,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"gomod_sumdb_url":   "https://sum.example.com",
 		"maven_upstream":    "https://maven.example.com/maven2",
 		"rubygems_upstream": "https://gems.example.com",
+		"composer_upstream": "https://packagist.example.com",
 		"gomod_upstream":    "https://goproxy.example.com",
 		"npm_upstream":      "https://npm.example.com",
 		"pypi_upstream":     "https://pypi.example.com",

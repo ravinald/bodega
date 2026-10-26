@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -133,6 +134,56 @@ func TestLoad_RubygemsUpstream(t *testing.T) {
 			t.Errorf("Load accepted rubygems_upstream %q", bad)
 		} else if !strings.Contains(err.Error(), "rubygems_upstream") {
 			t.Errorf("error %q does not name rubygems_upstream", err)
+		}
+	}
+}
+
+func TestLoad_ComposerUpstreamAndDistHosts(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ComposerUpstream != config.DefaultComposerUpstream {
+		t.Errorf("composer_upstream default = %q, want %s", cfg.ComposerUpstream, config.DefaultComposerUpstream)
+	}
+	if !slices.Equal(cfg.ComposerDistHosts, config.DefaultComposerDistHosts) {
+		t.Errorf("composer_dist_hosts default = %v, want %v", cfg.ComposerDistHosts, config.DefaultComposerDistHosts)
+	}
+
+	writeConfig(t, `{"composer_upstream":"https://packagist.example.com/","composer_dist_hosts":["Git.Example.com"]}`)
+	cfg, err = config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ComposerUpstream != "https://packagist.example.com" {
+		t.Errorf("composer_upstream = %q, want the trailing slash trimmed", cfg.ComposerUpstream)
+	}
+	if !slices.Equal(cfg.ComposerDistHosts, []string{"git.example.com"}) {
+		t.Errorf("composer_dist_hosts = %v, want the host lowercased", cfg.ComposerDistHosts)
+	}
+
+	// An empty list is kept: it refuses every archive, which is the
+	// operator's to choose.
+	writeConfig(t, `{"composer_dist_hosts":[]}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil || len(cfg.ComposerDistHosts) != 0 {
+		t.Errorf("composer_dist_hosts [] loaded as %v (err %v), want it kept empty", cfg.ComposerDistHosts, err)
+	}
+
+	for _, bad := range []string{"http://repo.packagist.org", "repo.packagist.org", "https://", "https://u:p@packagist.example/", "https://packagist.example/?x=1"} {
+		writeConfig(t, `{"composer_upstream":"`+bad+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted composer_upstream %q", bad)
+		} else if !strings.Contains(err.Error(), "composer_upstream") {
+			t.Errorf("error %q does not name composer_upstream", err)
+		}
+	}
+	for _, bad := range []string{"https://github.com", "github.com:443", "github.com/x"} {
+		writeConfig(t, `{"composer_dist_hosts":["`+bad+`"]}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil {
+			t.Errorf("Load accepted composer_dist_hosts entry %q", bad)
+		} else if !strings.Contains(err.Error(), "composer_dist_hosts") {
+			t.Errorf("error %q does not name composer_dist_hosts", err)
 		}
 	}
 }

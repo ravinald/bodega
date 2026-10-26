@@ -1408,6 +1408,7 @@ var createTypeOptions = []string{
 	manifest.TypeApt,
 	manifest.TypeBinary,
 	manifest.TypeCargo,
+	manifest.TypeComposer,
 	manifest.TypeDistfiles,
 	manifest.TypeFreeBSD,
 	manifest.TypeGit,
@@ -1888,6 +1889,30 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: checksumHint(restore("Checksum", ""))},
 		})
 
+	case manifest.TypeComposer:
+		// No Source URL: every composer entry resolves through
+		// composer_upstream, and each archive's URL comes from its metadata.
+		modeVal := restore("Mode", "proxy")
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "<vendor>/<package>, e.g. symfony/console"},
+			{Label: "Version", Value: restore("Version", ""),
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "Dist reference", Value: restore("Dist reference", ""),
+				Hint: "the commit the archive is of; leave empty unless one is uploaded for it"},
+			{Label: "Checksum", Value: restore("Checksum", ""),
+				Hint: checksumHint(restore("Checksum", ""))},
+		})
+
 	case manifest.TypeFreeBSD:
 		// A freebsd entry is a repository, not a package, so the form asks
 		// for the two halves of the path a pkg client composes: the
@@ -2142,6 +2167,16 @@ func validateCreateFields(fields []formField) string {
 		}
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for maven entries"
+		}
+	case manifest.TypeComposer:
+		if !manifest.ComposerValidName(fieldValueFromSlice(fields, "Name")) {
+			return "Name must be a lowercase <vendor>/<package> for composer entries, e.g. symfony/console"
+		}
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for composer entries"
+		}
+		if ref := fieldValueFromSlice(fields, "Dist reference"); ref != "" && !manifest.ComposerValidReference(ref) {
+			return "Dist reference must be a commit or tag name"
 		}
 	case manifest.TypeFreeBSD:
 		// Both halves of the path a pkg client composes, checked against what
@@ -2422,6 +2457,9 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
 		// nothing extra
 
+	case manifest.TypeComposer:
+		ve.Ref = fieldValueFromSlice(fields, "Dist reference")
+
 	case manifest.TypeFreeBSD:
 		// The version of a freebsd entry is the ABI directory above the
 		// repository, and the form asks for it under that name because that
@@ -2585,9 +2623,10 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
-	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
 		// No Source URL here names a package: cargo's and rubygems' are the
-		// registry root and maven's form has none. The Name field is required.
+		// registry root and maven's and composer's forms have none. The Name
+		// field is required.
 		return ""
 	default:
 		seg := lastURLSegment(rawURL)
