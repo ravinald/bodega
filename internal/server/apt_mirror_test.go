@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +26,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // The fixture archive stands in for archive.ubuntu.com: one Release signed by
@@ -1480,5 +1483,200 @@ func TestBannerGroupsMirroredCodenamesOnTheEffectiveComponentSet(t *testing.T) {
 	}
 	if !strings.Contains(banner, "Suites: resolute resolute-security resolute-updates") {
 		t.Errorf("equivalent component sets did not share a Suites: line:\n%s", banner)
+	}
+}
+
+const (
+	// debianSSLDevDeb is the path the B176 report names; debianSecuritySSLDevDeb
+	// is the one debian-security serves the same build under, a level deeper.
+	debianSSLDevDeb         = "pool/main/o/openssl/libssl-dev_3.5.7-1~deb13u3_amd64.deb"
+	debianSecuritySSLDevDeb = "pool/updates/main/o/openssl/libssl-dev_3.5.7-1~deb13u3_amd64.deb"
+	debianSSLDevBody        = "\x21<arch>\nlibssl-dev bytes"
+)
+
+// debianMirrorServer mirrors two archives the way a Debian host's sources
+// do, deb.debian.org/debian for trixie and security.debian.org/debian-security
+// for trixie-security, with the .deb at debPath on the one that serves it.
+func debianMirrorServer(t *testing.T, debPath string, onSecurity bool) (*Server, *fixtureArchive) {
+	t.Helper()
+	archive := newFixtureArchive(t, map[string]string{})
+	security := newFixtureArchive(t, map[string]string{})
+	serving := archive
+	if onSecurity {
+		serving = security
+	}
+	serving.setObject(debPath, debianSSLDevBody)
+	s := mirrorServer(t, archive, security)
+	s.cfg.AptUpstreams = map[string][]config.AptUpstream{
+		"trixie":          {{URL: archive.URL()}},
+		"trixie-security": {{URL: security.URL()}},
+	}
+	return s, serving
+}
+
+// restartedServer is a second Server over s's config, object store and audit
+// database: the cache holds what s fetched, and nothing in memory says which
+// archive it came from.
+func restartedServer(t *testing.T, s *Server) *Server {
+	t.Helper()
+	s2 := newServer(s.cfg, s.store, s.stores, "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s2.cache = s.cache
+	ctx, cancel := context.WithCancel(context.Background())
+	go s2.discovery.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		_ = s2.auditDB.Close()
+	})
+	return s2
+}
+
+// requireNoPoolRow fails if any discovery row carries name, which is what a
+// row keyed on the binary instead of the source would.
+func requireNoPoolRow(t *testing.T, s *Server, name string) {
+	t.Helper()
+	rows, err := s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{})
+	if err != nil {
+		t.Fatalf("list discovery: %v", err)
+	}
+	for _, row := range rows {
+		if row.PkgName == name {
+			t.Errorf("discovery row named %q, the binary: a profile learned from it matches nothing (%+v)", name, row)
+		}
+	}
+}
+
+// B176. Profile membership and the pool gate close over the source package,
+// so a discovery row naming the binary proposes a profile entry that matches
+// nothing; on Debian that is most libraries. Both layouts are covered because
+// debian-security's pool sits under pool/updates/, which is where the nightly's
+// libssl-dev came from.
+func TestDebianPoolDiscoveryRowsNameTheSource(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		debPath    string
+		onSecurity bool
+	}{
+		{"archive", debianSSLDevDeb, false},
+		{"security", debianSecuritySSLDevDeb, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, serving := debianMirrorServer(t, tc.debPath, tc.onSecurity)
+
+			if code, body := mirrorGet(t, s, "/apt/"+tc.debPath); code != http.StatusOK || string(body) != debianSSLDevBody {
+				t.Fatalf("pool miss = %d body %q, want 200 and the archive's bytes", code, body)
+			}
+			row := waitForPoolRow(t, s, "openssl", 1)
+			if row.PkgVersion != "3.5.7-1~deb13u3" {
+				t.Errorf("pkg_version = %q, want the .deb's own", row.PkgVersion)
+			}
+			if row.UpstreamURL != serving.URL()+"/"+tc.debPath {
+				t.Errorf("upstream_url = %q, want the archive that served it", row.UpstreamURL)
+			}
+
+			s2 := restartedServer(t, s)
+			if code, _ := mirrorGet(t, s2, "/apt/"+tc.debPath); code != http.StatusOK {
+				t.Fatalf("pool hit on a restarted server = %d, want 200", code)
+			}
+			if got := serving.count(tc.debPath); got != 1 {
+				t.Fatalf("upstream GETs = %d, want 1: the second request has to be a cache hit", got)
+			}
+			waitForPoolRow(t, s2, "openssl", 2)
+			requireNoPoolRow(t, s2, "libssl-dev")
+
+			// The audit trail records the file a client fetched.
+			rows := cacheRows(t, s2)
+			if len(rows) == 0 {
+				t.Fatal("no cache rows in the audit trail")
+			}
+			for _, ev := range rows {
+				if ev.PkgName != "libssl-dev" {
+					t.Errorf("audit %s row pkg_name = %q, want the binary libssl-dev", ev.Status, ev.PkgName)
+				}
+			}
+		})
+	}
+}
+
+// B176's refusal half: the denied row a profile writes, and the hint it
+// carries, name what `bodega profile add` has to list for the gate to pass.
+func TestDebianPoolRefusalProposesTheSource(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		debPath    string
+		onSecurity bool
+	}{
+		{"archive", debianSSLDevDeb, false},
+		{"security", debianSecuritySSLDevDeb, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, serving := debianMirrorServer(t, tc.debPath, tc.onSecurity)
+			f := bindProfile(t, s, "web", "web-host",
+				[]audit.ProfileTypeRule{closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)},
+				[]audit.ProfileEntry{{Type: manifest.TypeApt, Name: "curl"}})
+
+			if code, body := f.get(t, "/apt/"+tc.debPath); code != http.StatusForbidden {
+				t.Fatalf("pool fetch outside the profile = %d, want 403:\n%s", code, body)
+			}
+			if got := serving.count(tc.debPath); got != 0 {
+				t.Errorf("upstream GETs = %d, want 0", got)
+			}
+			rows := waitForAptRows(t, s, audit.DecisionDenied, 1)
+			if len(rows) != 1 || rows[0].PkgName != "openssl" {
+				t.Fatalf("denied rows = %+v, want one named openssl", rows)
+			}
+			if want := "bodega profile add web apt openssl"; rows[0].PatternHint != want {
+				t.Errorf("hint = %q, want %q", rows[0].PatternHint, want)
+			}
+
+			// Listing what the hint proposed is what admits the fetch.
+			f = bindProfile(t, s, "web2", "web2-host",
+				[]audit.ProfileTypeRule{closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)},
+				[]audit.ProfileEntry{{Type: manifest.TypeApt, Name: "openssl"}})
+			if code, body := f.get(t, "/apt/"+tc.debPath); code != http.StatusOK {
+				t.Fatalf("pool fetch after listing openssl = %d, want 200:\n%s", code, body)
+			}
+		})
+	}
+}
+
+// A generated suite lays its pool out under the binary name, so the path's
+// segment four is the binary and the row keeps it: libexpat1, not expat.
+func TestGeneratedPoolRefusalKeepsTheBinaryName(t *testing.T) {
+	s := generatedSuiteServer(t)
+	const deb = "pool/main/l/libexpat1/libexpat1_2.7.1-2_amd64.deb"
+	body := "\x21<arch>\nlibexpat1 bytes"
+	sum := sha256.Sum256([]byte(body))
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "libexpat1", manifest.VersionEntry{
+		Version:       "2.7.1-2",
+		SourceName:    "libexpat1",
+		SourcePackage: "expat",
+		ArtifactSize:  int64(len(body)),
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"_pool_path":   deb,
+			"_sha256":      hex.EncodeToString(sum[:]),
+		},
+	}); err != nil {
+		t.Fatalf("add libexpat1: %v", err)
+	}
+	pool, ok := s.stores.ForType(manifest.TypeApt).(*storage.Memory)
+	if !ok {
+		t.Fatal("the apt object store is not the in-memory one")
+	}
+	pool.Seed(manifest.AptKey(deb), body)
+	if err := s.store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("save index: %v", err)
+	}
+	f := generatedSuiteBind(t, s, "web", "curl")
+
+	if code, out := f.get(t, "/apt/"+deb); code != http.StatusForbidden {
+		t.Fatalf("pool fetch outside the profile = %d, want 403:\n%s", code, out)
+	}
+	rows := waitForAptRows(t, s, audit.DecisionDenied, 1)
+	if len(rows) != 1 || rows[0].PkgName != "libexpat1" {
+		t.Fatalf("denied rows = %+v, want one named libexpat1", rows)
+	}
+	if want := "bodega profile add web apt libexpat1"; rows[0].PatternHint != want {
+		t.Errorf("hint = %q, want %q", rows[0].PatternHint, want)
 	}
 }

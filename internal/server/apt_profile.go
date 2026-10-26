@@ -838,8 +838,15 @@ func (s *Server) aptScopedAnywhere() bool {
 // name is right to: a private archive free-forming its pool is a set closed on
 // whatever the path carried, which is wrong in the direction of refusing too
 // much and shows up as a refusal rather than as a leak.
+//
+// debian-security lays its pool out one level deeper, under
+// pool/updates/<component>/..., matching the updates/main components its
+// Release declares, so that segment is dropped before segment four is read.
 func aptPoolSourceName(poolPath string) string {
 	parts := strings.Split(poolPath, "/")
+	if len(parts) == 6 && parts[1] == "updates" {
+		parts = append(parts[:1], parts[2:]...)
+	}
 	if len(parts) != 5 || parts[0] != "pool" {
 		return ""
 	}
@@ -899,7 +906,7 @@ func (s *Server) refuseAptArchiveWith(w http.ResponseWriter, r *http.Request, p 
 	host, _ := splitUpstreamURL(upstreamURL)
 	s.recordDiscoveryRaw(r.Context(), r, manifest.TypeApt, host,
 		fmt.Sprintf("bodega profile set %s apt --archives %s", p.Name(), codename),
-		pkgName, "", audit.DecisionDenied, upstreamURL)
+		s.aptDiscoveryName(upstreamURL, pkgName), "", audit.DecisionDenied, upstreamURL)
 	recordDenialFor(s.auditDB, r, manifest.TypeApt, pkgName, "", audit.DenialProfileMembership, map[string]string{
 		"profile":  p.Name(),
 		"rule":     "apt_archives",
@@ -907,6 +914,20 @@ func (s *Server) refuseAptArchiveWith(w http.ResponseWriter, r *http.Request, p 
 		"incident": f.incident,
 	})
 	f.write(w, r)
+}
+
+// aptDiscoveryName is the discovery row's name for a refusal whose upstream
+// URL may be a pool path under a configured archive root, and fallback for
+// anything else (a dists/ path, a root no longer configured).
+func (s *Server) aptDiscoveryName(upstreamURL, fallback string) string {
+	for _, root := range s.cfg.AptPoolUpstreams() {
+		if poolPath, ok := strings.CutPrefix(upstreamURL, root+"/"); ok && strings.HasPrefix(poolPath, "pool/") {
+			if source := aptPoolSourceName(poolPath); source != "" {
+				return source
+			}
+		}
+	}
+	return fallback
 }
 
 // aptRefusedArchiveRoots maps each archive root that serves only vendor

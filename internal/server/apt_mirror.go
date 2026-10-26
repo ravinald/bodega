@@ -187,7 +187,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 			return s.aptMirrorHitGate(w, r, poolPath)
 		}, func(obj cachedObject) {
 			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
-			s.recordAptPoolHit(r, poolPath, key)
+			s.recordAptPoolHit(r, poolPath, key, obj)
 		})
 		return
 	}
@@ -487,18 +487,21 @@ func (s *Server) aptMirrorHitGate(w http.ResponseWriter, r *http.Request, poolPa
 // cached object is served without resolving one, so the archive has to be
 // recovered rather than probed: a HEAD per served .deb would undo the
 // short-circuit this sits inside. A fresh route entry answers first; failing
-// that, a single configured archive is unambiguous.
+// that, a single configured archive is unambiguous, and failing that, the
+// origin recorded when the bytes were fetched names the archive. That last one
+// is what a restarted server has for every .deb it cached under several
+// archives, Debian's two among them.
 //
-// With several archives configured and no fresh route, the row is skipped. The
-// alternative is a row whose pattern hint is not the host, which would split
-// one archive's traffic across two buckets in `bodega discover list` — a wrong
-// answer where this is a missing one. It resolves itself on the next miss,
-// which repopulates the route.
-func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
+// With none of the three, the row is skipped. The alternative is a row whose
+// pattern hint is not the host, which would split one archive's traffic across
+// two buckets in `bodega discover list` — a wrong answer where this is a
+// missing one. It resolves itself on the next miss, which repopulates the
+// route.
+func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string, obj cachedObject) {
 	if s.discovery == nil || s.discoverMode == "" {
 		return
 	}
-	upstream := s.aptPoolHitUpstream(poolPath)
+	upstream := s.aptPoolHitUpstream(r, poolPath, key, obj)
 	if upstream == "" {
 		s.logger.Debug("apt pool cache hit not recorded: no archive resolved for this path",
 			"pool_path", poolPath)
@@ -509,13 +512,25 @@ func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
 }
 
 // aptPoolHitUpstream names the archive a cached pool object came from, or ""
-// when nothing in memory can say without a network probe.
-func (s *Server) aptPoolHitUpstream(poolPath string) string {
+// when nothing short of a network probe can say. A recorded origin under no
+// configured root says nothing about today's archives and is not used.
+func (s *Server) aptPoolHitUpstream(r *http.Request, poolPath, key string, obj cachedObject) string {
 	if base, fresh := s.aptRoutes.get(poolPath); fresh && base != "" {
 		return base + "/" + poolPath
 	}
-	if candidates := s.cfg.AptPoolUpstreams(); len(candidates) == 1 {
+	candidates := s.cfg.AptPoolUpstreams()
+	if len(candidates) == 1 {
 		return candidates[0] + "/" + poolPath
+	}
+	if s.auditDB == nil {
+		return ""
+	}
+	if origin := s.cachedOrigin(r, key, obj); origin != "" {
+		for _, root := range candidates {
+			if strings.HasPrefix(origin, root+"/") {
+				return root + "/" + poolPath
+			}
+		}
 	}
 	return ""
 }

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -225,6 +226,13 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 	pkgName := discoveryPkgName
 	if pkgName == "" {
 		pkgName = keyName
+	}
+	// An apt pool row names the source package, as profile membership does;
+	// the caller's name is the binary, which the audit trail keeps.
+	if poolPath, ok := strings.CutPrefix(s3Key, manifest.AptPrefix); ok && regType == manifest.TypeApt {
+		if source := aptPoolSourceName(poolPath); source != "" {
+			pkgName = source
+		}
 	}
 	if pkgName == "" {
 		// For URL-scoped types the candidate is the URL itself, which is a

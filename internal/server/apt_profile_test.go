@@ -911,10 +911,13 @@ func mustParseRelease(t *testing.T, body []byte) map[string]string {
 // the filter did, and it reads a path rather than an index.
 func TestAptPoolSourceName(t *testing.T) {
 	cases := map[string]string{
-		profileNginxCommonDeb:                           "nginx",
-		"pool/universe/libf/libfoo/libfoo1_1.0_all.deb": "libfoo",
-		"pool/main/n/nginx":                             "",
-		"nginx_1.0_amd64.deb":                           "",
+		profileNginxCommonDeb:                             "nginx",
+		"pool/universe/libf/libfoo/libfoo1_1.0_all.deb":   "libfoo",
+		debianSecuritySSLDevDeb:                           "openssl",
+		"pool/updates/main/o/openssl/x/libssl3_1_all.deb": "",
+		"pool/extra/main/o/openssl/libssl3_1_all.deb":     "",
+		"pool/main/n/nginx":                               "",
+		"nginx_1.0_amd64.deb":                             "",
 	}
 	for in, want := range cases {
 		if got := aptPoolSourceName(in); got != want {
