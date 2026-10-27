@@ -2439,7 +2439,7 @@ Caused by:
   {"errors":[{"detail":"bodega refused cargo/itoa (allow-list, incident 567d03969769): cargo \"itoa\" is not on this server's upstream allow-list. Next step: ask an operator to run `bodega policy add cargo itoa` if it should be."}]}
 ```
 
-**helm** prints the status line and nothing else, so it gets the reason phrase pip does. The upstream it needed is not named, for the reason given above:
+**helm** prints the status line and nothing else, so it gets the reason phrase pip does. A chart pulled from `/v2/` is the exception: helm reads that route as a registry client and prints the message of the spec's JSON error body, so the refusal goes there, as it does for an image. The upstream it needed is not named, for the reason given above:
 
 ```text
 $ helm pull http://bodega.example.com:8080/helm/charts/e2e-ref-chart-1.0.0.tgz
@@ -4842,6 +4842,24 @@ bodega serves the bytes unchanged, so rustup's sha256 and GPG checks pass agains
 
 The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its root. An archive declaring a release other than the entry's `version` fails the fetch and is deleted rather than stored, because the archive filename, the `index.yaml` entry and the `/helm/charts/` object key are all rendered from the entry: a `version` and a `url` naming different releases would otherwise publish a chart that looks right by every name bodega prints and holds another release's templates. An entry naming no version pins nothing and is not checked. `appVersion` is still the manifest's word and is not read back from the chart.
 
+**Charts from an OCI registry.** Most public charts now ship as OCI artifacts (`oci://registry-1.docker.io/bitnamicharts/redis`), and bodega serves those through its `/v2/` registry routes rather than `/helm/`, from any registry in [`oci_upstreams`](#upstream-hosts). helm has no mirror setting, so you rewrite the chart reference itself to name bodega, with the registry's `oci_upstreams` key as the first path segment:
+
+```sh
+helm pull oci://bodega-host:8080/docker.io/bitnamicharts/redis --version 20.0.0
+helm install cache oci://bodega-host:8080/docker.io/bitnamicharts/redis --version 20.0.0
+```
+
+Add `--plain-http` against a plaintext bodega. Docker Hub's key is `docker.io`, not `registry-1.docker.io`: a first segment `oci_upstreams` does not hold is a `404` naming the key.
+
+bodega tells a chart from an image by its manifest's config media type, `application/vnd.cncf.helm.config.v1+json`, and judges a chart as `helm`, not `oci`. Its name is `<registry>/<repository>` (`docker.io/bitnamicharts/redis`) and its version the tag, so the allow-list, the discovery row, a hidden helm entry, the entry's version constraint and the profile all read it under `helm`:
+
+```sh
+bodega profile add web helm docker.io/bitnamicharts/redis --constraint exact --version 20.0.0
+bodega policy add helm docker.io/bitnamicharts/
+```
+
+A helm entry naming a classic chart (`redis`) keeps its meaning and does not reach the OCI chart, which is another name. `bodega profile add` takes either form for `helm` and refuses anything else, naming both. The chart's manifest and blobs are stored under the `oci/` keys, as an image's are. No entry is needed: the first pull fetches and records it, as an image pull does.
+
 ### Npm-specific fields
 
 ```json
@@ -5411,6 +5429,8 @@ Every fetched manifest and blob is verified against its digest before it is stor
 A manifest request passes the gates a Composer archive does: the [upstream allow-list](#upstream-allow-list) on the package identity, a discovery row naming it at the tag, the hidden-package and hidden-version checks, and the entry's `version_constraint` on the tag. An allow-list rule names one repository (`bodega policy add oci docker.io/library/nginx`) or every repository below a prefix ending `/*` (`docker.io/library/*`). A request by digest is judged by the tag bodega last resolved to that digest, and an index's platform manifests count as resolved by the tag that resolved the index; under a constraint, a digest bodega never resolved is refused, since the constraint has nothing to compare. A constraint orders tags as semver (`17`, `1.27.3`, `v4.1`), and an exact pin also matches its tag as a string, so `latest` pinned exactly is served. A blob is judged by the allow-list under the repository it is requested under, on a cache hit as well as a miss, and leaves a discovery row there. A tag list is judged by the allow-list and the hidden-package check.
 
 A tag list is fetched whole: bodega follows the registry's `Link: <...>; rel="next"` header through every page, up to 1000 pages and 16 MiB, and caches the sorted result as one document, so an outage serves the whole list rather than whichever pages were asked for. A next link is followed only on the registry's own scheme and host, since the registry's token goes with every request, and a list whose next link repeats is refused with `502` rather than read forever. A client sending `n`, `last` or both is paged from that copy as the spec describes: the tags after `last`, at most `n` of them, and a `Link: </v2/<name>/tags/list?last=<tag>&n=<n>>; rel="next"` header when more remain, which names bodega's route and keeps any `ns`. An `n` that is not a whole number is a `400` with code `PAGINATION_NUMBER_INVALID`.
+
+A Helm chart is served by the same routes and judged as `helm`, not `oci`: a manifest whose config media type is `application/vnd.cncf.helm.config.v1+json` passes every gate above under type `helm`, with the same `<registry>/<repository>` name and the tag as version, and its discovery row is recorded under `helm`. The chart's blobs and tag list follow its repository: once a manifest of the repository is judged a chart, or a helm entry names it, they are judged as `helm` too. bodega reads the type from the manifest it holds; for one it does not hold, it fetches the manifest and nothing else before judging, so a refused chart costs one manifest request and no layer. That fetch happens only when the request could pass as one type or the other, that is when oci's gates would admit it or a helm entry, a closed helm profile rule or a listed helm allow-list rule names it; a repository oci refuses and helm never mentions is refused as `oci` without a request leaving bodega. The fetched manifest is the copy served, so an admitted pull still reaches the registry once. See [Helm-specific fields](#helm-specific-fields) for the client side.
 
 An oci entry records the manifest digest in `ref`, which is what names the manifest it holds under `oci/manifests/` and `oci_root`; an entry with no `ref` is a statement about tags alone, enough for hiding and constraints. Nothing fetches an image ahead of a client: `bodega build fetch oci` has nothing to do.
 

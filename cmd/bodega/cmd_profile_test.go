@@ -1239,3 +1239,19 @@ func TestRequireGitEntryNameExampleFollowsNamespace(t *testing.T) {
 		t.Errorf("a non-git type was judged by the git rule: %v", err)
 	}
 }
+
+// A helm entry names a classic repository chart or an OCI chart's
+// <registry>/<repository>, and a refusal names both forms.
+func TestRequireEntryNameFormHelm(t *testing.T) {
+	for _, ok := range []string{"redis", "cert-manager", "docker.io/bitnamicharts/redis", "ghcr.io/org/charts/app"} {
+		if err := requireEntryNameForm(manifest.TypeHelm, ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "bitnamicharts/redis", "docker.io/", "Docker.io/x/y", "docker.io/x/Redis", "redis chart"} {
+		err := requireEntryNameForm(manifest.TypeHelm, bad)
+		if err == nil || !strings.Contains(err.Error(), "(redis)") || !strings.Contains(err.Error(), "<registry>/<repository>") {
+			t.Errorf("%q: err = %v, want a refusal naming both forms", bad, err)
+		}
+	}
+}

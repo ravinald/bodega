@@ -46,6 +46,9 @@ const refusalHeader = "X-Bodega-Refusal"
 // failed fetch and never its body: pip prints "403 Client Error: <phrase> for
 // url", helm "failed to fetch <url> : 403 <phrase>", apt "403 <phrase>
 // [IP: ...]", and composer "could not be downloaded (HTTP/1.1 403 <phrase>)".
+// A helm chart under /v2/ is the exception: helm reads it as a registry
+// client, which prints the spec's JSON error message, so it is answered the
+// way an image is.
 var statusLineClients = map[string]bool{
 	manifest.TypePypi:     true,
 	manifest.TypeHelm:     true,
@@ -163,7 +166,7 @@ func jsonBody(v any) []byte {
 // the body and headers are this type's.
 func (f *refusal) write(w http.ResponseWriter, r *http.Request) {
 	ctype, body := f.render()
-	if statusLineClients[f.pkgType] && f.client == "" && f.writeWithReasonPhrase(w, r, ctype, body) {
+	if statusLineClients[f.pkgType] && f.client == "" && !isOCIRoute(r.URL.Path) && f.writeWithReasonPhrase(w, r, ctype, body) {
 		return
 	}
 	h := w.Header()

@@ -2570,6 +2570,8 @@ func requireEntryNameForm(typ, name string) error {
 		return manifest.ValidateMavenName(name)
 	case manifest.TypeComposer:
 		return manifest.ValidateComposerName(name)
+	case manifest.TypeHelm:
+		return manifest.ValidateHelmName(name)
 	}
 	return nil
 }

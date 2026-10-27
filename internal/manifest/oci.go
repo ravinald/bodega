@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -52,6 +53,25 @@ func OCIValidDigest(d string) bool { return ociDigestRE.MatchString(d) }
 // apart from a Docker Hub namespace in the first segment of a path.
 func OCIValidRegistryName(name string) bool {
 	return len(name) <= 253 && ociRegistryNameRE.MatchString(name)
+}
+
+// HelmOCIConfigMediaType is the config media type of a chart pushed to an OCI
+// registry, which is what tells a chart manifest from an image's.
+const HelmOCIConfigMediaType = "application/vnd.cncf.helm.config.v1+json"
+
+var helmChartNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// ValidateHelmName refuses a helm entry in neither form the gate compares: a
+// chart name from a classic repository (redis), or the <registry>/<repository>
+// identity of a chart served under /v2/ (docker.io/bitnamicharts/redis).
+func ValidateHelmName(name string) error {
+	if helmChartNameRE.MatchString(name) {
+		return nil
+	}
+	if registry, repo, ok := strings.Cut(name, "/"); ok && OCIValidRegistryName(registry) && OCIValidRepository(repo) {
+		return nil
+	}
+	return fmt.Errorf("helm %q is neither a chart name from a classic repository (redis) nor an OCI chart as <registry>/<repository> in lowercase (docker.io/bitnamicharts/redis)", name)
 }
 
 // OCIBlobKey is a blob's key. One per digest, shared by every repository and

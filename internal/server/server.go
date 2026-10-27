@@ -110,6 +110,10 @@ type Server struct {
 	// ociTokens holds the Bearer tokens the OCI registries issued, per
 	// registry and scope, until each expires.
 	ociTokens ociTokenCache
+	// ociCharts names the repositories under /v2/ whose manifests were last
+	// judged as helm charts, so their blobs and tag lists are judged as helm
+	// too. See ociRepoType.
+	ociCharts sync.Map
 	// mavenArtifacts names the Maven artifacts a version's own file was asked
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.

@@ -274,36 +274,51 @@ func ociForceProxy(pm *manifest.PackageManifest) bool {
 // allow-list refuses would be served any layer an admitted one had cached.
 // A refusal leaves its discovery row; an admitted request leaves its row
 // where the fetch or the hit is recorded.
-func (s *Server) ociAllowListGate(w http.ResponseWriter, r *http.Request, t ociTarget, key string, immutable bool) bool {
-	baseline := s.baselineLookup(r.Context(), manifest.TypeOCI, t.name(), key, immutable)
-	override := s.allowListOverrideLookup(r.Context(), manifest.TypeOCI, t.name(), key, immutable)
-	decision, ok := s.upstreamPolicyGate(w, r, manifest.TypeOCI, "", t.name(), t.name(), key, true, baseline, override)
+func (s *Server) ociAllowListGate(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, key string, immutable bool) bool {
+	baseline := s.baselineLookup(r.Context(), typ, t.name(), key, immutable)
+	override := s.allowListOverrideLookup(r.Context(), typ, t.name(), key, immutable)
+	decision, ok := s.upstreamPolicyGate(w, r, typ, "", t.name(), t.name(), key, true, baseline, override)
 	if !ok && decision == audit.DecisionDenied && immutable {
-		s.recordFillRefusal(r, manifest.TypeOCI, t.name(), t.name(), key)
+		s.recordFillRefusal(r, typ, t.name(), t.name(), key)
 	}
 	return ok
 }
 
 // ociJudgeVersion is handleComposerDist's gate order for one tag: hidden,
-// then the entry's version constraint. An exact pin compares as a string,
-// since "latest" or "17-alpine" orders against nothing.
-func (s *Server) ociJudgeVersion(w http.ResponseWriter, r *http.Request, pm *manifest.PackageManifest, name, tag string) bool {
+// then the entry's version constraint, under typ.
+func (s *Server) ociJudgeVersion(w http.ResponseWriter, r *http.Request, typ string, pm *manifest.PackageManifest, name, tag string) bool {
 	if isVersionHidden(pm, tag) {
-		s.refuseHidden(w, r, manifest.TypeOCI, name, tag)
+		s.refuseHidden(w, r, typ, name, tag)
 		return false
 	}
-	vc, baseVer := packageVersionConstraint(pm)
-	if vc == "" || vc == manifest.ConstraintAny || baseVer == "" {
-		return true
-	}
-	if vc == manifest.ConstraintExact && tag == baseVer {
-		return true
-	}
-	if ok, ordered := versionAllowed(manifest.TypeOCI, baseVer, tag, vc); !ok {
-		s.refuseVersionConstraint(w, r, manifest.TypeOCI, name, baseVer, tag, vc, ordered)
+	if !ociVersionPermits(pm, typ, tag) {
+		vc, baseVer := packageVersionConstraint(pm)
+		_, ordered := versionAllowed(typ, baseVer, tag, vc)
+		s.refuseVersionConstraint(w, r, typ, name, baseVer, tag, vc, ordered)
 		return false
 	}
 	return true
+}
+
+// ociVersionPermits reports whether the entry's version constraint admits a
+// tag. An exact pin compares as a string, since "latest" or "17-alpine"
+// orders against nothing.
+func ociVersionPermits(pm *manifest.PackageManifest, typ, tag string) bool {
+	if !ociConstrained(pm) {
+		return true
+	}
+	vc, baseVer := packageVersionConstraint(pm)
+	if vc == manifest.ConstraintExact && tag == baseVer {
+		return true
+	}
+	ok, _ := versionAllowed(typ, baseVer, tag, vc)
+	return ok
+}
+
+// ociConstrained reports whether the entry holds its package to a version.
+func ociConstrained(pm *manifest.PackageManifest) bool {
+	vc, baseVer := packageVersionConstraint(pm)
+	return vc != "" && vc != manifest.ConstraintAny && baseVer != ""
 }
 
 // handleOCIManifestTag serves a manifest by tag. The tag's key holds the
@@ -314,32 +329,33 @@ func (s *Server) ociJudgeVersion(w http.ResponseWriter, r *http.Request, pm *man
 func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
-	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
+	typ, fetched := s.ociManifestType(r, t)
+	pm, _ := s.store.GetPackage(ctx, typ, name)
 	if pm != nil {
 		if isPackageHidden(pm) {
-			s.refuseHidden(w, r, manifest.TypeOCI, name, "")
+			s.refuseHidden(w, r, typ, name, "")
 			return
 		}
-		if !s.ociJudgeVersion(w, r, pm, name, t.ref) {
+		if !s.ociJudgeVersion(w, r, typ, pm, name, t.ref) {
 			return
 		}
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, t.ref) {
+	if !s.entitleGate(w, r, typ, name, t.ref) {
 		return
 	}
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCITagKey(t.registry, t.repo, t.ref)
-	if !s.ociAllowListGate(w, r, t, key, false) {
+	if !s.ociAllowListGate(w, r, typ, t, key, false) {
 		return
 	}
 
-	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store)))
+	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store, fetched)))
 	req.Method = http.MethodGet
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		req.Header.Del(h)
 	}
 	cw := &capturedResponse{header: http.Header{}}
-	s.proxyOrCache(cw, req, store, key, t.url(ociManifests+"/"+t.ref), manifest.TypeOCI, name, name, false, ociForceProxy(pm))
+	s.proxyOrCache(cw, req, store, key, t.url(ociManifests+"/"+t.ref), typ, name, name, false, ociForceProxy(pm))
 	if cw.status != http.StatusOK {
 		relayCaptured(w, cw)
 		return
@@ -362,7 +378,7 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 		s.logger.Warn("oci manifest missing for a cached tag, fetching it by digest", "key", key, "digest", doc.Digest, "error", err)
 		byDigest := t
 		byDigest.ref = doc.Digest
-		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), byDigest, pm, doc.MediaType)
+		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), typ, byDigest, pm, doc.MediaType, nil)
 		return
 	}
 	w.Header().Set("Cache-Control", cachePrivate)
@@ -411,46 +427,41 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
-	store := s.typeStore(manifest.TypeOCI)
-	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
+	typ, fetched := s.ociManifestType(r, t)
+	pm, _ := s.store.GetPackage(ctx, typ, name)
 	version := t.ref
 	if pm != nil {
 		if isPackageHidden(pm) {
-			s.refuseHidden(w, r, manifest.TypeOCI, name, "")
+			s.refuseHidden(w, r, typ, name, "")
 			return
 		}
-		tag := ""
-		if store != nil {
-			if b, err := store.Get(ctx, manifest.OCIResolvedKey(t.registry, t.repo, t.ref)); err == nil {
-				tag = string(b)
-			}
-		}
-		if tag != "" {
+		if tag := s.ociResolvedTag(ctx, t); tag != "" {
 			version = tag
-			if !s.ociJudgeVersion(w, r, pm, name, tag) {
+			if !s.ociJudgeVersion(w, r, typ, pm, name, tag) {
 				return
 			}
-		} else if vc, baseVer := packageVersionConstraint(pm); vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
-			s.refuseUnresolvedDigest(w, r, name, t.ref, baseVer, vc)
+		} else if ociConstrained(pm) {
+			vc, baseVer := packageVersionConstraint(pm)
+			s.refuseUnresolvedDigest(w, r, typ, name, t.ref, baseVer, vc)
 			return
 		}
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, version) {
+	if !s.entitleGate(w, r, typ, name, version) {
 		return
 	}
-	if !s.ociAllowListGate(w, r, t, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true) {
+	if !s.ociAllowListGate(w, r, typ, t, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true) {
 		return
 	}
-	s.serveOCIManifestDigest(w, r, t, pm, "")
+	s.serveOCIManifestDigest(w, r, typ, t, pm, "", fetched)
 }
 
 // refuseUnresolvedDigest answers a digest request a version constraint
 // cannot judge.
-func (s *Server) refuseUnresolvedDigest(w http.ResponseWriter, r *http.Request, name, digest, baseVer, vc string) {
-	f := newRefusal(checkConstraint, manifest.TypeOCI, name, digest, http.StatusForbidden)
+func (s *Server) refuseUnresolvedDigest(w http.ResponseWriter, r *http.Request, typ, name, digest, baseVer, vc string) {
+	f := newRefusal(checkConstraint, typ, name, digest, http.StatusForbidden)
 	f.reason = fmt.Sprintf("this server holds %s to version %s (%s), and no tag it resolved names this digest, so the constraint cannot judge it.", name, baseVer, vc)
 	f.next = fmt.Sprintf("pull %s by a tag the constraint admits, which records the digest it names, or ask an operator to widen the entry's constraint.", name)
-	recordDenialFor(s.auditDB, r, manifest.TypeOCI, name, digest, audit.DenialVersionConstraint, map[string]string{
+	recordDenialFor(s.auditDB, r, typ, name, digest, audit.DenialVersionConstraint, map[string]string{
 		"constraint": vc, "entry_version": baseVer, "incident": f.incident, "reason": f.reason,
 	})
 	f.write(w, r)
@@ -461,7 +472,7 @@ func (s *Server) refuseUnresolvedDigest(w http.ResponseWriter, r *http.Request, 
 // type the response carries on a cache hit; otherwise the type recorded when
 // the manifest was fetched does, and only a manifest stored with no record is
 // typed by its bytes.
-func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget, pm *manifest.PackageManifest, mediaType string) {
+func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, typ string, t ociTarget, pm *manifest.PackageManifest, mediaType string, fetched *ociFetched) {
 	ctx := r.Context()
 	store, err := s.versionStore(ctx, manifest.TypeOCI, t.name(), t.ref)
 	if err != nil {
@@ -477,11 +488,11 @@ func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, t
 	w.contentType = mediaType
 	w.Header().Set(ociDigestHeader, t.ref)
 	w.Header().Set("ETag", `"`+t.ref+`"`)
-	req := r.WithContext(withUpstreamOpener(ctx, s.ociManifestOpener(t, store)))
+	req := r.WithContext(withUpstreamOpener(ctx, s.ociManifestOpener(t, store, fetched)))
 	upstream := t.url(ociManifests + "/" + t.ref)
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	s.proxyOrResolve(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, req, store, key,
-		resolve, upstream, nil, manifest.TypeOCI, t.name(), t.name(), true, ociForceProxy(pm))
+		resolve, upstream, nil, typ, t.name(), t.name(), true, ociForceProxy(pm))
 }
 
 // ociStoredMediaType is the type a cached manifest is served under, "" when
@@ -504,17 +515,18 @@ func (s *Server) ociStoredMediaType(ctx context.Context, store storage.ObjectSto
 func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
-	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
+	typ := s.ociRepoType(ctx, t)
+	pm, _ := s.store.GetPackage(ctx, typ, name)
 	if pm != nil && isPackageHidden(pm) {
-		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
+		s.refuseHidden(w, r, typ, name, "")
 		return
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, "") {
+	if !s.entitleGate(w, r, typ, name, "") {
 		return
 	}
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCIBlobKey(t.ref)
-	if !s.ociAllowListGate(w, r, t, key, true) {
+	if !s.ociAllowListGate(w, r, typ, t, key, true) {
 		return
 	}
 	upstream := t.url(ociBlobs + "/" + t.ref)
@@ -529,7 +541,7 @@ func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarge
 	w.contentType = "application/octet-stream"
 	req := r.WithContext(withUpstreamOpener(ctx, s.ociDigestOpener(t)))
 	resolve := func(context.Context) (string, error) { return upstream, nil }
-	s.proxyOrResolve(dw, req, store, key, resolve, upstream, nil, manifest.TypeOCI, name, name, true, ociForceProxy(pm))
+	s.proxyOrResolve(dw, req, store, key, resolve, upstream, nil, typ, name, name, true, ociForceProxy(pm))
 }
 
 // serveOCIBlobHit is serveCacheHit with Range honored: containerd resumes an
@@ -542,7 +554,7 @@ func (s *Server) serveOCIBlobHit(w http.ResponseWriter, r *http.Request, store s
 	}
 	defer func() { _ = res.Body.Close() }()
 	obj := cachedObject{store: store, id: streamIdentity(store, res)}
-	s.recordCacheHit(r.Context(), r, manifest.TypeOCI, upstream, t.name(), t.name(), key, obj)
+	s.recordCacheHit(r.Context(), r, s.ociRepoType(r.Context(), t), upstream, t.name(), t.name(), key, obj)
 	noteServed(r, key, "")
 	h := w.Header()
 	h.Set("Content-Type", "application/octet-stream")
@@ -640,22 +652,23 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 			fmt.Sprintf("n=%q is not a count of tags; send a whole number, or leave n out for every tag.", r.URL.Query().Get("n")))
 		return
 	}
-	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
+	typ := s.ociRepoType(ctx, t)
+	pm, _ := s.store.GetPackage(ctx, typ, name)
 	if pm != nil && isPackageHidden(pm) {
-		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
+		s.refuseHidden(w, r, typ, name, "")
 		return
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, "") {
+	if !s.entitleGate(w, r, typ, name, "") {
 		return
 	}
 	key := manifest.OCITagListKey(t.registry, t.repo)
-	if !s.ociAllowListGate(w, r, t, key, false) {
+	if !s.ociAllowListGate(w, r, typ, t, key, false) {
 		return
 	}
 	req := r.Clone(withUpstreamOpener(ctx, s.ociTagListOpener(t)))
 	req.Method = http.MethodGet
 	cw := &capturedResponse{header: http.Header{}}
-	s.proxyOrCache(cw, req, s.typeStore(manifest.TypeOCI), key, t.url("tags/list"), manifest.TypeOCI, name, name, false, ociForceProxy(pm))
+	s.proxyOrCache(cw, req, s.typeStore(manifest.TypeOCI), key, t.url("tags/list"), typ, name, name, false, ociForceProxy(pm))
 	if cw.status != http.StatusOK {
 		relayCaptured(w, cw)
 		return
@@ -745,12 +758,13 @@ func (s *Server) ociDigestOpener(t ociTarget) upstreamOpener {
 // often as by its Content-Type, and the refusal has to come before a byte is
 // stored or served. The type it is served under is recorded before
 // proxyOrResolve stores the bytes, so a stored manifest always has one.
-func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore) upstreamOpener {
+func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, fetched *ociFetched) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
-		body, ct, answered, err := s.ociFetchManifest(ctx, t, rawURL)
+		f, err := s.ociFetchOnce(ctx, t, rawURL, &fetched)
 		if err != nil {
 			return nil, err
 		}
+		body, ct, answered := f.body, f.contentType, f.answered
 		if got := ociDigest(body); got != t.ref {
 			return nil, ociMismatch(t, got)
 		}
@@ -766,25 +780,35 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore) upstr
 }
 
 // ociFetchManifest reads one manifest whole, bounded, and refuses schema 1.
-func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL string) (body []byte, contentType, answered string, err error) {
+func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL string) (*ociFetched, error) {
 	resp, err := s.ociGet(ctx, t, rawURL, ociManifestAccept)
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	answered = answeredURL(resp, rawURL)
-	body, err = io.ReadAll(io.LimitReader(resp.Body, ociMaxManifest+1))
+	answered := answeredURL(resp, rawURL)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, ociMaxManifest+1))
 	if err != nil {
-		return nil, "", "", fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err)
+		return nil, fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err)
 	}
 	if len(body) > ociMaxManifest {
-		return nil, "", "", fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)
+		return nil, fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)
 	}
-	contentType = resp.Header.Get("Content-Type")
+	contentType := resp.Header.Get("Content-Type")
 	if ociIsSchema1(contentType, body) {
-		return nil, "", "", s.ociSchema1Refusal(t)
+		return nil, s.ociSchema1Refusal(t)
 	}
-	return body, contentType, answered, nil
+	return &ociFetched{body: body, contentType: contentType, sentDigest: resp.Header.Get(ociDigestHeader), answered: answered}, nil
+}
+
+// ociFetchOnce is the manifest fetched to classify the request, the first
+// time an opener asks, and a fresh fetch after that.
+func (s *Server) ociFetchOnce(ctx context.Context, t ociTarget, rawURL string, fetched **ociFetched) (*ociFetched, error) {
+	if f := *fetched; f != nil {
+		*fetched = nil
+		return f, nil
+	}
+	return s.ociFetchManifest(ctx, t, rawURL)
 }
 
 func ociDigest(b []byte) string {
@@ -898,26 +922,15 @@ func ociNextPage(current, link string) (string, error) {
 // stores them under their digest before the tag's record names it, so a
 // record never points at a manifest bodega does not hold. The record, not the
 // manifest, is what proxyOrResolve caches under the tag.
-func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOpener {
+func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, fetched *ociFetched) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
-		resp, err := s.ociGet(ctx, t, rawURL, ociManifestAccept)
+		f, err := s.ociFetchOnce(ctx, t, rawURL, &fetched)
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(io.LimitReader(resp.Body, ociMaxManifest+1))
-		if err != nil {
-			return nil, fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answeredURL(resp, rawURL), err)
-		}
-		if len(body) > ociMaxManifest {
-			return nil, fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)
-		}
-		ct := resp.Header.Get("Content-Type")
-		if ociIsSchema1(ct, body) {
-			return nil, s.ociSchema1Refusal(t)
-		}
+		body, ct := f.body, f.contentType
 		digest := ociDigest(body)
-		if sent := resp.Header.Get(ociDigestHeader); sent != "" && sent != digest {
+		if sent := f.sentDigest; sent != "" && sent != digest {
 			return nil, ociMismatchSent(t, sent, digest)
 		}
 		mediaType := ociMediaType(ct, body)
@@ -942,7 +955,7 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOp
 			}
 		}
 		doc, _ := json.Marshal(ociTagDoc{Digest: digest, MediaType: mediaType, Size: int64(len(body))})
-		return &upstreamStream{url: answeredURL(resp, rawURL), body: io.NopCloser(bytes.NewReader(doc)),
+		return &upstreamStream{url: f.answered, body: io.NopCloser(bytes.NewReader(doc)),
 			contentType: "application/json", contentLength: int64(len(doc))}, nil
 	}
 }
