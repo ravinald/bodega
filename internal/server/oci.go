@@ -548,7 +548,32 @@ func (s *Server) serveOCIBlobHit(w http.ResponseWriter, r *http.Request, store s
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("ETag", `"`+t.ref+`"`)
 	h.Del("Content-Length")
-	http.ServeContent(w, r, "", time.Time{}, seekableBody(res))
+	body := seekableBody(res)
+	if _, forward := body.(*forwardSeeker); forward && namesSeveralRanges(r.Header.Get("Range")) {
+		r = r.Clone(r.Context())
+		r.Header.Del("Range")
+	}
+	http.ServeContent(w, r, "", time.Time{}, body)
+}
+
+// namesSeveralRanges reports whether a Range header asks for more than one
+// part. ServeContent writes the 206 and the multipart length before it seeks
+// to each part in the order the client named them, so a descending or
+// overlapping set needs a backward seek after the headers are gone. A body
+// that reads forward only serves such a request in full instead, as HTTP
+// permits a server to ignore Range.
+func namesSeveralRanges(header string) bool {
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return false
+	}
+	parts := 0
+	for _, ra := range strings.Split(spec, ",") {
+		if strings.TrimSpace(ra) != "" {
+			parts++
+		}
+	}
+	return parts > 1
 }
 
 // seekableBody is the stored object as the io.ReadSeeker ServeContent asks
@@ -556,7 +581,8 @@ func (s *Server) serveOCIBlobHit(w http.ResponseWriter, r *http.Request, store s
 // only: ServeContent learns the size from a seek to the end, which the stored
 // length answers without moving, and then seeks once to the start of a range,
 // which skips forward. That holds only with Content-Type already set, since
-// ServeContent otherwise reads the head to sniff one and seeks back.
+// ServeContent otherwise reads the head to sniff one and seeks back, and only
+// for one range, which is why serveOCIBlobHit drops a request for several.
 func seekableBody(res *storage.StreamResult) io.ReadSeeker {
 	if rs, ok := res.Body.(io.ReadSeeker); ok {
 		return rs

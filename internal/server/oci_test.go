@@ -1,10 +1,16 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +21,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ociTokenHost is a token service: it issues a fresh token per request and
@@ -591,6 +598,125 @@ func TestForwardSeekerServesARange(t *testing.T) {
 	http.ServeContent(rec, req, "", time.Time{}, rs)
 	if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
 		t.Errorf("forwardSeeker range: %d %q, want 206 abcd", rec.Code, rec.Body.String())
+	}
+}
+
+// forwardOnlyStore hands back stored bodies with no Seek, as the S3 backend's
+// streamed HTTP body has none.
+type forwardOnlyStore struct{ storage.ObjectStore }
+
+func (s forwardOnlyStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	res, err := s.ObjectStore.GetStream(ctx, key)
+	if res != nil {
+		res.Body = struct {
+			io.Reader
+			io.Closer
+		}{res.Body, res.Body}
+	}
+	return res, err
+}
+
+// A body that reads forward only cannot serve parts in an order that seeks
+// back, so a request for several ranges gets the whole blob; one range is
+// still served from where it starts, which is the resume containerd sends.
+func TestOCIRangeOnAForwardOnlyCachedBlob(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	d := f.image.amd64LayerD
+	key := manifest.OCIBlobKey(d)
+	store := s.typeStore(manifest.TypeOCI)
+	if err := store.Put(t.Context(), key, f.image.amd64Layer); err != nil {
+		t.Fatal(err)
+	}
+	layer := f.image.amd64Layer
+	serve := func(rangeHeader string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+d, nil)
+		r.Header.Set("Range", rangeHeader)
+		rec := httptest.NewRecorder()
+		s.serveOCIBlobHit(rec, r, forwardOnlyStore{store}, key,
+			ociTarget{registry: "docker.io", repo: "library/nginx", ref: d}, f.hub.ts.URL)
+		return rec
+	}
+	for _, rh := range []string{"bytes=10-13,0-3", "bytes=0-9,5-14", "bytes=0-3,2-5", "bytes=0-3, 10-13"} {
+		rec := serve(rh)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: %d, want 200 with the whole blob", rh, rec.Code)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), layer) {
+			t.Errorf("%s: body is %d bytes, want the %d-byte blob", rh, rec.Body.Len(), len(layer))
+		}
+		if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(layer)) {
+			t.Errorf("%s: Content-Length %q, want %d", rh, got, len(layer))
+		}
+		if rec.Header().Get("Content-Range") != "" {
+			t.Errorf("%s: Content-Range %q on a whole-blob answer", rh, rec.Header().Get("Content-Range"))
+		}
+	}
+	rec := serve("bytes=6-10")
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != string(layer[6:11]) {
+		t.Errorf("single range: %d %q, want 206 %q", rec.Code, rec.Body.String(), layer[6:11])
+	}
+	if got := rec.Header().Get("Content-Range"); got != fmt.Sprintf("bytes 6-10/%d", len(layer)) {
+		t.Errorf("single range: Content-Range %q", got)
+	}
+}
+
+// seekingStore hands back stored bodies that seek, as the Local backend's
+// open file does.
+type seekingStore struct{ storage.ObjectStore }
+
+func (s seekingStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	res, err := s.ObjectStore.GetStream(ctx, key)
+	if res != nil {
+		data, rerr := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if rerr != nil {
+			return nil, rerr
+		}
+		res.Body = struct {
+			io.ReadSeeker
+			io.Closer
+		}{bytes.NewReader(data), io.NopCloser(nil)}
+	}
+	return res, err
+}
+
+// A store whose body seeks keeps multipart answers, in the order asked for.
+func TestOCIMultiRangeOnASeekableCachedBlob(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	d := f.image.amd64LayerD
+	key := manifest.OCIBlobKey(d)
+	store := s.typeStore(manifest.TypeOCI)
+	layer := f.image.amd64Layer
+	if err := store.Put(t.Context(), key, layer); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+d, nil)
+	r.Header.Set("Range", "bytes=10-13,0-3")
+	rec := httptest.NewRecorder()
+	s.serveOCIBlobHit(rec, r, seekingStore{store}, key,
+		ociTarget{registry: "docker.io", repo: "library/nginx", ref: d}, f.hub.ts.URL)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("multi-range: %d %s, want 206", rec.Code, rec.Body.String())
+	}
+	_, params, err := mime.ParseMediaType(rec.Header().Get("Content-Type"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mr := multipart.NewReader(rec.Body, params["boundary"])
+	for i, want := range [][]byte{layer[10:14], layer[0:4]} {
+		part, err := mr.NextPart()
+		if err != nil {
+			t.Fatalf("part %d: %v", i, err)
+		}
+		got, err := io.ReadAll(part)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("part %d: %q %v, want %q", i, got, err, want)
+		}
+	}
+	if _, err := mr.NextPart(); err != io.EOF {
+		t.Errorf("after two parts: %v, want EOF", err)
 	}
 }
 
