@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -28,6 +29,7 @@ const OCIDigestPrefix = "sha256:"
 
 var (
 	ociComponent      = `[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*`
+	ociComponentRE    = regexp.MustCompile(`^` + ociComponent + `$`)
 	ociRepositoryRE   = regexp.MustCompile(`^` + ociComponent + `(?:/` + ociComponent + `)*$`)
 	ociTagRE          = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 	ociDigestRE       = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
@@ -52,6 +54,49 @@ func OCIValidDigest(d string) bool { return ociDigestRE.MatchString(d) }
 // apart from a Docker Hub namespace in the first segment of a path.
 func OCIValidRegistryName(name string) bool {
 	return len(name) <= 253 && ociRegistryNameRE.MatchString(name)
+}
+
+// OCINamespaceWildcard is the last segment of a <registry>/<namespace>/*
+// profile entry: every repository under that namespace of that registry.
+const OCINamespaceWildcard = "*"
+
+// ValidateOCIName refuses a profile entry that is neither a package identity
+// a request resolves to nor <registry>/<namespace>/*, so no entry is stored
+// that the gate could never match. Docker Hub's official images are always
+// identified under library/, so docker.io/postgres is refused rather than
+// stored as an entry no request carries.
+func ValidateOCIName(name string) error {
+	const form = "write <registry>/<repository> as bodega identifies an image (docker.io/library/postgres, ghcr.io/acme-labs/widget), " +
+		"or <registry>/<namespace>/* for every repository of one namespace (ghcr.io/acme-labs/*)"
+	registry, repo, ok := strings.Cut(name, "/")
+	if !ok || !OCIValidRegistryName(registry) {
+		return fmt.Errorf("oci %q does not start with a registry name such as docker.io or ghcr.io; %s", name, form)
+	}
+	if ns, ok := strings.CutSuffix(repo, "/"+OCINamespaceWildcard); ok && ociComponentRE.MatchString(ns) {
+		return nil
+	}
+	if !OCIValidRepository(repo) {
+		return fmt.Errorf("oci %q is not a repository; %s", name, form)
+	}
+	if registry == "docker.io" && !strings.Contains(repo, "/") {
+		return fmt.Errorf("oci %q names a Docker Hub official image without its namespace; write docker.io/library/%s", name, repo)
+	}
+	return nil
+}
+
+// OCINamespaceEntry is the <registry>/<namespace>/* entry that covers name,
+// and false when name's repository has no namespace. The namespace is the
+// repository's first segment, so ghcr.io/a/* covers ghcr.io/a/b/c as well.
+func OCINamespaceEntry(name string) (string, bool) {
+	registry, repo, ok := strings.Cut(name, "/")
+	if !ok {
+		return "", false
+	}
+	ns, _, ok := strings.Cut(repo, "/")
+	if !ok || ns == "" {
+		return "", false
+	}
+	return registry + "/" + ns + "/" + OCINamespaceWildcard, true
 }
 
 // OCIBlobKey is a blob's key. One per digest, shared by every repository and

@@ -325,6 +325,12 @@ func profileRefusal(p *entitle.Profile, typ, name, version string, d entitle.Dec
 		f.reason = fmt.Sprintf("%s: %s.", entitle.RefusalConstraint, strings.TrimSuffix(d.Reason, "."))
 		f.next = fmt.Sprintf("ask an operator to move the pin with `bodega profile pin %s %s %s <version> --reason <why>`, or to float it with `bodega profile add %s %s %s --constraint any`.",
 			p.Name(), typ, name, p.Name(), typ, name)
+		if typ == manifest.TypeOCI && manifest.OCIValidDigest(version) {
+			// A digest is judged by the tags bodega resolved to it, and here it
+			// resolved none, so the pin was compared against the digest.
+			f.next = fmt.Sprintf("pull %s by a tag the profile permits first, which records the digest that tag names, or ask an operator to float it with `bodega profile add %s %s %s --constraint any`.",
+				name, p.Name(), typ, name)
+		}
 	default:
 		f.reason = fmt.Sprintf("profile %q refused %s: %s.", p.Name(), subject, strings.TrimSuffix(d.Reason, "."))
 		f.next = fmt.Sprintf("ask an operator to review `bodega profile show %s`.", p.Name())

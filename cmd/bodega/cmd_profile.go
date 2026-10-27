@@ -2144,7 +2144,7 @@ version it holds is one nothing can serve.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			var violations, unchecked, groupWide, vendorWide int
+			var violations, unchecked, groupWide, vendorWide, namespaceWide int
 			var notes []string
 			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -2171,6 +2171,10 @@ version it holds is one nothing can serve.`,
 					}
 					if e.Type == manifest.TypeComposer && strings.HasSuffix(e.Name, "/"+manifest.ComposerVendorWildcard) {
 						vendorWide++
+						continue
+					}
+					if e.Type == manifest.TypeOCI && strings.HasSuffix(e.Name, "/"+manifest.OCINamespaceWildcard) {
+						namespaceWide++
 						continue
 					}
 					reason, note, err := entryResolves(ctx, store, resolved, e, srcIndex)
@@ -2214,6 +2218,10 @@ version it holds is one nothing can serve.`,
 			if vendorWide > 0 {
 				fmt.Printf("%d composer vendor-wide entr%s not checked: <vendor>/* names every package of a vendor rather than one package the catalog holds.\n",
 					vendorWide, plural(vendorWide, "y", "ies"))
+			}
+			if namespaceWide > 0 {
+				fmt.Printf("%d oci namespace-wide entr%s not checked: <registry>/<namespace>/* names every repository of a namespace rather than one package the catalog holds.\n",
+					namespaceWide, plural(namespaceWide, "y", "ies"))
 			}
 			if violations == 0 {
 				fmt.Printf("OK: every entry in %d profile(s) resolves in the catalog.\n", len(names))
@@ -2570,6 +2578,8 @@ func requireEntryNameForm(typ, name string) error {
 		return manifest.ValidateMavenName(name)
 	case manifest.TypeComposer:
 		return manifest.ValidateComposerName(name)
+	case manifest.TypeOCI:
+		return manifest.ValidateOCIName(name)
 	}
 	return nil
 }
