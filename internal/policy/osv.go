@@ -69,6 +69,9 @@ func OSVEcosystems() []string {
 	return out
 }
 
+// OSVNotRunOCI is the reason the OSV check gives for every oci version.
+const OSVNotRunOCI = "not run: OSV has no container image ecosystem, so no advisory or malware record can be looked up for an image"
+
 type OSVChecker struct {
 	store OSVStore
 
@@ -136,6 +139,12 @@ func (c *OSVChecker) CheckMalware(ctx context.Context, pm *manifest.PackageManif
 func (c *OSVChecker) check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry, malwareOnly bool) Result {
 	if pm == nil || ve == nil {
 		return Result{Check: "osv", Action: ActionPass}
+	}
+	if pm.Type == manifest.TypeOCI {
+		// The other uncovered types pass, and an image must not: it carries
+		// whole distributions of packages OSV does cover, so a pass would read
+		// as a scan nobody ran.
+		return Result{Check: "osv", Action: ActionNotEvaluated, Reason: OSVNotRunOCI}
 	}
 	if !OSVCovers(pm.Type) {
 		return Result{Check: "osv", Action: ActionPass}

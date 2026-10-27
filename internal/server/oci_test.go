@@ -203,11 +203,19 @@ type ociImage struct {
 	arm64Layer, arm64ConfigBytes []byte
 }
 
-func newOCIImage() ociImage {
+func newOCIImage() ociImage { return newOCIImageCreated("") }
+
+// newOCIImageCreated is newOCIImage with created in each config, or no
+// created field when it is empty. The layers differ by created too, so two
+// images share no blob.
+func newOCIImageCreated(created string) ociImage {
 	var im ociImage
 	platformManifest := func(arch string) (m, cfg, layer []byte) {
 		cfg = []byte(`{"architecture":"` + arch + `","os":"linux"}`)
-		layer = []byte("layer bytes for " + arch + " 0123456789")
+		if created != "" {
+			cfg = []byte(`{"architecture":"` + arch + `","created":"` + created + `","os":"linux"}`)
+		}
+		layer = []byte("layer bytes for " + arch + " 0123456789" + created)
 		m, _ = json.Marshal(map[string]any{
 			"schemaVersion": 2, "mediaType": mediaOCIManifest,
 			"config": map[string]any{"mediaType": "application/vnd.oci.image.config.v1+json", "digest": ociDigest(cfg), "size": len(cfg)},

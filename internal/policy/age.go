@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,31 @@ var agePublishers = map[string]func(*AgeChecker, context.Context, string, string
 	manifest.TypeRubygems: (*AgeChecker).gemPublishedAt,
 	manifest.TypeMaven:    (*AgeChecker).mavenPublishedAt,
 	manifest.TypeComposer: (*AgeChecker).composerPublishedAt,
+	manifest.TypeOCI:      (*AgeChecker).ociPublishedAt,
+}
+
+// An oci tag is dated by bodega's registry when it resolves the tag, from the
+// image config, and the time reaches the check on the entry: PublishedAt holds
+// it and OCIDatedByKey in Metadata says which time it is. No registry answers
+// a lookup by repository and tag with a time, so there is nothing for the
+// check to ask.
+const (
+	OCIDatedByKey = "oci_dated_by"
+	// OCIDatedByCreated is the image config's created field.
+	OCIDatedByCreated = "created"
+	// OCIDatedByFirstSeen is when bodega first resolved the tag to its digest,
+	// used for a config with no created field or one at the Unix epoch, which
+	// reproducible builds write and which would pass any age floor.
+	OCIDatedByFirstSeen = "first_seen"
+	// OCIDateErrorKey is why the registry could not date the tag.
+	OCIDateErrorKey = "oci_date_error"
+)
+
+// LookupDatedEcosystems is AgeEcosystems less oci: the types whose publish
+// time a lookup by name and version reads, which is what recording one on a
+// manifest entry needs. An oci tag is dated only as bodega resolves it.
+func LookupDatedEcosystems() []string {
+	return slices.DeleteFunc(AgeEcosystems(), func(t string) bool { return t == manifest.TypeOCI })
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -121,15 +147,21 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			Reason: "version " + versionLabel(version) + " pins nothing; age gate is version-aware"}
 	}
 
-	type dated struct {
-		at  time.Time
-		err error
+	var publishedAt time.Time
+	datedBy := ""
+	if pm.Type == manifest.TypeOCI {
+		publishedAt, datedBy, err = ociDated(ve)
+	} else {
+		type dated struct {
+			at  time.Time
+			err error
+		}
+		d := SharedLookup(ctx, "age\x00"+pm.Type+"\x00"+pm.Name+"\x00"+version, func() dated {
+			at, err := c.PublishedAt(ctx, pm.Type, pm.Name, version)
+			return dated{at, err}
+		})
+		publishedAt, err = d.at, d.err
 	}
-	d := SharedLookup(ctx, "age\x00"+pm.Type+"\x00"+pm.Name+"\x00"+version, func() dated {
-		at, err := c.PublishedAt(ctx, pm.Type, pm.Name, version)
-		return dated{at, err}
-	})
-	publishedAt, err := d.at, d.err
 	if err != nil {
 		// Not having an upstream timestamp shouldn't fail-closed; short-circuit
 		// with a warn that shows up in the audit but doesn't block.
@@ -140,11 +172,16 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	age := c.Now().Sub(publishedAt)
 	minAge := time.Duration(policy.MinAgeSeconds) * time.Second
 	if age >= minAge {
-		return Result{Check: "age", Action: ActionPass,
+		r := Result{Check: "age", Action: ActionPass,
 			Details: map[string]any{"published_at": publishedAt.UTC().Format(time.RFC3339), "age_seconds": int64(age.Seconds())}}
+		if datedBy != "" {
+			r.Details["dated_by"] = datedBy
+			r.Reason = ociDatedPhrase(datedBy)
+		}
+		return r
 	}
 
-	return Result{
+	r := Result{
 		Check:  "age",
 		Action: policy.Action,
 		Reason: fmt.Sprintf("%s@%s is %s old, policy requires %s",
@@ -155,6 +192,36 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			"min_age_seconds": policy.MinAgeSeconds,
 		},
 	}
+	if datedBy != "" {
+		r.Details["dated_by"] = datedBy
+		r.Reason += " (" + ociDatedPhrase(datedBy) + ")"
+	}
+	return r
+}
+
+// ociDated reads the time bodega's registry recorded for an oci tag off its
+// entry, and which time it is.
+func ociDated(ve *manifest.VersionEntry) (time.Time, string, error) {
+	if msg := ve.Metadata[OCIDateErrorKey]; msg != "" {
+		return time.Time{}, "", errors.New(msg)
+	}
+	by := ve.Metadata[OCIDatedByKey]
+	if ve.PublishedAt == "" || (by != OCIDatedByCreated && by != OCIDatedByFirstSeen) {
+		return time.Time{}, "", errors.New("an image is dated by bodega's registry when it resolves the tag, and this entry carries no time from it")
+	}
+	t, err := time.Parse(time.RFC3339Nano, ve.PublishedAt)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("the time recorded for the tag does not parse: %w", err)
+	}
+	return t, by, nil
+}
+
+// ociDatedPhrase says which time an oci verdict used.
+func ociDatedPhrase(datedBy string) string {
+	if datedBy == OCIDatedByFirstSeen {
+		return "dated by when bodega first resolved the tag: the image config carries no created time, or the Unix epoch"
+	}
+	return "dated by the image config's created time"
 }
 
 // versionLabel names an unpinned version in a Reason, where the empty string
@@ -201,14 +268,21 @@ func (c *AgeChecker) AtUpstream(typ, upstream string) *AgeChecker {
 }
 
 // UndatableVersion reports a version string that names no single release:
-// unset, "*", "any", or an npm dist-tag. No registry can date one, so a caller
+// unset, "*", "any", an npm dist-tag, or any oci tag, since a tag moves to
+// whatever its publisher pushes next. No registry can date one, so a caller
 // recording publish times passes it over rather than reporting a failure.
 func UndatableVersion(typ, version string) bool {
 	v := strings.TrimSpace(version)
-	if v == "" || v == "*" || v == manifest.ConstraintAny {
+	if v == "" || v == "*" || v == manifest.ConstraintAny || typ == manifest.TypeOCI {
 		return true
 	}
 	return typ == manifest.TypeNpm && v == "latest"
+}
+
+// ociPublishedAt is the oci entry in agePublishers, which makes the gate
+// settable for oci. The time itself arrives on the entry; see ociDated.
+func (c *AgeChecker) ociPublishedAt(_ context.Context, name, tag string) (time.Time, error) {
+	return time.Time{}, fmt.Errorf("oci %s:%s is dated by bodega's registry from the image config when it resolves the tag, not by a lookup", name, tag)
 }
 
 func (c *AgeChecker) npmPublishedAt(ctx context.Context, name, version string) (time.Time, error) {

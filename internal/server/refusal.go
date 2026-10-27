@@ -421,6 +421,10 @@ func ageReason(f *refusal, d map[string]any) {
 	}
 	f.reason = fmt.Sprintf("this version was published %s and this server holds new versions back for %s.",
 		published.UTC().Format(time.DateOnly), policy.ShortDuration(minAge))
+	if d["dated_by"] == policy.OCIDatedByFirstSeen {
+		f.reason = fmt.Sprintf("this image's config carries no build time, so it is dated by when this server first resolved the tag, %s, and this server holds new images back for %s.",
+			published.UTC().Format(time.DateOnly), policy.ShortDuration(minAge))
+	}
 	f.next = fmt.Sprintf("the version becomes available on %s; pin an older version until then.",
 		published.Add(minAge).UTC().Format(time.DateOnly))
 }

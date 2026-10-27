@@ -205,7 +205,7 @@ it once before a hosted index can date them.`,
 // type the operator named that has no such source is refused rather than
 // skipped, since skipping reports a clean run over something never examined.
 func publishedTypes(types []string, named bool) ([]string, error) {
-	dated := policy.AgeEcosystems()
+	dated := policy.LookupDatedEcosystems()
 	var out []string
 	for _, t := range types {
 		if slices.Contains(dated, t) {
