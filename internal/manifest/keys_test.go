@@ -354,3 +354,31 @@ func TestRubygemsGemIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestComposerNormalizeVersionFollowsVersionParser(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		"v7.1.5":       "7.1.5.0",
+		"7.1.5":        "7.1.5.0",
+		"7.1.5.0":      "7.1.5.0",
+		"V7.1":         "7.1.0.0",
+		"7":            "7.0.0.0",
+		"2.0.0-RC1":    "2.0.0.0-RC1",
+		"v2.0.0-rc1":   "2.0.0.0-RC1",
+		"2.0.0-rc.2":   "2.0.0.0-RC2",
+		"1.0.0b1":      "1.0.0.0-beta1",
+		"1.0.0-alpha":  "1.0.0.0-alpha",
+		"1.0.0-a2":     "1.0.0.0-alpha2",
+		"1.0.0-pl1":    "1.0.0.0-patch1",
+		"1.0.0-stable": "1.0.0.0",
+		"1.0.0+build7": "1.0.0.0",
+		"1.0.0-dev":    "1.0.0.0-dev",
+		"dev-main":     "dev-main",
+		"1.x-dev":      "1.x-dev",
+		"1.2.3.4.5":    "1.2.3.4.5",
+	} {
+		if got := ComposerNormalizeVersion(in); got != want {
+			t.Errorf("ComposerNormalizeVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

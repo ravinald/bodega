@@ -415,3 +415,42 @@ func TestFingerprintTracksOneType(t *testing.T) {
 		t.Error("an npm entry moved the freebsd fingerprint")
 	}
 }
+
+// Packagist tags symfony/* with a leading v and monolog without, and Composer
+// calls the two spellings one version, so an exact composer pin does too.
+func TestComposerExactPinComparesTheWayComposerDoes(t *testing.T) {
+	for _, tc := range []struct {
+		pin, request string
+		want         bool
+	}{
+		{"7.1.5", "v7.1.5", true},
+		{"v7.1.5", "7.1.5", true},
+		{"7.1", "7.1.0", true},
+		{"7.1.5", "7.1.6", false},
+		{"7.1.5", "v7.1.6", false},
+		{"2.0.0-RC1", "v2.0.0-rc1", true},
+		{"dev-main", "dev-main", true},
+		{"dev-main", "dev-master", false},
+		{"dev-main", "v7.1.5", false},
+	} {
+		p := profile("web",
+			[]audit.ProfileTypeRule{rule(manifest.TypeComposer, audit.MembershipOpen, audit.VersionFloating)},
+			[]audit.ProfileEntry{{Type: manifest.TypeComposer, Name: "symfony/console", Constraint: manifest.ConstraintExact, Version: tc.pin}})
+		d := p.Permits(manifest.TypeComposer, "symfony/console", tc.request)
+		if d.Permitted != tc.want {
+			t.Errorf("pin %s, request %s: permitted=%v, want %v: %s", tc.pin, tc.request, d.Permitted, tc.want, d.Reason)
+		}
+		if !strings.Contains(d.Reason, "pinned to "+tc.pin) {
+			t.Errorf("pin %s, request %s: the reason does not name the pin as written: %s", tc.pin, tc.request, d.Reason)
+		}
+	}
+}
+
+func TestOtherTypesKeepTheByteCompare(t *testing.T) {
+	p := profile("web",
+		[]audit.ProfileTypeRule{rule(manifest.TypeNpm, audit.MembershipOpen, audit.VersionFloating)},
+		[]audit.ProfileEntry{{Type: manifest.TypeNpm, Name: "left-pad", Constraint: manifest.ConstraintExact, Version: "1.3.0"}})
+	if p.Permits(manifest.TypeNpm, "left-pad", "v1.3.0").Permitted {
+		t.Error("an npm exact pin of 1.3.0 permitted v1.3.0; only composer normalizes")
+	}
+}

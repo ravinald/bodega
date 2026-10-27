@@ -270,3 +270,39 @@ func TestFilterComposerMetadataKeepsEachVersionsExpansion(t *testing.T) {
 		t.Errorf("Packagist's empty answer = %s, %v", got, err)
 	}
 }
+
+// Packagist tags symfony/console with a leading v; an operator who pins the
+// bare number gets the release Composer would call by that number.
+func TestComposerPinWithoutVMatchesTheTaggedRelease(t *testing.T) {
+	const ref516 = "2c5df6bf7ded8f7d6d1f3d7f1a2a9e1b3b2b0c5e"
+	f := newPackagistFixture(t)
+	arch := f.archives.ts.URL
+	esc := func(s string) string { return strings.ReplaceAll(s, "/", `\/`) }
+	f.packagist.set("/p2/symfony/console.json", `{"packages":{"symfony/console":[`+
+		`{"name":"symfony/console","version":"v7.1.6","version_normalized":"7.1.6.0",`+
+		`"dist":{"url":"`+esc(arch+"/archives/symfony/console/"+ref516)+`","type":"zip","shasum":"","reference":"`+ref516+`"},`+
+		`"require":{"php":">=8.2"}},`+
+		`{"version":"v7.1.5","version_normalized":"7.1.5.0",`+
+		`"dist":{"url":"`+esc(arch+"/archives/symfony/console/"+consoleRef515)+`","type":"zip","shasum":"","reference":"`+consoleRef515+`"}}`+
+		`]},"minified":"composer/2.0"}`)
+	f.archives.set("/archives/symfony/console/"+ref516, "PK\x03\x04 console 7.1.6")
+	s := composerServer(t, f)
+	pf := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{{Type: manifest.TypeComposer, Membership: audit.MembershipOpen, VersionDefault: audit.VersionFloating}},
+		[]audit.ProfileEntry{{Type: manifest.TypeComposer, Name: "symfony/console", Constraint: manifest.ConstraintExact, Version: "7.1.5", Reason: "hold"}})
+
+	status, meta := pf.get(t, consoleMetadataPath)
+	vs := composerExpand(t, meta, "symfony/console")
+	if got := expandedVersions(vs); status != http.StatusOK || got != "v7.1.5" {
+		t.Fatalf("metadata under a 7.1.5 pin = %d %q, want only v7.1.5:\n%s", status, got, meta)
+	}
+	if vs[0]["require"] == nil {
+		t.Errorf("the kept v7.1.5 lost the require it inherits from the dropped v7.1.6: %v", vs[0])
+	}
+	if status, body := pf.get(t, consoleDistPath("v7.1.5", consoleRef515)); status != http.StatusOK || body != "PK\x03\x04 console 7.1.5" {
+		t.Errorf("v7.1.5 under a 7.1.5 pin answered %d: %q", status, body)
+	}
+	if status, body := pf.get(t, consoleDistPath("v7.1.6", ref516)); status != http.StatusForbidden || !strings.Contains(body, "pinned to 7.1.5") {
+		t.Errorf("v7.1.6 under a 7.1.5 pin = %d, want a 403 naming the pin: %s", status, body)
+	}
+}

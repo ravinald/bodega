@@ -879,6 +879,57 @@ func ComposerVendorEntry(name string) (string, bool) {
 	return vendor + "/" + ComposerVendorWildcard, true
 }
 
+var composerTagPattern = regexp.MustCompile(`(?i)^v?(\d{1,5})(\.\d+)?(\.\d+)?(\.\d+)?[._-]?(?:(stable|beta|b|rc|alpha|a|patch|pl|p)((?:[.-]?\d+)*))?([.-]?dev)?$`)
+
+// ComposerNormalizeVersion returns the form Composer compares a tagged version
+// in, following composer/semver's VersionParser::normalize: build metadata
+// and one leading v dropped, four numeric components, and the stability
+// suffix spelled as expandStability spells it, so v7.1.5, 7.1.5 and 7.1.5.0
+// all become 7.1.5.0 and 2.0.0-rc1 becomes 2.0.0.0-RC1. A branch (dev-main,
+// 1.x-dev) or anything else that is not a classical tag is returned as given,
+// so it equals only itself.
+func ComposerNormalizeVersion(version string) string {
+	v := strings.TrimSpace(version)
+	if base, _, ok := strings.Cut(v, "+"); ok && base != "" {
+		v = base
+	}
+	m := composerTagPattern.FindStringSubmatch(v)
+	if m == nil {
+		return version
+	}
+	out := m[1]
+	for _, part := range m[2:5] {
+		if part == "" {
+			part = ".0"
+		}
+		out += part
+	}
+	if strings.EqualFold(m[5], "stable") {
+		return out
+	}
+	if m[5] != "" {
+		out += "-" + composerExpandStability(m[5]) + strings.TrimLeft(m[6], ".-")
+	}
+	if m[7] != "" {
+		out += "-dev"
+	}
+	return out
+}
+
+func composerExpandStability(s string) string {
+	switch strings.ToLower(s) {
+	case "a", "alpha":
+		return "alpha"
+	case "b", "beta":
+		return "beta"
+	case "p", "pl", "patch":
+		return "patch"
+	case "rc":
+		return "RC"
+	}
+	return s
+}
+
 // ComposerValidReference reports whether ref can name a dist archive in a key.
 func ComposerValidReference(ref string) bool { return composerReferencePattern.MatchString(ref) }
 
