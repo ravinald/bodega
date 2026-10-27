@@ -63,9 +63,10 @@ Each Linux guest needs:
   `E2E_SERVER_HOST` resolves to. Suite 10 writes `/etc/hosts` entries when DNS
   does not answer.
 
-The client guest also installs `npm`, `python3-pip`, `cargo` and `helm` during
-suite 45. Nothing else is required in advance: the harness installs what it
-needs and reports what it could not.
+The client guest also installs `npm`, `python3-pip`, `cargo`, `helm`, `maven`,
+`default-jdk-headless`, `unzip` and `ruby-bundler` during suite 45, and
+downloads a Gradle distribution through the server. Nothing else is required in
+advance: the harness installs what it needs and reports what it could not.
 
 Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `ssh` and `sudo` access, and room under `/var/tmp`. Suite 47 ships
