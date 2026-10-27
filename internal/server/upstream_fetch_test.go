@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -259,14 +260,19 @@ func TestUpstreamRateLimitReachesTheClientAs503(t *testing.T) {
 		cached     bool
 		wantCode   int
 		wantRetry  string
+		wantWait   string
 	}{
-		{"429 with Retry-After", http.StatusTooManyRequests, "120", false, http.StatusServiceUnavailable, "120"},
-		{"429 with no Retry-After", http.StatusTooManyRequests, "", false, http.StatusServiceUnavailable, "60"},
-		{"503 with Retry-After", http.StatusServiceUnavailable, "30", false, http.StatusServiceUnavailable, "30"},
-		{"429 with a malformed Retry-After", http.StatusTooManyRequests, "soon", false, http.StatusServiceUnavailable, "60"},
-		{"500 stays an outage", http.StatusInternalServerError, "", false, http.StatusBadGateway, ""},
-		{"503 with no Retry-After stays an outage", http.StatusServiceUnavailable, "", false, http.StatusBadGateway, ""},
-		{"429 over a cached copy serves it", http.StatusTooManyRequests, "120", true, http.StatusOK, ""},
+		{"429 with Retry-After", http.StatusTooManyRequests, "120", false, http.StatusServiceUnavailable, "120", "120 seconds"},
+		{"429 with no Retry-After", http.StatusTooManyRequests, "", false, http.StatusServiceUnavailable, "60", "60 seconds"},
+		{"503 with Retry-After", http.StatusServiceUnavailable, "30", false, http.StatusServiceUnavailable, "30", "30 seconds"},
+		{"429 with zero-padded seconds", http.StatusTooManyRequests, "00000000120", false, http.StatusServiceUnavailable, "00000000120", "00000000120 seconds"},
+		{"429 with an HTTP-date", http.StatusTooManyRequests, "Wed, 28 Oct 2026 07:28:00 GMT", false, http.StatusServiceUnavailable, "Wed, 28 Oct 2026 07:28:00 GMT", "Wed, 28 Oct 2026 07:28:00 GMT"},
+		// Relayed as sent, but kept out of the body: upstream text there could
+		// name a host.
+		{"429 with a nonstandard Retry-After", http.StatusTooManyRequests, "see https://127.0.0.1/", false, http.StatusServiceUnavailable, "see https://127.0.0.1/", "Retry-After header"},
+		{"500 stays an outage", http.StatusInternalServerError, "", false, http.StatusBadGateway, "", ""},
+		{"503 with no Retry-After stays an outage", http.StatusServiceUnavailable, "", false, http.StatusBadGateway, "", ""},
+		{"429 over a cached copy serves it", http.StatusTooManyRequests, "120", true, http.StatusOK, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			allowLoopbackUpstream(t)
@@ -301,7 +307,7 @@ func TestUpstreamRateLimitReachesTheClientAs503(t *testing.T) {
 					t.Errorf("body = %q, want the cached copy", body)
 				}
 			case tc.wantCode == http.StatusServiceUnavailable:
-				if !strings.Contains(body, "rate-limiting") || !strings.Contains(body, tc.wantRetry+" seconds") {
+				if !strings.Contains(body, "rate-limiting") || !strings.Contains(body, tc.wantWait) {
 					t.Errorf("body = %q, want it to say the upstream is rate-limiting and when to retry", body)
 				}
 				if strings.Contains(body, "127.0.0.1") {
@@ -309,5 +315,28 @@ func TestUpstreamRateLimitReachesTheClientAs503(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A CDN that gzips its rate-limit page is still saying "wait". The identity
+// check guards artifact bodies, and a 429 carries none, so it must not turn
+// the answer into an encoding refusal.
+func TestEncodedRateLimitIsStillARateLimit(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "120")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(status)
+		}))
+		_, err := openUpstreamVia(t.Context(), ts.Client(), func(string) error { return nil }, ts.URL, true)
+		ts.Close()
+		var limited *upstreamRateLimited
+		if !errors.As(err, &limited) {
+			t.Errorf("status %d: err = %v, want *upstreamRateLimited", status, err)
+			continue
+		}
+		if limited.status != status || limited.retryAfter != "120" {
+			t.Errorf("status %d: got status %d Retry-After %q", status, limited.status, limited.retryAfter)
+		}
 	}
 }

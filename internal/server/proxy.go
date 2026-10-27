@@ -790,6 +790,15 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		return nil, err
 	}
 
+	// Ahead of the identity check: a rate-limit answer has no artifact body to
+	// protect, and a CDN that gzips its error page would otherwise turn
+	// "wait" into "misconfigured upstream".
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
+		resp.Body.Close()
+		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
+	}
+
 	if identity {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			resp.Body.Close()
@@ -802,11 +811,6 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
-	}
-	if resp.StatusCode == http.StatusTooManyRequests ||
-		(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
-		resp.Body.Close()
-		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -847,36 +851,35 @@ func (e *upstreamRateLimited) Error() string {
 // when the upstream rate-limited it without saying for how long.
 const defaultRateLimitRetryAfter = "60"
 
-// clientRetryAfter is the Retry-After the client is handed. The upstream's
-// value passes through unchanged when it is one of the two forms RFC 9110
-// allows, delta-seconds or an HTTP-date; anything else is not relayed, since
-// the header goes out under bodega's name.
+// clientRetryAfter is the Retry-After the client is handed: the upstream's
+// value as sent, so a client honoring it waits exactly as long as the upstream
+// asked. net/http's client has already refused CR and LF in it, and its
+// server rewrites them on output, so relaying it cannot split the response.
 func (e *upstreamRateLimited) clientRetryAfter() string {
-	v := strings.TrimSpace(e.retryAfter)
-	if v == "" {
+	if e.retryAfter == "" {
 		return defaultRateLimitRetryAfter
 	}
-	if isDeltaSeconds(v) {
-		return v
-	}
-	if _, err := http.ParseTime(v); err == nil {
-		return v
-	}
-	return defaultRateLimitRetryAfter
+	return e.retryAfter
 }
 
 func isDeltaSeconds(v string) bool {
-	return v != "" && len(v) <= 10 && strings.Trim(v, "0123456789") == ""
+	return v != "" && strings.Trim(v, "0123456789") == ""
 }
 
 // writeRateLimited answers a client whose fetch the upstream rate-limited.
 // 503 rather than 502: Maven, Gradle and pip back off and retry a 503 that
 // carries Retry-After, and they report a 502 as the repository being down.
+//
+// The body quotes the interval only in one of RFC 9110's two forms. Anything
+// else is upstream text that may name a host, and the body goes to whoever
+// can reach the route, so it points at the header instead.
 func writeRateLimited(w http.ResponseWriter, limited *upstreamRateLimited) {
 	retry := limited.clientRetryAfter()
-	wait := retry
+	wait := "the interval in its Retry-After header"
 	if isDeltaSeconds(retry) {
 		wait = retry + " seconds"
+	} else if _, err := http.ParseTime(retry); err == nil {
+		wait = retry
 	}
 	w.Header().Set("Retry-After", retry)
 	http.Error(w, "the upstream is rate-limiting bodega and nothing is cached for this request; retry after "+wait+".",
