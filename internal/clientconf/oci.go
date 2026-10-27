@@ -3,13 +3,17 @@ package clientconf
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
-	"regexp"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -199,7 +203,7 @@ func ContainerdConfig(base string) File {
 		System:  manifest.TypeOCI,
 		Label:   "containerd config.toml",
 		Paths:   map[string]string{OSLinux: ContainerdConfigPath},
-		Content: "version = 2\n\n" + containerdRegistryTable[2] + "\n  config_path = " + jsonString(ContainerdCertsDir) + "\n",
+		Content: "version = 2\n\n" + tomlHeaderText(containerdRegistryTable[2]) + "\n  config_path = " + jsonString(ContainerdCertsDir) + "\n",
 		Notes:   notes,
 	}
 }
@@ -312,76 +316,305 @@ func indentJSON(doc []member) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// containerdRegistryTable is the CRI plugin's registry table per config.toml
-// version. Version 1 names the plugin by its short id; containerd 1.x
-// ignores the long name there.
-var containerdRegistryTable = map[int]string{
-	1: "[plugins.cri.registry]",
-	2: `[plugins."io.containerd.grpc.v1.cri".registry]`,
-	3: `[plugins."io.containerd.cri.v1.images".registry]`,
+// containerdRegistryTable is the key path of the CRI plugin's registry table
+// per config.toml version. Version 1 names the plugin by its short id;
+// containerd 1.x ignores the long name there.
+var containerdRegistryTable = map[int][]string{
+	1: {"plugins", "cri", "registry"},
+	2: {"plugins", "io.containerd.grpc.v1.cri", "registry"},
+	3: {"plugins", "io.containerd.cri.v1.images", "registry"},
 }
 
-var (
-	containerdVersionRE    = regexp.MustCompile(`^\s*version\s*=\s*(\d+)\s*(#.*)?$`)
-	containerdConfigPathRE = regexp.MustCompile(`^(\s*config_path\s*=\s*)(?:"(.*)"|'(.*)')\s*(#.*)?$`)
-	tomlTableRE            = regexp.MustCompile(`^\s*\[`)
-)
+// ContainerdRegistry is what a containerd config.toml says about the CRI
+// plugin's registry table, read as containerd decodes it.
+type ContainerdRegistry struct {
+	Version int
+	// ConfigPath is the colon-separated hosts directory list, "" when the
+	// key is absent or empty: containerd reads no hosts.toml either way.
+	ConfigPath string
+	// Legacy names the first registry setting containerd refuses to start
+	// with beside config_path (mirrors, configs.<host>.tls), "" for none.
+	Legacy string
+	// CRIDisabled is a disabled_plugins entry naming the CRI plugin, as
+	// Docker's packaged config.toml carries: nothing then reads the table.
+	CRIDisabled bool
+}
+
+// ReadContainerdConfig decodes a config.toml and reports its CRI registry
+// settings. A file containerd could not load, or one in a format version
+// this release does not know, is an error.
+func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
+	var doc map[string]any
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return ContainerdRegistry{}, err
+	}
+	r := ContainerdRegistry{Version: 1}
+	if v, ok := doc["version"]; ok {
+		n, ok := v.(int64)
+		if !ok {
+			return r, fmt.Errorf("version = %v is not a number", v)
+		}
+		r.Version = int(n)
+	}
+	path, ok := containerdRegistryTable[r.Version]
+	if !ok {
+		return r, fmt.Errorf("it declares version = %d, a config.toml format this release does not know", r.Version)
+	}
+	if list, ok := doc["disabled_plugins"].([]any); ok {
+		for _, p := range list {
+			r.CRIDisabled = r.CRIDisabled || p == "cri" || p == "io.containerd.grpc.v1.cri" || p == path[1]
+		}
+	}
+	table := tomlTable(doc, path)
+	switch v := table["config_path"].(type) {
+	case nil:
+	case string:
+		r.ConfigPath = v
+	default:
+		return r, fmt.Errorf("config_path = %v is not a string", v)
+	}
+	if m, ok := table["mirrors"].(map[string]any); ok && len(m) > 0 {
+		r.Legacy = "mirrors"
+	}
+	if configs, ok := table["configs"].(map[string]any); ok && r.Legacy == "" {
+		names := make([]string, 0, len(configs))
+		for name := range configs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if c, ok := configs[name].(map[string]any); ok && c["tls"] != nil {
+				r.Legacy = "configs." + jsonString(name) + ".tls"
+				break
+			}
+		}
+	}
+	return r, nil
+}
+
+// tomlTable walks doc down path, nil where a step is missing or not a table.
+func tomlTable(doc map[string]any, path []string) map[string]any {
+	for _, k := range path {
+		next, ok := doc[k].(map[string]any)
+		if !ok {
+			return nil
+		}
+		doc = next
+	}
+	return doc
+}
 
 // MergeContainerdConfig returns existing with config_path set in the CRI
-// plugin's registry table when no line sets one, and existing unchanged when
-// one does: a config_path the operator chose is theirs, and certs.d is
-// containerd's own default for it. An empty config_path counts as unset. An
-// empty existing file gets planned.
+// plugin's registry table when it holds none, and existing unchanged when it
+// holds one: a config_path the operator chose is theirs. An empty
+// config_path counts as unset. An empty existing file gets planned.
 //
 // The edit is a line edit rather than a TOML round trip, which would drop
-// every comment the file carries. The table is chosen by the file's version
-// line: inserting a version line into a file without one would turn its
-// short plugin names, which version 2 refuses, into a containerd that does
-// not start.
+// every comment the file carries. Its result is decoded again and must equal
+// existing in every key but this one, so a form the line edit misreads (an
+// inline table, a dotted key it did not expect, a multi-line value) is
+// refused rather than written. A file containerd would not load, or one
+// whose registry table sets what containerd refuses beside config_path, is
+// refused too: a restart would leave containerd down.
 func MergeContainerdConfig(existing, planned []byte) ([]byte, error) {
 	if len(bytes.TrimSpace(existing)) == 0 {
 		return planned, nil
 	}
-	lines := strings.Split(string(existing), "\n")
-	version, inTop := 1, true
-	for i, line := range lines {
-		if tomlTableRE.MatchString(line) {
-			inTop = false
-		}
-		if m := containerdVersionRE.FindStringSubmatch(line); m != nil && inTop {
-			version, _ = strconv.Atoi(m[1])
-		}
-		if m := containerdConfigPathRE.FindStringSubmatch(line); m != nil {
-			if m[2]+m[3] != "" {
-				return existing, nil
-			}
-			lines[i] = m[1] + jsonString(ContainerdCertsDir)
-			return []byte(strings.Join(lines, "\n")), nil
-		}
+	have, err := ReadContainerdConfig(existing)
+	if err != nil {
+		return nil, fmt.Errorf("containerd cannot load it as it stands (%w); repair it, or add config_path = %q to its CRI registry table by hand, then re-run. Nothing was written", err, ContainerdCertsDir)
 	}
-	table, ok := containerdRegistryTable[version]
-	if !ok {
-		return nil, fmt.Errorf("it declares version = %d, a config.toml format this release does not know; add config_path = %q to its CRI registry table by hand", version, ContainerdCertsDir)
+	if have.ConfigPath != "" {
+		return existing, nil
 	}
-	setting := "  config_path = " + jsonString(ContainerdCertsDir)
-	for i, line := range lines {
-		if tomlHeader(line) == tomlHeader(table) {
-			lines = append(lines[:i+1], append([]string{setting}, lines[i+1:]...)...)
-			return []byte(strings.Join(lines, "\n")), nil
-		}
+	table := containerdRegistryTable[have.Version]
+	if have.Legacy != "" {
+		return nil, fmt.Errorf("%s sets %s, which containerd refuses to start with beside config_path; move it into hosts.toml files under %s and remove it, then re-run. Nothing was written", tomlHeaderText(table), have.Legacy, ContainerdCertsDir)
 	}
-	out := strings.TrimRight(string(existing), "\n") + "\n\n" + table + "\n" + setting + "\n"
-	return []byte(out), nil
+	out := setContainerdConfigPath(existing, table)
+	if err := sameButConfigPath(existing, out, table); err != nil {
+		return nil, fmt.Errorf("this release cannot edit the form its CRI registry table takes (%v); add config_path = %q to %s by hand, then re-run. Nothing was written", err, ContainerdCertsDir, tomlHeaderText(table))
+	}
+	return out, nil
 }
 
-// tomlHeader is a table header line with its comment, spacing and key
-// quoting removed, so the spellings TOML treats as one table compare equal.
-// Any other line is "".
-func tomlHeader(line string) string {
-	line, _, _ = strings.Cut(line, "#")
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "[") || strings.HasPrefix(line, "[[") {
-		return ""
+// setContainerdConfigPath rewrites the value of config_path in table, keeping
+// the key's spelling and the line's comment, or inserts the key under the
+// table's header, or appends the table. Lines inside a multi-line string are
+// skipped. What it gets wrong, sameButConfigPath catches.
+func setContainerdConfigPath(existing []byte, table []string) []byte {
+	lines := strings.Split(string(existing), "\n")
+	value := jsonString(ContainerdCertsDir)
+	want := append(append([]string{}, table...), "config_path")
+	var current []string
+	header, closing := -1, ""
+	for i, line := range lines {
+		if closing != "" {
+			if strings.Contains(line, closing) {
+				closing = ""
+			}
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[[") {
+			current = []string{"[["}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			if keys, rest, ok := parseTOMLKey(trimmed[1:]); ok && strings.HasPrefix(rest, "]") {
+				current = keys
+				if slices.Equal(keys, table) {
+					header = i
+				}
+			}
+			continue
+		}
+		keys, rest, ok := parseTOMLKey(trimmed)
+		if !ok || !strings.HasPrefix(rest, "=") {
+			continue
+		}
+		v := strings.TrimLeft(rest[1:], " \t")
+		for _, delim := range []string{`"""`, `'''`} {
+			if strings.HasPrefix(v, delim) && !strings.Contains(v[3:], delim) {
+				closing = delim
+			}
+		}
+		if !slices.Equal(append(append([]string{}, current...), keys...), want) {
+			continue
+		}
+		end := tomlStringEnd(v)
+		if end < 0 {
+			return existing
+		}
+		eq := len(line) - len(strings.TrimLeft(line, " \t")) + len(trimmed) - len(rest)
+		lines[i] = line[:eq+1] + " " + value + v[end:]
+		return []byte(strings.Join(lines, "\n"))
 	}
-	return strings.NewReplacer(" ", "", "\t", "", `"`, "", "'", "").Replace(line)
+	setting := "  config_path = " + value
+	if header >= 0 {
+		lines = append(lines[:header+1], append([]string{setting}, lines[header+1:]...)...)
+		return []byte(strings.Join(lines, "\n"))
+	}
+	return []byte(strings.TrimRight(string(existing), "\n") + "\n\n" + tomlHeaderText(table) + "\n" + setting + "\n")
+}
+
+// sameButConfigPath reports why out is not existing with table's config_path
+// set to certs.d: a decode error, the key not reading back, or any other key
+// differing.
+func sameButConfigPath(existing, out []byte, table []string) error {
+	got, err := ReadContainerdConfig(out)
+	if err != nil {
+		return err
+	}
+	if got.ConfigPath != ContainerdCertsDir {
+		return fmt.Errorf("config_path reads back as %q", got.ConfigPath)
+	}
+	var a, b map[string]any
+	if _, err := toml.Decode(string(existing), &a); err != nil {
+		return err
+	}
+	if _, err := toml.Decode(string(out), &b); err != nil {
+		return err
+	}
+	dropKey(a, table, "config_path")
+	dropKey(b, table, "config_path")
+	if !reflect.DeepEqual(a, b) {
+		return errors.New("the edit changed another key")
+	}
+	return nil
+}
+
+// dropKey deletes key from the table at path, then each table on the path
+// the deletion left empty, so a table the edit created compares equal to its
+// absence.
+func dropKey(doc map[string]any, path []string, key string) {
+	if len(path) == 0 {
+		delete(doc, key)
+		return
+	}
+	next, ok := doc[path[0]].(map[string]any)
+	if !ok {
+		return
+	}
+	dropKey(next, path[1:], key)
+	if len(next) == 0 {
+		delete(doc, path[0])
+	}
+}
+
+// parseTOMLKey reads a dotted TOML key (bare, "basic" or 'literal' parts)
+// from the start of s and returns its parts and what follows it.
+func parseTOMLKey(s string) ([]string, string, bool) {
+	var keys []string
+	for {
+		s = strings.TrimLeft(s, " \t")
+		switch {
+		case strings.HasPrefix(s, `"`):
+			end := tomlStringEnd(s)
+			if end < 0 {
+				return nil, "", false
+			}
+			k, err := strconv.Unquote(s[:end])
+			if err != nil {
+				return nil, "", false
+			}
+			keys, s = append(keys, k), s[end:]
+		case strings.HasPrefix(s, "'"):
+			end := tomlStringEnd(s)
+			if end < 0 {
+				return nil, "", false
+			}
+			keys, s = append(keys, s[1:end-1]), s[end:]
+		default:
+			n := 0
+			for n < len(s) && (s[n] == '_' || s[n] == '-' || s[n] >= '0' && s[n] <= '9' || s[n] >= 'a' && s[n] <= 'z' || s[n] >= 'A' && s[n] <= 'Z') {
+				n++
+			}
+			if n == 0 {
+				return nil, "", false
+			}
+			keys, s = append(keys, s[:n]), s[n:]
+		}
+		s = strings.TrimLeft(s, " \t")
+		if !strings.HasPrefix(s, ".") {
+			return keys, s, true
+		}
+		s = s[1:]
+	}
+}
+
+// tomlStringEnd is the length of the single-line basic or literal string s
+// opens with, or -1 when s opens with none.
+func tomlStringEnd(s string) int {
+	switch {
+	case strings.HasPrefix(s, `"""`), strings.HasPrefix(s, `'''`):
+		return -1
+	case strings.HasPrefix(s, "'"):
+		if end := strings.IndexByte(s[1:], '\''); end >= 0 {
+			return end + 2
+		}
+	case strings.HasPrefix(s, `"`):
+		for i := 1; i < len(s); i++ {
+			switch s[i] {
+			case '\\':
+				i++
+			case '"':
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// tomlHeaderText is the [table] header for path, quoting each part that is
+// not a bare key.
+func tomlHeaderText(path []string) string {
+	parts := make([]string, len(path))
+	for i, p := range path {
+		parts[i] = p
+		if keys, rest, ok := parseTOMLKey(p); !ok || rest != "" || len(keys) != 1 {
+			parts[i] = jsonString(p)
+		}
+	}
+	return "[" + strings.Join(parts, ".") + "]"
 }

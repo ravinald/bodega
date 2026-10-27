@@ -242,7 +242,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if f, ok := host.CheckComposer(); ok {
 				findings = append(findings, f)
 			}
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot}.Check(doctorBaseURL(gf, baseURL))...)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(doctorBaseURL(gf, baseURL))...)
 			if f, ok := ubuntuPro.finding(); ok {
 				findings = append(findings, f)
 			}

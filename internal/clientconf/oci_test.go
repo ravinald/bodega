@@ -173,6 +173,63 @@ func TestMergeContainerdConfigSetsConfigPathOnlyWhenUnset(t *testing.T) {
 	}
 }
 
+// F99 R1, R3: the merge edits the key containerd reads, whatever spelling
+// the file gives it, keeps the line's comment and every other key, and
+// refuses a form it cannot edit, or one containerd would refuse beside
+// config_path, rather than write it.
+func TestMergeContainerdConfigEditsTheEffectiveKey(t *testing.T) {
+	planned := []byte(ContainerdConfig("https://bodega.internal").Content)
+	cri := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n"
+	cases := []struct {
+		name, existing, want string
+	}{
+		{"quoted key", cri + `"config_path" = ""` + "\n", cri + `"config_path" = "/etc/containerd/certs.d"` + "\n"},
+		{"literal key", cri + `'config_path' = ''` + "\n", cri + `'config_path' = "/etc/containerd/certs.d"` + "\n"},
+		{"quoted comment", cri + `config_path = "" # example "/srv/x"` + "\n", cri + `config_path = "/etc/containerd/certs.d" # example "/srv/x"` + "\n"},
+		{"dotted from the plugin table", "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\n  registry.config_path = \"\"\n",
+			"version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\n  registry.config_path = \"/etc/containerd/certs.d\"\n"},
+		{"another plugin's config_path", "version = 2\n[plugins.\"io.containerd.other.v1\".registry]\n  config_path = \"\"\n",
+			"version = 2\n[plugins.\"io.containerd.other.v1\".registry]\n  config_path = \"\"\n\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n"},
+		{"another plugin's config_path set", "version = 2\n[plugins.\"io.containerd.other.v1\".registry]\n  config_path = \"/srv/other\"\n" + cri[len("version = 2\n"):] + "  config_path = \"\"\n",
+			"version = 2\n[plugins.\"io.containerd.other.v1\".registry]\n  config_path = \"/srv/other\"\n" + cri[len("version = 2\n"):] + "  config_path = \"/etc/containerd/certs.d\"\n"},
+		{"header inside a multi-line string", "version = 2\nnote = \"\"\"\n" + cri[len("version = 2\n"):] + "config_path = \"\"\n\"\"\"\n",
+			"version = 2\nnote = \"\"\"\n" + cri[len("version = 2\n"):] + "config_path = \"\"\n\"\"\"\n\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n"},
+		{"empty mirrors table", cri + "[plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]\n",
+			cri + "  config_path = \"/etc/containerd/certs.d\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors]\n"},
+	}
+	for _, c := range cases {
+		got, err := MergeContainerdConfig([]byte(c.existing), planned)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if string(got) != c.want {
+			t.Errorf("%s: merge =\n%s\nwant\n%s", c.name, got, c.want)
+		}
+		if r, err := ReadContainerdConfig(got); err != nil || r.ConfigPath != ContainerdCertsDir {
+			t.Errorf("%s: the merged file reads back as %+v, %v", c.name, r, err)
+		}
+		if again, err := MergeContainerdConfig(got, planned); err != nil || string(again) != string(got) {
+			t.Errorf("%s: a second merge = %v, changed:\n%s", c.name, err, again)
+		}
+	}
+	refused := []struct{ name, existing, says string }{
+		{"inline table", "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\n  registry = { config_path = \"\" }\n", "by hand"},
+		{"multi-line value", cri + "config_path = \"\"\"\n\"\"\"\n", "by hand"},
+		{"legacy mirrors", cri + "[plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"docker.io\"]\n  endpoint = [\"https://m.internal\"]\n", "sets mirrors"},
+		{"legacy tls", cri + "[plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"m.internal\".tls]\n  insecure_skip_verify = true\n", ".tls"},
+		{"duplicate key", cri + "config_path = \"\"\n\"config_path\" = \"\"\n", "cannot load"},
+		{"not TOML", "version = 2\n[plugins\n", "cannot load"},
+		{"non-string config_path", cri + "config_path = 3\n", "not a string"},
+	}
+	for _, c := range refused {
+		got, err := MergeContainerdConfig([]byte(c.existing), planned)
+		if err == nil || !strings.Contains(err.Error(), c.says) || !strings.Contains(err.Error(), "Nothing was written") {
+			t.Errorf("%s: merge = %v\n%s\nwant a refusal saying %q", c.name, err, got, c.says)
+		}
+	}
+}
+
 // F99 R3: every oci file applied through NewChange, then planned again,
 // changes nothing, and the merged daemon.json keeps the operator's key.
 func TestOCIApplyTwiceChangesNothing(t *testing.T) {

@@ -518,3 +518,193 @@ func TestCheckOCIContainerdAndPodman(t *testing.T) {
 		t.Errorf("podman mirroring another host = %+v, want WARN", f)
 	}
 }
+
+// ociFixture roots a scratch host for the oci checks and writes its files.
+func ociFixture(t *testing.T) (string, func(p, content string)) {
+	t.Helper()
+	root := t.TempDir()
+	return root, func(p, content string) {
+		t.Helper()
+		full := p
+		if !strings.HasPrefix(p, root) {
+			full = filepath.Join(root, p)
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func ociCheck(t *testing.T, h OCIHost, check string) Finding {
+	t.Helper()
+	for _, f := range h.Check("https://bodega.internal") {
+		if f.Check == check {
+			return f
+		}
+	}
+	t.Fatalf("no %s row", check)
+	return Finding{}
+}
+
+func onlyRuntime(name string) func(string) (string, error) {
+	return func(n string) (string, error) {
+		if n == name {
+			return "/usr/bin/" + n, nil
+		}
+		return "", errors.New("absent")
+	}
+}
+
+// F99 R4: containerd is judged by the hosts.toml in the directory its CRI
+// config_path makes it read, not by bodega's certs.d copy.
+func TestCheckOCIContainerdReadsTheEffectiveConfigPath(t *testing.T) {
+	bodegaHosts := clientconf.ContainerdHosts("https://bodega.internal", "docker.io", "https://registry-1.docker.io").Content
+	other := "server = \"https://registry-1.docker.io\"\n\n[host.\"https://other.internal\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+	cri := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n"
+	cases := []struct {
+		name   string
+		files  map[string]string
+		status Status
+		says   string
+		remedy string
+	}{
+		{"custom path, bodega only in certs.d", map[string]string{
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:                cri + "config_path = \"/srv/certs\"\n",
+		}, StatusWarn, "/srv/certs, which holds no docker.io", `config_path = "/srv/certs:/etc/containerd/certs.d"`},
+		{"custom path holding bodega", map[string]string{
+			"/srv/certs/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:   cri + "config_path = \"/srv/certs\"\n",
+		}, StatusOK, "/srv/certs/docker.io/hosts.toml sends", ""},
+		{"an earlier root shadows certs.d", map[string]string{
+			"/srv/certs/docker.io/hosts.toml":              other,
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:                cri + "config_path = \"/srv/certs:/etc/containerd/certs.d\"\n",
+		}, StatusWarn, "to https://other.internal before bodega", "put /etc/containerd/certs.d first"},
+		{"second root used when the first has no docker.io", map[string]string{
+			"/srv/certs/quay.io/hosts.toml":                other,
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:                cri + "config_path = \"/srv/certs:/etc/containerd/certs.d\"\n",
+		}, StatusOK, "certs.d/docker.io/hosts.toml sends", ""},
+		{"_default fallback", map[string]string{
+			"/etc/containerd/certs.d/_default/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:               cri + "config_path = \"/etc/containerd/certs.d\"\n",
+		}, StatusOK, "_default/hosts.toml sends", ""},
+		{"docker.io directory without hosts.toml", map[string]string{
+			"/etc/containerd/certs.d/docker.io/ca.crt": "",
+			clientconf.ContainerdConfigPath:            cri + "config_path = \"/etc/containerd/certs.d\"\n",
+		}, StatusWarn, "no ", ociRemedy},
+		{"no config.toml", map[string]string{
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+		}, StatusWarn, "has no config_path", ociRemedy},
+		{"another plugin's config_path", map[string]string{
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:                "version = 2\n[plugins.\"io.containerd.other.v1\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n",
+		}, StatusWarn, "sets no config_path", ociRemedy},
+		{"quoted key", map[string]string{
+			"/etc/containerd/certs.d/docker.io/hosts.toml": bodegaHosts,
+			clientconf.ContainerdConfigPath:                cri + "\"config_path\" = \"/etc/containerd/certs.d\" # \"x\"\n",
+		}, StatusOK, "sends containerd's Docker Hub pulls to https://bodega.internal", ""},
+		{"invalid config.toml", map[string]string{
+			clientconf.ContainerdConfigPath: cri + "config_path = \"\"\n\"config_path\" = \"\"\n",
+		}, StatusSkip, "not a config.toml containerd can load", "repair"},
+		{"CRI disabled", map[string]string{
+			clientconf.ContainerdConfigPath: "disabled_plugins = [\"cri\"]\n",
+		}, StatusSkip, "disables the CRI plugin", ""},
+		{"legacy mirrors", map[string]string{
+			clientconf.ContainerdConfigPath: cri + "[plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"docker.io\"]\nendpoint = [\"https://bodega.internal\"]\n",
+		}, StatusSkip, "deprecated mirrors", "hosts.toml"},
+		{"capabilities without pull", map[string]string{
+			"/etc/containerd/certs.d/docker.io/hosts.toml": "[host.\"https://bodega.internal\"]\n  capabilities = [\"resolve\"]\n",
+			clientconf.ContainerdConfigPath:                cri + "config_path = \"/etc/containerd/certs.d\"\n",
+		}, StatusWarn, "names no host at bodega", ociRemedy},
+	}
+	for _, c := range cases {
+		root, write := ociFixture(t)
+		for p, content := range c.files {
+			write(p, content)
+		}
+		f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("containerd")}, "oci-containerd")
+		if f.Status != c.status || !strings.Contains(f.Detail, c.says) || !strings.Contains(f.Remediation, c.remedy) {
+			t.Errorf("%s: %+v, want %s saying %q, remedy %q", c.name, f, c.status, c.says, c.remedy)
+		}
+	}
+}
+
+// F99 R4: podman is judged on the registries the runtimes resolve: a later
+// file replaces a table with the same prefix whole, the longest prefix a
+// pull matches is the one used, and a user's registries.conf stands in for
+// every system file.
+func TestCheckOCIPodmanResolvesRegistriesConfPrecedence(t *testing.T) {
+	bodega := clientconf.RegistriesConf("https://bodega.internal", []string{"docker.io", "quay.io"}).Content
+	direct := "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n"
+	cases := []struct {
+		name   string
+		files  map[string]string
+		env    string
+		status Status
+		says   string
+		remedy string
+	}{
+		{"bodega alone", map[string]string{clientconf.RegistriesConfDropIn: bodega}, "", StatusOK, "99-bodega.conf mirrors docker.io through bodega.internal/docker.io", ""},
+		{"a later drop-in replaces docker.io", map[string]string{
+			clientconf.RegistriesConfDropIn:                    bodega,
+			"/etc/containers/registries.conf.d/zz-direct.conf": direct,
+		}, "", StatusWarn, "zz-direct.conf defines docker.io with no mirror", "in " + "<root>/etc/containers/registries.conf.d/zz-direct.conf"},
+		{"a later drop-in for another registry", map[string]string{
+			clientconf.RegistriesConfDropIn:                    bodega,
+			"/etc/containers/registries.conf.d/zz-direct.conf": "[[registry]]\nlocation = \"quay.io\"\n",
+		}, "", StatusOK, "mirrors docker.io", ""},
+		{"an earlier drop-in is replaced by bodega's", map[string]string{
+			clientconf.RegistriesConfDropIn:                    bodega,
+			"/etc/containers/registries.conf.d/10-direct.conf": direct,
+		}, "", StatusOK, "99-bodega.conf mirrors docker.io", ""},
+		{"the main file is overridden by bodega's drop-in", map[string]string{
+			clientconf.RegistriesConfDropIn:   bodega,
+			"/etc/containers/registries.conf": direct,
+		}, "", StatusOK, "99-bodega.conf mirrors docker.io", ""},
+		{"a longer docker.io prefix with no mirror", map[string]string{
+			clientconf.RegistriesConfDropIn:                     bodega,
+			"/etc/containers/registries.conf.d/50-library.conf": "[[registry]]\nprefix = \"docker.io/library\"\nlocation = \"docker.io/library\"\n",
+		}, "", StatusWarn, "defines docker.io/library with no mirror", "50-library.conf"},
+		{"another mirror first", map[string]string{
+			clientconf.RegistriesConfDropIn: "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n[[registry.mirror]]\nlocation = \"other.internal/docker.io\"\n[[registry.mirror]]\nlocation = \"bodega.internal/docker.io\"\n",
+		}, "", StatusWarn, "other.internal/docker.io as its first mirror", ociRemedy},
+		{"digest-only mirror", map[string]string{
+			clientconf.RegistriesConfDropIn: "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n[[registry.mirror]]\nlocation = \"bodega.internal/docker.io\"\npull-from-mirror = \"digest-only\"\n",
+		}, "", StatusWarn, "with no mirror a tag pull uses", ociRemedy},
+		{"user registries.conf hides the system files", map[string]string{
+			clientconf.RegistriesConfDropIn:             bodega,
+			"<home>/.config/containers/registries.conf": "unqualified-search-registries = [\"docker.io\"]\n",
+		}, "", StatusWarn, "defines docker.io", ociRemedy},
+		{"user drop-in after the system ones", map[string]string{
+			clientconf.RegistriesConfDropIn:                      bodega,
+			"<home>/.config/containers/registries.conf.d/a.conf": direct,
+		}, "", StatusWarn, "a.conf defines docker.io with no mirror", "a.conf"},
+		{"CONTAINERS_REGISTRIES_CONF names a main file", map[string]string{
+			"<home>/main.conf": bodega,
+		}, "<home>/main.conf", StatusOK, "main.conf mirrors docker.io", ""},
+		{"version 1 format", map[string]string{
+			"/etc/containers/registries.conf": "[registries.search]\nregistries = [\"docker.io\"]\n",
+		}, "", StatusSkip, "version 1", "rewrite"},
+		{"not TOML", map[string]string{
+			clientconf.RegistriesConfDropIn: "[[registry\n",
+		}, "", StatusSkip, "not TOML podman can load", "repair"},
+	}
+	for _, c := range cases {
+		root, write := ociFixture(t)
+		home := filepath.Join(root, "home")
+		for p, content := range c.files {
+			write(strings.Replace(p, "<home>", home, 1), content)
+		}
+		h := OCIHost{Root: root, Home: home, RegistriesConf: strings.Replace(c.env, "<home>", home, 1), LookPath: onlyRuntime("podman")}
+		f := ociCheck(t, h, "oci-podman")
+		remedy := strings.Replace(c.remedy, "<root>", root, 1)
+		if f.Status != c.status || !strings.Contains(f.Detail, c.says) || !strings.Contains(f.Remediation, remedy) {
+			t.Errorf("%s: %+v, want %s saying %q, remedy %q", c.name, f, c.status, c.says, remedy)
+		}
+	}
+}
