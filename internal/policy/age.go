@@ -141,8 +141,12 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	// entry. "*" and "any" are the two spellings of unpinned beside the empty
 	// string, and this passes all three for every ecosystem agePublishers
 	// covers.
+	//
+	// A tag bodega's registry resolved is the exception: it names the image it
+	// resolved to, dated on the entry, and "any" is as legal a tag as "latest".
 	version := strings.TrimSpace(ve.Version)
-	if version == "" || version == "*" || version == manifest.ConstraintAny {
+	resolvedOCI := pm.Type == manifest.TypeOCI && (ve.Metadata[OCIDatedByKey] != "" || ve.Metadata[OCIDateErrorKey] != "")
+	if !resolvedOCI && (version == "" || version == "*" || version == manifest.ConstraintAny) {
 		return Result{Check: "age", Action: ActionPass,
 			Reason: "version " + versionLabel(version) + " pins nothing; age gate is version-aware"}
 	}

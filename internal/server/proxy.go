@@ -1332,13 +1332,15 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		notRun = "not run: a " + fill.typ + " proxy fill names no version the age and OSV checks can evaluate"
 	}
 	ve := manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy}
-	return fill, s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	_, ok := s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	return fill, ok
 }
 
 // admitFill writes the admission row for one version and refuses it when a
 // check blocked: versionPolicyGate's second half, shared with the oci tag,
-// which names its version in the tag rather than in a storage key.
-func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) bool {
+// which names its version in the tag rather than in a storage key. check is
+// the check that blocked, "" when none did.
+func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, ok bool) {
 	if baseline != nil {
 		if stored, ok := baseline(); ok {
 			ve.Baseline, ve.BaselineAt = true, stored.BaselineAt
@@ -1361,7 +1363,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 	}
 	s.recordFillPolicyEvent(r, fill, res)
 	if res.Block == nil {
-		return true
+		return "", true
 	}
 	f := admitRefusal(fill.typ, fill.name, admitBlock{check: res.Block.Check, version: fill.version,
 		incident: res.Incident, details: res.Block.Details})
@@ -1369,7 +1371,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
 	s.queueResult(r, fill.typ, fill.name, fill.version, *res.Block, f)
 	f.write(w, r)
-	return false
+	return res.Block.Check, false
 }
 
 // baselineLookup answers whether the stored manifest marks what a proxy

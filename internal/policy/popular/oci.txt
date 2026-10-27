@@ -1,6 +1,6 @@
-# Docker Hub official images by pull count, then widely pulled ghcr.io and quay.io
+# Docker Hub official images by pull count, then hand-picked ghcr.io and quay.io
 # repositories, each as the last two segments of its repository path.
-# source: https://hub.docker.com/v2/repositories/library/?page_size=100&ordering=pull_count and &ordering=-pull_count; ghcr.io and quay.io publish no pull counts, so their entries are the repositories the projects' own install docs name
+# source: https://hub.docker.com/v2/repositories/library/?page_size=100&ordering=pull_count and &ordering=-pull_count; the ghcr.io and quay.io entries are hand-picked, not ranked: neither registry publishes pull counts to rank them by
 # n: 291
 # date: 2026-10-27
 library/nginx

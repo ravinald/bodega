@@ -101,8 +101,8 @@ func TestOCIReleaseAgeEpochUsesFirstSeen(t *testing.T) {
 	}
 	key := manifest.OCITagKey("docker.io", "library/nginx", "repro")
 	first := ociStoredTagDoc(t, s, key)
-	if first.Created != "" || first.FirstSeen == "" {
-		t.Fatalf("tag record %+v, want first-seen and no created", first)
+	if first.FirstSeen == "" {
+		t.Fatalf("tag record %+v, want first-seen", first)
 	}
 
 	s.cache.MetadataTTL = time.Nanosecond
@@ -242,5 +242,226 @@ func TestOCIPickChild(t *testing.T) {
 		if got := ociConfigCreated([]byte(in)); got != want {
 			t.Errorf("ociConfigCreated(%s) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ociMixedImage is one index whose amd64 config was created amdAgo and whose
+// arm64 config armAgo.
+func ociMixedImage(amdAgo, armAgo time.Duration) ociImage {
+	im := newOCIImageCreated(ociCreatedAgo(amdAgo))
+	arm := newOCIImageCreated(ociCreatedAgo(armAgo))
+	im.arm64, im.arm64Digest = arm.arm64, arm.arm64Digest
+	im.arm64ConfigBytes, im.arm64ConfigD = arm.arm64ConfigBytes, arm.arm64ConfigD
+	im.arm64Layer, im.arm64LayerD = arm.arm64Layer, arm.arm64LayerD
+	var index map[string]any
+	_ = json.Unmarshal(im.index, &index)
+	child := index["manifests"].([]any)[1].(map[string]any)
+	child["digest"], child["size"] = im.arm64Digest, len(im.arm64)
+	im.index, _ = json.Marshal(index)
+	im.indexDigest = ociDigest(im.index)
+	return im
+}
+
+var ociArm64UA = map[string]string{"User-Agent": "docker/27.3.1 os/linux arch/arm64"}
+
+func ociGetCode(s *Server, path string, headers map[string]string) int {
+	return doRequest(s, http.MethodGet, path, headers).Code
+}
+
+// Each platform is dated by its own config, whether the tag is cached by an
+// amd64 request first or an arm64 one, and each platform's members take the
+// verdict of their own platform.
+func TestOCIReleaseAgePerPlatform(t *testing.T) {
+	for _, armFirst := range []bool{false, true} {
+		f := newOCIFixture(t)
+		im := ociMixedImage(30*24*time.Hour, time.Hour)
+		f.hub.publish("library/nginx", "mixed", im)
+		s, _ := ociPolicyServer(t, f)
+		tag := "/v2/library/nginx/manifests/mixed"
+		var amd, arm int
+		if armFirst {
+			arm, amd = ociGetCode(s, tag, ociArm64UA), ociGetCode(s, tag, nil)
+		} else {
+			amd, arm = ociGetCode(s, tag, nil), ociGetCode(s, tag, ociArm64UA)
+		}
+		if amd != http.StatusOK || arm != http.StatusForbidden {
+			t.Fatalf("arm64 first %v: amd64 tag %d, arm64 tag %d; want 200 and 403", armFirst, amd, arm)
+		}
+		for path, want := range map[string]int{
+			"/v2/library/nginx/manifests/" + im.indexDigest: http.StatusOK,
+			"/v2/library/nginx/manifests/" + im.amd64Digest: http.StatusOK,
+			"/v2/library/nginx/blobs/" + im.amd64LayerD:     http.StatusOK,
+			"/v2/library/nginx/manifests/" + im.arm64Digest: http.StatusForbidden,
+			"/v2/library/nginx/blobs/" + im.arm64LayerD:     http.StatusForbidden,
+			"/v2/library/nginx/blobs/" + im.arm64ConfigD:    http.StatusForbidden,
+		} {
+			if got := ociGetCode(s, path, nil); got != want {
+				t.Errorf("arm64 first %v: %s = %d, want %d", armFirst, path, got, want)
+			}
+		}
+	}
+}
+
+// "any" is an ordinary tag to a registry, and the age check judges it.
+func TestOCIReleaseAgeTagAny(t *testing.T) {
+	f := newOCIFixture(t)
+	f.hub.publish("library/nginx", "any", newOCIImageCreated(ociCreatedAgo(time.Hour)))
+	f.hub.publish("library/redis", "any", newOCIImageCreated(ociCreatedAgo(30*24*time.Hour)))
+	s, _ := ociPolicyServer(t, f)
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/any", nil), http.StatusForbidden, "DENIED", "holds new versions back")
+	if c := ociRowCheck(t, ociTagRow(t, s, "docker.io/library/nginx", "any"), audit.CheckAge); c.Status != audit.CheckBlock {
+		t.Errorf("age check on tag any: %+v, want a block", c)
+	}
+	if got := ociGetCode(s, "/v2/library/redis/manifests/any", nil); got != http.StatusOK {
+		t.Errorf("a 30d-old image tagged any = %d, want 200", got)
+	}
+}
+
+// A tag that moves leaves each image it named under the verdict that image
+// was given, in both directions: a young image stays refused after the tag
+// moves to an old one, and an old image stays served after the tag moves to
+// a young one. Index, platform manifests and blobs alike.
+func TestOCIMovedTagKeepsEachImagesVerdict(t *testing.T) {
+	members := func(im ociImage) []string {
+		return []string{
+			"/v2/library/nginx/manifests/" + im.indexDigest,
+			"/v2/library/nginx/manifests/" + im.amd64Digest,
+			"/v2/library/nginx/manifests/" + im.arm64Digest,
+			"/v2/library/nginx/blobs/" + im.amd64LayerD,
+			"/v2/library/nginx/blobs/" + im.amd64ConfigD,
+			"/v2/library/nginx/blobs/" + im.arm64LayerD,
+		}
+	}
+	for _, youngFirst := range []bool{true, false} {
+		f := newOCIFixture(t)
+		young, old := newOCIImageCreated(ociCreatedAgo(time.Hour)), newOCIImageCreated(ociCreatedAgo(30*24*time.Hour))
+		first, second := old, young
+		if youngFirst {
+			first, second = young, old
+		}
+		f.hub.publish("library/nginx", "moving", first)
+		s, _ := ociPolicyServer(t, f)
+		tag := "/v2/library/nginx/manifests/moving"
+		ociGetCode(s, tag, nil)
+		if !youngFirst {
+			// The old image is pulled whole before the tag moves.
+			for _, p := range members(old) {
+				if got := ociGetCode(s, p, nil); got != http.StatusOK {
+					t.Fatalf("old image before the move: %s = %d", p, got)
+				}
+			}
+		}
+		f.hub.publish("library/nginx", "moving", second)
+		s.cache.MetadataTTL = time.Nanosecond
+		time.Sleep(1100 * time.Millisecond)
+		moved := ociGetCode(s, tag, nil)
+		wantMoved := http.StatusOK
+		if !youngFirst {
+			wantMoved = http.StatusForbidden
+		}
+		if moved != wantMoved {
+			t.Fatalf("young first %v: moved tag = %d, want %d", youngFirst, moved, wantMoved)
+		}
+		for _, p := range members(young) {
+			if got := ociGetCode(s, p, nil); got != http.StatusForbidden {
+				t.Errorf("young first %v: young image member %s = %d, want 403", youngFirst, p, got)
+			}
+		}
+		for _, p := range members(old) {
+			if got := ociGetCode(s, p, nil); got != http.StatusOK {
+				t.Errorf("young first %v: old image member %s = %d, want 200", youngFirst, p, got)
+			}
+		}
+	}
+}
+
+// The platforms no request dated still belong to a refused image: their
+// config and layer are refused whether bodega fetched their manifest to
+// record them or held it already.
+func TestOCIRefusedImageCoversEveryPlatform(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		f := newOCIFixture(t)
+		im := newOCIImageCreated(ociCreatedAgo(time.Hour))
+		f.hub.publish("library/nginx", "young", im)
+		s, _ := ociPolicyServer(t, f)
+		if cached {
+			if got := ociGetCode(s, "/v2/library/nginx/manifests/"+im.arm64Digest, nil); got != http.StatusOK {
+				t.Fatalf("arm64 manifest before any tag: %d", got)
+			}
+		}
+		if got := ociGetCode(s, "/v2/library/nginx/manifests/young", nil); got != http.StatusForbidden {
+			t.Fatalf("young tag = %d", got)
+		}
+		for _, d := range []string{im.arm64ConfigD, im.arm64LayerD} {
+			rec := doRequest(s, http.MethodGet, "/v2/library/nginx/blobs/"+d, nil)
+			assertOCIError(t, rec, http.StatusForbidden, "DENIED", "tag young", "same verdict")
+		}
+		assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/"+im.arm64Digest, nil), http.StatusForbidden, "DENIED", "tag young")
+	}
+}
+
+// Nothing of an image is served while its tag is being judged: neither a
+// member bodega has recorded nor a digest it has not.
+func TestOCIPendingVerdictServesNothing(t *testing.T) {
+	f := newOCIFixture(t)
+	old := newOCIImageCreated(ociCreatedAgo(30 * 24 * time.Hour))
+	f.hub.publish("library/nginx", "old", old)
+	s, _ := ociPolicyServer(t, f)
+	during := map[string]int{}
+	prev := fetchCheckers
+	fetchCheckers = func(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
+		for _, d := range []string{old.amd64LayerD, old.arm64LayerD} {
+			during[d] = ociGetCode(s, "/v2/library/nginx/blobs/"+d, nil)
+		}
+		return prev(cfg, adb)
+	}
+	if got := ociGetCode(s, "/v2/library/nginx/manifests/old", nil); got != http.StatusOK {
+		t.Fatalf("old tag = %d", got)
+	}
+	for d, code := range during {
+		if code != http.StatusForbidden {
+			t.Errorf("blob %s while the tag was judged = %d, want 403", d, code)
+		}
+	}
+	fetchCheckers = prev
+	for _, d := range []string{old.amd64LayerD, old.arm64LayerD} {
+		if got := ociGetCode(s, "/v2/library/nginx/blobs/"+d, nil); got != http.StatusOK {
+			t.Errorf("blob %s once the tag was admitted = %d, want 200", d, got)
+		}
+	}
+}
+
+// A pending verdict a process never finished lapses into a refusal, and the
+// tag's next request judges the image afresh.
+func TestOCILapsedVerdict(t *testing.T) {
+	f := newOCIFixture(t)
+	old := newOCIImageCreated(ociCreatedAgo(30 * 24 * time.Hour))
+	f.hub.publish("library/nginx", "old", old)
+	s, _ := ociPolicyServer(t, f)
+	tg := ociTarget{registry: "docker.io", repo: "library/nginx"}
+	stale := ociImageVerdict{Tag: "old", State: ociPending, At: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), Direct: true}
+	if err := s.ociUpdateMembers(t.Context(), s.typeStore(manifest.TypeOCI), tg, []string{old.amd64LayerD}, func(_ string, m *ociMember) {
+		ociPutImage(m, ociImageKey(old.indexDigest, old.amd64Digest), stale)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/blobs/"+old.amd64LayerD, nil), http.StatusForbidden, "DENIED", "never recorded a verdict", "pull tag old again")
+	if got := ociGetCode(s, "/v2/library/nginx/manifests/old", nil); got != http.StatusOK {
+		t.Fatalf("old tag = %d", got)
+	}
+	if got := ociGetCode(s, "/v2/library/nginx/blobs/"+old.amd64LayerD, nil); got != http.StatusOK {
+		t.Errorf("blob after the tag was judged again = %d, want 200", got)
+	}
+}
+
+// F70 wrote the bare tag to a resolved key; it still names the tag, and
+// joins no judged image.
+func TestParseOCIMemberBareTag(t *testing.T) {
+	m, err := parseOCIMember([]byte("1.27"))
+	if err != nil || m.Tag != "1.27" || len(m.Images) != 0 {
+		t.Errorf("bare tag = %+v, %v", m, err)
+	}
+	if _, err := parseOCIMember([]byte("{not json")); err == nil {
+		t.Error("a broken record parsed")
 	}
 }

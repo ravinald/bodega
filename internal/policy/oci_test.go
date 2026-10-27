@@ -47,6 +47,28 @@ func TestOCIAgeJudgesTheRecordedTime(t *testing.T) {
 	}
 }
 
+// "any" is a tag an image can carry, so a resolved oci tag of that name is
+// judged by its time; the unpinned shortcut keeps applying to an entry that
+// names no resolved image, for oci and every other type.
+func TestOCIAgeJudgesTagAny(t *testing.T) {
+	ck := ociAgeChecker(7 * 24 * time.Hour)
+	ve := ociTagEntry(time.Now().Add(-time.Hour), OCIDatedByCreated)
+	ve.Version = manifest.ConstraintAny
+	if r := ck.Check(t.Context(), ociNginx, ve); r.Action != ActionBlock {
+		t.Errorf("a one-hour-old image tagged any = %+v, want a block", r)
+	}
+	if r := ck.Check(t.Context(), ociNginx, &manifest.VersionEntry{Version: manifest.ConstraintAny}); r.Action != ActionPass {
+		t.Errorf("an oci entry pinning nothing = %+v, want the unpinned pass", r)
+	}
+	npm := NewAgeChecker(&fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, MinAgeSeconds: 3600, Action: ActionBlock},
+	}})
+	if r := npm.Check(t.Context(), &manifest.PackageManifest{Type: manifest.TypeNpm, Name: "left-pad"},
+		&manifest.VersionEntry{Version: manifest.ConstraintAny}); r.Action != ActionPass {
+		t.Errorf("npm any = %+v, want the unpinned pass", r)
+	}
+}
+
 // A tag the registry could not date warns, as an unreachable upstream does
 // for every other type, and names why.
 func TestOCIAgeUndatedWarns(t *testing.T) {
