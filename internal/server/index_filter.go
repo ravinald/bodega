@@ -610,6 +610,7 @@ func (s *Server) upstreamJSON(ctx context.Context, url, accept string, into any)
 		return err
 	}
 	req.Header.Set("Accept", accept)
+	req.Header.Set("User-Agent", policy.UserAgent)
 	//nolint:gosec // G704: see above; guardedTransport refuses before any byte leaves.
 	resp, err := publishTimeClient.Do(req)
 	if err != nil {

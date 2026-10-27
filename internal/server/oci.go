@@ -22,6 +22,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -1005,6 +1006,7 @@ func ociDo(ctx context.Context, rawURL, accept, token string) (*http.Response, e
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", policy.UserAgent)
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
@@ -1059,6 +1061,7 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 	if err != nil {
 		return ociTokenEntry{}, err
 	}
+	req.Header.Set("User-Agent", policy.UserAgent)
 	if up.User != nil {
 		pw, _ := up.User.Password()
 		req.SetBasicAuth(up.User.Username(), pw)

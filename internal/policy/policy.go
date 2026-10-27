@@ -21,6 +21,14 @@ import (
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
+// UserAgent is what bodega names itself as on every request it sends an
+// upstream: bodega/ followed by the build's version. main assigns it at init,
+// for the reason builder.Version is assigned there. Without it a request goes
+// out as Go-http-client/1.1, and a registry that throttles per agent (Maven
+// Central's CDN does) counts bodega in one bucket with every other Go program
+// behind the same address.
+var UserAgent = "bodega/dev"
+
 // Rule kinds. Each registry type accepts exactly one kind (see RuleKindForType).
 const (
 	KindHost    = "host"    // apt: match URL hostname

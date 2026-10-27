@@ -260,6 +260,12 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
 			return
 		}
+		var limited *upstreamRateLimited
+		if errors.As(err, &limited) {
+			s.logger.Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			writeRateLimited(w, limited)
+			return
+		}
 		s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)
 		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
 		return
@@ -288,6 +294,12 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
+			return
+		}
+		var limited *upstreamRateLimited
+		if errors.As(err, &limited) {
+			s.logger.Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			writeRateLimited(w, limited)
 			return
 		}
 		var refused *resolveRefusal
@@ -762,6 +774,7 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", policy.UserAgent)
 	if identity {
 		// Go's transport adds "Accept-Encoding: gzip" on its own and decodes
 		// the answer transparently, so a caller that says nothing relays and
@@ -790,6 +803,11 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	}
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
+		resp.Body.Close()
+		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
+	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
@@ -809,6 +827,60 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		contentType:   resp.Header.Get("Content-Type"),
 		contentLength: resp.ContentLength,
 	}, nil
+}
+
+// upstreamRateLimited is an upstream telling bodega to slow down: a 429, or a
+// 503 that says when to come back. It is kept apart from the other non-200s
+// because the client's right move differs: an outage is worth reporting, a
+// rate limit is worth waiting out, and a 502 tells a build tool the former.
+type upstreamRateLimited struct {
+	url        string
+	status     int
+	retryAfter string // as the upstream sent it; empty when it sent none
+}
+
+func (e *upstreamRateLimited) Error() string {
+	return fmt.Sprintf("upstream returned %d with Retry-After %q: %s", e.status, e.retryAfter, e.url)
+}
+
+// defaultRateLimitRetryAfter is the interval bodega tells a client to wait
+// when the upstream rate-limited it without saying for how long.
+const defaultRateLimitRetryAfter = "60"
+
+// clientRetryAfter is the Retry-After the client is handed. The upstream's
+// value passes through unchanged when it is one of the two forms RFC 9110
+// allows, delta-seconds or an HTTP-date; anything else is not relayed, since
+// the header goes out under bodega's name.
+func (e *upstreamRateLimited) clientRetryAfter() string {
+	v := strings.TrimSpace(e.retryAfter)
+	if v == "" {
+		return defaultRateLimitRetryAfter
+	}
+	if isDeltaSeconds(v) {
+		return v
+	}
+	if _, err := http.ParseTime(v); err == nil {
+		return v
+	}
+	return defaultRateLimitRetryAfter
+}
+
+func isDeltaSeconds(v string) bool {
+	return v != "" && len(v) <= 10 && strings.Trim(v, "0123456789") == ""
+}
+
+// writeRateLimited answers a client whose fetch the upstream rate-limited.
+// 503 rather than 502: Maven, Gradle and pip back off and retry a 503 that
+// carries Retry-After, and they report a 502 as the repository being down.
+func writeRateLimited(w http.ResponseWriter, limited *upstreamRateLimited) {
+	retry := limited.clientRetryAfter()
+	wait := retry
+	if isDeltaSeconds(retry) {
+		wait = retry + " seconds"
+	}
+	w.Header().Set("Retry-After", retry)
+	http.Error(w, "the upstream is rate-limiting bodega and nothing is cached for this request; retry after "+wait+".",
+		http.StatusServiceUnavailable)
 }
 
 // spooledUpstream is an upstream body written to a temp file, with the digest
