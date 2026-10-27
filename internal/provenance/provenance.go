@@ -27,6 +27,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/verify"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // SLSA provenance predicate types. npm has published both; GitHub artifact
@@ -353,7 +354,7 @@ func (v *Verifier) get(ctx context.Context, url string, header http.Header, limi
 	for k, vs := range header {
 		req.Header[k] = vs
 	}
-	req.Header.Set("User-Agent", "bodega")
+	req.Header.Set("User-Agent", policy.UserAgent)
 	resp, err := v.client().Do(req)
 	if err != nil {
 		return nil, err

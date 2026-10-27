@@ -3,11 +3,16 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // shrinkUpstreamCap lowers the buffer ceiling for one test so the over-limit
@@ -220,5 +225,118 @@ func TestSpoolFileIsRemoved(t *testing.T) {
 	// resource nothing is using.
 	if st := s.spool.stats(); st.UsedBytes != 0 || st.InFlight != 0 {
 		t.Errorf("stats = %+v after close, want the budget returned", st)
+	}
+}
+
+// Maven Central's CDN throttles by User-Agent, and Go's default agent shares a
+// bucket with every Go program behind the same address. B179.
+func TestUpstreamFetchNamesBodega(t *testing.T) {
+	allowLoopbackUpstream(t)
+	got := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte("pom"))
+	}))
+	defer ts.Close()
+
+	if _, _, err := fetchUpstream(t.Context(), ts.URL); err != nil {
+		t.Fatal(err)
+	}
+	if ua := <-got; !strings.HasPrefix(ua, "bodega/") {
+		t.Errorf("User-Agent = %q, want bodega/<version>", ua)
+	}
+}
+
+// An upstream rate limit is not an outage: a 502 tells Maven and Gradle the
+// repository is down, a 503 with Retry-After tells them to wait.
+func TestUpstreamRateLimitReachesTheClientAs503(t *testing.T) {
+	const pkg = "leftpad"
+	key := manifest.NpmTarballKey(pkg, "1.2.0")
+
+	for _, tc := range []struct {
+		name       string
+		status     int
+		retryAfter string
+		cached     bool
+		wantCode   int
+		wantRetry  string
+		wantWait   string
+	}{
+		{"429 with Retry-After", http.StatusTooManyRequests, "120", false, http.StatusServiceUnavailable, "120", "120 seconds"},
+		{"429 with no Retry-After", http.StatusTooManyRequests, "", false, http.StatusServiceUnavailable, "60", "60 seconds"},
+		{"503 with Retry-After", http.StatusServiceUnavailable, "30", false, http.StatusServiceUnavailable, "30", "30 seconds"},
+		{"429 with zero-padded seconds", http.StatusTooManyRequests, "00000000120", false, http.StatusServiceUnavailable, "00000000120", "00000000120 seconds"},
+		{"429 with an HTTP-date", http.StatusTooManyRequests, "Wed, 28 Oct 2026 07:28:00 GMT", false, http.StatusServiceUnavailable, "Wed, 28 Oct 2026 07:28:00 GMT", "Wed, 28 Oct 2026 07:28:00 GMT"},
+		// Relayed as sent, but kept out of the body: upstream text there could
+		// name a host.
+		{"429 with a nonstandard Retry-After", http.StatusTooManyRequests, "see https://127.0.0.1/", false, http.StatusServiceUnavailable, "see https://127.0.0.1/", "Retry-After header"},
+		{"500 stays an outage", http.StatusInternalServerError, "", false, http.StatusBadGateway, "", ""},
+		{"503 with no Retry-After stays an outage", http.StatusServiceUnavailable, "", false, http.StatusBadGateway, "", ""},
+		{"429 over a cached copy serves it", http.StatusTooManyRequests, "120", true, http.StatusOK, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allowLoopbackUpstream(t)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer ts.Close()
+
+			s := newDiscoveryServer(t)
+			s.cache = CacheConfig{MetadataTTL: time.Nanosecond}
+			store := storage.NewMemory()
+			if tc.cached {
+				store.Seed(key, "cached-tarball")
+			}
+			req := httptest.NewRequest(http.MethodGet, "/npm/"+pkg+"/-/"+pkg+"-1.2.0.tgz", nil)
+			rec := httptest.NewRecorder()
+			s.proxyOrCache(rec, req, store, key, ts.URL+"/leftpad-1.2.0.tgz", manifest.TypeNpm, pkg, pkg, false, true)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := rec.Header().Get("Retry-After"); got != tc.wantRetry {
+				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetry)
+			}
+			body := rec.Body.String()
+			switch {
+			case tc.cached:
+				if body != "cached-tarball" {
+					t.Errorf("body = %q, want the cached copy", body)
+				}
+			case tc.wantCode == http.StatusServiceUnavailable:
+				if !strings.Contains(body, "rate-limiting") || !strings.Contains(body, tc.wantWait) {
+					t.Errorf("body = %q, want it to say the upstream is rate-limiting and when to retry", body)
+				}
+				if strings.Contains(body, "127.0.0.1") {
+					t.Errorf("body = %q names the upstream host", body)
+				}
+			}
+		})
+	}
+}
+
+// A CDN that gzips its rate-limit page is still saying "wait". The identity
+// check guards artifact bodies, and a 429 carries none, so it must not turn
+// the answer into an encoding refusal.
+func TestEncodedRateLimitIsStillARateLimit(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "120")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(status)
+		}))
+		_, err := openUpstreamVia(t.Context(), ts.Client(), func(string) error { return nil }, ts.URL, true)
+		ts.Close()
+		var limited *upstreamRateLimited
+		if !errors.As(err, &limited) {
+			t.Errorf("status %d: err = %v, want *upstreamRateLimited", status, err)
+			continue
+		}
+		if limited.status != status || limited.retryAfter != "120" {
+			t.Errorf("status %d: got status %d Retry-After %q", status, limited.status, limited.retryAfter)
+		}
 	}
 }

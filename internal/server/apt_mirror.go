@@ -674,6 +674,7 @@ func (s *Server) aptProbe(ctx context.Context, rawURL string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	req.Header.Set("User-Agent", policy.UserAgent)
 	//nolint:gosec // G704: see the guard above; the URL is validated.
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
