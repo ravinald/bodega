@@ -161,6 +161,8 @@ it once before a hosted index can date them.`,
 					)
 				case manifest.TypeComposer:
 					fmt.Fprintf(os.Stdout, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "fetch")
+				case manifest.TypeOCI:
+					fmt.Fprintf(os.Stdout, "\n>>> [oci] nothing to %s: images are pulled through /v2/ on first request\n", "fetch")
 				case manifest.TypeMaven:
 					allSummaries = append(allSummaries,
 						builder.FetchMaven(bcfg, store, entryFilter),

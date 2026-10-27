@@ -102,6 +102,8 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 		return rubygemsGemPath(buildDirs(cfg.rootFor(typ)), name, ve)
 	case manifest.TypeComposer:
 		return composerArchivePath(buildDirs(cfg.rootFor(typ)), name, ve)
+	case manifest.TypeOCI:
+		return ociManifestPath(cfg, name, ve)
 	case manifest.TypeDistfiles:
 		if manifest.DistfilesValidName(name) != nil {
 			return ""

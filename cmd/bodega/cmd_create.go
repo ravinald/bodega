@@ -131,6 +131,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeOCI:
+				name, ve, err = collectOCIVersion(r, name, "", "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypeFreeBSD:
 				name, ve, err = collectFreeBSDVersion(r, name, "", "")
 				if err != nil {
@@ -600,6 +606,31 @@ func collectComposerVersion(r *bufio.Reader, name, version, ref string) (string,
 		return "", manifest.VersionEntry{}, fmt.Errorf("dist reference %q is not a commit or tag name", ref)
 	}
 	return name, manifest.VersionEntry{Version: version, Ref: ref}, nil
+}
+
+// collectOCIVersion prompts for one image tag. The digest is optional: the
+// /v2/ route resolves a tag at the registry, and an entry records one only to
+// name the manifest it holds.
+func collectOCIVersion(r *bufio.Reader, name, tag, digest string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Image, <registry>/<repository> (e.g. docker.io/library/nginx)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	registry, repo, _ := strings.Cut(name, "/")
+	if !manifest.OCIValidRegistryName(registry) || !manifest.OCIValidRepository(repo) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("%q is not an image name: <registry>/<repository> in lowercase, e.g. docker.io/library/nginx", name)
+	}
+	if tag, err = prompt(r, "Tag (e.g. 1.27)", tag); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if !manifest.OCIValidTag(tag) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("tag %q is not a tag: letters, digits, '_', '.' and '-', up to 128, not starting with '.' or '-'", tag)
+	}
+	digest, _ = prompt(r, "Manifest digest (leave blank unless a manifest is uploaded for it)", digest)
+	if digest != "" && !manifest.OCIValidDigest(digest) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("digest %q is not sha256:<64 hex>", digest)
+	}
+	return name, manifest.VersionEntry{Version: tag, Ref: digest}, nil
 }
 
 // collectFreeBSDVersion prompts for one pkg repository.

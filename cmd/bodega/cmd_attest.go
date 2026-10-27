@@ -507,6 +507,8 @@ func servedPath(typ, name, version, key string) (string, error) {
 		return "/rubygems/gems/" + url.PathEscape(name+"-"+version+".gem"), nil
 	case manifest.TypeComposer:
 		return composerServedPath(key)
+	case manifest.TypeOCI:
+		return ociServedPath(name, key)
 	}
 	for _, m := range []struct{ key, route string }{
 		{manifest.AptPrefix, "/apt/"},
@@ -552,6 +554,25 @@ func composerServedPath(key string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no served route for %s object %q: not a composer dist key with a reference; pass --artifact with a local copy", manifest.TypeComposer, key)
+}
+
+// ociServedPath rebuilds the /v2/ route for an oci manifest or blob key. The
+// registry rides in the path's first segment, which every registry name
+// carries a dot in, so the route needs no ns parameter. A manifest key names
+// its own repository; a blob key is shared by every repository and names
+// none, so the blob is fetched under the one the statement's name gives,
+// which is also what the server judges it under.
+func ociServedPath(name, key string) (string, error) {
+	typ, keyName, digest := manifest.ParseKey(key)
+	kind := "manifests"
+	if typ == manifest.TypeOCI && keyName == "" {
+		kind, keyName = "blobs", name
+	}
+	registry, repo, _ := strings.Cut(keyName, "/")
+	if typ != manifest.TypeOCI || !manifest.OCIValidDigest(digest) || !manifest.OCIValidRegistryName(registry) || !manifest.OCIValidRepository(repo) {
+		return "", fmt.Errorf("no served route for %s object %q under %q: not an oci manifest or blob key with a <registry>/<repository> name; pass --artifact with a local copy", manifest.TypeOCI, key, name)
+	}
+	return "/v2/" + registry + "/" + repo + "/" + kind + "/" + digest, nil
 }
 
 func (v *verifyRequest) connect() error {

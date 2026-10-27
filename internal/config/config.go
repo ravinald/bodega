@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net/netip"
 	"net/url"
 	"os"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/distinfo"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 const (
@@ -125,48 +127,51 @@ type Config struct {
 	// provenance is verified against, for a host that cannot reach Sigstore's
 	// TUF repository. Empty means fetch it through TUF. serve refuses to
 	// start when it names a file that is missing or does not parse.
-	SigstoreTrustedRoot    string   `json:"sigstore_trusted_root,omitempty"`
-	ServerURL              string   `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
-	Token                  string   `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
-	ProxyCacheEnabled      bool     `json:"proxy_cache_enabled"`
-	MetadataTTL            string   `json:"metadata_ttl,omitempty"`
-	UpstreamConnectTimeout string   `json:"upstream_connect_timeout,omitempty"` // bound on one TCP connect to an upstream
-	StaleGrace             string   `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
-	GomodUpstream          string   `json:"gomod_upstream,omitempty"`
-	GomodSumdbURL          string   `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
-	NpmUpstream            string   `json:"npm_upstream,omitempty"`
-	PypiUpstream           string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
-	CargoUpstream          string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
-	CargoDLUpstream        string   `json:"cargo_dl_upstream,omitempty"`
-	MavenUpstream          string   `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
-	MavenUpstreams         []string `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
-	RubygemsUpstream       string   `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
-	ComposerUpstream       string   `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
-	ComposerDistHosts      []string `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
-	PrivateUpstreamHosts   []string `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
-	DiscoverMode           string   `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
-	GomodRoot              string   `json:"gomod_root,omitempty"`
-	HelmRoot               string   `json:"helm_root,omitempty"`
-	NpmRoot                string   `json:"npm_root,omitempty"`
-	CargoRoot              string   `json:"cargo_root,omitempty"`
-	MavenRoot              string   `json:"maven_root,omitempty"`
-	RubygemsRoot           string   `json:"rubygems_root,omitempty"`
-	ComposerRoot           string   `json:"composer_root,omitempty"`
-	FreeBSDRoot            string   `json:"freebsd_root,omitempty"`
-	DistfilesRoot          string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
-	AuditDB                string   `json:"audit_db,omitempty"`
-	DenyList               []string `json:"deny_list,omitempty"`
-	Timezone               string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
-	AuditEvents            []string `json:"audit_events,omitempty"`      // event types to record; empty = all
-	AuditSink              string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
-	AuditSinkDSN           string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
-	StorageBackend         string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
-	StoragePath            string   `json:"storage_path,omitempty"`      // root directory for local backend
-	AptCodename            string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
-	AptSuites              []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
-	AptSigningName         string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
-	AptSigningEmail        string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
-	AdminPermitCIDR        []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+	SigstoreTrustedRoot    string            `json:"sigstore_trusted_root,omitempty"`
+	ServerURL              string            `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token                  string            `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
+	ProxyCacheEnabled      bool              `json:"proxy_cache_enabled"`
+	MetadataTTL            string            `json:"metadata_ttl,omitempty"`
+	UpstreamConnectTimeout string            `json:"upstream_connect_timeout,omitempty"` // bound on one TCP connect to an upstream
+	StaleGrace             string            `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
+	GomodUpstream          string            `json:"gomod_upstream,omitempty"`
+	GomodSumdbURL          string            `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
+	NpmUpstream            string            `json:"npm_upstream,omitempty"`
+	PypiUpstream           string            `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
+	CargoUpstream          string            `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
+	CargoDLUpstream        string            `json:"cargo_dl_upstream,omitempty"`
+	MavenUpstream          string            `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
+	MavenUpstreams         []string          `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
+	RubygemsUpstream       string            `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
+	ComposerUpstream       string            `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
+	ComposerDistHosts      []string          `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
+	OCIUpstreams           map[string]string `json:"oci_upstreams,omitempty"`          // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
+	OCITokenHosts          []string          `json:"oci_token_hosts,omitempty"`        // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
+	PrivateUpstreamHosts   []string          `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
+	DiscoverMode           string            `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
+	GomodRoot              string            `json:"gomod_root,omitempty"`
+	HelmRoot               string            `json:"helm_root,omitempty"`
+	NpmRoot                string            `json:"npm_root,omitempty"`
+	CargoRoot              string            `json:"cargo_root,omitempty"`
+	MavenRoot              string            `json:"maven_root,omitempty"`
+	RubygemsRoot           string            `json:"rubygems_root,omitempty"`
+	ComposerRoot           string            `json:"composer_root,omitempty"`
+	OCIRoot                string            `json:"oci_root,omitempty"`
+	FreeBSDRoot            string            `json:"freebsd_root,omitempty"`
+	DistfilesRoot          string            `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
+	AuditDB                string            `json:"audit_db,omitempty"`
+	DenyList               []string          `json:"deny_list,omitempty"`
+	Timezone               string            `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
+	AuditEvents            []string          `json:"audit_events,omitempty"`      // event types to record; empty = all
+	AuditSink              string            `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
+	AuditSinkDSN           string            `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
+	StorageBackend         string            `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
+	StoragePath            string            `json:"storage_path,omitempty"`      // root directory for local backend
+	AptCodename            string            `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
+	AptSuites              []string          `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
+	AptSigningName         string            `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
+	AptSigningEmail        string            `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
+	AdminPermitCIDR        []string          `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 
 	// OSV gate. osv_db_dir holds the per-ecosystem archives `bodega policy osv
 	// sync` writes and defaults to {storage_path}/osv, so a connected host
@@ -384,6 +389,20 @@ const DefaultComposerUpstream = "https://repo.packagist.org"
 // package's metadata from pointing bodega's fetch at any host it likes.
 var DefaultComposerDistHosts = []string{"api.github.com", "codeload.github.com", "gitlab.com", "bitbucket.org"}
 
+// DefaultOCIUpstreams maps each registry a client may name under /v2/ to the
+// URL bodega fetches it from. Docker Hub's name and its API host differ.
+var DefaultOCIUpstreams = map[string]string{
+	"docker.io": "https://registry-1.docker.io",
+	"ghcr.io":   "https://ghcr.io",
+	"quay.io":   "https://quay.io",
+}
+
+// DefaultOCITokenHosts are the token services the default registries' Bearer
+// challenges name. A registry chooses its realm, so the list is what keeps an
+// upstream from sending bodega's token request, and the credential with it,
+// to a host of its choosing.
+var DefaultOCITokenHosts = []string{"auth.docker.io", "ghcr.io", "quay.io"}
+
 // DistfilesEnvironment is the declared client environment distfiles admission
 // reads ports against.
 func (cfg *Config) DistfilesEnvironment() distinfo.EnvironmentSpec {
@@ -490,6 +509,8 @@ var reservedPathElements = map[string]string{
 	"cargo":     "served route and cargo storage root",
 	"rubygems":  "served route and rubygems storage root",
 	"composer":  "served route and composer storage root",
+	"v2":        "served route (the OCI registry)",
+	"oci":       "oci storage root",
 	"git":       "served route",
 	"go":        "served route",
 	"healthz":   "served route",
@@ -631,6 +652,40 @@ func validateProxyUpstream(key, raw, def string) error {
 		return fmt.Errorf("%s %q carries a query or a fragment — the request path is appended to it (default %s)", key, shown, def)
 	}
 	return nil
+}
+
+// resolveOCIUpstreams fills in and validates oci_upstreams and
+// oci_token_hosts. An absent map takes the defaults and a given one is used
+// as written, so an operator can drop a registry by leaving it out; an empty
+// oci_token_hosts leaves each registry only its own host as a realm.
+func resolveOCIUpstreams(cfg *Config) error {
+	if cfg.OCIUpstreams == nil {
+		cfg.OCIUpstreams = maps.Clone(DefaultOCIUpstreams)
+	}
+	resolved := make(map[string]string, len(cfg.OCIUpstreams))
+	for name, raw := range cfg.OCIUpstreams {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if !manifest.OCIValidRegistryName(key) {
+			return fmt.Errorf("oci_upstreams key %q is not a registry hostname: lowercase, at least one dot, no scheme, port or path, e.g. \"ghcr.io\"", name)
+		}
+		if _, dup := resolved[key]; dup {
+			return fmt.Errorf("oci_upstreams names %q twice once case is folded", key)
+		}
+		u := strings.TrimRight(strings.TrimSpace(raw), "/")
+		def := DefaultOCIUpstreams[key]
+		if def == "" {
+			def = "https://" + key
+		}
+		if err := validateProxyUpstream(fmt.Sprintf("oci_upstreams[%q]", key), u, def); err != nil {
+			return err
+		}
+		resolved[key] = u
+	}
+	cfg.OCIUpstreams = resolved
+	if cfg.OCITokenHosts == nil {
+		cfg.OCITokenHosts = append([]string(nil), DefaultOCITokenHosts...)
+	}
+	return validateHostList("oci_token_hosts", cfg.OCITokenHosts)
 }
 
 // redactUserinfo masks the password in a URL url.Parse refused, which
@@ -1426,6 +1481,9 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		cfg.ComposerDistHosts = append([]string(nil), DefaultComposerDistHosts...)
 	}
 	if err := validateHostList("composer_dist_hosts", cfg.ComposerDistHosts); err != nil {
+		return nil, err
+	}
+	if err := resolveOCIUpstreams(cfg); err != nil {
 		return nil, err
 	}
 	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
@@ -2461,6 +2519,10 @@ func defaultConfigContent() []byte {
   "composer_upstream": "https://repo.packagist.org",
   "composer_dist_hosts": ["api.github.com", "codeload.github.com", "gitlab.com", "bitbucket.org"],
 
+  "_comment_oci": "oci_upstreams maps each registry a container client may name under /v2/ to the URL bodega pulls it from; a registry outside the map answers 404. A request names its registry with containerd's ?ns= parameter or as the first path segment (podman's mirror location), and anything else is Docker Hub. A URL may carry a credential as https://<user>:<token>@host, which bodega presents to the registry's token service as Basic auth and never to the registry itself. oci_token_hosts lists the hosts a registry's Bearer realm may name besides the registry's own; a realm anywhere else is refused with 502.",
+  "oci_upstreams": {"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io", "quay.io": "https://quay.io"},
+  "oci_token_hosts": ["auth.docker.io", "ghcr.io", "quay.io"],
+
   "_comment_private_upstream_hosts": "private_upstream_hosts: hostnames or IP literals (no scheme, port or path) the upstream guard lets resolve to a private address (RFC 1918, fc00::/7), for fronting an internal registry such as Artifactory, Nexus or Verdaccio, e.g. [\"registry.corp.example\"]. Listing a host trusts it as a public upstream is trusted: any client that can reach bodega can make it fetch any path under that ecosystem's route from the host. Loopback, link-local (including 169.254.169.254) and unspecified addresses stay refused for every host, listed or not, and each redirect hop is judged again, so a listed host cannot hand the fetch to an unlisted one. Names, not CIDRs: a range would trust whatever a public upstream's DNS points into it.",
   "private_upstream_hosts": [],
 
@@ -2488,6 +2550,7 @@ func defaultConfigContent() []byte {
   "cargo_root": "",
   "rubygems_root": "",
   "composer_root": "",
+  "oci_root": "",
 
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",

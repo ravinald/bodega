@@ -158,6 +158,9 @@ When a name is given after the type, only that entry is built.`,
 				case manifest.TypeComposer:
 					fmt.Fprintf(buildOut, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "build")
 
+				case manifest.TypeOCI:
+					fmt.Fprintf(buildOut, "\n>>> [oci] nothing to %s: images are pulled through /v2/ on first request\n", "build")
+
 				case manifest.TypeRubygems:
 					// rubygems has no build step; FetchRubygems skips already-fetched.
 					allSummaries = append(allSummaries,

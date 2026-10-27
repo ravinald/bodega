@@ -46,7 +46,7 @@ func RuleKindForType(registryType string) string {
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		return KindPackage
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return KindPrefix
@@ -294,6 +294,11 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 		// Packagist resolves a name case-insensitively and stores it lower
 		// case, so a rule written "Symfony/Console" names symfony/console.
 		return strings.EqualFold(candidate, r.Pattern)
+	case manifest.TypeOCI:
+		// <registry>/<repository> exactly, or a prefix ending "/*" that
+		// admits every repository below it: docker.io/library/* admits
+		// docker.io/library/nginx, and not docker.io/libraryx/nginx.
+		return matchNpm(candidate, r.Pattern)
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return strings.HasPrefix(candidate, r.Pattern)
 	}
@@ -315,7 +320,7 @@ func CandidateFor(registryType, packageName, entryURL string) string {
 // package name rather than on an upstream URL.
 func KeysByName(registryType string) bool {
 	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		return true
 	}
 	return false
@@ -376,7 +381,7 @@ func SuggestPattern(regType, host, fullPath, pkgName string) string {
 			}
 		}
 		return pkgName
-	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		return pkgName
 	case manifest.TypeGomod:
 		// Module paths look like host/org/repo... — propose host+org/.

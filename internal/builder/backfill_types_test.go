@@ -27,6 +27,13 @@ func TestArtifactPathForVersionCoversEveryType(t *testing.T) {
 			// no file in the repository layout.
 			name = "com.example:example-pkg"
 		}
+		ve := ve
+		if typ == manifest.TypeOCI {
+			// An OCI identity is <registry>/<repository>, and only a manifest
+			// digest in ref names a file.
+			name = "docker.io/library/example-pkg"
+			ve.Ref = "sha256:" + strings.Repeat("ab", 32)
+		}
 		got := artifactPathForVersion(cfg, typ, name, ve)
 		skip := slices.Contains(globTypes, typ)
 		switch {

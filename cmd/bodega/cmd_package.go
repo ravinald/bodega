@@ -148,6 +148,9 @@ When a name is given after the type, only that entry is packaged.`,
 				case manifest.TypeComposer:
 					fmt.Fprintf(os.Stdout, "\n>>> [composer] nothing to %s: dist archives are pulled through /composer/ on first request\n", "package")
 
+				case manifest.TypeOCI:
+					fmt.Fprintf(os.Stdout, "\n>>> [oci] nothing to %s: images are pulled through /v2/ on first request\n", "package")
+
 				case manifest.TypeRubygems:
 					// A gem file is already the artifact; the compact index
 					// is the upstream's, proxied.

@@ -115,6 +115,9 @@ func StoragePrefixes() []string {
 		ManifestsPrefix,
 		mavenPrefix,
 		npmPrefix,
+		ociBlobPrefix,
+		ociManifestPrefix,
+		ociTagPrefix,
 		AptPrefix,
 		PypiWheelPrefix,
 		GitPrefix,
@@ -1038,6 +1041,16 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 		}
 		return []string{ComposerDistKey(pm.Name, ve.Version, ve.Ref)}, nil
 
+	case TypeOCI:
+		// A tag moves, so only an entry that records the manifest digest it
+		// holds in Ref names a key. Its blobs are shared with every other
+		// image that carries them and are no one version's to delete.
+		registry, repo, _ := strings.Cut(pm.Name, "/")
+		if !OCIValidDigest(ve.Ref) || ociName(pm.Name) == "" {
+			return nil, fmt.Errorf("oci %s@%s records no sha256 manifest digest in ref, so no manifest key resolves for it", pm.Name, ve.Version)
+		}
+		return []string{OCIManifestKey(registry, repo, ve.Ref)}, nil
+
 	case TypeFreeBSD:
 		// The repository root, catalogue first: these are the keys this
 		// package can name without asking a backend what it holds. The
@@ -1238,6 +1251,10 @@ func ParseKey(key string) (typ, name, version string) {
 			return TypeComposer, "", ""
 		}
 		return TypeComposer, n, v
+
+	case strings.HasPrefix(key, "oci/"):
+		n, v := parseOCIKey(key)
+		return TypeOCI, n, v
 
 	case strings.HasPrefix(key, helmPrefix):
 		if key == HelmIndexKey {

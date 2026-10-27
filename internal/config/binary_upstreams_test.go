@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -208,6 +209,53 @@ func TestLoad_ComposerUpstreamAndDistHosts(t *testing.T) {
 			t.Errorf("Load accepted composer_dist_hosts entry %q", bad)
 		} else if !strings.Contains(err.Error(), "composer_dist_hosts") {
 			t.Errorf("error %q does not name composer_dist_hosts", err)
+		}
+	}
+}
+
+func TestLoad_OCIUpstreamsAndTokenHosts(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !maps.Equal(cfg.OCIUpstreams, config.DefaultOCIUpstreams) {
+		t.Errorf("oci_upstreams default = %v, want %v", cfg.OCIUpstreams, config.DefaultOCIUpstreams)
+	}
+	if !slices.Equal(cfg.OCITokenHosts, config.DefaultOCITokenHosts) {
+		t.Errorf("oci_token_hosts default = %v, want %v", cfg.OCITokenHosts, config.DefaultOCITokenHosts)
+	}
+
+	// A given map is used as written, a credential in userinfo is kept, and
+	// the key is folded to lower case.
+	writeConfig(t, `{"oci_upstreams":{"Registry.Example.com":"https://robot:s3cret@registry.example.com/"},"oci_token_hosts":["Auth.Example.com"]}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	//nolint:gosec // G101: a fixture credential, asserted to survive Load.
+	if want := map[string]string{"registry.example.com": "https://robot:s3cret@registry.example.com"}; !maps.Equal(cfg.OCIUpstreams, want) {
+		t.Errorf("oci_upstreams = %v, want %v", cfg.OCIUpstreams, want)
+	}
+	if !slices.Equal(cfg.OCITokenHosts, []string{"auth.example.com"}) {
+		t.Errorf("oci_token_hosts = %v, want the host lowercased", cfg.OCITokenHosts)
+	}
+
+	for _, tc := range []struct{ doc, key string }{
+		{`{"oci_upstreams":{"docker.io":"http://robot:s3cret@registry-1.docker.io"}}`, `oci_upstreams["docker.io"]`},
+		{`{"oci_upstreams":{"docker.io":"https://robot:s3cret@registry-1.docker.io/?x=1"}}`, `oci_upstreams["docker.io"]`},
+		{`{"oci_upstreams":{"localhost":"https://registry.example.com"}}`, "oci_upstreams key"},
+		{`{"oci_upstreams":{"https://ghcr.io":"https://ghcr.io"}}`, "oci_upstreams key"},
+		{`{"oci_token_hosts":["https://auth.docker.io"]}`, "oci_token_hosts"},
+	} {
+		writeConfig(t, tc.doc)
+		_, err := config.Load(t.TempDir(), "", "", "", false, false)
+		switch {
+		case err == nil:
+			t.Errorf("Load accepted %s", tc.doc)
+		case !strings.Contains(err.Error(), tc.key):
+			t.Errorf("error %q does not name %s", err, tc.key)
+		case strings.Contains(err.Error(), "s3cret"):
+			t.Errorf("error %q prints the credential", err)
 		}
 	}
 }

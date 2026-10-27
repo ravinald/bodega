@@ -285,6 +285,47 @@ func HelmDocument(repositories string) string {
 	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + repositories
 }
 
+// OCI renders the two files that point a container runtime at bodega by
+// hand: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
+// else, and a containerd hosts.toml for docker.io, which takes a copy per
+// registry. Neither carries an insecure-registry setting, so a plaintext base
+// is named in a note rather than written for the operator.
+func OCI(base string) []File {
+	b := trim(base)
+	var notes []string
+	if strings.HasPrefix(b, "http://") {
+		notes = append(notes, "bodega answers on plaintext http here, which Docker accepts only with the host in insecure-registries and containerd only with the host's scheme spelled http:// as above")
+	}
+	daemon := File{
+		System: manifest.TypeOCI,
+		Label:  "Docker daemon.json",
+		Paths: map[string]string{
+			OSLinux:  "/etc/docker/daemon.json",
+			OSDarwin: "~/.docker/daemon.json",
+		},
+		// dockerd stores a mirror with one trailing slash whatever it is
+		// given, so this is the form `docker info` prints back.
+		Content: fmt.Sprintf("{\n  \"registry-mirrors\": [%s]\n}\n", jsonString(b+"/")),
+		Notes: append([]string{
+			"Replaces the file; merge registry-mirrors into an existing daemon.json by hand, then restart dockerd",
+			"Docker Engine mirrors Docker Hub alone: an image from ghcr.io or quay.io still pulls from its own registry",
+		}, notes...),
+	}
+	containerd := File{
+		System: manifest.TypeOCI,
+		Label:  "containerd hosts.toml (docker.io)",
+		Paths: map[string]string{
+			OSLinux: "/etc/containerd/certs.d/docker.io/hosts.toml",
+		},
+		Content: fmt.Sprintf("server = \"https://registry-1.docker.io\"\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n", b),
+		Notes: append([]string{
+			"containerd reads certs.d only when config_path names it in config.toml's registry section",
+			"Copy the file to certs.d/ghcr.io/ and certs.d/quay.io/ with server set to that registry; containerd names the registry to bodega with ?ns=",
+		}, notes...),
+	}
+	return []File{daemon, containerd}
+}
+
 // Git renders one url.<base>/git/<namespace>/.insteadOf per git_upstreams
 // entry, sorted by namespace so two renders of one config are byte-identical.
 // A clone of the upstream URL is then rewritten onto bodega's smart-HTTP
@@ -626,6 +667,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Rubygems(in.Base)...)
 	case manifest.TypeComposer:
 		out = append(out, Composer(in.Base))
+	case manifest.TypeOCI:
+		out = append(out, OCI(in.Base)...)
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:

@@ -1416,6 +1416,7 @@ var createTypeOptions = []string{
 	manifest.TypeHelm,
 	manifest.TypeMaven,
 	manifest.TypeNpm,
+	manifest.TypeOCI,
 	manifest.TypePypi,
 	manifest.TypeRubygems,
 }
@@ -1913,6 +1914,28 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: checksumHint(restore("Checksum", ""))},
 		})
 
+	case manifest.TypeOCI:
+		// No Source URL: the registry is the first segment of the name, and
+		// oci_upstreams says where bodega fetches it.
+		modeVal := restore("Mode", "proxy")
+		constraintVal := prevLabelSelect["Tag"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "<registry>/<repository>, e.g. docker.io/library/nginx"},
+			{Label: "Tag", Value: restore("Tag", ""),
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "Manifest digest", Value: restore("Manifest digest", ""),
+				Hint: "sha256:<hex> of the manifest; leave empty unless one is uploaded for it"},
+		})
+
 	case manifest.TypeFreeBSD:
 		// A freebsd entry is a repository, not a package, so the form asks
 		// for the two halves of the path a pkg client composes: the
@@ -2178,6 +2201,17 @@ func validateCreateFields(fields []formField) string {
 		if ref := fieldValueFromSlice(fields, "Dist reference"); ref != "" && !manifest.ComposerValidReference(ref) {
 			return "Dist reference must be a commit or tag name"
 		}
+	case manifest.TypeOCI:
+		registry, repo, _ := strings.Cut(fieldValueFromSlice(fields, "Name"), "/")
+		if !manifest.OCIValidRegistryName(registry) || !manifest.OCIValidRepository(repo) {
+			return "Name must be a lowercase <registry>/<repository> for oci entries, e.g. docker.io/library/nginx"
+		}
+		if !manifest.OCIValidTag(fieldValueFromSlice(fields, "Tag")) {
+			return "Tag is required for oci entries: letters, digits, '_', '.' and '-', up to 128"
+		}
+		if d := fieldValueFromSlice(fields, "Manifest digest"); d != "" && !manifest.OCIValidDigest(d) {
+			return "Manifest digest must be sha256:<64 hex>"
+		}
 	case manifest.TypeFreeBSD:
 		// Both halves of the path a pkg client composes, checked against what
 		// the route will accept rather than against emptiness: an entry whose
@@ -2356,6 +2390,21 @@ func constraintToManifest(formVal string) string {
 	}
 }
 
+// manifestToConstraint is constraintToManifest's inverse: the dropdown value
+// a manifest constraint is shown under.
+func manifestToConstraint(c string) string {
+	switch c {
+	case manifest.ConstraintAny:
+		return "latest (*)"
+	case manifest.ConstraintCompatible:
+		return "compatible (^)"
+	case manifest.ConstraintPatch:
+		return "patch (~)"
+	default:
+		return "exact (=)"
+	}
+}
+
 // saveCreateEntry builds the appropriate manifest VersionEntry from fields and
 // adds it to the store via AddVersion, then persists the index.
 func saveCreateEntry(store *manifest.Store, fields []formField) error {
@@ -2460,6 +2509,14 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeComposer:
 		ve.Ref = fieldValueFromSlice(fields, "Dist reference")
 
+	case manifest.TypeOCI:
+		// The tag is the version, as the /v2/ route judges it, and its
+		// constraint rides on the Tag label rather than on a Version field
+		// this form does not have.
+		ve.Version = fieldValueFromSlice(fields, "Tag")
+		ve.VersionConstraint = constraintToManifest(labelSelectValue(fields, "Tag"))
+		ve.Ref = fieldValueFromSlice(fields, "Manifest digest")
+
 	case manifest.TypeFreeBSD:
 		// The version of a freebsd entry is the ABI directory above the
 		// repository, and the form asks for it under that name because that
@@ -2520,6 +2577,13 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 				// The freebsd form has no Version field; its version is the
 				// ABI, under the label a pkg client would recognize.
 				setFieldValue(p.formFields, "ABI", ve.Version)
+			}
+			if entryType == manifest.TypeOCI {
+				setFieldValue(p.formFields, "Tag", ve.Version)
+				setFieldValue(p.formFields, "Manifest digest", ve.Ref)
+				if ve.VersionConstraint != "" {
+					setLabelSelectValue(p.formFields, "Tag", manifestToConstraint(ve.VersionConstraint))
+				}
 			}
 			setFieldValue(p.formFields, "Source URL", ve.URL)
 			if ve.Ref != "" {
@@ -2623,10 +2687,10 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
-	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		// No Source URL here names a package: cargo's and rubygems' are the
-		// registry root and maven's and composer's forms have none. The Name
-		// field is required.
+		// registry root and maven's, composer's and oci's forms have none.
+		// The Name field is required.
 		return ""
 	default:
 		seg := lastURLSegment(rawURL)
@@ -2667,6 +2731,15 @@ func labelSelectValue(fields []formField, label string) string {
 
 // setFieldValue updates the Value of the first field whose Label matches key.
 // It also resets the field's cursor to the end of the new value.
+func setLabelSelectValue(fields []formField, key, value string) {
+	for i := range fields {
+		if fields[i].Label == key && fields[i].LabelSelect {
+			fields[i].LabelSelectValue = value
+			return
+		}
+	}
+}
+
 func setFieldValue(fields []formField, key, value string) {
 	for i := range fields {
 		if fields[i].Label == key {

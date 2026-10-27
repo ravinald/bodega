@@ -290,6 +290,15 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			})
 			return
 		}
+		var refused *resolveRefusal
+		if errors.As(err, &refused) {
+			// An opener read what the upstream sent and bodega refuses it:
+			// bytes that do not hash to the digest asked for, a token realm
+			// on an unlisted host. Nothing was cached.
+			s.logger.Warn("upstream fetch refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			refused.f.write(w, r)
+			return
+		}
 		if errors.Is(err, errUpstreamNotFound) {
 			s.logger.Debug("upstream has no such object", "url", upstreamURL)
 			http.NotFound(w, r)
@@ -432,7 +441,13 @@ type upstreamFetch struct {
 // fetchUpstream opens upstreamURL and spools its body. A spool refusal comes
 // back as the error spoolUpstream gave, so spoolDenialReason still reads it.
 func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string) upstreamFetch {
-	up, err := openUpstream(ctx, upstreamURL, requiresIdentityEncoding(regType))
+	open := func(ctx context.Context, u string) (*upstreamStream, error) {
+		return openUpstream(ctx, u, requiresIdentityEncoding(regType))
+	}
+	if o, ok := ctx.Value(upstreamOpenerKey{}).(upstreamOpener); ok {
+		open = o
+	}
+	up, err := open(ctx, upstreamURL)
 	if err != nil {
 		return upstreamFetch{err: err}
 	}
@@ -442,6 +457,19 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		return upstreamFetch{err: err}
 	}
 	return upstreamFetch{up: up, spool: spool}
+}
+
+// upstreamOpener opens one upstream URL in place of openUpstream, for a
+// route whose upstream speaks a protocol of its own on the way to the bytes:
+// the OCI registries answer a Bearer challenge before they serve anything. It
+// rides the context so that proxyOrResolve, its stale-refresh goroutine and
+// fetchUpstreamInOrder all reach it without one more parameter each.
+type upstreamOpener func(ctx context.Context, rawURL string) (*upstreamStream, error)
+
+type upstreamOpenerKey struct{}
+
+func withUpstreamOpener(ctx context.Context, open upstreamOpener) context.Context {
+	return context.WithValue(ctx, upstreamOpenerKey{}, open)
 }
 
 // fetchUpstreamInOrder fetches first and, while nothing has answered with its

@@ -248,7 +248,7 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 				for _, cidr := range nets {
 					if cidr.Contains(ip) {
 						recordDenial(auditDB, r, audit.DenialDenyList, nil)
-						if isClientPath(r.URL.Path) {
+						if isClientPath(r.URL.Path) || isOCIRoute(r.URL.Path) {
 							w.Header().Set("Cache-Control", "no-store")
 							http.Error(w, strings.TrimRight(deniedClientText(clientIP, cidr), "\n"), http.StatusForbidden)
 							return
@@ -263,10 +263,11 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 	}
 }
 
-// deniedClientText is the deny list's 403 body on a /client/ path. A host
-// configuring itself from the setup script has nobody watching the journal,
-// and a bare Forbidden there reads the same as a missing identity binding,
-// whose repair would not help.
+// deniedClientText is the deny list's 403 body on a /client/ or /v2/ path. A
+// host configuring itself from the setup script, or a container runtime
+// pulling an image, has nobody watching the journal, and a bare Forbidden
+// there reads the same as a missing identity binding, whose repair would not
+// help.
 func deniedClientText(ip string, cidr *net.IPNet) string {
 	return fmt.Sprintf("this host (%s) is on this server's deny list (%s), which refuses it before any identity is resolved.\n"+
 		"  Remove the entry if the refusal is wrong:  bodega acl deny remove %s\n"+
@@ -679,6 +680,11 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 			if pkgType == "" {
 				return
 			}
+			if pkgType == manifest.TypeOCI {
+				// containerd names the registry in a query parameter, which
+				// the path alone cannot see.
+				pkgName, pkgVersion = parseOCIPackagePath(path, r.URL.Query().Get("ns"))
+			}
 
 			// 404s on package routes are deliberately not recorded: the
 			// guard above has already discarded them, and apt probes several
@@ -868,6 +874,9 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 			return manifest.TypeComposer, name, ""
 		}
 		return manifest.TypeComposer, "", ""
+	case strings.HasPrefix(path, "/v2/"):
+		name, version := parseOCIPackagePath(path, "")
+		return manifest.TypeOCI, name, version
 	case strings.HasPrefix(path, "/maven/"):
 		// A path the layout rejects still names the type, so a read token
 		// scoped to another type is refused before the handler 404s it.
@@ -950,7 +959,7 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 func mutationAuth(admin NetsFunc, tokens *tokenCache, auditDB *audit.DB, pepper string, logger *slog.Logger, pushRoute func(*http.Request) bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) {
+			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) || isOCIRoute(r.URL.Path) {
 				if isSuperadminRoute(r.URL.Path) {
 					if !AdminPermits(admin.nets(), net.ParseIP(ClientIP(r))) {
 						logger.Warn("admin endpoint blocked: IP not in admin_permit_cidr",
@@ -1245,7 +1254,7 @@ func routeScope(r *http.Request) (scopes []string, pkgType string) {
 	if p == "/healthz" || strings.HasPrefix(p, authPathPrefix) {
 		return nil, ""
 	}
-	isRead := r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r)
+	isRead := r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch || isGitUploadPack(r) || isOCIRoute(p)
 	if isSuperadminRoute(p) {
 		return []string{audit.ScopeSuperadmin}, ""
 	}

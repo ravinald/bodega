@@ -26,6 +26,7 @@ var uncoveredReason = map[string]string{
 	manifest.TypeCargo:     "crates.io publishes no provenance bodega can verify",
 	manifest.TypeRubygems:  "bodega does not verify the Sigstore attestations RubyGems.org publishes yet",
 	manifest.TypeComposer:  "Packagist publishes no provenance; a dist archive is a forge's export of a commit the metadata names",
+	manifest.TypeOCI:       "bodega does not verify cosign or Notation signatures yet; a signature is an OCI artifact it serves like any other manifest",
 	manifest.TypeHelm:      "a chart's .prov file is a PGP signature with no key bodega is configured to trust, and is not verified yet",
 	manifest.TypeApt:       "a .deb carries no publisher provenance; the archive's Release signature covers the index, not who built the package",
 	manifest.TypeFreeBSD:   "the pkg repository signature covers the catalogue, not who built the package",
