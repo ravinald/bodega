@@ -16,6 +16,7 @@ const (
 	ociTagPrefix      = "oci/tags/"
 
 	ociDigestsMarker  = "/_digests/sha256/"
+	ociTypesMarker    = "/_types/sha256/"
 	ociTagsMarker     = "/_tags/"
 	ociResolvedMarker = "/_resolved/sha256/"
 	ociListSuffix     = "/_list"
@@ -64,6 +65,14 @@ func OCIManifestKey(registry, repo, digest string) string {
 	return ociManifestPrefix + registry + "/" + repo + ociDigestsMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
 }
 
+// OCIManifestTypeKey holds the media type the registry served a manifest
+// under, beside its bytes and in the same backend. Docker manifests need not
+// repeat their type in the body, so the bytes alone cannot say it, and the
+// bytes cannot be rewritten to carry it without changing their digest.
+func OCIManifestTypeKey(registry, repo, digest string) string {
+	return ociManifestPrefix + registry + "/" + repo + ociTypesMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
+}
+
 // OCITagKey is a tag's key: the digest and media type it resolved to, not the
 // manifest bytes. Regenerable.
 func OCITagKey(registry, repo, tag string) string {
@@ -95,6 +104,10 @@ func parseOCIKey(key string) (name, version string) {
 		rest := strings.TrimPrefix(key, ociManifestPrefix)
 		if i := strings.LastIndex(rest, ociDigestsMarker); i > 0 {
 			return ociNameVersion(rest[:i], ociDigestVersion(rest[i+len(ociDigestsMarker):]))
+		}
+		// A sibling of the manifest, not a second copy of its version.
+		if i := strings.LastIndex(rest, ociTypesMarker); i > 0 && ociDigestVersion(rest[i+len(ociTypesMarker):]) != "" {
+			return ociName(rest[:i]), ""
 		}
 	case strings.HasPrefix(key, ociTagPrefix):
 		rest := strings.TrimPrefix(key, ociTagPrefix)

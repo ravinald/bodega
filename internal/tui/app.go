@@ -2390,6 +2390,21 @@ func constraintToManifest(formVal string) string {
 	}
 }
 
+// manifestToConstraint is constraintToManifest's inverse: the dropdown value
+// a manifest constraint is shown under.
+func manifestToConstraint(c string) string {
+	switch c {
+	case manifest.ConstraintAny:
+		return "latest (*)"
+	case manifest.ConstraintCompatible:
+		return "compatible (^)"
+	case manifest.ConstraintPatch:
+		return "patch (~)"
+	default:
+		return "exact (=)"
+	}
+}
+
 // saveCreateEntry builds the appropriate manifest VersionEntry from fields and
 // adds it to the store via AddVersion, then persists the index.
 func saveCreateEntry(store *manifest.Store, fields []formField) error {
@@ -2495,8 +2510,11 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 		ve.Ref = fieldValueFromSlice(fields, "Dist reference")
 
 	case manifest.TypeOCI:
-		// The tag is the version, as the /v2/ route judges it.
+		// The tag is the version, as the /v2/ route judges it, and its
+		// constraint rides on the Tag label rather than on a Version field
+		// this form does not have.
 		ve.Version = fieldValueFromSlice(fields, "Tag")
+		ve.VersionConstraint = constraintToManifest(labelSelectValue(fields, "Tag"))
 		ve.Ref = fieldValueFromSlice(fields, "Manifest digest")
 
 	case manifest.TypeFreeBSD:
@@ -2559,6 +2577,13 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 				// The freebsd form has no Version field; its version is the
 				// ABI, under the label a pkg client would recognize.
 				setFieldValue(p.formFields, "ABI", ve.Version)
+			}
+			if entryType == manifest.TypeOCI {
+				setFieldValue(p.formFields, "Tag", ve.Version)
+				setFieldValue(p.formFields, "Manifest digest", ve.Ref)
+				if ve.VersionConstraint != "" {
+					setLabelSelectValue(p.formFields, "Tag", manifestToConstraint(ve.VersionConstraint))
+				}
 			}
 			setFieldValue(p.formFields, "Source URL", ve.URL)
 			if ve.Ref != "" {
@@ -2706,6 +2731,15 @@ func labelSelectValue(fields []formField, label string) string {
 
 // setFieldValue updates the Value of the first field whose Label matches key.
 // It also resets the field's cursor to the end of the new value.
+func setLabelSelectValue(fields []formField, key, value string) {
+	for i := range fields {
+		if fields[i].Label == key && fields[i].LabelSelect {
+			fields[i].LabelSelectValue = value
+			return
+		}
+	}
+}
+
 func setFieldValue(fields []formField, key, value string) {
 	for i := range fields {
 		if fields[i].Label == key {

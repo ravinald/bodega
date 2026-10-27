@@ -1,17 +1,18 @@
 package server
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -179,11 +180,6 @@ func (g *ociRegistry) endOutage() {
 	default:
 		close(g.resume)
 	}
-}
-
-func ociDigest(b []byte) string {
-	sum := sha256.Sum256(b)
-	return fmt.Sprintf("sha256:%x", sum)
 }
 
 // ociImage is a multi-arch image: an index naming an amd64 and an arm64
@@ -830,5 +826,240 @@ func TestOCIMalformedPathsAnswerTheSpecError(t *testing.T) {
 	}
 	if n := f.hub.total(); n != 0 {
 		t.Errorf("malformed paths reached the registry %d times", n)
+	}
+}
+
+// A Docker manifest need not repeat its media type in its body, so the type
+// a digest is served under has to come from what the registry said when it
+// was fetched: on the fill, on every cache hit, after a tag fetched it, and
+// on a server that never saw the fetch.
+func TestOCIDigestManifestKeepsUpstreamMediaType(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	manifestBody := []byte(`{"schemaVersion":2,"config":{},"layers":[]}`)
+	listBody := []byte(`{"schemaVersion":2,"manifests":[]}`)
+	byTag := []byte(`{"schemaVersion":2,"config":{"size":1},"layers":[]}`)
+	f.hub.mu.Lock()
+	f.hub.manifests["library/nginx@"+ociDigest(manifestBody)] = ociObject{mediaDockerManifest, manifestBody}
+	f.hub.manifests["library/nginx@"+ociDigest(listBody)] = ociObject{mediaDockerList, listBody}
+	f.hub.manifests["library/nginx@docker-tag"] = ociObject{mediaDockerManifest, byTag}
+	f.hub.manifests["library/nginx@"+ociDigest(byTag)] = ociObject{mediaDockerManifest, byTag}
+	f.hub.mu.Unlock()
+
+	check := func(s *Server, method, digest, want string) {
+		t.Helper()
+		rec := doRequest(s, method, "/v2/nginx/manifests/"+digest, nil)
+		if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != want || rec.Header().Get(ociDigestHeader) != digest {
+			t.Fatalf("%s %s: %d Content-Type %q digest %q, want %q", method, digest, rec.Code, rec.Header().Get("Content-Type"), rec.Header().Get(ociDigestHeader), want)
+		}
+	}
+	for _, c := range []struct {
+		body []byte
+		want string
+	}{{manifestBody, mediaDockerManifest}, {listBody, mediaDockerList}} {
+		d := ociDigest(c.body)
+		check(s, http.MethodGet, d, c.want)
+		check(s, http.MethodHead, d, c.want)
+		check(s, http.MethodGet, d, c.want)
+		if n := f.hub.hitsFor("/v2/library/nginx/manifests/" + d); n != 1 {
+			t.Errorf("%s fetched %d times, want 1", d, n)
+		}
+	}
+
+	if rec := doRequest(s, http.MethodGet, "/v2/nginx/manifests/docker-tag", nil); rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != mediaDockerManifest {
+		t.Fatalf("by tag: %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	check(s, http.MethodGet, ociDigest(byTag), mediaDockerManifest)
+	if n := f.hub.hitsFor("/v2/library/nginx/manifests/" + ociDigest(byTag)); n != 0 {
+		t.Errorf("a manifest the tag stored was fetched again by digest %d times", n)
+	}
+
+	// A server sharing only the storage stands in for a restart; the
+	// registry dropping the manifests proves the answer came from storage.
+	restarted := ociServer(t, f)
+	restarted.stores = s.stores
+	f.hub.mu.Lock()
+	for _, b := range [][]byte{manifestBody, listBody, byTag} {
+		delete(f.hub.manifests, "library/nginx@"+ociDigest(b))
+	}
+	f.hub.mu.Unlock()
+	check(restarted, http.MethodGet, ociDigest(manifestBody), mediaDockerManifest)
+	check(restarted, http.MethodHead, ociDigest(listBody), mediaDockerList)
+	check(restarted, http.MethodGet, ociDigest(byTag), mediaDockerManifest)
+}
+
+// A schema 1 manifest is told by its body when the registry names it with a
+// generic type or none, by digest as by tag, and nothing of it is stored.
+func TestOCISchema1RefusedByDigest(t *testing.T) {
+	for _, ct := range []string{"application/json", ""} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			t.Run(method+" "+ct, func(t *testing.T) {
+				f := newOCIFixture(t)
+				s := ociServer(t, f)
+				body := []byte(`{"schemaVersion":1,"name":"library/nginx","fsLayers":[]}`)
+				d := ociDigest(body)
+				f.hub.mu.Lock()
+				f.hub.manifests["library/nginx@"+d] = ociObject{ct, body}
+				f.hub.mu.Unlock()
+				rec := doRequest(s, method, "/v2/nginx/manifests/"+d, nil)
+				if method == http.MethodGet {
+					assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "schema 1")
+				} else if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 {
+					t.Fatalf("HEAD: %d %q, want a bodiless 404", rec.Code, rec.Body.String())
+				}
+				store := s.typeStore(manifest.TypeOCI)
+				for _, key := range []string{manifest.OCIManifestKey("docker.io", "library/nginx", d), manifest.OCIManifestTypeKey("docker.io", "library/nginx", d)} {
+					if info, err := store.Head(t.Context(), key); err != nil || info.Exists {
+						t.Errorf("%s stored after a schema 1 refusal (%v)", key, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A refusal written by middleware before the request reaches the /v2/
+// handler still carries the spec's error body and bodega's reason: the deny
+// list and a token whose scopes do not reach oci.
+func TestOCIRefusalsOutsideTheHandler(t *testing.T) {
+	denied := newACLServer(t, &config.Config{DenyList: []string{"127.0.0.1/32"}})
+	for _, p := range []string{"/v2/", "/v2/nginx/manifests/1.27", "/v2/nginx/blobs/sha256:" + strings.Repeat("a", 64)} {
+		rec := doRequest(denied, http.MethodGet, p, nil)
+		assertOCIError(t, rec, http.StatusForbidden, "DENIED", "deny list", "127.0.0.1/32")
+		if rec := doRequest(denied, http.MethodHead, p, nil); rec.Code != http.StatusForbidden || rec.Body.Len() != 0 {
+			t.Errorf("HEAD %s: %d %q", p, rec.Code, rec.Body.String())
+		}
+	}
+
+	//nolint:gosec // G101: a test fixture, not a credential.
+	const npmOnly = "bodega_ak_npm_only"
+	s := newInventoryServer(t, []string{"127.0.0.1/32"})
+	if err := s.auditDB.InsertScopedToken(t.Context(), "npm-only", "npm-only", audit.HashToken(npmOnly, invPepper), "", "read:npm", "test-operator", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec := send(s, http.MethodGet, "/v2/nginx/tags/list", localAddr, npmOnly, "")
+	assertOCIError(t, rec, http.StatusForbidden, "DENIED", "npm-only", "read:oci")
+}
+
+// pagingRegistry serves one repository's tag list in pages of two, unasked,
+// as a registry with a server-side page size does.
+func pagingRegistry(t *testing.T, tags []string, link func(last string) string) (*httptest.Server, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	hits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		rest := tags
+		if last := r.URL.Query().Get("last"); last != "" {
+			for i, tag := range tags {
+				if tag == last {
+					rest = tags[i+1:]
+				}
+			}
+		}
+		if len(rest) > 2 {
+			rest = rest[:2]
+			w.Header().Set("Link", link(rest[1]))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "library/nginx", "tags": rest})
+	}))
+	t.Cleanup(ts.Close)
+	return ts, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits
+	}
+}
+
+func tagListOf(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tags/list: %d %s", rec.Code, rec.Body.String())
+	}
+	var l ociTagList
+	if err := json.Unmarshal(rec.Body.Bytes(), &l); err != nil {
+		t.Fatalf("tags/list body: %v: %s", err, rec.Body.String())
+	}
+	return l.Tags
+}
+
+// bodega reads every page a registry offers into one cached list and pages
+// it again for a client that asks, with next links that name bodega and keep
+// the registry the client chose.
+func TestOCITagListPagination(t *testing.T) {
+	up, hits := pagingRegistry(t, []string{"a", "b", "c", "d", "e"}, func(last string) string {
+		return `</v2/library/nginx/tags/list?last=` + last + `&n=2>; rel="next"`
+	})
+	s := ociServer(t, newOCIFixture(t))
+	s.cfg.OCIUpstreams["docker.io"] = up.URL
+	s.cfg.OCIUpstreams["ghcr.io"] = up.URL
+
+	rec := doRequest(s, http.MethodGet, "/v2/nginx/tags/list", nil)
+	if got := strings.Join(tagListOf(t, rec), ","); got != "a,b,c,d,e" || rec.Header().Get("Link") != "" {
+		t.Fatalf("whole list %q Link %q, want every page and no link", got, rec.Header().Get("Link"))
+	}
+	if n := hits(); n != 3 {
+		t.Errorf("registry asked %d times for three pages", n)
+	}
+
+	next := "/v2/nginx/tags/list?n=2"
+	var pages []string
+	for next != "" && len(pages) < 5 {
+		rec := doRequest(s, http.MethodGet, next, nil)
+		pages = append(pages, strings.Join(tagListOf(t, rec), ","))
+		next = ""
+		if l := rec.Header().Get("Link"); l != "" {
+			target, _, _ := strings.Cut(l, ">")
+			next = strings.TrimPrefix(target, "<")
+			if !strings.HasPrefix(next, "/v2/nginx/tags/list?") || !strings.HasSuffix(l, `; rel="next"`) {
+				t.Fatalf("next link %q does not name bodega's route", l)
+			}
+		}
+	}
+	if got := strings.Join(pages, " | "); got != "a,b | c,d | e" {
+		t.Errorf("pages %q, want a,b | c,d | e", got)
+	}
+	if n := hits(); n != 3 {
+		t.Errorf("paging a cached list asked the registry again: %d requests", n)
+	}
+
+	rec = doRequest(s, http.MethodGet, "/v2/acme/app/tags/list?ns=ghcr.io&n=1&last=b", nil)
+	if got := strings.Join(tagListOf(t, rec), ","); got != "c" || !strings.Contains(rec.Header().Get("Link"), "ns=ghcr.io") {
+		t.Errorf("ns page %q Link %q, want c and a link keeping ns=ghcr.io", got, rec.Header().Get("Link"))
+	}
+	if got := tagListOf(t, doRequest(s, http.MethodGet, "/v2/nginx/tags/list?n=0", nil)); len(got) != 0 {
+		t.Errorf("n=0 listed %q", got)
+	}
+	if got := strings.Join(tagListOf(t, doRequest(s, http.MethodGet, "/v2/nginx/tags/list?last=c", nil)), ","); got != "d,e" {
+		t.Errorf("last=c listed %q, want d,e", got)
+	}
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/nginx/tags/list?n=many", nil), http.StatusBadRequest, "PAGINATION_NUMBER_INVALID", "n=")
+}
+
+// A next link is followed only on the registry's own host, since the
+// registry's token rides on every request, and a list whose next link never
+// moves is refused rather than read forever.
+func TestOCITagListRefusesLinksItCannotFollow(t *testing.T) {
+	var foreignHits atomic.Int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits.Add(1) }))
+	t.Cleanup(foreign.Close)
+	for name, link := range map[string]func(string) string{
+		"foreign host": func(last string) string {
+			return `<` + foreign.URL + `/v2/library/nginx/tags/list?last=` + last + `>; rel="next"`
+		},
+		"no progress": func(string) string { return `</v2/library/nginx/tags/list>; rel="next"` },
+	} {
+		t.Run(name, func(t *testing.T) {
+			up, _ := pagingRegistry(t, []string{"a", "b", "c"}, link)
+			s := ociServer(t, newOCIFixture(t))
+			s.cfg.OCIUpstreams["docker.io"] = up.URL
+			assertOCIError(t, doRequest(s, http.MethodGet, "/v2/nginx/tags/list", nil), http.StatusBadGateway, "UNKNOWN")
+		})
+	}
+	if n := foreignHits.Load(); n != 0 {
+		t.Errorf("a next link on another host was followed %d times", n)
 	}
 }

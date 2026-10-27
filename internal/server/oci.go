@@ -12,6 +12,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,9 +103,31 @@ func (t ociTarget) url(tail string) string {
 
 func (t ociTarget) isDigest() bool { return manifest.OCIValidDigest(t.ref) }
 
+// ociErrorMiddleware gives a refusal written before the request reaches
+// handleOCI the same JSON body handleOCI's own carry: the deny list and a
+// token's scopes refuse in middleware, as text, and docker prints the
+// message of a JSON error and nothing at all of a text one. It wraps
+// everything that can refuse, and an error handleOCI already formatted
+// passes through it untouched.
+func ociErrorMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isOCIRoute(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ow := &ociResponseWriter{ResponseWriter: w, r: r, kind: ociKindOf(strings.TrimPrefix(r.URL.Path, "/v2/"))}
+		defer ow.finish()
+		ow.Header().Set(ociAPIVersionHeader, "registry/2.0")
+		next.ServeHTTP(ow, r.WithContext(context.WithValue(r.Context(), ociOuterKey{}, ow)))
+	})
+}
+
+type ociOuterKey struct{}
+
 func (s *Server) handleOCI(w http.ResponseWriter, r *http.Request) {
 	p := r.PathValue("path")
-	ow := &ociResponseWriter{ResponseWriter: w, r: r, kind: ociKindOf(p)}
+	outer, _ := r.Context().Value(ociOuterKey{}).(*ociResponseWriter)
+	ow := &ociResponseWriter{ResponseWriter: w, r: r, kind: ociKindOf(p), outer: outer}
 	defer ow.finish()
 	ow.Header().Set(ociAPIVersionHeader, "registry/2.0")
 
@@ -432,7 +457,9 @@ func (s *Server) refuseUnresolvedDigest(w http.ResponseWriter, r *http.Request, 
 
 // serveOCIManifestDigest fetches or serves the manifest t.ref names, verified
 // against the digest before anything is stored. mediaType, when known, is the
-// type the response carries on a cache hit; otherwise the stored bytes say.
+// type the response carries on a cache hit; otherwise the type recorded when
+// the manifest was fetched does, and only a manifest stored with no record is
+// typed by its bytes.
 func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget, pm *manifest.PackageManifest, mediaType string) {
 	ctx := r.Context()
 	store, err := s.versionStore(ctx, manifest.TypeOCI, t.name(), t.ref)
@@ -444,18 +471,30 @@ func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, t
 	}
 	key := manifest.OCIManifestKey(t.registry, t.repo, t.ref)
 	if store != nil && mediaType == "" {
-		if b, err := store.Get(ctx, key); err == nil && b != nil {
-			mediaType = ociMediaType("", b)
-		}
+		mediaType = s.ociStoredMediaType(ctx, store, t, key)
 	}
 	w.contentType = mediaType
 	w.Header().Set(ociDigestHeader, t.ref)
 	w.Header().Set("ETag", `"`+t.ref+`"`)
-	req := r.WithContext(withUpstreamOpener(ctx, s.ociDigestOpener(t, ociManifestAccept)))
+	req := r.WithContext(withUpstreamOpener(ctx, s.ociManifestOpener(t, store)))
 	upstream := t.url(ociManifests + "/" + t.ref)
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	s.proxyOrResolve(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, req, store, key,
 		resolve, upstream, nil, manifest.TypeOCI, t.name(), t.name(), true, ociForceProxy(pm))
+}
+
+// ociStoredMediaType is the type a cached manifest is served under, "" when
+// none is cached.
+func (s *Server) ociStoredMediaType(ctx context.Context, store storage.ObjectStore, t ociTarget, key string) string {
+	if b, err := store.Get(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, t.ref)); err == nil && len(b) > 0 {
+		return string(b)
+	}
+	b, err := store.Get(ctx, key)
+	if err != nil || b == nil {
+		return ""
+	}
+	s.logger.Warn("oci manifest cached with no media type record, typing it by its bytes", "key", key)
+	return ociMediaType("", b)
 }
 
 // handleOCIBlob serves a layer or config blob from the one key its digest
@@ -487,7 +526,7 @@ func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarge
 		}
 	}
 	w.contentType = "application/octet-stream"
-	req := r.WithContext(withUpstreamOpener(ctx, s.ociDigestOpener(t, "")))
+	req := r.WithContext(withUpstreamOpener(ctx, s.ociDigestOpener(t)))
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	s.proxyOrResolve(dw, req, store, key, resolve, upstream, nil, manifest.TypeOCI, name, name, true, ociForceProxy(pm))
 }
@@ -559,11 +598,21 @@ func (f *forwardSeeker) Seek(offset int64, whence int) (int64, error) {
 	return f.pos, nil
 }
 
-// handleOCITagList proxies the upstream's tag list, mutable.
+// handleOCITagList serves the upstream's tag list, every page of it cached
+// as one mutable document, and pages it for a client that sends n or last.
+// Paging here rather than upstream keeps one cache key per repository, so an
+// outage serves the whole list and not whichever pages happened to be asked
+// for, and a next link that names bodega rather than the registry.
 func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
 	noSharedCache(w)
+	page, ok := ociPageOf(r.URL.Query())
+	if !ok {
+		w.writeError(http.StatusBadRequest, "PAGINATION_NUMBER_INVALID",
+			fmt.Sprintf("n=%q is not a count of tags; send a whole number, or leave n out for every tag.", r.URL.Query().Get("n")))
+		return
+	}
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
 	if pm != nil && isPackageHidden(pm) {
 		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
@@ -576,34 +625,245 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 	if !s.ociAllowListGate(w, r, t, key, false) {
 		return
 	}
-	req := r.WithContext(withUpstreamOpener(ctx, s.ociDigestOpener(t, "application/json")))
-	s.proxyOrCache(w, req, s.typeStore(manifest.TypeOCI), key, t.url("tags/list"), manifest.TypeOCI, name, name, false, ociForceProxy(pm))
+	req := r.Clone(withUpstreamOpener(ctx, s.ociTagListOpener(t)))
+	req.Method = http.MethodGet
+	cw := &capturedResponse{header: http.Header{}}
+	s.proxyOrCache(cw, req, s.typeStore(manifest.TypeOCI), key, t.url("tags/list"), manifest.TypeOCI, name, name, false, ociForceProxy(pm))
+	if cw.status != http.StatusOK {
+		relayCaptured(w, cw)
+		return
+	}
+	var list ociTagList
+	if err := json.Unmarshal(cw.body.Bytes(), &list); err != nil {
+		s.logger.Error("oci tag list does not parse", "key", key, "error", err)
+		w.writeError(http.StatusBadGateway, "UNKNOWN",
+			fmt.Sprintf("bodega's copy of the tag list for %s does not parse. Retry once metadata_ttl has passed.", name))
+		return
+	}
+	tags, more := page.slice(list.Tags)
+	if more {
+		q := url.Values{"n": {fmt.Sprint(page.n)}, "last": {tags[len(tags)-1]}}
+		if ns := r.URL.Query().Get("ns"); ns != "" {
+			q.Set("ns", ns)
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<%s?%s>; rel="next"`, r.URL.EscapedPath(), q.Encode()))
+	}
+	body, _ := json.Marshal(ociTagList{Name: list.Name, Tags: tags})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
+}
+
+// ociTagList is the tags/list document.
+type ociTagList struct {
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
+// ociPage is a client's n and last. n < 0 is no limit.
+type ociPage struct {
+	n    int
+	last string
+}
+
+func ociPageOf(q url.Values) (ociPage, bool) {
+	p := ociPage{n: -1, last: q.Get("last")}
+	if v := q.Get("n"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return p, false
+		}
+		p.n = n
+	}
+	return p, true
+}
+
+// slice is the page of a lexically sorted list after last, at most n long,
+// and whether tags remain past it.
+func (p ociPage) slice(tags []string) ([]string, bool) {
+	if p.last != "" {
+		tags = tags[sort.SearchStrings(tags, p.last):]
+		if len(tags) > 0 && tags[0] == p.last {
+			tags = tags[1:]
+		}
+	}
+	if p.n >= 0 && len(tags) > p.n {
+		return tags[:p.n], p.n > 0
+	}
+	return tags, false
 }
 
 // ---- upstream --------------------------------------------------------------
 
-// ociDigestOpener opens an upstream URL through the registry's token
-// handshake. For a blob or a manifest by digest the body is verified against
-// t.ref as it is read, and a mismatch fails the read before the spool is
-// cached, so no byte that does not hash to the digest is stored or served.
-func (s *Server) ociDigestOpener(t ociTarget, accept string) upstreamOpener {
+// ociDigestOpener opens a blob through the registry's token handshake. The
+// body is verified against t.ref as it is read, and a mismatch fails the read
+// before the spool is cached, so no byte that does not hash to the digest is
+// stored or served.
+func (s *Server) ociDigestOpener(t ociTarget) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
-		resp, err := s.ociGet(ctx, t, rawURL, accept)
+		resp, err := s.ociGet(ctx, t, rawURL, "")
 		if err != nil {
 			return nil, err
 		}
-		up := &upstreamStream{url: answeredURL(resp, rawURL), body: resp.Body,
-			contentType: resp.Header.Get("Content-Type"), contentLength: resp.ContentLength}
-		if t.kind == ociManifests && ociIsSchema1(up.contentType, nil) {
-			resp.Body.Close()
-			return nil, s.ociSchema1Refusal(t)
-		}
-		if t.isDigest() {
-			up.body = &ociDigestReader{r: resp.Body, h: sha256.New(), want: t.ref,
-				refuse: func(got string) error { return ociMismatch(t, got) }}
-		}
-		return up, nil
+		return &upstreamStream{url: answeredURL(resp, rawURL), contentType: resp.Header.Get("Content-Type"), contentLength: resp.ContentLength,
+			body: &ociDigestReader{r: resp.Body, h: sha256.New(), want: t.ref, refuse: func(got string) error { return ociMismatch(t, got) }}}, nil
 	}
+}
+
+// ociManifestOpener fetches a manifest by digest. It reads the manifest whole,
+// as the tag opener does, because a schema 1 manifest is told by its body as
+// often as by its Content-Type, and the refusal has to come before a byte is
+// stored or served. The type it is served under is recorded before
+// proxyOrResolve stores the bytes, so a stored manifest always has one.
+func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore) upstreamOpener {
+	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
+		body, ct, answered, err := s.ociFetchManifest(ctx, t, rawURL)
+		if err != nil {
+			return nil, err
+		}
+		if got := ociDigest(body); got != t.ref {
+			return nil, ociMismatch(t, got)
+		}
+		mediaType := ociMediaType(ct, body)
+		if store != nil {
+			if err := store.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, t.ref), []byte(mediaType)); err != nil {
+				return nil, fmt.Errorf("record the media type of manifest %s for %s: %w", t.ref, t.name(), err)
+			}
+		}
+		return &upstreamStream{url: answered, body: io.NopCloser(bytes.NewReader(body)),
+			contentType: mediaType, contentLength: int64(len(body))}, nil
+	}
+}
+
+// ociFetchManifest reads one manifest whole, bounded, and refuses schema 1.
+func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL string) (body []byte, contentType, answered string, err error) {
+	resp, err := s.ociGet(ctx, t, rawURL, ociManifestAccept)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer resp.Body.Close()
+	answered = answeredURL(resp, rawURL)
+	body, err = io.ReadAll(io.LimitReader(resp.Body, ociMaxManifest+1))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err)
+	}
+	if len(body) > ociMaxManifest {
+		return nil, "", "", fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)
+	}
+	contentType = resp.Header.Get("Content-Type")
+	if ociIsSchema1(contentType, body) {
+		return nil, "", "", s.ociSchema1Refusal(t)
+	}
+	return body, contentType, answered, nil
+}
+
+func ociDigest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return manifest.OCIDigestPrefix + hex.EncodeToString(sum[:])
+}
+
+// The tag list is read whole into memory, so its pages and its total are
+// bounded. Docker Hub's largest repositories list a few thousand tags.
+const (
+	ociMaxTagPages = 1000
+	ociMaxTagList  = 16 << 20
+)
+
+// ociTagListOpener reads every page of a registry's tag list, following its
+// next links, and answers with one sorted list. A next link is followed only
+// on the registry's own scheme and host: the registry's token rides on every
+// request, and a link elsewhere would carry it there.
+func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
+	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
+		var list ociTagList
+		list.Tags = []string{}
+		seen := map[string]bool{}
+		budget := ociMaxTagList
+		answered := ""
+		for next := rawURL; next != ""; {
+			if len(seen) == ociMaxTagPages {
+				return nil, fmt.Errorf("the tag list for %s at %s runs past %d pages; bodega serves none of it rather than part", t.name(), rawURL, ociMaxTagPages)
+			}
+			seen[next] = true
+			resp, err := s.ociGet(ctx, t, next, "application/json")
+			if err != nil {
+				return nil, err
+			}
+			if answered == "" {
+				answered = answeredURL(resp, next)
+			}
+			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
+			link := resp.Header.Get("Link")
+			drainClose(resp)
+			if err != nil {
+				return nil, fmt.Errorf("read the tag list for %s from %s: %w", t.name(), next, err)
+			}
+			if budget -= len(b); budget < 0 {
+				return nil, fmt.Errorf("the tag list for %s at %s is over %d bytes; bodega serves none of it rather than part", t.name(), rawURL, ociMaxTagList)
+			}
+			var page ociTagList
+			if err := json.Unmarshal(b, &page); err != nil {
+				return nil, fmt.Errorf("the tag list page %s for %s does not parse: %w", next, t.name(), err)
+			}
+			if list.Name == "" {
+				list.Name = page.Name
+			}
+			list.Tags = append(list.Tags, page.Tags...)
+			if next, err = ociNextPage(next, link); err != nil {
+				return nil, fmt.Errorf("the tag list for %s: %w", t.name(), err)
+			}
+			if seen[next] {
+				return nil, fmt.Errorf("the tag list for %s names %s as its next page twice, so it never ends; bodega serves none of it rather than part", t.name(), next)
+			}
+		}
+		if list.Name == "" {
+			list.Name = t.repo
+		}
+		sort.Strings(list.Tags)
+		list.Tags = slices.Compact(list.Tags)
+		doc, _ := json.Marshal(list)
+		return &upstreamStream{url: answered, body: io.NopCloser(bytes.NewReader(doc)),
+			contentType: "application/json", contentLength: int64(len(doc))}, nil
+	}
+}
+
+// ociNextPage is the URL a Link header's rel="next" names, resolved against
+// the page that carried it, or "" when there is none.
+func ociNextPage(current, link string) (string, error) {
+	for part := range strings.SplitSeq(link, ",") {
+		target, params, ok := strings.Cut(part, ";")
+		target = strings.TrimSpace(target)
+		if !ok || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		isNext := false
+		for p := range strings.SplitSeq(params, ";") {
+			k, v, _ := strings.Cut(strings.TrimSpace(p), "=")
+			if strings.EqualFold(k, "rel") && strings.EqualFold(strings.Trim(v, `"`), "next") {
+				isNext = true
+			}
+		}
+		if !isNext {
+			continue
+		}
+		base, err := url.Parse(current)
+		if err != nil {
+			return "", err
+		}
+		ref, err := url.Parse(target[1 : len(target)-1])
+		if err != nil {
+			return "", fmt.Errorf("next page link %q does not parse: %w", target, err)
+		}
+		u := base.ResolveReference(ref)
+		if u.Scheme != base.Scheme || !strings.EqualFold(u.Host, base.Host) {
+			return "", fmt.Errorf("next page link %q leaves %s, and bodega sends the registry's token nowhere else", target, base.Host)
+		}
+		return u.String(), nil
+	}
+	return "", nil
 }
 
 // ociTagOpener resolves a tag. It reads the manifest whole, refuses schema 1,
@@ -629,8 +889,7 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOp
 		if ociIsSchema1(ct, body) {
 			return nil, s.ociSchema1Refusal(t)
 		}
-		sum := sha256.Sum256(body)
-		digest := manifest.OCIDigestPrefix + hex.EncodeToString(sum[:])
+		digest := ociDigest(body)
 		if sent := resp.Header.Get(ociDigestHeader); sent != "" && sent != digest {
 			return nil, ociMismatchSent(t, sent, digest)
 		}
@@ -638,6 +897,9 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOp
 		mstore, err := s.versionStore(ctx, manifest.TypeOCI, t.name(), digest)
 		if err != nil {
 			return nil, fmt.Errorf("the backend recorded for %s@%s is not configured: %w", t.name(), digest, err)
+		}
+		if err := mstore.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, digest), []byte(mediaType)); err != nil {
+			return nil, fmt.Errorf("record the media type of manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
 		}
 		if err := mstore.Put(ctx, manifest.OCIManifestKey(t.registry, t.repo, digest), body); err != nil {
 			return nil, fmt.Errorf("store the manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
@@ -1004,6 +1266,10 @@ type ociResponseWriter struct {
 	wrote       bool
 	status      int
 	errBody     bytes.Buffer
+	// outer is ociErrorMiddleware's writer, which an error this one emits
+	// reaches already formatted; passthrough is that writer told so.
+	outer       *ociResponseWriter
+	passthrough bool
 }
 
 // ociMaxErrorBody bounds the text a refusal's body is read from.
@@ -1016,7 +1282,7 @@ func (o *ociResponseWriter) WriteHeader(code int) {
 		return
 	}
 	o.wrote, o.status = true, code
-	if code >= http.StatusBadRequest {
+	if code >= http.StatusBadRequest && !o.passthrough {
 		return
 	}
 	if o.contentType != "" && code < http.StatusMultipleChoices {
@@ -1029,7 +1295,7 @@ func (o *ociResponseWriter) Write(b []byte) (int, error) {
 	if !o.wrote {
 		o.WriteHeader(http.StatusOK)
 	}
-	if o.status >= http.StatusBadRequest {
+	if o.status >= http.StatusBadRequest && !o.passthrough {
 		if room := ociMaxErrorBody - o.errBody.Len(); room > 0 {
 			o.errBody.Write(b[:min(len(b), room)])
 		}
@@ -1039,16 +1305,23 @@ func (o *ociResponseWriter) Write(b []byte) (int, error) {
 }
 
 // finish writes a buffered error. A refusal's text runs to two lines, its
-// summary and its next step, and the message is one.
+// summary and its next step, and the message is one. A 401 goes out as 403:
+// a client answers a 401 from a registry by asking it for a token, and
+// bodega issues none, so the 401 would hide the reason behind a failed
+// handshake.
 func (o *ociResponseWriter) finish() {
-	if o.status < http.StatusBadRequest {
+	if o.status < http.StatusBadRequest || o.passthrough {
 		return
 	}
 	msg := strings.Join(strings.Fields(o.errBody.String()), " ")
 	if msg == "" {
 		msg = http.StatusText(o.status)
 	}
-	o.emit(o.status, ociErrorCode(o.status, o.kind), msg)
+	status := o.status
+	if status == http.StatusUnauthorized {
+		status = http.StatusForbidden
+	}
+	o.emit(status, ociErrorCode(status, o.kind), msg)
 }
 
 // writeError answers with an error bodega composed itself.
@@ -1058,6 +1331,9 @@ func (o *ociResponseWriter) writeError(status int, code, message string) {
 }
 
 func (o *ociResponseWriter) emit(status int, code, message string) {
+	if o.outer != nil {
+		o.outer.passthrough = true
+	}
 	h := o.Header()
 	h.Del("Content-Length")
 	h.Del(ociDigestHeader)

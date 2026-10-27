@@ -264,6 +264,79 @@ func TestServedPathComposer(t *testing.T) {
 	}
 }
 
+// An oci manifest is fetched at the repository its key names and a blob at
+// the one the statement names, each with the registry in the first segment.
+func TestServedPathOCI(t *testing.T) {
+	d := "sha256:" + strings.Repeat("a", 64)
+	for _, c := range []struct {
+		name, key, want, wantErr string
+	}{
+		{"docker.io/library/nginx", manifest.OCIManifestKey("docker.io", "library/nginx", d),
+			"/v2/docker.io/library/nginx/manifests/" + d, ""},
+		{"ghcr.io/acme/tools/app", manifest.OCIManifestKey("ghcr.io", "acme/tools/app", d),
+			"/v2/ghcr.io/acme/tools/app/manifests/" + d, ""},
+		{"quay.io/prometheus/node-exporter", manifest.OCIBlobKey(d),
+			"/v2/quay.io/prometheus/node-exporter/blobs/" + d, ""},
+		{"docker.io/library/nginx", manifest.OCIBlobKey(d),
+			"/v2/docker.io/library/nginx/blobs/" + d, ""},
+		{"nginx", manifest.OCIBlobKey(d), "", "--artifact"},
+		{"docker.io/library/nginx", manifest.OCITagKey("docker.io", "library/nginx", "1.27"), "", "--artifact"},
+		{"docker.io/library/nginx", manifest.NpmTarballKey("lodash", "4.17.21"), "", "--artifact"},
+	} {
+		got, err := servedPath(manifest.TypeOCI, c.name, d, c.key)
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) || !strings.Contains(err.Error(), c.key) {
+				t.Errorf("servedPath(%q, %q) = %q, %v; want an error naming the key and %s", c.name, c.key, got, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("servedPath(%q, %q) = %q, %v; want %q", c.name, c.key, got, err, c.want)
+		}
+	}
+}
+
+// An oci statement verifies against the manifest the server serves at the
+// rebuilt /v2/ route, the registry carried in its first segment.
+func TestAttestVerifyOCIFromServer(t *testing.T) {
+	_, ring := attestInstall(t)
+	artifact := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`)
+	sum := sha256.Sum256(artifact)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	st := attest.NewStatement(attest.Pin{Type: manifest.TypeOCI, Name: "ghcr.io/acme/app", Version: digest,
+		ObjectKey: manifest.OCIManifestKey("ghcr.io", "acme/app", digest), SHA256: hex.EncodeToString(sum[:])},
+		audit.Admission{Decision: audit.AdmissionAdmitted, DecidedAt: time.Now(), PolicyDigest: "sha256:" + strings.Repeat("ab", 32)},
+		"https://bodega.example", time.Now())
+	env, err := attest.Sign(ring.Signer(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := json.Marshal([]map[string]string{{"public_key_pem": string(ring.Keys()[0].PublicKeyPEM)}})
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/attestation"):
+			_, _ = w.Write(env)
+		case r.URL.Path == "/api/v1/attestation/keys":
+			_, _ = w.Write(keys)
+		case r.URL.Path == "/v2/ghcr.io/acme/app/manifests/"+digest:
+			_, _ = w.Write(artifact)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	out, err := runAttest(t, "verify", "oci/ghcr.io/acme/app/"+digest, "--server", ts.URL, "--key", ring.Signer().KeyID())
+	if err != nil {
+		t.Fatalf("verify oci from server: %v\n%s\nrequested %q", err, out, paths)
+	}
+	if !strings.Contains(out, "ok    subject-digest") {
+		t.Errorf("subject-digest did not pass:\n%s", out)
+	}
+}
+
 // A composer statement verifies by name against the zip at the rebuilt route,
 // and a 404 there says the dist may not be a zip and names --artifact.
 func TestAttestVerifyComposerFromServer(t *testing.T) {

@@ -2062,3 +2062,60 @@ func TestJSONEditSaveKeepsCursorOnPackage(t *testing.T) {
 		}
 	}
 }
+
+// The OCI form carries its constraint on the Tag label, and a save that read
+// it from Version stored every choice as exact.
+func TestOCIFormSavesTagConstraint(t *testing.T) {
+	for label, want := range map[string]string{
+		"exact (=)":      "",
+		"compatible (^)": manifest.ConstraintCompatible,
+		"patch (~)":      manifest.ConstraintPatch,
+		"latest (*)":     manifest.ConstraintAny,
+	} {
+		fields := rebuildCreateFields(manifest.TypeOCI, nil)
+		setFieldValue(fields, "Type", manifest.TypeOCI)
+		setFieldValue(fields, "Name", "ghcr.io/acme/app")
+		setFieldValue(fields, "Tag", "1.27")
+		setLabelSelectValue(fields, "Tag", label)
+		ve := saveAndReadBack(t, fields, manifest.TypeOCI, "ghcr.io/acme/app")
+		if ve.Version != "1.27" || ve.VersionConstraint != want {
+			t.Errorf("%s: saved version %q constraint %q, want 1.27 and %q", label, ve.Version, ve.VersionConstraint, want)
+		}
+		if got := manifestToConstraint(ve.VersionConstraint); got != label {
+			t.Errorf("%s: the saved constraint reads back as %q", label, got)
+		}
+	}
+}
+
+func TestOCIJSONApplyFillsTagAndDigest(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	apply := func(m *appModel, buf string) {
+		t.Helper()
+		if msg := m.makeJSONApplyFn()(buf); msg != "" {
+			t.Fatalf("apply: %s", msg)
+		}
+	}
+	m := &appModel{}
+	m.popup.formFields = rebuildCreateFields(manifest.TypeOCI, nil)
+	setFieldValue(m.popup.formFields, "Type", manifest.TypeOCI)
+	setLabelSelectValue(m.popup.formFields, "Tag", "patch (~)")
+
+	// An import naming no constraint keeps the one the user picked.
+	apply(m, `{"type":"oci","name":"docker.io/library/nginx","versions":[{"version":"1.27","ref":"`+digest+`"}]}`)
+	f := m.popup.formFields
+	if fieldValueFromSlice(f, "Tag") != "1.27" || fieldValueFromSlice(f, "Manifest digest") != digest || labelSelectValue(f, "Tag") != "patch (~)" {
+		t.Fatalf("into an empty form: Tag %q digest %q constraint %q", fieldValueFromSlice(f, "Tag"), fieldValueFromSlice(f, "Manifest digest"), labelSelectValue(f, "Tag"))
+	}
+
+	// A second import replaces both values and brings its own constraint.
+	other := "sha256:" + strings.Repeat("b", 64)
+	apply(m, `{"type":"oci","name":"docker.io/library/nginx","versions":[{"version":"1.28","ref":"`+other+`","version_constraint":"compatible"}]}`)
+	f = m.popup.formFields
+	if fieldValueFromSlice(f, "Tag") != "1.28" || fieldValueFromSlice(f, "Manifest digest") != other || labelSelectValue(f, "Tag") != "compatible (^)" {
+		t.Fatalf("over existing values: Tag %q digest %q constraint %q", fieldValueFromSlice(f, "Tag"), fieldValueFromSlice(f, "Manifest digest"), labelSelectValue(f, "Tag"))
+	}
+	ve := saveAndReadBack(t, f, manifest.TypeOCI, "docker.io/library/nginx")
+	if ve.Version != "1.28" || ve.Ref != other || ve.VersionConstraint != manifest.ConstraintCompatible {
+		t.Fatalf("saved %+v", ve)
+	}
+}

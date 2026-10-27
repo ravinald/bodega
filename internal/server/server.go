@@ -562,6 +562,7 @@ func (s *Server) handler() http.Handler {
 	// the host and not only the address.
 	h = IdentityMiddleware(s.identityFunc())(h)
 	h = DenyListMiddleware(s.denyNetsFunc(), s.auditDB)(h)
+	h = ociErrorMiddleware(h)
 	h = RequestLogger(s.logger)(h)
 	h = SecurityHeadersMiddleware(s.publicScheme)(h)
 	// RealIPMiddleware is outermost so the trusted set it stashes is in the

@@ -248,7 +248,7 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 				for _, cidr := range nets {
 					if cidr.Contains(ip) {
 						recordDenial(auditDB, r, audit.DenialDenyList, nil)
-						if isClientPath(r.URL.Path) {
+						if isClientPath(r.URL.Path) || isOCIRoute(r.URL.Path) {
 							w.Header().Set("Cache-Control", "no-store")
 							http.Error(w, strings.TrimRight(deniedClientText(clientIP, cidr), "\n"), http.StatusForbidden)
 							return
@@ -263,10 +263,11 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 	}
 }
 
-// deniedClientText is the deny list's 403 body on a /client/ path. A host
-// configuring itself from the setup script has nobody watching the journal,
-// and a bare Forbidden there reads the same as a missing identity binding,
-// whose repair would not help.
+// deniedClientText is the deny list's 403 body on a /client/ or /v2/ path. A
+// host configuring itself from the setup script, or a container runtime
+// pulling an image, has nobody watching the journal, and a bare Forbidden
+// there reads the same as a missing identity binding, whose repair would not
+// help.
 func deniedClientText(ip string, cidr *net.IPNet) string {
 	return fmt.Sprintf("this host (%s) is on this server's deny list (%s), which refuses it before any identity is resolved.\n"+
 		"  Remove the entry if the refusal is wrong:  bodega acl deny remove %s\n"+
