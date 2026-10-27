@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
@@ -47,7 +48,10 @@ var (
 // it, so the builder is handed the version here rather than at each call site.
 // init rather than main: a command stamps an artifact through cobra, and the
 // tests that drive those commands never run main.
-func init() { builder.Version = version }
+func init() {
+	builder.Version = version
+	policy.UserAgent = "bodega/" + version
+}
 
 // globalFlags holds values bound to the persistent root flags.
 type globalFlags struct {

@@ -470,7 +470,7 @@ func (c *AgeChecker) mavenPOMModified(ctx context.Context, endpoint, name, versi
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	req.Header.Set("User-Agent", "bodega")
+	req.Header.Set("User-Agent", UserAgent)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return time.Time{}, false, err
@@ -498,7 +498,7 @@ func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {
 		return err
 	}
 	// crates.io answers 403 to a request with no User-Agent.
-	req.Header.Set("User-Agent", "bodega")
+	req.Header.Set("User-Agent", UserAgent)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err

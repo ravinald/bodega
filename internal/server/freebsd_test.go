@@ -556,6 +556,31 @@ func TestFreeBSDProxyAsksUpstreamForIdentityEncoding(t *testing.T) {
 	}
 }
 
+// B179: the FreeBSD route asks for identity encoding, and a gzip-encoded rate
+// limit on a cold cache still reaches pkg(8) as a retryable 503.
+func TestFreeBSDProxyRelaysAnEncodedRateLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: upstream.URL, Mode: manifest.ModeProxy,
+	})
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, freeBSDURL("latest", manifest.FreeBSDCatalogFile), nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "120" {
+		t.Errorf("Retry-After = %q, want 120", got)
+	}
+}
+
 // R3 again: an upstream that encodes after identity was asked for is a proxy
 // rewriting the bytes, and nothing it sends is cached or relayed.
 func TestFreeBSDProxyRefusesAnEncodedUpstreamBody(t *testing.T) {
