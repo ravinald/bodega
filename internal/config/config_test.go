@@ -243,6 +243,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"maven_upstreams":   []string{"https://maven.example.com/maven2", "https://plugins.example.com/m2"},
 		"rubygems_upstream": "https://gems.example.com",
 		"composer_upstream": "https://packagist.example.com",
+		// Load requires registry hostnames for keys and https URLs for values.
+		"oci_upstreams":     map[string]string{"registry.example.com": "https://registry.example.com"},
+		"oci_token_hosts":   []string{"auth.example.com"},
 		"gomod_upstream":    "https://goproxy.example.com",
 		"npm_upstream":      "https://npm.example.com",
 		"pypi_upstream":     "https://pypi.example.com",

@@ -54,6 +54,8 @@ func PURL(typ, name, version, objectKey string) string {
 		} else {
 			b.WriteString(purlEscape(strings.ToLower(name)))
 		}
+	case manifest.TypeOCI:
+		return ociPURL(name, version, objectKey)
 	default:
 		b.WriteString("generic/" + purlEscape(typ) + "/" + purlEscape(name))
 	}
@@ -90,6 +92,32 @@ func PURLBase(purl string) string {
 // purlEscape percent-encodes everything outside the purl spec's unreserved
 // set, ':' excepted: the spec leaves it literal, and a Debian epoch or a
 // FreeBSD ABI carries one.
+// ociPURL writes the oci purl: the repository's last segment as the name,
+// the manifest digest as the version, and the registry and repository in
+// repository_url, as the purl spec's oci type has it. A version that is a tag
+// takes its digest from the object key, and is kept as the tag qualifier.
+func ociPURL(name, version, objectKey string) string {
+	segs := strings.Split(name, "/")
+	for i, s := range segs {
+		segs[i] = purlEscape(s)
+	}
+	digest, tag := version, ""
+	if !manifest.OCIValidDigest(version) {
+		if _, _, keyDigest := manifest.ParseKey(objectKey); manifest.OCIValidDigest(keyDigest) {
+			digest, tag = keyDigest, version
+		}
+	}
+	out := "pkg:oci/" + segs[len(segs)-1]
+	if digest != "" {
+		out += "@" + purlEscape(digest)
+	}
+	out += "?repository_url=" + strings.Join(segs, "/")
+	if tag != "" {
+		out += "&tag=" + purlEscape(tag)
+	}
+	return out
+}
+
 func purlEscape(s string) string {
 	const hex = "0123456789ABCDEF"
 	var b strings.Builder

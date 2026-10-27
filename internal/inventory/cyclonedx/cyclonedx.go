@@ -176,6 +176,13 @@ func toComponent(c component) inventory.Component {
 			if vendor, pkg, ok := namespacedPURLName(c.PURL, "composer"); ok {
 				out.Name = strings.ToLower(vendor + "/" + pkg)
 			}
+		case manifest.TypeOCI:
+			// An oci purl names the repository's last segment and carries
+			// <registry>/<repository> in repository_url, which is the name
+			// bodega serves the image under.
+			if repo := qualifiers.Get("repository_url"); repo != "" {
+				out.Name = repo
+			}
 		}
 	}
 	if out.Origin == "" {
@@ -202,6 +209,7 @@ var purlEcosystems = map[string]string{
 	"cargo":    manifest.TypeCargo,
 	"gem":      manifest.TypeRubygems,
 	"composer": manifest.TypeComposer,
+	"oci":      manifest.TypeOCI,
 	"maven":    manifest.TypeMaven,
 	"golang":   manifest.TypeGomod,
 	"helm":     manifest.TypeHelm,

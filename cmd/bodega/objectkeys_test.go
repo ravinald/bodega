@@ -295,6 +295,24 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/composer/dist/symfony/console/v7.1.5/0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c.zip",
 		},
 		{
+			// A manifest is keyed by the digest the entry records in ref, and
+			// the route names the registry with containerd's ns parameter.
+			typ:  manifest.TypeOCI,
+			pkg:  "docker.io/library/nginx",
+			ve:   manifest.VersionEntry{Version: "1.27", Ref: ociManifestDigest},
+			body: ociManifestBody,
+			local: map[string]string{
+				"oci/manifests/docker.io/library/nginx/_digests/sha256/" + strings.TrimPrefix(ociManifestDigest, "sha256:"): ociManifestBody,
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				return artifactPathUpload(builder.OCIArtifactPaths(bcfg, store, ""), dst, t)
+			},
+			configure: func(t *testing.T, cfg *config.Config) {
+				cfg.OCIUpstreams = map[string]string{"docker.io": "https://registry-1.docker.io"}
+			},
+			url: "/v2/library/nginx/manifests/" + ociManifestDigest + "?ns=docker.io",
+		},
+		{
 			// A mirrored repository: the name is the repository directory and
 			// the version is the ABI, so the local tree, the object key and
 			// the route are all the path a pkg client composes. The package
@@ -359,6 +377,13 @@ func objectKeyCases(t *testing.T) []keyCase {
 		},
 	}
 }
+
+const ociManifestBody = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`
+
+var ociManifestDigest = func() string {
+	sum := sha256.Sum256([]byte(ociManifestBody))
+	return fmt.Sprintf("sha256:%x", sum)
+}()
 
 // emptyEnvironmentDigest is the digest of a declaration naming nothing, which
 // is the environment a config without distfiles_environment_* admits in.

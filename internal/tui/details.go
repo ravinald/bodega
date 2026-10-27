@@ -1012,20 +1012,22 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.storedAndClientFields(n))
 
-	case manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer:
-		label := "Crate"
+	case manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+		label, versionLabel, refLabel := "Crate", "Version", "Dist reference"
 		switch n.EntryType {
 		case manifest.TypeRubygems:
 			label = "Gem"
 		case manifest.TypeComposer:
 			label = "Package"
+		case manifest.TypeOCI:
+			label, versionLabel, refLabel = "Image", "Tag", "Manifest digest"
 		}
 		sb.WriteString(field(label, pm.Name))
 		sb.WriteByte('\n')
-		sb.WriteString(field("Version", ve.Version))
+		sb.WriteString(field(versionLabel, ve.Version))
 		sb.WriteByte('\n')
 		if ve.Ref != "" {
-			sb.WriteString(field("Dist reference", ve.Ref))
+			sb.WriteString(field(refLabel, ve.Ref))
 			sb.WriteByte('\n')
 		}
 		if ve.URL != "" {

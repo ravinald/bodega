@@ -388,6 +388,11 @@ func packageVersionOrder(typ string) (string, bool) {
 		// A Packagist version is a tag, "v" prefix or not, which semver
 		// ordering reads; a dev branch orders against nothing.
 		return orderSemver, true
+	case manifest.TypeOCI:
+		// An image tag is whatever its publisher chose. The numbered ones
+		// (17, 1.27.3, v4.1) order as semver; "latest" orders against
+		// nothing, and the route compares an exact pin as a string.
+		return orderSemver, true
 	case manifest.TypeMaven:
 		return orderMaven, true
 	case manifest.TypeRubygems:

@@ -106,6 +106,10 @@ type Server struct {
 	// from upstream, so a second request for one serves the copy rather than
 	// starting a second fetch. See claimStaleRefresh.
 	staleRefreshes sync.Map
+
+	// ociTokens holds the Bearer tokens the OCI registries issued, per
+	// registry and scope, until each expires.
+	ociTokens ociTokenCache
 	// mavenArtifacts names the Maven artifacts a version's own file was asked
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.
@@ -1031,6 +1035,14 @@ func (s *Server) registerRoutes() {
 
 	// Composer repository (composer config repositories.bodega composer https://bodega/composer)
 	m.HandleFunc("GET /composer/{path...}", s.handleComposer)
+
+	// OCI registry, pull only. The push methods reach the handler too, which
+	// answers them with the spec's 405 rather than the mux's bare one, since
+	// docker and containerd print only the JSON body. A method-less pattern
+	// would conflict with the web UI's GET /.
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+		m.HandleFunc(method+" /v2/{path...}", s.handleOCI)
+	}
 
 	// FreeBSD pkg repository mirror. One route for the whole tree: the path a
 	// pkg client composes is <abi>/<repo>/<rest>, and rest is a repository

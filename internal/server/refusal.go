@@ -33,6 +33,8 @@ const (
 	checkIntegrate  = "integration"
 	checkPolicy     = "policy"
 	checkDistHost   = "dist-host"
+	checkTokenHost  = "token-host"
+	checkSchema     = "schema"
 )
 
 // refusalHeader carries the check and the incident on every refusal, so a
@@ -259,7 +261,7 @@ func observeHijack(w http.ResponseWriter, status int) {
 func allowListRefusal(regType, candidate, name, version string) *refusal {
 	f := newRefusal(checkAllowList, regType, name, version, http.StatusForbidden)
 	switch regType {
-	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer:
+	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		if f.name == "" {
 			f.name = candidate
 		}

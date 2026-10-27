@@ -480,6 +480,10 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 		// No stage writes an archive to disk, so there is nothing to stage.
 		// An archive already under composer_root still uploads.
 		s = &builder.Summary{}
+	case manifest.TypeOCI:
+		// Nothing writes an image to disk either; a manifest already under
+		// oci_root still uploads.
+		s = &builder.Summary{}
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

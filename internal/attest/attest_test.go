@@ -61,6 +61,10 @@ func TestPURL(t *testing.T) {
 		{manifest.TypeMaven, "androidx.core:core", "1.13.1", manifest.MavenKey("androidx/core/core/1.13.1/core-1.13.1-sources.aar"),
 			"pkg:maven/androidx.core/core@1.13.1?classifier=sources&type=aar"},
 		{manifest.TypeComposer, "symfony/console", "v7.1.5", "composer/dist/symfony/console/v7.1.5/abc", "pkg:composer/symfony/console@v7.1.5"},
+		{manifest.TypeOCI, "docker.io/library/nginx", "sha256:abababababababababababababababababababababababababababababababab", manifest.OCIBlobKey("sha256:abababababababababababababababababababababababababababababababab"),
+			"pkg:oci/nginx@sha256:abababababababababababababababababababababababababababababababab?repository_url=docker.io/library/nginx"},
+		{manifest.TypeOCI, "ghcr.io/example-corp/tools/cli", "1.2", manifest.OCIManifestKey("ghcr.io", "example-corp/tools/cli", "sha256:abababababababababababababababababababababababababababababababab"),
+			"pkg:oci/cli@sha256:abababababababababababababababababababababababababababababababab?repository_url=ghcr.io/example-corp/tools/cli&tag=1.2"},
 		{manifest.TypeApt, "hello", "2.10-3build1+x", "", "pkg:generic/apt/hello@2.10-3build1%2Bx"},
 		{manifest.TypeDistfiles, "sub/zsh-5.9.tar.xz", "", "", "pkg:generic/distfiles/sub%2Fzsh-5.9.tar.xz"},
 	} {

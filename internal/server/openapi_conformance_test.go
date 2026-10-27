@@ -40,6 +40,7 @@ var specPathsNotDocumented = map[string]string{
 	"/cargo/":           "cargo sparse index protocol",
 	"/maven/":           "Maven repository layout, consumed by Maven and Gradle",
 	"/rubygems/":        "RubyGems registry layout and Bundler's compact index",
+	"/v2/":              "OCI distribution spec, pull half, consumed by docker, containerd and podman",
 	"/composer/":        "Composer v2 repository layout, consumed by composer",
 	"/freebsd/":         "FreeBSD pkg repository layout, consumed by pkg rather than by a generated client",
 	"/freebsd-profile/": "the same pkg repository layout, filtered for one profile",
