@@ -3,6 +3,7 @@ package host
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -914,4 +916,153 @@ func firstHit(paths, markers []string) scanHit {
 		}
 	}
 	return scanHit{}
+}
+
+// OCIHost is what the container runtime checks read from the host: how a
+// runtime's command is found, and the directory the /etc paths sit under,
+// "" for the host's own. A test stands in for both.
+type OCIHost struct {
+	LookPath func(string) (string, error)
+	Root     string
+}
+
+const ociRemedy = "bodega doctor --configure oci --apply --url <bodega base URL>"
+
+// Check reports, for each container runtime on PATH, whether it pulls
+// through bodega: Docker's registry-mirrors, containerd's hosts.toml for
+// docker.io and the config_path that makes containerd read it, and a
+// registries.conf mirror for podman, buildah and CRI-O. base is bodega's
+// URL when doctor knows it; with none, any mirror counts, since doctor
+// cannot tell bodega's from another. A runtime not on PATH gets no row.
+func (t OCIHost) Check(base string) []Finding {
+	host := ""
+	if u, err := url.Parse(base); err == nil {
+		host = u.Host
+	}
+	var out []Finding
+	for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
+		present := false
+		for _, bin := range clientconf.RuntimeBinaries[rt] {
+			if _, err := t.LookPath(bin); err == nil {
+				present = true
+			}
+		}
+		if !present {
+			continue
+		}
+		var f Finding
+		switch rt {
+		case clientconf.RuntimeDocker:
+			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host)
+		case clientconf.RuntimeContainerd:
+			f = checkContainerdHosts(t.Root, host)
+		case clientconf.RuntimePodman:
+			f = checkRegistriesConf(t.Root, host)
+		}
+		f.Check = "oci-" + rt
+		if f.IsFinding() {
+			f.Remediation = ociRemedy
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// mirrorIsBodega reports whether a mirror URL or location names host, or,
+// with no host to compare, whether there is a mirror at all.
+func mirrorIsBodega(mirror, host string) bool {
+	if host == "" {
+		return mirror != ""
+	}
+	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
+	return m == host || strings.HasPrefix(m, host+"/")
+}
+
+func checkDockerMirror(path, host string) Finding {
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + path}
+	}
+	var doc struct {
+		Mirrors []string `json:"registry-mirrors"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return Finding{Status: StatusSkip, Detail: path + " is not JSON dockerd can read: " + err.Error(), Remediation: "repair " + path + "; dockerd refuses to start with it"}
+	}
+	for _, m := range doc.Mirrors {
+		if mirrorIsBodega(m, host) {
+			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)"}
+		}
+	}
+	if len(doc.Mirrors) == 0 {
+		return Finding{Status: StatusWarn, Detail: path + " sets no registry-mirrors, so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	}
+	return Finding{Status: StatusWarn, Detail: path + " mirrors Docker Hub through " + strings.Join(doc.Mirrors, ", ") + ", none of them bodega at " + host + "; bypasses bodega's registry"}
+}
+
+var tomlHostRE = regexp.MustCompile(`^\s*\[host\.["']([^"']+)["']\]`)
+
+func checkContainerdHosts(root, host string) Finding {
+	path := filepath.Join(root, clientconf.ContainerdCertsDir, "docker.io", "hosts.toml")
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, or repair what the error names"}
+	}
+	via := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if m := tomlHostRE.FindStringSubmatch(line); m != nil && via == "" && mirrorIsBodega(m[1], host) {
+			via = m[1]
+		}
+	}
+	if via == "" {
+		return Finding{Status: StatusWarn, Detail: path + " names no host at bodega" + inHost(host) + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	}
+	cfgPath := filepath.Join(root, clientconf.ContainerdConfigPath)
+	if cfg, err := os.ReadFile(cfgPath); err == nil && len(strings.TrimSpace(string(cfg))) > 0 {
+		merged, err := clientconf.MergeContainerdConfig(cfg, []byte(clientconf.ContainerdConfig("").Content))
+		if err == nil && string(merged) != string(cfg) {
+			return Finding{Status: StatusWarn, Detail: cfgPath + " sets no config_path, so containerd's CRI plugin never reads " + path + "; bypasses bodega's registry"}
+		}
+	}
+	return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + via}
+}
+
+func checkRegistriesConf(root, host string) Finding {
+	files := []string{filepath.Join(root, "/etc/containers/registries.conf")}
+	dropIns, _ := filepath.Glob(filepath.Join(root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
+	files = append(files, dropIns...)
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		inMirror := false
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "[") {
+				inMirror = trimmed == "[[registry.mirror]]"
+				continue
+			}
+			if v, ok := strings.CutPrefix(trimmed, "location"); ok && inMirror {
+				v = strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "=")), `"'`)
+				if mirrorIsBodega(v, host) {
+					return Finding{Status: StatusOK, Detail: path + " mirrors through " + v}
+				}
+			}
+		}
+	}
+	return Finding{Status: StatusWarn, Detail: "no registries.conf under /etc/containers names a mirror at bodega" + inHost(host) + ", so podman, buildah and CRI-O pull from each registry directly; bypasses bodega's registry"}
+}
+
+func inHost(host string) string {
+	if host == "" {
+		return ""
+	}
+	return " (" + host + ")"
 }

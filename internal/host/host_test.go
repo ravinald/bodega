@@ -472,3 +472,49 @@ func TestCheckComposerWarnsUntilConfigPointsAtBodega(t *testing.T) {
 		}
 	}
 }
+
+// F99 R4: containerd needs a hosts.toml naming bodega and a config_path that
+// makes the CRI plugin read it; podman needs a registries.conf mirror at
+// bodega. Each turns OK once the plan's file is in place.
+func TestCheckOCIContainerdAndPodman(t *testing.T) {
+	root := t.TempDir()
+	on := OCIHost{Root: root, LookPath: func(name string) (string, error) { return "/usr/bin/" + name, nil }}
+	write := func(p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, p), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := func() map[string]Finding {
+		out := map[string]Finding{}
+		for _, f := range on.Check("https://bodega.internal") {
+			out[f.Check] = f
+		}
+		return out
+	}
+	got := status()
+	for _, c := range []string{"oci-docker", "oci-containerd", "oci-podman"} {
+		if got[c].Status != StatusWarn || !strings.Contains(got[c].Remediation, "--configure oci") {
+			t.Errorf("%s on a bare host = %+v, want WARN naming --configure oci", c, got[c])
+		}
+	}
+	for _, f := range clientconf.OCIClient("https://bodega.internal", map[string]string{"docker.io": "https://registry-1.docker.io"}) {
+		write(f.Path(clientconf.OSLinux), f.Content)
+	}
+	write(clientconf.ContainerdConfigPath, "version = 2\n")
+	if f := status()["oci-containerd"]; f.Status != StatusWarn || !strings.Contains(f.Detail, "sets no config_path") {
+		t.Errorf("containerd with no config_path = %+v, want WARN", f)
+	}
+	write(clientconf.ContainerdConfigPath, clientconf.ContainerdConfig("https://bodega.internal").Content)
+	for c, f := range status() {
+		if f.Status != StatusOK {
+			t.Errorf("%s after the plan's files = %+v, want OK", c, f)
+		}
+	}
+	if f := (OCIHost{Root: root, LookPath: on.LookPath}).Check("https://other.internal")[2]; f.Status != StatusWarn {
+		t.Errorf("podman mirroring another host = %+v, want WARN", f)
+	}
+}

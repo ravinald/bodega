@@ -170,10 +170,13 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	default:
 		return q, fmt.Errorf("root=%q is not 0 or 1. Pass root=1 when the plan is applied as root", raw)
 	}
-	switch q.File = v.Get("file"); q.File {
-	case "", clientFileNodeMirror, clientFileBundler, clientFileGradle:
+	switch q.File = v.Get("file"); {
+	case q.File == "", q.File == clientFileNodeMirror, q.File == clientFileBundler, q.File == clientFileGradle:
+	case clientconf.OCIFileKeyValid(q.File):
 	default:
-		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s, %s, %s", q.File, clientFileNodeMirror, clientFileBundler, clientFileGradle)
+		return q, fmt.Errorf("file=%q names no companion file. Accepted: %s, %s, %s, %s, %s, %s",
+			q.File, clientFileNodeMirror, clientFileBundler, clientFileGradle,
+			clientconf.OCIFileContainerdConfig, clientconf.OCIFileRegistriesConf, clientconf.OCIHostsFileKey("<registry>"))
 	}
 	return q, nil
 }
@@ -365,6 +368,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return s.planMaven(h, one)
 	case manifest.TypeComposer:
 		return planComposer(h, one)
+	case manifest.TypeOCI:
+		return s.planOCI(h)
 	case manifest.TypeGit:
 		return s.planGit(h, one)
 	case manifest.TypeDistfiles:
@@ -472,6 +477,35 @@ func planComposer(h *clientHost, one func(clientconf.File) []planFile) []planFil
 	out := one(f)
 	if out[0].action == planInstall {
 		out[0].reason = strings.Join(f.Notes, ". ")
+	}
+	return out
+}
+
+// planOCI renders every container runtime's file: Docker's daemon.json,
+// containerd's hosts.toml per oci_upstreams registry and its config.toml,
+// and the registries.conf drop-in podman, buildah and CRI-O read. The server
+// cannot see which runtimes a host runs, so the plan carries all of them and
+// the host keeps the ones it finds. Each runtime's notes ride on one record
+// of its own, so a host that drops a runtime drops its notes with it.
+func (s *Server) planOCI(h *clientHost) []planFile {
+	if h.q.OS != clientconf.OSLinux {
+		return []planFile{{system: manifest.TypeOCI, action: planSkip,
+			reason: "container runtimes are configured on Linux, not " + h.q.OS}}
+	}
+	if len(s.cfg.OCIUpstreams) == 0 {
+		return []planFile{{system: manifest.TypeOCI, action: planSkip,
+			reason: "this server configures no oci_upstreams registry, so there is nothing to mirror"}}
+	}
+	var out []planFile
+	for _, f := range clientconf.OCIClient(h.base, s.cfg.OCIUpstreams) {
+		pf := planFile{system: manifest.TypeOCI, action: planInstall, path: f.Path(h.q.OS),
+			content: []byte(f.Content), reason: strings.Join(f.Notes, ". ")}
+		if f.Key != "" {
+			v, _ := url.ParseQuery(h.q.encode())
+			v.Set("file", f.Key)
+			pf.url = h.base + "/client/" + manifest.TypeOCI + "?" + v.Encode()
+		}
+		out = append(out, pf)
 	}
 	return out
 }
@@ -922,6 +956,10 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	case clientFileGradle:
 		s.serveClientGradle(w, r, h, sys)
 		return
+	case "":
+	default:
+		s.serveClientOCIFile(w, r, h, sys)
+		return
 	}
 	files := s.planSystem(r, h, sys)
 	f := files[0]
@@ -957,6 +995,31 @@ func (s *Server) serveClientAptArchive(w http.ResponseWriter, r *http.Request, h
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(s.aptArchiveFile(h, h.q.Archive).Content))
 	noteClient(r, sys, h, "", "")
+}
+
+// serveClientOCIFile serves the containerd or registries.conf file a plan's
+// oci record names, asking the profile first as planSystem does.
+func (s *Server) serveClientOCIFile(w http.ResponseWriter, r *http.Request, h *clientHost, sys string) {
+	if sys != manifest.TypeOCI {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusBadRequest, "", "file="+h.q.File+" selects a container runtime's file, and applies to /client/oci alone\n")
+		return
+	}
+	if reason := h.profile.Excludes(sys); reason != "" {
+		s.writeClientErrorFor(w, r, sys, h, http.StatusForbidden, audit.DenialClientExcluded, reason+"\n")
+		return
+	}
+	for _, f := range clientconf.OCIClient(h.base, s.cfg.OCIUpstreams) {
+		if f.Key == h.q.File && f.Path(h.q.OS) != "" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(f.Content))
+			noteClient(r, sys, h, "", "")
+			return
+		}
+	}
+	s.writeClientErrorFor(w, r, sys, h, http.StatusNotFound, "",
+		"file="+h.q.File+" names no oci file this server renders for "+h.q.OS+": the registry is not a key of oci_upstreams, or the runtime is not configured there\n")
 }
 
 // serveClientNodeMirror serves the NODEJS_ORG_MIRROR file a plan's npm
