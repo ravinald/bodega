@@ -381,7 +381,7 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	if listed {
 		out.Entry = &entry
 	}
-	out.Permitted, out.Reason = matches(kind, base, version)
+	out.Permitted, out.Reason = matches(typ, kind, base, version)
 	if out.Permitted {
 		out.Reason = fmt.Sprintf("profile %q permits %s/%s at %s (%s)", p.name, typ, name, version, out.Reason)
 	} else {
@@ -436,13 +436,20 @@ func versionRule(rule audit.ProfileTypeRule, entry audit.ProfileEntry, listed bo
 // and a Debian revision, and a git entry carries a ref, so parsing either as
 // semver to decide equality would refuse versions that are equal. compatible
 // and patch have no such shortcut and go through builder.FilterVersions, which
-// is the one implementation of what "^" and "~" mean here.
-func matches(kind, base, version string) (bool, string) {
+// is the one implementation of what "^" and "~" mean here. composer is the
+// exception to exact's byte compare: Packagist publishes symfony/console as
+// v7.1.5 and Composer calls that equal to 7.1.5, so both sides are compared
+// in Composer's normalized form.
+func matches(typ, kind, base, version string) (bool, string) {
 	switch kind {
 	case manifest.ConstraintAny:
 		return true, "any version"
 	case manifest.ConstraintExact, "":
-		if version == base {
+		equal := version == base
+		if typ == manifest.TypeComposer {
+			equal = manifest.ComposerNormalizeVersion(version) == manifest.ComposerNormalizeVersion(base)
+		}
+		if equal {
 			return true, "pinned to " + base
 		}
 		return false, "pinned to " + base
