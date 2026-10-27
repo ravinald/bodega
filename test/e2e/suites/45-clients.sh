@@ -369,7 +369,7 @@ check_eq CLI-MVN-00 "the server restarts proxying with discovery on and a gradle
 CLI_CIDR="${E2E_CLIENT_ADDR:-127.0.0.1}/32"
 CLI_CLIENT="${E2E_CLIENT_ADDR:-127.0.0.1}"
 
-# shellcheck disable=SC2329  # invoked by the EXIT trap cli_doctor sets
+# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap cli_doctor sets
 cli_doctor_on_exit() {
 	e2e_bodega server "identity unbind cidr $CLI_CIDR" >/dev/null 2>&1 || true
 	cleanup
