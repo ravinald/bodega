@@ -15,11 +15,12 @@ const (
 	ociManifestPrefix = "oci/manifests/"
 	ociTagPrefix      = "oci/tags/"
 
-	ociDigestsMarker  = "/_digests/sha256/"
-	ociTypesMarker    = "/_types/sha256/"
-	ociTagsMarker     = "/_tags/"
-	ociResolvedMarker = "/_resolved/sha256/"
-	ociListSuffix     = "/_list"
+	ociDigestsMarker   = "/_digests/sha256/"
+	ociTypesMarker     = "/_types/sha256/"
+	ociTagsMarker      = "/_tags/"
+	ociResolvedMarker  = "/_resolved/sha256/"
+	ociUnsettledMarker = "/_unsettled/"
+	ociListSuffix      = "/_list"
 )
 
 // OCIDigestPrefix is the one digest algorithm bodega serves. sha512 is legal
@@ -90,6 +91,19 @@ func OCIResolvedKey(registry, repo, digest string) string {
 	return ociTagPrefix + registry + "/" + repo + ociResolvedMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
 }
 
+// OCIUnsettledPrefix is the prefix of a repository's OCIUnsettledKey records.
+func OCIUnsettledPrefix(registry, repo string) string {
+	return ociTagPrefix + registry + "/" + repo + ociUnsettledMarker
+}
+
+// OCIUnsettledKey marks the image an index root dated by its platform
+// manifest child as one whose member digests are not all recorded under a
+// verdict: its checks are running, or it was refused without every platform
+// read.
+func OCIUnsettledKey(registry, repo, root, child string) string {
+	return OCIUnsettledPrefix(registry, repo) + strings.TrimPrefix(root, OCIDigestPrefix) + "." + strings.TrimPrefix(child, OCIDigestPrefix)
+}
+
 // parseOCIKey is ParseKey for the oci tree. The name is <registry>/<repository>
 // and the version a tag or a digest; a blob names no repository.
 func parseOCIKey(key string) (name, version string) {
@@ -116,6 +130,13 @@ func parseOCIKey(key string) (name, version string) {
 		}
 		if i := strings.LastIndex(rest, ociResolvedMarker); i > 0 {
 			return ociNameVersion(rest[:i], ociDigestVersion(rest[i+len(ociResolvedMarker):]))
+		}
+		// A record about the repository's images, not a version of it.
+		if i := strings.LastIndex(rest, ociUnsettledMarker); i > 0 {
+			root, child, ok := strings.Cut(rest[i+len(ociUnsettledMarker):], ".")
+			if ok && ociDigestVersion(root) != "" && ociDigestVersion(child) != "" {
+				return ociName(rest[:i]), ""
+			}
 		}
 		if n, ok := strings.CutSuffix(rest, ociListSuffix); ok {
 			return ociName(n), ""

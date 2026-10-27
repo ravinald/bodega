@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"slices"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -36,6 +35,9 @@ const (
 	ociAdmitted = "admitted"
 	ociRefused  = "refused"
 	ociLapsed   = "lapsed" // a pending verdict older than ociPendingTTL
+	// A digest no image claims, in a repository holding a refused image
+	// whose platforms were not all read.
+	ociIncomplete = "incomplete"
 )
 
 // ociPendingTTL bounds how long a pending verdict stands. A process that died
@@ -253,63 +255,112 @@ func ociMemberVerdict(images map[string]ociImageVerdict, now time.Time) (ociImag
 	return best, true
 }
 
-// ociUnsettled counts, per repository, the images being judged and the
-// refused images whose platforms could not all be read. Until both are none,
-// a digest no image claims may be one of theirs, so it is refused rather
-// than served on the allow-list alone. It is held in memory: the window it
-// covers is the length of one tag request, and a refused image left
-// incomplete is read again at its next one.
-type ociUnsettled struct {
-	mu         sync.Mutex
-	judging    map[string]map[string]int
-	incomplete map[string]map[string]bool
+// An image is unsettled from the moment a tag request learns the tag names it
+// until its verdict is recorded on every member digest bodega can name, and a
+// refused image stays unsettled while any of its platforms went unread. While
+// one is, a digest in its repository that no judged image claims may be one
+// of its members, so every bodega process sharing the store refuses it rather
+// than serving it on the allow-list alone. The marker is in the object store,
+// not in memory, because the requests it guards may reach another process or
+// a restarted one. One key per image keeps two processes judging two images
+// from overwriting each other's marker.
+//
+// A pending marker lapses after ociPendingTTL, as a pending verdict does, so a
+// process that died judging an image leaves its repository's unclaimed
+// digests refused only that long; the members it had recorded stay refused
+// as lapsed. An incomplete marker never lapses: only a tag request that reads
+// every platform, or admits the image, removes it.
+type ociUnsettledMark struct {
+	Tag        string `json:"tag"`
+	Pending    string `json:"pending,omitempty"`
+	Incomplete bool   `json:"incomplete,omitempty"`
 }
 
-func (u *ociUnsettled) begin(repo, key string) func() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.judging == nil {
-		u.judging = map[string]map[string]int{}
+func (m ociUnsettledMark) active(now time.Time) bool {
+	if m.Incomplete {
+		return true
 	}
-	if u.judging[repo] == nil {
-		u.judging[repo] = map[string]int{}
-	}
-	u.judging[repo][key]++
-	return func() {
-		u.mu.Lock()
-		defer u.mu.Unlock()
-		if u.judging[repo][key]--; u.judging[repo][key] <= 0 {
-			delete(u.judging[repo], key)
-		}
-		if len(u.judging[repo]) == 0 {
-			delete(u.judging, repo)
-		}
-	}
+	at, err := time.Parse(time.RFC3339Nano, m.Pending)
+	return err == nil && now.Sub(at) < ociPendingTTL
 }
 
-func (u *ociUnsettled) settle(repo, key string, complete bool) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if complete {
-		delete(u.incomplete[repo], key)
-		if len(u.incomplete[repo]) == 0 {
-			delete(u.incomplete, repo)
-		}
-		return
+// ociImageSettled reports that the image (root, child) already carries a
+// verdict that needs no marker: admitted, or refused with every platform read.
+func (s *Server) ociImageSettled(ctx context.Context, store storage.ObjectStore, t ociTarget, root, child string) bool {
+	m, err := s.ociLoadMember(ctx, store, t, root)
+	if err != nil {
+		return false
 	}
-	if u.incomplete == nil {
-		u.incomplete = map[string]map[string]bool{}
-	}
-	if u.incomplete[repo] == nil {
-		u.incomplete[repo] = map[string]bool{}
-	}
-	u.incomplete[repo][key] = true
+	v, ok := m.Images[ociImageKey(root, child)]
+	return ok && (v.State == ociAdmitted || (v.State == ociRefused && v.Complete))
 }
 
-func (u *ociUnsettled) any(repo string) bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return len(u.judging[repo]) > 0 || len(u.incomplete[repo]) > 0
+// ociMarkJudging marks the image as being judged by tag, keeping an
+// incomplete marker incomplete.
+func (s *Server) ociMarkJudging(ctx context.Context, store storage.ObjectStore, t ociTarget, root, child, tag string) error {
+	if store == nil {
+		return nil
+	}
+	key := manifest.OCIUnsettledKey(t.registry, t.repo, root, child)
+	unlock := s.ociMembers.lock(t.name())
+	defer unlock()
+	var m ociUnsettledMark
+	if b, err := store.Get(ctx, key); err != nil {
+		return fmt.Errorf("read the marker of image %s: %w", root, err)
+	} else if b != nil {
+		_ = json.Unmarshal(b, &m)
+	}
+	m.Tag, m.Pending = tag, time.Now().UTC().Format(time.RFC3339Nano)
+	b, _ := json.Marshal(m)
+	if err := store.Put(ctx, key, b); err != nil {
+		return fmt.Errorf("write the marker of image %s: %w", root, err)
+	}
+	return nil
+}
+
+// ociSettle removes the image's marker once every member it has carries the
+// verdict, and otherwise leaves it incomplete under tag.
+func (s *Server) ociSettle(ctx context.Context, store storage.ObjectStore, t ociTarget, root, child, tag string, settled bool) error {
+	if store == nil {
+		return nil
+	}
+	key := manifest.OCIUnsettledKey(t.registry, t.repo, root, child)
+	if settled {
+		return store.Delete(ctx, key)
+	}
+	b, _ := json.Marshal(ociUnsettledMark{Tag: tag, Incomplete: true})
+	return store.Put(ctx, key, b)
+}
+
+// ociRepoUnsettled is a marker standing in t's repository, if any.
+func (s *Server) ociRepoUnsettled(ctx context.Context, store storage.ObjectStore, t ociTarget) (ociUnsettledMark, bool, error) {
+	keys, err := store.List(ctx, manifest.OCIUnsettledPrefix(t.registry, t.repo))
+	if err != nil {
+		return ociUnsettledMark{}, false, err
+	}
+	now := time.Now()
+	var found ociUnsettledMark
+	for _, k := range keys {
+		b, err := store.Get(ctx, k)
+		if err != nil {
+			return ociUnsettledMark{}, false, err
+		}
+		var m ociUnsettledMark
+		if b == nil {
+			continue
+		}
+		if json.Unmarshal(b, &m) != nil {
+			m = ociUnsettledMark{Incomplete: true}
+		}
+		if !m.active(now) {
+			continue
+		}
+		if m.Incomplete {
+			return m, true, nil
+		}
+		found = m
+	}
+	return found, found.Pending != "", nil
 }
 
 // ociManifestBytes is the manifest digest names, read from the store, and
@@ -413,13 +464,10 @@ func (s *Server) ociTagPolicyGate(w *ociResponseWriter, r *http.Request, t ociTa
 		return true
 	}
 	ctx := r.Context()
-	child, childBody, childErr := doc.Digest, root, error(nil)
+	child := doc.Digest
 	if c := ociPickChild(root, ociPlatformOf(r)); c != "" {
 		child = c
-		childBody, childErr = s.ociManifestBytes(ctx, t, c, true)
 	}
-	ve := s.ociTagEntry(ctx, store, t, doc, child, childBody, childErr)
-
 	key := ociImageKey(doc.Digest, child)
 	rootRec, err := s.ociLoadMember(ctx, store, t, doc.Digest)
 	if err != nil {
@@ -427,14 +475,28 @@ func (s *Server) ociTagPolicyGate(w *ociResponseWriter, r *http.Request, t ociTa
 	}
 	prev, decided := rootRec.Images[key]
 	decided = decided && (prev.State == ociAdmitted || prev.State == ociRefused)
+	refuseUnrecorded := func(err error) bool {
+		s.logger.Error("oci image verdict not recorded; refusing the tag", "name", t.name(), "tag", t.ref, "digest", doc.Digest, "error", err)
+		w.writeError(http.StatusServiceUnavailable, "UNAVAILABLE",
+			fmt.Sprintf("bodega could not record that it is checking tag %s of %s, so it cannot hold the image's layers to the verdict: %v. Retry; if it persists, the storage backend is refusing writes.", t.ref, t.name(), err))
+		return false
+	}
+	// The marker goes down before the platform manifest and its config are
+	// read, since either read may be the one a client's blob request races.
 	if !decided {
-		defer s.ociUnsettled.begin(t.name(), key)()
+		if err := s.ociMarkJudging(ctx, store, t, doc.Digest, child, t.ref); err != nil {
+			return refuseUnrecorded(err)
+		}
+	}
+	childBody, childErr := root, error(nil)
+	if child != doc.Digest {
+		childBody, childErr = s.ociManifestBytes(ctx, t, child, true)
+	}
+	ve := s.ociTagEntry(ctx, store, t, doc, child, childBody, childErr)
+	if !decided {
 		pending := ociImageVerdict{Tag: t.ref, State: ociPending, At: time.Now().UTC().Format(time.RFC3339Nano)}
 		if _, err := s.ociRecordVerdict(ctx, store, t, doc.Digest, root, child, childBody, pending, false); err != nil {
-			s.logger.Error("oci image verdict not recorded; refusing the tag", "name", t.name(), "tag", t.ref, "digest", doc.Digest, "error", err)
-			w.writeError(http.StatusServiceUnavailable, "UNAVAILABLE",
-				fmt.Sprintf("bodega could not record that it is checking tag %s of %s, so it cannot hold the image's layers to the verdict: %v. Retry; if it persists, the storage backend is refusing writes.", t.ref, t.name(), err))
-			return false
+			return refuseUnrecorded(err)
 		}
 	}
 
@@ -448,7 +510,9 @@ func (s *Server) ociTagPolicyGate(w *ociResponseWriter, r *http.Request, t ociTa
 		return ok
 	}
 	complete, err := s.ociRecordVerdict(ctx, store, t, doc.Digest, root, child, childBody, v, v.State == ociRefused)
-	s.ociUnsettled.settle(t.name(), key, v.State == ociAdmitted || complete)
+	if serr := s.ociSettle(ctx, store, t, doc.Digest, child, t.ref, err == nil && (v.State == ociAdmitted || complete)); serr != nil {
+		err = errors.Join(err, fmt.Errorf("settle the marker of image %s: %w", doc.Digest, serr))
+	}
 	if err == nil {
 		return ok
 	}
@@ -525,10 +589,20 @@ func (s *Server) ociMemberGate(w *ociResponseWriter, r *http.Request, t ociTarge
 	}
 	v, found := ociMemberVerdict(m.Images, time.Now())
 	if !found {
-		if !s.ociUnsettled.any(name) {
+		mark, unsettled, err := s.ociRepoUnsettled(r.Context(), store, t)
+		if err != nil {
+			s.logger.Error("oci unsettled images not read; refusing", "name", name, "digest", t.ref, "error", err)
+			w.writeError(http.StatusServiceUnavailable, "UNAVAILABLE",
+				fmt.Sprintf("bodega could not read whether an image in %s is still being checked, so it cannot tell whether %s is part of one: %v. Retry; if it persists, the storage backend's own logs say why it refused the read.", name, t.ref, err))
+			return false
+		}
+		if !unsettled {
 			return true
 		}
-		v = ociImageVerdict{State: ociPending}
+		v = ociImageVerdict{Tag: mark.Tag, State: ociPending}
+		if mark.Incomplete {
+			v.State = ociIncomplete
+		}
 	}
 	if v.State == ociAdmitted {
 		return true
@@ -551,6 +625,10 @@ func (s *Server) ociMemberGate(w *ociResponseWriter, r *http.Request, t ociTarge
 		if v.Tag != "" {
 			f.next = fmt.Sprintf("retry once the request for tag %s has answered.", v.Tag)
 		}
+	case ociIncomplete:
+		f = newRefusal(checkPolicy, manifest.TypeOCI, name, t.ref, http.StatusForbidden)
+		f.reason = fmt.Sprintf("bodega refused tag %s of %s and could not read every platform of the image it names, so it cannot tell whether %s is part of that image; until it can, it serves no digest of %s that no checked image claims.", v.Tag, name, t.ref, name)
+		f.next = fmt.Sprintf("pull tag %s again once the registry serves every platform manifest of it, or pull a tag the policy admits.", v.Tag)
 	default:
 		f = newRefusal(checkPolicy, manifest.TypeOCI, name, t.ref, http.StatusForbidden)
 		f.reason = fmt.Sprintf("bodega began checking tag %s of %s, which %s is part of, and never recorded a verdict: the process checking it stopped.", v.Tag, name, t.ref)

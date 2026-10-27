@@ -199,11 +199,8 @@ type Server struct {
 	freeBSDBuild keyedMutex
 
 	// ociMembers serializes the read-modify-write of one repository's oci
-	// member records, and ociUnsettled counts, per repository, the images
-	// whose members are not all recorded under a verdict yet; see
-	// oci_verdict.go.
-	ociMembers   keyedMutex
-	ociUnsettled ociUnsettled
+	// member records; see oci_verdict.go.
+	ociMembers keyedMutex
 
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.

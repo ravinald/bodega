@@ -344,7 +344,7 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 		return
 	}
 
-	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store)))
+	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store, ociPlatformOf(r))))
 	req.Method = http.MethodGet
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		req.Header.Del(h)
@@ -912,7 +912,7 @@ func ociNextPage(current, link string) (string, error) {
 // stores them under their digest before the tag's record names it, so a
 // record never points at a manifest bodega does not hold. The record, not the
 // manifest, is what proxyOrResolve caches under the tag.
-func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOpener {
+func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, platform ociPlatform) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
 		resp, err := s.ociGet(ctx, t, rawURL, ociManifestAccept)
 		if err != nil {
@@ -935,6 +935,20 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOp
 			return nil, ociMismatchSent(t, sent, digest)
 		}
 		mediaType := ociMediaType(ct, body)
+		// From here on bodega knows the image the tag names, and storing its
+		// manifest and recording its children are what let a digest request
+		// reach it, so the image is marked unsettled before either.
+		if s.auditDB != nil {
+			child := digest
+			if c := ociPickChild(body, platform); c != "" {
+				child = c
+			}
+			if !s.ociImageSettled(ctx, store, t, digest, child) {
+				if err := s.ociMarkJudging(ctx, store, t, digest, child, t.ref); err != nil {
+					return nil, fmt.Errorf("record that bodega is checking tag %s of %s before serving any of it: %w", t.ref, t.name(), err)
+				}
+			}
+		}
 		if err := s.ociStoreManifest(ctx, t, digest, mediaType, body); err != nil {
 			return nil, err
 		}

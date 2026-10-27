@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -463,5 +464,164 @@ func TestParseOCIMemberBareTag(t *testing.T) {
 	}
 	if _, err := parseOCIMember([]byte("{not json")); err == nil {
 		t.Error("a broken record parsed")
+	}
+}
+
+// ociPeer is a second bodega process: its own memory and audit database, the
+// same object and manifest stores as s.
+func ociPeer(t *testing.T, f *ociFixture, s *Server) *Server {
+	t.Helper()
+	peer := ociServer(t, f)
+	peer.stores, peer.store = s.stores, s.store
+	return peer
+}
+
+func ociUnsettledKeys(t *testing.T, s *Server) []string {
+	t.Helper()
+	keys, err := s.typeStore(manifest.TypeOCI).List(t.Context(), manifest.OCIUnsettledPrefix("docker.io", "library/nginx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
+}
+
+// The tag's image is unsettled from the moment its manifest is read, so a
+// request racing the read of the config that dates it is refused, on this
+// process and on a peer, and served once the tag is admitted.
+func TestOCIDatingReadServesNothing(t *testing.T) {
+	for _, young := range []bool{true, false} {
+		f := newOCIFixture(t)
+		ago := 30 * 24 * time.Hour
+		if young {
+			ago = time.Hour
+		}
+		im := newOCIImageCreated(ociCreatedAgo(ago))
+		f.hub.publish("library/nginx", "t", im)
+		s, built := ociPolicyServer(t, f)
+		peer := ociPeer(t, f, s)
+		blobs := []string{im.amd64ConfigD, im.amd64LayerD, im.arm64ConfigD, im.arm64LayerD}
+		during := map[string]int{}
+		var once atomic.Bool
+		hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/library/nginx/blobs/"+im.amd64ConfigD && once.CompareAndSwap(false, true) {
+				for i, d := range blobs {
+					on := s
+					if i%2 == 1 {
+						on = peer
+					}
+					during[d] = ociGetCode(on, "/v2/library/nginx/blobs/"+d, nil)
+				}
+			}
+			f.hub.serve(w, r)
+		}))
+		defer hook.Close()
+		s.cfg.OCIUpstreams["docker.io"] = hook.URL
+		peer.cfg.OCIUpstreams["docker.io"] = hook.URL
+		want := http.StatusOK
+		if young {
+			want = http.StatusForbidden
+		}
+		if got := ociGetCode(s, "/v2/library/nginx/manifests/t", nil); got != want {
+			t.Fatalf("young=%v: tag = %d, want %d", young, got, want)
+		}
+		if !once.Load() {
+			t.Fatalf("young=%v: the config was never fetched upstream", young)
+		}
+		for _, d := range blobs {
+			if during[d] != http.StatusForbidden {
+				t.Errorf("young=%v: blob %s while the config was read = %d, want 403", young, d, during[d])
+			}
+		}
+		if n := built.Load(); n != 1 {
+			t.Errorf("young=%v: checks built %d times, want 1", young, n)
+		}
+		if keys := ociUnsettledKeys(t, s); len(keys) != 0 {
+			t.Errorf("young=%v: markers left after a complete verdict: %v", young, keys)
+		}
+		if !young {
+			for _, d := range blobs {
+				if got := ociGetCode(peer, "/v2/library/nginx/blobs/"+d, nil); got != http.StatusOK {
+					t.Errorf("blob %s on the peer once admitted = %d, want 200", d, got)
+				}
+			}
+		}
+	}
+}
+
+// A peer process refuses the image's digests while the tag's checks run on
+// another, whether or not either has recorded them yet.
+func TestOCIPendingVerdictOnPeer(t *testing.T) {
+	f := newOCIFixture(t)
+	im := newOCIImageCreated(ociCreatedAgo(time.Hour))
+	f.hub.publish("library/nginx", "young", im)
+	s, built := ociPolicyServer(t, f)
+	peer := ociPeer(t, f, s)
+	during := map[string]int{}
+	prev := fetchCheckers
+	fetchCheckers = func(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
+		for _, d := range []string{im.amd64ConfigD, im.amd64LayerD, im.arm64ConfigD, im.arm64LayerD} {
+			during[d] = ociGetCode(peer, "/v2/library/nginx/blobs/"+d, nil)
+		}
+		return prev(cfg, adb)
+	}
+	defer func() { fetchCheckers = prev }()
+	if got := ociGetCode(s, "/v2/library/nginx/manifests/young", nil); got != http.StatusForbidden {
+		t.Fatalf("young tag = %d", got)
+	}
+	for d, code := range during {
+		if code != http.StatusForbidden {
+			t.Errorf("blob %s on the peer while checks ran = %d, want 403", d, code)
+		}
+	}
+	if n := built.Load(); n != 1 {
+		t.Errorf("checks built %d times, want 1", n)
+	}
+}
+
+// A refused image whose platforms were not all read keeps its repository's
+// unclaimed digests refused on a restarted process and on a peer, and only a
+// tag request that reads every platform lifts that.
+func TestOCIIncompleteRefusalOutlivesTheProcess(t *testing.T) {
+	f := newOCIFixture(t)
+	im := newOCIImageCreated(ociCreatedAgo(time.Hour))
+	f.hub.publish("library/nginx", "young", im)
+	arm := "library/nginx@" + im.arm64Digest
+	f.hub.mu.Lock()
+	armManifest := f.hub.manifests[arm]
+	delete(f.hub.manifests, arm)
+	f.hub.mu.Unlock()
+	s, built := ociPolicyServer(t, f)
+	if got := ociGetCode(s, "/v2/library/nginx/manifests/young", nil); got != http.StatusForbidden {
+		t.Fatalf("young tag = %d", got)
+	}
+	unread := []string{im.arm64ConfigD, im.arm64LayerD}
+	for _, d := range unread {
+		assertOCIError(t, doRequest(ociPeer(t, f, s), http.MethodGet, "/v2/library/nginx/blobs/"+d, nil),
+			http.StatusForbidden, "DENIED", "tag young", "every platform")
+	}
+
+	// The registry recovering is not enough; the refusal stands on a fresh
+	// process until the tag is read again.
+	f.hub.mu.Lock()
+	f.hub.manifests[arm] = armManifest
+	f.hub.mu.Unlock()
+	for _, d := range unread {
+		if got := ociGetCode(ociPeer(t, f, s), "/v2/library/nginx/blobs/"+d, nil); got != http.StatusForbidden {
+			t.Errorf("blob %s on a restarted process = %d, want 403", d, got)
+		}
+	}
+	if n := built.Load(); n != 1 {
+		t.Errorf("checks built %d times before the tag was pulled again, want 1", n)
+	}
+
+	if got := ociGetCode(s, "/v2/library/nginx/manifests/young", nil); got != http.StatusForbidden {
+		t.Fatalf("young tag again = %d", got)
+	}
+	if keys := ociUnsettledKeys(t, s); len(keys) != 0 {
+		t.Errorf("markers left once every platform was read: %v", keys)
+	}
+	for _, d := range unread {
+		assertOCIError(t, doRequest(ociPeer(t, f, s), http.MethodGet, "/v2/library/nginx/blobs/"+d, nil),
+			http.StatusForbidden, "DENIED", "tag young", "same verdict")
 	}
 }
