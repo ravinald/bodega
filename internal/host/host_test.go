@@ -708,3 +708,112 @@ func TestCheckOCIPodmanResolvesRegistriesConfPrecedence(t *testing.T) {
 		}
 	}
 }
+
+// F99 R4: containerd runs with the config_path its imports leave, so a
+// main file naming certs.d proves nothing while an import replaces the CRI
+// table, and an import doctor cannot load or judge is reported, not skipped.
+func TestCheckOCIContainerdResolvesImports(t *testing.T) {
+	bodegaHosts := clientconf.ContainerdHosts("https://bodega.internal", "docker.io", "https://registry-1.docker.io").Content
+	cri := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n"
+	importing := func(imp, path string) string {
+		return "version = 2\nimports = [\"" + imp + "\"]\n" + cri[len("version = 2\n"):] + "config_path = \"" + path + "\"\n"
+	}
+	cases := []struct {
+		name   string
+		files  map[string]string
+		status Status
+		says   string
+		remedy string
+	}{
+		{"relative import overrides config_path", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": cri + "config_path = \"/srv/direct\"\n",
+		}, StatusWarn, "conf.d/runtime.toml names /srv/direct, which holds no docker.io", "to config_path in "},
+		{"globbed import overrides config_path", map[string]string{
+			clientconf.ContainerdConfigPath:    importing("/etc/containerd/conf.d/*.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/a.toml":    "version = 2\n[plugins.\"io.containerd.grpc.v1.other\"]\n",
+			"/etc/containerd/conf.d/zz.toml":   cri + "config_path = \"/srv/direct\"\n",
+			"/srv/direct/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n",
+		}, StatusWarn, "names no host at bodega", "conf.d/zz.toml and systemctl restart containerd"},
+		{"import names certs.d over a direct main file", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", "/srv/direct"),
+			"/etc/containerd/conf.d/runtime.toml": cri + "config_path = \"/etc/containerd/certs.d\"\n",
+		}, StatusOK, "certs.d/docker.io/hosts.toml sends", ""},
+		{"nested import resolves against its own file", map[string]string{
+			clientconf.ContainerdConfigPath:   importing("conf.d/a.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/a.toml":   "imports = [\"b/c.toml\"]\n",
+			"/etc/containerd/conf.d/b/c.toml": cri + "config_path = \"/srv/direct\"\n",
+		}, StatusWarn, "conf.d/b/c.toml names /srv/direct", ""},
+		{"import of another plugin keeps the main file's", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": "version = 2\n[plugins.\"io.containerd.grpc.v1.other\"]\nx = 1\n",
+		}, StatusOK, "certs.d/docker.io/hosts.toml sends", ""},
+		{"missing import", map[string]string{
+			clientconf.ContainerdConfigPath: importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+		}, StatusSkip, "conf.d/runtime.toml, which could not be read", "repair or remove the import"},
+		{"CRI table without config_path", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": cri + "max_concurrent_downloads = 3\n",
+		}, StatusSkip, "doctor cannot tell which runs here", "set config_path"},
+		{"import in another format version", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": "version = 3\n",
+		}, StatusSkip, "does not judge", ""},
+		{"import disables CRI", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": "disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+		}, StatusSkip, "disables the CRI plugin", ""},
+	}
+	for _, c := range cases {
+		root, write := ociFixture(t)
+		write("/etc/containerd/certs.d/docker.io/hosts.toml", bodegaHosts)
+		for p, content := range c.files {
+			write(p, content)
+		}
+		f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("containerd")}, "oci-containerd")
+		if f.Status != c.status || !strings.Contains(f.Detail, c.says) || !strings.Contains(f.Remediation, c.remedy) {
+			t.Errorf("%s: %+v, want %s saying %q, remedy %q", c.name, f, c.status, c.says, c.remedy)
+		}
+	}
+
+	root, write := ociFixture(t)
+	write(clientconf.ContainerdConfigPath, importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir))
+	write("/etc/containerd/certs.d/docker.io/hosts.toml", bodegaHosts)
+	write("/etc/containerd/conf.d/runtime.toml", cri+"config_path = \"/etc/containerd/certs.d\"\n")
+	if err := os.Chmod(filepath.Join(root, "/etc/containerd/conf.d/runtime.toml"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(filepath.Join(root, "/etc/containerd/conf.d/runtime.toml")); err == nil {
+		t.Skip("running as root; an unreadable import cannot be staged")
+	}
+	if f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("containerd")}, "oci-containerd"); f.Status != StatusSkip || !strings.Contains(f.Detail, "could not be read") {
+		t.Errorf("unreadable import: %+v, want a skip saying it could not be read", f)
+	}
+}
+
+// F99 R4: a registries.conf table covers only the names its prefix
+// matches, so a docker.io/library mirror leaves the rest of Docker Hub
+// direct, while a docker.io mirror with the same override covers it all.
+func TestCheckOCIPodmanRequiresRegistryWideCoverage(t *testing.T) {
+	library := "[[registry]]\nprefix = \"docker.io/library\"\nlocation = \"docker.io/library\"\n[[registry.mirror]]\nlocation = \"bodega.internal/docker.io/library\"\n"
+	whole := clientconf.RegistriesConf("https://bodega.internal", []string{"docker.io"}).Content
+	cases := []struct {
+		name, content string
+		status        Status
+		says          string
+	}{
+		{"library only", library, StatusWarn, "define only docker.io/library and no table for docker.io itself"},
+		{"docker.io with a library override", whole + library, StatusOK, "mirrors docker.io through bodega.internal/docker.io"},
+	}
+	for _, c := range cases {
+		root, write := ociFixture(t)
+		write(clientconf.RegistriesConfDropIn, c.content)
+		f := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("podman")}, "oci-podman")
+		if f.Status != c.status || !strings.Contains(f.Detail, c.says) {
+			t.Errorf("%s: %+v, want %s saying %q", c.name, f, c.status, c.says)
+		}
+		if c.status == StatusWarn && f.Remediation != ociRemedy {
+			t.Errorf("%s: remedy %q, want %q", c.name, f.Remediation, ociRemedy)
+		}
+	}
+}

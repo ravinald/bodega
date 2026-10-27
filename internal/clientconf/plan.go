@@ -247,7 +247,9 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 		case strings.HasSuffix(rec.Path, "/docker/daemon.json"):
 			c.New, err = MergeDockerDaemon(c.Old, content)
 		case strings.HasSuffix(rec.Path, "/containerd/config.toml"):
-			c.New, err = MergeContainerdConfig(c.Old, content)
+			if c.New, err = MergeContainerdConfig(c.Old, content); err == nil {
+				err = ContainerdEditEffective("", target, c.New)
+			}
 		}
 		if err != nil {
 			return Change{}, fmt.Errorf("%s: cannot merge bodega's settings into %s: %w", rec.System, target, err)

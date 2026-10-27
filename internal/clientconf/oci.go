@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -338,21 +340,41 @@ type ContainerdRegistry struct {
 	// CRIDisabled is a disabled_plugins entry naming the CRI plugin, as
 	// Docker's packaged config.toml carries: nothing then reads the table.
 	CRIDisabled bool
+	// Imports is the file's imports list as written.
+	Imports []string
+	// HasPlugin is whether the file holds the CRI plugin's table at all, and
+	// SetsConfigPath whether its registry table names config_path, even "".
+	HasPlugin      bool
+	SetsConfigPath bool
 }
 
 // ReadContainerdConfig decodes a config.toml and reports its CRI registry
 // settings. A file containerd could not load, or one in a format version
 // this release does not know, is an error.
 func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
+	return readContainerdConfig(data, 0)
+}
+
+// readContainerdConfig reads data as format version, or as the version it
+// declares when version is 0. An imported file is read in its parent's
+// format: one declaring another is refused, since containerd 2.x migrates
+// each file on its own and doctor does not follow that.
+func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) {
 	var doc map[string]any
 	if _, err := toml.Decode(string(data), &doc); err != nil {
 		return ContainerdRegistry{}, err
 	}
 	r := ContainerdRegistry{Version: 1}
+	if version != 0 {
+		r.Version = version
+	}
 	if v, ok := doc["version"]; ok {
 		n, ok := v.(int64)
 		if !ok {
 			return r, fmt.Errorf("version = %v is not a number", v)
+		}
+		if version != 0 && int(n) != version {
+			return r, fmt.Errorf("it declares version = %d under a config.toml of version %d, a combination doctor does not judge", n, version)
 		}
 		r.Version = int(n)
 	}
@@ -360,12 +382,27 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 	if !ok {
 		return r, fmt.Errorf("it declares version = %d, a config.toml format this release does not know", r.Version)
 	}
+	switch v := doc["imports"].(type) {
+	case nil:
+	case []any:
+		for _, i := range v {
+			s, ok := i.(string)
+			if !ok {
+				return r, fmt.Errorf("imports entry %v is not a string", i)
+			}
+			r.Imports = append(r.Imports, s)
+		}
+	default:
+		return r, fmt.Errorf("imports = %v is not a list", v)
+	}
+	r.HasPlugin = tomlTable(doc, path[:2]) != nil
 	if list, ok := doc["disabled_plugins"].([]any); ok {
 		for _, p := range list {
 			r.CRIDisabled = r.CRIDisabled || p == "cri" || p == "io.containerd.grpc.v1.cri" || p == path[1]
 		}
 	}
 	table := tomlTable(doc, path)
+	_, r.SetsConfigPath = table["config_path"]
 	switch v := table["config_path"].(type) {
 	case nil:
 	case string:
@@ -390,6 +427,117 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 		}
 	}
 	return r, nil
+}
+
+// ContainerdEffective is the CRI registry configuration containerd runs
+// with once config.toml and every file it imports are loaded.
+type ContainerdEffective struct {
+	ContainerdRegistry
+	// Source is the file whose config_path containerd reads: the last one
+	// loaded that sets it, or the main file when none does.
+	Source string
+}
+
+// ResolveContainerdConfig loads data, the config.toml at path, and then each
+// file its imports name, breadth first, as containerd's LoadConfig does: a
+// relative import resolves against its parent's directory, a pattern holding
+// "*" is globbed, and a file already loaded is skipped. Paths are host paths,
+// read under root ("" for this host).
+//
+// containerd 1.x replaces a plugin's whole table with an import's, so an
+// imported CRI table without config_path drops the main file's; 2.x merges
+// key by key and keeps it. Where the two disagree the configuration is
+// refused rather than guessed at. Disabling the CRI plugin or setting a
+// legacy registry key in any loaded file counts.
+func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffective, error) {
+	main, err := ReadContainerdConfig(data)
+	if err != nil {
+		return ContainerdEffective{}, err
+	}
+	eff := ContainerdEffective{ContainerdRegistry: main, Source: path}
+	replaced, replacedFrom := main.ConfigPath, path
+	pending, err := containerdImports(root, path, main.Imports)
+	if err != nil {
+		return eff, err
+	}
+	loaded := map[string]bool{path: true}
+	for len(pending) > 0 {
+		p := pending[0]
+		pending = pending[1:]
+		if loaded[p] {
+			continue
+		}
+		loaded[p] = true
+		b, err := os.ReadFile(filepath.Join(root, p))
+		if err != nil {
+			return eff, fmt.Errorf("it imports %s, which could not be read (%w); containerd will not start while an import fails to load", p, err)
+		}
+		r, err := readContainerdConfig(b, main.Version)
+		if err != nil {
+			return eff, fmt.Errorf("its import %s cannot be judged: %w", p, err)
+		}
+		eff.CRIDisabled = eff.CRIDisabled || r.CRIDisabled
+		if eff.Legacy == "" {
+			eff.Legacy = r.Legacy
+		}
+		if r.HasPlugin {
+			replaced, replacedFrom = r.ConfigPath, p
+		}
+		if r.SetsConfigPath {
+			eff.ConfigPath, eff.Source = r.ConfigPath, p
+		}
+		next, err := containerdImports(root, p, r.Imports)
+		if err != nil {
+			return eff, err
+		}
+		pending = append(pending, next...)
+	}
+	if replaced != eff.ConfigPath {
+		return eff, fmt.Errorf("its import %s carries the CRI plugin table without config_path, so containerd 1.x reads none and 2.x keeps %q from %s; doctor cannot tell which runs here. Set config_path in %s", replacedFrom, eff.ConfigPath, eff.Source, replacedFrom)
+	}
+	return eff, nil
+}
+
+// containerdImports resolves parent's imports to host paths in the order
+// containerd loads them.
+func containerdImports(root, parent string, imports []string) ([]string, error) {
+	var out []string
+	for _, p := range imports {
+		p = filepath.Clean(p)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(filepath.Dir(parent), p)
+		}
+		if !strings.Contains(p, "*") {
+			out = append(out, p)
+			continue
+		}
+		matches, err := filepath.Glob(filepath.Join(root, p))
+		if err != nil {
+			return nil, fmt.Errorf("%s imports %q, which is not a pattern containerd can expand: %w", parent, p, err)
+		}
+		for _, m := range matches {
+			if root != "" {
+				m = string(filepath.Separator) + strings.TrimLeft(strings.TrimPrefix(m, filepath.Clean(root)), string(filepath.Separator))
+			}
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// ContainerdEditEffective reports why config_path set to certs.d in merged,
+// the config.toml at path, would not be the one containerd reads: an import
+// that fails to load or cannot be judged, or one whose CRI table supersedes
+// the main file's with a config_path that leaves certs.d out.
+func ContainerdEditEffective(root, path string, merged []byte) error {
+	eff, err := ResolveContainerdConfig(root, path, merged)
+	if err != nil {
+		return err
+	}
+	if eff.Source != path && !slices.Contains(strings.Split(eff.ConfigPath, ":"), ContainerdCertsDir) {
+		return fmt.Errorf("its import %s sets config_path = %q, which containerd reads in place of this file's and which leaves out %s; add %s to config_path there, then re-run. Nothing was written", eff.Source, eff.ConfigPath, ContainerdCertsDir, ContainerdCertsDir)
+	}
+	return nil
 }
 
 // tomlTable walks doc down path, nil where a step is missing or not a table.

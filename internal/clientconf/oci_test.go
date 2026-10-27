@@ -272,3 +272,59 @@ func TestOCIApplyTwiceChangesNothing(t *testing.T) {
 		t.Errorf("daemon.json after apply = %s", daemon)
 	}
 }
+
+// F99 R3: the config_path edit is planned only where containerd would read
+// it: an import whose CRI table supersedes the main file's, or one that
+// fails to load, refuses the change rather than present it as effective.
+func TestNewChangeRefusesAContainerdEditAnImportSupersedes(t *testing.T) {
+	f := ContainerdConfig("https://bodega.internal")
+	sum := sha256.Sum256([]byte(f.Content))
+	rec := PlanRecord{System: manifest.TypeOCI, Action: PlanInstall, Path: "~" + f.Path(OSLinux), SHA256: hex.EncodeToString(sum[:])}
+	cri := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n"
+	main := "version = 2\nimports = [\"conf.d/*.toml\"]\n"
+	cases := []struct {
+		name, imported, refusal string
+	}{
+		{"import sets another path", cri + "config_path = \"/srv/direct\"\n", "sets config_path = \"/srv/direct\""},
+		{"import sets an empty path", cri + "config_path = \"\"\n", "sets config_path = \"\""},
+		{"import carries the table without config_path", cri + "max_concurrent_downloads = 3\n", "doctor cannot tell"},
+		{"import names certs.d", cri + "config_path = \"/srv/a:/etc/containerd/certs.d\"\n", ""},
+		{"import of another plugin", "version = 2\n[plugins.\"io.containerd.grpc.v1.other\"]\nx = 1\n", ""},
+		{"no import matches the glob", "", ""},
+	}
+	for _, c := range cases {
+		home := t.TempDir()
+		dir := filepath.Join(home, "etc/containerd/conf.d")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "etc/containerd/config.toml"), []byte(main), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if c.imported != "" {
+			if err := os.WriteFile(filepath.Join(dir, "runtime.toml"), []byte(c.imported), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ch, err := NewChange(rec, []byte(f.Content), home)
+		switch {
+		case c.refusal == "" && err != nil:
+			t.Errorf("%s: %v, want the edit planned", c.name, err)
+		case c.refusal == "" && !strings.Contains(string(ch.New), "config_path = \"/etc/containerd/certs.d\""):
+			t.Errorf("%s: planned\n%s\nwant config_path set", c.name, ch.New)
+		case c.refusal != "" && (err == nil || !strings.Contains(err.Error(), c.refusal)):
+			t.Errorf("%s: %v, want a refusal saying %q", c.name, err, c.refusal)
+		}
+	}
+
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "etc/containerd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "etc/containerd/config.toml"), []byte("version = 2\nimports = [\"missing.toml\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewChange(rec, []byte(f.Content), home); err == nil || !strings.Contains(err.Error(), "missing.toml, which could not be read") {
+		t.Errorf("missing import: %v, want a refusal naming it", err)
+	}
+}
