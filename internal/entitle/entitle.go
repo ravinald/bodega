@@ -391,6 +391,51 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	return out
 }
 
+// PermitsOneOf is Permits for a request that carries no version of its own,
+// only the versions known to name what it asks for: an oci digest, held to
+// the tags bodega resolved to it. It permits when any candidate is permitted
+// and answers that candidate. With none, a version rule that admits every
+// version still permits, and any other refuses outright rather than
+// comparing something that is not a version against the rule, so no pin
+// value can be written that admits a request no candidate supports. The
+// refusal names the first candidate when there is one.
+func (p *Profile) PermitsOneOf(typ, name string, candidates []string) (Decision, string) {
+	d := p.Covers(typ, name)
+	if !d.Permitted || !d.Governed || d.Outside {
+		return d, ""
+	}
+	for _, v := range candidates {
+		if out := p.Permits(typ, name, v); out.Permitted {
+			return out, v
+		}
+	}
+	if len(candidates) > 0 {
+		return p.Permits(typ, name, candidates[0]), candidates[0]
+	}
+	entry, listed := p.entry(typ, name)
+	kind, base := versionRule(*d.Rule, entry, listed)
+	if kind == manifest.ConstraintAny {
+		return Decision{Permitted: true, Governed: true, Rule: d.Rule,
+			Reason: fmt.Sprintf("profile %q permits %s/%s at any version", p.name, typ, name)}, ""
+	}
+	out := Decision{Governed: true, Rule: d.Rule, Refusal: RefusalConstraint}
+	if listed {
+		out.Entry = &entry
+	}
+	var held string
+	switch kind {
+	case audit.VersionPinned:
+		held = "pinned, with no version named for it"
+	case manifest.ConstraintExact:
+		held = "pinned to " + base
+	default:
+		held = kind + " " + base
+	}
+	out.Reason = fmt.Sprintf("profile %q does not permit %s/%s without a version to compare: %s",
+		p.name, typ, name, held)
+	return out, ""
+}
+
 // entry is the profile's entry for typ/name. A maven coordinate, a composer
 // package or an oci repository the profile does not name falls back to its
 // <groupId>:*, <vendor>/* or <registry>/<namespace>/* entry, so a wide entry

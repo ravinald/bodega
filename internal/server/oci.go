@@ -21,7 +21,6 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
-	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -364,8 +363,13 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 		byDigest := t
 		byDigest.ref = doc.Digest
 		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), byDigest, pm, doc.MediaType)
+		if mstore != nil {
+			body, _ = mstore.Get(ctx, manifest.OCIManifestKey(t.registry, t.repo, doc.Digest))
+		}
+		s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
 		return
 	}
+	s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
 	w.Header().Set("Cache-Control", cachePrivate)
 	writeOCIManifest(w, r, doc.MediaType, doc.Digest, body)
 }
@@ -407,9 +411,10 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 
 // handleOCIManifestDigest serves a manifest by digest. A digest names no
 // tag, so it is judged by the tags bodega resolved to it: the allow-list's
-// constraint by the most recent one, and under a version constraint a digest
-// bodega never resolved is refused, since the constraint has nothing to
-// compare. The profile is judged by ociProfileVersion.
+// constraint by the one the registry last answered, and under a version
+// constraint a digest bodega never resolved is refused, since the constraint
+// has nothing to compare. The profile admits it when any tag resolved to it
+// is one the profile permits.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
@@ -419,10 +424,10 @@ func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, 
 		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
 		return
 	}
-	tags := ociResolvedTags(ctx, store, t)
+	last := ociResolvedTag(ctx, store, t)
 	if pm != nil {
-		if len(tags) > 0 {
-			if !s.ociJudgeVersion(w, r, pm, name, tags[0]) {
+		if last != "" {
+			if !s.ociJudgeVersion(w, r, pm, name, last) {
 				return
 			}
 		} else if vc, baseVer := packageVersionConstraint(pm); vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
@@ -430,8 +435,14 @@ func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, 
 			return
 		}
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, ociProfileVersion(s.profileFor(r), name, t.ref, tags)) {
-		return
+	if p := s.profileFor(r); p != nil {
+		d, tag := p.PermitsOneOf(manifest.TypeOCI, name, s.ociResolvedByTags(ctx, store, t, last))
+		if tag == "" {
+			tag = t.ref
+		}
+		if !s.entitleGateDecided(w, r, p, manifest.TypeOCI, name, tag, d, http.StatusForbidden) {
+			return
+		}
 	}
 	if !s.ociAllowListGate(w, r, t, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true) {
 		return
@@ -439,65 +450,74 @@ func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, 
 	s.serveOCIManifestDigest(w, r, t, pm, "")
 }
 
-// ociProfileVersion is the version a digest request is held to by the
-// profile: the first tag resolved to the digest that the profile permits,
-// else the most recent one, so the refusal names a tag, else the digest
-// itself, which an exact pin or a semver constraint refuses and an open
-// version rule admits.
-//
-// Any permitted tag rather than only the latest: hosts under different
-// profiles pull one digest under different tags (17 and latest), and judging
-// by whichever was resolved last would refuse a host its own pinned image
-// because another host pulled the same bytes under another name.
-func ociProfileVersion(p *entitle.Profile, name, digest string, tags []string) string {
-	for _, tag := range tags {
-		if p.Permits(manifest.TypeOCI, name, tag).Permitted {
-			return tag
-		}
-	}
-	if len(tags) > 0 {
-		return tags[0]
-	}
-	return digest
-}
-
-// ociMaxResolvedTags bounds the tags recorded against one digest. A digest
-// that many tags name is a rolling alias set (latest, 17, 17.2, 17.2-bookworm,
-// ...), and the oldest drops off first.
-const ociMaxResolvedTags = 32
-
-// ociResolvedTags reads the tags bodega resolved to t.ref, most recent first.
-// The record is one tag per line, so a record written with a single tag reads
-// as a list of one.
-func ociResolvedTags(ctx context.Context, store storage.ObjectStore, t ociTarget) []string {
+// ociResolvedTag reads the tag the registry last resolved to t.ref. The
+// record's first line is the tag, so a record holding more reads as its first.
+func ociResolvedTag(ctx context.Context, store storage.ObjectStore, t ociTarget) string {
 	if store == nil {
-		return nil
+		return ""
 	}
 	b, err := store.Get(ctx, manifest.OCIResolvedKey(t.registry, t.repo, t.ref))
-	if err != nil || len(b) == 0 {
-		return nil
+	if err != nil {
+		return ""
 	}
+	tag, _, _ := strings.Cut(string(b), "\n")
+	if !manifest.OCIValidTag(tag) {
+		return ""
+	}
+	return tag
+}
+
+// ociResolvedByTags is every tag bodega resolved to t.ref, last first. last
+// is the allow-list's record, which is all a digest resolved before the
+// per-tag markers existed carries. A listing that fails leaves the markers
+// out, so a pinned profile refuses rather than guesses.
+func (s *Server) ociResolvedByTags(ctx context.Context, store storage.ObjectStore, t ociTarget, last string) []string {
 	var tags []string
-	for _, tag := range strings.Split(string(b), "\n") {
-		if manifest.OCIValidTag(tag) {
+	if last != "" {
+		tags = append(tags, last)
+	}
+	if store == nil {
+		return tags
+	}
+	prefix := manifest.OCIResolvedByPrefix(t.registry, t.repo, t.ref)
+	keys, err := store.List(ctx, prefix)
+	if err != nil {
+		s.logger.Warn("oci tag resolutions not listed; the digest is judged by the last tag alone",
+			"name", t.name(), "digest", t.ref, "error", err)
+		return tags
+	}
+	for _, k := range keys {
+		if tag, ok := manifest.OCIResolvedByTag(prefix, k); ok && tag != last {
 			tags = append(tags, tag)
 		}
 	}
 	return tags
 }
 
-// recordOCIResolved puts tag first in digest's record. Two resolutions racing
-// can lose one tag from the record, which a later pull of that tag restores.
-func recordOCIResolved(ctx context.Context, store storage.ObjectStore, t ociTarget, digest string) error {
-	byDigest := t
-	byDigest.ref = digest
-	tags := []string{t.ref}
-	for _, tag := range ociResolvedTags(ctx, store, byDigest) {
-		if tag != t.ref && len(tags) < ociMaxResolvedTags {
-			tags = append(tags, tag)
+// recordOCIResolvedBy marks t.ref as resolving to digest and, for an index,
+// to each platform manifest it lists, which a client pulling the tag asks
+// for next by digest. It runs on every tag response bodega serves, cache
+// hits and stale answers included, so a digest is judged by the tag a host
+// just pulled whatever another host's pulls did to the cache in between.
+// One key per tag, so no write loses another's and nothing is evicted; a
+// marker already there is not written again.
+func (s *Server) recordOCIResolvedBy(ctx context.Context, store storage.ObjectStore, t ociTarget, digest string, body []byte) {
+	if store == nil {
+		return
+	}
+	// The client may hang up as soon as it has the bytes, and the next
+	// request it makes by digest depends on these writes.
+	ctx = context.WithoutCancel(ctx)
+	for _, d := range append([]string{digest}, ociIndexChildren(body)...) {
+		key := manifest.OCIResolvedByKey(t.registry, t.repo, d, t.ref)
+		if info, err := store.Head(ctx, key); err == nil && info != nil && info.Exists {
+			continue
+		}
+		if err := store.Put(ctx, key, []byte(t.ref)); err != nil {
+			s.logger.Warn("oci tag resolution not recorded; a profile with a version rule refuses this digest until it is",
+				"name", t.name(), "tag", t.ref, "digest", d, "error", err)
 		}
 	}
-	return store.Put(ctx, manifest.OCIResolvedKey(t.registry, t.repo, digest), []byte(strings.Join(tags, "\n")))
 }
 
 // refuseUnresolvedDigest answers a digest request a version constraint
@@ -1005,7 +1025,7 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore) upstreamOp
 		// index; otherwise a version constraint would refuse every
 		// multi-arch pull at its second request.
 		for _, d := range append([]string{digest}, ociIndexChildren(body)...) {
-			if err := recordOCIResolved(ctx, store, t, d); err != nil {
+			if err := store.Put(ctx, manifest.OCIResolvedKey(t.registry, t.repo, d), []byte(t.ref)); err != nil {
 				s.logger.Warn("oci tag resolution not recorded; a later request by this digest is judged as never resolved",
 					"name", t.name(), "tag", t.ref, "digest", d, "error", err)
 			}

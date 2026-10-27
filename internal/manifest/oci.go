@@ -20,6 +20,7 @@ const (
 	ociTypesMarker    = "/_types/sha256/"
 	ociTagsMarker     = "/_tags/"
 	ociResolvedMarker = "/_resolved/sha256/"
+	ociResolvedBy     = "/_resolvedby/sha256/"
 	ociListSuffix     = "/_list"
 )
 
@@ -130,9 +131,29 @@ func OCITagListKey(registry, repo string) string {
 }
 
 // OCIResolvedKey holds the tag bodega last resolved to digest in a
-// repository, which is what a request by digest is judged under.
+// repository, which is what the allow-list judges a request by digest under.
 func OCIResolvedKey(registry, repo, digest string) string {
 	return ociTagPrefix + registry + "/" + repo + ociResolvedMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
+}
+
+// OCIResolvedByKey marks that tag resolved to digest in a repository, which
+// is what a profile judges a request by digest under. One key per tag rather
+// than a list under one key, so recording a tag never rewrites, and never
+// loses, a tag another request recorded.
+func OCIResolvedByKey(registry, repo, digest, tag string) string {
+	return OCIResolvedByPrefix(registry, repo, digest) + tag
+}
+
+// OCIResolvedByPrefix lists the OCIResolvedByKey markers of one digest.
+func OCIResolvedByPrefix(registry, repo, digest string) string {
+	return ociTagPrefix + registry + "/" + repo + ociResolvedBy + strings.TrimPrefix(digest, OCIDigestPrefix) + "/"
+}
+
+// OCIResolvedByTag is the tag an OCIResolvedByKey under prefix names, and
+// false for a key that is not one.
+func OCIResolvedByTag(prefix, key string) (string, bool) {
+	tag, ok := strings.CutPrefix(key, prefix)
+	return tag, ok && OCIValidTag(tag)
 }
 
 // parseOCIKey is ParseKey for the oci tree. The name is <registry>/<repository>
@@ -156,6 +177,13 @@ func parseOCIKey(key string) (name, version string) {
 		}
 	case strings.HasPrefix(key, ociTagPrefix):
 		rest := strings.TrimPrefix(key, ociTagPrefix)
+		if i := strings.LastIndex(rest, ociResolvedBy); i > 0 {
+			hex, tag, ok := strings.Cut(rest[i+len(ociResolvedBy):], "/")
+			if !ok || !OCIValidTag(tag) {
+				return "", ""
+			}
+			return ociNameVersion(rest[:i], ociDigestVersion(hex))
+		}
 		if i := strings.LastIndex(rest, ociTagsMarker); i > 0 && OCIValidTag(rest[i+len(ociTagsMarker):]) {
 			return ociNameVersion(rest[:i], rest[i+len(ociTagsMarker):])
 		}

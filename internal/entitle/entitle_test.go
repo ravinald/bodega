@@ -519,3 +519,56 @@ func TestOCITagPins(t *testing.T) {
 		t.Errorf("compatible 17.1 judged the tag latest as %v: %s", d.Permitted, d.Reason)
 	}
 }
+
+// PermitsOneOf permits on any permitted candidate and, with none, refuses
+// under a version rule however the pin is spelled: an exact pin equal to the
+// digest a request names admits nothing, because the digest is never compared.
+// Membership, a floating rule, an ungoverned type and expansion answer as
+// Permits does.
+func TestOCIPermitsOneOf(t *testing.T) {
+	const pg = "docker.io/library/postgres"
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pinned := func(version string) *Profile {
+		return profile("db",
+			[]audit.ProfileTypeRule{blocking(rule(manifest.TypeOCI, audit.MembershipClosed, audit.VersionFloating))},
+			[]audit.ProfileEntry{{Type: manifest.TypeOCI, Name: pg, Constraint: manifest.ConstraintExact, Version: version}})
+	}
+
+	if d, tag := pinned("17").PermitsOneOf(manifest.TypeOCI, pg, []string{"latest", "17"}); !d.Permitted || tag != "17" {
+		t.Errorf("a permitted second candidate: permitted=%v tag=%q: %s", d.Permitted, tag, d.Reason)
+	}
+	if d, tag := pinned("17").PermitsOneOf(manifest.TypeOCI, pg, []string{"latest", "17.2"}); d.Permitted || tag != "latest" || d.Refusal != RefusalConstraint {
+		t.Errorf("no permitted candidate: permitted=%v tag=%q refusal=%q, want a constraint refusal naming latest", d.Permitted, tag, d.Refusal)
+	}
+	d, tag := pinned(digest).PermitsOneOf(manifest.TypeOCI, pg, nil)
+	if d.Permitted || tag != "" || d.Refusal != RefusalConstraint || !strings.Contains(d.Reason, "without a version to compare") {
+		t.Errorf("an exact pin equal to the digest, no candidate: permitted=%v tag=%q refusal=%q: %s", d.Permitted, tag, d.Refusal, d.Reason)
+	}
+	if !pinned(digest).Permits(manifest.TypeOCI, pg, digest).Permitted {
+		t.Error("Permits stopped comparing an exact pin as a string")
+	}
+
+	for name, p := range map[string]*Profile{
+		"floating entry": profile("db",
+			[]audit.ProfileTypeRule{blocking(rule(manifest.TypeOCI, audit.MembershipClosed, audit.VersionFloating))},
+			[]audit.ProfileEntry{{Type: manifest.TypeOCI, Name: pg}}),
+		"ungoverned type": profile("db",
+			[]audit.ProfileTypeRule{blocking(rule(manifest.TypeNpm, audit.MembershipClosed, audit.VersionPinned))}, nil),
+		"outside, warn": profile("db",
+			[]audit.ProfileTypeRule{rule(manifest.TypeOCI, audit.MembershipClosed, audit.VersionPinned)}, nil),
+		"no profile": nil,
+	} {
+		if d, _ := p.PermitsOneOf(manifest.TypeOCI, pg, nil); !d.Permitted {
+			t.Errorf("%s refused a digest with no candidate: %s", name, d.Reason)
+		}
+	}
+	closed := profile("db",
+		[]audit.ProfileTypeRule{blocking(rule(manifest.TypeOCI, audit.MembershipClosed, audit.VersionFloating))}, nil)
+	if d, _ := closed.PermitsOneOf(manifest.TypeOCI, pg, []string{"17"}); d.Permitted || d.Refusal != RefusalMembership {
+		t.Errorf("a repository outside a blocking set: permitted=%v refusal=%q, want membership", d.Permitted, d.Refusal)
+	}
+	open := profile("db", []audit.ProfileTypeRule{rule(manifest.TypeOCI, audit.MembershipOpen, audit.VersionPinned)}, nil)
+	if d, _ := open.PermitsOneOf(manifest.TypeOCI, pg, nil); d.Permitted || !strings.Contains(d.Reason, "with no version named") {
+		t.Errorf("an open type pinning every version, no candidate: permitted=%v: %s", d.Permitted, d.Reason)
+	}
+}

@@ -289,6 +289,12 @@ func (s *Server) entitleGateAnswering(w http.ResponseWriter, r *http.Request, ty
 	} else {
 		d = p.Permits(typ, name, version)
 	}
+	return s.entitleGateDecided(w, r, p, typ, name, version, d, status)
+}
+
+// entitleGateDecided records and answers a decision the route already made
+// against p, for a route whose version is not one string Permits can judge.
+func (s *Server) entitleGateDecided(w http.ResponseWriter, r *http.Request, p *entitle.Profile, typ, name, version string, d entitle.Decision, status int) bool {
 	if d.Reportable() {
 		s.recordProfileReach(r, p, typ, name, version)
 	}
@@ -326,8 +332,8 @@ func profileRefusal(p *entitle.Profile, typ, name, version string, d entitle.Dec
 		f.next = fmt.Sprintf("ask an operator to move the pin with `bodega profile pin %s %s %s <version> --reason <why>`, or to float it with `bodega profile add %s %s %s --constraint any`.",
 			p.Name(), typ, name, p.Name(), typ, name)
 		if typ == manifest.TypeOCI && manifest.OCIValidDigest(version) {
-			// A digest is judged by the tags bodega resolved to it, and here it
-			// resolved none, so the pin was compared against the digest.
+			// A digest is judged by the tags bodega resolved to it, and here
+			// it resolved none, so there was no tag to compare.
 			f.next = fmt.Sprintf("pull %s by a tag the profile permits first, which records the digest that tag names, or ask an operator to float it with `bodega profile add %s %s %s --constraint any`.",
 				name, p.Name(), typ, name)
 		}
