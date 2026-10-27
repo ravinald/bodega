@@ -772,6 +772,9 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 	if err := policy.ValidateType(regType); err != nil {
 		return err
 	}
+	if regType == manifest.TypeApt {
+		return errAptManifestFromDiscovery("promote --as manifest")
+	}
 
 	cfg, err := loadConfig(gf)
 	if err != nil {
@@ -847,6 +850,14 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 	fmt.Fprintf(out, "\nPromoted %d manifest %s, skipped %d already present, %d without an upstream URL, %d without a version.\n",
 		added, plural(added, "entry", "entries"), present, len(noURL), len(noVersion))
 	return nil
+}
+
+// errAptManifestFromDiscovery refuses to build apt entries from traffic. A pool
+// row names the source package the pool gate judges, while an entry needs the
+// binary 'apt-get download' fetches and its architecture, which only a host's
+// own package list carries.
+func errAptManifestFromDiscovery(verb string) error {
+	return fmt.Errorf("discover %s cannot write apt entries: apt discovery rows name a source package and carry no architecture, so they cannot become an entry — build one from a host's inventory instead, with 'bodega discover promote apt <name> --inventory <identity>' or 'bodega pkg convert apt' over dpkg-query output", verb)
 }
 
 // ---- Bulk manifest generation ---------------------------------------------
@@ -953,6 +964,9 @@ func generateManifests(gf *globalFlags, out, errOut io.Writer, regType string, o
 	if regType != "" {
 		if err := policy.ValidateType(regType); err != nil {
 			return err
+		}
+		if regType == manifest.TypeApt {
+			return errAptManifestFromDiscovery("generate-manifests")
 		}
 	}
 

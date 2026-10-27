@@ -411,6 +411,95 @@ func TestPromoteDefaultsToPolicy(t *testing.T) {
 	}
 }
 
+// aptPoolRows are what the apt pool gate records: allowed and denied rows
+// naming the source package, never no_manifest.
+func aptPoolRows() []audit.DiscoveryRow {
+	row := func(decision, version string) audit.DiscoveryRow {
+		return audit.DiscoveryRow{
+			RegistryType: manifest.TypeApt,
+			Host:         "archive.ubuntu.com",
+			PatternHint:  "archive.ubuntu.com",
+			PkgName:      "openssl",
+			PkgVersion:   version,
+			Decision:     decision,
+			UpstreamURL:  "http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl3t64_" + version + "_amd64.deb",
+			LastClient:   "10.0.0.5",
+		}
+	}
+	return []audit.DiscoveryRow{
+		row(audit.DecisionAllowed, "3.0.13-0ubuntu3.5"),
+		row(audit.DecisionDenied, "3.0.13-0ubuntu3.4"),
+	}
+}
+
+// An apt row names a source package and no architecture, so a manifest entry
+// built from it would name a package apt-get download cannot fetch. The
+// refusal has to name the inventory routes that can build one.
+func TestPromoteAptAsManifestRefusesWithInventoryRoutes(t *testing.T) {
+	cases := map[string][]string{
+		"promote":     {"promote", "apt", "archive.ubuntu.com", "--as", "manifest"},
+		"promote-all": {"promote-all", "apt", "--as", "manifest"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			env := newDiscoverEnv(t)
+			env.seedDiscovery(t, aptPoolRows()...)
+
+			_, err := runDiscover(t, args...)
+			if err == nil {
+				t.Fatal("promote --as manifest on apt rows succeeded")
+			}
+			for _, want := range []string{"--inventory", "pkg convert apt", "source package", "architecture"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if pm := env.readManifest(t, manifest.TypeApt, "openssl"); pm != nil {
+				t.Errorf("a refused promote wrote a manifest: %+v", pm)
+			}
+		})
+	}
+}
+
+func TestGenerateManifestsAptRefusesWithInventoryRoutes(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, aptPoolRows()...)
+
+	out, _, err := runDiscoverSplit(t, "generate-manifests", "apt")
+	if err == nil {
+		t.Fatalf("generate-manifests apt succeeded with output %q", out)
+	}
+	for _, want := range []string{"--inventory", "pkg convert apt"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// The apt refusal is for manifests only: the host rule is the apt promotion
+// an observe window exists to produce.
+func TestPromoteAptAsPolicyStillWritesTheRule(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, aptPoolRows()...)
+
+	if _, err := runDiscover(t, "promote", "apt", "archive.ubuntu.com"); err != nil {
+		t.Fatalf("promote apt: %v", err)
+	}
+
+	db, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	rules, err := db.ListPolicies(context.Background())
+	if err != nil {
+		t.Fatalf("list policies: %v", err)
+	}
+	if len(rules) != 1 || rules[0].RegistryType != manifest.TypeApt || rules[0].Pattern != "archive.ubuntu.com" {
+		t.Errorf("policy rules = %+v, want one apt rule for archive.ubuntu.com", rules)
+	}
+}
+
 // ---- generate-manifests ----------------------------------------------------
 
 // runDiscoverSplit keeps stdout and stderr apart: the payload is only pipeable
