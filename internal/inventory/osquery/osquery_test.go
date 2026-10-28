@@ -335,7 +335,7 @@ func TestConfigSchedule(t *testing.T) {
 }
 
 func TestScheduleQuotesDirectories(t *testing.T) {
-	s := Schedule(config.OsqueryDirs{Python: []string{"/opt/it's"}}, time.Hour)
+	s := Schedule(config.OsqueryDirs{Python: []string{"/opt/it's"}}, time.Hour, false)
 	if !strings.Contains(s[QueryLinux].Query, "('/opt/it''s')") {
 		t.Errorf("a quote reached the query undoubled: %s", s[QueryLinux].Query)
 	}

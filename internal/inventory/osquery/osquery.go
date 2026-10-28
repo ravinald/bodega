@@ -79,6 +79,7 @@ type Source struct {
 	mode     string
 	interval time.Duration
 	maxBody  int64
+	origins  bool
 	scanDirs func(identity string) config.OsqueryDirs
 }
 
@@ -111,7 +112,11 @@ func newSource(instance string, s *inventory.Settings) (inventory.Source, error)
 	if maxBody <= 0 {
 		return nil, s.Errorf("max_body_bytes", "want a positive byte count, got %d", maxBody)
 	}
-	return &Source{instance: instance, mode: mode, interval: interval, maxBody: maxBody}, nil
+	origins, err := s.Bool("origins", false)
+	if err != nil {
+		return nil, err
+	}
+	return &Source{instance: instance, mode: mode, interval: interval, maxBody: maxBody, origins: origins}, nil
 }
 
 func (*Source) Type() string         { return TypeName }
@@ -122,6 +127,10 @@ func (*Source) Capabilities() []inventory.Capability {
 
 // OsqueryMode is the instance's mode key: ModeServer or ModeShipper.
 func (s *Source) OsqueryMode() string { return s.mode }
+
+// Origins reports whether the schedule reads package origins, which needs
+// bodega's osquery extension loaded on every host the instance serves.
+func (s *Source) Origins() bool { return s.origins }
 
 // Interval is how often the schedule's snapshot queries run.
 func (s *Source) Interval() time.Duration { return s.interval }
@@ -313,8 +322,8 @@ func (s *Source) serveConfig(w http.ResponseWriter, r *http.Request, env *invent
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"schedule":                Schedule(s.dirsFor(n.Identity), s.interval),
-		"auto_table_construction": AutoTables(),
+		"schedule":                Schedule(s.dirsFor(n.Identity), s.interval, s.origins),
+		"auto_table_construction": AutoTables(s.origins),
 	})
 }
 

@@ -610,7 +610,7 @@ paths:
       description: >
         The union of the latest report from each inventory source instance
         mapped to the identity. Each component carries the class recorded when
-        its report arrived (refused, unknown, unattributed, served, baseline,
+        its report arrived (refused, foreign-origin, unknown, unattributed, served, baseline,
         or unclassified for a report nothing classified: it arrived before
         reconciliation ran, or while the audit sink could not answer),
         the reason, and the instances that reported it. Each mapped instance is
@@ -2982,6 +2982,12 @@ components:
           items:
             type: string
           description: Trees npm_packages reads on this host, from its profile's osquery_scan_dirs entry
+        origins:
+          type: boolean
+          description: >-
+            The instance's origins key, absent when false: its schedule reads
+            bodega's osquery extension, which bodega doctor --configure osquery
+            installs on the host
 
     ClientPlanRecord:
       type: object
@@ -3100,7 +3106,7 @@ components:
           description: Instances whose latest report holds this component
         class:
           type: string
-          enum: [refused, unknown, unattributed, unclassified, served, baseline]
+          enum: [refused, foreign-origin, unknown, unattributed, unclassified, served, baseline]
         reason:
           type: string
 

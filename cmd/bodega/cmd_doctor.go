@@ -123,6 +123,16 @@ beside the original, suffixed .bodega-<UTC timestamp>, then writes.
 A system the plan does not list is an error naming the ones it does, and so
 is a named system the plan refuses or skips, with the server's reason.
 
+--configure osquery runs alone and installs bodega's osquery extension, for
+a host whose server-mode osquery source sets origins: it links this binary,
+which must be owned by root, at /usr/local/lib/bodega/bodega.ext and lists
+that path in the autoload file osqueryd reads: the one its flagfile's
+--extensions_autoload names, kept as it is, else the package default, which
+it then names there. osqueryd's other flags, its enroll secret and its
+restart stay with the served setup script (--systems osquery).
+
+  sudo bodega doctor --configure osquery --url https://bodega.internal --apply
+
 --write-apt-sources and --write-pkg-repo are --configure apt --apply and
 --configure freebsd --apply. They combine with each other and with
 --configure.
@@ -522,6 +532,12 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	var plan clientconf.Plan
 	if err := getJSON(client, "/client/plan?"+q.Encode(), &plan); err != nil {
 		return err
+	}
+	if slices.Contains(req.systems, clientconf.SystemOsquery) {
+		if len(req.systems) > 1 || req.quietPro || req.quietOS {
+			return fmt.Errorf("--configure osquery installs bodega's osquery extension and runs alone; configure the other systems in a second run")
+		}
+		return configureOsqueryExtension(os.Stdout, plan, req.apply)
 	}
 	records, err := plan.Select(req.systems)
 	if err != nil {

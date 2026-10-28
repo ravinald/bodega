@@ -39,18 +39,38 @@ type AutoTable struct {
 // the config mounts that database as this table instead.
 const TableFreeBSDPkg = "bodega_pkg_packages"
 
+// TableFreeBSDOrigins mounts the same database's repository annotation: the
+// name of the repository pkg installed each package from, as pkg.conf names
+// it.
+const TableFreeBSDOrigins = "bodega_pkg_origins"
+
+const freebsdPkgDB = "/var/db/pkg/local.sqlite"
+
 // AutoTables is the auto_table_construction block every config carries
 // beside the schedule. platform keeps a Linux host from mounting a path it
-// does not have.
-func AutoTables() map[string]AutoTable {
-	return map[string]AutoTable{
+// does not have. origins adds the repository annotation table the origins
+// schedule joins.
+func AutoTables(origins bool) map[string]AutoTable {
+	out := map[string]AutoTable{
 		TableFreeBSDPkg: {
 			Query:    "SELECT name, version FROM packages",
-			Path:     "/var/db/pkg/local.sqlite",
+			Path:     freebsdPkgDB,
 			Columns:  []string{"name", "version"},
 			Platform: "freebsd",
 		},
 	}
+	if origins {
+		out[TableFreeBSDOrigins] = AutoTable{
+			Query: "SELECT p.name, p.version, v.annotation AS repository FROM packages p" +
+				" JOIN pkg_annotation pa ON pa.package_id = p.id" +
+				" JOIN annotation t ON t.annotation_id = pa.tag_id AND t.annotation = 'repository'" +
+				" JOIN annotation v ON v.annotation_id = pa.value_id",
+			Path:     freebsdPkgDB,
+			Columns:  []string{"name", "version", "repository"},
+			Platform: "freebsd",
+		}
+	}
+	return out
 }
 
 // The schedule's query names, one per platform. A result line is read as
@@ -73,23 +93,36 @@ const (
 // only installed ones: a package removed with its config left behind reads
 // "deinstall ok config-files" and is not on the host.
 //
-// The output depends on dirs and interval alone, with directories sorted and
+// origins adds an origin column, filled from bodega's extension tables and
+// the pkg repository annotation. Without it the queries name none of them:
+// osquery fails a query naming a table the host has not loaded, whole, so a
+// host without the extension would report nothing at all.
+//
+// The output depends on its arguments alone, with directories sorted and
 // deduplicated, so the schedule changes only when the plan does.
-func Schedule(dirs config.OsqueryDirs, interval time.Duration) map[string]Query {
+func Schedule(dirs config.OsqueryDirs, interval time.Duration, origins bool) map[string]Query {
 	secs := int64(interval / time.Second)
-	lang := languageSelects(dirs)
+	lang := languageSelects(dirs, origins)
+	linux := []string{
+		"SELECT 'apt' AS ecosystem, name, version, '' AS path FROM deb_packages WHERE status = 'install ok installed'",
+		"SELECT 'rpm', name, version || '-' || release, '' FROM rpm_packages",
+	}
+	freebsd := []string{"SELECT 'freebsd' AS ecosystem, name, version, '' AS path FROM " + TableFreeBSDPkg}
+	if origins {
+		linux = []string{
+			"SELECT 'apt' AS ecosystem, name, version, '' AS path, '' AS origin FROM deb_packages WHERE status = 'install ok installed'",
+			"SELECT 'rpm', name, version || '-' || release, '', '' FROM rpm_packages",
+		}
+		freebsd = []string{"SELECT 'freebsd' AS ecosystem, p.name, p.version, '' AS path, o.repository AS origin FROM " + TableFreeBSDPkg +
+			" p LEFT JOIN " + TableFreeBSDOrigins + " o ON o.name = p.name AND o.version = p.version"}
+	}
 	return map[string]Query{
 		QueryLinux: {
-			Query: unionAll(append([]string{
-				"SELECT 'apt' AS ecosystem, name, version, '' AS path FROM deb_packages WHERE status = 'install ok installed'",
-				"SELECT 'rpm', name, version || '-' || release, '' FROM rpm_packages",
-			}, lang...)),
+			Query:    unionAll(append(linux, lang...)),
 			Interval: secs, Snapshot: true, Platform: "linux",
 		},
 		QueryFreeBSD: {
-			Query: unionAll(append([]string{
-				"SELECT 'freebsd' AS ecosystem, name, version, '' AS path FROM " + TableFreeBSDPkg,
-			}, lang...)),
+			Query:    unionAll(append(freebsd, lang...)),
 			Interval: secs, Snapshot: true, Platform: "freebsd",
 		},
 	}
@@ -99,13 +132,30 @@ func Schedule(dirs config.OsqueryDirs, interval time.Duration) map[string]Query 
 // declared directories. With none declared the table is left out: unfiltered,
 // python_packages walks only the interpreter's default paths and npm_packages
 // only global modules, which would read as a scan that found nothing.
-func languageSelects(dirs config.OsqueryDirs) []string {
+//
+// Under origins each joins the extension's table over the same directories.
+// The origin rows sit in a subquery because SQLite never flattens one holding
+// a virtual table into the right side of a LEFT JOIN: it is read once per
+// run, not once per package, and a package with no origin row still reports.
+func languageSelects(dirs config.OsqueryDirs, origins bool) []string {
 	var out []string
 	if in := sqlList(dirs.Python); in != "" {
-		out = append(out, "SELECT 'pypi', name, version, path FROM python_packages WHERE directory IN ("+in+")")
+		if origins {
+			out = append(out, "SELECT 'pypi', p.name, p.version, p.path, o.url FROM python_packages p"+
+				" LEFT JOIN (SELECT path, url FROM "+TablePipOrigins+" WHERE directory IN ("+in+")) o ON o.path = p.path"+
+				" WHERE p.directory IN ("+in+")")
+		} else {
+			out = append(out, "SELECT 'pypi', name, version, path FROM python_packages WHERE directory IN ("+in+")")
+		}
 	}
 	if in := sqlList(dirs.NPM); in != "" {
-		out = append(out, "SELECT 'npm', name, version, path FROM npm_packages WHERE directory IN ("+in+")")
+		if origins {
+			out = append(out, "SELECT 'npm', n.name, n.version, n.path, o.resolved FROM npm_packages n"+
+				" LEFT JOIN (SELECT path, resolved FROM "+TableNPMOrigins+" WHERE directory IN ("+in+")) o ON o.path = n.path"+
+				" WHERE n.directory IN ("+in+")")
+		} else {
+			out = append(out, "SELECT 'npm', name, version, path FROM npm_packages WHERE directory IN ("+in+")")
+		}
 	}
 	return out
 }
@@ -201,15 +251,23 @@ func normalize(events []event, externalID string) (inventory.Batch, error) {
 // component maps one row of a bodega query into the common model. The
 // ecosystem column is the literal each SELECT writes, and each is a bodega
 // type. rpm_packages reports version-release with no epoch, which
-// reconciliation compares epoch-free.
+// reconciliation compares epoch-free. The origin column, present under an
+// origins schedule, is a URL for npm and pypi, kept as its host, and a
+// repository name for FreeBSD.
 func component(row map[string]any) (inventory.Component, bool) {
 	c := inventory.Component{Name: str(row["name"]), Version: str(row["version"]), Path: str(row["path"])}
 	if c.Name == "" {
 		return c, false
 	}
 	switch eco := str(row["ecosystem"]); eco {
-	case manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypePypi, manifest.TypeNpm, manifest.TypeRpm:
+	case manifest.TypeApt, manifest.TypeRpm:
 		c.Ecosystem = eco
+	case manifest.TypePypi, manifest.TypeNpm:
+		c.Ecosystem = eco
+		c.Origin = OriginHost(str(row["origin"]))
+	case manifest.TypeFreeBSD:
+		c.Ecosystem = eco
+		c.Origin = strings.TrimSpace(str(row["origin"]))
 	default:
 		c.Ecosystem = inventory.EcosystemOther
 	}
