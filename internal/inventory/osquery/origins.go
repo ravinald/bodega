@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	// osquery-go publishes no release tags, so go.mod pins a pseudo-version
+	// at upstream master commit eb39ad3443df. Move to a tag once one exists.
 	osq "github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
 )
