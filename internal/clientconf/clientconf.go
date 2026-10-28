@@ -474,18 +474,18 @@ const SystemOsquery = "osquery"
 // OsqueryFlagsPaths is where each OS's osquery package reads its flags when
 // nothing overrides it: the deb's /etc/default/osqueryd FLAG_FILE, and the
 // sysutils/osquery rc script's osqueryd_flagfile default. setup.sh writes
-// here only when the host names no other path; see osqueryFlagSources.
+// here only when the host names no other path; see OsqueryFlagSources.
 var OsqueryFlagsPaths = map[string]string{
 	OSLinux:   "/etc/osquery/osquery.flags",
 	OSFreeBSD: "/usr/local/etc/osquery/osquery.flags",
 }
 
-// osqueryFlagSources is where each OS's package names the flagfile its
+// OsqueryFlagSources is where each OS's package names the flagfile its
 // daemon reads, as the variable and either the file holding it or "sysrc"
 // for rc.conf. Following it rather than OsqueryFlagsPaths alone means a host
 // whose operator moved the flags gets bodega's flags where osqueryd reads
 // them, not in a file nothing opens.
-var osqueryFlagSources = map[string][2]string{
+var OsqueryFlagSources = map[string][2]string{
 	OSLinux:   {"FLAG_FILE", "/etc/default/osqueryd"},
 	OSFreeBSD: {"osqueryd_flagfile", "sysrc"},
 }
@@ -505,6 +505,24 @@ var osquerySecretPaths = map[string]string{
 var osqueryCABundles = map[string]string{
 	OSLinux:   "/etc/ssl/certs/ca-certificates.crt",
 	OSFreeBSD: "/etc/ssl/cert.pem",
+}
+
+// OsqueryExtensionPaths is where bodega doctor --configure osquery links
+// the bodega binary as an osquery extension. osqueryd's autoloader takes
+// only a path ending in .ext, owned by root and writable by no one else.
+var OsqueryExtensionPaths = map[string]string{
+	OSLinux:   "/usr/local/lib/bodega/bodega.ext",
+	OSFreeBSD: "/usr/local/lib/bodega/bodega.ext",
+}
+
+// OsqueryAutoloadPaths are each OS package's default extensions_autoload
+// file, one extension path per line. bodega adds its line and keeps the
+// rest. A flags file that already names another file keeps it, and bodega's
+// line goes there: replacing the flag would drop every extension the
+// operator's file lists.
+var OsqueryAutoloadPaths = map[string]string{
+	OSLinux:   "/etc/osquery/extensions.load",
+	OSFreeBSD: "/usr/local/etc/osquery/extensions.load",
 }
 
 // How setup.sh merges one OsqueryFlag into the host's flags file.
@@ -538,7 +556,9 @@ type OsqueryFlag struct {
 // logger_plugin is merged rather than set because a deployed host may feed
 // its filesystem log, osquery's default, to something else. host_identifier
 // defaults to uuid because osquery's own default, hostname, changes when a
-// host is renamed, and a shipper's mapping keys on it.
+// host is renamed, and a shipper's mapping keys on it. extensions_autoload
+// defaults, and only for an origins instance, whose schedule needs the
+// extension: a host already naming its own file keeps it.
 func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	b, err := url.Parse(base)
 	if err != nil || b.Host == "" {
@@ -563,12 +583,32 @@ func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	if src.Interval > 0 {
 		out = append(out, set("config_refresh", strconv.FormatInt(src.Interval, 10)))
 	}
-	return append(out,
+	out = append(out,
 		OsqueryFlag{OsqueryFlagDefault, "host_identifier", "uuid"},
 		OsqueryFlag{OsqueryFlagDefault, "logger_plugin", "filesystem,tls"},
 		OsqueryFlag{OsqueryFlagInclude, "logger_plugin", "tls"},
 		set("logger_tls_endpoint", path+"/log"),
 	)
+	if src.Origins {
+		out = append(out, OsqueryFlag{OsqueryFlagDefault, "extensions_autoload", OsqueryAutoloadPaths[goos]})
+	}
+	return out
+}
+
+// OsqueryFlagValue reads the value the last line of an osquery flags file
+// setting name gives it, as setup.sh's merge recognizes such a line: "--",
+// the name, then "=", a blank or the end of the line. set reports whether
+// any line sets it. osqueryd's flagfile parser keeps the last setting.
+func OsqueryFlagValue(body []byte, name string) (value string, set bool) {
+	for _, line := range strings.Split(string(body), "\n") {
+		s := strings.Trim(line, " \t\r")
+		rest, ok := strings.CutPrefix(s, "--"+name)
+		if !ok || (rest != "" && !strings.ContainsAny(rest[:1], "= \t")) {
+			continue
+		}
+		value, set = strings.Trim(strings.TrimPrefix(rest, "="), " \t"), true
+	}
+	return value, set
 }
 
 // Osquery renders the osquery system's plan file for one server-mode
@@ -584,7 +624,7 @@ func Osquery(base string, src OsqueryPlan) []File {
 		if flags == nil {
 			return nil
 		}
-		from := osqueryFlagSources[goos]
+		from := OsqueryFlagSources[goos]
 		var sb strings.Builder
 		sb.WriteString("from\t" + from[0] + "\t" + from[1] + "\n")
 		for _, f := range flags {

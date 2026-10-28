@@ -1720,3 +1720,34 @@ func TestSetupScriptLeavesOCIToDoctor(t *testing.T) {
 		t.Errorf("--systems oci = %v:\n%s", err, out)
 	}
 }
+
+// Reconciliation vouches for exactly the pkg repository names the client
+// plan writes into a host's repos file, so the two cannot drift: a hidden
+// entry is in neither.
+func TestFreeBSDPlanTagsAreThePlanRepositories(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/latest", Mode: manifest.ModeProxy,
+	})
+	addVersion(t, s, manifest.TypeFreeBSD, "quarterly", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/quarterly", Mode: manifest.ModeProxy, Hidden: true,
+	})
+	tags, err := s.freeBSDPlanTags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 1 || tags[0] != pkgrepos.TagPrefix+"latest" {
+		t.Fatalf("plan tags = %v, want [%slatest]", tags, pkgrepos.TagPrefix)
+	}
+	f := webProfile(t, s)
+	plan := planRecordFor(planJSON(t, s, f.token, "os=freebsd&abi="+freeBSDABI), manifest.TypeFreeBSD)
+	if len(plan) != 1 || plan[0].Action != planInstall {
+		t.Fatalf("freebsd plan = %+v, want one install", plan)
+	}
+	_, body := clientGet(t, s, f.token, "/client/freebsd?os=freebsd&abi="+freeBSDABI)
+	if !strings.Contains(body, tags[0]+":") {
+		t.Errorf("the plan's repos file does not define %s:\n%s", tags[0], body)
+	}
+}
