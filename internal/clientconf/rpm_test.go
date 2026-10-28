@@ -108,27 +108,35 @@ func TestRpmDistroTable(t *testing.T) {
 	}
 }
 
+func repoIDs(repos []YumRepo) []string {
+	var ids []string
+	for _, r := range repos {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
 // F103 R3: every enabled repository that can fetch around bodega is
 // reported, mirrorlist, metalink and a second baseurl alike; disabled ones
-// and bodega's own are not, and a file not ending .repo is not read.
+// and bodega's own are not, and a file not ending .repo is not read. With
+// no base, a bodega- id proves nothing: a section whose URL cannot be
+// bodega's route is around, and one whose URLs might be is unverified.
 func TestRpmBypassesOverAFixtureReposDir(t *testing.T) {
-	repos, err := ReadYumRepos(filepath.Join("testdata", "rpm", "yum.repos.d"), filepath.Join("testdata", "rpm", "absent"))
+	conf, err := ReadDnfConfig("", []string{filepath.Join("testdata", "rpm", "yum.repos.d"), filepath.Join("testdata", "rpm", "absent")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ids []string
-	for _, r := range RpmBypasses(repos, testBase) {
-		ids = append(ids, r.ID)
+	repos := conf.Repos
+	around, unverified := RpmBypasses(repos, testBase)
+	if want := []string{"bodega-split", "epel", "baseos"}; !slices.Equal(repoIDs(around), want) || len(unverified) != 0 {
+		t.Errorf("bypasses = %v, unverified %v, want %v", repoIDs(around), repoIDs(unverified), want)
 	}
-	if want := []string{"bodega-split", "epel", "baseos"}; !slices.Equal(ids, want) {
-		t.Errorf("bypasses = %v, want %v", ids, want)
+	around, unverified = RpmBypasses(repos, "")
+	if want := []string{"bodega-split", "epel", "baseos"}; !slices.Equal(repoIDs(around), want) {
+		t.Errorf("bypasses with no base = %v, want %v", repoIDs(around), want)
 	}
-	var none []string
-	for _, r := range RpmBypasses(repos, "") {
-		none = append(none, r.ID)
-	}
-	if want := []string{"epel", "baseos"}; !slices.Equal(none, want) {
-		t.Errorf("bypasses with no base = %v, want %v", none, want)
+	if want := []string{"bodega-rocky-baseos"}; !slices.Equal(repoIDs(unverified), want) {
+		t.Errorf("unverified with no base = %v, want %v", repoIDs(unverified), want)
 	}
 
 	d, _ := RpmDistroFor("rocky", "9.4")
@@ -138,5 +146,118 @@ func TestRpmBypassesOverAFixtureReposDir(t *testing.T) {
 	}
 	if got := RpmDisableIDs(d, []string{"rocky-baseos"}, repos, "x86_64"); !slices.Equal(got, []string{"baseos"}) {
 		t.Errorf("disable with only baseos served = %v; epel has no bodega section to replace it", got)
+	}
+}
+
+// F103 R3: a bodega-named section pointing at the vendor is never passed on
+// its name, with or without a base to compare.
+func TestRpmBypassesIgnoresTheID(t *testing.T) {
+	r := []YumRepo{{ID: "bodega-rocky-baseos", Enabled: true, URLs: []string{"https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/"}}}
+	for _, base := range []string{"", testBase} {
+		if around, _ := RpmBypasses(r, base); len(around) != 1 {
+			t.Errorf("base %q: a bodega- id pointing upstream was passed", base)
+		}
+	}
+	empty := []YumRepo{{ID: "bodega-rocky-baseos", Enabled: true}}
+	if around, _ := RpmBypasses(empty, testBase); len(around) != 1 {
+		t.Error("a bodega- id with no URL was passed")
+	}
+}
+
+// F103 R2, R3: values read as dnf reads them. libdnf's IniParser strips one
+// pair of matching quotes, joins indented and whitespace-only lines onto the
+// value above (an empty line ends it), and
+// dnf keeps enabled's default (on) for a value it cannot parse, so only an
+// unquoted false word turns a repository off.
+func TestParseDnfIniValueForms(t *testing.T) {
+	for _, c := range []struct {
+		enabled string
+		want    bool
+	}{
+		{`"1"`, true}, {`'1'`, true}, {`"0"`, false}, {`'no'`, false}, {`Off`, false},
+		{``, true}, {`""`, true}, {`maybe`, true}, {`"1`, true}, {`"0'`, true},
+	} {
+		secs := parseDnfIni([]byte("[baseos]\nenabled=" + c.enabled + "\n"))
+		if got := secs[0].repo("x.repo").Enabled; got != c.want {
+			t.Errorf("enabled=%s read as %v, want %v", c.enabled, got, c.want)
+		}
+	}
+	// A key dnf does not know (dnf matches option names exactly) changes nothing.
+	if !parseDnfIni([]byte("[baseos]\nEnabled=0\n"))[0].repo("x.repo").Enabled {
+		t.Error("Enabled=0 turned the repository off; dnf does not read that key")
+	}
+
+	data := "\uFEFF[baseos]\nbaseurl = \"https://a.example/rpm/x/,\n\thttps://b.example/os/\"\n  \n  https://c.example/os/\n# comment\n  enabled=0\nmirrorlist=None\n[appstream] # trailing comment\nenabled = 0\n"
+	secs := parseDnfIni([]byte(data))
+	if len(secs) != 2 {
+		t.Fatalf("sections = %+v", secs)
+	}
+	base := secs[0].repo("x.repo")
+	if want := []string{`"https://a.example/rpm/x/`, `https://b.example/os/"`, "https://c.example/os/"}; !slices.Equal(base.URLs, want) {
+		t.Errorf("baseurl = %q, want %q: the quotes do not match end to end once the continuation joins", base.URLs, want)
+	}
+	if !base.Enabled {
+		t.Error("an indented enabled=0 after a comment ended the value was read as a key")
+	}
+	if secs[1].repo("x.repo").Enabled {
+		t.Error("[appstream] with a trailing comment was not read as a section")
+	}
+	quoted := parseDnfIni([]byte("[epel]\nbaseurl=\"https://a.example/1/\n https://b.example/2/\"\n"))[0].repo("x.repo")
+	if want := []string{"https://a.example/1/", "https://b.example/2/"}; !slices.Equal(quoted.URLs, want) {
+		t.Errorf("quoted continued baseurl = %q, want %q", quoted.URLs, want)
+	}
+}
+
+// F103 R2, R3: repositories come from dnf.conf's own sections and from the
+// reposdir it sets, and only from there: a default directory reposdir
+// leaves out is not read, a quoted enabled is enabled, and the first
+// definition of an id is the one kept.
+func TestReadDnfConfigFollowsMainConf(t *testing.T) {
+	root := t.TempDir()
+	custom, skipped := filepath.Join(root, "custom.repos.d"), filepath.Join(root, "yum.repos.d")
+	for _, dir := range []string{custom, skipped} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainConf := filepath.Join(root, "dnf.conf")
+	write(mainConf, "[main]\ngpgcheck=1\nreposdir=\""+custom+"\"\n\n[baseos]\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\nenabled=\"1\"\n")
+	write(filepath.Join(custom, "ext.repo"), "[ext]\nmirrorlist=https://mirror.example/list\n\n[baseos]\nbaseurl="+testBase+"/rpm/rocky-baseos/9/x86_64/\n")
+	write(filepath.Join(skipped, "stray.repo"), "[stray]\nbaseurl=https://stray.example/\n")
+
+	conf, err := ReadDnfConfig(mainConf, []string{skipped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"baseos", "ext"}; !slices.Equal(repoIDs(conf.Repos), want) {
+		t.Errorf("repos = %v, want %v", repoIDs(conf.Repos), want)
+	}
+	if conf.Repos[0].File != mainConf || !conf.Repos[0].Enabled {
+		t.Errorf("baseos = %+v, want enabled from %s", conf.Repos[0], mainConf)
+	}
+	if !conf.ReadsDir(custom+"/") || conf.ReadsDir(skipped) {
+		t.Errorf("reposdir = %v", conf.ReposDirs)
+	}
+	around, _ := RpmBypasses(conf.Repos, testBase)
+	if want := []string{"baseos", "ext"}; !slices.Equal(repoIDs(around), want) {
+		t.Errorf("bypasses = %v, want %v", repoIDs(around), want)
+	}
+	d, _ := RpmDistroFor("rocky", "9")
+	if got := RpmDisableIDs(d, []string{"rocky-baseos"}, conf.Repos, "x86_64"); !slices.Equal(got, []string{"baseos"}) {
+		t.Errorf("disable = %v, want [baseos] from dnf.conf", got)
+	}
+
+	write(mainConf, "[main]\nreposdir=\n")
+	if conf, err := ReadDnfConfig(mainConf, []string{skipped}); err != nil || len(conf.Repos) != 0 || conf.ReadsDir(skipped) {
+		t.Errorf("an empty reposdir = %+v, %v; dnf reads no directory", conf, err)
+	}
+	if conf, err := ReadDnfConfig(filepath.Join(root, "absent.conf"), []string{skipped}); err != nil || !slices.Equal(repoIDs(conf.Repos), []string{"stray"}) {
+		t.Errorf("no dnf.conf = %+v, %v; the default directories apply", conf, err)
 	}
 }

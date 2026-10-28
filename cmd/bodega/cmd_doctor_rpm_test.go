@@ -28,18 +28,19 @@ mirrorlist=https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=AppStre
 enabled=%s
 `
 
-// rpmHostFixture stands in for a Rocky 9 host: its os-release, a
-// yum.repos.d holding the vendor's repositories, and dnf on PATH. The
-// returned function rewrites rocky.repo's enabled lines, as dnf
+// rpmHostFixture stands in for a Rocky 9 host under home: its os-release, a
+// yum.repos.d holding the vendor's repositories where bodega.repo lands, a
+// dnf.conf path that holds nothing until a test writes it, and dnf on PATH.
+// The returned function rewrites rocky.repo's enabled lines, as dnf
 // config-manager would.
-func rpmHostFixture(t *testing.T, bins ...string) (reposDir string, setEnabled func(string)) {
+func rpmHostFixture(t *testing.T, home string, bins ...string) (reposDir, dnfConf string, setEnabled func(string)) {
 	t.Helper()
 	dir := t.TempDir()
 	osRelease := filepath.Join(dir, "os-release")
 	if err := os.WriteFile(osRelease, []byte("NAME=\"Rocky Linux\"\nID=\"rocky\"\nVERSION_ID=\"9.4\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reposDir = filepath.Join(dir, "yum.repos.d")
+	reposDir = filepath.Join(home, filepath.Dir(clientconf.RpmRepoPath))
 	if err := os.MkdirAll(reposDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -50,10 +51,11 @@ func rpmHostFixture(t *testing.T, bins ...string) (reposDir string, setEnabled f
 	}
 	setEnabled("1")
 	stubRuntimes(t, bins...)
-	prevOS, prevDirs := doctorOSRelease, doctorYumReposDirs
-	doctorOSRelease, doctorYumReposDirs = osRelease, []string{reposDir}
-	t.Cleanup(func() { doctorOSRelease, doctorYumReposDirs = prevOS, prevDirs })
-	return reposDir, setEnabled
+	dnfConf = filepath.Join(dir, "dnf.conf")
+	prevOS, prevConf, prevDirs := doctorOSRelease, doctorDnfConf, doctorYumReposDirs
+	doctorOSRelease, doctorDnfConf, doctorYumReposDirs = osRelease, dnfConf, []string{reposDir}
+	t.Cleanup(func() { doctorOSRelease, doctorDnfConf, doctorYumReposDirs = prevOS, prevConf, prevDirs })
+	return reposDir, dnfConf, setEnabled
 }
 
 // rpmPlanServer answers /client/plan as a server configuring Rocky's BaseOS
@@ -96,7 +98,7 @@ func rpmPlanServer(t *testing.T) (*httptest.Server, *[]string) {
 func TestDoctorConfigureRpmWritesTheRepoAndDisablesTheVendors(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	_, setEnabled := rpmHostFixture(t, "dnf")
+	_, _, setEnabled := rpmHostFixture(t, home, "dnf")
 	var ran [][]string
 	prevRun := doctorRun
 	doctorRun = func(name string, args ...string) error {
@@ -145,7 +147,7 @@ func TestDoctorConfigureRpmWritesTheRepoAndDisablesTheVendors(t *testing.T) {
 func TestDoctorConfigureRpmRefusesWithNoDnf(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	rpmHostFixture(t)
+	rpmHostFixture(t, home)
 	srv, _ := rpmPlanServer(t)
 	_, err := runDoctor(t, "--configure", "rpm", "--url", srv.URL, "--allow-plaintext", "--apply")
 	if err == nil || !strings.Contains(err.Error(), "dnf is not on PATH") {
@@ -160,7 +162,7 @@ func TestDoctorConfigureRpmRefusesWithNoDnf(t *testing.T) {
 // fetches around bodega, and the command that configures it; a disabled
 // one and bodega's own are not named, and a host with no dnf gets no row.
 func TestDoctorReportsDnfRepositoriesAroundBodega(t *testing.T) {
-	reposDir, _ := rpmHostFixture(t, "dnf")
+	reposDir, _, _ := rpmHostFixture(t, t.TempDir(), "dnf")
 	if err := os.WriteFile(filepath.Join(reposDir, "epel.repo"), []byte("[epel]\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=epel-$releasever\nenabled=0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -195,5 +197,105 @@ func TestDoctorReportsDnfRepositoriesAroundBodega(t *testing.T) {
 	out, _ = runDoctor(t, "--url", "https://bodega.internal")
 	if strings.Contains(out, "dnf-repos") {
 		t.Errorf("a host with no dnf got a dnf-repos row:\n%s", out)
+	}
+}
+
+// dnfReposRow runs bare doctor with args and returns its dnf-repos row.
+func dnfReposRow(t *testing.T, args ...string) string {
+	t.Helper()
+	prevExit := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = prevExit })
+	out, err := runDoctor(t, args...)
+	if err != nil {
+		t.Fatalf("doctor = %v:\n%s", err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "dnf-repos") {
+			return line
+		}
+	}
+	t.Fatalf("no dnf-repos row:\n%s", out)
+	return ""
+}
+
+// F103 R3: with no --url and no public_url, doctor has no bodega to compare
+// against, so a bodega- section pointing at the vendor is reported and one
+// that might be bodega's is named as unverified; neither is passed on its id.
+func TestDoctorDnfReposWithNoBaseURL(t *testing.T) {
+	reposDir, _, setEnabled := rpmHostFixture(t, t.TempDir(), "dnf")
+	setEnabled("0")
+	bodegaRepo := filepath.Join(reposDir, "bodega.repo")
+	if err := os.WriteFile(bodegaRepo, []byte("[bodega-rocky-baseos]\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\nenabled=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if row := dnfReposRow(t); !strings.Contains(row, "WARN") || !strings.Contains(row, "bodega-rocky-baseos (bodega.repo: https://dl.rockylinux.org") {
+		t.Errorf("a bodega- section pointing upstream = %q", row)
+	}
+
+	if err := os.WriteFile(bodegaRepo, []byte("[bodega-rocky-baseos]\nbaseurl=https://bodega.internal/rpm/rocky-baseos/$releasever/$basearch/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if row := dnfReposRow(t); !strings.Contains(row, "SKIPPED") || !strings.Contains(row, "bodega-rocky-baseos") {
+		t.Errorf("a section doctor cannot place = %q, want SKIPPED naming it", row)
+	}
+	if row := dnfReposRow(t, "--url", "https://bodega.internal"); !strings.Contains(row, "OK") {
+		t.Errorf("the same section against its own bodega = %q", row)
+	}
+}
+
+// F103 R2, R3: doctor reads dnf.conf's own repository sections and the
+// reposdir it sets, a quoted enabled counts as enabled, and the dnf step
+// disables a vendor repository dnf.conf defines.
+func TestDoctorDnfReposFollowDnfConf(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	reposDir, dnfConf, setEnabled := rpmHostFixture(t, home, "dnf")
+	setEnabled("0")
+	custom := filepath.Join(t.TempDir(), "custom.repos.d")
+	if err := os.MkdirAll(custom, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(custom, "ext.repo"), []byte("[ext]\nmirrorlist=https://mirror.example/list\nenabled=\"1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeConf := func(reposdir string) {
+		t.Helper()
+		body := "[main]\nreposdir=" + reposdir + "\n\n[baseos]\nname=Rocky BaseOS\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\nenabled=\"1\"\n"
+		if err := os.WriteFile(dnfConf, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConf(reposDir + "," + custom)
+
+	row := dnfReposRow(t, "--url", "https://bodega.internal")
+	if !strings.Contains(row, "WARN") || !strings.Contains(row, "baseos (dnf.conf:") || !strings.Contains(row, "ext (ext.repo: https://mirror.example/list)") {
+		t.Errorf("dnf-repos row = %q", row)
+	}
+
+	var ran [][]string
+	prevRun := doctorRun
+	doctorRun = func(name string, args ...string) error {
+		ran = append(ran, append([]string{name}, args...))
+		return nil
+	}
+	t.Cleanup(func() { doctorRun = prevRun })
+	srv, _ := rpmPlanServer(t)
+	out, err := runDoctor(t, "--configure", "rpm", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil || len(ran) != 1 || !slices.Equal(ran[0], strings.Fields("dnf config-manager --set-disabled baseos")) {
+		t.Fatalf("--apply = %v, ran %v:\n%s", err, ran, out)
+	}
+
+	if err := os.Remove(filepath.Join(home, clientconf.RpmRepoPath)); err != nil {
+		t.Fatal(err)
+	}
+	writeConf(custom)
+	ran = nil
+	_, err = runDoctor(t, "--configure", "rpm", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err == nil || !strings.Contains(err.Error(), "dnf would never read") || len(ran) != 0 {
+		t.Errorf("--apply with reposdir leaving out yum.repos.d = %v, ran %v", err, ran)
+	}
+	if _, err := os.Stat(filepath.Join(home, clientconf.RpmRepoPath)); err == nil {
+		t.Error("bodega.repo was written where dnf's reposdir does not look")
 	}
 }

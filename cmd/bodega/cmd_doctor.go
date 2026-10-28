@@ -254,7 +254,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			}
 			base := doctorBaseURL(gf, baseURL)
 			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
-			if f, ok := (host.RpmHost{LookPath: doctorLookPath, Dirs: doctorYumReposDirs}).Check(base); ok {
+			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
 			if f, ok := ubuntuPro.finding(); ok {
@@ -713,9 +713,11 @@ var (
 	doctorOCIRoot  = ""
 )
 
-// doctorYumReposDirs are where doctor reads dnf's .repo files, and
-// doctorRun how it runs the dnf step, so a test can stand in for both.
+// doctorDnfConf and doctorYumReposDirs are where doctor reads dnf's
+// configuration, and doctorRun how it runs the dnf step, so a test can stand
+// in for each.
 var (
+	doctorDnfConf      = clientconf.DnfMainConf
 	doctorYumReposDirs = clientconf.YumReposDirs
 	doctorRun          = func(name string, args ...string) error {
 		cmd := exec.Command(name, args...)
@@ -774,11 +776,19 @@ func rpmDisableStep(changes []clientconf.Change) ([]string, error) {
 		id, ver := clientconf.OSReleaseIDs(data)
 		return nil, fmt.Errorf("rpm: the plan configures dnf, and %s reads ID=%s VERSION_ID=%s, which this bodega's rpm client table does not name; upgrade bodega on this host", doctorOSRelease, id, ver)
 	}
-	repos, err := clientconf.ReadYumRepos(doctorYumReposDirs...)
+	conf, err := clientconf.ReadDnfConfig(doctorDnfConf, doctorYumReposDirs)
 	if err != nil {
 		return nil, fmt.Errorf("rpm: %w", err)
 	}
-	ids := clientconf.RpmDisableIDs(d, clientconf.RpmHostUpstreams(repoFile.New), repos, clientconf.RpmBasearch(runtime.GOARCH))
+	if dir := filepath.Dir(repoFile.Target); !conf.ReadsDir(dir) {
+		dirs := strings.Join(conf.ReposDirs, ",")
+		if dirs == "" {
+			dirs = "nothing"
+		}
+		return nil, fmt.Errorf("rpm: %s sets reposdir to %s, so dnf would never read %s and nothing was written.\n"+
+			"  Add %s to reposdir in %s, then re-run", doctorDnfConf, dirs, repoFile.Target, dir, doctorDnfConf)
+	}
+	ids := clientconf.RpmDisableIDs(d, clientconf.RpmHostUpstreams(repoFile.New), conf.Repos, clientconf.RpmBasearch(runtime.GOARCH))
 	if len(ids) == 0 {
 		return nil, nil
 	}

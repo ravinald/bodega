@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,10 @@ const (
 	RpmKeyPath  = "/etc/pki/rpm-gpg/RPM-GPG-KEY-bodega"
 	RpmKeyRoute = "/rpm/bodega.gpg"
 )
+
+// DnfMainConf is dnf's main configuration file, which can define
+// repositories itself and sets the reposdir dnf reads .repo files from.
+const DnfMainConf = "/etc/dnf/dnf.conf"
 
 // YumReposDirs are the directories dnf reads .repo files from when dnf.conf
 // sets no reposdir, in dnf's own order.
@@ -195,7 +200,7 @@ func RpmHostUpstreams(content []byte) []string {
 	return out
 }
 
-// YumRepo is one repository section of a .repo file, as dnf reads it.
+// YumRepo is one repository section of dnf's configuration, as dnf reads it.
 type YumRepo struct {
 	ID      string
 	File    string
@@ -206,111 +211,235 @@ type YumRepo struct {
 	URLs []string
 }
 
-// ReadYumRepos reads every .repo file in dirs, skipping a directory that
-// does not exist. A repository with no enabled line is enabled, as dnf
-// treats it. A value continued on an indented line (a second baseurl) is
-// read as part of the key above it.
-func ReadYumRepos(dirs ...string) ([]YumRepo, error) {
-	var out []YumRepo
-	for _, dir := range dirs {
-		files, err := filepath.Glob(filepath.Join(dir, "*.repo"))
-		if err != nil {
-			return nil, err
-		}
-		slices.Sort(files)
-		for _, path := range files {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil, fmt.Errorf("read %s: %w", path, err)
-			}
-			out = append(out, parseYumRepos(path, data)...)
-		}
-	}
-	return out, nil
+// DnfConfig is the repository configuration dnf loads on a host: the
+// repository sections of its main file and of every .repo file in the
+// reposdir that file sets, or in the default directories when it sets none.
+type DnfConfig struct {
+	Repos     []YumRepo
+	ReposDirs []string
 }
 
-func parseYumRepos(path string, data []byte) []YumRepo {
-	var out []YumRepo
-	var cur *YumRepo
-	lastKey := ""
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimRight(raw, " \t\r")
-		trimmed := strings.TrimSpace(line)
+// ReadsDir reports whether dnf reads .repo files from dir.
+func (c DnfConfig) ReadsDir(dir string) bool {
+	return slices.ContainsFunc(c.ReposDirs, func(d string) bool { return filepath.Clean(d) == filepath.Clean(dir) })
+}
+
+// ReadDnfConfig reads dnf's repositories the way dnf's RepoReader does: the
+// sections of mainConf other than [main] first, then each *.repo file in the
+// effective reposdir, sorted by path. A mainConf or directory that does not
+// exist contributes nothing, and an empty mainConf is not read. A repository
+// id seen twice keeps its first definition, which is the one dnf loads.
+func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
+	c := DnfConfig{ReposDirs: defaultDirs}
+	var sections []iniSection
+	if mainConf != "" {
+		data, err := os.ReadFile(mainConf)
 		switch {
-		case trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";"):
-			continue
-		case strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"):
-			out = append(out, YumRepo{ID: strings.TrimSpace(trimmed[1 : len(trimmed)-1]), File: path, Enabled: true})
-			cur, lastKey = &out[len(out)-1], ""
-			continue
-		case cur == nil:
-			continue
-		case line[0] == ' ' || line[0] == '\t':
-			if lastKey == "baseurl" {
-				cur.URLs = append(cur.URLs, strings.Fields(trimmed)...)
-			}
-			continue
-		}
-		key, val, ok := strings.Cut(trimmed, "=")
-		if !ok {
-			continue
-		}
-		key, val = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(val)
-		lastKey = key
-		switch key {
-		case "enabled":
-			cur.Enabled = yumTrue(val)
-		case "baseurl":
-			cur.URLs = append(cur.URLs, strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })...)
-		case "mirrorlist", "metalink":
-			if val != "" {
-				cur.URLs = append(cur.URLs, val)
-			}
+		case err == nil:
+			sections = parseDnfIni(data)
+		case !os.IsNotExist(err):
+			return DnfConfig{}, fmt.Errorf("read %s: %w", mainConf, err)
 		}
 	}
+	for _, sec := range sections {
+		if sec.name != "main" {
+			continue
+		}
+		if v, ok := sec.values["reposdir"]; ok {
+			c.ReposDirs = dnfList(v)
+		}
+	}
+	add := func(path string, secs []iniSection) {
+		for _, sec := range secs {
+			if sec.name == "main" || slices.ContainsFunc(c.Repos, func(r YumRepo) bool { return r.ID == sec.name }) {
+				continue
+			}
+			c.Repos = append(c.Repos, sec.repo(path))
+		}
+	}
+	add(mainConf, sections)
+	var files []string
+	for _, dir := range c.ReposDirs {
+		found, err := filepath.Glob(filepath.Join(dir, "*.repo"))
+		if err != nil {
+			return DnfConfig{}, err
+		}
+		files = append(files, found...)
+	}
+	slices.SortFunc(files, func(a, b string) int {
+		return slices.Compare(strings.Split(strings.TrimSuffix(a, ".repo"), "/"), strings.Split(strings.TrimSuffix(b, ".repo"), "/"))
+	})
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return DnfConfig{}, fmt.Errorf("read %s: %w", path, err)
+		}
+		add(path, parseDnfIni(data))
+	}
+	return c, nil
+}
+
+type iniSection struct {
+	name   string
+	values map[string]string
+}
+
+// repo reads a section as a repository. dnf looks options up by their exact
+// name, and keeps an option's default when its value does not parse, so an
+// enabled value dnf cannot read leaves the repository enabled.
+func (s iniSection) repo(path string) YumRepo {
+	r := YumRepo{ID: s.name, File: path, Enabled: true}
+	if v, ok := s.values["enabled"]; ok {
+		r.Enabled = !slices.Contains([]string{"0", "no", "false", "off"}, strings.ToLower(v))
+	}
+	r.URLs = dnfList(s.values["baseurl"])
+	for _, k := range []string{"mirrorlist", "metalink"} {
+		if v := strings.TrimSpace(s.values[k]); v != "" && v != "None" {
+			r.URLs = append(r.URLs, v)
+		}
+	}
+	return r
+}
+
+// dnfList splits a list option (baseurl, reposdir) on commas and whitespace,
+// continuation lines included.
+func dnfList(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' })
+}
+
+// parseDnfIni reads a dnf configuration file with libdnf's IniParser rules:
+// a comment is a line opening with # or ; in its first column; a line
+// opening with whitespace continues the value above it, joined by a newline;
+// a value's trailing newlines go, and then one pair of matching quotes
+// around it. A repeated section merges and a repeated key keeps its last
+// value. Where IniParser rejects the whole file this reads what it can, so a
+// malformed file is reported on rather than read as holding nothing.
+func parseDnfIni(data []byte) []iniSection {
+	var out []iniSection
+	cur := -1
+	key, val, inValue := "", "", false
+	flush := func() {
+		if !inValue {
+			return
+		}
+		val = strings.TrimRight(val, "\n")
+		if len(val) > 1 && val[0] == val[len(val)-1] && (val[0] == '"' || val[0] == '\'') {
+			val = val[1 : len(val)-1]
+		}
+		out[cur].values[key] = val
+		inValue = false
+	}
+	for _, line := range strings.Split(strings.TrimPrefix(string(data), "\uFEFF"), "\n") {
+		if line == "" || line[0] == '#' || line[0] == ';' {
+			flush()
+			continue
+		}
+		start := strings.IndexFunc(line, func(r rune) bool { return r != ' ' && r != '\t' && r != '\r' })
+		if start < 0 {
+			if inValue {
+				val += "\n"
+			}
+			continue
+		}
+		body := strings.TrimRight(line[start:], " \t\r")
+		if inValue && (start == 0 || body[0] == '[') {
+			flush()
+		}
+		switch {
+		case body[0] == '[':
+			end := sectionEnd(body)
+			if end < 0 {
+				continue
+			}
+			name := body[1:end]
+			cur = slices.IndexFunc(out, func(s iniSection) bool { return s.name == name })
+			if cur < 0 {
+				out = append(out, iniSection{name: name, values: map[string]string{}})
+				cur = len(out) - 1
+			}
+		case cur < 0:
+		case start > 0:
+			if inValue {
+				val += "\n" + body
+			}
+		default:
+			eq := strings.IndexByte(body, '=')
+			if eq <= 0 {
+				continue
+			}
+			key = strings.TrimRight(body[:eq], " \t")
+			val = strings.TrimLeft(body[eq+1:], " \t")
+			inValue = true
+		}
+	}
+	flush()
 	return out
 }
 
-// yumTrue reads a dnf boolean. Anything dnf does not read as true is false.
-func yumTrue(v string) bool {
-	switch strings.ToLower(v) {
-	case "1", "yes", "true", "on":
-		return true
+// sectionEnd is the index of the ] closing a section header, skipping one
+// that closes a [...] range inside the name, or -1 when there is none.
+func sectionEnd(header string) int {
+	inRange := false
+	for i := 1; i < len(header); i++ {
+		switch header[i] {
+		case ']':
+			if !inRange {
+				return i
+			}
+			inRange = false
+		case '[':
+			inRange = true
+		}
 	}
-	return false
+	return -1
 }
 
-// RpmBypasses returns every enabled repository that can fetch from anywhere
-// but bodega: one any of whose URLs does not sit under base's /rpm/ route.
-// With no base to compare, a repository counts as bodega's only when its id
-// is one RpmHost writes.
-func RpmBypasses(repos []YumRepo, base string) []YumRepo {
+// RpmBypasses sorts the enabled repositories that cannot be shown to fetch
+// through bodega. With base, around is every one any of whose URLs is not
+// under base's /rpm/ route, or that has no URL at all. With no base there is
+// no bodega to compare against: a URL whose path holds no /rpm/ segment
+// cannot be bodega's rpm route and still lands in around, and a repository
+// whose every URL might be is unverified rather than passed, whatever its id.
+func RpmBypasses(repos []YumRepo, base string) (around, unverified []YumRepo) {
 	prefix := ""
 	if base != "" {
-		prefix = strings.TrimPrefix(strings.TrimPrefix(trim(base), "https://"), "http://") + "/rpm/"
+		prefix = stripScheme(trim(base)) + "/rpm/"
 	}
-	var out []YumRepo
 	for _, r := range repos {
 		if !r.Enabled {
 			continue
 		}
-		if prefix == "" {
-			if !strings.HasPrefix(r.ID, "bodega-") {
-				out = append(out, r)
-			}
-			continue
-		}
+		bypass, maybe := len(r.URLs) == 0, false
 		for _, u := range r.URLs {
-			if !strings.HasPrefix(strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://"), prefix) {
-				out = append(out, r)
-				break
+			switch {
+			case prefix != "" && !strings.HasPrefix(stripScheme(u), prefix):
+				bypass = true
+			case prefix == "" && !strings.Contains(urlPath(u), "/rpm/"):
+				bypass = true
+			case prefix == "":
+				maybe = true
 			}
 		}
-		if len(r.URLs) == 0 && !strings.HasPrefix(r.ID, "bodega-") {
-			out = append(out, r)
+		switch {
+		case bypass:
+			around = append(around, r)
+		case maybe:
+			unverified = append(unverified, r)
 		}
 	}
-	return out
+	return around, unverified
+}
+
+func stripScheme(u string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+}
+
+// urlPath is u's path, or u itself when it does not parse as a URL.
+func urlPath(u string) string {
+	if p, err := url.Parse(u); err == nil {
+		return p.Path
+	}
+	return u
 }
 
 // RpmDisableIDs names the vendor repositories `dnf config-manager

@@ -1242,44 +1242,61 @@ func inHost(host string) string {
 	return " (" + host + ")"
 }
 
-// RpmHost is what the dnf check reads, so a test can stand in for both: how
-// to find dnf, and the directories dnf reads .repo files from.
+// RpmHost is what the dnf check reads, so a test can stand in for each: how
+// to find dnf, dnf's main configuration file, and the directories dnf reads
+// .repo files from when that file sets no reposdir.
 type RpmHost struct {
 	LookPath func(string) (string, error)
+	MainConf string
 	Dirs     []string
 }
 
 const rpmRemedy = "bodega doctor --configure rpm --apply --url <bodega base URL>"
 
 // Check reports every enabled dnf repository that fetches from anywhere but
-// bodega's /rpm/ route. ok is false on a host with no dnf, which gets no row.
+// bodega's /rpm/ route. With no base it cannot tell bodega's repositories
+// from others, so it names the ones it could not place rather than passing
+// them. ok is false on a host with no dnf, which gets no row.
 func (t RpmHost) Check(base string) (f Finding, ok bool) {
 	if _, err := t.LookPath("dnf"); err != nil {
 		return Finding{}, false
 	}
 	f.Check = "dnf-repos"
-	repos, err := clientconf.ReadYumRepos(t.Dirs...)
+	conf, err := clientconf.ReadDnfConfig(t.MainConf, t.Dirs)
 	if err != nil {
 		f.Status, f.Detail = StatusSkip, err.Error()
 		f.Remediation = "run doctor as root, or repair the file named"
 		return f, true
 	}
-	bypass := clientconf.RpmBypasses(repos, base)
-	if len(bypass) == 0 {
+	around, unverified := clientconf.RpmBypasses(conf.Repos, base)
+	const noBase = "with no bodega URL to compare against, these may or may not be bodega's"
+	switch {
+	case len(around) == 0 && len(unverified) == 0:
 		f.Status, f.Detail = StatusOK, "every enabled dnf repository fetches through bodega"
-		return f, true
+	case len(around) == 0:
+		f.Status = StatusSkip
+		f.Detail = fmt.Sprintf("%s (%d): %s", noBase, len(unverified), describeYumRepos(unverified))
+		f.Remediation = "pass --url <bodega base URL>, or set public_url in the config file"
+	default:
+		f.Status = StatusWarn
+		f.Detail = fmt.Sprintf("enabled dnf repositories fetching around bodega (%d): %s; bypasses bodega's rpm proxy",
+			len(around), describeYumRepos(around))
+		if len(unverified) > 0 {
+			f.Detail += fmt.Sprintf("; %s (%d): %s", noBase, len(unverified), describeYumRepos(unverified))
+		}
+		f.Remediation = rpmRemedy + "; a repository bodega does not serve is disabled with dnf config-manager --set-disabled <id>"
 	}
-	parts := make([]string, len(bypass))
-	for i, r := range bypass {
+	return f, true
+}
+
+func describeYumRepos(repos []clientconf.YumRepo) string {
+	parts := make([]string, len(repos))
+	for i, r := range repos {
 		where := "no baseurl"
 		if len(r.URLs) > 0 {
 			where = strings.Join(r.URLs, " ")
 		}
 		parts[i] = fmt.Sprintf("%s (%s: %s)", r.ID, filepath.Base(r.File), where)
 	}
-	f.Status = StatusWarn
-	f.Detail = fmt.Sprintf("enabled dnf repositories fetching around bodega (%d): %s; bypasses bodega's rpm proxy",
-		len(bypass), strings.Join(parts, ", "))
-	f.Remediation = rpmRemedy + "; a repository bodega does not serve is disabled with dnf config-manager --set-disabled <id>"
-	return f, true
+	return strings.Join(parts, ", ")
 }
