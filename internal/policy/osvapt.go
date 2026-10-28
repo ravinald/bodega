@@ -204,7 +204,12 @@ type osvLookup struct {
 // with it rather than passing.
 func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defaultSuite string, servedSuites []string) osvLookup {
 	if pm.Type == manifest.TypeRpm {
-		eco := ve.Metadata[RpmOSVEcosystemKey]
+		vendor := ve.Metadata[RpmOSVEcosystemKey]
+		eco := rpmReleaseEcosystem(vendor, ve.Metadata[RpmReleaseKey])
+		if eco == "" {
+			return osvLookup{reason: fmt.Sprintf("rpm entry %s names no Enterprise Linux release (%s %q), so nothing selects which of %s's releases' advisories cover it; "+
+				"fetch it through /rpm/<repository>/<releasever>/, which records the release", pm.Name, RpmReleaseKey, ve.Metadata[RpmReleaseKey], vendor)}
+		}
 		return osvLookup{targets: []osvTarget{{ecosystem: eco, name: pm.Name}},
 			queried: fmt.Sprintf("%s in %s", pm.Name, eco)}
 	}

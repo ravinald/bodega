@@ -124,12 +124,19 @@ func TestOSVTrimChangesNoVerdict(t *testing.T) {
 			}
 
 			for _, key := range keys {
+				// An rpm vendor index files a package under "<major>/<name>",
+				// and a lookup names the release rather than the vendor.
+				lookupEco, name := eco, key
+				if idx.ByRelease {
+					major, n, _ := strings.Cut(key, "/")
+					lookupEco, name = eco+":"+major, n
+				}
 				for _, v := range versions {
-					gotVulns, gotSkipped, err := trimmed.Match(eco, key, v)
+					gotVulns, gotSkipped, err := trimmed.Match(lookupEco, name, v)
 					if err != nil {
 						t.Fatalf("%s %s@%s: %v", eco, key, v, err)
 					}
-					wantVulns, wantSkipped, err := kept.Match(eco, key, v)
+					wantVulns, wantSkipped, err := kept.Match(lookupEco, name, v)
 					if err != nil {
 						t.Fatalf("%s %s@%s: %v", eco, key, v, err)
 					}

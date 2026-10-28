@@ -591,7 +591,7 @@ func (s *Server) handleRpmPackage(w http.ResponseWriter, r *http.Request, t rpmT
 	verify := rpmVerifyingOpener(pkg.sumType, pkg.sum, func(got string) error {
 		return rpmMismatch(t, href, name, version, "primary", pkg.sumType, pkg.sum, got)
 	})
-	fill := rpmFill{repo: t.repo, ecosystem: s.cfg.RpmOSVEcosystem(t.repo), published: pkg.published, datedBy: pkg.datedBy}
+	fill := rpmFill{repo: t.repo, releasever: t.releasever, ecosystem: s.cfg.RpmOSVEcosystem(t.repo), published: pkg.published, datedBy: pkg.datedBy}
 	req := r.WithContext(withRpmFill(withUpstreamOpener(ctx, verify), fill))
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
@@ -816,12 +816,12 @@ func rpmPublished(build, file string) (time.Time, string) {
 }
 
 // rpmFill is what the version gate needs to know about the package a fill
-// fetches beyond its name and version: the repository it comes from, which
-// OSV ecosystem covers that repository, and when primary dates it.
+// fetches beyond its name and version: the repository and release it comes
+// from, which OSV ecosystem covers that repository, and when primary dates it.
 type rpmFill struct {
-	repo, ecosystem string
-	published       time.Time
-	datedBy         string
+	repo, releasever, ecosystem string
+	published                   time.Time
+	datedBy                     string
 }
 
 type rpmFillKey struct{}
@@ -839,7 +839,7 @@ func rpmFillFrom(ctx context.Context) rpmFill {
 
 // describe records f on the version entry the age and OSV checks read.
 func (f rpmFill) describe(ve *manifest.VersionEntry) {
-	ve.Metadata = map[string]string{policy.RpmRepositoryKey: f.repo}
+	ve.Metadata = map[string]string{policy.RpmRepositoryKey: f.repo, policy.RpmReleaseKey: f.releasever}
 	if f.ecosystem != "" {
 		ve.Metadata[policy.RpmOSVEcosystemKey] = f.ecosystem
 	}

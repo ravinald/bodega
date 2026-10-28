@@ -143,6 +143,95 @@ func isRpmEcosystem(ecosystem string) bool {
 	return slices.Contains(manifest.RpmOSVEcosystems, base)
 }
 
+// rpmReleaseEcosystem is the ecosystem an rpm package is looked up under: its
+// vendor and the Enterprise Linux major release it was served for, "Rocky
+// Linux:9" for a releasever of 9 and of 9.4 alike. "" when either is missing.
+//
+// A vendor files every release in one export, and a fixed build for 10 says
+// nothing about 9: el9's openssl and el10's are different source packages
+// with different fixed versions, and a range from one refuses or admits the
+// other wrongly.
+func rpmReleaseEcosystem(vendor, releasever string) string {
+	major, _, _ := strings.Cut(releasever, ".")
+	if vendor == "" || major == "" || strings.Trim(major, "0123456789") != "" {
+		return ""
+	}
+	return vendor + ":" + major
+}
+
+// rpmRecordedRelease is the release ecosystem an `affected` entry answers for,
+// in rpmReleaseEcosystem's form, or "" for one no stock host installs from.
+//
+// Rocky Linux and AlmaLinux file a release as "Rocky Linux:9". Red Hat files
+// the stock release as "Red Hat:enterprise_linux:9::appstream", and its EUS,
+// AUS, E4S and layered-product streams under other product names; those carry
+// release strings a stock host never installed, so they answer nothing here,
+// the same way Ubuntu's FIPS and Realtime streams do not; see
+// ubuntuProEcosystem.
+func rpmRecordedRelease(recorded string) string {
+	parts := strings.Split(recorded, ":")
+	if len(parts) < 2 || !slices.Contains(manifest.RpmOSVEcosystems, parts[0]) {
+		return ""
+	}
+	release := parts[1]
+	if parts[0] == "Red Hat" {
+		if parts[1] != "enterprise_linux" || len(parts) < 3 {
+			return ""
+		}
+		release = parts[2]
+	}
+	return rpmReleaseEcosystem(parts[0], release)
+}
+
+// osvIndexFor names the index a lookup ecosystem is answered from and the key
+// a package is filed under there, and reports whether that index must be
+// keyed by release.
+//
+// An rpm release shares its vendor's index, keyed "<major>/<name>", because a
+// sync is per vendor: which releases clients will ask /rpm/ for is decided by
+// the client's $releasever, not by anything a sync can read.
+func osvIndexFor(ecosystem, name string) (index, key string, byRelease bool) {
+	if isRpmEcosystem(ecosystem) {
+		vendor, major, _ := strings.Cut(ecosystem, ":")
+		return vendor, rpmIndexKey(major, name), true
+	}
+	return ecosystem, osvPackageKey(ecosystem, name), false
+}
+
+func rpmIndexKey(major, name string) string {
+	return major + "/" + strings.ToLower(name)
+}
+
+// rpmAffectsRelease reports whether an API answer's record affects version in
+// the release ecosystem asked about, judged by the record's own entries for
+// that release. api.osv.dev is queried under the vendor and matches any
+// release's ranges, so its hit alone is not an answer for this one. A range
+// the rpm ordering cannot walk keeps the record: the API placed it, and
+// nothing here can say it was wrong.
+func rpmAffectsRelease(ecosystem, version string, affected []osvRecordedAffected) bool {
+	for _, aff := range affected {
+		if rpmRecordedRelease(aff.Package.Ecosystem) != ecosystem {
+			continue
+		}
+		matched, bad := osvAffected{Versions: aff.Versions, Ranges: aff.Ranges}.affects(orderRpm, version)
+		if matched || bad != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// osvRecordedAffected is one `affected` entry as OSV publishes it, with the
+// ecosystem string the release is read from.
+type osvRecordedAffected struct {
+	Package struct {
+		Name      string `json:"name"`
+		Ecosystem string `json:"ecosystem"`
+	} `json:"package"`
+	Versions []string   `json:"versions"`
+	Ranges   []osvRange `json:"ranges"`
+}
+
 // isDistroEcosystem reports whether an OSV ecosystem is one of the per-release
 // Ubuntu or Debian exports ("Ubuntu:22.04:LTS", "Debian:12"), whose versions
 // are full distro version strings rather than upstream releases.

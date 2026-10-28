@@ -169,6 +169,10 @@ type osvIndex struct {
 	Ecosystem string                   `json:"ecosystem"`
 	FetchedAt time.Time                `json:"fetched_at"`
 	Packages  map[string]osvRecordList `json:"packages"`
+	// ByRelease marks an rpm vendor index whose packages are keyed by
+	// release; see osvIndexFor. One without it is keyed by name alone, which
+	// no rpm lookup reads, so Match refuses it rather than answer clean.
+	ByRelease bool `json:"by_release,omitempty"`
 }
 
 // osvRecordList is the records one package key carries, shared across the keys
@@ -428,6 +432,7 @@ func (d *OSVDatabase) Meta(ecosystem string) (OSVDBMeta, error) {
 	if d == nil {
 		return OSVDBMeta{}, ErrOSVDBMissing
 	}
+	ecosystem, _, _ = osvIndexFor(ecosystem, "")
 	if err := validEcosystemFile(ecosystem); err != nil {
 		return OSVDBMeta{}, err
 	}
@@ -461,12 +466,19 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 	if d == nil {
 		return nil, nil, ErrOSVDBMissing
 	}
-	idx, err := d.index(ecosystem)
+	index, key, byRelease := osvIndexFor(ecosystem, name)
+	if byRelease && !strings.Contains(ecosystem, ":") {
+		return nil, nil, fmt.Errorf("rpm lookup in %s names no release, and %s's advisories are kept per release", ecosystem, ecosystem)
+	}
+	idx, err := d.index(index)
 	if err != nil {
 		return nil, nil, err
 	}
+	if byRelease && !idx.ByRelease {
+		return nil, nil, fmt.Errorf("the %s index was written before rpm advisories were kept per release, so it cannot tell %s's records from another release's; run `bodega policy osv sync rpm`", index, ecosystem)
+	}
 	order := osvVersionOrder(ecosystem)
-	for _, rec := range idx.Packages[osvPackageKey(ecosystem, name)] {
+	for _, rec := range idx.Packages[key] {
 		hit, unorderable := false, ""
 		for _, aff := range rec.Affected {
 			matched, bad := aff.affects(order, version)
@@ -623,7 +635,7 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 	indexes := make(map[string]*osvIndex, len(ecosystems))
 	records := make(map[string]int, len(ecosystems))
 	for _, eco := range ecosystems {
-		indexes[eco] = &osvIndex{Ecosystem: eco, Packages: map[string]osvRecordList{}}
+		indexes[eco] = &osvIndex{Ecosystem: eco, Packages: map[string]osvRecordList{}, ByRelease: isRpmEcosystem(eco)}
 	}
 
 	for _, entry := range zr.File {
@@ -688,6 +700,13 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 				byEcosystem[eco] = map[string]osvAffectedList{}
 			}
 			key := osvPackageKey(eco, aff.Package.Name)
+			if isRpmEcosystem(eco) {
+				release := rpmRecordedRelease(aff.Package.Ecosystem)
+				if release == "" {
+					continue
+				}
+				_, key, _ = osvIndexFor(release, aff.Package.Name)
+			}
 			byEcosystem[eco][key] = append(byEcosystem[eco][key], osvAffected{Versions: osvVersions(versions), Ranges: ranges})
 		}
 		for eco, byPackage := range byEcosystem {

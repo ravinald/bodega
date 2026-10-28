@@ -130,6 +130,7 @@ type osvValueIndex struct {
 	Ecosystem string                      `json:"ecosystem"`
 	FetchedAt time.Time                   `json:"fetched_at"`
 	Packages  map[string][]osvValueRecord `json:"packages"`
+	ByRelease bool                        `json:"by_release,omitempty"`
 }
 
 type osvValueRecord struct {
@@ -144,6 +145,7 @@ func valueShapedOSV(idx *osvIndex) *osvValueIndex {
 		Ecosystem: idx.Ecosystem,
 		FetchedAt: idx.FetchedAt,
 		Packages:  make(map[string][]osvValueRecord, len(idx.Packages)),
+		ByRelease: idx.ByRelease,
 	}
 	for key, recs := range idx.Packages {
 		values := make([]osvValueRecord, len(recs))

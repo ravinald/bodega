@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -977,9 +978,16 @@ func TestRpmRefusedByAge(t *testing.T) {
 
 // rpmRockyRecord is RLSA-2024:6783 as OSV files it, cut to what the matcher
 // reads: openssl in Rocky Linux 9, fixed at 1:3.0.7-28.el9_4.
+//
+// rpmRockyEL10Record is a synthetic advisory filed under Rocky Linux 10 alone,
+// in the same export: it must refuse an EL10 build and say nothing about an
+// EL9 one.
+const rpmRockyEL10Record = `{"id":"EL10-ONLY","affected":[{"package":{"name":"openssl","ecosystem":"Rocky Linux:10"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.5.1-1.el10"}]}]}]}`
+
 const rpmRockyRecord = `{"id":"RLSA-2024:6783","summary":"Moderate: openssl security update","affected":[{"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-28.el9_4"}]}]}]}`
 
 // gateRpmOSV syncs "Rocky Linux" from an export holding rpmRockyRecord and
+// rpmRockyEL10Record and
 // turns the rpm advisory gate on.
 func gateRpmOSV(t *testing.T, s *Server) {
 	t.Helper()
@@ -993,6 +1001,8 @@ func gateRpmOSV(t *testing.T, s *Server) {
 		zw := zip.NewWriter(&buf)
 		f, _ := zw.Create("RLSA-2024:6783.json")
 		_, _ = f.Write([]byte(rpmRockyRecord))
+		f, _ = zw.Create("EL10-ONLY.json")
+		_, _ = f.Write([]byte(rpmRockyEL10Record))
 		_ = zw.Close()
 		_, _ = w.Write(buf.Bytes())
 	}))
@@ -1011,7 +1021,9 @@ func gateRpmOSV(t *testing.T, s *Server) {
 // A repository whose upstream is a Rocky mirror, named so by osv_ecosystem,
 // has its packages checked against Rocky Linux's advisories with the epoch
 // primary gives them: the vulnerable openssl is refused before it is fetched,
-// naming the advisory, and the fixed one is served.
+// naming the advisory, and the fixed one is served. The export also carries an
+// EL10-only advisory, which refuses the EL10 build asked for under releasever
+// 10 and not the EL9 build fixed under EL9's own.
 func TestRpmRefusedByOSV(t *testing.T) {
 	m := newRPMMirror(t)
 	s, _ := rpmServer(t, m)
@@ -1021,7 +1033,12 @@ func TestRpmRefusedByOSV(t *testing.T) {
 	built := time.Now().Add(-90 * 24 * time.Hour)
 	vulnerable := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.0.7", rel: "27.el9", build: built}
 	fixed := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.0.7", rel: "28.el9_4", build: built}
-	rpmPublish(t, m, vulnerable, fixed)
+	el10Vulnerable := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.5.0", rel: "1.el10", build: built}
+	el10Fixed := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.5.1", rel: "1.el10", build: built}
+	rpmPublish(t, m, vulnerable, fixed, el10Vulnerable, el10Fixed)
+	// The mirror holds one tree, so the EL10 repository's URL names it
+	// outright and only the releasever bodega is asked under says 10.
+	s.cfg.RpmUpstreams["rocky-baseos-10"] = config.RpmUpstream{URL: m.ts.URL + "/9/BaseOS/$basearch/os/", OSVEcosystem: "Rocky Linux"}
 	gateRpmOSV(t, s)
 
 	rec := doRequest(s, http.MethodGet, rpmRepoPath+vulnerable.href(), nil)
@@ -1038,18 +1055,42 @@ func TestRpmRefusedByOSV(t *testing.T) {
 	if rec := doRequest(s, http.MethodGet, rpmRepoPath+fixed.href(), nil); rec.Code != http.StatusOK {
 		t.Errorf("openssl 1:3.0.7-28.el9_4: %d (%s)", rec.Code, rec.Body.String())
 	}
+
+	rec = doRequest(s, http.MethodGet, "/rpm/rocky-baseos-10/10/x86_64/"+el10Vulnerable.href(), nil)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "EL10-ONLY") || strings.Contains(rec.Body.String(), "RLSA-2024:6783") {
+		t.Errorf("openssl 1:3.5.0-1.el10 under releasever 10: %d, want 403 naming EL10-ONLY alone (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := doRequest(s, http.MethodGet, "/rpm/rocky-baseos-10/10/x86_64/"+el10Fixed.href(), nil); rec.Code != http.StatusOK {
+		t.Errorf("openssl 1:3.5.1-1.el10 under releasever 10: %d (%s)", rec.Code, rec.Body.String())
+	}
 }
 
 // EPEL belongs to no OSV ecosystem. Its package is served with the gate on,
 // and the admission row records the check not run, naming the repository,
-// rather than a pass nobody earned.
+// rather than a pass nobody earned. With both OSV actions ignored it still
+// is not a pass: ignoring a check that cannot run does not make it one that
+// ran.
 func TestRpmEPELRecordsOSVNotRun(t *testing.T) {
+	for _, ignored := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ignored=%v", ignored), func(t *testing.T) { rpmEPELRecordsOSVNotRun(t, ignored) })
+	}
+}
+
+func rpmEPELRecordsOSVNotRun(t *testing.T, ignored bool) {
 	m := newRPMMirror(t)
 	s, _ := rpmServer(t, m)
 	s.cfg.RpmUpstreams["epel"] = config.RpmUpstream{URL: m.ts.URL + "/$releasever/BaseOS/$basearch/os/"}
 	pkg := rpmFixturePkg{name: "htop", epoch: "0", ver: "3.3.0", rel: "1.el9", build: time.Now().Add(-90 * 24 * time.Hour)}
 	rpmPublish(t, m, pkg)
 	gateRpmOSV(t, s)
+	if ignored {
+		if err := s.auditDB.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeRpm, Action: policy.ActionIgnore}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.auditDB.SetOSVMalwarePolicy(t.Context(), audit.OSVMalwarePolicy{Ecosystem: manifest.TypeRpm, Action: policy.ActionIgnore}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if rec := doRequest(s, http.MethodGet, "/rpm/epel/9/x86_64/"+pkg.href(), nil); rec.Code != http.StatusOK {
 		t.Fatalf("htop from EPEL: %d (%s)", rec.Code, rec.Body.String())
 	}
