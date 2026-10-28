@@ -114,6 +114,11 @@ type Server struct {
 	// rpmPrimaries holds each repository tree's parsed primary until
 	// repomd.xml names a new one. See rpmPrimary.
 	rpmPrimaries rpmPrimaryCache
+	// rpmServed is the repomd.xml each client was last served, which its
+	// repomd.xml.asc is signed over.
+	rpmServed rpmServedRepomds
+	// rpmVerified is the cached packages already hashed against primary.
+	rpmVerified rpmVerifiedObjects
 	// mavenArtifacts names the Maven artifacts a version's own file was asked
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.

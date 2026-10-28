@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -467,5 +471,167 @@ func TestRpmPrimaryIndexFollowsTheChecksum(t *testing.T) {
 	}
 	if n := m.hitsFor(rpmPrimaryZst); n != 1 {
 		t.Errorf("new primary fetched %d times, want 1", n)
+	}
+}
+
+// A warm cache answers to the allow-list as a cold fill does: the package an
+// operator stops admitting is refused even where bodega already holds it.
+func TestRpmCachedPackageRefusedByTheAllowList(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	if rec := doRequest(s, http.MethodGet, rpmRepoPath+rpmNginxHref, nil); rec.Code != http.StatusOK {
+		t.Fatalf("warming nginx: %d (%s)", rec.Code, rec.Body.String())
+	}
+	if err := s.auditDB.SetAdmissionMode(t.Context(), audit.AdmissionMode{Ecosystem: manifest.TypeRpm, Mode: audit.ModeListed}); err != nil {
+		t.Fatal(err)
+	}
+	s.policy.Invalidate()
+	if cold := doRequest(s, http.MethodGet, rpmRepoPath+rpmHttpdHref, nil); cold.Code != http.StatusForbidden {
+		t.Fatalf("cold httpd under listed mode: %d, want 403", cold.Code)
+	}
+	got := doRequest(s, http.MethodGet, rpmRepoPath+rpmNginxHref, nil)
+	if got.Code != http.StatusForbidden {
+		t.Fatalf("cached nginx under listed mode: %d, want 403; body=%q", got.Code, got.Body.String())
+	}
+	refusalIncident(t, got.Header(), checkAllowList)
+	if strings.Contains(got.Body.String(), "fixture bytes") {
+		t.Errorf("refusal carries the package bytes: %q", got.Body.String())
+	}
+	if n := m.hitsFor(rpmNginxHref); n != 1 {
+		t.Errorf("upstream asked %d times for nginx, want only the warming fetch", n)
+	}
+	waitForRpmDiscovery(t, s, "nginx", rpmNginxEVR, audit.DecisionDenied)
+}
+
+// The cached signature pair holds across a stale_grace refresh: the client
+// served the old revision is signed the old revision, though the refresh has
+// replaced the cached copy by the time it asks.
+func TestRpmSignatureCoversTheStaleRepomdAfterARefreshLands(t *testing.T) {
+	m := newRPMMirror(t)
+	s, kr := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	s.cache.StaleGrace = time.Millisecond
+	handler := m.ts.Config.Handler
+	m.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		handler.ServeHTTP(w, r)
+	})
+	old := doRequest(s, http.MethodGet, rpmRepoPath+"repodata/repomd.xml", nil).Body.String()
+	moved := old + "<!-- new revision -->"
+	m.set("repodata/repomd.xml", []byte(moved))
+	served := doRequest(s, http.MethodGet, rpmRepoPath+"repodata/repomd.xml", nil).Body.String()
+	if served != old {
+		t.Fatal("stale_grace did not serve the cached revision")
+	}
+	waitForRpmRepomd(t, s, moved)
+	sig := doRequest(s, http.MethodGet, rpmRepoPath+"repodata/repomd.xml.asc", nil)
+	if err := rpmVerifySignature(kr, served, sig.Body.String()); err != nil {
+		t.Fatalf("signature after the refresh landed does not cover the served repomd.xml: %v", err)
+	}
+}
+
+// Two clients holding two revisions are each signed their own.
+func TestRpmSignatureFollowsEachClientsRevision(t *testing.T) {
+	m := newRPMMirror(t)
+	s, kr := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	const hostA, hostB = "192.0.2.10:40000", "192.0.2.20:40000"
+	first := rpmRequestFrom(s, hostA, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	m.set("repodata/repomd.xml", []byte(first+"<!-- new revision -->"))
+	second := rpmRequestFrom(s, hostB, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	if first == second {
+		t.Fatal("the second client was not served the new revision")
+	}
+	for _, c := range []struct{ addr, doc string }{{hostA, first}, {hostB, second}} {
+		sig := rpmRequestFrom(s, c.addr, rpmRepoPath+"repodata/repomd.xml.asc")
+		if err := rpmVerifySignature(kr, c.doc, sig.Body.String()); err != nil {
+			t.Errorf("client %s: signature does not cover the repomd.xml it was served: %v", c.addr, err)
+		}
+	}
+}
+
+// A package whose checksum changes in a new primary, at the same name,
+// version and href, is never answered from the bytes cached under the old one.
+func TestRpmCachedPackageDisagreeingWithPrimaryIs502(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	first := doRequest(s, http.MethodGet, rpmRepoPath+rpmNginxHref, nil)
+	if first.Code != http.StatusOK {
+		t.Fatal(first.Code, first.Body.String())
+	}
+	compressed := rpmFixture(t, rpmPrimaryGz)
+	reader, closeFn, err := rpmDecompress(compressed, ".gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(reader)
+	closeFn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSum := rpmSHA256(first.Body.Bytes())
+	replacement := []byte("new package bytes")
+	newSum := rpmSHA256(replacement)
+	raw = bytes.ReplaceAll(raw, []byte(oldSum), []byte(newSum))
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	newHref := "repodata/" + rpmSHA256(buf.Bytes()) + "-primary.xml.gz"
+	repomd := strings.NewReplacer(rpmPrimaryGz, newHref, rpmSHA256(compressed), rpmSHA256(buf.Bytes())).Replace(string(rpmFixture(t, "repodata/repomd.xml")))
+	m.set(newHref, buf.Bytes())
+	m.set("repodata/repomd.xml", []byte(repomd))
+	m.set(rpmNginxHref, replacement)
+
+	for i := range 2 {
+		got := doRequest(s, http.MethodGet, rpmRepoPath+rpmNginxHref, nil)
+		if got.Code != http.StatusBadGateway {
+			t.Fatalf("request %d after primary moved: %d, want 502; body sha256 %s", i, got.Code, rpmSHA256(got.Body.Bytes()))
+		}
+		refusalIncident(t, got.Header(), checkChecksum)
+		if body := got.Body.String(); !strings.Contains(body, oldSum) || !strings.Contains(body, newSum) {
+			t.Errorf("refusal does not name both digests:\n%s", body)
+		}
+	}
+	stored, _ := s.typeStore(manifest.TypeRpm).Get(t.Context(), manifest.RpmPackageKey(rpmFixtureRepoID, "9", "x86_64", "nginx", rpmNginxEVR, path.Base(rpmNginxHref)))
+	if rpmSHA256(stored) != oldSum {
+		t.Errorf("the cached object changed under a refusal: sha256 %s", rpmSHA256(stored))
+	}
+}
+
+func rpmRequestFrom(s *Server, remoteAddr, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.RemoteAddr = remoteAddr
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func rpmVerifySignature(kr *aptsign.KeyRing, doc, sig string) error {
+	pub, err := kr.PublicKey()
+	if err != nil {
+		return err
+	}
+	ring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+	if err != nil {
+		return err
+	}
+	_, err = openpgp.CheckArmoredDetachedSignature(ring, strings.NewReader(doc), strings.NewReader(sig), nil)
+	return err
+}
+
+func waitForRpmRepomd(t *testing.T, s *Server, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, _ := s.typeStore(manifest.TypeRpm).Get(t.Context(), manifest.RpmRepomdKey(rpmFixtureRepoID, "9", "x86_64"))
+		if string(b) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the background refresh never stored the new repomd.xml")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

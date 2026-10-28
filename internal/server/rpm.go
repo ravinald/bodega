@@ -18,12 +18,15 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ---- dnf repositories ------------------------------------------------------
@@ -131,16 +134,48 @@ func splitRpmPath(escaped string) ([]string, bool) {
 
 // handleRpmRepomd serves the upstream's repomd.xml as it came. Its
 // signature is a separate route, so the bytes here are the upstream's.
+//
+// A client's GET is answered from a copy of the whole document, and that copy
+// is remembered as what this client holds, for the .asc request that follows.
+// The cached object cannot answer that: stale_grace hands one client the old
+// revision while a refresh lands the new one, and another client's request
+// can refresh it between this client's two requests.
 func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTree) {
 	noSharedCache(w)
 	markIndexResponse(r)
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeRpm), manifest.RpmRepomdKey(t.repo, t.releasever, t.basearch),
-		t.base+"repodata/repomd.xml", manifest.TypeRpm, "", "", false, true)
+	key := manifest.RpmRepomdKey(t.repo, t.releasever, t.basearch)
+	serve := func(w http.ResponseWriter) {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeRpm), key, t.base+"repodata/repomd.xml", manifest.TypeRpm, "", "", false, true)
+	}
+	if isOwnRead(r) || r.Method != http.MethodGet {
+		serve(w)
+		return
+	}
+	cw := &capturedResponse{header: http.Header{}}
+	serve(cw)
+	if cw.tooBig {
+		s.logger.Error("rpm repomd.xml exceeds the response buffer", "repository", t.id(), "limit", maxUpstreamBody)
+		http.Error(w, fmt.Sprintf("repomd.xml of %s exceeds bodega's %d-byte buffer; the upstream is not publishing a repository index.", t.id(), maxUpstreamBody), http.StatusBadGateway)
+		return
+	}
+	for k, v := range cw.header {
+		w.Header()[k] = v
+	}
+	status := cw.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status == http.StatusOK {
+		s.rpmServed.record(t.id(), rpmClientKey(r), cw.body.Bytes(), time.Now())
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(cw.body.Bytes())
 }
 
-// handleRpmRepomdSignature signs the cached repomd.xml, read without
-// refreshing it, so a TTL that expires between dnf's two requests does not
-// hand it a signature over a newer document than the one it holds.
+// handleRpmRepomdSignature signs the repomd.xml this client was last served,
+// so the pair verifies whichever revision the cache holds by now. A client
+// with no document on record within rpmServedWindow gets a signature over the
+// cached copy, read without refreshing it.
 func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request, t rpmTree) {
 	noSharedCache(w)
 	markIndexResponse(r)
@@ -149,10 +184,13 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 		http.Error(w, "this server holds no signing key, so it serves repomd.xml unsigned; an operator runs `bodega apt key generate`, or a client sets repo_gpgcheck=0.", http.StatusNotFound)
 		return
 	}
-	doc, err := s.rpmCachedRepomd(r, t)
-	if err != nil {
-		s.writeRpmReadError(w, r, t, "repomd.xml", err)
-		return
+	doc, ok := s.rpmServed.lookup(t.id(), rpmClientKey(r), time.Now())
+	if !ok {
+		var err error
+		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
+			s.writeRpmReadError(w, r, t, "repomd.xml", err)
+			return
+		}
 	}
 	sig, err := sign.signer.DetachSign(doc)
 	if err != nil {
@@ -162,6 +200,84 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", "application/pgp-signature")
 	_, _ = w.Write(sig)
+}
+
+// rpmServedWindow is how long the repomd.xml a client was served stays the
+// one its .asc request is signed over. dnf asks for the signature right after
+// the document; the window only has to outlast a slow link between the two.
+const rpmServedWindow = 10 * time.Minute
+
+// rpmServedClients bounds the clients remembered per repository tree. A client
+// past it is signed the cached copy, as one arriving after the window is.
+const rpmServedClients = 1 << 16
+
+// rpmClientKey is who a repomd.xml was served to: the address and the
+// identity the request carried. Two hosts behind one address with no identity
+// of their own share a key, and the later document wins.
+func rpmClientKey(r *http.Request) string {
+	return ClientIP(r) + "\x00" + callerName(r)
+}
+
+// rpmServedRepomds is the repomd.xml each client was last served, per
+// repository tree. In memory and per process: a second bodega behind the same
+// address answers .asc from the cached copy.
+type rpmServedRepomds struct {
+	mu    sync.Mutex
+	trees map[string]*rpmServedTree
+}
+
+type rpmServedTree struct {
+	latest    []byte
+	clients   map[string]rpmServedDoc
+	lastPrune time.Time
+}
+
+type rpmServedDoc struct {
+	doc []byte
+	at  time.Time
+}
+
+func (c *rpmServedRepomds) record(tree, client string, doc []byte, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.trees == nil {
+		c.trees = map[string]*rpmServedTree{}
+	}
+	t := c.trees[tree]
+	if t == nil {
+		t = &rpmServedTree{clients: map[string]rpmServedDoc{}}
+		c.trees[tree] = t
+	}
+	// One copy per revision, however many clients hold it.
+	if !bytes.Equal(t.latest, doc) {
+		t.latest = bytes.Clone(doc)
+	}
+	if now.Sub(t.lastPrune) > rpmServedWindow {
+		for k, d := range t.clients {
+			if now.Sub(d.at) > rpmServedWindow {
+				delete(t.clients, k)
+			}
+		}
+		t.lastPrune = now
+	}
+	if _, held := t.clients[client]; !held && len(t.clients) >= rpmServedClients {
+		return
+	}
+	t.clients[client] = rpmServedDoc{doc: t.latest, at: now}
+}
+
+func (c *rpmServedRepomds) lookup(tree, client string, now time.Time) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.trees[tree]
+	if t == nil {
+		return nil, false
+	}
+	d, ok := t.clients[client]
+	if !ok || now.Sub(d.at) > rpmServedWindow {
+		return nil, false
+	}
+	return d.doc, true
 }
 
 // rpmCachedRepomd is the stored repomd.xml, fetched through the repomd route
@@ -360,14 +476,131 @@ func (s *Server) handleRpmPackage(w http.ResponseWriter, r *http.Request, t rpmT
 	}
 	key := manifest.RpmPackageKey(t.repo, t.releasever, t.basearch, name, version, path.Base(href))
 	upstream := t.base + href
+	candidate := policy.RpmCandidate(name, t.base)
+	cw := &cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}
+	if st, err := store.Head(ctx, key); err == nil && st != nil && st.Exists {
+		s.serveRpmCachedPackage(cw, r, t, store, key, upstream, candidate, href, pkg)
+		return
+	}
 	verify := rpmVerifyingOpener(pkg.sumType, pkg.sum, func(got string) error {
 		return rpmMismatch(t, href, name, version, "primary", pkg.sumType, pkg.sum, got)
 	})
 	req := r.WithContext(withUpstreamOpener(ctx, verify))
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
-	s.proxyOrResolve(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, req, store, key,
-		resolve, upstream, nil, manifest.TypeRpm, policy.RpmCandidate(name, t.base), name, true, forceProxy)
+	s.proxyOrResolve(cw, req, rpmFillStore{store}, key,
+		resolve, upstream, nil, manifest.TypeRpm, candidate, name, true, forceProxy)
+}
+
+// rpmFillStore is the package store with Head answering that nothing is
+// there, so proxyOrResolve only ever fills. proxyOrResolve serves an
+// immutable hit with no allow-list verdict and no digest check, which suits a
+// key that names its bytes; an rpm key names a version, and the allow-list and
+// the current primary both have to rule on every response. A copy landing
+// between serveRpmCachedPackage's Head and this fill is fetched and verified
+// again rather than served unjudged.
+type rpmFillStore struct{ storage.ObjectStore }
+
+func (rpmFillStore) Head(context.Context, string) (*storage.ObjectInfo, error) {
+	return &storage.ObjectInfo{}, nil
+}
+
+// serveRpmCachedPackage answers from the cache once the allow-list admits the
+// package and the cached bytes hash to the checksum the current primary gives
+// it. One discovery row per request: the gate writes a refusal's, the hit or
+// the mismatch writes the rest.
+func (s *Server) serveRpmCachedPackage(w http.ResponseWriter, r *http.Request, t rpmTree, store storage.ObjectStore, key, upstream, candidate, href string, pkg rpmPackage) {
+	ctx := r.Context()
+	name, version := pkg.name, pkg.evr()
+	baseline := s.baselineLookup(ctx, manifest.TypeRpm, name, key, true)
+	override := s.allowListOverrideLookup(ctx, manifest.TypeRpm, name, key, true)
+	admit := func(obj cachedObject) bool {
+		if _, ok := s.upstreamPolicyGate(w, r, manifest.TypeRpm, upstream, candidate, name, key, true, baseline, override); !ok {
+			return false
+		}
+		got, err := s.rpmCachedDigest(ctx, store, key, pkg, obj)
+		if err != nil {
+			s.logger.Error("rpm cached package could not be verified", "repository", t.id(), "key", key, "error", err)
+			http.Error(w, fmt.Sprintf("bodega could not verify its cached copy of %s %s against the current primary of %s; the server log names the cause. Retry.", name, version, t.id()), http.StatusBadGateway)
+			return false
+		}
+		if got != pkg.sum {
+			s.recordCacheHitDiscovery(ctx, r, manifest.TypeRpm, upstream, candidate, name, key)
+			f := newRefusal(checkChecksum, manifest.TypeRpm, name, version, http.StatusBadGateway)
+			f.reason = fmt.Sprintf("bodega holds %s of %s with %s %s, and the current primary gives it %s, so bodega served nothing.", href, t.id(), pkg.sumType, got, pkg.sum)
+			f.next = fmt.Sprintf("the repository republished %s %s with other bytes; an operator who trusts the new primary runs `bodega pkg remove rpm %s`, and the next request fetches and verifies the package again.", name, version, name)
+			s.logger.Warn("rpm cached package disagrees with primary", "repository", t.id(), "key", key, "cached", got, "primary", pkg.sum, "incident", f.incident)
+			f.write(w, r)
+			return false
+		}
+		return true
+	}
+	s.serveCacheHitIf(w, r, store, key, true, admit, func(obj cachedObject) {
+		s.recordCacheHit(ctx, r, manifest.TypeRpm, upstream, candidate, name, key, obj)
+	})
+}
+
+// rpmCachedDigest is the digest, under the primary's checksum type, of the
+// object serveCacheHitIf opened. The hash reads the object through a second
+// handle, so it vouches for the served one only where both report the same
+// identity; a writer landing between the two opens is an error to retry.
+// A digest already taken for the same identity and checksum is reused, so a
+// warm package is hashed once per process rather than once per request.
+func (s *Server) rpmCachedDigest(ctx context.Context, store storage.ObjectStore, key string, pkg rpmPackage, obj cachedObject) (string, error) {
+	if obj.id.Known() && s.rpmVerified.holds(key, pkg.sum, obj.id) {
+		return pkg.sum, nil
+	}
+	res, err := store.GetStream(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("%s vanished while it was being verified", key)
+	}
+	defer func() { _ = res.Body.Close() }()
+	h := rpmHash(pkg.sumType)
+	if _, err := io.Copy(h, res.Body); err != nil {
+		return "", err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !obj.id.Known() {
+		return got, nil
+	}
+	if streamIdentity(store, res) != obj.id {
+		return "", fmt.Errorf("%s was replaced while it was being verified", key)
+	}
+	if got == pkg.sum {
+		s.rpmVerified.remember(key, pkg.sum, obj.id)
+	}
+	return got, nil
+}
+
+// rpmVerifiedObjects is which stored package objects already hashed to which
+// primary checksum, by the identity the store reported for them.
+type rpmVerifiedObjects struct {
+	mu sync.Mutex
+	m  map[string]rpmVerifiedObject
+}
+
+type rpmVerifiedObject struct {
+	sum string
+	id  audit.ObjectIdentity
+}
+
+func (c *rpmVerifiedObjects) holds(key, sum string, id audit.ObjectIdentity) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[key]
+	return ok && v.sum == sum && v.id == id
+}
+
+func (c *rpmVerifiedObjects) remember(key, sum string, id audit.ObjectIdentity) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]rpmVerifiedObject{}
+	}
+	c.m[key] = rpmVerifiedObject{sum: sum, id: id}
 }
 
 // ---- checksums -------------------------------------------------------------
