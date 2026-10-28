@@ -203,3 +203,142 @@ func TestOCIImageBesideAChartStaysOCI(t *testing.T) {
 	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/example-corp/web")
 	refusalIncident(t, rec.Header(), checkHidden)
 }
+
+// A tag that moved between an image and a chart since bodega cached it is
+// judged again as what the refresh served, in both directions.
+func TestOCIHelmMovedTagJudgedAsWhatItNowNames(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	const toChart = "/v2/library/nginx/manifests/1.27"
+	if rec := doRequest(s, http.MethodGet, toChart, nil); rec.Code != http.StatusOK {
+		t.Fatalf("image: %d %s", rec.Code, rec.Body.String())
+	}
+	f.hub.publishChart("charts/app", "1.0")
+	if rec := doRequest(s, http.MethodGet, "/v2/charts/app/manifests/1.0", nil); rec.Code != http.StatusOK {
+		t.Fatalf("chart: %d %s", rec.Code, rec.Body.String())
+	}
+
+	c := f.hub.publishChart("library/nginx", "1.27")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/library/nginx", manifest.VersionEntry{Version: "1.27", Mode: manifest.ModeProxy, Hidden: true})
+	f.hub.publish("charts/app", "1.0", f.image)
+	addVersion(t, s, manifest.TypeOCI, "docker.io/charts/app", manifest.VersionEntry{Version: "1.0", Mode: manifest.ModeProxy, Hidden: true})
+	s.cache.MetadataTTL = time.Nanosecond
+
+	rec := doRequest(s, http.MethodGet, toChart, nil)
+	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/library/nginx")
+	if strings.Contains(rec.Body.String(), string(c.manifest)) {
+		t.Errorf("the hidden chart's manifest was served")
+	}
+	rec = doRequest(s, http.MethodGet, "/v2/charts/app/manifests/1.0", nil)
+	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/charts/app")
+}
+
+// A classification fetch that fails judges the request as oci, and a
+// serving fetch that then gets a chart does not serve it under that verdict.
+func TestOCIHelmFailedClassificationNeverServesAChartAsOCI(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	c := f.hub.publishChart("charts/app", "2.0.0")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/charts/app", manifest.VersionEntry{Version: "2.0.0", Mode: manifest.ModeProxy, Hidden: true})
+
+	byDigest := "/v2/charts/app/manifests/" + c.digest
+	f.hub.mu.Lock()
+	f.hub.failOnce[byDigest] = true
+	f.hub.failOnce["/v2/charts/app/manifests/2.0.0"] = true
+	f.hub.mu.Unlock()
+
+	rec := doRequest(s, http.MethodGet, byDigest, nil)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a chart fetched after a failed classification was served as oci: %s", rec.Body.String())
+	}
+	if rec := doRequest(s, http.MethodGet, byDigest, nil); rec.Code != http.StatusNotFound {
+		t.Errorf("retry by digest = %d %s, want the helm hide's 404", rec.Code, rec.Body.String())
+	}
+	rec = doRequest(s, http.MethodGet, "/v2/charts/app/manifests/2.0.0", nil)
+	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/charts/app")
+	if n := f.hub.blobHits(c, "charts/app"); n != 0 {
+		t.Errorf("the hidden chart's blobs were fetched %d times", n)
+	}
+}
+
+// A chart's config and layer follow the verdict of the chart that names
+// them: a hidden version refuses both before either is fetched, and a
+// constraint added after a blob was cached refuses the cached copy too.
+func TestOCIHelmBlobsFollowTheirChartsVerdict(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	cur := f.hub.publishChart("charts/app", "2.0.0")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/charts/app", manifest.VersionEntry{Version: "2.0.0", Mode: manifest.ModeProxy, Hidden: true})
+
+	rec := doRequest(s, http.MethodGet, "/v2/charts/app/manifests/2.0.0", nil)
+	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/charts/app")
+	for _, d := range []string{cur.configD, cur.layerD} {
+		rec := doRequest(s, http.MethodGet, "/v2/charts/app/blobs/"+d, nil)
+		assertOCIError(t, rec, http.StatusNotFound, "BLOB_UNKNOWN", "docker.io/charts/app")
+	}
+	if n := f.hub.blobHits(cur, "charts/app"); n != 0 {
+		t.Errorf("the hidden version's blobs were fetched %d times", n)
+	}
+
+	old := f.hub.publishChart("charts/other", "1.0.0")
+	if rec := doRequest(s, http.MethodGet, "/v2/charts/other/manifests/1.0.0", nil); rec.Code != http.StatusOK {
+		t.Fatalf("chart 1.0.0: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, d := range []string{old.configD, old.layerD} {
+		if rec := doRequest(s, http.MethodGet, "/v2/charts/other/blobs/"+d, nil); rec.Code != http.StatusOK {
+			t.Fatalf("chart 1.0.0 blob %s: %d %s", d, rec.Code, rec.Body.String())
+		}
+	}
+	addVersion(t, s, manifest.TypeHelm, "docker.io/charts/other", manifest.VersionEntry{Version: "3.0.0", Mode: manifest.ModeProxy, VersionConstraint: manifest.ConstraintExact})
+	for _, d := range []string{old.configD, old.layerD} {
+		rec := doRequest(s, http.MethodGet, "/v2/charts/other/blobs/"+d, nil)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("cached blob of a chart the pin now refuses = %d %s, want 403", rec.Code, rec.Body.String())
+		}
+		refusalIncident(t, rec.Header(), checkConstraint)
+	}
+	if n := f.hub.blobHits(old, "charts/other"); n != 2 {
+		t.Errorf("the cached blobs were fetched %d times, want once each", n)
+	}
+}
+
+// An image in a repository that also holds a chart keeps F70's verdict
+// through its blobs: hiding the chart's version does not reach them.
+func TestOCIHelmImageBlobsInAChartRepositoryStayOCI(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	c := f.hub.publishChart("library/nginx", "chart-1.0.0")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/library/nginx", manifest.VersionEntry{Version: "chart-1.0.0", Mode: manifest.ModeProxy, Hidden: true})
+	rec := doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/chart-1.0.0", nil)
+	assertOCIError(t, rec, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/library/nginx")
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/blobs/"+c.layerD, nil), http.StatusNotFound, "BLOB_UNKNOWN")
+
+	for _, p := range []string{"/v2/library/nginx/manifests/1.27", "/v2/library/nginx/manifests/" + f.image.amd64Digest,
+		"/v2/library/nginx/blobs/" + f.image.amd64ConfigD, "/v2/library/nginx/blobs/" + f.image.amd64LayerD} {
+		if rec := doRequest(s, http.MethodGet, p, nil); rec.Code != http.StatusOK {
+			t.Errorf("%s: %d %s, want the image served as oci", p, rec.Code, rec.Body.String())
+		}
+	}
+	waitForDiscoveryRow(t, s, manifest.TypeOCI, "docker.io/library/nginx", f.image.amd64LayerD)
+}
+
+// A profile entry pinning a chart, with no package entry behind it, admits
+// the chart's digest once a tag it admits resolved to it, and still refuses
+// a digest no tag resolved.
+func TestOCIHelmProfilePinAdmitsTheResolvedDigest(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	c := f.hub.publishChart("charts/app", "1.0.0")
+	pf := bindProfile(t, s, "charts", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeHelm, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeHelm, Name: "docker.io/charts/app", Constraint: manifest.ConstraintExact, Version: "1.0.0"}})
+
+	if status, body := pf.get(t, "/v2/charts/app/manifests/"+c.digest); status != http.StatusForbidden {
+		t.Errorf("unresolved digest = %d %s, want 403", status, body)
+	}
+	for _, p := range []string{"/v2/charts/app/manifests/1.0.0", "/v2/charts/app/manifests/" + c.digest, "/v2/charts/app/blobs/" + c.layerD} {
+		if status, body := pf.get(t, p); status != http.StatusOK {
+			t.Errorf("%s: %d %s, want the pinned chart served", p, status, body)
+		}
+	}
+}

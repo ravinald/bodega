@@ -330,22 +330,10 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 	ctx := r.Context()
 	name := t.name()
 	typ, fetched := s.ociManifestType(r, t)
-	pm, _ := s.store.GetPackage(ctx, typ, name)
-	if pm != nil {
-		if isPackageHidden(pm) {
-			s.refuseHidden(w, r, typ, name, "")
-			return
-		}
-		if !s.ociJudgeVersion(w, r, typ, pm, name, t.ref) {
-			return
-		}
-	}
-	if !s.entitleGate(w, r, typ, name, t.ref) {
-		return
-	}
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCITagKey(t.registry, t.repo, t.ref)
-	if !s.ociAllowListGate(w, r, typ, t, key, false) {
+	pm, ok := s.ociGate(w, r, typ, t, t.ref, true, key, false)
+	if !ok {
 		return
 	}
 
@@ -380,6 +368,16 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 		byDigest.ref = doc.Digest
 		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), typ, byDigest, pm, doc.MediaType, nil)
 		return
+	}
+	// A refresh can move the tag to a manifest of the other type after the
+	// gates ran, so what is served is judged again as what it is.
+	if served := ociArtifactType(body); served != typ {
+		if _, ok := s.ociGate(w, r, served, t, t.ref, true, key, false); !ok {
+			return
+		}
+	}
+	if ociArtifactType(body) == manifest.TypeHelm {
+		s.ociRecordChart(ctx, t, doc.Digest, body)
 	}
 	w.Header().Set("Cache-Control", cachePrivate)
 	writeOCIManifest(w, r, doc.MediaType, doc.Digest, body)
@@ -426,30 +424,10 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 // constraint has nothing to compare.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
-	name := t.name()
 	typ, fetched := s.ociManifestType(r, t)
-	pm, _ := s.store.GetPackage(ctx, typ, name)
-	version := t.ref
-	if pm != nil {
-		if isPackageHidden(pm) {
-			s.refuseHidden(w, r, typ, name, "")
-			return
-		}
-		if tag := s.ociResolvedTag(ctx, t); tag != "" {
-			version = tag
-			if !s.ociJudgeVersion(w, r, typ, pm, name, tag) {
-				return
-			}
-		} else if ociConstrained(pm) {
-			vc, baseVer := packageVersionConstraint(pm)
-			s.refuseUnresolvedDigest(w, r, typ, name, t.ref, baseVer, vc)
-			return
-		}
-	}
-	if !s.entitleGate(w, r, typ, name, version) {
-		return
-	}
-	if !s.ociAllowListGate(w, r, typ, t, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true) {
+	version, resolved := s.ociVersionFor(ctx, t)
+	pm, ok := s.ociGate(w, r, typ, t, version, resolved, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true)
+	if !ok {
 		return
 	}
 	s.serveOCIManifestDigest(w, r, typ, t, pm, "", fetched)
@@ -488,7 +466,7 @@ func (s *Server) serveOCIManifestDigest(w *ociResponseWriter, r *http.Request, t
 	w.contentType = mediaType
 	w.Header().Set(ociDigestHeader, t.ref)
 	w.Header().Set("ETag", `"`+t.ref+`"`)
-	req := r.WithContext(withUpstreamOpener(ctx, s.ociManifestOpener(t, store, fetched)))
+	req := r.WithContext(withUpstreamOpener(ctx, s.ociManifestOpener(t, store, typ, fetched)))
 	upstream := t.url(ociManifests + "/" + t.ref)
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	s.proxyOrResolve(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, req, store, key,
@@ -515,18 +493,10 @@ func (s *Server) ociStoredMediaType(ctx context.Context, store storage.ObjectSto
 func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
-	typ := s.ociRepoType(ctx, t)
-	pm, _ := s.store.GetPackage(ctx, typ, name)
-	if pm != nil && isPackageHidden(pm) {
-		s.refuseHidden(w, r, typ, name, "")
-		return
-	}
-	if !s.entitleGate(w, r, typ, name, "") {
-		return
-	}
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCIBlobKey(t.ref)
-	if !s.ociAllowListGate(w, r, typ, t, key, true) {
+	typ, pm, ok := s.ociBlobGate(w, r, t, key)
+	if !ok {
 		return
 	}
 	upstream := t.url(ociBlobs + "/" + t.ref)
@@ -534,7 +504,7 @@ func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarge
 	dw := &cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}
 	if store != nil {
 		if info, err := store.Head(ctx, key); err == nil && info != nil && info.Exists {
-			s.serveOCIBlobHit(dw, r, store, key, t, upstream)
+			s.serveOCIBlobHit(dw, r, store, key, typ, t, upstream)
 			return
 		}
 	}
@@ -547,14 +517,14 @@ func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarge
 // serveOCIBlobHit is serveCacheHit with Range honored: containerd resumes an
 // interrupted layer with one, and a layer runs to gigabytes. The row is
 // recorded off the handle that supplies the bytes, as serveCacheHit does.
-func (s *Server) serveOCIBlobHit(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key string, t ociTarget, upstream string) {
+func (s *Server) serveOCIBlobHit(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, typ string, t ociTarget, upstream string) {
 	res, ok := s.openStored(w, r, store, key)
 	if !ok {
 		return
 	}
 	defer func() { _ = res.Body.Close() }()
 	obj := cachedObject{store: store, id: streamIdentity(store, res)}
-	s.recordCacheHit(r.Context(), r, s.ociRepoType(r.Context(), t), upstream, t.name(), t.name(), key, obj)
+	s.recordCacheHit(r.Context(), r, typ, upstream, t.name(), t.name(), key, obj)
 	noteServed(r, key, "")
 	h := w.Header()
 	h.Set("Content-Type", "application/octet-stream")
@@ -652,7 +622,10 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 			fmt.Sprintf("n=%q is not a count of tags; send a whole number, or leave n out for every tag.", r.URL.Query().Get("n")))
 		return
 	}
-	typ := s.ociRepoType(ctx, t)
+	typ := manifest.TypeOCI
+	if s.ociRepoHoldsCharts(ctx, t) {
+		typ = manifest.TypeHelm
+	}
 	pm, _ := s.store.GetPackage(ctx, typ, name)
 	if pm != nil && isPackageHidden(pm) {
 		s.refuseHidden(w, r, typ, name, "")
@@ -758,7 +731,7 @@ func (s *Server) ociDigestOpener(t ociTarget) upstreamOpener {
 // often as by its Content-Type, and the refusal has to come before a byte is
 // stored or served. The type it is served under is recorded before
 // proxyOrResolve stores the bytes, so a stored manifest always has one.
-func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, fetched *ociFetched) upstreamOpener {
+func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, typ string, fetched *ociFetched) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
 		f, err := s.ociFetchOnce(ctx, t, rawURL, &fetched)
 		if err != nil {
@@ -767,6 +740,9 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, fetch
 		body, ct, answered := f.body, f.contentType, f.answered
 		if got := ociDigest(body); got != t.ref {
 			return nil, ociMismatch(t, got)
+		}
+		if got := ociArtifactType(body); got != typ {
+			return nil, ociTypeChanged(t, typ, got)
 		}
 		mediaType := ociMediaType(ct, body)
 		if store != nil {

@@ -20,6 +20,7 @@ const (
 	ociTypesMarker    = "/_types/sha256/"
 	ociTagsMarker     = "/_tags/"
 	ociResolvedMarker = "/_resolved/sha256/"
+	ociChartsMarker   = "/_charts/sha256/"
 	ociListSuffix     = "/_list"
 )
 
@@ -110,6 +111,25 @@ func OCIResolvedKey(registry, repo, digest string) string {
 	return ociTagPrefix + registry + "/" + repo + ociResolvedMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
 }
 
+// OCIChartBlobKey records that the chart manifest manifestDigest names blob
+// in a repository, and holds the tag the manifest was reached under. A blob
+// request names no manifest, so this is what judges a chart's config and
+// layer under the chart's verdict. Regenerable from the manifests.
+func OCIChartBlobKey(registry, repo, blob, manifestDigest string) string {
+	return OCIChartBlobPrefix(registry, repo, blob) + strings.TrimPrefix(manifestDigest, OCIDigestPrefix)
+}
+
+// OCIChartBlobPrefix lists every chart manifest of a repository naming blob.
+func OCIChartBlobPrefix(registry, repo, blob string) string {
+	return OCIChartsPrefix(registry, repo) + strings.TrimPrefix(blob, OCIDigestPrefix) + "/"
+}
+
+// OCIChartsPrefix lists every chart blob record of a repository, so a
+// repository holds charts exactly when something is listed under it.
+func OCIChartsPrefix(registry, repo string) string {
+	return ociTagPrefix + registry + "/" + repo + ociChartsMarker
+}
+
 // parseOCIKey is ParseKey for the oci tree. The name is <registry>/<repository>
 // and the version a tag or a digest; a blob names no repository.
 func parseOCIKey(key string) (name, version string) {
@@ -136,6 +156,12 @@ func parseOCIKey(key string) (name, version string) {
 		}
 		if i := strings.LastIndex(rest, ociResolvedMarker); i > 0 {
 			return ociNameVersion(rest[:i], ociDigestVersion(rest[i+len(ociResolvedMarker):]))
+		}
+		if i := strings.LastIndex(rest, ociChartsMarker); i > 0 {
+			if blob, m, ok := strings.Cut(rest[i+len(ociChartsMarker):], "/"); ok && ociDigestVersion(blob) != "" && ociDigestVersion(m) != "" {
+				return ociName(rest[:i]), ""
+			}
+			return "", ""
 		}
 		if n, ok := strings.CutSuffix(rest, ociListSuffix); ok {
 			return ociName(n), ""
