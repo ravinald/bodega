@@ -194,8 +194,9 @@ type Change struct {
 	Existed bool
 	// New is what Apply writes: the fetched file, which matched the plan's
 	// digest, plus any credential KeepCredential carried over from Old, or
-	// for Maven's settings.xml and Composer's config.json, Old with the fetched
-	// file's mirrors or repositories merged in.
+	// for Maven's settings.xml, Composer's config.json, Docker's daemon.json
+	// and containerd's config.toml, Old with the fetched file's settings
+	// merged in.
 	New []byte
 }
 
@@ -242,6 +243,19 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	if rec.System == manifest.TypeComposer {
 		if c.New, err = MergeComposerConfig(c.Old, content); err != nil {
 			return Change{}, fmt.Errorf("%s: cannot merge bodega's repository into %s: %w", rec.System, target, err)
+		}
+	}
+	if rec.System == manifest.TypeOCI {
+		switch {
+		case strings.HasSuffix(rec.Path, "/docker/daemon.json"):
+			c.New, err = MergeDockerDaemon(c.Old, content)
+		case strings.HasSuffix(rec.Path, "/containerd/config.toml"):
+			if c.New, err = MergeContainerdConfig(c.Old, content); err == nil {
+				err = ContainerdEditEffective("", target, c.New)
+			}
+		}
+		if err != nil {
+			return Change{}, fmt.Errorf("%s: cannot merge bodega's settings into %s: %w", rec.System, target, err)
 		}
 	}
 	return c, nil

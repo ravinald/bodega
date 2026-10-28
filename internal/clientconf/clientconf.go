@@ -285,44 +285,17 @@ func HelmDocument(repositories string) string {
 	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + repositories
 }
 
-// OCI renders the two files that point a container runtime at bodega by
-// hand: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
-// else, and a containerd hosts.toml for docker.io, which takes a copy per
-// registry. Neither carries an insecure-registry setting, so a plaintext base
-// is named in a note rather than written for the operator.
+// OCI renders the files a pane shows for pointing a container runtime at
+// bodega: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
+// else, and containerd's hosts.toml for docker.io. `bodega doctor
+// --configure oci` installs the full set OCIClient renders, one hosts.toml
+// per registry the server's oci_upstreams names.
 func OCI(base string) []File {
-	b := trim(base)
-	var notes []string
-	if strings.HasPrefix(b, "http://") {
-		notes = append(notes, "bodega answers on plaintext http here, which Docker accepts only with the host in insecure-registries and containerd only with the host's scheme spelled http:// as above")
-	}
-	daemon := File{
-		System: manifest.TypeOCI,
-		Label:  "Docker daemon.json",
-		Paths: map[string]string{
-			OSLinux:  "/etc/docker/daemon.json",
-			OSDarwin: "~/.docker/daemon.json",
-		},
-		// dockerd stores a mirror with one trailing slash whatever it is
-		// given, so this is the form `docker info` prints back.
-		Content: fmt.Sprintf("{\n  \"registry-mirrors\": [%s]\n}\n", jsonString(b+"/")),
-		Notes: append([]string{
-			"Replaces the file; merge registry-mirrors into an existing daemon.json by hand, then restart dockerd",
-			"Docker Engine mirrors Docker Hub alone: an image from ghcr.io or quay.io still pulls from its own registry",
-		}, notes...),
-	}
-	containerd := File{
-		System: manifest.TypeOCI,
-		Label:  "containerd hosts.toml (docker.io)",
-		Paths: map[string]string{
-			OSLinux: "/etc/containerd/certs.d/docker.io/hosts.toml",
-		},
-		Content: fmt.Sprintf("server = \"https://registry-1.docker.io\"\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n", b),
-		Notes: append([]string{
-			"containerd reads certs.d only when config_path names it in config.toml's registry section",
-			"Copy the file to certs.d/ghcr.io/ and certs.d/quay.io/ with server set to that registry; containerd names the registry to bodega with ?ns=",
-		}, notes...),
-	}
+	daemon := DockerDaemon(base, nil)
+	daemon.Paths = map[string]string{OSLinux: DockerDaemonPath, OSDarwin: "~/.docker/daemon.json"}
+	containerd := ContainerdHosts(base, "docker.io", "https://registry-1.docker.io")
+	containerd.Notes = append(ContainerdConfig(base).Notes,
+		"Copy the file to certs.d/ghcr.io/ and certs.d/quay.io/ with server set to that registry; containerd names the registry to bodega with ?ns=")
 	return []File{daemon, containerd}
 }
 

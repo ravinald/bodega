@@ -41,6 +41,9 @@ reads, keeping every other line, writes the enroll secret from
 BODEGA_OSQUERY_SECRET to a file only root can read, and enables and restarts
 osqueryd. Mint the secret on the server with
 `bodega osquery secret create <instance> <identity>`.
+
+The oci system is left to `bodega doctor --configure oci`, which keeps the
+container runtimes this host runs and merges daemon.json and config.toml.
 EOF
 }
 
@@ -608,6 +611,7 @@ printf '%s\n\n' "$header"
 want=
 if [ -n "$systems" ]; then
 	for s in $(printf '%s' "$systems" | tr ',' ' '); do
+		[ "$s" != oci ] || die "the oci system merges into Docker's daemon.json and containerd's config.toml and keeps only the container runtimes this host runs, which takes a JSON parser this script does not carry. Run: bodega doctor --configure oci --apply --url $base"
 		case " $all " in
 		*" $s "*) want="$want $s" ;;
 		*) die "the plan lists no system named $s. It lists: $(printf '%s' "$all" | sed 's/ /, /g')" ;;
@@ -615,10 +619,11 @@ if [ -n "$systems" ]; then
 	done
 fi
 # osquery writes an enroll secret and restarts a daemon, so a run that names
-# no systems leaves it out rather than doing either unasked.
+# no systems leaves it out rather than doing either unasked. oci is doctor's
+# alone (see usage).
 selected() {
 	if [ -z "$want" ]; then
-		[ "$1" != osquery ]
+		[ "$1" != osquery ] && [ "$1" != oci ]
 		return
 	fi
 	case "$want " in
@@ -653,6 +658,9 @@ fi
 if [ -z "$want" ]; then
 	case " $all " in
 	*" osquery "*) printf '%-8s %-10s %s\n' skip osquery "writes an enroll secret and restarts osqueryd, so it runs only when named: --systems osquery" ;;
+	esac
+	case " $all " in
+	*" oci "*) printf '%-8s %-10s %s\n' skip oci "merges into daemon.json and config.toml for the runtimes this host runs: bodega doctor --configure oci --apply --url $base" ;;
 	esac
 fi
 

@@ -252,6 +252,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if f, ok := host.CheckComposer(); ok {
 				findings = append(findings, f)
 			}
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(doctorBaseURL(gf, baseURL))...)
 			if f, ok := ubuntuPro.finding(); ok {
 				findings = append(findings, f)
 			}
@@ -546,6 +547,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		return err
 	}
+	if records, err = keepPresentRuntimes(records, slices.Contains(req.systems, manifest.TypeOCI)); err != nil {
+		return err
+	}
 	if len(plan.Records) > 0 {
 		r := plan.Records[0]
 		profile := "no profile"
@@ -662,7 +666,104 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 			fmt.Println("Confirm the upstream repository is off:  pkg -vv | grep -A2 -E '^  (FreeBSD|bodega)'")
 		}
 	}
+	printRuntimeRestarts(changes)
 	return nil
+}
+
+// doctorLookPath is how doctor asks whether a container runtime is installed,
+// and doctorOCIRoot the directory its /etc files are read under, so a test
+// can stand in for both.
+var (
+	doctorLookPath = exec.LookPath
+	doctorOCIRoot  = ""
+)
+
+// runtimePresent reports whether any of rt's commands is on PATH.
+func runtimePresent(rt string) bool {
+	for _, bin := range clientconf.RuntimeBinaries[rt] {
+		if _, err := doctorLookPath(bin); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// keepPresentRuntimes drops each oci record whose runtime this host does not
+// run. The server cannot see which runtimes a host has, so its plan carries
+// every one, and writing daemon.json on a host with no dockerd configures
+// nothing but leaves a file to puzzle over. named says the operator asked for
+// oci by name, where finding no runtime at all is an error rather than a
+// quiet skip.
+func keepPresentRuntimes(records []clientconf.PlanRecord, named bool) ([]clientconf.PlanRecord, error) {
+	var out []clientconf.PlanRecord
+	sawOCI := false
+	for _, r := range records {
+		if r.System != manifest.TypeOCI || r.Action != clientconf.PlanInstall {
+			out = append(out, r)
+			continue
+		}
+		sawOCI = true
+		if rt := clientconf.OCIRuntimeOf(r.Path); rt != "" && runtimePresent(rt) {
+			out = append(out, r)
+		}
+	}
+	for _, r := range out {
+		if r.System == manifest.TypeOCI {
+			return out, nil
+		}
+	}
+	if sawOCI && named {
+		var bins []string
+		for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
+			bins = append(bins, clientconf.RuntimeBinaries[rt]...)
+		}
+		return nil, fmt.Errorf("the oci system configures a container runtime, and none is on PATH here (looked for %s), so nothing was written.\n"+
+			"  Install the runtime first; doctor looks for it on this process's PATH, so run it with the PATH the runtime's service uses", strings.Join(bins, ", "))
+	}
+	if sawOCI {
+		fmt.Printf("skip       %-10s no container runtime on PATH\n", manifest.TypeOCI)
+	}
+	return out, nil
+}
+
+// printRuntimeRestarts names the restart each container runtime needs to
+// read what was written, once per runtime, and runs none: restarting dockerd
+// stops every container it runs, which is the operator's to schedule.
+// podman and buildah read registries.conf on their next run.
+func printRuntimeRestarts(changes []clientconf.Change) {
+	done := map[string]bool{}
+	for _, c := range changes {
+		rt := ""
+		if c.Record.System == manifest.TypeOCI && !c.Unchanged() {
+			rt = clientconf.OCIRuntimeOf(c.Record.Path)
+		}
+		if rt == "" || done[rt] {
+			continue
+		}
+		done[rt] = true
+		switch rt {
+		case clientconf.RuntimeDocker:
+			fmt.Println("\nRestart dockerd to read it (running containers stop unless live-restore is set):  systemctl restart docker")
+		case clientconf.RuntimeContainerd:
+			fmt.Println("\nRestart containerd to read config_path:  systemctl restart containerd")
+		case clientconf.RuntimePodman:
+			if _, err := doctorLookPath("crio"); err == nil {
+				fmt.Println("\nRestart CRI-O to read it:  systemctl restart crio")
+			}
+		}
+	}
+}
+
+// doctorBaseURL is the bodega URL doctor's report compares a client's
+// mirror against: --url, else public_url, else "" when neither is set.
+func doctorBaseURL(gf *globalFlags, baseURL string) string {
+	if baseURL != "" {
+		return baseURL
+	}
+	if cfg, err := loadConfig(gf); err == nil {
+		return cfg.PublicURL
+	}
+	return ""
 }
 
 // doctorOSRelease is where suiteHint reads this host's codename.

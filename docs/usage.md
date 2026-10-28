@@ -2206,6 +2206,14 @@ On Linux, three more rows name the OS services that reach out on their own whate
 
 A failure to read `/etc/default/motd-news` or chrony's configuration reports the row `SKIPPED`, naming the error.
 
+For each container runtime on `PATH`, an **`oci-docker`**, **`oci-containerd`** or **`oci-podman`** row says whether it pulls through bodega's registry under `/v2/`, and a runtime that is not installed gets no row. The remediation on each is `bodega doctor --configure oci --apply --url <bodega base URL>`. A mirror counts as bodega's when its host is the one in `--url`, or `public_url` from the config file; with neither set, any mirror counts, since doctor cannot tell bodega's from another.
+
+- **`oci-docker`** (`dockerd` on `PATH`) warns when `/etc/docker/daemon.json` is absent or its `registry-mirrors` names no bodega mirror. An `OK` covers Docker Hub alone, because that is all `registry-mirrors` covers.
+- **`oci-containerd`** (`containerd`) reads `/etc/containerd/config.toml` as containerd decodes it and judges the `hosts.toml` containerd would use: the first root in the CRI registry table's `config_path` (a `:`-separated list) holding a `docker.io` or `_default` directory. It warns when there is no `config.toml` or it sets no `config_path` (a `config_path` in another plugin's table does not count), when no root holds such a directory, and when the first `[host]` there that may pull is not bodega. When containerd reads a directory other than `/etc/containerd/certs.d`, the remediation names the `config_path` edit, because `--configure oci` keeps a `config_path` the operator set. A `config.toml` containerd cannot load, one that disables the CRI plugin (Docker's packaged file does), and one still on the deprecated `registry.mirrors` report `SKIPPED`. The `config_path` judged is the one containerd runs with after loading every file `imports` names, in containerd's order (relative to the importing file, globs expanded, nested imports followed), so an imported CRI table naming another directory overrides the main file's. An import that cannot be read, one declaring another `version`, one declaring none that holds another format's CRI plugin table (containerd 2.x migrates a versionless import's `[plugins.cri]` into the CRI plugin's table, which doctor does not follow), and one carrying the CRI plugin table without `config_path` (containerd 1.x then reads none and 2.x keeps the earlier value) report `SKIPPED` and name the file. `--configure oci` refuses before writing in each of those cases.
+- **`oci-podman`** (`podman`, `buildah` or `crio`) resolves the files the runtimes read, in their order: `/etc/containers/registries.conf` (or the file `CONTAINERS_REGISTRIES_CONF` names), then `/etc/containers/registries.conf.d/*.conf`, then `~/.config/containers/registries.conf.d/*.conf`. A `~/.config/containers/registries.conf` replaces all of the system files. A later `[[registry]]` with the same `prefix` replaces an earlier one whole, so the check warns when any resolved `docker.io` table, including a longer prefix such as `docker.io/library`, has a first tag-pull mirror that is not bodega, naming the file that defines it. A table for `docker.io` itself is required: one for `docker.io/library` alone covers only that namespace, and the check warns that every other Docker Hub repository goes direct. A `digest-only` mirror does not count. `~` is the home of the account doctor runs as, so `sudo` judges root's podman.
+
+A `daemon.json` that is not JSON, or one this account cannot read, reports `oci-docker` `SKIPPED`, naming the error.
+
 `--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is left out otherwise, and named it runs alone and does one thing: for a host whose `server`-mode source sets `origins`, it links this binary as bodega's osquery extension, lists it in the autoload file osqueryd reads, and sets `--extensions_autoload` in osqueryd's flagfile when that names none (see [Package origins](#package-origins)). For any other host it writes nothing and refuses. The other flags, the enroll secret and the restart stay with the setup script, since the flags file alone points at a secret nothing wrote and a daemon nothing installed.
 
 ```bash
@@ -2216,6 +2224,27 @@ sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
 `--configure` refuses plain `http` unless `--allow-plaintext` is set, for `--url` and again for every file URL the plan names, since those carry the server's `public_url` rather than `--url`. Over plain HTTP the bearer token travels in the clear, and the plan and its files can be rewritten in transit together, digests included. Pass it only on a link you trust.
 
 A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url` it writes `trusted-host = <host>`, the base's hostname without its port and, for an IPv6 literal, without brackets. pip ignores an `http` index whose host is not trusted, and does so as a warning followed by "no matching distribution", which names the package rather than the transport, so a `pip.conf` without it installs nothing. The bare host matches the index on any port. An `https` base writes no `trusted-host`.
+
+`--configure oci` points each container runtime on the host at bodega's registry under `/v2/`, Linux only. The server cannot see which runtimes a host runs, so its plan carries every runtime's files and doctor keeps those whose commands are on `PATH`; `oci` named on a host with none of `dockerd`, `containerd`, `podman`, `buildah` or `crio` is an error. The registries are the keys of the server's `oci_upstreams`:
+
+| Runtime                   | File                                               | What bodega writes                                                                                                                                                                  |
+| ------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Docker Engine (`dockerd`) | `/etc/docker/daemon.json`                          | `registry-mirrors` set to bodega, merged into the file: every other key is kept, and a mirror already listed is replaced                                                            |
+| containerd                | `/etc/containerd/certs.d/<registry>/hosts.toml`    | one per registry: `server` the upstream, without its credential, and one `[host."<bodega base URL>"]` with `capabilities = ["pull", "resolve"]`; containerd appends `/v2/` and `ns` |
+| containerd                | `/etc/containerd/config.toml`                      | `config_path = "/etc/containerd/certs.d"` in the CRI registry table, only when no `config_path` is set; the rest of the file, comments included, is kept                            |
+| podman, buildah and CRI-O | `/etc/containers/registries.conf.d/99-bodega.conf` | a `[[registry]]` per registry, each with a `[[registry.mirror]]` at `<bodega-host>/<registry>`                                                                                      |
+
+Docker Engine's `registry-mirrors` covers Docker Hub only: an image from `ghcr.io` or `quay.io` still pulls from its own registry, and the plan's note on `daemon.json` says so. containerd's `hosts.toml` and the podman drop-in cover every registry, and nerdctl and `ctr --hosts-dir` read the same `certs.d`. containerd and podman try bodega first and fall back to the registry itself, which a host whose egress is closed sees as bodega's error.
+
+`config.toml` gains `config_path` in the table its `version` line names: `io.containerd.grpc.v1.cri` for version 2 (and for a host with no file, which gets a version 2 file), `io.containerd.cri.v1.images` for version 3, and `plugins.cri` for a file with no `version` line, such as the one Docker's `containerd.io` package ships. A `version` line is never added: version 2 refuses the short plugin names a version 1 file uses, and containerd would not start. The edit touches the one `config_path` line, keeping how its key is spelled and its comment, or inserts the key, and the result must decode to the original file plus `config_path`. A file containerd cannot load, a CRI registry table that sets `mirrors` or `configs.<host>.tls` (containerd refuses to start with either beside `config_path`), a form the edit cannot change safely, such as an inline table, and an import that fails to load or whose CRI table replaces the main file's with a `config_path` leaving out `/etc/containerd/certs.d` are refused with nothing written.
+
+A plaintext base adds `insecure-registries` with bodega's `host:port` to `daemon.json` (keeping the entries already listed), `skip_verify = true` to each `hosts.toml`, and `insecure = true` to each mirror in the drop-in, and the plan's notes say it did. An `https` base adds none of them.
+
+With `--apply`, doctor prints the restart each runtime needs to read what it wrote and runs none of them: `systemctl restart docker`, which stops running containers unless `live-restore` is set, `systemctl restart containerd`, and `systemctl restart crio` where CRI-O is installed. podman and buildah read the drop-in on their next run. A second `--apply` finds nothing to change and prints no restart.
+
+```bash
+sudo bodega doctor --configure oci --url https://bodega.internal --apply
+```
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
@@ -4950,7 +4979,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `a6482f1c377ea3fe8cf56d6a52ecad304ae3ba4c5e57a1d9b0c53007cbf5d9cf`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `c9f45017ad9456d3cfea3dbbedcc4786f49425c99e7160894512d08d0f2365e9`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4973,7 +5002,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
 
    Each file that differs is copied beside the original as `<file>.bodega-<UTC timestamp>`, then written. A file that already matches is left alone, so a second run writes nothing and makes no backup. Every target is checked writable before the first write, so a run lacking root stops before it has changed anything. apt reads every file in `sources.list.d/` and prints a notice for the backup's unknown extension on each `apt update` until you delete it.
 
-`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest, except `osquery`.
+`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest, except `osquery` and `oci`. `oci` is `bodega doctor --configure oci`'s alone, named or not: it merges into `daemon.json` and `config.toml`, which takes a JSON parser the script does not carry, and keeps only the runtimes the host runs.
 
 **osquery.** The `osquery` system runs only when `--systems` names it, because it does more than write a file. It points the host at an [`osquery` source](#the-osquery-source) in `server` mode:
 
@@ -5350,9 +5379,9 @@ A composer entry records the dist reference in `ref`, which is what names the ar
 
 **Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. The age, OSV and similarity gates for Composer are not built yet; a profile governs Composer as it does the other package types.
 
-**OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts). `bodega doctor` does not configure a container runtime yet, so point one at bodega by hand.
+**OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts).
 
-Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
+`bodega doctor --configure oci --apply` writes every file below for the runtimes a host runs, merging into an existing `daemon.json` and `config.toml`; see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext). By hand, Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
 
 ```json
 {
@@ -5543,15 +5572,15 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                                                                                   |
-| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                                         |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                                         |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base                   |
-| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`                            |
-| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives)                |
-| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                            |
-| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven` |
+| Parameter  | Required        | Value                                                                                                                                                                                                                                                  |
+| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                                                                                                                                        |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                                                                                                                                        |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base                                                                                                                  |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`                                                                                                                           |
+| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives)                                                                                                               |
+| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                                                                                                                           |
+| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven`, and on `/client/oci` `containerd-config`, `registries-conf` and `containerd-hosts.<registry>` |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
