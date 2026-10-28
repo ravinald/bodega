@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -345,5 +347,85 @@ func TestOCIProfileDigestPinAdmitsNoUnresolvedDigest(t *testing.T) {
 		[]audit.ProfileEntry{{Type: manifest.TypeOCI, Name: "docker.io/library/postgres"}})
 	if rec := floating.oci("/v2/library/postgres/manifests/" + f.image.indexDigest); rec.Code != http.StatusOK {
 		t.Errorf("a floating entry refused an unresolved digest: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// pauseAfterBody holds the handler once size bytes reached the socket, which
+// is the moment a client that read the whole response sends its next request.
+type pauseAfterBody struct {
+	http.ResponseWriter
+	after func()
+	size  int
+	wrote int
+}
+
+func (w *pauseAfterBody) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.wrote += n
+	if w.wrote >= w.size && w.after != nil {
+		fn := w.after
+		w.after = nil
+		fn()
+	}
+	return n, err
+}
+
+// A tag whose manifest went missing is fetched again by digest, and its
+// markers exist before the client holds the tag's body: the digests a client
+// asks for next are not refused in the gap.
+func TestOCIProfileRecoveredTagRecordsBeforeAnswering(t *testing.T) {
+	f := newOCIFixture(t)
+	// Past HTTP's small-response buffering, so the body reaches the client
+	// while the handler is still inside Write.
+	f.image.index = append(f.image.index, bytes.Repeat([]byte(" "), 65536-len(f.image.index))...)
+	f.image.indexDigest = ociDigest(f.image.index)
+	f.hub.publish("library/postgres", "17", f.image)
+	f.hub.publish("library/postgres", "latest", f.image)
+	s := ociServer(t, f)
+	pf := bindProfile(t, s, "db", "db01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeOCI, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeOCI, Name: "docker.io/library/postgres", Constraint: manifest.ConstraintExact, Version: "17"}})
+	for _, tag := range []string{"17", "latest"} {
+		if rec := doRequest(s, http.MethodGet, "/v2/library/postgres/manifests/"+tag, nil); rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", tag, rec.Code, rec.Body.String())
+		}
+	}
+	im := f.image
+	forgetResolvedBy(t, s, "library/postgres", "17", im.indexDigest, im.amd64Digest, im.arm64Digest)
+	if err := s.typeStore(manifest.TypeOCI).Delete(context.Background(), manifest.OCIManifestKey("docker.io", "library/postgres", im.indexDigest)); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	h := s.handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/library/postgres/manifests/17" {
+			w = &pauseAfterBody{ResponseWriter: w, size: len(im.index), after: func() { <-release }}
+		}
+		h.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	defer close(release)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v2/library/postgres/manifests/17", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+pf.token)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("the tag's body did not arrive whole: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != string(im.index) {
+		t.Fatalf("the recovered tag: %d, %d bytes", resp.StatusCode, len(body))
+	}
+	for _, d := range []string{im.indexDigest, im.amd64Digest} {
+		if rec := pf.oci("/v2/library/postgres/manifests/" + d); rec.Code != http.StatusOK {
+			t.Errorf("digest %s, asked for once the recovered tag arrived: %d %s", d, rec.Code, rec.Body.String())
+		}
 	}
 }

@@ -360,13 +360,33 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 		// The tag record outlived its manifest, which only a reset or a
 		// failed write leaves behind. Fetch it by digest, as bodega's own read.
 		s.logger.Warn("oci manifest missing for a cached tag, fetching it by digest", "key", key, "digest", doc.Digest, "error", err)
+		// The fetch is captured rather than sent: the client asks for the
+		// index's children by digest the moment it holds the body, so the
+		// markers that admit them are written first.
 		byDigest := t
 		byDigest.ref = doc.Digest
-		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), byDigest, pm, doc.MediaType)
-		if mstore != nil {
-			body, _ = mstore.Get(ctx, manifest.OCIManifestKey(t.registry, t.repo, doc.Digest))
+		dcw := &capturedResponse{header: http.Header{}}
+		inner := &ociResponseWriter{ResponseWriter: dcw, r: r, kind: w.kind, passthrough: true}
+		dreq := r.Clone(withOwnRead(ctx))
+		dreq.Method = http.MethodGet
+		s.serveOCIManifestDigest(inner, dreq, byDigest, pm, doc.MediaType)
+		if dcw.status != http.StatusOK {
+			relayCaptured(w, dcw)
+			return
+		}
+		if dcw.tooBig || ociDigest(dcw.body.Bytes()) != doc.Digest {
+			w.writeError(http.StatusBadGateway, "UNKNOWN",
+				fmt.Sprintf("the manifest bodega fetched again for tag %s in %s does not match digest %s, so it is not served. Retry once metadata_ttl has passed.", t.ref, name, doc.Digest))
+			return
+		}
+		body = dcw.body.Bytes()
+		mediaType := doc.MediaType
+		if mediaType == "" {
+			mediaType = dcw.header.Get("Content-Type")
 		}
 		s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
+		w.Header().Set("Cache-Control", cachePrivate)
+		writeOCIManifest(w, r, mediaType, doc.Digest, body)
 		return
 	}
 	s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
