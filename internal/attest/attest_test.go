@@ -65,6 +65,9 @@ func TestPURL(t *testing.T) {
 			"pkg:oci/nginx@sha256:abababababababababababababababababababababababababababababababab?repository_url=docker.io/library/nginx"},
 		{manifest.TypeOCI, "ghcr.io/example-corp/tools/cli", "1.2", manifest.OCIManifestKey("ghcr.io", "example-corp/tools/cli", "sha256:abababababababababababababababababababababababababababababababab"),
 			"pkg:oci/cli@sha256:abababababababababababababababababababababababababababababababab?repository_url=ghcr.io/example-corp/tools/cli&tag=1.2"},
+		{manifest.TypeRpm, "nginx", "2:1.20.1-20.el9", manifest.RpmPackageKey("rocky-baseos", "9", "x86_64", "nginx", "2:1.20.1-20.el9", "nginx-1.20.1-20.el9.x86_64.rpm"),
+			"pkg:rpm/nginx@1.20.1-20.el9?arch=x86_64&epoch=2"},
+		{manifest.TypeRpm, "httpd", "2.4.57-5.el9", "", "pkg:rpm/httpd@2.4.57-5.el9"},
 		{manifest.TypeApt, "hello", "2.10-3build1+x", "", "pkg:generic/apt/hello@2.10-3build1%2Bx"},
 		{manifest.TypeDistfiles, "sub/zsh-5.9.tar.xz", "", "", "pkg:generic/distfiles/sub%2Fzsh-5.9.tar.xz"},
 	} {

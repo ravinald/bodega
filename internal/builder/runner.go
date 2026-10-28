@@ -59,6 +59,10 @@ type Config struct {
 	// image is pulled through the server's /v2/ route.
 	OCIRoot string
 
+	// RpmRoot roots the rpm tree reset clears. No stage writes a package; one
+	// is pulled through the server's /rpm/ route.
+	RpmRoot string
+
 	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
 	// <root>/distfiles/@<environment digest>/. DistfilesPortsTree is the ports
 	// tree whose distinfo admits each file, and DistfilesUpstream is where a
@@ -401,6 +405,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.OCIRoot != "" {
 			return c.OCIRoot
 		}
+	case "rpm":
+		if c.RpmRoot != "" {
+			return c.RpmRoot
+		}
 	case "freebsd":
 		if c.FreeBSDRoot != "" {
 			return c.FreeBSDRoot
@@ -458,6 +466,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		RubygemsRoot:   app.RubygemsRoot,
 		ComposerRoot:   app.ComposerRoot,
 		OCIRoot:        app.OCIRoot,
+		RpmRoot:        app.RpmRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
 		DistfilesRoot:  app.DistfilesRoot,
 		AutoImportDeps: true,
@@ -509,6 +518,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.composer
 	case manifest.TypeOCI:
 		return d.oci
+	case manifest.TypeRpm:
+		return d.rpm
 	case manifest.TypeFreeBSD:
 		return d.freebsd
 	case manifest.TypeDistfiles:
@@ -562,6 +573,8 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.composer}
 	case manifest.TypeOCI:
 		return []string{d.oci}
+	case manifest.TypeRpm:
+		return []string{d.rpm}
 	case manifest.TypeFreeBSD:
 		return []string{d.freebsd}
 	case manifest.TypeDistfiles:
@@ -755,6 +768,7 @@ type dirs struct {
 	rubygems string
 	composer string
 	oci      string
+	rpm      string
 	freebsd  string
 
 	// distfiles is a DISTDIR: <DIST_SUBDIR>/<file> beneath it, exactly as
@@ -778,6 +792,7 @@ func buildDirs(root string) dirs {
 		rubygems: filepath.Join(root, "rubygems"),
 		composer: filepath.Join(root, "composer"),
 		oci:      filepath.Join(root, "oci"),
+		rpm:      filepath.Join(root, "rpm"),
 		freebsd:  filepath.Join(root, "freebsd"),
 
 		distfiles: filepath.Join(root, "distfiles"),

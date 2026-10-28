@@ -114,6 +114,14 @@ var keyRoundTrips = map[string][]roundTrip{
 		{key: ComposerMetadataKey("symfony/console", false), name: "symfony/console"},
 		{key: ComposerMetadataKey("symfony/console", true), name: "symfony/console"},
 	},
+	TypeRpm: {
+		{key: RpmPackageKey("rocky-baseos", "9", "x86_64", "nginx", "2:1.20.1-20.el9", "nginx-1.20.1-20.el9.x86_64.rpm"), name: "nginx", version: "2:1.20.1-20.el9"},
+		{key: RpmPackageKey("epel", "9", "noarch", "python3.12-foo", "1.0-1.el9", "python3.12-foo-1.0-1.el9.noarch.rpm"), name: "python3.12-foo", version: "1.0-1.el9"},
+		// repomd.xml and the metadata it names belong to a repository, not a
+		// package.
+		{key: RpmRepomdKey("rocky-baseos", "9", "x86_64")},
+		{key: RpmMetadataKey("rocky-baseos", "9", "x86_64", "c5f5", "c5f5-primary.xml.gz")},
+	},
 	TypeOCI: {
 		{key: OCIManifestKey("docker.io", "library/nginx", "sha256:abababababababababababababababababababababababababababababababab"), name: "docker.io/library/nginx", version: "sha256:abababababababababababababababababababababababababababababababab"},
 		{key: OCITagKey("ghcr.io", "acme/widget", "v4.1"), name: "ghcr.io/acme/widget", version: "v4.1"},

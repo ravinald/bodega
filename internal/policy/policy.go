@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -55,6 +56,10 @@ func RuleKindForType(registryType string) string {
 	case manifest.TypeGit:
 		return KindOrg
 	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+		return KindPackage
+	case manifest.TypeRpm:
+		// A package name, or a repository base URL prefix written with its
+		// scheme; see matchRpm.
 		return KindPackage
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return KindPrefix
@@ -307,10 +312,51 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 		// admits every repository below it: docker.io/library/* admits
 		// docker.io/library/nginx, and not docker.io/libraryx/nginx.
 		return matchNpm(candidate, r.Pattern)
+	case manifest.TypeRpm:
+		return matchRpm(candidate, r.Pattern)
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return strings.HasPrefix(candidate, r.Pattern)
 	}
 	return false
+}
+
+// RpmCandidate is what an rpm package request is checked under: the package
+// name and the base URL of the repository it comes from, its userinfo
+// removed so no credential reaches an audit row. A request names both, and a
+// rule may admit by either.
+func RpmCandidate(name, baseURL string) string {
+	if u, err := url.Parse(baseURL); err == nil && u.User != nil {
+		u.User = nil
+		baseURL = u.String()
+	}
+	return name + " " + baseURL
+}
+
+// matchRpm admits a candidate RpmCandidate built. A pattern carrying a
+// scheme is a repository base URL prefix, judged as apt's host rules are on
+// the scheme and host, case folded, with the path a prefix of the
+// repository's; "https://dl.rockylinux.org/pub/rocky/" admits every Rocky
+// repository on that host. Anything else is an RPM package name, which rpm
+// compares case-sensitively. A bare hostname is not a URL rule, since an RPM
+// name may hold dots (python3.12) and the two would read the same.
+func matchRpm(candidate, pattern string) bool {
+	name, base, _ := strings.Cut(candidate, " ")
+	if !strings.Contains(pattern, "://") {
+		return name == pattern
+	}
+	if base == "" {
+		return false
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	p, err := url.Parse(pattern)
+	if err != nil || p.Host == "" {
+		return false
+	}
+	return strings.EqualFold(b.Scheme, p.Scheme) && strings.EqualFold(b.Host, p.Host) &&
+		strings.HasPrefix(b.EscapedPath(), p.EscapedPath())
 }
 
 // CandidateFor picks the string a caller should pass to Check based on type.
@@ -328,7 +374,7 @@ func CandidateFor(registryType, packageName, entryURL string) string {
 // package name rather than on an upstream URL.
 func KeysByName(registryType string) bool {
 	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeRpm:
 		return true
 	}
 	return false
@@ -389,7 +435,7 @@ func SuggestPattern(regType, host, fullPath, pkgName string) string {
 			}
 		}
 		return pkgName
-	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeRpm:
 		return pkgName
 	case manifest.TypeGomod:
 		// Module paths look like host/org/repo... — propose host+org/.

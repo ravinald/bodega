@@ -249,17 +249,18 @@ func normalize(events []event, externalID string) (inventory.Batch, error) {
 }
 
 // component maps one row of a bodega query into the common model. The
-// ecosystem column is the literal each SELECT writes; rpm has no bodega type,
-// so it lands in "other" with a purl that keeps what it was. The origin
-// column, present under an origins schedule, is a URL for npm and pypi, kept
-// as its host, and a repository name for FreeBSD.
+// ecosystem column is the literal each SELECT writes, and each is a bodega
+// type. rpm_packages reports version-release with no epoch, which
+// reconciliation compares epoch-free. The origin column, present under an
+// origins schedule, is a URL for npm and pypi, kept as its host, and a
+// repository name for FreeBSD.
 func component(row map[string]any) (inventory.Component, bool) {
 	c := inventory.Component{Name: str(row["name"]), Version: str(row["version"]), Path: str(row["path"])}
 	if c.Name == "" {
 		return c, false
 	}
 	switch eco := str(row["ecosystem"]); eco {
-	case manifest.TypeApt:
+	case manifest.TypeApt, manifest.TypeRpm:
 		c.Ecosystem = eco
 	case manifest.TypePypi, manifest.TypeNpm:
 		c.Ecosystem = eco
@@ -267,12 +268,6 @@ func component(row map[string]any) (inventory.Component, bool) {
 	case manifest.TypeFreeBSD:
 		c.Ecosystem = eco
 		c.Origin = strings.TrimSpace(str(row["origin"]))
-	case "rpm":
-		c.Ecosystem = inventory.EcosystemOther
-		c.PURL = "pkg:rpm/" + c.Name
-		if c.Version != "" {
-			c.PURL += "@" + c.Version
-		}
 	default:
 		c.Ecosystem = inventory.EcosystemOther
 	}

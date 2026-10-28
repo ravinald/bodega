@@ -137,6 +137,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeRpm:
+				name, ve, err = collectRpmVersion(r, name, "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypeFreeBSD:
 				name, ve, err = collectFreeBSDVersion(r, name, "", "")
 				if err != nil {
@@ -631,6 +637,25 @@ func collectOCIVersion(r *bufio.Reader, name, tag, digest string) (string, manif
 		return "", manifest.VersionEntry{}, fmt.Errorf("digest %q is not sha256:<64 hex>", digest)
 	}
 	return name, manifest.VersionEntry{Version: tag, Ref: digest}, nil
+}
+
+// collectRpmVersion prompts for one RPM version. No URL: a package is
+// pulled through whichever rpm_upstreams repository a client names.
+func collectRpmVersion(r *bufio.Reader, name, version string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Package name (e.g. nginx)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if !manifest.RpmValidName(name) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("%q is not an RPM package name: letters, digits, '.', '_', '+' and '-'", name)
+	}
+	if version, err = prompt(r, "Version, epoch:version-release with a 0 epoch left off (e.g. 2:1.20.1-20.el9)", version); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if !manifest.RpmValidEVR(version) {
+		return "", manifest.VersionEntry{}, fmt.Errorf("version %q is not epoch:version-release, e.g. 2:1.20.1-20.el9 or 2.4.57-5.el9", version)
+	}
+	return name, manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy}, nil
 }
 
 // collectFreeBSDVersion prompts for one pkg repository.

@@ -312,6 +312,31 @@ func TestNamesCanonicalizeAcrossEcosystems(t *testing.T) {
 	wantClass(t, got, "React@18.2.0", ClassUnknown, "")
 }
 
+// An installed RPM is reported as version-release with no epoch, and is
+// served and refused under the epoch primary gives it; the two compare
+// without it, as apt's do.
+func TestRpmClassifiesLikeApt(t *testing.T) {
+	h := newHarness(t)
+	h.served("web-01", manifest.TypeRpm, "nginx", "1.20.1-20.el9",
+		manifest.RpmPackageKey("rocky-baseos", "9", "x86_64", "nginx", "2:1.20.1-20.el9", "nginx-1.20.1-20.el9.x86_64.rpm"), "")
+	h.served("web-02", manifest.TypeRpm, "redis", "6.2.7-1.el9",
+		manifest.RpmPackageKey("rocky-appstream", "9", "x86_64", "redis", "6.2.7-1.el9", "redis-6.2.7-1.el9.x86_64.rpm"), "")
+	if err := h.db.RecordAdmission(h.ctx, audit.Admission{PkgType: manifest.TypeRpm, PkgName: "httpd", PkgVersion: "1:2.4.57-5.el9",
+		Decision: audit.AdmissionPolicyBlocked, Checks: []audit.AdmissionCheck{{Check: audit.CheckAllowList, Action: "block", Status: audit.CheckBlock}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := h.bom("web-01",
+		purl("pkg:rpm/rocky/nginx@1.20.1-20.el9?arch=x86_64&epoch=2", "nginx", "1.20.1-20.el9", ""),
+		purl("pkg:rpm/rocky/redis@6.2.7-1.el9?arch=x86_64", "redis", "6.2.7-1.el9", ""),
+		purl("pkg:rpm/rocky/httpd@2.4.57-5.el9?arch=x86_64&epoch=1", "httpd", "2.4.57-5.el9", ""),
+	)
+	got := h.classesOf(rep)
+	wantClass(t, got, "nginx@1.20.1-20.el9", ClassServed, "")
+	wantClass(t, got, "redis@6.2.7-1.el9", ClassUnattributed, "")
+	wantClass(t, got, "httpd@2.4.57-5.el9", ClassRefused, "")
+}
+
 // A baseline hides unknown, never refused, and applies to reports that arrive
 // after it: the report it was taken from keeps the classes it got.
 func TestBaselineHidesUnknownNotRefused(t *testing.T) {
@@ -560,6 +585,7 @@ func TestServedIdentityParsesKeys(t *testing.T) {
 		{audit.ServedObject{PkgType: "apt", PkgName: "pool/main/s/sudo/sudo_1%3a1.9_amd64.deb", ObjectKey: "apt-cache/x"}, "apt", "sudo", "1:1.9"},
 		{audit.ServedObject{PkgType: "freebsd", PkgName: "FreeBSD", PkgVersion: "FreeBSD:14:amd64", ObjectKey: "freebsd/FreeBSD:14:amd64/FreeBSD/All/curl-8.5.0.pkg"}, "freebsd", "curl", "8.5.0"},
 		{audit.ServedObject{PkgType: "npm", PkgName: "@scope/pkg", PkgVersion: "1.0.0", ObjectKey: "npm/@scope--pkg/pkg-1.0.0.tgz"}, "npm", "@scope/pkg", "1.0.0"},
+		{audit.ServedObject{PkgType: "rpm", PkgName: "nginx", PkgVersion: "1.20.1-20.el9", ObjectKey: "rpm/epel/9/x86_64/packages/nginx/2:1.20.1-20.el9/nginx-1.20.1-20.el9.x86_64.rpm"}, "rpm", "nginx", "2:1.20.1-20.el9"},
 	} {
 		eco, name, version := ServedIdentity(tc.so)
 		if eco != tc.eco || name != tc.name || version != tc.version {

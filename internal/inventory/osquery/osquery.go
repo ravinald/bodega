@@ -329,11 +329,10 @@ func (s *Source) serveConfig(w http.ResponseWriter, r *http.Request, env *invent
 
 // Covers is what the schedule reads on identity's host: the system package
 // tables always, and pip or npm trees only where the host's profile declares
-// a directory to scan. rpm lands in "other", but so does everything a
-// CycloneDX document cannot type, so osquery claims no coverage of it.
+// a directory to scan.
 func (s *Source) Covers(identity, ecosystem string) bool {
 	switch ecosystem {
-	case manifest.TypeApt, manifest.TypeFreeBSD:
+	case manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeRpm:
 		return true
 	case manifest.TypePypi:
 		return len(CleanDirs(s.dirsFor(identity).Python)) > 0

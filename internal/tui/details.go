@@ -588,6 +588,7 @@ func clientFiles(cfg *config.Config, store *manifest.Store, entryType, name stri
 	if cfg != nil {
 		in.GitUpstreams = cfg.GitUpstreams
 		in.BinaryUpstreams = cfg.BinaryUpstreams
+		in.RpmRepos = cfg.RpmRepoNames()
 	}
 	pm, err := store.GetPackage(context.Background(), entryType, name)
 	if err != nil {
@@ -1012,9 +1013,11 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.storedAndClientFields(n))
 
-	case manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+	case manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeRpm:
 		label, versionLabel, refLabel := "Crate", "Version", "Dist reference"
 		switch n.EntryType {
+		case manifest.TypeRpm:
+			label = "Package"
 		case manifest.TypeRubygems:
 			label = "Gem"
 		case manifest.TypeComposer:

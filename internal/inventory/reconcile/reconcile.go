@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -304,6 +305,13 @@ func ServedIdentity(so audit.ServedObject) (eco, name, version string) {
 			return eco, n, v
 		}
 		return eco, "", ""
+	case manifest.TypeRpm:
+		// The object key names the package as primary does, epoch included;
+		// the request path's filename has none.
+		if _, n, v := manifest.ParseKey(so.ObjectKey); n != "" {
+			return eco, n, v
+		}
+		return eco, "", ""
 	}
 	return eco, name, version
 }
@@ -328,8 +336,9 @@ func freeBSDPkgIdentity(file string) (name, version string) {
 
 // Key is the form two records of one package compare equal under: the
 // ecosystem, the name as bodega's own types canonicalize it, and the version
-// with an apt epoch dropped, since a pool filename carries none and dpkg
-// reports one.
+// with an apt or rpm epoch dropped. A pool filename carries none and dpkg
+// reports one; rpm is the reverse, primary naming one and rpm_packages
+// reporting version-release alone.
 func Key(eco, name, version string) string {
 	return nameKey(eco, name) + "\x00" + normVersion(eco, version)
 }
@@ -346,6 +355,9 @@ func canonical(eco, name string) string {
 }
 
 func normVersion(eco, v string) string {
+	if eco == manifest.TypeRpm {
+		return manifest.RpmDropEpoch(v)
+	}
 	if eco != manifest.TypeApt {
 		return v
 	}
@@ -464,11 +476,21 @@ func (r *Reconciler) refusal(ctx context.Context, ev *evidence, c audit.Inventor
 	if reason, ok := ev.refusal[k]; ok {
 		return reason, nil
 	}
-	rows, err := r.DB.Admissions(ctx, audit.AdmissionFilter{
-		PkgType: c.Ecosystem, PkgName: canonical(c.Ecosystem, c.Name), PkgVersion: c.Version, Limit: 1,
-	})
+	filter := audit.AdmissionFilter{PkgType: c.Ecosystem, PkgName: canonical(c.Ecosystem, c.Name), PkgVersion: c.Version, Limit: 1}
+	if c.Ecosystem == manifest.TypeRpm {
+		// The row carries the epoch primary gave the package and the host
+		// reports none, so the name's rows are read and the newest whose
+		// version matches without its epoch decides.
+		filter.PkgVersion, filter.Limit = "", 0
+	}
+	rows, err := r.DB.Admissions(ctx, filter)
 	if err != nil {
 		return "", fmt.Errorf("read admission decisions: %w", err)
+	}
+	if c.Ecosystem == manifest.TypeRpm {
+		rows = slices.DeleteFunc(rows, func(a audit.Admission) bool {
+			return normVersion(c.Ecosystem, a.PkgVersion) != normVersion(c.Ecosystem, c.Version)
+		})
 	}
 	reason := ""
 	if len(rows) > 0 && rows[0].Decision != audit.AdmissionAdmitted {

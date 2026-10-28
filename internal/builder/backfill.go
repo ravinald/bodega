@@ -126,6 +126,11 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 		// landing here by omission gets the same silent skip as one that
 		// belongs here, which is how cargo went unbackfilled.
 		return ""
+	case manifest.TypeRpm:
+		// An rpm version is cached once per repository, release and
+		// architecture it was pulled through, under keys the request path
+		// names, so a version entry alone points at no single file.
+		return ""
 	}
 	return ""
 }

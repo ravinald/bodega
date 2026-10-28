@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -313,6 +314,24 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/v2/library/nginx/manifests/" + ociManifestDigest + "?ns=docker.io",
 		},
 		{
+			// No stage writes an rpm; the case holds the pull-through cache's
+			// keys together. The package is served only at an href primary
+			// lists, so the upload is the repository's repomd.xml and primary
+			// beside the package, and inventory and delete find the package by
+			// listing, since an entry records no repository.
+			typ:  manifest.TypeRpm,
+			pkg:  "nginx",
+			ve:   manifest.VersionEntry{Version: "2:1.20.1-20.el9"},
+			body: "rpm-bytes",
+			upload: func(t *testing.T, _ *builder.Config, _ *manifest.Store, dst storage.ObjectStore) []string {
+				return rpmRepositoryUpload(t, dst, "rpm-bytes")
+			},
+			configure: func(t *testing.T, cfg *config.Config) {
+				cfg.RpmUpstreams = map[string]string{"rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"}
+			},
+			url: "/rpm/rocky-baseos/9/x86_64/Packages/n/nginx-1.20.1-20.el9.x86_64.rpm",
+		},
+		{
 			// A mirrored repository: the name is the repository directory and
 			// the version is the ABI, so the local tree, the object key and
 			// the route are all the path a pkg client composes. The package
@@ -376,6 +395,37 @@ func objectKeyCases(t *testing.T) []keyCase {
 			url: "/distfiles/@" + emptyEnvironmentDigest(t) + "/pcpustat/1.6.tar.bz2",
 		},
 	}
+}
+
+// rpmRepositoryUpload stores one repository tree holding one package: the
+// repomd.xml naming a gzipped primary, that primary listing nginx with the
+// body's checksum, and the package.
+func rpmRepositoryUpload(t *testing.T, dst storage.ObjectStore, body string) []string {
+	t.Helper()
+	pkgSum := sha256.Sum256([]byte(body))
+	primary := fmt.Sprintf(`<metadata xmlns="http://linux.duke.edu/metadata/common" packages="1"><package type="rpm"><name>nginx</name><arch>x86_64</arch>`+
+		`<version epoch="2" ver="1.20.1" rel="20.el9"/><checksum type="sha256" pkgid="YES">%x</checksum>`+
+		`<location href="Packages/n/nginx-1.20.1-20.el9.x86_64.rpm"/></package></metadata>`, pkgSum)
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte(primary))
+	_ = zw.Close()
+	primarySum := fmt.Sprintf("%x", sha256.Sum256(gz.Bytes()))
+	repomd := fmt.Sprintf(`<repomd xmlns="http://linux.duke.edu/metadata/repo"><data type="primary"><checksum type="sha256">%s</checksum>`+
+		`<location href="repodata/primary.xml.gz"/></data></repomd>`, primarySum)
+	objects := map[string][]byte{
+		manifest.RpmRepomdKey("rocky-baseos", "9", "x86_64"):                                                                []byte(repomd),
+		manifest.RpmMetadataKey("rocky-baseos", "9", "x86_64", primarySum, "primary.xml.gz"):                                gz.Bytes(),
+		manifest.RpmPackageKey("rocky-baseos", "9", "x86_64", "nginx", "2:1.20.1-20.el9", "nginx-1.20.1-20.el9.x86_64.rpm"): []byte(body),
+	}
+	var keys []string
+	for k, b := range objects {
+		if err := dst.Put(t.Context(), k, b); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 const ociManifestBody = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`

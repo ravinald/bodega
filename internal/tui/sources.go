@@ -308,6 +308,10 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 	ociEntries := collectEntries(manifest.TypeOCI, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeOCI, ociEntries))
 
+	// rpm — the version is epoch:version-release.
+	rpmEntries := collectEntries(manifest.TypeRpm, func(ve manifest.VersionEntry) string { return ve.Version })
+	roots = append(roots, buildGroup(manifest.TypeRpm, rpmEntries))
+
 	// freebsd — the version is the ABI, which is what a mirrored repository
 	// has one of per entry.
 	freebsdEntries := collectEntries(manifest.TypeFreeBSD, func(ve manifest.VersionEntry) string { return ve.Version })

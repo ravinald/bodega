@@ -118,8 +118,8 @@ func TestSaveKeepsGeneratedComments(t *testing.T) {
 			t.Errorf("Save rewrote %q:\n got %s\nwant %s", k, got, want)
 		}
 	}
-	if comments != 35 {
-		t.Errorf("generated config carries %d comment blocks, want 35 — update this count with the guidance, not around it", comments)
+	if comments != 36 {
+		t.Errorf("generated config carries %d comment blocks, want 36 — update this count with the guidance, not around it", comments)
 	}
 
 	// Key by key is not enough. The comments are only useful beside what they

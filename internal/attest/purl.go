@@ -56,6 +56,8 @@ func PURL(typ, name, version, objectKey string) string {
 		}
 	case manifest.TypeOCI:
 		return ociPURL(name, version, objectKey)
+	case manifest.TypeRpm:
+		return rpmPURL(name, version, objectKey)
 	default:
 		b.WriteString("generic/" + purlEscape(typ) + "/" + purlEscape(name))
 	}
@@ -114,6 +116,35 @@ func ociPURL(name, version, objectKey string) string {
 	out += "?repository_url=" + strings.Join(segs, "/")
 	if tag != "" {
 		out += "&tag=" + purlEscape(tag)
+	}
+	return out
+}
+
+// rpmPURL writes the rpm purl: the version as version-release, and the epoch
+// and the architecture the object key's filename carries as qualifiers, which
+// is where the purl spec's rpm type puts them. No namespace: which vendor
+// built the package is the repository's to say, and the key does not record
+// one.
+func rpmPURL(name, version, objectKey string) string {
+	out := "pkg:rpm/" + purlEscape(name)
+	epoch := ""
+	if e, vr, ok := strings.Cut(version, ":"); ok {
+		epoch, version = e, vr
+	}
+	if version != "" {
+		out += "@" + purlEscape(version)
+	}
+	var q []string
+	if base, ok := strings.CutSuffix(path.Base(objectKey), ".rpm"); ok {
+		if i := strings.LastIndexByte(base, '.'); i > 0 && i < len(base)-1 {
+			q = append(q, "arch="+purlEscape(base[i+1:]))
+		}
+	}
+	if epoch != "" {
+		q = append(q, "epoch="+purlEscape(epoch))
+	}
+	if len(q) > 0 {
+		out += "?" + strings.Join(q, "&")
 	}
 	return out
 }

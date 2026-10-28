@@ -1418,6 +1418,7 @@ var createTypeOptions = []string{
 	manifest.TypeNpm,
 	manifest.TypeOCI,
 	manifest.TypePypi,
+	manifest.TypeRpm,
 	manifest.TypeRubygems,
 }
 
@@ -1936,6 +1937,26 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "sha256:<hex> of the manifest; leave empty unless one is uploaded for it"},
 		})
 
+	case manifest.TypeRpm:
+		// No Source URL and no hosted mode: every rpm package is pulled
+		// through a repository in rpm_upstreams, which a request names.
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: "proxy", Select: true,
+				Options: []string{"proxy"},
+				Hint:    "proxy = pulled through /rpm/ from the repositories in rpm_upstreams"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "the RPM package name, e.g. nginx"},
+			{Label: "Version", Value: restore("Version", ""),
+				Hint:        "epoch:version-release, the epoch left off when it is 0, e.g. 2:1.20.1-20.el9",
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+		})
+
 	case manifest.TypeFreeBSD:
 		// A freebsd entry is a repository, not a package, so the form asks
 		// for the two halves of the path a pkg client composes: the
@@ -2200,6 +2221,13 @@ func validateCreateFields(fields []formField) string {
 		}
 		if ref := fieldValueFromSlice(fields, "Dist reference"); ref != "" && !manifest.ComposerValidReference(ref) {
 			return "Dist reference must be a commit or tag name"
+		}
+	case manifest.TypeRpm:
+		if !manifest.RpmValidName(fieldValueFromSlice(fields, "Name")) {
+			return "Name must be an RPM package name for rpm entries, e.g. nginx"
+		}
+		if !manifest.RpmValidEVR(fieldValueFromSlice(fields, "Version")) {
+			return "Version must be epoch:version-release for rpm entries, e.g. 2:1.20.1-20.el9"
 		}
 	case manifest.TypeOCI:
 		registry, repo, _ := strings.Cut(fieldValueFromSlice(fields, "Name"), "/")
@@ -2503,7 +2531,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeHelm:
 		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems:
+	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeRpm:
 		// nothing extra
 
 	case manifest.TypeComposer:
@@ -2687,9 +2715,9 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
-	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
+	case manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeRpm:
 		// No Source URL here names a package: cargo's and rubygems' are the
-		// registry root and maven's, composer's and oci's forms have none.
+		// registry root and maven's, composer's, oci's and rpm's forms have none.
 		// The Name field is required.
 		return ""
 	default:
