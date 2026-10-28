@@ -517,6 +517,15 @@ func (s *Server) handleRpmMetadata(w http.ResponseWriter, r *http.Request, t rpm
 		s.writeRpmReadError(w, r, t, "repomd.xml", err)
 		return
 	}
+	s.serveRpmMetadataEntry(w, r, t, entry)
+}
+
+// serveRpmMetadataEntry serves the file one repomd.xml entry names, cached
+// under that entry's checksum and verified against it, so the bytes are the
+// entry's whichever publication another caller holds.
+func (s *Server) serveRpmMetadataEntry(w http.ResponseWriter, r *http.Request, t rpmTree, entry rpmRepomdData) {
+	markIndexResponse(r)
+	href := entry.Location.Href
 	if !rpmChecksumUsable(entry.Checksum.Type, entry.Checksum.Value) {
 		s.refuseRpmChecksumType(w, r, t, href, "", "", entry.Checksum.Type)
 		return
@@ -858,7 +867,11 @@ func (s *Server) rpmPrimary(r *http.Request, t rpmTree) (*rpmPrimaryIndex, error
 	if !strings.HasPrefix(href, "repodata/") || strings.Contains(strings.TrimPrefix(href, "repodata/"), "/") {
 		return nil, fmt.Errorf("repomd.xml places primary at %q, outside repodata/, which bodega does not serve", href)
 	}
-	raw, err := s.rpmRead(r, t, "primary", func(w http.ResponseWriter, req *http.Request) { s.handleRpmMetadata(w, req, t, href) })
+	// Served from the entry selected above rather than resolved by href
+	// again: a repository that reuses primary's filename across revisions
+	// would otherwise hand back the bytes of a revision this caller holds,
+	// and they would be indexed under this entry's checksum.
+	raw, err := s.rpmRead(r, t, "primary", func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, entry) })
 	if err != nil {
 		return nil, err
 	}

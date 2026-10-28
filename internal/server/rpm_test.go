@@ -733,3 +733,57 @@ func waitForRpmRepomd(t *testing.T, s *Server, want string) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A repository that keeps primary's filename across revisions must not let a
+// client holding the old revision index the old bytes under the new checksum:
+// a fresh client would then be refused the current package.
+func TestRpmPrimaryReusedHrefIndexesCurrentBytes(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	const a, b = "192.0.2.10:40000", "192.0.2.20:40000"
+	first := rpmRequestFrom(s, a, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	old := rpmFixture(t, rpmPrimaryGz)
+	if rec := rpmRequestFrom(s, a, rpmRepoPath+rpmPrimaryGz); rec.Code != 200 {
+		t.Fatal(rec.Code)
+	}
+	reader, closeFn, err := rpmDecompress(old, ".gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(reader)
+	closeFn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement package bytes")
+	raw = bytes.ReplaceAll(raw, []byte(rpmSHA256(rpmFixture(t, rpmNginxHref))), []byte(rpmSHA256(replacement)))
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	m.set(rpmPrimaryGz, buf.Bytes())
+	m.set("repodata/repomd.xml", []byte(strings.ReplaceAll(first, ">"+rpmSHA256(old)+"<", ">"+rpmSHA256(buf.Bytes())+"<")))
+	m.set(rpmNginxHref, replacement)
+	if rec := rpmRequestFrom(s, a, rpmRepoPath+rpmNginxHref); rec.Code != 200 {
+		t.Fatalf("reader A holding the old repomd.xml: %d %s", rec.Code, rec.Body.String())
+	}
+	slot := s.rpmPrimaries.slot(rpmFixtureRepoID + "/9/x86_64")
+	slot.mu.Lock()
+	if slot.idx == nil {
+		slot.mu.Unlock()
+		t.Fatal("no index")
+	}
+	checksum, pkgSum := slot.idx.checksum, slot.idx.pkgs[rpmNginxHref].sum
+	slot.mu.Unlock()
+	if checksum != rpmSHA256(buf.Bytes()) || pkgSum != rpmSHA256(replacement) {
+		t.Fatalf("index under primary %s gives nginx %s; want primary %s giving %s", checksum, pkgSum, rpmSHA256(buf.Bytes()), rpmSHA256(replacement))
+	}
+	rec := rpmRequestFrom(s, b, rpmRepoPath+rpmNginxHref)
+	if rec.Code != 200 {
+		t.Fatalf("fresh reader B: %d %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), replacement) {
+		t.Fatalf("fresh reader got old package bytes")
+	}
+}
