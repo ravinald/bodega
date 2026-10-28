@@ -282,3 +282,61 @@ func TestComposerProfileTakesSetAddPinAndRemove(t *testing.T) {
 		t.Error("symfony/console is still covered after the vendor-wide entry was removed")
 	}
 }
+
+// An oci entry is a package identity, <registry>/<repository>, or a
+// namespace-wide <registry>/<namespace>/*, and a name in any other form is
+// refused before it is stored, since no request resolves to it.
+func TestOCIProfileTakesSetAddPinAndRemove(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "oci", "ghcr.io/acme-labs/*")
+	mustRunProfile(t, "add", "web", "oci", "docker.io/library/nginx")
+	mustRunProfile(t, "pin", "web", "oci", "docker.io/library/postgres", "17", "--reason", "18 changes the data directory")
+	mustRunProfile(t, "set", "web", "oci", "--membership", "closed", "--expansion", "block")
+
+	for _, bad := range []string{"postgres", "library/postgres", "docker.io/postgres", "Docker.io/library/postgres",
+		"docker.io/library/Postgres", "ghcr.io/*", "ghcr.io/acme-labs/net*", "ghcr.io/*/widget", "ghcr.io/a/b/*", "localhost:5000/app"} {
+		if _, err := runProfile(t, "add", "web", "oci", bad); err == nil || !strings.Contains(err.Error(), "oci") {
+			t.Errorf("add oci %q = %v, want a refusal naming the repository form", bad, err)
+		}
+	}
+	if _, err := runProfile(t, "pin", "web", "oci", "docker.io/postgres", "17", "--reason", "x"); err == nil || !strings.Contains(err.Error(), "docker.io/library/postgres") {
+		t.Errorf("pin took docker.io/postgres or did not name the library/ form: %v", err)
+	}
+	if _, err := runProfile(t, "unpin", "web", "oci", "postgres"); err == nil {
+		t.Error("unpin took an oci name with no registry")
+	}
+	if _, err := runProfile(t, "remove", "web", "oci", "nginx"); err == nil {
+		t.Error("remove took an oci name with no registry")
+	}
+
+	p := storedProfile(t, env, "web")
+	for name, want := range map[string]bool{
+		"docker.io/library/nginx":     true,
+		"ghcr.io/acme-labs/widget":    true,
+		"ghcr.io/acme-labs/plugins":   true,
+		"ghcr.io/example-corp/widget": false,
+		"docker.io/library/redis":     false,
+	} {
+		if got := p.Covers(manifest.TypeOCI, name).Permitted; got != want {
+			t.Errorf("Covers(oci, %s) = %v, want %v", name, got, want)
+		}
+	}
+	if !p.Permits(manifest.TypeOCI, "docker.io/library/postgres", "17").Permitted ||
+		p.Permits(manifest.TypeOCI, "docker.io/library/postgres", "17.2").Permitted {
+		t.Error("the postgres pin of 17 does not admit 17 and refuse 17.2")
+	}
+
+	out, err := runProfile(t, "check", "web")
+	if strings.Contains(out, "acme-labs/*") {
+		t.Errorf("profile check reported the namespace-wide entry as a package it could not find (%v):\n%s", err, out)
+	}
+	if !strings.Contains(out, "1 oci namespace-wide entry not checked") {
+		t.Errorf("profile check does not say the namespace-wide entry went unchecked:\n%s", out)
+	}
+
+	mustRunProfile(t, "remove", "web", "oci", "ghcr.io/acme-labs/*")
+	if storedProfile(t, env, "web").Covers(manifest.TypeOCI, "ghcr.io/acme-labs/widget").Permitted {
+		t.Error("ghcr.io/acme-labs/widget is still covered after the namespace-wide entry was removed")
+	}
+}

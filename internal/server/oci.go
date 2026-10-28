@@ -374,6 +374,7 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 	if !s.ociTagPolicyGate(w, r, t, store, doc, body, decision, baseline, override) {
 		return
 	}
+	s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
 	w.Header().Set("Cache-Control", cachePrivate)
 	writeOCIManifest(w, r, doc.MediaType, doc.Digest, body)
 }
@@ -417,24 +418,24 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 }
 
 // handleOCIManifestDigest serves a manifest by digest. A digest names no
-// tag, so it is judged by the tag bodega last resolved to it, and under a
-// version constraint a digest bodega never resolved is refused: the
-// constraint has nothing to compare.
+// tag, so it is judged by the tags bodega resolved to it: the allow-list's
+// constraint by the one the registry last answered, and under a version
+// constraint a digest bodega never resolved is refused, since the constraint
+// has nothing to compare. The profile admits it when any tag resolved to it
+// is one the profile permits.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
 	store := s.typeStore(manifest.TypeOCI)
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeOCI, name)
-	version := t.ref
-	tag := s.ociResolvedTag(ctx, store, t, t.ref)
+	if pm != nil && isPackageHidden(pm) {
+		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
+		return
+	}
+	last := s.ociResolvedTag(ctx, store, t, t.ref)
 	if pm != nil {
-		if isPackageHidden(pm) {
-			s.refuseHidden(w, r, manifest.TypeOCI, name, "")
-			return
-		}
-		if tag != "" {
-			version = tag
-			if !s.ociJudgeVersion(w, r, pm, name, tag) {
+		if last != "" {
+			if !s.ociJudgeVersion(w, r, pm, name, last) {
 				return
 			}
 		} else if vc, baseVer := packageVersionConstraint(pm); vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
@@ -442,8 +443,14 @@ func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, 
 			return
 		}
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, version) {
-		return
+	if p := s.profileFor(r); p != nil {
+		d, tag := p.PermitsOneOf(manifest.TypeOCI, name, s.ociResolvedByTags(ctx, store, t, last))
+		if tag == "" {
+			tag = t.ref
+		}
+		if !s.entitleGateDecided(w, r, p, manifest.TypeOCI, name, tag, d, http.StatusForbidden) {
+			return
+		}
 	}
 	if !s.ociAllowListGate(w, r, t, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true) {
 		return
@@ -452,6 +459,59 @@ func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, 
 		return
 	}
 	s.serveOCIManifestDigest(w, r, t, pm, "")
+}
+
+// ociResolvedByTags is every tag bodega resolved to t.ref, last first. last
+// is the allow-list's record, which is all a digest resolved before the
+// per-tag markers existed carries. A listing that fails leaves the markers
+// out, so a pinned profile refuses rather than guesses.
+func (s *Server) ociResolvedByTags(ctx context.Context, store storage.ObjectStore, t ociTarget, last string) []string {
+	var tags []string
+	if last != "" {
+		tags = append(tags, last)
+	}
+	if store == nil {
+		return tags
+	}
+	prefix := manifest.OCIResolvedByPrefix(t.registry, t.repo, t.ref)
+	keys, err := store.List(ctx, prefix)
+	if err != nil {
+		s.logger.Warn("oci tag resolutions not listed; the digest is judged by the last tag alone",
+			"name", t.name(), "digest", t.ref, "error", err)
+		return tags
+	}
+	for _, k := range keys {
+		if tag, ok := manifest.OCIResolvedByTag(prefix, k); ok && tag != last {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+// recordOCIResolvedBy marks t.ref as resolving to digest and, for an index,
+// to each platform manifest it lists, which a client pulling the tag asks
+// for next by digest. It runs on every tag response bodega serves, cache
+// hits and stale answers included, so a digest is judged by the tag a host
+// just pulled whatever another host's pulls did to the cache in between.
+// One key per tag, so no write loses another's and nothing is evicted; a
+// marker already there is not written again.
+func (s *Server) recordOCIResolvedBy(ctx context.Context, store storage.ObjectStore, t ociTarget, digest string, body []byte) {
+	if store == nil {
+		return
+	}
+	// The client may hang up as soon as it has the bytes, and the next
+	// request it makes by digest depends on these writes.
+	ctx = context.WithoutCancel(ctx)
+	for _, d := range append([]string{digest}, ociIndexChildren(body)...) {
+		key := manifest.OCIResolvedByKey(t.registry, t.repo, d, t.ref)
+		if info, err := store.Head(ctx, key); err == nil && info != nil && info.Exists {
+			continue
+		}
+		if err := store.Put(ctx, key, []byte(t.ref)); err != nil {
+			s.logger.Warn("oci tag resolution not recorded; a profile with a version rule refuses this digest until it is",
+				"name", t.name(), "tag", t.ref, "digest", d, "error", err)
+		}
+	}
 }
 
 // refuseUnresolvedDigest answers a digest request a version constraint
@@ -658,7 +718,9 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 		s.refuseHidden(w, r, manifest.TypeOCI, name, "")
 		return
 	}
-	if !s.entitleGate(w, r, manifest.TypeOCI, name, "") {
+	// 404 rather than 403 for a repository the profile excludes: to that
+	// host it does not exist, which is what a client listing tags is told.
+	if !s.entitleGateAnswering(w, r, manifest.TypeOCI, name, "", http.StatusNotFound) {
 		return
 	}
 	key := manifest.OCITagListKey(t.registry, t.repo)
@@ -679,6 +741,17 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 		w.writeError(http.StatusBadGateway, "UNKNOWN",
 			fmt.Sprintf("bodega's copy of the tag list for %s does not parse. Retry once metadata_ttl has passed.", name))
 		return
+	}
+	// Filtered here, on the way out, and never stored: the cache holds the
+	// registry's list, which every other host is served from.
+	if permit := profileVersionFilter(s.profileFor(r), manifest.TypeOCI, name); permit != nil {
+		kept := []string{}
+		for _, tag := range list.Tags {
+			if permit(tag) {
+				kept = append(kept, tag)
+			}
+		}
+		list.Tags = kept
 	}
 	tags, more := page.slice(list.Tags)
 	if more {
