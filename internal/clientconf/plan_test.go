@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -310,6 +311,22 @@ func TestOsqueryFlagsNameCertsOnlyOverTLS(t *testing.T) {
 		)
 		if got := OsqueryFlags(c.base, src, c.goos); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s on %s:\n got  %+v\n want %+v", c.base, c.goos, got, want)
+		}
+	}
+
+	// An origins instance's schedule reads the extension, so its flags name
+	// the autoload file; without origins they stay as above.
+	withOrigins := src
+	withOrigins.Origins = true
+	for goos, autoload := range map[string]string{OSLinux: "/etc/osquery/extensions.load", OSFreeBSD: "/usr/local/etc/osquery/extensions.load"} {
+		plain, got := OsqueryFlags("https://b.example:8443", src, goos), OsqueryFlags("https://b.example:8443", withOrigins, goos)
+		if want := append(slices.Clone(plain), OsqueryFlag{OsqueryFlagSet, "extensions_autoload", autoload}); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s with origins:\n got  %+v\n want %+v", goos, got, want)
+		}
+		for _, f := range plain {
+			if strings.HasPrefix(f.Name, "extensions") {
+				t.Errorf("%s without origins sets %s", goos, f.Name)
+			}
 		}
 	}
 

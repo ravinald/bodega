@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/config"
 )
 
 func osquerySecretEnv(t *testing.T) (dbPath string, pepper func() string) {
@@ -142,5 +146,106 @@ func TestOsquerySecretCreateRefusesNonServerInstances(t *testing.T) {
 	_ = create.Flags().Set("expires", "soon")
 	if err := create.RunE(create, []string{"osq", "web-01"}); err == nil || !strings.Contains(err.Error(), "--expires") {
 		t.Errorf("bad --expires: %v", err)
+	}
+}
+
+// The client plan installs the extension only for a server-mode instance
+// that sets origins; any other plan writes nothing and keeps the refusal
+// --configure osquery has always given.
+func TestPlanOsqueryExtension(t *testing.T) {
+	server := clientconf.OsqueryPlan{Instance: "osq", Mode: "server"}
+	withOrigins := server
+	withOrigins.Origins = true
+	shipper := clientconf.OsqueryPlan{Instance: "osq-b", Mode: "shipper", Origins: true}
+
+	for name, p := range map[string]clientconf.Plan{
+		"no osquery":           {},
+		"server, no origins":   {Osquery: []clientconf.OsqueryPlan{server}},
+		"shipper with origins": {Osquery: []clientconf.OsqueryPlan{shipper}},
+	} {
+		root := t.TempDir()
+		if _, err := planOsqueryExtension(p, clientconf.OSLinux, "/usr/local/bin/bodega", root); err == nil || !strings.Contains(err.Error(), "setup.sh") {
+			t.Errorf("%s: err = %v, want a refusal pointing at setup.sh", name, err)
+		}
+		if entries, _ := os.ReadDir(root); len(entries) != 0 {
+			t.Errorf("%s: wrote %v", name, entries)
+		}
+	}
+
+	root := t.TempDir()
+	autoload := filepath.Join(root, "etc", "osquery", "extensions.load")
+	if err := os.MkdirAll(filepath.Dir(autoload), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(autoload, []byte("/opt/other/other.ext"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "usr", "local", "bin", "bodega")
+	plan := clientconf.Plan{Osquery: []clientconf.OsqueryPlan{shipper, withOrigins}}
+	ext, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ext.unchanged() {
+		t.Fatal("a fresh host reads as already configured")
+	}
+	if err := ext.apply(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "usr", "local", "lib", "bodega", "bodega.ext")
+	if dest, err := os.Readlink(link); err != nil || dest != binary {
+		t.Errorf("link = %q, %v; want it pointing at %s", dest, err, binary)
+	}
+	if got, _ := os.ReadFile(autoload); string(got) != "/opt/other/other.ext\n/usr/local/lib/bodega/bodega.ext\n" {
+		t.Errorf("autoload file = %q, want the operator's line kept and bodega's added", got)
+	}
+	again, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root)
+	if err != nil || !again.unchanged() {
+		t.Errorf("second plan = %+v, %v; want nothing to change", again, err)
+	}
+	if fb, err := planOsqueryExtension(plan, clientconf.OSFreeBSD, binary, root); err != nil ||
+		fb.autoload != filepath.Join(root, "usr", "local", "etc", "osquery", "extensions.load") {
+		t.Errorf("freebsd autoload = %+v, %v", fb, err)
+	}
+}
+
+// osqueryd refuses an extension anyone but root could rewrite, and says so
+// only in its own log.
+func TestCheckExtensionBinary(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "bodega")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := checkExtensionBinary(bin)
+	if os.Geteuid() == 0 {
+		if err != nil {
+			t.Errorf("root-owned 0755 binary refused: %v", err)
+		}
+		if err := os.Chmod(bin, 0o775); err != nil {
+			t.Fatal(err)
+		}
+		err = checkExtensionBinary(bin)
+	}
+	if err == nil || !strings.Contains(err.Error(), "owned by root") {
+		t.Errorf("err = %v, want a refusal naming root ownership", err)
+	}
+}
+
+func TestOsqueryExtensionArgs(t *testing.T) {
+	got, ok := osqueryExtensionArgs([]string{"/usr/local/lib/bodega/bodega.ext", "--socket", "/var/osquery/osquery.em", "--timeout", "3", "--interval", "3"})
+	want := []string{"/usr/local/lib/bodega/bodega.ext", "osquery", "extension", "--socket", "/var/osquery/osquery.em", "--timeout", "3", "--interval", "3"}
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %v, %v", got, ok)
+	}
+	if _, ok := osqueryExtensionArgs([]string{"/usr/local/bin/bodega", "osquery", "secret", "list"}); ok {
+		t.Error("the bodega binary under its own name ran as the extension")
+	}
+	t.Setenv(config.EnvConfigFile, filepath.Join(t.TempDir(), "config.json"))
+	cmd := newRootCmd()
+	cmd.SetArgs(want[1:])
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "osquery") {
+		t.Errorf("extension against no osqueryd: err = %v, want the socket named", err)
 	}
 }

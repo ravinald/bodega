@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -25,17 +26,19 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
 // Classes, worst first. Stale is a host-level class: it describes a source
 // instance that stopped reporting, not a component.
 const (
-	ClassRefused      = "refused"
-	ClassUnknown      = "unknown"
-	ClassUnattributed = "unattributed"
-	ClassServed       = "served"
-	ClassBaseline     = "baseline"
-	ClassStale        = "stale"
+	ClassRefused       = "refused"
+	ClassForeignOrigin = "foreign-origin"
+	ClassUnknown       = "unknown"
+	ClassUnattributed  = "unattributed"
+	ClassServed        = "served"
+	ClassBaseline      = "baseline"
+	ClassStale         = "stale"
 
 	// ClassUnclassified marks a component of a report that has no recorded
 	// classification: it arrived before reconciliation existed, or while the
@@ -44,7 +47,7 @@ const (
 )
 
 // Classes lists every class a report can show, in display order.
-var Classes = []string{ClassRefused, ClassUnknown, ClassUnattributed, ClassUnclassified, ClassServed, ClassBaseline, ClassStale}
+var Classes = []string{ClassRefused, ClassForeignOrigin, ClassUnknown, ClassUnattributed, ClassUnclassified, ClassServed, ClassBaseline, ClassStale}
 
 func rank(class string) int {
 	for i, c := range Classes {
@@ -66,10 +69,13 @@ type Catalog interface {
 // Reconciler classifies reports and assembles host state. DB is required;
 // Catalog may be nil (nothing is cataloged), and Instances names the
 // configured sources, which coverage, staleness and disagreement read.
+// PublicURL is the base hosts reach bodega at; an npm or pypi origin naming
+// any other host is foreign. Empty, no npm or pypi origin is judged.
 type Reconciler struct {
 	DB        *audit.DB
 	Catalog   Catalog
 	Instances []*inventory.Instance
+	PublicURL string
 	Logger    *slog.Logger
 	Now       func() time.Time
 }
@@ -131,7 +137,7 @@ func (r *Reconciler) Record(ctx context.Context, rep audit.InventoryReport) (aud
 
 func (r *Reconciler) audit(ctx context.Context, rep audit.InventoryReport, c audit.InventoryClassification) {
 	counts := Count(c.Components)
-	if counts[ClassRefused]+counts[ClassUnknown] > 0 {
+	if counts[ClassRefused]+counts[ClassForeignOrigin]+counts[ClassUnknown] > 0 {
 		details, _ := json.Marshal(map[string]any{
 			"report_id": rep.ID, "source": rep.Source, "counts": counts,
 		})
@@ -358,6 +364,9 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 		}
 		return ClassBaseline, fmt.Sprintf("an accepted baseline covers %s", label), nil
 	}
+	if manager, origin, foreign := r.foreignOrigin(c); foreign {
+		return ClassForeignOrigin, fmt.Sprintf("%s says it came from %s, not bodega", manager, origin), nil
+	}
 	if !known {
 		return ClassUnknown, fmt.Sprintf("bodega serves no %q packages, and no baseline covers this one", c.Ecosystem), nil
 	}
@@ -377,6 +386,55 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 		return ClassUnattributed, fmt.Sprintf("%s is cataloged, and bodega never served it to %s", label, identity), nil
 	}
 	return ClassUnknown, fmt.Sprintf("no catalog entry and no serve_fetch row for %s", label), nil
+}
+
+// foreignOrigin reports whether the package manager recorded a source for c
+// other than bodega, naming that package manager and the source as the
+// reason quotes it. FreeBSD's origin is a
+// repository name, bodega's carrying pkgrepos.TagPrefix as the client plan
+// writes it; every other origin is a URL or a host, compared by host against
+// public_url. An origin bodega cannot judge (none recorded, or no public_url
+// to compare with) is not foreign, so the component classifies as it would
+// without one.
+func (r *Reconciler) foreignOrigin(c audit.InventoryComponent) (manager, origin string, foreign bool) {
+	origin = strings.TrimSpace(c.Origin)
+	if origin == "" {
+		return "", "", false
+	}
+	if c.Ecosystem == manifest.TypeFreeBSD {
+		return "pkg", origin, !strings.HasPrefix(origin, pkgrepos.TagPrefix)
+	}
+	own := hostOf(r.PublicURL)
+	if own == "" {
+		return "", "", false
+	}
+	host := hostOf(origin)
+	if host == "" {
+		host, _, _ = strings.Cut(strings.ToLower(origin), "/")
+	}
+	return packageManager(c.Ecosystem), host, host != own
+}
+
+// hostOf is a URL's host with its port, lowercased, or "" when raw is no
+// absolute URL. A source may record a bare host, as osquery's normalizer
+// does, or a scheme-less reference such as an OCI repository_url; the caller
+// reads those up to the first slash.
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+func packageManager(eco string) string {
+	switch eco {
+	case manifest.TypePypi:
+		return "pip"
+	case "":
+		return "the package manager"
+	}
+	return eco
 }
 
 // refusal answers with the reason bodega refused this name@version at

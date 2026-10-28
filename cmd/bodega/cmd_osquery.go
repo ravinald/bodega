@@ -5,14 +5,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/inventory/osquery"
@@ -25,8 +30,8 @@ const enrollSecretPrefix = "bodega_es_"
 // node_key.
 func newOsqueryCmd(gf *globalFlags) *cobra.Command {
 	parent := &cobra.Command{
-		Use:   "osquery <secret>",
-		Short: "Manage osquery enroll secrets for an osquery inventory source",
+		Use:   "osquery <secret|extension>",
+		Short: "Manage osquery enroll secrets, and run bodega's osquery extension",
 	}
 	secret := &cobra.Command{
 		Use:   "secret <create|list|revoke>",
@@ -42,8 +47,67 @@ Examples:
   bodega osquery secret revoke 3f9a01c2d4e5b6a7`,
 	}
 	secret.AddCommand(newOsquerySecretCreateCmd(gf), newOsquerySecretListCmd(gf), newOsquerySecretRevokeCmd(gf))
-	parent.AddCommand(secret)
+	parent.AddCommand(secret, newOsqueryExtensionCmd())
 	return parent
+}
+
+func newOsqueryExtensionCmd() *cobra.Command {
+	var (
+		socket            string
+		timeout, interval int
+		verbose           bool
+	)
+	c := &cobra.Command{
+		Use:   "extension --socket <path>",
+		Short: "Serve the package origin tables to osqueryd as an extension",
+		Long: `Registers two tables with the osqueryd listening on --socket and serves
+them until osqueryd exits:
+
+  bodega_npm_origins  directory, name, version, path, resolved
+                      from <directory>/node_modules/.package-lock.json
+  bodega_pip_origins  directory, name, version, path, url
+                      from <directory>/*.dist-info/direct_url.json (PEP 610)
+
+Both need directory in the WHERE clause and return no rows without it. A
+file that does not parse is skipped and named on stderr.
+
+osqueryd starts it with --socket, --timeout and --interval when the bodega
+binary is listed in its extensions_autoload file under a name ending in .ext,
+which ` + "`bodega doctor --configure osquery --apply`" + ` sets up. A binary invoked
+under such a name runs this command directly.
+
+Examples:
+  osqueryi --extension /usr/local/lib/bodega/bodega.ext
+  bodega osquery extension --socket /var/osquery/osquery.em`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if timeout <= 0 || interval <= 0 {
+				return fmt.Errorf("--timeout and --interval take a positive number of seconds, got %d and %d", timeout, interval)
+			}
+			return osquery.RunExtension(osquery.ExtensionOptions{
+				Socket:   socket,
+				Timeout:  time.Duration(timeout) * time.Second,
+				Interval: time.Duration(interval) * time.Second,
+				Log:      cmd.ErrOrStderr(),
+			})
+		},
+	}
+	c.Flags().StringVar(&socket, "socket", "", "Path to osqueryd's extensions socket")
+	c.Flags().IntVar(&timeout, "timeout", 3, "Seconds to wait for osqueryd to answer")
+	c.Flags().IntVar(&interval, "interval", 3, "Seconds between checks that osqueryd is still there")
+	c.Flags().BoolVar(&verbose, "verbose", false, "Accepted because osqueryd passes it; the extension logs only skipped files")
+	return c
+}
+
+// osqueryExtensionArgs turns the command line osqueryd starts an autoloaded
+// extension with into bodega's own. osqueryd runs the .ext path itself with
+// its flags and no subcommand, so a binary invoked under that name is the
+// extension.
+func osqueryExtensionArgs(args []string) ([]string, bool) {
+	if len(args) == 0 || !strings.HasSuffix(args[0], ".ext") {
+		return args, false
+	}
+	return append([]string{args[0], "osquery", "extension"}, args[1:]...), true
 }
 
 // osqueryServerInstance refuses an instance that is not an osquery source in
@@ -245,4 +309,164 @@ next config or log request. Reports already stored keep their identity.`,
 			return nil
 		},
 	}
+}
+
+// osqueryExtension is what --configure osquery installs for a host whose
+// server-mode instance sets origins: the bodega binary linked under a .ext
+// name, and that name listed in osqueryd's autoload file. root prefixes both
+// paths, "" on a real host.
+type osqueryExtension struct {
+	binary string
+	// name is the link's path as osqueryd reads it, without root.
+	name         string
+	link         string
+	autoload     string
+	linkCurrent  bool
+	listed       bool
+	autoloadBody []byte
+}
+
+// planOsqueryExtension decides the extension install from the plan. It
+// refuses a host whose server-mode instance does not set origins, with the
+// refusal --configure osquery has always given: the flags, the enroll secret
+// and the restart are setup.sh's, and without origins there is nothing else.
+func planOsqueryExtension(plan clientconf.Plan, goos, binary, root string) (*osqueryExtension, error) {
+	var servers []clientconf.OsqueryPlan
+	for _, p := range plan.Osquery {
+		if p.Mode == osquery.ModeServer {
+			servers = append(servers, p)
+		}
+	}
+	setupHint := "  Run the served setup script for the flags, the enroll secret and the restart: BODEGA_OSQUERY_SECRET=<secret> sh setup.sh --url <base> --systems osquery --apply"
+	switch {
+	case len(servers) != 1:
+		return nil, fmt.Errorf("--configure osquery installs bodega's osquery extension for the one server-mode osquery source a host enrolls with, and this server runs %d.\n%s", len(servers), setupHint)
+	case !servers[0].Origins:
+		return nil, fmt.Errorf("osquery source %q does not set origins, so its schedule reads no extension and --configure osquery has nothing to install.\n%s", servers[0].Instance, setupHint)
+	}
+	link, autoload := clientconf.OsqueryExtensionPaths[goos], clientconf.OsqueryAutoloadPaths[goos]
+	if link == "" || autoload == "" {
+		return nil, fmt.Errorf("bodega knows where osqueryd autoloads extensions on linux and freebsd, not on %s", goos)
+	}
+	ext := &osqueryExtension{binary: binary, name: link, link: filepath.Join(root, link), autoload: filepath.Join(root, autoload)}
+	if dest, err := os.Readlink(ext.link); err == nil && dest == binary {
+		ext.linkCurrent = true
+	}
+	body, err := os.ReadFile(ext.autoload)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read osqueryd's autoload file %s: %w", ext.autoload, err)
+	}
+	ext.autoloadBody = body
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.TrimSpace(line) == link {
+			ext.listed = true
+		}
+	}
+	return ext, nil
+}
+
+// checkExtensionBinary refuses a binary osqueryd's autoloader would refuse:
+// one not owned by root, or writable by its group or anyone. osqueryd says
+// so only in its own log, and the host would report nothing at all, since
+// its schedule names the extension's tables.
+func checkExtensionBinary(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat the bodega binary %s: %w", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot read the owner of %s on this platform", path)
+	}
+	if st.Uid != 0 || fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("osqueryd autoloads only an extension owned by root and writable by no one else, and %s is owned by uid %d with mode %s.\n"+
+			"  Install bodega where root owns it (install -o root -m 0755 bodega /usr/local/bin/bodega), then re-run from there", path, st.Uid, fi.Mode().Perm())
+	}
+	return nil
+}
+
+func (e *osqueryExtension) unchanged() bool { return e.linkCurrent && e.listed }
+
+func (e *osqueryExtension) printPlan(w io.Writer) {
+	if e.linkCurrent {
+		fmt.Fprintf(w, "unchanged  %-10s %s -> %s\n", clientconf.SystemOsquery, e.link, e.binary)
+	} else {
+		fmt.Fprintf(w, "link       %-10s %s -> %s (osquery extension)\n", clientconf.SystemOsquery, e.link, e.binary)
+	}
+	if e.listed {
+		fmt.Fprintf(w, "unchanged  %-10s %s lists the extension\n", clientconf.SystemOsquery, e.autoload)
+	} else {
+		fmt.Fprintf(w, "autoload   %-10s %s gains the line %s\n", clientconf.SystemOsquery, e.autoload, e.name)
+	}
+}
+
+// apply writes the link and the autoload line. The link is replaced through
+// a rename so osqueryd never reads a half-made one, and the autoload file
+// keeps every line it held.
+func (e *osqueryExtension) apply() error {
+	if !e.linkCurrent {
+		if err := os.MkdirAll(filepath.Dir(e.link), 0o755); err != nil {
+			return fmt.Errorf("create %s for the osquery extension: %w", filepath.Dir(e.link), err)
+		}
+		tmp := e.link + ".bodega-tmp"
+		_ = os.Remove(tmp)
+		if err := os.Symlink(e.binary, tmp); err != nil {
+			return fmt.Errorf("link the osquery extension: %w", err)
+		}
+		if err := os.Rename(tmp, e.link); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("link the osquery extension at %s: %w", e.link, err)
+		}
+	}
+	if !e.listed {
+		body := e.autoloadBody
+		if len(body) > 0 && body[len(body)-1] != '\n' {
+			body = append(body, '\n')
+		}
+		body = append(body, e.name+"\n"...)
+		if err := os.MkdirAll(filepath.Dir(e.autoload), 0o755); err != nil {
+			return fmt.Errorf("create %s for osqueryd's autoload file: %w", filepath.Dir(e.autoload), err)
+		}
+		if err := os.WriteFile(e.autoload, body, 0o644); err != nil {
+			return fmt.Errorf("write osqueryd's autoload file %s: %w", e.autoload, err)
+		}
+	}
+	return nil
+}
+
+// configureOsqueryExtension is --configure osquery: the extension half of
+// the osquery system, which only this binary can do because the extension
+// is this binary.
+func configureOsqueryExtension(w io.Writer, plan clientconf.Plan, apply bool) error {
+	binary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find the bodega binary to link as the osquery extension: %w", err)
+	}
+	if binary, err = filepath.EvalSymlinks(binary); err != nil {
+		return fmt.Errorf("resolve the bodega binary: %w", err)
+	}
+	ext, err := planOsqueryExtension(plan, runtime.GOOS, binary, "")
+	if err != nil {
+		return err
+	}
+	if err := checkExtensionBinary(binary); err != nil {
+		return err
+	}
+	ext.printPlan(w)
+	restart := "osqueryd loads it at its next start: the setup script sets extensions_autoload and restarts osqueryd (--systems osquery --apply)"
+	switch {
+	case ext.unchanged():
+		fmt.Fprintf(w, "\nNothing to change: the extension is linked and listed. %s.\n", restart)
+		return nil
+	case !apply:
+		fmt.Fprintln(w, "\nDry run: nothing was written. Re-run with --apply, as root, to link and list the extension.")
+		return nil
+	case os.Geteuid() != 0:
+		return fmt.Errorf("osqueryd autoloads only a root-owned extension from a root-owned directory, so --configure osquery --apply needs root. Re-run with sudo. Nothing was written")
+	}
+	if err := ext.apply(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "wrote      %s\nwrote      %s\n\n%s.\n", ext.link, ext.autoload, restart)
+	return nil
 }

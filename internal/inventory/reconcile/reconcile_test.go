@@ -567,3 +567,73 @@ func TestServedIdentityParsesKeys(t *testing.T) {
 		}
 	}
 }
+
+// A package manager naming a source other than bodega outranks what bodega
+// served: the served and catalog checks never run for it.
+func TestForeignOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.rc.PublicURL = "https://Bodega.Example:8443/"
+	h.bind("agent", "host-1", "web-01")
+	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
+	h.served("web-01", "npm", "lodash", "4.17.21", "npm/lodash/lodash-4.17.21.tgz", "")
+	h.served("web-01", "npm", "chalk", "5.3.0", "npm/chalk/chalk-5.3.0.tgz", "")
+	h.served("web-01", "freebsd", "curl", "8.10.1", "freebsd/curl-8.10.1.pkg", "")
+	h.served("web-01", "freebsd", "bash", "5.2.37", "freebsd/bash-5.2.37.pkg", "")
+	h.catalog(manifest.TypePypi, "six", manifest.VersionEntry{Version: "1.17.0", Mode: manifest.ModeProxy})
+
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0", Origin: "registry.npmjs.org"},
+		inventory.Component{Ecosystem: "npm", Name: "lodash", Version: "4.17.21", Origin: "bodega.example:8443"},
+		inventory.Component{Ecosystem: "npm", Name: "chalk", Version: "5.3.0"},
+		inventory.Component{Ecosystem: "npm", Name: "sideload", Version: "0.1.0"},
+		inventory.Component{Ecosystem: "pypi", Name: "six", Version: "1.17.0", Origin: "github.com"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "8.10.1", Origin: "FreeBSD"},
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "5.2.37", Origin: "bodega-latest"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "left-pad@1.3.0", ClassForeignOrigin, "npm says it came from registry.npmjs.org, not bodega")
+	wantClass(t, got, "lodash@4.17.21", ClassServed, "served lodash@4.17.21 to web-01")
+	wantClass(t, got, "chalk@5.3.0", ClassServed, "served chalk@5.3.0")
+	wantClass(t, got, "sideload@0.1.0", ClassUnknown, "no catalog entry")
+	wantClass(t, got, "six@1.17.0", ClassForeignOrigin, "pip says it came from github.com, not bodega")
+	wantClass(t, got, "curl@8.10.1", ClassForeignOrigin, "pkg says it came from FreeBSD, not bodega")
+	wantClass(t, got, "bash@5.2.37", ClassServed, "served bash@5.2.37")
+
+	// CycloneDX carries the whole URL, or a scheme-less OCI repository_url,
+	// and compares by host all the same.
+	cdx := h.classesOf(h.bom("web-02",
+		`{"name":"x","version":"1","purl":"pkg:npm/x@1","externalReferences":[{"type":"distribution","url":"https://registry.npmjs.org/x/-/x-1.tgz"}]}`,
+		`{"name":"y","version":"2","purl":"pkg:npm/y@2","externalReferences":[{"type":"distribution","url":"https://bodega.example:8443/npm/y/-/y-2.tgz"}]}`,
+		`{"name":"nginx","version":"1.27","purl":"pkg:oci/nginx@1.27?repository_url=docker.io/library/nginx"}`,
+	))
+	wantClass(t, cdx, "x@1", ClassForeignOrigin, "npm says it came from registry.npmjs.org")
+	wantClass(t, cdx, "y@2", ClassUnknown, "no catalog entry")
+	wantClass(t, cdx, "docker.io/library/nginx@1.27", ClassForeignOrigin, "oci says it came from docker.io")
+
+	host, err := h.rc.Host(h.ctx, "web-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !host.Alert || host.Counts[ClassForeignOrigin] != 3 {
+		t.Errorf("host alert = %v, counts %v, want an alert with 3 foreign-origin", host.Alert, host.Counts)
+	}
+	if rank(ClassForeignOrigin) != rank(ClassRefused)+1 || rank(ClassUnknown) != rank(ClassForeignOrigin)+1 {
+		t.Errorf("classes = %v, want foreign-origin between refused and unknown", Classes)
+	}
+}
+
+// Without public_url there is no bodega host to compare an npm or pypi origin
+// with, so it classifies as though none were recorded; a FreeBSD repository
+// name needs no URL.
+func TestForeignOriginWithoutPublicURL(t *testing.T) {
+	h := newHarness(t)
+	h.bind("agent", "host-1", "web-01")
+	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0", Origin: "registry.npmjs.org"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "8.10.1", Origin: "FreeBSD"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "left-pad@1.3.0", ClassServed, "served left-pad@1.3.0")
+	wantClass(t, got, "curl@8.10.1", ClassForeignOrigin, "pkg says it came from FreeBSD")
+}

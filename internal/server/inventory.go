@@ -53,7 +53,7 @@ func (s *Server) setupInventory() {
 // newReconciler reads the same store and instances the frame was built with,
 // so a report is classified against the catalog this server serves.
 func (s *Server) newReconciler(instances []*inventory.Instance) *reconcile.Reconciler {
-	rc := &reconcile.Reconciler{DB: s.auditDB, Instances: instances, Logger: s.logger}
+	rc := &reconcile.Reconciler{DB: s.auditDB, Instances: instances, Logger: s.logger, PublicURL: s.cfg.ResolvePublicURL("")}
 	if s.store != nil {
 		rc.Catalog = s.store
 	}
@@ -165,6 +165,7 @@ func (s *Server) osqueryPlan(h *clientHost) []clientconf.OsqueryPlan {
 			Interval:   int64(src.Interval() / time.Second),
 			PythonDirs: osquery.CleanDirs(dirs.Python),
 			NPMDirs:    osquery.CleanDirs(dirs.NPM),
+			Origins:    src.Origins(),
 		})
 	}
 	return out

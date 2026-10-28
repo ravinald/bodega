@@ -1451,9 +1451,9 @@ bodega inventory baseline <identity> [--json]
 
 `report` exits 1 when a component of the host's current set is `refused`, `unknown` or `unclassified`, or two sources disagree, whatever `--class` narrows the output to; 0 otherwise. `accept` writes a `create` audit row with `pkg_type=inventory-baseline`.
 
-### `bodega osquery secret <create|list|revoke>`
+### `bodega osquery secret <create|list|revoke>`, `bodega osquery extension`
 
-Manages the enroll secrets an [`osquery` source](#the-osquery-source) in `server` mode accepts. A host presenting one gets a `node_key`, and the secret's identity becomes the identity of every report under that key.
+`secret` manages the enroll secrets an [`osquery` source](#the-osquery-source) in `server` mode accepts. A host presenting one gets a `node_key`, and the secret's identity becomes the identity of every report under that key.
 
 ```bash
 bodega osquery secret create <instance> <identity> [--expires <duration>] [--label <name>]
@@ -1462,6 +1462,12 @@ bodega osquery secret revoke <id>
 ```
 
 `create` prints the secret once and stores only its peppered hash, keyed on the same pepper as API tokens. `--expires` takes a Go duration (`12h`), `30d`, `1y`, a date, or `never` (the default), and stops new enrollments after that time. It refuses an instance that is not an `osquery` source in `server` mode. `list` shows each secret's id, source, label, identity, creation and expiry, and how many nodes enrolled with it, never the secret. `revoke` deletes the secret and every `node_key` enrolled with it. `create` and `revoke` each write a `create` or `delete` audit row with `pkg_type=osquery-secret`.
+
+```bash
+bodega osquery extension --socket <path> [--timeout <seconds>] [--interval <seconds>]
+```
+
+`extension` runs as an osquery extension and serves `bodega_npm_origins` and `bodega_pip_origins` until osqueryd exits; see [Package origins](#package-origins). osqueryd starts it with these flags when it autoloads the binary under a name ending in `.ext`, and the binary invoked under such a name runs `extension` with no subcommand needed. It reads no bodega config and writes none.
 
 ### `bodega identity <bind|unbind|list>`
 
@@ -2200,7 +2206,7 @@ On Linux, three more rows name the OS services that reach out on their own whate
 
 A failure to read `/etc/default/motd-news` or chrony's configuration reports the row `SKIPPED`, naming the error.
 
-`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is refused by name and left out otherwise: its flags file alone points at a secret nothing wrote and a daemon nothing installed, so only the setup script configures it.
+`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is left out otherwise, and named it runs alone and does one thing: for a host whose `server`-mode source sets `origins`, it links this binary as bodega's osquery extension and lists it in osqueryd's autoload file (see [Package origins](#package-origins)). For any other host it writes nothing and refuses. The flags, the enroll secret and the restart stay with the setup script, since the flags file alone points at a secret nothing wrote and a daemon nothing installed.
 
 ```bash
 bodega doctor --configure apt,pypi --url https://bodega.internal
@@ -8022,11 +8028,12 @@ A fleet can run one instance of each. A host belongs to one: a `server` instance
 }
 ```
 
-| Key              | Default             | Meaning                                                                                                                                                             |
-| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mode`           | required            | `server` or `shipper`                                                                                                                                               |
-| `interval`       | `"1h"`              | How often the schedule's snapshot queries run, in whole seconds. Minimum `"1m"`. In `shipper` mode it is advisory: the plan states it, and the config owner decides |
-| `max_body_bytes` | `16777216` (16 MiB) | Cap on a `log` or `results` post; a larger body is refused with `413`. `enroll` and `config` are capped at 64 KiB                                                   |
+| Key              | Default             | Meaning                                                                                                                                                                                                                                                  |
+| ---------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`           | required            | `server` or `shipper`                                                                                                                                                                                                                                    |
+| `interval`       | `"1h"`              | How often the schedule's snapshot queries run, in whole seconds. Minimum `"1m"`. In `shipper` mode it is advisory: the plan states it, and the config owner decides                                                                                      |
+| `max_body_bytes` | `16777216` (16 MiB) | Cap on a `log` or `results` post; a larger body is refused with `413`. `enroll` and `config` are capped at 64 KiB                                                                                                                                        |
+| `origins`        | `false`             | Join bodega's osquery extension tables and pkg's repository annotation into the schedule, so components carry the origin their package manager recorded. Every host the instance serves must load the extension; see [Package origins](#package-origins) |
 
 ##### Tables and ecosystems
 
@@ -8150,6 +8157,42 @@ Each run reads from the recorded offset, posts the new complete lines (a line os
 
 A single line larger than `--max-bytes` is posted alone, and one larger than `max_body_bytes` is refused with `413` on every run, which stops the shipper at that line. Raise `max_body_bytes` on the instance if a host's snapshot outgrows it.
 
+##### Package origins
+
+With `origins` set to `true`, an instance's schedule also reads where each package's manager says it came from, and reconciliation classifies a package whose origin is not bodega as [`foreign-origin`](#classes). osquery collects none of this itself, so the bodega binary doubles as an osquery extension, `bodega osquery extension`, serving two tables:
+
+| Table                | Columns                                            | Read from                                                                                             |
+| -------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `bodega_npm_origins` | `directory`, `name`, `version`, `path`, `resolved` | `<directory>/node_modules/.package-lock.json`, the hidden lockfile npm 7 and later keep               |
+| `bodega_pip_origins` | `directory`, `name`, `version`, `path`, `url`      | `<directory>/*.dist-info/direct_url.json`, which pip writes (PEP 610) for a URL, VCS or local install |
+
+Both require `directory` in the `WHERE` clause (`=` or `IN`) and return no rows without it, as `npm_packages` and `python_packages` do, so no query walks the whole disk. `path` is the value osquery's own table reports for the same package (the `package.json` path for npm, the `.dist-info` directory for pip), and the schedule joins on it with a `LEFT JOIN`, so a package with no origin row still reports. A lockfile or `direct_url.json` that does not parse is skipped, and the extension names it on its stderr, which osqueryd logs; the table still answers.
+
+The normalizer keeps a URL's host, port included and credentials dropped: `https://ci:token@bodega.example.com:8443/npm/...` is stored as `bodega.example.com:8443`. A `file://` URL, from a pip install of a local directory, has no host and leaves the origin empty.
+
+On FreeBSD the origin is pkg's `repository` annotation, the repository `pkg install` took the package from, which `pkg query %R` prints. It lives in the same `/var/db/pkg/local.sqlite`, so an origins config mounts a second table, `bodega_pkg_origins` (`name`, `version`, `repository`), next to `bodega_pkg_packages`, and needs no extension. Every repository bodega's client plan writes is named `bodega-<repo>`; any other name is foreign.
+
+A query naming a table osqueryd has not loaded fails whole, and the host would send no report at all. So with `origins` at `false` the schedule names neither table and is the same, byte for byte, as before the key existed, and every host an origins instance serves must load the extension before its next `config` fetch.
+
+In `server` mode the host's plan carries `"origins": true`, and two commands set the host up. Run both as root, `doctor` first:
+
+```bash
+sudo bodega doctor --configure osquery --url https://bodega.example.com:8443 --apply
+BODEGA_OSQUERY_SECRET=<secret> sh setup.sh --url https://bodega.example.com:8443 --systems osquery --apply
+```
+
+`doctor --configure osquery` links the running bodega binary at `/usr/local/lib/bodega/bodega.ext` and appends that path to osqueryd's autoload file (`/etc/osquery/extensions.load` on Linux, `/usr/local/etc/osquery/extensions.load` on FreeBSD), keeping the lines already there. osqueryd autoloads only a path ending in `.ext` whose file root owns and nobody else can write, so `doctor` refuses a binary that is not root-owned or is group- or world-writable, and names the `install` command that fixes it. `setup.sh` then merges `--extensions_autoload=<that file>` with the other flags and restarts osqueryd, which starts the extension with `--socket`, `--timeout` and `--interval`. For a host whose instance does not set `origins`, `doctor --configure osquery` writes nothing and points at `setup.sh`, as it did before, and the flags name no autoload file.
+
+In `shipper` mode the config owner loads the extension by hand: install bodega root-owned, then on each host
+
+```bash
+sudo install -d -o root -m 0755 /usr/local/lib/bodega
+sudo ln -sf /usr/local/bin/bodega /usr/local/lib/bodega/bodega.ext
+echo /usr/local/lib/bodega/bodega.ext | sudo tee -a /etc/osquery/extensions.load
+```
+
+and add `--extensions_autoload=/etc/osquery/extensions.load` to osqueryd's flags before restarting it. Take the origins queries and `auto_table_construction` from the `config` answer of a `server` instance with `origins` set, or write them from the tables above. To check that the tables are there, `osqueryi --extension /usr/local/lib/bodega/bodega.ext --extensions_require=bodega "SELECT * FROM bodega_npm_origins WHERE directory = '/srv/app';"` prints the rows the schedule would join.
+
 ### Host mapping
 
 Each source names hosts its own way: a node key, a vendor host id, a token's identity. `inventory_hosts` maps `(source instance, external id)` to a bodega identity, and a report reaches an identity through that table and nothing else. Whatever identity a normalizer writes into a report is discarded.
@@ -8254,22 +8297,23 @@ bodega inventory baseline web-01
 
 Worst first. A component gets the first class whose rule holds:
 
-| Class          | Rule                                                                                                                                                                                                |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `refused`      | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                              |
-| `baseline`     | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                            |
-| `unknown`      | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row |
-| `served`       | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                             |
-| `unattributed` | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                        |
-| `stale`        | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                 |
+| Class            | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refused`        | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                                                                                                                                                                                                                                                                                               |
+| `baseline`       | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                                                                                                                                                                                                                                                                                             |
+| `foreign-origin` | The package manager recorded where the component came from, and it is not bodega: for npm and pypi, a host other than `public_url`'s; for FreeBSD, a repository whose name does not start with `bodega-`, the prefix of every repository the client plan writes. The reason names the source: `npm says it came from registry.npmjs.org, not bodega`. A component with no recorded origin skips this rule, and so does an npm or pypi one when `public_url` is unset |
+| `unknown`        | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row                                                                                                                                                                                                                                                                  |
+| `served`         | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                                                                                                                                                                                                                                                                                              |
+| `unattributed`   | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                                                                                                                                                                                                                                                                                         |
+| `stale`          | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                                                                                                                                                                                                                                                                                  |
 
-Classes are displayed worst first: `refused`, `unknown`, `unattributed`, `served`, `baseline`. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
+Classes are displayed worst first: `refused`, `foreign-origin`, `unknown`, `unattributed`, `served`, `baseline`. A `foreign-origin` component alerts like an `unknown` one: `report` exits 1 and the report's `inventory`/`bypass` event counts it. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
 
 Names compare the way bodega's types canonicalize them: `Django` installed and `django` served are one pypi package, while npm names stay case-sensitive. A version compares exactly, except that an apt epoch is dropped on both sides, since dpkg reports `1:2.38.1-5` and the pool file is `util-linux_2.38.1-5_amd64.deb`. An apt or FreeBSD `serve_fetch` row names a pool path or a repository, so the object key's filename says which package was served. A catalog entry counts only at its exact version: a range or open entry records nothing about a version bodega never served under it, so a host holding one got it elsewhere.
 
 Classes are recorded, not recomputed. Hiding a version, serving a package, or accepting a baseline changes the class of components in reports that arrive afterwards, never of those already stored.
 
-`foreign-origin` (the package manager itself names a non-bodega source) is reserved and not emitted.
+Only some package managers record an origin, so only some components can read `foreign-origin`. npm keeps each package's `resolved` URL in `node_modules/.package-lock.json`; pip writes `direct_url.json` (PEP 610) for a package installed from a URL, a VCS or a local path, though not for one installed from an index, which reads as before; FreeBSD pkg keeps the repository it installed from in its own database. The `osquery` source reads all three once its instance sets [`origins`](#the-osquery-source), and a CycloneDX document carries one wherever a component's purl has `repository_url` or `download_url`, or it has a `distribution` reference. apt keeps no record of the archive a package came from once it is installed, `cargo install` keeps one in `~/.cargo/.crates2.json` but under no directory bodega is told to scan, and a Go binary's module list (`go version -m`) names modules and sums but no download host, so none of the three can carry an origin.
 
 #### The current set
 

@@ -62,8 +62,9 @@ or the report predates reconciliation) reads unclassified.
 Then each source instance with its last report, and whether it is stale, and
 any component one source reports and another omits (source-disagreement).
 
-Exits 1 when a component is refused, unknown or unclassified, or two sources
-disagree, whatever --class shows, so a scheduled job can alert on it.
+Exits 1 when a component is refused, foreign-origin, unknown or unclassified,
+or two sources disagree, whatever --class shows, so a scheduled job can alert
+on it.
 
 Examples:
   bodega inventory report web-01

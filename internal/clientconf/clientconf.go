@@ -534,6 +534,23 @@ var osqueryCABundles = map[string]string{
 	OSFreeBSD: "/etc/ssl/cert.pem",
 }
 
+// OsqueryExtensionPaths is where bodega doctor --configure osquery links
+// the bodega binary as an osquery extension. osqueryd's autoloader takes
+// only a path ending in .ext, owned by root and writable by no one else.
+var OsqueryExtensionPaths = map[string]string{
+	OSLinux:   "/usr/local/lib/bodega/bodega.ext",
+	OSFreeBSD: "/usr/local/lib/bodega/bodega.ext",
+}
+
+// OsqueryAutoloadPaths are each OS package's default extensions_autoload
+// file, one extension path per line. bodega adds its line and keeps the
+// rest, and names the file in the flags so a host that moved it still reads
+// bodega's.
+var OsqueryAutoloadPaths = map[string]string{
+	OSLinux:   "/etc/osquery/extensions.load",
+	OSFreeBSD: "/usr/local/etc/osquery/extensions.load",
+}
+
 // How setup.sh merges one OsqueryFlag into the host's flags file.
 const (
 	// OsqueryFlagSet is a flag bodega needs to work: every line setting it
@@ -565,7 +582,8 @@ type OsqueryFlag struct {
 // logger_plugin is merged rather than set because a deployed host may feed
 // its filesystem log, osquery's default, to something else. host_identifier
 // defaults to uuid because osquery's own default, hostname, changes when a
-// host is renamed, and a shipper's mapping keys on it.
+// host is renamed, and a shipper's mapping keys on it. extensions_autoload
+// is set only for an origins instance, whose schedule needs the extension.
 func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	b, err := url.Parse(base)
 	if err != nil || b.Host == "" {
@@ -590,12 +608,16 @@ func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	if src.Interval > 0 {
 		out = append(out, set("config_refresh", strconv.FormatInt(src.Interval, 10)))
 	}
-	return append(out,
+	out = append(out,
 		OsqueryFlag{OsqueryFlagDefault, "host_identifier", "uuid"},
 		OsqueryFlag{OsqueryFlagDefault, "logger_plugin", "filesystem,tls"},
 		OsqueryFlag{OsqueryFlagInclude, "logger_plugin", "tls"},
 		set("logger_tls_endpoint", path+"/log"),
 	)
+	if src.Origins {
+		out = append(out, set("extensions_autoload", OsqueryAutoloadPaths[goos]))
+	}
+	return out
 }
 
 // Osquery renders the osquery system's plan file for one server-mode

@@ -77,6 +77,9 @@ func TestOsqueryPlanSection(t *testing.T) {
 	if a.Interval != 1800 || b.Interval != 3600 {
 		t.Errorf("intervals = %d / %d, want 1800 and the 3600 default", a.Interval, b.Interval)
 	}
+	if a.Origins || b.Origins || strings.Contains(body, `"origins"`) {
+		t.Errorf("instances without origins carry it in the plan: %s", body)
+	}
 	if !reflect.DeepEqual(a.NPMDirs, []string{"/srv/a", "/srv/b"}) || len(a.PythonDirs) != 0 || a.PythonDirs == nil {
 		t.Errorf("dirs = python %v npm %v; want the profile's entry, sorted, replacing the default", a.PythonDirs, a.NPMDirs)
 	}
@@ -260,6 +263,54 @@ func TestOsquerySystemFlagsFile(t *testing.T) {
 	for _, r := range planJSON(t, s, f.token, "os=linux&codename=noble") {
 		if r.System == "osquery" && (r.Action != planSkip || !strings.Contains(r.Reason, "no osquery source in server mode")) {
 			t.Errorf("shipper mode only: %+v, want a skip", r)
+		}
+	}
+}
+
+// An origins instance carries the key in the plan, names the autoload file
+// in the flags setup.sh merges, and hands its hosts a schedule joining the
+// extension's tables.
+func TestOsqueryOriginsPlan(t *testing.T) {
+	s := hostedServer(t)
+	f := clientProfile(t, s)
+	s.cfg.PublicURL = "https://bodega.example.com:8443/b"
+	s.cfg.InventorySources = map[string]config.InventorySource{
+		"osq": {"type": "osquery", "enabled": true, "mode": "server", "interval": "30m", "origins": true},
+	}
+	s.cfg.OsqueryScanDirs = config.OsqueryScanDirs{Default: config.OsqueryDirs{NPM: []string{"/srv/app"}}}
+	s.setupInventory()
+	if s.inventoryErr != nil {
+		t.Fatal(s.inventoryErr)
+	}
+	_, body := clientGet(t, s, f.token, "/client/plan?os=linux&codename=noble")
+	var plan clientPlan
+	if err := json.Unmarshal([]byte(body), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Osquery) != 1 || !plan.Osquery[0].Origins {
+		t.Fatalf("osquery section = %+v, want origins set", plan.Osquery)
+	}
+	for _, r := range planJSON(t, s, f.token, "os=linux&codename=noble") {
+		if r.System != "osquery" {
+			continue
+		}
+		if _, flags := clientGet(t, s, f.token, r.URL[strings.Index(r.URL, "/client/"):]); !strings.HasSuffix(flags, "set\textensions_autoload\t/etc/osquery/extensions.load\n") {
+			t.Errorf("flags do not name the autoload file:\n%s", flags)
+		}
+	}
+
+	secret := addEnrollSecret(t, s, "osq", "web-host")
+	rec := send(s, http.MethodPost, "/api/v1/inventory/sources/osq/enroll", outsideAddr, "", `{"enroll_secret":"`+secret+`"}`)
+	var enrolled struct {
+		NodeKey string `json:"node_key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &enrolled); err != nil || enrolled.NodeKey == "" {
+		t.Fatalf("enroll = %d %s", rec.Code, rec.Body)
+	}
+	rec = send(s, http.MethodPost, "/api/v1/inventory/sources/osq/config", outsideAddr, "", `{"node_key":"`+enrolled.NodeKey+`"}`)
+	for _, want := range []string{osquery.TableNPMOrigins, osquery.TableFreeBSDOrigins} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("config names no %s: %s", want, rec.Body)
 		}
 	}
 }
