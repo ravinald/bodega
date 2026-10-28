@@ -71,6 +71,16 @@ type globalFlags struct {
 }
 
 func main() {
+	// osqueryd runs the extension as root with no HOME of the operator's, so
+	// it skips the first-run config below rather than write one for root.
+	if args, ok := osqueryExtensionArgs(os.Args); ok {
+		root := newRootCmd()
+		root.SetArgs(args[1:])
+		if err := root.Execute(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	// Ensure config file and log directory exist on first run.
 	path, err := config.EnsureConfigAndLogDir()
 	if err != nil {

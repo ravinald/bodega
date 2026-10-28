@@ -110,7 +110,7 @@ func (r *Reconciler) host(ctx context.Context, identity string, mapped map[strin
 		out.Counts[c.Class]++
 	}
 	out.Disagreements = currentDisagreements(latest, classes)
-	out.Alert = out.Counts[ClassRefused]+out.Counts[ClassUnknown]+out.Counts[ClassUnclassified] > 0 || len(out.Disagreements) > 0
+	out.Alert = out.Counts[ClassRefused]+out.Counts[ClassForeignOrigin]+out.Counts[ClassUnknown]+out.Counts[ClassUnclassified] > 0 || len(out.Disagreements) > 0
 	return out, nil
 }
 

@@ -61,7 +61,9 @@ type Plan struct {
 // source's routes sit under (enroll, config and log in server mode, results
 // in shipper mode). Interval is in seconds, osquery's unit. PythonDirs and
 // NPMDirs are the trees python_packages and npm_packages read on this host,
-// from its profile's osquery_scan_dirs entry.
+// from its profile's osquery_scan_dirs entry. Origins is the instance's
+// origins key: its schedule reads bodega's osquery extension, which the host
+// then has to load.
 type OsqueryPlan struct {
 	Instance   string   `json:"instance"`
 	Mode       string   `json:"mode"`
@@ -69,6 +71,7 @@ type OsqueryPlan struct {
 	Interval   int64    `json:"interval"`
 	PythonDirs []string `json:"python_dirs"`
 	NPMDirs    []string `json:"npm_dirs"`
+	Origins    bool     `json:"origins,omitempty"`
 }
 
 // Systems names each system the plan lists, once, in plan order.
