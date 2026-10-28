@@ -114,7 +114,7 @@ type Server struct {
 	// rpmPrimaries holds each repository tree's parsed primary until
 	// repomd.xml names a new one. See rpmPrimary.
 	rpmPrimaries rpmPrimaryCache
-	// rpmServed is the repomd.xml each client was last served, which its
+	// rpmServed is the repomd.xml each client holds, which its
 	// repomd.xml.asc is signed over.
 	rpmServed rpmServedRepomds
 	// rpmVerified is the cached packages already hashed against primary.

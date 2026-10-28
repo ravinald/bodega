@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -135,24 +137,29 @@ func splitRpmPath(escaped string) ([]string, bool) {
 // handleRpmRepomd serves the upstream's repomd.xml as it came. Its
 // signature is a separate route, so the bytes here are the upstream's.
 //
-// A client's GET is answered from a copy of the whole document, and that copy
-// is remembered as what this client holds, for the .asc request that follows.
-// The cached object cannot answer that: stale_grace hands one client the old
-// revision while a refresh lands the new one, and another client's request
-// can refresh it between this client's two requests.
+// A client's GET is answered through rpmServed, which decides the revision
+// this client is handed, for the .asc request that follows. The cached object
+// cannot answer that: stale_grace hands one client the old revision while a
+// refresh lands the new one, and another client's request can refresh it
+// between this client's two requests. The GET is always answered in full, so
+// a client never keeps a revision through a 304 that bodega has no record of.
 func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTree) {
 	noSharedCache(w)
 	markIndexResponse(r)
 	key := manifest.RpmRepomdKey(t.repo, t.releasever, t.basearch)
-	serve := func(w http.ResponseWriter) {
+	serve := func(w http.ResponseWriter, r *http.Request) {
 		s.proxyOrCache(w, r, s.typeStore(manifest.TypeRpm), key, t.base+"repodata/repomd.xml", manifest.TypeRpm, "", "", false, true)
 	}
 	if isOwnRead(r) || r.Method != http.MethodGet {
-		serve(w)
+		serve(w, r)
 		return
 	}
+	full := r.Clone(r.Context())
+	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		full.Header.Del(h)
+	}
 	cw := &capturedResponse{header: http.Header{}}
-	serve(cw)
+	serve(cw, full)
 	if cw.tooBig {
 		s.logger.Error("rpm repomd.xml exceeds the response buffer", "repository", t.id(), "limit", maxUpstreamBody)
 		http.Error(w, fmt.Sprintf("repomd.xml of %s exceeds bodega's %d-byte buffer; the upstream is not publishing a repository index.", t.id(), maxUpstreamBody), http.StatusBadGateway)
@@ -165,16 +172,23 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 	if status == 0 {
 		status = http.StatusOK
 	}
+	body := cw.body.Bytes()
 	if status == http.StatusOK {
-		s.rpmServed.record(t.id(), rpmClientKey(r), cw.body.Bytes(), time.Now())
+		if held := s.rpmServed.publish(t.id(), rpmClientKey(r), body, time.Now()); !bytes.Equal(held, body) {
+			body = held
+			for _, h := range []string{"ETag", "Last-Modified"} {
+				w.Header().Del(h)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write(cw.body.Bytes())
+	_, _ = w.Write(body)
 }
 
-// handleRpmRepomdSignature signs the repomd.xml this client was last served,
-// so the pair verifies whichever revision the cache holds by now. A client
-// with no document on record within rpmServedWindow gets a signature over the
+// handleRpmRepomdSignature signs the repomd.xml this client was handed, so
+// the pair verifies whichever revision the cache holds by now. A client with
+// no document on record within rpmServedWindow gets a signature over the
 // cached copy, read without refreshing it.
 func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request, t rpmTree) {
 	noSharedCache(w)
@@ -184,7 +198,7 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 		http.Error(w, "this server holds no signing key, so it serves repomd.xml unsigned; an operator runs `bodega apt key generate`, or a client sets repo_gpgcheck=0.", http.StatusNotFound)
 		return
 	}
-	doc, ok := s.rpmServed.lookup(t.id(), rpmClientKey(r), time.Now())
+	doc, ok := s.rpmServed.sign(t.id(), rpmClientKey(r), time.Now())
 	if !ok {
 		var err error
 		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
@@ -202,25 +216,42 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 	_, _ = w.Write(sig)
 }
 
-// rpmServedWindow is how long the repomd.xml a client was served stays the
-// one its .asc request is signed over. dnf asks for the signature right after
-// the document; the window only has to outlast a slow link between the two.
+// rpmServedWindow is how long the repomd.xml a client was handed stays the
+// one its .asc request is signed over, when nothing moved it since.
 const rpmServedWindow = 10 * time.Minute
 
-// rpmServedClients bounds the clients remembered per repository tree. A client
-// past it is signed the cached copy, as one arriving after the window is.
-const rpmServedClients = 1 << 16
+// rpmSignatureWait is how long a reader that has not asked for its signature
+// holds its client key on the revision it was handed. dnf asks for the
+// signature right after the document, so this only has to outlast a slow link
+// between the two; a reader that never asks (repo_gpgcheck=0, a probe) stops
+// holding the revision once it passes.
+const rpmSignatureWait = 30 * time.Second
+
+// rpmServedClients bounds the clients remembered per repository tree, and
+// rpmServedPending the readers counted per client. A client past the first is
+// handed the cached copy and signed it, as one arriving after the window is.
+const (
+	rpmServedClients = 1 << 16
+	rpmServedPending = 1 << 10
+)
 
 // rpmClientKey is who a repomd.xml was served to: the address and the
 // identity the request carried. Two hosts behind one address with no identity
-// of their own share a key, and the later document wins.
+// of their own share a key, and so share a revision; see rpmServedRepomds.
 func rpmClientKey(r *http.Request) string {
 	return ClientIP(r) + "\x00" + callerName(r)
 }
 
-// rpmServedRepomds is the repomd.xml each client was last served, per
-// repository tree. In memory and per process: a second bodega behind the same
-// address answers .asc from the cached copy.
+// rpmServedRepomds is the repomd.xml each client key holds, per repository
+// tree. In memory and per process: a second bodega behind the same address
+// answers .asc from the cached copy.
+//
+// The .asc request carries nothing that says which repomd.xml its reader got,
+// so every reader behind one key has to have got the same one. A key moves to
+// a new revision only when no reader it was handed the current one is still
+// owed a signature: each GET adds a pending reader, each .asc settles the
+// oldest, and a reader unsettled after rpmSignatureWait stops counting. Until
+// then the key is handed the revision it holds, however the cache moved.
 type rpmServedRepomds struct {
 	mu    sync.Mutex
 	trees map[string]*rpmServedTree
@@ -228,16 +259,31 @@ type rpmServedRepomds struct {
 
 type rpmServedTree struct {
 	latest    []byte
-	clients   map[string]rpmServedDoc
+	clients   map[string]*rpmServedClient
 	lastPrune time.Time
 }
 
-type rpmServedDoc struct {
-	doc []byte
-	at  time.Time
+// rpmServedClient is the revision one client key holds, when it was last
+// handed out, and when each reader still owed a signature was served, oldest
+// first.
+type rpmServedClient struct {
+	doc     []byte
+	at      time.Time
+	pending []time.Time
 }
 
-func (c *rpmServedRepomds) record(tree, client string, doc []byte, now time.Time) {
+func (c *rpmServedClient) settleExpired(now time.Time) {
+	n := 0
+	for n < len(c.pending) && now.Sub(c.pending[n]) > rpmSignatureWait {
+		n++
+	}
+	c.pending = slices.Delete(c.pending, 0, n)
+}
+
+// publish records that client was served fetched and returns the revision
+// to hand it: fetched, unless a reader behind the same key still holds
+// another.
+func (c *rpmServedRepomds) publish(tree, client string, fetched []byte, now time.Time) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.trees == nil {
@@ -245,12 +291,8 @@ func (c *rpmServedRepomds) record(tree, client string, doc []byte, now time.Time
 	}
 	t := c.trees[tree]
 	if t == nil {
-		t = &rpmServedTree{clients: map[string]rpmServedDoc{}}
+		t = &rpmServedTree{clients: map[string]*rpmServedClient{}}
 		c.trees[tree] = t
-	}
-	// One copy per revision, however many clients hold it.
-	if !bytes.Equal(t.latest, doc) {
-		t.latest = bytes.Clone(doc)
 	}
 	if now.Sub(t.lastPrune) > rpmServedWindow {
 		for k, d := range t.clients {
@@ -260,24 +302,68 @@ func (c *rpmServedRepomds) record(tree, client string, doc []byte, now time.Time
 		}
 		t.lastPrune = now
 	}
-	if _, held := t.clients[client]; !held && len(t.clients) >= rpmServedClients {
-		return
+	cl := t.clients[client]
+	if cl == nil {
+		if len(t.clients) >= rpmServedClients {
+			return fetched
+		}
+		cl = &rpmServedClient{}
+		t.clients[client] = cl
 	}
-	t.clients[client] = rpmServedDoc{doc: t.latest, at: now}
+	cl.settleExpired(now)
+	if len(cl.pending) == 0 {
+		// One copy per revision, however many clients hold it.
+		if !bytes.Equal(t.latest, fetched) {
+			t.latest = bytes.Clone(fetched)
+		}
+		cl.doc = t.latest
+	}
+	cl.at = now
+	if len(cl.pending) < rpmServedPending {
+		cl.pending = append(cl.pending, now)
+	} else {
+		cl.pending[len(cl.pending)-1] = now
+	}
+	return cl.doc
 }
 
-func (c *rpmServedRepomds) lookup(tree, client string, now time.Time) ([]byte, bool) {
+// sign returns the revision client holds for its .asc request and settles
+// one pending reader.
+func (c *rpmServedRepomds) sign(tree, client string, now time.Time) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	cl := c.heldLocked(tree, client, now)
+	if cl == nil {
+		return nil, false
+	}
+	cl.settleExpired(now)
+	if len(cl.pending) > 0 {
+		cl.pending = slices.Delete(cl.pending, 0, 1)
+	}
+	return cl.doc, true
+}
+
+// held returns the revision client holds without settling anything.
+func (c *rpmServedRepomds) held(tree, client string, now time.Time) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cl := c.heldLocked(tree, client, now)
+	if cl == nil {
+		return nil, false
+	}
+	return cl.doc, true
+}
+
+func (c *rpmServedRepomds) heldLocked(tree, client string, now time.Time) *rpmServedClient {
 	t := c.trees[tree]
 	if t == nil {
-		return nil, false
+		return nil
 	}
-	d, ok := t.clients[client]
-	if !ok || now.Sub(d.at) > rpmServedWindow {
-		return nil, false
+	cl := t.clients[client]
+	if cl == nil || now.Sub(cl.at) > rpmServedWindow {
+		return nil
 	}
-	return d.doc, true
+	return cl
 }
 
 // rpmCachedRepomd is the stored repomd.xml, fetched through the repomd route
@@ -391,11 +477,38 @@ func (s *Server) rpmMetadataEntry(r *http.Request, t rpmTree, match func(rpmRepo
 	return rpmRepomdData{}, errRpmNotListed
 }
 
+// rpmHeldEntry is the first entry match accepts in the repomd.xml this
+// client holds, or errRpmNotListed when it holds none or that one names none.
+func (s *Server) rpmHeldEntry(r *http.Request, t rpmTree, match func(rpmRepomdData) bool) (rpmRepomdData, error) {
+	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), time.Now())
+	if !ok {
+		return rpmRepomdData{}, errRpmNotListed
+	}
+	data, err := parseRpmRepomd(doc)
+	if err != nil {
+		return rpmRepomdData{}, errRpmNotListed
+	}
+	for _, d := range data {
+		if match(d) {
+			return d, nil
+		}
+	}
+	return rpmRepomdData{}, errRpmNotListed
+}
+
 // handleRpmMetadata serves a file the current repomd.xml names, verified
-// against the checksum it gives the file and cached under that checksum.
+// against the checksum it gives the file and cached under that checksum. The
+// current repomd.xml for a client is the one rpmServed says it holds, which
+// can trail the cache, so that entry is tried first: a repository naming its
+// files without a checksum in the href gives the same name another checksum
+// in the next revision, and the client verifies against its own.
 func (s *Server) handleRpmMetadata(w http.ResponseWriter, r *http.Request, t rpmTree, href string) {
 	markIndexResponse(r)
-	entry, err := s.rpmMetadataEntry(r, t, func(d rpmRepomdData) bool { return d.Location.Href == href })
+	match := func(d rpmRepomdData) bool { return d.Location.Href == href }
+	entry, err := s.rpmHeldEntry(r, t, match)
+	if err != nil {
+		entry, err = s.rpmMetadataEntry(r, t, match)
+	}
 	if err != nil {
 		if errors.Is(err, errRpmNotListed) {
 			http.Error(w, fmt.Sprintf("the current repomd.xml of %s names no %s.", t.id(), href), http.StatusNotFound)

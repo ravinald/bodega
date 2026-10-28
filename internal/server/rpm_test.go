@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -547,6 +548,103 @@ func TestRpmSignatureFollowsEachClientsRevision(t *testing.T) {
 		if err := rpmVerifySignature(kr, c.doc, sig.Body.String()); err != nil {
 			t.Errorf("client %s: signature does not cover the repomd.xml it was served: %v", c.addr, err)
 		}
+	}
+}
+
+// Two hosts behind one address with no identity of their own are one client
+// key, and the .asc request says nothing about which repomd.xml its reader
+// got. So the key keeps the revision its first reader holds until every
+// reader has asked for its signature, and moves on after that; a reader handed
+// the held revision is served the metadata that revision names, after the
+// cache stopped naming it.
+func TestRpmSignatureSharedAddress(t *testing.T) {
+	m := newRPMMirror(t)
+	s, kr := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	const hostA, hostB, hostC = "192.0.2.10:40000", "192.0.2.10:40001", "192.0.2.10:40002"
+	first := rpmRequestFrom(s, hostA, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	moved := strings.ReplaceAll(first, rpmPrimaryGz, "repodata/0000-primary.xml.gz") + "<!-- new revision -->"
+	m.set("repodata/repomd.xml", []byte(moved))
+	second := rpmRequestFrom(s, hostB, rpmRepoPath+"repodata/repomd.xml")
+	if second.Body.String() != first {
+		t.Fatal("the second reader behind the address was handed a revision the first reader's signature cannot cover")
+	}
+	if cl := second.Header().Get("Content-Length"); cl != "" && cl != strconv.Itoa(len(first)) {
+		t.Errorf("Content-Length %s for a %d-byte document", cl, len(first))
+	}
+	waitForRpmRepomd(t, s, moved)
+	if got := rpmRequestFrom(s, hostB, rpmRepoPath+rpmPrimaryGz); got.Code != http.StatusOK {
+		t.Errorf("primary named by the revision the client holds: %d %s", got.Code, got.Body.String())
+	}
+	for _, addr := range []string{hostA, hostB} {
+		sig := rpmRequestFrom(s, addr, rpmRepoPath+"repodata/repomd.xml.asc")
+		if err := rpmVerifySignature(kr, first, sig.Body.String()); err != nil {
+			t.Errorf("client %s: signature does not cover the repomd.xml it was served: %v", addr, err)
+		}
+	}
+	third := rpmRequestFrom(s, hostC, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	if third != moved {
+		t.Fatal("the address stayed on the old revision after every reader had its signature")
+	}
+	sig := rpmRequestFrom(s, hostC, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err := rpmVerifySignature(kr, third, sig.Body.String()); err != nil {
+		t.Errorf("signature does not cover the new revision: %v", err)
+	}
+}
+
+// A conditional GET is answered in full, so the revision a client keeps is
+// always one bodega recorded handing it.
+func TestRpmRepomdIgnoresConditionalRequests(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	first := doRequest(s, http.MethodGet, rpmRepoPath+"repodata/repomd.xml", nil)
+	req := httptest.NewRequest(http.MethodGet, rpmRepoPath+"repodata/repomd.xml", nil)
+	req.Header.Set("If-None-Match", first.Header().Get("ETag"))
+	req.Header.Set("If-Modified-Since", time.Now().UTC().Format(http.TimeFormat))
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != first.Body.String() {
+		t.Errorf("conditional GET: %d, %d bytes; want 200 with the document", rec.Code, rec.Body.Len())
+	}
+}
+
+// The hold on a revision ends when every reader asked for its signature, or
+// when a reader that never asks has waited out rpmSignatureWait, so a key a
+// repo_gpgcheck=0 host shares does not keep the old revision.
+func TestRpmServedRepomdsHold(t *testing.T) {
+	const tree, key = "rocky-baseos/9/x86_64", "192.0.2.10\x00"
+	r1, r2 := []byte("revision 1"), []byte("revision 2")
+	t0 := time.Unix(1_800_000_000, 0)
+
+	var c rpmServedRepomds
+	if got := c.publish(tree, key, r1, t0); !bytes.Equal(got, r1) {
+		t.Fatalf("first publish handed %q", got)
+	}
+	if got := c.publish(tree, key, r2, t0.Add(time.Second)); !bytes.Equal(got, r1) {
+		t.Errorf("a reader still owed a signature: handed %q, want the held revision", got)
+	}
+	if got, _ := c.sign(tree, key, t0.Add(2*time.Second)); !bytes.Equal(got, r1) {
+		t.Errorf("signed %q, want the held revision", got)
+	}
+	if got := c.publish(tree, key, r2, t0.Add(3*time.Second)); !bytes.Equal(got, r1) {
+		t.Errorf("one reader still owed a signature: handed %q", got)
+	}
+	_, _ = c.sign(tree, key, t0.Add(4*time.Second))
+	_, _ = c.sign(tree, key, t0.Add(4*time.Second))
+	if got := c.publish(tree, key, r2, t0.Add(5*time.Second)); !bytes.Equal(got, r2) {
+		t.Errorf("every reader settled: handed %q, want the new revision", got)
+	}
+
+	var u rpmServedRepomds
+	u.publish(tree, key, r1, t0)
+	if got := u.publish(tree, key, r2, t0.Add(rpmSignatureWait+time.Second)); !bytes.Equal(got, r2) {
+		t.Errorf("a reader that never asked held the revision past rpmSignatureWait: handed %q", got)
+	}
+	if got, ok := u.held(tree, key, t0.Add(rpmSignatureWait+time.Second)); !ok || !bytes.Equal(got, r2) {
+		t.Errorf("held %q, %v", got, ok)
+	}
+	if _, ok := u.sign(tree, key, t0.Add(rpmSignatureWait+rpmServedWindow+2*time.Second)); ok {
+		t.Error("a record older than rpmServedWindow still answered the signature")
 	}
 }
 
