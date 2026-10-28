@@ -3,6 +3,7 @@ package policy
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -114,8 +115,9 @@ func (e *osvEvent) UnmarshalJSON(b []byte) error {
 
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
 // ecosystem. PyPI orders by PEP 440, RubyGems by Gem::Version, Maven by
-// Maven's ComparableVersion, Ubuntu and Debian by dpkg's ordering, and the rest of what bodega maps order by semver,
-// so an unknown ecosystem gets semver rather than an error.
+// Maven's ComparableVersion, Ubuntu and Debian by dpkg's ordering, the
+// Enterprise Linux vendors by rpm's, and the rest of what bodega maps order by
+// semver, so an unknown ecosystem gets semver rather than an error.
 func osvVersionOrder(ecosystem string) string {
 	switch {
 	case ecosystem == "PyPI":
@@ -126,8 +128,19 @@ func osvVersionOrder(ecosystem string) string {
 		return orderMaven
 	case isDistroEcosystem(ecosystem):
 		return orderDebian
+	case isRpmEcosystem(ecosystem):
+		return orderRpm
 	}
 	return orderSemver
+}
+
+// isRpmEcosystem reports whether an OSV ecosystem is an Enterprise Linux
+// vendor's, release suffix or not ("Rocky Linux:9",
+// "Red Hat:enterprise_linux:9::appstream"), whose versions are
+// epoch:version-release.
+func isRpmEcosystem(ecosystem string) bool {
+	base, _, _ := strings.Cut(ecosystem, ":")
+	return slices.Contains(manifest.RpmOSVEcosystems, base)
 }
 
 // isDistroEcosystem reports whether an OSV ecosystem is one of the per-release

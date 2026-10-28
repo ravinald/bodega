@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -479,8 +480,43 @@ func TestAgePolicy_ComposerLookupIsShared(t *testing.T) {
 	}
 }
 
+// An rpm package is dated by the time /rpm/ read from its repository's
+// primary and recorded on the entry, build or file, never by a lookup. A
+// package one day old under a seven-day minimum is refused naming which time
+// dated it; one that primary dated by neither warns rather than passing.
+func TestAgePolicy_RpmDatedFromPrimary(t *testing.T) {
+	now := time.Now()
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	dated := func(age time.Duration, by string) *manifest.VersionEntry {
+		return &manifest.VersionEntry{Version: "1:3.0.7-27.el9", PublishedAt: now.Add(-age).UTC().Format(time.RFC3339),
+			Metadata: map[string]string{RpmDatedByKey: by}}
+	}
+	for _, tc := range []struct {
+		label  string
+		ve     *manifest.VersionEntry
+		action string
+		reason string
+	}{
+		{"one day by build", dated(24*time.Hour, RpmDatedByBuild), ActionBlock, "openssl@1:3.0.7-27.el9 is 1d old, policy requires 7d (dated by the build time primary gives the package)"},
+		{"one day by file", dated(24*time.Hour, RpmDatedByFile), ActionBlock, "(dated by the file time primary gives the package: its build time is 0)"},
+		{"thirty days by build", dated(30*24*time.Hour, RpmDatedByBuild), ActionPass, "dated by the build time"},
+		{"undated", &manifest.VersionEntry{Version: "1:3.0.7-27.el9"}, ActionWarn, "carries neither"},
+		{"a time with no source", &manifest.VersionEntry{Version: "1:3.0.7-27.el9", PublishedAt: now.UTC().Format(time.RFC3339)}, ActionWarn, "carries neither"},
+	} {
+		r := NewAgeChecker(store).Check(t.Context(), &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}, tc.ve)
+		if r.Action != tc.action || !strings.Contains(r.Reason, tc.reason) {
+			t.Errorf("%s: got %s %q, want %s containing %q", tc.label, r.Action, r.Reason, tc.action, tc.reason)
+		}
+	}
+	if slices.Contains(LookupDatedEcosystems(), manifest.TypeRpm) {
+		t.Error("rpm is dated as /rpm/ serves it, and no lookup by name and version can record a time for it")
+	}
+}
+
 func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRubygems}
+	want := []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
 	got := AgeEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)

@@ -327,7 +327,7 @@ func objectKeyCases(t *testing.T) []keyCase {
 				return rpmRepositoryUpload(t, dst, "rpm-bytes")
 			},
 			configure: func(t *testing.T, cfg *config.Config) {
-				cfg.RpmUpstreams = map[string]string{"rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"}
+				cfg.RpmUpstreams = map[string]config.RpmUpstream{"rocky-baseos": {URL: "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"}}
 			},
 			url: "/rpm/rocky-baseos/9/x86_64/Packages/n/nginx-1.20.1-20.el9.x86_64.rpm",
 		},

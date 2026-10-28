@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +21,10 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -96,7 +100,7 @@ func (m *rpmMirror) hitsFor(rel string) int {
 func rpmServer(t *testing.T, m *rpmMirror) (*Server, *aptsign.KeyRing) {
 	t.Helper()
 	s := proxyingServer(t)
-	s.cfg.RpmUpstreams = map[string]string{rpmFixtureRepoID: m.ts.URL + "/$releasever/BaseOS/$basearch/os/"}
+	s.cfg.RpmUpstreams = map[string]config.RpmUpstream{rpmFixtureRepoID: {URL: m.ts.URL + "/$releasever/BaseOS/$basearch/os/"}}
 	kr, err := aptsign.Generate("bodega test", "test@example.invalid", aptsign.KeyEd25519)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -405,7 +409,7 @@ func waitForRpmDiscovery(t *testing.T, s *Server, name, version, decision string
 		}
 		for _, r := range rows {
 			if r.PkgName == name && r.PkgVersion == version && r.Decision == decision {
-				if !strings.HasPrefix(r.UpstreamURL, s.cfg.RpmUpstreams[rpmFixtureRepoID][:len("http://127.0.0.1")]) {
+				if !strings.HasPrefix(r.UpstreamURL, s.cfg.RpmUpstreams[rpmFixtureRepoID].URL[:len("http://127.0.0.1")]) {
 					t.Errorf("discovery row names upstream %q, not the repository", r.UpstreamURL)
 				}
 				return
@@ -879,5 +883,207 @@ func TestRpmPrimaryReusedHrefIndexesCurrentBytes(t *testing.T) {
 	}
 	if !bytes.Equal(rec.Body.Bytes(), replacement) {
 		t.Fatalf("fresh reader got old package bytes")
+	}
+}
+
+// rpmFixturePkg is one package rpmPublish lists in a primary of its own.
+type rpmFixturePkg struct {
+	name, epoch, ver, rel string
+	build, file           time.Time
+}
+
+func (p rpmFixturePkg) href() string {
+	return "Packages/" + p.name[:1] + "/" + p.name + "-" + p.ver + "-" + p.rel + ".x86_64.rpm"
+}
+
+func (p rpmFixturePkg) body() []byte { return []byte("fixture bytes of " + p.href()) }
+
+// rpmPublish replaces the fixture's primary with one listing pkgs, each with
+// the <time> element a real primary carries, and serves each package's bytes.
+// A zero time is written as 0, which is how createrepo_c writes one it lacks.
+func rpmPublish(t *testing.T, m *rpmMirror, pkgs ...rpmFixturePkg) {
+	t.Helper()
+	unix := func(at time.Time) int64 {
+		if at.IsZero() {
+			return 0
+		}
+		return at.Unix()
+	}
+	var doc strings.Builder
+	doc.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="` + strconv.Itoa(len(pkgs)) + `">` + "\n")
+	for _, p := range pkgs {
+		doc.WriteString(`<package type="rpm"><name>` + p.name + `</name><arch>x86_64</arch>` +
+			`<version epoch="` + p.epoch + `" ver="` + p.ver + `" rel="` + p.rel + `"/>` +
+			`<checksum type="sha256" pkgid="YES">` + rpmSHA256(p.body()) + `</checksum>` +
+			`<time file="` + strconv.FormatInt(unix(p.file), 10) + `" build="` + strconv.FormatInt(unix(p.build), 10) + `"/>` +
+			`<location href="` + p.href() + `"/></package>` + "\n")
+		m.set(p.href(), p.body())
+	}
+	doc.WriteString("</metadata>\n")
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte(doc.String()))
+	_ = zw.Close()
+	m.set(rpmPrimaryGz, gz.Bytes())
+	repomd := strings.ReplaceAll(string(rpmFixture(t, "repodata/repomd.xml")), ">"+rpmSHA256(rpmFixture(t, rpmPrimaryGz))+"<", ">"+rpmSHA256(gz.Bytes())+"<")
+	m.set("repodata/repomd.xml", []byte(repomd))
+}
+
+// gateRpm runs the proxy fill's real admission checks rather than the
+// stubs proxyingServer installs.
+func gateRpm(t *testing.T) {
+	t.Helper()
+	prev := fetchCheckers
+	fetchCheckers = admit.VersionCheckers
+	t.Cleanup(func() { fetchCheckers = prev })
+}
+
+// The age gate dates a package by primary's build time, or its file time
+// when build is 0, and refuses one a day old under a seven-day minimum before
+// it is fetched. A package past the window is served.
+func TestRpmRefusedByAge(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	gateRpm(t)
+	now := time.Now()
+	fresh := rpmFixturePkg{name: "nginx", epoch: "2", ver: "1.26.3", rel: "1.el9", build: now.Add(-24 * time.Hour), file: now.Add(-30 * 24 * time.Hour)}
+	byFile := rpmFixturePkg{name: "tmux", epoch: "0", ver: "3.2a", rel: "5.el9", file: now.Add(-24 * time.Hour)}
+	old := rpmFixturePkg{name: "httpd", epoch: "0", ver: "2.4.62", rel: "1.el9", build: now.Add(-30 * 24 * time.Hour), file: now.Add(-time.Hour)}
+	rpmPublish(t, m, fresh, byFile, old)
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeRpm, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	// nginx's file time is thirty days old, so only its build time refuses
+	// it; tmux's build time is 0, so only its file time does.
+	published := "was published " + now.Add(-24*time.Hour).UTC().Format("2006-01-02")
+	for _, pkg := range []rpmFixturePkg{fresh, byFile} {
+		rec := doRequest(s, http.MethodGet, rpmRepoPath+pkg.href(), nil)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: status %d, want 403 (%s)", pkg.name, rec.Code, rec.Body.String())
+		}
+		refusalIncident(t, rec.Header(), checkAge)
+		if !strings.Contains(rec.Body.String(), published) {
+			t.Errorf("%s: refusal does not say the package %s:\n%s", pkg.name, published, rec.Body.String())
+		}
+		if n := m.hitsFor(pkg.href()); n != 0 {
+			t.Errorf("%s: upstream asked %d times for a package the age gate refused", pkg.name, n)
+		}
+	}
+	if rec := doRequest(s, http.MethodGet, rpmRepoPath+old.href(), nil); rec.Code != http.StatusOK {
+		t.Errorf("a package built thirty days ago: %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// rpmRockyRecord is RLSA-2024:6783 as OSV files it, cut to what the matcher
+// reads: openssl in Rocky Linux 9, fixed at 1:3.0.7-28.el9_4.
+const rpmRockyRecord = `{"id":"RLSA-2024:6783","summary":"Moderate: openssl security update","affected":[{"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-28.el9_4"}]}]}]}`
+
+// gateRpmOSV syncs "Rocky Linux" from an export holding rpmRockyRecord and
+// turns the rpm advisory gate on.
+func gateRpmOSV(t *testing.T, s *Server) {
+	t.Helper()
+	gateRpm(t)
+	export := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/Rocky Linux/all.zip" {
+			http.NotFound(w, r)
+			return
+		}
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, _ := zw.Create("RLSA-2024:6783.json")
+		_, _ = f.Write([]byte(rpmRockyRecord))
+		_ = zw.Close()
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(export.Close)
+	s.cfg.OSVDBDir = t.TempDir()
+	db := policy.NewOSVDatabase(s.cfg.OSVDBDir)
+	db.ExportBase = export.URL
+	if _, err := db.Sync(t.Context(), "Rocky Linux"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := s.auditDB.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeRpm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A repository whose upstream is a Rocky mirror, named so by osv_ecosystem,
+// has its packages checked against Rocky Linux's advisories with the epoch
+// primary gives them: the vulnerable openssl is refused before it is fetched,
+// naming the advisory, and the fixed one is served.
+func TestRpmRefusedByOSV(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	up := s.cfg.RpmUpstreams[rpmFixtureRepoID]
+	up.OSVEcosystem = "Rocky Linux"
+	s.cfg.RpmUpstreams[rpmFixtureRepoID] = up
+	built := time.Now().Add(-90 * 24 * time.Hour)
+	vulnerable := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.0.7", rel: "27.el9", build: built}
+	fixed := rpmFixturePkg{name: "openssl", epoch: "1", ver: "3.0.7", rel: "28.el9_4", build: built}
+	rpmPublish(t, m, vulnerable, fixed)
+	gateRpmOSV(t, s)
+
+	rec := doRequest(s, http.MethodGet, rpmRepoPath+vulnerable.href(), nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("openssl 1:3.0.7-27.el9: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkOSV)
+	if !strings.Contains(rec.Body.String(), "RLSA-2024:6783") {
+		t.Errorf("refusal does not name the advisory:\n%s", rec.Body.String())
+	}
+	if n := m.hitsFor(vulnerable.href()); n != 0 {
+		t.Errorf("upstream asked %d times for a package OSV refused", n)
+	}
+	if rec := doRequest(s, http.MethodGet, rpmRepoPath+fixed.href(), nil); rec.Code != http.StatusOK {
+		t.Errorf("openssl 1:3.0.7-28.el9_4: %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// EPEL belongs to no OSV ecosystem. Its package is served with the gate on,
+// and the admission row records the check not run, naming the repository,
+// rather than a pass nobody earned.
+func TestRpmEPELRecordsOSVNotRun(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	s.cfg.RpmUpstreams["epel"] = config.RpmUpstream{URL: m.ts.URL + "/$releasever/BaseOS/$basearch/os/"}
+	pkg := rpmFixturePkg{name: "htop", epoch: "0", ver: "3.3.0", rel: "1.el9", build: time.Now().Add(-90 * 24 * time.Hour)}
+	rpmPublish(t, m, pkg)
+	gateRpmOSV(t, s)
+	if rec := doRequest(s, http.MethodGet, "/rpm/epel/9/x86_64/"+pkg.href(), nil); rec.Code != http.StatusOK {
+		t.Fatalf("htop from EPEL: %d (%s)", rec.Code, rec.Body.String())
+	}
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeRpm, PkgName: "htop", PkgVersion: "3.3.0-1.el9"})
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("no admission row for htop: %v", err)
+	}
+	checks := rows[len(rows)-1].Checks
+	i := slices.IndexFunc(checks, func(c audit.AdmissionCheck) bool { return c.Check == audit.CheckOSV })
+	if i < 0 {
+		t.Fatalf("admission row names no OSV check: %+v", checks)
+	}
+	if c := checks[i]; c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "rpm repository epel belongs to no OSV ecosystem") {
+		t.Errorf("osv check %+v, want not_evaluated naming epel", c)
+	}
+}
+
+// A package whose name is one edit from one a stock EL9 host installs is
+// held by the similarity gate before it is fetched.
+func TestRpmNearMissNameHeld(t *testing.T) {
+	m := newRPMMirror(t)
+	s, _ := rpmServer(t, m)
+	gateRpm(t)
+	squat := rpmFixturePkg{name: "sytemd", epoch: "0", ver: "252", rel: "1.el9", build: time.Now().Add(-90 * 24 * time.Hour)}
+	rpmPublish(t, m, squat)
+	if err := s.auditDB.SetSimilarityPolicy(t.Context(), audit.SimilarityPolicy{Ecosystem: manifest.TypeRpm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	rec := doRequest(s, http.MethodGet, rpmRepoPath+squat.href(), nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("sytemd: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkSimilarity)
+	if n := m.hitsFor(squat.href()); n != 0 {
+		t.Errorf("upstream asked %d times for a held name", n)
 	}
 }

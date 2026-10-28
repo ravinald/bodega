@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -106,8 +107,9 @@ type osvAgreementCase struct {
 
 // osvDistroFixtures are the releases syncedDB writes beside the agreement
 // cases, distilled out of the Ubuntu and Debian fixtures the same way a real
-// sync distills them out of the aggregate archive.
-var osvDistroFixtures = []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Debian:12"}
+// sync distills them out of the aggregate archive, and the Rocky Linux
+// export, requested under its bare name as rpm requests it.
+var osvDistroFixtures = []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Debian:12", "Rocky Linux"}
 
 // exportServer serves the testdata records as OSV's per-ecosystem export:
 // <base>/<ecosystem>/all.zip, one JSON file per record.
@@ -786,5 +788,66 @@ func TestOSVChecker_ComposerVPrefixedVersion(t *testing.T) {
 	}
 	if got := OSVEcosystemFor(manifest.TypeComposer); got != "Packagist" {
 		t.Errorf("OSVEcosystemFor(composer) = %q, want Packagist", got)
+	}
+}
+
+// An rpm package is checked against the ecosystem its repository belongs to,
+// read from the entry, and compared in rpm's order with the epoch. The fixture
+// is OSV's own two Rocky Linux 9 openssl advisories, filed under
+// "Rocky Linux:9" and requested under "Rocky Linux". 1:3.2.2-6.el9_5 sorts
+// below the fix 1:3.2.2-6.el9_5.1, which a semver compare reads as equal at
+// best. A repository with no ecosystem, EPEL's, is not run and says why.
+func TestOSVChecker_RockyLinuxOpenssl(t *testing.T) {
+	srv := exportServer(t)
+	t.Cleanup(srv.Close)
+	db := NewOSVDatabase(t.TempDir())
+	db.ExportBase = srv.URL
+	if _, err := db.Sync(t.Context(), "Rocky Linux"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	rocky := func(v string) *manifest.VersionEntry {
+		return &manifest.VersionEntry{Version: v, Metadata: map[string]string{RpmOSVEcosystemKey: "Rocky Linux", RpmRepositoryKey: "rocky-baseos"}}
+	}
+	openssl := &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}
+	for _, tc := range []struct {
+		version string
+		ids     []string
+	}{
+		{"1:3.0.7-27.el9", []string{"RLSA-2024:6783", "RLSA-2024:9333"}},
+		{"1:3.0.7-28.el9_4", []string{"RLSA-2024:9333"}},
+		{"1:3.2.2-6.el9_5", []string{"RLSA-2024:9333"}},
+	} {
+		r := ck.Check(t.Context(), openssl, rocky(tc.version))
+		got, _ := r.Details["vulns"].([]string)
+		if r.Action != ActionBlock || !slices.Equal(got, tc.ids) || !strings.Contains(r.Reason, "queried as openssl in Rocky Linux") {
+			t.Errorf("openssl %s = %+v, want a block naming %v", tc.version, r, tc.ids)
+		}
+	}
+	for _, v := range []string{"1:3.2.2-6.el9_5.1", "1:3.5.1-7.el9_7"} {
+		if r := ck.Check(t.Context(), openssl, rocky(v)); r.Action != ActionPass {
+			t.Errorf("openssl %s = %+v, want a pass", v, r)
+		}
+	}
+	// Without the epoch the version sorts below every fix: 3.2.2 is epoch 0.
+	if r := ck.Check(t.Context(), openssl, rocky("3.5.1-7.el9_7")); r.Action != ActionBlock {
+		t.Errorf("openssl 3.5.1-7.el9_7, epoch 0 = %+v, want a block", r)
+	}
+
+	epel := &manifest.VersionEntry{Version: "1.24.0-1.el9", Metadata: map[string]string{RpmRepositoryKey: "epel"}}
+	r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "htop", Type: manifest.TypeRpm}, epel)
+	if r.Action != ActionNotEvaluated || !strings.Contains(r.Reason, "not run: rpm repository epel belongs to no OSV ecosystem") ||
+		!strings.Contains(r.Reason, "osv_ecosystem") {
+		t.Errorf("an EPEL package = %+v, want not evaluated naming the repository and the key that covers a mirror", r)
+	}
+	if got := osvVersionOrder("Rocky Linux:9"); got != orderRpm {
+		t.Errorf("osvVersionOrder(Rocky Linux:9) = %s, want rpm", got)
+	}
+	if got := osvVersionOrder("Red Hat:enterprise_linux:9::appstream"); got != orderRpm {
+		t.Errorf("osvVersionOrder(Red Hat:...) = %s, want rpm", got)
 	}
 }

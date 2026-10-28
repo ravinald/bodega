@@ -1230,6 +1230,8 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 // the ones the age gate can date, which are also the ones whose storage key
 // names the version being fetched. A freebsd key's version slot holds the ABI,
 // and checking an advisory against that would answer for the wrong thing.
+// rpm's key names the version too, and the time and ecosystem a fill is judged
+// by arrive on the request; see withRpmFill.
 var fetchGatedTypes = map[string]bool{
 	manifest.TypeNpm:      true,
 	manifest.TypePypi:     true,
@@ -1238,6 +1240,7 @@ var fetchGatedTypes = map[string]bool{
 	manifest.TypeMaven:    true,
 	manifest.TypeRubygems: true,
 	manifest.TypeComposer: true,
+	manifest.TypeRpm:      true,
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age
@@ -1334,6 +1337,9 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		notRun = "not run: a " + fill.typ + " proxy fill names no version the age and OSV checks can evaluate"
 	}
 	ve := manifest.VersionEntry{Version: fill.version, Mode: manifest.ModeProxy}
+	if fill.typ == manifest.TypeRpm {
+		rpmFillFrom(r.Context()).describe(&ve)
+	}
 	_, ok := s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
 	return fill, ok
 }

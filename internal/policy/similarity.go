@@ -29,9 +29,11 @@ var popularFS embed.FS
 
 // SimilarityEcosystems are the types the name-similarity check compares:
 // the ones whose packages are named by whoever publishes them, on a registry
-// anyone can publish to.
+// anyone can publish to. rpm is the exception in kind: a vendor's
+// repositories are curated, but a host takes packages from any repository
+// rpm_upstreams names, and a third-party one names its packages as it likes.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
 }
 
 // SimilarityName is the part of a package name the check compares. An oci
