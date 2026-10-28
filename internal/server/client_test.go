@@ -1751,3 +1751,52 @@ func TestFreeBSDPlanTagsAreThePlanRepositories(t *testing.T) {
 		t.Errorf("the plan's repos file does not define %s:\n%s", tags[0], body)
 	}
 }
+
+// F103 R1, R2: a Rocky 9 host whose server configures BaseOS and AppStream
+// and not EPEL gets bodega.repo with two sections, a note naming EPEL, and
+// bodega's key from /rpm/bodega.gpg, each digest matching what its URL
+// serves. A host the table does not name, or that states nothing, gets a
+// skip saying what it read.
+func TestClientPlanRpmMapsTheHostsDistribution(t *testing.T) {
+	s, f := pocketServer(t)
+	s.cfg.RpmUpstreams = map[string]string{
+		"rocky-baseos":    "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
+		"rocky-appstream": "https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/",
+	}
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&os_id=rocky&os_version_id=9.4"), manifest.TypeRpm)
+	if len(recs) != 2 || recs[0].Path != clientconf.RpmRepoPath || recs[1].Path != clientconf.RpmKeyPath {
+		t.Fatalf("rpm records = %+v, want bodega.repo then the key", recs)
+	}
+	if !strings.Contains(recs[0].Reason, "epel is left out") {
+		t.Errorf("bodega.repo reason = %q, want it to name epel", recs[0].Reason)
+	}
+	if recs[1].URL != "http://bodega.example.com:8080/rpm/bodega.gpg" {
+		t.Errorf("key URL = %q", recs[1].URL)
+	}
+	for _, r := range recs {
+		u, _ := url.Parse(r.URL)
+		code, body := clientGet(t, s, f.token, u.RequestURI())
+		sum := sha256.Sum256([]byte(body))
+		if code != http.StatusOK || hex.EncodeToString(sum[:]) != r.SHA256 {
+			t.Errorf("GET %s = %d, digest does not match the plan's for %s:\n%s", u.RequestURI(), code, r.Path, body)
+		}
+		if r.Path == clientconf.RpmRepoPath && (!strings.Contains(body, "[bodega-rocky-appstream]") || strings.Contains(body, "epel")) {
+			t.Errorf("bodega.repo:\n%s", body)
+		}
+	}
+
+	for query, want := range map[string]string{
+		"os=linux&os_id=ubuntu&os_version_id=24.04": "reads ID=ubuntu VERSION_ID=24.04",
+		"os=linux": `os_id="" os_version_id=""`,
+		"os=freebsd&os_id=rocky&os_version_id=9.4":  "not freebsd",
+		"os=linux&os_id=almalinux&os_version_id=10": "configures none of them",
+	} {
+		recs := planRecordFor(planJSON(t, s, f.token, query), manifest.TypeRpm)
+		if len(recs) != 1 || recs[0].Action != planSkip || !strings.Contains(recs[0].Reason, want) {
+			t.Errorf("%s: rpm = %+v, want one skip saying %q", query, recs, want)
+		}
+	}
+	if code, _ := clientGet(t, s, f.token, "/client/plan?os=linux&os_id=Rocky%20Linux"); code != http.StatusBadRequest {
+		t.Errorf("a malformed os_id = %d, want 400", code)
+	}
+}

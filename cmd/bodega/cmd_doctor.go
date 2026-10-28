@@ -252,7 +252,11 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if f, ok := host.CheckComposer(); ok {
 				findings = append(findings, f)
 			}
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(doctorBaseURL(gf, baseURL))...)
+			base := doctorBaseURL(gf, baseURL)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
+			if f, ok := (host.RpmHost{LookPath: doctorLookPath, Dirs: doctorYumReposDirs}).Check(base); ok {
+				findings = append(findings, f)
+			}
 			if f, ok := ubuntuPro.finding(); ok {
 				findings = append(findings, f)
 			}
@@ -530,6 +534,13 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	if os.Geteuid() == 0 {
 		q.Set("root", "1")
 	}
+	if data, err := os.ReadFile(doctorOSRelease); err == nil {
+		id, ver := clientconf.OSReleaseIDs(data)
+		if clientconf.OSReleaseValueValid(id) && clientconf.OSReleaseValueValid(ver) {
+			q.Set("os_id", id)
+			q.Set("os_version_id", ver)
+		}
+	}
 	var plan clientconf.Plan
 	if err := getJSON(client, "/client/plan?"+q.Encode(), &plan); err != nil {
 		return err
@@ -548,6 +559,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		return err
 	}
 	if records, err = keepPresentRuntimes(records, slices.Contains(req.systems, manifest.TypeOCI)); err != nil {
+		return err
+	}
+	if records, err = keepDnfHost(records, slices.Contains(req.systems, manifest.TypeRpm)); err != nil {
 		return err
 	}
 	if len(plan.Records) > 0 {
@@ -594,6 +608,14 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("\n%s", d)
 		changed++
 	}
+	dnfStep, err := rpmDisableStep(changes)
+	if err != nil {
+		return err
+	}
+	if dnfStep != nil {
+		fmt.Printf("\nrun        %-10s %s\n", manifest.TypeRpm, strings.Join(dnfStep, " "))
+		fmt.Println("           (turns off the vendor repositories bodega.repo replaces)")
+	}
 	var proPlan, osPlan []string
 	if req.quietPro {
 		steps, why, err := ubuntuPro.quietSteps()
@@ -612,11 +634,14 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osPlan = steps
 	}
 	switch {
-	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0:
+	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && dnfStep == nil:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		return nil
-	case !req.apply && len(proPlan)+len(osPlan) > 0:
+	case !req.apply && len(proPlan)+len(osPlan) > 0 || !req.apply && dnfStep != nil:
 		var runs []string
+		if dnfStep != nil {
+			runs = append(runs, "the dnf step")
+		}
 		if len(proPlan) > 0 {
 			runs = append(runs, fmt.Sprintf("%d Ubuntu Pro step(s)", len(proPlan)))
 		}
@@ -654,6 +679,14 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		fmt.Printf("recorded   %s (undo: bodega doctor %s)\n", q.ledger.path, q.ledger.restoreFlag)
 	}
+	if dnfStep != nil {
+		if err := doctorRun(dnfStep[0], dnfStep[1:]...); err != nil {
+			return fmt.Errorf("%s failed: %w.\n"+
+				"  bodega.repo is written and the vendor repositories it replaces are still enabled, so dnf can still fetch around bodega.\n"+
+				"  config-manager comes from dnf-plugins-core and needs root: sudo dnf install dnf-plugins-core, then re-run", strings.Join(dnfStep, " "), err)
+		}
+		fmt.Printf("ran        %s\n", strings.Join(dnfStep, " "))
+	}
 	aptHinted := false
 	for _, c := range changes {
 		switch {
@@ -661,6 +694,8 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		case c.Record.System == manifest.TypeApt && strings.HasSuffix(c.Target, ".sources") && !aptHinted:
 			aptHinted = true
 			fmt.Println("\nApply it:  apt-get update")
+		case c.Record.System == manifest.TypeRpm && strings.HasSuffix(c.Record.Path, clientconf.RpmRepoPath):
+			fmt.Println("\nApply it:  dnf makecache")
 		case c.Record.System == manifest.TypeFreeBSD:
 			fmt.Println("\nApply it:  pkg update")
 			fmt.Println("Confirm the upstream repository is off:  pkg -vv | grep -A2 -E '^  (FreeBSD|bodega)'")
@@ -677,6 +712,78 @@ var (
 	doctorLookPath = exec.LookPath
 	doctorOCIRoot  = ""
 )
+
+// doctorYumReposDirs are where doctor reads dnf's .repo files, and
+// doctorRun how it runs the dnf step, so a test can stand in for both.
+var (
+	doctorYumReposDirs = clientconf.YumReposDirs
+	doctorRun          = func(name string, args ...string) error {
+		cmd := exec.Command(name, args...)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+)
+
+// keepDnfHost drops the rpm records on a host with no dnf, as
+// keepPresentRuntimes drops a runtime the host does not run. named says the
+// operator asked for rpm by name, where that is an error instead.
+func keepDnfHost(records []clientconf.PlanRecord, named bool) ([]clientconf.PlanRecord, error) {
+	if _, err := doctorLookPath("dnf"); err == nil {
+		return records, nil
+	}
+	var out []clientconf.PlanRecord
+	saw := false
+	for _, r := range records {
+		if r.System == manifest.TypeRpm && r.Action == clientconf.PlanInstall {
+			saw = true
+			continue
+		}
+		out = append(out, r)
+	}
+	switch {
+	case saw && named:
+		return nil, fmt.Errorf("the rpm system configures dnf, and dnf is not on PATH here, so nothing was written.\n" +
+			"  Run it on a RHEL-family host (Rocky, AlmaLinux, RHEL 9 or 10)")
+	case saw:
+		fmt.Printf("skip       %-10s no dnf on PATH\n", manifest.TypeRpm)
+	}
+	return out, nil
+}
+
+// rpmDisableStep is the dnf config-manager command that turns off the vendor
+// repositories bodega.repo carries a section for, or nil when none of them is
+// enabled on this host. It is read from the file the plan writes rather than
+// the plan's notes, so a repository rpm_upstreams leaves out is never
+// disabled with nothing in its place.
+func rpmDisableStep(changes []clientconf.Change) ([]string, error) {
+	var repoFile *clientconf.Change
+	for i, c := range changes {
+		if c.Record.System == manifest.TypeRpm && strings.HasSuffix(c.Record.Path, clientconf.RpmRepoPath) {
+			repoFile = &changes[i]
+		}
+	}
+	if repoFile == nil {
+		return nil, nil
+	}
+	data, err := os.ReadFile(doctorOSRelease)
+	if err != nil {
+		return nil, fmt.Errorf("rpm: read %s to name the vendor repositories to disable: %w", doctorOSRelease, err)
+	}
+	d, ok := clientconf.RpmDistroFor(clientconf.OSReleaseIDs(data))
+	if !ok {
+		id, ver := clientconf.OSReleaseIDs(data)
+		return nil, fmt.Errorf("rpm: the plan configures dnf, and %s reads ID=%s VERSION_ID=%s, which this bodega's rpm client table does not name; upgrade bodega on this host", doctorOSRelease, id, ver)
+	}
+	repos, err := clientconf.ReadYumRepos(doctorYumReposDirs...)
+	if err != nil {
+		return nil, fmt.Errorf("rpm: %w", err)
+	}
+	ids := clientconf.RpmDisableIDs(d, clientconf.RpmHostUpstreams(repoFile.New), repos, clientconf.RpmBasearch(runtime.GOARCH))
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return append([]string{"dnf", "config-manager", "--set-disabled"}, ids...), nil
+}
 
 // runtimePresent reports whether any of rt's commands is on PATH.
 func runtimePresent(rt string) bool {

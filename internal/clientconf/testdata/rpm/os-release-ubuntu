@@ -1,0 +1,5 @@
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+VERSION_ID="24.04"
+VERSION_CODENAME=noble

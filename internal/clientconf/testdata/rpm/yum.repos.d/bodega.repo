@@ -1,0 +1,9 @@
+[bodega-rocky-baseos]
+name=bodega rocky-baseos
+baseurl=https://bodega.example.com/rpm/rocky-baseos/$releasever/$basearch/
+enabled=1
+
+[bodega-split]
+name=a section whose second baseurl leaves bodega
+baseurl=https://bodega.example.com/rpm/rocky-appstream/$releasever/$basearch/
+  https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/

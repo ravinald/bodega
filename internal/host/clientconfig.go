@@ -1241,3 +1241,45 @@ func inHost(host string) string {
 	}
 	return " (" + host + ")"
 }
+
+// RpmHost is what the dnf check reads, so a test can stand in for both: how
+// to find dnf, and the directories dnf reads .repo files from.
+type RpmHost struct {
+	LookPath func(string) (string, error)
+	Dirs     []string
+}
+
+const rpmRemedy = "bodega doctor --configure rpm --apply --url <bodega base URL>"
+
+// Check reports every enabled dnf repository that fetches from anywhere but
+// bodega's /rpm/ route. ok is false on a host with no dnf, which gets no row.
+func (t RpmHost) Check(base string) (f Finding, ok bool) {
+	if _, err := t.LookPath("dnf"); err != nil {
+		return Finding{}, false
+	}
+	f.Check = "dnf-repos"
+	repos, err := clientconf.ReadYumRepos(t.Dirs...)
+	if err != nil {
+		f.Status, f.Detail = StatusSkip, err.Error()
+		f.Remediation = "run doctor as root, or repair the file named"
+		return f, true
+	}
+	bypass := clientconf.RpmBypasses(repos, base)
+	if len(bypass) == 0 {
+		f.Status, f.Detail = StatusOK, "every enabled dnf repository fetches through bodega"
+		return f, true
+	}
+	parts := make([]string, len(bypass))
+	for i, r := range bypass {
+		where := "no baseurl"
+		if len(r.URLs) > 0 {
+			where = strings.Join(r.URLs, " ")
+		}
+		parts[i] = fmt.Sprintf("%s (%s: %s)", r.ID, filepath.Base(r.File), where)
+	}
+	f.Status = StatusWarn
+	f.Detail = fmt.Sprintf("enabled dnf repositories fetching around bodega (%d): %s; bypasses bodega's rpm proxy",
+		len(bypass), strings.Join(parts, ", "))
+	f.Remediation = rpmRemedy + "; a repository bodega does not serve is disabled with dnf config-manager --set-disabled <id>"
+	return f, true
+}

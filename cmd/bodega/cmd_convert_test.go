@@ -173,3 +173,50 @@ func TestOSReleaseCodename(t *testing.T) {
 		t.Errorf("a missing os-release read %q", got)
 	}
 }
+
+// F103 R4: `pkg convert rpm` keys each package by epoch:version-release,
+// leaving off a zero or "(none)" epoch, folds a package installed for two
+// architectures into one entry, and skips the gpg-pubkey headers rpm
+// --import writes.
+func TestConvertRpm(t *testing.T) {
+	listing := "nginx\t2\t1.20.1\t20.el9\tx86_64\n" +
+		"bash\t(none)\t5.1.8\t9.el9\tx86_64\n" +
+		"glibc\t0\t2.34\t100.el9\tx86_64\n" +
+		"glibc\t0\t2.34\t100.el9\ti686\n" +
+		"gpg-pubkey\t(none)\t350d275d\t6279464b\t(none)\n"
+	out := filepath.Join(t.TempDir(), "catalog.json")
+	var errbuf bytes.Buffer
+	cmd := newConvertCmd(&globalFlags{})
+	cmd.SetArgs([]string{"rpm", writeTemp(t, "rpm.txt", listing), "-o", out, "--origin", "rocky-host"})
+	cmd.SetErr(&errbuf)
+	cmd.SilenceUsage, cmd.SilenceErrors = true, true
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("convert rpm = %v: %s", err, errbuf.String())
+	}
+	blob, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pms []manifest.PackageManifest
+	if err := json.Unmarshal(blob, &pms); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, pm := range pms {
+		if pm.Type != manifest.TypeRpm {
+			t.Errorf("%s has type %q", pm.Name, pm.Type)
+		}
+		for _, ve := range pm.Versions {
+			got[pm.Name] = append(got[pm.Name], ve.Version)
+		}
+	}
+	want := map[string][]string{"bash": {"5.1.8-9.el9"}, "glibc": {"2.34-100.el9"}, "nginx": {"2:1.20.1-20.el9"}}
+	if len(got) != len(want) {
+		t.Fatalf("converted %v, want %v", got, want)
+	}
+	for name, vs := range want {
+		if strings.Join(got[name], ",") != strings.Join(vs, ",") {
+			t.Errorf("%s = %v, want %v", name, got[name], vs)
+		}
+	}
+}
