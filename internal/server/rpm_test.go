@@ -553,13 +553,13 @@ func TestRpmSignatureFollowsEachClientsRevision(t *testing.T) {
 
 // Two hosts behind one address with no identity of their own are one client
 // key, and the .asc request says nothing about which repomd.xml its reader
-// got. So the key keeps the revision its first reader holds until every
-// reader has asked for its signature, and moves on after that; a reader handed
-// the held revision is served the metadata that revision names, after the
-// cache stopped naming it.
+// got. So the key keeps the revision it holds while any reader may still be
+// between its two requests, and a reader handed the held revision is served
+// the metadata that revision names, after the cache stopped naming it.
 func TestRpmSignatureSharedAddress(t *testing.T) {
 	m := newRPMMirror(t)
 	s, kr := rpmServer(t, m)
+	clock := rpmTestClock(s)
 	s.cache.MetadataTTL = time.Nanosecond
 	const hostA, hostB, hostC = "192.0.2.10:40000", "192.0.2.10:40001", "192.0.2.10:40002"
 	first := rpmRequestFrom(s, hostA, rpmRepoPath+"repodata/repomd.xml").Body.String()
@@ -582,14 +582,100 @@ func TestRpmSignatureSharedAddress(t *testing.T) {
 			t.Errorf("client %s: signature does not cover the repomd.xml it was served: %v", addr, err)
 		}
 	}
+	clock.advance(rpmSignatureWait + time.Second)
 	third := rpmRequestFrom(s, hostC, rpmRepoPath+"repodata/repomd.xml").Body.String()
 	if third != moved {
-		t.Fatal("the address stayed on the old revision after every reader had its signature")
+		t.Fatal("the address stayed on the old revision after it was quiet for rpmSignatureWait")
 	}
 	sig := rpmRequestFrom(s, hostC, rpmRepoPath+"repodata/repomd.xml.asc")
 	if err := rpmVerifySignature(kr, third, sig.Body.String()); err != nil {
 		t.Errorf("signature does not cover the new revision: %v", err)
 	}
+}
+
+// A signature request reads the revision a key holds and never moves it, so
+// one reader asking for its signature again and again cannot hand another
+// reader behind the same address a signature over a revision it never got.
+// This is the reviewer's probe from F97's audit of 2d8f4b1, with C's request
+// expected to be held rather than advanced: C arrives while B may still be
+// between its two requests.
+func TestRpmSignatureRetryKeepsAnotherReadersRevision(t *testing.T) {
+	m := newRPMMirror(t)
+	s, kr := rpmServer(t, m)
+	rpmTestClock(s)
+	s.cache.MetadataTTL = time.Nanosecond
+	const a, b, c = "192.0.2.10:40000", "192.0.2.10:40001", "192.0.2.10:40002"
+	first := rpmRequestFrom(s, a, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	held := rpmRequestFrom(s, b, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	for range 5 {
+		sig := rpmRequestFrom(s, a, rpmRepoPath+"repodata/repomd.xml.asc")
+		if err := rpmVerifySignature(kr, first, sig.Body.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.set("repodata/repomd.xml", []byte(first+"<!-- next -->"))
+	if next := rpmRequestFrom(s, c, rpmRepoPath+"repodata/repomd.xml").Body.String(); next != first {
+		t.Fatal("a signature request let the key move while reader B was still owed its signature")
+	}
+	sig := rpmRequestFrom(s, b, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err := rpmVerifySignature(kr, held, sig.Body.String()); err != nil {
+		t.Fatalf("reader B signature after reader A retried .asc: %v", err)
+	}
+}
+
+// A key that is never quiet still moves once the cache has held a newer
+// revision for rpmRolloverGrace, and from then on the pair it serves is the
+// new one.
+func TestRpmBusyAddressRollsOverAfterTheGrace(t *testing.T) {
+	m := newRPMMirror(t)
+	s, kr := rpmServer(t, m)
+	clock := rpmTestClock(s)
+	s.cache.MetadataTTL = time.Nanosecond
+	const host = "192.0.2.10:40000"
+	first := rpmRequestFrom(s, host, rpmRepoPath+"repodata/repomd.xml").Body.String()
+	moved := first + "<!-- new revision -->"
+	m.set("repodata/repomd.xml", []byte(moved))
+	for elapsed := time.Duration(0); elapsed < rpmRolloverGrace; elapsed += rpmSignatureWait / 2 {
+		if got := rpmRequestFrom(s, host, rpmRepoPath+"repodata/repomd.xml").Body.String(); got != first {
+			t.Fatalf("moved %v into the grace while the key was busy", elapsed)
+		}
+		sig := rpmRequestFrom(s, host, rpmRepoPath+"repodata/repomd.xml.asc")
+		if err := rpmVerifySignature(kr, first, sig.Body.String()); err != nil {
+			t.Fatalf("%v into the grace: signature does not cover the held revision: %v", elapsed, err)
+		}
+		clock.advance(rpmSignatureWait / 2)
+	}
+	if got := rpmRequestFrom(s, host, rpmRepoPath+"repodata/repomd.xml").Body.String(); got != moved {
+		t.Fatal("a busy key kept the old revision past rpmRolloverGrace")
+	}
+	sig := rpmRequestFrom(s, host, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err := rpmVerifySignature(kr, moved, sig.Body.String()); err != nil {
+		t.Errorf("signature after the rollover does not cover the new revision: %v", err)
+	}
+}
+
+type rpmFakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *rpmFakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func (c *rpmFakeClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// rpmTestClock gives the server's publication record a clock the test moves.
+func rpmTestClock(s *Server) *rpmFakeClock {
+	c := &rpmFakeClock{now: time.Unix(1_800_000_000, 0)}
+	s.rpmServed.clock = c.read
+	return c
 }
 
 // A conditional GET is answered in full, so the revision a client keeps is
@@ -608,9 +694,9 @@ func TestRpmRepomdIgnoresConditionalRequests(t *testing.T) {
 	}
 }
 
-// The hold on a revision ends when every reader asked for its signature, or
-// when a reader that never asks has waited out rpmSignatureWait, so a key a
-// repo_gpgcheck=0 host shares does not keep the old revision.
+// A key moves to a newer revision only on a repomd.xml request, and only
+// once it was quiet for rpmSignatureWait or the cache held the newer one for
+// rpmRolloverGrace. Reading what it holds never moves it.
 func TestRpmServedRepomdsHold(t *testing.T) {
 	const tree, key = "rocky-baseos/9/x86_64", "192.0.2.10\x00"
 	r1, r2 := []byte("revision 1"), []byte("revision 2")
@@ -621,29 +707,37 @@ func TestRpmServedRepomdsHold(t *testing.T) {
 		t.Fatalf("first publish handed %q", got)
 	}
 	if got := c.publish(tree, key, r2, t0.Add(time.Second)); !bytes.Equal(got, r1) {
-		t.Errorf("a reader still owed a signature: handed %q, want the held revision", got)
+		t.Errorf("a reader may still be owed a signature: handed %q, want the held revision", got)
 	}
-	if got, _ := c.sign(tree, key, t0.Add(2*time.Second)); !bytes.Equal(got, r1) {
-		t.Errorf("signed %q, want the held revision", got)
+	for range 10 {
+		if got, _ := c.held(tree, key, t0.Add(2*time.Second)); !bytes.Equal(got, r1) {
+			t.Fatalf("held %q, want the held revision", got)
+		}
 	}
 	if got := c.publish(tree, key, r2, t0.Add(3*time.Second)); !bytes.Equal(got, r1) {
-		t.Errorf("one reader still owed a signature: handed %q", got)
+		t.Errorf("reading the signature moved the key: handed %q", got)
 	}
-	_, _ = c.sign(tree, key, t0.Add(4*time.Second))
-	_, _ = c.sign(tree, key, t0.Add(4*time.Second))
-	if got := c.publish(tree, key, r2, t0.Add(5*time.Second)); !bytes.Equal(got, r2) {
-		t.Errorf("every reader settled: handed %q, want the new revision", got)
+	quiet := t0.Add(3*time.Second + rpmSignatureWait + time.Second)
+	if got := c.publish(tree, key, r2, quiet); !bytes.Equal(got, r2) {
+		t.Errorf("quiet for rpmSignatureWait: handed %q, want the new revision", got)
 	}
-
-	var u rpmServedRepomds
-	u.publish(tree, key, r1, t0)
-	if got := u.publish(tree, key, r2, t0.Add(rpmSignatureWait+time.Second)); !bytes.Equal(got, r2) {
-		t.Errorf("a reader that never asked held the revision past rpmSignatureWait: handed %q", got)
-	}
-	if got, ok := u.held(tree, key, t0.Add(rpmSignatureWait+time.Second)); !ok || !bytes.Equal(got, r2) {
+	if got, ok := c.held(tree, key, quiet); !ok || !bytes.Equal(got, r2) {
 		t.Errorf("held %q, %v", got, ok)
 	}
-	if _, ok := u.sign(tree, key, t0.Add(rpmSignatureWait+rpmServedWindow+2*time.Second)); ok {
+
+	var busy rpmServedRepomds
+	busy.publish(tree, key, r1, t0)
+	newer := t0.Add(rpmSignatureWait / 2)
+	at := newer
+	for ; at.Sub(newer) < rpmRolloverGrace; at = at.Add(rpmSignatureWait / 2) {
+		if got := busy.publish(tree, key, r2, at); !bytes.Equal(got, r1) {
+			t.Fatalf("busy key moved %v after the newer revision appeared", at.Sub(newer))
+		}
+	}
+	if got := busy.publish(tree, key, r2, at); !bytes.Equal(got, r2) {
+		t.Errorf("busy key at rpmRolloverGrace: handed %q", got)
+	}
+	if _, ok := busy.held(tree, key, at.Add(rpmServedWindow+2*time.Second)); ok {
 		t.Error("a record older than rpmServedWindow still answered the signature")
 	}
 }

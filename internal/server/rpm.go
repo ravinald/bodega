@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -174,7 +173,7 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 	}
 	body := cw.body.Bytes()
 	if status == http.StatusOK {
-		if held := s.rpmServed.publish(t.id(), rpmClientKey(r), body, time.Now()); !bytes.Equal(held, body) {
+		if held := s.rpmServed.publish(t.id(), rpmClientKey(r), body, s.rpmServed.now()); !bytes.Equal(held, body) {
 			body = held
 			for _, h := range []string{"ETag", "Last-Modified"} {
 				w.Header().Del(h)
@@ -198,7 +197,7 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 		http.Error(w, "this server holds no signing key, so it serves repomd.xml unsigned; an operator runs `bodega apt key generate`, or a client sets repo_gpgcheck=0.", http.StatusNotFound)
 		return
 	}
-	doc, ok := s.rpmServed.sign(t.id(), rpmClientKey(r), time.Now())
+	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		var err error
 		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
@@ -220,20 +219,25 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 // one its .asc request is signed over, when nothing moved it since.
 const rpmServedWindow = 10 * time.Minute
 
-// rpmSignatureWait is how long a reader that has not asked for its signature
-// holds its client key on the revision it was handed. dnf asks for the
-// signature right after the document, so this only has to outlast a slow link
-// between the two; a reader that never asks (repo_gpgcheck=0, a probe) stops
-// holding the revision once it passes.
+// rpmSignatureWait is how long after a client key was last handed a
+// repomd.xml one of its readers may still ask for the signature. dnf asks for
+// it right after the document, so this only has to outlast a slow link
+// between the two. A key quiet for longer has no reader left to break, and
+// moves to a newer revision on its next request.
 const rpmSignatureWait = 30 * time.Second
 
-// rpmServedClients bounds the clients remembered per repository tree, and
-// rpmServedPending the readers counted per client. A client past the first is
-// handed the cached copy and signed it, as one arriving after the window is.
-const (
-	rpmServedClients = 1 << 16
-	rpmServedPending = 1 << 10
-)
+// rpmRolloverGrace bounds how long a key that is never quiet (many hosts
+// behind one NAT address) keeps the revision it holds once the cache has a
+// newer one. It is the window the old repomd.xml and its signature stay
+// served as a pair after a refresh. Ten minutes is a sixth of the default
+// metadata_ttl, so a busy key trails the cache by less than the TTL already
+// lets any client trail the upstream.
+const rpmRolloverGrace = 10 * time.Minute
+
+// rpmServedClients bounds the clients remembered per repository tree. A
+// client past the bound is handed the cached copy and signed it, as one
+// arriving after rpmServedWindow is.
+const rpmServedClients = 1 << 16
 
 // rpmClientKey is who a repomd.xml was served to: the address and the
 // identity the request carried. Two hosts behind one address with no identity
@@ -243,18 +247,30 @@ func rpmClientKey(r *http.Request) string {
 }
 
 // rpmServedRepomds is the repomd.xml each client key holds, per repository
-// tree. In memory and per process: a second bodega behind the same address
-// answers .asc from the cached copy.
+// tree. In memory and per process: after a restart, or on a second bodega
+// behind the same address, .asc is signed over the cached copy.
 //
 // The .asc request carries nothing that says which repomd.xml its reader got,
-// so every reader behind one key has to have got the same one. A key moves to
-// a new revision only when no reader it was handed the current one is still
-// owed a signature: each GET adds a pending reader, each .asc settles the
-// oldest, and a reader unsettled after rpmSignatureWait stops counting. Until
-// then the key is handed the revision it holds, however the cache moved.
+// so the signature is always over the revision the key holds, and only a
+// repomd.xml request moves a key to a new revision: a signature request reads
+// and never changes what is held. A key moves when it has been quiet for
+// rpmSignatureWait, so no reader is left between its two requests, or when
+// the cache has held a newer revision for rpmRolloverGrace. The second case
+// is the race this design accepts: a reader whose two requests straddle that
+// forced move gets a signature over the newer revision, fails repo_gpgcheck
+// once, and its next dnf makecache verifies.
 type rpmServedRepomds struct {
 	mu    sync.Mutex
 	trees map[string]*rpmServedTree
+	// clock is time.Now outside tests.
+	clock func() time.Time
+}
+
+func (c *rpmServedRepomds) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
 }
 
 type rpmServedTree struct {
@@ -264,25 +280,15 @@ type rpmServedTree struct {
 }
 
 // rpmServedClient is the revision one client key holds, when it was last
-// handed out, and when each reader still owed a signature was served, oldest
-// first.
+// handed out, and since when the cache has offered a newer one.
 type rpmServedClient struct {
-	doc     []byte
-	at      time.Time
-	pending []time.Time
-}
-
-func (c *rpmServedClient) settleExpired(now time.Time) {
-	n := 0
-	for n < len(c.pending) && now.Sub(c.pending[n]) > rpmSignatureWait {
-		n++
-	}
-	c.pending = slices.Delete(c.pending, 0, n)
+	doc        []byte
+	at         time.Time
+	newerSince time.Time
 }
 
 // publish records that client was served fetched and returns the revision
-// to hand it: fetched, unless a reader behind the same key still holds
-// another.
+// to hand it: the one it holds, until rpmServedRepomds says it moves.
 func (c *rpmServedRepomds) publish(tree, client string, fetched []byte, now time.Time) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -302,68 +308,46 @@ func (c *rpmServedRepomds) publish(tree, client string, fetched []byte, now time
 		}
 		t.lastPrune = now
 	}
-	cl := t.clients[client]
-	if cl == nil {
-		if len(t.clients) >= rpmServedClients {
-			return fetched
-		}
-		cl = &rpmServedClient{}
-		t.clients[client] = cl
-	}
-	cl.settleExpired(now)
-	if len(cl.pending) == 0 {
-		// One copy per revision, however many clients hold it.
-		if !bytes.Equal(t.latest, fetched) {
-			t.latest = bytes.Clone(fetched)
-		}
-		cl.doc = t.latest
-	}
-	cl.at = now
-	if len(cl.pending) < rpmServedPending {
-		cl.pending = append(cl.pending, now)
-	} else {
-		cl.pending[len(cl.pending)-1] = now
-	}
-	return cl.doc
-}
-
-// sign returns the revision client holds for its .asc request and settles
-// one pending reader.
-func (c *rpmServedRepomds) sign(tree, client string, now time.Time) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cl := c.heldLocked(tree, client, now)
-	if cl == nil {
-		return nil, false
-	}
-	cl.settleExpired(now)
-	if len(cl.pending) > 0 {
-		cl.pending = slices.Delete(cl.pending, 0, 1)
-	}
-	return cl.doc, true
-}
-
-// held returns the revision client holds without settling anything.
-func (c *rpmServedRepomds) held(tree, client string, now time.Time) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cl := c.heldLocked(tree, client, now)
-	if cl == nil {
-		return nil, false
-	}
-	return cl.doc, true
-}
-
-func (c *rpmServedRepomds) heldLocked(tree, client string, now time.Time) *rpmServedClient {
-	t := c.trees[tree]
-	if t == nil {
-		return nil
+	// One copy per revision, however many clients hold it.
+	if !bytes.Equal(t.latest, fetched) {
+		t.latest = bytes.Clone(fetched)
 	}
 	cl := t.clients[client]
 	if cl == nil || now.Sub(cl.at) > rpmServedWindow {
-		return nil
+		if cl == nil && len(t.clients) >= rpmServedClients {
+			return fetched
+		}
+		cl = &rpmServedClient{doc: t.latest}
+		t.clients[client] = cl
 	}
-	return cl
+	switch {
+	case bytes.Equal(cl.doc, t.latest):
+		cl.newerSince = time.Time{}
+	case now.Sub(cl.at) > rpmSignatureWait:
+		cl.doc, cl.newerSince = t.latest, time.Time{}
+	case cl.newerSince.IsZero():
+		cl.newerSince = now
+	case now.Sub(cl.newerSince) >= rpmRolloverGrace:
+		cl.doc, cl.newerSince = t.latest, time.Time{}
+	}
+	cl.at = now
+	return cl.doc
+}
+
+// held returns the revision client holds, changing nothing: the .asc route
+// and the metadata routes both read it.
+func (c *rpmServedRepomds) held(tree, client string, now time.Time) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.trees[tree]
+	if t == nil {
+		return nil, false
+	}
+	cl := t.clients[client]
+	if cl == nil || now.Sub(cl.at) > rpmServedWindow {
+		return nil, false
+	}
+	return cl.doc, true
 }
 
 // rpmCachedRepomd is the stored repomd.xml, fetched through the repomd route
@@ -480,7 +464,7 @@ func (s *Server) rpmMetadataEntry(r *http.Request, t rpmTree, match func(rpmRepo
 // rpmHeldEntry is the first entry match accepts in the repomd.xml this
 // client holds, or errRpmNotListed when it holds none or that one names none.
 func (s *Server) rpmHeldEntry(r *http.Request, t rpmTree, match func(rpmRepomdData) bool) (rpmRepomdData, error) {
-	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), time.Now())
+	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		return rpmRepomdData{}, errRpmNotListed
 	}
