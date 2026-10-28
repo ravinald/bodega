@@ -199,6 +199,10 @@ func TestPlanOsqueryExtension(t *testing.T) {
 	if got, _ := os.ReadFile(autoload); string(got) != "/opt/other/other.ext\n/usr/local/lib/bodega/bodega.ext\n" {
 		t.Errorf("autoload file = %q, want the operator's line kept and bodega's added", got)
 	}
+	flags := filepath.Join(root, "etc", "osquery", "osquery.flags")
+	if got, _ := os.ReadFile(flags); string(got) != "--extensions_autoload=/etc/osquery/extensions.load\n" {
+		t.Errorf("flagfile = %q, want the autoload flag naming the default file", got)
+	}
 	again, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root)
 	if err != nil || !again.unchanged() {
 		t.Errorf("second plan = %+v, %v; want nothing to change", again, err)
@@ -206,6 +210,66 @@ func TestPlanOsqueryExtension(t *testing.T) {
 	if fb, err := planOsqueryExtension(plan, clientconf.OSFreeBSD, binary, root); err != nil ||
 		fb.autoload != filepath.Join(root, "usr", "local", "etc", "osquery", "extensions.load") {
 		t.Errorf("freebsd autoload = %+v, %v", fb, err)
+	}
+}
+
+// A host whose package configuration moved the flagfile, and whose flags
+// name their own autoload file listing another extension, keeps both: doctor
+// adds bodega's line to the file osqueryd reads and leaves the flags alone.
+func TestPlanOsqueryExtensionFollowsTheActiveAutoloadFlag(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, body string) {
+		t.Helper()
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("etc/default/osqueryd", "# managed\nexport FLAG_FILE=\"/opt/osq/osquery.flags\"\n")
+	flagsBody := "--config_plugin=tls\n--extensions_autoload=/opt/fleet/extensions.load\n--verbose\n"
+	write("opt/osq/osquery.flags", flagsBody)
+	write("opt/fleet/extensions.load", "/opt/fleet/fleet.ext\n")
+
+	plan := clientconf.Plan{Osquery: []clientconf.OsqueryPlan{{Instance: "osq", Mode: "server", Origins: true}}}
+	binary := filepath.Join(root, "usr", "local", "bin", "bodega")
+	ext, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ext.apply(); err != nil {
+		t.Fatal(err)
+	}
+	flags, _ := os.ReadFile(filepath.Join(root, "opt/osq/osquery.flags"))
+	if string(flags) != flagsBody {
+		t.Errorf("flagfile = %q, want it unchanged", flags)
+	}
+	if fi, _ := os.Stat(filepath.Join(root, "opt/osq/osquery.flags")); fi.Mode().Perm() != 0o600 {
+		t.Errorf("flagfile mode = %v, want 0600 kept", fi.Mode().Perm())
+	}
+	active, _ := clientconf.OsqueryFlagValue(flags, "extensions_autoload")
+	got, _ := os.ReadFile(filepath.Join(root, active))
+	if string(got) != "/opt/fleet/fleet.ext\n/usr/local/lib/bodega/bodega.ext\n" {
+		t.Errorf("%s = %q, want the fleet extension kept and bodega's added", active, got)
+	}
+	for _, untouched := range []string{"etc/osquery/extensions.load", "etc/osquery/osquery.flags"} {
+		if _, err := os.Stat(filepath.Join(root, untouched)); !os.IsNotExist(err) {
+			t.Errorf("%s was written; osqueryd does not read it here", untouched)
+		}
+	}
+	if again, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root); err != nil || !again.unchanged() {
+		t.Errorf("second plan = %+v, %v; want nothing to change", again, err)
+	}
+
+	write("opt/osq/osquery.flags", "--extensions_autoload=extensions.load\n")
+	if _, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root); err == nil || !strings.Contains(err.Error(), "absolute path") {
+		t.Errorf("relative autoload file: err = %v, want a refusal naming the path", err)
+	}
+	write("etc/default/osqueryd", "FLAG_FILE=osquery.flags\n")
+	if _, err := planOsqueryExtension(plan, clientconf.OSLinux, binary, root); err == nil || !strings.Contains(err.Error(), "FLAG_FILE") {
+		t.Errorf("relative flagfile: err = %v, want a refusal naming FLAG_FILE", err)
 	}
 }
 

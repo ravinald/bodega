@@ -126,9 +126,10 @@ is a named system the plan refuses or skips, with the server's reason.
 --configure osquery runs alone and installs bodega's osquery extension, for
 a host whose server-mode osquery source sets origins: it links this binary,
 which must be owned by root, at /usr/local/lib/bodega/bodega.ext and lists
-that path in osqueryd's extensions_autoload file. osqueryd's flags, its
-enroll secret and its restart stay with the served setup script
-(--systems osquery), whose flags name the autoload file.
+that path in the autoload file osqueryd reads: the one its flagfile's
+--extensions_autoload names, kept as it is, else the package default, which
+it then names there. osqueryd's other flags, its enroll secret and its
+restart stay with the served setup script (--systems osquery).
 
   sudo bodega doctor --configure osquery --url https://bodega.internal --apply
 

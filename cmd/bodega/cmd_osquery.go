@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -313,23 +314,36 @@ next config or log request. Reports already stored keep their identity.`,
 
 // osqueryExtension is what --configure osquery installs for a host whose
 // server-mode instance sets origins: the bodega binary linked under a .ext
-// name, and that name listed in osqueryd's autoload file. root prefixes both
-// paths, "" on a real host.
+// name, that name listed in the autoload file osqueryd reads, and, when the
+// flags file names none, the extensions_autoload flag naming the default
+// one. root prefixes every path, "" on a real host.
 type osqueryExtension struct {
+	goos   string
 	binary string
 	// name is the link's path as osqueryd reads it, without root.
-	name         string
-	link         string
-	autoload     string
+	name     string
+	link     string
+	autoload string
+	// autoloadName is the autoload file as the flag names it, without root.
+	autoloadName string
+	flagfile     string
 	linkCurrent  bool
 	listed       bool
+	flagSet      bool
 	autoloadBody []byte
+	flagBody     []byte
+	flagMode     os.FileMode
 }
 
 // planOsqueryExtension decides the extension install from the plan. It
 // refuses a host whose server-mode instance does not set origins, with the
 // refusal --configure osquery has always given: the flags, the enroll secret
 // and the restart are setup.sh's, and without origins there is nothing else.
+//
+// The autoload file is the one osqueryd will read: the flagfile is found
+// where setup.sh finds it, and an extensions_autoload line already in it is
+// kept and followed. Pointing the flag at bodega's default instead would
+// drop every extension the operator's file lists at the next restart.
 func planOsqueryExtension(plan clientconf.Plan, goos, binary, root string) (*osqueryExtension, error) {
 	var servers []clientconf.OsqueryPlan
 	for _, p := range plan.Osquery {
@@ -348,10 +362,31 @@ func planOsqueryExtension(plan clientconf.Plan, goos, binary, root string) (*osq
 	if link == "" || autoload == "" {
 		return nil, fmt.Errorf("bodega knows where osqueryd autoloads extensions on linux and freebsd, not on %s", goos)
 	}
-	ext := &osqueryExtension{binary: binary, name: link, link: filepath.Join(root, link), autoload: filepath.Join(root, autoload)}
+	flagfile, err := osqueryFlagfile(goos, root)
+	if err != nil {
+		return nil, err
+	}
+	ext := &osqueryExtension{goos: goos, binary: binary, name: link, link: filepath.Join(root, link), flagfile: filepath.Join(root, flagfile), flagMode: 0o644}
 	if dest, err := os.Readlink(ext.link); err == nil && dest == binary {
 		ext.linkCurrent = true
 	}
+	if fi, err := os.Stat(ext.flagfile); err == nil {
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("osqueryd's flagfile %s is not a regular file; move it aside, then re-run. Nothing was written", ext.flagfile)
+		}
+		ext.flagMode = fi.Mode().Perm()
+	}
+	if ext.flagBody, err = os.ReadFile(ext.flagfile); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read osqueryd's flagfile %s: %w", ext.flagfile, err)
+	}
+	ext.autoloadName = autoload
+	if v, set := clientconf.OsqueryFlagValue(ext.flagBody, "extensions_autoload"); set {
+		if !filepath.IsAbs(v) || filepath.Clean(v) != v {
+			return nil, fmt.Errorf("%s sets --extensions_autoload=%q, which is not a clean absolute path bodega can add its extension to. Name the file osqueryd should read, or remove the line for %s, then re-run. Nothing was written", ext.flagfile, v, autoload)
+		}
+		ext.autoloadName, ext.flagSet = v, true
+	}
+	ext.autoload = filepath.Join(root, ext.autoloadName)
 	body, err := os.ReadFile(ext.autoload)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read osqueryd's autoload file %s: %w", ext.autoload, err)
@@ -363,6 +398,68 @@ func planOsqueryExtension(plan clientconf.Plan, goos, binary, root string) (*osq
 		}
 	}
 	return ext, nil
+}
+
+// osqueryFlagfile is the flagfile osqueryd reads, found as setup.sh's
+// osq_flagfile finds it: the variable the OS package sets it in, else the
+// package default. Two implementations disagreeing would put the flag in a
+// file one of them never opens.
+func osqueryFlagfile(goos, root string) (string, error) {
+	variable, source := clientconf.OsqueryFlagSources[goos][0], clientconf.OsqueryFlagSources[goos][1]
+	found := ""
+	switch source {
+	case "sysrc":
+		args := []string{"-n", variable}
+		if root != "" {
+			args = append([]string{"-R", root}, args...)
+		}
+		if out, err := exec.Command("sysrc", args...).Output(); err == nil {
+			found = strings.TrimSpace(string(out))
+		}
+	default:
+		body, err := os.ReadFile(filepath.Join(root, source))
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("read %s for where osqueryd's flagfile is: %w", filepath.Join(root, source), err)
+		}
+		found = shellAssignment(body, variable)
+	}
+	if found == "" {
+		return clientconf.OsqueryFlagsPaths[goos], nil
+	}
+	if !filepath.IsAbs(found) || strings.IndexFunc(found, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/._-", r))
+	}) >= 0 {
+		return "", fmt.Errorf("%s in %s names %s as osqueryd's flagfile, which is not an absolute path bodega will write. Nothing was written", variable, source, found)
+	}
+	return found, nil
+}
+
+// shellAssignment is the last value a shell-syntax file such as
+// /etc/default/osqueryd assigns name, quoted or bare, as setup.sh reads it.
+func shellAssignment(body []byte, name string) string {
+	v := ""
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimLeft(line, " \t")
+		if rest, ok := strings.CutPrefix(line, "export"); ok && rest != "" && strings.ContainsAny(rest[:1], " \t") {
+			line = strings.TrimLeft(rest, " \t")
+		}
+		val, ok := strings.CutPrefix(line, name+"=")
+		if !ok {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(val, `"`):
+			val, _, _ = strings.Cut(val[1:], `"`)
+		case strings.HasPrefix(val, "'"):
+			val, _, _ = strings.Cut(val[1:], "'")
+		default:
+			if i := strings.IndexAny(val, " \t#"); i >= 0 {
+				val = val[:i]
+			}
+		}
+		v = val
+	}
+	return v
 }
 
 // checkExtensionBinary refuses a binary osqueryd's autoloader would refuse:
@@ -385,7 +482,7 @@ func checkExtensionBinary(path string) error {
 	return nil
 }
 
-func (e *osqueryExtension) unchanged() bool { return e.linkCurrent && e.listed }
+func (e *osqueryExtension) unchanged() bool { return e.linkCurrent && e.listed && e.flagSet }
 
 func (e *osqueryExtension) printPlan(w io.Writer) {
 	if e.linkCurrent {
@@ -398,11 +495,17 @@ func (e *osqueryExtension) printPlan(w io.Writer) {
 	} else {
 		fmt.Fprintf(w, "autoload   %-10s %s gains the line %s\n", clientconf.SystemOsquery, e.autoload, e.name)
 	}
+	if e.flagSet {
+		fmt.Fprintf(w, "unchanged  %-10s %s names %s as the autoload file\n", clientconf.SystemOsquery, e.flagfile, e.autoloadName)
+	} else {
+		fmt.Fprintf(w, "flag       %-10s %s gains --extensions_autoload=%s\n", clientconf.SystemOsquery, e.flagfile, e.autoloadName)
+	}
 }
 
-// apply writes the link and the autoload line. The link is replaced through
-// a rename so osqueryd never reads a half-made one, and the autoload file
-// keeps every line it held.
+// apply writes the link, the autoload line and the flag, each only when
+// missing, in that order so a flag never names a file before bodega's line
+// is in it. Every file is replaced through a rename, so osqueryd never reads
+// a half-written one, and keeps every line it held.
 func (e *osqueryExtension) apply() error {
 	if !e.linkCurrent {
 		if err := os.MkdirAll(filepath.Dir(e.link), 0o755); err != nil {
@@ -419,19 +522,65 @@ func (e *osqueryExtension) apply() error {
 		}
 	}
 	if !e.listed {
-		body := e.autoloadBody
-		if len(body) > 0 && body[len(body)-1] != '\n' {
-			body = append(body, '\n')
+		mode := os.FileMode(0o644)
+		if fi, err := os.Stat(e.autoload); err == nil {
+			mode = fi.Mode().Perm()
 		}
-		body = append(body, e.name+"\n"...)
-		if err := os.MkdirAll(filepath.Dir(e.autoload), 0o755); err != nil {
-			return fmt.Errorf("create %s for osqueryd's autoload file: %w", filepath.Dir(e.autoload), err)
-		}
-		if err := os.WriteFile(e.autoload, body, 0o644); err != nil {
+		if err := replaceFile(e.autoload, appendLine(e.autoloadBody, e.name), mode); err != nil {
 			return fmt.Errorf("write osqueryd's autoload file %s: %w", e.autoload, err)
 		}
 	}
+	if !e.flagSet {
+		if err := replaceFile(e.flagfile, appendLine(e.flagBody, "--extensions_autoload="+e.autoloadName), e.flagMode); err != nil {
+			return fmt.Errorf("write osqueryd's flagfile %s: %w. The extension is linked and listed; re-run to set the flag", e.flagfile, err)
+		}
+	}
 	return nil
+}
+
+func appendLine(body []byte, line string) []byte {
+	out := append([]byte(nil), body...)
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		out = append(out, '\n')
+	}
+	return append(out, line+"\n"...)
+}
+
+// replaceFile writes body to path through a temporary file beside it and a
+// rename. A symlinked path is written through to its target, so the link an
+// operator made still names the file osqueryd reads.
+func replaceFile(path string, body []byte, mode os.FileMode) error {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".bodega-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// osqueryRestart is the command that makes osqueryd read what apply wrote.
+func osqueryRestart(goos string) string {
+	if goos == clientconf.OSFreeBSD {
+		return "service osqueryd restart"
+	}
+	return "systemctl restart osqueryd"
 }
 
 // configureOsqueryExtension is --configure osquery: the extension half of
@@ -453,10 +602,9 @@ func configureOsqueryExtension(w io.Writer, plan clientconf.Plan, apply bool) er
 		return err
 	}
 	ext.printPlan(w)
-	restart := "osqueryd loads it at its next start: the setup script sets extensions_autoload and restarts osqueryd (--systems osquery --apply)"
 	switch {
 	case ext.unchanged():
-		fmt.Fprintf(w, "\nNothing to change: the extension is linked and listed. %s.\n", restart)
+		fmt.Fprintf(w, "\nNothing to change: the extension is linked, listed in %s, and the flags name that file. osqueryd loads it at its next start (%s).\n", ext.autoloadName, osqueryRestart(ext.goos))
 		return nil
 	case !apply:
 		fmt.Fprintln(w, "\nDry run: nothing was written. Re-run with --apply, as root, to link and list the extension.")
@@ -467,6 +615,14 @@ func configureOsqueryExtension(w io.Writer, plan clientconf.Plan, apply bool) er
 	if err := ext.apply(); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "wrote      %s\nwrote      %s\n\n%s.\n", ext.link, ext.autoload, restart)
+	for _, f := range []struct {
+		done bool
+		path string
+	}{{ext.linkCurrent, ext.link}, {ext.listed, ext.autoload}, {ext.flagSet, ext.flagfile}} {
+		if !f.done {
+			fmt.Fprintf(w, "wrote      %s\n", f.path)
+		}
+	}
+	fmt.Fprintf(w, "\nosqueryd loads the extension at its next start: %s\n", osqueryRestart(ext.goos))
 	return nil
 }

@@ -50,12 +50,26 @@ func (s *Server) setupInventory() {
 	}
 }
 
+// freeBSDPlanTags are the pkg repository names planFreeBSD writes for any
+// ABI. A component's report carries no ABI, so a host is held to every
+// repository this server would configure on some FreeBSD host, not only the
+// one matching its own release.
+func (s *Server) freeBSDPlanTags(context.Context) ([]string, error) {
+	repos := s.freeBSDStatusFor(nil).Repos
+	out := make([]string, 0, len(repos))
+	for _, r := range repos {
+		out = append(out, r.Tag)
+	}
+	return out, nil
+}
+
 // newReconciler reads the same store and instances the frame was built with,
 // so a report is classified against the catalog this server serves.
 func (s *Server) newReconciler(instances []*inventory.Instance) *reconcile.Reconciler {
 	rc := &reconcile.Reconciler{DB: s.auditDB, Instances: instances, Logger: s.logger, PublicURL: s.cfg.ResolvePublicURL("")}
 	if s.store != nil {
 		rc.Catalog = s.store
+		rc.FreeBSDRepos = s.freeBSDPlanTags
 	}
 	return rc
 }

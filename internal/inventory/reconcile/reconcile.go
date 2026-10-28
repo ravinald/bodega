@@ -26,7 +26,6 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
-	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
 // Classes, worst first. Stale is a host-level class: it describes a source
@@ -71,13 +70,17 @@ type Catalog interface {
 // configured sources, which coverage, staleness and disagreement read.
 // PublicURL is the base hosts reach bodega at; an npm or pypi origin naming
 // any other host is foreign. Empty, no npm or pypi origin is judged.
+// FreeBSDRepos lists the pkg repository names the client plan writes; a
+// FreeBSD origin naming anything else is foreign. Nil, no FreeBSD origin is
+// judged.
 type Reconciler struct {
-	DB        *audit.DB
-	Catalog   Catalog
-	Instances []*inventory.Instance
-	PublicURL string
-	Logger    *slog.Logger
-	Now       func() time.Time
+	DB           *audit.DB
+	Catalog      Catalog
+	Instances    []*inventory.Instance
+	PublicURL    string
+	FreeBSDRepos func(context.Context) ([]string, error)
+	Logger       *slog.Logger
+	Now          func() time.Time
 }
 
 func (r *Reconciler) now() time.Time {
@@ -210,6 +213,9 @@ type evidence struct {
 	catalog  map[string]map[string]bool // type -> safe names in the index
 	pkgs     map[string]*manifest.PackageManifest
 	refusal  map[string]string // key -> reason, "" when not refused
+	// freebsdRepos is nil when no FreeBSD origin can be judged, and empty
+	// when the client plan writes no repository, so every origin is foreign.
+	freebsdRepos map[string]bool
 }
 
 func (r *Reconciler) evidence(ctx context.Context, identity string) (*evidence, error) {
@@ -220,6 +226,16 @@ func (r *Reconciler) evidence(ctx context.Context, identity string) (*evidence, 
 		refusal:  map[string]string{},
 	}
 	var err error
+	if r.FreeBSDRepos != nil {
+		names, err := r.FreeBSDRepos(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list the pkg repositories the client plan writes: %w", err)
+		}
+		ev.freebsdRepos = make(map[string]bool, len(names))
+		for _, n := range names {
+			ev.freebsdRepos[n] = true
+		}
+	}
 	if ev.mine, err = r.servedSet(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -364,7 +380,7 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 		}
 		return ClassBaseline, fmt.Sprintf("an accepted baseline covers %s", label), nil
 	}
-	if manager, origin, foreign := r.foreignOrigin(c); foreign {
+	if manager, origin, foreign := r.foreignOrigin(ev, c); foreign {
 		return ClassForeignOrigin, fmt.Sprintf("%s says it came from %s, not bodega", manager, origin), nil
 	}
 	if !known {
@@ -390,19 +406,22 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 
 // foreignOrigin reports whether the package manager recorded a source for c
 // other than bodega, naming that package manager and the source as the
-// reason quotes it. FreeBSD's origin is a
-// repository name, bodega's carrying pkgrepos.TagPrefix as the client plan
-// writes it; every other origin is a URL or a host, compared by host against
-// public_url. An origin bodega cannot judge (none recorded, or no public_url
-// to compare with) is not foreign, so the component classifies as it would
-// without one.
-func (r *Reconciler) foreignOrigin(c audit.InventoryComponent) (manager, origin string, foreign bool) {
+// reason quotes it. FreeBSD's origin is a repository name, bodega's only
+// when it is one the client plan writes, compared whole: a name sharing
+// pkgrepos.TagPrefix is anyone's to choose. Every other origin is a URL or a
+// host, compared by host against public_url. An origin bodega cannot judge
+// (none recorded, or nothing to compare it with) is not foreign, so the
+// component classifies as it would without one.
+func (r *Reconciler) foreignOrigin(ev *evidence, c audit.InventoryComponent) (manager, origin string, foreign bool) {
 	origin = strings.TrimSpace(c.Origin)
 	if origin == "" {
 		return "", "", false
 	}
 	if c.Ecosystem == manifest.TypeFreeBSD {
-		return "pkg", origin, !strings.HasPrefix(origin, pkgrepos.TagPrefix)
+		if ev.freebsdRepos == nil {
+			return "", "", false
+		}
+		return "pkg", origin, !ev.freebsdRepos[origin]
 	}
 	own := hostOf(r.PublicURL)
 	if own == "" {

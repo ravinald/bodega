@@ -573,6 +573,7 @@ func TestServedIdentityParsesKeys(t *testing.T) {
 func TestForeignOrigin(t *testing.T) {
 	h := newHarness(t)
 	h.rc.PublicURL = "https://Bodega.Example:8443/"
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return []string{"bodega-latest"}, nil }
 	h.bind("agent", "host-1", "web-01")
 	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
 	h.served("web-01", "npm", "lodash", "4.17.21", "npm/lodash/lodash-4.17.21.tgz", "")
@@ -623,17 +624,49 @@ func TestForeignOrigin(t *testing.T) {
 }
 
 // Without public_url there is no bodega host to compare an npm or pypi origin
-// with, so it classifies as though none were recorded; a FreeBSD repository
-// name needs no URL.
+// with, and without the plan's repository list no FreeBSD name to compare a
+// pkg origin with, so each classifies as though none were recorded.
 func TestForeignOriginWithoutPublicURL(t *testing.T) {
 	h := newHarness(t)
 	h.bind("agent", "host-1", "web-01")
 	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
+	h.served("web-01", "freebsd", "curl", "8.10.1", "freebsd/curl-8.10.1.pkg", "")
 	h.agent("host-1",
 		inventory.Component{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0", Origin: "registry.npmjs.org"},
 		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "8.10.1", Origin: "FreeBSD"},
 	)
 	got := h.classesOf(h.latest("web-01", "agent"))
 	wantClass(t, got, "left-pad@1.3.0", ClassServed, "served left-pad@1.3.0")
-	wantClass(t, got, "curl@8.10.1", ClassForeignOrigin, "pkg says it came from FreeBSD")
+	wantClass(t, got, "curl@8.10.1", ClassServed, "served curl@8.10.1")
+}
+
+// A FreeBSD origin is bodega's only when it names, whole, a repository the
+// client plan writes. Sharing the bodega- prefix proves nothing, since anyone
+// may name a pkg repository that, and a serve row does not rescue it.
+func TestForeignOriginFreeBSDNamesThePlanRepository(t *testing.T) {
+	h := newHarness(t)
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return []string{"bodega-latest"}, nil }
+	h.bind("agent", "host-1", "web-01")
+	for _, name := range []string{"bash", "curl", "git", "vim"} {
+		h.served("web-01", "freebsd", name, "1.0", "freebsd/"+name+"-1.0.pkg", "")
+	}
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "1.0", Origin: "bodega-latest"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "1.0", Origin: "bodega-unconfigured-third-party"},
+		inventory.Component{Ecosystem: "freebsd", Name: "git", Version: "1.0", Origin: "bodega-"},
+		inventory.Component{Ecosystem: "freebsd", Name: "vim", Version: "1.0"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "bash@1.0", ClassServed, "served bash@1.0")
+	wantClass(t, got, "curl@1.0", ClassForeignOrigin, "pkg says it came from bodega-unconfigured-third-party, not bodega")
+	wantClass(t, got, "git@1.0", ClassForeignOrigin, "pkg says it came from bodega-, not bodega")
+	wantClass(t, got, "vim@1.0", ClassServed, "served vim@1.0")
+
+	// A server that writes no pkg repository has none to vouch for.
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return nil, nil }
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "1.0", Origin: "bodega-latest"},
+	)
+	got = h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "bash@1.0", ClassForeignOrigin, "pkg says it came from bodega-latest, not bodega")
 }

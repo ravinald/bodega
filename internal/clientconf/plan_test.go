@@ -320,7 +320,7 @@ func TestOsqueryFlagsNameCertsOnlyOverTLS(t *testing.T) {
 	withOrigins.Origins = true
 	for goos, autoload := range map[string]string{OSLinux: "/etc/osquery/extensions.load", OSFreeBSD: "/usr/local/etc/osquery/extensions.load"} {
 		plain, got := OsqueryFlags("https://b.example:8443", src, goos), OsqueryFlags("https://b.example:8443", withOrigins, goos)
-		if want := append(slices.Clone(plain), OsqueryFlag{OsqueryFlagSet, "extensions_autoload", autoload}); !reflect.DeepEqual(got, want) {
+		if want := append(slices.Clone(plain), OsqueryFlag{OsqueryFlagDefault, "extensions_autoload", autoload}); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s with origins:\n got  %+v\n want %+v", goos, got, want)
 		}
 		for _, f := range plain {
@@ -347,5 +347,27 @@ func TestOsqueryFlagsNameCertsOnlyOverTLS(t *testing.T) {
 	}
 	if OsqueryFlagsPaths[OSFreeBSD] != "/usr/local/etc/osquery/osquery.flags" {
 		t.Errorf("FreeBSD flags path = %s, want the sysutils/osquery rc script's default", OsqueryFlagsPaths[OSFreeBSD])
+	}
+}
+
+// OsqueryFlagValue recognizes a flag line as setup.sh's merge does, and the
+// last setting wins, as it does for osqueryd.
+func TestOsqueryFlagValue(t *testing.T) {
+	for body, want := range map[string]struct {
+		value string
+		set   bool
+	}{
+		"":                                  {"", false},
+		"--verbose\n":                       {"", false},
+		"--extensions_autoload_timeout=3\n": {"", false},
+		"# --extensions_autoload=/x\n":      {"", false},
+		"--extensions_autoload=/a\n":        {"/a", true},
+		"  --extensions_autoload /b \n":     {"/b", true},
+		"--extensions_autoload=/a\n--extensions_autoload=/c": {"/c", true},
+		"--extensions_autoload\n":                            {"", true},
+	} {
+		if v, set := OsqueryFlagValue([]byte(body), "extensions_autoload"); v != want.value || set != want.set {
+			t.Errorf("OsqueryFlagValue(%q) = %q, %v; want %q, %v", body, v, set, want.value, want.set)
+		}
 	}
 }

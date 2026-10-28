@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory/osquery"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -267,7 +269,7 @@ func TestOsquerySystemFlagsFile(t *testing.T) {
 	}
 }
 
-// An origins instance carries the key in the plan, names the autoload file
+// An origins instance carries the key in the plan, defaults the autoload file
 // in the flags setup.sh merges, and hands its hosts a schedule joining the
 // extension's tables.
 func TestOsqueryOriginsPlan(t *testing.T) {
@@ -294,9 +296,11 @@ func TestOsqueryOriginsPlan(t *testing.T) {
 		if r.System != "osquery" {
 			continue
 		}
-		if _, flags := clientGet(t, s, f.token, r.URL[strings.Index(r.URL, "/client/"):]); !strings.HasSuffix(flags, "set\textensions_autoload\t/etc/osquery/extensions.load\n") {
+		_, flags := clientGet(t, s, f.token, r.URL[strings.Index(r.URL, "/client/"):])
+		if !strings.HasSuffix(flags, "default\textensions_autoload\t/etc/osquery/extensions.load\n") {
 			t.Errorf("flags do not name the autoload file:\n%s", flags)
 		}
+		testOsqMergeKeepsTheAutoloadFile(t, flags)
 	}
 
 	secret := addEnrollSecret(t, s, "osq", "web-host")
@@ -311,6 +315,47 @@ func TestOsqueryOriginsPlan(t *testing.T) {
 	for _, want := range []string{osquery.TableNPMOrigins, osquery.TableFreeBSDOrigins} {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("config names no %s: %s", want, rec.Body)
+		}
+	}
+}
+
+// testOsqMergeKeepsTheAutoloadFile runs setup.sh's own osq_merge over an
+// origins plan. A host whose flags already name an autoload file keeps it,
+// because that file lists the operator's other extensions and doctor adds
+// bodega's line there; a host naming none gains the package default.
+func testOsqMergeKeepsTheAutoloadFile(t *testing.T, plan string) {
+	t.Helper()
+	src := string(clientSetupScript)
+	start := strings.Index(src, "\nosq_merge() {\n")
+	end := strings.Index(src[start+1:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("no osq_merge() function in client_setup.sh; the test cannot reach the script's rule")
+	}
+	dir := t.TempDir()
+	fn := dir + "/merge.sh"
+	prelude := "tab=\"$(printf '\\t')\"\ndie() { echo \"$*\" >&2; exit 1; }\n"
+	if err := os.WriteFile(fn, []byte(prelude+src[start+1:start+1+end+3]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/plan", []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for existing, want := range map[string]string{
+		"--extensions_autoload=/opt/fleet/extensions.load\n--verbose\n": "/opt/fleet/extensions.load",
+		"--verbose\n": "/etc/osquery/extensions.load",
+	} {
+		if err := os.WriteFile(dir+"/flags", []byte(existing), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("sh", "-c", `. "$1" && osq_merge "$2" "$3" "$4" && cat "$4"`, "sh", fn, dir+"/flags", dir+"/plan", dir+"/merged").CombinedOutput()
+		if err != nil {
+			t.Fatalf("sh osq_merge(): %v\n%s", err, out)
+		}
+		if got, set := clientconf.OsqueryFlagValue(out, "extensions_autoload"); !set || got != want {
+			t.Errorf("merging into %q: extensions_autoload = %q (set %v), want %q\n%s", existing, got, set, want, out)
+		}
+		if strings.Count(string(out), "--extensions_autoload") != 1 || !strings.Contains(string(out), "--verbose\n") {
+			t.Errorf("merging into %q lost or doubled a line:\n%s", existing, out)
 		}
 	}
 }
