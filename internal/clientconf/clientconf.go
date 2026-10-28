@@ -14,6 +14,7 @@ package clientconf
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -285,45 +286,46 @@ func HelmDocument(repositories string) string {
 	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + repositories
 }
 
-// OCI renders the two files that point a container runtime at bodega by
-// hand: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
-// else, and a containerd hosts.toml for docker.io, which takes a copy per
-// registry. Neither carries an insecure-registry setting, so a plaintext base
-// is named in a note rather than written for the operator.
+// OCI renders the files a pane shows for pointing a container runtime at
+// bodega: Docker Engine's daemon.json, which mirrors Docker Hub and nothing
+// else, and containerd's hosts.toml for docker.io. `bodega doctor
+// --configure oci` installs the full set OCIClient renders, one hosts.toml
+// per registry the server's oci_upstreams names.
 func OCI(base string) []File {
-	b := trim(base)
-	var notes []string
-	if strings.HasPrefix(b, "http://") {
-		notes = append(notes, "bodega answers on plaintext http here, which Docker accepts only with the host in insecure-registries and containerd only with the host's scheme spelled http:// as above")
-	}
-	daemon := File{
-		System: manifest.TypeOCI,
-		Label:  "Docker daemon.json",
-		Paths: map[string]string{
-			OSLinux:  "/etc/docker/daemon.json",
-			OSDarwin: "~/.docker/daemon.json",
-		},
-		// dockerd stores a mirror with one trailing slash whatever it is
-		// given, so this is the form `docker info` prints back.
-		Content: fmt.Sprintf("{\n  \"registry-mirrors\": [%s]\n}\n", jsonString(b+"/")),
-		Notes: append([]string{
-			"Replaces the file; merge registry-mirrors into an existing daemon.json by hand, then restart dockerd",
-			"Docker Engine mirrors Docker Hub alone: an image from ghcr.io or quay.io still pulls from its own registry",
-		}, notes...),
-	}
-	containerd := File{
-		System: manifest.TypeOCI,
-		Label:  "containerd hosts.toml (docker.io)",
-		Paths: map[string]string{
-			OSLinux: "/etc/containerd/certs.d/docker.io/hosts.toml",
-		},
-		Content: fmt.Sprintf("server = \"https://registry-1.docker.io\"\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n", b),
-		Notes: append([]string{
-			"containerd reads certs.d only when config_path names it in config.toml's registry section",
-			"Copy the file to certs.d/ghcr.io/ and certs.d/quay.io/ with server set to that registry; containerd names the registry to bodega with ?ns=",
-		}, notes...),
-	}
+	daemon := DockerDaemon(base, nil)
+	daemon.Paths = map[string]string{OSLinux: DockerDaemonPath, OSDarwin: "~/.docker/daemon.json"}
+	containerd := ContainerdHosts(base, "docker.io", "https://registry-1.docker.io")
+	containerd.Notes = append(ContainerdConfig(base).Notes,
+		"Copy the file to certs.d/ghcr.io/ and certs.d/quay.io/ with server set to that registry; containerd names the registry to bodega with ?ns=")
 	return []File{daemon, containerd}
+}
+
+// Rpm renders /etc/yum.repos.d/bodega.repo with one section per repository
+// bodega serves, sorted so two renders of one config are byte-identical. dnf
+// checks bodega's signature over repomd.xml and the vendor's over each
+// package, so both checks are on and the vendor's key has to be named beside
+// bodega's. A server naming no repository renders the URL form as a comment,
+// which dnf reads as a file with no repositories in it.
+func Rpm(base string, repos []string) File {
+	b := trim(base)
+	var sb strings.Builder
+	if len(repos) == 0 {
+		fmt.Fprintf(&sb, "# rpm_upstreams on this server names no repository yet. Each one it names is served at\n# baseurl=%s/rpm/<name>/$releasever/$basearch/\n", b)
+	}
+	for _, name := range slices.Sorted(slices.Values(repos)) {
+		fmt.Fprintf(&sb, "[bodega-%s]\nname=bodega %s\nbaseurl=%s/rpm/%s/$releasever/$basearch/\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=%s/rpm/bodega.gpg\n\n",
+			name, name, b, name, b)
+	}
+	return File{
+		System:  manifest.TypeRpm,
+		Label:   "dnf repositories",
+		Paths:   map[string]string{OSLinux: "/etc/yum.repos.d/bodega.repo"},
+		Content: strings.TrimSuffix(sb.String(), "\n"),
+		Notes: []string{
+			"Append the vendor's key file to each gpgkey line (e.g. file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9): packages keep the vendor's signature, and gpgcheck verifies it",
+			"Disable the vendor repositories these replace, e.g. dnf config-manager --set-disabled baseos appstream",
+		},
+	}
 }
 
 // Git renders one url.<base>/git/<namespace>/.insteadOf per git_upstreams
@@ -501,18 +503,18 @@ const SystemOsquery = "osquery"
 // OsqueryFlagsPaths is where each OS's osquery package reads its flags when
 // nothing overrides it: the deb's /etc/default/osqueryd FLAG_FILE, and the
 // sysutils/osquery rc script's osqueryd_flagfile default. setup.sh writes
-// here only when the host names no other path; see osqueryFlagSources.
+// here only when the host names no other path; see OsqueryFlagSources.
 var OsqueryFlagsPaths = map[string]string{
 	OSLinux:   "/etc/osquery/osquery.flags",
 	OSFreeBSD: "/usr/local/etc/osquery/osquery.flags",
 }
 
-// osqueryFlagSources is where each OS's package names the flagfile its
+// OsqueryFlagSources is where each OS's package names the flagfile its
 // daemon reads, as the variable and either the file holding it or "sysrc"
 // for rc.conf. Following it rather than OsqueryFlagsPaths alone means a host
 // whose operator moved the flags gets bodega's flags where osqueryd reads
 // them, not in a file nothing opens.
-var osqueryFlagSources = map[string][2]string{
+var OsqueryFlagSources = map[string][2]string{
 	OSLinux:   {"FLAG_FILE", "/etc/default/osqueryd"},
 	OSFreeBSD: {"osqueryd_flagfile", "sysrc"},
 }
@@ -532,6 +534,24 @@ var osquerySecretPaths = map[string]string{
 var osqueryCABundles = map[string]string{
 	OSLinux:   "/etc/ssl/certs/ca-certificates.crt",
 	OSFreeBSD: "/etc/ssl/cert.pem",
+}
+
+// OsqueryExtensionPaths is where bodega doctor --configure osquery links
+// the bodega binary as an osquery extension. osqueryd's autoloader takes
+// only a path ending in .ext, owned by root and writable by no one else.
+var OsqueryExtensionPaths = map[string]string{
+	OSLinux:   "/usr/local/lib/bodega/bodega.ext",
+	OSFreeBSD: "/usr/local/lib/bodega/bodega.ext",
+}
+
+// OsqueryAutoloadPaths are each OS package's default extensions_autoload
+// file, one extension path per line. bodega adds its line and keeps the
+// rest. A flags file that already names another file keeps it, and bodega's
+// line goes there: replacing the flag would drop every extension the
+// operator's file lists.
+var OsqueryAutoloadPaths = map[string]string{
+	OSLinux:   "/etc/osquery/extensions.load",
+	OSFreeBSD: "/usr/local/etc/osquery/extensions.load",
 }
 
 // How setup.sh merges one OsqueryFlag into the host's flags file.
@@ -565,7 +585,9 @@ type OsqueryFlag struct {
 // logger_plugin is merged rather than set because a deployed host may feed
 // its filesystem log, osquery's default, to something else. host_identifier
 // defaults to uuid because osquery's own default, hostname, changes when a
-// host is renamed, and a shipper's mapping keys on it.
+// host is renamed, and a shipper's mapping keys on it. extensions_autoload
+// defaults, and only for an origins instance, whose schedule needs the
+// extension: a host already naming its own file keeps it.
 func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	b, err := url.Parse(base)
 	if err != nil || b.Host == "" {
@@ -590,12 +612,32 @@ func OsqueryFlags(base string, src OsqueryPlan, goos string) []OsqueryFlag {
 	if src.Interval > 0 {
 		out = append(out, set("config_refresh", strconv.FormatInt(src.Interval, 10)))
 	}
-	return append(out,
+	out = append(out,
 		OsqueryFlag{OsqueryFlagDefault, "host_identifier", "uuid"},
 		OsqueryFlag{OsqueryFlagDefault, "logger_plugin", "filesystem,tls"},
 		OsqueryFlag{OsqueryFlagInclude, "logger_plugin", "tls"},
 		set("logger_tls_endpoint", path+"/log"),
 	)
+	if src.Origins {
+		out = append(out, OsqueryFlag{OsqueryFlagDefault, "extensions_autoload", OsqueryAutoloadPaths[goos]})
+	}
+	return out
+}
+
+// OsqueryFlagValue reads the value the last line of an osquery flags file
+// setting name gives it, as setup.sh's merge recognizes such a line: "--",
+// the name, then "=", a blank or the end of the line. set reports whether
+// any line sets it. osqueryd's flagfile parser keeps the last setting.
+func OsqueryFlagValue(body []byte, name string) (value string, set bool) {
+	for _, line := range strings.Split(string(body), "\n") {
+		s := strings.Trim(line, " \t\r")
+		rest, ok := strings.CutPrefix(s, "--"+name)
+		if !ok || (rest != "" && !strings.ContainsAny(rest[:1], "= \t")) {
+			continue
+		}
+		value, set = strings.Trim(strings.TrimPrefix(rest, "="), " \t"), true
+	}
+	return value, set
 }
 
 // Osquery renders the osquery system's plan file for one server-mode
@@ -611,7 +653,7 @@ func Osquery(base string, src OsqueryPlan) []File {
 		if flags == nil {
 			return nil
 		}
-		from := osqueryFlagSources[goos]
+		from := OsqueryFlagSources[goos]
 		var sb strings.Builder
 		sb.WriteString("from\t" + from[0] + "\t" + from[1] + "\n")
 		for _, f := range flags {
@@ -644,6 +686,8 @@ type Inputs struct {
 	// Osquery is the one server-mode source a host enrolls with: osqueryd
 	// takes its config from exactly one server.
 	Osquery *OsqueryPlan
+	// RpmRepos is the rpm_upstreams keys, one dnf repository section each.
+	RpmRepos []string
 }
 
 // ForType renders every file a client of entryType installs. It is the one
@@ -669,6 +713,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Composer(in.Base))
 	case manifest.TypeOCI:
 		out = append(out, OCI(in.Base)...)
+	case manifest.TypeRpm:
+		out = append(out, Rpm(in.Base, in.RpmRepos))
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:

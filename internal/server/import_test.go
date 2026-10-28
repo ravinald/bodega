@@ -135,7 +135,7 @@ func TestBulkImportMergeAddsVersions(t *testing.T) {
 // package nothing serves, while the rest of the push continues.
 func TestBulkImportRejectsAnUnknownType(t *testing.T) {
 	s, _, _ := refreshTestServer(t)
-	body := `[{"config_version":1,"name":"weird","type":"rpm","versions":[{"version":"1.0"}]},` + aptManifest("fine", "1.0") + "]"
+	body := `[{"config_version":1,"name":"weird","type":"conda","versions":[{"version":"1.0"}]},` + aptManifest("fine", "1.0") + "]"
 	_, resp := postImport(t, s, body, "")
 	if resp.Imported != 1 || resp.Skipped != 1 {
 		t.Fatalf("imported = %d, skipped = %d, want 1 and 1", resp.Imported, resp.Skipped)

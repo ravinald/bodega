@@ -9,8 +9,9 @@ import (
 )
 
 // globTypes map one entry onto several files matched by a glob, so there is no
-// single artifact path to return and "" is the right answer.
-var globTypes = []string{manifest.TypeApt, manifest.TypePypi}
+// single artifact path to return and "" is the right answer. An rpm version is
+// one file per repository, release and architecture it was pulled under.
+var globTypes = []string{manifest.TypeApt, manifest.TypePypi, manifest.TypeRpm}
 
 // artifactPathForVersion returned "" for two different reasons through one
 // default arm: apt and pypi belong there, and cargo landed there by omission.

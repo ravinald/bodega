@@ -208,6 +208,9 @@ func ArtifactKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.P
 	if err == nil {
 		return keys, nil
 	}
+	if errors.Is(err, manifest.ErrRpmKeysListed) {
+		return rpmPackageKeys(ctx, store, pm, ve)
+	}
 	if !errors.Is(err, manifest.ErrAptPoolPathUnknown) {
 		return nil, err
 	}
@@ -256,6 +259,26 @@ func freeBSDRepoKeys(ctx context.Context, store storage.ObjectStore, pm *manifes
 	}
 	sort.Strings(rest)
 	return append(keys, rest...), nil
+}
+
+// rpmPackageKeys lists every cached copy of one rpm version, under each
+// repository, release and architecture it was pulled through.
+func rpmPackageKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) ([]string, error) {
+	if store == nil {
+		return nil, nil
+	}
+	listed, err := store.List(ctx, manifest.RpmPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list the rpm cache for %s@%s: %w", pm.Name, ve.Version, err)
+	}
+	var keys []string
+	for _, k := range listed {
+		if _, n, v := manifest.ParseKey(k); n == pm.Name && v == ve.Version {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 // aptPoolPathFromListing finds a version's path relative to manifest.AptPrefix

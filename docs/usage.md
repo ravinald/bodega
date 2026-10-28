@@ -1261,6 +1261,7 @@ What it keeps: the config file, and every artifact in storage. Stored artifacts 
 | `rubygems`  | `rubygems_root`  | `rubygems`                                                                                                                 |
 | `composer`  | `composer_root`  | `composer`                                                                                                                 |
 | `oci`       | `oci_root`       | `oci`                                                                                                                      |
+| `rpm`       | `rpm_root`       | `rpm`                                                                                                                      |
 | `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
 | `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
 
@@ -1451,9 +1452,9 @@ bodega inventory baseline <identity> [--json]
 
 `report` exits 1 when a component of the host's current set is `refused`, `unknown` or `unclassified`, or two sources disagree, whatever `--class` narrows the output to; 0 otherwise. `accept` writes a `create` audit row with `pkg_type=inventory-baseline`.
 
-### `bodega osquery secret <create|list|revoke>`
+### `bodega osquery secret <create|list|revoke>`, `bodega osquery extension`
 
-Manages the enroll secrets an [`osquery` source](#the-osquery-source) in `server` mode accepts. A host presenting one gets a `node_key`, and the secret's identity becomes the identity of every report under that key.
+`secret` manages the enroll secrets an [`osquery` source](#the-osquery-source) in `server` mode accepts. A host presenting one gets a `node_key`, and the secret's identity becomes the identity of every report under that key.
 
 ```bash
 bodega osquery secret create <instance> <identity> [--expires <duration>] [--label <name>]
@@ -1462,6 +1463,12 @@ bodega osquery secret revoke <id>
 ```
 
 `create` prints the secret once and stores only its peppered hash, keyed on the same pepper as API tokens. `--expires` takes a Go duration (`12h`), `30d`, `1y`, a date, or `never` (the default), and stops new enrollments after that time. It refuses an instance that is not an `osquery` source in `server` mode. `list` shows each secret's id, source, label, identity, creation and expiry, and how many nodes enrolled with it, never the secret. `revoke` deletes the secret and every `node_key` enrolled with it. `create` and `revoke` each write a `create` or `delete` audit row with `pkg_type=osquery-secret`.
+
+```bash
+bodega osquery extension --socket <path> [--timeout <seconds>] [--interval <seconds>]
+```
+
+`extension` runs as an osquery extension and serves `bodega_npm_origins` and `bodega_pip_origins` until osqueryd exits; see [Package origins](#package-origins). osqueryd starts it with these flags when it autoloads the binary under a name ending in `.ext`, and the binary invoked under such a name runs `extension` with no subcommand needed. It reads no bodega config and writes none.
 
 ### `bodega identity <bind|unbind|list>`
 
@@ -2202,7 +2209,15 @@ On Linux, three more rows name the OS services that reach out on their own whate
 
 A failure to read `/etc/default/motd-news` or chrony's configuration reports the row `SKIPPED`, naming the error.
 
-`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is refused by name and left out otherwise: its flags file alone points at a secret nothing wrote and a daemon nothing installed, so only the setup script configures it.
+For each container runtime on `PATH`, an **`oci-docker`**, **`oci-containerd`** or **`oci-podman`** row says whether it pulls through bodega's registry under `/v2/`, and a runtime that is not installed gets no row. The remediation on each is `bodega doctor --configure oci --apply --url <bodega base URL>`. A mirror counts as bodega's when its host is the one in `--url`, or `public_url` from the config file; with neither set, any mirror counts, since doctor cannot tell bodega's from another.
+
+- **`oci-docker`** (`dockerd` on `PATH`) warns when `/etc/docker/daemon.json` is absent or its `registry-mirrors` names no bodega mirror. An `OK` covers Docker Hub alone, because that is all `registry-mirrors` covers.
+- **`oci-containerd`** (`containerd`) reads `/etc/containerd/config.toml` as containerd decodes it and judges the `hosts.toml` containerd would use: the first root in the CRI registry table's `config_path` (a `:`-separated list) holding a `docker.io` or `_default` directory. It warns when there is no `config.toml` or it sets no `config_path` (a `config_path` in another plugin's table does not count), when no root holds such a directory, and when the first `[host]` there that may pull is not bodega. When containerd reads a directory other than `/etc/containerd/certs.d`, the remediation names the `config_path` edit, because `--configure oci` keeps a `config_path` the operator set. A `config.toml` containerd cannot load, one that disables the CRI plugin (Docker's packaged file does), and one still on the deprecated `registry.mirrors` report `SKIPPED`. The `config_path` judged is the one containerd runs with after loading every file `imports` names, in containerd's order (relative to the importing file, globs expanded, nested imports followed), so an imported CRI table naming another directory overrides the main file's. An import that cannot be read, one declaring another `version`, one declaring none that holds another format's CRI plugin table (containerd 2.x migrates a versionless import's `[plugins.cri]` into the CRI plugin's table, which doctor does not follow), and one carrying the CRI plugin table without `config_path` (containerd 1.x then reads none and 2.x keeps the earlier value) report `SKIPPED` and name the file. `--configure oci` refuses before writing in each of those cases.
+- **`oci-podman`** (`podman`, `buildah` or `crio`) resolves the files the runtimes read, in their order: `/etc/containers/registries.conf` (or the file `CONTAINERS_REGISTRIES_CONF` names), then `/etc/containers/registries.conf.d/*.conf`, then `~/.config/containers/registries.conf.d/*.conf`. A `~/.config/containers/registries.conf` replaces all of the system files. A later `[[registry]]` with the same `prefix` replaces an earlier one whole, so the check warns when any resolved `docker.io` table, including a longer prefix such as `docker.io/library`, has a first tag-pull mirror that is not bodega, naming the file that defines it. A table for `docker.io` itself is required: one for `docker.io/library` alone covers only that namespace, and the check warns that every other Docker Hub repository goes direct. A `digest-only` mirror does not count. `~` is the home of the account doctor runs as, so `sudo` judges root's podman.
+
+A `daemon.json` that is not JSON, or one this account cannot read, reports `oci-docker` `SKIPPED`, naming the error.
+
+`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is left out otherwise, and named it runs alone and does one thing: for a host whose `server`-mode source sets `origins`, it links this binary as bodega's osquery extension, lists it in the autoload file osqueryd reads, and sets `--extensions_autoload` in osqueryd's flagfile when that names none (see [Package origins](#package-origins)). For any other host it writes nothing and refuses. The other flags, the enroll secret and the restart stay with the setup script, since the flags file alone points at a secret nothing wrote and a daemon nothing installed.
 
 ```bash
 bodega doctor --configure apt,pypi --url https://bodega.internal
@@ -2212,6 +2227,27 @@ sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
 `--configure` refuses plain `http` unless `--allow-plaintext` is set, for `--url` and again for every file URL the plan names, since those carry the server's `public_url` rather than `--url`. Over plain HTTP the bearer token travels in the clear, and the plan and its files can be rewritten in transit together, digests included. Pass it only on a link you trust.
 
 A plaintext base also changes the `pip.conf` the plan carries. Beside `index-url` it writes `trusted-host = <host>`, the base's hostname without its port and, for an IPv6 literal, without brackets. pip ignores an `http` index whose host is not trusted, and does so as a warning followed by "no matching distribution", which names the package rather than the transport, so a `pip.conf` without it installs nothing. The bare host matches the index on any port. An `https` base writes no `trusted-host`.
+
+`--configure oci` points each container runtime on the host at bodega's registry under `/v2/`, Linux only. The server cannot see which runtimes a host runs, so its plan carries every runtime's files and doctor keeps those whose commands are on `PATH`; `oci` named on a host with none of `dockerd`, `containerd`, `podman`, `buildah` or `crio` is an error. The registries are the keys of the server's `oci_upstreams`:
+
+| Runtime                   | File                                               | What bodega writes                                                                                                                                                                  |
+| ------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Docker Engine (`dockerd`) | `/etc/docker/daemon.json`                          | `registry-mirrors` set to bodega, merged into the file: every other key is kept, and a mirror already listed is replaced                                                            |
+| containerd                | `/etc/containerd/certs.d/<registry>/hosts.toml`    | one per registry: `server` the upstream, without its credential, and one `[host."<bodega base URL>"]` with `capabilities = ["pull", "resolve"]`; containerd appends `/v2/` and `ns` |
+| containerd                | `/etc/containerd/config.toml`                      | `config_path = "/etc/containerd/certs.d"` in the CRI registry table, only when no `config_path` is set; the rest of the file, comments included, is kept                            |
+| podman, buildah and CRI-O | `/etc/containers/registries.conf.d/99-bodega.conf` | a `[[registry]]` per registry, each with a `[[registry.mirror]]` at `<bodega-host>/<registry>`                                                                                      |
+
+Docker Engine's `registry-mirrors` covers Docker Hub only: an image from `ghcr.io` or `quay.io` still pulls from its own registry, and the plan's note on `daemon.json` says so. containerd's `hosts.toml` and the podman drop-in cover every registry, and nerdctl and `ctr --hosts-dir` read the same `certs.d`. containerd and podman try bodega first and fall back to the registry itself, which a host whose egress is closed sees as bodega's error.
+
+`config.toml` gains `config_path` in the table its `version` line names: `io.containerd.grpc.v1.cri` for version 2 (and for a host with no file, which gets a version 2 file), `io.containerd.cri.v1.images` for version 3, and `plugins.cri` for a file with no `version` line, such as the one Docker's `containerd.io` package ships. A `version` line is never added: version 2 refuses the short plugin names a version 1 file uses, and containerd would not start. The edit touches the one `config_path` line, keeping how its key is spelled and its comment, or inserts the key, and the result must decode to the original file plus `config_path`. A file containerd cannot load, a CRI registry table that sets `mirrors` or `configs.<host>.tls` (containerd refuses to start with either beside `config_path`), a form the edit cannot change safely, such as an inline table, and an import that fails to load or whose CRI table replaces the main file's with a `config_path` leaving out `/etc/containerd/certs.d` are refused with nothing written.
+
+A plaintext base adds `insecure-registries` with bodega's `host:port` to `daemon.json` (keeping the entries already listed), `skip_verify = true` to each `hosts.toml`, and `insecure = true` to each mirror in the drop-in, and the plan's notes say it did. An `https` base adds none of them.
+
+With `--apply`, doctor prints the restart each runtime needs to read what it wrote and runs none of them: `systemctl restart docker`, which stops running containers unless `live-restore` is set, `systemctl restart containerd`, and `systemctl restart crio` where CRI-O is installed. podman and buildah read the drop-in on their next run. A second `--apply` finds nothing to change and prints no restart.
+
+```bash
+sudo bodega doctor --configure oci --url https://bodega.internal --apply
+```
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
@@ -2336,23 +2372,23 @@ bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" 
 Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
 ```
 
-| Check         | Status | Where it refuses                                                                                                                          |
-| ------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `allow-list`  | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                                                                              |
-| `age`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                |
-| `osv`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                |
-| `provenance`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks   |
-| `similarity`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `name_similarity` check blocks       |
-| `integration` | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks |
-| `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                                          |
-| `profile`     | 403    | any package route on a host whose profile governs the type                                                                                |
-| `constraint`  | 403    | an npm, gomod, maven, rubygems, composer, oci or cargo version outside the entry's `version_constraint`                                   |
-| `dist-host`   | 403    | a Composer archive whose dist URL is on a host `composer_dist_hosts` does not list; the reason names the host                             |
-| `token-host`  | 502    | an OCI pull whose registry names a token realm on a host neither its own nor on `oci_token_hosts`; the reason names the host              |
-| `schema`      | 404    | an OCI manifest the registry serves only as Docker schema 1                                                                               |
-| `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                                      |
-| `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                                 |
-| `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest, or an OCI manifest or blob with the digest it was asked by    |
+| Check         | Status | Where it refuses                                                                                                                                                                                                             |
+| ------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allow-list`  | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                                                                                                                                                                 |
+| `age`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                                                                                                   |
+| `osv`         | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`                                                                                                                                   |
+| `provenance`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `upstream_provenance` check blocks                                                                                      |
+| `similarity`  | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when the `name_similarity` check blocks                                                                                          |
+| `integration` | 403    | a proxied npm, pypi, gomod, cargo, rubygems or maven download, and `POST /api/v1/packages`, when an `integration:<instance>` check blocks                                                                                    |
+| `policy`      | 403    | the same routes, when a version check with no word of its own blocks; the reason names the check                                                                                                                             |
+| `profile`     | 403    | any package route on a host whose profile governs the type                                                                                                                                                                   |
+| `constraint`  | 403    | an npm, gomod, maven, rubygems, composer, oci, rpm or cargo version outside the entry's `version_constraint`                                                                                                                 |
+| `dist-host`   | 403    | a Composer archive whose dist URL is on a host `composer_dist_hosts` does not list; the reason names the host                                                                                                                |
+| `token-host`  | 502    | an OCI pull whose registry names a token realm on a host neither its own nor on `oci_token_hosts`; the reason names the host                                                                                                 |
+| `schema`      | 404    | an OCI manifest the registry serves only as Docker schema 1                                                                                                                                                                  |
+| `hidden`      | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it                                                                                                                                         |
+| `frozen`      | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                                                                                                                                                                    |
+| `checksum`    | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest, an OCI manifest or blob with the digest it was asked by, or an rpm metadata file or package with the checksum `repomd.xml` or `primary` gives it |
 
 Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
 
@@ -4396,6 +4432,7 @@ Each type can build under its own directory instead of `build_root`, which is wh
 | `rubygems_root`  | rubygems  | `<root>/rubygems`, one `<name>/<version>/<name>-<version>.gem` per fetched gem   |
 | `composer_root`  | composer  | `<root>/composer`, one `<vendor>/<package>/<version>/<reference>` per archive    |
 | `oci_root`       | oci       | `<root>/oci`, a manifest at its storage key below `oci/`                         |
+| `rpm_root`       | rpm       | `<root>/rpm`, which nothing writes: every package is pulled through `/rpm/`      |
 | `freebsd_root`   | freebsd   | `<root>/freebsd`                                                                 |
 | `distfiles_root` | distfiles | `<root>/distfiles`, with the DISTDIR at `<root>/distfiles/@<environment digest>` |
 
@@ -4420,7 +4457,7 @@ Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`,
 
 `custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
 
-**Gap:** the TUI's config form shows four of the fourteen roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `maven_root`, `rubygems_root`, `composer_root`, `oci_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
+**Gap:** the TUI's config form shows four of the fifteen roots (`apt_root`, `git_root`, `pypi_root`, `binary_root`), so `gomod_root`, `helm_root`, `npm_root`, `cargo_root`, `maven_root`, `rubygems_root`, `composer_root`, `oci_root`, `rpm_root`, `freebsd_root` and `distfiles_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -4973,7 +5010,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `a6482f1c377ea3fe8cf56d6a52ecad304ae3ba4c5e57a1d9b0c53007cbf5d9cf`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `c9f45017ad9456d3cfea3dbbedcc4786f49425c99e7160894512d08d0f2365e9`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -4996,7 +5033,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
 
    Each file that differs is copied beside the original as `<file>.bodega-<UTC timestamp>`, then written. A file that already matches is left alone, so a second run writes nothing and makes no backup. Every target is checked writable before the first write, so a run lacking root stops before it has changed anything. apt reads every file in `sources.list.d/` and prints a notice for the backup's unknown extension on each `apt update` until you delete it.
 
-`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest, except `osquery`.
+`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest, except `osquery` and `oci`. `oci` is `bodega doctor --configure oci`'s alone, named or not: it merges into `daemon.json` and `config.toml`, which takes a JSON parser the script does not carry, and keeps only the runtimes the host runs.
 
 **osquery.** The `osquery` system runs only when `--systems` names it, because it does more than write a file. It points the host at an [`osquery` source](#the-osquery-source) in `server` mode:
 
@@ -5373,9 +5410,9 @@ A composer entry records the dist reference in `ref`, which is what names the ar
 
 **Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. The age, OSV and similarity gates for Composer are not built yet; a profile governs Composer as it does the other package types.
 
-**OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts). `bodega doctor` does not configure a container runtime yet, so point one at bodega by hand.
+**OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts).
 
-Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
+`bodega doctor --configure oci --apply` writes every file below for the runtimes a host runs, merging into an existing `daemon.json` and `config.toml`; see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext). By hand, Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
 
 ```json
 {
@@ -5459,6 +5496,61 @@ A Helm chart is served by the same routes and judged as `helm`, not `oci`: a man
 An oci entry records the manifest digest in `ref`, which is what names the manifest it holds under `oci/manifests/` and `oci_root`; an entry with no `ref` is a statement about tags alone, enough for hiding and constraints. Nothing fetches an image ahead of a client: `bodega build fetch oci` has nothing to do.
 
 **Gaps.** Pull only: push, and serving images bodega built, are out of scope. Blobs are never garbage collected; storage grows as the other types' caches do, and `bodega reset` clears the type. An image index is served whole, with no filtering by platform. Signatures (cosign, Notation) are served like any other manifest and not verified. Docker Engine hosts are identified by address only, because the daemon sends credentials to a mirror only after a `401`, which bodega never sends for a read. `bodega doctor --configure oci` is not built yet; a profile governs OCI as the `oci` paragraph under [Profiles](#profiles) describes.
+
+**RPM repositories** (dnf on Rocky Linux, AlmaLinux, RHEL and their relatives). bodega serves each repository in [`rpm_upstreams`](#upstream-hosts) as a pull-through cache under `/rpm/`, signs every `repomd.xml` it serves with its own OpenPGP key, and passes every metadata file and package through byte for byte. `rpm_upstreams` is empty by default: you name the repositories bodega serves, each under a name you choose, with dnf's `$releasever` and `$basearch` left in the URL for the request to fill. Rocky Linux 9's BaseOS and AppStream with EPEL:
+
+```json
+{
+  "rpm_upstreams": {
+    "rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
+    "rocky-appstream": "https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/",
+    "epel": "https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/"
+  }
+}
+```
+
+Load refuses a name that is not one path segment of letters, digits, `.`, `_` and `-`, and a URL that is not https once `9` and `x86_64` are substituted, or that carries any other dnf variable (`$contentdir`, `$stream`), since bodega would send it upstream as literal text. A URL may carry a credential in its userinfo, which every load error masks. `bodega doctor` does not configure dnf yet, so point a host at bodega by hand, in `/etc/yum.repos.d/bodega.repo`, with the vendor repositories it replaces disabled (`dnf config-manager --set-disabled baseos appstream`):
+
+```ini
+[bodega-rocky-baseos]
+name=bodega rocky-baseos
+baseurl=https://bodega-host:8080/rpm/rocky-baseos/$releasever/$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://bodega-host:8080/rpm/bodega.gpg file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+```
+
+| Route                                                             | What it is                                                                                                                                                                          | Cached as                                           |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `GET /rpm/bodega.gpg`                                             | bodega's public key, armored: the key apt clients already trust                                                                                                                     | not cached; read from the loaded key                |
+| `GET /rpm/<repo>/<releasever>/<basearch>/repodata/repomd.xml`     | the upstream's `repomd.xml`, as it came                                                                                                                                             | mutable, under `metadata_ttl` with `stale_grace`    |
+| `GET /rpm/<repo>/<releasever>/<basearch>/repodata/repomd.xml.asc` | bodega's detached signature over the `repomd.xml` that client holds                                                                                                                 | not cached; signed per request                      |
+| `GET /rpm/<repo>/<releasever>/<basearch>/repodata/<file>`         | a file the current `repomd.xml` names: `primary`, `filelists`, `other`, `updateinfo`, `group`, `modules`, in whatever compression the upstream published (`gz`, `xz`, `zst`, `bz2`) | immutable, under the checksum `repomd.xml` gives it |
+| `GET /rpm/<repo>/<releasever>/<basearch>/<href>`                  | a package at the `location href` the current `primary` gives it (`Packages/n/nginx-1.20.1-20.el9.x86_64.rpm`)                                                                       | immutable                                           |
+
+A repository outside `rpm_upstreams` answers `404` naming the key. `<releasever>` must be a release number (`9` or `9.4`) and `<basearch>` one of `x86_64`, `aarch64`, `noarch`, `ppc64le`, `s390x`, or the request answers `400` before any upstream URL is built, so a path cannot substitute anything else into one. Each segment is checked as the client sent it, so an encoded `/` cannot move text into the next one. A metadata file `repomd.xml` does not name, and an href `primary` does not list, answer `404` without contacting the upstream.
+
+**Signing.** The default RHEL-family repository files set `gpgcheck=1` and `repo_gpgcheck=0`: each package carries its vendor's signature in its header, and the metadata is trusted on TLS alone. bodega turns the second check on with its own key rather than passing the vendor's `repomd.xml.asc` through, for two reasons: most vendors (Rocky and Alma among them) publish no `repomd.xml` signature to pass through, and a profile's filtered `primary` changes `repomd.xml`, which no vendor signature would cover. The signature is the apt signing key's (`bodega apt key generate`), made with `aptsign.KeyRing.DetachSign` and verified by dnf against the key at `/rpm/bodega.gpg`; a server with no key loaded answers `404` for both, and a host must then set `repo_gpgcheck=0`. One signature covers the tree: `repomd.xml` carries the checksum of every metadata file and `primary` carries the checksum of every package. Packages are never rewritten, so `gpgcheck=1` still verifies each one against the vendor's key, which the host names in `gpgkey` beside bodega's, and `rpm -K` on the host still reports the vendor's signature. Re-signing packages was rejected: it would make bodega's key the only thing between a host and any package, and it breaks every existing `rpm -V` workflow. The signature is made over the `repomd.xml` that client holds, which bodega remembers per repository tree for 10 minutes by the client's address and identity, so the pair verifies even when a `metadata_ttl` expiry, another client's request or a refresh `stale_grace` left running in the background replaces the cached copy between dnf's two requests. dnf's request for `repomd.xml.asc` says nothing about which `repomd.xml` it got, so hosts behind one address that present no identity of their own are one client to bodega and are handed one revision. A signature request reads the revision an address holds and never moves it; only a request for `repomd.xml` does, and only when the address has gone 30 seconds without one (so no reader is left between its two requests), or when the cache has held a newer revision for 10 minutes. Until then a reader behind that address is handed the revision the address holds, and served the metadata files that revision names, even after the cache moved on. An address busy enough never to go 30 seconds quiet therefore trails the cache by up to 10 minutes, and when it moves, a reader whose two requests straddle that moment is signed the newer revision: dnf reports a bad signature for that one refresh, and the next `dnf makecache` verifies. Giving hosts an identity (a token per host) makes each its own client and removes both. A `GET` for `repomd.xml` is always answered in full, ignoring `If-None-Match`, `If-Modified-Since` and `Range`, so a host never keeps a revision through a `304` bodega did not record. A client with nothing on record (its `repomd.xml` came from another bodega process, or more than 10 minutes ago) is signed the cached copy, read without refreshing it.
+
+**Caching and verification.** `repomd.xml` is mutable: held for `metadata_ttl` and served stale within `stale_grace` while the upstream does not answer, as every other index is. Every file it names is fetched, verified against the `<checksum>` `repomd.xml` gives it, and only then cached, under that checksum, so a new `primary` is a new object and the old one is never overwritten. Every package is verified against the `<checksum>` `primary` gives it before it is cached, and a cached package is served only once its bytes hash to the checksum the current `primary` gives it: a repository that republishes a version with other bytes gets a `502` `checksum` refusal naming both digests until an operator runs `bodega pkg remove rpm <name>`, and bodega never serves the copy the old `primary` vouched for. The hash is taken once per stored object and checksum and remembered in memory, so a warm package is not re-read on every request. Bytes that hash to anything else answer `502` with a `checksum` refusal naming both digests, and nothing is stored. bodega verifies SHA-256, SHA-224, SHA-384 and SHA-512; a file given an MD5 or SHA-1 checksum is refused with `502` and a `checksum` refusal naming the type, since a collision in either would let an upstream swap a file under a checksum bodega's signature vouches for. Requests go upstream with `Accept-Encoding: identity`, and an upstream that compresses a file in transit anyway is refused, because the checksum covers the bytes as published.
+
+bodega parses `primary` and nothing else: the package request is judged under the name and version `primary` gives the href. The parsed index is kept in memory per repository, release and architecture until `repomd.xml` names a `primary` with another checksum. A `primary` package whose location carries `xml:base`, or whose href is absolute or leaves the repository, is not served.
+
+| Object           | Key                                                               | Class                                          |
+| ---------------- | ----------------------------------------------------------------- | ---------------------------------------------- |
+| `repomd.xml`     | `rpm/<repo>/<releasever>/<basearch>/repomd.xml`                   | mutable, `metadata_ttl` with `stale_grace`     |
+| metadata file    | `rpm/<repo>/<releasever>/<basearch>/repodata/<checksum>/<file>`   | immutable                                      |
+| package          | `rpm/<repo>/<releasever>/<basearch>/packages/<name>/<evr>/<file>` | immutable, verified against `primary` first    |
+| parsed `primary` | in memory, per repository, release and architecture               | rebuilt when `repomd.xml` names a new checksum |
+
+A package is keyed by its name and version rather than its href, so the audit trail, discovery and `bodega pkg delete rpm <name> --remove-artifacts` name the package; delete removes every cached copy of the version, under every repository, release and architecture it was pulled through.
+
+**Policy.** The package identity is the RPM name, and the version is `epoch:version-release` with a zero epoch left off, the form `rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}'` prints (`2:1.20.1-20.el9`, `2.4.57-5.el9`). Architecture is part of the object, not the identity, so one hide covers every architecture. A package request passes the [upstream allow-list](#upstream-allow-list), a discovery row naming the package and version with the repository's URL beside it, the hidden-package and hidden-version checks (`404`), the entry's `version_constraint`, ordered as rpm orders versions, and the host's profile, before any of the package is asked for, and the allow-list rules on a package bodega already holds as it does on a cold fill, so a package no rule admits any longer is refused from the cache too. An allow-list rule admits either a package by name (`bodega policy add rpm nginx`, case-sensitive) or every package in a repository by its base URL prefix, written with the scheme (`bodega policy add rpm https://dl.rockylinux.org/pub/rocky/`), which compares the scheme and host case-folded and the path as a prefix of the repository's URL with `$releasever` and `$basearch` substituted. A bare hostname is not a URL rule, since an RPM name may hold dots (`python3.12`). `repomd.xml` and the metadata files pass no allow-list: they belong to a repository the operator already chose by naming it in `rpm_upstreams`. Hosts reporting their installed RPMs through osquery or a CycloneDX document reconcile against what bodega served as apt hosts do, comparing versions without the epoch, which `rpm_packages` does not report.
+
+An rpm entry is a statement about a package, for hiding and constraints, with no `url` and no hosted mode: `bodega pkg create rpm nginx` asks for the name and the version. Nothing fetches a package ahead of a client: `bodega build fetch rpm` has nothing to do.
+
+**Gaps.** Pull-through only: a synced mirror for offline-first operation is not built. Mirrorlists and metalinks are not followed; each repository has one base URL, which is also the URL the allow-list judges. RHEL's own CDN needs entitlement certificates bodega does not present; Rocky, AlmaLinux and EPEL are what is served. Module metadata (`modules.yaml`) is passed through unfiltered. `<open-checksum>`, the checksum of a file's decompressed content, is not checked; the compressed checksum is. A metadata file outside `repodata/` is not served. EL7 and `yum` are not targeted, and EL8 is served by the same code but not tested end to end. Amazon Linux takes a base URL like any other repository and nothing tests it. SUSE and zypper read the same `repomd.xml` but are not configured or tested. A host whose `repomd.xml` and `repomd.xml.asc` requests straddle the moment a busy shared address moves to a new revision fails `repo_gpgcheck` once (see Signing). Per-profile filtered metadata, `bodega doctor --configure rpm` and `bodega pkg convert rpm`, and the age, OSV and similarity gates are not built yet.
 
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 
@@ -5581,15 +5673,15 @@ A host with no `bodega` binary asks the server what it should become. The server
 
 Every route takes the same query parameters:
 
-| Parameter  | Required        | Value                                                                                                                                                   |
-| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                                         |
-| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                                         |
-| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base                   |
-| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`                            |
-| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives)                |
-| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                            |
-| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven` |
+| Parameter  | Required        | Value                                                                                                                                                                                                                                                  |
+| ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                                                                                                                                                                        |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it                                                                                                                                                        |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite; a mirrored pocket counts with its base                                                                                                                  |
+| `release`  | no              | a FreeBSD major release, `1` to `99`, when it differs from the one the pkg repository is named for. Anything else is a `400`                                                                                                                           |
+| `archives` | no              | vendor apt codenames, comma-separated, `stable,noble-pgdg`. Each adds its key and stanza to apt; see [Vendor archives](#vendor-archives)                                                                                                               |
+| `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                                                                                                                           |
+| `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven`, and on `/client/oci` `containerd-config`, `registries-conf` and `containerd-hosts.<registry>` |
 
 The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
@@ -7527,7 +7619,7 @@ Which upstreams may be reached at all is the allow-list's decision, not this swi
 
 ### Upstream hosts
 
-Ten flat keys name the registries a proxying instance fetches from, and `composer_dist_hosts` lists the hosts a Composer archive may come from. `oci_upstreams` maps each container registry served under `/v2/` to its URL, and `oci_token_hosts` lists the token services those registries may send bodega to. They are not interchangeable, and three ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
+Ten flat keys name the registries a proxying instance fetches from, and `composer_dist_hosts` lists the hosts a Composer archive may come from. `oci_upstreams` maps each container registry served under `/v2/` to its URL, and `oci_token_hosts` lists the token services those registries may send bodega to. `rpm_upstreams` maps each dnf repository served under `/rpm/` to its base URL. They are not interchangeable, and three ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
 
 | Key                   | Default                                                                                                    | What that host serves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -7543,6 +7635,7 @@ Ten flat keys name the registries a proxying instance fetches from, and `compose
 | `composer_dist_hosts` | `api.github.com`, `codeload.github.com`, `gitlab.com`, `bitbucket.org`                                     | The hosts a dist URL in that metadata may name. Whoever publishes a package chooses its dist URL, so an archive on any other host is refused with a `dist-host` 403 rather than fetched. Hostnames or IP literals, no scheme, port or path; load lowercases them. An empty list refuses every archive                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `oci_upstreams`       | `docker.io` > `https://registry-1.docker.io`, `ghcr.io` > `https://ghcr.io`, `quay.io` > `https://quay.io` | A map from registry name to the URL bodega pulls it from under `/v2/`; see [OCI images](#client-configuration). A registry outside it answers 404. A key is a lowercase hostname with a dot; a value is an https URL that may carry a credential in its userinfo, which bodega presents to the registry's token realm as Basic auth and never to the registry, and which every load error masks. An absent map takes the default; a given map is used as written, so leaving `docker.io` out stops serving Docker Hub                                                                                                                                                                                                                                                                            |
 | `oci_token_hosts`     | `auth.docker.io`, `ghcr.io`, `quay.io`                                                                     | The hosts a registry's Bearer realm may name besides the registry's own. A realm anywhere else is refused with a `token-host` 502 and nothing is sent to it. Hostnames or IP literals, no scheme, port or path; load lowercases them                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `rpm_upstreams`       | empty                                                                                                      | A map from a repository name you choose to its base URL, served under `/rpm/<name>/<releasever>/<basearch>/`; see [RPM repositories](#client-configuration). The URL may carry `$releasever` and `$basearch`, which a request fills; Load refuses any other dnf variable, a name that is not one path segment, and a URL that is not https with a host and no query or fragment once `9` and `x86_64` are substituted. Userinfo is kept and masked in every load error. A repository outside the map answers 404                                                                                                                                                                                                                                                                                 |
 | `distfiles_upstream`  | `http://distcache.FreeBSD.org/ports-distfiles/`                                                            | Ports distfiles, by distinfo name. Plain `http` on purpose; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 crates.io names its own download root in `https://index.crates.io/config.json`, and bodega does not read it. Fetching that document at startup would make `bodega serve` fail to bind because a registry was unreachable, and an operator mirroring the index is not thereby mirroring the tarballs: point the two keys wherever each actually lives.
@@ -8067,11 +8160,12 @@ A fleet can run one instance of each. A host belongs to one: a `server` instance
 }
 ```
 
-| Key              | Default             | Meaning                                                                                                                                                             |
-| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mode`           | required            | `server` or `shipper`                                                                                                                                               |
-| `interval`       | `"1h"`              | How often the schedule's snapshot queries run, in whole seconds. Minimum `"1m"`. In `shipper` mode it is advisory: the plan states it, and the config owner decides |
-| `max_body_bytes` | `16777216` (16 MiB) | Cap on a `log` or `results` post; a larger body is refused with `413`. `enroll` and `config` are capped at 64 KiB                                                   |
+| Key              | Default             | Meaning                                                                                                                                                                                                                                                  |
+| ---------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`           | required            | `server` or `shipper`                                                                                                                                                                                                                                    |
+| `interval`       | `"1h"`              | How often the schedule's snapshot queries run, in whole seconds. Minimum `"1m"`. In `shipper` mode it is advisory: the plan states it, and the config owner decides                                                                                      |
+| `max_body_bytes` | `16777216` (16 MiB) | Cap on a `log` or `results` post; a larger body is refused with `413`. `enroll` and `config` are capped at 64 KiB                                                                                                                                        |
+| `origins`        | `false`             | Join bodega's osquery extension tables and pkg's repository annotation into the schedule, so components carry the origin their package manager recorded. Every host the instance serves must load the extension; see [Package origins](#package-origins) |
 
 ##### Tables and ecosystems
 
@@ -8195,6 +8289,42 @@ Each run reads from the recorded offset, posts the new complete lines (a line os
 
 A single line larger than `--max-bytes` is posted alone, and one larger than `max_body_bytes` is refused with `413` on every run, which stops the shipper at that line. Raise `max_body_bytes` on the instance if a host's snapshot outgrows it.
 
+##### Package origins
+
+With `origins` set to `true`, an instance's schedule also reads where each package's manager says it came from, and reconciliation classifies a package whose origin is not bodega as [`foreign-origin`](#classes). osquery collects none of this itself, so the bodega binary doubles as an osquery extension, `bodega osquery extension`, serving two tables:
+
+| Table                | Columns                                            | Read from                                                                                             |
+| -------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `bodega_npm_origins` | `directory`, `name`, `version`, `path`, `resolved` | `<directory>/node_modules/.package-lock.json`, the hidden lockfile npm 7 and later keep               |
+| `bodega_pip_origins` | `directory`, `name`, `version`, `path`, `url`      | `<directory>/*.dist-info/direct_url.json`, which pip writes (PEP 610) for a URL, VCS or local install |
+
+Both require `directory` in the `WHERE` clause (`=` or `IN`) and return no rows without it, as `npm_packages` and `python_packages` do, so no query walks the whole disk. `path` is the value osquery's own table reports for the same package (the `package.json` path for npm, the `.dist-info` directory for pip), and the schedule joins on it with a `LEFT JOIN`, so a package with no origin row still reports. A lockfile or `direct_url.json` that does not parse is skipped, and the extension names it on its stderr, which osqueryd logs; the table still answers.
+
+The normalizer keeps a URL's host, port included and credentials dropped: `https://ci:token@bodega.example.com:8443/npm/...` is stored as `bodega.example.com:8443`. A `file://` URL, from a pip install of a local directory, has no host and leaves the origin empty.
+
+On FreeBSD the origin is pkg's `repository` annotation, the repository `pkg install` took the package from, which `pkg query %R` prints. It lives in the same `/var/db/pkg/local.sqlite`, so an origins config mounts a second table, `bodega_pkg_origins` (`name`, `version`, `repository`), next to `bodega_pkg_packages`, and needs no extension. Reconciliation compares the whole name against the repositories the client plan writes for some FreeBSD host, each named `bodega-<repo>` after a visible `freebsd` entry: any other name is foreign, including one that only shares the `bodega-` prefix, since anyone can name a pkg repository that.
+
+A query naming a table osqueryd has not loaded fails whole, and the host would send no report at all. So with `origins` at `false` the schedule names neither table and is the same, byte for byte, as before the key existed, and every host an origins instance serves must load the extension before its next `config` fetch.
+
+In `server` mode the host's plan carries `"origins": true`, and two commands set the host up. Run both as root, `doctor` first:
+
+```bash
+sudo bodega doctor --configure osquery --url https://bodega.example.com:8443 --apply
+BODEGA_OSQUERY_SECRET=<secret> sh setup.sh --url https://bodega.example.com:8443 --systems osquery --apply
+```
+
+`doctor --configure osquery` links the running bodega binary at `/usr/local/lib/bodega/bodega.ext` and appends that path to the autoload file osqueryd reads, keeping the lines already there. It finds osqueryd's flagfile where `setup.sh` does (`FLAG_FILE` in `/etc/default/osqueryd` on Linux, `osqueryd_flagfile` in `rc.conf` on FreeBSD, else `/etc/osquery/osquery.flags` or `/usr/local/etc/osquery/osquery.flags`). When that file already sets `--extensions_autoload`, bodega's line goes in the file it names and the flag is left alone, so the extensions an operator's own file lists keep loading; a flag naming a relative path is refused. When it sets none, `doctor` uses the package default (`/etc/osquery/extensions.load` on Linux, `/usr/local/etc/osquery/extensions.load` on FreeBSD) and appends `--extensions_autoload=<that file>` to the flagfile. `setup.sh` merges the same flag under the same rule, keeping a value already there, so the two run in either order. osqueryd autoloads only a path ending in `.ext` whose file root owns and nobody else can write, so `doctor` refuses a binary that is not root-owned or is group- or world-writable, and names the `install` command that fixes it. osqueryd starts the extension with `--socket`, `--timeout` and `--interval` at its next start: `doctor` prints the restart command (`systemctl restart osqueryd`, `service osqueryd restart`) and does not run it. A flag passed on osqueryd's command line rather than in the flagfile, as some fleet agents do, is outside what either reads; load the extension there as shipper mode does below. For a host whose instance does not set `origins`, `doctor --configure osquery` writes nothing and points at `setup.sh`, as it did before, and the flags name no autoload file.
+
+In `shipper` mode the config owner loads the extension by hand: install bodega root-owned, then on each host
+
+```bash
+sudo install -d -o root -m 0755 /usr/local/lib/bodega
+sudo ln -sf /usr/local/bin/bodega /usr/local/lib/bodega/bodega.ext
+echo /usr/local/lib/bodega/bodega.ext | sudo tee -a /etc/osquery/extensions.load
+```
+
+and add `--extensions_autoload=/etc/osquery/extensions.load` to osqueryd's flags before restarting it. A host whose flags already name another autoload file takes the `tee -a` into that file instead, and keeps its flag. Take the origins queries and `auto_table_construction` from the `config` answer of a `server` instance with `origins` set, or write them from the tables above. To check that the tables are there, `osqueryi --extension /usr/local/lib/bodega/bodega.ext --extensions_require=bodega "SELECT * FROM bodega_npm_origins WHERE directory = '/srv/app';"` prints the rows the schedule would join.
+
 ### Host mapping
 
 Each source names hosts its own way: a node key, a vendor host id, a token's identity. `inventory_hosts` maps `(source instance, external id)` to a bodega identity, and a report reaches an identity through that table and nothing else. Whatever identity a normalizer writes into a report is discarded.
@@ -8299,22 +8429,23 @@ bodega inventory baseline web-01
 
 Worst first. A component gets the first class whose rule holds:
 
-| Class          | Rule                                                                                                                                                                                                |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `refused`      | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                              |
-| `baseline`     | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                            |
-| `unknown`      | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row |
-| `served`       | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                             |
-| `unattributed` | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                        |
-| `stale`        | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                 |
+| Class            | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refused`        | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                                                                                                                                                                                                                                                                                               |
+| `baseline`       | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                                                                                                                                                                                                                                                                                             |
+| `foreign-origin` | The package manager recorded where the component came from, and it is not bodega: for npm and pypi, a host other than `public_url`'s; for FreeBSD, a repository other than the `bodega-<repo>` names the client plan writes, compared whole. Hiding or removing a `freebsd` entry drops its name from that list, so packages a host installed from it read `foreign-origin` until they are reinstalled from a repository bodega still serves: bodega no longer vouches for that source, and the class says so rather than trusting a name it stopped writing. The reason names the source: `npm says it came from registry.npmjs.org, not bodega`. A component with no recorded origin skips this rule, and so does an npm or pypi one when `public_url` is unset |
+| `unknown`        | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row                                                                                                                                                                                                                                                                  |
+| `served`         | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                                                                                                                                                                                                                                                                                              |
+| `unattributed`   | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                                                                                                                                                                                                                                                                                         |
+| `stale`          | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                                                                                                                                                                                                                                                                                  |
 
-Classes are displayed worst first: `refused`, `unknown`, `unattributed`, `served`, `baseline`. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
+Classes are displayed worst first: `refused`, `foreign-origin`, `unknown`, `unattributed`, `served`, `baseline`. A `foreign-origin` component alerts like an `unknown` one: `report` exits 1 and the report's `inventory`/`bypass` event counts it. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
 
 Names compare the way bodega's types canonicalize them: `Django` installed and `django` served are one pypi package, while npm names stay case-sensitive. A version compares exactly, except that an apt epoch is dropped on both sides, since dpkg reports `1:2.38.1-5` and the pool file is `util-linux_2.38.1-5_amd64.deb`. An apt or FreeBSD `serve_fetch` row names a pool path or a repository, so the object key's filename says which package was served. A catalog entry counts only at its exact version: a range or open entry records nothing about a version bodega never served under it, so a host holding one got it elsewhere.
 
 Classes are recorded, not recomputed. Hiding a version, serving a package, or accepting a baseline changes the class of components in reports that arrive afterwards, never of those already stored.
 
-`foreign-origin` (the package manager itself names a non-bodega source) is reserved and not emitted.
+Only some package managers record an origin, so only some components can read `foreign-origin`. npm keeps each package's `resolved` URL in `node_modules/.package-lock.json`; pip writes `direct_url.json` (PEP 610) for a package installed from a URL, a VCS or a local path, though not for one installed from an index, which reads as before; FreeBSD pkg keeps the repository it installed from in its own database. The `osquery` source reads all three once its instance sets [`origins`](#the-osquery-source), and a CycloneDX document carries one wherever a component's purl has `repository_url` or `download_url`, or it has a `distribution` reference. apt keeps no record of the archive a package came from once it is installed, `cargo install` keeps one in `~/.cargo/.crates2.json` but under no directory bodega is told to scan, and a Go binary's module list (`go version -m`) names modules and sums but no download host, so none of the three can carry an origin.
 
 #### The current set
 
@@ -8718,33 +8849,34 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 
 `freebsd` keeps everything literal as well, for a different reason: the key is the path the upstream repository serves the object at, so an ABI's colons and a hashed filename's `~` and `$` all survive into it. S3 accepts all three in a key and every POSIX filesystem accepts them in a path, and encoding them would buy nothing while costing a decoder at four call sites — where a wrong decode serves the wrong bytes under a signature that still verifies.
 
-| Type      | S3 prefix         | Example key                                                                       |
-| --------- | ----------------- | --------------------------------------------------------------------------------- |
-| apt       | `packages/apt/`   | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                     |
-| git       | `repos/`          | `repos/widget/widget-v4.5.7.bundle`                                               |
-| pypi      | `pypi/wheels/`    | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                  |
-| binary    | `binaries/`       | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`              |
-| gomod     | `gomod/`          | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                               |
-| helm      | `charts/`         | `charts/ingress-nginx-4.11.0.tgz`                                                 |
-| npm       | `npm/`            | `npm/lodash/lodash-4.17.21.tgz`                                                   |
-| cargo     | `cargo/crates/`   | `cargo/crates/serde-1.0.200.crate`                                                |
-| cargo     | `cargo/index/`    | `cargo/index/se/rd/serde`                                                         |
-| maven     | `maven/`          | `maven/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar`                           |
-| rubygems  | `rubygems/gems/`  | `rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem`                                  |
-| rubygems  | `rubygems/quick/` | `rubygems/quick/Marshal.4.8/rack-3.1.8.gemspec.rz`                                |
-| rubygems  | `rubygems/index/` | `rubygems/index/info/rack`                                                        |
-| composer  | `composer/dist/`  | `composer/dist/symfony/console/v7.1.5/0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c`   |
-| composer  | `composer/p2/`    | `composer/p2/symfony/console.json`                                                |
-| oci       | `oci/blobs/`      | `oci/blobs/sha256/<hex>`, one copy per digest for every repository                |
-| oci       | `oci/manifests/`  | `oci/manifests/docker.io/library/nginx/_digests/sha256/<hex>`                     |
-| oci       | `oci/tags/`       | `oci/tags/docker.io/library/nginx/_tags/1.27`                                     |
-| distfiles | `distfiles/`      | `distfiles/zsh-5.9.2.tar.xz`                                                      |
-| freebsd   | `freebsd/`        | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`   |
-| manifests | `manifests/`      | `manifests/apt/python3/manifest.json`                                             |
-| attest    | `attestations/`   | `attestations/npm/lodash/lodash-4.17.21.tgz/20261010T120000.000000000Z.dsse.json` |
-| index     | `index.json`      | Fast startup without loading every manifest                                       |
-| graph     | `graph.json`      | Dependency graph with typed edges                                                 |
-| metrics   | `metrics.json`    | Dashboard metrics                                                                 |
+| Type      | S3 prefix         | Example key                                                                               |
+| --------- | ----------------- | ----------------------------------------------------------------------------------------- |
+| apt       | `packages/apt/`   | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                             |
+| git       | `repos/`          | `repos/widget/widget-v4.5.7.bundle`                                                       |
+| pypi      | `pypi/wheels/`    | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                          |
+| binary    | `binaries/`       | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`                      |
+| gomod     | `gomod/`          | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                                       |
+| helm      | `charts/`         | `charts/ingress-nginx-4.11.0.tgz`                                                         |
+| npm       | `npm/`            | `npm/lodash/lodash-4.17.21.tgz`                                                           |
+| cargo     | `cargo/crates/`   | `cargo/crates/serde-1.0.200.crate`                                                        |
+| cargo     | `cargo/index/`    | `cargo/index/se/rd/serde`                                                                 |
+| maven     | `maven/`          | `maven/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar`                                   |
+| rubygems  | `rubygems/gems/`  | `rubygems/gems/nokogiri-1.16.7-x86_64-linux.gem`                                          |
+| rubygems  | `rubygems/quick/` | `rubygems/quick/Marshal.4.8/rack-3.1.8.gemspec.rz`                                        |
+| rubygems  | `rubygems/index/` | `rubygems/index/info/rack`                                                                |
+| composer  | `composer/dist/`  | `composer/dist/symfony/console/v7.1.5/0a3bd4fd5bcb6d5b4b9d1b5d9e0e7c9f1f0f8a3c`           |
+| composer  | `composer/p2/`    | `composer/p2/symfony/console.json`                                                        |
+| oci       | `oci/blobs/`      | `oci/blobs/sha256/<hex>`, one copy per digest for every repository                        |
+| oci       | `oci/manifests/`  | `oci/manifests/docker.io/library/nginx/_digests/sha256/<hex>`                             |
+| oci       | `oci/tags/`       | `oci/tags/docker.io/library/nginx/_tags/1.27`                                             |
+| rpm       | `rpm/`            | `rpm/rocky-baseos/9/x86_64/packages/nginx/2:1.20.1-20.el9/nginx-1.20.1-20.el9.x86_64.rpm` |
+| distfiles | `distfiles/`      | `distfiles/zsh-5.9.2.tar.xz`                                                              |
+| freebsd   | `freebsd/`        | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`           |
+| manifests | `manifests/`      | `manifests/apt/python3/manifest.json`                                                     |
+| attest    | `attestations/`   | `attestations/npm/lodash/lodash-4.17.21.tgz/20261010T120000.000000000Z.dsse.json`         |
+| index     | `index.json`      | Fast startup without loading every manifest                                               |
+| graph     | `graph.json`      | Dependency graph with typed edges                                                         |
+| metrics   | `metrics.json`    | Dashboard metrics                                                                         |
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

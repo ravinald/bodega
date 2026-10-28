@@ -42,6 +42,11 @@ const (
 	// a version is a tag, or a digest for a request by digest.
 	TypeOCI = "oci"
 
+	// TypeRpm is a pull-through cache of dnf repositories under /rpm/, one
+	// route for every repository in rpm_upstreams. A name is the RPM package
+	// name and a version is epoch:version-release, a zero epoch omitted.
+	TypeRpm = "rpm"
+
 	// TypeFreeBSD is a mirrored FreeBSD pkg repository. Named for the OS
 	// rather than for pkg, because "pkg" is already bodega's own subcommand
 	// and `bodega pkg create pkg nginx` is a sentence nobody should have to
@@ -70,7 +75,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeRubygems, TypeComposer, TypeOCI, TypeFreeBSD, TypeDistfiles}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeMaven, TypeRubygems, TypeComposer, TypeOCI, TypeRpm, TypeFreeBSD, TypeDistfiles}
 
 // Dependency is one dependency a version declares, recorded in the shape the
 // registry protocol publishes rather than the shape the ecosystem's build file

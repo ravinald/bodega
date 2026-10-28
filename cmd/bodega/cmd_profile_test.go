@@ -525,10 +525,10 @@ func TestProfileMutationsAreAudited(t *testing.T) {
 func TestProfileRefusesAnUnknownPackageType(t *testing.T) {
 	newDiscoverEnv(t)
 	mustRunProfile(t, "create", "web")
-	if _, err := runProfile(t, "add", "web", "rpm", "httpd"); err == nil {
+	if _, err := runProfile(t, "add", "web", "conda", "numpy"); err == nil {
 		t.Fatal("an entry under a type bodega does not serve was accepted")
 	}
-	if _, err := runProfile(t, "set", "web", "rpm", "--membership", "open"); err == nil {
+	if _, err := runProfile(t, "set", "web", "conda", "--membership", "open"); err == nil {
 		t.Fatal("a marker for a type bodega does not serve was accepted")
 	}
 }

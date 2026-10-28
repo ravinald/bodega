@@ -484,6 +484,10 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) (*b
 		// Nothing writes an image to disk either; a manifest already under
 		// oci_root still uploads.
 		s = &builder.Summary{}
+	case manifest.TypeRpm:
+		// Nothing writes a package to disk, and a package's key names the
+		// repository it was pulled from, which no file under rpm_root records.
+		s = &builder.Summary{}
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

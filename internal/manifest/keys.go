@@ -121,6 +121,7 @@ func StoragePrefixes() []string {
 		AptPrefix,
 		PypiWheelPrefix,
 		GitPrefix,
+		RpmPrefix,
 		rubygemsGemPrefix,
 		rubygemsIndexPrefix,
 		rubygemsSpecPrefix,
@@ -957,7 +958,8 @@ func ComposerDistKey(name, version, reference string) string {
 // first.
 //
 // apt returns ErrAptPoolPathUnknown when the entry predates the _pool_path
-// metadata key, and pypi always returns ErrPypiNoObjectKey. Both are sentinels
+// metadata key, rpm always returns ErrRpmKeysListed, and pypi always returns
+// ErrPypiNoObjectKey. Both are sentinels
 // rather than an empty slice, because "no key resolved" and "the object is
 // gone" are the two states a delete must never confuse.
 func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
@@ -1050,6 +1052,9 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 			return nil, fmt.Errorf("oci %s@%s records no sha256 manifest digest in ref, so no manifest key resolves for it", pm.Name, ve.Version)
 		}
 		return []string{OCIManifestKey(registry, repo, ve.Ref)}, nil
+
+	case TypeRpm:
+		return nil, ErrRpmKeysListed
 
 	case TypeFreeBSD:
 		// The repository root, catalogue first: these are the keys this
@@ -1255,6 +1260,10 @@ func ParseKey(key string) (typ, name, version string) {
 	case strings.HasPrefix(key, "oci/"):
 		n, v := parseOCIKey(key)
 		return TypeOCI, n, v
+
+	case strings.HasPrefix(key, RpmPrefix):
+		n, v := parseRpmKey(key)
+		return TypeRpm, n, v
 
 	case strings.HasPrefix(key, helmPrefix):
 		if key == HelmIndexKey {

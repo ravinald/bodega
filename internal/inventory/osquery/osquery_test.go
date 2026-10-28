@@ -15,6 +15,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 const testPepper = "test-pepper"
@@ -334,7 +335,7 @@ func TestConfigSchedule(t *testing.T) {
 }
 
 func TestScheduleQuotesDirectories(t *testing.T) {
-	s := Schedule(config.OsqueryDirs{Python: []string{"/opt/it's"}}, time.Hour)
+	s := Schedule(config.OsqueryDirs{Python: []string{"/opt/it's"}}, time.Hour, false)
 	if !strings.Contains(s[QueryLinux].Query, "('/opt/it''s')") {
 		t.Errorf("a quote reached the query undoubled: %s", s[QueryLinux].Query)
 	}
@@ -373,7 +374,7 @@ func TestLogResults(t *testing.T) {
 	for _, c := range r.Components {
 		got[c.Name] = c
 	}
-	want := map[string]string{"curl": "apt", "bash": inventory.EcosystemOther, "requests": "pypi", "lodash": "npm", "nginx": "freebsd"}
+	want := map[string]string{"curl": "apt", "bash": manifest.TypeRpm, "requests": "pypi", "lodash": "npm", "nginx": "freebsd"}
 	if len(got) != len(want) {
 		t.Errorf("components = %+v", r.Components)
 	}
@@ -382,8 +383,8 @@ func TestLogResults(t *testing.T) {
 			t.Errorf("%s ecosystem = %q, want %q", name, got[name].Ecosystem, eco)
 		}
 	}
-	if got["bash"].PURL != "pkg:rpm/bash@5.2-1" || got["requests"].Path != "/opt/a/requests-2.32.3.dist-info/" {
-		t.Errorf("rpm purl or python path lost: %+v %+v", got["bash"], got["requests"])
+	if got["bash"].Version != "5.2-1" || got["requests"].Path != "/opt/a/requests-2.32.3.dist-info/" {
+		t.Errorf("rpm version-release or python path lost: %+v %+v", got["bash"], got["requests"])
 	}
 
 	rec = h.post(RouteLog, `{"node_key":"`+key+`","log_type":"status","data":[{"severity":"0","message":"osqueryd started"}]}`)

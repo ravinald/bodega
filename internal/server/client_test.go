@@ -1673,3 +1673,81 @@ func TestSetupScriptConfiguresComposerWithoutReplacingAConfig(t *testing.T) {
 		t.Errorf("~/.composer was created (%v), want only the XDG directory\n%s", err, out)
 	}
 }
+
+// F99 R1: oci plans every runtime's file from oci_upstreams, each at a URL
+// serving the bytes its digest names; FreeBSD gets a skip.
+func TestClientPlanOCIServesEachRuntimeFile(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	s.cfg.OCIUpstreams = map[string]string{"docker.io": "https://registry-1.docker.io", "quay.io": "https://quay.io"}
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	recs := planRecordFor(planJSON(t, s, f.token, "os=linux"), manifest.TypeOCI)
+	want := []string{clientconf.DockerDaemonPath, "/etc/containerd/certs.d/docker.io/hosts.toml", "/etc/containerd/certs.d/quay.io/hosts.toml",
+		clientconf.ContainerdConfigPath, clientconf.RegistriesConfDropIn}
+	if len(recs) != len(want) {
+		t.Fatalf("oci records = %+v, want %v", recs, want)
+	}
+	for i, r := range recs {
+		if r.Path != want[i] || r.Action != clientconf.PlanInstall {
+			t.Errorf("record %d = %s %s, want install of %s", i, r.Action, r.Path, want[i])
+		}
+		u, _ := url.Parse(r.URL)
+		code, body := clientGet(t, s, f.token, u.RequestURI())
+		sum := sha256.Sum256([]byte(body))
+		if code != http.StatusOK || hex.EncodeToString(sum[:]) != r.SHA256 {
+			t.Errorf("GET %s = %d, digest does not match the plan's for %s:\n%s", u.RequestURI(), code, r.Path, body)
+		}
+	}
+	if !strings.Contains(recs[0].Reason, "Docker Hub only") {
+		t.Errorf("daemon.json reason = %q, want the Docker Hub-only note", recs[0].Reason)
+	}
+	if code, _ := clientGet(t, s, f.token, "/client/oci?os=linux&file="+clientconf.OCIHostsFileKey("ghcr.io")); code != http.StatusNotFound {
+		t.Errorf("hosts.toml for a registry oci_upstreams lacks = %d, want 404", code)
+	}
+	bsd := planRecordFor(planJSON(t, s, f.token, "os=freebsd"), manifest.TypeOCI)
+	if len(bsd) != 1 || bsd[0].Action != clientconf.PlanSkip {
+		t.Errorf("oci on freebsd = %+v, want one skip", bsd)
+	}
+}
+
+// F99: the setup script leaves oci to doctor, which merges daemon.json and
+// keeps only the runtimes a host runs, on a bare run and when named.
+func TestSetupScriptLeavesOCIToDoctor(t *testing.T) {
+	s := hostedServer(t)
+	f := bindProfile(t, s, "open", "open-host", nil, nil)
+	out, _, err := setupScriptAgainst(t, s, f.token, nil, "--systems", "oci")
+	if err == nil || !strings.Contains(out, "bodega doctor --configure oci") {
+		t.Errorf("--systems oci = %v:\n%s", err, out)
+	}
+}
+
+// Reconciliation vouches for exactly the pkg repository names the client
+// plan writes into a host's repos file, so the two cannot drift: a hidden
+// entry is in neither.
+func TestFreeBSDPlanTagsAreThePlanRepositories(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/latest", Mode: manifest.ModeProxy,
+	})
+	addVersion(t, s, manifest.TypeFreeBSD, "quarterly", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/quarterly", Mode: manifest.ModeProxy, Hidden: true,
+	})
+	tags, err := s.freeBSDPlanTags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 1 || tags[0] != pkgrepos.TagPrefix+"latest" {
+		t.Fatalf("plan tags = %v, want [%slatest]", tags, pkgrepos.TagPrefix)
+	}
+	f := webProfile(t, s)
+	plan := planRecordFor(planJSON(t, s, f.token, "os=freebsd&abi="+freeBSDABI), manifest.TypeFreeBSD)
+	if len(plan) != 1 || plan[0].Action != planInstall {
+		t.Fatalf("freebsd plan = %+v, want one install", plan)
+	}
+	_, body := clientGet(t, s, f.token, "/client/freebsd?os=freebsd&abi="+freeBSDABI)
+	if !strings.Contains(body, tags[0]+":") {
+		t.Errorf("the plan's repos file does not define %s:\n%s", tags[0], body)
+	}
+}

@@ -610,7 +610,7 @@ paths:
       description: >
         The union of the latest report from each inventory source instance
         mapped to the identity. Each component carries the class recorded when
-        its report arrived (refused, unknown, unattributed, served, baseline,
+        its report arrived (refused, foreign-origin, unknown, unattributed, served, baseline,
         or unclassified for a report nothing classified: it arrived before
         reconciliation ran, or while the audit sink could not answer),
         the reason, and the instances that reported it. Each mapped instance is
@@ -820,7 +820,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles, osquery]
+            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles, osquery]
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
@@ -1672,7 +1672,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles]
+        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles]
     PackageName:
       name: name
       in: path
@@ -1837,6 +1837,10 @@ components:
           items:
             $ref: "#/components/schemas/PackageManifest"
         oci:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        rpm:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
@@ -2147,7 +2151,7 @@ components:
           description: Package name
         type:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles]
         description:
           type: string
         dep_policy:
@@ -2978,6 +2982,12 @@ components:
           items:
             type: string
           description: Trees npm_packages reads on this host, from its profile's osquery_scan_dirs entry
+        origins:
+          type: boolean
+          description: >-
+            The instance's origins key, absent when false: its schedule reads
+            bodega's osquery extension, which bodega doctor --configure osquery
+            installs on the host
 
     ClientPlanRecord:
       type: object
@@ -2994,7 +3004,7 @@ components:
           description: The binding that resolved it, "token:<id>" or "cidr:<prefix>"
         system:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles, osquery]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles, osquery]
         action:
           type: string
           enum: [install, refuse, skip]
@@ -3096,7 +3106,7 @@ components:
           description: Instances whose latest report holds this component
         class:
           type: string
-          enum: [refused, unknown, unattributed, unclassified, served, baseline]
+          enum: [refused, foreign-origin, unknown, unattributed, unclassified, served, baseline]
         reason:
           type: string
 

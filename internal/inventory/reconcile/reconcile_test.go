@@ -312,6 +312,31 @@ func TestNamesCanonicalizeAcrossEcosystems(t *testing.T) {
 	wantClass(t, got, "React@18.2.0", ClassUnknown, "")
 }
 
+// An installed RPM is reported as version-release with no epoch, and is
+// served and refused under the epoch primary gives it; the two compare
+// without it, as apt's do.
+func TestRpmClassifiesLikeApt(t *testing.T) {
+	h := newHarness(t)
+	h.served("web-01", manifest.TypeRpm, "nginx", "1.20.1-20.el9",
+		manifest.RpmPackageKey("rocky-baseos", "9", "x86_64", "nginx", "2:1.20.1-20.el9", "nginx-1.20.1-20.el9.x86_64.rpm"), "")
+	h.served("web-02", manifest.TypeRpm, "redis", "6.2.7-1.el9",
+		manifest.RpmPackageKey("rocky-appstream", "9", "x86_64", "redis", "6.2.7-1.el9", "redis-6.2.7-1.el9.x86_64.rpm"), "")
+	if err := h.db.RecordAdmission(h.ctx, audit.Admission{PkgType: manifest.TypeRpm, PkgName: "httpd", PkgVersion: "1:2.4.57-5.el9",
+		Decision: audit.AdmissionPolicyBlocked, Checks: []audit.AdmissionCheck{{Check: audit.CheckAllowList, Action: "block", Status: audit.CheckBlock}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := h.bom("web-01",
+		purl("pkg:rpm/rocky/nginx@1.20.1-20.el9?arch=x86_64&epoch=2", "nginx", "1.20.1-20.el9", ""),
+		purl("pkg:rpm/rocky/redis@6.2.7-1.el9?arch=x86_64", "redis", "6.2.7-1.el9", ""),
+		purl("pkg:rpm/rocky/httpd@2.4.57-5.el9?arch=x86_64&epoch=1", "httpd", "2.4.57-5.el9", ""),
+	)
+	got := h.classesOf(rep)
+	wantClass(t, got, "nginx@1.20.1-20.el9", ClassServed, "")
+	wantClass(t, got, "redis@6.2.7-1.el9", ClassUnattributed, "")
+	wantClass(t, got, "httpd@2.4.57-5.el9", ClassRefused, "")
+}
+
 // A baseline hides unknown, never refused, and applies to reports that arrive
 // after it: the report it was taken from keeps the classes it got.
 func TestBaselineHidesUnknownNotRefused(t *testing.T) {
@@ -560,10 +585,114 @@ func TestServedIdentityParsesKeys(t *testing.T) {
 		{audit.ServedObject{PkgType: "apt", PkgName: "pool/main/s/sudo/sudo_1%3a1.9_amd64.deb", ObjectKey: "apt-cache/x"}, "apt", "sudo", "1:1.9"},
 		{audit.ServedObject{PkgType: "freebsd", PkgName: "FreeBSD", PkgVersion: "FreeBSD:14:amd64", ObjectKey: "freebsd/FreeBSD:14:amd64/FreeBSD/All/curl-8.5.0.pkg"}, "freebsd", "curl", "8.5.0"},
 		{audit.ServedObject{PkgType: "npm", PkgName: "@scope/pkg", PkgVersion: "1.0.0", ObjectKey: "npm/@scope--pkg/pkg-1.0.0.tgz"}, "npm", "@scope/pkg", "1.0.0"},
+		{audit.ServedObject{PkgType: "rpm", PkgName: "nginx", PkgVersion: "1.20.1-20.el9", ObjectKey: "rpm/epel/9/x86_64/packages/nginx/2:1.20.1-20.el9/nginx-1.20.1-20.el9.x86_64.rpm"}, "rpm", "nginx", "2:1.20.1-20.el9"},
 	} {
 		eco, name, version := ServedIdentity(tc.so)
 		if eco != tc.eco || name != tc.name || version != tc.version {
 			t.Errorf("ServedIdentity(%+v) = %s %s %s, want %s %s %s", tc.so, eco, name, version, tc.eco, tc.name, tc.version)
 		}
 	}
+}
+
+// A package manager naming a source other than bodega outranks what bodega
+// served: the served and catalog checks never run for it.
+func TestForeignOrigin(t *testing.T) {
+	h := newHarness(t)
+	h.rc.PublicURL = "https://Bodega.Example:8443/"
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return []string{"bodega-latest"}, nil }
+	h.bind("agent", "host-1", "web-01")
+	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
+	h.served("web-01", "npm", "lodash", "4.17.21", "npm/lodash/lodash-4.17.21.tgz", "")
+	h.served("web-01", "npm", "chalk", "5.3.0", "npm/chalk/chalk-5.3.0.tgz", "")
+	h.served("web-01", "freebsd", "curl", "8.10.1", "freebsd/curl-8.10.1.pkg", "")
+	h.served("web-01", "freebsd", "bash", "5.2.37", "freebsd/bash-5.2.37.pkg", "")
+	h.catalog(manifest.TypePypi, "six", manifest.VersionEntry{Version: "1.17.0", Mode: manifest.ModeProxy})
+
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0", Origin: "registry.npmjs.org"},
+		inventory.Component{Ecosystem: "npm", Name: "lodash", Version: "4.17.21", Origin: "bodega.example:8443"},
+		inventory.Component{Ecosystem: "npm", Name: "chalk", Version: "5.3.0"},
+		inventory.Component{Ecosystem: "npm", Name: "sideload", Version: "0.1.0"},
+		inventory.Component{Ecosystem: "pypi", Name: "six", Version: "1.17.0", Origin: "github.com"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "8.10.1", Origin: "FreeBSD"},
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "5.2.37", Origin: "bodega-latest"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "left-pad@1.3.0", ClassForeignOrigin, "npm says it came from registry.npmjs.org, not bodega")
+	wantClass(t, got, "lodash@4.17.21", ClassServed, "served lodash@4.17.21 to web-01")
+	wantClass(t, got, "chalk@5.3.0", ClassServed, "served chalk@5.3.0")
+	wantClass(t, got, "sideload@0.1.0", ClassUnknown, "no catalog entry")
+	wantClass(t, got, "six@1.17.0", ClassForeignOrigin, "pip says it came from github.com, not bodega")
+	wantClass(t, got, "curl@8.10.1", ClassForeignOrigin, "pkg says it came from FreeBSD, not bodega")
+	wantClass(t, got, "bash@5.2.37", ClassServed, "served bash@5.2.37")
+
+	// CycloneDX carries the whole URL, or a scheme-less OCI repository_url,
+	// and compares by host all the same.
+	cdx := h.classesOf(h.bom("web-02",
+		`{"name":"x","version":"1","purl":"pkg:npm/x@1","externalReferences":[{"type":"distribution","url":"https://registry.npmjs.org/x/-/x-1.tgz"}]}`,
+		`{"name":"y","version":"2","purl":"pkg:npm/y@2","externalReferences":[{"type":"distribution","url":"https://bodega.example:8443/npm/y/-/y-2.tgz"}]}`,
+		`{"name":"nginx","version":"1.27","purl":"pkg:oci/nginx@1.27?repository_url=docker.io/library/nginx"}`,
+	))
+	wantClass(t, cdx, "x@1", ClassForeignOrigin, "npm says it came from registry.npmjs.org")
+	wantClass(t, cdx, "y@2", ClassUnknown, "no catalog entry")
+	wantClass(t, cdx, "docker.io/library/nginx@1.27", ClassForeignOrigin, "oci says it came from docker.io")
+
+	host, err := h.rc.Host(h.ctx, "web-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !host.Alert || host.Counts[ClassForeignOrigin] != 3 {
+		t.Errorf("host alert = %v, counts %v, want an alert with 3 foreign-origin", host.Alert, host.Counts)
+	}
+	if rank(ClassForeignOrigin) != rank(ClassRefused)+1 || rank(ClassUnknown) != rank(ClassForeignOrigin)+1 {
+		t.Errorf("classes = %v, want foreign-origin between refused and unknown", Classes)
+	}
+}
+
+// Without public_url there is no bodega host to compare an npm or pypi origin
+// with, and without the plan's repository list no FreeBSD name to compare a
+// pkg origin with, so each classifies as though none were recorded.
+func TestForeignOriginWithoutPublicURL(t *testing.T) {
+	h := newHarness(t)
+	h.bind("agent", "host-1", "web-01")
+	h.served("web-01", "npm", "left-pad", "1.3.0", "npm/left-pad/left-pad-1.3.0.tgz", "")
+	h.served("web-01", "freebsd", "curl", "8.10.1", "freebsd/curl-8.10.1.pkg", "")
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "npm", Name: "left-pad", Version: "1.3.0", Origin: "registry.npmjs.org"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "8.10.1", Origin: "FreeBSD"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "left-pad@1.3.0", ClassServed, "served left-pad@1.3.0")
+	wantClass(t, got, "curl@8.10.1", ClassServed, "served curl@8.10.1")
+}
+
+// A FreeBSD origin is bodega's only when it names, whole, a repository the
+// client plan writes. Sharing the bodega- prefix proves nothing, since anyone
+// may name a pkg repository that, and a serve row does not rescue it.
+func TestForeignOriginFreeBSDNamesThePlanRepository(t *testing.T) {
+	h := newHarness(t)
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return []string{"bodega-latest"}, nil }
+	h.bind("agent", "host-1", "web-01")
+	for _, name := range []string{"bash", "curl", "git", "vim"} {
+		h.served("web-01", "freebsd", name, "1.0", "freebsd/"+name+"-1.0.pkg", "")
+	}
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "1.0", Origin: "bodega-latest"},
+		inventory.Component{Ecosystem: "freebsd", Name: "curl", Version: "1.0", Origin: "bodega-unconfigured-third-party"},
+		inventory.Component{Ecosystem: "freebsd", Name: "git", Version: "1.0", Origin: "bodega-"},
+		inventory.Component{Ecosystem: "freebsd", Name: "vim", Version: "1.0"},
+	)
+	got := h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "bash@1.0", ClassServed, "served bash@1.0")
+	wantClass(t, got, "curl@1.0", ClassForeignOrigin, "pkg says it came from bodega-unconfigured-third-party, not bodega")
+	wantClass(t, got, "git@1.0", ClassForeignOrigin, "pkg says it came from bodega-, not bodega")
+	wantClass(t, got, "vim@1.0", ClassServed, "served vim@1.0")
+
+	// A server that writes no pkg repository has none to vouch for.
+	h.rc.FreeBSDRepos = func(context.Context) ([]string, error) { return nil, nil }
+	h.agent("host-1",
+		inventory.Component{Ecosystem: "freebsd", Name: "bash", Version: "1.0", Origin: "bodega-latest"},
+	)
+	got = h.classesOf(h.latest("web-01", "agent"))
+	wantClass(t, got, "bash@1.0", ClassForeignOrigin, "pkg says it came from bodega-latest, not bodega")
 }

@@ -509,6 +509,10 @@ func servedPath(typ, name, version, key string) (string, error) {
 		return composerServedPath(key)
 	case manifest.TypeOCI:
 		return ociServedPath(name, key)
+	case manifest.TypeRpm:
+		// The key names the package's file but not the href its repository
+		// serves it at, which only primary records.
+		return "", fmt.Errorf("no served route for %s object %q: its key does not record the href primary gives it; pass --artifact with a local copy", typ, key)
 	}
 	for _, m := range []struct{ key, route string }{
 		{manifest.AptPrefix, "/apt/"},

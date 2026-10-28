@@ -17,7 +17,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -30,12 +32,13 @@ import (
 // Classes, worst first. Stale is a host-level class: it describes a source
 // instance that stopped reporting, not a component.
 const (
-	ClassRefused      = "refused"
-	ClassUnknown      = "unknown"
-	ClassUnattributed = "unattributed"
-	ClassServed       = "served"
-	ClassBaseline     = "baseline"
-	ClassStale        = "stale"
+	ClassRefused       = "refused"
+	ClassForeignOrigin = "foreign-origin"
+	ClassUnknown       = "unknown"
+	ClassUnattributed  = "unattributed"
+	ClassServed        = "served"
+	ClassBaseline      = "baseline"
+	ClassStale         = "stale"
 
 	// ClassUnclassified marks a component of a report that has no recorded
 	// classification: it arrived before reconciliation existed, or while the
@@ -44,7 +47,7 @@ const (
 )
 
 // Classes lists every class a report can show, in display order.
-var Classes = []string{ClassRefused, ClassUnknown, ClassUnattributed, ClassUnclassified, ClassServed, ClassBaseline, ClassStale}
+var Classes = []string{ClassRefused, ClassForeignOrigin, ClassUnknown, ClassUnattributed, ClassUnclassified, ClassServed, ClassBaseline, ClassStale}
 
 func rank(class string) int {
 	for i, c := range Classes {
@@ -66,12 +69,19 @@ type Catalog interface {
 // Reconciler classifies reports and assembles host state. DB is required;
 // Catalog may be nil (nothing is cataloged), and Instances names the
 // configured sources, which coverage, staleness and disagreement read.
+// PublicURL is the base hosts reach bodega at; an npm or pypi origin naming
+// any other host is foreign. Empty, no npm or pypi origin is judged.
+// FreeBSDRepos lists the pkg repository names the client plan writes; a
+// FreeBSD origin naming anything else is foreign. Nil, no FreeBSD origin is
+// judged.
 type Reconciler struct {
-	DB        *audit.DB
-	Catalog   Catalog
-	Instances []*inventory.Instance
-	Logger    *slog.Logger
-	Now       func() time.Time
+	DB           *audit.DB
+	Catalog      Catalog
+	Instances    []*inventory.Instance
+	PublicURL    string
+	FreeBSDRepos func(context.Context) ([]string, error)
+	Logger       *slog.Logger
+	Now          func() time.Time
 }
 
 func (r *Reconciler) now() time.Time {
@@ -131,7 +141,7 @@ func (r *Reconciler) Record(ctx context.Context, rep audit.InventoryReport) (aud
 
 func (r *Reconciler) audit(ctx context.Context, rep audit.InventoryReport, c audit.InventoryClassification) {
 	counts := Count(c.Components)
-	if counts[ClassRefused]+counts[ClassUnknown] > 0 {
+	if counts[ClassRefused]+counts[ClassForeignOrigin]+counts[ClassUnknown] > 0 {
 		details, _ := json.Marshal(map[string]any{
 			"report_id": rep.ID, "source": rep.Source, "counts": counts,
 		})
@@ -204,6 +214,9 @@ type evidence struct {
 	catalog  map[string]map[string]bool // type -> safe names in the index
 	pkgs     map[string]*manifest.PackageManifest
 	refusal  map[string]string // key -> reason, "" when not refused
+	// freebsdRepos is nil when no FreeBSD origin can be judged, and empty
+	// when the client plan writes no repository, so every origin is foreign.
+	freebsdRepos map[string]bool
 }
 
 func (r *Reconciler) evidence(ctx context.Context, identity string) (*evidence, error) {
@@ -214,6 +227,16 @@ func (r *Reconciler) evidence(ctx context.Context, identity string) (*evidence, 
 		refusal:  map[string]string{},
 	}
 	var err error
+	if r.FreeBSDRepos != nil {
+		names, err := r.FreeBSDRepos(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list the pkg repositories the client plan writes: %w", err)
+		}
+		ev.freebsdRepos = make(map[string]bool, len(names))
+		for _, n := range names {
+			ev.freebsdRepos[n] = true
+		}
+	}
 	if ev.mine, err = r.servedSet(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -282,6 +305,13 @@ func ServedIdentity(so audit.ServedObject) (eco, name, version string) {
 			return eco, n, v
 		}
 		return eco, "", ""
+	case manifest.TypeRpm:
+		// The object key names the package as primary does, epoch included;
+		// the request path's filename has none.
+		if _, n, v := manifest.ParseKey(so.ObjectKey); n != "" {
+			return eco, n, v
+		}
+		return eco, "", ""
 	}
 	return eco, name, version
 }
@@ -306,8 +336,9 @@ func freeBSDPkgIdentity(file string) (name, version string) {
 
 // Key is the form two records of one package compare equal under: the
 // ecosystem, the name as bodega's own types canonicalize it, and the version
-// with an apt epoch dropped, since a pool filename carries none and dpkg
-// reports one.
+// with an apt or rpm epoch dropped. A pool filename carries none and dpkg
+// reports one; rpm is the reverse, primary naming one and rpm_packages
+// reporting version-release alone.
 func Key(eco, name, version string) string {
 	return nameKey(eco, name) + "\x00" + normVersion(eco, version)
 }
@@ -324,6 +355,9 @@ func canonical(eco, name string) string {
 }
 
 func normVersion(eco, v string) string {
+	if eco == manifest.TypeRpm {
+		return manifest.RpmDropEpoch(v)
+	}
 	if eco != manifest.TypeApt {
 		return v
 	}
@@ -358,6 +392,9 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 		}
 		return ClassBaseline, fmt.Sprintf("an accepted baseline covers %s", label), nil
 	}
+	if manager, origin, foreign := r.foreignOrigin(ev, c); foreign {
+		return ClassForeignOrigin, fmt.Sprintf("%s says it came from %s, not bodega", manager, origin), nil
+	}
 	if !known {
 		return ClassUnknown, fmt.Sprintf("bodega serves no %q packages, and no baseline covers this one", c.Ecosystem), nil
 	}
@@ -379,6 +416,58 @@ func (r *Reconciler) classify(ctx context.Context, ev *evidence, identity string
 	return ClassUnknown, fmt.Sprintf("no catalog entry and no serve_fetch row for %s", label), nil
 }
 
+// foreignOrigin reports whether the package manager recorded a source for c
+// other than bodega, naming that package manager and the source as the
+// reason quotes it. FreeBSD's origin is a repository name, bodega's only
+// when it is one the client plan writes, compared whole: a name sharing
+// pkgrepos.TagPrefix is anyone's to choose. Every other origin is a URL or a
+// host, compared by host against public_url. An origin bodega cannot judge
+// (none recorded, or nothing to compare it with) is not foreign, so the
+// component classifies as it would without one.
+func (r *Reconciler) foreignOrigin(ev *evidence, c audit.InventoryComponent) (manager, origin string, foreign bool) {
+	origin = strings.TrimSpace(c.Origin)
+	if origin == "" {
+		return "", "", false
+	}
+	if c.Ecosystem == manifest.TypeFreeBSD {
+		if ev.freebsdRepos == nil {
+			return "", "", false
+		}
+		return "pkg", origin, !ev.freebsdRepos[origin]
+	}
+	own := hostOf(r.PublicURL)
+	if own == "" {
+		return "", "", false
+	}
+	host := hostOf(origin)
+	if host == "" {
+		host, _, _ = strings.Cut(strings.ToLower(origin), "/")
+	}
+	return packageManager(c.Ecosystem), host, host != own
+}
+
+// hostOf is a URL's host with its port, lowercased, or "" when raw is no
+// absolute URL. A source may record a bare host, as osquery's normalizer
+// does, or a scheme-less reference such as an OCI repository_url; the caller
+// reads those up to the first slash.
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+func packageManager(eco string) string {
+	switch eco {
+	case manifest.TypePypi:
+		return "pip"
+	case "":
+		return "the package manager"
+	}
+	return eco
+}
+
 // refusal answers with the reason bodega refused this name@version at
 // admission, or "". The newest decision is the one in force: a version
 // blocked and later admitted under a changed policy is not refused now.
@@ -387,11 +476,21 @@ func (r *Reconciler) refusal(ctx context.Context, ev *evidence, c audit.Inventor
 	if reason, ok := ev.refusal[k]; ok {
 		return reason, nil
 	}
-	rows, err := r.DB.Admissions(ctx, audit.AdmissionFilter{
-		PkgType: c.Ecosystem, PkgName: canonical(c.Ecosystem, c.Name), PkgVersion: c.Version, Limit: 1,
-	})
+	filter := audit.AdmissionFilter{PkgType: c.Ecosystem, PkgName: canonical(c.Ecosystem, c.Name), PkgVersion: c.Version, Limit: 1}
+	if c.Ecosystem == manifest.TypeRpm {
+		// The row carries the epoch primary gave the package and the host
+		// reports none, so the name's rows are read and the newest whose
+		// version matches without its epoch decides.
+		filter.PkgVersion, filter.Limit = "", 0
+	}
+	rows, err := r.DB.Admissions(ctx, filter)
 	if err != nil {
 		return "", fmt.Errorf("read admission decisions: %w", err)
+	}
+	if c.Ecosystem == manifest.TypeRpm {
+		rows = slices.DeleteFunc(rows, func(a audit.Admission) bool {
+			return normVersion(c.Ecosystem, a.PkgVersion) != normVersion(c.Ecosystem, c.Version)
+		})
 	}
 	reason := ""
 	if len(rows) > 0 && rows[0].Decision != audit.AdmissionAdmitted {

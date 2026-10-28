@@ -3,6 +3,7 @@ package host
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,9 +13,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 )
@@ -914,4 +919,325 @@ func firstHit(paths, markers []string) scanHit {
 		}
 	}
 	return scanHit{}
+}
+
+// OCIHost is what the container runtime checks read from the host: how a
+// runtime's command is found, and the directory the /etc paths sit under,
+// "" for the host's own. A test stands in for both.
+type OCIHost struct {
+	LookPath func(string) (string, error)
+	Root     string
+	// Home is the home directory of the user whose podman pulls the check
+	// judges, and RegistriesConf CONTAINERS_REGISTRIES_CONF, which names
+	// the main registries.conf in place of the system one.
+	Home           string
+	RegistriesConf string
+}
+
+const ociRemedy = "bodega doctor --configure oci --apply --url <bodega base URL>"
+
+// Check reports, for each container runtime on PATH, whether it pulls
+// through bodega: Docker's registry-mirrors, containerd's hosts.toml for
+// docker.io and the config_path that makes containerd read it, and a
+// registries.conf mirror for podman, buildah and CRI-O. base is bodega's
+// URL when doctor knows it; with none, any mirror counts, since doctor
+// cannot tell bodega's from another. A runtime not on PATH gets no row.
+func (t OCIHost) Check(base string) []Finding {
+	host := ""
+	if u, err := url.Parse(base); err == nil {
+		host = u.Host
+	}
+	var out []Finding
+	for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
+		present := false
+		for _, bin := range clientconf.RuntimeBinaries[rt] {
+			if _, err := t.LookPath(bin); err == nil {
+				present = true
+			}
+		}
+		if !present {
+			continue
+		}
+		var f Finding
+		switch rt {
+		case clientconf.RuntimeDocker:
+			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host)
+		case clientconf.RuntimeContainerd:
+			f = checkContainerdHosts(t.Root, host)
+		case clientconf.RuntimePodman:
+			f = t.checkRegistriesConf(host)
+		}
+		f.Check = "oci-" + rt
+		if f.IsFinding() && f.Remediation == "" {
+			f.Remediation = ociRemedy
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// mirrorIsBodega reports whether a mirror URL or location names host, or,
+// with no host to compare, whether there is a mirror at all.
+func mirrorIsBodega(mirror, host string) bool {
+	if host == "" {
+		return mirror != ""
+	}
+	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
+	return m == host || strings.HasPrefix(m, host+"/")
+}
+
+func checkDockerMirror(path, host string) Finding {
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + path}
+	}
+	var doc struct {
+		Mirrors []string `json:"registry-mirrors"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return Finding{Status: StatusSkip, Detail: path + " is not JSON dockerd can read: " + err.Error(), Remediation: "repair " + path + "; dockerd refuses to start with it"}
+	}
+	for _, m := range doc.Mirrors {
+		if mirrorIsBodega(m, host) {
+			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)"}
+		}
+	}
+	if len(doc.Mirrors) == 0 {
+		return Finding{Status: StatusWarn, Detail: path + " sets no registry-mirrors, so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	}
+	return Finding{Status: StatusWarn, Detail: path + " mirrors Docker Hub through " + strings.Join(doc.Mirrors, ", ") + ", none of them bodega at " + host + "; bypasses bodega's registry"}
+}
+
+func checkContainerdHosts(root, host string) Finding {
+	cfgPath := filepath.Join(root, clientconf.ContainerdConfigPath)
+	data, err := os.ReadFile(cfgPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Finding{Status: StatusWarn, Detail: "no " + cfgPath + ", so containerd's CRI plugin has no config_path and reads no hosts.toml; bypasses bodega's registry"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: cfgPath + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + cfgPath}
+	}
+	if _, err := clientconf.ReadContainerdConfig(data); err != nil {
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a config.toml containerd can load: " + err.Error(), Remediation: "repair " + cfgPath + "; containerd refuses to start with it"}
+	}
+	cfg, err := clientconf.ResolveContainerdConfig(root, clientconf.ContainerdConfigPath, data)
+	if err != nil {
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not judged: " + err.Error(), Remediation: "repair or remove the import it names, or set config_path = \"" + clientconf.ContainerdCertsDir + "\" in that file's CRI registry table, then run " + ociRemedy}
+	}
+	src := filepath.Join(root, cfg.Source)
+	switch {
+	case cfg.CRIDisabled:
+		return Finding{Status: StatusSkip, Detail: cfgPath + " disables the CRI plugin, so nothing here pulls through containerd's registry configuration; the oci-docker row covers dockerd"}
+	case cfg.ConfigPath == "" && cfg.Legacy != "":
+		return Finding{Status: StatusSkip, Detail: cfgPath + " routes CRI pulls through the deprecated " + cfg.Legacy + " rather than config_path, which doctor does not judge",
+			Remediation: "move " + cfg.Legacy + " into hosts.toml files under " + clientconf.ContainerdCertsDir + " and remove it, then run " + ociRemedy}
+	case cfg.ConfigPath == "":
+		return Finding{Status: StatusWarn, Detail: src + " sets no config_path, so containerd's CRI plugin reads no hosts.toml; bypasses bodega's registry"}
+	}
+	// containerd takes the first config_path root holding a directory for
+	// the registry, docker.io or else _default, and reads only that one.
+	var roots []string
+	dir := ""
+	for _, r := range strings.Split(cfg.ConfigPath, ":") {
+		if r == "" {
+			continue
+		}
+		roots = append(roots, r)
+		for _, ns := range []string{"docker.io", "_default"} {
+			if p := filepath.Join(root, r, ns); dir == "" {
+				if _, err := os.Stat(p); err == nil {
+					dir = p
+				}
+			}
+		}
+	}
+	certs := filepath.Join(root, clientconf.ContainerdCertsDir)
+	if dir == "" {
+		f := Finding{Status: StatusWarn, Detail: "config_path in " + src + " names " + cfg.ConfigPath + ", which holds no docker.io or _default directory, so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+		if !slices.Contains(roots, clientconf.ContainerdCertsDir) {
+			f.Remediation = "add " + clientconf.ContainerdCertsDir + " to config_path in " + src + " (config_path = \"" + cfg.ConfigPath + ":" + clientconf.ContainerdCertsDir + "\"), run " + ociRemedy + ", then systemctl restart containerd"
+		}
+		return f
+	}
+	f := judgeContainerdHosts(filepath.Join(dir, "hosts.toml"), host)
+	if f.IsFinding() && filepath.Dir(dir) != certs {
+		f.Remediation = "containerd reads " + dir + ", the first config_path root with a directory for docker.io; name bodega in its hosts.toml, or put " + clientconf.ContainerdCertsDir + " first in config_path in " + src + " and systemctl restart containerd"
+	}
+	return f
+}
+
+// judgeContainerdHosts reads the hosts.toml containerd uses for docker.io.
+// containerd tries its hosts in file order and the upstream server last, so
+// bodega must be the first host that may pull.
+func judgeContainerdHosts(path, host string) Finding {
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, or repair what the error names"}
+	}
+	var doc struct {
+		Host map[string]struct {
+			Capabilities []string `toml:"capabilities"`
+		} `toml:"host"`
+	}
+	md, err := toml.Decode(string(data), &doc)
+	if err != nil {
+		return Finding{Status: StatusSkip, Detail: path + " is not TOML containerd can load: " + err.Error(), Remediation: "repair " + path + "; containerd fails every Docker Hub pull while it stands"}
+	}
+	for _, k := range md.Keys() {
+		if len(k) != 2 || k[0] != "host" {
+			continue
+		}
+		caps := doc.Host[k[1]].Capabilities
+		if caps != nil && !slices.Contains(caps, "pull") {
+			continue
+		}
+		if !mirrorIsBodega(k[1], host) {
+			return Finding{Status: StatusWarn, Detail: path + " sends containerd's Docker Hub pulls to " + k[1] + " before bodega" + inHost(host) + "; bypasses bodega's registry"}
+		}
+		return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + k[1]}
+	}
+	return Finding{Status: StatusWarn, Detail: path + " names no host at bodega" + inHost(host) + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
+}
+
+// containersRegistry is the part of a containers-registries.conf(5)
+// [[registry]] table that decides where a tag pull goes.
+type containersRegistry struct {
+	Prefix             string `toml:"prefix"`
+	Location           string `toml:"location"`
+	MirrorByDigestOnly bool   `toml:"mirror-by-digest-only"`
+	Mirrors            []struct {
+		Location       string `toml:"location"`
+		PullFromMirror string `toml:"pull-from-mirror"`
+	} `toml:"mirror"`
+	source string
+}
+
+// registriesConfFiles lists the files podman, buildah and CRI-O read, in the
+// order they apply, per containers-registries.conf.d(5): the main file, then
+// the system drop-ins, then the user's. A user's own registries.conf
+// replaces the main file and every system file with it.
+func (t OCIHost) registriesConfFiles() []string {
+	userDir := ""
+	if t.Home != "" {
+		userDir = filepath.Join(t.Home, ".config/containers/registries.conf.d")
+		if user := filepath.Join(t.Home, ".config/containers/registries.conf"); t.RegistriesConf == "" {
+			if _, err := os.Stat(user); err == nil {
+				drop, _ := filepath.Glob(filepath.Join(userDir, "*.conf"))
+				return append([]string{user}, drop...)
+			}
+		}
+	}
+	main := filepath.Join(t.Root, "/etc/containers/registries.conf")
+	if t.RegistriesConf != "" {
+		main = t.RegistriesConf
+	}
+	files := []string{main}
+	drop, _ := filepath.Glob(filepath.Join(t.Root, filepath.Dir(clientconf.RegistriesConfDropIn), "*.conf"))
+	files = append(files, drop...)
+	if userDir != "" {
+		drop, _ = filepath.Glob(filepath.Join(userDir, "*.conf"))
+		files = append(files, drop...)
+	}
+	return files
+}
+
+// checkRegistriesConf resolves the [[registry]] tables the way the runtimes
+// do (a later file replaces a table with the same prefix whole, the first
+// one in a file wins inside it) and judges every table a docker.io pull can
+// match, since the longest matching prefix is the one used. A table for
+// docker.io itself must be among them.
+func (t OCIHost) checkRegistriesConf(host string) Finding {
+	effective := map[string]containersRegistry{}
+	files := t.registriesConfFiles()
+	for i, path := range files {
+		data, err := os.ReadFile(path)
+		switch {
+		case i == 0 && errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as the user whose pulls it judges, or as root for " + filepath.Dir(clientconf.RegistriesConfDropIn)}
+		}
+		var doc struct {
+			Registries []containersRegistry `toml:"registry"`
+			V1         map[string]any       `toml:"registries"`
+		}
+		if _, err := toml.Decode(string(data), &doc); err != nil {
+			return Finding{Status: StatusSkip, Detail: path + " is not TOML podman can load: " + err.Error(), Remediation: "repair " + path + "; podman refuses to pull while it stands"}
+		}
+		if doc.V1 != nil {
+			return Finding{Status: StatusSkip, Detail: path + " uses the version 1 [registries.*] format, which doctor does not judge", Remediation: "rewrite " + path + " as [[registry]] tables, then run " + ociRemedy}
+		}
+		seen := map[string]bool{}
+		for _, r := range doc.Registries {
+			if r.Prefix == "" {
+				r.Prefix = r.Location
+			}
+			if seen[r.Prefix] {
+				continue
+			}
+			seen[r.Prefix] = true
+			r.source = path
+			effective[r.Prefix] = r
+		}
+	}
+	var prefixes []string
+	for p := range effective {
+		if p == "docker.io" || strings.HasPrefix(p, "docker.io/") {
+			prefixes = append(prefixes, p)
+		}
+	}
+	sort.Strings(prefixes)
+	if len(prefixes) == 0 {
+		return Finding{Status: StatusWarn, Detail: "no registries.conf podman reads (" + strings.Join(files, ", ") + ") defines docker.io, so podman, buildah and CRI-O pull Docker Hub images from Docker Hub; bypasses bodega's registry"}
+	}
+	dropIn := filepath.Join(t.Root, clientconf.RegistriesConfDropIn)
+	// A table applies only to the names its prefix matches, so only one for
+	// docker.io itself covers every Docker Hub repository; narrower ones
+	// are overrides inside it.
+	whole, ok := effective["docker.io"]
+	if !ok {
+		return Finding{Status: StatusWarn, Detail: "the registries.conf files podman reads define only " + strings.Join(prefixes, ", ") + " and no table for docker.io itself, so podman, buildah and CRI-O pull every other Docker Hub repository from Docker Hub; bypasses bodega's registry"}
+	}
+	for _, p := range prefixes {
+		r := effective[p]
+		first := r.tagMirror()
+		if mirrorIsBodega(first, host) {
+			continue
+		}
+		via := "with no mirror a tag pull uses"
+		if first != "" {
+			via = "with " + first + " as its first mirror"
+		}
+		f := Finding{Status: StatusWarn, Detail: r.source + " defines " + p + " " + via + ", not bodega" + inHost(host) + ", and podman, buildah and CRI-O read it in place of any earlier table for " + p + "; bypasses bodega's registry"}
+		if r.source != dropIn {
+			f.Remediation = "edit or remove the [[registry]] for " + p + " in " + r.source + ", which overrides " + dropIn + ", then run " + ociRemedy
+		}
+		return f
+	}
+	return Finding{Status: StatusOK, Detail: whole.source + " mirrors " + whole.Prefix + " through " + whole.tagMirror()}
+}
+
+// tagMirror is the first mirror a tag pull tries, "" when none may serve
+// one: mirror-by-digest-only and pull-from-mirror = "digest-only" each keep
+// a tag pull on the registry itself.
+func (r containersRegistry) tagMirror() string {
+	for _, m := range r.Mirrors {
+		if !r.MirrorByDigestOnly && m.PullFromMirror != "digest-only" {
+			return m.Location
+		}
+	}
+	return ""
+}
+
+func inHost(host string) string {
+	if host == "" {
+		return ""
+	}
+	return " (" + host + ")"
 }

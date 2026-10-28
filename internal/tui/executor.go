@@ -149,7 +149,7 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		s.Print(buf)
 		totalFail += s.Failures
 	case manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
-		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeFreeBSD,
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI, manifest.TypeRpm, manifest.TypeFreeBSD,
 		manifest.TypeDistfiles:
 		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
 	default:
@@ -204,6 +204,8 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		fmt.Fprintf(buf, "No separate package step for composer — the dist archive is the artifact, and clients read the proxied metadata.\n")
 	case manifest.TypeOCI:
 		fmt.Fprintf(buf, "No separate package step for oci — the manifest and its blobs are the artifacts, pulled through /v2/.\n")
+	case manifest.TypeRpm:
+		fmt.Fprintf(buf, "No separate package step for rpm — packages pass through /rpm/ byte for byte, and bodega signs only repomd.xml.\n")
 	case manifest.TypeRubygems:
 		fmt.Fprintf(buf, "No separate package step for rubygems — the fetched gem file is the artifact, and clients read the proxied compact index.\n")
 	default:
@@ -403,6 +405,8 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, audi
 			fmt.Fprintf(buf, "No fetcher for composer — dist archives are pulled through /composer/ on first request.\n")
 		case manifest.TypeOCI:
 			fmt.Fprintf(buf, "No fetcher for oci — images are pulled through /v2/ on first request.\n")
+		case manifest.TypeRpm:
+			fmt.Fprintf(buf, "No fetcher for rpm — packages are pulled through /rpm/ on first request.\n")
 		default:
 			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}

@@ -4,14 +4,16 @@
 
 Everything that gates a merge in this repository is a unit test. `make check`
 runs seven legs, CI runs six jobs, and every one of them is `go test` or a
-linter. bodega serves nine package types to their native clients, and until this
-harness existed nothing automated had ever pointed `apt-get`, `pip`, `helm`,
-`npm`, `cargo`, `go`, `git`, `curl`, `pkg` or the ports tree's `make fetch` at a
-running server and checked what came back.
+linter. bodega serves thirteen package types to their native clients, and until
+this harness existed nothing automated had ever pointed `apt-get`, `pip`,
+`helm`, `npm`, `cargo`, `go`, `mvn`, `gradle`, `gem`, `bundle`, `git`, `curl`,
+`pkg` or the ports tree's `make fetch` at a running server and checked what came
+back.
 
 This harness answers one question: **does a bodega built from this commit serve
-its nine package types to their native clients, enforce its access controls
-against a request that is not from loopback, and record what it did?**
+twelve of its package types to their native clients, enforce its access
+controls against a request that is not from loopback, and record what it did?**
+composer is the thirteenth, and no suite drives `composer` yet.
 
 It runs from a workstation against four scratch guests, described under
 [Host requirements](#host-requirements). It does not run in CI and never will:
@@ -21,6 +23,7 @@ it needs several hosts, a real network between them, and several minutes.
 | --------------------------------------------------- | ---------------- | ---------------------- |
 | `apt-get`, `pip`, `helm`, `npm`, `cargo`            | `client`         | `45-clients`           |
 | `git`, `curl`, the portable `pkg` build             | `client`         | `45-clients`           |
+| `mvn`, the `gradle` wrapper, `gem`, `bundle`        | `client`         | `45-clients`           |
 | `go`                                                | `server`         | `45-clients`           |
 | `pkg install` onto a FreeBSD root                   | `freebsd`        | `47-freebsd-client`    |
 | `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client`    |
@@ -60,9 +63,10 @@ Each Linux guest needs:
   `E2E_SERVER_HOST` resolves to. Suite 10 writes `/etc/hosts` entries when DNS
   does not answer.
 
-The client guest also installs `npm`, `python3-pip`, `cargo` and `helm` during
-suite 45. Nothing else is required in advance: the harness installs what it
-needs and reports what it could not.
+The client guest also installs `npm`, `python3-pip`, `cargo`, `helm`, `maven`,
+`default-jdk-headless`, `unzip` and `ruby-bundler` during suite 45, and
+downloads a Gradle distribution through the server. Nothing else is required in
+advance: the harness installs what it needs and reports what it could not.
 
 Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `ssh` and `sudo` access, and room under `/var/tmp`. Suite 47 ships

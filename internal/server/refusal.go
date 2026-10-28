@@ -270,6 +270,16 @@ func allowListRefusal(regType, candidate, name, version string) *refusal {
 		}
 		f.reason = fmt.Sprintf("%s %q is not on this server's upstream allow-list.", regType, candidate)
 		f.next = fmt.Sprintf("ask an operator to run `bodega policy add %s %s` if it should be.", regType, candidate)
+	case manifest.TypeRpm:
+		// The candidate is the name and the repository's base URL. A rule may
+		// name either, and the body names only the package: the URL is in the
+		// audit row.
+		pkg, _, _ := strings.Cut(candidate, " ")
+		if f.name == "" {
+			f.name = pkg
+		}
+		f.reason = fmt.Sprintf("rpm package %q is not on this server's upstream allow-list.", pkg)
+		f.next = fmt.Sprintf("ask an operator to run `bodega policy add rpm %s` if it should be; a rule naming the repository's base URL prefix, which incident %s's audit row names, admits the whole repository.", pkg, f.incident)
 	default:
 		f.reason = fmt.Sprintf("the upstream this %s request needs is not on this server's upstream allow-list.", regType)
 		f.next = fmt.Sprintf("give an operator incident %s; its audit row names the upstream, and `bodega policy add %s <%s>` admits it.",

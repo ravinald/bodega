@@ -50,6 +50,8 @@ func queuePattern(regType, upstreamURL, candidate, name string) string {
 	switch regType {
 	case manifest.TypeNpm, manifest.TypePypi, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeRubygems, manifest.TypeComposer, manifest.TypeOCI:
 		return candidate
+	case manifest.TypeRpm:
+		return name
 	}
 	u := upstreamURL
 	if u == "" {

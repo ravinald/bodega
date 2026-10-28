@@ -1392,6 +1392,7 @@ var clientURLSeeds = map[string]struct {
 	manifest.TypeRubygems: {"rack", manifest.VersionEntry{Version: "3.1.8"}},
 	manifest.TypeComposer: {"symfony/console", manifest.VersionEntry{Version: "v7.1.5"}},
 	manifest.TypeOCI:      {"docker.io/library/nginx", manifest.VersionEntry{Version: "1.27"}},
+	manifest.TypeRpm:      {"nginx", manifest.VersionEntry{Version: "2:1.20.1-20.el9"}},
 	// The version is the ABI, which is what the pkg.conf stanza leaves as a
 	// literal ${ABI} and what the route carries.
 	manifest.TypeFreeBSD: {"latest", manifest.VersionEntry{

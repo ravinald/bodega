@@ -20,6 +20,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,6 +148,7 @@ type Config struct {
 	ComposerDistHosts      []string          `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
 	OCIUpstreams           map[string]string `json:"oci_upstreams,omitempty"`          // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
 	OCITokenHosts          []string          `json:"oci_token_hosts,omitempty"`        // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
+	RpmUpstreams           map[string]string `json:"rpm_upstreams,omitempty"`          // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
 	PrivateUpstreamHosts   []string          `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
 	DiscoverMode           string            `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string            `json:"gomod_root,omitempty"`
@@ -157,6 +159,7 @@ type Config struct {
 	RubygemsRoot           string            `json:"rubygems_root,omitempty"`
 	ComposerRoot           string            `json:"composer_root,omitempty"`
 	OCIRoot                string            `json:"oci_root,omitempty"`
+	RpmRoot                string            `json:"rpm_root,omitempty"`
 	FreeBSDRoot            string            `json:"freebsd_root,omitempty"`
 	DistfilesRoot          string            `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
 	AuditDB                string            `json:"audit_db,omitempty"`
@@ -511,6 +514,7 @@ var reservedPathElements = map[string]string{
 	"composer":  "served route and composer storage root",
 	"v2":        "served route (the OCI registry)",
 	"oci":       "oci storage root",
+	"rpm":       "served route and rpm storage root",
 	"git":       "served route",
 	"go":        "served route",
 	"healthz":   "served route",
@@ -686,6 +690,50 @@ func resolveOCIUpstreams(cfg *Config) error {
 		cfg.OCITokenHosts = append([]string(nil), DefaultOCITokenHosts...)
 	}
 	return validateHostList("oci_token_hosts", cfg.OCITokenHosts)
+}
+
+// RpmSampleReleasever and RpmSampleBasearch are what resolveRpmUpstreams
+// substitutes into a base URL to validate it, since the URL bodega fetches
+// exists only once a request names both.
+const (
+	RpmSampleReleasever = "9"
+	RpmSampleBasearch   = "x86_64"
+)
+
+// resolveRpmUpstreams validates rpm_upstreams. There is no default: an
+// operator names the repositories bodega serves, and an absent map serves
+// none. A base URL may carry $releasever and $basearch, which a request
+// supplies; any other dnf variable ($contentdir, $stream) would reach the
+// upstream as literal text, so it is refused here rather than as a 404 from
+// the mirror.
+func resolveRpmUpstreams(cfg *Config) error {
+	resolved := make(map[string]string, len(cfg.RpmUpstreams))
+	for name, raw := range cfg.RpmUpstreams {
+		key := strings.TrimSpace(name)
+		if !manifest.RpmValidRepoName(key) {
+			return fmt.Errorf("rpm_upstreams key %q is not a repository name: letters, digits, '.', '_' and '-', up to 64, not starting with '.' or '-', e.g. \"rocky-baseos\"", name)
+		}
+		if _, dup := resolved[key]; dup {
+			return fmt.Errorf("rpm_upstreams names %q twice once whitespace is trimmed", key)
+		}
+		u := strings.TrimRight(strings.TrimSpace(raw), "/") + "/"
+		sample := strings.NewReplacer("$releasever", RpmSampleReleasever, "$basearch", RpmSampleBasearch).Replace(u)
+		field := fmt.Sprintf("rpm_upstreams[%q]", key)
+		if err := validateProxyUpstream(field, sample, "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"); err != nil {
+			return err
+		}
+		if strings.Contains(sample, "$") {
+			return fmt.Errorf("%s names a variable other than $releasever and $basearch, which bodega does not substitute: write the value it stands for", field)
+		}
+		resolved[key] = u
+	}
+	cfg.RpmUpstreams = resolved
+	return nil
+}
+
+// RpmRepoNames is the rpm_upstreams keys, sorted.
+func (cfg *Config) RpmRepoNames() []string {
+	return slices.Sorted(maps.Keys(cfg.RpmUpstreams))
 }
 
 // redactUserinfo masks the password in a URL url.Parse refused, which
@@ -1484,6 +1532,9 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		return nil, err
 	}
 	if err := resolveOCIUpstreams(cfg); err != nil {
+		return nil, err
+	}
+	if err := resolveRpmUpstreams(cfg); err != nil {
 		return nil, err
 	}
 	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
@@ -2523,6 +2574,9 @@ func defaultConfigContent() []byte {
   "oci_upstreams": {"docker.io": "https://registry-1.docker.io", "ghcr.io": "https://ghcr.io", "quay.io": "https://quay.io"},
   "oci_token_hosts": ["auth.docker.io", "ghcr.io", "quay.io"],
 
+  "_comment_rpm": "rpm_upstreams maps a repository name you choose to the base URL of a dnf repository, served under /rpm/<name>/<releasever>/<basearch>/. The URL may carry $releasever and $basearch, which bodega fills from the request path; no other dnf variable is substituted. Empty serves no repository, and a name outside the map answers 404. bodega signs every repomd.xml it serves with the apt signing key (/rpm/bodega.gpg) and passes packages through byte for byte, so their vendor signatures still verify. e.g. {\"rocky-baseos\": \"https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/\", \"epel\": \"https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/\"}",
+  "rpm_upstreams": {},
+
   "_comment_private_upstream_hosts": "private_upstream_hosts: hostnames or IP literals (no scheme, port or path) the upstream guard lets resolve to a private address (RFC 1918, fc00::/7), for fronting an internal registry such as Artifactory, Nexus or Verdaccio, e.g. [\"registry.corp.example\"]. Listing a host trusts it as a public upstream is trusted: any client that can reach bodega can make it fetch any path under that ecosystem's route from the host. Loopback, link-local (including 169.254.169.254) and unspecified addresses stay refused for every host, listed or not, and each redirect hop is judged again, so a listed host cannot hand the fetch to an unlisted one. Names, not CIDRs: a range would trust whatever a public upstream's DNS points into it.",
   "private_upstream_hosts": [],
 
@@ -2551,6 +2605,7 @@ func defaultConfigContent() []byte {
   "rubygems_root": "",
   "composer_root": "",
   "oci_root": "",
+  "rpm_root": "",
 
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",
