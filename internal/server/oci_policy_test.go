@@ -446,7 +446,7 @@ func TestOCILapsedVerdict(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/blobs/"+old.amd64LayerD, nil), http.StatusForbidden, "DENIED", "never recorded a verdict", "pull tag old again")
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/blobs/"+old.amd64LayerD, nil), http.StatusForbidden, "DENIED", "has recorded no verdict", "pull tag old again")
 	if got := ociGetCode(s, "/v2/library/nginx/manifests/old", nil); got != http.StatusOK {
 		t.Fatalf("old tag = %d", got)
 	}
@@ -624,4 +624,103 @@ func TestOCIIncompleteRefusalOutlivesTheProcess(t *testing.T) {
 		assertOCIError(t, doRequest(ociPeer(t, f, s), http.MethodGet, "/v2/library/nginx/blobs/"+d, nil),
 			http.StatusForbidden, "DENIED", "tag young", "same verdict")
 	}
+}
+
+// ageUnsettled rewrites every pending marker in library/nginx as older than
+// ociPendingTTL, which is what a check outliving it, or a process that died
+// during one, leaves in the store.
+func ageUnsettled(t *testing.T, s *Server) {
+	t.Helper()
+	store := s.typeStore(manifest.TypeOCI)
+	for _, k := range ociUnsettledKeys(t, s) {
+		b, err := store.Get(t.Context(), k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var mark ociUnsettledMark
+		if err := json.Unmarshal(b, &mark); err != nil {
+			t.Fatal(err)
+		}
+		if mark.Pending == "" {
+			continue
+		}
+		mark.Pending = time.Now().Add(-ociPendingTTL - time.Second).UTC().Format(time.RFC3339Nano)
+		b, _ = json.Marshal(mark)
+		if err := store.Put(t.Context(), k, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Time alone admits nothing: a pending marker past ociPendingTTL still holds
+// the repository's unclaimed digests, whether the check is still running or
+// the process running it died, until a verdict covers the image.
+func TestOCIPendingMarkerExpiryAdmitsNothing(t *testing.T) {
+	t.Run("check still running", func(t *testing.T) {
+		f := newOCIFixture(t)
+		im := newOCIImageCreated(ociCreatedAgo(time.Hour))
+		f.hub.publish("library/nginx", "young", im)
+		s, built := ociPolicyServer(t, f)
+		peer := ociPeer(t, f, s)
+		var during []int
+		prev := fetchCheckers
+		fetchCheckers = func(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
+			ageUnsettled(t, s)
+			for _, d := range []string{im.arm64ConfigD, im.arm64LayerD} {
+				during = append(during, ociGetCode(peer, "/v2/library/nginx/blobs/"+d, nil))
+			}
+			return prev(cfg, adb)
+		}
+		defer func() { fetchCheckers = prev }()
+		if got := ociGetCode(s, "/v2/library/nginx/manifests/young", nil); got != http.StatusForbidden {
+			t.Fatalf("young tag = %d", got)
+		}
+		for i, code := range during {
+			if code != http.StatusForbidden {
+				t.Errorf("unjudged blob %d after the pending marker aged = %d, want 403", i, code)
+			}
+		}
+		if n := built.Load(); n != 1 {
+			t.Errorf("checks built %d times, want 1: a digest request must not judge again", n)
+		}
+	})
+
+	t.Run("process died", func(t *testing.T) {
+		f := newOCIFixture(t)
+		im := newOCIImageCreated(ociCreatedAgo(30 * 24 * time.Hour))
+		f.hub.publish("library/nginx", "old", im)
+		s, built := ociPolicyServer(t, f)
+		prev := fetchCheckers
+		// The process stops after its marker is down and before any verdict.
+		fetchCheckers = func(*config.Config, *audit.DB) []policy.VersionChecker { panic(http.ErrAbortHandler) }
+		func() {
+			defer func() { _ = recover() }()
+			ociGetCode(s, "/v2/library/nginx/manifests/old", nil)
+		}()
+		fetchCheckers = prev
+		if len(ociUnsettledKeys(t, s)) == 0 {
+			t.Fatal("no marker left behind by the interrupted check")
+		}
+		ageUnsettled(t, s)
+		restarted := ociPeer(t, f, s)
+		for _, d := range []string{im.arm64ConfigD, im.arm64LayerD} {
+			assertOCIError(t, doRequest(restarted, http.MethodGet, "/v2/library/nginx/blobs/"+d, nil),
+				http.StatusForbidden, "DENIED", "tag old", "pull tag old again")
+		}
+		if n := built.Load(); n != 0 {
+			t.Errorf("digest requests built checks %d times, want 0", n)
+		}
+		// Judging the image afresh settles it and releases its members.
+		if got := ociGetCode(restarted, "/v2/library/nginx/manifests/old", nil); got != http.StatusOK {
+			t.Fatalf("old tag after restart = %d", got)
+		}
+		if keys := ociUnsettledKeys(t, s); len(keys) != 0 {
+			t.Errorf("markers left once the image was admitted: %v", keys)
+		}
+		for _, d := range []string{im.amd64LayerD, im.arm64LayerD} {
+			if got := ociGetCode(restarted, "/v2/library/nginx/blobs/"+d, nil); got != http.StatusOK {
+				t.Errorf("blob %s after the image was admitted = %d, want 200", d, got)
+			}
+		}
+	})
 }
