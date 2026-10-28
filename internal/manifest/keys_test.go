@@ -118,8 +118,10 @@ var keyRoundTrips = map[string][]roundTrip{
 		{key: OCIManifestKey("docker.io", "library/nginx", "sha256:abababababababababababababababababababababababababababababababab"), name: "docker.io/library/nginx", version: "sha256:abababababababababababababababababababababababababababababababab"},
 		{key: OCITagKey("ghcr.io", "acme/widget", "v4.1"), name: "ghcr.io/acme/widget", version: "v4.1"},
 		{key: OCIResolvedKey("quay.io", "a/b/c", "sha256:abababababababababababababababababababababababababababababababab"), name: "quay.io/a/b/c", version: "sha256:abababababababababababababababababababababababababababababababab"},
+		{key: OCIResolvedByKey("quay.io", "a/b/c", "sha256:abababababababababababababababababababababababababababababababab", "17"), name: "quay.io/a/b/c", version: "sha256:abababababababababababababababababababababababababababababababab"},
 		{key: OCITagListKey("docker.io", "library/nginx"), name: "docker.io/library/nginx"},
 		{key: OCIChartBlobKey("docker.io", "bitnamicharts/redis", "sha256:abababababababababababababababababababababababababababababababab", "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"), name: "docker.io/bitnamicharts/redis"},
+		{key: OCIUnsettledKey("docker.io", "library/nginx", "sha256:abababababababababababababababababababababababababababababababab", "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"), name: "docker.io/library/nginx"},
 		{key: OCIManifestTypeKey("ghcr.io", "acme/widget", "sha256:abababababababababababababababababababababababababababababababab"), name: "ghcr.io/acme/widget"},
 		// A blob is shared by every repository and names none.
 		{key: OCIBlobKey("sha256:abababababababababababababababababababababababababababababababab"), version: "sha256:abababababababababababababababababababababababababababababababab"},

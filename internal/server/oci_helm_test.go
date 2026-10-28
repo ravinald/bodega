@@ -297,8 +297,10 @@ func TestOCIHelmBlobsFollowTheirChartsVerdict(t *testing.T) {
 		}
 		refusalIncident(t, rec.Header(), checkConstraint)
 	}
-	if n := f.hub.blobHits(old, "charts/other"); n != 2 {
-		t.Errorf("the cached blobs were fetched %d times, want once each", n)
+	// Once each to serve them, and the config once more when the tag's
+	// checks read it to date the chart.
+	if n := f.hub.blobHits(old, "charts/other"); n != 3 {
+		t.Errorf("the cached blobs were fetched %d times, want 3", n)
 	}
 }
 
@@ -339,6 +341,108 @@ func TestOCIHelmProfilePinAdmitsTheResolvedDigest(t *testing.T) {
 	for _, p := range []string{"/v2/charts/app/manifests/1.0.0", "/v2/charts/app/manifests/" + c.digest, "/v2/charts/app/blobs/" + c.layerD} {
 		if status, body := pf.get(t, p); status != http.StatusOK {
 			t.Errorf("%s: %d %s, want the pinned chart served", p, status, body)
+		}
+	}
+}
+
+// A tag cached as an image that the registry moved to a chart is judged as
+// the chart on refresh, and the chart's blobs take its refusal: a hidden
+// chart's config and layer are refused, on this process and a fresh one, and
+// never fetched.
+func TestOCIHelmRefreshedHiddenChartRefusesItsBlobs(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	path := "/v2/library/nginx/manifests/1.27"
+	if rec := doRequest(s, http.MethodGet, path, nil); rec.Code != http.StatusOK {
+		t.Fatalf("the image: %d %s", rec.Code, rec.Body.String())
+	}
+	c := f.hub.publishChart("library/nginx", "1.27")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/library/nginx", manifest.VersionEntry{Version: "1.27", Mode: manifest.ModeProxy, Hidden: true})
+	s.cache.MetadataTTL = time.Nanosecond
+	assertOCIError(t, doRequest(s, http.MethodGet, path, nil), http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/library/nginx")
+	for _, srv := range []*Server{s, ociPeer(t, f, s)} {
+		for _, d := range []string{c.configD, c.layerD} {
+			assertOCIError(t, doRequest(srv, http.MethodGet, "/v2/library/nginx/blobs/"+d, nil), http.StatusNotFound, "BLOB_UNKNOWN", "docker.io/library/nginx")
+		}
+	}
+	if n := f.hub.blobHits(c, "library/nginx"); n != 0 {
+		t.Errorf("the hidden chart's blobs were fetched %d times", n)
+	}
+}
+
+// A tag that moved from an image to an admitted chart leaves a helm
+// discovery row when the refresh serves the chart.
+func TestOCIHelmRefreshedChartRecordsHelmDiscovery(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	path := "/v2/library/nginx/manifests/1.27"
+	if rec := doRequest(s, http.MethodGet, path, nil); rec.Code != http.StatusOK {
+		t.Fatalf("the image: %d %s", rec.Code, rec.Body.String())
+	}
+	waitForDiscoveryRow(t, s, manifest.TypeOCI, "docker.io/library/nginx", "1.27")
+	c := f.hub.publishChart("library/nginx", "1.27")
+	s.cache.MetadataTTL = time.Nanosecond
+	if rec := doRequest(s, http.MethodGet, path, nil); rec.Code != http.StatusOK || rec.Body.String() != string(c.manifest) {
+		t.Fatalf("the refreshed chart: %d %s", rec.Code, rec.Body.String())
+	}
+	waitForDiscoveryRow(t, s, manifest.TypeHelm, "docker.io/library/nginx", "1.27")
+}
+
+// An oci hide is a statement about images: a chart helm admits under the same
+// identity is served.
+func TestOCIHelmChartServedUnderAnOCIHide(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	c := f.hub.publishChart("charts/app", "1.0.0")
+	addVersion(t, s, manifest.TypeOCI, "docker.io/charts/app", manifest.VersionEntry{Version: "1.0.0", Mode: manifest.ModeProxy, Hidden: true})
+	rec := doRequest(s, http.MethodGet, "/v2/charts/app/manifests/1.0.0", nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != string(c.manifest) {
+		t.Fatalf("a chart under an oci hide: %d %s", rec.Code, rec.Body.String())
+	}
+	waitForDiscoveryRow(t, s, manifest.TypeHelm, "docker.io/charts/app", "1.0.0")
+}
+
+// A refused chart in a repository of images takes nothing away from the
+// images: the tag list is the same before and after bodega read the chart.
+func TestOCIHelmRefusedChartLeavesTheImageTagList(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	list := "/v2/library/nginx/tags/list"
+	if rec := doRequest(s, http.MethodGet, list, nil); rec.Code != http.StatusOK {
+		t.Fatalf("tag list before any chart: %d %s", rec.Code, rec.Body.String())
+	}
+	f.hub.publishChart("library/nginx", "chart-1.0")
+	addVersion(t, s, manifest.TypeHelm, "docker.io/library/nginx", manifest.VersionEntry{Version: "chart-1.0", Mode: manifest.ModeProxy, Hidden: true})
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/chart-1.0", nil), http.StatusNotFound, "MANIFEST_UNKNOWN")
+	if rec := doRequest(s, http.MethodGet, list, nil); rec.Code != http.StatusOK {
+		t.Errorf("tag list after a refused chart: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/1.27", nil); rec.Code != http.StatusOK {
+		t.Errorf("the image beside the refused chart: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Two tags resolving to one chart digest each admit it: a second tag the
+// profile does not permit never displaces the one it does.
+func TestOCIHelmProfileDigestFollowsAnyPermittedTag(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	c := f.hub.publishChart("charts/app", "1.0.0")
+	f.hub.mu.Lock()
+	f.hub.manifests["charts/app@stable"] = ociObject{mediaOCIManifest, c.manifest}
+	f.hub.mu.Unlock()
+	pf := bindProfile(t, s, "charts", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeHelm, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeHelm, Name: "docker.io/charts/app", Constraint: manifest.ConstraintExact, Version: "1.0.0"}})
+	if status, body := pf.get(t, "/v2/charts/app/manifests/1.0.0"); status != http.StatusOK {
+		t.Fatalf("the pinned tag: %d %s", status, body)
+	}
+	if rec := doRequest(s, http.MethodGet, "/v2/charts/app/manifests/stable", nil); rec.Code != http.StatusOK {
+		t.Fatalf("an unprofiled host's stable: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, p := range []string{"/v2/charts/app/manifests/" + c.digest, "/v2/charts/app/blobs/" + c.layerD} {
+		if status, body := pf.get(t, p); status != http.StatusOK {
+			t.Errorf("%s after another tag resolved to the chart: %d %s", p, status, body)
 		}
 	}
 }

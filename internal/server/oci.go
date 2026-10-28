@@ -277,11 +277,19 @@ func ociForceProxy(pm *manifest.PackageManifest) bool {
 func (s *Server) ociAllowListGate(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, key string, immutable bool) bool {
 	baseline := s.baselineLookup(r.Context(), typ, t.name(), key, immutable)
 	override := s.allowListOverrideLookup(r.Context(), typ, t.name(), key, immutable)
+	_, ok := s.ociAllowListVerdict(w, r, typ, t, key, immutable, baseline, override)
+	return ok
+}
+
+// ociAllowListVerdict is ociAllowListGate with the lookups supplied, for the
+// tag, whose admission row has to read the same baseline and override answer
+// the allow-list did.
+func (s *Server) ociAllowListVerdict(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, key string, immutable bool, baseline baselineLookup, override overrideLookup) (string, bool) {
 	decision, ok := s.upstreamPolicyGate(w, r, typ, "", t.name(), t.name(), key, true, baseline, override)
 	if !ok && decision == audit.DecisionDenied && immutable {
 		s.recordFillRefusal(r, typ, t.name(), t.name(), key)
 	}
-	return ok
+	return decision, ok
 }
 
 // ociJudgeVersion is handleComposerDist's gate order for one tag: hidden,
@@ -329,15 +337,20 @@ func ociConstrained(pm *manifest.PackageManifest) bool {
 func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
 	name := t.name()
-	typ, fetched := s.ociManifestType(r, t)
+	typ, fetched, err := s.ociManifestType(r, t)
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCITagKey(t.registry, t.repo, t.ref)
-	pm, ok := s.ociGate(w, r, typ, t, t.ref, true, key, false)
+	if err != nil {
+		s.refuseChartUnrecorded(w, t, err)
+		return
+	}
+	g, ok := s.ociGateFull(w, r, typ, t, []string{t.ref}, true, key, false)
 	if !ok {
 		return
 	}
 
-	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store, fetched)))
+	pm := g.pm
+	req := r.Clone(withUpstreamOpener(ctx, s.ociTagOpener(t, store, ociPlatformOf(r), fetched)))
 	req.Method = http.MethodGet
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		req.Header.Del(h)
@@ -355,39 +368,49 @@ func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t o
 			fmt.Sprintf("bodega's record of tag %s in %s does not parse, so it cannot say which manifest the tag names. Retry once metadata_ttl has passed.", t.ref, name))
 		return
 	}
-	var body []byte
-	mstore, err := s.versionStore(ctx, manifest.TypeOCI, name, doc.Digest)
-	if err == nil && mstore != nil {
-		body, err = mstore.Get(ctx, manifest.OCIManifestKey(t.registry, t.repo, doc.Digest))
-	}
-	if err != nil || body == nil {
-		// The tag record outlived its manifest, which only a reset or a
-		// failed write leaves behind. Fetch it by digest, as bodega's own read.
-		s.logger.Warn("oci manifest missing for a cached tag, fetching it by digest", "key", key, "digest", doc.Digest, "error", err)
-		byDigest := t
-		byDigest.ref = doc.Digest
-		s.serveOCIManifestDigest(w, r.WithContext(withOwnRead(ctx)), typ, byDigest, pm, doc.MediaType, nil)
+	// The tag record can outlive its manifest, which only a reset or a failed
+	// write leaves behind; the manifest is then fetched again by digest.
+	body, err := s.ociManifestBytes(ctx, t, doc.Digest, true)
+	if err != nil {
+		s.logger.Error("oci manifest for a cached tag not read", "key", key, "digest", doc.Digest, "error", err)
+		w.writeError(http.StatusBadGateway, "UNKNOWN",
+			fmt.Sprintf("tag %s of %s names manifest %s, which bodega does not hold and could not fetch: %v. Retry once the registry answers.", t.ref, name, doc.Digest, err))
 		return
 	}
 	// A refresh can move the tag to a manifest of the other type after the
-	// gates ran, so what is served is judged again as what it is.
-	if served := ociArtifactType(body); served != typ {
-		if _, ok := s.ociGate(w, r, served, t, t.ref, true, key, false); !ok {
+	// gates ran. A chart's blobs are recorded as its own before anything is
+	// refused or served, and what is served is judged again as what it is,
+	// with its discovery row under that type.
+	served := ociArtifactType(body)
+	if served == manifest.TypeHelm {
+		if err := s.ociRecordChart(ctx, t, doc.Digest, body); err != nil {
+			s.refuseChartUnrecorded(w, t, err)
 			return
 		}
 	}
-	if ociArtifactType(body) == manifest.TypeHelm {
-		s.ociRecordChart(ctx, t, doc.Digest, body)
+	if served != typ {
+		if g, ok = s.ociGateFull(w, r, served, t, []string{t.ref}, true, key, false); !ok {
+			return
+		}
+		typ = served
+		s.recordCacheHitDiscovery(ctx, r, typ, t.url(ociManifests+"/"+t.ref), name, name, key)
 	}
+	if !s.ociTagPolicyGate(w, r, typ, t, store, doc, body, g.decision, g.baseline, g.override) {
+		return
+	}
+	s.recordOCIResolvedBy(ctx, store, t, doc.Digest, body)
 	w.Header().Set("Cache-Control", cachePrivate)
 	writeOCIManifest(w, r, doc.MediaType, doc.Digest, body)
 }
 
-// ociTagDoc is what a tag's key holds.
+// ociTagDoc is what a tag's key holds. FirstSeen is when bodega first
+// resolved the tag to Digest, which dates an image whose config carries no
+// created time.
 type ociTagDoc struct {
 	Digest    string `json:"digest"`
 	MediaType string `json:"mediaType"`
 	Size      int64  `json:"size"`
+	FirstSeen string `json:"firstSeen,omitempty"`
 }
 
 func writeOCIManifest(w http.ResponseWriter, r *http.Request, mediaType, digest string, body []byte) {
@@ -419,18 +442,82 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 }
 
 // handleOCIManifestDigest serves a manifest by digest. A digest names no
-// tag, so it is judged by the tag bodega last resolved to it, and under a
-// version constraint a digest bodega never resolved is refused: the
-// constraint has nothing to compare.
+// tag, so it is judged by the tags bodega resolved to it: the allow-list's
+// constraint by the one the registry last answered, and under a version
+// constraint a digest bodega never resolved is refused, since the constraint
+// has nothing to compare. The profile admits it when any tag resolved to it
+// is one the profile permits.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
 	ctx := r.Context()
-	typ, fetched := s.ociManifestType(r, t)
-	version, resolved := s.ociVersionFor(ctx, t)
-	pm, ok := s.ociGate(w, r, typ, t, version, resolved, manifest.OCIManifestKey(t.registry, t.repo, t.ref), true)
+	store := s.typeStore(manifest.TypeOCI)
+	typ, fetched, err := s.ociManifestType(r, t)
+	if err != nil {
+		s.refuseChartUnrecorded(w, t, err)
+		return
+	}
+	last := s.ociResolvedTag(ctx, store, t, t.ref)
+	tags := s.ociResolvedByTags(ctx, store, t, last)
+	pm, ok := s.ociGate(w, r, typ, t, tags, last != "", manifest.OCIManifestKey(t.registry, t.repo, t.ref), true)
 	if !ok {
 		return
 	}
+	if !s.ociMemberGate(w, r, t, store) {
+		return
+	}
 	s.serveOCIManifestDigest(w, r, typ, t, pm, "", fetched)
+}
+
+// ociResolvedByTags is every tag bodega resolved to t.ref, last first. last
+// is the allow-list's record, which is all a digest resolved before the
+// per-tag markers existed carries. A listing that fails leaves the markers
+// out, so a pinned profile refuses rather than guesses.
+func (s *Server) ociResolvedByTags(ctx context.Context, store storage.ObjectStore, t ociTarget, last string) []string {
+	var tags []string
+	if last != "" {
+		tags = append(tags, last)
+	}
+	if store == nil {
+		return tags
+	}
+	prefix := manifest.OCIResolvedByPrefix(t.registry, t.repo, t.ref)
+	keys, err := store.List(ctx, prefix)
+	if err != nil {
+		s.logger.Warn("oci tag resolutions not listed; the digest is judged by the last tag alone",
+			"name", t.name(), "digest", t.ref, "error", err)
+		return tags
+	}
+	for _, k := range keys {
+		if tag, ok := manifest.OCIResolvedByTag(prefix, k); ok && tag != last {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+// recordOCIResolvedBy marks t.ref as resolving to digest and, for an index,
+// to each platform manifest it lists, which a client pulling the tag asks
+// for next by digest. It runs on every tag response bodega serves, cache
+// hits and stale answers included, so a digest is judged by the tag a host
+// just pulled whatever another host's pulls did to the cache in between.
+// One key per tag, so no write loses another's and nothing is evicted; a
+// marker already there is not written again.
+func (s *Server) recordOCIResolvedBy(ctx context.Context, store storage.ObjectStore, t ociTarget, digest string, body []byte) {
+	if store == nil {
+		return
+	}
+	// The client may hang up as soon as it has the bytes, and the next
+	// request it makes by digest depends on these writes.
+	ctx = context.WithoutCancel(ctx)
+	for _, d := range append([]string{digest}, ociIndexChildren(body)...) {
+		key := manifest.OCIResolvedByKey(t.registry, t.repo, d, t.ref)
+		if info, err := store.Head(ctx, key); err == nil && info != nil && info.Exists {
+			continue
+		}
+		if err := store.Put(ctx, key, []byte(t.ref)); err != nil {
+			s.logger.Warn("oci tag resolution not recorded; a profile with a version rule refuses this digest until it is",
+				"name", t.name(), "tag", t.ref, "digest", d, "error", err)
+		}
+	}
 }
 
 // refuseUnresolvedDigest answers a digest request a version constraint
@@ -497,6 +584,9 @@ func (s *Server) handleOCIBlob(w *ociResponseWriter, r *http.Request, t ociTarge
 	key := manifest.OCIBlobKey(t.ref)
 	typ, pm, ok := s.ociBlobGate(w, r, t, key)
 	if !ok {
+		return
+	}
+	if !s.ociMemberGate(w, r, t, store) {
 		return
 	}
 	upstream := t.url(ociBlobs + "/" + t.ref)
@@ -622,8 +712,14 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 			fmt.Sprintf("n=%q is not a count of tags; send a whole number, or leave n out for every tag.", r.URL.Query().Get("n")))
 		return
 	}
+	// A repository can hold images and charts at once, and a list names
+	// both, so it is judged as oci, and as helm only where oci refuses it and
+	// helm admits it: a chart bodega read never takes away a list a host was
+	// served before it.
 	typ := manifest.TypeOCI
-	if s.ociRepoHoldsCharts(ctx, t) {
+	listKey := manifest.OCITagListKey(t.registry, t.repo)
+	if s.ociRepoHoldsCharts(ctx, t) && !s.ociListAdmits(r, manifest.TypeOCI, t, listKey) &&
+		s.ociListAdmits(r, manifest.TypeHelm, t, listKey) {
 		typ = manifest.TypeHelm
 	}
 	pm, _ := s.store.GetPackage(ctx, typ, name)
@@ -631,7 +727,9 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 		s.refuseHidden(w, r, typ, name, "")
 		return
 	}
-	if !s.entitleGate(w, r, typ, name, "") {
+	// 404 rather than 403 for a repository the profile excludes: to that
+	// host it does not exist, which is what a client listing tags is told.
+	if !s.entitleGateAnswering(w, r, typ, name, "", http.StatusNotFound) {
 		return
 	}
 	key := manifest.OCITagListKey(t.registry, t.repo)
@@ -652,6 +750,17 @@ func (s *Server) handleOCITagList(w *ociResponseWriter, r *http.Request, t ociTa
 		w.writeError(http.StatusBadGateway, "UNKNOWN",
 			fmt.Sprintf("bodega's copy of the tag list for %s does not parse. Retry once metadata_ttl has passed.", name))
 		return
+	}
+	// Filtered here, on the way out, and never stored: the cache holds the
+	// registry's list, which every other host is served from.
+	if permit := profileVersionFilter(s.profileFor(r), manifest.TypeOCI, name); permit != nil {
+		kept := []string{}
+		for _, tag := range list.Tags {
+			if permit(tag) {
+				kept = append(kept, tag)
+			}
+		}
+		list.Tags = kept
 	}
 	tags, more := page.slice(list.Tags)
 	if more {
@@ -745,10 +854,16 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, typ s
 			return nil, ociTypeChanged(t, typ, got)
 		}
 		mediaType := ociMediaType(ct, body)
+		if typ == manifest.TypeHelm {
+			if err := s.ociRecordChart(ctx, t, t.ref, body); err != nil {
+				return nil, err
+			}
+		}
 		if store != nil {
 			if err := store.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, t.ref), []byte(mediaType)); err != nil {
 				return nil, fmt.Errorf("record the media type of manifest %s for %s: %w", t.ref, t.name(), err)
 			}
+			s.ociInheritVerdicts(ctx, store, t, body)
 		}
 		return &upstreamStream{url: answered, body: io.NopCloser(bytes.NewReader(body)),
 			contentType: mediaType, contentLength: int64(len(body))}, nil
@@ -898,7 +1013,7 @@ func ociNextPage(current, link string) (string, error) {
 // stores them under their digest before the tag's record names it, so a
 // record never points at a manifest bodega does not hold. The record, not the
 // manifest, is what proxyOrResolve caches under the tag.
-func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, fetched *ociFetched) upstreamOpener {
+func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, platform ociPlatform, fetched *ociFetched) upstreamOpener {
 	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
 		f, err := s.ociFetchOnce(ctx, t, rawURL, &fetched)
 		if err != nil {
@@ -910,30 +1025,173 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, fetched *o
 			return nil, ociMismatchSent(t, sent, digest)
 		}
 		mediaType := ociMediaType(ct, body)
-		mstore, err := s.versionStore(ctx, manifest.TypeOCI, t.name(), digest)
-		if err != nil {
-			return nil, fmt.Errorf("the backend recorded for %s@%s is not configured: %w", t.name(), digest, err)
+		// From here on bodega knows the image the tag names, and storing its
+		// manifest and recording its children are what let a digest request
+		// reach it, so the image is marked unsettled before either.
+		if s.auditDB != nil {
+			child := digest
+			if c := ociPickChild(body, platform); c != "" {
+				child = c
+			}
+			if !s.ociImageSettled(ctx, store, t, digest, child) {
+				if err := s.ociMarkJudging(ctx, store, t, digest, child, t.ref); err != nil {
+					return nil, fmt.Errorf("record that bodega is checking tag %s of %s before serving any of it: %w", t.ref, t.name(), err)
+				}
+			}
 		}
-		if err := mstore.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, digest), []byte(mediaType)); err != nil {
-			return nil, fmt.Errorf("record the media type of manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
+		// A chart's blobs are recorded as its own before its manifest is
+		// stored, so no request finds the chart cached with its blobs still
+		// judged as an image's.
+		if ociArtifactType(body) == manifest.TypeHelm {
+			if err := s.ociRecordChart(ctx, t, digest, body); err != nil {
+				return nil, err
+			}
 		}
-		if err := mstore.Put(ctx, manifest.OCIManifestKey(t.registry, t.repo, digest), body); err != nil {
-			return nil, fmt.Errorf("store the manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
+		if err := s.ociStoreManifest(ctx, t, digest, mediaType, body); err != nil {
+			return nil, err
 		}
 		// An index's platform manifests are fetched by digest and never by
 		// tag, so they are recorded as resolved by the tag that named their
 		// index; otherwise a version constraint would refuse every
 		// multi-arch pull at its second request.
-		for _, d := range append([]string{digest}, ociIndexChildren(body)...) {
-			if err := store.Put(ctx, manifest.OCIResolvedKey(t.registry, t.repo, d), []byte(t.ref)); err != nil {
-				s.logger.Warn("oci tag resolution not recorded; a later request by this digest is judged as never resolved",
-					"name", t.name(), "tag", t.ref, "digest", d, "error", err)
-			}
+		s.ociRecordResolved(ctx, store, t, t.ref, append(append([]string{digest}, ociIndexChildren(body)...), ociImageBlobs(body)...))
+		tagDoc := ociTagDoc{Digest: digest, MediaType: mediaType, Size: int64(len(body)), FirstSeen: time.Now().UTC().Format(time.RFC3339)}
+		if prev := s.ociCachedTagDoc(ctx, store, t); prev.Digest == digest && prev.FirstSeen != "" {
+			tagDoc.FirstSeen = prev.FirstSeen
 		}
-		doc, _ := json.Marshal(ociTagDoc{Digest: digest, MediaType: mediaType, Size: int64(len(body))})
+		doc, _ := json.Marshal(tagDoc)
 		return &upstreamStream{url: f.answered, body: io.NopCloser(bytes.NewReader(doc)),
 			contentType: "application/json", contentLength: int64(len(doc))}, nil
 	}
+}
+
+// ociStoreManifest stores a manifest verified against digest, its media type
+// first, so a stored manifest always has one.
+func (s *Server) ociStoreManifest(ctx context.Context, t ociTarget, digest, mediaType string, body []byte) error {
+	mstore, err := s.versionStore(ctx, manifest.TypeOCI, t.name(), digest)
+	if err != nil {
+		return fmt.Errorf("the backend recorded for %s@%s is not configured: %w", t.name(), digest, err)
+	}
+	if err := mstore.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, digest), []byte(mediaType)); err != nil {
+		return fmt.Errorf("record the media type of manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
+	}
+	if err := mstore.Put(ctx, manifest.OCIManifestKey(t.registry, t.repo, digest), body); err != nil {
+		return fmt.Errorf("store the manifest %s for %s:%s: %w", digest, t.name(), t.ref, err)
+	}
+	return nil
+}
+
+// ociCachedTagDoc is the tag's record as the cache holds it, zero when there
+// is none.
+func (s *Server) ociCachedTagDoc(ctx context.Context, store storage.ObjectStore, t ociTarget) ociTagDoc {
+	var doc ociTagDoc
+	if store == nil {
+		return doc
+	}
+	if b, err := store.Get(ctx, manifest.OCITagKey(t.registry, t.repo, t.ref)); err == nil {
+		_ = json.Unmarshal(b, &doc)
+	}
+	return doc
+}
+
+// ociPlatform is the platform a client pulls for.
+type ociPlatform struct{ os, arch string }
+
+// ociPlatformOf reads the platform Docker Engine names in its User-Agent
+// ("... os/linux arch/arm64 ..."). No other client names one on a manifest
+// request, and those get linux/amd64.
+func ociPlatformOf(r *http.Request) ociPlatform {
+	p := ociPlatform{os: "linux", arch: "amd64"}
+	for f := range strings.FieldsSeq(r.Header.Get("User-Agent")) {
+		if v, ok := strings.CutPrefix(f, "os/"); ok && v != "" {
+			p.os = v
+		} else if v, ok := strings.CutPrefix(f, "arch/"); ok && v != "" {
+			p.arch = v
+		}
+	}
+	return p
+}
+
+// ociConfigCreated is an image config's created time in RFC 3339, "" when it
+// has none, does not parse, or is at or before the Unix epoch, which
+// reproducible builds write in place of a build time.
+func ociConfigCreated(cfg []byte) string {
+	var c struct {
+		Created string `json:"created"`
+	}
+	if json.Unmarshal(cfg, &c) != nil || c.Created == "" {
+		return ""
+	}
+	at, err := time.Parse(time.RFC3339Nano, c.Created)
+	if err != nil || !at.After(time.Unix(0, 0)) {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339)
+}
+
+// ociPickChild is the child manifest of an index whose config dates the
+// image, "" for a body that is not an index.
+func ociPickChild(body []byte, platform ociPlatform) string {
+	var idx struct {
+		Manifests []struct {
+			Digest   string `json:"digest"`
+			Platform *struct {
+				OS           string `json:"os"`
+				Architecture string `json:"architecture"`
+			} `json:"platform"`
+		} `json:"manifests"`
+	}
+	if json.Unmarshal(body, &idx) != nil {
+		return ""
+	}
+	first, amd64 := "", ""
+	for _, m := range idx.Manifests {
+		if !manifest.OCIValidDigest(m.Digest) {
+			continue
+		}
+		if first == "" {
+			first = m.Digest
+		}
+		if m.Platform == nil {
+			continue
+		}
+		if m.Platform.OS == platform.os && m.Platform.Architecture == platform.arch {
+			return m.Digest
+		}
+		if amd64 == "" && m.Platform.OS == "linux" && m.Platform.Architecture == "amd64" {
+			amd64 = m.Digest
+		}
+	}
+	if amd64 != "" {
+		return amd64
+	}
+	return first
+}
+
+// ociImageBlobs lists the config and layer digests an image manifest names,
+// and nothing for an index.
+func ociImageBlobs(body []byte) []string {
+	var m struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return nil
+	}
+	var out []string
+	if manifest.OCIValidDigest(m.Config.Digest) {
+		out = append(out, m.Config.Digest)
+	}
+	for _, l := range m.Layers {
+		if manifest.OCIValidDigest(l.Digest) {
+			out = append(out, l.Digest)
+		}
+	}
+	return out
 }
 
 func answeredURL(resp *http.Response, rawURL string) string {

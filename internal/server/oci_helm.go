@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 
@@ -84,38 +86,51 @@ func ociChartBlobs(body []byte) []string {
 
 // ociManifestType is the type a manifest request is judged under, and the
 // manifest when it had to be fetched to say. A manifest bodega holds answers
-// from the store. One it does not is fetched only when the request could be
-// served under either type: oci's own gates admit it, or helm's name it. A
-// repository oci refuses and helm never mentions is judged as oci without a
-// request leaving bodega, which is what keeps refused content off the
-// registry's logs.
+// from the store. One it does not is fetched when ociWorthClassifying says
+// so, and otherwise judged as oci without a request leaving bodega.
 //
 // A fetch that fails is judged as oci. The serve path that follows meets the
 // same failure and answers it as F70 does, and a later fetch that succeeds
-// with a chart is checked against that judgment where it is served.
-func (s *Server) ociManifestType(r *http.Request, t ociTarget) (string, *ociFetched) {
+// with a chart is checked against that judgment where it is served. err is
+// a chart whose blobs could not be recorded as its own, which the caller
+// refuses: those blobs would otherwise be judged as an image's.
+func (s *Server) ociManifestType(r *http.Request, t ociTarget) (string, *ociFetched, error) {
 	ctx := r.Context()
 	if digest, body, ok := s.ociCachedManifest(ctx, t); ok {
 		typ := ociArtifactType(body)
 		if typ == manifest.TypeHelm {
-			s.ociRecordChart(ctx, t, digest, body)
+			if err := s.ociRecordChart(ctx, t, digest, body); err != nil {
+				return typ, nil, err
+			}
 		}
-		return typ, nil
+		return typ, nil, nil
 	}
-	version, resolved := s.ociVersionFor(ctx, t)
-	if !s.ociGatesAdmit(r, manifest.TypeOCI, t, version, resolved, ociManifestRequestKey(t), t.isDigest()) && !s.ociHelmNames(ctx, r, t.name()) {
-		return manifest.TypeOCI, nil
+	tags, resolved := s.ociVersionsFor(ctx, t)
+	key := ociManifestRequestKey(t)
+	if !s.ociWorthClassifying(r, t, tags, resolved, key) {
+		return manifest.TypeOCI, nil, nil
 	}
 	f, err := s.ociFetchManifest(ctx, t, t.url(ociManifests+"/"+t.ref))
 	if err != nil {
 		s.logger.Debug("oci manifest not classified; judging it as oci", "name", t.name(), "ref", t.ref, "error", err)
-		return manifest.TypeOCI, nil
+		return manifest.TypeOCI, nil, nil
 	}
 	typ := ociArtifactType(f.body)
 	if digest := ociDigest(f.body); typ == manifest.TypeHelm && ociFetchMatches(t, f, digest) {
-		s.ociRecordChart(ctx, t, digest, f.body)
+		if err := s.ociRecordChart(ctx, t, digest, f.body); err != nil {
+			return typ, nil, err
+		}
 	}
-	return typ, f
+	return typ, f, nil
+}
+
+// refuseChartUnrecorded answers a chart whose blobs bodega could not record
+// as the chart's, which it refuses rather than let them be judged as an
+// image's.
+func (s *Server) refuseChartUnrecorded(w *ociResponseWriter, t ociTarget, err error) {
+	s.logger.Error("oci chart blobs not recorded; refusing the chart", "name", t.name(), "ref", t.ref, "error", err)
+	w.writeError(http.StatusServiceUnavailable, "UNAVAILABLE",
+		fmt.Sprintf("bodega could not record which blobs chart %s@%s names, so it cannot hold them to the chart's verdict: %v. Retry; if it persists, the storage backend is refusing writes.", t.name(), t.ref, err))
 }
 
 // ociFetchMatches reports whether a fetched manifest is the one the request
@@ -170,37 +185,60 @@ func (s *Server) ociStoredManifest(ctx context.Context, t ociTarget, digest stri
 	return body
 }
 
-// ociVersionFor is the version a manifest request is judged under: the tag
-// it names, or the tag bodega last resolved to the digest it names. resolved
-// is false for a digest no tag ever named, which a version constraint cannot
-// judge.
-func (s *Server) ociVersionFor(ctx context.Context, t ociTarget) (version string, resolved bool) {
+// ociVersionsFor is the versions a manifest request is judged under: the tag
+// it names, or every tag bodega resolved to the digest it names, the last
+// one first. resolved is false for a digest no tag ever named, which a
+// version constraint cannot judge.
+func (s *Server) ociVersionsFor(ctx context.Context, t ociTarget) (tags []string, resolved bool) {
 	if !t.isDigest() {
-		return t.ref, true
+		return []string{t.ref}, true
 	}
-	if tag := s.ociResolvedTag(ctx, t, t.ref); tag != "" {
-		return tag, true
-	}
-	return t.ref, false
+	store := s.typeStore(manifest.TypeOCI)
+	last := s.ociResolvedTag(ctx, store, t, t.ref)
+	return s.ociResolvedByTags(ctx, store, t, last), last != ""
 }
 
 // ociGatesAdmit answers, writing nothing, whether ociGate would admit the
-// request under typ.
-func (s *Server) ociGatesAdmit(r *http.Request, typ string, t ociTarget, version string, resolved bool, key string, immutable bool) bool {
+// request under typ. tags are the versions it may be judged under; the
+// version constraint reads the first, the profile admits any of them.
+func (s *Server) ociGatesAdmit(r *http.Request, typ string, t ociTarget, tags []string, resolved bool, key string, immutable bool) bool {
+	return s.ociEntryAdmits(r, typ, t, tags, resolved) && s.ociAccessAdmits(r, typ, t, tags, key, immutable)
+}
+
+// ociEntryAdmits is the half of ociGatesAdmit that reads the type's own
+// package entry: its hide and its version constraint.
+func (s *Server) ociEntryAdmits(r *http.Request, typ string, t ociTarget, tags []string, resolved bool) bool {
+	version := t.ref
+	if len(tags) > 0 {
+		version = tags[0]
+	}
+	pm, _ := s.store.GetPackage(r.Context(), typ, t.name())
+	if pm == nil {
+		return true
+	}
+	switch {
+	case isPackageHidden(pm):
+		return false
+	case !resolved && ociConstrained(pm):
+		return false
+	case resolved && (isVersionHidden(pm, version) || !ociVersionPermits(pm, typ, version)):
+		return false
+	}
+	return true
+}
+
+// ociAccessAdmits is the other half: the profile and the allow-list, which
+// say whether this host may reach the repository at all.
+func (s *Server) ociAccessAdmits(r *http.Request, typ string, t ociTarget, tags []string, key string, immutable bool) bool {
 	ctx := r.Context()
 	name := t.name()
-	if pm, _ := s.store.GetPackage(ctx, typ, name); pm != nil {
-		switch {
-		case isPackageHidden(pm):
-			return false
-		case !resolved && ociConstrained(pm):
-			return false
-		case resolved && (isVersionHidden(pm, version) || !ociVersionPermits(pm, typ, version)):
+	if p := s.profileFor(r); p != nil {
+		if len(tags) == 0 && !t.isDigest() {
+			tags = []string{t.ref}
+		}
+		if d, _ := p.PermitsOneOf(typ, name, tags); !d.Permitted {
 			return false
 		}
-	}
-	if p := s.profileFor(r); p != nil && !p.Permits(typ, name, version).Permitted {
-		return false
 	}
 	if s.policy == nil {
 		return true
@@ -222,32 +260,92 @@ func (s *Server) ociGatesAdmit(r *http.Request, typ string, t ociTarget, version
 	return false
 }
 
+// ociWorthClassifying reports whether a manifest bodega does not hold is
+// fetched to learn its type. It is when oci admits it, when helm's own
+// configuration names the repository, or when the only thing refusing it is
+// oci's package entry (a hide or a constraint on images) and helm admits it:
+// an entry about images says nothing about a chart. A profile or allow-list
+// that keeps this host from the repository under oci keeps the request off
+// the registry unless helm names it, so refused content stays off the
+// registry's logs.
+func (s *Server) ociWorthClassifying(r *http.Request, t ociTarget, tags []string, resolved bool, key string) bool {
+	immutable := t.isDigest()
+	ociAccess := s.ociAccessAdmits(r, manifest.TypeOCI, t, tags, key, immutable)
+	switch {
+	case ociAccess && s.ociEntryAdmits(r, manifest.TypeOCI, t, tags, resolved):
+		return true
+	case s.ociHelmNames(r.Context(), r, t.name()):
+		return true
+	case ociAccess:
+		return s.ociGatesAdmit(r, manifest.TypeHelm, t, tags, resolved, key, immutable)
+	}
+	return false
+}
+
 // ociGate runs the gates F70 runs on a manifest under typ, in its order:
 // hiding, the version constraint, the profile, then the allow-list. A digest
 // no tag resolved is refused under a version constraint, which has nothing
 // to compare it with. It answers every refusal itself.
-func (s *Server) ociGate(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, version string, resolved bool, key string, immutable bool) (*manifest.PackageManifest, bool) {
+func (s *Server) ociGate(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, tags []string, resolved bool, key string, immutable bool) (*manifest.PackageManifest, bool) {
+	g, ok := s.ociGateFull(w, r, typ, t, tags, resolved, key, immutable)
+	return g.pm, ok
+}
+
+// ociGated is what ociGateFull read on the way through, which a tag's
+// per-version checks record their admission row against.
+type ociGated struct {
+	pm       *manifest.PackageManifest
+	decision string
+	baseline baselineLookup
+	override overrideLookup
+}
+
+// ociGateFull is ociGate. tags are the versions the request may be judged
+// under, the last one bodega resolved first: the version constraint reads
+// that one, and the profile admits any of them, so a second tag resolving to
+// a digest never displaces the one a profile permits.
+func (s *Server) ociGateFull(w http.ResponseWriter, r *http.Request, typ string, t ociTarget, tags []string, resolved bool, key string, immutable bool) (ociGated, bool) {
+	ctx := r.Context()
 	name := t.name()
-	pm, _ := s.store.GetPackage(r.Context(), typ, name)
-	if pm != nil {
+	version := t.ref
+	if len(tags) > 0 {
+		version = tags[0]
+	}
+	var g ociGated
+	g.pm, _ = s.store.GetPackage(ctx, typ, name)
+	if pm := g.pm; pm != nil {
 		if isPackageHidden(pm) {
 			s.refuseHidden(w, r, typ, name, "")
-			return pm, false
+			return g, false
 		}
 		if resolved {
 			if !s.ociJudgeVersion(w, r, typ, pm, name, version) {
-				return pm, false
+				return g, false
 			}
 		} else if ociConstrained(pm) {
 			vc, baseVer := packageVersionConstraint(pm)
 			s.refuseUnresolvedDigest(w, r, typ, name, t.ref, baseVer, vc)
-			return pm, false
+			return g, false
 		}
 	}
-	if !s.entitleGate(w, r, typ, name, version) {
-		return pm, false
+	// A digest is never compared with a pin itself: only the tags resolved
+	// to it are.
+	if p := s.profileFor(r); p != nil && t.isDigest() {
+		d, tag := p.PermitsOneOf(typ, name, tags)
+		if tag == "" {
+			tag = t.ref
+		}
+		if !s.entitleGateDecided(w, r, p, typ, name, tag, d, http.StatusForbidden) {
+			return g, false
+		}
+	} else if !s.entitleGate(w, r, typ, name, version) {
+		return g, false
 	}
-	return pm, s.ociAllowListGate(w, r, typ, t, key, immutable)
+	g.baseline = s.baselineLookup(ctx, typ, name, key, immutable)
+	g.override = s.allowListOverrideLookup(ctx, typ, name, key, immutable)
+	var ok bool
+	g.decision, ok = s.ociAllowListVerdict(w, r, typ, t, key, immutable, g.baseline, g.override)
+	return g, ok
 }
 
 // ociHelmNames reports whether helm's configuration names the identity
@@ -275,29 +373,36 @@ func (s *Server) ociHelmNames(ctx context.Context, r *http.Request, name string)
 // ociRecordChart records each blob a chart manifest names, under the tag the
 // request reached it by. A request by digest records the tag bodega resolved
 // to it, and an unresolved digest records none, never erasing a tag an
-// earlier request wrote. A record that fails to write leaves the blob unowned,
-// which judges it as oci; the failure is logged for that reason.
-func (s *Server) ociRecordChart(ctx context.Context, t ociTarget, digest string, body []byte) {
+// earlier request wrote. Every write is attempted and any failure is
+// returned: an unrecorded blob is judged as an image's, so the caller refuses
+// the chart rather than let its blobs pass under the wrong type.
+func (s *Server) ociRecordChart(ctx context.Context, t ociTarget, digest string, body []byte) error {
 	store := s.typeStore(manifest.TypeOCI)
 	if store == nil {
-		return
+		return nil
 	}
 	tag := ""
 	if !t.isDigest() {
 		tag = t.ref
 	} else {
-		tag = s.ociResolvedTag(ctx, t, digest)
+		tag = s.ociResolvedTag(ctx, store, t, digest)
 	}
+	var errs []error
 	for _, blob := range ociChartBlobs(body) {
 		key := manifest.OCIChartBlobKey(t.registry, t.repo, blob, digest)
 		old, err := store.Get(ctx, key)
-		if err == nil && old != nil && (tag == "" || string(old) == tag) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read the chart record of blob %s: %w", blob, err))
+			continue
+		}
+		if old != nil && (tag == "" || string(old) == tag) {
 			continue
 		}
 		if err := store.Put(ctx, key, []byte(tag)); err != nil {
-			s.logger.Warn("oci chart blob not recorded; a request for it is judged as oci", "name", t.name(), "blob", blob, "manifest", digest, "error", err)
+			errs = append(errs, fmt.Errorf("record blob %s as chart %s's: %w", blob, digest, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // ociChartOwner is one chart manifest that names a blob.
@@ -368,26 +473,53 @@ func (s *Server) ociBlobGate(w http.ResponseWriter, r *http.Request, t ociTarget
 	}
 	chosen := owners[0]
 	for _, o := range owners {
-		if version, resolved := s.ociOwnerVersion(ctx, t, o); s.ociGatesAdmit(r, manifest.TypeHelm, t, version, resolved, key, true) {
+		if tags, resolved := s.ociOwnerVersions(ctx, t, o); s.ociGatesAdmit(r, manifest.TypeHelm, ociByChart(t, o), tags, resolved, key, true) {
 			chosen = o
 			break
 		}
 	}
-	version, resolved := s.ociOwnerVersion(ctx, t, chosen)
-	byChart := t
-	byChart.ref = chosen.digest
-	pm, ok := s.ociGate(w, r, manifest.TypeHelm, byChart, version, resolved, key, true)
+	tags, resolved := s.ociOwnerVersions(ctx, t, chosen)
+	pm, ok := s.ociGate(w, r, manifest.TypeHelm, ociByChart(t, chosen), tags, resolved, key, true)
 	return manifest.TypeHelm, pm, ok
 }
 
-func (s *Server) ociOwnerVersion(ctx context.Context, t ociTarget, o ociChartOwner) (string, bool) {
-	if o.tag != "" {
-		return o.tag, true
+// ociByChart is the request t judged as one by the digest of chart o.
+func ociByChart(t ociTarget, o ociChartOwner) ociTarget {
+	byChart := t
+	byChart.ref = o.digest
+	return byChart
+}
+
+// ociOwnerVersions is every tag a chart was reached by: the one its blob
+// record names and every tag bodega resolved to its digest.
+func (s *Server) ociOwnerVersions(ctx context.Context, t ociTarget, o ociChartOwner) ([]string, bool) {
+	store := s.typeStore(manifest.TypeOCI)
+	byChart := ociByChart(t, o)
+	last := s.ociResolvedTag(ctx, store, byChart, o.digest)
+	tags := s.ociResolvedByTags(ctx, store, byChart, last)
+	if o.tag != "" && !slices.Contains(tags, o.tag) {
+		tags = append(tags, o.tag)
 	}
-	if tag := s.ociResolvedTag(ctx, t, o.digest); tag != "" {
-		return tag, true
+	return tags, len(tags) > 0
+}
+
+// ociListAdmits answers, writing nothing, whether a tag list's gates (the
+// package hide, the profile's membership and the allow-list) admit the
+// repository under typ. A list names no version, so no constraint applies.
+func (s *Server) ociListAdmits(r *http.Request, typ string, t ociTarget, key string) bool {
+	ctx := r.Context()
+	name := t.name()
+	if pm, _ := s.store.GetPackage(ctx, typ, name); pm != nil && isPackageHidden(pm) {
+		return false
 	}
-	return o.digest, false
+	if p := s.profileFor(r); p != nil && !p.Covers(typ, name).Permitted {
+		return false
+	}
+	if s.policy == nil {
+		return true
+	}
+	_, violation, err := s.upstreamPolicyVerdict(ctx, typ, name)
+	return err == nil && !violation
 }
 
 // ociRepoHoldsCharts reports whether bodega recorded a chart in the
@@ -409,17 +541,4 @@ func ociTypeChanged(t ociTarget, judged, got string) error {
 	f.reason = fmt.Sprintf("bodega judged %s@%s as %s and registry %s then served it as %s, so bodega served nothing under a verdict it did not reach.", t.name(), t.ref, judged, t.registry, got)
 	f.next = "retry; the next request judges the manifest as what the registry now serves."
 	return &resolveRefusal{f: f}
-}
-
-// ociResolvedTag is the tag bodega last resolved to digest in the
-// repository t names, "" when it never resolved one.
-func (s *Server) ociResolvedTag(ctx context.Context, t ociTarget, digest string) string {
-	store := s.typeStore(manifest.TypeOCI)
-	if store == nil {
-		return ""
-	}
-	if b, err := store.Get(ctx, manifest.OCIResolvedKey(t.registry, t.repo, digest)); err == nil {
-		return string(b)
-	}
-	return ""
 }

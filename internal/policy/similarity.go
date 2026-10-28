@@ -31,7 +31,27 @@ var popularFS embed.FS
 // the ones whose packages are named by whoever publishes them, on a registry
 // anyone can publish to.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypePypi, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRubygems}
+}
+
+// SimilarityName is the part of a package name the check compares. An oci
+// name is <registry>/<repository>, and the comparison takes the repository's
+// last two path segments: library/nginx for docker.io/library/nginx. The
+// registry is left out because the same squat works at every one of them, and
+// the segments above the last two are a group's own layout, which a reader
+// skims. Every other type is compared whole.
+func SimilarityName(typ, name string) string {
+	if typ != manifest.TypeOCI {
+		return name
+	}
+	segs := strings.Split(strings.TrimSpace(name), "/")
+	if len(segs) > 1 {
+		segs = segs[1:]
+	}
+	if len(segs) > 2 {
+		segs = segs[len(segs)-2:]
+	}
+	return strings.Join(segs, "/")
 }
 
 // NormalizeName is the form two names are compared in. pypi applies PEP 503,
@@ -474,14 +494,14 @@ func LoadPopularNames(ctx context.Context, store SimilarityStore, ecosystem stri
 
 // ExactRule reports whether an allow-list rule names one package rather than
 // a family of them. pypi, cargo and rubygems rules are always exact; an npm rule is
-// unless it is the `@scope/*` wildcard, and a maven rule unless it is the
-// `<groupId>:*` one. Every other kind is a host or a
+// unless it is the `@scope/*` wildcard, an oci rule unless it is a `/*`
+// prefix, and a maven rule unless it is the `<groupId>:*` one. Every other kind is a host or a
 // prefix, which names no package at all.
 func ExactRule(typ, pattern string) bool {
 	switch typ {
 	case manifest.TypePypi, manifest.TypeCargo, manifest.TypeRubygems, manifest.TypeComposer:
 		return true
-	case manifest.TypeNpm:
+	case manifest.TypeNpm, manifest.TypeOCI:
 		return !strings.HasSuffix(pattern, "/*")
 	case manifest.TypeMaven:
 		return !strings.HasSuffix(pattern, ":"+manifest.MavenGroupWildcard)
@@ -571,11 +591,12 @@ func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Res
 		r.Action, r.Reason = ActionNotEvaluated, "no popular-name list for "+typ
 		return r
 	}
-	if list.Contains(name) {
+	compared := SimilarityName(typ, name)
+	if list.Contains(compared) {
 		r.Reason = name + " is itself on the popular " + typ + " list (" + list.Label() + ")"
 		return r
 	}
-	popular, distance, near := list.Near(name)
+	popular, distance, near := list.Near(compared)
 	if !near {
 		r.Reason = fmt.Sprintf("no popular %s name within distance %d (%s)", typ, MaxSimilarityDistance, list.Label())
 		return r
@@ -646,7 +667,7 @@ func NearPopularName(ctx context.Context, store SimilarityStore, typ, name strin
 	if err != nil || !has {
 		return "", 0, false, err
 	}
-	popular, distance, ok = list.Near(name)
+	popular, distance, ok = list.Near(SimilarityName(typ, name))
 	return popular, distance, ok, nil
 }
 
