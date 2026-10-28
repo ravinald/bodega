@@ -1,0 +1,420 @@
+# Docker Hub official images by pull count, then hand-picked ghcr.io and quay.io
+# repositories, each as the last two segments of its repository path.
+# source: https://hub.docker.com/v2/repositories/library/?page_size=100&ordering=pull_count and &ordering=-pull_count for the Docker Hub entries; the ghcr.io and quay.io entries are hand-picked, and each group cites the registry page its publisher lists it on
+# n: 291
+# date: 2026-10-27
+#
+# Neither ghcr.io nor quay.io publishes pull counts, so no ranking of them
+# exists to take a top-N from. The entries below are images the projects
+# behind them publish there, picked because Kubernetes add-on and
+# self-hosting install guides name them as the image to pull. A name here
+# is only a target name similarity compares against; it admits nothing.
+library/nginx
+library/memcached
+library/busybox
+library/alpine
+library/postgres
+library/redis
+library/ubuntu
+library/python
+library/node
+library/mysql
+library/mongo
+library/httpd
+library/rabbitmq
+library/docker
+library/traefik
+library/hello-world
+library/mariadb
+library/golang
+library/openjdk
+library/registry
+library/debian
+library/ruby
+library/wordpress
+library/php
+library/sonarqube
+library/centos
+library/haproxy
+library/influxdb
+library/consul
+library/nextcloud
+library/amazonlinux
+library/elasticsearch
+library/tomcat
+library/maven
+library/caddy
+library/eclipse-mosquitto
+library/telegraf
+library/bash
+library/vault
+library/adminer
+library/ghost
+library/eclipse-temurin
+library/kong
+library/zookeeper
+library/solr
+library/neo4j
+library/gradle
+library/mongo-express
+library/cassandra
+library/buildpack-deps
+library/nats
+library/perl
+library/composer
+library/percona
+library/kibana
+library/drupal
+library/couchdb
+library/logstash
+library/rust
+library/amazoncorretto
+library/chronograf
+library/jenkins
+library/java
+library/matomo
+library/fedora
+library/teamspeak
+library/sentry
+library/nats-streaming
+library/adoptopenjdk
+library/flink
+library/phpmyadmin
+library/couchbase
+library/joomla
+library/swarm
+library/groovy
+library/rethinkdb
+library/rocket.chat
+library/redmine
+library/elixir
+library/erlang
+library/kapacitor
+library/owncloud
+library/odoo
+library/jruby
+library/mediawiki
+library/jetty
+library/oraclelinux
+library/rockylinux
+library/mono
+library/clojure
+library/arangodb
+library/pypy
+library/swift
+library/ros
+library/archlinux
+library/xwiki
+library/gcc
+library/znc
+library/hylang
+library/tomee
+library/websphere-liberty
+library/haxe
+library/sapmachine
+library/yourls
+library/django
+library/varnish
+library/piwik
+library/crate
+library/aerospike
+library/photon
+library/almalinux
+library/iojs
+library/julia
+library/orientdb
+library/bonita
+library/monica
+library/open-liberty
+library/ibm-semeru-runtimes
+library/fluentd
+library/ibmjava
+library/r-base
+library/neurodebian
+library/opensuse
+library/storm
+library/rails
+library/ubuntu-debootstrap
+library/irssi
+library/haskell
+library/plone
+library/backdrop
+library/clickhouse
+library/lightstreamer
+library/geonetwork
+library/cirros
+library/clearlinux
+library/notary
+library/friendica
+library/convertigo
+library/postfixadmin
+library/nuxeo
+library/emqx
+library/hello-seattle
+library/php-zendserver
+library/dart
+library/gazebo
+library/celery
+library/spiped
+library/swipl
+library/kaazing-gateway
+library/thrift
+library/fsharp
+library/eggdrop
+library/rapidoid
+library/docker-dev
+library/rakudo-star
+library/express-gateway
+library/silverpeas
+library/spark
+library/known
+library/ubuntu-upstart
+library/mageia
+library/hola-mundo
+library/liquibase
+library/glassfish
+library/unit
+library/crux
+library/alt
+library/clefos
+library/krakend
+library/jobber
+library/euleros
+library/sourcemage
+library/sl
+library/satosa
+library/hitch
+library/hipache
+library/scratch
+library/azul-zulu
+library/api-firewall
+library/nim
+library/espocrm
+
+# ghcr.io, listed at https://github.com/home-assistant?tab=packages
+home-assistant/home-assistant
+
+# ghcr.io, listed at https://github.com/linuxserver?tab=packages
+linuxserver/plex
+linuxserver/sonarr
+linuxserver/radarr
+linuxserver/jellyfin
+linuxserver/qbittorrent
+linuxserver/prowlarr
+linuxserver/bazarr
+linuxserver/lidarr
+linuxserver/readarr
+linuxserver/sabnzbd
+linuxserver/jackett
+linuxserver/tautulli
+linuxserver/overseerr
+linuxserver/nextcloud
+linuxserver/swag
+linuxserver/code-server
+linuxserver/transmission
+linuxserver/heimdall
+linuxserver/syncthing
+linuxserver/wireguard
+linuxserver/duplicati
+linuxserver/mariadb
+
+# ghcr.io, listed at https://github.com/immich-app?tab=packages
+immich-app/immich-server
+immich-app/immich-machine-learning
+
+# ghcr.io, listed at https://github.com/netbox-community?tab=packages
+netbox-community/netbox
+
+# ghcr.io, listed at https://github.com/paperless-ngx?tab=packages
+paperless-ngx/paperless-ngx
+
+# ghcr.io, listed at https://github.com/goauthentik?tab=packages
+goauthentik/server
+
+# ghcr.io, listed at https://github.com/open-webui?tab=packages
+open-webui/open-webui
+
+# ghcr.io, listed at https://github.com/actions?tab=packages
+actions/actions-runner
+actions/gha-runner-scale-set-controller
+
+# ghcr.io, listed at https://github.com/external-secrets?tab=packages
+external-secrets/external-secrets
+
+# ghcr.io, listed at https://github.com/fluxcd?tab=packages
+fluxcd/source-controller
+fluxcd/kustomize-controller
+fluxcd/helm-controller
+fluxcd/notification-controller
+
+# ghcr.io, listed at https://github.com/dexidp?tab=packages
+dexidp/dex
+
+# ghcr.io, listed at https://github.com/aquasecurity?tab=packages
+aquasecurity/trivy
+
+# ghcr.io, listed at https://github.com/gethomepage?tab=packages
+gethomepage/homepage
+
+# ghcr.io, listed at https://github.com/dani-garcia?tab=packages
+dani-garcia/vaultwarden
+
+# ghcr.io, listed at https://github.com/zwave-js?tab=packages
+zwave-js/zwave-js-ui
+
+# ghcr.io, listed at https://github.com/esphome?tab=packages
+esphome/esphome
+
+# ghcr.io, listed at https://github.com/mealie-recipes?tab=packages
+mealie-recipes/mealie
+
+# ghcr.io, listed at https://github.com/advplyr?tab=packages
+advplyr/audiobookshelf
+
+# ghcr.io, listed at https://github.com/cloudnative-pg?tab=packages
+cloudnative-pg/cloudnative-pg
+cloudnative-pg/postgresql
+
+# ghcr.io, listed at https://github.com/kube-vip?tab=packages
+kube-vip/kube-vip
+
+# ghcr.io, listed at https://github.com/siderolabs?tab=packages
+siderolabs/installer
+
+# ghcr.io under open-telemetry/opentelemetry-collector-releases, listed at https://github.com/open-telemetry?tab=packages
+opentelemetry-collector-releases/opentelemetry-collector
+opentelemetry-collector-releases/opentelemetry-collector-contrib
+
+# ghcr.io, listed at https://github.com/coder?tab=packages
+coder/coder
+
+# ghcr.io, listed at https://github.com/renovatebot?tab=packages
+renovatebot/renovate
+
+# ghcr.io, listed at https://github.com/super-linter?tab=packages
+super-linter/super-linter
+
+# ghcr.io, listed at https://github.com/stakater?tab=packages
+stakater/reloader
+
+# ghcr.io, listed at https://github.com/tailscale?tab=packages
+tailscale/tailscale
+
+# ghcr.io, listed at https://github.com/linkerd?tab=packages
+linkerd/proxy
+linkerd/controller
+
+# ghcr.io, listed at https://github.com/kyverno?tab=packages
+kyverno/kyverno
+
+# ghcr.io, listed at https://github.com/headlamp-k8s?tab=packages
+headlamp-k8s/headlamp
+
+# ghcr.io, listed at https://github.com/mastodon?tab=packages
+mastodon/mastodon
+
+# quay.io, listed at https://quay.io/repository/prometheus/<name> for each name below
+prometheus/prometheus
+prometheus/alertmanager
+prometheus/node-exporter
+prometheus/blackbox-exporter
+prometheus/pushgateway
+
+# quay.io, listed at https://quay.io/repository/prometheus-operator/<name> for each name below
+prometheus-operator/prometheus-operator
+prometheus-operator/prometheus-config-reloader
+
+# quay.io, listed at https://quay.io/repository/jetstack/<name> for each name below
+jetstack/cert-manager-controller
+jetstack/cert-manager-webhook
+jetstack/cert-manager-cainjector
+jetstack/cert-manager-acmesolver
+jetstack/cert-manager-startupapicheck
+
+# quay.io, listed at https://quay.io/repository/cilium/<name> for each name below
+cilium/cilium
+cilium/operator-generic
+cilium/hubble-relay
+cilium/hubble-ui
+
+# quay.io, listed at https://quay.io/repository/calico/<name> for each name below
+calico/node
+calico/cni
+calico/kube-controllers
+calico/typha
+
+# quay.io, listed at https://quay.io/repository/tigera/<name> for each name below
+tigera/operator
+
+# quay.io, listed at https://quay.io/repository/coreos/<name> for each name below
+coreos/etcd
+
+# quay.io, listed at https://quay.io/repository/argoproj/<name> for each name below
+argoproj/argocd
+argoproj/argo-rollouts
+argoproj/workflow-controller
+argoproj/argocli
+argoproj/argoexec
+
+# quay.io, listed at https://quay.io/repository/keycloak/<name> for each name below
+keycloak/keycloak
+
+# quay.io, listed at https://quay.io/repository/minio/<name> for each name below
+minio/minio
+minio/mc
+
+# quay.io, listed at https://quay.io/repository/strimzi/<name> for each name below
+strimzi/kafka
+strimzi/operator
+
+# quay.io, listed at https://quay.io/repository/thanos/<name> for each name below
+thanos/thanos
+
+# quay.io, listed at https://quay.io/repository/brancz/<name> for each name below
+brancz/kube-rbac-proxy
+
+# quay.io, listed at https://quay.io/repository/kiwigrid/<name> for each name below
+kiwigrid/k8s-sidecar
+
+# quay.io, listed at https://quay.io/repository/oauth2-proxy/<name> for each name below
+oauth2-proxy/oauth2-proxy
+
+# quay.io, listed at https://quay.io/repository/frrouting/<name> for each name below
+frrouting/frr
+
+# quay.io, listed at https://quay.io/repository/metallb/<name> for each name below
+metallb/controller
+metallb/speaker
+
+# quay.io, listed at https://quay.io/repository/ceph/<name> for each name below
+ceph/ceph
+
+# quay.io, listed at https://quay.io/repository/cephcsi/<name> for each name below
+cephcsi/cephcsi
+
+# quay.io, listed at https://quay.io/repository/podman/<name> for each name below
+podman/stable
+
+# quay.io, listed at https://quay.io/repository/buildah/<name> for each name below
+buildah/stable
+
+# quay.io, listed at https://quay.io/repository/skopeo/<name> for each name below
+skopeo/stable
+
+# quay.io, listed at https://quay.io/repository/containers/<name> for each name below
+containers/podman
+
+# quay.io, listed at https://quay.io/repository/fedora/<name> for each name below
+fedora/fedora
+
+# quay.io, listed at https://quay.io/repository/centos/<name> for each name below
+centos/centos
+
+# quay.io, listed at https://quay.io/repository/kubevirt/<name> for each name below
+kubevirt/virt-operator
+
+# quay.io, listed at https://quay.io/repository/netboxcommunity/<name> for each name below
+netboxcommunity/netbox
+
+# quay.io, listed at https://quay.io/repository/operator-framework/<name> for each name below
+operator-framework/olm

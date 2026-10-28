@@ -83,6 +83,7 @@ type ociRegistry struct {
 	blobs     map[string][]byte
 	tagLists  map[string]string
 	tamper    map[string][]byte // path > body served in place of the real one
+	failOnce  map[string]bool   // path > answered 503 the next time it is asked for
 	sawBasic  bool
 	hang      chan struct{}
 	resume    chan struct{}
@@ -91,7 +92,7 @@ type ociRegistry struct {
 func newOCIRegistry(t *testing.T, tokens *ociTokenHost) *ociRegistry {
 	t.Helper()
 	g := &ociRegistry{tokens: tokens, hits: map[string]int{}, manifests: map[string]ociObject{},
-		blobs: map[string][]byte{}, tagLists: map[string]string{}, tamper: map[string][]byte{},
+		blobs: map[string][]byte{}, tagLists: map[string]string{}, tamper: map[string][]byte{}, failOnce: map[string]bool{},
 		hang: make(chan struct{}), resume: make(chan struct{})}
 	g.ts = httptest.NewServer(http.HandlerFunc(g.serve))
 	t.Cleanup(func() {
@@ -128,6 +129,12 @@ func (g *ociRegistry) serve(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	g.hits[r.URL.Path]++
 	tampered, isTampered := g.tamper[r.URL.Path]
+	if g.failOnce[r.URL.Path] {
+		delete(g.failOnce, r.URL.Path)
+		g.mu.Unlock()
+		http.Error(w, "outage", http.StatusServiceUnavailable)
+		return
+	}
 	var obj ociObject
 	var ok bool
 	switch kind {
@@ -203,11 +210,19 @@ type ociImage struct {
 	arm64Layer, arm64ConfigBytes []byte
 }
 
-func newOCIImage() ociImage {
+func newOCIImage() ociImage { return newOCIImageCreated("") }
+
+// newOCIImageCreated is newOCIImage with created in each config, or no
+// created field when it is empty. The layers differ by created too, so two
+// images share no blob.
+func newOCIImageCreated(created string) ociImage {
 	var im ociImage
 	platformManifest := func(arch string) (m, cfg, layer []byte) {
 		cfg = []byte(`{"architecture":"` + arch + `","os":"linux"}`)
-		layer = []byte("layer bytes for " + arch + " 0123456789")
+		if created != "" {
+			cfg = []byte(`{"architecture":"` + arch + `","created":"` + created + `","os":"linux"}`)
+		}
+		layer = []byte("layer bytes for " + arch + " 0123456789" + created)
 		m, _ = json.Marshal(map[string]any{
 			"schemaVersion": 2, "mediaType": mediaOCIManifest,
 			"config": map[string]any{"mediaType": "application/vnd.oci.image.config.v1+json", "digest": ociDigest(cfg), "size": len(cfg)},
@@ -633,7 +648,7 @@ func TestOCIRangeOnAForwardOnlyCachedBlob(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+d, nil)
 		r.Header.Set("Range", rangeHeader)
 		rec := httptest.NewRecorder()
-		s.serveOCIBlobHit(rec, r, forwardOnlyStore{store}, key,
+		s.serveOCIBlobHit(rec, r, forwardOnlyStore{store}, key, manifest.TypeOCI,
 			ociTarget{registry: "docker.io", repo: "library/nginx", ref: d}, f.hub.ts.URL)
 		return rec
 	}
@@ -695,7 +710,7 @@ func TestOCIMultiRangeOnASeekableCachedBlob(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+d, nil)
 	r.Header.Set("Range", "bytes=10-13,0-3")
 	rec := httptest.NewRecorder()
-	s.serveOCIBlobHit(rec, r, seekingStore{store}, key,
+	s.serveOCIBlobHit(rec, r, seekingStore{store}, key, manifest.TypeOCI,
 		ociTarget{registry: "docker.io", repo: "library/nginx", ref: d}, f.hub.ts.URL)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("multi-range: %d %s, want 206", rec.Code, rec.Body.String())
@@ -864,7 +879,9 @@ func TestOCIRefusedWhenHidden(t *testing.T) {
 	addVersion(t, s, manifest.TypeOCI, "docker.io/example-corp/web", manifest.VersionEntry{Version: "2.0", Mode: manifest.ModeProxy, Hidden: true})
 	rec = doRequest(s, http.MethodGet, "/v2/example-corp/web/blobs/"+f.image.amd64LayerD, nil)
 	assertOCIError(t, rec, http.StatusNotFound, "BLOB_UNKNOWN", "docker.io/example-corp/web")
-	if n := f.hub.total(); n != 0 {
+	// The hidden tag's manifest is read once to learn whether it is a chart,
+	// which an entry about images does not judge; nothing else is fetched.
+	if n := f.hub.total() - f.hub.hitsFor("/v2/library/nginx/manifests/1.27"); n != 0 {
 		t.Errorf("registry contacted %d times for hidden content", n)
 	}
 }
@@ -888,7 +905,9 @@ func TestOCIRefusedByAVersionConstraint(t *testing.T) {
 	rec = doRequest(s, http.MethodGet, "/v2/library/nginx/manifests/"+im.strayDigest, nil)
 	assertOCIError(t, rec, http.StatusForbidden, "DENIED", "no tag it resolved")
 	refusalIncident(t, rec.Header(), checkConstraint)
-	if n := f.hub.total(); n != 0 {
+	// Each refused manifest is read once to learn whether it is a chart,
+	// which a constraint on images does not judge; nothing else is fetched.
+	if n := f.hub.total() - f.hub.hitsFor("/v2/library/nginx/manifests/1.28") - f.hub.hitsFor("/v2/library/nginx/manifests/"+im.strayDigest); n != 0 {
 		t.Errorf("registry contacted %d times for refused versions", n)
 	}
 

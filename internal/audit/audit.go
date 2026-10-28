@@ -169,6 +169,7 @@ const (
 	DenialDistfileClient    = "distfile_client"    // the client did not measure the environment distfiles are admitted in
 	DenialWithheldVersion   = "withheld_version"   // an artifact whose version the index filter withholds, requested directly
 	DenialHidden            = "hidden"             // package or version an operator hid; answered 404
+	DenialTagRefused        = "tag_refused"        // an oci blob or manifest by digest whose tag the per-version checks refused
 
 	// Refusals by the host profile bound to the requesting identity. Two
 	// values rather than one, because the operator's repair is opposite in

@@ -207,6 +207,10 @@ type Server struct {
 	// requests from one `pkg update` produce one build rather than three.
 	freeBSDBuild keyedMutex
 
+	// ociMembers serializes the read-modify-write of one repository's oci
+	// member records; see oci_verdict.go.
+	ociMembers keyedMutex
+
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
