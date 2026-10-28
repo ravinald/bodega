@@ -273,9 +273,10 @@ func TestOCIApplyTwiceChangesNothing(t *testing.T) {
 	}
 }
 
-// F99 R3: the config_path edit is planned only where containerd would read
-// it: an import whose CRI table supersedes the main file's, or one that
-// fails to load, refuses the change rather than present it as effective.
+// F99 R3, R4: the config_path edit is planned only where containerd would
+// read it: an import whose CRI table supersedes the main file's, one that
+// fails to load, or a versionless one containerd 2.x migrates into the CRI
+// plugin's table refuses the change rather than present it as effective.
 func TestNewChangeRefusesAContainerdEditAnImportSupersedes(t *testing.T) {
 	f := ContainerdConfig("https://bodega.internal")
 	sum := sha256.Sum256([]byte(f.Content))
@@ -290,6 +291,10 @@ func TestNewChangeRefusesAContainerdEditAnImportSupersedes(t *testing.T) {
 		{"import carries the table without config_path", cri + "max_concurrent_downloads = 3\n", "doctor cannot tell"},
 		{"import names certs.d", cri + "config_path = \"/srv/a:/etc/containerd/certs.d\"\n", ""},
 		{"import of another plugin", "version = 2\n[plugins.\"io.containerd.grpc.v1.other\"]\nx = 1\n", ""},
+		{"versionless import names the short CRI id", "[plugins.cri.registry]\nconfig_path = \"/srv/direct\"\n", "it sets no version and holds [plugins.cri]"},
+		{"versionless import names a version 3 table", "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/srv/direct\"\n", "holds [plugins.\"io.containerd.cri.v1.images\"]"},
+		{"versionless import in the main file's own names", cri[len("version = 2\n"):] + "config_path = \"/srv/direct\"\n", "sets config_path = \"/srv/direct\""},
+		{"versionless import of another plugin", "[plugins.cgroups]\nno_prometheus = true\n", ""},
 		{"no import matches the glob", "", ""},
 	}
 	for _, c := range cases {

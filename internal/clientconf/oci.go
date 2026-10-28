@@ -357,8 +357,9 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 
 // readContainerdConfig reads data as format version, or as the version it
 // declares when version is 0. An imported file is read in its parent's
-// format: one declaring another is refused, since containerd 2.x migrates
-// each file on its own and doctor does not follow that.
+// format: one declaring another, or one declaring none that names another
+// format's CRI plugin, is refused, since containerd 2.x migrates each file
+// on its own and doctor does not follow that.
 func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) {
 	var doc map[string]any
 	if _, err := toml.Decode(string(data), &doc); err != nil {
@@ -381,6 +382,24 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	path, ok := containerdRegistryTable[r.Version]
 	if !ok {
 		return r, fmt.Errorf("it declares version = %d, a config.toml format this release does not know", r.Version)
+	}
+	// containerd 2.x migrates an import with no version from version 1 up to
+	// the main file's before merging it, so [plugins.cri] there becomes the
+	// CRI plugin's table. Reading the file in its parent's format would miss
+	// it, so a versionless import naming any other format's CRI plugin is
+	// refused rather than judged as something containerd does not load.
+	if _, declared := doc["version"]; version > 1 && !declared {
+		key := func(name string) string {
+			if strings.Contains(name, ".") {
+				return jsonString(name)
+			}
+			return name
+		}
+		for v := 1; v <= len(containerdRegistryTable); v++ {
+			if other := containerdRegistryTable[v]; v != r.Version && tomlTable(doc, other[:2]) != nil {
+				return r, fmt.Errorf("it sets no version and holds [plugins.%s], which containerd 2.x migrates into the CRI plugin's table under a version = %d config.toml; doctor does not follow that migration. Add version = %d to it and rename the table to [plugins.%s]", key(other[1]), version, version, key(path[1]))
+			}
+		}
 	}
 	switch v := doc["imports"].(type) {
 	case nil:

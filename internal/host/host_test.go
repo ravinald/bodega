@@ -759,6 +759,14 @@ func TestCheckOCIContainerdResolvesImports(t *testing.T) {
 			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
 			"/etc/containerd/conf.d/runtime.toml": "version = 3\n",
 		}, StatusSkip, "does not judge", ""},
+		{"versionless import names the short CRI id", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": "[plugins.cri.registry]\nconfig_path = \"/srv/direct\"\n",
+		}, StatusSkip, "conf.d/runtime.toml cannot be judged: it sets no version and holds [plugins.cri]", "repair or remove the import"},
+		{"versionless import in the main file's own names", map[string]string{
+			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
+			"/etc/containerd/conf.d/runtime.toml": cri[len("version = 2\n"):] + "config_path = \"/srv/direct\"\n",
+		}, StatusWarn, "conf.d/runtime.toml names /srv/direct", ""},
 		{"import disables CRI", map[string]string{
 			clientconf.ContainerdConfigPath:       importing("conf.d/runtime.toml", clientconf.ContainerdCertsDir),
 			"/etc/containerd/conf.d/runtime.toml": "disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
