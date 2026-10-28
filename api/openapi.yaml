@@ -820,7 +820,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles, osquery]
+            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles, osquery]
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
@@ -1672,7 +1672,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles]
+        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles]
     PackageName:
       name: name
       in: path
@@ -1837,6 +1837,10 @@ components:
           items:
             $ref: "#/components/schemas/PackageManifest"
         oci:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        rpm:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
@@ -2147,7 +2151,7 @@ components:
           description: Package name
         type:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles]
         description:
           type: string
         dep_policy:
@@ -2994,7 +2998,7 @@ components:
           description: The binding that resolved it, "token:<id>" or "cidr:<prefix>"
         system:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, distfiles, osquery]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles, osquery]
         action:
           type: string
           enum: [install, refuse, skip]

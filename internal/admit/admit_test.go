@@ -119,7 +119,7 @@ func TestAdmitRequiresTheBasics(t *testing.T) {
 		{"dot name", &manifest.PackageManifest{Name: ".", Type: manifest.TypeNpm}, "path syntax"},
 		{"dotdot name", &manifest.PackageManifest{Name: "..", Type: manifest.TypeNpm}, "path syntax"},
 		{"no type", &manifest.PackageManifest{Name: "x"}, "type is required"},
-		{"unknown type", &manifest.PackageManifest{Name: "x", Type: "rpm"}, "unknown type"},
+		{"unknown type", &manifest.PackageManifest{Name: "x", Type: "conda"}, "unknown type"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := Admit(t.Context(), nil, nil, &config.Config{}, tc.pm, "")

@@ -225,6 +225,7 @@ func TestForTypeCoversEveryKnownType(t *testing.T) {
 		Apt:          []aptsources.Sources{aptsources.Render(aptsources.State{PublicURL: testBase})},
 		FreeBSD:      []pkgrepos.Repo{{Repo: "latest", ABI: "FreeBSD:15:amd64", Conf: "bodega-latest: {}\n"}},
 		Binary:       []BinaryLink{{Filename: "tool", Path: "tool/1.0/tool"}},
+		RpmRepos:     []string{"rocky-baseos"},
 	}
 	for _, typ := range manifest.AllTypes {
 		if got := ForType(typ, in); len(got) == 0 {

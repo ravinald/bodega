@@ -260,6 +260,48 @@ func TestLoad_OCIUpstreamsAndTokenHosts(t *testing.T) {
 	}
 }
 
+func TestLoad_RpmUpstreams(t *testing.T) {
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.RpmUpstreams) != 0 {
+		t.Errorf("rpm_upstreams default = %v, want empty: an operator names what bodega serves", cfg.RpmUpstreams)
+	}
+
+	writeConfig(t, `{"rpm_upstreams":{"rocky-baseos":"https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os","epel":"https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/"}}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := map[string]string{
+		"rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
+		"epel":         "https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/",
+	}
+	if !maps.Equal(cfg.RpmUpstreams, want) {
+		t.Errorf("rpm_upstreams = %v, want %v with one trailing slash each", cfg.RpmUpstreams, want)
+	}
+
+	for _, tc := range []struct{ doc, key string }{
+		{`{"rpm_upstreams":{"rocky":"http://robot:s3cret@dl.rockylinux.org/$releasever/"}}`, `rpm_upstreams["rocky"]`},
+		{`{"rpm_upstreams":{"rocky":"https://robot:s3cret@dl.rockylinux.org/$releasever/?x=1"}}`, `rpm_upstreams["rocky"]`},
+		{`{"rpm_upstreams":{"rocky":"https://dl.rockylinux.org/$contentdir/$releasever/"}}`, `rpm_upstreams["rocky"]`},
+		{`{"rpm_upstreams":{"../x":"https://dl.rockylinux.org/"}}`, "rpm_upstreams key"},
+		{`{"rpm_upstreams":{"a/b":"https://dl.rockylinux.org/"}}`, "rpm_upstreams key"},
+	} {
+		writeConfig(t, tc.doc)
+		_, err := config.Load(t.TempDir(), "", "", "", false, false)
+		switch {
+		case err == nil:
+			t.Errorf("Load accepted %s", tc.doc)
+		case !strings.Contains(err.Error(), tc.key):
+			t.Errorf("error %q does not name %s", err, tc.key)
+		case strings.Contains(err.Error(), "s3cret"):
+			t.Errorf("error %q prints the credential", err)
+		}
+	}
+}
+
 func TestLoad_ProxyUpstreamsRequireHTTPS(t *testing.T) {
 	defaults := map[string]string{
 		"gomod_upstream":    "https://proxy.golang.org",

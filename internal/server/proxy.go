@@ -707,14 +707,16 @@ var errUpstreamNotFound = errors.New("the upstream does not publish this")
 // requiresIdentityEncoding reports whether a type's upstream bytes have to
 // arrive untransformed.
 //
-// freebsd is the one, and it is the type whose archives carry FreeBSD's own
+// freebsd is one, and it is the type whose archives carry FreeBSD's own
 // signature as a tar member rather than beside it. A body the transport
 // decoded is not the body that was signed, and the client reports the
-// difference as a signature failure against bodega. Every other type verifies
-// against a digest bodega records after the decode, so an encoding negotiated
-// on the wire costs them nothing.
+// difference as a signature failure against bodega. rpm is the other: every
+// file it fetches is verified against a checksum repomd.xml or primary gives
+// the bytes as published, and a .gz the transport unpacked would fail it.
+// Every other type verifies against a digest bodega records after the decode,
+// so an encoding negotiated on the wire costs them nothing.
 func requiresIdentityEncoding(regType string) bool {
-	return regType == manifest.TypeFreeBSD
+	return regType == manifest.TypeFreeBSD || regType == manifest.TypeRpm
 }
 
 // maxUpstreamBody caps an upstream body a caller reads into memory whole.

@@ -110,6 +110,10 @@ type Server struct {
 	// ociTokens holds the Bearer tokens the OCI registries issued, per
 	// registry and scope, until each expires.
 	ociTokens ociTokenCache
+
+	// rpmPrimaries holds each repository tree's parsed primary until
+	// repomd.xml names a new one. See rpmPrimary.
+	rpmPrimaries rpmPrimaryCache
 	// mavenArtifacts names the Maven artifacts a version's own file was asked
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.
@@ -1045,6 +1049,10 @@ func (s *Server) registerRoutes() {
 		m.HandleFunc(method+" /v2/{path...}", s.handleOCI)
 	}
 
+	// dnf repositories, pulled through from rpm_upstreams
+	// (baseurl=https://bodega/rpm/<repo>/$releasever/$basearch/).
+	m.HandleFunc("GET /rpm/{path...}", s.handleRpm)
+
 	// FreeBSD pkg repository mirror. One route for the whole tree: the path a
 	// pkg client composes is <abi>/<repo>/<rest>, and rest is a repository
 	// root file or a catalogue record's own repopath, which carries any
@@ -1247,7 +1255,8 @@ func (s *Server) clientFiles(r *http.Request, t string, pm *manifest.PackageMani
 	if isPackageHidden(pm) {
 		return out
 	}
-	in := clientconf.Inputs{Base: s.publicBase(r), GitUpstreams: s.cfg.GitUpstreams, BinaryUpstreams: s.cfg.BinaryUpstreams}
+	in := clientconf.Inputs{Base: s.publicBase(r), GitUpstreams: s.cfg.GitUpstreams, BinaryUpstreams: s.cfg.BinaryUpstreams,
+		RpmRepos: s.cfg.RpmRepoNames()}
 	switch t {
 	case manifest.TypeApt:
 		in.Apt = s.aptSourcesForPackage(r, pm)

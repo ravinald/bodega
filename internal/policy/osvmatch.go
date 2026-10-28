@@ -19,6 +19,7 @@ const (
 	orderDebian   = "debian"
 	orderRubyGems = "rubygems"
 	orderMaven    = "maven"
+	orderRpm      = "rpm"
 )
 
 // osvAffected is the subset of an OSV record's `affected` entry the matcher
@@ -314,6 +315,8 @@ func compareVersions(order, a, b string) (int, bool) {
 		return compareGemVersions(a, b)
 	case orderMaven:
 		return compareMavenVersions(a, b)
+	case orderRpm:
+		return compareRpmEVR(a, b)
 	}
 	return compareSemver(a, b)
 }
@@ -374,6 +377,22 @@ func ReleaseSegments(typ, v string) ([]int, bool) {
 			out = append(out, s.num)
 		}
 		return out, true
+	case orderRpm:
+		// The version's leading dot-separated numbers; the epoch and the
+		// release are not release segments.
+		_, version, _, ok := splitRpmEVR(v)
+		if !ok {
+			return nil, false
+		}
+		var out []int
+		for _, seg := range strings.Split(version, ".") {
+			n, err := strconv.Atoi(seg)
+			if err != nil {
+				break
+			}
+			out = append(out, n)
+		}
+		return out, len(out) > 0
 	}
 	sv := parseSemver(v)
 	return sv.release, sv.ok
@@ -397,6 +416,8 @@ func packageVersionOrder(typ string) (string, bool) {
 		return orderMaven, true
 	case manifest.TypeRubygems:
 		return orderRubyGems, true
+	case manifest.TypeRpm:
+		return orderRpm, true
 	}
 	return "", false
 }
@@ -414,8 +435,144 @@ func orderable(order, v string) bool {
 	case orderMaven:
 		_, ok := parseMavenVersion(v)
 		return ok
+	case orderRpm:
+		_, _, _, ok := splitRpmEVR(v)
+		return ok
 	}
 	return parseSemver(v).ok
+}
+
+// splitRpmEVR splits epoch:version-release. The epoch defaults to 0 and the
+// release to "", which compares as absent: rpm orders a version with no
+// release against the version alone.
+func splitRpmEVR(v string) (epoch int, version, release string, ok bool) {
+	rest := v
+	if i := strings.IndexByte(rest, ':'); i >= 0 {
+		n, err := strconv.Atoi(rest[:i])
+		if err != nil || n < 0 {
+			return 0, "", "", false
+		}
+		epoch, rest = n, rest[i+1:]
+	}
+	version = rest
+	if i := strings.LastIndexByte(rest, '-'); i >= 0 {
+		version, release = rest[:i], rest[i+1:]
+	}
+	return epoch, version, release, version != ""
+}
+
+// compareRpmEVR orders two RPM versions as rpm does: the epoch numerically,
+// then the version, then the release when both carry one, each by rpmvercmp.
+func compareRpmEVR(a, b string) (int, bool) {
+	ea, va, ra, oka := splitRpmEVR(a)
+	eb, vb, rb, okb := splitRpmEVR(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	if ea != eb {
+		if ea < eb {
+			return -1, true
+		}
+		return 1, true
+	}
+	if c := rpmvercmp(va, vb); c != 0 {
+		return c, true
+	}
+	if ra == "" || rb == "" {
+		return 0, true
+	}
+	return rpmvercmp(ra, rb), true
+}
+
+// rpmvercmp is rpm's own comparison of one version or release string
+// (rpmio/rpmvercmp.c): runs of digits compare numerically and runs of
+// letters lexically, a digit run outranks a letter run, '~' sorts before
+// anything including the end of the string, and '^' sorts after the end but
+// before anything else.
+func rpmvercmp(a, b string) int {
+	if a == b {
+		return 0
+	}
+	isAlnum := func(c byte) bool { return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
+	isAlpha := func(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		for i < len(a) && !isAlnum(a[i]) && a[i] != '~' && a[i] != '^' {
+			i++
+		}
+		for j < len(b) && !isAlnum(b[j]) && b[j] != '~' && b[j] != '^' {
+			j++
+		}
+		if (i < len(a) && a[i] == '~') || (j < len(b) && b[j] == '~') {
+			if i >= len(a) || a[i] != '~' {
+				return 1
+			}
+			if j >= len(b) || b[j] != '~' {
+				return -1
+			}
+			i, j = i+1, j+1
+			continue
+		}
+		if (i < len(a) && a[i] == '^') || (j < len(b) && b[j] == '^') {
+			if i >= len(a) {
+				return -1
+			}
+			if j >= len(b) {
+				return 1
+			}
+			if a[i] != '^' {
+				return 1
+			}
+			if b[j] != '^' {
+				return -1
+			}
+			i, j = i+1, j+1
+			continue
+		}
+		if i >= len(a) || j >= len(b) {
+			break
+		}
+		numeric := isDigit(a[i])
+		in := isAlpha
+		if numeric {
+			in = isDigit
+		}
+		si, sj := i, j
+		for i < len(a) && in(a[i]) {
+			i++
+		}
+		for j < len(b) && in(b[j]) {
+			j++
+		}
+		sa, sb := a[si:i], b[sj:j]
+		if sb == "" {
+			// Unlike segment types: a number is newer than letters.
+			if numeric {
+				return 1
+			}
+			return -1
+		}
+		if numeric {
+			sa, sb = strings.TrimLeft(sa, "0"), strings.TrimLeft(sb, "0")
+			if len(sa) != len(sb) {
+				if len(sa) > len(sb) {
+					return 1
+				}
+				return -1
+			}
+		}
+		if c := strings.Compare(sa, sb); c != 0 {
+			return c
+		}
+	}
+	switch {
+	case i >= len(a) && j >= len(b):
+		return 0
+	case i < len(a):
+		return 1
+	}
+	return -1
 }
 
 // gemVersionPattern is Gem::Version's ANCHORED_VERSION_PATTERN.

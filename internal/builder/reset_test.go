@@ -38,6 +38,7 @@ func overriddenConfig(t *testing.T) (*Config, map[string]string) {
 		RubygemsRoot:  roots[manifest.TypeRubygems],
 		ComposerRoot:  roots[manifest.TypeComposer],
 		OCIRoot:       roots[manifest.TypeOCI],
+		RpmRoot:       roots[manifest.TypeRpm],
 		FreeBSDRoot:   roots[manifest.TypeFreeBSD],
 		DistfilesRoot: roots[manifest.TypeDistfiles],
 	}

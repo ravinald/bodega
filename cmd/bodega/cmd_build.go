@@ -161,6 +161,9 @@ When a name is given after the type, only that entry is built.`,
 				case manifest.TypeOCI:
 					fmt.Fprintf(buildOut, "\n>>> [oci] nothing to %s: images are pulled through /v2/ on first request\n", "build")
 
+				case manifest.TypeRpm:
+					fmt.Fprintf(buildOut, "\n>>> [rpm] nothing to %s: packages are pulled through /rpm/ on first request\n", "build")
+
 				case manifest.TypeRubygems:
 					// rubygems has no build step; FetchRubygems skips already-fetched.
 					allSummaries = append(allSummaries,

@@ -582,6 +582,10 @@ func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter 
 		return builder.ComposerArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeOCI:
 		return builder.OCIArtifactPaths(cfg, store, entryFilter), noRelease, nil
+	case manifest.TypeRpm:
+		// Nothing writes an rpm under rpm_root: every package is pulled
+		// through /rpm/ and cached at a key naming its repository.
+		return nil, noRelease, nil
 	case manifest.TypeMaven:
 		return builder.MavenArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeFreeBSD:

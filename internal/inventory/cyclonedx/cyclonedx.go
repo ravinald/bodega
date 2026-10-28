@@ -210,6 +210,7 @@ var purlEcosystems = map[string]string{
 	"gem":      manifest.TypeRubygems,
 	"composer": manifest.TypeComposer,
 	"oci":      manifest.TypeOCI,
+	"rpm":      manifest.TypeRpm,
 	"maven":    manifest.TypeMaven,
 	"golang":   manifest.TypeGomod,
 	"helm":     manifest.TypeHelm,

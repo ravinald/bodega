@@ -122,3 +122,34 @@ func TestReleaseSegments(t *testing.T) {
 		}
 	}
 }
+
+// Cases from rpm's own tests/rpmvercmp.at.
+func TestCompareVersionsRpm(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want int
+	}{
+		{"1.0-1", "1.0-1", 0},
+		{"1.0-1", "2.0-1", -1},
+		{"2.0.1-1", "2.0-1", 1},
+		{"5.5p1-1", "5.5p2-1", -1},
+		{"5.5p10-1", "5.5p1-1", 1},
+		{"10xyz-1", "10.1xyz-1", -1},
+		{"xyz.4-1", "8-1", -1},
+		{"1.0010-1", "1.9-1", 1},
+		{"1.05-1", "1.5-1", 0},
+		{"1.0~rc1-1", "1.0-1", -1},
+		{"1.0~rc1-1", "1.0~rc2-1", -1},
+		{"1.0^-1", "1.0-1", 1},
+		{"1.0^git1-1", "1.0^git2-1", -1},
+		{"1.0^git1-1", "1.01-1", -1},
+		{"1:1.0-1", "2.0-1", 1},
+		{"1.20.1-20.el9", "1.20.1-14.el9", 1},
+		{"2:1.20.1-20.el9", "1:1.22.1-1.el9", 1},
+	} {
+		got, ok := CompareVersions(manifest.TypeRpm, tc.a, tc.b)
+		if !ok || got != tc.want {
+			t.Errorf("CompareVersions(rpm, %q, %q) = %d, %v, want %d", tc.a, tc.b, got, ok, tc.want)
+		}
+	}
+}

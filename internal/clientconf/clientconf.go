@@ -14,6 +14,7 @@ package clientconf
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -324,6 +325,34 @@ func OCI(base string) []File {
 		}, notes...),
 	}
 	return []File{daemon, containerd}
+}
+
+// Rpm renders /etc/yum.repos.d/bodega.repo with one section per repository
+// bodega serves, sorted so two renders of one config are byte-identical. dnf
+// checks bodega's signature over repomd.xml and the vendor's over each
+// package, so both checks are on and the vendor's key has to be named beside
+// bodega's. A server naming no repository renders the URL form as a comment,
+// which dnf reads as a file with no repositories in it.
+func Rpm(base string, repos []string) File {
+	b := trim(base)
+	var sb strings.Builder
+	if len(repos) == 0 {
+		fmt.Fprintf(&sb, "# rpm_upstreams on this server names no repository yet. Each one it names is served at\n# baseurl=%s/rpm/<name>/$releasever/$basearch/\n", b)
+	}
+	for _, name := range slices.Sorted(slices.Values(repos)) {
+		fmt.Fprintf(&sb, "[bodega-%s]\nname=bodega %s\nbaseurl=%s/rpm/%s/$releasever/$basearch/\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=%s/rpm/bodega.gpg\n\n",
+			name, name, b, name, b)
+	}
+	return File{
+		System:  manifest.TypeRpm,
+		Label:   "dnf repositories",
+		Paths:   map[string]string{OSLinux: "/etc/yum.repos.d/bodega.repo"},
+		Content: strings.TrimSuffix(sb.String(), "\n"),
+		Notes: []string{
+			"Append the vendor's key file to each gpgkey line (e.g. file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9): packages keep the vendor's signature, and gpgcheck verifies it",
+			"Disable the vendor repositories these replace, e.g. dnf config-manager --set-disabled baseos appstream",
+		},
+	}
 }
 
 // Git renders one url.<base>/git/<namespace>/.insteadOf per git_upstreams
@@ -644,6 +673,8 @@ type Inputs struct {
 	// Osquery is the one server-mode source a host enrolls with: osqueryd
 	// takes its config from exactly one server.
 	Osquery *OsqueryPlan
+	// RpmRepos is the rpm_upstreams keys, one dnf repository section each.
+	RpmRepos []string
 }
 
 // ForType renders every file a client of entryType installs. It is the one
@@ -669,6 +700,8 @@ func ForType(entryType string, in Inputs) []File {
 		out = append(out, Composer(in.Base))
 	case manifest.TypeOCI:
 		out = append(out, OCI(in.Base)...)
+	case manifest.TypeRpm:
+		out = append(out, Rpm(in.Base, in.RpmRepos))
 	case manifest.TypeGomod:
 		out = append(out, Gomod(in.Base))
 	case manifest.TypeHelm:

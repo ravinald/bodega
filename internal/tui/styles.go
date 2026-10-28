@@ -103,6 +103,8 @@ func typeIcon(t string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("104")).Render("O")
 	case "oci":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("38")).Render("I")
+	case "rpm":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("202")).Render("Y")
 	case "freebsd":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("124")).Render("F")
 	case "distfiles":

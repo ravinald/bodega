@@ -877,6 +877,16 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 	case strings.HasPrefix(path, "/v2/"):
 		name, version := parseOCIPackagePath(path, "")
 		return manifest.TypeOCI, name, version
+	case strings.HasPrefix(path, "/rpm/"):
+		// A package path's filename names the package and its
+		// version-release; the epoch is only in primary, and the row's object
+		// key carries it. Metadata paths name no package.
+		if strings.HasSuffix(path, ".rpm") {
+			if n, v := manifest.RpmFileIdentity(path[strings.LastIndexByte(path, '/')+1:]); n != "" {
+				return manifest.TypeRpm, n, v
+			}
+		}
+		return manifest.TypeRpm, "", ""
 	case strings.HasPrefix(path, "/maven/"):
 		// A path the layout rejects still names the type, so a read token
 		// scoped to another type is refused before the handler 404s it.
