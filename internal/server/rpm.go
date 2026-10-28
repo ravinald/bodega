@@ -173,7 +173,18 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 	}
 	body := cw.body.Bytes()
 	if status == http.StatusOK {
-		if held := s.rpmServed.publish(t.id(), rpmClientKey(r), body, s.rpmServed.now()); !bytes.Equal(held, body) {
+		served := body
+		p := s.profileFor(r)
+		if rpmFilters(p) {
+			filtered, err := s.rpmProfileRepomd(r, t, p, body)
+			if err != nil {
+				s.logger.Error("rpm repomd.xml could not be filtered for a profile", "profile", p.Name(), "repository", t.id(), "error", err)
+				http.Error(w, fmt.Sprintf("bodega could not filter the metadata of %s for profile %q, so it served no repomd.xml rather than the unfiltered one; the server log names the cause.", t.id(), p.Name()), http.StatusBadGateway)
+				return
+			}
+			served = filtered
+		}
+		if held := s.rpmServed.publish(rpmViewID(t, p), rpmClientKey(r), served, s.rpmServed.now()); !bytes.Equal(held, body) {
 			body = held
 			for _, h := range []string{"ETag", "Last-Modified"} {
 				w.Header().Del(h)
@@ -197,12 +208,19 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 		http.Error(w, "this server holds no signing key, so it serves repomd.xml unsigned; an operator runs `bodega apt key generate`, or a client sets repo_gpgcheck=0.", http.StatusNotFound)
 		return
 	}
-	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), s.rpmServed.now())
+	p := s.profileFor(r)
+	doc, ok := s.rpmServed.held(rpmViewID(t, p), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		var err error
 		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
 			s.writeRpmReadError(w, r, t, "repomd.xml", err)
 			return
+		}
+		if rpmFilters(p) {
+			if doc, err = s.rpmProfileRepomd(r, t, p, doc); err != nil {
+				s.writeRpmReadError(w, r, t, "repomd.xml", err)
+				return
+			}
 		}
 	}
 	sig, err := sign.signer.DetachSign(doc)
@@ -464,7 +482,7 @@ func (s *Server) rpmMetadataEntry(r *http.Request, t rpmTree, match func(rpmRepo
 // rpmHeldEntry is the first entry match accepts in the repomd.xml this
 // client holds, or errRpmNotListed when it holds none or that one names none.
 func (s *Server) rpmHeldEntry(r *http.Request, t rpmTree, match func(rpmRepomdData) bool) (rpmRepomdData, error) {
-	doc, ok := s.rpmServed.held(t.id(), rpmClientKey(r), s.rpmServed.now())
+	doc, ok := s.rpmServed.held(rpmViewID(t, s.profileFor(r)), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		return rpmRepomdData{}, errRpmNotListed
 	}
@@ -488,6 +506,10 @@ func (s *Server) rpmHeldEntry(r *http.Request, t rpmTree, match func(rpmRepomdDa
 // in the next revision, and the client verifies against its own.
 func (s *Server) handleRpmMetadata(w http.ResponseWriter, r *http.Request, t rpmTree, href string) {
 	markIndexResponse(r)
+	if p := s.profileFor(r); rpmFilters(p) {
+		s.handleRpmProfileMetadata(w, r, t, p, href)
+		return
+	}
 	match := func(d rpmRepomdData) bool { return d.Location.Href == href }
 	entry, err := s.rpmHeldEntry(r, t, match)
 	if err != nil {
@@ -898,9 +920,8 @@ func rpmDecompress(raw []byte, ext string) (io.Reader, func(), error) {
 }
 
 // parseRpmPrimary reads every <package> of a primary document, streaming,
-// since EPEL's runs to hundreds of thousands of elements. A package whose
-// location carries xml:base lives on another host and is left out: bodega
-// fetches only under the repository's own base URL.
+// since EPEL's runs to hundreds of thousands of elements, leaving out each one
+// rpmPrimaryElement.servable refuses.
 func parseRpmPrimary(raw []byte, ext string) (map[string]rpmPackage, error) {
 	r, closeFn, err := rpmDecompress(raw, ext)
 	if err != nil {
@@ -925,37 +946,46 @@ func parseRpmPrimary(raw []byte, ext string) (map[string]rpmPackage, error) {
 		if !ok || se.Name.Local != "package" {
 			continue
 		}
-		var p struct {
-			Name    string `xml:"name"`
-			Version struct {
-				Epoch string `xml:"epoch,attr"`
-				Ver   string `xml:"ver,attr"`
-				Rel   string `xml:"rel,attr"`
-			} `xml:"version"`
-			Checksum struct {
-				Type  string `xml:"type,attr"`
-				Value string `xml:",chardata"`
-			} `xml:"checksum"`
-			Location struct {
-				Href  string     `xml:"href,attr"`
-				Attrs []xml.Attr `xml:",any,attr"`
-			} `xml:"location"`
-		}
+		var p rpmPrimaryElement
 		if err := dec.DecodeElement(&p, &se); err != nil {
 			return nil, err
 		}
-		if hasXMLBase(p.Location.Attrs) || p.Location.Href == "" ||
-			!manifest.RpmValidName(p.Name) || !rpmSafeHref(p.Location.Href) {
-			continue
+		if pkg, ok := p.servable(); ok {
+			out[p.Location.Href] = pkg
 		}
-		pkg := rpmPackage{name: p.Name, epoch: p.Version.Epoch, ver: p.Version.Ver, rel: p.Version.Rel,
-			sumType: p.Checksum.Type, sum: strings.ToLower(strings.TrimSpace(p.Checksum.Value))}
-		if !manifest.RpmValidEVR(pkg.evr()) {
-			continue
-		}
-		out[p.Location.Href] = pkg
 	}
 	return out, nil
+}
+
+// rpmPrimaryElement is the part of one primary <package> bodega reads.
+type rpmPrimaryElement struct {
+	Name    string `xml:"name"`
+	Version struct {
+		Epoch string `xml:"epoch,attr"`
+		Ver   string `xml:"ver,attr"`
+		Rel   string `xml:"rel,attr"`
+	} `xml:"version"`
+	Checksum struct {
+		Type  string `xml:"type,attr"`
+		Value string `xml:",chardata"`
+	} `xml:"checksum"`
+	Location struct {
+		Href  string     `xml:"href,attr"`
+		Attrs []xml.Attr `xml:",any,attr"`
+	} `xml:"location"`
+}
+
+// servable is the package this element describes, and whether bodega would
+// serve it at all: a location carrying xml:base lives on another host, and
+// bodega fetches only under the repository's own base URL.
+func (p *rpmPrimaryElement) servable() (rpmPackage, bool) {
+	if hasXMLBase(p.Location.Attrs) || p.Location.Href == "" ||
+		!manifest.RpmValidName(p.Name) || !rpmSafeHref(p.Location.Href) {
+		return rpmPackage{}, false
+	}
+	pkg := rpmPackage{name: p.Name, epoch: p.Version.Epoch, ver: p.Version.Ver, rel: p.Version.Rel,
+		sumType: p.Checksum.Type, sum: strings.ToLower(strings.TrimSpace(p.Checksum.Value))}
+	return pkg, manifest.RpmValidEVR(pkg.evr())
 }
 
 func hasXMLBase(attrs []xml.Attr) bool {

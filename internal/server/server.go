@@ -119,6 +119,9 @@ type Server struct {
 	rpmServed rpmServedRepomds
 	// rpmVerified is the cached packages already hashed against primary.
 	rpmVerified rpmVerifiedObjects
+	// rpmProfileBuilds is each profile's filtered primary, filelists and
+	// other per repository tree. See rpmProfileFiles.
+	rpmProfileBuilds rpmProfileBuilds
 	// mavenArtifacts names the Maven artifacts a version's own file was asked
 	// for, which is what tells mavenMetadataGate a metadata path's artifact
 	// reading is a real artifact. See mavenArtifactKnown.
