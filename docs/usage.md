@@ -588,7 +588,7 @@ A flag naming a host the entry already lists passes. `--origin db01` over an ent
 
 `--baseline` marks every imported version as what your hosts already run. Each version gets `baseline: true` and `baseline_at`, the import time. A gate that fails on a baseline version records the finding and admits the version rather than refusing it, on every path that admits one: this import, [`pkg prefetch`](#bodega-pkg-prefetch-lockfile-lockfile), a build's fetch, a proxy fill of a `mode: proxy` entry (the form `pkg convert` writes) and a [re-vet](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration). The admission row records that check with status `baseline` and the original failure in its detail, so the finding is kept rather than read as a pass. [`bodega policy report`](#bodega-policy-report---since-duration---json) lists it under "Baseline debt" until [`bodega policy baseline clear`](#bodega-policy-baseline-clear-ecosystem---older-than-duration) removes the mark.
 
-On the proxy path the [index filter](#bodega-policy-filter-setlist) keeps a marked version listed, and in `listed` [admission mode](#bodega-policy-mode-setlist) a package holding a marked version has its index served even with no allow-list rule, so a host pinned to that version can resolve it. The package's unmarked versions stay in that index and are refused at the artifact; add an allow-list rule to admit them.
+On the proxy path the [index filter](#bodega-policy-filter-setlist) keeps a marked version listed, and in `listed` [admission mode](#bodega-policy-mode-setunsetlist) a package holding a marked version has its index served even with no allow-list rule, so a host pinned to that version can resolve it. The package's unmarked versions stay in that index and are refused at the artifact; add an allow-list rule to admit them.
 
 ```bash
 bodega pkg convert npm < installed.txt > baseline.json
@@ -2551,7 +2551,7 @@ bodega policy add git example.com/example-corp/ "widget maintainers"
 bodega policy add npm @example-cloud/*
 ```
 
-An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on, or set the type's [admission mode](#bodega-policy-mode-setlist) to `listed` or `open` explicitly. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
+An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on, or set the type's [admission mode](#bodega-policy-mode-setunsetlist) to `listed` or `open` explicitly. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
 
 An exact npm, pypi, cargo, rubygems, maven, composer or oci name within two edits of a popular package it is not equal to asks before writing the rule, naming both, because an exact rule exempts the name from the [name similarity check](#bodega-policy-similarity-setlistload) and a typo here admits the squat it was meant to keep out:
 
@@ -3419,7 +3419,7 @@ Every 401 has the same body, `Unauthorized`, so a caller without the secret lear
 
 Use `--data-binary`, not `-d`: `-d` strips newlines from a file argument, and the server verifies the bytes it received. The secret sits in `config.json`, which bodega writes `0600`. Generate it with `openssl rand -hex 32`.
 
-### `bodega policy mode <set|list>`
+### `bodega policy mode <set|unset|list>`
 
 Sets how an ecosystem decides which names it admits.
 
@@ -3430,9 +3430,14 @@ Sets how an ecosystem decides which names it admits.
 
 An ecosystem nobody set a mode for follows its allow-list: `listed` when it has rules, `open` when it has none, which is how every ecosystem behaved before modes existed. `open` is admission by criteria: no person approves each name, and the gates decide each version. `set` writes a `policy` audit event with the mode before and after, and warns when it sets `listed` on an ecosystem with no rules.
 
+`unset` deletes the mode set for an ecosystem, so it follows its allow-list again, and writes a `policy` audit event whose details carry `admission_mode: "default"`, the mode before, `before_set` and the mode in effect after. On an ecosystem with no mode set it prints the default, records nothing and exits 0.
+
+Restore a default with `unset`, not `set open`. A mode set to `open` stays `open` after allow-list rules are added, so every rule added later admits nothing extra; the default would have read those rules as `listed`. A script that changes a mode and puts it back afterwards should record the SOURCE column from `list` first, and run `unset` for an ecosystem whose source began with `default:`.
+
 ```bash
 bodega policy mode set npm open
 bodega policy mode set pypi listed
+bodega policy mode unset npm
 bodega policy mode list
 ```
 
@@ -3468,7 +3473,7 @@ npm: enforce
 
 `report` refuses an ecosystem already in report mode, because saving the warns it set would lose the actions `enforce` restores; `enforce` refuses one that is not. A gate somebody changed while the ecosystem was in report mode is still restored to the action it had before the switch, and the event's `before` says what it was changed to.
 
-Two things are left as they are. The [OSV malware action](#malware-records) keeps blocking: a known-malicious package is not one to admit while someone reads a report. The allow-list has no action to switch; [`bodega policy mode set <ecosystem> open`](#bodega-policy-mode-setlist) is how it stops deciding admission.
+Two things are left as they are. The [OSV malware action](#malware-records) keeps blocking: a known-malicious package is not one to admit while someone reads a report. The allow-list has no action to switch; [`bodega policy mode set <ecosystem> open`](#bodega-policy-mode-setunsetlist) is how it stops deciding admission.
 
 ### `bodega policy report [--since DURATION] [--json]`
 
@@ -3622,7 +3627,7 @@ The change uses the words the policy commands use, as `ecosystem=value`, and eac
 | `--osv npm=remove`         | `bodega policy osv remove npm`; also `--age`, `--provenance` and `--similarity` |
 | `--allow-file rules.json`  | replaces the allow-list of every type the file names                            |
 
-An ecosystem or action the matching `set` refuses is refused here too. The allow-file is a JSON object from type to the complete list of patterns that type would have, in `bodega policy add` syntax; an empty list proposes no rules for that type. The simulation reads the mode on record from [`bodega policy mode`](#bodega-policy-mode-setlist), so an empty list admits every name only in an ecosystem that is `open` or has no mode set, and refuses every name in one set to `listed`:
+An ecosystem or action the matching `set` refuses is refused here too. The allow-file is a JSON object from type to the complete list of patterns that type would have, in `bodega policy add` syntax; an empty list proposes no rules for that type. The simulation reads the mode on record from [`bodega policy mode`](#bodega-policy-mode-setunsetlist), so an empty list admits every name only in an ecosystem that is `open` or has no mode set, and refuses every name in one set to `listed`:
 
 ```json
 { "npm": ["lodash", "@example/*"], "pypi": [] }
@@ -5436,7 +5441,7 @@ An archive passes the same gates as a gem file: the [upstream allow-list](#upstr
 
 A composer entry records the dist reference in `ref`, which is what names the archive it holds under `composer/dist/` and `composer_root`; an entry with no `ref` is a statement about versions alone, enough for hiding and constraints. Nothing fetches an archive ahead of a client: `bodega build fetch composer` has nothing to do, and an archive arrives in storage when a client first requests it.
 
-**Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. The age, OSV and similarity gates for Composer are not built yet; a profile governs Composer as it does the other package types.
+**Gaps.** A version with no `dist` (a source-only release) is passed through unchanged, so Composer clones it from its `source` URL, around bodega. A profile governs Composer as it does the other package types.
 
 **OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts).
 
@@ -7552,7 +7557,7 @@ When a dependency has a security issue, fails checksum verification, or is other
 
 ### Upstream allow-list
 
-The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior). An [admission mode](#bodega-policy-mode-setlist) set on a type overrides that default either way. [Rolling out enforcement](#rolling-out-enforcement) is the procedure for turning the gates on without breaking what already builds.
+The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior). An [admission mode](#bodega-policy-mode-setunsetlist) set on a type overrides that default either way. [Rolling out enforcement](#rolling-out-enforcement) is the procedure for turning the gates on without breaking what already builds.
 
 Enforcement happens in four places:
 

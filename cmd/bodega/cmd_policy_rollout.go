@@ -37,13 +37,15 @@ func newPolicyModeCmd(gf *globalFlags) *cobra.Command {
 An ecosystem nobody set a mode for follows its allow-list: listed when it
 has rules, open when it has none, which is how bodega behaved before modes
 existed. Open admission is admission by criteria: no person approves each
-name, and the gates decide each version.
+name, and the gates decide each version. unset returns an ecosystem to that
+default; a mode set to open stays open after allow-list rules are added.
 
   bodega policy mode list
   bodega policy mode set npm open
-  bodega policy mode set pypi listed`,
+  bodega policy mode set pypi listed
+  bodega policy mode unset npm`,
 	}
-	cmd.AddCommand(newPolicyModeSetCmd(gf), newPolicyModeListCmd(gf))
+	cmd.AddCommand(newPolicyModeSetCmd(gf), newPolicyModeUnsetCmd(gf), newPolicyModeListCmd(gf))
 	return cmd
 }
 
@@ -83,6 +85,55 @@ func newPolicyModeSetCmd(gf *globalFlags) *cobra.Command {
 			if mode == audit.ModeListed && before.Rules == 0 {
 				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s has no allow-list rules, so listed mode admits no name until 'bodega policy add %s <pattern>' adds one\n", eco, eco)
 			}
+			return nil
+		},
+	}
+}
+
+func newPolicyModeUnsetCmd(gf *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "unset <ecosystem>",
+		Short: "Return an ecosystem to the admission mode its allow-list implies",
+		Long: `Delete the mode set for an ecosystem, so it follows its allow-list again:
+listed when it has rules, open when it has none. An ecosystem with no mode
+set is left as it is and nothing is recorded, so a restore script can run
+this unconditionally.
+
+  bodega policy mode unset npm`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			eco := args[0]
+			if err := policy.ValidateType(eco); err != nil {
+				return err
+			}
+			adb, err := openMutableAuditDB(gf)
+			if err != nil {
+				return err
+			}
+			defer adb.Close()
+			ctx := context.Background()
+			before, err := policy.NewChecker(adb).ModeFor(ctx, eco)
+			if err != nil {
+				return err
+			}
+			if !before.Set {
+				fmt.Printf("%s has no admission mode set; it is %s by default\n", eco, before.Mode)
+				return nil
+			}
+			if _, err := adb.ClearAdmissionMode(ctx, eco); err != nil {
+				return err
+			}
+			after, err := policy.NewChecker(adb).ModeFor(ctx, eco)
+			if err != nil {
+				return fmt.Errorf("unset %s, but reading its default mode failed: %w", eco, err)
+			}
+			details, _ := json.Marshal(map[string]any{"admission_mode": "default", "before": before.Mode,
+				"before_set": before.Set, "after": after.Mode})
+			if err := adb.Record(ctx, audit.Event{EventType: audit.EventPolicy, PkgType: eco, Actor: audit.CurrentActor(),
+				Status: "success", Details: string(details)}); err != nil {
+				return fmt.Errorf("unset %s, but the audit event was not written: %w", eco, err)
+			}
+			fmt.Printf("Unset %s admission mode: now %s by default (was %s, set)\n", eco, after.Mode, before.Mode)
 			return nil
 		},
 	}

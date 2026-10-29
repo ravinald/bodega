@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -263,5 +264,28 @@ func TestAdmittedVersionsListsUnversionedObjectsByKey(t *testing.T) {
 				t.Errorf("Admissions(tool-darwin.tgz) = %+v (%v), want the newest row at that key", byKey, err)
 			}
 		})
+	}
+}
+
+// A restore that sets a mode and later wants the default back has only the
+// delete; an absent row has to be a no-op so it can run unconditionally.
+func TestClearAdmissionMode(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.SetAdmissionMode(ctx, AdmissionMode{Ecosystem: "npm", Mode: ModeOpen, Actor: "t"}); err != nil {
+		t.Fatalf("SetAdmissionMode: %v", err)
+	}
+	if removed, err := db.ClearAdmissionMode(ctx, "npm"); err != nil || !removed {
+		t.Fatalf("ClearAdmissionMode = %v, %v; want true, nil", removed, err)
+	}
+	if _, err := db.GetAdmissionMode(ctx, "npm"); !errors.Is(err, ErrAdmissionModeNotFound) {
+		t.Fatalf("GetAdmissionMode after clear: %v; want ErrAdmissionModeNotFound", err)
+	}
+	if removed, err := db.ClearAdmissionMode(ctx, "npm"); err != nil || removed {
+		t.Fatalf("clearing an absent row = %v, %v; want false, nil", removed, err)
 	}
 }
