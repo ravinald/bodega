@@ -791,6 +791,20 @@ t_ok "issue filing dry-run names each failure" yes \
 t_ok "issue filing dry-run skips mapped failures" yes \
 	"$(case "$dryrun" in *SELF-20*) echo no ;; *) echo yes ;; esac)"
 
+# The first line of a capture is taken by parameter expansion, never by a pipe
+# into head: once the capture outgrows the pipe buffer, head's early exit
+# SIGPIPEs the producer and pipefail turns a correct read into exit 141.
+# 97-machine-readable reads the CSV header of an export this size.
+big_csv="name,version,sha256"$'\n'"$(head -c 300000 /dev/zero | tr '\0' 'x')"
+header_rc=0
+header="$(
+	set -euo pipefail
+	E2E_OUT="$big_csv"
+	printf '%s' "${E2E_OUT%%$'\n'*}" | tr ',' '\n' | sort | tr '\n' ' '
+)" || header_rc=$?
+t_ok "first line of a 300 KB capture: the subshell exits 0" 0 "$header_rc"
+t_ok "first line of a 300 KB capture: the header's fields" "name sha256 version " "$header"
+
 # ---- mirrored apt stanzas -------------------------------------------------
 #
 # SHIP-APT-01 and -02 build their expectation from these two helpers, so a
