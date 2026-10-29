@@ -1,11 +1,18 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -98,4 +105,79 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatalf("read pipe: %v", err)
 	}
 	return string(out)
+}
+
+// An ecosystem set open ignores its allow-list; unset is the way back to the
+// default, where one rule makes it listed.
+func TestPolicyModeUnsetReturnsToDefault(t *testing.T) {
+	dir := t.TempDir()
+	adbPath := filepath.Join(dir, "audit.db")
+	loadFrom(t, fmt.Sprintf(`{"audit_db": %q, "log_dir": %q, "manifest_dir": %q}`, adbPath, dir, filepath.Join(dir, "manifests")))
+	adb, err := audit.Open(adbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	if err := adb.InsertPolicy(ctx, audit.PolicyInfo{ID: "r1", RegistryType: manifest.TypeNpm, RuleKind: policy.KindPackage, Pattern: "lodash"}); err != nil {
+		t.Fatal(err)
+	}
+	adb.Close()
+
+	run := func(c *cobra.Command, args ...string) string {
+		t.Helper()
+		var runErr error
+		out := captureStdout(t, func() { runErr = c.RunE(c, args) })
+		if runErr != nil {
+			t.Fatalf("%s %v: %v", c.Name(), args, runErr)
+		}
+		return out
+	}
+	run(newPolicyModeSetCmd(&globalFlags{}), "npm", "open")
+	out := run(newPolicyModeUnsetCmd(&globalFlags{}), "npm")
+	if want := "Unset npm admission mode: now listed by default (was open, set)\n"; out != want {
+		t.Errorf("unset printed %q, want %q", out, want)
+	}
+	out = run(newPolicyModeUnsetCmd(&globalFlags{}), "npm")
+	if want := "npm has no admission mode set; it is listed by default\n"; out != want {
+		t.Errorf("second unset printed %q, want %q", out, want)
+	}
+
+	adb, err = audit.Open(adbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adb.Close()
+	m, err := policy.NewChecker(adb).ModeFor(ctx, manifest.TypeNpm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Mode != audit.ModeListed || m.Set {
+		t.Errorf("ModeFor after unset = %+v, want listed and not set", m)
+	}
+	events, err := adb.Query(ctx, audit.Filter{EventType: audit.EventPolicy, PkgType: manifest.TypeNpm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unsets []map[string]any
+	for _, e := range events {
+		var d map[string]any
+		if err := json.Unmarshal([]byte(e.Details), &d); err != nil {
+			t.Fatalf("details %q: %v", e.Details, err)
+		}
+		if d["admission_mode"] == "default" {
+			if e.Status != "success" || e.Actor == "" {
+				t.Errorf("unset event status=%q actor=%q", e.Status, e.Actor)
+			}
+			unsets = append(unsets, d)
+		}
+	}
+	if len(unsets) != 1 {
+		t.Fatalf("want exactly one unset event (the second unset records none), got %d: %v", len(unsets), unsets)
+	}
+	want := map[string]any{"admission_mode": "default", "before": "open", "before_set": true, "after": "listed"}
+	for k, v := range want {
+		if unsets[0][k] != v {
+			t.Errorf("details[%q] = %v, want %v", k, unsets[0][k], v)
+		}
+	}
 }
