@@ -37,6 +37,7 @@ var agePublishers = map[string]func(*AgeChecker, context.Context, string, string
 	manifest.TypeMaven:    (*AgeChecker).mavenPublishedAt,
 	manifest.TypeComposer: (*AgeChecker).composerPublishedAt,
 	manifest.TypeOCI:      (*AgeChecker).ociPublishedAt,
+	manifest.TypeRpm:      (*AgeChecker).rpmPublishedAt,
 }
 
 // An oci tag is dated by bodega's registry when it resolves the tag, from the
@@ -56,11 +57,26 @@ const (
 	OCIDateErrorKey = "oci_date_error"
 )
 
-// LookupDatedEcosystems is AgeEcosystems less oci: the types whose publish
-// time a lookup by name and version reads, which is what recording one on a
-// manifest entry needs. An oci tag is dated only as bodega resolves it.
+// An rpm package is dated by the <time> element its repository's primary
+// gives it, read by /rpm/ as it serves the package: PublishedAt holds the
+// time and RpmDatedByKey says which attribute it came from. A package's
+// version is the same string in every repository that builds one, so a
+// lookup by name and version has nowhere to ask.
+const (
+	RpmDatedByKey = "rpm_dated_by"
+	// RpmDatedByBuild is <time build>, when rpmbuild made the package.
+	RpmDatedByBuild = "build"
+	// RpmDatedByFile is <time file>, the package file's mtime when the
+	// repository was composed, read for a package whose build time is 0.
+	RpmDatedByFile = "file"
+)
+
+// LookupDatedEcosystems is AgeEcosystems less oci and rpm: the types whose
+// publish time a lookup by name and version reads, which is what recording one
+// on a manifest entry needs. An oci tag is dated only as bodega resolves it,
+// and an rpm package only as /rpm/ reads it from primary.
 func LookupDatedEcosystems() []string {
-	return slices.DeleteFunc(AgeEcosystems(), func(t string) bool { return t == manifest.TypeOCI })
+	return slices.DeleteFunc(AgeEcosystems(), func(t string) bool { return t == manifest.TypeOCI || t == manifest.TypeRpm })
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -153,9 +169,12 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 
 	var publishedAt time.Time
 	datedBy := ""
-	if pm.Type == manifest.TypeOCI {
+	switch pm.Type {
+	case manifest.TypeOCI:
 		publishedAt, datedBy, err = ociDated(ve)
-	} else {
+	case manifest.TypeRpm:
+		publishedAt, datedBy, err = rpmDated(ve)
+	default:
 		type dated struct {
 			at  time.Time
 			err error
@@ -180,7 +199,7 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			Details: map[string]any{"published_at": publishedAt.UTC().Format(time.RFC3339), "age_seconds": int64(age.Seconds())}}
 		if datedBy != "" {
 			r.Details["dated_by"] = datedBy
-			r.Reason = ociDatedPhrase(datedBy)
+			r.Reason = datedPhrase(datedBy)
 		}
 		return r
 	}
@@ -198,7 +217,7 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	}
 	if datedBy != "" {
 		r.Details["dated_by"] = datedBy
-		r.Reason += " (" + ociDatedPhrase(datedBy) + ")"
+		r.Reason += " (" + datedPhrase(datedBy) + ")"
 	}
 	return r
 }
@@ -220,10 +239,29 @@ func ociDated(ve *manifest.VersionEntry) (time.Time, string, error) {
 	return t, by, nil
 }
 
-// ociDatedPhrase says which time an oci verdict used.
-func ociDatedPhrase(datedBy string) string {
-	if datedBy == OCIDatedByFirstSeen {
+// rpmDated reads the time /rpm/ recorded for a package off its entry, and
+// which of primary's attributes it came from.
+func rpmDated(ve *manifest.VersionEntry) (time.Time, string, error) {
+	by := ve.Metadata[RpmDatedByKey]
+	if ve.PublishedAt == "" || (by != RpmDatedByBuild && by != RpmDatedByFile) {
+		return time.Time{}, "", errors.New("an rpm package is dated by the build or file time its repository's primary gives it, and this entry carries neither: primary lists it with both at 0, or it was not served through /rpm/")
+	}
+	t, err := time.Parse(time.RFC3339Nano, ve.PublishedAt)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("the time recorded for the package does not parse: %w", err)
+	}
+	return t, by, nil
+}
+
+// datedPhrase says which time an oci or rpm verdict used.
+func datedPhrase(datedBy string) string {
+	switch datedBy {
+	case OCIDatedByFirstSeen:
 		return "dated by when bodega first resolved the tag: the image config carries no created time, or the Unix epoch"
+	case RpmDatedByBuild:
+		return "dated by the build time primary gives the package"
+	case RpmDatedByFile:
+		return "dated by the file time primary gives the package: its build time is 0"
 	}
 	return "dated by the image config's created time"
 }
@@ -287,6 +325,12 @@ func UndatableVersion(typ, version string) bool {
 // settable for oci. The time itself arrives on the entry; see ociDated.
 func (c *AgeChecker) ociPublishedAt(_ context.Context, name, tag string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("oci %s:%s is dated by bodega's registry from the image config when it resolves the tag, not by a lookup", name, tag)
+}
+
+// rpmPublishedAt is the rpm entry in agePublishers, which makes the gate
+// settable for rpm. The time itself arrives on the entry; see rpmDated.
+func (c *AgeChecker) rpmPublishedAt(_ context.Context, name, version string) (time.Time, error) {
+	return time.Time{}, fmt.Errorf("rpm %s %s is dated by the time its repository's primary gives it as /rpm/ serves it, not by a lookup", name, version)
 }
 
 func (c *AgeChecker) npmPublishedAt(ctx context.Context, name, version string) (time.Time, error) {

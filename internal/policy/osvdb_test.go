@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -106,8 +108,9 @@ type osvAgreementCase struct {
 
 // osvDistroFixtures are the releases syncedDB writes beside the agreement
 // cases, distilled out of the Ubuntu and Debian fixtures the same way a real
-// sync distills them out of the aggregate archive.
-var osvDistroFixtures = []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Debian:12"}
+// sync distills them out of the aggregate archive, and the Rocky Linux
+// export, requested under its bare name as rpm requests it.
+var osvDistroFixtures = []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Debian:12", "Rocky Linux"}
 
 // exportServer serves the testdata records as OSV's per-ecosystem export:
 // <base>/<ecosystem>/all.zip, one JSON file per record.
@@ -786,5 +789,288 @@ func TestOSVChecker_ComposerVPrefixedVersion(t *testing.T) {
 	}
 	if got := OSVEcosystemFor(manifest.TypeComposer); got != "Packagist" {
 		t.Errorf("OSVEcosystemFor(composer) = %q, want Packagist", got)
+	}
+}
+
+// An rpm package is checked against the ecosystem its repository belongs to,
+// read from the entry, and compared in rpm's order with the epoch. The fixture
+// is OSV's own two Rocky Linux 9 openssl advisories, filed under
+// "Rocky Linux:9" and requested under "Rocky Linux". 1:3.2.2-6.el9_5 sorts
+// below the fix 1:3.2.2-6.el9_5.1, which a semver compare reads as equal at
+// best. A repository with no ecosystem, EPEL's, is not run and says why.
+func TestOSVChecker_RockyLinuxOpenssl(t *testing.T) {
+	srv := exportServer(t)
+	t.Cleanup(srv.Close)
+	db := NewOSVDatabase(t.TempDir())
+	db.ExportBase = srv.URL
+	if _, err := db.Sync(t.Context(), "Rocky Linux"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	rocky := func(v string) *manifest.VersionEntry {
+		return &manifest.VersionEntry{Version: v, Metadata: map[string]string{RpmOSVEcosystemKey: "Rocky Linux", RpmRepositoryKey: "rocky-baseos", RpmReleaseKey: "9"}}
+	}
+	openssl := &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}
+	for _, tc := range []struct {
+		version string
+		ids     []string
+	}{
+		{"1:3.0.7-27.el9", []string{"RLSA-2024:6783", "RLSA-2024:9333"}},
+		{"1:3.0.7-28.el9_4", []string{"RLSA-2024:9333"}},
+		{"1:3.2.2-6.el9_5", []string{"RLSA-2024:9333"}},
+	} {
+		r := ck.Check(t.Context(), openssl, rocky(tc.version))
+		got, _ := r.Details["vulns"].([]string)
+		if r.Action != ActionBlock || !slices.Equal(got, tc.ids) || !strings.Contains(r.Reason, "queried as openssl in Rocky Linux:9") {
+			t.Errorf("openssl %s = %+v, want a block naming %v", tc.version, r, tc.ids)
+		}
+	}
+	for _, v := range []string{"1:3.2.2-6.el9_5.1", "1:3.5.1-7.el9_7"} {
+		if r := ck.Check(t.Context(), openssl, rocky(v)); r.Action != ActionPass {
+			t.Errorf("openssl %s = %+v, want a pass", v, r)
+		}
+	}
+	// Without the epoch the version sorts below every fix: 3.2.2 is epoch 0.
+	if r := ck.Check(t.Context(), openssl, rocky("3.5.1-7.el9_7")); r.Action != ActionBlock {
+		t.Errorf("openssl 3.5.1-7.el9_7, epoch 0 = %+v, want a block", r)
+	}
+
+	epel := &manifest.VersionEntry{Version: "1.24.0-1.el9", Metadata: map[string]string{RpmRepositoryKey: "epel"}}
+	r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "htop", Type: manifest.TypeRpm}, epel)
+	if r.Action != ActionNotEvaluated || !strings.Contains(r.Reason, "not run: rpm repository epel belongs to no OSV ecosystem") ||
+		!strings.Contains(r.Reason, "osv_ecosystem") {
+		t.Errorf("an EPEL package = %+v, want not evaluated naming the repository and the key that covers a mirror", r)
+	}
+	if got := osvVersionOrder("Rocky Linux:9"); got != orderRpm {
+		t.Errorf("osvVersionOrder(Rocky Linux:9) = %s, want rpm", got)
+	}
+	if got := osvVersionOrder("Red Hat:enterprise_linux:9::appstream"); got != orderRpm {
+		t.Errorf("osvVersionOrder(Red Hat:...) = %s, want rpm", got)
+	}
+}
+
+// rpmMixedReleases is one vendor export carrying several releases, the way
+// OSV publishes Rocky Linux, AlmaLinux and Red Hat: an EL9 advisory, an
+// EL10-only one, one advisory naming both releases with a fix in each, and Red
+// Hat's stock and EUS streams. The ids are synthetic; the ecosystem strings
+// are OSV's.
+const rpmMixedReleases = `[
+ {"id":"EL9-ONLY","affected":[{"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-28.el9_4"}]}]}]},
+ {"id":"EL10-ONLY","affected":[{"package":{"name":"openssl","ecosystem":"Rocky Linux:10"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.5.1-1.el10"}]}]}]},
+ {"id":"BOTH","affected":[
+  {"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-27.el9"}]}]},
+  {"package":{"name":"openssl","ecosystem":"Rocky Linux:10"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.5.2-1.el10"}]}]}]},
+ {"id":"RH-STOCK","affected":[{"package":{"name":"openssl","ecosystem":"Red Hat:enterprise_linux:9::baseos"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-28.el9_4"}]}]}]},
+ {"id":"RH-EUS","affected":[{"package":{"name":"openssl","ecosystem":"Red Hat:rhel_eus:9.2::baseos"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-30.el9_2"}]}]}]}
+]`
+
+// rpmMixedDB syncs each vendor out of an export serving rpmMixedReleases at
+// <vendor>/all.zip, through the same SyncGroup a real sync runs.
+func rpmMixedDB(t *testing.T, vendors ...string) *OSVDatabase {
+	t.Helper()
+	body, err := os.ReadFile(exportZip(t, "rpm-mixed", []byte(rpmMixedReleases)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	db := NewOSVDatabase(t.TempDir())
+	db.ExportBase = srv.URL
+	for _, res := range db.SyncGroup(t.Context(), vendors) {
+		if res.Err != nil {
+			t.Fatalf("sync %s: %v", res.Ecosystem, res.Err)
+		}
+	}
+	return db
+}
+
+// A vendor's advisories are kept per release, so an EL9 build is judged by
+// EL9's ranges alone and an EL10 build by EL10's, out of one archive, and a
+// releasever of 9.4 is release 9. Red Hat's EUS stream answers no stock
+// release.
+func TestOSVRpmReleasesStayApart(t *testing.T) {
+	db := rpmMixedDB(t, "Rocky Linux", "Red Hat")
+	ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+	}})
+	ck.LocalDB = db
+	openssl := &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}
+	for _, tc := range []struct {
+		vendor, release, version string
+		ids                      []string
+	}{
+		{"Rocky Linux", "9", "1:3.0.7-27.el9", []string{"EL9-ONLY"}},
+		{"Rocky Linux", "9.4", "1:3.0.7-27.el9", []string{"EL9-ONLY"}},
+		{"Rocky Linux", "9", "1:3.0.7-28.el9_4", nil},
+		{"Rocky Linux", "10", "1:3.5.0-1.el10", []string{"BOTH", "EL10-ONLY"}},
+		{"Rocky Linux", "10", "1:3.5.1-1.el10", []string{"BOTH"}},
+		{"Rocky Linux", "10", "1:3.5.2-1.el10", nil},
+		{"Red Hat", "9", "1:3.0.7-28.el9_4", nil},
+		{"Red Hat", "9", "1:3.0.7-27.el9", []string{"RH-STOCK"}},
+	} {
+		ve := &manifest.VersionEntry{Version: tc.version, Metadata: map[string]string{
+			RpmOSVEcosystemKey: tc.vendor, RpmReleaseKey: tc.release, RpmRepositoryKey: "baseos"}}
+		r := ck.Check(t.Context(), openssl, ve)
+		got, _ := r.Details["vulns"].([]string)
+		want := ActionBlock
+		if tc.ids == nil {
+			want = ActionPass
+		}
+		if r.Action != want || !slices.Equal(got, tc.ids) {
+			t.Errorf("%s %s openssl %s = %+v, want %s naming %v", tc.vendor, tc.release, tc.version, r, want, tc.ids)
+		}
+	}
+
+	ve := &manifest.VersionEntry{Version: "1:3.0.7-27.el9", Metadata: map[string]string{
+		RpmOSVEcosystemKey: "Rocky Linux", RpmRepositoryKey: "baseos"}}
+	if r := ck.Check(t.Context(), openssl, ve); r.Action != ActionWarn || !strings.Contains(r.Reason, "names no Enterprise Linux release") {
+		t.Errorf("an entry naming no release = %+v, want a warn saying so", r)
+	}
+}
+
+// An index synced before rpm advisories were kept per release cannot tell
+// one release's records from another's, so it warns and names the sync that
+// fixes it instead of answering.
+func TestOSVRpmIndexWithoutReleasesRefused(t *testing.T) {
+	db := rpmMixedDB(t, "Rocky Linux")
+	idx := mustOSVIndex(t, db, "Rocky Linux")
+	idx.ByRelease = false
+	if _, err := db.writeIndex("Rocky Linux", idx); err != nil {
+		t.Fatal(err)
+	}
+	ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+	}})
+	ck.LocalDB = NewOSVDatabase(db.Dir())
+	ve := &manifest.VersionEntry{Version: "1:3.0.7-28.el9_4", Metadata: map[string]string{
+		RpmOSVEcosystemKey: "Rocky Linux", RpmReleaseKey: "9", RpmRepositoryKey: "baseos"}}
+	r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}, ve)
+	if r.Action != ActionWarn || !strings.Contains(r.Reason, "bodega policy osv sync rpm") {
+		t.Errorf("an index keyed by name alone = %+v, want a warn naming the sync", r)
+	}
+}
+
+// api.osv.dev is asked under the vendor and answers with every release's
+// hits, so the fallback keeps only the records whose own entries for the
+// release asked about cover the version.
+func TestOSVRpmAPIFallbackKeepsTheRelease(t *testing.T) {
+	var asked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			Package struct{ Ecosystem string } `json:"package"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		asked = q.Package.Ecosystem
+		var recs []json.RawMessage
+		_ = json.Unmarshal([]byte(rpmMixedReleases), &recs)
+		_, _ = fmt.Fprintf(w, `{"vulns":[%s,%s,%s]}`, recs[0], recs[1], recs[2])
+	}))
+	t.Cleanup(srv.Close)
+	ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+	}})
+	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
+	for _, tc := range []struct {
+		release, version string
+		ids              []string
+	}{
+		{"9", "1:3.0.7-28.el9_4", nil},
+		{"9", "1:3.0.7-26.el9", []string{"BOTH", "EL9-ONLY"}},
+		{"10", "1:3.5.1-1.el10", []string{"BOTH"}},
+	} {
+		ve := &manifest.VersionEntry{Version: tc.version, Metadata: map[string]string{
+			RpmOSVEcosystemKey: "Rocky Linux", RpmReleaseKey: tc.release, RpmRepositoryKey: "baseos"}}
+		r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}, ve)
+		got, _ := r.Details["vulns"].([]string)
+		if !slices.Equal(got, tc.ids) {
+			t.Errorf("release %s openssl %s = %+v, want %v", tc.release, tc.version, r, tc.ids)
+		}
+	}
+	if asked != "Rocky Linux" {
+		t.Errorf("api.osv.dev asked under %q, want the vendor", asked)
+	}
+}
+
+// One record can name several packages, each in its own release. The
+// fallback reads only the entries filed under the package asked about, keyed
+// the way a local lookup keys them, so another package's EL9 range never
+// judges openssl on EL9. The ids are synthetic.
+func TestOSVRpmAPIFallbackKeepsThePackage(t *testing.T) {
+	const (
+		otherOnEL9  = `{"package":{"name":"other-package","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"9:9.0-1.el9"}]}]}`
+		opensslEL10 = `{"package":{"name":"openssl","ecosystem":"Rocky Linux:10"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.5.1-1.el10"}]}]}`
+		fixedOnEL9  = `{"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-27.el9"}]}]}`
+		hitOnEL9    = `{"package":{"name":"OpenSSL","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-30.el9"}]}]}`
+	)
+	for _, tc := range []struct {
+		name     string
+		affected []string
+		ids      []string
+	}{
+		{"openssl only on EL10, another package on EL9", []string{opensslEL10, otherOnEL9}, nil},
+		{"openssl fixed on EL9 and affected on EL10, another package on EL9", []string{fixedOnEL9, otherOnEL9, opensslEL10}, nil},
+		{"openssl affected on EL9 beside another package", []string{otherOnEL9, hitOnEL9, opensslEL10}, []string{"MULTI-PACKAGE"}},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprintf(w, `{"vulns":[{"id":"MULTI-PACKAGE","affected":[%s]}]}`, strings.Join(tc.affected, ","))
+		}))
+		ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+			manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+		}})
+		ck.Endpoint = srv.URL
+		ck.AllowAPIFallback = true
+		ve := &manifest.VersionEntry{Version: "1:3.0.7-28.el9_4", Metadata: map[string]string{
+			RpmOSVEcosystemKey: "Rocky Linux", RpmReleaseKey: "9", RpmRepositoryKey: "baseos"}}
+		r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}, ve)
+		srv.Close()
+		got, _ := r.Details["vulns"].([]string)
+		want := ActionBlock
+		if tc.ids == nil {
+			want = ActionPass
+		}
+		if r.Action != want || !slices.Equal(got, tc.ids) {
+			t.Errorf("%s: EL9 openssl 1:3.0.7-28.el9_4 = %+v, want %s naming %v", tc.name, r, want, tc.ids)
+		}
+	}
+}
+
+// An rpm repository no OSV ecosystem covers is not run whatever else holds:
+// ignored actions, the malware-only pass and an unresolved stub all say so
+// rather than pass.
+func TestOSVRpmUncoveredNotRunBeforeEveryPass(t *testing.T) {
+	ignored := &fakeOSVStore{
+		policies: map[string]audit.OSVPolicy{manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionIgnore}},
+		malware:  map[string]audit.OSVMalwarePolicy{manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionIgnore}},
+	}
+	htop := &manifest.PackageManifest{Name: "htop", Type: manifest.TypeRpm}
+	for _, tc := range []struct {
+		name    string
+		store   *fakeOSVStore
+		version string
+		malware bool
+	}{
+		{"actions ignored", ignored, "3.3.0-1.el9", false},
+		{"malware only", &fakeOSVStore{}, "3.3.0-1.el9", true},
+		{"no version", &fakeOSVStore{}, "", false},
+		{"no version, actions ignored", ignored, "", false},
+	} {
+		ck := NewOSVChecker(tc.store)
+		ve := &manifest.VersionEntry{Version: tc.version, Metadata: map[string]string{RpmRepositoryKey: "epel"}}
+		var r Result
+		if tc.malware {
+			r = ck.CheckMalware(t.Context(), htop, ve)
+		} else {
+			r = ck.Check(t.Context(), htop, ve)
+		}
+		if r.Action != ActionNotEvaluated || !strings.Contains(r.Reason, "rpm repository epel belongs to no OSV ecosystem") {
+			t.Errorf("%s: %+v, want not_evaluated naming epel", tc.name, r)
+		}
 	}
 }

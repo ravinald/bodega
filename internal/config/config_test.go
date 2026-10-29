@@ -245,7 +245,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"composer_upstream": "https://packagist.example.com",
 		// Load requires registry hostnames for keys and https URLs for values.
 		"oci_upstreams":     map[string]string{"registry.example.com": "https://registry.example.com"},
-		"rpm_upstreams":     map[string]string{"rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"},
+		"rpm_upstreams":     map[string]config.RpmUpstream{"rocky-baseos": {URL: "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"}, "mirror": {URL: "https://rocky.example.com/$releasever/BaseOS/$basearch/os/", OSVEcosystem: "Rocky Linux"}},
 		"oci_token_hosts":   []string{"auth.example.com"},
 		"gomod_upstream":    "https://goproxy.example.com",
 		"npm_upstream":      "https://npm.example.com",

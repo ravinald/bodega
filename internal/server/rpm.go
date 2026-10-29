@@ -79,7 +79,7 @@ func (s *Server) handleRpm(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	raw, ok := s.cfg.RpmUpstreams[segs[0]]
+	up, ok := s.cfg.RpmUpstreams[segs[0]]
 	if !ok {
 		noSharedCache(w)
 		http.Error(w, fmt.Sprintf("rpm repository %q is not in rpm_upstreams on this server; an operator names each repository bodega serves there.", segs[0]), http.StatusNotFound)
@@ -96,7 +96,7 @@ func (s *Server) handleRpm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := rpmTree{repo: segs[0], releasever: segs[1], basearch: segs[2],
-		base: strings.NewReplacer("$releasever", segs[1], "$basearch", segs[2]).Replace(raw)}
+		base: strings.NewReplacer("$releasever", segs[1], "$basearch", segs[2]).Replace(up.URL)}
 	rest := segs[3]
 	switch {
 	case rest == "repodata/repomd.xml":
@@ -591,7 +591,8 @@ func (s *Server) handleRpmPackage(w http.ResponseWriter, r *http.Request, t rpmT
 	verify := rpmVerifyingOpener(pkg.sumType, pkg.sum, func(got string) error {
 		return rpmMismatch(t, href, name, version, "primary", pkg.sumType, pkg.sum, got)
 	})
-	req := r.WithContext(withUpstreamOpener(ctx, verify))
+	fill := rpmFill{repo: t.repo, releasever: t.releasever, ecosystem: s.cfg.RpmOSVEcosystem(t.repo), published: pkg.published, datedBy: pkg.datedBy}
+	req := r.WithContext(withRpmFill(withUpstreamOpener(ctx, verify), fill))
 	resolve := func(context.Context) (string, error) { return upstream, nil }
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
 	s.proxyOrResolve(cw, req, rpmFillStore{store}, key,
@@ -791,11 +792,61 @@ func (v *rpmVerifyingReader) Close() error { return v.r.Close() }
 
 // ---- primary ---------------------------------------------------------------
 
-// rpmPackage is what bodega keeps of one primary <package>: its identity and
-// the checksum its bytes must match.
+// rpmPackage is what bodega keeps of one primary <package>: its identity,
+// the checksum its bytes must match, and the time the age gate dates it by.
 type rpmPackage struct {
 	name, epoch, ver, rel string
 	sumType, sum          string
+	// published is <time build>, or <time file> when build is 0, and datedBy
+	// says which; zero when primary gives neither.
+	published time.Time
+	datedBy   string
+}
+
+// rpmPublished reads a primary <time> element's attributes, Unix seconds
+// each: build, when rpmbuild made the package, or file, the package file's
+// mtime when the repository was composed, for one whose build time is 0.
+func rpmPublished(build, file string) (time.Time, string) {
+	for _, c := range []struct{ v, by string }{{build, policy.RpmDatedByBuild}, {file, policy.RpmDatedByFile}} {
+		if n, err := strconv.ParseInt(strings.TrimSpace(c.v), 10, 64); err == nil && n > 0 {
+			return time.Unix(n, 0).UTC(), c.by
+		}
+	}
+	return time.Time{}, ""
+}
+
+// rpmFill is what the version gate needs to know about the package a fill
+// fetches beyond its name and version: the repository and release it comes
+// from, which OSV ecosystem covers that repository, and when primary dates it.
+type rpmFill struct {
+	repo, releasever, ecosystem string
+	published                   time.Time
+	datedBy                     string
+}
+
+type rpmFillKey struct{}
+
+// withRpmFill carries f from the /rpm/ route to versionPolicyGate, across
+// proxyOrResolve, which knows nothing of primary.
+func withRpmFill(ctx context.Context, f rpmFill) context.Context {
+	return context.WithValue(ctx, rpmFillKey{}, f)
+}
+
+func rpmFillFrom(ctx context.Context) rpmFill {
+	f, _ := ctx.Value(rpmFillKey{}).(rpmFill)
+	return f
+}
+
+// describe records f on the version entry the age and OSV checks read.
+func (f rpmFill) describe(ve *manifest.VersionEntry) {
+	ve.Metadata = map[string]string{policy.RpmRepositoryKey: f.repo, policy.RpmReleaseKey: f.releasever}
+	if f.ecosystem != "" {
+		ve.Metadata[policy.RpmOSVEcosystemKey] = f.ecosystem
+	}
+	if !f.published.IsZero() {
+		ve.PublishedAt = f.published.Format(time.RFC3339)
+		ve.Metadata[policy.RpmDatedByKey] = f.datedBy
+	}
 }
 
 func (p rpmPackage) evr() string { return manifest.RpmEVR(p.epoch, p.ver, p.rel) }
@@ -940,6 +991,10 @@ func parseRpmPrimary(raw []byte, ext string) (map[string]rpmPackage, error) {
 				Href  string     `xml:"href,attr"`
 				Attrs []xml.Attr `xml:",any,attr"`
 			} `xml:"location"`
+			Time struct {
+				File  string `xml:"file,attr"`
+				Build string `xml:"build,attr"`
+			} `xml:"time"`
 		}
 		if err := dec.DecodeElement(&p, &se); err != nil {
 			return nil, err
@@ -950,6 +1005,7 @@ func parseRpmPrimary(raw []byte, ext string) (map[string]rpmPackage, error) {
 		}
 		pkg := rpmPackage{name: p.Name, epoch: p.Version.Epoch, ver: p.Version.Ver, rel: p.Version.Rel,
 			sumType: p.Checksum.Type, sum: strings.ToLower(strings.TrimSpace(p.Checksum.Value))}
+		pkg.published, pkg.datedBy = rpmPublished(p.Time.Build, p.Time.File)
 		if !manifest.RpmValidEVR(pkg.evr()) {
 			continue
 		}
