@@ -743,7 +743,7 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 	}
 	vulns := make([]osvVuln, 0, len(out.Vulns))
 	for _, v := range out.Vulns {
-		if queryEco != ecosystem && !rpmAffectsRelease(ecosystem, version, v.Affected) {
+		if queryEco != ecosystem && !rpmAffectsRelease(ecosystem, name, version, v.Affected) {
 			continue
 		}
 		v.Malicious = v.DatabaseSpecific.malicious()

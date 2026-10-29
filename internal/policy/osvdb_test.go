@@ -998,6 +998,49 @@ func TestOSVRpmAPIFallbackKeepsTheRelease(t *testing.T) {
 	}
 }
 
+// One record can name several packages, each in its own release. The
+// fallback reads only the entries filed under the package asked about, keyed
+// the way a local lookup keys them, so another package's EL9 range never
+// judges openssl on EL9. The ids are synthetic.
+func TestOSVRpmAPIFallbackKeepsThePackage(t *testing.T) {
+	const (
+		otherOnEL9  = `{"package":{"name":"other-package","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"9:9.0-1.el9"}]}]}`
+		opensslEL10 = `{"package":{"name":"openssl","ecosystem":"Rocky Linux:10"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.5.1-1.el10"}]}]}`
+		fixedOnEL9  = `{"package":{"name":"openssl","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-27.el9"}]}]}`
+		hitOnEL9    = `{"package":{"name":"OpenSSL","ecosystem":"Rocky Linux:9"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1:3.0.7-30.el9"}]}]}`
+	)
+	for _, tc := range []struct {
+		name     string
+		affected []string
+		ids      []string
+	}{
+		{"openssl only on EL10, another package on EL9", []string{opensslEL10, otherOnEL9}, nil},
+		{"openssl fixed on EL9 and affected on EL10, another package on EL9", []string{fixedOnEL9, otherOnEL9, opensslEL10}, nil},
+		{"openssl affected on EL9 beside another package", []string{otherOnEL9, hitOnEL9, opensslEL10}, []string{"MULTI-PACKAGE"}},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprintf(w, `{"vulns":[{"id":"MULTI-PACKAGE","affected":[%s]}]}`, strings.Join(tc.affected, ","))
+		}))
+		ck := NewOSVChecker(&fakeOSVStore{policies: map[string]audit.OSVPolicy{
+			manifest.TypeRpm: {Ecosystem: manifest.TypeRpm, Action: ActionBlock},
+		}})
+		ck.Endpoint = srv.URL
+		ck.AllowAPIFallback = true
+		ve := &manifest.VersionEntry{Version: "1:3.0.7-28.el9_4", Metadata: map[string]string{
+			RpmOSVEcosystemKey: "Rocky Linux", RpmReleaseKey: "9", RpmRepositoryKey: "baseos"}}
+		r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "openssl", Type: manifest.TypeRpm}, ve)
+		srv.Close()
+		got, _ := r.Details["vulns"].([]string)
+		want := ActionBlock
+		if tc.ids == nil {
+			want = ActionPass
+		}
+		if r.Action != want || !slices.Equal(got, tc.ids) {
+			t.Errorf("%s: EL9 openssl 1:3.0.7-28.el9_4 = %+v, want %s naming %v", tc.name, r, want, tc.ids)
+		}
+	}
+}
+
 // An rpm repository no OSV ecosystem covers is not run whatever else holds:
 // ignored actions, the malware-only pass and an unresolved stub all say so
 // rather than pass.

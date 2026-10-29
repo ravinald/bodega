@@ -202,15 +202,23 @@ func rpmIndexKey(major, name string) string {
 	return major + "/" + strings.ToLower(name)
 }
 
-// rpmAffectsRelease reports whether an API answer's record affects version in
-// the release ecosystem asked about, judged by the record's own entries for
-// that release. api.osv.dev is queried under the vendor and matches any
-// release's ranges, so its hit alone is not an answer for this one. A range
-// the rpm ordering cannot walk keeps the record: the API placed it, and
-// nothing here can say it was wrong.
-func rpmAffectsRelease(ecosystem, version string, affected []osvRecordedAffected) bool {
+// rpmAffectsRelease reports whether an API answer's record affects name at
+// version in the release ecosystem asked about, judged by the record's own
+// entries for that package in that release. api.osv.dev is queried under the
+// vendor and matches any release's ranges, and one record can name several
+// packages, so its hit alone is not an answer for this one. An entry counts
+// only when it is filed under the same index key a local lookup reads, so the
+// fallback and the synced database agree on which entries are this package's.
+// A range the rpm ordering cannot walk keeps the record: the API placed it,
+// and nothing here can say it was wrong.
+func rpmAffectsRelease(ecosystem, name, version string, affected []osvRecordedAffected) bool {
+	_, want, _ := osvIndexFor(ecosystem, name)
 	for _, aff := range affected {
-		if rpmRecordedRelease(aff.Package.Ecosystem) != ecosystem {
+		release := rpmRecordedRelease(aff.Package.Ecosystem)
+		if release != ecosystem {
+			continue
+		}
+		if _, key, _ := osvIndexFor(release, aff.Package.Name); key != want {
 			continue
 		}
 		matched, bad := osvAffected{Versions: aff.Versions, Ranges: aff.Ranges}.affects(orderRpm, version)
