@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 
@@ -314,5 +315,267 @@ func TestRpmProfileBuildIsSharedAcrossAProfilesHosts(t *testing.T) {
 	}
 	if n := m.hitsFor(rpmPrimaryGz); n != 1 {
 		t.Errorf("upstream asked for primary %d times, want 1", n)
+	}
+}
+
+func rpmVerifies(t *testing.T, kr interface{ PublicKey() ([]byte, error) }, doc, sig string) error {
+	t.Helper()
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = openpgp.CheckArmoredDetachedSignature(ring, strings.NewReader(doc), strings.NewReader(sig), nil)
+	return err
+}
+
+func rpmParseRepomd(t *testing.T, doc string) rpmRepomdDoc {
+	t.Helper()
+	var md rpmRepomdDoc
+	if err := xml.Unmarshal([]byte(doc), &md); err != nil {
+		t.Fatalf("repomd.xml does not parse: %v\n%s", err, doc)
+	}
+	return md
+}
+
+func rpmEntryHref(t *testing.T, doc, typ string) string {
+	t.Helper()
+	for _, d := range rpmParseRepomd(t, doc).Data {
+		if d.Type == typ {
+			return d.Location.Href
+		}
+	}
+	t.Fatalf("repomd.xml lists no %s:\n%s", typ, doc)
+	return ""
+}
+
+// A profile edit is a permission change, not an upstream rollover: the host's
+// next repomd.xml lists what the edited profile admits, the pair it is signed
+// as verifies, and the previous listing's filtered files are no longer served
+// to it.
+func TestRpmProfileEditMovesTheHostToTheNewListing(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name          string
+		entry         audit.ProfileEntry
+		edit          func(t *testing.T, s *Server)
+		before, after []string
+	}{
+		{
+			name:   "removal",
+			entry:  audit.ProfileEntry{Type: manifest.TypeRpm, Name: "nginx"},
+			before: []string{"nginx"},
+			edit: func(t *testing.T, s *Server) {
+				if _, err := s.auditDB.RemoveProfileEntry(ctx, "web", manifest.TypeRpm, "nginx"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "changed version pin",
+			entry:  audit.ProfileEntry{Type: manifest.TypeRpm, Name: "nginx", Constraint: manifest.ConstraintExact, Version: "2:1.20.1-20.el9"},
+			before: []string{"nginx"},
+			edit: func(t *testing.T, s *Server) {
+				if _, err := s.auditDB.PutProfileEntry(ctx, audit.ProfileEntry{Profile: "web", Type: manifest.TypeRpm, Name: "nginx",
+					Constraint: manifest.ConstraintExact, Version: "2:9.0-1.el9"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "expansion",
+			entry:  audit.ProfileEntry{Type: manifest.TypeRpm, Name: "nginx"},
+			before: []string{"nginx"},
+			after:  []string{"nginx", "httpd"},
+			edit: func(t *testing.T, s *Server) {
+				if err := s.auditDB.SetProfileTypeRule(ctx, audit.ProfileTypeRule{Profile: "web", Type: manifest.TypeRpm,
+					Membership: audit.MembershipClosed, VersionDefault: audit.VersionFloating, Expansion: audit.ExpansionWarn}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newRPMMirror(t)
+			rpmFullRepo(t, m)
+			s, kr := rpmServer(t, m)
+			pf := bindProfile(t, s, "web", "web01",
+				[]audit.ProfileTypeRule{closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)},
+				[]audit.ProfileEntry{tc.entry})
+			lists := func(doc string) string {
+				open := string(rpmGunzip(t, rpmPrimaryOf(t, pf, rpmParseRepomd(t, doc))))
+				var names []string
+				for _, n := range []string{"nginx", "httpd"} {
+					if strings.Contains(open, "<name>"+n+"</name>") {
+						names = append(names, n)
+					}
+				}
+				return strings.Join(names, ",")
+			}
+
+			_, before := pf.get(t, rpmRepoPath+"repodata/repomd.xml")
+			if got, want := lists(before), strings.Join(tc.before, ","); got != want {
+				t.Fatalf("before the edit the primary lists %q, want %q", got, want)
+			}
+			oldPrimary := rpmEntryHref(t, before, "primary")
+
+			tc.edit(t, s)
+			s.refreshProfiles(ctx)
+
+			status, after := pf.get(t, rpmRepoPath+"repodata/repomd.xml")
+			if status != http.StatusOK {
+				t.Fatalf("repomd.xml after the edit: %d %s", status, after)
+			}
+			if got, want := lists(after), strings.Join(tc.after, ","); got != want {
+				t.Errorf("after the edit the primary lists %q, want %q", got, want)
+			}
+			status, sig := pf.get(t, rpmRepoPath+"repodata/repomd.xml.asc")
+			if status != http.StatusOK {
+				t.Fatalf("repomd.xml.asc after the edit: %d %s", status, sig)
+			}
+			if err := rpmVerifies(t, kr, after, sig); err != nil {
+				t.Errorf("the signature does not verify over the repomd.xml served after the edit: %v", err)
+			}
+			if status, _ := pf.get(t, rpmRepoPath+oldPrimary); status != http.StatusNotFound {
+				t.Errorf("the pre-edit filtered primary for web01 after the edit: %d, want 404", status)
+			}
+		})
+	}
+}
+
+// An unchanged profile keeps upstream rollover behavior: a key handed a
+// filtered repomd.xml moments ago keeps it, and its signature, while the
+// upstream moves underneath, and a profile refresh that changes nothing does
+// not move it either.
+func TestRpmProfileUnchangedHoldsItsRevisionAcrossAnUpstreamMove(t *testing.T) {
+	m := newRPMMirror(t)
+	upstream, _ := rpmFullRepo(t, m)
+	s, kr := rpmServer(t, m)
+	s.cache.MetadataTTL = time.Nanosecond
+	pf := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeRpm, Name: "nginx"}})
+
+	_, first := pf.get(t, rpmRepoPath+"repodata/repomd.xml")
+	m.set("repodata/repomd.xml", append(bytes.Clone(upstream), "<!-- moved -->\n"...))
+	s.refreshProfiles(context.Background())
+	_, second := pf.get(t, rpmRepoPath+"repodata/repomd.xml")
+	if second != first {
+		t.Errorf("a key inside rpmSignatureWait was moved to the upstream's next revision:\n%s\n---\n%s", second, first)
+	}
+	_, sig := pf.get(t, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err := rpmVerifies(t, kr, first, sig); err != nil {
+		t.Errorf("the signature does not cover the revision the key holds: %v", err)
+	}
+}
+
+// The filtered repomd.xml is a function of the profile and the upstream
+// metadata alone, so a signature asked of a process that never served the
+// document (a restart, or a second instance on the same store and key)
+// verifies over the bytes the first one served.
+func TestRpmProfileSignatureVerifiesAfterARestartAndOnASecondInstance(t *testing.T) {
+	m := newRPMMirror(t)
+	rpmFullRepo(t, m)
+	rules := func() []audit.ProfileTypeRule {
+		return []audit.ProfileTypeRule{closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)}
+	}
+	entries := func() []audit.ProfileEntry { return []audit.ProfileEntry{{Type: manifest.TypeRpm, Name: "nginx"}} }
+	s, kr := rpmServer(t, m)
+	pf := bindProfile(t, s, "web", "web01", rules(), entries())
+	other, _ := rpmServer(t, m)
+	other.stores = s.stores
+	other.aptSign.Store(s.aptSign.Load())
+	pf2 := bindProfile(t, other, "web", "web01", rules(), entries())
+
+	status, doc := pf.get(t, rpmRepoPath+"repodata/repomd.xml")
+	if status != http.StatusOK {
+		t.Fatalf("repomd.xml: %d %s", status, doc)
+	}
+	// A wall-clock timestamp in the filtered entries would differ from here on.
+	time.Sleep(1100 * time.Millisecond)
+
+	t.Run("a second instance on the same store and key", func(t *testing.T) {
+		status, sig := pf2.get(t, rpmRepoPath+"repodata/repomd.xml.asc")
+		if status != http.StatusOK {
+			t.Fatalf("repomd.xml.asc: %d %s", status, sig)
+		}
+		if err := rpmVerifies(t, kr, doc, sig); err != nil {
+			t.Errorf("the second instance signed other bytes than the first served: %v", err)
+		}
+	})
+	t.Run(".asc first after a restart", func(t *testing.T) {
+		s.rpmServed = rpmServedRepomds{}
+		s.rpmProfileBuilds = rpmProfileBuilds{}
+		status, sig := pf.get(t, rpmRepoPath+"repodata/repomd.xml.asc")
+		if status != http.StatusOK {
+			t.Fatalf("repomd.xml.asc: %d %s", status, sig)
+		}
+		if err := rpmVerifies(t, kr, doc, sig); err != nil {
+			t.Errorf("after a restart the signature is over other bytes than were served: %v", err)
+		}
+	})
+}
+
+// The root's packages count is set whatever XML quoting and spacing the
+// upstream wrote it with, and no other attribute is touched.
+func TestRpmFilterPackagesSetsTheRootCount(t *testing.T) {
+	primaryPkg := func(id string) string {
+		return `<package type="rpm"><name>` + id + `</name><arch>x86_64</arch><version epoch="0" ver="1" rel="1"/>` +
+			`<checksum type="sha256" pkgid="YES">` + id + `</checksum><location href="Packages/` + id + `-1-1.x86_64.rpm"/></package>`
+	}
+	attrPkg := func(id string) string { return `<package pkgid='` + id + `' name="` + id + `" arch="x86_64"/>` }
+	roots := []struct {
+		typ, root string
+		pkg       func(string) string
+	}{
+		{"primary", "metadata", primaryPkg},
+		{"filelists", "filelists", attrPkg},
+		{"other", "otherdata", attrPkg},
+	}
+	attrs := []struct{ name, attr, keepsVerbatim string }{
+		{"double quotes", `packages="2"`, ""},
+		{"single quotes", `packages='2'`, ""},
+		{"spaced equals", `packages = "2"`, ""},
+		{"newline and tab", "packages\n=\t'2'", ""},
+		{"beside a prefixed packages attribute", `xmlns:x="urn:x" x:packages="2" packages="2"`, `x:packages="2"`},
+		{"beside a value that names packages", `xml:lang="u packages='2'" packages='2'`, `xml:lang="u packages='2'"`},
+	}
+	for _, rt := range roots {
+		for _, at := range attrs {
+			t.Run(rt.typ+"/"+at.name, func(t *testing.T) {
+				raw := []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n<" + rt.root + ` xmlns="urn:test" ` + at.attr + ">\n" +
+					rt.pkg("keep") + "\n" + rt.pkg("drop") + "\n</" + rt.root + ">\n")
+				gz, open, err := rpmFilterPackages(raw, ".xml", 1, map[string]bool{"keep": true}, rt.typ == "primary")
+				if err != nil {
+					t.Fatal(err)
+				}
+				out := rpmGunzip(t, gz)
+				if rpmSHA256(out) != open.sum || int64(len(out)) != open.size {
+					t.Errorf("open-checksum %s open-size %d do not describe the output (%s, %d)", open.sum, open.size, rpmSHA256(out), len(out))
+				}
+				var got struct {
+					Attrs    []xml.Attr `xml:",any,attr"`
+					Packages []struct{} `xml:"package"`
+				}
+				if err := xml.Unmarshal(out, &got); err != nil {
+					t.Fatalf("output does not parse: %v\n%s", err, out)
+				}
+				count := ""
+				for _, a := range got.Attrs {
+					if a.Name.Space == "" && a.Name.Local == "packages" {
+						count = a.Value
+					}
+				}
+				if len(got.Packages) != 1 || count != "1" {
+					t.Errorf("packages=%q with %d <package> elements, want 1 and 1:\n%s", count, len(got.Packages), out)
+				}
+				if at.keepsVerbatim != "" && !bytes.Contains(out, []byte(at.keepsVerbatim)) {
+					t.Errorf("%s was rewritten:\n%s", at.keepsVerbatim, out)
+				}
+			})
+		}
 	}
 }

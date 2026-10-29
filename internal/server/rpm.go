@@ -183,6 +183,7 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 				return
 			}
 			served = filtered
+			s.rpmServed.retire(rpmProfileView(t, p), rpmViewID(t, p))
 		}
 		if held := s.rpmServed.publish(rpmViewID(t, p), rpmClientKey(r), served, s.rpmServed.now()); !bytes.Equal(held, body) {
 			body = held
@@ -368,6 +369,19 @@ func (c *rpmServedRepomds) held(tree, client string, now time.Time) ([]byte, boo
 	return cl.doc, true
 }
 
+// retire forgets every tree whose key starts with prefix except keep: the
+// views of a profile's earlier versions, which no request names again once
+// the profile has changed.
+func (c *rpmServedRepomds) retire(prefix, keep string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.trees {
+		if k != keep && strings.HasPrefix(k, prefix) {
+			delete(c.trees, k)
+		}
+	}
+}
+
 // rpmCachedRepomd is the stored repomd.xml, fetched through the repomd route
 // only when none is stored.
 func (s *Server) rpmCachedRepomd(r *http.Request, t rpmTree) ([]byte, error) {
@@ -440,6 +454,7 @@ type rpmRepomdData struct {
 	Location struct {
 		Href string `xml:"href,attr"`
 	} `xml:"location"`
+	Timestamp string `xml:"timestamp"`
 }
 
 func parseRpmRepomd(doc []byte) ([]rpmRepomdData, error) {

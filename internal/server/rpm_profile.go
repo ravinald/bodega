@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,8 +37,9 @@ import (
 // listed for it. The filter is a listing control; the package route's
 // entitleGate is what refuses a package by name, whatever href asks for it.
 
-// rpmFilteredTypes are the repomd.xml entries a profile rewrites. They are
-// the three that list packages and that dnf reads by default.
+// rpmFilteredTypes are the repomd.xml entries a profile rewrites: the three
+// that list packages. Their *_zck variants are left as the upstream's, and a
+// dnf with zchunk on, its default, reads those instead where they exist.
 var rpmFilteredTypes = []string{"primary", "filelists", "other"}
 
 // rpmProfileBuildsKept is how many builds a profile keeps per repository tree.
@@ -51,13 +51,22 @@ const rpmProfileBuildsKept = 2
 func rpmFilters(p *entitle.Profile) bool { return p.Governs(manifest.TypeRpm) }
 
 // rpmViewID is the key rpmServed holds a host's repomd.xml under. A governed
-// host's view is its profile's, so a filtered document and the upstream's are
-// never two revisions of one tree.
+// host's view is its profile's as it stands now, so a filtered document and
+// the upstream's are never two revisions of one tree, and neither are two
+// versions of one profile. The fingerprint is what keeps a profile edit out
+// of rpmServed's rollover grace: that grace lets a key keep the revision it
+// holds while the upstream moves, and applied to an edit it would keep
+// serving a listing the profile no longer grants.
 func rpmViewID(t rpmTree, p *entitle.Profile) string {
 	if !rpmFilters(p) {
 		return t.id()
 	}
-	return t.id() + "\x00profile\x00" + p.Name()
+	return rpmProfileView(t, p) + p.Fingerprint(manifest.TypeRpm)
+}
+
+// rpmProfileView is the part of rpmViewID every version of p shares.
+func rpmProfileView(t rpmTree, p *entitle.Profile) string {
+	return t.id() + "\x00profile\x00" + p.Name() + "\x00"
 }
 
 // rpmFilteredFile is one filtered metadata file as its repomd.xml entry
@@ -145,14 +154,26 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	if store == nil {
 		return nil, errors.New("no storage backend holds the rpm type, so a filtered metadata file has nowhere to live")
 	}
+	stamps := map[string]int64{}
+	var latest int64
+	for _, d := range data {
+		if ts, ok := rpmTimestamp(d); ok && ts > latest {
+			latest = ts
+		}
+	}
 	key := p.Fingerprint(manifest.TypeRpm)
 	for _, typ := range rpmFilteredTypes {
 		if e, ok := entries[typ]; ok {
-			key += "\x00" + typ + "=" + e.Checksum.Value
+			ts, ok := rpmTimestamp(e)
+			if !ok {
+				ts = latest
+			}
+			stamps[typ] = ts
+			key += "\x00" + typ + "=" + e.Checksum.Value + "@" + strconv.FormatInt(ts, 10)
 		}
 	}
 
-	sl := s.rpmProfileBuilds.slot(rpmViewID(t, p))
+	sl := s.rpmProfileBuilds.slot(rpmProfileView(t, p))
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 	for _, b := range sl.recent {
@@ -177,7 +198,6 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	if err != nil {
 		return nil, fmt.Errorf("primary %s of %s: %w", primary.Location.Href, t.id(), err)
 	}
-	now := time.Now().Unix()
 	b := &rpmProfileBuild{key: key, files: map[string]rpmFilteredFile{}}
 	for _, typ := range rpmFilteredTypes {
 		e, ok := entries[typ]
@@ -195,7 +215,7 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 			return nil, fmt.Errorf("filter %s %s of %s: %w", typ, e.Location.Href, t.id(), err)
 		}
 		sum := rpmSHA256Hex(body)
-		f := rpmFilteredFile{typ: typ, sum: sum, openSum: open.sum, size: int64(len(body)), openSize: open.size, timestamp: now,
+		f := rpmFilteredFile{typ: typ, sum: sum, openSum: open.sum, size: int64(len(body)), openSize: open.size, timestamp: stamps[typ],
 			href: "repodata/" + sum + "-" + typ + ".xml.gz"}
 		if err := store.Put(r.Context(), rpmFilteredKey(t, f), body); err != nil {
 			return nil, fmt.Errorf("store the filtered %s of %s: %w", typ, t.id(), err)
@@ -212,6 +232,21 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	s.logger.Info("filtered an rpm repository's metadata for a profile",
 		"profile", p.Name(), "repository", t.id(), "primary", primary.Checksum.Value, "kept", len(kept))
 	return b, nil
+}
+
+// rpmTimestamp is the timestamp an upstream entry gives its file. A filtered
+// file carries its upstream file's, never the time it was built, because the
+// filtered repomd.xml has to come out byte for byte the same wherever it is
+// rebuilt: a .asc request reaching a restarted process, or another instance
+// on the same store, signs a reconstruction, and a build-time timestamp makes
+// that signature fail against the document the client already holds. An
+// entry with none takes the newest any entry gives.
+func rpmTimestamp(d rpmRepomdData) (int64, bool) {
+	f, err := strconv.ParseFloat(strings.TrimSpace(d.Timestamp), 64)
+	if err != nil || f <= 0 {
+		return 0, false
+	}
+	return int64(f), true
 }
 
 func (s *Server) rpmProfileBuildStored(r *http.Request, t rpmTree, b *rpmProfileBuild) bool {
@@ -409,9 +444,55 @@ type rpmOpen struct {
 	size int64
 }
 
-// rpmPackagesAttr is the root element's package count in primary, filelists
-// and other.
-var rpmPackagesAttr = regexp.MustCompile(`\bpackages="[0-9]*"`)
+// rpmSetPackagesAttr sets the packages attribute of the start tag tag, the
+// root element's package count in primary, filelists and other, to n, and
+// leaves every other byte as written. It walks the tag attribute by
+// attribute, as XML lays one out, rather than matching a pattern over it: a
+// pattern either misses single quotes and spacing around "=", or also
+// matches a prefixed x:packages and the same text inside another
+// attribute's value. A tag with no unprefixed packages attribute comes back
+// as it came.
+func rpmSetPackagesAttr(tag []byte, n int) []byte {
+	space := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	nameEnd := func(c byte) bool { return space(c) || c == '=' || c == '>' || c == '/' }
+	skip := func(i int) int {
+		for i < len(tag) && space(tag[i]) {
+			i++
+		}
+		return i
+	}
+	i := 1
+	for i < len(tag) && !nameEnd(tag[i]) {
+		i++
+	}
+	for {
+		i = skip(i)
+		start := i
+		for i < len(tag) && !nameEnd(tag[i]) {
+			i++
+		}
+		if i == start {
+			return tag
+		}
+		name := string(tag[start:i])
+		if i = skip(i); i >= len(tag) || tag[i] != '=' {
+			return tag
+		}
+		if i = skip(i + 1); i >= len(tag) || (tag[i] != '"' && tag[i] != '\'') {
+			return tag
+		}
+		end := bytes.IndexByte(tag[i+1:], tag[i])
+		if end < 0 {
+			return tag
+		}
+		end += i + 1
+		if name == "packages" {
+			out := append(bytes.Clone(tag[:i+1]), strconv.Itoa(n)...)
+			return append(out, tag[end:]...)
+		}
+		i = end + 1
+	}
+}
 
 // rpmFilterPackages copies one of primary, filelists or other through,
 // keeping each top-level <package> whose pkgid kept holds and the whitespace
@@ -460,9 +541,8 @@ func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, prim
 			if depth == 0 {
 				hdr := rec.take(dec.InputOffset())
 				at := bytes.LastIndexByte(hdr, '<')
-				root := rpmPackagesAttr.ReplaceAll(hdr[at:], []byte(`packages="`+strconv.Itoa(n)+`"`))
 				write(hdr[:at])
-				write(root)
+				write(rpmSetPackagesAttr(hdr[at:], n))
 				depth++
 				continue
 			}
