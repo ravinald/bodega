@@ -805,6 +805,49 @@ header="$(
 t_ok "first line of a 300 KB capture: the subshell exits 0" 0 "$header_rc"
 t_ok "first line of a 300 KB capture: the header's fields" "name sha256 version " "$header"
 
+# A sed or grep stage between printf and head takes the SIGPIPE when head exits,
+# so a filter chain over a capture never ends in an early-exiting reader. These
+# cases run the suites' own assignments, extracted from the files, over a
+# capture led by a line that does not match, so a read that takes the first
+# input line instead of the first match fails too.
+big_capture() { awk -v r="$1" 'BEGIN { print "noise"; for (i = 0; i < 20000; i++) print r }'; }
+# A child bash rather than a subshell: errexit is ignored on the left of ||,
+# and a subshell inherits that, so a 141 from the assignment would pass.
+suite_read() {
+	local code rc=0 got
+	code="$(sed -n "s/^[[:space:]]*\($2=.*\)/\1/p" "$E2E_DIR/suites/$1")"
+	# shellcheck disable=SC2016  # expanded by the child shell
+	got="$(big_capture "$3" | bash -c 'set -euo pipefail; E2E_OUT="$(cat)"; eval "$1"; printf "%s" "${!2}"' \
+		suite_read "$code" "$2")" || rc=$?
+	printf '%s %s' "$rc" "$got"
+}
+fpr40="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+t_ok "40-serve-hosted wheel over a 520 KB index" "0 six.whl" \
+	"$(suite_read 40-serve-hosted.sh wheel '<a href="six.whl">six</a>')"
+t_ok "45-clients server_fpr over an 820 KB key listing" "0 $fpr40" \
+	"$(suite_read 45-clients.sh server_fpr "$fpr40")"
+t_ok "80-systemd fpr over an 820 KB key listing" "0 $fpr40" \
+	"$(suite_read 80-systemd.sh fpr "$fpr40")"
+t_ok "45-clients server_fpr with no fingerprint reads empty" "0 " \
+	"$(suite_read 45-clients.sh server_fpr "no key here")"
+t_ok "60-access E2E_TOKEN takes the first Token: line" "0 tok-1" \
+	"$(suite_read 60-access.sh E2E_TOKEN "Token: tok-1")"
+
+big_banner="Suites: trixie"$'\n'"Components: main"$'\n'"$(big_capture "Suites: trixie")"
+stanza_rc=0
+stanza="$(
+	set -euo pipefail
+	e2e_apt_stanza_components "$big_banner" trixie
+)" || stanza_rc=$?
+t_ok "stanza components over a 300 KB banner" "0 main" "$stanza_rc $stanza"
+
+check_matches SELF-BIG "a match on the first line of a 300 KB value" '^name,' "$big_csv"
+t_ok "check_matches over a 300 KB value: PASS" PASS "$(verdict_of SELF-BIG)"
+check_matches SELF-EMPTY "an empty value matches no line" '^$' ""
+t_ok "check_matches on an empty value -> FAIL" FAIL "$(verdict_of SELF-EMPTY)"
+check_matches SELF-NL "a trailing newline adds no empty line" '^$' "x"$'\n'
+t_ok "check_matches on a value ending in newline -> FAIL" FAIL "$(verdict_of SELF-NL)"
+
 # ---- mirrored apt stanzas -------------------------------------------------
 #
 # SHIP-APT-01 and -02 build their expectation from these two helpers, so a

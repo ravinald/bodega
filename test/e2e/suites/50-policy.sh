@@ -227,7 +227,8 @@ ref_check() {
 	E2E_HOST=client
 	check_contains "$id-a" "$client prints the $check check and an incident" "($check, incident " "$out" \
 		"internal/server/refusal.go" "$cmd"
-	inc="$(printf '%s' "$out" | sed -n "s/.*($check, incident \([0-9a-f]\{12\}\)).*/\1/p" | head -1)"
+	inc="$(printf '%s' "$out" | sed -n "s/.*($check, incident \([0-9a-f]\{12\}\)).*/\1/p")"
+	inc="${inc%%$'\n'*}"
 	E2E_HOST=server
 	e2e_on server "curl -s --max-time 30 'http://127.0.0.1:8080/api/v1/audit?limit=2000'" || true
 	check_contains "$id-b" "the incident $client printed is the one its audit row carries" \

@@ -154,7 +154,7 @@ e2e_bodega server "token generate e2e-token expiry 1d 'e2e run' --scope write:bi
 # Anchored on the "Token:" label. Taking the longest string in the output
 # instead picks up the token ID, which is the same shape, printed two lines
 # later, and produces a 401 that reads as a broken auth path.
-E2E_TOKEN="$(printf '%s' "$E2E_OUT" | awk '/^[[:space:]]*Token:/ {print $2; exit}')"
+E2E_TOKEN="$(printf '%s' "$E2E_OUT" | awk '!f && /^[[:space:]]*Token:/ {print $2; f = 1}')"
 check_matches ACC-06 "token generate prints a token once" '.{24,}' "${E2E_TOKEN:-none}" \
 	"cmd/bodega/cmd_token.go:86" "bodega token generate e2e-token expiry 1d --scope write:binary"
 
