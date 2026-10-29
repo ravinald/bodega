@@ -347,6 +347,56 @@ t_ok "empty zfs output names no dataset" "1|zfs list named no single dataset for
 t_ok "a leading slash names no dataset" 1 "$(zfs_of "$work/s" "/bodega" | awk -F"|" 'NR == 1 {print $1}')"
 t_ok "two lines name no dataset" 1 "$(zfs_of "$work/t" "$(printf 'a\nb')" | awk -F"|" 'NR == 1 {print $1}')"
 
+# Suite 50 clears bodega's caches under a store the login shell cannot read.
+# ref_clear_caches runs here from the suite's own text, with the store moved to
+# a scratch directory left mode 000 and a sudo stub that opens it only for the
+# command it runs. A glob the login shell expands reaches rm as a literal `*`
+# and removes nothing, as it did on the guest.
+store="$work/clear/bodega"
+mkdir -p "$store/cargo/crates/itoa-1.0.11" "$store/pypi/wheels" "$work/clearbin"
+touch "$store/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl"
+# shellcheck disable=SC2016  # expands in the stub, not here
+printf '#!/bin/sh\nchmod 755 "%s"\n"$@"\nrc=$?\nchmod 000 "%s"\nexit "$rc"\n' "$store" "$store" \
+	>"$work/clearbin/sudo"
+# shellcheck disable=SC2016  # expands in the stub, not here
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" >>"%s"\nexec /bin/rm "$@"\n' "$work/clear/rm.args" \
+	>"$work/clearbin/rm"
+chmod +x "$work/clearbin/sudo" "$work/clearbin/rm"
+# clear_caches echoes ref_clear_caches's exit code, run against the scratch store.
+clear_caches() {
+	(
+		# shellcheck disable=SC2329  # invoked by ref_clear_caches
+		e2e_on() {
+			shift
+			PATH="$work/clearbin:$PATH" sh -c "$*"
+		}
+		eval "$(awk '/^ref_clear_caches\(\) \{/ {f = 1} f {print} f && /^\}/ {exit}' \
+			"$E2E_DIR/suites/50-policy.sh" | sed "s|/var/lib/bodega|$store|g")"
+		chmod 000 "$store"
+		rc=0
+		ref_clear_caches || rc=$?
+		chmod 755 "$store"
+		echo "$rc"
+	)
+}
+chmod 000 "$store"
+if ls "$store" >/dev/null 2>&1; then
+	# Under root, mode 000 hides nothing from the login shell, so both forms
+	# expand the globs and the case cannot fail.
+	printf 'skip ref_clear_caches: mode 000 does not hide the store from root\n'
+	chmod 755 "$store"
+else
+	chmod 755 "$store"
+	t_ok "ref_clear_caches exits 0" 0 "$(clear_caches)"
+	t_ok "ref_clear_caches hands rm no literal glob" none \
+		"$(awk '/\*/ {b = b $0 " "} END {print (b ? b : "none")}' "$work/clear/rm.args")"
+	t_ok "ref_clear_caches removes the itoa crate and the toml wheel" "absent absent" \
+		"$(for p in cargo/crates/itoa-1.0.11 pypi/wheels/toml-0.10.2-py2.py3-none-any.whl; do
+			[ -e "$store/$p" ] && echo present || echo absent
+		done | tr '\n' ' ' | sed 's/ $//')"
+	t_ok "ref_clear_caches exits 0 when nothing matches" 0 "$(clear_caches)"
+fi
+
 # ---- suite 47's pkg-configuration helper ----------------------------------
 #
 # Driven against scratch roots on this host. `state` stays out: its `stat -f`
