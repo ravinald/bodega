@@ -47,6 +47,18 @@ func (a *DB) SetAdmissionMode(ctx context.Context, m AdmissionMode) error {
 	return err
 }
 
+// ClearAdmissionMode deletes the mode set for ecosystem, returning it to the
+// default its allow-list implies. It reports whether a row was there, and
+// clearing an ecosystem with none is not an error.
+func (a *DB) ClearAdmissionMode(ctx context.Context, ecosystem string) (bool, error) {
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM admission_mode WHERE ecosystem = ?`, ecosystem)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // GetAdmissionMode returns the mode set for ecosystem, or
 // ErrAdmissionModeNotFound.
 func (a *DB) GetAdmissionMode(ctx context.Context, ecosystem string) (AdmissionMode, error) {
