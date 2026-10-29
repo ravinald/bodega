@@ -288,7 +288,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			missing := map[string][]string{}
 			covered := policy.OSVEcosystems()
 			for _, p := range rows {
-				st := osvDBState(db, p.Ecosystem, aptSuites)
+				st := osvDBState(db, cfg, p.Ecosystem, aptSuites)
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 					p.Ecosystem, renderAction(p.Action, p.Ecosystem, covered),
 					p.UpdatedAt.Format("2006-01-02"), st.synced, st.age)
@@ -431,6 +431,11 @@ and whose catalog holds no apt still exits 0 once the other ecosystems have
 written; naming apt on the command line fails, because that request fetched
 nothing.
 
+rpm expands to one export per vendor whose repositories rpm_upstreams
+names: Rocky Linux, AlmaLinux or Red Hat, by each repository's
+osv_ecosystem or its base URL's host. A repository belonging to none, EPEL
+among them, adds nothing, and its packages record the check not run.
+
 This is the only OSV subcommand that reaches the network. On an
 air-gapped host, run it where the network is, copy the directory over,
 and point osv_db_dir at the copy.`,
@@ -472,21 +477,24 @@ and point osv_db_dir at the copy.`,
 			// release would download it once each.
 			owner := map[string]string{}
 			for _, eco := range ecosystems {
-				exports, unmapped := policy.OSVExportsFor(eco, aptSuites)
+				exports, unmapped := osvExports(cfg, eco, aptSuites)
 				for _, suite := range unmapped {
 					skipped = append(skipped, fmt.Sprintf("%s: OSV publishes no Ubuntu or Debian export for suite %q", eco, suite))
 				}
 				if len(exports) == 0 {
-					// Only apt can resolve to nothing, and a set that does
-					// is a skip rather than a failure: the language
+					// Only apt and rpm can resolve to nothing, and a set
+					// that does is a skip rather than a failure: the language
 					// ecosystems synced, and an operator whose apt_suites are
 					// house names and whose catalog holds no apt would
 					// otherwise get exit 1 out of the no-argument form
 					// forever. Naming the type on the command line still
 					// fails, because that request fetched nothing.
-					if named {
+					switch {
+					case named:
 						failed = append(failed, fmt.Sprintf("%s: no OSV export to fetch", eco))
-					} else if len(unmapped) == 0 {
+					case eco == manifest.TypeRpm:
+						skipped = append(skipped, fmt.Sprintf("%s: no repository in rpm_upstreams belongs to an OSV ecosystem", eco))
+					case len(unmapped) == 0:
 						skipped = append(skipped, fmt.Sprintf("%s: no suite to fetch an OSV export for", eco))
 					}
 					continue
@@ -554,14 +562,14 @@ type osvState struct {
 // the DB SYNCED column on purpose: such an archive is stale in size, not in
 // content, and a column reading "never" or an age warning would tell an
 // operator their advisories are old when they are current.
-func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) osvState {
+func osvDBState(db *policy.OSVDatabase, cfg *config.Config, ecosystem string, aptSuites []string) osvState {
 	if !policy.OSVCovers(ecosystem) {
 		// A stored row for a type the gate cannot query. "never" would read as
 		// a sync nobody has run yet, and there is no sync that would fix it;
 		// reportUncovered names the row under the table.
 		return osvState{synced: "n/a", age: "-"}
 	}
-	osvEcos, _ := policy.OSVExportsFor(ecosystem, aptSuites)
+	osvEcos, _ := osvExports(cfg, ecosystem, aptSuites)
 	if len(osvEcos) == 0 {
 		return osvState{synced: "never", age: "-"}
 	}
@@ -585,6 +593,15 @@ func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) os
 	}
 	st.synced, st.age = oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest))
 	return st
+}
+
+// osvExports is policy.OSVExportsFor with rpm's exports read from
+// rpm_upstreams: one per vendor whose repositories this server serves.
+func osvExports(cfg *config.Config, ecosystem string, aptSuites []string) (exports, unmapped []string) {
+	if ecosystem == manifest.TypeRpm {
+		return cfg.RpmOSVEcosystemsServed(), nil
+	}
+	return policy.OSVExportsFor(ecosystem, aptSuites)
 }
 
 // reportMissing names, per row, the exports the gate has no index for. For apt

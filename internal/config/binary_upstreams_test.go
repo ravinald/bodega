@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/json"
 	"maps"
 	"slices"
 	"strings"
@@ -274,12 +275,44 @@ func TestLoad_RpmUpstreams(t *testing.T) {
 	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := map[string]string{
-		"rocky-baseos": "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
-		"epel":         "https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/",
+	want := map[string]config.RpmUpstream{
+		"rocky-baseos": {URL: "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"},
+		"epel":         {URL: "https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/"},
 	}
 	if !maps.Equal(cfg.RpmUpstreams, want) {
 		t.Errorf("rpm_upstreams = %v, want %v with one trailing slash each", cfg.RpmUpstreams, want)
+	}
+
+	writeConfig(t, `{"rpm_upstreams":{
+		"rocky-baseos":"https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
+		"alma-appstream":"https://repo.almalinux.org/almalinux/$releasever/AppStream/$basearch/os/",
+		"rhel-baseos":"https://cdn.redhat.com/content/dist/rhel9/$releasever/$basearch/baseos/os/",
+		"epel":"https://dl.fedoraproject.org/pub/epel/$releasever/Everything/$basearch/",
+		"rocky-mirror":{"url":"https://mirror.example.com/rocky/$releasever/BaseOS/$basearch/os/","osv_ecosystem":"Rocky Linux"},
+		"alma-at-rocky":{"url":"https://dl.rockylinux.org/x/","osv_ecosystem":"AlmaLinux"}}}`)
+	if cfg, err = config.Load(t.TempDir(), "", "", "", false, false); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for repo, eco := range map[string]string{
+		"rocky-baseos": "Rocky Linux", "alma-appstream": "AlmaLinux", "rhel-baseos": "Red Hat",
+		"epel": "", "rocky-mirror": "Rocky Linux", "alma-at-rocky": "AlmaLinux", "absent": "",
+	} {
+		if got := cfg.RpmOSVEcosystem(repo); got != eco {
+			t.Errorf("RpmOSVEcosystem(%s) = %q, want %q", repo, got, eco)
+		}
+	}
+	if got := cfg.RpmOSVEcosystemsServed(); !slices.Equal(got, []string{"AlmaLinux", "Red Hat", "Rocky Linux"}) {
+		t.Errorf("RpmOSVEcosystemsServed = %v", got)
+	}
+	// The short form survives a write: only an entry naming an ecosystem is
+	// written as an object.
+	out, err := json.Marshal(cfg.RpmUpstreams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"epel":"https://dl.fedoraproject.org/`) ||
+		!strings.Contains(string(out), `"rocky-mirror":{"url":"https://mirror.example.com/rocky/$releasever/BaseOS/$basearch/os/","osv_ecosystem":"Rocky Linux"}`) {
+		t.Errorf("rpm_upstreams marshals as %s", out)
 	}
 
 	for _, tc := range []struct{ doc, key string }{
@@ -288,6 +321,8 @@ func TestLoad_RpmUpstreams(t *testing.T) {
 		{`{"rpm_upstreams":{"rocky":"https://dl.rockylinux.org/$contentdir/$releasever/"}}`, `rpm_upstreams["rocky"]`},
 		{`{"rpm_upstreams":{"../x":"https://dl.rockylinux.org/"}}`, "rpm_upstreams key"},
 		{`{"rpm_upstreams":{"a/b":"https://dl.rockylinux.org/"}}`, "rpm_upstreams key"},
+		{`{"rpm_upstreams":{"epel":{"url":"https://dl.fedoraproject.org/pub/epel/","osv_ecosystem":"EPEL"}}}`, `rpm_upstreams["epel"] osv_ecosystem "EPEL"`},
+		{`{"rpm_upstreams":{"epel":{"url":"https://dl.fedoraproject.org/pub/epel/","osv":"Rocky Linux"}}}`, "osv_ecosystem"},
 	} {
 		writeConfig(t, tc.doc)
 		_, err := config.Load(t.TempDir(), "", "", "", false, false)

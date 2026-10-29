@@ -547,3 +547,26 @@ func TestNameSimilarityComposerSharedPackageNamedByVendor(t *testing.T) {
 		t.Errorf("shared = %v, want psr7 and discovery; parsedown and http (a label of php-http) are named", shared)
 	}
 }
+
+// An rpm name a character or two from one a stock EL9 host installs is held,
+// and the name itself is not.
+func TestNameSimilarityRpm(t *testing.T) {
+	for _, tc := range []struct {
+		name, nearest string
+		distance      int
+	}{
+		{"openssl-lib", "openssl-libs", 1},
+		{"sytemd", "systemd", 1},
+		{"curll", "curl", 1},
+	} {
+		r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeRpm, tc.name)
+		if r.Action != ActionBlock || r.Details["nearest"] != tc.nearest || r.Details["distance"] != tc.distance {
+			t.Errorf("%s = %+v, want a block naming %s at distance %d", tc.name, r, tc.nearest, tc.distance)
+		}
+	}
+	for _, name := range []string{"openssl-libs", "NetworkManager", "acme-billing-agent"} {
+		if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeRpm, name); r.Action != ActionPass {
+			t.Errorf("%s = %+v, want a pass", name, r)
+		}
+	}
+}

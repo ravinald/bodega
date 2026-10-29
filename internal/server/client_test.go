@@ -1759,9 +1759,9 @@ func TestFreeBSDPlanTagsAreThePlanRepositories(t *testing.T) {
 // skip saying what it read.
 func TestClientPlanRpmMapsTheHostsDistribution(t *testing.T) {
 	s, f := pocketServer(t)
-	s.cfg.RpmUpstreams = map[string]string{
-		"rocky-baseos":    "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/",
-		"rocky-appstream": "https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/",
+	s.cfg.RpmUpstreams = map[string]config.RpmUpstream{
+		"rocky-baseos":    {URL: "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"},
+		"rocky-appstream": {URL: "https://dl.rockylinux.org/pub/rocky/$releasever/AppStream/$basearch/os/"},
 	}
 	recs := planRecordFor(planJSON(t, s, f.token, "os=linux&os_id=rocky&os_version_id=9.4"), manifest.TypeRpm)
 	if len(recs) != 2 || recs[0].Path != clientconf.RpmRepoPath || recs[1].Path != clientconf.RpmKeyPath {

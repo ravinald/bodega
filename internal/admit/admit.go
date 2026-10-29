@@ -722,7 +722,7 @@ var NewProvenanceVerifier = func(cfg *config.Config) *provenance.Verifier {
 // A registry that cannot be reached is tried once per manifest, so an offline
 // import of a long version list costs one timeout rather than one per version.
 func RecordPublished(ctx context.Context, pm, existing *manifest.PackageManifest, res *Result) {
-	if !slices.Contains(policy.AgeEcosystems(), pm.Type) {
+	if !slices.Contains(policy.LookupDatedEcosystems(), pm.Type) {
 		return
 	}
 	recordPublished(ctx, NewPublishReader(), pm, existing, res)

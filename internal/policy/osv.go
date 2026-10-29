@@ -31,6 +31,11 @@ type OSVStore interface {
 // Debian backport a fix without moving the upstream version, so the records
 // that settle a version live in the export for its own release. See
 // osvLookupFor and OSVExportsFor.
+//
+// rpm breaks it the same way: Rocky Linux, AlmaLinux and Red Hat each publish
+// their own advisories against their own builds, so the ecosystem is the one
+// the package's repository belongs to, carried on the entry under
+// RpmOSVEcosystemKey.
 var osvEcosystemFor = map[string]string{
 	manifest.TypeNpm:      "npm",
 	manifest.TypePypi:     "PyPI",
@@ -55,22 +60,43 @@ func OSVEcosystemFor(registryType string) string {
 // and OSVEcosystemFor is the wrong one to ask now that apt has no single
 // identifier.
 func OSVCovers(registryType string) bool {
-	return registryType == manifest.TypeApt || osvEcosystemFor[registryType] != ""
+	return registryType == manifest.TypeApt || registryType == manifest.TypeRpm || osvEcosystemFor[registryType] != ""
 }
 
 // OSVEcosystems returns the registry types the OSV gate can query, sorted.
 func OSVEcosystems() []string {
-	out := make([]string, 0, len(osvEcosystemFor)+1)
+	out := make([]string, 0, len(osvEcosystemFor)+2)
 	for eco := range osvEcosystemFor {
 		out = append(out, eco)
 	}
-	out = append(out, manifest.TypeApt)
+	out = append(out, manifest.TypeApt, manifest.TypeRpm)
 	sort.Strings(out)
 	return out
 }
 
 // OSVNotRunOCI is the reason the OSV check gives for every oci version.
 const OSVNotRunOCI = "not run: OSV has no container image ecosystem, so no advisory or malware record can be looked up for an image"
+
+// RpmOSVEcosystemKey names, on an rpm version entry, the OSV ecosystem whose
+// advisories cover it: the one rpm_upstreams gives the repository /rpm/
+// served it from. RpmRepositoryKey names that repository, and RpmReleaseKey
+// the $releasever it was served for, whose major release selects which of the
+// vendor's advisories apply.
+const (
+	RpmOSVEcosystemKey = "rpm_osv_ecosystem"
+	RpmRepositoryKey   = "rpm_repository"
+	RpmReleaseKey      = "rpm_release"
+)
+
+// rpmNotRunReason is why an rpm entry carrying no ecosystem is not checked.
+func rpmNotRunReason(name string, ve *manifest.VersionEntry) string {
+	if repo := ve.Metadata[RpmRepositoryKey]; repo != "" {
+		return fmt.Sprintf("not run: rpm repository %s belongs to no OSV ecosystem, so no advisory covers %s from it. "+
+			"OSV publishes RPM advisories for Rocky Linux, AlmaLinux and Red Hat builds only, and none for EPEL or another add-on repository; "+
+			"a mirror of one of those three names it with osv_ecosystem on its rpm_upstreams entry", repo, name)
+	}
+	return fmt.Sprintf("not run: rpm %s names no repository, and the OSV ecosystem an rpm package is checked against is its repository's", name)
+}
 
 type OSVChecker struct {
 	store OSVStore
@@ -152,13 +178,20 @@ func (c *OSVChecker) check(ctx context.Context, pm *manifest.PackageManifest, ve
 	// An apt entry with no version is a stub whose .deb nothing has resolved
 	// yet, and a stub is exactly what the gate must not wave through: see the
 	// warn below, once the actions say the gate is on at all.
-	if ve.Version == "" && pm.Type != manifest.TypeApt {
+	// An rpm entry from a repository no OSV ecosystem covers is answered
+	// before every shortcut to a pass, ignored actions and an unresolved stub
+	// included: a pass there would read as a scan that found nothing.
+	uncoveredRpm := pm.Type == manifest.TypeRpm && ve.Metadata[RpmOSVEcosystemKey] == ""
+	if ve.Version == "" && pm.Type != manifest.TypeApt && !uncoveredRpm {
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
 	acts := c.actions(ctx, pm.Type)
 	if malwareOnly {
 		acts.advisory = ActionIgnore
+	}
+	if uncoveredRpm {
+		return Result{Check: "osv", Action: ActionNotEvaluated, Reason: acts.qualify(rpmNotRunReason(pm.Name, ve))}
 	}
 	if acts.advisory == ActionIgnore && acts.malware == ActionIgnore {
 		return acts.pass()
@@ -667,8 +700,11 @@ func osvAPIBodyLimit(ecosystem string) int64 {
 }
 
 func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string) ([]osvVuln, error) {
+	// An rpm release is not an ecosystem api.osv.dev knows: Red Hat files one
+	// under several strings. The vendor is asked, and the release filtered here.
+	queryEco, _, _ := osvIndexFor(ecosystem, "")
 	body, _ := json.Marshal(map[string]any{
-		"package": map[string]string{"name": name, "ecosystem": ecosystem},
+		"package": map[string]string{"name": name, "ecosystem": queryEco},
 		"version": version,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(body))
@@ -698,7 +734,8 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 	var out struct {
 		Vulns []struct {
 			osvVuln
-			DatabaseSpecific osvDatabaseSpecific `json:"database_specific"`
+			DatabaseSpecific osvDatabaseSpecific   `json:"database_specific"`
+			Affected         []osvRecordedAffected `json:"affected"`
 		} `json:"vulns"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -706,6 +743,9 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 	}
 	vulns := make([]osvVuln, 0, len(out.Vulns))
 	for _, v := range out.Vulns {
+		if queryEco != ecosystem && !rpmAffectsRelease(ecosystem, name, version, v.Affected) {
+			continue
+		}
 		v.Malicious = v.DatabaseSpecific.malicious()
 		vulns = append(vulns, v.osvVuln)
 	}
