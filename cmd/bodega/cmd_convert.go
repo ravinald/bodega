@@ -60,6 +60,7 @@ Sources per type:
   maven   find ~/.m2/repository -name '*.pom'
   composer composer global show --format=json
   helm    helm list -o json
+  rpm     rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n'
   freebsd pkg query '%R\t%q'
 
 A freebsd entry is a repository, one version per ABI, so convert collapses the
@@ -76,6 +77,7 @@ Examples:
   apt list --installed | bodega pkg convert apt -o catalog.json
   pip list --format=json | bodega pkg convert pypi | bodega pkg import -
   pkg query '%R\t%q' | bodega pkg convert freebsd -o catalog.json
+  rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n' | bodega pkg convert rpm -o catalog.json
   bodega pkg convert apt installed.txt
   bodega pkg convert apt --origin db01 --suite noble db01-installed.txt`,
 		Args: cobra.RangeArgs(1, 2),

@@ -635,6 +635,7 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:P
 apt list --installed | bodega pkg convert apt -o catalog.json
 pip list --format=json | bodega pkg convert pypi | bodega pkg import -
 pkg query '%R\t%q' | bodega pkg convert freebsd -o catalog.json
+rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n' | bodega pkg convert rpm -o catalog.json
 bodega pkg convert apt --origin db01 --suite noble db01-installed.txt
 ```
 
@@ -666,6 +667,7 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
 | `composer` | `composer global show --format=json`                                                                                      |
 | `helm`     | `helm list -o json`                                                                                                       |
 | `freebsd`  | `pkg query '%R\t%q'`                                                                                                      |
+| `rpm`      | `rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n'`                                                  |
 
 **`git` and `binary` have no importer.** Nothing on a host records a `git clone` or a downloaded binary, so there is no inventory to read. Catalog those with `bodega pkg create`, or run the server with `discover_mode` set to `"observe"` and promote what clients reach for.
 
@@ -688,6 +690,7 @@ Prefer `dpkg-query` to `apt list --installed`: it is machine readable, it carrie
 - **helm** entries import with **no URL**. A helm release records the chart it came from (`nginx-18.2.4`) but not the repository, and bodega resolves helm upstreams per version. Fill the URLs in before importing, or resolve them with `helm search repo <chart> -o json`. Guessing a repository would put an unverified URL into a supply-chain catalog.
 - **cargo** crates installed from a git or path source are skipped: the registry has no such version to serve.
 - **freebsd** entries are named for the host's own label for the repository (`FreeBSD-ports`), carry the ABI as their version, import as `proxy`, and have **no URL**. pkg records the label on every package and the address nowhere `pkg query` reaches, so fill each URL in from `pkg -vv` on the host, `${ABI}` substituted (`https://pkg.FreeBSD.org/FreeBSD:15:aarch64/quarterly`), before importing. The entry's name is the directory a client is pointed at under `/freebsd/{abi}/`, so rename it if your clients use another. A repository the host already reads through bodega shows up under its bodega label and is one to drop rather than import. `proxy` because `hosted` would mirror a whole FreeBSD repository per host imported. Noarch packages (ABI `FreeBSD:15:*`) add no version, since no client requests that ABI, and packages built from ports (`unknown-repository`) are skipped.
+- **rpm** entries carry the name and `epoch:version-release`, a zero or `(none)` epoch left off, import as `proxy`, and have no URL: a package is served from whichever `rpm_upstreams` repository the host asks for it under. `gpg-pubkey` rows are keys, not packages, and are skipped.
 - **Removed packages are skipped.** `dpkg-query -W` reports a package removed without `--purge` as `deinstall ok config-files`, and it looks installed in every other column. On one Ubuntu 22.04 server that is 139 of 774 rows, mostly superseded kernel images.
 
 Every skip and every gap is reported on stderr, so stdout stays a clean payload that pipes into `pkg import`.
@@ -2232,6 +2235,8 @@ For each container runtime on `PATH`, an **`oci-docker`**, **`oci-containerd`** 
 
 A `daemon.json` that is not JSON, or one this account cannot read, reports `oci-docker` `SKIPPED`, naming the error.
 
+On a host with `dnf` on `PATH`, a **`dnf-repos`** row warns for every enabled repository dnf loads that can fetch from anywhere but bodega's `/rpm/` route: a `baseurl`, `mirrorlist` or `metalink` whose host and path do not start with the one in `--url` (or `public_url`), or a repository with none of the three, naming the repository, its file and the URL. dnf prefers a `mirrorlist` or `metalink` to `baseurl`, so any one of them leaving bodega counts. doctor reads repositories where dnf does: the sections of `/etc/dnf/dnf.conf` other than `[main]`, then every `.repo` file in the `reposdir` that file sets, or in `/etc/yum.repos.d`, `/etc/yum/repos.d` and `/etc/distro.repos.d` when it sets none. Values are read with dnf's rules: one pair of matching quotes is stripped, so `enabled="1"` is enabled; an indented line continues the value above it; and an `enabled` value dnf cannot parse leaves the repository enabled, as dnf does. A repository's id proves nothing about where it fetches from. With no bodega URL known, a URL whose path holds no `/rpm/` segment still warns, and a repository whose URLs could be bodega's is named in a `SKIPPED` row, since doctor has nothing to compare it against; pass `--url` to settle it. The remediation is `bodega doctor --configure rpm --apply --url <bodega base URL>`, and `dnf config-manager --set-disabled <id>` for a repository bodega does not serve. A `.repo` file dnf's parser rejects (a section header missing its `]`, a line with no `=`, a key before any section, an indented line with no value above it) is skipped whole, as dnf skips it, so no section in it hides a later definition of the same id; the row warns and names the file and the line, because dnf warns about it on every run and its repositories come back unchecked once it is repaired. A `dnf.conf` that does not parse reports `SKIPPED`, since dnf will not run at all until it is fixed. A host with no `dnf` gets no row, and a `.repo` file that cannot be read reports it `SKIPPED`.
+
 `--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is left out otherwise, and named it runs alone and does one thing: for a host whose `server`-mode source sets `origins`, it links this binary as bodega's osquery extension, lists it in the autoload file osqueryd reads, and sets `--extensions_autoload` in osqueryd's flagfile when that names none (see [Package origins](#package-origins)). For any other host it writes nothing and refuses. The other flags, the enroll secret and the restart stay with the setup script, since the flags file alone points at a secret nothing wrote and a daemon nothing installed.
 
 ```bash
@@ -2263,6 +2268,8 @@ With `--apply`, doctor prints the restart each runtime needs to read what it wro
 ```bash
 sudo bodega doctor --configure oci --url https://bodega.internal --apply
 ```
+
+`--configure rpm` writes `/etc/yum.repos.d/bodega.repo` and bodega's key for the repositories the host's distribution reads, and disables the vendor repositories it replaces with `dnf config-manager --set-disabled`; see **RPM repositories** under [Client configuration](#client-configuration) for the table, the files and the disable step.
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
@@ -5530,7 +5537,29 @@ An oci entry records the manifest digest in `ref`, which is what names the manif
 }
 ```
 
-Load refuses a name that is not one path segment of letters, digits, `.`, `_` and `-`, and a URL that is not https once `9` and `x86_64` are substituted, or that carries any other dnf variable (`$contentdir`, `$stream`), since bodega would send it upstream as literal text. A URL may carry a credential in its userinfo, which every load error masks. `bodega doctor` does not configure dnf yet, so point a host at bodega by hand, in `/etc/yum.repos.d/bodega.repo`, with the vendor repositories it replaces disabled (`dnf config-manager --set-disabled baseos appstream`):
+Load refuses a name that is not one path segment of letters, digits, `.`, `_` and `-`, and a URL that is not https once `9` and `x86_64` are substituted, or that carries any other dnf variable (`$contentdir`, `$stream`), since bodega would send it upstream as literal text. A URL may carry a credential in its userinfo, which every load error masks.
+
+**Configuring a host.** `bodega doctor --configure rpm` points a dnf host at bodega. Run it on the host, as root to apply:
+
+```bash
+sudo bodega doctor --configure rpm --url https://bodega-host:8080
+sudo bodega doctor --configure rpm --url https://bodega-host:8080 --apply
+```
+
+doctor sends the host's `/etc/os-release` `ID` and `VERSION_ID` with the plan request, and the server maps them to repository names through a table in `internal/clientconf`. The major release decides the row, so Rocky 9.4 reads Rocky 9's:
+
+| `ID`        | `VERSION_ID` | `rpm_upstreams` keys                      | Vendor repository ids disabled                                                          | Vendor key files                                            |
+| ----------- | ------------ | ----------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `rocky`     | 9, 10        | `rocky-baseos`, `rocky-appstream`, `epel` | `baseos`, `appstream`, `epel`                                                           | `RPM-GPG-KEY-Rocky-<major>`, `RPM-GPG-KEY-EPEL-<major>`     |
+| `almalinux` | 9, 10        | `alma-baseos`, `alma-appstream`, `epel`   | `baseos`, `appstream`, `epel`                                                           | `RPM-GPG-KEY-AlmaLinux-<major>`, `RPM-GPG-KEY-EPEL-<major>` |
+| `rhel`      | 9, 10        | `rhel-baseos`, `rhel-appstream`, `epel`   | `rhel-<major>-for-<arch>-baseos-rpms`, `rhel-<major>-for-<arch>-appstream-rpms`, `epel` | `RPM-GPG-KEY-redhat-release`, `RPM-GPG-KEY-EPEL-<major>`    |
+
+Name the repositories in `rpm_upstreams` with those keys. The plan writes two files:
+
+- `/etc/yum.repos.d/bodega.repo`, one section per repository the table maps the host to and `rpm_upstreams` configures. A repository the table maps that `rpm_upstreams` lacks is left out, the plan's note names it, and the host's own copy of it stays enabled.
+- `/etc/pki/rpm-gpg/RPM-GPG-KEY-bodega`, bodega's key as `/rpm/bodega.gpg` serves it, checked against the plan's digest like every other file.
+
+A Rocky 9 host on a server configuring all three gets:
 
 ```ini
 [bodega-rocky-baseos]
@@ -5539,7 +5568,21 @@ baseurl=https://bodega-host:8080/rpm/rocky-baseos/$releasever/$basearch/
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=https://bodega-host:8080/rpm/bodega.gpg file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-bodega file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+```
+
+and the same for `rocky-appstream` and `epel`, the last naming `RPM-GPG-KEY-EPEL-9`. dnf reads one `gpgkey` list for both checks, so bodega's key, which signs `repomd.xml`, is listed beside the vendor's, which signed the packages. bodega never signs a package, but a host trusting its key for these sections would accept a package it signed. The EPEL key file is installed by `epel-release`; a host without it fails `gpgcheck` on EPEL packages until it is installed.
+
+Then it disables the vendor repositories `bodega.repo` replaces: `dnf config-manager --set-disabled <id>...` with each vendor id whose upstream has a section in the file, that the host defines (in `/etc/dnf/dnf.conf` or a `.repo` file in its `reposdir`, read as the `dnf-repos` row reads them), and that is still enabled. A `reposdir` in `dnf.conf` that leaves out `/etc/yum.repos.d` is refused before anything is written, because dnf would never read `bodega.repo` there; add the directory to `reposdir` and re-run. So is a `dnf.conf` that does not parse. A malformed `.repo` file is named on a `skip` line and nothing in it is disabled. An id the host lacks is left off, since config-manager refuses an id it cannot find, and so is one bodega does not serve, since disabling it would leave nothing in its place. The dry run prints the command; `--apply` writes both files, key first, then runs it. `config-manager` is part of `dnf-plugins-core`; when it fails, `bodega.repo` is already written and the vendor repositories are still enabled, and doctor says so. A second `--apply` on a configured host finds nothing to change.
+
+The vendor `.repo` files (`rocky-repos`, `almalinux-repos`, `epel-release`) are packaged `%config(noreplace)`, and config-manager edits them in place. An update of the `*-repos` package then leaves the edited file alone and writes the new one beside it as `.rpmnew`, so the vendor repositories stay disabled across updates. A vendor repository that is enabled again by hand, or by replacing the file with its `.rpmnew`, is reported by the `dnf-repos` row of a bare `bodega doctor`.
+
+A host whose `ID` and `VERSION_ID` the table does not name, or a host on which doctor could not read them, gets a plan that changes nothing, and the skip names the `ID` and `VERSION_ID` the server read. `rpm` named on a host with no `dnf` on `PATH` is an error, and nothing is written. The setup script states no `ID`, so it skips `rpm`.
+
+**Cataloging a host's packages.** `bodega pkg convert rpm` reads `rpm -qa` with a fixed format and writes rpm entries, keyed as `primary` keys a package: the name, and `epoch:version-release` with a zero or `(none)` epoch left off. The `gpg-pubkey` headers `rpm --import` writes are skipped, and a package installed for two architectures (`glibc.x86_64` and `glibc.i686`) is one entry:
+
+```bash
+rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n' | bodega pkg convert rpm -o catalog.json
 ```
 
 | Route                                                             | What it is                                                                                                                                                                          | Cached as                                           |
@@ -5603,7 +5646,7 @@ A vendor's export carries every release (`Rocky Linux:9` beside `Rocky Linux:10`
 
 An rpm entry is a statement about a package, for hiding and constraints, with no `url` and no hosted mode: `bodega pkg create rpm nginx` asks for the name and the version. Nothing fetches a package ahead of a client: `bodega build fetch rpm` has nothing to do.
 
-**Gaps.** Pull-through only: a synced mirror for offline-first operation is not built. Mirrorlists and metalinks are not followed; each repository has one base URL, which is also the URL the allow-list judges. RHEL's own CDN needs entitlement certificates bodega does not present; Rocky, AlmaLinux and EPEL are what is served. Module metadata (`modules.yaml`) is passed through unfiltered, under a profile too. `<open-checksum>`, the checksum of a file's decompressed content, is not checked; the compressed checksum is. A metadata file outside `repodata/` is not served. EL7 and `yum` are not targeted, and EL8 is served by the same code but not tested end to end. Amazon Linux takes a base URL like any other repository and nothing tests it. SUSE and zypper read the same `repomd.xml` but are not configured or tested. A host whose `repomd.xml` and `repomd.xml.asc` requests straddle the moment a busy shared address moves to a new revision fails `repo_gpgcheck` once (see Signing). `bodega doctor --configure rpm` and `bodega pkg convert rpm` are not built yet. The age and OSV gates refuse a package at its href but do not withhold it from `primary`: the [index filter](#bodega-policy-filter-setlist) does not cover rpm, so dnf can still resolve to a version bodega then refuses. EPEL and every add-on repository without a vendor's advisories go unchecked by OSV.
+**Gaps.** Pull-through only: a synced mirror for offline-first operation is not built. Mirrorlists and metalinks are not followed; each repository has one base URL, which is also the URL the allow-list judges. RHEL's own CDN needs entitlement certificates bodega does not present; Rocky, AlmaLinux and EPEL are what is served. Module metadata (`modules.yaml`) is passed through unfiltered, under a profile too. `<open-checksum>`, the checksum of a file's decompressed content, is not checked; the compressed checksum is. A metadata file outside `repodata/` is not served. EL7 and `yum` are not targeted, and EL8 is served by the same code but not tested end to end. Amazon Linux takes a base URL like any other repository and nothing tests it. SUSE and zypper read the same `repomd.xml` but are not configured or tested. A host whose `repomd.xml` and `repomd.xml.asc` requests straddle the moment a busy shared address moves to a new revision fails `repo_gpgcheck` once (see Signing). RHEL's repository ids in the client table are the ones subscription-manager writes into `redhat.repo`, and nothing tests the RHEL path end to end. The age and OSV gates refuse a package at its href but do not withhold it from `primary`: the [index filter](#bodega-policy-filter-setlist) does not cover rpm, so dnf can still resolve to a version bodega then refuses. EPEL and every add-on repository without a vendor's advisories go unchecked by OSV.
 
 **git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 

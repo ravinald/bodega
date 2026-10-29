@@ -461,3 +461,52 @@ func ParseComposer(r io.Reader) (Result, error) {
 
 // filepathToSlash reads a Windows path listing the way the layout is written.
 func filepathToSlash(p string) string { return strings.ReplaceAll(p, `\`, "/") }
+
+// rpmPubkey is the name rpm gives each OpenPGP key `rpm --import` loaded.
+// It is a header in the database, not a package any repository serves.
+const rpmPubkey = "gpg-pubkey"
+
+// ParseRpm converts `rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n'`.
+// The version is epoch:version-release with a zero or "(none)" epoch left
+// off, the form an rpm entry is keyed by. A package installed for two
+// architectures (glibc.x86_64 and glibc.i686) is one entry, since the
+// architecture is part of the object and not the identity.
+func ParseRpm(r io.Reader) (Result, error) {
+	var res Result
+	invalid := 0
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) != 5 {
+			return Result{}, fmt.Errorf("parse rpm line %q: want 5 tab-separated fields, got %d\nexpected: rpm -qa --qf '%%{NAME}\\t%%{EPOCH}\\t%%{VERSION}\\t%%{RELEASE}\\t%%{ARCH}\\n'", line, len(f))
+		}
+		name, epoch := f[0], f[1]
+		if name == rpmPubkey {
+			continue
+		}
+		if epoch == "(none)" {
+			epoch = ""
+		}
+		evr := manifest.RpmEVR(epoch, f[2], f[3])
+		if !manifest.RpmValidName(name) || !manifest.RpmValidEVR(evr) {
+			invalid++
+			continue
+		}
+		res.Packages = append(res.Packages, pkg(manifest.TypeRpm, name, evr, "", registryMode))
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("scan rpm output: %w", err)
+	}
+	res.Packages = mergeSameName(res.Packages)
+	sortPackages(res.Packages)
+	if invalid > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d package(s) whose name or epoch:version-release is not one bodega keys an rpm entry by", invalid))
+	}
+	return res, nil
+}

@@ -1,0 +1,2 @@
+[ignored]
+baseurl=https://example.com/
