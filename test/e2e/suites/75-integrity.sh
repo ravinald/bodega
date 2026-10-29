@@ -85,7 +85,7 @@ check_eq INT-03 "a clean store verifies" 0 "$E2E_RC" \
 # It used to guard itself behind a MISSING row and skip when there was none, so
 # once the MISSING rows went the check could only ever SKIP: the store shape it
 # was written to confirm was the one shape it stopped measuring.
-if printf '%s' "$E2E_OUT" | grep -qE 'MISSING|UNVERIFIABLE|ERROR|FAIL'; then
+if grep -qE 'MISSING|UNVERIFIABLE|ERROR|FAIL' <<<"$E2E_OUT"; then
 	check_lacks INT-03a "the verify summary does not contradict the rows above it" \
 		"passed integrity check" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
 else

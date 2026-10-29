@@ -155,7 +155,8 @@ e2e_on client "rm -rf $AGE_ROOT" || true
 # client's only route to it, and asserting a name the index does not publish
 # would test the fixture instead of the server.
 e2e_body client "/pypi/simple/six/" || true
-wheel="$(printf '%s' "$E2E_OUT" | sed -n 's/.*href="\([^"]*\.whl\)".*/\1/p' | head -1)"
+wheel="$(printf '%s' "$E2E_OUT" | sed -n 's/.*href="\([^"]*\.whl\)".*/\1/p')"
+wheel="${wheel%%$'\n'*}"
 if [ -n "$wheel" ]; then
 	e2e_index_check SRV-ART-pypi "pypi serves the wheel its index links to" \
 		"$wheel" "internal/server/pypi.go:155"

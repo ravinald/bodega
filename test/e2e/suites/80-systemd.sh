@@ -85,7 +85,8 @@ check_ne SYS-08 "the replacement process is a new one" "$pid_before" \
 e2e_on server "systemctl cat bodega | grep -c LoadCredential || true" || true
 if [ "${E2E_OUT:-0}" -gt 0 ]; then
 	e2e_bodega server "apt key show" || true
-	fpr="$(printf '%s' "$E2E_OUT" | tr -dc '[:alnum:]\n' | grep -Eo '[0-9A-F]{40}' | head -1)"
+	fpr="$(printf '%s' "$E2E_OUT" | tr -dc '[:alnum:]\n' | grep -Eo '[0-9A-F]{40}' || true)"
+	fpr="${fpr%%$'\n'*}"
 	e2e_on server "curl -s --max-time 30 http://127.0.0.1:8080/apt/bodega-archive-keyring.gpg | \
 		gpg --show-keys --with-colons 2>/dev/null | awk -F: '/^fpr:/{print \$10; exit}'" || true
 	check_eq SYS-09 "the served keyring carries the key the server reports" \

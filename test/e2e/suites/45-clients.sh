@@ -73,7 +73,8 @@ E2E_HOST=server
 e2e_bodega server "apt key generate --name 'bodega e2e' --email admin@example.com" || true
 e2e_restart server || true
 e2e_bodega server "apt key show" || true
-server_fpr="$(printf '%s' "$E2E_OUT" | tr -dc '[:alnum:]\n' | grep -Eo '[0-9A-F]{40}' | head -1)"
+server_fpr="$(printf '%s' "$E2E_OUT" | tr -dc '[:alnum:]\n' | grep -Eo '[0-9A-F]{40}' || true)"
+server_fpr="${server_fpr%%$'\n'*}"
 check_matches CLI-APT-01 "the server holds a signing key" '^[0-9A-F]{40}$' \
 	"${server_fpr:-none}" "cmd/bodega/cmd_apt.go:154" "bodega apt key show"
 
