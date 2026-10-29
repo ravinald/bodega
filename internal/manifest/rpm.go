@@ -30,6 +30,11 @@ const (
 // the three.
 var ErrRpmKeysListed = errors.New("rpm objects are keyed by repository, release and architecture, which an entry does not record; list them under " + RpmPrefix)
 
+// RpmOSVEcosystems are the OSV ecosystems that publish advisories against an
+// Enterprise Linux vendor's RPM builds. A record's own ecosystem string may
+// carry a release after a colon ("Rocky Linux:9").
+var RpmOSVEcosystems = []string{"AlmaLinux", "Red Hat", "Rocky Linux"}
+
 // RpmBasearches are the architectures a /rpm/ path may substitute for
 // $basearch. Anything else would put caller-chosen text into an upstream URL.
 var RpmBasearches = []string{"x86_64", "aarch64", "noarch", "ppc64le", "s390x"}

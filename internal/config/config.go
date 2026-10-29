@@ -128,53 +128,53 @@ type Config struct {
 	// provenance is verified against, for a host that cannot reach Sigstore's
 	// TUF repository. Empty means fetch it through TUF. serve refuses to
 	// start when it names a file that is missing or does not parse.
-	SigstoreTrustedRoot    string            `json:"sigstore_trusted_root,omitempty"`
-	ServerURL              string            `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
-	Token                  string            `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
-	ProxyCacheEnabled      bool              `json:"proxy_cache_enabled"`
-	MetadataTTL            string            `json:"metadata_ttl,omitempty"`
-	UpstreamConnectTimeout string            `json:"upstream_connect_timeout,omitempty"` // bound on one TCP connect to an upstream
-	StaleGrace             string            `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
-	GomodUpstream          string            `json:"gomod_upstream,omitempty"`
-	GomodSumdbURL          string            `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
-	NpmUpstream            string            `json:"npm_upstream,omitempty"`
-	PypiUpstream           string            `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
-	CargoUpstream          string            `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
-	CargoDLUpstream        string            `json:"cargo_dl_upstream,omitempty"`
-	MavenUpstream          string            `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
-	MavenUpstreams         []string          `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
-	RubygemsUpstream       string            `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
-	ComposerUpstream       string            `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
-	ComposerDistHosts      []string          `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
-	OCIUpstreams           map[string]string `json:"oci_upstreams,omitempty"`          // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
-	OCITokenHosts          []string          `json:"oci_token_hosts,omitempty"`        // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
-	RpmUpstreams           map[string]string `json:"rpm_upstreams,omitempty"`          // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
-	PrivateUpstreamHosts   []string          `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
-	DiscoverMode           string            `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
-	GomodRoot              string            `json:"gomod_root,omitempty"`
-	HelmRoot               string            `json:"helm_root,omitempty"`
-	NpmRoot                string            `json:"npm_root,omitempty"`
-	CargoRoot              string            `json:"cargo_root,omitempty"`
-	MavenRoot              string            `json:"maven_root,omitempty"`
-	RubygemsRoot           string            `json:"rubygems_root,omitempty"`
-	ComposerRoot           string            `json:"composer_root,omitempty"`
-	OCIRoot                string            `json:"oci_root,omitempty"`
-	RpmRoot                string            `json:"rpm_root,omitempty"`
-	FreeBSDRoot            string            `json:"freebsd_root,omitempty"`
-	DistfilesRoot          string            `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
-	AuditDB                string            `json:"audit_db,omitempty"`
-	DenyList               []string          `json:"deny_list,omitempty"`
-	Timezone               string            `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
-	AuditEvents            []string          `json:"audit_events,omitempty"`      // event types to record; empty = all
-	AuditSink              string            `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
-	AuditSinkDSN           string            `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
-	StorageBackend         string            `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
-	StoragePath            string            `json:"storage_path,omitempty"`      // root directory for local backend
-	AptCodename            string            `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
-	AptSuites              []string          `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
-	AptSigningName         string            `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
-	AptSigningEmail        string            `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
-	AdminPermitCIDR        []string          `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+	SigstoreTrustedRoot    string                 `json:"sigstore_trusted_root,omitempty"`
+	ServerURL              string                 `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token                  string                 `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
+	ProxyCacheEnabled      bool                   `json:"proxy_cache_enabled"`
+	MetadataTTL            string                 `json:"metadata_ttl,omitempty"`
+	UpstreamConnectTimeout string                 `json:"upstream_connect_timeout,omitempty"` // bound on one TCP connect to an upstream
+	StaleGrace             string                 `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
+	GomodUpstream          string                 `json:"gomod_upstream,omitempty"`
+	GomodSumdbURL          string                 `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
+	NpmUpstream            string                 `json:"npm_upstream,omitempty"`
+	PypiUpstream           string                 `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
+	CargoUpstream          string                 `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
+	CargoDLUpstream        string                 `json:"cargo_dl_upstream,omitempty"`
+	MavenUpstream          string                 `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
+	MavenUpstreams         []string               `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
+	RubygemsUpstream       string                 `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
+	ComposerUpstream       string                 `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
+	ComposerDistHosts      []string               `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
+	OCIUpstreams           map[string]string      `json:"oci_upstreams,omitempty"`          // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
+	OCITokenHosts          []string               `json:"oci_token_hosts,omitempty"`        // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
+	RpmUpstreams           map[string]RpmUpstream `json:"rpm_upstreams,omitempty"`          // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
+	PrivateUpstreamHosts   []string               `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
+	DiscoverMode           string                 `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
+	GomodRoot              string                 `json:"gomod_root,omitempty"`
+	HelmRoot               string                 `json:"helm_root,omitempty"`
+	NpmRoot                string                 `json:"npm_root,omitempty"`
+	CargoRoot              string                 `json:"cargo_root,omitempty"`
+	MavenRoot              string                 `json:"maven_root,omitempty"`
+	RubygemsRoot           string                 `json:"rubygems_root,omitempty"`
+	ComposerRoot           string                 `json:"composer_root,omitempty"`
+	OCIRoot                string                 `json:"oci_root,omitempty"`
+	RpmRoot                string                 `json:"rpm_root,omitempty"`
+	FreeBSDRoot            string                 `json:"freebsd_root,omitempty"`
+	DistfilesRoot          string                 `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
+	AuditDB                string                 `json:"audit_db,omitempty"`
+	DenyList               []string               `json:"deny_list,omitempty"`
+	Timezone               string                 `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
+	AuditEvents            []string               `json:"audit_events,omitempty"`      // event types to record; empty = all
+	AuditSink              string                 `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
+	AuditSinkDSN           string                 `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
+	StorageBackend         string                 `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
+	StoragePath            string                 `json:"storage_path,omitempty"`      // root directory for local backend
+	AptCodename            string                 `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
+	AptSuites              []string               `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
+	AptSigningName         string                 `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
+	AptSigningEmail        string                 `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
+	AdminPermitCIDR        []string               `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 
 	// OSV gate. osv_db_dir holds the per-ecosystem archives `bodega policy osv
 	// sync` writes and defaults to {storage_path}/osv, so a connected host
@@ -707,8 +707,8 @@ const (
 // upstream as literal text, so it is refused here rather than as a 404 from
 // the mirror.
 func resolveRpmUpstreams(cfg *Config) error {
-	resolved := make(map[string]string, len(cfg.RpmUpstreams))
-	for name, raw := range cfg.RpmUpstreams {
+	resolved := make(map[string]RpmUpstream, len(cfg.RpmUpstreams))
+	for name, up := range cfg.RpmUpstreams {
 		key := strings.TrimSpace(name)
 		if !manifest.RpmValidRepoName(key) {
 			return fmt.Errorf("rpm_upstreams key %q is not a repository name: letters, digits, '.', '_' and '-', up to 64, not starting with '.' or '-', e.g. \"rocky-baseos\"", name)
@@ -716,7 +716,7 @@ func resolveRpmUpstreams(cfg *Config) error {
 		if _, dup := resolved[key]; dup {
 			return fmt.Errorf("rpm_upstreams names %q twice once whitespace is trimmed", key)
 		}
-		u := strings.TrimRight(strings.TrimSpace(raw), "/") + "/"
+		u := strings.TrimRight(strings.TrimSpace(up.URL), "/") + "/"
 		sample := strings.NewReplacer("$releasever", RpmSampleReleasever, "$basearch", RpmSampleBasearch).Replace(u)
 		field := fmt.Sprintf("rpm_upstreams[%q]", key)
 		if err := validateProxyUpstream(field, sample, "https://dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/"); err != nil {
@@ -725,10 +725,92 @@ func resolveRpmUpstreams(cfg *Config) error {
 		if strings.Contains(sample, "$") {
 			return fmt.Errorf("%s names a variable other than $releasever and $basearch, which bodega does not substitute: write the value it stands for", field)
 		}
-		resolved[key] = u
+		eco := strings.TrimSpace(up.OSVEcosystem)
+		if eco != "" && !slices.Contains(manifest.RpmOSVEcosystems, eco) {
+			return fmt.Errorf("%s osv_ecosystem %q is not one OSV publishes RPM advisories under: write one of %q, or leave it out for a repository no vendor's advisories cover", field, eco, manifest.RpmOSVEcosystems)
+		}
+		resolved[key] = RpmUpstream{URL: u, OSVEcosystem: eco}
 	}
 	cfg.RpmUpstreams = resolved
 	return nil
+}
+
+// RpmUpstream is one rpm_upstreams entry. The value is either the base URL
+// alone or an object carrying it as "url" beside "osv_ecosystem", the OSV
+// ecosystem whose advisories cover the repository's packages. Left out, the
+// ecosystem follows the URL's host; see RpmOSVEcosystem.
+type RpmUpstream struct {
+	URL          string `json:"url"`
+	OSVEcosystem string `json:"osv_ecosystem,omitempty"`
+}
+
+// UnmarshalJSON reads either form.
+func (u *RpmUpstream) UnmarshalJSON(b []byte) error {
+	var base string
+	if err := json.Unmarshal(b, &base); err == nil {
+		*u = RpmUpstream{URL: base}
+		return nil
+	}
+	type plain RpmUpstream
+	var p plain
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return fmt.Errorf("an rpm_upstreams value is a base URL or {\"url\": ..., \"osv_ecosystem\": ...}: %w", err)
+	}
+	*u = RpmUpstream(p)
+	return nil
+}
+
+// MarshalJSON writes the URL alone when no ecosystem is named, so a config
+// that wrote the short form keeps it through Save.
+func (u RpmUpstream) MarshalJSON() ([]byte, error) {
+	if u.OSVEcosystem == "" {
+		return json.Marshal(u.URL)
+	}
+	type plain RpmUpstream
+	return json.Marshal(plain(u))
+}
+
+// rpmOSVEcosystemByHost names the ecosystem a vendor's own host serves. A
+// mirror is named by osv_ecosystem instead: a mirror's hostname says nothing
+// about whose packages it carries.
+var rpmOSVEcosystemByHost = map[string]string{
+	"dl.rockylinux.org":  "Rocky Linux",
+	"repo.almalinux.org": "AlmaLinux",
+	"cdn.redhat.com":     "Red Hat",
+}
+
+// RpmOSVEcosystem is the OSV ecosystem whose advisories cover repo's
+// packages: its osv_ecosystem, or the one its base URL's host belongs to. ""
+// means none does, which is EPEL and every other add-on repository: OSV
+// carries no advisory feed for them.
+func (cfg *Config) RpmOSVEcosystem(repo string) string {
+	up, ok := cfg.RpmUpstreams[repo]
+	if !ok {
+		return ""
+	}
+	if up.OSVEcosystem != "" {
+		return up.OSVEcosystem
+	}
+	parsed, err := url.Parse(up.URL)
+	if err != nil {
+		return ""
+	}
+	return rpmOSVEcosystemByHost[strings.ToLower(parsed.Hostname())]
+}
+
+// RpmOSVEcosystemsServed is every ecosystem RpmOSVEcosystem answers for some
+// repository, sorted: the exports `policy osv sync rpm` fetches.
+func (cfg *Config) RpmOSVEcosystemsServed() []string {
+	var out []string
+	for repo := range cfg.RpmUpstreams {
+		if eco := cfg.RpmOSVEcosystem(repo); eco != "" && !slices.Contains(out, eco) {
+			out = append(out, eco)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RpmRepoNames is the rpm_upstreams keys, sorted.

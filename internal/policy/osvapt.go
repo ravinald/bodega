@@ -203,6 +203,16 @@ type osvLookup struct {
 // A reason means nothing can answer. B34's rule holds here: the caller warns
 // with it rather than passing.
 func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defaultSuite string, servedSuites []string) osvLookup {
+	if pm.Type == manifest.TypeRpm {
+		vendor := ve.Metadata[RpmOSVEcosystemKey]
+		eco := rpmReleaseEcosystem(vendor, ve.Metadata[RpmReleaseKey])
+		if eco == "" {
+			return osvLookup{reason: fmt.Sprintf("rpm entry %s names no Enterprise Linux release (%s %q), so nothing selects which of %s's releases' advisories cover it; "+
+				"fetch it through /rpm/<repository>/<releasever>/, which records the release", pm.Name, RpmReleaseKey, ve.Metadata[RpmReleaseKey], vendor)}
+		}
+		return osvLookup{targets: []osvTarget{{ecosystem: eco, name: pm.Name}},
+			queried: fmt.Sprintf("%s in %s", pm.Name, eco)}
+	}
 	if pm.Type != manifest.TypeApt {
 		eco := osvEcosystemFor[pm.Type]
 		if eco == "" {
