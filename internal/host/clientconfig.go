@@ -1241,3 +1241,85 @@ func inHost(host string) string {
 	}
 	return " (" + host + ")"
 }
+
+// RpmHost is what the dnf check reads, so a test can stand in for each: how
+// to find dnf, dnf's main configuration file, and the directories dnf reads
+// .repo files from when that file sets no reposdir.
+type RpmHost struct {
+	LookPath func(string) (string, error)
+	MainConf string
+	Dirs     []string
+}
+
+const rpmRemedy = "bodega doctor --configure rpm --apply --url <bodega base URL>"
+
+// Check reports every enabled dnf repository that fetches from anywhere but
+// bodega's /rpm/ route. With no base it cannot tell bodega's repositories
+// from others, so it names the ones it could not place rather than passing
+// them. ok is false on a host with no dnf, which gets no row.
+func (t RpmHost) Check(base string) (f Finding, ok bool) {
+	if _, err := t.LookPath("dnf"); err != nil {
+		return Finding{}, false
+	}
+	f.Check = "dnf-repos"
+	conf, err := clientconf.ReadDnfConfig(t.MainConf, t.Dirs)
+	if err != nil {
+		f.Status, f.Detail = StatusSkip, err.Error()
+		f.Remediation = "run doctor as root, or repair the file named"
+		return f, true
+	}
+	around, unverified := clientconf.RpmBypasses(conf.Repos, base)
+	const noBase = "with no bodega URL to compare against, these may or may not be bodega's"
+	switch {
+	case len(around) == 0 && len(unverified) == 0:
+		f.Status, f.Detail = StatusOK, "every enabled dnf repository fetches through bodega"
+	case len(around) == 0:
+		f.Status = StatusSkip
+		f.Detail = fmt.Sprintf("%s (%d): %s", noBase, len(unverified), describeYumRepos(unverified))
+		f.Remediation = "pass --url <bodega base URL>, or set public_url in the config file"
+	default:
+		f.Status = StatusWarn
+		f.Detail = fmt.Sprintf("enabled dnf repositories fetching around bodega (%d): %s; bypasses bodega's rpm proxy",
+			len(around), describeYumRepos(around))
+		if len(unverified) > 0 {
+			f.Detail += fmt.Sprintf("; %s (%d): %s", noBase, len(unverified), describeYumRepos(unverified))
+		}
+		f.Remediation = rpmRemedy + "; a repository bodega does not serve is disabled with dnf config-manager --set-disabled <id>"
+	}
+	// A skipped file is a warning even when everything dnf loads passes: dnf
+	// warns about it on every run, and the repositories in it come back,
+	// unchecked, the moment someone repairs it.
+	if len(conf.Skipped) > 0 {
+		skipped := make([]string, len(conf.Skipped))
+		files := make([]string, len(conf.Skipped))
+		for i, s := range conf.Skipped {
+			skipped[i] = fmt.Sprintf("%s (%v)", s.File, s.Err)
+			files[i] = s.File
+		}
+		detail := fmt.Sprintf("dnf skips %d malformed .repo file(s), so no repository in them is loaded or checked: %s",
+			len(skipped), strings.Join(skipped, ", "))
+		fix := "repair or remove " + strings.Join(files, ", ") + ", then re-run doctor"
+		switch {
+		case f.Status == StatusWarn:
+			f.Detail, f.Remediation = f.Detail+"; "+detail, f.Remediation+"; "+fix
+		case f.Remediation != "":
+			f.Detail, f.Remediation = detail+"; "+f.Detail, fix+"; "+f.Remediation
+		default:
+			f.Detail, f.Remediation = detail+"; "+f.Detail, fix
+		}
+		f.Status = StatusWarn
+	}
+	return f, true
+}
+
+func describeYumRepos(repos []clientconf.YumRepo) string {
+	parts := make([]string, len(repos))
+	for i, r := range repos {
+		where := "no baseurl"
+		if len(r.URLs) > 0 {
+			where = strings.Join(r.URLs, " ")
+		}
+		parts[i] = fmt.Sprintf("%s (%s: %s)", r.ID, filepath.Base(r.File), where)
+	}
+	return strings.Join(parts, ", ")
+}

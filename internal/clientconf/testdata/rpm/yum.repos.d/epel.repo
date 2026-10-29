@@ -1,0 +1,5 @@
+[epel]
+name=Extra Packages for Enterprise Linux $releasever - $basearch
+metalink=https://mirrors.fedoraproject.org/metalink?repo=epel-$releasever&arch=$basearch
+enabled=1
+gpgcheck=1

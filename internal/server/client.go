@@ -102,6 +102,10 @@ type clientQuery struct {
 	// Archive selects one vendor archive's stanza on /client/apt, which is
 	// the URL a plan's archive record names.
 	Archive string
+	// OSID and OSVersionID are /etc/os-release's ID and VERSION_ID, which
+	// pick the dnf repositories a RHEL-family host reads.
+	OSID        string
+	OSVersionID string
 	// Root says the plan is applied as root, which puts per-host files where
 	// a per-user one would otherwise go: npm's node-gyp mirror.
 	Root bool
@@ -128,7 +132,8 @@ var (
 
 func parseClientQuery(r *http.Request) (clientQuery, error) {
 	v := r.URL.Query()
-	q := clientQuery{OS: v.Get("os"), ABI: v.Get("abi"), Codename: v.Get("codename")}
+	q := clientQuery{OS: v.Get("os"), ABI: v.Get("abi"), Codename: v.Get("codename"),
+		OSID: v.Get("os_id"), OSVersionID: v.Get("os_version_id")}
 	switch q.OS {
 	case clientconf.OSLinux, clientconf.OSFreeBSD:
 	case "":
@@ -142,6 +147,11 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 	}
 	if q.Codename != "" && !clientCodenameRe.MatchString(q.Codename) {
 		return q, fmt.Errorf("codename=%q is not an apt suite name. Pass VERSION_CODENAME from /etc/os-release, for example noble", q.Codename)
+	}
+	for _, kv := range [][2]string{{"os_id", q.OSID}, {"os_version_id", q.OSVersionID}} {
+		if kv[1] != "" && !clientconf.OSReleaseValueValid(kv[1]) {
+			return q, fmt.Errorf("%s=%q is not an os-release value. Pass ID and VERSION_ID from /etc/os-release, for example os_id=rocky&os_version_id=9.4", kv[0], kv[1])
+		}
 	}
 	if raw := v.Get("release"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -214,6 +224,12 @@ func (q clientQuery) encode() string {
 	}
 	if q.Release != 0 {
 		v.Set("release", strconv.Itoa(q.Release))
+	}
+	if q.OSID != "" {
+		v.Set("os_id", q.OSID)
+	}
+	if q.OSVersionID != "" {
+		v.Set("os_version_id", q.OSVersionID)
 	}
 	if q.Root {
 		v.Set("root", "1")
@@ -376,6 +392,8 @@ func (s *Server) planSystem(r *http.Request, h *clientHost, sys string) []planFi
 		return s.planDistfiles(h, one)
 	case manifest.TypeApt:
 		return s.planApt(r, h, one)
+	case manifest.TypeRpm:
+		return s.planRpm(h, one)
 	case manifest.TypeFreeBSD:
 		return s.planFreeBSD(r, h, one)
 	case manifest.TypeBinary:
@@ -737,6 +755,45 @@ func (s *Server) aptPocketStanza(r *http.Request, base string, pockets []string)
 		}
 	}
 	return aptsources.Render(one)
+}
+
+// planRpm renders bodega.repo for the repositories this host's distribution
+// reads, then bodega's key, which every section's gpgkey names first, in the
+// order Apply relies on to write the key first. Disabling the vendor's own
+// repositories is the host's step, not a file: only the host can see which of
+// them it has enabled.
+func (s *Server) planRpm(h *clientHost, one func(clientconf.File) []planFile) []planFile {
+	skip := func(reason string) []planFile {
+		return []planFile{{system: manifest.TypeRpm, action: planSkip, reason: reason}}
+	}
+	if h.q.OS != clientconf.OSLinux {
+		return skip("dnf runs on RHEL-family Linux, not " + h.q.OS)
+	}
+	if h.q.OSID == "" || h.q.OSVersionID == "" {
+		return skip(fmt.Sprintf("the repositories depend on this host's distribution, and it stated os_id=%q os_version_id=%q. bodega doctor sends ID and VERSION_ID from /etc/os-release; a direct request passes os_id=rocky&os_version_id=9.4",
+			h.q.OSID, h.q.OSVersionID))
+	}
+	d, ok := clientconf.RpmDistroFor(h.q.OSID, h.q.OSVersionID)
+	if !ok {
+		return skip(fmt.Sprintf("this host's /etc/os-release reads ID=%s VERSION_ID=%s, which the rpm client table does not name, so nothing on it is changed. The table names %s",
+			h.q.OSID, h.q.OSVersionID, clientconf.RpmDistroNames()))
+	}
+	key := s.aptSign.Load().pub()
+	if len(key) == 0 {
+		return skip("every section sets repo_gpgcheck=1, and this server holds no signing key to sign repomd.xml with; an operator runs `bodega apt key generate`")
+	}
+	f, kept := clientconf.RpmHost(h.base, d, func(up string) bool { _, ok := s.cfg.RpmUpstreams[up]; return ok })
+	if len(kept) == 0 {
+		names := make([]string, len(d.Repos))
+		for i, r := range d.Repos {
+			names[i] = r.Upstream
+		}
+		return skip(fmt.Sprintf("%s reads %s, and rpm_upstreams on this server configures none of them", d.Name(), strings.Join(names, ", ")))
+	}
+	out := one(f)
+	out[0].reason = strings.Join(f.Notes, ". ")
+	return append(out, planFile{system: manifest.TypeRpm, action: planInstall, path: clientconf.RpmKeyPath,
+		content: key, url: h.base + clientconf.RpmKeyRoute})
 }
 
 // planFreeBSD picks this host's repository by ABI, the same choice `bodega
