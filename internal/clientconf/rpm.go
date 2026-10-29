@@ -214,9 +214,17 @@ type YumRepo struct {
 // DnfConfig is the repository configuration dnf loads on a host: the
 // repository sections of its main file and of every .repo file in the
 // reposdir that file sets, or in the default directories when it sets none.
+// Skipped is each .repo file dnf skips whole because it does not parse.
 type DnfConfig struct {
 	Repos     []YumRepo
 	ReposDirs []string
+	Skipped   []DnfSkipped
+}
+
+// DnfSkipped is a .repo file dnf skips, and the parse error it skips it on.
+type DnfSkipped struct {
+	File string
+	Err  error
 }
 
 // ReadsDir reports whether dnf reads .repo files from dir.
@@ -229,6 +237,12 @@ func (c DnfConfig) ReadsDir(dir string) bool {
 // effective reposdir, sorted by path. A mainConf or directory that does not
 // exist contributes nothing, and an empty mainConf is not read. A repository
 // id seen twice keeps its first definition, which is the one dnf loads.
+//
+// A file libdnf's parser rejects contributes nothing, not even the sections
+// before the error: dnf skips such a .repo file whole with a warning, so a
+// section in it never shadows a later definition of the same id. dnf
+// refuses to run on a main file that does not parse, so that is an error
+// here rather than a partial set of defaults no dnf run would see.
 func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 	c := DnfConfig{ReposDirs: defaultDirs}
 	var sections []iniSection
@@ -236,7 +250,9 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 		data, err := os.ReadFile(mainConf)
 		switch {
 		case err == nil:
-			sections = parseDnfIni(data)
+			if sections, err = parseDnfIni(data); err != nil {
+				return DnfConfig{}, fmt.Errorf("dnf will not run until %s parses: %w", mainConf, err)
+			}
 		case !os.IsNotExist(err):
 			return DnfConfig{}, fmt.Errorf("read %s: %w", mainConf, err)
 		}
@@ -274,7 +290,12 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 		if err != nil {
 			return DnfConfig{}, fmt.Errorf("read %s: %w", path, err)
 		}
-		add(path, parseDnfIni(data))
+		secs, err := parseDnfIni(data)
+		if err != nil {
+			c.Skipped = append(c.Skipped, DnfSkipped{File: path, Err: err})
+			continue
+		}
+		add(path, secs)
 	}
 	return c, nil
 }
@@ -312,9 +333,8 @@ func dnfList(v string) []string {
 // opening with whitespace continues the value above it, joined by a newline;
 // a value's trailing newlines go, and then one pair of matching quotes
 // around it. A repeated section merges and a repeated key keeps its last
-// value. Where IniParser rejects the whole file this reads what it can, so a
-// malformed file is reported on rather than read as holding nothing.
-func parseDnfIni(data []byte) []iniSection {
+// value. A line IniParser throws on fails the whole file, with no sections.
+func parseDnfIni(data []byte) ([]iniSection, error) {
 	var out []iniSection
 	cur := -1
 	key, val, inValue := "", "", false
@@ -329,7 +349,8 @@ func parseDnfIni(data []byte) []iniSection {
 		out[cur].values[key] = val
 		inValue = false
 	}
-	for _, line := range strings.Split(strings.TrimPrefix(string(data), "\uFEFF"), "\n") {
+	for n, line := range strings.Split(strings.TrimPrefix(string(data), "\uFEFF"), "\n") {
+		fail := func(msg string) ([]iniSection, error) { return nil, dnfIniError{msg, n + 1} }
 		if line == "" || line[0] == '#' || line[0] == ';' {
 			flush()
 			continue
@@ -348,8 +369,22 @@ func parseDnfIni(data []byte) []iniSection {
 		switch {
 		case body[0] == '[':
 			end := sectionEnd(body)
-			if end < 0 {
-				continue
+			switch {
+			case end < 0:
+				return fail("Missing ']'")
+			case end == 1:
+				return fail("Empty section name")
+			}
+			// IniParser's scan stops one short of the last character, so
+			// "[id]x" parses and "[id]xy" does not.
+			for i := end + 1; i < len(body)-1; i++ {
+				ch := body[i]
+				if ch == '#' || ch == ';' {
+					break
+				}
+				if ch != ' ' && ch != '\t' && ch != '\r' {
+					return fail("Text after section")
+				}
 			}
 			name := body[1:end]
 			cur = slices.IndexFunc(out, func(s iniSection) bool { return s.name == name })
@@ -358,14 +393,18 @@ func parseDnfIni(data []byte) []iniSection {
 				cur = len(out) - 1
 			}
 		case cur < 0:
+			return fail("Missing section header")
 		case start > 0:
-			if inValue {
-				val += "\n" + body
+			if !inValue {
+				return fail("Illegal continuation line")
 			}
+			val += "\n" + body
+		case body[0] == '=':
+			return fail("Missing key")
 		default:
 			eq := strings.IndexByte(body, '=')
-			if eq <= 0 {
-				continue
+			if eq < 0 {
+				return fail("Missing '='")
 			}
 			key = strings.TrimRight(body[:eq], " \t")
 			val = strings.TrimLeft(body[eq+1:], " \t")
@@ -373,11 +412,20 @@ func parseDnfIni(data []byte) []iniSection {
 		}
 	}
 	flush()
-	return out
+	return out, nil
 }
 
+// dnfIniError is a line libdnf's IniParser throws on, worded as libdnf words
+// it, so the message matches the warning dnf prints for the same file.
+type dnfIniError struct {
+	msg  string
+	line int
+}
+
+func (e dnfIniError) Error() string { return fmt.Sprintf("%s at line %d", e.msg, e.line) }
+
 // sectionEnd is the index of the ] closing a section header, skipping one
-// that closes a [...] range inside the name, or -1 when there is none.
+// that closes a [...] range inside the name, or -1 when the line ends first.
 func sectionEnd(header string) int {
 	inRange := false
 	for i := 1; i < len(header); i++ {
@@ -389,6 +437,8 @@ func sectionEnd(header string) int {
 			inRange = false
 		case '[':
 			inRange = true
+		case '\r':
+			return -1
 		}
 	}
 	return -1

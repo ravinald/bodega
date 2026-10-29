@@ -299,3 +299,78 @@ func TestDoctorDnfReposFollowDnfConf(t *testing.T) {
 		t.Error("bodega.repo was written where dnf's reposdir does not look")
 	}
 }
+
+// F103 R2, R3: a malformed .repo file is skipped whole, as dnf skips it, so
+// the disabled baseos in a.repo does not hide the enabled baseos in z.repo.
+// The report warns on z.repo's baseos and names a.repo as skipped, and the
+// dnf step disables baseos.
+func TestDoctorDnfReposMalformedFileShadowsNothing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	reposDir, _, _ := rpmHostFixture(t, home, "dnf")
+	if err := os.Remove(filepath.Join(reposDir, "rocky.repo")); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"a.repo": "[baseos]\nenabled=0\n[broken\n",
+		"z.repo": "[baseos]\nenabled=1\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\n",
+	} {
+		if err := os.WriteFile(filepath.Join(reposDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row := dnfReposRow(t, "--url", "https://bodega.internal")
+	if !strings.Contains(row, "WARN") || !strings.Contains(row, "baseos (z.repo: https://dl.rockylinux.org") {
+		t.Errorf("dnf-repos row = %q, want WARN naming baseos from z.repo", row)
+	}
+	if !strings.Contains(row, filepath.Join(reposDir, "a.repo")+" (Missing ']' at line 3)") {
+		t.Errorf("dnf-repos row = %q, want a.repo named as skipped", row)
+	}
+
+	var ran [][]string
+	prevRun := doctorRun
+	doctorRun = func(name string, args ...string) error {
+		ran = append(ran, append([]string{name}, args...))
+		return nil
+	}
+	t.Cleanup(func() { doctorRun = prevRun })
+	srv, _ := rpmPlanServer(t)
+	out, err := runDoctor(t, "--configure", "rpm", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err != nil || len(ran) != 1 || !slices.Equal(ran[0], strings.Fields("dnf config-manager --set-disabled baseos")) {
+		t.Fatalf("--apply = %v, ran %v:\n%s", err, ran, out)
+	}
+	if !strings.Contains(out, "dnf skips "+filepath.Join(reposDir, "a.repo")) {
+		t.Errorf("--apply did not name the skipped a.repo:\n%s", out)
+	}
+}
+
+// F103 R2, R3: dnf will not run on a dnf.conf that does not parse, so
+// doctor reports it rather than reading the sections before the error, and
+// --configure rpm refuses before writing anything.
+func TestDoctorDnfReposMalformedDnfConf(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	_, dnfConf, _ := rpmHostFixture(t, home, "dnf")
+	if err := os.WriteFile(dnfConf, []byte("[main]\nreposdir=/nowhere\n[broken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if row := dnfReposRow(t, "--url", "https://bodega.internal"); !strings.Contains(row, "SKIPPED") || !strings.Contains(row, dnfConf) {
+		t.Errorf("dnf-repos row = %q, want SKIPPED naming %s", row, dnfConf)
+	}
+
+	var ran [][]string
+	prevRun := doctorRun
+	doctorRun = func(name string, args ...string) error {
+		ran = append(ran, append([]string{name}, args...))
+		return nil
+	}
+	t.Cleanup(func() { doctorRun = prevRun })
+	srv, _ := rpmPlanServer(t)
+	_, err := runDoctor(t, "--configure", "rpm", "--url", srv.URL, "--allow-plaintext", "--apply")
+	if err == nil || !strings.Contains(err.Error(), "Missing ']' at line 3") || len(ran) != 0 {
+		t.Errorf("--apply over a malformed dnf.conf = %v, ran %v", err, ran)
+	}
+	if _, err := os.Stat(filepath.Join(home, clientconf.RpmRepoPath)); err == nil {
+		t.Error("bodega.repo was written while dnf.conf does not parse")
+	}
+}

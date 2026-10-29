@@ -825,3 +825,44 @@ func TestCheckOCIPodmanRequiresRegistryWideCoverage(t *testing.T) {
 		}
 	}
 }
+
+// F103 R2, R3: the review's reproduction. A disabled baseos in a malformed
+// a.repo must not hide the enabled baseos in z.repo, since dnf skips a.repo
+// whole; the check warns on z.repo's baseos and names a.repo, and the dnf
+// step planned from the same read disables baseos.
+func TestRpmHostMalformedRepoFileShadowsNothing(t *testing.T) {
+	root := t.TempDir()
+	for name, body := range map[string]string{
+		"a.repo": "[baseos]\nenabled=0\n[broken\n",
+		"z.repo": "[baseos]\nenabled=1\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := RpmHost{LookPath: func(string) (string, error) { return "/usr/bin/dnf", nil }, Dirs: []string{root}}
+	f, ok := h.Check("https://bodega.internal")
+	if !ok || f.Status != StatusWarn || !strings.Contains(f.Detail, "baseos (z.repo: https://dl.rockylinux.org") {
+		t.Errorf("check = %s: %s; want WARN naming baseos from z.repo", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, filepath.Join(root, "a.repo")+" (Missing ']' at line 3)") || !strings.Contains(f.Remediation, "repair or remove") {
+		t.Errorf("check = %s: %s (%s); want a.repo named as skipped", f.Status, f.Detail, f.Remediation)
+	}
+
+	c, err := clientconf.ReadDnfConfig("", []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := clientconf.RpmDistroFor("rocky", "9")
+	if got := clientconf.RpmDisableIDs(d, []string{"rocky-baseos"}, c.Repos, "x86_64"); !slices.Equal(got, []string{"baseos"}) {
+		t.Errorf("disable IDs = %v, want [baseos]", got)
+	}
+
+	// With nothing else wrong, the skipped file alone still warns.
+	if err := os.Remove(filepath.Join(root, "z.repo")); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := h.Check("https://bodega.internal"); f.Status != StatusWarn || !strings.Contains(f.Detail, "a.repo") {
+		t.Errorf("check with only the malformed file = %s: %s; want WARN naming it", f.Status, f.Detail)
+	}
+}

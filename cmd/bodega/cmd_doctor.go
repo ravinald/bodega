@@ -788,6 +788,10 @@ func rpmDisableStep(changes []clientconf.Change) ([]string, error) {
 		return nil, fmt.Errorf("rpm: %s sets reposdir to %s, so dnf would never read %s and nothing was written.\n"+
 			"  Add %s to reposdir in %s, then re-run", doctorDnfConf, dirs, repoFile.Target, dir, doctorDnfConf)
 	}
+	for _, s := range conf.Skipped {
+		fmt.Printf("skip       %-10s dnf skips %s as malformed (%v), so nothing in it is disabled; repair or remove it, then re-run\n",
+			manifest.TypeRpm, s.File, s.Err)
+	}
 	ids := clientconf.RpmDisableIDs(d, clientconf.RpmHostUpstreams(repoFile.New), conf.Repos, clientconf.RpmBasearch(runtime.GOARCH))
 	if len(ids) == 0 {
 		return nil, nil

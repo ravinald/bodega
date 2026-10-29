@@ -177,18 +177,18 @@ func TestParseDnfIniValueForms(t *testing.T) {
 		{`"1"`, true}, {`'1'`, true}, {`"0"`, false}, {`'no'`, false}, {`Off`, false},
 		{``, true}, {`""`, true}, {`maybe`, true}, {`"1`, true}, {`"0'`, true},
 	} {
-		secs := parseDnfIni([]byte("[baseos]\nenabled=" + c.enabled + "\n"))
+		secs := mustParseDnfIni(t, "[baseos]\nenabled="+c.enabled+"\n")
 		if got := secs[0].repo("x.repo").Enabled; got != c.want {
 			t.Errorf("enabled=%s read as %v, want %v", c.enabled, got, c.want)
 		}
 	}
 	// A key dnf does not know (dnf matches option names exactly) changes nothing.
-	if !parseDnfIni([]byte("[baseos]\nEnabled=0\n"))[0].repo("x.repo").Enabled {
+	if !mustParseDnfIni(t, "[baseos]\nEnabled=0\n")[0].repo("x.repo").Enabled {
 		t.Error("Enabled=0 turned the repository off; dnf does not read that key")
 	}
 
-	data := "\uFEFF[baseos]\nbaseurl = \"https://a.example/rpm/x/,\n\thttps://b.example/os/\"\n  \n  https://c.example/os/\n# comment\n  enabled=0\nmirrorlist=None\n[appstream] # trailing comment\nenabled = 0\n"
-	secs := parseDnfIni([]byte(data))
+	data := "\uFEFF[baseos]\nbaseurl = \"https://a.example/rpm/x/,\n\thttps://b.example/os/\"\n  \n  https://c.example/os/\n# comment\nmirrorlist=None\n[appstream] # trailing comment\nenabled = 0\n"
+	secs := mustParseDnfIni(t, data)
 	if len(secs) != 2 {
 		t.Fatalf("sections = %+v", secs)
 	}
@@ -196,15 +196,101 @@ func TestParseDnfIniValueForms(t *testing.T) {
 	if want := []string{`"https://a.example/rpm/x/`, `https://b.example/os/"`, "https://c.example/os/"}; !slices.Equal(base.URLs, want) {
 		t.Errorf("baseurl = %q, want %q: the quotes do not match end to end once the continuation joins", base.URLs, want)
 	}
-	if !base.Enabled {
-		t.Error("an indented enabled=0 after a comment ended the value was read as a key")
-	}
 	if secs[1].repo("x.repo").Enabled {
 		t.Error("[appstream] with a trailing comment was not read as a section")
 	}
-	quoted := parseDnfIni([]byte("[epel]\nbaseurl=\"https://a.example/1/\n https://b.example/2/\"\n"))[0].repo("x.repo")
+	quoted := mustParseDnfIni(t, "[epel]\nbaseurl=\"https://a.example/1/\n https://b.example/2/\"\n")[0].repo("x.repo")
 	if want := []string{"https://a.example/1/", "https://b.example/2/"}; !slices.Equal(quoted.URLs, want) {
 		t.Errorf("quoted continued baseurl = %q, want %q", quoted.URLs, want)
+	}
+}
+
+func mustParseDnfIni(t *testing.T, data string) []iniSection {
+	t.Helper()
+	secs, err := parseDnfIni([]byte(data))
+	if err != nil {
+		t.Fatalf("parse %q: %v", data, err)
+	}
+	return secs
+}
+
+// F103 R2, R3: every line libdnf's IniParser throws on fails the file, with
+// libdnf's own message and line, and returns no sections, so nothing before
+// the bad line survives to be read as configuration.
+func TestParseDnfIniRejectsWhatIniParserRejects(t *testing.T) {
+	for _, c := range []struct{ data, want string }{
+		{"[baseos]\nenabled=0\n[broken\n", "Missing ']' at line 3"},
+		{"[baseos\r\nenabled=0\n", "Missing ']' at line 1"},
+		{"[]\nenabled=0\n", "Empty section name at line 1"},
+		{"[baseos]xy\n", "Text after section at line 1"},
+		{"enabled=0\n[baseos]\n", "Missing section header at line 1"},
+		{"[baseos]\nenabled=0\n# comment\n  enabled=1\n", "Illegal continuation line at line 4"},
+		{"[baseos]\nenabled=0\n\n  enabled=1\n", "Illegal continuation line at line 4"},
+		{"[baseos]\n=0\n", "Missing key at line 2"},
+		{"[baseos]\nenabled\n", "Missing '=' at line 2"},
+	} {
+		secs, err := parseDnfIni([]byte(c.data))
+		if err == nil || err.Error() != c.want || secs != nil {
+			t.Errorf("%q = %v, %v; want no sections and %q", c.data, secs, err, c.want)
+		}
+	}
+	for _, ok := range []string{"[baseos]x\n", "[baseos] ; note\n", "  [baseos]\nenabled=0\n", "[base[os]]\n", "# only a comment\n\n"} {
+		if _, err := parseDnfIni([]byte(ok)); err != nil {
+			t.Errorf("%q: %v; IniParser accepts it", ok, err)
+		}
+	}
+}
+
+// F103 R2, R3: a .repo file dnf skips shadows nothing. A disabled baseos in
+// a malformed a.repo leaves the enabled baseos in z.repo as the one dnf
+// loads, so it is reported as fetching around bodega and is disabled, and
+// a.repo is named as skipped.
+func TestReadDnfConfigSkipsAMalformedRepoFileWhole(t *testing.T) {
+	dir := t.TempDir()
+	writeRepoFiles(t, dir, map[string]string{
+		"a.repo": "[baseos]\nenabled=0\n[broken\n",
+		"z.repo": "[baseos]\nenabled=1\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\n",
+	})
+	conf, err := ReadDnfConfig("", []string{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conf.Repos) != 1 || conf.Repos[0].File != filepath.Join(dir, "z.repo") || !conf.Repos[0].Enabled {
+		t.Errorf("repos = %+v, want only z.repo's enabled baseos", conf.Repos)
+	}
+	if len(conf.Skipped) != 1 || conf.Skipped[0].File != filepath.Join(dir, "a.repo") || conf.Skipped[0].Err.Error() != "Missing ']' at line 3" {
+		t.Errorf("skipped = %+v, want a.repo on its missing bracket", conf.Skipped)
+	}
+	if around, _ := RpmBypasses(conf.Repos, testBase); !slices.Equal(repoIDs(around), []string{"baseos"}) {
+		t.Errorf("bypasses = %v, want [baseos]", repoIDs(around))
+	}
+	d, _ := RpmDistroFor("rocky", "9")
+	if got := RpmDisableIDs(d, []string{"rocky-baseos"}, conf.Repos, "x86_64"); !slices.Equal(got, []string{"baseos"}) {
+		t.Errorf("disable = %v, want [baseos]", got)
+	}
+}
+
+// F103 R2, R3: dnf will not run on a main file that does not parse, so its
+// sections before the error are never taken as the host's configuration.
+func TestReadDnfConfigRefusesAMalformedMainConf(t *testing.T) {
+	dir := t.TempDir()
+	mainConf := filepath.Join(dir, "dnf.conf")
+	writeRepoFiles(t, dir, map[string]string{
+		"dnf.conf": "[main]\nreposdir=/nowhere\n[broken\n",
+		"z.repo":   "[baseos]\nbaseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/\n",
+	})
+	conf, err := ReadDnfConfig(mainConf, []string{dir})
+	if err == nil || !strings.Contains(err.Error(), mainConf) || !strings.Contains(err.Error(), "Missing ']' at line 3") {
+		t.Errorf("ReadDnfConfig = %+v, %v; want a refusal naming %s and the line", conf, err, mainConf)
+	}
+}
+
+func writeRepoFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

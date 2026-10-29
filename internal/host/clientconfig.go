@@ -1286,6 +1286,29 @@ func (t RpmHost) Check(base string) (f Finding, ok bool) {
 		}
 		f.Remediation = rpmRemedy + "; a repository bodega does not serve is disabled with dnf config-manager --set-disabled <id>"
 	}
+	// A skipped file is a warning even when everything dnf loads passes: dnf
+	// warns about it on every run, and the repositories in it come back,
+	// unchecked, the moment someone repairs it.
+	if len(conf.Skipped) > 0 {
+		skipped := make([]string, len(conf.Skipped))
+		files := make([]string, len(conf.Skipped))
+		for i, s := range conf.Skipped {
+			skipped[i] = fmt.Sprintf("%s (%v)", s.File, s.Err)
+			files[i] = s.File
+		}
+		detail := fmt.Sprintf("dnf skips %d malformed .repo file(s), so no repository in them is loaded or checked: %s",
+			len(skipped), strings.Join(skipped, ", "))
+		fix := "repair or remove " + strings.Join(files, ", ") + ", then re-run doctor"
+		switch {
+		case f.Status == StatusWarn:
+			f.Detail, f.Remediation = f.Detail+"; "+detail, f.Remediation+"; "+fix
+		case f.Remediation != "":
+			f.Detail, f.Remediation = detail+"; "+f.Detail, fix+"; "+f.Remediation
+		default:
+			f.Detail, f.Remediation = detail+"; "+f.Detail, fix
+		}
+		f.Status = StatusWarn
+	}
 	return f, true
 }
 
