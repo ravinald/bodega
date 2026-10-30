@@ -335,9 +335,9 @@ func ociConstrained(pm *manifest.PackageManifest) bool {
 // proxyOrCache gives the tag every gate, discovery row and stale-grace
 // answer a mutable document gets; the bytes then come from the digest key.
 func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t ociTarget) {
+	r, typ, fetched, err := s.ociManifestType(r, t)
 	ctx := r.Context()
 	name := t.name()
-	typ, fetched, err := s.ociManifestType(r, t)
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCITagKey(t.registry, t.repo, t.ref)
 	if err != nil {
@@ -448,9 +448,9 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 // has nothing to compare. The profile admits it when any tag resolved to it
 // is one the profile permits.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
+	r, typ, fetched, err := s.ociManifestType(r, t)
 	ctx := r.Context()
 	store := s.typeStore(manifest.TypeOCI)
-	typ, fetched, err := s.ociManifestType(r, t)
 	if err != nil {
 		s.refuseChartUnrecorded(w, t, err)
 		return

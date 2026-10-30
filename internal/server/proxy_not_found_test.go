@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -422,8 +423,67 @@ func TestEncodedErrorStatusKeepsItsMeaning(t *testing.T) {
 				if got := get(); got == http.StatusOK {
 					t.Fatal("an encoded 200 was served; identity still has to refuse it")
 				}
+				if keys, _ := store.List(t.Context(), notFoundPrefix); len(keys) != 0 {
+					t.Fatalf("records after a refused encoded 200 = %v, want none: the upstream has the path", keys)
+				}
+				code.Store(http.StatusInternalServerError)
+				if got := get(); got != http.StatusBadGateway {
+					t.Fatalf("encoded 500 after a refused encoded 200 = %d, want 502", got)
+				}
 			})
 		}
+	}
+}
+
+// A manifest fetched to classify the request is the requested path answering.
+// Its body breaking off still clears the record, and the proxy's own fetch
+// failing after it is an outage for a path the upstream has, not a 404.
+func TestOCIClassificationAnswerClearsRecord(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, ref := range []string{"v1", digest} {
+		t.Run(ref, func(t *testing.T) {
+			var phase, calls atomic.Int64
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if phase.Load() == 0 {
+					http.NotFound(w, r)
+					return
+				}
+				if calls.Add(1) == 1 {
+					w.Header().Set("Content-Length", "1000")
+					_, _ = w.Write([]byte("partial"))
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(up.Close)
+			s := notFoundServer(t, storage.NewMemory(), up.URL)
+			s.cfg.OCIUpstreams = map[string]string{"registry.example": up.URL}
+			path := "registry.example/example/image/manifests/" + ref
+			get := func() int {
+				r := httptest.NewRequest(http.MethodGet, "/v2/"+path, nil)
+				r.SetPathValue("path", path)
+				w := httptest.NewRecorder()
+				s.handleOCI(w, r)
+				return w.Code
+			}
+			records := func() int {
+				keys, err := s.typeStore(manifest.TypeOCI).List(t.Context(), notFoundPrefix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return len(keys)
+			}
+			if got := get(); got != http.StatusNotFound {
+				t.Fatalf("initial = %d, want 404", got)
+			}
+			if records() != 1 {
+				t.Fatal("no record after the upstream's 404")
+			}
+			phase.Store(1)
+			if got := get(); got != http.StatusBadGateway || records() != 0 {
+				t.Fatalf("truncated 200 then 500: response = %d, records = %d, calls = %d; want 502 and none", got, records(), calls.Load())
+			}
+		})
 	}
 }
 

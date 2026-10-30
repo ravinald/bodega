@@ -384,7 +384,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		fetched = s.fetchUpstreamInOrder(ctx, upstreamURL, order, regType)
 	}
 	up, spool, err := fetched.up, fetched.spool, fetched.err
-	if fetched.answered && store != nil {
+	if (fetched.answered || pathAnsweredIn(ctx)) && store != nil {
 		s.clearNotFound(ctx, store, s3Key)
 	}
 	if err != nil {
@@ -543,6 +543,21 @@ func upstreamAnsweredIn(err error) bool {
 	return errors.As(err, &status) && status.status >= 200 && status.status < 300
 }
 
+// pathAnsweredKey marks a request whose requested path already answered 2xx
+// before the proxy fetched it: a manifest fetched to classify the request.
+// The observation holds for the rest of the request, so no later failure in it
+// recreates a not-found record or answers from one.
+type pathAnsweredKey struct{}
+
+func withPathAnswered(ctx context.Context) context.Context {
+	return context.WithValue(ctx, pathAnsweredKey{}, true)
+}
+
+func pathAnsweredIn(ctx context.Context) bool {
+	answered, _ := ctx.Value(pathAnsweredKey{}).(bool)
+	return answered
+}
+
 // upstreamOpener opens one upstream URL in place of openUpstream, for a
 // route whose upstream speaks a protocol of its own on the way to the bytes:
 // the OCI registries answer a Bearer challenge before they serve anything. It
@@ -661,7 +676,7 @@ func (s *Server) notFoundTTL(regType string) time.Duration {
 }
 
 func (s *Server) recordNotFound(ctx context.Context, store storage.ObjectStore, regType, s3Key string) {
-	if store == nil || s.notFoundTTL(regType) <= 0 {
+	if store == nil || s.notFoundTTL(regType) <= 0 || pathAnsweredIn(ctx) {
 		return
 	}
 	b, err := json.Marshal(notFoundRecord{Type: regType, Path: s3Key, At: time.Now().UTC()})
@@ -685,7 +700,7 @@ func (s *Server) clearNotFound(ctx context.Context, store storage.ObjectStore, s
 // caller: a path never seen missing is a 502, so an outage invents nothing.
 func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, regType, s3Key string, err error) bool {
 	ttl := s.notFoundTTL(regType)
-	if store == nil || ttl <= 0 || !upstreamUnreachable(err) {
+	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(r.Context()) {
 		return false
 	}
 	b, gerr := store.Get(r.Context(), notFoundPrefix+s3Key)
@@ -999,9 +1014,9 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if identity {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			resp.Body.Close()
-			return nil, fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+			return nil, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
 				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
-				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL))
 		}
 	}
 
