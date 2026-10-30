@@ -47,22 +47,32 @@ const (
 )
 
 // rpmMirror serves the fixture under rpmUpstreamTree, any file replaced by
-// what set gives it, and counts every path asked for.
+// what set gives it, and counts every path asked for. A path stall holds
+// answers nothing until it is released.
 type rpmMirror struct {
 	ts       *httptest.Server
 	mu       sync.Mutex
 	hits     map[string]int
 	override map[string][]byte
+	stalled  map[string]chan struct{}
 }
 
 func newRPMMirror(t *testing.T) *rpmMirror {
 	t.Helper()
-	m := &rpmMirror{hits: map[string]int{}, override: map[string][]byte{}}
+	m := &rpmMirror{hits: map[string]int{}, override: map[string][]byte{}, stalled: map[string]chan struct{}{}}
 	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		m.hits[r.URL.Path]++
 		body, replaced := m.override[r.URL.Path]
+		gate := m.stalled[r.URL.Path]
 		m.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		rel, ok := strings.CutPrefix(r.URL.Path, rpmUpstreamTree)
 		if !ok {
 			http.NotFound(w, r)
@@ -88,6 +98,20 @@ func (m *rpmMirror) set(rel string, body []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.override[rpmUpstreamTree+rel] = body
+}
+
+// stall holds every answer for rel until the returned release runs, which the
+// test's cleanup also does so the mirror can close.
+func (m *rpmMirror) stall(t *testing.T, rel string) (release func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.stalled[rpmUpstreamTree+rel] = gate
+	m.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	return release
 }
 
 func (m *rpmMirror) hitsFor(rel string) int {

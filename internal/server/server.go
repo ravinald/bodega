@@ -316,6 +316,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		MetadataTTL: ttl,
 		StaleGrace:  grace,
 	}
+	s.rpmProfileBuilds.timeout, _ = time.ParseDuration(cfg.RpmProfileBuildTimeout)
 	setPrivateUpstreamHosts(cfg.PrivateUpstreamHosts)
 	if d, _ := time.ParseDuration(cfg.UpstreamConnectTimeout); d > 0 {
 		upstreamConnectTimeout.Store(int64(d))
@@ -2314,7 +2315,7 @@ func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.O
 		return
 	}
 	defer func() { _ = result.Body.Close() }()
-	s.serveStored(w, s3Key, result)
+	s.serveStored(w, r, s3Key, result)
 }
 
 // serveArtifact is proxyS3 for a stored artifact: the serve_fetch row names
@@ -2328,7 +2329,7 @@ func (s *Server) serveArtifact(w http.ResponseWriter, r *http.Request, store sto
 	}
 	defer func() { _ = result.Body.Close() }()
 	noteServed(r, key, digest)
-	s.serveStored(w, key, result)
+	s.serveStored(w, r, key, result)
 }
 
 // openStored opens s3Key for streaming and answers the client itself when the
@@ -2344,7 +2345,7 @@ func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storag
 	}
 	result, err := store.GetStream(r.Context(), s3Key)
 	if err != nil {
-		s.logger.Error("object proxy error", "key", s3Key, "error", err)
+		s.logFor(r.Context()).Error("object proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return nil, false
 	}
@@ -2356,7 +2357,7 @@ func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storag
 }
 
 // serveStored streams an already-open object to the response.
-func (s *Server) serveStored(w http.ResponseWriter, s3Key string, result *storage.StreamResult) {
+func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, s3Key string, result *storage.StreamResult) {
 	// Set Content-Type from extension, falling back to the backend's stored value.
 	ct := contentTypeForKey(s3Key)
 	if ct == "" {
@@ -2375,7 +2376,49 @@ func (s *Server) serveStored(w http.ResponseWriter, s3Key string, result *storag
 	}
 
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, result.Body)
+	if _, err := io.Copy(w, result.Body); err != nil {
+		_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
+	}
+}
+
+// bodyTransfer is the outcome of copying a response body, for a read bodega
+// makes of its own routes. The status line is written before the copy starts,
+// so a capturing writer holds 200 and whatever bytes arrived even when the
+// copy failed; this is where the reader learns those bytes are not the
+// document, which they can be mistaken for when they happen to parse.
+type bodyTransfer struct {
+	mu  sync.Mutex
+	err error
+}
+
+type bodyTransferKey struct{}
+
+func withBodyTransfer(ctx context.Context) (context.Context, *bodyTransfer) {
+	t := &bodyTransfer{}
+	return context.WithValue(ctx, bodyTransferKey{}, t), t
+}
+
+// failBodyTransfer records that the body being written under ctx was cut
+// short by err, and reports whether there was a reader to record it for. That
+// reader then owns the failure's record. Outside an own read there is none: a
+// client's response has no reader in this process to tell.
+func failBodyTransfer(ctx context.Context, err error) bool {
+	t, _ := ctx.Value(bodyTransferKey{}).(*bodyTransfer)
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.err == nil {
+		t.err = err
+	}
+	return true
+}
+
+func (t *bodyTransfer) failed() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
 }
 
 // ---- Helpers ---------------------------------------------------------------

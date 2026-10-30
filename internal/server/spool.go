@@ -219,7 +219,7 @@ func spoolDenialReason(err error) string {
 // second is an ENOSPC from whatever wrote to that filesystem next.
 func (s *Server) recordSpoolRefusal(r *http.Request, pkgType, pkgName, s3Key, reason string, err error) {
 	st := s.spool.stats()
-	s.logger.Error("proxy fetch refused: the spool is at its bound",
+	s.logFor(r.Context()).Error("proxy fetch refused: the spool is at its bound",
 		"key", s3Key, "reason", reason, "error", err,
 		"spool_dir", st.Dir, "spool_used_bytes", st.UsedBytes, "spool_in_flight", st.InFlight,
 		"spool_max_total_bytes", st.BudgetBytes, "spool_max_artifact_bytes", st.MaxArtifactBytes)

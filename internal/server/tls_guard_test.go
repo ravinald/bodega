@@ -270,7 +270,7 @@ func probeTLS(addr string) bool {
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // self-signed fixture
 	}
-	resp, err := client.Get("https://" + addr + "/healthz")
+	resp, err := client.Get("https://" + addr + "/healthz") //nolint:gosec // addr is a loopback port the test reserved
 	if err != nil {
 		return false
 	}
@@ -280,7 +280,7 @@ func probeTLS(addr string) bool {
 
 func probePlain(addr string) bool {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://" + addr + "/healthz")
+	resp, err := client.Get("http://" + addr + "/healthz") //nolint:gosec // addr is a loopback port the test reserved
 	if err != nil {
 		return false
 	}
