@@ -661,17 +661,43 @@ const releaseUpgrades = "/etc/update-manager/release-upgrades"
 // oscStepPrompt names the step that sets Prompt=never. A recorded name of
 // oscStepPrompt+"="+v put back v; the bare name inserted a Prompt line the
 // file did not have, and its undo removes that line. oscStepPromptDefault
-// prepended addedDefault to a file with no [DEFAULT] header, where
+// prepended defaultPrefix to a file with no [DEFAULT] header, where
 // ConfigParser's DEFAULT section is implicit, and its undo strips that prefix.
 const (
 	oscStepPrompt        = "release-upgrade-prompt"
 	oscStepPromptDefault = oscStepPrompt + "+default"
 )
 
-// addedDefault goes before every byte of the file, so whatever came first,
-// a comment, another section or nothing, stays exactly as it was and
-// removing the prefix gives the file back.
-const addedDefault = "[DEFAULT]\nPrompt=never\n"
+// defaultPrefix is what insertDefault puts before every byte of text, so
+// whatever came first, a comment, another section or nothing, stays exactly as
+// it was and removing the prefix gives the file back. Prompt takes the indent
+// of text's first line that is not blank or a comment: any shallower and
+// ConfigParser would read that line, a section header in a valid file, and
+// everything up to the next shallower line as Prompt's continuation.
+func defaultPrefix(text string) string {
+	return "[DEFAULT]\n" + firstIndent(text) + "Prompt=never\n"
+}
+
+// cutDefaultPrefix gives back the text insertDefault was handed, when text is
+// that text with defaultPrefix of it in front.
+func cutDefaultPrefix(text string) (string, bool) {
+	after, ok := strings.CutPrefix(text, "[DEFAULT]\n")
+	if !ok {
+		return "", false
+	}
+	_, rest, ok := strings.Cut(after, "\n")
+	return rest, ok && text == defaultPrefix(rest)+rest
+}
+
+func firstIndent(text string) string {
+	for line := range strings.Lines(text) {
+		content := strings.TrimRightFunc(line, unicode.IsSpace)
+		if v := strings.TrimSpace(content); v != "" && v[0] != '#' && v[0] != ';' {
+			return leadingSpace(content)
+		}
+	}
+	return ""
+}
 
 // promptSetting is the Prompt option of the [DEFAULT] section in
 // release-upgrades, read the way ubuntu-release-upgrader's ConfigParser
@@ -696,6 +722,11 @@ type promptSetting struct {
 	// or a comment.
 	below  int
 	indent string
+	// headers and options count the section headers and option lines
+	// ConfigParser reads, continuations excluded, so an edit can check that it
+	// added or removed exactly what it meant to and turned no line into a
+	// continuation.
+	headers, options int
 }
 
 func (p promptSetting) found() bool { return p.line >= 0 }
@@ -792,6 +823,7 @@ func parsePrompt(text string) promptSetting {
 		}
 		if j := strings.LastIndexByte(v, ']'); v[0] == '[' && j > 1 {
 			section = v[1:j]
+			p.headers++
 			opt, inOption, inPrompt = "", false, false
 			if section == "DEFAULT" && p.below < 0 {
 				p.below, underHeader = off, true
@@ -803,6 +835,7 @@ func parsePrompt(text string) promptSetting {
 			continue // ConfigParser refuses the file, so nothing reads Prompt
 		}
 		inOption, opt = true, ""
+		p.options++
 		if section == "DEFAULT" {
 			opt = strings.ToLower(strings.TrimSpace(content[:sep]))
 			defaults[opt] = strings.TrimSpace(content[sep+1:])
@@ -889,12 +922,20 @@ func (h *osCallersHost) readPrompt() (promptSetting, error) {
 }
 
 // writePrompt replaces the file with text once a fresh parse of text gives check
-// what it wants, so an edit this parser and ConfigParser would read
-// differently fails before anything is written.
-func (h *osCallersHost) writePrompt(text string, check func(promptSetting) bool, want string) error {
-	if got := parsePrompt(text); !check(got) {
+// what it wants and reads the headers and options of was, changed by the
+// counts the edit itself adds or removes, so an edit this parser and
+// ConfigParser would read differently, or one that turns a line into a
+// continuation, fails before anything is written.
+func (h *osCallersHost) writePrompt(was promptSetting, text string, headers, options int, check func(promptSetting) bool, want string) error {
+	got := parsePrompt(text)
+	if !check(got) {
 		return fmt.Errorf("editing %s would leave %s, not %s; the file is unchanged, so set it by hand",
 			h.path(releaseUpgrades), got.shown(), want)
+	}
+	if got.headers != was.headers+headers || got.options != was.options+options {
+		return fmt.Errorf("editing %s would read %d section header(s) and %d option(s) where %d and %d belong, "+
+			"so a line would change meaning; the file is unchanged, so set it by hand",
+			h.path(releaseUpgrades), got.headers, got.options, was.headers+headers, was.options+options)
 	}
 	return os.WriteFile(h.path(releaseUpgrades), []byte(text), 0o644)
 }
@@ -911,7 +952,7 @@ func (h *osCallersHost) setPrompt(to string) error {
 		return fmt.Errorf("%s has no Prompt line under [DEFAULT] to set to %s; add Prompt=%s under [DEFAULT], then re-run",
 			h.path(releaseUpgrades), quoteMultiline(to), quoteMultiline(to))
 	}
-	return h.writePrompt(p.text[:p.start]+to+p.text[p.end:],
+	return h.writePrompt(p, p.text[:p.start]+to+p.text[p.end:], 0, 0,
 		func(got promptSetting) bool { return got.found() && got.raw() == to }, "Prompt="+quoteMultiline(promptJoined(to)))
 }
 
@@ -932,7 +973,7 @@ func (h *osCallersHost) insertPrompt() error {
 	if !strings.HasSuffix(p.text[:p.below], "\n") {
 		add = "\n" + p.indent + "Prompt=never"
 	}
-	return h.writePrompt(p.text[:p.below]+add+p.text[p.below:], promptSetting.never, "Prompt=never")
+	return h.writePrompt(p, p.text[:p.below]+add+p.text[p.below:], 0, 1, promptSetting.never, "Prompt=never")
 }
 
 func (h *osCallersHost) removePrompt() error {
@@ -949,11 +990,11 @@ func (h *osCallersHost) removePrompt() error {
 	} else if from > 0 {
 		from-- // the newline insertPrompt put before a header ending the file
 	}
-	return h.writePrompt(p.text[:from]+p.text[to:],
+	return h.writePrompt(p, p.text[:from]+p.text[to:], 0, -1,
 		func(got promptSetting) bool { return !got.found() }, "no Prompt line")
 }
 
-// insertDefault prepends addedDefault to a file whose DEFAULT section is
+// insertDefault prepends defaultPrefix to a file whose DEFAULT section is
 // implicit, and removeDefault strips it again. The removal refuses once the
 // prefix is not the one the edit wrote, or once options were added under it,
 // because removing the header would then hand those options to no section
@@ -966,7 +1007,7 @@ func (h *osCallersHost) insertDefault() error {
 	if p.below >= 0 {
 		return fmt.Errorf("%s gained a [DEFAULT] section after the plan was made; re-run --quiet-os-callers", h.path(releaseUpgrades))
 	}
-	return h.writePrompt(addedDefault+p.text, promptSetting.never, "Prompt=never")
+	return h.writePrompt(p, defaultPrefix(p.text)+p.text, 1, 1, promptSetting.never, "Prompt=never")
 }
 
 func (h *osCallersHost) removeDefault() error {
@@ -974,19 +1015,19 @@ func (h *osCallersHost) removeDefault() error {
 	if err != nil {
 		return err
 	}
-	rest, ok := strings.CutPrefix(p.text, addedDefault)
+	rest, ok := cutDefaultPrefix(p.text)
 	if !ok {
 		if !p.found() && p.below < 0 {
 			return nil // already restored
 		}
-		return fmt.Errorf("%s no longer starts with the %q --quiet-os-callers added; remove those lines by hand",
-			h.path(releaseUpgrades), addedDefault)
+		return fmt.Errorf("%s no longer starts with the [DEFAULT] header and Prompt=never line --quiet-os-callers added; remove those lines by hand",
+			h.path(releaseUpgrades))
 	}
 	if optionBeforeHeader(rest) {
 		return fmt.Errorf("%s has options under the [DEFAULT] header --quiet-os-callers added; "+
 			"remove the header and the Prompt=never line by hand, keeping those options under a section", h.path(releaseUpgrades))
 	}
-	return h.writePrompt(rest, func(got promptSetting) bool { return !got.found() && got.below < 0 }, "no [DEFAULT] header")
+	return h.writePrompt(p, rest, -1, -1, func(got promptSetting) bool { return !got.found() && got.below < 0 }, "no [DEFAULT] header")
 }
 
 // optionBeforeHeader is true when a line before the first section header is

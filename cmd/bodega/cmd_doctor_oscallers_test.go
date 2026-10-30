@@ -538,11 +538,20 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 		{"no Prompt line, header unterminated", "[DEFAULT]", "release-upgrade-prompt", "found no Prompt line", "[DEFAULT]\nPrompt=never"},
 		{"no Prompt line, indented options, header with trailing text", "[DEFAULT] # c\n\n  Other=1\n   cont\n",
 			"release-upgrade-prompt", "found no Prompt line", "[DEFAULT] # c\n  Prompt=never\n\n  Other=1\n   cont\n"},
-		{"empty", "", oscStepPromptDefault, implicit, addedDefault},
-		{"comment only", "# release upgrade policy\n", oscStepPromptDefault, implicit, addedDefault + "# release upgrade policy\n"},
-		{"comment only, no final newline", "# release upgrade policy", oscStepPromptDefault, implicit, addedDefault + "# release upgrade policy"},
-		{"another section only", "[other]\nvalue=1\n", oscStepPromptDefault, implicit, addedDefault + "[other]\nvalue=1\n"},
-		{"another section only, no final newline", "\n[other]\nvalue=1", oscStepPromptDefault, implicit, addedDefault + "\n[other]\nvalue=1"},
+		{"empty", "", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n"},
+		{"comment only", "# release upgrade policy\n", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n# release upgrade policy\n"},
+		{"comment only, no final newline", "# release upgrade policy", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n# release upgrade policy"},
+		{"another section only", "[other]\nvalue=1\n", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n[other]\nvalue=1\n"},
+		{"another section only, no final newline", "\n[other]\nvalue=1", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n\n[other]\nvalue=1"},
+		// An indented first header would be a continuation of a Prompt line
+		// at a shallower indent, so Prompt takes the header's indent.
+		{"indented section", "  [other]\n  value=1\n", oscStepPromptDefault, implicit, "[DEFAULT]\n  Prompt=never\n  [other]\n  value=1\n"},
+		{"indented section, no final newline", "  [other]\n  value=1", oscStepPromptDefault, implicit, "[DEFAULT]\n  Prompt=never\n  [other]\n  value=1"},
+		{"comments, then an indented section and a deeper option", "# policy\n\n  ; more\n\t[other]\n\t  value=1\n\t   cont\n[second]\nx=2\n",
+			oscStepPromptDefault, implicit, "[DEFAULT]\n\tPrompt=never\n# policy\n\n  ; more\n\t[other]\n\t  value=1\n\t   cont\n[second]\nx=2\n"},
+		{"indented section, CRLF", "\r\n   [other]\r\n   value=1\r\n", oscStepPromptDefault, implicit, "[DEFAULT]\n   Prompt=never\n\r\n   [other]\r\n   value=1\r\n"},
+		{"explicit DEFAULT before an indented section", "[DEFAULT]\n  [other]\n  value=1\n", "release-upgrade-prompt", "found no Prompt line",
+			"[DEFAULT]\n  Prompt=never\n  [other]\n  value=1\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -730,8 +739,9 @@ func TestRemoveDefault(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, want string
 	}{
-		{"options added under the header", addedDefault + "Other=1\n[x]\n", "has options under the [DEFAULT] header"},
+		{"options added under the header", "[DEFAULT]\nPrompt=never\nOther=1\n[x]\n", "has options under the [DEFAULT] header"},
 		{"prefix edited", "[DEFAULT]\nPrompt=lts\n", "no longer starts with"},
+		{"prefix indented for another first line", "[DEFAULT]\n  Prompt=never\n[x]\n", "no longer starts with"},
 		{"already restored", "[x]\n", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -744,5 +754,21 @@ func TestRemoveDefault(t *testing.T) {
 				t.Errorf("removeDefault wrote %q", b)
 			}
 		})
+	}
+}
+
+// An edit whose result reads a different count of headers or options than the
+// edit accounts for has turned a line into a continuation, and is refused
+// before the file changes.
+func TestWritePromptRefusesLostStructure(t *testing.T) {
+	const body = "  [other]\n  value=1\n"
+	h := stubOSCallers(t, map[string]string{releaseUpgrades: body}, &fakeOS{})
+	err := h.writePrompt(parsePrompt(body), "[DEFAULT]\nPrompt=never\n"+body, 1, 1,
+		func(promptSetting) bool { return true }, "Prompt=never")
+	if err == nil || !strings.Contains(err.Error(), "would read 1 section header(s) and 1 option(s) where 2 and 2 belong") {
+		t.Errorf("writePrompt = %v, want the structure refused", err)
+	}
+	if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != body {
+		t.Errorf("writePrompt wrote %q", b)
 	}
 }
