@@ -90,9 +90,9 @@ fi
 # this one resolved through /etc/bodega/config.json, which is root-owned on both
 # guests, so it took a permission error a bare CI runner never sees.
 
-E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -count=1 -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
+E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -count=1 -timeout 10m -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
 check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega installed" \
-	0 "$E2E_RC" "test/e2e/README.md" "go test -run TestJSONEditPopupEscClears ./internal/tui/" "$E2E_RC"
+	0 "$E2E_RC" "test/e2e/README.md" "go test -timeout 10m -run TestJSONEditPopupEscClears ./internal/tui/" "$E2E_RC"
 
 # ---- contention under the runner's shape -----------------------------------
 #
@@ -138,9 +138,9 @@ E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1
 check_eq GAT-09 "the proxy RSS harness runs" 0 "$E2E_RC" \
 	"internal/server/proxy_rss_test.go:49" "BODEGA_PROXY_RSS=1 go test -run TestProxyPeakRSS ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 ./internal/policy/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 -timeout 35m ./internal/policy/ 2>&1 | tail -25" || true
 check_eq GAT-10 "the live OSV comparison runs against api.osv.dev" 0 "$E2E_RC" \
-	"internal/policy/osvlive_test.go:21" "BODEGA_OSV_LIVE=1 go test ./internal/policy/" "$E2E_RC"
+	"internal/policy/osvlive_test.go:21" "BODEGA_OSV_LIVE=1 go test -timeout 35m ./internal/policy/" "$E2E_RC"
 
 # ---- the containerized apt harness ----------------------------------------
 #

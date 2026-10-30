@@ -919,6 +919,7 @@ gated_race() {
 			printf '%s\n' "$3" >"$work/gated.reason"
 		}
 		: >"$work/gated.blocks"
+		# shellcheck disable=SC2030  # each helper sets the override in its own subshell
 		if [ "$1" = - ]; then unset E2E_GATED_RACE_TIMEOUT; else export E2E_GATED_RACE_TIMEOUT="$1"; fi
 		E2E_SERVER_UP=yes REPO_ROOT="$work"
 		# shellcheck source=../suites/85-gated.sh
@@ -935,6 +936,60 @@ for v in '' 0m 1441m 10000m 153722867280912930m 060m 1h 60 '60m;x' ' 60m'; do
 	t_ok "suite 85: the block for <$v> names the variable and its value" yes \
 		"$(grep -qF "E2E_GATED_RACE_TIMEOUT=\"$v\"" "$work/gated.reason" && echo yes || echo no)"
 done
+
+# Every go test the suite sends carries its own -timeout at least 5m inside the
+# ssh bound it runs under, so go's panic, which names the stuck test, lands
+# before ssh's cut, which prints nothing. The walk covers whatever the suite
+# emits rather than a list of ids, so a call added later with no bound fails.
+gated_go_bounds() {
+	(
+		# shellcheck disable=SC2329  # invoked by the sourced suite
+		e2e_on() {
+			E2E_RC=0
+			case "$*" in
+			*'go test '*) printf '%s|%s\n' "${E2E_SSH_TIMEOUT:-300}" "$*" ;;
+			esac
+		}
+		# shellcheck disable=SC2329
+		e2e_local() { E2E_RC=0; }
+		# shellcheck disable=SC2329
+		e2e_put() { :; }
+		# shellcheck disable=SC2329
+		check_eq() { :; }
+		# shellcheck disable=SC2329
+		e2e_skip() { :; }
+		# shellcheck disable=SC2329
+		e2e_block() { :; }
+		# shellcheck disable=SC2031  # each helper sets the override in its own subshell
+		if [ "$1" = - ]; then unset E2E_GATED_RACE_TIMEOUT; else export E2E_GATED_RACE_TIMEOUT="$1"; fi
+		E2E_SERVER_UP=yes REPO_ROOT="$work"
+		# shellcheck source=../suites/85-gated.sh
+		. "$E2E_DIR/suites/85-gated.sh"
+	)
+}
+go_bound_violations() {
+	awk -F'|' '{
+		cmd = substr($0, length($1) + 2)
+		if (!match(cmd, /-timeout[= ][0-9]+[hms]( |$)/)) { print "no parseable -timeout: " cmd; next }
+		v = substr(cmd, RSTART + 9, RLENGTH - 9); sub(/ $/, "", v)
+		n = substr(v, 1, length(v) - 1); u = substr(v, length(v))
+		s = n * (u == "h" ? 3600 : u == "m" ? 60 : 1)
+		if (s + 300 > $1 + 0) print "-timeout " v " is not 5m inside ssh bound " $1 ": " cmd
+	}'
+}
+for v in - 45m 1440m; do
+	bounds="$(gated_go_bounds "$v")"
+	t_ok "suite 85 <$v>: every go test call carries -timeout 5m inside its ssh bound" "" \
+		"$(printf '%s\n' "$bounds" | go_bound_violations)"
+	t_ok "suite 85 <$v>: the walk saw all seven go test calls" 7 \
+		"$(printf '%s\n' "$bounds" | awk 'NF { n++ } END { print n + 0 }')"
+done
+t_ok "go test bound check: a call with no -timeout is reported" 1 \
+	"$(printf '900|/usr/local/go/bin/go test -count=1 ./internal/tui/\n' | go_bound_violations | awk 'END { print NR }')"
+t_ok "go test bound check: a -timeout under 5m inside its bound is reported" 1 \
+	"$(printf '1800|go test -timeout 26m ./x/\n' | go_bound_violations | awk 'END { print NR }')"
+t_ok "go test bound check: -timeout=10m at 900s passes" "" \
+	"$(printf '900|go test -timeout=10m ./x/\n' | go_bound_violations)"
 
 # ---- verdict ---------------------------------------------------------------
 
