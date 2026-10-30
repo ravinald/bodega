@@ -316,6 +316,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		MetadataTTL: ttl,
 		StaleGrace:  grace,
 	}
+	s.rpmProfileBuilds.timeout, _ = time.ParseDuration(cfg.RpmProfileBuildTimeout)
 	setPrivateUpstreamHosts(cfg.PrivateUpstreamHosts)
 	if d, _ := time.ParseDuration(cfg.UpstreamConnectTimeout); d > 0 {
 		upstreamConnectTimeout.Store(int64(d))

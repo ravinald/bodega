@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
@@ -12,11 +13,13 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -81,23 +84,70 @@ type rpmFilteredFile struct {
 // rpmProfileBuild is one profile's filtered files over one set of upstream
 // files, identified by the profile's fingerprint and the upstream checksums.
 type rpmProfileBuild struct {
-	key   string
-	files map[string]rpmFilteredFile
+	key, fingerprint string
+	files            map[string]rpmFilteredFile
 }
 
-// rpmProfileBuilds holds each profile view's recent builds. built counts the
-// builds made, which is what a test reads to show a second host on a profile
-// reused the first host's.
+// rpmProfileBuilds holds each profile view's recent builds and the builds
+// running for it. built counts the builds made, which is what a test reads to
+// show a second host on a profile reused the first host's.
 type rpmProfileBuilds struct {
 	mu    sync.Mutex
 	views map[string]*rpmProfileSlot
 	built int
+	// timeout bounds one build, rpmProfileBuildTimeout when zero. wait is how
+	// long a request waits on a running build before answering without it,
+	// rpmProfileBuildWait when zero.
+	timeout, wait time.Duration
+	// running counts the build goroutines alive, so a test can let them end
+	// before its store goes away.
+	running sync.WaitGroup
 }
 
+// rpmProfileBuildWait is how long a request waits on a build before it is
+// answered from the previous build or with a 503. It stays under 5 seconds so
+// the client has a byte long before dnf's 30-second low-speed cutoff, and a
+// build that small repositories finish inside it is answered in one request.
+const rpmProfileBuildWait = 3 * time.Second
+
+// rpmProfileRetryAfter is the Retry-After a 503 for a running build carries.
+const rpmProfileRetryAfter = "10"
+
+var rpmProfileBuildTimeout = func() time.Duration {
+	d, _ := time.ParseDuration(config.DefaultRpmProfileBuildTimeout)
+	return d
+}()
+
 type rpmProfileSlot struct {
-	mu     sync.Mutex
-	recent []*rpmProfileBuild
+	mu      sync.Mutex
+	recent  []*rpmProfileBuild
+	running map[string]*rpmProfileJob
 }
+
+// rpmProfileJob is one build in progress. b and err are set before done is
+// closed and never written after.
+type rpmProfileJob struct {
+	done chan struct{}
+	b    *rpmProfileBuild
+	err  error
+}
+
+// errRpmProfileBuilding is a request that found its view's build running past
+// rpmProfileBuildWait with no previous build to serve.
+var errRpmProfileBuilding = errors.New("the profile's filtered metadata is still being built")
+
+// rpmProfileBuildError is a build that failed. The build logged it, so the
+// requests waiting on it answer without logging it again.
+type rpmProfileBuildError struct {
+	file string
+	err  error
+}
+
+func (e *rpmProfileBuildError) Error() string {
+	return fmt.Sprintf("building the filtered %s: %v", e.file, e.err)
+}
+
+func (e *rpmProfileBuildError) Unwrap() error { return e.err }
 
 func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
 	c.mu.Lock()
@@ -107,7 +157,7 @@ func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
 	}
 	sl := c.views[view]
 	if sl == nil {
-		sl = &rpmProfileSlot{}
+		sl = &rpmProfileSlot{running: map[string]*rpmProfileJob{}}
 		c.views[view] = sl
 	}
 	return sl
@@ -173,15 +223,98 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 		}
 	}
 
+	fingerprint := p.Fingerprint(manifest.TypeRpm)
 	sl := s.rpmProfileBuilds.slot(rpmProfileView(t, p))
 	sl.mu.Lock()
-	defer sl.mu.Unlock()
-	for _, b := range sl.recent {
+	recent := slices.Clone(sl.recent)
+	sl.mu.Unlock()
+	for _, b := range recent {
 		if b.key == key && s.rpmProfileBuildStored(r, t, b) {
 			return b, nil
 		}
 	}
 
+	sl.mu.Lock()
+	job := sl.running[key]
+	if job == nil {
+		job = &rpmProfileJob{done: make(chan struct{})}
+		sl.running[key] = job
+		timeout := s.rpmProfileBuilds.timeout
+		if timeout <= 0 {
+			timeout = rpmProfileBuildTimeout
+		}
+		// The build belongs to no request: dnf gives up on a repomd.xml after
+		// 30 seconds without a byte, and a build of BaseOS's filelists takes
+		// longer, so under the request's context it would be canceled and
+		// started over by every retry. It keeps the request's values (who
+		// asked, for the upstream fetch's records) and drops its cancellation.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
+		br := r.Clone(ctx)
+		s.rpmProfileBuilds.running.Add(1)
+		go func() {
+			defer s.rpmProfileBuilds.running.Done()
+			defer cancel()
+			b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps)
+			sl.mu.Lock()
+			delete(sl.running, key)
+			if err == nil {
+				sl.recent = append([]*rpmProfileBuild{b}, sl.recent...)
+				if len(sl.recent) > rpmProfileBuildsKept {
+					sl.recent = sl.recent[:rpmProfileBuildsKept]
+				}
+			}
+			job.b, job.err = b, err
+			sl.mu.Unlock()
+			close(job.done)
+		}()
+	}
+	sl.mu.Unlock()
+
+	wait := s.rpmProfileBuilds.wait
+	if wait <= 0 {
+		wait = rpmProfileBuildWait
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-job.done:
+		return job.b, job.err
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	case <-timer.C:
+	}
+	// A previous build under this fingerprint lists what the profile grants
+	// today over an older upstream; one under another fingerprint would list
+	// what an edited profile no longer grants, so it is never served.
+	sl.mu.Lock()
+	recent = slices.Clone(sl.recent)
+	sl.mu.Unlock()
+	for _, b := range recent {
+		if b.fingerprint == fingerprint && s.rpmProfileBuildStored(r, t, b) {
+			return b, nil
+		}
+	}
+	return nil, errRpmProfileBuilding
+}
+
+// rpmBuildProfileFiles reads, filters and stores the files entries names,
+// under r's context, which is the build's own. A failure is logged here, once
+// for every request waiting on it.
+func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64) (b *rpmProfileBuild, err error) {
+	file := "primary"
+	defer func() {
+		// A request's handler has net/http's recover behind it; this
+		// goroutine has none, and a panic in a filter would stop the server.
+		if v := recover(); v != nil {
+			err = fmt.Errorf("panic: %v", v)
+		}
+		if err != nil {
+			s.logger.Error("rpm metadata could not be filtered for a profile",
+				"profile", p.Name(), "repository", t.id(), "file", file, "error", err)
+			b, err = nil, &rpmProfileBuildError{file: file, err: err}
+		}
+	}()
+	store := s.typeStore(manifest.TypeRpm)
 	read := func(e rpmRepomdData) ([]byte, error) {
 		if !rpmMetadataHrefServed(e.Location.Href) {
 			return nil, fmt.Errorf("repomd.xml places %s at %q, outside repodata/, which bodega does not serve", e.Type, e.Location.Href)
@@ -198,12 +331,13 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	if err != nil {
 		return nil, fmt.Errorf("primary %s of %s: %w", primary.Location.Href, t.id(), err)
 	}
-	b := &rpmProfileBuild{key: key, files: map[string]rpmFilteredFile{}}
+	b = &rpmProfileBuild{key: key, fingerprint: fingerprint, files: map[string]rpmFilteredFile{}}
 	for _, typ := range rpmFilteredTypes {
 		e, ok := entries[typ]
 		if !ok {
 			continue
 		}
+		file = typ
 		if typ != "primary" {
 			if raw, err = read(e); err != nil {
 				return nil, err
@@ -221,10 +355,6 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 			return nil, fmt.Errorf("store the filtered %s of %s: %w", typ, t.id(), err)
 		}
 		b.files[typ] = f
-	}
-	sl.recent = append([]*rpmProfileBuild{b}, sl.recent...)
-	if len(sl.recent) > rpmProfileBuildsKept {
-		sl.recent = sl.recent[:rpmProfileBuildsKept]
 	}
 	s.rpmProfileBuilds.mu.Lock()
 	s.rpmProfileBuilds.built++
@@ -291,11 +421,15 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if err != nil {
-		if errors.Is(err, errRpmNotListed) {
+		var failed *rpmProfileBuildError
+		switch {
+		case errors.Is(err, errRpmNotListed):
 			http.Error(w, fmt.Sprintf("the repomd.xml profile %q is served for %s names no %s.", p.Name(), t.id(), href), http.StatusNotFound)
-			return
+		case errors.Is(err, errRpmProfileBuilding), errors.As(err, &failed):
+			s.writeRpmProfileError(w, t, p, err)
+		default:
+			s.writeRpmReadError(w, r, t, "repomd.xml", err)
 		}
-		s.writeRpmReadError(w, r, t, "repomd.xml", err)
 		return
 	}
 	if !rpmFilteredType(entry.Type) {
@@ -311,6 +445,23 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", "application/gzip")
 	http.ServeContent(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, r, "", time.Time{}, bytes.NewReader(body))
+}
+
+// writeRpmProfileError answers a request whose profile's repomd.xml could not
+// be made. It never falls back to the unfiltered document, which lists what
+// the profile withholds.
+func (s *Server) writeRpmProfileError(w http.ResponseWriter, t rpmTree, p *entitle.Profile, err error) {
+	var failed *rpmProfileBuildError
+	switch {
+	case errors.Is(err, errRpmProfileBuilding):
+		w.Header().Set("Retry-After", rpmProfileRetryAfter)
+		http.Error(w, fmt.Sprintf("bodega is still building the metadata of %s for profile %q; dnf retries, and the build continues without it.", t.id(), p.Name()), http.StatusServiceUnavailable)
+		return
+	case errors.As(err, &failed):
+	default:
+		s.logger.Error("rpm repomd.xml could not be filtered for a profile", "profile", p.Name(), "repository", t.id(), "error", err)
+	}
+	http.Error(w, fmt.Sprintf("bodega could not filter the metadata of %s for profile %q, so it served no repomd.xml rather than the unfiltered one; the server log names the cause.", t.id(), p.Name()), http.StatusBadGateway)
 }
 
 func rpmFilteredType(typ string) bool {

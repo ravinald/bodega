@@ -7,8 +7,10 @@ import (
 	"encoding/xml"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -577,5 +579,208 @@ func TestRpmFilterPackagesSetsTheRootCount(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// rpmBuildFixture is one governed host on a filtered rocky-baseos, behind a
+// real listener so a request can be canceled the way a client hanging up
+// cancels it.
+type rpmBuildFixture struct {
+	m        *rpmMirror
+	s        *Server
+	ts       *httptest.Server
+	web01    *profileFixture
+	upstream []byte
+}
+
+func newRpmBuildFixture(t *testing.T) *rpmBuildFixture {
+	t.Helper()
+	f := &rpmBuildFixture{m: newRPMMirror(t)}
+	f.upstream, _ = rpmFullRepo(t, f.m)
+	f.s, _ = rpmServer(t, f.m)
+	// Registered before any stall, so it runs after the stall is released:
+	// a build still writing when the test's store is removed fails cleanup.
+	t.Cleanup(f.s.rpmProfileBuilds.running.Wait)
+	f.web01 = bindProfile(t, f.s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeRpm, Name: "nginx"}})
+	f.ts = httptest.NewServer(f.s.Handler())
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+// get is pf's GET of path under ctx, and how long the answer took.
+func (f *rpmBuildFixture) get(ctx context.Context, pf *profileFixture, path string) (*http.Response, string, time.Duration, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.ts.URL+path, nil)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+pf.token)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", time.Since(start), err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return resp, string(body), time.Since(start), err
+}
+
+func (f *rpmBuildFixture) filelistsHref(t *testing.T) string {
+	t.Helper()
+	return rpmEntryHref(t, string(f.upstream), "filelists")
+}
+
+// A client that gives up on repomd.xml mid-build does not cancel the build:
+// the upstream read it started finishes, the filtered files are stored, and
+// the next request is served them without a second build.
+func TestRpmProfileBuildOutlivesTheRequestThatStartedIt(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = time.Minute
+	fhref := f.filelistsHref(t)
+	release := f.m.stall(t, fhref)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := f.get(ctx, f.web01, rpmRepoPath+"repodata/repomd.xml")
+		done <- err
+	}()
+	waitFor(t, func() bool { return f.m.hitsFor(fhref) > 0 })
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("the canceled request was answered; it was meant to be cut off mid-build")
+	}
+	release()
+	waitFor(t, func() bool { return f.s.rpmProfileBuilds.count() == 1 })
+
+	resp, doc, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml after the stall cleared: %v %v %s", err, resp, doc)
+	}
+	if doc == string(f.upstream) || rpmEntryHref(t, doc, "filelists") == fhref {
+		t.Errorf("web01 was served the unfiltered repomd.xml:\n%s", doc)
+	}
+	if n := f.s.rpmProfileBuilds.count(); n != 1 {
+		t.Errorf("builds = %d, want 1: the canceled request's build was started over", n)
+	}
+	if n := f.m.hitsFor(fhref); n != 1 {
+		t.Errorf("upstream asked for filelists %d times, want 1", n)
+	}
+}
+
+// With no previous build to serve, a request during a stalled build is told
+// to come back, inside the 5 seconds a client has before it reads silence as
+// a hang, and is never handed the unfiltered document.
+func TestRpmProfileBuildRunningAnswers503(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.m.stall(t, f.filelistsHref(t))
+
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("repomd.xml during the first build: %d Retry-After=%q, want 503 with Retry-After\n%s", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+	}
+	if took >= 5*time.Second {
+		t.Errorf("answered after %s, want under 5s", took)
+	}
+	if strings.Contains(body, "<repomd") {
+		t.Errorf("the 503 carried a repomd.xml:\n%s", body)
+	}
+}
+
+// With a previous build held, a request during the next build is served the
+// previous build's listing, signed so dnf's repo_gpgcheck passes.
+func TestRpmProfileBuildRunningServesThePreviousBuild(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = 200 * time.Millisecond
+	resp, first, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("first repomd.xml: %v %v %s", err, resp, first)
+	}
+	if n := f.s.rpmProfileBuilds.count(); n != 1 {
+		t.Fatalf("builds after the first repomd.xml = %d, want 1", n)
+	}
+
+	// The upstream moves: a new filelists, which is a new build key.
+	fhref := f.filelistsHref(t)
+	f.m.mu.Lock()
+	oldGz := f.m.override[rpmUpstreamTree+fhref]
+	f.m.mu.Unlock()
+	oldOpen := rpmGunzip(t, oldGz)
+	newOpen := append(bytes.Clone(oldOpen), "<!-- republished -->\n"...)
+	newGz := rpmGzip(t, newOpen)
+	newHref := "repodata/" + rpmSHA256(newGz) + "-filelists.xml.gz"
+	f.m.set(newHref, newGz)
+	moved := strings.Replace(string(f.upstream), rpmDataEntry("filelists", fhref, oldGz, oldOpen), rpmDataEntry("filelists", newHref, newGz, newOpen), 1)
+	if moved == string(f.upstream) {
+		t.Fatal("the fixture's filelists entry was not replaced")
+	}
+	f.m.set("repodata/repomd.xml", []byte(moved))
+	f.s.cache.MetadataTTL = time.Nanosecond
+	f.m.stall(t, newHref)
+
+	web02 := addProfileHost(t, f.s, "web", "web02")
+	resp, doc, took, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml during the second build: %v %v %s", err, resp, doc)
+	}
+	if took >= 5*time.Second {
+		t.Errorf("answered after %s, want under 5s", took)
+	}
+	for _, typ := range rpmFilteredTypes {
+		if got, want := rpmEntryHref(t, doc, typ), rpmEntryHref(t, first, typ); got != want {
+			t.Errorf("%s during the second build = %s, want the previous build's %s", typ, got, want)
+		}
+	}
+	_, sig, _, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rpmVerifies(t, f.s.aptSign.Load().signer, doc, sig); err != nil {
+		t.Errorf("the previous build's repomd.xml does not verify against its signature: %v", err)
+	}
+	for _, typ := range rpmFilteredTypes {
+		if resp, _, _, err := f.get(context.Background(), web02, rpmRepoPath+rpmEntryHref(t, doc, typ)); err != nil || resp.StatusCode != http.StatusOK {
+			t.Errorf("the previous build's %s for web02: %v %v", typ, err, resp)
+		}
+	}
+}
+
+// Ten hosts arriving during one build share it.
+func TestRpmProfileBuildIsSharedByConcurrentRequests(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = time.Minute
+	fhref := f.filelistsHref(t)
+	release := f.m.stall(t, fhref)
+
+	const n = 10
+	var wg sync.WaitGroup
+	docs := make([]string, n)
+	codes := make([]int, n)
+	for i := range n {
+		wg.Go(func() {
+			resp, doc, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+			if err == nil {
+				codes[i], docs[i] = resp.StatusCode, doc
+			}
+		})
+	}
+	waitFor(t, func() bool { return f.m.hitsFor(fhref) > 0 })
+	time.Sleep(200 * time.Millisecond)
+	release()
+	wg.Wait()
+	for i := range n {
+		if codes[i] != http.StatusOK || docs[i] != docs[0] {
+			t.Errorf("request %d: %d, want 200 and the same repomd.xml as request 0", i, codes[i])
+		}
+	}
+	if got := f.s.rpmProfileBuilds.count(); got != 1 {
+		t.Errorf("builds = %d, want 1", got)
+	}
+	if got := f.m.hitsFor(rpmPrimaryGz); got != 1 {
+		t.Errorf("upstream asked for primary %d times, want 1", got)
 	}
 }

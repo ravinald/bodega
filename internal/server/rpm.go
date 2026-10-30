@@ -178,8 +178,7 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 		if rpmFilters(p) {
 			filtered, err := s.rpmProfileRepomd(r, t, p, body)
 			if err != nil {
-				s.logger.Error("rpm repomd.xml could not be filtered for a profile", "profile", p.Name(), "repository", t.id(), "error", err)
-				http.Error(w, fmt.Sprintf("bodega could not filter the metadata of %s for profile %q, so it served no repomd.xml rather than the unfiltered one; the server log names the cause.", t.id(), p.Name()), http.StatusBadGateway)
+				s.writeRpmProfileError(w, t, p, err)
 				return
 			}
 			served = filtered
@@ -219,7 +218,7 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 		}
 		if rpmFilters(p) {
 			if doc, err = s.rpmProfileRepomd(r, t, p, doc); err != nil {
-				s.writeRpmReadError(w, r, t, "repomd.xml", err)
+				s.writeRpmProfileError(w, t, p, err)
 				return
 			}
 		}
