@@ -294,6 +294,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// either status code. "The upstream does not publish this" is not a
 	// gateway failure, and conflating the two makes every unpublished path
 	// read as an outage.
+	var fetched upstreamFetch
 	fail := func(err error) {
 		if status != nil && status.Exists {
 			s.logFor(r.Context()).Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
@@ -338,7 +339,11 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			if !sinkUpstreamErr(r.Context(), err) {
 				s.logFor(r.Context()).Debug("upstream has no such object", "url", upstreamURL)
 			}
-			s.recordNotFound(ctx, store, regType, s3Key)
+			// A 404 past the requested path's own 200, such as a tag list's
+			// later page, says nothing about the path.
+			if !fetched.answered {
+				s.recordNotFound(ctx, store, regType, s3Key)
+			}
 			http.NotFound(w, r)
 			return
 		}
@@ -348,7 +353,6 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 	}
 
-	var fetched upstreamFetch
 	if graced {
 		// Detached so that a client giving up does not cancel the refresh it
 		// is waiting on; upstreamClient's Timeout is what bounds it instead.
@@ -499,9 +503,7 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 	}
 	up, err := open(ctx, upstreamURL)
 	if err != nil {
-		var status *upstreamStatusError
-		answered := errors.As(err, &status) && status.status >= 200 && status.status < 300
-		return upstreamFetch{err: err, answered: answered}
+		return upstreamFetch{err: err, answered: upstreamAnsweredIn(err)}
 	}
 	defer up.body.Close()
 	spool, err := s.spoolUpstream(up)
@@ -509,6 +511,36 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		return upstreamFetch{err: err, answered: true}
 	}
 	return upstreamFetch{up: up, spool: spool, answered: true}
+}
+
+// upstreamAnswered marks an opener failure that came after the requested path
+// answered 200: a body that does not parse, a digest that does not match, a
+// store that refused the result. The upstream has the path whatever bodega
+// made of its answer, so the failure clears a recorded 404 and is never read
+// as an outage.
+type upstreamAnswered struct{ err error }
+
+func (e *upstreamAnswered) Error() string { return e.err.Error() }
+func (e *upstreamAnswered) Unwrap() error { return e.err }
+
+// afterAnswer wraps err, when there is one, as a failure past a 200.
+func afterAnswer(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &upstreamAnswered{err: err}
+}
+
+// upstreamAnsweredIn reports an open failure whose upstream answered 2xx for
+// the requested path: a 2xx bodega does not serve, or an opener's own failure
+// past a 200.
+func upstreamAnsweredIn(err error) bool {
+	var after *upstreamAnswered
+	if errors.As(err, &after) {
+		return true
+	}
+	var status *upstreamStatusError
+	return errors.As(err, &status) && status.status >= 200 && status.status < 300
 }
 
 // upstreamOpener opens one upstream URL in place of openUpstream, for a
@@ -683,6 +715,9 @@ func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, 
 // redirect the guard refused would otherwise read as a network failure. Outside
 // it, the only net.Error a fetch returns is the guard's own DNS lookup.
 func upstreamUnreachable(err error) bool {
+	if upstreamAnsweredIn(err) {
+		return false
+	}
 	var status *upstreamStatusError
 	if errors.As(err, &status) {
 		return status.status >= 500
@@ -949,15 +984,6 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
 	}
 
-	if identity {
-		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-			resp.Body.Close()
-			return nil, fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
-				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
-				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)
-		}
-	}
-
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
@@ -965,6 +991,18 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+	}
+
+	// After the status: the identity rule protects artifact bytes, and only a
+	// 200 carries any. A CDN that gzips its 404 or 5xx page has still said
+	// "missing" or "failing", and the not-found record reads that status.
+	if identity {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+			resp.Body.Close()
+			return nil, fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)
+		}
 	}
 
 	// resp.Request is the last request in the chain, so its URL is the server

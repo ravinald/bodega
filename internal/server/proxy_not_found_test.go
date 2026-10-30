@@ -160,6 +160,7 @@ func TestRecordAnswersOnlyAnUnreachableUpstream(t *testing.T) {
 		{"redirect the guard refused", &url.Error{Op: "Get", URL: "u", Err: refusal}, false},
 		{"connection refused", &url.Error{Op: "Get", URL: "u", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, true},
 		{"redirect to an unresolvable host", &url.Error{Op: "Get", URL: "u", Err: fmt.Errorf("cannot resolve: %w", dnsTimeout)}, true},
+		{"5xx past the path's own 200", afterAnswer(&upstreamStatusError{url: "u", status: http.StatusInternalServerError}), false},
 	} {
 		if got := upstreamUnreachable(c.err); got != c.want {
 			t.Errorf("%s: upstreamUnreachable = %v, want %v", c.name, got, c.want)
@@ -361,4 +362,178 @@ func TestNotFoundRecordSurvivesARestart(t *testing.T) {
 	up.ts.Close()
 	after := notFoundServer(t, storage.NewLocal(root), up.ts.URL)
 	wantMaven(t, after, markerJar, http.StatusNotFound)
+}
+
+// encodedUpstream sends Content-Encoding: gzip on every answer, at a status
+// the test stores: a CDN that compresses its error pages.
+func encodedUpstream(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var code atomic.Int64
+	code.Store(http.StatusNotFound)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(int(code.Load()))
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &code
+}
+
+// The identity rule guards artifact bytes, so it cannot hide the status of an
+// answer that carries none: an encoded 404 is still recorded, and an encoded
+// 5xx is still the outage a record answers.
+func TestEncodedErrorStatusKeepsItsMeaning(t *testing.T) {
+	for _, typ := range []string{manifest.TypeRpm, manifest.TypeFreeBSD} {
+		for _, c := range []struct {
+			name     string
+			recorded bool
+			ttl      time.Duration
+			want     int
+		}{
+			{"recorded", true, 0, http.StatusNotFound},
+			{"expired", true, time.Nanosecond, http.StatusBadGateway},
+			{"never recorded", false, 0, http.StatusBadGateway},
+		} {
+			t.Run(typ+"/"+c.name, func(t *testing.T) {
+				ts, code := encodedUpstream(t)
+				s := notFoundServer(t, storage.NewMemory(), ts.URL)
+				store := s.typeStore(typ)
+				get := func() int {
+					w := httptest.NewRecorder()
+					r := httptest.NewRequest(http.MethodGet, "/"+typ+"/missing", nil)
+					s.proxyOrCache(w, r, store, typ+"/missing", ts.URL+"/missing", typ, ts.URL, "example", true, true)
+					return w.Code
+				}
+				if c.recorded {
+					if got := get(); got != http.StatusNotFound {
+						t.Fatalf("encoded 404 = %d, want 404", got)
+					}
+					if keys, _ := store.List(t.Context(), notFoundPrefix); len(keys) != 1 {
+						t.Fatalf("records after an encoded 404 = %v, want one", keys)
+					}
+				}
+				if c.ttl > 0 {
+					s.cache.NotFoundTTL = map[string]time.Duration{typ: c.ttl}
+				}
+				code.Store(http.StatusInternalServerError)
+				if got := get(); got != c.want {
+					t.Fatalf("encoded 500 = %d, want %d", got, c.want)
+				}
+				code.Store(http.StatusOK)
+				if got := get(); got == http.StatusOK {
+					t.Fatal("an encoded 200 was served; identity still has to refuse it")
+				}
+			})
+		}
+	}
+}
+
+// ociTagListUpstream is a registry's tag list for example/image answering
+// 404 until a test stores another status; at 200 it sends body, and a Link to
+// a second page answering 404 when next is set.
+type ociTagListUpstream struct {
+	ts   *httptest.Server
+	code atomic.Int64
+	body atomic.Pointer[string]
+	next atomic.Bool
+}
+
+func newOCITagListUpstream(t *testing.T) *ociTagListUpstream {
+	t.Helper()
+	u := &ociTagListUpstream{}
+	u.code.Store(http.StatusNotFound)
+	u.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("last") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		if u.next.Load() {
+			w.Header().Set("Link", `</v2/example/image/tags/list?last=a>; rel="next"`)
+		}
+		w.WriteHeader(int(u.code.Load()))
+		if b := u.body.Load(); b != nil {
+			_, _ = w.Write([]byte(*b))
+		}
+	}))
+	t.Cleanup(u.ts.Close)
+	return u
+}
+
+// A 200 for the requested path clears its record even when bodega refuses
+// what the 200 carried, and a failure past that 200 never reads as an
+// outage or records a 404 of its own.
+func TestOCIAnswerPastA200ClearsTheRecord(t *testing.T) {
+	malformed, onePage := "{not json", `{"name":"example/image","tags":["a"]}`
+	for _, c := range []struct {
+		name string
+		body *string
+		next bool
+	}{
+		{"body that does not parse", &malformed, false},
+		{"later page answering 404", &onePage, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up := newOCITagListUpstream(t)
+			s := notFoundServer(t, storage.NewMemory(), up.ts.URL)
+			store := s.typeStore(manifest.TypeOCI)
+			target := ociTarget{registry: "registry.example", repo: "example/image"}
+			key := manifest.OCITagListKey(target.registry, target.repo)
+			get := func() int {
+				r := httptest.NewRequest(http.MethodGet, "/v2/example/image/tags/list", nil)
+				r = r.WithContext(withUpstreamOpener(r.Context(), s.ociTagListOpener(target)))
+				w := httptest.NewRecorder()
+				s.proxyOrCache(w, r, store, key, up.ts.URL+"/v2/example/image/tags/list", manifest.TypeOCI, target.name(), target.name(), false, true)
+				return w.Code
+			}
+			if got := get(); got != http.StatusNotFound {
+				t.Fatalf("initial = %d, want 404", got)
+			}
+			up.code.Store(http.StatusOK)
+			up.body.Store(c.body)
+			up.next.Store(c.next)
+			if got := get(); got == http.StatusOK {
+				t.Fatalf("a tag list bodega cannot read whole was served")
+			}
+			if keys, _ := store.List(t.Context(), notFoundPrefix); len(keys) != 0 {
+				t.Fatalf("records after the path answered 200 = %v, want none", keys)
+			}
+			up.code.Store(http.StatusInternalServerError)
+			up.body.Store(nil)
+			up.next.Store(false)
+			if got := get(); got != http.StatusBadGateway {
+				t.Fatalf("outage after the 200 = %d, want 502", got)
+			}
+		})
+	}
+}
+
+// A manifest whose bytes do not hash to the digest asked for is refused, and
+// the registry still had the path.
+func TestOCIManifestMismatchClearsTheRecord(t *testing.T) {
+	up := newStatusUpstream(t)
+	s := notFoundServer(t, storage.NewMemory(), up.ts.URL)
+	store := s.typeStore(manifest.TypeOCI)
+	digest := ociDigest([]byte("some other manifest"))
+	target := ociTarget{registry: "registry.example", repo: "example/image", ref: digest}
+	key := manifest.OCIManifestKey(target.registry, target.repo, digest)
+	get := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/v2/example/image/manifests/"+digest, nil)
+		r = r.WithContext(withUpstreamOpener(r.Context(), s.ociManifestOpener(target, store, manifest.TypeOCI, nil)))
+		w := httptest.NewRecorder()
+		s.proxyOrCache(w, r, store, key, up.ts.URL+"/v2/example/image/manifests/"+digest, manifest.TypeOCI, target.name(), target.name(), true, true)
+		return w.Code
+	}
+	if got := get(); got != http.StatusNotFound {
+		t.Fatalf("initial = %d, want 404", got)
+	}
+	up.code.Store(http.StatusOK)
+	if got := get(); got == http.StatusOK {
+		t.Fatal("a manifest that does not hash to its digest was served")
+	}
+	if keys, _ := store.List(t.Context(), notFoundPrefix); len(keys) != 0 {
+		t.Fatalf("records after the path answered 200 = %v, want none", keys)
+	}
+	up.code.Store(http.StatusInternalServerError)
+	if got := get(); got != http.StatusBadGateway {
+		t.Fatalf("outage after the 200 = %d, want 502", got)
+	}
 }
