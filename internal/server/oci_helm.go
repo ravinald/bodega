@@ -94,34 +94,61 @@ func ociChartBlobs(body []byte) []string {
 // with a chart is checked against that judgment where it is served. err is
 // a chart whose blobs could not be recorded as its own, which the caller
 // refuses: those blobs would otherwise be judged as an image's.
-func (s *Server) ociManifestType(r *http.Request, t ociTarget) (string, *ociFetched, error) {
+//
+// The returned request carries the observation when the classifying fetch saw
+// the path answer 2xx, whatever bodega then made of the body, and the path's
+// not-found record is already gone: every exit after this, the gates and the
+// proxy alike, reads that observation instead of an earlier 404.
+func (s *Server) ociManifestType(r *http.Request, t ociTarget) (*http.Request, string, *ociFetched, error) {
 	ctx := r.Context()
 	if digest, body, ok := s.ociCachedManifest(ctx, t); ok {
 		typ := ociArtifactType(body)
 		if typ == manifest.TypeHelm {
 			if err := s.ociRecordChart(ctx, t, digest, body); err != nil {
-				return typ, nil, err
+				return r, typ, nil, err
 			}
 		}
-		return typ, nil, nil
+		return r, typ, nil, nil
 	}
 	tags, resolved := s.ociVersionsFor(ctx, t)
 	key := ociManifestRequestKey(t)
 	if !s.ociWorthClassifying(r, t, tags, resolved, key) {
-		return manifest.TypeOCI, nil, nil
+		return r, manifest.TypeOCI, nil, nil
 	}
 	f, err := s.ociFetchManifest(ctx, t, t.url(ociManifests+"/"+t.ref))
+	if err == nil || upstreamAnsweredIn(err) {
+		s.ociClearNotFound(ctx, t, key)
+		r = r.WithContext(withPathAnswered(ctx))
+		ctx = r.Context()
+	}
 	if err != nil {
 		s.logger.Debug("oci manifest not classified; judging it as oci", "name", t.name(), "ref", t.ref, "error", err)
-		return manifest.TypeOCI, nil, nil
+		return r, manifest.TypeOCI, nil, nil
 	}
 	typ := ociArtifactType(f.body)
 	if digest := ociDigest(f.body); typ == manifest.TypeHelm && ociFetchMatches(t, f, digest) {
 		if err := s.ociRecordChart(ctx, t, digest, f.body); err != nil {
-			return typ, nil, err
+			return r, typ, nil, err
 		}
 	}
-	return typ, f, nil
+	return r, typ, f, nil
+}
+
+// ociClearNotFound removes the not-found record a manifest request's proxy
+// keeps, in the store that proxy reads: the type's for a tag, the version's
+// for a digest.
+func (s *Server) ociClearNotFound(ctx context.Context, t ociTarget, key string) {
+	store := s.typeStore(manifest.TypeOCI)
+	if t.isDigest() {
+		var err error
+		if store, err = s.versionStore(ctx, manifest.TypeOCI, t.name(), t.ref); err != nil {
+			s.logger.Warn("could not resolve the store holding an earlier upstream 404", "key", key, "error", err)
+			return
+		}
+	}
+	if store != nil {
+		s.clearNotFound(ctx, store, key)
+	}
 }
 
 // refuseChartUnrecorded answers a chart whose blobs bodega could not record
