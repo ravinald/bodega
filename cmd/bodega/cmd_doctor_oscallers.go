@@ -13,8 +13,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ravinald/bodega/internal/host"
 )
@@ -288,7 +291,8 @@ func (h *osCallersHost) unitState(verb, unit string) string {
 }
 
 // findings reports a row per caller that is active on this host, and none for
-// one that is absent or off. internal names the hosts chrony may take time
+// one that is absent or off, except release-upgrade-check, which reports OK
+// and N/A rows as well. internal names the hosts chrony may take time
 // from without calling out: the bodega server and any the operator names.
 // Every row is read from files, systemctl and a snapd already running, never
 // the network, so it answers on a host whose egress reaches only bodega.
@@ -658,123 +662,181 @@ const releaseUpgrades = "/etc/update-manager/release-upgrades"
 // file did not have, and its undo removes that line.
 const oscStepPrompt = "release-upgrade-prompt"
 
-// promptSetting is the Prompt key of the [DEFAULT] section in
-// release-upgrades, read the way ubuntu-release-upgrader's configparser
-// reads it: the key in any case, = or : between key and value, # and ;
-// comments. lines keeps every byte, so an edit changes the value alone.
+// promptSetting is the Prompt option of the [DEFAULT] section in
+// release-upgrades, read the way ubuntu-release-upgrader's ConfigParser
+// reads it: the key in any case and at any indent, = or : between key and
+// value, # and ; comment lines, a header ending at its last ], and a line
+// indented deeper than its option continuing that option's value. Offsets
+// index text, so an edit replaces the value's bytes and nothing around them.
 type promptSetting struct {
 	exists bool
-	lines  []string
-	// line is the Prompt line, or -1; header is the [DEFAULT] line, or -1.
-	line, header int
-	// start and end bound the value within lines[line].
-	start, end int
+	text   string
+	// value is the effective value: the first line's and every
+	// continuation's, joined by newlines, as ConfigParser.get returns it.
+	value string
+	// line is where the Prompt option's first line starts, or -1, and start
+	// and end bound its value, continuations included.
+	line, start, end int
+	// below is where the line after the first [DEFAULT] header starts, or -1,
+	// and indent is the indent of the first line under it that is not blank
+	// or a comment.
+	below  int
+	indent string
 }
 
-func (p promptSetting) value() string {
-	if p.line < 0 {
-		return ""
-	}
-	return p.lines[p.line][p.start:p.end]
-}
+func (p promptSetting) found() bool { return p.line >= 0 }
 
-func (p promptSetting) never() bool { return strings.EqualFold(p.value(), "never") }
+func (p promptSetting) never() bool { return p.found() && strings.EqualFold(p.value, "never") }
+
+// raw is the value as the file spells it, which is what the restore writes
+// back.
+func (p promptSetting) raw() string { return p.text[p.start:p.end] }
 
 func (p promptSetting) stepName() string {
-	if p.line < 0 {
+	if !p.found() {
 		return oscStepPrompt
 	}
-	return oscStepPrompt + "=" + p.value()
+	return oscStepPrompt + "=" + p.raw()
 }
 
-// shown is the setting as the row and the plan print it. With no Prompt
-// line the upgrader takes the default, normal, which checks for every
-// release.
+// shown is the setting as the row prints it. With no Prompt option the
+// upgrader takes the default, normal, which checks for every release.
 func (p promptSetting) shown() string {
-	if p.line < 0 {
+	if !p.found() {
 		return "no Prompt line, which means Prompt=normal"
 	}
-	return "Prompt=" + p.value()
+	return "Prompt=" + quoteMultiline(p.value)
 }
 
-func (h *osCallersHost) readPrompt() (promptSetting, error) {
-	p := promptSetting{line: -1, header: -1}
-	b, err := os.ReadFile(h.path(releaseUpgrades))
-	if errors.Is(err, fs.ErrNotExist) {
-		return p, nil
+// promptValue is what the upgrader reads from a raw value. Its continuations
+// were indented past their option's indent, so past none at all here too.
+func promptValue(raw string) string {
+	return parsePrompt("[DEFAULT]\nPrompt=" + raw).value
+}
+
+func quoteMultiline(v string) string {
+	if strings.ContainsAny(v, "\r\n") {
+		return strconv.Quote(v)
 	}
-	if err != nil {
-		return p, err
-	}
-	p.exists = true
-	p.lines = strings.SplitAfter(string(b), "\n")
-	section := ""
-	for i, line := range p.lines {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';':
-			continue
-		case line[0] == ' ' || line[0] == '\t':
-			continue // a continuation of the value above
-		case strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"):
-			section = trimmed[1 : len(trimmed)-1]
-			if section == "DEFAULT" && p.header < 0 {
-				p.header = i
+	return v
+}
+
+func leadingSpace(s string) string {
+	return s[:len(s)-len(strings.TrimLeftFunc(s, unicode.IsSpace))]
+}
+
+func parsePrompt(text string) promptSetting {
+	p := promptSetting{exists: true, text: text, line: -1, below: -1}
+	section, inOption, inPrompt, underHeader := "", false, false, false
+	indent, off := 0, 0
+	for line := range strings.Lines(text) {
+		lineOff := off
+		off += len(line)
+		content := strings.TrimRightFunc(line, unicode.IsSpace)
+		v := strings.TrimSpace(content)
+		if v == "" || v[0] == '#' || v[0] == ';' {
+			// A blank line inside a value is part of it; a comment is not.
+			if v == "" && inPrompt {
+				p.value += "\n"
 			}
 			continue
 		}
-		if section != "DEFAULT" {
+		lead := leadingSpace(content)
+		cur := utf8.RuneCountInString(lead)
+		if inOption && cur > indent {
+			if inPrompt {
+				p.value += "\n" + v
+				p.end = lineOff + len(content)
+			}
 			continue
 		}
-		sep := strings.IndexAny(line, "=:")
-		if sep < 0 || !strings.EqualFold(strings.TrimSpace(line[:sep]), "Prompt") {
+		indent = cur
+		if underHeader {
+			p.indent, underHeader = lead, false
+		}
+		if j := strings.LastIndexByte(v, ']'); v[0] == '[' && j > 1 {
+			section = v[1:j]
+			inOption, inPrompt = false, false
+			if section == "DEFAULT" && p.below < 0 {
+				p.below, underHeader = off, true
+			}
 			continue
 		}
-		rest := line[sep+1:]
-		v := strings.TrimSpace(rest)
-		p.line = i
-		p.start = sep + 1 + strings.Index(rest, v)
-		p.end = p.start + len(v)
+		sep := strings.IndexAny(content, "=:")
+		if sep < 0 || section == "" || strings.TrimSpace(content[:sep]) == "" {
+			continue // ConfigParser refuses the file, so nothing reads Prompt
+		}
+		inOption = true
+		inPrompt = section == "DEFAULT" && strings.EqualFold(strings.TrimSpace(content[:sep]), "prompt")
+		if !inPrompt {
+			continue
+		}
+		p.line = lineOff
+		p.start = lineOff + sep + 1 + len(leadingSpace(content[sep+1:]))
+		p.end = lineOff + len(content)
+		p.value = text[p.start:p.end]
 	}
-	return p, nil
+	p.value = strings.TrimRightFunc(p.value, unicode.IsSpace)
+	return p
 }
 
-func (p promptSetting) write(path string) error {
-	return os.WriteFile(path, []byte(strings.Join(p.lines, "")), 0o644)
+func (h *osCallersHost) readPrompt() (promptSetting, error) {
+	b, err := os.ReadFile(h.path(releaseUpgrades))
+	if errors.Is(err, fs.ErrNotExist) {
+		return promptSetting{line: -1, below: -1}, nil
+	}
+	if err != nil {
+		return promptSetting{line: -1, below: -1}, err
+	}
+	return parsePrompt(string(b)), nil
 }
 
-// setPrompt replaces the value of the Prompt line and nothing around it.
+// writePrompt replaces the file with text once a fresh parse of text gives check
+// what it wants, so an edit this parser and ConfigParser would read
+// differently fails before anything is written.
+func (h *osCallersHost) writePrompt(text string, check func(promptSetting) bool, want string) error {
+	if got := parsePrompt(text); !check(got) {
+		return fmt.Errorf("editing %s would leave %s, not %s; the file is unchanged, so set it by hand",
+			h.path(releaseUpgrades), got.shown(), want)
+	}
+	return os.WriteFile(h.path(releaseUpgrades), []byte(text), 0o644)
+}
+
+// setPrompt replaces the Prompt value, continuations included, with to and
+// nothing around it; to is a raw value, so a restore writes back every byte
+// the edit took out.
 func (h *osCallersHost) setPrompt(to string) error {
 	p, err := h.readPrompt()
 	if err != nil {
 		return err
 	}
-	if p.line < 0 {
+	if !p.found() {
 		return fmt.Errorf("%s has no Prompt line under [DEFAULT] to set to %s; add Prompt=%s under [DEFAULT], then re-run",
-			h.path(releaseUpgrades), to, to)
+			h.path(releaseUpgrades), quoteMultiline(to), quoteMultiline(to))
 	}
-	l := p.lines[p.line]
-	p.lines[p.line] = l[:p.start] + to + l[p.end:]
-	return p.write(h.path(releaseUpgrades))
+	want := promptValue(to)
+	return h.writePrompt(p.text[:p.start]+to+p.text[p.end:],
+		func(got promptSetting) bool { return got.found() && got.value == want }, "Prompt="+quoteMultiline(want))
 }
 
 // insertPrompt adds Prompt=never directly under [DEFAULT], and removePrompt
 // takes the Prompt line out again, newline included, so the pair leaves the
-// file as it was.
+// file as it was. The new line takes the indent of the line after it: any
+// shallower and ConfigParser would read that line as a continuation of
+// Prompt.
 func (h *osCallersHost) insertPrompt() error {
 	p, err := h.readPrompt()
 	if err != nil {
 		return err
 	}
-	if p.header < 0 {
+	if p.below < 0 {
 		return fmt.Errorf("%s has no [DEFAULT] section to add Prompt=never to; set it by hand", h.path(releaseUpgrades))
 	}
-	add := "Prompt=never\n"
-	if !strings.HasSuffix(p.lines[p.header], "\n") {
-		add = "\nPrompt=never"
+	add := p.indent + "Prompt=never\n"
+	if !strings.HasSuffix(p.text[:p.below], "\n") {
+		add = "\n" + p.indent + "Prompt=never"
 	}
-	p.lines[p.header] += add
-	return p.write(h.path(releaseUpgrades))
+	return h.writePrompt(p.text[:p.below]+add+p.text[p.below:], promptSetting.never, "Prompt=never")
 }
 
 func (h *osCallersHost) removePrompt() error {
@@ -782,14 +844,17 @@ func (h *osCallersHost) removePrompt() error {
 	if err != nil {
 		return err
 	}
-	if p.line < 0 {
+	if !p.found() {
 		return nil
 	}
-	if !strings.HasSuffix(p.lines[p.line], "\n") && p.line > 0 {
-		p.lines[p.line-1] = strings.TrimSuffix(p.lines[p.line-1], "\n")
+	from, to := p.line, len(p.text)
+	if i := strings.IndexByte(p.text[p.end:], '\n'); i >= 0 {
+		to = p.end + i + 1
+	} else if from > 0 {
+		from-- // the newline insertPrompt put before a header ending the file
 	}
-	p.lines = slices.Delete(p.lines, p.line, p.line+1)
-	return p.write(h.path(releaseUpgrades))
+	return h.writePrompt(p.text[:from]+p.text[to:],
+		func(got promptSetting) bool { return !got.found() }, "no Prompt line")
 }
 
 // releaseUpgradeStep resolves a recorded oscStepPrompt name, which carries
@@ -802,7 +867,7 @@ func (h *osCallersHost) releaseUpgradeStep(name string) (quietStep, bool) {
 	st := quietStep{edit: func() error { return h.setPrompt("never") }}
 	shown := "no Prompt line"
 	if hadLine {
-		shown = "Prompt=" + found
+		shown = "Prompt=" + quoteMultiline(promptValue(found))
 		st.revert = func() error { return h.setPrompt(found) }
 	} else {
 		st.edit = h.insertPrompt
