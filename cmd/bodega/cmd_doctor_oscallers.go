@@ -690,16 +690,13 @@ type promptSetting struct {
 
 func (p promptSetting) found() bool { return p.line >= 0 }
 
-// never is the upgrader's own test: it lowercases what ConfigParser.get
-// returns and skips the check at never or no. A Prompt whose references do
-// not resolve makes get raise, which is not a setting anybody chose, so it
-// counts as on and --quiet-os-callers replaces it.
+// never is true only when what ConfigParser.get returns is never, in any
+// case. The upgrader also skips the check at no, but doctor's contract is
+// that only never is off, so no warns and --quiet-os-callers replaces it. A
+// Prompt whose references do not resolve makes get raise, which is not a
+// setting anybody chose, so it counts as on as well.
 func (p promptSetting) never() bool {
-	if !p.found() || p.resolveErr != nil {
-		return false
-	}
-	v := strings.ToLower(p.value)
-	return v == "never" || v == "no"
+	return p.found() && p.resolveErr == nil && strings.EqualFold(p.value, "never")
 }
 
 // raw is the value as the file spells it, which is what the restore writes
