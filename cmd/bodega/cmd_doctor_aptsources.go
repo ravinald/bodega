@@ -34,7 +34,7 @@ var aptSources = &aptSourcesHost{
 
 func (h *aptSourcesHost) ledger() stepRecord {
 	return stepRecord{
-		path: h.record, lookup: h.step,
+		path: h.record, lookup: h.step, newestFirst: true,
 		quietFlag: "--configure apt --apply", restoreFlag: "--restore-apt-sources", what: "apt source edits",
 	}
 }
@@ -82,15 +82,8 @@ func (h *aptSourcesHost) plan(written []string, baseURL string) ([]string, error
 	if err != nil {
 		return nil, fmt.Errorf("apt: %w; nothing was written. Run doctor as root, or correct the source, then re-run", err)
 	}
-	rec, err := h.ledger().load()
-	if err != nil {
+	if _, err := h.ledger().load(); err != nil {
 		return nil, err
-	}
-	recorded := map[string]bool{}
-	for _, s := range rec.Steps {
-		if e, err := host.ParseAptEdit(s); err == nil {
-			recorded[e.Path] = true
-		}
 	}
 	bodegaHost := ""
 	if u, err := url.Parse(baseURL); err == nil {
@@ -122,8 +115,6 @@ func (h *aptSourcesHost) plan(written []string, baseURL string) ([]string, error
 		var disable []host.AptSource
 		for _, s := range byFile[file] {
 			switch {
-			case s.Public != "" && s.SetsEnabled:
-				keep(s, "names "+s.Public+" and sets Enabled itself; set it to no by hand")
 			case s.Public != "":
 				disable = append(disable, s)
 			case !namesBodega(s.URIs):
@@ -133,22 +124,23 @@ func (h *aptSourcesHost) plan(written []string, baseURL string) ([]string, error
 		if len(disable) == 0 {
 			continue
 		}
-		if recorded[file] {
-			for _, s := range disable {
-				keep(s, "names "+s.Public+", and "+h.record+" already records edits to this file; run bodega doctor --restore-apt-sources, then re-run")
-			}
-			continue
-		}
 		lines := make([]int, len(disable))
-		how := "comments the line out"
-		if disable[0].Deb822 {
-			how = "adds Enabled: no"
-		}
 		for i, s := range disable {
 			lines[i] = s.Line
+			how := "comments the line out"
+			switch {
+			case s.Deb822 && s.SetsEnabled:
+				how = "sets Enabled: no"
+			case s.Deb822:
+				how = "adds Enabled: no"
+			}
 			fmt.Printf("disable    %-10s %s:%d  %s names %s; %s\n", manifest.TypeApt, s.File, s.Line, strings.Join(s.URIs, " "), s.Public, how)
 		}
-		steps = append(steps, host.DisableAptSources(file, disable[0].Deb822, lines).String())
+		e, err := host.DisableAptSources(h.root, file, disable[0].Deb822, lines)
+		if err != nil {
+			return nil, fmt.Errorf("apt: %w", err)
+		}
+		steps = append(steps, e.Name())
 	}
 	if len(steps) > 0 {
 		fmt.Printf("           (undo: bodega doctor --restore-apt-sources)\n")

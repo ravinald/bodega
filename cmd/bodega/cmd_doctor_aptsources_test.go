@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -149,9 +150,10 @@ func TestDoctorConfigureAptDisablesDistroSourcesAndRestores(t *testing.T) {
 		t.Error("--apply edited the third-party source")
 	}
 	var rec proRecord
-	if b, err := os.ReadFile(aptSources.record); err != nil || json.Unmarshal(b, &rec) != nil ||
-		len(rec.Steps) != 1 || rec.Steps[0] != "deb822 /etc/apt/sources.list.d/ubuntu.sources 3,11" {
+	if b, err := os.ReadFile(aptSources.record); err != nil || json.Unmarshal(b, &rec) != nil || len(rec.Steps) != 1 {
 		t.Errorf("record = %+v (%v)", rec, err)
+	} else if e, err := host.ParseAptEdit(rec.Steps[0]); err != nil || e.String() != "deb822 /etc/apt/sources.list.d/ubuntu.sources 3,10" {
+		t.Errorf("recorded edit = %v (%v)", e, err)
 	}
 
 	ran = nil
@@ -190,10 +192,153 @@ func TestDoctorRestoreAptSourcesRefusesAForeignRecord(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(aptSources.record), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(aptSources.record, []byte(`{"steps":["deb822 /etc/shadow.sources 1"]}`), 0o644); err != nil {
+	foreign := host.AptEdit{Path: "/etc/shadow.sources", Deb822: true, Units: []host.AptUnit{{
+		Line: 1, Before: []string{"Types: deb\n"}, After: []string{"Enabled: no\n", "Types: deb\n"},
+	}}}
+	rec, _ := json.Marshal(proRecord{Steps: []string{foreign.Name()}})
+	if err := os.WriteFile(aptSources.record, rec, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runDoctor(t, "--restore-apt-sources"); err == nil || !strings.Contains(err.Error(), "does not know") {
 		t.Errorf("restore of a foreign record = %v", err)
+	}
+}
+
+// assertNoPublicAptSource fails on any enabled source under root naming a
+// public archive, by the parse the apt-sources row reads.
+func assertNoPublicAptSource(t *testing.T, root string) {
+	t.Helper()
+	sources, err := host.AptSources(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range sources {
+		if s.Public != "" {
+			t.Errorf("public archive still enabled: %s:%d %s", s.File, s.Line, s.Public)
+		}
+	}
+}
+
+// writeAptTree writes files under root, each path unrooted.
+func writeAptTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for p, body := range files {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A public stanza that sets Enabled itself is disabled like any other, and
+// restores to the value it had.
+func TestDoctorConfigureAptSetsAnExplicitEnabledToNo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	const explicit = "Types: deb\nEnabled: yes\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute\nComponents: main\n"
+	writeAptTree(t, home, map[string]string{"/etc/apt/sources.list.d/ubuntu.sources": explicit})
+	var ran []string
+	var fail error
+	stubAptHost(t, home, &ran, &fail)
+	srv := aptPlanServer(t)
+	out, err := runDoctor(t, "--configure", "apt", "--apply", "--url", srv.URL, "--allow-plaintext")
+	if err != nil || !strings.Contains(out, "ubuntu.sources:1  http://archive.ubuntu.com/ubuntu/ names archive.ubuntu.com; sets Enabled: no") {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	path := filepath.Join(home, "/etc/apt/sources.list.d/ubuntu.sources")
+	if b, _ := os.ReadFile(path); string(b) != strings.Replace(explicit, "Enabled: yes", "Enabled: no", 1) {
+		t.Errorf("after --apply:\n%s", b)
+	}
+	assertNoPublicAptSource(t, home)
+	if out, err := runDoctor(t, "--restore-apt-sources"); err != nil {
+		t.Fatalf("restore = %v:\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(path); string(b) != explicit {
+		t.Errorf("not restored byte for byte:\n%q", b)
+	}
+}
+
+// A public source added to a file doctor already edited is planned on the
+// next run, and the restore undoes both runs' edits, newest first.
+func TestDoctorConfigureAptReappliesToARecordedFile(t *testing.T) {
+	for _, tc := range []struct{ name, path, first, added string }{
+		{"one-line", "/etc/apt/sources.list",
+			"deb http://archive.ubuntu.com/ubuntu/ resolute main\n",
+			"deb http://security.ubuntu.com/ubuntu/ resolute-security main\n"},
+		{"deb822", "/etc/apt/sources.list.d/ubuntu.sources",
+			"Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute\n",
+			"\nTypes: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: resolute-security\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeAptTree(t, root, map[string]string{tc.path: tc.first})
+			h := &aptSourcesHost{goos: "linux", root: root, record: filepath.Join(root, "record.json")}
+			apply := func() {
+				t.Helper()
+				steps, err := h.plan(nil, "https://bodega.internal")
+				if err != nil || len(steps) != 1 {
+					t.Fatalf("plan = %v, %v", steps, err)
+				}
+				if err := h.ledger().quiet(steps); err != nil {
+					t.Fatal(err)
+				}
+			}
+			apply()
+			full := filepath.Join(root, tc.path)
+			b, _ := os.ReadFile(full)
+			beforeSecond := string(b) + tc.added
+			if err := os.WriteFile(full, []byte(beforeSecond), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			apply()
+			assertNoPublicAptSource(t, root)
+			if steps, err := h.plan(nil, "https://bodega.internal"); err != nil || len(steps) != 0 {
+				t.Errorf("third plan = %v, %v; want nothing", steps, err)
+			}
+			if err := h.ledger().restore(); err != nil {
+				t.Fatal(err)
+			}
+			if b, _ := os.ReadFile(full); string(b) != tc.first+tc.added {
+				t.Errorf("restore of both runs:\n%q\nwant:\n%q", b, tc.first+tc.added)
+			}
+			if _, err := os.Stat(h.record); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("record survived: %v", err)
+			}
+		})
+	}
+}
+
+// A restore that cannot prove the file still holds its edit changes nothing
+// and keeps the record.
+func TestDoctorRestoreAptSourcesKeepsTheRecordWhenRefused(t *testing.T) {
+	root := t.TempDir()
+	path := "/etc/apt/sources.list.d/ubuntu.sources"
+	writeAptTree(t, root, map[string]string{path: resoluteUbuntuSources})
+	h := &aptSourcesHost{goos: "linux", root: root, record: filepath.Join(root, "record.json")}
+	steps, err := h.plan(nil, "https://bodega.internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ledger().quiet(steps); err != nil {
+		t.Fatal(err)
+	}
+	full := filepath.Join(root, path)
+	b, _ := os.ReadFile(full)
+	edited := "Types: deb\nEnabled: no\nURIs: https://vendor.example/repo\nSuites: stable\n\n" + string(b)
+	if err := os.WriteFile(full, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := os.ReadFile(h.record)
+	if err := h.ledger().restore(); err == nil {
+		t.Error("restore of a shifted file succeeded")
+	}
+	if b, _ := os.ReadFile(full); string(b) != edited {
+		t.Errorf("a refused restore wrote the file:\n%s", b)
+	}
+	if b, _ := os.ReadFile(h.record); string(b) != string(rec) {
+		t.Errorf("a refused restore changed the record:\n%s", b)
 	}
 }

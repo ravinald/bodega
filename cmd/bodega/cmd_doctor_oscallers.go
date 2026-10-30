@@ -43,6 +43,9 @@ type stepRecord struct {
 	quietFlag   string
 	restoreFlag string
 	what        string // the steps' subject, for errors
+	// newestFirst undoes the last step recorded first, for steps that edit
+	// a file a later step edited again and so read against its edit.
+	newestFirst bool
 	run         func(argv []string) (string, error)
 }
 
@@ -144,7 +147,11 @@ func (r stepRecord) restore() error {
 		return nil
 	}
 	for len(rec.Steps) > 0 {
-		st, _ := r.step(rec.Steps[0])
+		next := 0
+		if r.newestFirst {
+			next = len(rec.Steps) - 1
+		}
+		st, _ := r.step(rec.Steps[next])
 		ran, err := r.perform(st, true)
 		if err != nil {
 			return errors.Join(
@@ -152,7 +159,7 @@ func (r stepRecord) restore() error {
 				r.save(rec))
 		}
 		fmt.Printf("ran        %s\n", ran)
-		rec.Steps = rec.Steps[1:]
+		rec.Steps = slices.Delete(rec.Steps, next, next+1)
 	}
 	if err := os.Remove(r.path); err != nil {
 		return fmt.Errorf("every step was undone, and removing %s failed: %w", r.path, err)

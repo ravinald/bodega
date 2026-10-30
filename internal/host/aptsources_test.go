@@ -63,10 +63,13 @@ func disableAll(t *testing.T, root string) []AptEdit {
 	}
 	var edits []AptEdit
 	for _, f := range files {
-		e := DisableAptSources(f, deb822[f], byFile[f])
-		back, err := ParseAptEdit(e.String())
-		if err != nil || back.String() != e.String() {
-			t.Fatalf("ParseAptEdit(%q) = %v, %v", e.String(), back, err)
+		e, err := DisableAptSources(root, f, deb822[f], byFile[f])
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := ParseAptEdit(e.Name())
+		if err != nil || back.Name() != e.Name() {
+			t.Fatalf("ParseAptEdit(%q) = %v, %v", e.Name(), back, err)
 		}
 		if err := back.Apply(root); err != nil {
 			t.Fatal(err)
@@ -143,7 +146,7 @@ deb https://bodega.internal/apt/debian bookworm main`},
 			edits := disableAll(t, root)
 			n := 0
 			for _, e := range edits {
-				n += len(e.Lines)
+				n += len(e.Units)
 			}
 			if n != tc.disable {
 				t.Errorf("disabled %d sources (%v), want %d", n, edits, tc.disable)
@@ -207,18 +210,105 @@ func TestAptSourcesClassifiesWhatItLeaves(t *testing.T) {
 }
 
 func TestParseAptEditRefusesOtherFiles(t *testing.T) {
+	unit := `[{"line":1,"before":["deb http://archive.ubuntu.com/ubuntu resolute main\n"],"after":["# deb http://archive.ubuntu.com/ubuntu resolute main\n"]}]`
+	stanza := `[{"line":1,"before":["Types: deb\n"],"after":["Enabled: no\n","Types: deb\n"]}]`
 	for _, s := range []string{
-		"deb822 /etc/passwd 1",
-		"deb822 /etc/apt/sources.list.d/../../shadow.sources 1",
-		"deb822 /etc/apt/sources.list 1",
-		"one-line /etc/apt/sources.list.d/ubuntu.sources 1",
-		"one-line /etc/apt/sources.list 2,1",
-		"one-line /etc/apt/sources.list 0",
-		"deb822 /etc/apt/sources.list.d/ubuntu.sources",
+		`deb822 /etc/apt/sources.list.d/ubuntu.sources 1`,
+		`{"path":"/etc/passwd","deb822":false,"units":` + unit + `}`,
+		`{"path":"/etc/apt/sources.list.d/../../shadow.sources","deb822":true,"units":` + stanza + `}`,
+		`{"path":"/etc/apt/sources.list","deb822":true,"units":` + stanza + `}`,
+		`{"path":"/etc/apt/sources.list.d/ubuntu.sources","deb822":false,"units":` + unit + `}`,
+		`{"path":"/etc/apt/sources.list","deb822":false,"units":[]}`,
+		`{"path":"/etc/apt/sources.list","deb822":false,"units":` + strings.Replace(unit, `"line":1`, `"line":0`, 1) + `}`,
+		`{"path":"/etc/apt/sources.list","deb822":false,"units":` + strings.Replace(unit, `"after":["# deb`, `"after":["deb`, 1) + `}`,
+		`{"path":"/etc/apt/sources.list","deb822":false,"units":` + strings.Replace(unit, `main\n"],"after"`, `main\nrm -rf /\n"],"after"`, 1) + `}`,
+		`{"path":"/etc/apt/sources.list","deb822":false,"extra":1,"units":` + unit + `}`,
 	} {
 		if e, err := ParseAptEdit(s); err == nil {
 			t.Errorf("ParseAptEdit(%q) = %+v, want a refusal", s, e)
 		}
+	}
+	if _, err := ParseAptEdit(`{"path":"/etc/apt/sources.list","deb822":false,"units":` + unit + `}`); err != nil {
+		t.Errorf("a well-formed one-line edit: %v", err)
+	}
+}
+
+// A stanza that sets Enabled itself has the value set to no in place, and
+// restores to the spelling it had.
+func TestAptEditSetsAnExplicitEnabledToNo(t *testing.T) {
+	const explicit = "Types: deb\r\nenabled:   Yes\r\nURIs: http://archive.ubuntu.com/ubuntu/\r\nSuites: resolute\r\n\n" +
+		"Types: deb\nEnabled: no\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: resolute-security\n\n" +
+		"Types: deb\nEnabled: true\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: resolute-security\n"
+	root := writeTree(t, map[string]string{"/etc/apt/sources.list.d/ubuntu.sources": explicit})
+	edits := disableAll(t, root)
+	if len(edits) != 1 || len(edits[0].Units) != 2 {
+		t.Fatalf("edits = %+v, want the two enabled stanzas and not the disabled one", edits)
+	}
+	path := "/etc/apt/sources.list.d/ubuntu.sources"
+	want := strings.Replace(strings.Replace(explicit, "enabled:   Yes\r\n", "enabled: no\r\n", 1), "Enabled: true\n", "Enabled: no\n", 1)
+	if got := readTree(t, root, []string{path})[path]; got != want {
+		t.Errorf("after the edit:\n%q\nwant:\n%q", got, want)
+	}
+	assertFinding(t, checkAptSources(root, "linux"), StatusOK)
+	if err := edits[0].Revert(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTree(t, root, []string{path})[path]; got != explicit {
+		t.Errorf("not restored byte for byte:\n%q", got)
+	}
+}
+
+// Revert proves ownership by the lines it wrote at the place it wrote them.
+// Whatever an operator moved under them, including a stanza of their own they
+// disabled the same way, is refused with the file untouched.
+func TestAptEditRevertRefusesAShiftedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, text, prepend string
+	}{
+		{"one-line", "/etc/apt/sources.list", "deb http://archive.ubuntu.com/ubuntu/ resolute main\n",
+			"# deb https://vendor.example/repo stable main\n"},
+		{"deb822", "/etc/apt/sources.list.d/ubuntu.sources", ubuntuResoluteSources,
+			"Enabled: no\nTypes: deb\nURIs: https://vendor.example/repo\nSuites: stable\n\n"},
+		{"deb822 same stanza", "/etc/apt/sources.list.d/ubuntu.sources",
+			"Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute\n",
+			"\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{tc.path: tc.text})
+			edits := disableAll(t, root)
+			full := filepath.Join(root, tc.path)
+			b, _ := os.ReadFile(full)
+			edited := tc.prepend + string(b)
+			if err := os.WriteFile(full, []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := edits[0].Revert(root); err == nil || !strings.Contains(err.Error(), "no longer reads as doctor left it") {
+				t.Errorf("revert of a shifted file = %v", err)
+			}
+			if b, _ := os.ReadFile(full); string(b) != edited {
+				t.Errorf("a refused revert wrote the file:\n%s", b)
+			}
+		})
+	}
+}
+
+// Apply refuses a file that changed between the plan and the edit.
+func TestAptEditApplyRefusesAFileChangedSincePlanned(t *testing.T) {
+	root := writeTree(t, map[string]string{"/etc/apt/sources.list": "deb http://archive.ubuntu.com/ubuntu/ resolute main\n"})
+	e, err := DisableAptSources(root, "/etc/apt/sources.list", false, []int{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := filepath.Join(root, "/etc/apt/sources.list")
+	const changed = "deb https://vendor.example/repo stable main\ndeb http://archive.ubuntu.com/ubuntu/ resolute main\n"
+	if err := os.WriteFile(full, []byte(changed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Apply(root); err == nil {
+		t.Error("apply against a changed file succeeded")
+	}
+	if b, _ := os.ReadFile(full); string(b) != changed {
+		t.Errorf("a refused apply wrote the file:\n%s", b)
 	}
 }
 
@@ -231,7 +321,7 @@ func TestAptEditRevertRefusesAChangedFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := edits[0].Revert(root); err == nil || !strings.Contains(err.Error(), "changed since doctor disabled it") {
+	if err := edits[0].Revert(root); err == nil || !strings.Contains(err.Error(), "no longer reads as doctor left it") {
 		t.Errorf("revert of a hand-edited file = %v", err)
 	}
 	if b, _ := os.ReadFile(path); string(b) != edited {

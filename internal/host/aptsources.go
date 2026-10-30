@@ -1,6 +1,7 @@
 package host
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -108,34 +109,76 @@ func aptPublicHost(root, uri string) (string, error) {
 	return "", nil
 }
 
-const (
-	aptDisabledField = "Enabled: no\n"
-	aptCommentPrefix = "# "
-)
+const aptCommentPrefix = "# "
 
 // AptEdit takes sources in one file out of apt's path, and puts them back.
-// In a deb822 file it inserts an Enabled: no line at the head of each
-// stanza; in a one-line file it comments each entry out. Lines are counted
-// in the edited file, so the edit's String names exactly the lines Revert
-// removes or uncomments, and Revert refuses a file whose lines no longer
-// read as the edit left them rather than guessing.
+// Each unit carries the lines it replaced and the lines it wrote, at the
+// position it wrote them, so Revert can prove a file still holds doctor's
+// edit before changing it: a line number alone matches whatever an operator
+// has since moved under it.
 type AptEdit struct {
-	Path   string
-	Deb822 bool
-	Lines  []int
+	Path   string    `json:"path"`
+	Deb822 bool      `json:"deb822"`
+	Units  []AptUnit `json:"units"`
+}
+
+// AptUnit is one source disabled: a deb822 stanza, from its first field line
+// to the blank line that ends it, or a one-line entry. Line counts from 1 in
+// the file as it was before this edit; Before and After keep their line
+// endings.
+type AptUnit struct {
+	Line   int      `json:"line"`
+	Before []string `json:"before"`
+	After  []string `json:"after"`
 }
 
 // DisableAptSources plans the edit that disables the sources at lines, as
-// AptSource.Line reports them, in path.
-func DisableAptSources(path string, deb822 bool, lines []int) AptEdit {
-	e := AptEdit{Path: path, Deb822: deb822, Lines: slices.Sorted(slices.Values(lines))}
-	if deb822 {
-		// Each insertion pushes every later stanza down a line.
-		for i := range e.Lines {
-			e.Lines[i] += i
-		}
+// AptSource.Line reports them, in path under root. A deb822 stanza gets an
+// Enabled: no line at its head, or each Enabled field it already carries set
+// to no; a one-line entry is commented out.
+func DisableAptSources(root, path string, deb822 bool, lines []int) (AptEdit, error) {
+	e := AptEdit{Path: path, Deb822: deb822}
+	file, text, err := e.read(root)
+	if err != nil {
+		return e, err
 	}
-	return e
+	for _, l := range slices.Sorted(slices.Values(lines)) {
+		i := l - 1
+		if i >= len(text) || strings.TrimSpace(text[i]) == "" {
+			return e, fmt.Errorf("%s has no source at line %d; re-run doctor to plan against the file as it is now", file, l)
+		}
+		end := i + 1
+		for deb822 && end < len(text) && strings.TrimSpace(text[end]) != "" {
+			end++
+		}
+		before := slices.Clone(text[i:end])
+		e.Units = append(e.Units, AptUnit{Line: l, Before: before, After: aptDisabled(deb822, before)})
+	}
+	return e, nil
+}
+
+// aptDisabled is what a unit reads once disabled.
+func aptDisabled(deb822 bool, before []string) []string {
+	if !deb822 {
+		return []string{aptCommentPrefix + before[0]}
+	}
+	after := slices.Clone(before)
+	set := false
+	for i, line := range after {
+		if line == "" || line[0] == '#' || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "enabled") {
+			continue
+		}
+		after[i] = name + ": no" + value[len(strings.TrimRight(value, "\r\n")):]
+		set = true
+	}
+	if !set {
+		after = append([]string{"Enabled: no\n"}, after...)
+	}
+	return after
 }
 
 func (e AptEdit) kind() string {
@@ -145,24 +188,44 @@ func (e AptEdit) kind() string {
 	return "one-line"
 }
 
-// String is the edit's name in the record --restore-apt-sources reads.
+// Lines are the lines, before the edit, of the sources it disables.
+func (e AptEdit) Lines() []int {
+	out := make([]int, len(e.Units))
+	for i, u := range e.Units {
+		out[i] = u.Line
+	}
+	return out
+}
+
+// String is the edit's row in doctor's output.
 func (e AptEdit) String() string {
-	nums := make([]string, len(e.Lines))
-	for i, l := range e.Lines {
+	nums := make([]string, len(e.Units))
+	for i, l := range e.Lines() {
 		nums[i] = strconv.Itoa(l)
 	}
 	return e.kind() + " " + e.Path + " " + strings.Join(nums, ",")
 }
 
-// ParseAptEdit reads a name String wrote. It accepts only a path apt reads
-// sources from, so a record edited by hand cannot point the restore at any
-// other file.
-func ParseAptEdit(s string) (AptEdit, error) {
-	f := strings.Fields(s)
-	if len(f) != 3 || (f[0] != "deb822" && f[0] != "one-line") {
-		return AptEdit{}, fmt.Errorf("%q is not <deb822|one-line> <path> <lines>", s)
+// Name is the edit as the record --restore-apt-sources reads stores it.
+func (e AptEdit) Name() string {
+	b, err := json.Marshal(e)
+	if err != nil {
+		panic(err) // strings, ints and bools always marshal
 	}
-	e := AptEdit{Path: f[1], Deb822: f[0] == "deb822"}
+	return string(b)
+}
+
+// ParseAptEdit reads a name Name wrote. It accepts only a path apt reads
+// sources from, and only units whose After is what disabling their Before
+// writes, so a record edited by hand can point the restore at no other file
+// and no other change.
+func ParseAptEdit(s string) (AptEdit, error) {
+	var e AptEdit
+	d := json.NewDecoder(strings.NewReader(s))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&e); err != nil {
+		return AptEdit{}, fmt.Errorf("%q is not an apt source edit doctor recorded: %v", s, err)
+	}
 	ext := ".list"
 	if e.Deb822 {
 		ext = ".sources"
@@ -171,60 +234,65 @@ func ParseAptEdit(s string) (AptEdit, error) {
 	if filepath.Clean(e.Path) != e.Path || !(inDir || (!e.Deb822 && e.Path == aptSourcesList)) {
 		return AptEdit{}, fmt.Errorf("%q names %s, which is not a %s apt sources file", s, e.Path, e.kind())
 	}
-	for _, n := range strings.Split(f[2], ",") {
-		l, err := strconv.Atoi(n)
-		if err != nil || l < 1 || (len(e.Lines) > 0 && l <= e.Lines[len(e.Lines)-1]) {
-			return AptEdit{}, fmt.Errorf("%q: lines must be ascending numbers from 1", s)
+	if len(e.Units) == 0 {
+		return AptEdit{}, fmt.Errorf("%q records no source", s)
+	}
+	next := 1
+	for _, u := range e.Units {
+		if u.Line < next || len(u.Before) == 0 || (!e.Deb822 && len(u.Before) != 1) ||
+			slices.ContainsFunc(u.Before, func(l string) bool { return strings.Contains(strings.TrimSuffix(l, "\n"), "\n") }) ||
+			!slices.Equal(u.After, aptDisabled(e.Deb822, u.Before)) {
+			return AptEdit{}, fmt.Errorf("%q: unit at line %d is not one doctor writes (units ascend from line 1, never overlap, and each After disables its Before)", s, u.Line)
 		}
-		e.Lines = append(e.Lines, l)
+		next = u.Line + len(u.Before)
 	}
 	return e, nil
 }
 
-// Apply makes the edit to the file under root.
+// Apply makes the edit to the file under root, provided every source still
+// reads as it did when the edit was planned; otherwise nothing changes.
 func (e AptEdit) Apply(root string) error {
 	path, lines, err := e.read(root)
 	if err != nil {
 		return err
 	}
-	for _, l := range e.Lines {
-		i := l - 1
-		switch {
-		case e.Deb822 && i < len(lines):
-			lines = slices.Insert(lines, i, aptDisabledField)
-		case !e.Deb822 && i < len(lines) && !strings.HasPrefix(lines[i], "#"):
-			lines[i] = aptCommentPrefix + lines[i]
-		default:
-			return fmt.Errorf("%s has no line %d to disable; nothing in it was changed. Re-run doctor to plan against the file as it is now", path, l)
+	for _, u := range e.Units {
+		if !aptLinesAt(lines, u.Line-1, u.Before) {
+			return fmt.Errorf("%s changed at line %d since doctor planned the edit; nothing in it was changed. Re-run doctor to plan against the file as it is now", path, u.Line)
 		}
+	}
+	for _, u := range slices.Backward(e.Units) {
+		lines = slices.Replace(lines, u.Line-1, u.Line-1+len(u.Before), u.After...)
 	}
 	return e.write(path, lines)
 }
 
-// Revert undoes Apply, byte for byte, provided nothing else changed those
-// lines since.
+// Revert undoes Apply, byte for byte, provided every line the edit wrote
+// still reads as it wrote it, where it wrote it. Anything else is a file
+// doctor can no longer prove it owns the edit in, so nothing is changed.
 func (e AptEdit) Revert(root string) error {
 	path, lines, err := e.read(root)
 	if err != nil {
 		return err
 	}
-	for _, l := range slices.Backward(e.Lines) {
-		i := l - 1
-		switch {
-		case e.Deb822 && i < len(lines) && lines[i] == aptDisabledField:
-			lines = slices.Delete(lines, i, i+1)
-		case !e.Deb822 && i < len(lines) && strings.HasPrefix(lines[i], aptCommentPrefix):
-			lines[i] = strings.TrimPrefix(lines[i], aptCommentPrefix)
-		default:
-			want := "the line Enabled: no"
-			if !e.Deb822 {
-				want = "a line commented out with " + strconv.Quote(aptCommentPrefix)
-			}
-			return fmt.Errorf("line %d of %s is not %s, so it changed since doctor disabled it and nothing in the file was restored. "+
-				"Restore the file by hand, then remove %q from the record", l, path, want, e.String())
+	at := make([]int, len(e.Units))
+	shift := 0
+	for i, u := range e.Units {
+		at[i] = u.Line - 1 + shift
+		if !aptLinesAt(lines, at[i], u.After) {
+			return fmt.Errorf("line %d of %s no longer reads as doctor left it (%q), so the file changed since and nothing in it was restored. "+
+				"Restore the file by hand, then remove its entry from the record", at[i]+1, path, u.After[0])
 		}
+		shift += len(u.After) - len(u.Before)
+	}
+	for i, u := range slices.Backward(e.Units) {
+		lines = slices.Replace(lines, at[i], at[i]+len(u.After), u.Before...)
 	}
 	return e.write(path, lines)
+}
+
+func aptLinesAt(lines []string, i int, want []string) bool {
+	return i >= 0 && i+len(want) <= len(lines) && slices.Equal(lines[i:i+len(want)], want)
 }
 
 func (e AptEdit) read(root string) (string, []string, error) {
