@@ -169,7 +169,9 @@ check_lacks() {
 # check_matches <id> <title> <ere> <actual> [ref] [cmd] [rc]
 check_matches() {
 	local id="$1" title="$2" re="$3" actual="$4" ref="${5:-}" cmd="${6:-}" rc="${7:-0}"
-	if printf '%s' "$actual" | grep -Eq -- "$re"; then
+	# The here-string's added newline is cancelled by stripping one, and an
+	# empty value is no lines at all, so grep sees what printf '%s' gave it.
+	if [ -n "$actual" ] && grep -Eq -- "$re" <<<"${actual%$'\n'}"; then
 		e2e_record "$id" PASS "$title" "matches: $re" "$(e2e_excerpt "$actual")" "$cmd" "$rc" "$ref"
 	else
 		e2e_record "$id" FAIL "$title" "matches: $re" "$(e2e_excerpt "$actual")" "$cmd" "$rc" "$ref"

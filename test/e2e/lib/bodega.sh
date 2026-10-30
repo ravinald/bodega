@@ -166,11 +166,13 @@ e2e_apt_mirror_groups() {
 # ignored and a stanza naming one more codename is not taken for this one.
 e2e_apt_stanza_components() {
 	printf '%s\n' "$1" | awk -v want="Suites: $2" '
+		done { next }
 		{ sub(/[ \t\r]+$/, "") }
 		found {
 			i = index($0, "Components: ")
 			if (i) print substr($0, i + 12)
-			exit
+			done = 1
+			next
 		}
 		{ i = index($0, "Suites: "); if (i && substr($0, i) == want) found = 1 }
 		END { exit !found }'

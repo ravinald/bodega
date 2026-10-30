@@ -841,6 +841,63 @@ t_ok "issue filing dry-run names each failure" yes \
 t_ok "issue filing dry-run skips mapped failures" yes \
 	"$(case "$dryrun" in *SELF-20*) echo no ;; *) echo yes ;; esac)"
 
+# The first line of a capture is taken by parameter expansion, never by a pipe
+# into head: once the capture outgrows the pipe buffer, head's early exit
+# SIGPIPEs the producer and pipefail turns a correct read into exit 141.
+# 97-machine-readable reads the CSV header of an export this size.
+big_csv="name,version,sha256"$'\n'"$(head -c 300000 /dev/zero | tr '\0' 'x')"
+header_rc=0
+header="$(
+	set -euo pipefail
+	E2E_OUT="$big_csv"
+	printf '%s' "${E2E_OUT%%$'\n'*}" | tr ',' '\n' | sort | tr '\n' ' '
+)" || header_rc=$?
+t_ok "first line of a 300 KB capture: the subshell exits 0" 0 "$header_rc"
+t_ok "first line of a 300 KB capture: the header's fields" "name sha256 version " "$header"
+
+# A sed or grep stage between printf and head takes the SIGPIPE when head exits,
+# so a filter chain over a capture never ends in an early-exiting reader. These
+# cases run the suites' own assignments, extracted from the files, over a
+# capture led by a line that does not match, so a read that takes the first
+# input line instead of the first match fails too.
+big_capture() { awk -v r="$1" 'BEGIN { print "noise"; for (i = 0; i < 20000; i++) print r }'; }
+# A child bash rather than a subshell: errexit is ignored on the left of ||,
+# and a subshell inherits that, so a 141 from the assignment would pass.
+suite_read() {
+	local code rc=0 got
+	code="$(sed -n "s/^[[:space:]]*\($2=.*\)/\1/p" "$E2E_DIR/suites/$1")"
+	# shellcheck disable=SC2016  # expanded by the child shell
+	got="$(big_capture "$3" | bash -c 'set -euo pipefail; E2E_OUT="$(cat)"; eval "$1"; printf "%s" "${!2}"' \
+		suite_read "$code" "$2")" || rc=$?
+	printf '%s %s' "$rc" "$got"
+}
+fpr40="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+t_ok "40-serve-hosted wheel over a 520 KB index" "0 six.whl" \
+	"$(suite_read 40-serve-hosted.sh wheel '<a href="six.whl">six</a>')"
+t_ok "45-clients server_fpr over an 820 KB key listing" "0 $fpr40" \
+	"$(suite_read 45-clients.sh server_fpr "$fpr40")"
+t_ok "80-systemd fpr over an 820 KB key listing" "0 $fpr40" \
+	"$(suite_read 80-systemd.sh fpr "$fpr40")"
+t_ok "45-clients server_fpr with no fingerprint reads empty" "0 " \
+	"$(suite_read 45-clients.sh server_fpr "no key here")"
+t_ok "60-access E2E_TOKEN takes the first Token: line" "0 tok-1" \
+	"$(suite_read 60-access.sh E2E_TOKEN "Token: tok-1")"
+
+big_banner="Suites: trixie"$'\n'"Components: main"$'\n'"$(big_capture "Suites: trixie")"
+stanza_rc=0
+stanza="$(
+	set -euo pipefail
+	e2e_apt_stanza_components "$big_banner" trixie
+)" || stanza_rc=$?
+t_ok "stanza components over a 300 KB banner" "0 main" "$stanza_rc $stanza"
+
+check_matches SELF-BIG "a match on the first line of a 300 KB value" '^name,' "$big_csv"
+t_ok "check_matches over a 300 KB value: PASS" PASS "$(verdict_of SELF-BIG)"
+check_matches SELF-EMPTY "an empty value matches no line" '^$' ""
+t_ok "check_matches on an empty value -> FAIL" FAIL "$(verdict_of SELF-EMPTY)"
+check_matches SELF-NL "a trailing newline adds no empty line" '^$' "x"$'\n'
+t_ok "check_matches on a value ending in newline -> FAIL" FAIL "$(verdict_of SELF-NL)"
+
 # ---- mirrored apt stanzas -------------------------------------------------
 #
 # SHIP-APT-01 and -02 build their expectation from these two helpers, so a
@@ -879,6 +936,110 @@ t_ok "stanza components: read under a journal prefix" "main contrib non-free non
 	"$(e2e_apt_stanza_components "$banner" "trixie trixie-security trixie-updates")"
 t_ok "stanza components: a Suites: line naming one more codename is not this stanza" 1 \
 	"$(e2e_apt_stanza_components "$banner" "resolute resolute-backports resolute-security resolute-updates" >/dev/null && echo 0 || echo 1)"
+
+# ---- suite 85's -race bound -----------------------------------------------
+#
+# The suite is sourced with every guest call stubbed, so what is asserted is the
+# command it would send: go's -timeout and the ssh bound around it, or a block.
+
+# gated_race <value|-> — "<ssh bound> <go -timeout>" per race run, or
+# "BLOCK <id>" per block, space-separated. "-" leaves the override unset.
+gated_race() {
+	(
+		# shellcheck disable=SC2329  # invoked by the sourced suite
+		e2e_on() {
+			E2E_RC=0
+			case "$*" in
+			*'test -race'*)
+				printf '%s %s\n' "$E2E_SSH_TIMEOUT" "$(printf '%s\n' "$*" | sed -n 's/.*-timeout \([^ ]*\).*/\1/p')"
+				;;
+			esac
+		}
+		# shellcheck disable=SC2329
+		e2e_local() { E2E_RC=0; }
+		# shellcheck disable=SC2329
+		e2e_put() { :; }
+		# shellcheck disable=SC2329
+		check_eq() { :; }
+		# shellcheck disable=SC2329
+		e2e_skip() { :; }
+		# shellcheck disable=SC2329
+		e2e_block() {
+			printf 'BLOCK %s\n' "$1" >>"$work/gated.blocks"
+			printf '%s\n' "$3" >"$work/gated.reason"
+		}
+		: >"$work/gated.blocks"
+		# shellcheck disable=SC2030  # each helper sets the override in its own subshell
+		if [ "$1" = - ]; then unset E2E_GATED_RACE_TIMEOUT; else export E2E_GATED_RACE_TIMEOUT="$1"; fi
+		E2E_SERVER_UP=yes REPO_ROOT="$work"
+		# shellcheck source=../suites/85-gated.sh
+		. "$E2E_DIR/suites/85-gated.sh"
+		cat "$work/gated.blocks"
+	) | tr '\n' ' ' | sed 's/ $//'
+}
+t_ok "suite 85: unset override runs both -race calls at 60m inside 4200s" "4200 60m 4200 60m" "$(gated_race -)"
+t_ok "suite 85: 45m runs both -race calls inside 3300s" "3300 45m 3300 45m" "$(gated_race 45m)"
+t_ok "suite 85: 1440m is the ceiling and runs" "87000 1440m 87000 1440m" "$(gated_race 1440m)"
+for v in '' 0m 1441m 10000m 153722867280912930m 060m 1h 60 '60m;x' ' 60m'; do
+	t_ok "suite 85: override <$v> blocks GAT-06 and GAT-07 and runs no -race call" \
+		"BLOCK GAT-06 BLOCK GAT-07" "$(gated_race "$v")"
+	t_ok "suite 85: the block for <$v> names the variable and its value" yes \
+		"$(grep -qF "E2E_GATED_RACE_TIMEOUT=\"$v\"" "$work/gated.reason" && echo yes || echo no)"
+done
+
+# Every go test the suite sends carries its own -timeout at least 5m inside the
+# ssh bound it runs under, so go's panic, which names the stuck test, lands
+# before ssh's cut, which prints nothing. The walk covers whatever the suite
+# emits rather than a list of ids, so a call added later with no bound fails.
+gated_go_bounds() {
+	(
+		# shellcheck disable=SC2329  # invoked by the sourced suite
+		e2e_on() {
+			E2E_RC=0
+			case "$*" in
+			*'go test '*) printf '%s|%s\n' "${E2E_SSH_TIMEOUT:-300}" "$*" ;;
+			esac
+		}
+		# shellcheck disable=SC2329
+		e2e_local() { E2E_RC=0; }
+		# shellcheck disable=SC2329
+		e2e_put() { :; }
+		# shellcheck disable=SC2329
+		check_eq() { :; }
+		# shellcheck disable=SC2329
+		e2e_skip() { :; }
+		# shellcheck disable=SC2329
+		e2e_block() { :; }
+		# shellcheck disable=SC2031  # each helper sets the override in its own subshell
+		if [ "$1" = - ]; then unset E2E_GATED_RACE_TIMEOUT; else export E2E_GATED_RACE_TIMEOUT="$1"; fi
+		E2E_SERVER_UP=yes REPO_ROOT="$work"
+		# shellcheck source=../suites/85-gated.sh
+		. "$E2E_DIR/suites/85-gated.sh"
+	)
+}
+go_bound_violations() {
+	awk -F'|' '{
+		cmd = substr($0, length($1) + 2)
+		if (!match(cmd, /-timeout[= ][0-9]+[hms]( |$)/)) { print "no parseable -timeout: " cmd; next }
+		v = substr(cmd, RSTART + 9, RLENGTH - 9); sub(/ $/, "", v)
+		n = substr(v, 1, length(v) - 1); u = substr(v, length(v))
+		s = n * (u == "h" ? 3600 : u == "m" ? 60 : 1)
+		if (s + 300 > $1 + 0) print "-timeout " v " is not 5m inside ssh bound " $1 ": " cmd
+	}'
+}
+for v in - 45m 1440m; do
+	bounds="$(gated_go_bounds "$v")"
+	t_ok "suite 85 <$v>: every go test call carries -timeout 5m inside its ssh bound" "" \
+		"$(printf '%s\n' "$bounds" | go_bound_violations)"
+	t_ok "suite 85 <$v>: the walk saw all seven go test calls" 7 \
+		"$(printf '%s\n' "$bounds" | awk 'NF { n++ } END { print n + 0 }')"
+done
+t_ok "go test bound check: a call with no -timeout is reported" 1 \
+	"$(printf '900|/usr/local/go/bin/go test -count=1 ./internal/tui/\n' | go_bound_violations | awk 'END { print NR }')"
+t_ok "go test bound check: a -timeout under 5m inside its bound is reported" 1 \
+	"$(printf '1800|go test -timeout 26m ./x/\n' | go_bound_violations | awk 'END { print NR }')"
+t_ok "go test bound check: -timeout=10m at 900s passes" "" \
+	"$(printf '900|go test -timeout=10m ./x/\n' | go_bound_violations)"
 
 # ---- verdict ---------------------------------------------------------------
 

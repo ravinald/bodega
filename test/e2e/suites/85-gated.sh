@@ -42,6 +42,14 @@ WORK="$GATED_ROOT/tree"
 # move with the build: internal/policy/osvlive_test.go unpacks the OSV archives
 # through it and internal/server/sink_load_test.go writes its spool there.
 GOTMP="$GATED_ROOT/tmp"
+# go test's own -timeout for the two -race runs below. Unset, go applies its
+# 10m default, which kills internal/server partway through a normal run and
+# files the panic as a product failure. Sized on 2026-10-28 at 4a00d25 on two
+# pinned cores: internal/audit passed in 787s, internal/server passed 188
+# top-level tests summing 1791s and was still running at a 30m limit.
+# Only an unset variable takes the default: an explicitly empty one is a value
+# somebody set, and the check below blocks it by name.
+GATED_RACE_TIMEOUT="${E2E_GATED_RACE_TIMEOUT-60m}"
 
 e2e_on server "test -x $GO" || true
 if [ "$E2E_RC" -ne 0 ]; then
@@ -72,7 +80,7 @@ if [ "$E2E_RC" -ne 0 ]; then
 	for id in GAT-05 GAT-06 GAT-07 GAT-08 GAT-09 GAT-10 GAT-11; do
 		e2e_block "$id" "a gated Go suite" "the tree did not unpack on the server guest (GAT-02)"
 	done
-	unset GO GATED_ROOT WORK GOTMP id
+	unset GO GATED_ROOT WORK GOTMP GATED_RACE_TIMEOUT id
 	return 0
 fi
 
@@ -82,9 +90,9 @@ fi
 # this one resolved through /etc/bodega/config.json, which is root-owned on both
 # guests, so it took a permission error a bare CI runner never sees.
 
-E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -count=1 -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
+E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -count=1 -timeout 10m -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
 check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega installed" \
-	0 "$E2E_RC" "test/e2e/README.md" "go test -run TestJSONEditPopupEscClears ./internal/tui/" "$E2E_RC"
+	0 "$E2E_RC" "test/e2e/README.md" "go test -timeout 10m -run TestJSONEditPopupEscClears ./internal/tui/" "$E2E_RC"
 
 # ---- contention under the runner's shape -----------------------------------
 #
@@ -92,27 +100,47 @@ check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega ins
 # GitHub gives two cores and this guest has sixteen. Running the whole package
 # rather than one subtest is what supplies the load.
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/audit/ 2>&1 | tail -20" || true
-check_eq GAT-06 "the audit package passes under -race on two cores" 0 "$E2E_RC" \
-	"docs/design.md:618" "GOMAXPROCS=2 taskset -c 0,1 go test -race ./internal/audit/" "$E2E_RC"
+# The ssh bound sits 10m past go's, so go's timeout fires first and prints the
+# stuck test; ssh's cut prints nothing. -timeout covers only the test binary,
+# not the -race build ahead of it, which on two cores takes minutes of the
+# margin. A value with no whole-minute form has no seconds to add the margin
+# to, and running unbounded is how a stuck test eats the night. The ceiling is
+# a day: past it the bound is no bound for a nightly run, and four digits keep
+# the arithmetic below inside bash's 64-bit integers, where a longer value
+# wraps and hands timeout(1) a negative bound.
+if [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]{0,3}m$ ]] && [ "${GATED_RACE_TIMEOUT%m}" -le 1440 ]; then
+	race_ssh_timeout=$((${GATED_RACE_TIMEOUT%m} * 60 + 600))
 
-E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/server/ 2>&1 | tail -20" || true
-check_eq GAT-07 "the server package passes under -race on two cores" 0 "$E2E_RC" \
-	"docs/design.md:641" "GOMAXPROCS=2 taskset -c 0,1 go test -race ./internal/server/" "$E2E_RC"
+	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/audit/ 2>&1 | tail -20" || true
+	check_eq GAT-06 "the audit package passes under -race on two cores" 0 "$E2E_RC" \
+		"docs/design.md:618" "GOMAXPROCS=2 taskset -c 0,1 go test -race -timeout $GATED_RACE_TIMEOUT ./internal/audit/" "$E2E_RC"
+
+	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/server/ 2>&1 | tail -20" || true
+	check_eq GAT-07 "the server package passes under -race on two cores" 0 "$E2E_RC" \
+		"docs/design.md:641" "GOMAXPROCS=2 taskset -c 0,1 go test -race -timeout $GATED_RACE_TIMEOUT ./internal/server/" "$E2E_RC"
+	unset race_ssh_timeout
+else
+	E2E_HOST=local
+	for id in GAT-06 GAT-07; do
+		e2e_block "$id" "a -race package run on two cores" \
+			"E2E_GATED_RACE_TIMEOUT=\"$GATED_RACE_TIMEOUT\" is not a whole number of minutes from 1m to 1440m (for example 60m); set it to one and rerun suite 85"
+	done
+	E2E_HOST=server
+fi
 
 # ---- the env-gated harnesses ----------------------------------------------
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_SINK_LOAD=1 $GO test -count=1 -run 'SinkLoad' ./internal/server/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_SINK_LOAD=1 $GO test -count=1 -timeout 25m -run 'SinkLoad' ./internal/server/ 2>&1 | tail -25" || true
 check_eq GAT-08 "the audit sink load harness runs" 0 "$E2E_RC" \
 	"internal/server/sink_load_test.go:38" "BODEGA_SINK_LOAD=1 go test -run SinkLoad ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1 $GO test -count=1 -run 'TestProxyPeakRSS' ./internal/server/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1 $GO test -count=1 -timeout 25m -run 'TestProxyPeakRSS' ./internal/server/ 2>&1 | tail -25" || true
 check_eq GAT-09 "the proxy RSS harness runs" 0 "$E2E_RC" \
 	"internal/server/proxy_rss_test.go:49" "BODEGA_PROXY_RSS=1 go test -run TestProxyPeakRSS ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 ./internal/policy/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 -timeout 35m ./internal/policy/ 2>&1 | tail -25" || true
 check_eq GAT-10 "the live OSV comparison runs against api.osv.dev" 0 "$E2E_RC" \
-	"internal/policy/osvlive_test.go:21" "BODEGA_OSV_LIVE=1 go test ./internal/policy/" "$E2E_RC"
+	"internal/policy/osvlive_test.go:21" "BODEGA_OSV_LIVE=1 go test -timeout 35m ./internal/policy/" "$E2E_RC"
 
 # ---- the containerized apt harness ----------------------------------------
 #
@@ -131,4 +159,4 @@ else
 		"Makefile:183"
 fi
 
-unset GO GATED_ROOT WORK GOTMP
+unset GO GATED_ROOT WORK GOTMP GATED_RACE_TIMEOUT id

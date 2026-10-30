@@ -49,7 +49,7 @@ var doctorExit = os.Exit
 // The threat model and rationale for each check is documented in
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS bool
+	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS, restoreApt bool
 	var token, baseURL, pkgABI, aptSuite string
 	var configure, ntpServers, aptArchives []string
 	var pkgRelease int
@@ -174,6 +174,17 @@ undoes those and only those.
   sudo bodega doctor --configure apt --quiet-ubuntu-pro --apply --url https://bodega.internal
   sudo bodega doctor --restore-ubuntu-pro
 
+--configure apt also takes the distro's own sources out of apt's path, so
+apt cannot fetch from a public archive beside bodega: Enabled: no in each
+deb822 stanza naming one (directly or through a mirror+file list), and each
+such one-line entry commented out. A source naming neither a public archive
+nor bodega is listed and left in place. --apply makes the edits only after
+apt-get update against bodega.sources alone succeeds, and records them in
+/etc/bodega/doctor-apt-sources.json. --restore-apt-sources undoes those and
+only those.
+
+  sudo bodega doctor --restore-apt-sources
+
 On Linux, doctor also names the OS services that call out whatever bodega
 serves: chrony taking time over NTS (chrony-nts), motd-news (motd-news) and
 snapd's refresh check (snapd-refresh). --ntp-server names an internal time
@@ -197,17 +208,23 @@ See docs/threat-model.md for the rationale behind each check.`,
 				systems = append(systems, manifest.TypeFreeBSD)
 			}
 			configuring := len(systems) > 0 || cmd.Flags().Changed("configure")
-			if restorePro && (writeCreds || configuring || restoreOS) {
+			if restorePro && (writeCreds || configuring || restoreOS || restoreApt) {
 				return fmt.Errorf("run one write at a time: --restore-ubuntu-pro undoes what --quiet-ubuntu-pro ran, and nothing else")
 			}
 			if restorePro {
 				return ubuntuPro.ledger().restore()
 			}
-			if restoreOS && (writeCreds || configuring) {
+			if restoreOS && (writeCreds || configuring || restoreApt) {
 				return fmt.Errorf("run one write at a time: --restore-os-callers undoes what --quiet-os-callers ran, and nothing else")
 			}
 			if restoreOS {
 				return osCallers.ledger().restore()
+			}
+			if restoreApt && (writeCreds || configuring) {
+				return fmt.Errorf("run one write at a time: --restore-apt-sources undoes the edits --configure apt --apply made to the distro's sources, and nothing else")
+			}
+			if restoreApt {
+				return aptSources.ledger().restore()
 			}
 			if writeCreds && configuring {
 				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
@@ -308,6 +325,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"With --configure: also turn motd-news off and hold snap refreshes on a Linux host")
 	c.Flags().BoolVar(&restoreOS, "restore-os-callers", false,
 		"Undo the steps --quiet-os-callers recorded, and nothing else")
+	c.Flags().BoolVar(&restoreApt, "restore-apt-sources", false,
+		"Undo the edits --configure apt --apply made to the distro's apt sources, and nothing else")
 	c.Flags().StringSliceVar(&ntpServers, "ntp-server", nil,
 		"An internal time source the chrony-nts row accepts beside the bodega server (comma-separated or repeated)")
 	c.Flags().StringVar(&aptSuite, "suite", "",
@@ -616,6 +635,13 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("\nrun        %-10s %s\n", manifest.TypeRpm, strings.Join(dnfStep, " "))
 		fmt.Println("           (turns off the vendor repositories bodega.repo replaces)")
 	}
+	bodegaSources, aptWritten := bodegaAptSources(changes)
+	var aptPlan []string
+	if bodegaSources != "" {
+		if aptPlan, err = aptSources.plan(aptWritten, client.BaseURL); err != nil {
+			return err
+		}
+	}
 	var proPlan, osPlan []string
 	if req.quietPro {
 		steps, why, err := ubuntuPro.quietSteps()
@@ -634,13 +660,16 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osPlan = steps
 	}
 	switch {
-	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && dnfStep == nil:
+	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		return nil
-	case !req.apply && len(proPlan)+len(osPlan) > 0 || !req.apply && dnfStep != nil:
+	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil:
 		var runs []string
 		if dnfStep != nil {
 			runs = append(runs, "the dnf step")
+		}
+		if len(aptPlan) > 0 {
+			runs = append(runs, fmt.Sprintf("%d apt source edit(s)", len(aptPlan)))
 		}
 		if len(proPlan) > 0 {
 			runs = append(runs, fmt.Sprintf("%d Ubuntu Pro step(s)", len(proPlan)))
@@ -679,6 +708,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		fmt.Printf("recorded   %s (undo: bodega doctor %s)\n", q.ledger.path, q.ledger.restoreFlag)
 	}
+	if len(aptPlan) > 0 {
+		if err := disableDistroAptSources(bodegaSources, aptPlan); err != nil {
+			return err
+		}
+	}
 	if dnfStep != nil {
 		if err := doctorRun(dnfStep[0], dnfStep[1:]...); err != nil {
 			return fmt.Errorf("%s failed: %w.\n"+
@@ -688,6 +722,10 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("ran        %s\n", strings.Join(dnfStep, " "))
 	}
 	aptHinted := false
+	if len(aptPlan) > 0 {
+		aptHinted = true
+		fmt.Println("\nApply it:  apt-get update")
+	}
 	for _, c := range changes {
 		switch {
 		case c.Unchanged():
@@ -702,6 +740,26 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 	}
 	printRuntimeRestarts(changes)
+	return nil
+}
+
+// disableDistroAptSources runs the apt source edits once apt-get update
+// against bodega.sources alone has succeeded, so a host whose bodega does not
+// answer keeps the sources it has rather than being left with none that work.
+func disableDistroAptSources(bodegaSources string, steps []string) error {
+	update := aptUpdateAgainst(bodegaSources)
+	if err := doctorRun(update[0], update[1:]...); err != nil {
+		return fmt.Errorf("%s failed: %w.\n"+
+			"  bodega.sources is written and nothing in the distro's sources was disabled, so apt still reads them beside bodega.\n"+
+			"  Fix what apt printed above (the URL in %s, its Signed-By key, the suite), confirm it with the same command, then re-run",
+			shellJoin(update), err, bodegaSources)
+	}
+	fmt.Printf("ran        %s\n", shellJoin(update))
+	l := aptSources.ledger()
+	if err := l.quiet(steps); err != nil {
+		return err
+	}
+	fmt.Printf("recorded   %s (undo: bodega doctor %s)\n", l.path, l.restoreFlag)
 	return nil
 }
 

@@ -218,7 +218,7 @@ fsrv_cell() {
 		TestLocalPublish*) ref="internal/storage/local_test.go" ;;
 		TestZFSPassthrough*) ref="test/e2e/guest/publish_freebsd_test.go" ;;
 		esac
-		verdict="$(printf '%s\n' "$out" | awk -v t="$t" '$1 == "---" && $3 == t {print $2; exit}')"
+		verdict="$(printf '%s\n' "$out" | awk -v t="$t" '!f && $1 == "---" && $3 == t {print $2; f = 1}')"
 		case "$verdict" in
 		PASS:)
 			e2e_record "$id" PASS "$title" "PASS" "PASS" "$cmd" "$rc" "$ref"

@@ -5,17 +5,26 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 const (
@@ -548,7 +557,7 @@ func TestRpmFilterPackagesSetsTheRootCount(t *testing.T) {
 			t.Run(rt.typ+"/"+at.name, func(t *testing.T) {
 				raw := []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n<" + rt.root + ` xmlns="urn:test" ` + at.attr + ">\n" +
 					rt.pkg("keep") + "\n" + rt.pkg("drop") + "\n</" + rt.root + ">\n")
-				gz, open, err := rpmFilterPackages(raw, ".xml", 1, map[string]bool{"keep": true}, rt.typ == "primary")
+				gz, open, err := rpmFilterPackages(context.Background(), raw, ".xml", 1, map[string]bool{"keep": true}, rt.typ == "primary")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -577,5 +586,1117 @@ func TestRpmFilterPackagesSetsTheRootCount(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// rpmBuildFixture is one governed host on a filtered rocky-baseos, behind a
+// real listener so a request can be canceled the way a client hanging up
+// cancels it.
+type rpmBuildFixture struct {
+	m        *rpmMirror
+	s        *Server
+	ts       *httptest.Server
+	web01    *profileFixture
+	upstream []byte
+}
+
+func newRpmBuildFixture(t *testing.T) *rpmBuildFixture {
+	t.Helper()
+	f := &rpmBuildFixture{m: newRPMMirror(t)}
+	f.upstream, _ = rpmFullRepo(t, f.m)
+	f.s, _ = rpmServer(t, f.m)
+	// Registered before any stall, so it runs after the stall is released:
+	// a build still writing when the test's store is removed fails cleanup.
+	t.Cleanup(f.s.rpmProfileBuilds.running.Wait)
+	f.web01 = bindProfile(t, f.s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeRpm, Name: "nginx"}})
+	f.ts = httptest.NewServer(f.s.Handler())
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+// get is pf's GET of path under ctx, and how long the answer took.
+func (f *rpmBuildFixture) get(ctx context.Context, pf *profileFixture, path string) (*http.Response, string, time.Duration, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.ts.URL+path, nil)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+pf.token)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", time.Since(start), err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return resp, string(body), time.Since(start), err
+}
+
+func (f *rpmBuildFixture) filelistsHref(t *testing.T) string {
+	t.Helper()
+	return rpmEntryHref(t, string(f.upstream), "filelists")
+}
+
+// A client that gives up on repomd.xml mid-build does not cancel the build:
+// the upstream read it started finishes, the filtered files are stored, and
+// the next request is served them without a second build.
+func TestRpmProfileBuildOutlivesTheRequestThatStartedIt(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = time.Minute
+	fhref := f.filelistsHref(t)
+	release := f.m.stall(t, fhref)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := f.get(ctx, f.web01, rpmRepoPath+"repodata/repomd.xml")
+		done <- err
+	}()
+	waitFor(t, func() bool { return f.m.hitsFor(fhref) > 0 })
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("the canceled request was answered; it was meant to be cut off mid-build")
+	}
+	release()
+	waitFor(t, func() bool { return f.s.rpmProfileBuilds.count() == 1 })
+
+	resp, doc, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml after the stall cleared: %v %v %s", err, resp, doc)
+	}
+	if doc == string(f.upstream) || rpmEntryHref(t, doc, "filelists") == fhref {
+		t.Errorf("web01 was served the unfiltered repomd.xml:\n%s", doc)
+	}
+	if n := f.s.rpmProfileBuilds.count(); n != 1 {
+		t.Errorf("builds = %d, want 1: the canceled request's build was started over", n)
+	}
+	if n := f.m.hitsFor(fhref); n != 1 {
+		t.Errorf("upstream asked for filelists %d times, want 1", n)
+	}
+}
+
+// With no previous build to serve, a request during a stalled build is told
+// to come back, inside the 5 seconds a client has before it reads silence as
+// a hang, and is never handed the unfiltered document.
+func TestRpmProfileBuildRunningAnswers503(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.m.stall(t, f.filelistsHref(t))
+
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("repomd.xml during the first build: %d Retry-After=%q, want 503 with Retry-After\n%s", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+	}
+	if took >= 5*time.Second {
+		t.Errorf("answered after %s, want under 5s", took)
+	}
+	if strings.Contains(body, "<repomd") {
+		t.Errorf("the 503 carried a repomd.xml:\n%s", body)
+	}
+}
+
+// With a previous build held, a request during the next build is served the
+// previous build's listing, signed so dnf's repo_gpgcheck passes.
+func TestRpmProfileBuildRunningServesThePreviousBuild(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = 200 * time.Millisecond
+	resp, first, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("first repomd.xml: %v %v %s", err, resp, first)
+	}
+	if n := f.s.rpmProfileBuilds.count(); n != 1 {
+		t.Fatalf("builds after the first repomd.xml = %d, want 1", n)
+	}
+
+	// The upstream moves: a new filelists, which is a new build key.
+	fhref := f.filelistsHref(t)
+	f.m.mu.Lock()
+	oldGz := f.m.override[rpmUpstreamTree+fhref]
+	f.m.mu.Unlock()
+	oldOpen := rpmGunzip(t, oldGz)
+	newOpen := append(bytes.Clone(oldOpen), "<!-- republished -->\n"...)
+	newGz := rpmGzip(t, newOpen)
+	newHref := "repodata/" + rpmSHA256(newGz) + "-filelists.xml.gz"
+	f.m.set(newHref, newGz)
+	moved := strings.Replace(string(f.upstream), rpmDataEntry("filelists", fhref, oldGz, oldOpen), rpmDataEntry("filelists", newHref, newGz, newOpen), 1)
+	if moved == string(f.upstream) {
+		t.Fatal("the fixture's filelists entry was not replaced")
+	}
+	f.m.set("repodata/repomd.xml", []byte(moved))
+	f.s.cache.MetadataTTL = time.Nanosecond
+	f.m.stall(t, newHref)
+
+	web02 := addProfileHost(t, f.s, "web", "web02")
+	resp, doc, took, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml during the second build: %v %v %s", err, resp, doc)
+	}
+	if took >= 5*time.Second {
+		t.Errorf("answered after %s, want under 5s", took)
+	}
+	for _, typ := range rpmFilteredTypes {
+		if got, want := rpmEntryHref(t, doc, typ), rpmEntryHref(t, first, typ); got != want {
+			t.Errorf("%s during the second build = %s, want the previous build's %s", typ, got, want)
+		}
+	}
+	_, sig, _, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml.asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rpmVerifies(t, f.s.aptSign.Load().signer, doc, sig); err != nil {
+		t.Errorf("the previous build's repomd.xml does not verify against its signature: %v", err)
+	}
+	for _, typ := range rpmFilteredTypes {
+		if resp, _, _, err := f.get(context.Background(), web02, rpmRepoPath+rpmEntryHref(t, doc, typ)); err != nil || resp.StatusCode != http.StatusOK {
+			t.Errorf("the previous build's %s for web02: %v %v", typ, err, resp)
+		}
+	}
+}
+
+// Ten hosts arriving during one build share it.
+func TestRpmProfileBuildIsSharedByConcurrentRequests(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.s.rpmProfileBuilds.wait = time.Minute
+	fhref := f.filelistsHref(t)
+	release := f.m.stall(t, fhref)
+
+	const n = 10
+	var wg sync.WaitGroup
+	docs := make([]string, n)
+	codes := make([]int, n)
+	for i := range n {
+		wg.Go(func() {
+			resp, doc, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+			if err == nil {
+				codes[i], docs[i] = resp.StatusCode, doc
+			}
+		})
+	}
+	waitFor(t, func() bool { return f.m.hitsFor(fhref) > 0 })
+	time.Sleep(200 * time.Millisecond)
+	release()
+	wg.Wait()
+	for i := range n {
+		if codes[i] != http.StatusOK || docs[i] != docs[0] {
+			t.Errorf("request %d: %d, want 200 and the same repomd.xml as request 0", i, codes[i])
+		}
+	}
+	if got := f.s.rpmProfileBuilds.count(); got != 1 {
+		t.Errorf("builds = %d, want 1", got)
+	}
+	if got := f.m.hitsFor(rpmPrimaryGz); got != 1 {
+		t.Errorf("upstream asked for primary %d times, want 1", got)
+	}
+}
+
+// rpmGatedStore holds each store call hold matches until release runs, and
+// closes entered the first time it holds one.
+type rpmGatedStore struct {
+	storage.ObjectStore
+	hold    func(ctx context.Context, op, key string) bool
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func gateStore(t *testing.T, s *Server, hold func(ctx context.Context, op, key string) bool) (g *rpmGatedStore, release func()) {
+	t.Helper()
+	g = &rpmGatedStore{ObjectStore: s.typeStore(manifest.TypeRpm), hold: hold, gate: make(chan struct{}), entered: make(chan struct{})}
+	s.stores = rpmOneStore{Resolver: s.stores, store: g}
+	var once sync.Once
+	release = func() { once.Do(func() { close(g.gate) }) }
+	t.Cleanup(release)
+	return g, release
+}
+
+func (g *rpmGatedStore) wait(ctx context.Context, op, key string) {
+	if g.hold(ctx, op, key) {
+		g.once.Do(func() { close(g.entered) })
+		<-g.gate
+	}
+}
+
+func (g *rpmGatedStore) Get(ctx context.Context, key string) ([]byte, error) {
+	g.wait(ctx, "Get", key)
+	return g.ObjectStore.Get(ctx, key)
+}
+
+func (g *rpmGatedStore) Head(ctx context.Context, key string) (*storage.ObjectInfo, error) {
+	info, err := g.ObjectStore.Head(ctx, key)
+	g.wait(ctx, "Head", key)
+	return info, err
+}
+
+func (g *rpmGatedStore) Put(ctx context.Context, key string, body []byte) error {
+	g.wait(ctx, "Put", key)
+	return g.ObjectStore.Put(ctx, key, body)
+}
+
+type rpmOneStore struct {
+	storage.Resolver
+	store storage.ObjectStore
+}
+
+func (r rpmOneStore) ForType(string) storage.ObjectStore { return r.store }
+
+func (f *rpmBuildFixture) tree() rpmTree {
+	return rpmTree{repo: rpmFixtureRepoID, releasever: "9", basearch: "x86_64", base: f.m.ts.URL + rpmUpstreamTree}
+}
+
+func (f *rpmBuildFixture) slot(t *testing.T) (*rpmProfileSlot, *entitle.Profile) {
+	t.Helper()
+	p := f.s.profileNow().profileFor("web01")
+	return f.s.rpmProfileBuilds.slot(rpmProfileView(f.tree(), p)), p
+}
+
+func (f *rpmBuildFixture) warm(t *testing.T) string {
+	t.Helper()
+	resp, doc, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("first repomd.xml: %v %v %s", err, resp, doc)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	return doc
+}
+
+// A build whose deadline has passed is not published, even when every
+// upstream file it reads is already cached and no network read is left to
+// notice the deadline.
+func TestRpmProfileBuildPastItsDeadlineIsNotPublished(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	sl, p := f.slot(t)
+	sl.mu.Lock()
+	sl.recent = nil
+	sl.mu.Unlock()
+	f.s.rpmProfileBuilds.timeout = time.Nanosecond
+	data, _ := parseRpmRepomd(f.upstream)
+	b, err := f.s.rpmProfileFiles(httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), p, data)
+	if err == nil || b != nil {
+		t.Fatalf("a build past its deadline returned build=%v error=%v, want a deadline error", b != nil, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want one wrapping context.DeadlineExceeded", err)
+	}
+	if n := f.s.rpmProfileBuilds.count(); n != 1 {
+		t.Errorf("builds = %d, want only the warm-up's", n)
+	}
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if len(sl.recent) != 0 {
+		t.Errorf("a build past its deadline was published: %d held", len(sl.recent))
+	}
+}
+
+// rpmCountdownCtx reports itself canceled from its nth Err call on, which is
+// a deadline passing partway through a filter.
+type rpmCountdownCtx struct {
+	context.Context
+	left atomic.Int32
+}
+
+func (c *rpmCountdownCtx) Err() error {
+	if c.left.Add(-1) < 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestRpmFiltersStopWhenTheBuildContextEnds(t *testing.T) {
+	var doc bytes.Buffer
+	doc.WriteString(`<?xml version="1.0"?>` + "\n" + `<filelists packages="2000">` + "\n")
+	for i := range 2000 {
+		fmt.Fprintf(&doc, `<package pkgid="%064d" name="p%d" arch="x86_64"><file>/usr/bin/p%d</file></package>`+"\n", i, i, i)
+	}
+	doc.WriteString("</filelists>\n")
+	ctx := &rpmCountdownCtx{Context: context.Background()}
+	ctx.left.Store(3)
+	if _, _, err := rpmFilterPackages(ctx, doc.Bytes(), ".xml", 1, map[string]bool{}, false); !errors.Is(err, context.Canceled) {
+		t.Errorf("filter canceled partway: error = %v, want context.Canceled", err)
+	}
+	if ctx.left.Load() >= 0 {
+		t.Errorf("the filter finished inside 3 reads of a %d-byte file; the test does not cancel it partway", doc.Len())
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	primary := rpmFixture(t, rpmPrimaryGz)
+	if _, _, err := rpmAdmittedPkgids(canceled, primary, ".gz", nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("reading primary under a canceled context: error = %v, want context.Canceled", err)
+	}
+}
+
+// A request that checked the store before another request's build of the
+// same key finished does not build that key again once it has.
+func TestRpmProfileBuildRegistrationSeesABuildThatJustFinished(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	sl, p := f.slot(t)
+	sl.mu.Lock()
+	b := sl.recent[0]
+	sl.mu.Unlock()
+	key := rpmFilteredKey(f.tree(), b.files["primary"])
+	if err := f.s.typeStore(manifest.TypeRpm).Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	type paused struct{}
+	g, release := gateStore(t, f.s, func(ctx context.Context, op, k string) bool {
+		return op == "Head" && k == key && ctx.Value(paused{}) != nil
+	})
+	data, _ := parseRpmRepomd(f.upstream)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.s.rpmProfileFiles(req.WithContext(context.WithValue(req.Context(), paused{}, true)), f.tree(), p, data)
+		done <- err
+	}()
+	<-g.entered
+	if _, err := f.s.rpmProfileFiles(req, f.tree(), p, data); err != nil {
+		t.Fatalf("the rebuild: %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Errorf("the request that checked first: %v", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	if n := f.s.rpmProfileBuilds.count(); n != 2 {
+		t.Errorf("builds = %d, want 2: the warm-up and one shared rebuild", n)
+	}
+}
+
+// The 5 seconds cover the upstream repomd.xml's refresh as well as the wait on
+// the build: a stale_grace that alone fills most of them, or one past them,
+// still leaves the client answered inside them, and with a 503 dnf retries
+// rather than the unfiltered document.
+func TestRpmProfileBudgetCoversTheRepomdRefresh(t *testing.T) {
+	for _, grace := range []time.Duration{3 * time.Second, 10 * time.Second} {
+		t.Run(grace.String(), func(t *testing.T) {
+			f := newRpmBuildFixture(t)
+			f.s.cache.MetadataTTL = time.Nanosecond
+			f.s.cache.StaleGrace = grace
+			f.m.stall(t, f.filelistsHref(t))
+			if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("starting the build: %v %v", err, resp)
+			}
+			f.m.stall(t, "repodata/repomd.xml")
+			for _, path := range []string{"repodata/repomd.xml", f.filelistsHref(t)} {
+				web02 := addProfileHost(t, f.s, "web", "web02-"+strconv.Itoa(len(path)))
+				resp, body, took, err := f.get(context.Background(), web02, rpmRepoPath+path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if took >= 5*time.Second {
+					t.Errorf("%s answered after %s, want under 5s", path, took)
+				}
+				if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+					t.Errorf("%s: %d Retry-After=%q, want 503 with Retry-After\n%s", path, resp.StatusCode, resp.Header.Get("Retry-After"), body)
+				}
+			}
+		})
+	}
+}
+
+// A filtered file whose store read does not return inside the budget is
+// answered 503 rather than left hanging.
+func TestRpmProfileBudgetCoversTheFilteredFileRead(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	doc := f.warm(t)
+	href := rpmEntryHref(t, doc, "filelists")
+	gateStore(t, f.s, func(_ context.Context, op, key string) bool {
+		return op == "Get" && strings.HasSuffix(key, path.Base(href))
+	})
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+href)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took >= 5*time.Second || resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("filtered filelists behind a stalled store: %d Retry-After=%q after %s, want 503 with Retry-After under 5s\n%s", resp.StatusCode, resp.Header.Get("Retry-After"), took, body)
+	}
+}
+
+// The previous build stands in only for a document naming the filtered types
+// it built: one that gained filelists would otherwise list the upstream's
+// unfiltered filelists, and one that lost them would serve a primary filtered
+// alongside files the document no longer names.
+func TestRpmProfileFallbackRefusesAnotherSetOfFilteredTypes(t *testing.T) {
+	t.Run("upstream adds filelists and other", func(t *testing.T) {
+		f := newRpmBuildFixture(t)
+		f.s.cache.MetadataTTL = time.Nanosecond
+		f.s.rpmProfileBuilds.wait = 100 * time.Millisecond
+		f.m.set("repodata/repomd.xml", rpmFixture(t, "repodata/repomd.xml"))
+		f.warm(t)
+		f.m.set("repodata/repomd.xml", f.upstream)
+		f.m.stall(t, f.filelistsHref(t))
+		web02 := addProfileHost(t, f.s, "web", "web02")
+		resp, doc, _, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable || strings.Contains(doc, f.filelistsHref(t)) {
+			t.Errorf("repomd.xml during a build that adds filelists: %d, want 503 and no upstream filelists\n%s", resp.StatusCode, doc)
+		}
+	})
+	t.Run("upstream drops filelists and other", func(t *testing.T) {
+		f := newRpmBuildFixture(t)
+		f.s.cache.MetadataTTL = time.Nanosecond
+		f.s.rpmProfileBuilds.wait = 100 * time.Millisecond
+		f.warm(t)
+		f.m.set("repodata/repomd.xml", rpmFixture(t, "repodata/repomd.xml"))
+		_, release := gateStore(t, f.s, func(_ context.Context, op, key string) bool {
+			return op == "Put" && strings.HasSuffix(key, "-primary.xml.gz")
+		})
+		web02 := addProfileHost(t, f.s, "web", "web02")
+		resp, doc, _, err := f.get(context.Background(), web02, rpmRepoPath+"repodata/repomd.xml")
+		release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("repomd.xml during a build that drops filelists: %d, want 503\n%s", resp.StatusCode, doc)
+		}
+	})
+}
+
+// A build that fails is recorded once, with the profile, the repository, the
+// file and the upstream's own error, however many requests were waiting on it.
+func TestRpmProfileBuildFailureIsLoggedOnceWithItsCause(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.s.rpmProfileBuilds.timeout = 200 * time.Millisecond
+	f.s.rpmProfileBuilds.wait = time.Minute
+	release := f.m.stall(t, f.filelistsHref(t))
+	var wg sync.WaitGroup
+	codes := make([]int, 5)
+	for i := range codes {
+		wg.Go(func() {
+			if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err == nil {
+				codes[i] = resp.StatusCode
+			}
+		})
+	}
+	wg.Wait()
+	f.s.rpmProfileBuilds.running.Wait()
+	for i, c := range codes {
+		if c != http.StatusBadGateway {
+			t.Errorf("request %d: %d, want 502 for the failed build", i, c)
+		}
+	}
+	var errs []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "level=ERROR") {
+			errs = append(errs, line)
+		}
+	}
+	if len(errs) != 1 {
+		t.Fatalf("error records = %d, want 1:\n%s", len(errs), strings.Join(errs, "\n"))
+	}
+	for _, want := range []string{"profile=web", "repository=" + rpmFixtureRepoID, "file=filelists", "context deadline exceeded"} {
+		if !strings.Contains(errs[0], want) {
+			t.Errorf("the failure record lacks %q:\n%s", want, errs[0])
+		}
+	}
+	release()
+	f.s.rpmProfileBuilds.timeout = 0
+	if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("the request after the failure: %v %v, want 200 from a new build", err, resp)
+	}
+}
+
+// rpmStepStore blocks each call hold matches until the test releases that
+// call, handing the release out on calls. returned receives once each such
+// call has finished, so a test can tell when abandoned work went on.
+type rpmStepStore struct {
+	storage.ObjectStore
+	hold     func(op, key string) bool
+	calls    chan func()
+	returned chan string
+	mu       sync.Mutex
+	gates    []chan struct{}
+}
+
+func stepStore(t *testing.T, s *Server, hold func(op, key string) bool) *rpmStepStore {
+	t.Helper()
+	st := &rpmStepStore{ObjectStore: s.typeStore(manifest.TypeRpm), hold: hold, calls: make(chan func(), 16), returned: make(chan string, 16)}
+	s.stores = rpmOneStore{Resolver: s.stores, store: st}
+	t.Cleanup(func() {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		for _, g := range st.gates {
+			select {
+			case <-g:
+			default:
+				close(g)
+			}
+		}
+	})
+	return st
+}
+
+func (st *rpmStepStore) step(op, key string) func() {
+	if !st.hold(op, key) {
+		return func() {}
+	}
+	g := make(chan struct{})
+	st.mu.Lock()
+	st.gates = append(st.gates, g)
+	st.mu.Unlock()
+	var once sync.Once
+	st.calls <- func() { once.Do(func() { close(g) }) }
+	<-g
+	return func() { st.returned <- op + " " + key }
+}
+
+func (st *rpmStepStore) Get(ctx context.Context, key string) ([]byte, error) {
+	defer st.step("Get", key)()
+	return st.ObjectStore.Get(ctx, key)
+}
+
+func (st *rpmStepStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	defer st.step("GetStream", key)()
+	return st.ObjectStore.GetStream(ctx, key)
+}
+
+func (st *rpmStepStore) Head(ctx context.Context, key string) (*storage.ObjectInfo, error) {
+	defer st.step("Head", key)()
+	return st.ObjectStore.Head(ctx, key)
+}
+
+func (st *rpmStepStore) Put(ctx context.Context, key string, body []byte) error {
+	defer st.step("Put", key)()
+	return st.ObjectStore.Put(ctx, key, body)
+}
+
+// A build stuck in a store call that ignores its context is retired at its
+// deadline all the same: its waiters get the failure, the next request starts
+// a new build, and the stuck call finishing afterwards neither publishes the
+// abandoned build nor retires the one that replaced it.
+func TestRpmProfileBuildBlockedInTheStoreIsRetiredAtItsDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hold func(upstreamFilelists string) func(op, key string) bool
+	}{
+		{"filtered write", func(string) func(op, key string) bool {
+			// The last write, so the abandoned build returns a whole build
+			// once it is let go.
+			return func(op, key string) bool { return op == "Put" && strings.HasSuffix(key, "-other.xml.gz") }
+		}},
+		{"cached upstream read", func(sum string) func(op, key string) bool {
+			return func(op, key string) bool { return op != "Put" && strings.Contains(key, sum) }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRpmBuildFixture(t)
+			f.warm(t)
+			var logs syncBuffer
+			f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			sl, p := f.slot(t)
+			sl.mu.Lock()
+			sl.recent = nil
+			sl.mu.Unlock()
+			data, _ := parseRpmRepomd(f.upstream)
+			var filelistsSum string
+			for _, d := range data {
+				if d.Type == "filelists" {
+					filelistsSum = d.Checksum.Value
+				}
+			}
+			// Only each build's first matching call is held: a read may Head
+			// the key and then Get it, and holding both would leave the second
+			// build waiting on a release the test never hands out.
+			hold, holds := tc.hold(filelistsSum), atomic.Int32{}
+			st := stepStore(t, f.s, func(op, key string) bool { return hold(op, key) && holds.Add(1) <= 2 })
+			f.s.rpmProfileBuilds.timeout = 200 * time.Millisecond
+			f.s.rpmProfileBuilds.wait = time.Minute
+			build := func() <-chan error {
+				done := make(chan error, 1)
+				go func() {
+					_, err := f.s.rpmProfileFiles(httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), p, data)
+					done <- err
+				}()
+				return done
+			}
+
+			first := build()
+			releaseFirst := <-st.calls
+			var err error
+			select {
+			case err = <-first:
+			case <-time.After(5 * time.Second):
+				t.Fatal("a build stuck in the store was not retired at its deadline")
+			}
+			var failed *rpmProfileBuildError
+			if !errors.As(err, &failed) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("the stuck build's waiter got %v, want a build error wrapping the deadline", err)
+			}
+			sl.mu.Lock()
+			running := len(sl.running)
+			sl.mu.Unlock()
+			if running != 0 {
+				t.Fatalf("running builds after the deadline = %d, want 0", running)
+			}
+
+			f.s.rpmProfileBuilds.timeout = time.Minute
+			second := build()
+			releaseSecond := <-st.calls
+			sl.mu.Lock()
+			replacement := sl.running[sl.runningKey()]
+			sl.mu.Unlock()
+			if replacement == nil {
+				t.Fatal("the request after the retired build started no build of its own")
+			}
+
+			releaseFirst()
+			<-st.returned
+			// The abandoned build returns within microseconds of its store
+			// call; give it far longer to do anything it should not.
+			time.Sleep(100 * time.Millisecond)
+			sl.mu.Lock()
+			still, held := sl.running[sl.runningKey()], len(sl.recent)
+			sl.mu.Unlock()
+			if still != replacement {
+				t.Error("the abandoned build finishing retired the build that replaced it")
+			}
+			if held != 0 {
+				t.Errorf("the abandoned build finishing published %d builds, want none", held)
+			}
+			if n := f.s.rpmProfileBuilds.count(); n != 1 {
+				t.Errorf("builds = %d after the abandoned one finished, want only the warm-up's", n)
+			}
+
+			releaseSecond()
+			if err := <-second; err != nil {
+				t.Fatalf("the replacement build: %v", err)
+			}
+			if n := f.s.rpmProfileBuilds.count(); n != 2 {
+				t.Errorf("builds = %d, want the warm-up's and the replacement's", n)
+			}
+			var errs []string
+			for _, line := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(line, "level=ERROR") {
+					errs = append(errs, line)
+				}
+			}
+			if len(errs) != 1 || !strings.Contains(errs[0], "build timeout") {
+				t.Errorf("error records = %d, want 1 naming the build timeout:\n%s", len(errs), strings.Join(errs, "\n"))
+			}
+		})
+	}
+}
+
+// runningKey is the key of the one build sl has running. The caller
+// holds sl.mu.
+func (sl *rpmProfileSlot) runningKey() string {
+	for k := range sl.running {
+		return k
+	}
+	return ""
+}
+
+// A filtered file the host's repomd.xml names that has gone from the store
+// while its view rebuilds answers 503 with Retry-After, not a 404 telling the
+// client it is gone; an href that repomd.xml does not name is still a 404.
+func TestRpmProfileMissingHeldFileDuringARebuildAnswers503(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	doc := f.warm(t)
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	old := sl.recent[0]
+	sl.mu.Unlock()
+	key := rpmFilteredKey(f.tree(), old.files["filelists"])
+	if err := f.s.typeStore(manifest.TypeRpm).Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	st := stepStore(t, f.s, func(op, k string) bool { return op == "Put" && k == key })
+	f.s.rpmProfileBuilds.wait = 100 * time.Millisecond
+	if resp, body, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("repomd.xml during the rebuild: %v %v %s, want 503", err, resp, body)
+	}
+	release := <-st.calls
+
+	href := rpmEntryHref(t, doc, "filelists")
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+href)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" || took > 5*time.Second {
+		t.Errorf("the missing filelists during its rebuild: %d Retry-After=%q in %s, want 503 with Retry-After inside 5s: %s",
+			resp.StatusCode, resp.Header.Get("Retry-After"), took, body)
+	}
+
+	release()
+	f.s.rpmProfileBuilds.running.Wait()
+	if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+href); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("the filelists once the rebuild finished: %v %v, want 200", err, resp)
+	}
+	if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/"+strings.Repeat("0", 64)+"-filelists.xml.gz"); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Errorf("an href the host's repomd.xml does not name: %v %v, want 404", err, resp)
+	}
+}
+
+// An upstream file the proxy refuses on its checksum fails the build with one
+// record, at any level, which keeps the refusal's incident and reason.
+func TestRpmProfileChecksumRefusalIsLoggedOnce(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	f.m.set(f.filelistsHref(t), []byte("not the filelists repomd.xml describes"))
+	resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("repomd.xml over a corrupt filelists: %d, want 502", resp.StatusCode)
+	}
+	var records []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		// Every level but INFO, which traces the fetch rather than its
+		// failure; a line naming the incident counts at any level.
+		failure := strings.Contains(line, "filelists") && !strings.Contains(line, "level=INFO")
+		if failure || strings.Contains(line, "incident") || strings.Contains(line, "refused") {
+			records = append(records, line)
+		}
+	}
+	if len(records) != 1 {
+		t.Fatalf("records of the refusal = %d, want 1:\n%s", len(records), strings.Join(records, "\n"))
+	}
+	for _, want := range []string{"level=ERROR", "profile=web", "file=filelists", "checksum", "incident"} {
+		if !strings.Contains(records[0], want) {
+			t.Errorf("the record lacks %q:\n%s", want, records[0])
+		}
+	}
+}
+
+// rpmFailingStore fails the reads and writes its predicates match, after gate
+// closes when gate is set, so a test can hold a failure past a build's
+// deadline.
+type rpmFailingStore struct {
+	storage.ObjectStore
+	failRead  func(key string) bool
+	failWrite func(key string) bool
+	gate      <-chan struct{}
+}
+
+var errRpmTestStore = errors.New("test: the store refused")
+
+func (s rpmFailingStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	if s.failRead != nil && s.failRead(key) {
+		if s.gate != nil {
+			<-s.gate
+		}
+		return nil, errRpmTestStore
+	}
+	return s.ObjectStore.GetStream(ctx, key)
+}
+
+func (s rpmFailingStore) PutFile(ctx context.Context, localPath, key string) error {
+	if s.failWrite != nil && s.failWrite(key) {
+		return errRpmTestStore
+	}
+	return s.ObjectStore.PutFile(ctx, localPath, key)
+}
+
+// rpmFailureRecords is every record in logs at warning or above.
+func rpmFailureRecords(logs string) []string {
+	var out []string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "level=WARN") || strings.Contains(line, "level=ERROR") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// coldBuild clears f's recent builds and sends logs to a buffer, so the next
+// rpmProfileFiles builds and its records can be counted.
+func (f *rpmBuildFixture) coldBuild(t *testing.T) (*entitle.Profile, *syncBuffer) {
+	t.Helper()
+	sl, p := f.slot(t)
+	sl.mu.Lock()
+	sl.recent = nil
+	sl.mu.Unlock()
+	logs := &syncBuffer{}
+	f.s.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return p, logs
+}
+
+func (f *rpmBuildFixture) build(p *entitle.Profile) (*rpmProfileBuild, error) {
+	data, _ := parseRpmRepomd(f.upstream)
+	return f.s.rpmProfileFiles(httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), p, data)
+}
+
+// A cached upstream file the store cannot read fails the build with one
+// record, the build's, carrying the store's error; the proxy route the read
+// went through writes none of its own, and the next build starts over.
+func TestRpmProfileBuildOwnsACachedReadFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	good := f.s.stores
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: good, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+
+	if _, err := f.build(p); !errors.Is(err, errRpmTestStore) {
+		t.Fatalf("build error = %v, want one carrying the store's error", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	recs := rpmFailureRecords(logs.String())
+	if len(recs) != 1 || !strings.Contains(recs[0], "rpm metadata could not be filtered for a profile") ||
+		!strings.Contains(recs[0], errRpmTestStore.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the store's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+
+	f.s.stores = good
+	before := f.s.rpmProfileBuilds.built
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("the build after a failed one: %v", err)
+	}
+	if got := f.s.rpmProfileBuilds.built - before; got != 1 {
+		t.Errorf("the build after a failed one counted %d builds, want 1", got)
+	}
+}
+
+// A cached read that fails after its build was retired at the deadline writes
+// nothing: the build's one record is already written, and the log is no
+// longer the abandoned work's to write to.
+func TestRpmProfileBuildRetiredReadFailureIsSilent(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	gate := make(chan struct{})
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }, gate: gate}}
+	f.s.rpmProfileBuilds.timeout = 100 * time.Millisecond
+
+	// The supervisor writes its record before it closes the job, and a
+	// deadline error reaches the caller only through that close.
+	if _, err := f.build(p); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("build error = %v, want the build's deadline", err)
+	}
+	before := logs.String()
+	close(gate)
+	f.s.rpmProfileBuilds.running.Wait()
+	if after := logs.String(); after != before {
+		t.Errorf("the retired build's read wrote to the log after its failure was recorded:\n%s", strings.TrimPrefix(after, before))
+	}
+	if recs := rpmFailureRecords(before); len(recs) != 1 {
+		t.Errorf("want the build's one record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A read that succeeds around a failure, here the cache write the proxy
+// treats as best effort, still gets one record, the build's, naming the
+// file and the store's error, and the build is kept.
+func TestRpmProfileBuildRecordsAFailureItSucceededAround(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	upstream := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failWrite: func(k string) bool { return strings.HasSuffix(k, upstream) }}}
+
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("a build whose cache write failed: %v", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	// The pin advisory is a note every cold metadata fill writes, at warning
+	// level, and not a failure of the read.
+	var recs []string
+	for _, rec := range rpmFailureRecords(logs.String()) {
+		if !strings.Contains(rec, "pinned an object with no admission decision") {
+			recs = append(recs, rec)
+		}
+	}
+	if len(recs) != 1 || !strings.Contains(recs[0], "succeeded around a failure") ||
+		!strings.Contains(recs[0], errRpmTestStore.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the store's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A metadata read no build owns logs its failure where it happens, as every
+// other proxied read does.
+func TestRpmMetadataReadOutsideABuildLogsItsOwnFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	_, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+	data, _ := parseRpmRepomd(f.upstream)
+	var entry rpmRepomdData
+	for _, d := range data {
+		if d.Type == "filelists" {
+			entry = d
+		}
+	}
+	w := httptest.NewRecorder()
+	f.s.serveRpmMetadataEntry(w, httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), entry)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 1 || !strings.Contains(recs[0], "object proxy error") {
+		t.Errorf("want the proxy's own record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+var errRpmTestBody = errors.New("test: the stored body failed mid-stream")
+
+// rpmCutBodyStore opens every object, and makes the body of a key cut
+// matches fail: at once, or after its last byte in place of EOF when deliver
+// is set, which leaves the reader holding the whole document. A gate holds
+// the failing Read until it closes.
+type rpmCutBodyStore struct {
+	storage.ObjectStore
+	cut     func(key string) bool
+	deliver bool
+	gate    <-chan struct{}
+}
+
+func (s rpmCutBodyStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	res, err := s.ObjectStore.GetStream(ctx, key)
+	if err == nil && res != nil && s.cut(key) {
+		res.Body = &rpmCutBody{ReadCloser: res.Body, deliver: s.deliver, gate: s.gate}
+	}
+	return res, err
+}
+
+type rpmCutBody struct {
+	io.ReadCloser
+	deliver bool
+	gate    <-chan struct{}
+}
+
+func (b *rpmCutBody) Read(p []byte) (int, error) {
+	if b.deliver {
+		n, err := b.ReadCloser.Read(p)
+		if err == io.EOF {
+			err = errRpmTestBody
+		}
+		return n, err
+	}
+	if b.gate != nil {
+		<-b.gate
+	}
+	return 0, errRpmTestBody
+}
+
+// A cached file whose body fails after the store opened it fails the build
+// with one record, the build's, carrying the store's error; the next build
+// starts over and is counted once.
+func TestRpmProfileBuildOwnsACachedBodyFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	good := f.s.stores
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: good, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+
+	if _, err := f.build(p); !errors.Is(err, errRpmTestBody) {
+		t.Fatalf("build error = %v, want one carrying the body's error", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	recs := rpmFailureRecords(logs.String())
+	if len(recs) != 1 || !strings.Contains(recs[0], "rpm metadata could not be filtered for a profile") ||
+		!strings.Contains(recs[0], errRpmTestBody.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the body's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+
+	f.s.stores = good
+	before := f.s.rpmProfileBuilds.count()
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("the build after a failed one: %v", err)
+	}
+	if got := f.s.rpmProfileBuilds.count() - before; got != 1 {
+		t.Errorf("the build after a failed one counted %d builds, want 1", got)
+	}
+}
+
+// Bytes that parse are not a delivered document when the read ended in an
+// error rather than EOF: the build fails, is not published and is not
+// counted.
+func TestRpmProfileBuildFailsOnACutBodyThatParses(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }, deliver: true}}
+
+	before := f.s.rpmProfileBuilds.count()
+	b, err := f.build(p)
+	f.s.rpmProfileBuilds.running.Wait()
+	if b != nil || !errors.Is(err, errRpmTestBody) {
+		t.Fatalf("build=%v error=%v, want no build and the body's error", b != nil, err)
+	}
+	if got := f.s.rpmProfileBuilds.count() - before; got != 0 {
+		t.Errorf("a build whose read failed counted %d builds, want 0", got)
+	}
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	held := len(sl.recent)
+	sl.mu.Unlock()
+	if held != 0 {
+		t.Errorf("a build whose read failed was published: %d held", held)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 1 || !strings.Contains(recs[0], errRpmTestBody.Error()) {
+		t.Errorf("want the build's one record naming the body's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A body that fails after its build was retired at the deadline writes
+// nothing past the build's one record.
+func TestRpmProfileBuildRetiredBodyFailureIsSilent(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	gate := make(chan struct{})
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }, gate: gate}}
+	f.s.rpmProfileBuilds.timeout = 100 * time.Millisecond
+
+	if _, err := f.build(p); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("build error = %v, want the build's deadline", err)
+	}
+	before := logs.String()
+	close(gate)
+	f.s.rpmProfileBuilds.running.Wait()
+	if after := logs.String(); after != before {
+		t.Errorf("the retired build's read wrote to the log after its failure was recorded:\n%s", strings.TrimPrefix(after, before))
+	}
+	if recs := rpmFailureRecords(before); len(recs) != 1 {
+		t.Errorf("want the build's one record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A client's own request for the same file is served as before: the status
+// is already out when the body fails, and nothing is logged in its name.
+func TestRpmMetadataCutBodyToAClientIsUnchanged(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	_, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+	data, _ := parseRpmRepomd(f.upstream)
+	var entry rpmRepomdData
+	for _, d := range data {
+		if d.Type == "filelists" {
+			entry = d
+		}
+	}
+	w := httptest.NewRecorder()
+	f.s.serveRpmMetadataEntry(w, httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), entry)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the 200 already written", w.Code)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 0 {
+		t.Errorf("a client's cut read logged:\n%s", strings.Join(recs, "\n"))
 	}
 }

@@ -83,7 +83,7 @@ check_matches JSON-EMPTY-01 "a discover export is a collection, not null" \
 # equality rather than order: JSON object keys carry none, and asserting a
 # sequence would fail on a reordering that breaks no consumer.
 e2e_bodega server "discover export csv pypi" || true
-csv_header="$(printf '%s' "$E2E_OUT" | head -1 | tr ',' '\n' | sort | tr '\n' ' ')"
+csv_header="$(printf '%s' "${E2E_OUT%%$'\n'*}" | tr ',' '\n' | sort | tr '\n' ' ')"
 e2e_bodega server "discover export json pypi" || true
 json_keys="$(printf '%s' "$E2E_OUT" | jq -r 'if length > 0 then .[0] | keys[] else empty end' 2>/dev/null | sort | tr '\n' ' ')"
 if [ -z "${json_keys// /}" ]; then

@@ -116,6 +116,8 @@ check and writes `dry-run-plan.txt`, which is every command the real run will
 issue, in order. A dry run changes nothing outside its results directory:
 builds and deletions go into the plan, not the tree.
 
+Suite 85 takes over an hour on a two-core guest: GAT-07 runs `internal/server` under `-race` pinned to two cores, which measured over 30 minutes on its own, and GAT-06 adds about 13 more for `internal/audit`. `--deadline` is checked only as each suite starts, and only against the total: 85 starts with any time left at all, runs to its end past the deadline, and every suite after it is then blocked. Nothing enforces a suite's budget, so leave at least 90 minutes for 85 when choosing a `--deadline`; that figure is planning advice, not an admission check. `E2E_GATED_RACE_TIMEOUT` (default `60m`, whole minutes from `1m` to `1440m`; an empty or other value blocks GAT-06 and GAT-07 by name) sets go's `-timeout` for both, and the ssh bound around each is that plus 10 minutes, so go's timeout fires first and names the stuck test.
+
 Other flags: `--suite <prefix>` runs a subset and still ships: 00-preflight
 always runs because it sets the reachability flags the others read, and
 10-ship-install runs too, so a filtered run measures HEAD rather than whatever
