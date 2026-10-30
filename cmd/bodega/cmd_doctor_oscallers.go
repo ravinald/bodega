@@ -22,17 +22,24 @@ import (
 // quietStep is one change a --quiet-* flag makes, printed under row, with an
 // undo fixed rather than recorded: a step is planned only when the host is
 // not already in the quiet state, so the undo returns it to what it was.
+//
+// A step that edits a file rather than running a tool sets edit and revert
+// instead of do and undo, and row then names the edit.
 type quietStep struct {
-	row      string
-	do, undo []string
+	row          string
+	do, undo     []string
+	edit, revert func() error
 }
 
 // stepRecord is the file a --quiet-* flag writes and its --restore-* flag
 // reads: the names of the steps that ran, which is the whole of what the
 // restore undoes.
 type stepRecord struct {
-	path        string
-	steps       map[string]quietStep
+	path  string
+	steps map[string]quietStep
+	// lookup resolves a step the map does not hold, for steps whose name
+	// carries the change itself.
+	lookup      func(name string) (quietStep, bool)
 	quietFlag   string
 	restoreFlag string
 	what        string // the steps' subject, for errors
@@ -41,6 +48,34 @@ type stepRecord struct {
 
 type proRecord struct {
 	Steps []string `json:"steps"`
+}
+
+func (r stepRecord) step(name string) (quietStep, bool) {
+	if st, ok := r.steps[name]; ok {
+		return st, true
+	}
+	if r.lookup != nil {
+		return r.lookup(name)
+	}
+	return quietStep{}, false
+}
+
+// perform runs the step's change, or its undo, and returns what it ran.
+func (r stepRecord) perform(st quietStep, undo bool) (string, error) {
+	if st.edit != nil {
+		if undo {
+			return "revert " + st.row, st.revert()
+		}
+		return "edit " + st.row, st.edit()
+	}
+	argv := st.do
+	if undo {
+		argv = st.undo
+	}
+	if out, err := r.run(argv); err != nil {
+		return shellJoin(argv), fmt.Errorf("%s failed (%v): %s", shellJoin(argv), err, out)
+	}
+	return shellJoin(argv), nil
 }
 
 // shellJoin prints argv so it pastes into a shell as the same argv.
@@ -80,12 +115,13 @@ func (r stepRecord) quiet(steps []string) error {
 	}
 	var runErr error
 	for _, s := range steps {
-		argv := r.steps[s].do
-		if out, err := r.run(argv); err != nil {
-			runErr = fmt.Errorf("%s failed (%v): %s; nothing after it ran. Re-run as root", shellJoin(argv), err, out)
+		st, _ := r.step(s)
+		ran, err := r.perform(st, false)
+		if err != nil {
+			runErr = fmt.Errorf("%w; nothing after it ran. Re-run as root", err)
 			break
 		}
-		fmt.Printf("ran        %s\n", shellJoin(argv))
+		fmt.Printf("ran        %s\n", ran)
 		if !slices.Contains(rec.Steps, s) {
 			rec.Steps = append(rec.Steps, s)
 		}
@@ -108,13 +144,14 @@ func (r stepRecord) restore() error {
 		return nil
 	}
 	for len(rec.Steps) > 0 {
-		argv := r.steps[rec.Steps[0]].undo
-		if out, err := r.run(argv); err != nil {
+		st, _ := r.step(rec.Steps[0])
+		ran, err := r.perform(st, true)
+		if err != nil {
 			return errors.Join(
-				fmt.Errorf("%s failed (%v): %s. Re-run as root; %s still records what is left", shellJoin(argv), err, out, r.path),
+				fmt.Errorf("%w. Re-run as root; %s still records what is left", err, r.path),
 				r.save(rec))
 		}
-		fmt.Printf("ran        %s\n", shellJoin(argv))
+		fmt.Printf("ran        %s\n", ran)
 		rec.Steps = rec.Steps[1:]
 	}
 	if err := os.Remove(r.path); err != nil {
@@ -136,7 +173,7 @@ func (r stepRecord) load() (proRecord, error) {
 		return rec, fmt.Errorf("%s is not the record %s writes (%v); move it aside, then re-run", r.path, r.quietFlag, err)
 	}
 	for _, s := range rec.Steps {
-		if _, ok := r.steps[s]; !ok {
+		if _, ok := r.step(s); !ok {
 			return rec, fmt.Errorf("%s names a step this doctor does not know, %q; move it aside, then re-run", r.path, s)
 		}
 	}
