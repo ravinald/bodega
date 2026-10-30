@@ -1543,3 +1543,160 @@ func TestRpmMetadataReadOutsideABuildLogsItsOwnFailure(t *testing.T) {
 		t.Errorf("want the proxy's own record; got:\n%s", strings.Join(recs, "\n"))
 	}
 }
+
+var errRpmTestBody = errors.New("test: the stored body failed mid-stream")
+
+// rpmCutBodyStore opens every object, and makes the body of a key cut
+// matches fail: at once, or after its last byte in place of EOF when deliver
+// is set, which leaves the reader holding the whole document. A gate holds
+// the failing Read until it closes.
+type rpmCutBodyStore struct {
+	storage.ObjectStore
+	cut     func(key string) bool
+	deliver bool
+	gate    <-chan struct{}
+}
+
+func (s rpmCutBodyStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	res, err := s.ObjectStore.GetStream(ctx, key)
+	if err == nil && res != nil && s.cut(key) {
+		res.Body = &rpmCutBody{ReadCloser: res.Body, deliver: s.deliver, gate: s.gate}
+	}
+	return res, err
+}
+
+type rpmCutBody struct {
+	io.ReadCloser
+	deliver bool
+	gate    <-chan struct{}
+}
+
+func (b *rpmCutBody) Read(p []byte) (int, error) {
+	if b.deliver {
+		n, err := b.ReadCloser.Read(p)
+		if err == io.EOF {
+			err = errRpmTestBody
+		}
+		return n, err
+	}
+	if b.gate != nil {
+		<-b.gate
+	}
+	return 0, errRpmTestBody
+}
+
+// A cached file whose body fails after the store opened it fails the build
+// with one record, the build's, carrying the store's error; the next build
+// starts over and is counted once.
+func TestRpmProfileBuildOwnsACachedBodyFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	good := f.s.stores
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: good, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+
+	if _, err := f.build(p); !errors.Is(err, errRpmTestBody) {
+		t.Fatalf("build error = %v, want one carrying the body's error", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	recs := rpmFailureRecords(logs.String())
+	if len(recs) != 1 || !strings.Contains(recs[0], "rpm metadata could not be filtered for a profile") ||
+		!strings.Contains(recs[0], errRpmTestBody.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the body's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+
+	f.s.stores = good
+	before := f.s.rpmProfileBuilds.count()
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("the build after a failed one: %v", err)
+	}
+	if got := f.s.rpmProfileBuilds.count() - before; got != 1 {
+		t.Errorf("the build after a failed one counted %d builds, want 1", got)
+	}
+}
+
+// Bytes that parse are not a delivered document when the read ended in an
+// error rather than EOF: the build fails, is not published and is not
+// counted.
+func TestRpmProfileBuildFailsOnACutBodyThatParses(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }, deliver: true}}
+
+	before := f.s.rpmProfileBuilds.count()
+	b, err := f.build(p)
+	f.s.rpmProfileBuilds.running.Wait()
+	if b != nil || !errors.Is(err, errRpmTestBody) {
+		t.Fatalf("build=%v error=%v, want no build and the body's error", b != nil, err)
+	}
+	if got := f.s.rpmProfileBuilds.count() - before; got != 0 {
+		t.Errorf("a build whose read failed counted %d builds, want 0", got)
+	}
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	held := len(sl.recent)
+	sl.mu.Unlock()
+	if held != 0 {
+		t.Errorf("a build whose read failed was published: %d held", held)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 1 || !strings.Contains(recs[0], errRpmTestBody.Error()) {
+		t.Errorf("want the build's one record naming the body's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A body that fails after its build was retired at the deadline writes
+// nothing past the build's one record.
+func TestRpmProfileBuildRetiredBodyFailureIsSilent(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	gate := make(chan struct{})
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }, gate: gate}}
+	f.s.rpmProfileBuilds.timeout = 100 * time.Millisecond
+
+	if _, err := f.build(p); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("build error = %v, want the build's deadline", err)
+	}
+	before := logs.String()
+	close(gate)
+	f.s.rpmProfileBuilds.running.Wait()
+	if after := logs.String(); after != before {
+		t.Errorf("the retired build's read wrote to the log after its failure was recorded:\n%s", strings.TrimPrefix(after, before))
+	}
+	if recs := rpmFailureRecords(before); len(recs) != 1 {
+		t.Errorf("want the build's one record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A client's own request for the same file is served as before: the status
+// is already out when the body fails, and nothing is logged in its name.
+func TestRpmMetadataCutBodyToAClientIsUnchanged(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	_, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmCutBodyStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		cut: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+	data, _ := parseRpmRepomd(f.upstream)
+	var entry rpmRepomdData
+	for _, d := range data {
+		if d.Type == "filelists" {
+			entry = d
+		}
+	}
+	w := httptest.NewRecorder()
+	f.s.serveRpmMetadataEntry(w, httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), entry)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the 200 already written", w.Code)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 0 {
+		t.Errorf("a client's cut read logged:\n%s", strings.Join(recs, "\n"))
+	}
+}

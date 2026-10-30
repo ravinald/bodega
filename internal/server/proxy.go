@@ -451,7 +451,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if _, err := io.Copy(w, spool.file); err != nil {
 		// The status line is already out, so there is nothing to tell the
 		// client. The object is cached and the next request serves it.
-		s.logFor(r.Context()).Warn("client read of a proxied artifact was cut short", "key", s3Key, "error", err)
+		if !failBodyTransfer(r.Context(), fmt.Errorf("stream %s from the spool: %w", s3Key, err)) {
+			s.logFor(r.Context()).Warn("client read of a proxied artifact was cut short", "key", s3Key, "error", err)
+		}
 	}
 }
 
@@ -1994,7 +1996,7 @@ func (s *Server) serveCacheHitIf(w http.ResponseWriter, r *http.Request, store s
 	if immutable {
 		noteServed(r, s3Key, "")
 	}
-	s.serveStored(w, s3Key, res)
+	s.serveStored(w, r, s3Key, res)
 }
 
 // cacheFills is the attribution for keys whose proxied bytes have reached the

@@ -438,7 +438,7 @@ func (s *Server) rpmCachedRepomd(r *http.Request, t rpmTree) ([]byte, error) {
 // object key from the package's serve_fetch row, which is where
 // reconciliation reads the package's version.
 func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(http.ResponseWriter, *http.Request)) ([]byte, error) {
-	ctx := context.WithValue(withOwnRead(r.Context()), servedObjectCtxKey{}, &servedObject{})
+	ctx, transfer := withBodyTransfer(context.WithValue(withOwnRead(r.Context()), servedObjectCtxKey{}, &servedObject{}))
 	req := r.Clone(ctx)
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		req.Header.Del(h)
@@ -448,6 +448,8 @@ func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(htt
 	switch {
 	case cw.tooBig:
 		return nil, fmt.Errorf("%s of %s exceeds bodega's %d-byte buffer", what, t.id(), maxUpstreamBody)
+	case transfer.failed() != nil:
+		return nil, &rpmReadCut{what: what, tree: t.id(), status: cw.status, n: cw.body.Len(), err: transfer.failed()}
 	case cw.status == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: %s publishes no %s", errUpstreamNotFound, t.base, what)
 	case cw.status != 0 && cw.status != http.StatusOK:
@@ -455,6 +457,20 @@ func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(htt
 	}
 	return cw.body.Bytes(), nil
 }
+
+// rpmReadCut is a read whose route wrote its status and then failed to
+// deliver the body. The bytes held may still parse, and are not the document.
+type rpmReadCut struct {
+	what, tree string
+	status, n  int
+	err        error
+}
+
+func (e *rpmReadCut) Error() string {
+	return fmt.Sprintf("reading %s of %s was cut short after HTTP %d and %d bytes: %v", e.what, e.tree, e.status, e.n, e.err)
+}
+
+func (e *rpmReadCut) Unwrap() error { return e.err }
 
 // rpmReadStatus is a non-200 answer from one of this file's own routes,
 // relayed to the client whose request needed it.

@@ -490,7 +490,12 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 		sink := &upstreamErrSink{owner: rpmBuildOwnerFrom(ctx)}
 		raw, err := s.rpmRead(r.WithContext(withUpstreamErrSink(ctx, sink)), t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
 		cause := sink.get()
+		var cut *rpmReadCut
 		switch {
+		case errors.As(err, &cut) && cause != nil:
+			// The cut body fails the read whatever else was sunk beside it,
+			// such as a failed cache write, so both are kept.
+			return nil, fmt.Errorf("reading %s %s: %w", e.Type, e.Location.Href, rpmReadFailures{cause, err})
 		case err != nil && cause != nil:
 			return nil, fmt.Errorf("reading %s %s: %w", e.Type, e.Location.Href, cause)
 		case cause != nil:
