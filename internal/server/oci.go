@@ -335,9 +335,9 @@ func ociConstrained(pm *manifest.PackageManifest) bool {
 // proxyOrCache gives the tag every gate, discovery row and stale-grace
 // answer a mutable document gets; the bytes then come from the digest key.
 func (s *Server) handleOCIManifestTag(w *ociResponseWriter, r *http.Request, t ociTarget) {
+	r, typ, fetched, err := s.ociManifestType(r, t)
 	ctx := r.Context()
 	name := t.name()
-	typ, fetched, err := s.ociManifestType(r, t)
 	store := s.typeStore(manifest.TypeOCI)
 	key := manifest.OCITagKey(t.registry, t.repo, t.ref)
 	if err != nil {
@@ -448,9 +448,9 @@ func relayCaptured(w http.ResponseWriter, cw *capturedResponse) {
 // has nothing to compare. The profile admits it when any tag resolved to it
 // is one the profile permits.
 func (s *Server) handleOCIManifestDigest(w *ociResponseWriter, r *http.Request, t ociTarget) {
+	r, typ, fetched, err := s.ociManifestType(r, t)
 	ctx := r.Context()
 	store := s.typeStore(manifest.TypeOCI)
-	typ, fetched, err := s.ociManifestType(r, t)
 	if err != nil {
 		s.refuseChartUnrecorded(w, t, err)
 		return
@@ -848,20 +848,20 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, typ s
 		}
 		body, ct, answered := f.body, f.contentType, f.answered
 		if got := ociDigest(body); got != t.ref {
-			return nil, ociMismatch(t, got)
+			return nil, afterAnswer(ociMismatch(t, got))
 		}
 		if got := ociArtifactType(body); got != typ {
-			return nil, ociTypeChanged(t, typ, got)
+			return nil, afterAnswer(ociTypeChanged(t, typ, got))
 		}
 		mediaType := ociMediaType(ct, body)
 		if typ == manifest.TypeHelm {
 			if err := s.ociRecordChart(ctx, t, t.ref, body); err != nil {
-				return nil, err
+				return nil, afterAnswer(err)
 			}
 		}
 		if store != nil {
 			if err := store.Put(ctx, manifest.OCIManifestTypeKey(t.registry, t.repo, t.ref), []byte(mediaType)); err != nil {
-				return nil, fmt.Errorf("record the media type of manifest %s for %s: %w", t.ref, t.name(), err)
+				return nil, afterAnswer(fmt.Errorf("record the media type of manifest %s for %s: %w", t.ref, t.name(), err))
 			}
 			s.ociInheritVerdicts(ctx, store, t, body)
 		}
@@ -880,14 +880,14 @@ func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL strin
 	answered := answeredURL(resp, rawURL)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, ociMaxManifest+1))
 	if err != nil {
-		return nil, fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err)
+		return nil, afterAnswer(fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err))
 	}
 	if len(body) > ociMaxManifest {
-		return nil, fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)
+		return nil, afterAnswer(fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest))
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if ociIsSchema1(contentType, body) {
-		return nil, s.ociSchema1Refusal(t)
+		return nil, afterAnswer(s.ociSchema1Refusal(t))
 	}
 	return &ociFetched{body: body, contentType: contentType, sentDigest: resp.Header.Get(ociDigestHeader), answered: answered}, nil
 }
@@ -919,12 +919,17 @@ const (
 // on the registry's own scheme and host: the registry's token rides on every
 // request, and a link elsewhere would carry it there.
 func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
-	return func(ctx context.Context, rawURL string) (*upstreamStream, error) {
+	return func(ctx context.Context, rawURL string) (_ *upstreamStream, err error) {
 		var list ociTagList
 		list.Tags = []string{}
 		seen := map[string]bool{}
 		budget := ociMaxTagList
 		answered := ""
+		defer func() {
+			if answered != "" {
+				err = afterAnswer(err)
+			}
+		}()
 		for next := rawURL; next != ""; {
 			if len(seen) == ociMaxTagPages {
 				return nil, fmt.Errorf("the tag list for %s at %s runs past %d pages; bodega serves none of it rather than part", t.name(), rawURL, ociMaxTagPages)
@@ -1022,7 +1027,7 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, platform o
 		body, ct := f.body, f.contentType
 		digest := ociDigest(body)
 		if sent := f.sentDigest; sent != "" && sent != digest {
-			return nil, ociMismatchSent(t, sent, digest)
+			return nil, afterAnswer(ociMismatchSent(t, sent, digest))
 		}
 		mediaType := ociMediaType(ct, body)
 		// From here on bodega knows the image the tag names, and storing its
@@ -1035,7 +1040,7 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, platform o
 			}
 			if !s.ociImageSettled(ctx, store, t, digest, child) {
 				if err := s.ociMarkJudging(ctx, store, t, digest, child, t.ref); err != nil {
-					return nil, fmt.Errorf("record that bodega is checking tag %s of %s before serving any of it: %w", t.ref, t.name(), err)
+					return nil, afterAnswer(fmt.Errorf("record that bodega is checking tag %s of %s before serving any of it: %w", t.ref, t.name(), err))
 				}
 			}
 		}
@@ -1044,11 +1049,11 @@ func (s *Server) ociTagOpener(t ociTarget, store storage.ObjectStore, platform o
 		// judged as an image's.
 		if ociArtifactType(body) == manifest.TypeHelm {
 			if err := s.ociRecordChart(ctx, t, digest, body); err != nil {
-				return nil, err
+				return nil, afterAnswer(err)
 			}
 		}
 		if err := s.ociStoreManifest(ctx, t, digest, mediaType, body); err != nil {
-			return nil, err
+			return nil, afterAnswer(err)
 		}
 		// An index's platform manifests are fetched by digest and never by
 		// tag, so they are recorded as resolved by the tag that named their
@@ -1243,7 +1248,7 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	default:
 		drainClose(resp)
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
+		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
 	}
 }
 
