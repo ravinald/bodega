@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -23,6 +24,7 @@ const (
 	ociResolvedBy      = "/_resolvedby/sha256/"
 	ociChartsMarker    = "/_charts/sha256/"
 	ociUnsettledMarker = "/_unsettled/"
+	ociReferrersMarker = "/_referrers/sha256/"
 	ociListSuffix      = "/_list"
 )
 
@@ -151,6 +153,18 @@ func OCITagListKey(registry, repo string) string {
 	return ociTagPrefix + registry + "/" + repo + ociListSuffix
 }
 
+// OCIReferrersKey is the referrers index of digest in a repository, one key
+// per artifactType filter and the unfiltered index under none. A media type
+// carries a "/", which is escaped so the filter stays one segment.
+// Regenerable.
+func OCIReferrersKey(registry, repo, digest, artifactType string) string {
+	key := ociTagPrefix + registry + "/" + repo + ociReferrersMarker + strings.TrimPrefix(digest, OCIDigestPrefix)
+	if artifactType != "" {
+		key += "/" + url.PathEscape(artifactType)
+	}
+	return key
+}
+
 // OCIResolvedKey holds the tag bodega last resolved to digest in a
 // repository, which is what the allow-list judges a request by digest under.
 func OCIResolvedKey(registry, repo, digest string) string {
@@ -230,6 +244,14 @@ func parseOCIKey(key string) (name, version string) {
 		}
 	case strings.HasPrefix(key, ociTagPrefix):
 		rest := strings.TrimPrefix(key, ociTagPrefix)
+		// A record about the repository's images, not a version of it.
+		if i := strings.LastIndex(rest, ociReferrersMarker); i > 0 {
+			hex, _, _ := strings.Cut(rest[i+len(ociReferrersMarker):], "/")
+			if ociDigestVersion(hex) != "" {
+				return ociName(rest[:i]), ""
+			}
+			return "", ""
+		}
 		if i := strings.LastIndex(rest, ociResolvedBy); i > 0 {
 			hex, tag, ok := strings.Cut(rest[i+len(ociResolvedBy):], "/")
 			if !ok || !OCIValidTag(tag) {

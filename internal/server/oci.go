@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -36,6 +37,7 @@ import (
 //   GET|HEAD /v2/<name>/manifests/<tag|digest>   — tag mutable, digest immutable
 //   GET|HEAD /v2/<name>/blobs/<digest>           — one key per digest, shared
 //   GET /v2/<name>/tags/list                     — mutable
+//   GET /v2/<name>/referrers/<digest>            — mutable, never a 404
 //
 // One route serves every registry, so the request has to say which one it
 // means, and the three client families say it three ways; ociTargetFor reads
@@ -48,11 +50,13 @@ const (
 	ociManifests = "manifests"
 	ociBlobs     = "blobs"
 	ociTags      = "tags"
+	ociReferrers = "referrers"
 )
 
 const (
 	ociAPIVersionHeader = "Docker-Distribution-API-Version"
 	ociDigestHeader     = "Docker-Content-Digest"
+	ociFiltersHeader    = "OCI-Filters-Applied"
 	ociErrorContentType = "application/json"
 
 	ociDockerHub = "docker.io"
@@ -82,7 +86,7 @@ type ociTarget struct {
 	registry string // a key of oci_upstreams
 	repo     string // the repository at that registry
 	upstream string // oci_upstreams[registry], userinfo and all
-	kind     string // ociManifests, ociBlobs or ociTags
+	kind     string // ociManifests, ociBlobs, ociTags or ociReferrers
 	ref      string // a tag or digest; "list" for the tag list
 }
 
@@ -162,6 +166,8 @@ func (s *Server) handleOCI(w http.ResponseWriter, r *http.Request) {
 		s.handleOCIBlob(ow, r, t)
 	case ociTags:
 		s.handleOCITagList(ow, r, t)
+	case ociReferrers:
+		s.handleOCIReferrers(ow, r, t)
 	}
 }
 
@@ -236,9 +242,9 @@ func parseOCIPackagePath(path, ns string) (name, version string) {
 // error to answer with, and no upstream has been contacted.
 func (s *Server) ociTargetFor(p, ns string) (ociTarget, int, string, string) {
 	n, kind, ref, ok := splitOCIPath(p)
-	if !ok || (kind != ociManifests && kind != ociBlobs && !(kind == ociTags && ref == "list")) {
+	if !ok || (kind != ociManifests && kind != ociBlobs && kind != ociReferrers && !(kind == ociTags && ref == "list")) {
 		return ociTarget{}, http.StatusNotFound, "NAME_UNKNOWN",
-			fmt.Sprintf("bodega serves /v2/<name>/manifests/<reference>, /v2/<name>/blobs/<digest> and /v2/<name>/tags/list, and %q is none of them.", "/v2/"+p)
+			fmt.Sprintf("bodega serves /v2/<name>/manifests/<reference>, /v2/<name>/blobs/<digest>, /v2/<name>/tags/list and /v2/<name>/referrers/<digest>, and %q is none of them.", "/v2/"+p)
 	}
 	registry, repo := ociRegistryOf(n, ns)
 	upstream, configured := s.cfg.OCIUpstreams[registry]
@@ -255,6 +261,9 @@ func (s *Server) ociTargetFor(p, ns string) (ociTarget, int, string, string) {
 	case kind == ociBlobs && !manifest.OCIValidDigest(ref):
 		return ociTarget{}, http.StatusBadRequest, "DIGEST_INVALID",
 			fmt.Sprintf("%q is not a sha256 digest; bodega serves blobs by sha256:<64 hex> only.", ref)
+	case kind == ociReferrers && !manifest.OCIValidDigest(ref):
+		return ociTarget{}, http.StatusBadRequest, "DIGEST_INVALID",
+			fmt.Sprintf("%q is not a sha256 digest; referrers are listed for a manifest by sha256:<64 hex> only.", ref)
 	case kind == ociManifests && !manifest.OCIValidDigest(ref) && !manifest.OCIValidTag(ref):
 		return ociTarget{}, http.StatusNotFound, "MANIFEST_UNKNOWN",
 			fmt.Sprintf("%q is neither a tag nor a sha256 digest.", ref)
@@ -818,6 +827,134 @@ func (p ociPage) slice(tags []string) ([]string, bool) {
 	return tags, false
 }
 
+// handleOCIReferrers serves the referrers index of a manifest, cached as a
+// mutable document under one key per artifactType filter. Docker Engine asks
+// a mirror for it on every pull and takes anything but a 200 as the cue to
+// ask the registry itself, around bodega, so a registry with no referrers
+// API, an outage with nothing cached and a stored copy that will not parse
+// all answer an empty index rather than an error: referrers add signatures
+// and attestations to a pull and never take the image away. A refusal is
+// still a refusal, judged as a manifest by the same digest is.
+func (s *Server) handleOCIReferrers(w *ociResponseWriter, r *http.Request, t ociTarget) {
+	ctx := r.Context()
+	name := t.name()
+	noSharedCache(w)
+	artifactType := r.URL.Query().Get("artifactType")
+	if artifactType != "" && !ociValidMediaType(artifactType) {
+		w.writeError(http.StatusBadRequest, "UNSUPPORTED",
+			fmt.Sprintf("artifactType=%q is not a media type such as application/vnd.example.sbom.v1+json; send one, or leave artifactType out for every referrer.", artifactType))
+		return
+	}
+	store := s.typeStore(manifest.TypeOCI)
+	key := manifest.OCIReferrersKey(t.registry, t.repo, t.ref, artifactType)
+	// The subject is judged as a manifest by the same digest is, by its own
+	// type: a repository can hold images and charts side by side, and a hidden
+	// chart's signatures are the chart's. The request ociManifestType returns
+	// is dropped because its mark says the manifest path answered, which
+	// says nothing about the referrers path.
+	subject := t
+	subject.kind = ociManifests
+	_, typ, _, err := s.ociManifestType(r, subject)
+	if err != nil {
+		s.refuseChartUnrecorded(w, subject, err)
+		return
+	}
+	last := s.ociResolvedTag(ctx, store, t, t.ref)
+	pm, ok := s.ociGate(w, r, typ, subject, s.ociResolvedByTags(ctx, store, t, last), last != "",
+		manifest.OCIManifestKey(t.registry, t.repo, t.ref), true)
+	if !ok {
+		return
+	}
+	if !s.ociMemberGate(w, r, subject, store) {
+		return
+	}
+	upstream := t.url(ociReferrers + "/" + t.ref)
+	if artifactType != "" {
+		upstream += "?" + url.Values{"artifactType": {artifactType}}.Encode()
+	}
+	req := r.Clone(withUpstreamOpener(ctx, s.ociReferrersOpener(t)))
+	req.Method = http.MethodGet
+	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		req.Header.Del(h)
+	}
+	cw := &capturedResponse{header: http.Header{}}
+	s.proxyOrCache(cw, req, store, key, upstream, typ, name, name, false, ociForceProxy(pm))
+	var idx ociReferrersIndex
+	switch {
+	case cw.status == http.StatusOK && json.Unmarshal(cw.body.Bytes(), &idx) == nil:
+	case cw.header.Get(refusalHeader) != "":
+		relayCaptured(w, cw)
+		return
+	default:
+		idx = s.ociReferrersFallback(ctx, store, t, artifactType, cw)
+	}
+	if artifactType != "" {
+		idx = idx.filtered(artifactType)
+		w.Header().Set(ociFiltersHeader, "artifactType")
+	}
+	body, _ := json.Marshal(idx)
+	w.Header().Set("Content-Type", mediaOCIIndex)
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		//nolint:gosec // G705: an index bodega marshaled itself, under the index media type.
+		_, _ = w.Write(body)
+	}
+}
+
+// ociReferrersFallback is the index served when neither the registry nor
+// the copy cached under the request's own key answered one: a filtered
+// request reads the unfiltered copy, which it filters on the way out, and
+// anything else is the empty index.
+func (s *Server) ociReferrersFallback(ctx context.Context, store storage.ObjectStore, t ociTarget, artifactType string, cw *capturedResponse) ociReferrersIndex {
+	s.logger.Warn("oci referrers not answered, serving what bodega holds",
+		"name", t.name(), "digest", t.ref, "artifact_type", artifactType, "status", cw.status)
+	if artifactType != "" && store != nil {
+		if b, err := store.Get(ctx, manifest.OCIReferrersKey(t.registry, t.repo, t.ref, "")); err == nil && b != nil {
+			var idx ociReferrersIndex
+			if json.Unmarshal(b, &idx) == nil {
+				return idx
+			}
+		}
+	}
+	return emptyOCIReferrers()
+}
+
+// ociReferrersIndex is the referrers response: an image index whose
+// manifests are the descriptors of the artifacts that name the subject.
+type ociReferrersIndex struct {
+	SchemaVersion int               `json:"schemaVersion"`
+	MediaType     string            `json:"mediaType"`
+	Manifests     []json.RawMessage `json:"manifests"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
+}
+
+func emptyOCIReferrers() ociReferrersIndex {
+	return ociReferrersIndex{SchemaVersion: 2, MediaType: mediaOCIIndex, Manifests: []json.RawMessage{}}
+}
+
+// filtered keeps the descriptors whose artifactType is the one asked for.
+// Applying it to an index the registry already filtered changes nothing.
+func (idx ociReferrersIndex) filtered(artifactType string) ociReferrersIndex {
+	kept := []json.RawMessage{}
+	for _, d := range idx.Manifests {
+		var desc struct {
+			ArtifactType string `json:"artifactType"`
+		}
+		if json.Unmarshal(d, &desc) == nil && desc.ArtifactType == artifactType {
+			kept = append(kept, d)
+		}
+	}
+	idx.Manifests = kept
+	return idx
+}
+
+// ociMediaTypeRE is RFC 6838's type/subtype, narrowed to the characters
+// registries use, so a filter is safe as one segment of a storage key.
+var ociMediaTypeRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+_-]{0,126}/[A-Za-z0-9][A-Za-z0-9.+_-]{0,126}$`)
+
+func ociValidMediaType(v string) bool { return ociMediaTypeRE.MatchString(v) }
+
 // ---- upstream --------------------------------------------------------------
 
 // ociDigestOpener opens a blob through the registry's token handshake. The
@@ -974,6 +1111,75 @@ func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
 		doc, _ := json.Marshal(list)
 		return &upstreamStream{url: answered, body: io.NopCloser(bytes.NewReader(doc)),
 			contentType: "application/json", contentLength: int64(len(doc))}, nil
+	}
+}
+
+// ociReferrersOpener reads every page of a registry's referrers index,
+// following its next links as the tag list's opener does, and answers with
+// one normalized index, or with the empty index when the first page is a 404:
+// a registry with no referrers API answers that for every digest, and storing
+// the empty index keeps each pull from asking it again until metadata_ttl.
+// Any later failure, a 404 on a later page included, is an error, so a
+// partial index is never cached as the whole one and a stale copy or the
+// handler's fallback answers instead. A body that is not an index is an
+// error too, so nothing unparseable is cached.
+func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
+	return func(ctx context.Context, rawURL string) (_ *upstreamStream, err error) {
+		idx := emptyOCIReferrers()
+		seen := map[string]bool{}
+		budget := ociMaxManifest
+		answered := ""
+		defer func() {
+			if answered != "" {
+				err = afterAnswer(err)
+			}
+		}()
+		for next := rawURL; next != ""; {
+			if len(seen) == ociMaxTagPages {
+				return nil, fmt.Errorf("the referrers of %s@%s at %s run past %d pages; bodega serves none of them rather than part", t.name(), t.ref, rawURL, ociMaxTagPages)
+			}
+			seen[next] = true
+			resp, err := s.ociGet(ctx, t, next, mediaOCIIndex)
+			switch {
+			case answered == "" && errors.Is(err, errUpstreamNotFound):
+				answered = rawURL
+				next = ""
+				continue
+			case answered != "" && err != nil:
+				return nil, fmt.Errorf("the referrers of %s@%s: page %s failed after an earlier page answered, so bodega serves none of them rather than part: %v", t.name(), t.ref, next, err)
+			case err != nil:
+				return nil, err
+			}
+			if answered == "" {
+				answered = answeredURL(resp, next)
+			}
+			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
+			link := resp.Header.Get("Link")
+			drainClose(resp)
+			if err != nil {
+				return nil, fmt.Errorf("read the referrers of %s@%s from %s: %w", t.name(), t.ref, next, err)
+			}
+			if budget -= len(b); budget < 0 {
+				return nil, fmt.Errorf("the referrers of %s@%s at %s are over %d bytes; bodega serves none of them rather than part", t.name(), t.ref, rawURL, ociMaxManifest)
+			}
+			var page ociReferrersIndex
+			if err := json.Unmarshal(b, &page); err != nil || page.SchemaVersion != 2 {
+				return nil, fmt.Errorf("the referrers page %s for %s@%s is not an image index (%v)", next, t.name(), t.ref, err)
+			}
+			idx.Manifests = append(idx.Manifests, page.Manifests...)
+			if idx.Annotations == nil {
+				idx.Annotations = page.Annotations
+			}
+			if next, err = ociNextPage(next, link); err != nil {
+				return nil, fmt.Errorf("the referrers of %s@%s: %w", t.name(), t.ref, err)
+			}
+			if seen[next] {
+				return nil, fmt.Errorf("the referrers of %s@%s name %s as their next page twice, so they never end; bodega serves none of them rather than part", t.name(), t.ref, next)
+			}
+		}
+		doc, _ := json.Marshal(idx)
+		return &upstreamStream{url: answered, body: io.NopCloser(bytes.NewReader(doc)),
+			contentType: mediaOCIIndex, contentLength: int64(len(doc))}, nil
 	}
 }
 
@@ -1646,7 +1852,7 @@ func ociErrorCode(status int, kind string) string {
 		return "DENIED"
 	case http.StatusNotFound:
 		switch kind {
-		case ociManifests:
+		case ociManifests, ociReferrers:
 			return "MANIFEST_UNKNOWN"
 		case ociBlobs:
 			return "BLOB_UNKNOWN"
