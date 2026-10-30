@@ -97,6 +97,17 @@ var ubuntuChrony = map[string]string{
 		"server ntp-bootstrap.ubuntu.com iburst nts\n",
 }
 
+// ubuntuReleaseUpgrades is what Ubuntu 26.04 ships in
+// /etc/update-manager/release-upgrades.
+const ubuntuReleaseUpgrades = "# Default behavior for the release upgrader.\n\n" +
+	"[DEFAULT]\n" +
+	"# Default prompting and upgrade behavior, valid options:\n" +
+	"#\n" +
+	"#  never  - Never check for, or allow upgrading to, a new release.\n" +
+	"#  normal - Check to see if a new release is available.\n" +
+	"#  lts    - Check to see if a new LTS release is available.\n" +
+	"Prompt=lts\n"
+
 func withFiles(base map[string]string, extra map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range base {
@@ -198,6 +209,21 @@ func TestOSCallerRows(t *testing.T) {
 			fakeOS{snapd: "active", refreshTime: "hold: forever"}, nil, "snapd-refresh", "", nil, nil},
 		{"snapd inactive", snapd, fakeOS{}, nil, "snapd-refresh", "", nil, nil},
 		{"snapd not installed", nil, fakeOS{snapd: "active"}, nil, "snapd-refresh", "", nil, nil},
+		{"release upgrades at lts", map[string]string{releaseUpgrades: ubuntuReleaseUpgrades}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn,
+			[]string{releaseUpgrades, "Prompt=lts", "changelogs.ubuntu.com", "fetches no packages"},
+			[]string{"Prompt=never", "--quiet-os-callers --apply", "--restore-os-callers"}},
+		{"release upgrades with no Prompt line", map[string]string{releaseUpgrades: "[DEFAULT]\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{"no Prompt line, which means Prompt=normal", "changelogs.ubuntu.com"}, nil},
+		{"release upgrades at normal, spaced", map[string]string{releaseUpgrades: "[DEFAULT]\nprompt = normal\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{"Prompt=normal"}, nil},
+		{"release upgrades at never", map[string]string{releaseUpgrades: "[DEFAULT]\n# Prompt=lts\nPrompt=never\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=never"}, nil},
+		{"release upgrades at never in another section only", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=lts\n[other]\nPrompt=never\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"Prompt=lts"}, nil},
+		{"release upgrades absent", nil, fakeOS{}, nil, "release-upgrade-check", host.StatusNA, []string{"not installed"}, nil},
+		{"release upgrades unreadable", map[string]string{releaseUpgrades + "/x": ""}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusSkip, []string{"could not read", releaseUpgrades}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -451,5 +477,85 @@ func TestDoctorQuietOSCallersClearsSnapdInStandby(t *testing.T) {
 	}
 	if slices.ContainsFunc(fake.calls, func(c string) bool { return strings.HasPrefix(c, "snap ") }) {
 		t.Errorf("the report ran %v against a standby snapd", fake.calls)
+	}
+}
+
+// --quiet-os-callers sets Prompt=never and records what it found, and
+// --restore-os-callers puts the file back byte for byte, whatever form the
+// Prompt line took or whether there was one at all.
+func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv, _ := planServer(t, map[string]string{"npm": "registry=x\n"})
+	saved := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = saved })
+	cases := []struct {
+		name, body, step, found string
+	}{
+		{"ubuntu default", ubuntuReleaseUpgrades, "release-upgrade-prompt=lts", "found Prompt=lts"},
+		{"spaced, lower-case key, CRLF", "[DEFAULT]\r\nprompt = normal  \r\n[x]\nPrompt=lts\n", "release-upgrade-prompt=normal", "found Prompt=normal"},
+		{"colon, no final newline", "[DEFAULT]\nPrompt: lts", "release-upgrade-prompt=lts", "found Prompt=lts"},
+		{"no Prompt line", "# c\n[DEFAULT]\nOther=1\n", "release-upgrade-prompt", "found no Prompt line"},
+		{"no Prompt line, header unterminated", "[DEFAULT]", "release-upgrade-prompt", "found no Prompt line"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeOS{}
+			h := stubOSCallers(t, map[string]string{releaseUpgrades: tc.body}, fake)
+			args := []string{"--configure", "npm", "--quiet-os-callers", "--url", srv.URL, "--allow-plaintext"}
+
+			out, err := runDoctor(t, args...)
+			plan := "release-upgrade-check  set Prompt=never in " + releaseUpgrades + ", " + tc.found + "  (undo: bodega doctor --restore-os-callers)"
+			if err != nil || !strings.Contains(out, plan) || !strings.Contains(out, "run the 1 OS caller step(s) above") {
+				t.Fatalf("plan = %v, want %q:\n%s", err, plan, out)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Fatalf("the dry run wrote %q", b)
+			}
+
+			if out, err := runDoctor(t, append(args, "--apply")...); err != nil {
+				t.Fatalf("--apply = %v:\n%s", err, out)
+			}
+			p, err := h.readPrompt()
+			if err != nil || !p.never() {
+				t.Fatalf("after --apply Prompt = %q (%v), want never", p.value(), err)
+			}
+			rec, err := os.ReadFile(h.record)
+			if err != nil || !strings.Contains(string(rec), `"`+tc.step+`"`) {
+				t.Fatalf("record = %s (%v), want %q", rec, err, tc.step)
+			}
+			report, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+			if f, _ := h.releaseUpgradeCheck(); f.Status != host.StatusOK || !strings.Contains(report, "release-upgrade-check") {
+				t.Errorf("after --apply the row is %s, want OK:\n%s", f.Status, report)
+			}
+			if out, _ := runDoctor(t, args...); !strings.Contains(out, "nothing to quiet") || !strings.Contains(out, "release-upgrade check is off") {
+				t.Errorf("a second plan after --apply is not empty:\n%s", out)
+			}
+
+			if out, err := runDoctor(t, "--restore-os-callers"); err != nil {
+				t.Fatalf("--restore-os-callers = %v:\n%s", err, out)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Errorf("restored file = %q, want %q", b, tc.body)
+			}
+			if _, err := os.Stat(h.record); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("record survived a complete restore: %v", err)
+			}
+			if len(fake.ran) != 0 {
+				t.Errorf("the edit ran tools: %v", fake.ran)
+			}
+		})
+	}
+}
+
+func TestReleaseUpgradeStepNames(t *testing.T) {
+	h := &osCallersHost{root: t.TempDir()}
+	for name, ok := range map[string]bool{
+		"release-upgrade-prompt": true, "release-upgrade-prompt=lts": true, "release-upgrade-prompt=": true,
+		"release-upgrade-promptx": false, "motd": false,
+	} {
+		if _, got := h.releaseUpgradeStep(name); got != ok {
+			t.Errorf("releaseUpgradeStep(%q) = %v, want %v", name, got, ok)
+		}
 	}
 }

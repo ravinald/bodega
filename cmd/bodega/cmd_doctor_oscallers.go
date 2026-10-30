@@ -104,7 +104,11 @@ func (r stepRecord) printPlan(steps []string, why, none string) {
 	}
 	fmt.Println()
 	for _, s := range steps {
-		st := r.steps[s]
+		st, _ := r.step(s)
+		if st.edit != nil {
+			fmt.Printf("%s  (undo: bodega doctor %s)\n", st.row, r.restoreFlag)
+			continue
+		}
 		fmt.Printf("%s  %s  (undo: %s)\n", st.row, shellJoin(st.do), shellJoin(st.undo))
 	}
 }
@@ -263,7 +267,7 @@ func runLocalTool(argv []string) (string, error) {
 
 func (h *osCallersHost) ledger() stepRecord {
 	return stepRecord{
-		path: h.record, steps: osCallerSteps, run: h.run,
+		path: h.record, steps: osCallerSteps, lookup: h.releaseUpgradeStep, run: h.run,
 		quietFlag: "--quiet-os-callers", restoreFlag: "--restore-os-callers", what: "OS caller steps",
 	}
 }
@@ -297,6 +301,7 @@ func (h *osCallersHost) findings(internal []string) []host.Finding {
 		func() (host.Finding, bool) { return h.chronyNTS(internal) },
 		h.motdNews,
 		h.snapdRefresh,
+		h.releaseUpgradeCheck,
 	} {
 		if f, ok := check(); ok {
 			out = append(out, f)
@@ -603,6 +608,13 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 			steps = append(steps, oscStepSnapHold)
 		}
 	}
+	prompt, err := h.readPrompt()
+	if err != nil {
+		return nil, "", fmt.Errorf("--quiet-os-callers cannot read %s: %w", h.path(releaseUpgrades), err)
+	}
+	if prompt.exists && !prompt.never() {
+		steps = append(steps, prompt.stepName())
+	}
 	if len(steps) == 0 {
 		why = "motd-news is off, and snapd is "
 		switch {
@@ -612,6 +624,9 @@ func (h *osCallersHost) quietSteps() (steps []string, why string, err error) {
 			why += "already held"
 		default:
 			why += "not active"
+		}
+		if prompt.exists {
+			why += "; the release-upgrade check is off"
 		}
 	}
 	return steps, why, nil
@@ -634,6 +649,197 @@ func snapHeld(refreshTime string, now time.Time) bool {
 		return err == nil && t.After(now.Add(snapHoldWindow))
 	}
 	return false
+}
+
+const releaseUpgrades = "/etc/update-manager/release-upgrades"
+
+// oscStepPrompt names the step that sets Prompt=never. A recorded name of
+// oscStepPrompt+"="+v put back v; the bare name inserted a Prompt line the
+// file did not have, and its undo removes that line.
+const oscStepPrompt = "release-upgrade-prompt"
+
+// promptSetting is the Prompt key of the [DEFAULT] section in
+// release-upgrades, read the way ubuntu-release-upgrader's configparser
+// reads it: the key in any case, = or : between key and value, # and ;
+// comments. lines keeps every byte, so an edit changes the value alone.
+type promptSetting struct {
+	exists bool
+	lines  []string
+	// line is the Prompt line, or -1; header is the [DEFAULT] line, or -1.
+	line, header int
+	// start and end bound the value within lines[line].
+	start, end int
+}
+
+func (p promptSetting) value() string {
+	if p.line < 0 {
+		return ""
+	}
+	return p.lines[p.line][p.start:p.end]
+}
+
+func (p promptSetting) never() bool { return strings.EqualFold(p.value(), "never") }
+
+func (p promptSetting) stepName() string {
+	if p.line < 0 {
+		return oscStepPrompt
+	}
+	return oscStepPrompt + "=" + p.value()
+}
+
+// shown is the setting as the row and the plan print it. With no Prompt
+// line the upgrader takes the default, normal, which checks for every
+// release.
+func (p promptSetting) shown() string {
+	if p.line < 0 {
+		return "no Prompt line, which means Prompt=normal"
+	}
+	return "Prompt=" + p.value()
+}
+
+func (h *osCallersHost) readPrompt() (promptSetting, error) {
+	p := promptSetting{line: -1, header: -1}
+	b, err := os.ReadFile(h.path(releaseUpgrades))
+	if errors.Is(err, fs.ErrNotExist) {
+		return p, nil
+	}
+	if err != nil {
+		return p, err
+	}
+	p.exists = true
+	p.lines = strings.SplitAfter(string(b), "\n")
+	section := ""
+	for i, line := range p.lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';':
+			continue
+		case line[0] == ' ' || line[0] == '\t':
+			continue // a continuation of the value above
+		case strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"):
+			section = trimmed[1 : len(trimmed)-1]
+			if section == "DEFAULT" && p.header < 0 {
+				p.header = i
+			}
+			continue
+		}
+		if section != "DEFAULT" {
+			continue
+		}
+		sep := strings.IndexAny(line, "=:")
+		if sep < 0 || !strings.EqualFold(strings.TrimSpace(line[:sep]), "Prompt") {
+			continue
+		}
+		rest := line[sep+1:]
+		v := strings.TrimSpace(rest)
+		p.line = i
+		p.start = sep + 1 + strings.Index(rest, v)
+		p.end = p.start + len(v)
+	}
+	return p, nil
+}
+
+func (p promptSetting) write(path string) error {
+	return os.WriteFile(path, []byte(strings.Join(p.lines, "")), 0o644)
+}
+
+// setPrompt replaces the value of the Prompt line and nothing around it.
+func (h *osCallersHost) setPrompt(to string) error {
+	p, err := h.readPrompt()
+	if err != nil {
+		return err
+	}
+	if p.line < 0 {
+		return fmt.Errorf("%s has no Prompt line under [DEFAULT] to set to %s; add Prompt=%s under [DEFAULT], then re-run",
+			h.path(releaseUpgrades), to, to)
+	}
+	l := p.lines[p.line]
+	p.lines[p.line] = l[:p.start] + to + l[p.end:]
+	return p.write(h.path(releaseUpgrades))
+}
+
+// insertPrompt adds Prompt=never directly under [DEFAULT], and removePrompt
+// takes the Prompt line out again, newline included, so the pair leaves the
+// file as it was.
+func (h *osCallersHost) insertPrompt() error {
+	p, err := h.readPrompt()
+	if err != nil {
+		return err
+	}
+	if p.header < 0 {
+		return fmt.Errorf("%s has no [DEFAULT] section to add Prompt=never to; set it by hand", h.path(releaseUpgrades))
+	}
+	add := "Prompt=never\n"
+	if !strings.HasSuffix(p.lines[p.header], "\n") {
+		add = "\nPrompt=never"
+	}
+	p.lines[p.header] += add
+	return p.write(h.path(releaseUpgrades))
+}
+
+func (h *osCallersHost) removePrompt() error {
+	p, err := h.readPrompt()
+	if err != nil {
+		return err
+	}
+	if p.line < 0 {
+		return nil
+	}
+	if !strings.HasSuffix(p.lines[p.line], "\n") && p.line > 0 {
+		p.lines[p.line-1] = strings.TrimSuffix(p.lines[p.line-1], "\n")
+	}
+	p.lines = slices.Delete(p.lines, p.line, p.line+1)
+	return p.write(h.path(releaseUpgrades))
+}
+
+// releaseUpgradeStep resolves a recorded oscStepPrompt name, which carries
+// the value the step found, so the restore needs nothing but the record.
+func (h *osCallersHost) releaseUpgradeStep(name string) (quietStep, bool) {
+	found, hadLine := strings.CutPrefix(name, oscStepPrompt+"=")
+	if !hadLine && name != oscStepPrompt {
+		return quietStep{}, false
+	}
+	st := quietStep{edit: func() error { return h.setPrompt("never") }}
+	shown := "no Prompt line"
+	if hadLine {
+		shown = "Prompt=" + found
+		st.revert = func() error { return h.setPrompt(found) }
+	} else {
+		st.edit = h.insertPrompt
+		st.revert = h.removePrompt
+	}
+	st.row = "release-upgrade-check  set Prompt=never in " + releaseUpgrades + ", found " + shown
+	return st, true
+}
+
+// releaseUpgradeCheck reports ubuntu-release-upgrader's new-release check,
+// which the update-notifier timers and the motd's release-upgrade fragment
+// run against changelogs.ubuntu.com unless Prompt=never. It fetches no
+// packages, so it never bypasses bodega; on a locked host it fails on every
+// run and fills the drop log.
+func (h *osCallersHost) releaseUpgradeCheck() (host.Finding, bool) {
+	f := host.Finding{Check: "release-upgrade-check"}
+	p, err := h.readPrompt()
+	switch {
+	case err != nil:
+		f.Status = host.StatusSkip
+		f.Detail = "could not read " + h.path(releaseUpgrades) + ": " + err.Error()
+		f.Remediation = skipRemedy(h.path(releaseUpgrades), err)
+	case !p.exists:
+		f.Status = host.StatusNA
+		f.Detail = "no " + releaseUpgrades + ", so ubuntu-release-upgrader is not installed"
+	case p.never():
+		f.Status = host.StatusOK
+		f.Detail = releaseUpgrades + " has Prompt=never, so the new-release check makes no request"
+	default:
+		f.Status = host.StatusWarn
+		f.Detail = releaseUpgrades + " has " + p.shown() + ", so ubuntu-release-upgrader checks changelogs.ubuntu.com " +
+			"for a new release from the update-notifier timers and the motd's release-upgrade fragment; " +
+			"it fetches no packages, and on a host that cannot reach it the check fails every time and fills the drop log"
+		f.Remediation = "set Prompt=never in " + releaseUpgrades + ", or bodega doctor --configure <system> --quiet-os-callers --apply, " +
+			"which sets it and records the value it found for --restore-os-callers"
+	}
+	return f, true
 }
 
 // internalTimeSources is what the chrony-nts row accepts as a time source
