@@ -63,23 +63,8 @@ func checkAptSources(root, goos string) Finding {
 		return f
 	}
 
-	dir := filepath.Join(root, "/etc/apt/sources.list.d")
-	paths := []string{filepath.Join(root, "/etc/apt/sources.list")}
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			n := e.Name()
-			if !strings.HasSuffix(n, ".list") && !strings.HasSuffix(n, ".sources") {
-				continue
-			}
-			paths = append(paths, filepath.Join(dir, n))
-		}
-	}
-
 	var unread *aptMirrorError
-	for _, p := range paths {
+	for _, p := range rooted(root, aptSourcePaths(root)) {
 		uris, err := aptSourceURIs(p)
 		if err != nil {
 			continue
@@ -147,16 +132,35 @@ func aptSourceURIs(path string) ([]string, error) {
 }
 
 func deb822URIs(text string) []string {
-	var out, uris []string
-	enabled := true
+	var out []string
+	for _, e := range deb822Stanzas(text) {
+		if e.enabled {
+			out = append(out, e.uris...)
+		}
+	}
+	return out
+}
+
+// aptEntry is one source apt reads: a deb822 stanza, located by its first
+// field line, or a one-line entry, located by its own line. Lines count from 1.
+type aptEntry struct {
+	line        int
+	uris        []string
+	enabled     bool
+	setsEnabled bool
+}
+
+func deb822Stanzas(text string) []aptEntry {
+	var out []aptEntry
+	cur := aptEntry{enabled: true}
 	field := ""
 	flush := func() {
-		if enabled {
-			out = append(out, uris...)
+		if cur.line > 0 {
+			out = append(out, cur)
 		}
-		uris, enabled, field = nil, true, ""
+		cur, field = aptEntry{enabled: true}, ""
 	}
-	for _, line := range strings.Split(text, "\n") {
+	for i, line := range strings.Split(text, "\n") {
 		line = strings.TrimRight(line, "\r")
 		switch {
 		case strings.TrimSpace(line) == "":
@@ -164,9 +168,13 @@ func deb822URIs(text string) []string {
 			continue
 		case strings.HasPrefix(line, "#"):
 			continue
-		case line[0] == ' ' || line[0] == '\t':
+		}
+		if cur.line == 0 {
+			cur.line = i + 1
+		}
+		if line[0] == ' ' || line[0] == '\t' {
 			if field == "uris" {
-				uris = append(uris, strings.Fields(line)...)
+				cur.uris = append(cur.uris, strings.Fields(line)...)
 			}
 			continue
 		}
@@ -178,9 +186,10 @@ func deb822URIs(text string) []string {
 		field = strings.ToLower(strings.TrimSpace(name))
 		switch field {
 		case "uris":
-			uris = append(uris, strings.Fields(value)...)
+			cur.uris = append(cur.uris, strings.Fields(value)...)
 		case "enabled":
-			enabled = !aptFalse(strings.TrimSpace(value))
+			cur.setsEnabled = true
+			cur.enabled = !aptFalse(strings.TrimSpace(value))
 		}
 	}
 	flush()
@@ -200,7 +209,15 @@ func aptFalse(v string) bool {
 // cuts each line at its first '#'.
 func oneLineURIs(text string) []string {
 	var out []string
-	for _, line := range strings.Split(text, "\n") {
+	for _, e := range oneLineEntries(text) {
+		out = append(out, e.uris...)
+	}
+	return out
+}
+
+func oneLineEntries(text string) []aptEntry {
+	var out []aptEntry
+	for i, line := range strings.Split(text, "\n") {
 		line, _, _ = strings.Cut(line, "#")
 		fields := strings.Fields(line)
 		if len(fields) < 2 || (fields[0] != "deb" && fields[0] != "deb-src") {
@@ -216,7 +233,7 @@ func oneLineURIs(text string) []string {
 			}
 		}
 		if len(rest) > 0 {
-			out = append(out, rest[0])
+			out = append(out, aptEntry{line: i + 1, uris: rest[:1], enabled: true})
 		}
 	}
 	return out

@@ -2202,9 +2202,9 @@ bodega-latest: {
 
 `GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` is encoded whole, as `%2E` and `%2E%2E`, since a client resolves a literal dot segment away before it sends the request. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N] [--quiet-ubuntu-pro] [--quiet-os-callers]] [--restore-ubuntu-pro] [--restore-os-callers] [--ntp-server HOST] [--write-apt-sources] [--write-pkg-repo] [--allow-plaintext]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N] [--quiet-ubuntu-pro] [--quiet-os-callers]] [--restore-ubuntu-pro] [--restore-os-callers] [--restore-apt-sources] [--ntp-server HOST] [--write-apt-sources] [--write-pkg-repo] [--allow-plaintext]`
 
-Without flags, `doctor` reports and changes nothing. It has four writes, `--write-credentials`, `--configure`, `--restore-ubuntu-pro` and `--restore-os-callers`, and they run one at a time.
+Without flags, `doctor` reports and changes nothing. It has five writes, `--write-credentials`, `--configure`, `--restore-ubuntu-pro`, `--restore-os-callers` and `--restore-apt-sources`, and they run one at a time.
 
 It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. A row whose check names no next step is listed there under its detail line, so every skipped check appears in the block. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
 
@@ -2304,6 +2304,24 @@ A stanza naming the base alone breaks a stock host twice. The host already runs 
 The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A profile-bound host gets the base's filtered codename and one per mirrored pocket on one `Suites:` line (see [apt under a profile](#apt-under-a-profile)). When the rebuild withdrew a pocket's codename, the plan refuses apt for the host and names the pocket, rather than write a stanza that would stop its updates. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
 `--archive <codename>` adds a vendor archive the server mirrors to `--configure apt`: the vendor's key at `/etc/apt/keyrings/bodega-<codename>.asc` and a stanza at `/etc/apt/sources.list.d/bodega-<codename>.sources` whose `Signed-By:` names it. Repeat it, or comma-separate, for several. It is refused without `--configure`, and with a `--configure` list that does not name `apt`. See [Vendor archives](#vendor-archives) for the server half and the fingerprint the key is checked against.
+
+`--configure apt` also takes the distro's own sources out of apt's path, so apt cannot fetch from a public archive beside bodega. It reads them by the rules the `apt-sources` row uses, `mirror+file` lists included, and plans a step for every enabled source naming a public archive: an `Enabled: no` line at the head of each such deb822 stanza, or its own `Enabled:` field set to `no` where it carries one, and `# ` before each such one-line entry. The files the plan writes, `bodega.sources` among them, are never touched. A source naming neither a public archive nor bodega, such as a vendor's repository, is listed and left in place. Without `--apply` the plan prints each source it would disable:
+
+```text
+disable    apt        /etc/apt/sources.list.d/ubuntu.sources:9  http://archive.ubuntu.com/ubuntu/ names archive.ubuntu.com; adds Enabled: no
+disable    apt        /etc/apt/sources.list.d/ubuntu.sources:17  http://security.ubuntu.com/ubuntu/ names security.ubuntu.com; adds Enabled: no
+keep       apt        /etc/apt/sources.list.d/docker.sources:1  https://download.docker.com/linux/ubuntu names neither a public archive nor bodega; left in place
+           (undo: bodega doctor --restore-apt-sources)
+```
+
+With `--apply`, doctor writes the plan's files, then runs `apt-get update -o Dir::Etc::SourceList=/etc/apt/sources.list.d/bodega.sources -o Dir::Etc::SourceParts=- -o APT::Get::List-Cleanup=0 -o APT::Update::Error-Mode=any`, which reads bodega's stanza alone and fails on any index it cannot fetch. Only when that succeeds does it edit the distro's sources, so a host whose bodega does not answer keeps the sources it has; a failed update disables nothing and says what to fix. Each edit is recorded in `/etc/bodega/doctor-apt-sources.json` with the lines it replaced and the lines it wrote, and the edit is refused, with the file untouched, if a source no longer reads as it did when planned. A second run finds those sources disabled and plans nothing, and the `apt-sources` row reports `OK`; a public source added to an edited file since is planned and recorded beside the earlier edit. `--restore-apt-sources` undoes the recorded edits, newest first, which returns each file byte for byte to what it was, and deletes the record. A file whose recorded lines no longer read as doctor left them, where it left them, stops the restore with the file untouched and the record kept, because doctor can no longer prove which lines it wrote; a record naming a file apt does not read sources from is refused.
+
+```bash
+sudo bodega doctor --configure apt --apply --url https://bodega.internal
+sudo bodega doctor --restore-apt-sources
+```
+
+`--restore-apt-sources` runs alone.
 
 `--configure apt` leaves the Ubuntu Pro hook alone unless asked. `--quiet-ubuntu-pro` adds the `ubuntu-pro-hook` remediation to the plan as two steps, each printed beside its undo before anything is written:
 
