@@ -660,8 +660,18 @@ const releaseUpgrades = "/etc/update-manager/release-upgrades"
 
 // oscStepPrompt names the step that sets Prompt=never. A recorded name of
 // oscStepPrompt+"="+v put back v; the bare name inserted a Prompt line the
-// file did not have, and its undo removes that line.
-const oscStepPrompt = "release-upgrade-prompt"
+// file did not have, and its undo removes that line. oscStepPromptDefault
+// prepended addedDefault to a file with no [DEFAULT] header, where
+// ConfigParser's DEFAULT section is implicit, and its undo strips that prefix.
+const (
+	oscStepPrompt        = "release-upgrade-prompt"
+	oscStepPromptDefault = oscStepPrompt + "+default"
+)
+
+// addedDefault goes before every byte of the file, so whatever came first,
+// a comment, another section or nothing, stays exactly as it was and
+// removing the prefix gives the file back.
+const addedDefault = "[DEFAULT]\nPrompt=never\n"
 
 // promptSetting is the Prompt option of the [DEFAULT] section in
 // release-upgrades, read the way ubuntu-release-upgrader's ConfigParser
@@ -704,6 +714,9 @@ func (p promptSetting) never() bool {
 func (p promptSetting) raw() string { return p.text[p.start:p.end] }
 
 func (p promptSetting) stepName() string {
+	if !p.found() && p.below < 0 {
+		return oscStepPromptDefault
+	}
 	if !p.found() {
 		return oscStepPrompt
 	}
@@ -940,9 +953,67 @@ func (h *osCallersHost) removePrompt() error {
 		func(got promptSetting) bool { return !got.found() }, "no Prompt line")
 }
 
+// insertDefault prepends addedDefault to a file whose DEFAULT section is
+// implicit, and removeDefault strips it again. The removal refuses once the
+// prefix is not the one the edit wrote, or once options were added under it,
+// because removing the header would then hand those options to no section
+// and ConfigParser would refuse the file.
+func (h *osCallersHost) insertDefault() error {
+	p, err := h.readPrompt()
+	if err != nil {
+		return err
+	}
+	if p.below >= 0 {
+		return fmt.Errorf("%s gained a [DEFAULT] section after the plan was made; re-run --quiet-os-callers", h.path(releaseUpgrades))
+	}
+	return h.writePrompt(addedDefault+p.text, promptSetting.never, "Prompt=never")
+}
+
+func (h *osCallersHost) removeDefault() error {
+	p, err := h.readPrompt()
+	if err != nil {
+		return err
+	}
+	rest, ok := strings.CutPrefix(p.text, addedDefault)
+	if !ok {
+		if !p.found() && p.below < 0 {
+			return nil // already restored
+		}
+		return fmt.Errorf("%s no longer starts with the %q --quiet-os-callers added; remove those lines by hand",
+			h.path(releaseUpgrades), addedDefault)
+	}
+	if optionBeforeHeader(rest) {
+		return fmt.Errorf("%s has options under the [DEFAULT] header --quiet-os-callers added; "+
+			"remove the header and the Prompt=never line by hand, keeping those options under a section", h.path(releaseUpgrades))
+	}
+	return h.writePrompt(rest, func(got promptSetting) bool { return !got.found() && got.below < 0 }, "no [DEFAULT] header")
+}
+
+// optionBeforeHeader is true when a line before the first section header is
+// anything but blank or a comment, which ConfigParser refuses.
+func optionBeforeHeader(text string) bool {
+	for line := range strings.Lines(text) {
+		v := strings.TrimSpace(line)
+		switch {
+		case v == "" || v[0] == '#' || v[0] == ';':
+		case v[0] == '[' && strings.LastIndexByte(v, ']') > 1:
+			return false
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // releaseUpgradeStep resolves a recorded oscStepPrompt name, which carries
 // the value the step found, so the restore needs nothing but the record.
 func (h *osCallersHost) releaseUpgradeStep(name string) (quietStep, bool) {
+	if name == oscStepPromptDefault {
+		return quietStep{
+			row:  "release-upgrade-check  set Prompt=never in " + releaseUpgrades + ", found no [DEFAULT] header and no Prompt line",
+			edit: h.insertDefault, revert: h.removeDefault,
+		}, true
+	}
 	found, hadLine := strings.CutPrefix(name, oscStepPrompt+"=")
 	if !hadLine && name != oscStepPrompt {
 		return quietStep{}, false

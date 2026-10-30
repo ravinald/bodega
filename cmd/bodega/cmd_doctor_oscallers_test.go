@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -512,6 +515,7 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 	t.Cleanup(func() { doctorExit = saved })
 	// quieted is the file --apply leaves, each checked against Python's
 	// configparser to read Prompt as never and every other option as before.
+	const implicit = "found no [DEFAULT] header and no Prompt line"
 	cases := []struct {
 		name, body, step, found, quieted string
 	}{
@@ -534,6 +538,11 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 		{"no Prompt line, header unterminated", "[DEFAULT]", "release-upgrade-prompt", "found no Prompt line", "[DEFAULT]\nPrompt=never"},
 		{"no Prompt line, indented options, header with trailing text", "[DEFAULT] # c\n\n  Other=1\n   cont\n",
 			"release-upgrade-prompt", "found no Prompt line", "[DEFAULT] # c\n  Prompt=never\n\n  Other=1\n   cont\n"},
+		{"empty", "", oscStepPromptDefault, implicit, addedDefault},
+		{"comment only", "# release upgrade policy\n", oscStepPromptDefault, implicit, addedDefault + "# release upgrade policy\n"},
+		{"comment only, no final newline", "# release upgrade policy", oscStepPromptDefault, implicit, addedDefault + "# release upgrade policy"},
+		{"another section only", "[other]\nvalue=1\n", oscStepPromptDefault, implicit, addedDefault + "[other]\nvalue=1\n"},
+		{"another section only, no final newline", "\n[other]\nvalue=1", oscStepPromptDefault, implicit, addedDefault + "\n[other]\nvalue=1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -559,6 +568,12 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 			p, err := h.readPrompt()
 			if err != nil || !p.never() {
 				t.Fatalf("after --apply Prompt = %q (%v), want never", p.value, err)
+			}
+			if before, ok := configParserRead(t, tc.body); ok {
+				after, _ := configParserRead(t, tc.quieted)
+				if after.Prompt == nil || *after.Prompt != "never" || !reflect.DeepEqual(after.Others, before.Others) {
+					t.Errorf("configparser reads %q as Prompt %q, options %v; want never and %v", tc.quieted, after.prompt(), after.Others, before.Others)
+				}
 			}
 			rec, err := os.ReadFile(h.record)
 			if err != nil || !strings.Contains(string(rec), `"`+tc.step+`"`) {
@@ -618,6 +633,7 @@ func TestReleaseUpgradeStepNames(t *testing.T) {
 	h := &osCallersHost{root: t.TempDir()}
 	for name, ok := range map[string]bool{
 		"release-upgrade-prompt": true, "release-upgrade-prompt=lts": true, "release-upgrade-prompt=": true,
+		"release-upgrade-prompt+default": true, "release-upgrade-prompt+x": false,
 		"release-upgrade-promptx": false, "motd": false,
 	} {
 		if _, got := h.releaseUpgradeStep(name); got != ok {
@@ -653,6 +669,79 @@ func TestParsePromptMatchesConfigParser(t *testing.T) {
 			p := parsePrompt(tc.text)
 			if p.found() != tc.found || p.value != tc.want {
 				t.Errorf("parsePrompt(%q) = found %v, %q; configparser reads found %v, %q", tc.text, p.found(), p.value, tc.found, tc.want)
+			}
+		})
+	}
+}
+
+type configParserView struct {
+	Prompt *string                      `json:"prompt"`
+	Others map[string]map[string]string `json:"others"`
+}
+
+func (v configParserView) prompt() string {
+	if v.Prompt == nil {
+		return "(get raises)"
+	}
+	return *v.Prompt
+}
+
+const configParserScript = `import configparser, json, sys
+cp = configparser.ConfigParser()
+cp.read_string(sys.stdin.read())
+try:
+    prompt = cp.get("DEFAULT", "Prompt", fallback="normal")
+except configparser.Error:
+    prompt = None
+others = {"DEFAULT": {k: v for k, v in cp.defaults().items() if k != "prompt"}}
+for s in cp.sections():
+    others[s] = dict(cp._sections[s])
+json.dump({"prompt": prompt, "others": others}, sys.stdout)
+`
+
+// configParserRead is what Python's configparser, the library
+// ubuntu-release-upgrader reads the file with, makes of text: the Prompt
+// get returns, nil when get raises, and every other option raw. ok is false
+// where python3 is not installed.
+func configParserRead(t *testing.T, text string) (configParserView, bool) {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Log("no python3, so configparser does not check this case")
+		return configParserView{}, false
+	}
+	cmd := exec.Command(py, "-I", "-c", configParserScript)
+	cmd.Stdin = strings.NewReader(text)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("configparser refuses %q: %v", text, err)
+	}
+	var v configParserView
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("configparser oracle printed %q: %v", out, err)
+	}
+	return v, true
+}
+
+// The undo of an added [DEFAULT] header leaves the file alone once anybody
+// put options under it, since stripping the header would leave them in no
+// section, and is a no-op once the header is already gone.
+func TestRemoveDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{"options added under the header", addedDefault + "Other=1\n[x]\n", "has options under the [DEFAULT] header"},
+		{"prefix edited", "[DEFAULT]\nPrompt=lts\n", "no longer starts with"},
+		{"already restored", "[x]\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := stubOSCallers(t, map[string]string{releaseUpgrades: tc.body}, &fakeOS{})
+			err := h.removeDefault()
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Errorf("removeDefault = %v, want %q", err, tc.want)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Errorf("removeDefault wrote %q", b)
 			}
 		})
 	}
