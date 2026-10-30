@@ -309,6 +309,12 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			})
 			return
 		}
+		// Ahead of the rate limit: a 503 carrying Retry-After is still the
+		// upstream failing, and the record is the better answer for a path
+		// it had said it lacks.
+		if s.answerRecordedNotFound(w, r, store, regType, s3Key, err) {
+			return
+		}
 		var limited *upstreamRateLimited
 		if errors.As(err, &limited) {
 			if !sinkUpstreamErr(r.Context(), err) {
@@ -334,9 +340,6 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			}
 			s.recordNotFound(ctx, store, regType, s3Key)
 			http.NotFound(w, r)
-			return
-		}
-		if s.answerRecordedNotFound(w, r, store, regType, s3Key, err) {
 			return
 		}
 		if !sinkUpstreamErr(r.Context(), err) {
@@ -377,6 +380,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		fetched = s.fetchUpstreamInOrder(ctx, upstreamURL, order, regType)
 	}
 	up, spool, err := fetched.up, fetched.spool, fetched.err
+	if fetched.answered && store != nil {
+		s.clearNotFound(ctx, store, s3Key)
+	}
 	if err != nil {
 		if reason := spoolDenialReason(err); reason != "" {
 			s.recordSpoolRefusal(r, regType, discoveryPkgName, s3Key, reason, err)
@@ -427,7 +433,6 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// never looks at.
 	if store != nil {
 		s.fillCache(ctx, store, s3Key, spool.path(), up.url, spool.sha256, spool.size)
-		s.clearNotFound(ctx, store, s3Key)
 	}
 
 	// After the store write and before the body: by here the fetch has been
@@ -472,10 +477,15 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 // upstreamFetch is an upstream body read to the spool, or why it was not. The
 // body is closed by the time it is returned; up carries the URL that answered
 // and the content type.
+//
+// answered is set when an upstream answered 2xx, even where err is set: a
+// status bodega does not serve, or a body that broke off. Either way the
+// upstream has the path, so a recorded 404 for it no longer holds.
 type upstreamFetch struct {
-	up    *upstreamStream
-	spool *spooledUpstream
-	err   error
+	up       *upstreamStream
+	spool    *spooledUpstream
+	err      error
+	answered bool
 }
 
 // fetchUpstream opens upstreamURL and spools its body. A spool refusal comes
@@ -489,14 +499,16 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 	}
 	up, err := open(ctx, upstreamURL)
 	if err != nil {
-		return upstreamFetch{err: err}
+		var status *upstreamStatusError
+		answered := errors.As(err, &status) && status.status >= 200 && status.status < 300
+		return upstreamFetch{err: err, answered: answered}
 	}
 	defer up.body.Close()
 	spool, err := s.spoolUpstream(up)
 	if err != nil {
-		return upstreamFetch{err: err}
+		return upstreamFetch{err: err, answered: true}
 	}
-	return upstreamFetch{up: up, spool: spool}
+	return upstreamFetch{up: up, spool: spool, answered: true}
 }
 
 // upstreamOpener opens one upstream URL in place of openUpstream, for a
@@ -521,21 +533,30 @@ func withUpstreamOpener(ctx context.Context, open upstreamOpener) context.Contex
 // failure that was not a 404, because "one repository is down" is the
 // answer that tells the operator something when the rest merely lack the
 // file; and failing that, the last 404.
+//
+// The result's answered is set when any upstream walked answered 2xx, not
+// only the one returned.
 func (s *Server) fetchUpstreamInOrder(ctx context.Context, first string, order *upstreamOrder, regType string) upstreamFetch {
 	fetched := s.fetchUpstream(ctx, first, regType)
 	if order == nil {
 		return fetched
 	}
+	answered := false
+	result := func(f upstreamFetch) upstreamFetch {
+		f.answered = f.answered || answered
+		return f
+	}
 	var failed *upstreamFetch
 	for i := 0; ; i++ {
+		answered = answered || fetched.answered
 		if fetched.err == nil {
 			if order.served != nil {
 				order.served(i)
 			}
-			return fetched
+			return result(fetched)
 		}
 		if spoolDenialReason(fetched.err) != "" || ctx.Err() != nil {
-			return fetched
+			return result(fetched)
 		}
 		if failed == nil && !errors.Is(fetched.err, errUpstreamNotFound) {
 			f := fetched
@@ -549,9 +570,9 @@ func (s *Server) fetchUpstreamInOrder(ctx context.Context, first string, order *
 		fetched = s.fetchUpstream(ctx, next, regType)
 	}
 	if failed != nil {
-		return *failed
+		return result(*failed)
 	}
-	return fetched
+	return result(fetched)
 }
 
 // claimStaleRefresh takes the one refresh slot for s3Key. It reports false
@@ -570,6 +591,9 @@ func (s *Server) claimStaleRefresh(s3Key string) (func(), bool) {
 func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstreamFetch, store storage.ObjectStore, s3Key string, release func()) {
 	defer release()
 	res := <-results
+	if res.answered {
+		s.clearNotFound(ctx, store, s3Key)
+	}
 	if res.err != nil {
 		s.logFor(ctx).Error("background refresh of a stale cached copy failed, the stale copy stays", "key", s3Key, "error", res.err)
 		return
@@ -613,13 +637,13 @@ func (s *Server) recordNotFound(ctx context.Context, store storage.ObjectStore, 
 		err = store.Put(context.WithoutCancel(ctx), notFoundPrefix+s3Key, b)
 	}
 	if err != nil {
-		s.logger.Warn("could not record the upstream's 404, an outage will answer 502 for this path", "key", s3Key, "error", err)
+		s.logFor(ctx).Warn("could not record the upstream's 404, an outage will answer 502 for this path", "key", s3Key, "error", err)
 	}
 }
 
 func (s *Server) clearNotFound(ctx context.Context, store storage.ObjectStore, s3Key string) {
 	if err := store.Delete(context.WithoutCancel(ctx), notFoundPrefix+s3Key); err != nil {
-		s.logger.Warn("could not remove the record of an earlier upstream 404", "key", s3Key, "error", err)
+		s.logFor(ctx).Warn("could not remove the record of an earlier upstream 404", "key", s3Key, "error", err)
 	}
 }
 
@@ -644,25 +668,35 @@ func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, 
 	if age < 0 || age >= ttl {
 		return false
 	}
-	s.logger.Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
+	s.logFor(r.Context()).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
 	http.NotFound(w, r)
 	return true
 }
 
 // upstreamUnreachable reports a fetch that got no answer from the upstream: a
-// connection error, a timeout, or a 5xx. A 403, a refused redirect or a rate
-// limit is the upstream answering, and none of them may turn into a 404.
+// connection error, a failed DNS lookup, a timeout, or a 5xx, a 503 carrying
+// Retry-After included. A 403, a 429, a redirect or URL the guard refused is
+// the upstream answering or bodega's policy, and none of them may turn into a
+// 404.
+//
+// url.Error is unwrapped by hand because it satisfies net.Error itself, so a
+// redirect the guard refused would otherwise read as a network failure. Outside
+// it, the only net.Error a fetch returns is the guard's own DNS lookup.
 func upstreamUnreachable(err error) bool {
 	var status *upstreamStatusError
 	if errors.As(err, &status) {
 		return status.status >= 500
 	}
+	var limited *upstreamRateLimited
+	if errors.As(err, &limited) {
+		return limited.status >= 500
+	}
+	var ne net.Error
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		var ne net.Error
 		return ue.Timeout() || errors.As(ue.Err, &ne)
 	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return errors.As(err, &ne) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // cacheEnabled returns true if the proxy/cache feature is active.
