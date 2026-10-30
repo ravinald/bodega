@@ -395,6 +395,29 @@ else
 			[ -e "$store/$p" ] && echo present || echo absent
 		done | tr '\n' ' ' | sed 's/ $//')"
 	t_ok "ref_clear_caches exits 0 when nothing matches" 0 "$(clear_caches)"
+
+	# Suite 65's restore clears the filtered pypi wheel inline, so its line is
+	# lifted from the suite's text the same way and run against the same store.
+	touch "$store/pypi/wheels/iniconfig-2.0.0-py3-none-any.whl"
+	: >"$work/clear/rm.args"
+	filter_line="$(awk '/e2e_on server .*\/var\/lib\/bodega\/pypi\/wheels\/\$filter_pypi/ {print}' "$E2E_DIR/suites/65-proxy.sh")"
+	t_ok "suite 65 has one wheel-clearing line" 1 "$(printf '%s\n' "$filter_line" | awk 'NF {n++} END {print n + 0}')"
+	(
+		# shellcheck disable=SC2329  # invoked by the eval'd suite line
+		e2e_on() {
+			shift
+			PATH="$work/clearbin:$PATH" sh -c "$*"
+		}
+		# shellcheck disable=SC2034  # read by the eval'd suite line
+		filter_pypi=iniconfig
+		chmod 000 "$store"
+		eval "$(printf '%s\n' "$filter_line" | sed -e "s|/var/lib/bodega|$store|g" -e "s|/tmp/|$work/clear/|g")"
+		chmod 755 "$store"
+	)
+	t_ok "suite 65 hands rm no literal glob" none \
+		"$(awk '/\*/ {b = b $0 " "} END {print (b ? b : "none")}' "$work/clear/rm.args")"
+	t_ok "suite 65 removes the filtered iniconfig wheel" absent \
+		"$([ -e "$store/pypi/wheels/iniconfig-2.0.0-py3-none-any.whl" ] && echo present || echo absent)"
 fi
 
 # ---- suite 47's pkg-configuration helper ----------------------------------
