@@ -1370,3 +1370,176 @@ func TestRpmProfileChecksumRefusalIsLoggedOnce(t *testing.T) {
 		}
 	}
 }
+
+// rpmFailingStore fails the reads and writes its predicates match, after gate
+// closes when gate is set, so a test can hold a failure past a build's
+// deadline.
+type rpmFailingStore struct {
+	storage.ObjectStore
+	failRead  func(key string) bool
+	failWrite func(key string) bool
+	gate      <-chan struct{}
+}
+
+var errRpmTestStore = errors.New("test: the store refused")
+
+func (s rpmFailingStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	if s.failRead != nil && s.failRead(key) {
+		if s.gate != nil {
+			<-s.gate
+		}
+		return nil, errRpmTestStore
+	}
+	return s.ObjectStore.GetStream(ctx, key)
+}
+
+func (s rpmFailingStore) PutFile(ctx context.Context, localPath, key string) error {
+	if s.failWrite != nil && s.failWrite(key) {
+		return errRpmTestStore
+	}
+	return s.ObjectStore.PutFile(ctx, localPath, key)
+}
+
+// rpmFailureRecords is every record in logs at warning or above.
+func rpmFailureRecords(logs string) []string {
+	var out []string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "level=WARN") || strings.Contains(line, "level=ERROR") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// coldBuild clears f's recent builds and sends logs to a buffer, so the next
+// rpmProfileFiles builds and its records can be counted.
+func (f *rpmBuildFixture) coldBuild(t *testing.T) (*entitle.Profile, *syncBuffer) {
+	t.Helper()
+	sl, p := f.slot(t)
+	sl.mu.Lock()
+	sl.recent = nil
+	sl.mu.Unlock()
+	logs := &syncBuffer{}
+	f.s.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return p, logs
+}
+
+func (f *rpmBuildFixture) build(p *entitle.Profile) (*rpmProfileBuild, error) {
+	data, _ := parseRpmRepomd(f.upstream)
+	return f.s.rpmProfileFiles(httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), p, data)
+}
+
+// A cached upstream file the store cannot read fails the build with one
+// record, the build's, carrying the store's error; the proxy route the read
+// went through writes none of its own, and the next build starts over.
+func TestRpmProfileBuildOwnsACachedReadFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	good := f.s.stores
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: good, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+
+	if _, err := f.build(p); !errors.Is(err, errRpmTestStore) {
+		t.Fatalf("build error = %v, want one carrying the store's error", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	recs := rpmFailureRecords(logs.String())
+	if len(recs) != 1 || !strings.Contains(recs[0], "rpm metadata could not be filtered for a profile") ||
+		!strings.Contains(recs[0], errRpmTestStore.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the store's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+
+	f.s.stores = good
+	before := f.s.rpmProfileBuilds.built
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("the build after a failed one: %v", err)
+	}
+	if got := f.s.rpmProfileBuilds.built - before; got != 1 {
+		t.Errorf("the build after a failed one counted %d builds, want 1", got)
+	}
+}
+
+// A cached read that fails after its build was retired at the deadline writes
+// nothing: the build's one record is already written, and the log is no
+// longer the abandoned work's to write to.
+func TestRpmProfileBuildRetiredReadFailureIsSilent(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	gate := make(chan struct{})
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }, gate: gate}}
+	f.s.rpmProfileBuilds.timeout = 100 * time.Millisecond
+
+	// The supervisor writes its record before it closes the job, and a
+	// deadline error reaches the caller only through that close.
+	if _, err := f.build(p); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("build error = %v, want the build's deadline", err)
+	}
+	before := logs.String()
+	close(gate)
+	f.s.rpmProfileBuilds.running.Wait()
+	if after := logs.String(); after != before {
+		t.Errorf("the retired build's read wrote to the log after its failure was recorded:\n%s", strings.TrimPrefix(after, before))
+	}
+	if recs := rpmFailureRecords(before); len(recs) != 1 {
+		t.Errorf("want the build's one record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A read that succeeds around a failure, here the cache write the proxy
+// treats as best effort, still gets one record, the build's, naming the
+// file and the store's error, and the build is kept.
+func TestRpmProfileBuildRecordsAFailureItSucceededAround(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	upstream := path.Base(f.filelistsHref(t))
+	p, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failWrite: func(k string) bool { return strings.HasSuffix(k, upstream) }}}
+
+	if b, err := f.build(p); err != nil || b == nil {
+		t.Fatalf("a build whose cache write failed: %v", err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	// The pin advisory is a note every cold metadata fill writes, at warning
+	// level, and not a failure of the read.
+	var recs []string
+	for _, rec := range rpmFailureRecords(logs.String()) {
+		if !strings.Contains(rec, "pinned an object with no admission decision") {
+			recs = append(recs, rec)
+		}
+	}
+	if len(recs) != 1 || !strings.Contains(recs[0], "succeeded around a failure") ||
+		!strings.Contains(recs[0], errRpmTestStore.Error()) || !strings.Contains(recs[0], "file=filelists") {
+		t.Fatalf("want one record, the build's, naming the file and the store's error; got:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+// A metadata read no build owns logs its failure where it happens, as every
+// other proxied read does.
+func TestRpmMetadataReadOutsideABuildLogsItsOwnFailure(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	cached := path.Base(f.filelistsHref(t))
+	_, logs := f.coldBuild(t)
+	f.s.stores = rpmOneStore{Resolver: f.s.stores, store: rpmFailingStore{ObjectStore: f.s.typeStore(manifest.TypeRpm),
+		failRead: func(k string) bool { return strings.HasSuffix(k, cached) }}}
+	data, _ := parseRpmRepomd(f.upstream)
+	var entry rpmRepomdData
+	for _, d := range data {
+		if d.Type == "filelists" {
+			entry = d
+		}
+	}
+	w := httptest.NewRecorder()
+	f.s.serveRpmMetadataEntry(w, httptest.NewRequest(http.MethodGet, "/", nil), f.tree(), entry)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if recs := rpmFailureRecords(logs.String()); len(recs) != 1 || !strings.Contains(recs[0], "object proxy error") {
+		t.Errorf("want the proxy's own record; got:\n%s", strings.Join(recs, "\n"))
+	}
+}

@@ -2345,7 +2345,7 @@ func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storag
 	}
 	result, err := store.GetStream(r.Context(), s3Key)
 	if err != nil {
-		s.logger.Error("object proxy error", "key", s3Key, "error", err)
+		s.logFor(r.Context()).Error("object proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return nil, false
 	}

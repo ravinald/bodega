@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"slices"
@@ -393,7 +394,8 @@ func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpm
 	// fetch's records) and drops its cancellation and its budget.
 	ctx := context.WithValue(context.WithoutCancel(r.Context()), rpmBudgetKey{}, nil)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	br := r.Clone(ctx)
+	owner := &rpmBuildOwner{}
+	br := r.Clone(withRpmBuildOwner(ctx, owner))
 	// The job is retired by this goroutine alone, once, when the work returns
 	// or the deadline passes, whichever is first. A store may ignore its
 	// context, so a write or cached read can outlast the deadline; the work is
@@ -426,15 +428,19 @@ func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpm
 			res.err = fmt.Errorf("not finished within the build timeout of %s, so the store or upstream operation it was in is abandoned: %w", timeout, ctx.Err())
 		}
 		if res.err != nil {
-			s.logger.Error("rpm metadata could not be filtered for a profile",
-				"profile", p.Name(), "repository", t.id(), "file", file.Load(), "error", res.err)
+			owner.retire(func() {
+				s.logger.Error("rpm metadata could not be filtered for a profile",
+					"profile", p.Name(), "repository", t.id(), "file", file.Load(), "error", res.err)
+			})
 			res = result{err: &rpmProfileBuildError{file: file.Load().(string), err: res.err}}
 		} else {
 			s.rpmProfileBuilds.mu.Lock()
 			s.rpmProfileBuilds.built++
 			s.rpmProfileBuilds.mu.Unlock()
-			s.logger.Info("filtered an rpm repository's metadata for a profile",
-				"profile", p.Name(), "repository", t.id(), "primary", entries["primary"].Checksum.Value, "kept", res.b.kept)
+			owner.retire(func() {
+				s.logger.Info("filtered an rpm repository's metadata for a profile",
+					"profile", p.Name(), "repository", t.id(), "primary", entries["primary"].Checksum.Value, "kept", res.b.kept)
+			})
 		}
 		sl.mu.Lock()
 		if sl.running[key] == job {
@@ -478,13 +484,23 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 		if !rpmMetadataHrefServed(e.Location.Href) {
 			return nil, fmt.Errorf("repomd.xml places %s at %q, outside repodata/, which bodega does not serve", e.Type, e.Location.Href)
 		}
-		// The proxy hands an upstream failure to the sink instead of logging
-		// it, so the one record of it is this build's, with the profile and
-		// file beside the cause.
-		sink := &upstreamErrSink{}
+		// Every route the read passes through hands its failures to the sink
+		// instead of logging them, so the one record of a failure is this
+		// build's, with the profile and file beside the cause.
+		sink := &upstreamErrSink{owner: rpmBuildOwnerFrom(ctx)}
 		raw, err := s.rpmRead(r.WithContext(withUpstreamErrSink(ctx, sink)), t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
-		if cause := sink.get(); err != nil && cause != nil {
-			return nil, fmt.Errorf("reading %s %s from the upstream: %w", e.Type, e.Location.Href, cause)
+		cause := sink.get()
+		switch {
+		case err != nil && cause != nil:
+			return nil, fmt.Errorf("reading %s %s: %w", e.Type, e.Location.Href, cause)
+		case cause != nil:
+			// The read succeeded around a failure, such as a cache write the
+			// proxy treats as best effort; still worth a record, and still
+			// the build's to write.
+			sink.owner.emit(func() {
+				s.logger.Warn("an rpm metadata read for a profile's build succeeded around a failure",
+					"profile", p.Name(), "repository", t.id(), "file", e.Type, "error", cause)
+			})
 		}
 		return raw, err
 	}
@@ -529,12 +545,15 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 	return b, nil
 }
 
-// upstreamErrSink takes the error an upstream fetch failed with, in place of
-// the proxy's own log record of it, for a read whose owner logs the failure
-// with what the read was for.
+// upstreamErrSink collects the failures one read meets, in place of the log
+// records the routes it passes through would write, for a read whose owner
+// logs its outcome with what the read was for. A route either hands its error
+// to the sink directly (sinkUpstreamErr, which keeps the error's type) or logs
+// through logFor, which turns a warning or worse into a sunk failure.
 type upstreamErrSink struct {
-	mu  sync.Mutex
-	err error
+	mu    sync.Mutex
+	errs  []error
+	owner *rpmBuildOwner
 }
 
 type upstreamErrSinkKey struct{}
@@ -562,15 +581,162 @@ func sinkUpstreamErr(ctx context.Context, err error) bool {
 func (k *upstreamErrSink) set(err error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if k.err == nil {
-		k.err = err
-	}
+	k.errs = append(k.errs, err)
 }
 
+// get is every failure set, in the order met, or nil when there was none.
 func (k *upstreamErrSink) get() error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return k.err
+	switch len(k.errs) {
+	case 0:
+		return nil
+	case 1:
+		return k.errs[0]
+	}
+	return rpmReadFailures(slices.Clone(k.errs))
+}
+
+// rpmReadFailures is more than one failure met by one read, such as a store
+// read that failed before the upstream fetch that replaced it failed too.
+type rpmReadFailures []error
+
+func (e rpmReadFailures) Error() string {
+	parts := make([]string, len(e))
+	for i, err := range e {
+		parts[i] = err.Error()
+	}
+	return strings.Join(parts, "; then ")
+}
+
+func (e rpmReadFailures) Unwrap() []error { return e }
+
+// logFor is the logger for work done under ctx. Outside a sinked read it is
+// s.logger. Inside one, a record at warning or above is a failure of the read
+// and goes to the sink instead of the log, and the rest reach the log only
+// while the read's owner still holds it. Every route a build-owned read can
+// pass through logs through this, so that a failure has one record, the
+// owner's, however deep in the proxy it happened, and none once the build
+// that started the read has been retired.
+func (s *Server) logFor(ctx context.Context) *slog.Logger {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return s.logger
+	}
+	return slog.New(&sinkHandler{next: s.logger.Handler(), sink: sink})
+}
+
+// noteFor is logFor for a warning that records a decision rather than a
+// failure, such as a fill admitted with a policy warning: it reaches the log
+// at its own level while the read's owner holds it, and is never sunk.
+func (s *Server) noteFor(ctx context.Context) *slog.Logger {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return s.logger
+	}
+	return slog.New(&sinkHandler{next: s.logger.Handler(), sink: sink, notes: true})
+}
+
+// sinkHandler is logFor's and noteFor's handler inside a sinked read.
+type sinkHandler struct {
+	next  slog.Handler
+	sink  *upstreamErrSink
+	attrs []slog.Attr
+	notes bool
+}
+
+func (h *sinkHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return (!h.notes && l >= slog.LevelWarn) || h.next.Enabled(ctx, l)
+}
+
+func (h *sinkHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if !h.notes && rec.Level >= slog.LevelWarn {
+		h.sink.set(newLoggedFailure(rec, h.attrs))
+		return nil
+	}
+	var err error
+	h.sink.owner.emit(func() { err = h.next.Handle(ctx, rec) })
+	return err
+}
+
+func (h *sinkHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return &sinkHandler{next: h.next.WithAttrs(as), sink: h.sink, attrs: append(slices.Clone(h.attrs), as...), notes: h.notes}
+}
+
+func (h *sinkHandler) WithGroup(name string) slog.Handler {
+	return &sinkHandler{next: h.next.WithGroup(name), sink: h.sink, attrs: h.attrs, notes: h.notes}
+}
+
+// loggedFailure is a record a route would have logged, carried as an error:
+// its message and attributes, unwrapping to the error attribute it named.
+type loggedFailure struct {
+	text string
+	err  error
+}
+
+func newLoggedFailure(rec slog.Record, attrs []slog.Attr) *loggedFailure {
+	var b strings.Builder
+	f := &loggedFailure{}
+	b.WriteString(rec.Message)
+	add := func(a slog.Attr) bool {
+		if err, ok := a.Value.Any().(error); ok && f.err == nil {
+			f.err = err
+		}
+		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
+		return true
+	}
+	for _, a := range attrs {
+		add(a)
+	}
+	rec.Attrs(add)
+	f.text = b.String()
+	return f
+}
+
+func (f *loggedFailure) Error() string { return f.text }
+
+func (f *loggedFailure) Unwrap() error { return f.err }
+
+// rpmBuildOwner is a build's claim on the log. The build's supervisor retires
+// it once, writing the build's one outcome record as it does; anything the
+// build's work would log afterwards, having outlived the deadline, is dropped.
+// A nil owner holds the log forever, for a sinked read no build owns.
+type rpmBuildOwner struct {
+	mu      sync.Mutex
+	retired bool
+}
+
+type rpmBuildOwnerKey struct{}
+
+func withRpmBuildOwner(ctx context.Context, o *rpmBuildOwner) context.Context {
+	return context.WithValue(ctx, rpmBuildOwnerKey{}, o)
+}
+
+func rpmBuildOwnerFrom(ctx context.Context) *rpmBuildOwner {
+	o, _ := ctx.Value(rpmBuildOwnerKey{}).(*rpmBuildOwner)
+	return o
+}
+
+// emit runs log unless o is retired. The lock is held across it, so a record
+// is either written before retire's or not at all.
+func (o *rpmBuildOwner) emit(log func()) {
+	if o == nil {
+		log()
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.retired {
+		log()
+	}
+}
+
+// retire writes the build's outcome with log and ends the build's claim.
+func (o *rpmBuildOwner) retire(log func()) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.retired = true
+	log()
 }
 
 // rpmTimestamp is the timestamp an upstream entry gives its file. A filtered

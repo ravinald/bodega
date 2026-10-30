@@ -817,7 +817,7 @@ func (s *Server) refuseRpmChecksumType(w http.ResponseWriter, r *http.Request, t
 	f.reason = fmt.Sprintf("%s gives %s a %q checksum, and bodega verifies only well-formed SHA-2 checksums before it caches a file.", t.id(), href, typ)
 	f.next = "an operator points this repository at a mirror that publishes SHA-256 metadata, which every current RHEL-family repository does."
 	if !sinkUpstreamErr(r.Context(), &resolveRefusal{f: f}) {
-		s.logger.Warn("rpm checksum type refused", "repository", t.id(), "href", href, "type", typ, "incident", f.incident)
+		s.logFor(r.Context()).Warn("rpm checksum type refused", "repository", t.id(), "href", href, "type", typ, "incident", f.incident)
 	}
 	f.write(w, r)
 }

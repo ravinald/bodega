@@ -209,12 +209,12 @@ func (s *Server) emitAttestation(ctx context.Context, store storage.ObjectStore,
 	}
 	ek, err := s.attest.Emit(ctx, store, p)
 	if err != nil {
-		s.logger.Error("attestation not signed", "type", p.Type, "package", p.Name, "version", p.Version,
+		s.logFor(ctx).Error("attestation not signed", "type", p.Type, "package", p.Name, "version", p.Version,
 			"key", p.ObjectKey, "error", err)
 		return
 	}
 	if ek != "" {
-		s.logger.Debug("attestation signed", "key", p.ObjectKey, "envelope", ek)
+		s.logFor(ctx).Debug("attestation signed", "key", p.ObjectKey, "envelope", ek)
 	}
 }
 

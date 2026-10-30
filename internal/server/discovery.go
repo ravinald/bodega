@@ -303,7 +303,7 @@ func (s *Server) recordCacheHitDiscovery(ctx context.Context, r *http.Request, r
 		// that cannot answer is not a reason to fail it, only a reason to
 		// leave the observation unrecorded rather than record it as something
 		// it is not.
-		s.logger.Debug("cache hit not recorded: policy verdict unavailable",
+		s.logFor(ctx).Debug("cache hit not recorded: policy verdict unavailable",
 			"type", regType, "key", s3Key, "error", err)
 		return
 	}
