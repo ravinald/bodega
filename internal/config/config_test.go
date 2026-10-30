@@ -180,6 +180,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		},
 		"storage_by_type":  map[string]string{"apt": "bulk"},
 		"storage_by_group": map[string]string{"mirror-set": "bulk"},
+		// Load parses each value as a duration.
+		"not_found_ttl": map[string]string{"maven": "720h"},
 		// git_upstreams and binary_upstreams keys and values are both
 		// validated, and an empty mode is defaulted by Load, so the round trip
 		// only measures Save when the filled value is already the shape Load

@@ -311,10 +311,17 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	if grace <= 0 {
 		grace, _ = time.ParseDuration(config.DefaultStaleGrace)
 	}
+	notFound := make(map[string]time.Duration, len(cfg.NotFoundTTL))
+	for typ, v := range cfg.NotFoundTTL {
+		if d, err := time.ParseDuration(v); err == nil {
+			notFound[typ] = d
+		}
+	}
 	s.cache = CacheConfig{
 		Enabled:     cfg.ProxyCacheEnabled,
 		MetadataTTL: ttl,
 		StaleGrace:  grace,
+		NotFoundTTL: notFound,
 	}
 	setPrivateUpstreamHosts(cfg.PrivateUpstreamHosts)
 	if d, _ := time.ParseDuration(cfg.UpstreamConnectTimeout); d > 0 {

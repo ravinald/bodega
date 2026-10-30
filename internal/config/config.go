@@ -58,6 +58,9 @@ const (
 	// DefaultStaleGrace is how long a request holding a stale cached copy waits
 	// for the upstream before taking that copy, inside every client's timeout.
 	DefaultStaleGrace = "3s"
+	// DefaultNotFoundTTL is how long an upstream's 404 for a path keeps
+	// answering 404 for it while the upstream cannot be reached.
+	DefaultNotFoundTTL = "168h"
 
 	// DefaultSpoolMaxArtifactBytes is the largest single upstream artifact the
 	// proxy will copy to disk. 8 GiB is roughly twice the biggest thing a real
@@ -252,6 +255,11 @@ type Config struct {
 	// the next write for that type goes. It never decides where an artifact
 	// already written lives: that is the name recorded on the version entry.
 	StorageByType map[string]string `json:"storage_by_type,omitempty"`
+
+	// NotFoundTTL maps a package type to how long a 404 from its upstreams
+	// still answers 404 for that path while they cannot be reached. A type
+	// not named takes DefaultNotFoundTTL; "0s" turns the answer off.
+	NotFoundTTL map[string]string `json:"not_found_ttl,omitempty"`
 
 	// StorageByGroup maps a storage *group* name to a backend name. A package
 	// joins a group with storage_groups in its manifest, and the group rule
@@ -1584,6 +1592,11 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	} {
 		if v, err := time.ParseDuration(d.val); err != nil || v <= 0 {
 			return nil, fmt.Errorf("invalid %s %q (want a positive Go duration, e.g. %q)", d.key, d.val, d.example)
+		}
+	}
+	for typ, val := range cfg.NotFoundTTL {
+		if v, err := time.ParseDuration(val); err != nil || v < 0 {
+			return nil, fmt.Errorf("invalid not_found_ttl[%q] %q (want a Go duration, e.g. %q, or \"0s\" to answer 502 as before)", typ, val, DefaultNotFoundTTL)
 		}
 	}
 	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")

@@ -1243,7 +1243,7 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	default:
 		drainClose(resp)
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
+		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
 	}
 }
 
