@@ -153,12 +153,33 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 		serve(w, r)
 		return
 	}
+	p := s.profileFor(r)
+	governed := rpmFilters(p)
+	if governed {
+		r = withRpmBudget(r)
+	}
 	full := r.Clone(r.Context())
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		full.Header.Del(h)
 	}
 	cw := &capturedResponse{header: http.Header{}}
-	serve(cw, full)
+	if governed {
+		// The refresh shares the budget with the build the answer waits on
+		// next. A read given up on keeps running into its own response and
+		// served-object record, which nothing reads after.
+		full = full.WithContext(context.WithValue(full.Context(), servedObjectCtxKey{}, &servedObject{index: true}))
+		var ok bool
+		if cw, ok = rpmBounded(rpmBudgetEnd(r), func() *capturedResponse {
+			own := &capturedResponse{header: http.Header{}}
+			serve(own, full)
+			return own
+		}); !ok {
+			s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+			return
+		}
+	} else {
+		serve(cw, full)
+	}
 	if cw.tooBig {
 		s.logger.Error("rpm repomd.xml exceeds the response buffer", "repository", t.id(), "limit", maxUpstreamBody)
 		http.Error(w, fmt.Sprintf("repomd.xml of %s exceeds bodega's %d-byte buffer; the upstream is not publishing a repository index.", t.id(), maxUpstreamBody), http.StatusBadGateway)
@@ -174,8 +195,7 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 	body := cw.body.Bytes()
 	if status == http.StatusOK {
 		served := body
-		p := s.profileFor(r)
-		if rpmFilters(p) {
+		if governed {
 			filtered, err := s.rpmProfileRepomd(r, t, p, body)
 			if err != nil {
 				s.writeRpmProfileError(w, t, p, err)
@@ -212,7 +232,25 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 	doc, ok := s.rpmServed.held(rpmViewID(t, p), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		var err error
-		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
+		if rpmFilters(p) {
+			r = withRpmBudget(r)
+			type read struct {
+				doc []byte
+				err error
+			}
+			got, ok := rpmBounded(rpmBudgetEnd(r), func() read {
+				d, err := s.rpmCachedRepomd(r, t)
+				return read{d, err}
+			})
+			if !ok {
+				s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+				return
+			}
+			doc, err = got.doc, got.err
+		} else {
+			doc, err = s.rpmCachedRepomd(r, t)
+		}
+		if err != nil {
 			s.writeRpmReadError(w, r, t, "repomd.xml", err)
 			return
 		}

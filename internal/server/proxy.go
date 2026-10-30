@@ -316,7 +316,11 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			http.NotFound(w, r)
 			return
 		}
-		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
+		if sink := upstreamErrSinkFrom(r.Context()); sink != nil {
+			sink.set(err)
+		} else {
+			s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
+		}
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 	}
 

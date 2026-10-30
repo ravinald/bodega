@@ -105,10 +105,21 @@ type rpmProfileBuilds struct {
 }
 
 // rpmProfileBuildWait is how long a request waits on a build before it is
-// answered from the previous build or with a 503. It stays under 5 seconds so
-// the client has a byte long before dnf's 30-second low-speed cutoff, and a
-// build that small repositories finish inside it is answered in one request.
+// answered from the previous build or with a 503. A build that small
+// repositories finish inside it is answered in one request; rpmProfileBudget
+// shortens it for a request that spent part of its budget elsewhere.
 const rpmProfileBuildWait = 3 * time.Second
+
+// rpmProfileBudget is how long a governed host's metadata request may wait,
+// on the upstream repomd.xml's refresh, a running build and the store
+// together, before bodega answers it without what it was waiting for. It sits
+// a second under the 5 seconds a client is promised, and far under dnf's
+// 30-second low-speed cutoff, so the answer is written inside both.
+const rpmProfileBudget = 4 * time.Second
+
+// rpmProfileFallbackReserve is the part of the budget a wait on a build
+// leaves for checking that the previous build is still stored.
+const rpmProfileFallbackReserve = 500 * time.Millisecond
 
 // rpmProfileRetryAfter is the Retry-After a 503 for a running build carries.
 const rpmProfileRetryAfter = "10"
@@ -122,6 +133,11 @@ type rpmProfileSlot struct {
 	mu      sync.Mutex
 	recent  []*rpmProfileBuild
 	running map[string]*rpmProfileJob
+	// gen counts the builds published to recent. A request checks the store
+	// with the lock released, and registers a build only while the
+	// generation it checked against still stands: a build that finished in
+	// between is checked first, or the same key is built twice.
+	gen uint64
 }
 
 // rpmProfileJob is one build in progress. b and err are set before done is
@@ -133,8 +149,12 @@ type rpmProfileJob struct {
 }
 
 // errRpmProfileBuilding is a request that found its view's build running past
-// rpmProfileBuildWait with no previous build to serve.
+// its wait with no previous build it could serve.
 var errRpmProfileBuilding = errors.New("the profile's filtered metadata is still being built")
+
+// errRpmProfileSlow is a request whose budget ran out on the upstream
+// repomd.xml or the store before it had what it needed to answer.
+var errRpmProfileSlow = errors.New("the upstream repomd.xml or the store did not answer within the request's budget")
 
 // rpmProfileBuildError is a build that failed. The build logged it, so the
 // requests waiting on it answer without logging it again.
@@ -148,6 +168,42 @@ func (e *rpmProfileBuildError) Error() string {
 }
 
 func (e *rpmProfileBuildError) Unwrap() error { return e.err }
+
+type rpmBudgetKey struct{}
+
+// withRpmBudget starts r's budget, unless the request r was read for already
+// started one.
+func withRpmBudget(r *http.Request) *http.Request {
+	if _, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), rpmBudgetKey{}, time.Now().Add(rpmProfileBudget)))
+}
+
+// rpmBudgetEnd is when r's budget runs out.
+func rpmBudgetEnd(r *http.Request) time.Time {
+	if end, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
+		return end
+	}
+	return time.Now().Add(rpmProfileBudget)
+}
+
+// rpmBounded runs f and waits for it until end; ok is false when f had not
+// returned by then. f is left to finish on its own rather than canceled,
+// because a storage backend may ignore its context, so f must write nothing
+// the caller reads after giving up on it.
+func rpmBounded[T any](end time.Time, f func() T) (v T, ok bool) {
+	ch := make(chan T, 1)
+	go func() { ch <- f() }()
+	timer := time.NewTimer(time.Until(end))
+	defer timer.Stop()
+	select {
+	case v = <-ch:
+		return v, true
+	case <-timer.C:
+		return v, false
+	}
+}
 
 func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
 	c.mu.Lock()
@@ -185,8 +241,11 @@ func (s *Server) rpmProfileRepomd(r *http.Request, t rpmTree, p *entitle.Profile
 
 // rpmProfileFiles is p's build over the upstream files data names, made when
 // no build for this fingerprint and these checksums is held or one of its
-// files has gone from the store.
+// files has gone from the store. It answers within r's budget: with the
+// build, with the previous build when that one can stand in for it, or with
+// errRpmProfileBuilding or errRpmProfileSlow.
 func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, data []rpmRepomdData) (*rpmProfileBuild, error) {
+	end := rpmBudgetEnd(r)
 	entries := map[string]rpmRepomdData{}
 	for _, d := range data {
 		for _, typ := range rpmFilteredTypes {
@@ -200,8 +259,7 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	if _, ok := entries["primary"]; !ok {
 		return nil, nil
 	}
-	store := s.typeStore(manifest.TypeRpm)
-	if store == nil {
+	if s.typeStore(manifest.TypeRpm) == nil {
 		return nil, errors.New("no storage backend holds the rpm type, so a filtered metadata file has nowhere to live")
 	}
 	stamps := map[string]int64{}
@@ -225,56 +283,39 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 
 	fingerprint := p.Fingerprint(manifest.TypeRpm)
 	sl := s.rpmProfileBuilds.slot(rpmProfileView(t, p))
-	sl.mu.Lock()
-	recent := slices.Clone(sl.recent)
-	sl.mu.Unlock()
-	for _, b := range recent {
-		if b.key == key && s.rpmProfileBuildStored(r, t, b) {
-			return b, nil
-		}
-	}
-
-	sl.mu.Lock()
-	job := sl.running[key]
-	if job == nil {
-		job = &rpmProfileJob{done: make(chan struct{})}
-		sl.running[key] = job
-		timeout := s.rpmProfileBuilds.timeout
-		if timeout <= 0 {
-			timeout = rpmProfileBuildTimeout
-		}
-		// The build belongs to no request: dnf gives up on a repomd.xml after
-		// 30 seconds without a byte, and a build of BaseOS's filelists takes
-		// longer, so under the request's context it would be canceled and
-		// started over by every retry. It keeps the request's values (who
-		// asked, for the upstream fetch's records) and drops its cancellation.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
-		br := r.Clone(ctx)
-		s.rpmProfileBuilds.running.Add(1)
-		go func() {
-			defer s.rpmProfileBuilds.running.Done()
-			defer cancel()
-			b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps)
-			sl.mu.Lock()
-			delete(sl.running, key)
-			if err == nil {
-				sl.recent = append([]*rpmProfileBuild{b}, sl.recent...)
-				if len(sl.recent) > rpmProfileBuildsKept {
-					sl.recent = sl.recent[:rpmProfileBuildsKept]
-				}
+	var job *rpmProfileJob
+	for job == nil {
+		sl.mu.Lock()
+		recent, gen := slices.Clone(sl.recent), sl.gen
+		sl.mu.Unlock()
+		for _, b := range recent {
+			if b.key != key {
+				continue
 			}
-			job.b, job.err = b, err
-			sl.mu.Unlock()
-			close(job.done)
-		}()
+			stored, ok := s.rpmProfileBuildStored(end, r, t, b)
+			if !ok {
+				return nil, errRpmProfileSlow
+			}
+			if stored {
+				return b, nil
+			}
+		}
+		sl.mu.Lock()
+		if job = sl.running[key]; job == nil && sl.gen == gen {
+			job = s.startRpmProfileBuild(r, sl, t, p, key, fingerprint, entries, stamps)
+		}
+		sl.mu.Unlock()
 	}
-	sl.mu.Unlock()
 
 	wait := s.rpmProfileBuilds.wait
 	if wait <= 0 {
 		wait = rpmProfileBuildWait
 	}
-	timer := time.NewTimer(wait)
+	waitEnd := time.Now().Add(wait)
+	if last := end.Add(-rpmProfileFallbackReserve); last.Before(waitEnd) {
+		waitEnd = last
+	}
+	timer := time.NewTimer(time.Until(waitEnd))
 	defer timer.Stop()
 	select {
 	case <-job.done:
@@ -285,22 +326,91 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	}
 	// A previous build under this fingerprint lists what the profile grants
 	// today over an older upstream; one under another fingerprint would list
-	// what an edited profile no longer grants, so it is never served.
+	// what an edited profile no longer grants, so it is never served. It
+	// stands in only for a document naming the same filtered types it built:
+	// rpmRewriteRepomd leaves an entry the build has no file for as the
+	// upstream's, which would list the unfiltered file, and cannot add one
+	// the document lacks.
 	sl.mu.Lock()
-	recent = slices.Clone(sl.recent)
+	recent := slices.Clone(sl.recent)
 	sl.mu.Unlock()
 	for _, b := range recent {
-		if b.fingerprint == fingerprint && s.rpmProfileBuildStored(r, t, b) {
+		if b.fingerprint != fingerprint || !b.coversTypes(entries) {
+			continue
+		}
+		stored, ok := s.rpmProfileBuildStored(end, r, t, b)
+		if !ok {
+			break
+		}
+		if stored {
 			return b, nil
 		}
 	}
 	return nil, errRpmProfileBuilding
 }
 
+// coversTypes reports whether b filtered exactly the types entries names.
+func (b *rpmProfileBuild) coversTypes(entries map[string]rpmRepomdData) bool {
+	if len(b.files) != len(entries) {
+		return false
+	}
+	for typ := range entries {
+		if _, ok := b.files[typ]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// startRpmProfileBuild registers the build of key in sl and starts it. The
+// caller holds sl.mu.
+func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64) *rpmProfileJob {
+	job := &rpmProfileJob{done: make(chan struct{})}
+	sl.running[key] = job
+	timeout := s.rpmProfileBuilds.timeout
+	if timeout <= 0 {
+		timeout = rpmProfileBuildTimeout
+	}
+	// The build belongs to no request: dnf gives up on a repomd.xml after 30
+	// seconds without a byte, and a build of BaseOS's filelists takes longer,
+	// so under the request's context it would be canceled and started over by
+	// every retry. It keeps the request's values (who asked, for the upstream
+	// fetch's records) and drops its cancellation and its budget.
+	ctx := context.WithValue(context.WithoutCancel(r.Context()), rpmBudgetKey{}, nil)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	br := r.Clone(ctx)
+	s.rpmProfileBuilds.running.Add(1)
+	go func() {
+		defer s.rpmProfileBuilds.running.Done()
+		defer cancel()
+		b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps)
+		sl.mu.Lock()
+		delete(sl.running, key)
+		if err == nil {
+			kept := []*rpmProfileBuild{b}
+			for _, old := range sl.recent {
+				if old.key != key && len(kept) < rpmProfileBuildsKept {
+					kept = append(kept, old)
+				}
+			}
+			sl.recent = kept
+			sl.gen++
+		}
+		job.b, job.err = b, err
+		sl.mu.Unlock()
+		close(job.done)
+	}()
+	return job
+}
+
 // rpmBuildProfileFiles reads, filters and stores the files entries names,
-// under r's context, which is the build's own. A failure is logged here, once
-// for every request waiting on it.
+// under r's context, which is the build's own and bounds every step: the
+// reads, the filtering and each store write, which is not begun past the
+// deadline, and a build whose deadline passed during its last write is not
+// published, because a store may ignore its context. A failure is logged
+// here, once for every request waiting on it.
 func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64) (b *rpmProfileBuild, err error) {
+	ctx := r.Context()
 	file := "primary"
 	defer func() {
 		// A request's handler has net/http's recover behind it; this
@@ -316,10 +426,21 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 	}()
 	store := s.typeStore(manifest.TypeRpm)
 	read := func(e rpmRepomdData) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !rpmMetadataHrefServed(e.Location.Href) {
 			return nil, fmt.Errorf("repomd.xml places %s at %q, outside repodata/, which bodega does not serve", e.Type, e.Location.Href)
 		}
-		return s.rpmRead(r, t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
+		// The proxy hands an upstream failure to the sink instead of logging
+		// it, so the one record of it is this build's, with the profile and
+		// file beside the cause.
+		sink := &upstreamErrSink{}
+		raw, err := s.rpmRead(r.WithContext(withUpstreamErrSink(ctx, sink)), t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
+		if cause := sink.get(); err != nil && cause != nil {
+			return nil, fmt.Errorf("reading %s %s from the upstream: %w", e.Type, e.Location.Href, cause)
+		}
+		return raw, err
 	}
 	primary := entries["primary"]
 	raw, err := read(primary)
@@ -327,7 +448,7 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 		return nil, err
 	}
 	ext := path.Ext(primary.Location.Href)
-	kept, n, err := rpmAdmittedPkgids(raw, ext, p)
+	kept, n, err := rpmAdmittedPkgids(ctx, raw, ext, p)
 	if err != nil {
 		return nil, fmt.Errorf("primary %s of %s: %w", primary.Location.Href, t.id(), err)
 	}
@@ -344,17 +465,23 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 			}
 			ext = path.Ext(e.Location.Href)
 		}
-		body, open, err := rpmFilterPackages(raw, ext, n, kept, typ == "primary")
+		body, open, err := rpmFilterPackages(ctx, raw, ext, n, kept, typ == "primary")
 		if err != nil {
 			return nil, fmt.Errorf("filter %s %s of %s: %w", typ, e.Location.Href, t.id(), err)
 		}
 		sum := rpmSHA256Hex(body)
 		f := rpmFilteredFile{typ: typ, sum: sum, openSum: open.sum, size: int64(len(body)), openSize: open.size, timestamp: stamps[typ],
 			href: "repodata/" + sum + "-" + typ + ".xml.gz"}
-		if err := store.Put(r.Context(), rpmFilteredKey(t, f), body); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := store.Put(ctx, rpmFilteredKey(t, f), body); err != nil {
 			return nil, fmt.Errorf("store the filtered %s of %s: %w", typ, t.id(), err)
 		}
 		b.files[typ] = f
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	s.rpmProfileBuilds.mu.Lock()
 	s.rpmProfileBuilds.built++
@@ -362,6 +489,39 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 	s.logger.Info("filtered an rpm repository's metadata for a profile",
 		"profile", p.Name(), "repository", t.id(), "primary", primary.Checksum.Value, "kept", len(kept))
 	return b, nil
+}
+
+// upstreamErrSink takes the error an upstream fetch failed with, in place of
+// the proxy's own log record of it, for a read whose owner logs the failure
+// with what the read was for.
+type upstreamErrSink struct {
+	mu  sync.Mutex
+	err error
+}
+
+type upstreamErrSinkKey struct{}
+
+func withUpstreamErrSink(ctx context.Context, sink *upstreamErrSink) context.Context {
+	return context.WithValue(ctx, upstreamErrSinkKey{}, sink)
+}
+
+func upstreamErrSinkFrom(ctx context.Context) *upstreamErrSink {
+	sink, _ := ctx.Value(upstreamErrSinkKey{}).(*upstreamErrSink)
+	return sink
+}
+
+func (k *upstreamErrSink) set(err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.err == nil {
+		k.err = err
+	}
+}
+
+func (k *upstreamErrSink) get() error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.err
 }
 
 // rpmTimestamp is the timestamp an upstream entry gives its file. A filtered
@@ -379,14 +539,19 @@ func rpmTimestamp(d rpmRepomdData) (int64, bool) {
 	return int64(f), true
 }
 
-func (s *Server) rpmProfileBuildStored(r *http.Request, t rpmTree, b *rpmProfileBuild) bool {
+// rpmProfileBuildStored reports whether every file of b is still in the
+// store; ok is false when the store had not answered by end.
+func (s *Server) rpmProfileBuildStored(end time.Time, r *http.Request, t rpmTree, b *rpmProfileBuild) (stored, ok bool) {
 	store := s.typeStore(manifest.TypeRpm)
-	for _, f := range b.files {
-		if info, err := store.Head(r.Context(), rpmFilteredKey(t, f)); err != nil || info == nil || !info.Exists {
-			return false
+	ctx := r.Context()
+	return rpmBounded(end, func() bool {
+		for _, f := range b.files {
+			if info, err := store.Head(ctx, rpmFilteredKey(t, f)); err != nil || info == nil || !info.Exists {
+				return false
+			}
 		}
-	}
-	return true
+		return true
+	})
 }
 
 func rpmFilteredKey(t rpmTree, f rpmFilteredFile) string {
@@ -408,11 +573,24 @@ func rpmSHA256Hex(b []byte) string {
 // current upstream document filters to. A filtered entry is read from the
 // store under its own checksum; any other entry is the upstream's file.
 func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request, t rpmTree, p *entitle.Profile, href string) {
+	r = withRpmBudget(r)
+	end := rpmBudgetEnd(r)
+	type read struct {
+		b   []byte
+		err error
+	}
 	match := func(d rpmRepomdData) bool { return d.Location.Href == href }
 	entry, err := s.rpmHeldEntry(r, t, match)
 	if err != nil {
 		var doc []byte
-		doc, err = s.rpmRead(r, t, "repomd.xml", func(w http.ResponseWriter, req *http.Request) { s.handleRpmRepomd(w, req, t) })
+		got, ok := rpmBounded(end, func() read {
+			d, err := s.rpmRead(r, t, "repomd.xml", func(w http.ResponseWriter, req *http.Request) { s.handleRpmRepomd(w, req, t) })
+			return read{d, err}
+		})
+		doc, err = got.b, got.err
+		if !ok {
+			err = errRpmProfileSlow
+		}
 		if err == nil {
 			doc, err = s.rpmProfileRepomd(r, t, p, doc)
 		}
@@ -425,7 +603,7 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		switch {
 		case errors.Is(err, errRpmNotListed):
 			http.Error(w, fmt.Sprintf("the repomd.xml profile %q is served for %s names no %s.", p.Name(), t.id(), href), http.StatusNotFound)
-		case errors.Is(err, errRpmProfileBuilding), errors.As(err, &failed):
+		case errors.Is(err, errRpmProfileBuilding), errors.Is(err, errRpmProfileSlow), errors.As(err, &failed):
 			s.writeRpmProfileError(w, t, p, err)
 		default:
 			s.writeRpmReadError(w, r, t, "repomd.xml", err)
@@ -437,7 +615,16 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		return
 	}
 	key := manifest.RpmMetadataKey(t.repo, t.releasever, t.basearch, entry.Checksum.Value, path.Base(entry.Location.Href))
-	body, err := s.typeStore(manifest.TypeRpm).Get(r.Context(), key)
+	store := s.typeStore(manifest.TypeRpm)
+	got, ok := rpmBounded(end, func() read {
+		b, err := store.Get(r.Context(), key)
+		return read{b, err}
+	})
+	if !ok {
+		s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+		return
+	}
+	body, err := got.b, got.err
 	if err != nil || len(body) == 0 {
 		s.logger.Warn("a filtered rpm metadata file the profile's repomd.xml names is not in the store", "profile", p.Name(), "repository", t.id(), "key", key, "error", err)
 		http.Error(w, fmt.Sprintf("bodega no longer holds the filtered %s of %s for profile %q; run `dnf makecache` to fetch a current repomd.xml, which rebuilds it.", entry.Type, t.id(), p.Name()), http.StatusNotFound)
@@ -456,6 +643,12 @@ func (s *Server) writeRpmProfileError(w http.ResponseWriter, t rpmTree, p *entit
 	case errors.Is(err, errRpmProfileBuilding):
 		w.Header().Set("Retry-After", rpmProfileRetryAfter)
 		http.Error(w, fmt.Sprintf("bodega is still building the metadata of %s for profile %q; dnf retries, and the build continues without it.", t.id(), p.Name()), http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, errRpmProfileSlow):
+		s.logger.Warn("a governed rpm metadata request ran out of its budget waiting on the upstream repomd.xml or the store",
+			"profile", p.Name(), "repository", t.id(), "budget", rpmProfileBudget)
+		w.Header().Set("Retry-After", rpmProfileRetryAfter)
+		http.Error(w, fmt.Sprintf("bodega could not read the metadata of %s for profile %q within %s, from the upstream or its store; dnf retries.", t.id(), p.Name(), rpmProfileBudget), http.StatusServiceUnavailable)
 		return
 	case errors.As(err, &failed):
 	default:
@@ -551,14 +744,15 @@ func (f rpmFilteredFile) repomdData() string {
 
 // rpmAdmittedPkgids reads primary for the pkgid of every package p admits,
 // by name and by the version primary gives it, and counts them. A package
-// bodega would not serve at all is left out with the rest.
-func rpmAdmittedPkgids(raw []byte, ext string, p *entitle.Profile) (map[string]bool, int, error) {
+// bodega would not serve at all is left out with the rest. It stops with
+// ctx's error once ctx is done.
+func rpmAdmittedPkgids(ctx context.Context, raw []byte, ext string, p *entitle.Profile) (map[string]bool, int, error) {
 	r, closeFn, err := rpmDecompress(raw, ext)
 	if err != nil {
 		return nil, 0, fmt.Errorf("decompress: %w", err)
 	}
 	defer closeFn()
-	lr := &io.LimitedReader{R: r, N: rpmMaxPrimary + 1}
+	lr := &io.LimitedReader{R: rpmCtxReader{ctx: ctx, r: r}, N: rpmMaxPrimary + 1}
 	dec := xml.NewDecoder(lr)
 	kept, n := map[string]bool{}, 0
 	for {
@@ -567,6 +761,9 @@ func rpmAdmittedPkgids(raw []byte, ext string, p *entitle.Profile) (map[string]b
 			return kept, n, nil
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, 0, cerr
+			}
 			if lr.N <= 0 {
 				return nil, 0, fmt.Errorf("expands past %d bytes", int64(rpmMaxPrimary))
 			}
@@ -653,14 +850,15 @@ func rpmSetPackagesAttr(tag []byte, n int) []byte {
 // nothing the filter does not understand is lost by a re-encode.
 //
 // primary carries the pkgid in a child (<checksum pkgid="YES">); filelists
-// and other carry it as the package's own attribute.
-func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, primary bool) ([]byte, rpmOpen, error) {
+// and other carry it as the package's own attribute. It stops with ctx's
+// error once ctx is done.
+func rpmFilterPackages(ctx context.Context, raw []byte, ext string, n int, kept map[string]bool, primary bool) ([]byte, rpmOpen, error) {
 	r, closeFn, err := rpmDecompress(raw, ext)
 	if err != nil {
 		return nil, rpmOpen{}, fmt.Errorf("decompress: %w", err)
 	}
 	defer closeFn()
-	lr := &io.LimitedReader{R: r, N: rpmMaxPrimary + 1}
+	lr := &io.LimitedReader{R: rpmCtxReader{ctx: ctx, r: r}, N: rpmMaxPrimary + 1}
 	rec := &rpmRecorder{r: bufio.NewReader(lr)}
 	dec := xml.NewDecoder(rec)
 
@@ -682,6 +880,9 @@ func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, prim
 			break
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, rpmOpen{}, cerr
+			}
 			if lr.N <= 0 {
 				return nil, rpmOpen{}, fmt.Errorf("expands past %d bytes", int64(rpmMaxPrimary))
 			}
@@ -729,6 +930,20 @@ func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, prim
 		return nil, rpmOpen{}, err
 	}
 	return gz.Bytes(), rpmOpen{sum: hex.EncodeToString(open.Sum(nil)), size: openSize}, nil
+}
+
+// rpmCtxReader fails every read once ctx is done, so decompressing and
+// parsing a file stops at a build's deadline rather than at the file's end.
+type rpmCtxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c rpmCtxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // rpmPkgid reads the pkgid of the <package> se opens, consuming the element.
