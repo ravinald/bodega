@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -96,6 +99,17 @@ var ubuntuChrony = map[string]string{
 		"pool 2.ntp.ubuntu.com iburst maxsources 1 nts prefer\n" +
 		"server ntp-bootstrap.ubuntu.com iburst nts\n",
 }
+
+// ubuntuReleaseUpgrades is what Ubuntu 26.04 ships in
+// /etc/update-manager/release-upgrades.
+const ubuntuReleaseUpgrades = "# Default behavior for the release upgrader.\n\n" +
+	"[DEFAULT]\n" +
+	"# Default prompting and upgrade behavior, valid options:\n" +
+	"#\n" +
+	"#  never  - Never check for, or allow upgrading to, a new release.\n" +
+	"#  normal - Check to see if a new release is available.\n" +
+	"#  lts    - Check to see if a new LTS release is available.\n" +
+	"Prompt=lts\n"
 
 func withFiles(base map[string]string, extra map[string]string) map[string]string {
 	out := map[string]string{}
@@ -198,6 +212,42 @@ func TestOSCallerRows(t *testing.T) {
 			fakeOS{snapd: "active", refreshTime: "hold: forever"}, nil, "snapd-refresh", "", nil, nil},
 		{"snapd inactive", snapd, fakeOS{}, nil, "snapd-refresh", "", nil, nil},
 		{"snapd not installed", nil, fakeOS{snapd: "active"}, nil, "snapd-refresh", "", nil, nil},
+		{"release upgrades at lts", map[string]string{releaseUpgrades: ubuntuReleaseUpgrades}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn,
+			[]string{releaseUpgrades, "Prompt=lts", "changelogs.ubuntu.com", "fetches no packages"},
+			[]string{"Prompt=never", "--quiet-os-callers --apply", "--restore-os-callers"}},
+		{"release upgrades with no Prompt line", map[string]string{releaseUpgrades: "[DEFAULT]\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{"no Prompt line, which means Prompt=normal", "changelogs.ubuntu.com"}, nil},
+		{"release upgrades at normal, spaced", map[string]string{releaseUpgrades: "[DEFAULT]\nprompt = normal\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{"Prompt=normal"}, nil},
+		{"release upgrades at never", map[string]string{releaseUpgrades: "[DEFAULT]\n# Prompt=lts\nPrompt=never\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=never"}, nil},
+		{"release upgrades at never in another section only", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=lts\n[other]\nPrompt=never\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"Prompt=lts"}, nil},
+		{"release upgrades at never, key indented", map[string]string{releaseUpgrades: "[DEFAULT]\n Prompt=never\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=never"}, nil},
+		{"release upgrades at never, continued", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=never\n normal\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{`Prompt="never\nnormal"`, "changelogs.ubuntu.com"}, nil},
+		{"release upgrades at never, header with trailing text", map[string]string{releaseUpgrades: "[DEFAULT] # comment\nPrompt=never\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=never"}, nil},
+		{"release upgrades at no", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=No\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{releaseUpgrades, "Prompt=No", "changelogs.ubuntu.com"}, []string{"Prompt=never"}},
+		{"release upgrades interpolated to no", map[string]string{releaseUpgrades: "[DEFAULT]\nPolicy=no\nPrompt=%(policy)s\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusWarn, []string{"Prompt=%(policy)s, which resolves to no", "changelogs.ubuntu.com"}, nil},
+		{"release upgrades at never, upper case", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=NEVER\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=NEVER"}, nil},
+		{"release upgrades interpolated to never", map[string]string{releaseUpgrades: "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=%(Policy)s, which resolves to never"}, nil},
+		{"release upgrades interpolated to lts through a chain", map[string]string{releaseUpgrades: "[DEFAULT]\nPROMPT=%(a)s\nA=%(B)s\nb=lts\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn,
+			[]string{"Prompt=%(a)s, which resolves to lts", "changelogs.ubuntu.com"}, []string{"Prompt=never"}},
+		{"release upgrades interpolated from another section", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=%(p)s\n[x]\np=never\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"cannot resolve", "%(p)s names no [DEFAULT] option"}, nil},
+		{"release upgrades interpolation cycle", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=%(a)s\na=%(prompt)s\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"cannot resolve", "nest more than 10 deep"}, nil},
+		{"release upgrades absent", nil, fakeOS{}, nil, "release-upgrade-check", host.StatusNA, []string{"not installed"}, nil},
+		{"release upgrades unreadable", map[string]string{releaseUpgrades + "/x": ""}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusSkip, []string{"could not read", releaseUpgrades}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -451,5 +501,274 @@ func TestDoctorQuietOSCallersClearsSnapdInStandby(t *testing.T) {
 	}
 	if slices.ContainsFunc(fake.calls, func(c string) bool { return strings.HasPrefix(c, "snap ") }) {
 		t.Errorf("the report ran %v against a standby snapd", fake.calls)
+	}
+}
+
+// --quiet-os-callers sets Prompt=never and records what it found, and
+// --restore-os-callers puts the file back byte for byte, whatever form the
+// Prompt line took or whether there was one at all.
+func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv, _ := planServer(t, map[string]string{"npm": "registry=x\n"})
+	saved := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = saved })
+	// quieted is the file --apply leaves, each checked against Python's
+	// configparser to read Prompt as never and every other option as before.
+	const implicit = "found no [DEFAULT] header and no Prompt line"
+	cases := []struct {
+		name, body, step, found, quieted string
+	}{
+		{"ubuntu default", ubuntuReleaseUpgrades, "release-upgrade-prompt=lts", "found Prompt=lts",
+			strings.Replace(ubuntuReleaseUpgrades, "Prompt=lts", "Prompt=never", 1)},
+		{"spaced, lower-case key, CRLF", "[DEFAULT]\r\nprompt = normal  \r\n[x]\nPrompt=lts\n", "release-upgrade-prompt=normal", "found Prompt=normal",
+			"[DEFAULT]\r\nprompt = never  \r\n[x]\nPrompt=lts\n"},
+		{"colon, no final newline", "[DEFAULT]\nPrompt: lts", "release-upgrade-prompt=lts", "found Prompt=lts", "[DEFAULT]\nPrompt: never"},
+		{"key indented", "[DEFAULT]\n Prompt=lts\n", "release-upgrade-prompt=lts", "found Prompt=lts", "[DEFAULT]\n Prompt=never\n"},
+		{"value continued past never", "[DEFAULT]\nPrompt=never\n normal\n# c\n\n  lts\nOther=1\n",
+			"release-upgrade-prompt=never\\n normal\\n# c\\n\\n  lts", `found Prompt="never\nnormal\n\nlts"`,
+			"[DEFAULT]\nPrompt=never\nOther=1\n"},
+		{"no, which the upgrader also skips", "[DEFAULT]\nPrompt=No\n", "release-upgrade-prompt=No", "found Prompt=No",
+			"[DEFAULT]\nPrompt=never\n"},
+		{"interpolated to lts", "[DEFAULT]\nPolicy=LTS\nPrompt=%(policy)s\n", "release-upgrade-prompt=%(policy)s", "found Prompt=%(policy)s",
+			"[DEFAULT]\nPolicy=LTS\nPrompt=never\n"},
+		{"interpolation that does not resolve", "[DEFAULT]\nPrompt=%(gone)s %%\n", "release-upgrade-prompt=%(gone)s %%", "found Prompt=%(gone)s %%",
+			"[DEFAULT]\nPrompt=never\n"},
+		{"no Prompt line", "# c\n[DEFAULT]\nOther=1\n", "release-upgrade-prompt", "found no Prompt line", "# c\n[DEFAULT]\nPrompt=never\nOther=1\n"},
+		{"no Prompt line, header unterminated", "[DEFAULT]", "release-upgrade-prompt", "found no Prompt line", "[DEFAULT]\nPrompt=never"},
+		{"no Prompt line, indented options, header with trailing text", "[DEFAULT] # c\n\n  Other=1\n   cont\n",
+			"release-upgrade-prompt", "found no Prompt line", "[DEFAULT] # c\n  Prompt=never\n\n  Other=1\n   cont\n"},
+		{"empty", "", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n"},
+		{"comment only", "# release upgrade policy\n", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n# release upgrade policy\n"},
+		{"comment only, no final newline", "# release upgrade policy", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n# release upgrade policy"},
+		{"another section only", "[other]\nvalue=1\n", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n[other]\nvalue=1\n"},
+		{"another section only, no final newline", "\n[other]\nvalue=1", oscStepPromptDefault, implicit, "[DEFAULT]\nPrompt=never\n\n[other]\nvalue=1"},
+		// An indented first header would be a continuation of a Prompt line
+		// at a shallower indent, so Prompt takes the header's indent.
+		{"indented section", "  [other]\n  value=1\n", oscStepPromptDefault, implicit, "[DEFAULT]\n  Prompt=never\n  [other]\n  value=1\n"},
+		{"indented section, no final newline", "  [other]\n  value=1", oscStepPromptDefault, implicit, "[DEFAULT]\n  Prompt=never\n  [other]\n  value=1"},
+		{"comments, then an indented section and a deeper option", "# policy\n\n  ; more\n\t[other]\n\t  value=1\n\t   cont\n[second]\nx=2\n",
+			oscStepPromptDefault, implicit, "[DEFAULT]\n\tPrompt=never\n# policy\n\n  ; more\n\t[other]\n\t  value=1\n\t   cont\n[second]\nx=2\n"},
+		{"indented section, CRLF", "\r\n   [other]\r\n   value=1\r\n", oscStepPromptDefault, implicit, "[DEFAULT]\n   Prompt=never\n\r\n   [other]\r\n   value=1\r\n"},
+		{"explicit DEFAULT before an indented section", "[DEFAULT]\n  [other]\n  value=1\n", "release-upgrade-prompt", "found no Prompt line",
+			"[DEFAULT]\n  Prompt=never\n  [other]\n  value=1\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeOS{}
+			h := stubOSCallers(t, map[string]string{releaseUpgrades: tc.body}, fake)
+			args := []string{"--configure", "npm", "--quiet-os-callers", "--url", srv.URL, "--allow-plaintext"}
+
+			out, err := runDoctor(t, args...)
+			plan := "release-upgrade-check  set Prompt=never in " + releaseUpgrades + ", " + tc.found + "  (undo: bodega doctor --restore-os-callers)"
+			if err != nil || !strings.Contains(out, plan) || !strings.Contains(out, "run the 1 OS caller step(s) above") {
+				t.Fatalf("plan = %v, want %q:\n%s", err, plan, out)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Fatalf("the dry run wrote %q", b)
+			}
+
+			if out, err := runDoctor(t, append(args, "--apply")...); err != nil {
+				t.Fatalf("--apply = %v:\n%s", err, out)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.quieted {
+				t.Fatalf("after --apply the file = %q, want %q", b, tc.quieted)
+			}
+			p, err := h.readPrompt()
+			if err != nil || !p.never() {
+				t.Fatalf("after --apply Prompt = %q (%v), want never", p.value, err)
+			}
+			if before, ok := configParserRead(t, tc.body); ok {
+				after, _ := configParserRead(t, tc.quieted)
+				if after.Prompt == nil || *after.Prompt != "never" || !reflect.DeepEqual(after.Others, before.Others) {
+					t.Errorf("configparser reads %q as Prompt %q, options %v; want never and %v", tc.quieted, after.prompt(), after.Others, before.Others)
+				}
+			}
+			rec, err := os.ReadFile(h.record)
+			if err != nil || !strings.Contains(string(rec), `"`+tc.step+`"`) {
+				t.Fatalf("record = %s (%v), want %q", rec, err, tc.step)
+			}
+			report, _ := runDoctor(t, "--url", srv.URL, "--allow-plaintext")
+			if f, _ := h.releaseUpgradeCheck(); f.Status != host.StatusOK || !strings.Contains(report, "release-upgrade-check") {
+				t.Errorf("after --apply the row is %s, want OK:\n%s", f.Status, report)
+			}
+			if out, _ := runDoctor(t, args...); !strings.Contains(out, "nothing to quiet") || !strings.Contains(out, "release-upgrade check is off") {
+				t.Errorf("a second plan after --apply is not empty:\n%s", out)
+			}
+
+			if out, err := runDoctor(t, "--restore-os-callers"); err != nil {
+				t.Fatalf("--restore-os-callers = %v:\n%s", err, out)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Errorf("restored file = %q, want %q", b, tc.body)
+			}
+			if _, err := os.Stat(h.record); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("record survived a complete restore: %v", err)
+			}
+			if len(fake.ran) != 0 {
+				t.Errorf("the edit ran tools: %v", fake.ran)
+			}
+		})
+	}
+}
+
+// Each text makes configparser's get raise, which the upgrader does not
+// catch, so the row counts it as on rather than off.
+func TestParsePromptInterpolationErrors(t *testing.T) {
+	for _, text := range []string{
+		"[DEFAULT]\nPrompt=%(gone)s\n",
+		"[DEFAULT]\nPrompt=50%\n",
+		"[DEFAULT]\nPrompt=%(a\n",
+		"[DEFAULT]\nPrompt=%(prompt)s\n",
+		"[DEFAULT]\nPrompt=%(a)s\nA=%(b)s\nB=%(c)s\nC=%x\n",
+	} {
+		if p := parsePrompt(text); p.resolveErr == nil || p.never() {
+			t.Errorf("parsePrompt(%q) resolved to %q (never %v); configparser raises", text, p.value, p.never())
+		}
+	}
+}
+
+// An interpolated Prompt that resolves to never is already off, so
+// --quiet-os-callers plans no step for it.
+func TestQuietStepsInterpolatedNever(t *testing.T) {
+	h := stubOSCallers(t, map[string]string{releaseUpgrades: "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n"}, &fakeOS{})
+	steps, why, err := h.quietSteps()
+	if err != nil || len(steps) != 0 || !strings.Contains(why, "release-upgrade check is off") {
+		t.Errorf("quietSteps = %q, %q, %v; want none, release-upgrade check off", steps, why, err)
+	}
+}
+
+func TestReleaseUpgradeStepNames(t *testing.T) {
+	h := &osCallersHost{root: t.TempDir()}
+	for name, ok := range map[string]bool{
+		"release-upgrade-prompt": true, "release-upgrade-prompt=lts": true, "release-upgrade-prompt=": true,
+		"release-upgrade-prompt+default": true, "release-upgrade-prompt+x": false,
+		"release-upgrade-promptx": false, "motd": false,
+	} {
+		if _, got := h.releaseUpgradeStep(name); got != ok {
+			t.Errorf("releaseUpgradeStep(%q) = %v, want %v", name, got, ok)
+		}
+	}
+}
+
+// The values are what Python's configparser returns for
+// ConfigParser.get("DEFAULT", "Prompt") on each text, which is how
+// ubuntu-release-upgrader reads the file.
+func TestParsePromptMatchesConfigParser(t *testing.T) {
+	for _, tc := range []struct {
+		name, text, want string
+		found            bool
+	}{
+		{"key indented", "[DEFAULT]\n Prompt=never\n", "never", true},
+		{"reference", "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n", "never", true},
+		{"reference defined after Prompt, any case", "[DEFAULT]\nPrompt=%(POLICY)s\npolicy = lts\n", "lts", true},
+		{"chained references and a literal percent", "[DEFAULT]\nPrompt=%(a)s-%%-%(b)s\nA=%(b)s%(b)s\nB=lts\n", "ltslts-%-lts", true},
+		{"reference to a continued option", "[DEFAULT]\nPrompt=%(a)s\na=never\n  normal\n", "never\nnormal", true},
+		{"reference across a repeated DEFAULT", "[DEFAULT]\nPrompt=%(a)s\n[x]\na=lts\n[DEFAULT]\na=never\n", "never", true},
+		{"continued", "[DEFAULT]\nPrompt=never\n normal\n", "never\nnormal", true},
+		{"header with trailing text", "[DEFAULT] # comment\nPrompt=never\n", "never", true},
+		{"blank line inside the value", "[DEFAULT]\nPrompt=never\n\n  normal\n", "never\n\nnormal", true},
+		{"indented comment is not a continuation", "[DEFAULT]\nPrompt=never\n  # lts\nOther=1\n", "never", true},
+		{"trailing blank lines dropped", "[DEFAULT]\nPrompt=never\n\n\nOther=1\n", "never", true},
+		{"header indented", "  [DEFAULT]\n  Prompt = never\n", "never", true},
+		{"key under a deeper indent continues the option above", "[DEFAULT]\n  Other=1\n    Prompt=lts\n", "", false},
+		{"no option", "[DEFAULT]\nOther=1\n", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := parsePrompt(tc.text)
+			if p.found() != tc.found || p.value != tc.want {
+				t.Errorf("parsePrompt(%q) = found %v, %q; configparser reads found %v, %q", tc.text, p.found(), p.value, tc.found, tc.want)
+			}
+		})
+	}
+}
+
+type configParserView struct {
+	Prompt *string                      `json:"prompt"`
+	Others map[string]map[string]string `json:"others"`
+}
+
+func (v configParserView) prompt() string {
+	if v.Prompt == nil {
+		return "(get raises)"
+	}
+	return *v.Prompt
+}
+
+const configParserScript = `import configparser, json, sys
+cp = configparser.ConfigParser()
+cp.read_string(sys.stdin.read())
+try:
+    prompt = cp.get("DEFAULT", "Prompt", fallback="normal")
+except configparser.Error:
+    prompt = None
+others = {"DEFAULT": {k: v for k, v in cp.defaults().items() if k != "prompt"}}
+for s in cp.sections():
+    others[s] = dict(cp._sections[s])
+json.dump({"prompt": prompt, "others": others}, sys.stdout)
+`
+
+// configParserRead is what Python's configparser, the library
+// ubuntu-release-upgrader reads the file with, makes of text: the Prompt
+// get returns, nil when get raises, and every other option raw. ok is false
+// where python3 is not installed.
+func configParserRead(t *testing.T, text string) (configParserView, bool) {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Log("no python3, so configparser does not check this case")
+		return configParserView{}, false
+	}
+	cmd := exec.Command(py, "-I", "-c", configParserScript)
+	cmd.Stdin = strings.NewReader(text)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("configparser refuses %q: %v", text, err)
+	}
+	var v configParserView
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("configparser oracle printed %q: %v", out, err)
+	}
+	return v, true
+}
+
+// The undo of an added [DEFAULT] header leaves the file alone once anybody
+// put options under it, since stripping the header would leave them in no
+// section, and is a no-op once the header is already gone.
+func TestRemoveDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{"options added under the header", "[DEFAULT]\nPrompt=never\nOther=1\n[x]\n", "has options under the [DEFAULT] header"},
+		{"prefix edited", "[DEFAULT]\nPrompt=lts\n", "no longer starts with"},
+		{"prefix indented for another first line", "[DEFAULT]\n  Prompt=never\n[x]\n", "no longer starts with"},
+		{"already restored", "[x]\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := stubOSCallers(t, map[string]string{releaseUpgrades: tc.body}, &fakeOS{})
+			err := h.removeDefault()
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Errorf("removeDefault = %v, want %q", err, tc.want)
+			}
+			if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != tc.body {
+				t.Errorf("removeDefault wrote %q", b)
+			}
+		})
+	}
+}
+
+// An edit whose result reads a different count of headers or options than the
+// edit accounts for has turned a line into a continuation, and is refused
+// before the file changes.
+func TestWritePromptRefusesLostStructure(t *testing.T) {
+	const body = "  [other]\n  value=1\n"
+	h := stubOSCallers(t, map[string]string{releaseUpgrades: body}, &fakeOS{})
+	err := h.writePrompt(parsePrompt(body), "[DEFAULT]\nPrompt=never\n"+body, 1, 1,
+		func(promptSetting) bool { return true }, "Prompt=never")
+	if err == nil || !strings.Contains(err.Error(), "would read 1 section header(s) and 1 option(s) where 2 and 2 belong") {
+		t.Errorf("writePrompt = %v, want the structure refused", err)
+	}
+	if b, _ := os.ReadFile(h.path(releaseUpgrades)); string(b) != body {
+		t.Errorf("writePrompt wrote %q", b)
 	}
 }
