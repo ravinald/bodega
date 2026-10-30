@@ -1401,3 +1401,183 @@ func TestOCIReferrersArtifactTypeFilter(t *testing.T) {
 	assertOCIError(t, doRequest(s, http.MethodGet, path+"?artifactType=not-a-type", nil),
 		http.StatusBadRequest, "UNSUPPORTED", "not-a-type")
 }
+
+// A referrers request is judged as a manifest by the same digest is, by the
+// subject's own type: a hidden chart's referrers are refused on a cache miss
+// and a hit, and in a repository holding an image and a chart under opposing
+// oci and helm profile rules, each subject follows its own type's verdict.
+func TestOCIReferrersJudgedAsTheSubjectManifest(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	miss := f.hub.publishChart("charts/app", "1.0.0")
+	f.hub.publishReferrers("charts/app", miss.digest)
+	hit := f.hub.publishChart("charts/cached", "1.0.0")
+	f.hub.publishReferrers("charts/cached", hit.digest)
+	if rec := doRequest(s, http.MethodGet, "/v2/charts/cached/manifests/1.0.0", nil); rec.Code != http.StatusOK {
+		t.Fatalf("chart: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, c := range []struct {
+		repo, digest string
+	}{{"charts/app", miss.digest}, {"charts/cached", hit.digest}} {
+		addVersion(t, s, manifest.TypeHelm, "docker.io/"+c.repo, manifest.VersionEntry{Version: "1.0.0", Mode: manifest.ModeProxy, Hidden: true})
+		m := doRequest(s, http.MethodGet, "/v2/"+c.repo+"/manifests/"+c.digest, nil)
+		assertOCIError(t, m, http.StatusNotFound, "MANIFEST_UNKNOWN", "docker.io/"+c.repo)
+		r := doRequest(s, http.MethodGet, "/v2/"+c.repo+"/referrers/"+c.digest, nil)
+		assertOCIError(t, r, m.Code, "MANIFEST_UNKNOWN", "docker.io/"+c.repo)
+		refusalIncident(t, r.Header(), checkHidden)
+		if n := f.hub.hitsFor("/v2/" + c.repo + "/referrers/" + c.digest); n != 0 {
+			t.Errorf("%s: a hidden chart's referrers reached the registry %d times", c.repo, n)
+		}
+	}
+
+	chart := f.hub.publishChart("acme/app", "1.0.0")
+	f.hub.publish("acme/app", "img", f.image)
+	f.hub.publishReferrers("acme/app", chart.digest)
+	f.hub.publishReferrers("acme/app", f.image.indexDigest)
+	pf := bindProfile(t, s, "charts", "web01",
+		[]audit.ProfileTypeRule{
+			closedRule(manifest.TypeOCI, audit.VersionFloating, audit.ExpansionBlock),
+			closedRule(manifest.TypeHelm, audit.VersionFloating, audit.ExpansionBlock),
+		},
+		[]audit.ProfileEntry{{Type: manifest.TypeHelm, Name: "docker.io/acme/app"}})
+	if rec := pf.oci("/v2/acme/app/manifests/1.0.0"); rec.Code != http.StatusOK {
+		t.Fatalf("the listed chart: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := ociReferrersOf(t, pf.oci("/v2/acme/app/referrers/"+chart.digest)); len(got) != 2 {
+		t.Errorf("the admitted chart's referrers %v, want both", got)
+	}
+	m := pf.oci("/v2/acme/app/manifests/" + f.image.indexDigest)
+	r := pf.oci("/v2/acme/app/referrers/" + f.image.indexDigest)
+	assertOCIError(t, r, m.Code, "DENIED", `profile "charts"`)
+	if n := f.hub.hitsFor("/v2/acme/app/referrers/" + f.image.indexDigest); n != 0 {
+		t.Errorf("the refused image's referrers reached the registry %d times", n)
+	}
+}
+
+// ociPagedReferrers is a registry whose referrers come in pages: page n
+// carries one descriptor of types[n-1] and links to page n+1. link, when set,
+// replaces the link page 1 carries, and failing pages answer 500.
+type ociPagedReferrers struct {
+	srv     *httptest.Server
+	types   []string
+	mu      sync.Mutex
+	link    string
+	failing map[string]bool
+	hits    map[string]int
+}
+
+func newOCIPagedReferrers(t *testing.T, s *Server, types ...string) *ociPagedReferrers {
+	p := &ociPagedReferrers{types: types, failing: map[string]bool{}, hits: map[string]int{}}
+	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		page := r.URL.Query().Get("page")
+		if page == "" {
+			page = "1"
+		}
+		n, _ := strconv.Atoi(page)
+		if !strings.Contains(r.URL.Path, "/referrers/") || n < 1 || n > len(p.types) {
+			http.NotFound(w, r)
+			return
+		}
+		p.hits[page]++
+		if p.failing[page] {
+			http.Error(w, "upstream down", http.StatusInternalServerError)
+			return
+		}
+		switch {
+		case n == 1 && p.link != "":
+			w.Header().Set("Link", p.link)
+		case n < len(p.types):
+			w.Header().Set("Link", fmt.Sprintf(`<%s?page=%d>; rel="next"`, r.URL.Path, n+1))
+		}
+		w.Header().Set("Content-Type", mediaOCIIndex)
+		typ := p.types[n-1]
+		_ = json.NewEncoder(w).Encode(map[string]any{"schemaVersion": 2, "mediaType": mediaOCIIndex, "manifests": []any{
+			map[string]any{"mediaType": mediaOCIManifest, "digest": ociDigest([]byte(typ)), "size": len(typ), "artifactType": typ},
+		}})
+	}))
+	t.Cleanup(p.srv.Close)
+	s.cfg.OCIUpstreams["docker.io"] = p.srv.URL
+	return p
+}
+
+func (p *ociPagedReferrers) set(f func(p *ociPagedReferrers)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f(p)
+}
+
+func (p *ociPagedReferrers) hitsOn(page string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hits[page]
+}
+
+// Every page of an upstream's referrers is served and cached as one index,
+// so a filter finds a type only a later page names, an outage serves the
+// whole index, and a later page that fails caches nothing.
+func TestOCIReferrersAggregatesEveryPage(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	up := newOCIPagedReferrers(t, s, ociTestSigType, ociTestSBOMType)
+	path := "/v2/library/nginx/referrers/" + f.image.indexDigest
+
+	if got := ociReferrersOf(t, doRequest(s, http.MethodGet, path, nil)); len(got) != 2 || got[1] != ociTestSBOMType {
+		t.Errorf("referrers %v, want both pages", got)
+	}
+	rec := doRequest(s, http.MethodGet, path+"?artifactType="+strings.ReplaceAll(ociTestSBOMType, "+", "%2B"), nil)
+	if got := ociReferrersOf(t, rec); len(got) != 1 || got[0] != ociTestSBOMType {
+		t.Errorf("filtered referrers %v, want the page-two %s", got, ociTestSBOMType)
+	}
+	if h := rec.Header().Get(ociFiltersHeader); h != "artifactType" {
+		t.Errorf("%s %q, want artifactType", ociFiltersHeader, h)
+	}
+
+	s.cache.MetadataTTL = time.Nanosecond
+	up.set(func(p *ociPagedReferrers) { p.failing["2"] = true })
+	if got := ociReferrersOf(t, doRequest(s, http.MethodGet, path, nil)); len(got) != 2 {
+		t.Errorf("page two failing with a cached copy: %v, want the complete cached index", got)
+	}
+
+	fresh := "/v2/library/nginx/referrers/" + f.image.amd64Digest
+	if got := ociReferrersOf(t, doRequest(s, http.MethodGet, fresh, nil)); len(got) != 0 {
+		t.Errorf("page two failing with nothing cached: %v, want the empty index rather than page one", got)
+	}
+	key := manifest.OCIReferrersKey("docker.io", "library/nginx", f.image.amd64Digest, "")
+	if b, _ := s.typeStore(manifest.TypeOCI).Get(t.Context(), key); b != nil {
+		t.Errorf("a partial index was cached: %s", b)
+	}
+}
+
+// A next link off the registry's host, or one that loops, is never followed
+// to the end: bodega answers the empty index, caches nothing, and sends the
+// registry's token nowhere else.
+func TestOCIReferrersRefusesUnsafeAndCyclicLinks(t *testing.T) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("a next link on another host was followed: %s", r.URL)
+	}))
+	defer elsewhere.Close()
+	for name, link := range map[string]func(path string) string{
+		"another host": func(path string) string { return `<` + elsewhere.URL + path + `?page=2>; rel="next"` },
+		"a cycle":      func(path string) string { return `<` + path + `>; rel="next"` },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newOCIFixture(t)
+			s := ociServer(t, f)
+			up := newOCIPagedReferrers(t, s, ociTestSigType, ociTestSBOMType)
+			path := "/v2/library/nginx/referrers/" + f.image.indexDigest
+			up.set(func(p *ociPagedReferrers) { p.link = link(path) })
+			if got := ociReferrersOf(t, doRequest(s, http.MethodGet, path, nil)); len(got) != 0 {
+				t.Errorf("referrers %v, want the empty index rather than part", got)
+			}
+			if n := up.hitsOn("1"); n != 1 {
+				t.Errorf("page one asked %d times, want once", n)
+			}
+			key := manifest.OCIReferrersKey("docker.io", "library/nginx", f.image.indexDigest, "")
+			if b, _ := s.typeStore(manifest.TypeOCI).Get(t.Context(), key); b != nil {
+				t.Errorf("a partial index was cached: %s", b)
+			}
+		})
+	}
+}
