@@ -61,6 +61,11 @@ const (
 	// DefaultNotFoundTTL is how long an upstream's 404 for a path keeps
 	// answering 404 for it while the upstream cannot be reached.
 	DefaultNotFoundTTL = "168h"
+	// DefaultRpmProfileBuildTimeout bounds one build of a profile's filtered
+	// rpm metadata. It runs apart from any client's request, so it has to
+	// outlast reading and filtering the largest filelists an upstream
+	// publishes (BaseOS, EPEL) rather than any client's timeout.
+	DefaultRpmProfileBuildTimeout = "15m"
 
 	// DefaultSpoolMaxArtifactBytes is the largest single upstream artifact the
 	// proxy will copy to disk. 8 GiB is roughly twice the biggest thing a real
@@ -144,16 +149,17 @@ type Config struct {
 	PypiUpstream           string                 `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string                 `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
 	CargoDLUpstream        string                 `json:"cargo_dl_upstream,omitempty"`
-	MavenUpstream          string                 `json:"maven_upstream,omitempty"`         // one repository root; Load folds it into MavenUpstreams and empties it
-	MavenUpstreams         []string               `json:"maven_upstreams,omitempty"`        // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
-	RubygemsUpstream       string                 `json:"rubygems_upstream,omitempty"`      // serves gem files, the compact index and the full index from one root
-	ComposerUpstream       string                 `json:"composer_upstream,omitempty"`      // Packagist's metadata root; the archives live where the metadata says
-	ComposerDistHosts      []string               `json:"composer_dist_hosts,omitempty"`    // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
-	OCIUpstreams           map[string]string      `json:"oci_upstreams,omitempty"`          // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
-	OCITokenHosts          []string               `json:"oci_token_hosts,omitempty"`        // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
-	RpmUpstreams           map[string]RpmUpstream `json:"rpm_upstreams,omitempty"`          // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
-	PrivateUpstreamHosts   []string               `json:"private_upstream_hosts,omitempty"` // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
-	DiscoverMode           string                 `json:"discover_mode,omitempty"`          // "" or "observe" — see internal/server/discovery.go
+	MavenUpstream          string                 `json:"maven_upstream,omitempty"`            // one repository root; Load folds it into MavenUpstreams and empties it
+	MavenUpstreams         []string               `json:"maven_upstreams,omitempty"`           // repository roots in the Maven layout, tried in order; /maven/<path> is appended to each
+	RubygemsUpstream       string                 `json:"rubygems_upstream,omitempty"`         // serves gem files, the compact index and the full index from one root
+	ComposerUpstream       string                 `json:"composer_upstream,omitempty"`         // Packagist's metadata root; the archives live where the metadata says
+	ComposerDistHosts      []string               `json:"composer_dist_hosts,omitempty"`       // hosts a Packagist dist URL may name; see DefaultComposerDistHosts
+	OCIUpstreams           map[string]string      `json:"oci_upstreams,omitempty"`             // registry name > fetch URL, served under /v2/; see DefaultOCIUpstreams
+	OCITokenHosts          []string               `json:"oci_token_hosts,omitempty"`           // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
+	RpmUpstreams           map[string]RpmUpstream `json:"rpm_upstreams,omitempty"`             // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
+	RpmProfileBuildTimeout string                 `json:"rpm_profile_build_timeout,omitempty"` // bound on building one profile's filtered rpm metadata
+	PrivateUpstreamHosts   []string               `json:"private_upstream_hosts,omitempty"`    // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
+	DiscoverMode           string                 `json:"discover_mode,omitempty"`             // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string                 `json:"gomod_root,omitempty"`
 	HelmRoot               string                 `json:"helm_root,omitempty"`
 	NpmRoot                string                 `json:"npm_root,omitempty"`
@@ -1584,11 +1590,13 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.MetadataTTL = firstNonEmpty(cfg.MetadataTTL, "1h")
 	cfg.UpstreamConnectTimeout = firstNonEmpty(cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout)
 	cfg.StaleGrace = firstNonEmpty(cfg.StaleGrace, DefaultStaleGrace)
-	// The server parses both with no error path, so a typo here would become
+	cfg.RpmProfileBuildTimeout = firstNonEmpty(cfg.RpmProfileBuildTimeout, DefaultRpmProfileBuildTimeout)
+	// The server parses these with no error path, so a typo here would become
 	// a zero: no connect bound at all, or no grace.
 	for _, d := range []struct{ key, val, example string }{
 		{"upstream_connect_timeout", cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout},
 		{"stale_grace", cfg.StaleGrace, DefaultStaleGrace},
+		{"rpm_profile_build_timeout", cfg.RpmProfileBuildTimeout, DefaultRpmProfileBuildTimeout},
 	} {
 		if v, err := time.ParseDuration(d.val); err != nil || v <= 0 {
 			return nil, fmt.Errorf("invalid %s %q (want a positive Go duration, e.g. %q)", d.key, d.val, d.example)

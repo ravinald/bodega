@@ -29,7 +29,7 @@ func (s *Server) queueRefusal(r *http.Request, q audit.QueueRefusal) {
 	ctx, cancel := auditContext(r)
 	defer cancel()
 	if err := s.auditDB.RecordRefusal(ctx, q, time.Now()); err != nil {
-		s.logger.Error("audit write failed, refusal not queued", "type", q.PkgType, "package", q.PkgName,
+		s.logFor(r.Context()).Error("audit write failed, refusal not queued", "type", q.PkgType, "package", q.PkgName,
 			"version", q.PkgVersion, "check", q.Check, "error", err)
 	}
 }
