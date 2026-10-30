@@ -40,6 +40,9 @@ type CacheConfig struct {
 	// the upstream before it is served that copy and the refresh carries on in
 	// the background. Zero waits for the upstream however long it takes.
 	StaleGrace time.Duration
+	// NotFoundTTL is not_found_ttl by type; a type absent from it takes
+	// config.DefaultNotFoundTTL.
+	NotFoundTTL map[string]time.Duration
 }
 
 // proxyOrCache serves an S3 object, optionally fetching from upstream on miss.
@@ -128,7 +131,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 
 	status, err := store.Head(ctx, s3Key)
 	if err != nil {
-		s.logger.Error("s3 head check failed", "key", s3Key, "error", err)
+		s.logFor(r.Context()).Error("s3 head check failed", "key", s3Key, "error", err)
 		// Fall through to upstream fetch if proxy enabled.
 	}
 
@@ -137,7 +140,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// - (immutable OR within TTL)
 	if status != nil && status.Exists {
 		if immutable || !s.isCacheStale(status) {
-			s.logger.Debug("cache hit", "key", s3Key, "immutable", immutable)
+			s.logFor(r.Context()).Debug("cache hit", "key", s3Key, "immutable", immutable)
 			// Before the body, not after: a client that hangs up mid-transfer
 			// still asked for the artifact, and the row is the record of the
 			// request rather than of the delivery.
@@ -146,7 +149,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			})
 			return
 		}
-		s.logger.Debug("cache stale", "key", s3Key)
+		s.logFor(r.Context()).Debug("cache stale", "key", s3Key)
 	}
 
 	// Cache miss or stale — fetch from upstream if proxy is enabled.
@@ -199,7 +202,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if graced {
 		var claimed bool
 		if release, claimed = s.claimStaleRefresh(s3Key); !claimed {
-			s.logger.Info("a refresh of this stale cached copy is already running, serving the cached copy", "key", s3Key)
+			s.logFor(r.Context()).Info("a refresh of this stale cached copy is already running, serving the cached copy", "key", s3Key)
 			s.serveCacheHit(w, r, store, s3Key, immutable, func(obj cachedObject) {
 				s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, obj)
 			})
@@ -224,7 +227,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if knownUpstream != "" {
 		miss = append(miss, "upstream", knownUpstream)
 	}
-	s.logger.Info("cache miss, fetching upstream", miss...)
+	s.logFor(r.Context()).Info("cache miss, fetching upstream", miss...)
 
 	upstreamURL, err := resolve(ctx)
 	if err != nil {
@@ -234,12 +237,12 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// upstream it found. The log keeps the incident beside the key,
 			// which the body leaves out.
 			s.recordUpstreamAttempt(r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, decision)
-			s.logger.Warn("upstream resolution refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			s.logFor(r.Context()).Warn("upstream resolution refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
 			refused.f.write(w, r)
 			return
 		}
 		if status != nil && status.Exists {
-			s.logger.Error("upstream resolution failed, serving the stale cached copy", "key", s3Key, "error", err)
+			s.logFor(r.Context()).Error("upstream resolution failed, serving the stale cached copy", "key", s3Key, "error", err)
 			// An outage is the window an operator reads these columns in.
 			// Left unrecorded, request_count and last_client go quiet exactly
 			// while the upstream is down and the cache is carrying the fleet.
@@ -256,24 +259,34 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// The reason names the upstream URL, which a manifest may write
 			// with userinfo in it, so it stays in the log: this route takes no
 			// token.
-			s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logFor(r.Context()).Info("upstream publishes no such artifact", "key", s3Key, "error", err)
+			}
+			s.recordNotFound(ctx, store, regType, s3Key)
 			http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
+			return
+		}
+		if s.answerRecordedNotFound(w, r, store, regType, s3Key, err) {
 			return
 		}
 		var limited *upstreamRateLimited
 		if errors.As(err, &limited) {
-			s.logger.Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			}
 			writeRateLimited(w, limited)
 			return
 		}
-		s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)
+		if !sinkUpstreamErr(r.Context(), err) {
+			s.logFor(r.Context()).Error("upstream resolution failed", "key", s3Key, "error", err)
+		}
 		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
 		return
 	}
 	s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 
 	if upstreamURL != knownUpstream {
-		s.logger.Info("resolved the upstream artifact URL", "key", s3Key, "upstream", upstreamURL)
+		s.logFor(r.Context()).Info("resolved the upstream artifact URL", "key", s3Key, "upstream", upstreamURL)
 	}
 
 	// A stale copy beats both error paths here: the upstream said something
@@ -281,9 +294,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// either status code. "The upstream does not publish this" is not a
 	// gateway failure, and conflating the two makes every unpublished path
 	// read as an outage.
+	var fetched upstreamFetch
 	fail := func(err error) {
 		if status != nil && status.Exists {
-			s.logger.Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
+			s.logFor(r.Context()).Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
 			// The audit row, not the discovery row. This branch is below the
 			// allow-list gate, which already recorded the attempt for this
 			// request, and a second discovery write would bump request_count
@@ -296,9 +310,17 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			})
 			return
 		}
+		// Ahead of the rate limit: a 503 carrying Retry-After is still the
+		// upstream failing, and the record is the better answer for a path
+		// it had said it lacks.
+		if s.answerRecordedNotFound(w, r, store, regType, s3Key, err) {
+			return
+		}
 		var limited *upstreamRateLimited
 		if errors.As(err, &limited) {
-			s.logger.Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			}
 			writeRateLimited(w, limited)
 			return
 		}
@@ -307,20 +329,30 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// An opener read what the upstream sent and bodega refuses it:
 			// bytes that do not hash to the digest asked for, a token realm
 			// on an unlisted host. Nothing was cached.
-			s.logger.Warn("upstream fetch refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logFor(r.Context()).Warn("upstream fetch refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			}
 			refused.f.write(w, r)
 			return
 		}
 		if errors.Is(err, errUpstreamNotFound) {
-			s.logger.Debug("upstream has no such object", "url", upstreamURL)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logFor(r.Context()).Debug("upstream has no such object", "url", upstreamURL)
+			}
+			// A 404 past the requested path's own 200, such as a tag list's
+			// later page, says nothing about the path.
+			if !fetched.answered {
+				s.recordNotFound(ctx, store, regType, s3Key)
+			}
 			http.NotFound(w, r)
 			return
 		}
-		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
+		if !sinkUpstreamErr(r.Context(), err) {
+			s.logFor(r.Context()).Error("upstream fetch failed", "url", upstreamURL, "error", err)
+		}
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 	}
 
-	var fetched upstreamFetch
 	if graced {
 		// Detached so that a client giving up does not cancel the refresh it
 		// is waiting on; upstreamClient's Timeout is what bounds it instead.
@@ -339,7 +371,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		if !answered {
 			go s.finishStaleRefresh(fetchCtx, results, store, s3Key, release)
 			release = nil
-			s.logger.Warn("upstream did not answer within stale_grace, serving the stale cached copy and refreshing in the background",
+			s.logFor(r.Context()).Warn("upstream did not answer within stale_grace, serving the stale cached copy and refreshing in the background",
 				"url", upstreamURL, "stale_grace", s.cache.StaleGrace)
 			// Recorded as the failed-fetch fallback records it: the attempt
 			// row is already written, and these are cached bytes.
@@ -352,6 +384,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		fetched = s.fetchUpstreamInOrder(ctx, upstreamURL, order, regType)
 	}
 	up, spool, err := fetched.up, fetched.spool, fetched.err
+	if (fetched.answered || pathAnsweredIn(ctx)) && store != nil {
+		s.clearNotFound(ctx, store, s3Key)
+	}
 	if err != nil {
 		if reason := spoolDenialReason(err); reason != "" {
 			s.recordSpoolRefusal(r, regType, discoveryPkgName, s3Key, reason, err)
@@ -390,7 +425,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// known, and a truncated response is not a refusal.
 	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
 		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
-		s.logger.Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
+		s.logFor(r.Context()).Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
 		f.write(w, r)
 		return
 	}
@@ -426,7 +461,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		ct = "application/octet-stream"
 	}
 	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
-		s.logger.Error("could not rewind the spooled artifact", "key", s3Key, "error", err)
+		s.logFor(r.Context()).Error("could not rewind the spooled artifact", "key", s3Key, "error", err)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -437,17 +472,24 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if _, err := io.Copy(w, spool.file); err != nil {
 		// The status line is already out, so there is nothing to tell the
 		// client. The object is cached and the next request serves it.
-		s.logger.Warn("client read of a proxied artifact was cut short", "key", s3Key, "error", err)
+		if !failBodyTransfer(r.Context(), fmt.Errorf("stream %s from the spool: %w", s3Key, err)) {
+			s.logFor(r.Context()).Warn("client read of a proxied artifact was cut short", "key", s3Key, "error", err)
+		}
 	}
 }
 
 // upstreamFetch is an upstream body read to the spool, or why it was not. The
 // body is closed by the time it is returned; up carries the URL that answered
 // and the content type.
+//
+// answered is set when an upstream answered 2xx, even where err is set: a
+// status bodega does not serve, or a body that broke off. Either way the
+// upstream has the path, so a recorded 404 for it no longer holds.
 type upstreamFetch struct {
-	up    *upstreamStream
-	spool *spooledUpstream
-	err   error
+	up       *upstreamStream
+	spool    *spooledUpstream
+	err      error
+	answered bool
 }
 
 // fetchUpstream opens upstreamURL and spools its body. A spool refusal comes
@@ -461,14 +503,59 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 	}
 	up, err := open(ctx, upstreamURL)
 	if err != nil {
-		return upstreamFetch{err: err}
+		return upstreamFetch{err: err, answered: upstreamAnsweredIn(err)}
 	}
 	defer up.body.Close()
 	spool, err := s.spoolUpstream(up)
 	if err != nil {
-		return upstreamFetch{err: err}
+		return upstreamFetch{err: err, answered: true}
 	}
-	return upstreamFetch{up: up, spool: spool}
+	return upstreamFetch{up: up, spool: spool, answered: true}
+}
+
+// upstreamAnswered marks an opener failure that came after the requested path
+// answered 200: a body that does not parse, a digest that does not match, a
+// store that refused the result. The upstream has the path whatever bodega
+// made of its answer, so the failure clears a recorded 404 and is never read
+// as an outage.
+type upstreamAnswered struct{ err error }
+
+func (e *upstreamAnswered) Error() string { return e.err.Error() }
+func (e *upstreamAnswered) Unwrap() error { return e.err }
+
+// afterAnswer wraps err, when there is one, as a failure past a 200.
+func afterAnswer(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &upstreamAnswered{err: err}
+}
+
+// upstreamAnsweredIn reports an open failure whose upstream answered 2xx for
+// the requested path: a 2xx bodega does not serve, or an opener's own failure
+// past a 200.
+func upstreamAnsweredIn(err error) bool {
+	var after *upstreamAnswered
+	if errors.As(err, &after) {
+		return true
+	}
+	var status *upstreamStatusError
+	return errors.As(err, &status) && status.status >= 200 && status.status < 300
+}
+
+// pathAnsweredKey marks a request whose requested path already answered 2xx
+// before the proxy fetched it: a manifest fetched to classify the request.
+// The observation holds for the rest of the request, so no later failure in it
+// recreates a not-found record or answers from one.
+type pathAnsweredKey struct{}
+
+func withPathAnswered(ctx context.Context) context.Context {
+	return context.WithValue(ctx, pathAnsweredKey{}, true)
+}
+
+func pathAnsweredIn(ctx context.Context) bool {
+	answered, _ := ctx.Value(pathAnsweredKey{}).(bool)
+	return answered
 }
 
 // upstreamOpener opens one upstream URL in place of openUpstream, for a
@@ -493,21 +580,30 @@ func withUpstreamOpener(ctx context.Context, open upstreamOpener) context.Contex
 // failure that was not a 404, because "one repository is down" is the
 // answer that tells the operator something when the rest merely lack the
 // file; and failing that, the last 404.
+//
+// The result's answered is set when any upstream walked answered 2xx, not
+// only the one returned.
 func (s *Server) fetchUpstreamInOrder(ctx context.Context, first string, order *upstreamOrder, regType string) upstreamFetch {
 	fetched := s.fetchUpstream(ctx, first, regType)
 	if order == nil {
 		return fetched
 	}
+	answered := false
+	result := func(f upstreamFetch) upstreamFetch {
+		f.answered = f.answered || answered
+		return f
+	}
 	var failed *upstreamFetch
 	for i := 0; ; i++ {
+		answered = answered || fetched.answered
 		if fetched.err == nil {
 			if order.served != nil {
 				order.served(i)
 			}
-			return fetched
+			return result(fetched)
 		}
 		if spoolDenialReason(fetched.err) != "" || ctx.Err() != nil {
-			return fetched
+			return result(fetched)
 		}
 		if failed == nil && !errors.Is(fetched.err, errUpstreamNotFound) {
 			f := fetched
@@ -517,13 +613,13 @@ func (s *Server) fetchUpstreamInOrder(ctx context.Context, first string, order *
 			break
 		}
 		next := order.fallbacks[i]
-		s.logger.Info("upstream did not answer with the object, asking the next in order", "error", fetched.err, "next", next)
+		s.logFor(ctx).Info("upstream did not answer with the object, asking the next in order", "error", fetched.err, "next", next)
 		fetched = s.fetchUpstream(ctx, next, regType)
 	}
 	if failed != nil {
-		return *failed
+		return result(*failed)
 	}
-	return fetched
+	return result(fetched)
 }
 
 // claimStaleRefresh takes the one refresh slot for s3Key. It reports false
@@ -542,13 +638,115 @@ func (s *Server) claimStaleRefresh(s3Key string) (func(), bool) {
 func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstreamFetch, store storage.ObjectStore, s3Key string, release func()) {
 	defer release()
 	res := <-results
+	if res.answered {
+		s.clearNotFound(ctx, store, s3Key)
+	}
 	if res.err != nil {
-		s.logger.Error("background refresh of a stale cached copy failed, the stale copy stays", "key", s3Key, "error", res.err)
+		s.logFor(ctx).Error("background refresh of a stale cached copy failed, the stale copy stays", "key", s3Key, "error", res.err)
 		return
 	}
 	defer res.spool.close()
 	s.fillCache(ctx, store, s3Key, res.spool.path(), res.up.url, res.spool.sha256, res.spool.size)
-	s.logger.Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
+	s.logFor(ctx).Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
+}
+
+// notFoundPrefix holds one record per path every upstream answered 404 for.
+// It sits outside every type's key prefix, so no index built by listing a
+// type's keys ever lists a record as an artifact.
+const notFoundPrefix = "_notfound/"
+
+// notFoundRecord is an upstream's 404 for one path, kept in the store beside
+// the cache so it outlives a restart. It is read only once the upstream has
+// failed to answer: a client that tolerates a 404 and not a 5xx (Gradle
+// asking for a plugin marker's .jar, which is never published) would
+// otherwise fail every build bodega's cache could have carried.
+type notFoundRecord struct {
+	Type string    `json:"type"`
+	Path string    `json:"path"`
+	At   time.Time `json:"at"`
+}
+
+// notFoundTTL is how long a record for regType answers 404 during an outage.
+func (s *Server) notFoundTTL(regType string) time.Duration {
+	if d, ok := s.cache.NotFoundTTL[regType]; ok {
+		return d
+	}
+	d, _ := time.ParseDuration(config.DefaultNotFoundTTL)
+	return d
+}
+
+func (s *Server) recordNotFound(ctx context.Context, store storage.ObjectStore, regType, s3Key string) {
+	if store == nil || s.notFoundTTL(regType) <= 0 || pathAnsweredIn(ctx) {
+		return
+	}
+	b, err := json.Marshal(notFoundRecord{Type: regType, Path: s3Key, At: time.Now().UTC()})
+	if err == nil {
+		err = store.Put(context.WithoutCancel(ctx), notFoundPrefix+s3Key, b)
+	}
+	if err != nil {
+		s.logFor(ctx).Warn("could not record the upstream's 404, an outage will answer 502 for this path", "key", s3Key, "error", err)
+	}
+}
+
+func (s *Server) clearNotFound(ctx context.Context, store storage.ObjectStore, s3Key string) {
+	if err := store.Delete(context.WithoutCancel(ctx), notFoundPrefix+s3Key); err != nil {
+		s.logFor(ctx).Warn("could not remove the record of an earlier upstream 404", "key", s3Key, "error", err)
+	}
+}
+
+// answerRecordedNotFound answers 404 for a fetch that failed because the
+// upstream could not be reached, when a record younger than the type's TTL
+// says the upstream had answered 404 for it. Anything else is left to the
+// caller: a path never seen missing is a 502, so an outage invents nothing.
+func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, regType, s3Key string, err error) bool {
+	ttl := s.notFoundTTL(regType)
+	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(r.Context()) {
+		return false
+	}
+	b, gerr := store.Get(r.Context(), notFoundPrefix+s3Key)
+	if gerr != nil || b == nil {
+		return false
+	}
+	var rec notFoundRecord
+	if json.Unmarshal(b, &rec) != nil || rec.Path != s3Key {
+		return false
+	}
+	age := time.Since(rec.At)
+	if age < 0 || age >= ttl {
+		return false
+	}
+	s.logFor(r.Context()).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
+	http.NotFound(w, r)
+	return true
+}
+
+// upstreamUnreachable reports a fetch that got no answer from the upstream: a
+// connection error, a failed DNS lookup, a timeout, or a 5xx, a 503 carrying
+// Retry-After included. A 403, a 429, a redirect or URL the guard refused is
+// the upstream answering or bodega's policy, and none of them may turn into a
+// 404.
+//
+// url.Error is unwrapped by hand because it satisfies net.Error itself, so a
+// redirect the guard refused would otherwise read as a network failure. Outside
+// it, the only net.Error a fetch returns is the guard's own DNS lookup.
+func upstreamUnreachable(err error) bool {
+	if upstreamAnsweredIn(err) {
+		return false
+	}
+	var status *upstreamStatusError
+	if errors.As(err, &status) {
+		return status.status >= 500
+	}
+	var limited *upstreamRateLimited
+	if errors.As(err, &limited) {
+		return limited.status >= 500
+	}
+	var ne net.Error
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Timeout() || errors.As(ue.Err, &ne)
+	}
+	return errors.As(err, &ne) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // cacheEnabled returns true if the proxy/cache feature is active.
@@ -801,22 +999,25 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
 	}
 
-	if identity {
-		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-			resp.Body.Close()
-			return nil, fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
-				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
-				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)
-		}
-	}
-
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
+		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+	}
+
+	// After the status: the identity rule protects artifact bytes, and only a
+	// 200 carries any. A CDN that gzips its 404 or 5xx page has still said
+	// "missing" or "failing", and the not-found record reads that status.
+	if identity {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+			resp.Body.Close()
+			return nil, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL))
+		}
 	}
 
 	// resp.Request is the last request in the chain, so its URL is the server
@@ -847,6 +1048,18 @@ type upstreamRateLimited struct {
 
 func (e *upstreamRateLimited) Error() string {
 	return fmt.Sprintf("upstream returned %d with Retry-After %q: %s", e.status, e.retryAfter, e.url)
+}
+
+// upstreamStatusError is an upstream answering with a status bodega neither
+// serves nor relays. Its code is kept so a 5xx can be told from a 403: the
+// first is the upstream failing, the second is the upstream answering.
+type upstreamStatusError struct {
+	url    string
+	status int
+}
+
+func (e *upstreamStatusError) Error() string {
+	return fmt.Sprintf("upstream returned %d: %s", e.status, e.url)
 }
 
 // defaultRateLimitRetryAfter is the interval bodega tells a client to wait
@@ -1023,7 +1236,7 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 	// Look up stored checksum.
 	stored, err := s.auditDB.GetChecksum(ctx, s3Key)
 	if err != nil {
-		s.logger.Error("checksum DB unavailable, refusing to serve immutable resource", "key", s3Key, "error", err)
+		s.logFor(ctx).Error("checksum DB unavailable, refusing to serve immutable resource", "key", s3Key, "error", err)
 		return fmt.Errorf("checksum lookup unavailable: %w", err)
 	}
 
@@ -1036,9 +1249,9 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 		// First fetch — store the computed checksum.
 		pkgType, pkgName, pkgVersion := manifest.ParseKey(s3Key)
 		if err := s.auditDB.StoreChecksum(ctx, s3Key, pkgType, pkgName, pkgVersion, "sha256", computed, "computed"); err != nil {
-			s.logger.Warn("failed to store checksum", "key", s3Key, "error", err)
+			s.logFor(ctx).Warn("failed to store checksum", "key", s3Key, "error", err)
 		} else {
-			s.logger.Info("checksum stored", "key", s3Key, "sha256", computed[:12]+"...")
+			s.logFor(ctx).Info("checksum stored", "key", s3Key, "sha256", computed[:12]+"...")
 		}
 		return nil
 	}
@@ -1067,7 +1280,7 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 			msg: fmt.Sprintf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))}
 	}
 
-	s.logger.Debug("checksum verified", "key", s3Key)
+	s.logFor(ctx).Debug("checksum verified", "key", s3Key)
 	return nil
 }
 
@@ -1100,7 +1313,7 @@ func shortDigest(v string) string {
 func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandidate string) (string, bool, error) {
 	listed, listedErr := s.policy.Listed(ctx, regType)
 	if listedErr != nil {
-		s.logger.Error("policy rules lookup failed", "error", listedErr)
+		s.logFor(ctx).Error("policy rules lookup failed", "error", listedErr)
 	}
 	err := s.policy.Check(ctx, regType, policyCandidate)
 	violation := err != nil && policy.IsViolation(err)
@@ -1176,20 +1389,20 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 	defer cancel()
 	decision, violation, err := s.upstreamPolicyVerdict(ctx, regType, policyCandidate)
 	if err != nil {
-		s.logger.Error("policy check failed", "error", err)
+		s.logFor(r.Context()).Error("policy check failed", "error", err)
 		http.Error(w, "policy check failed", http.StatusInternalServerError)
 		return "", false
 	}
 	if violation && override != nil {
 		if o, ok := override(); ok {
-			s.logger.Warn("upstream admitted past the allow-list by override", "type", regType,
+			s.noteFor(r.Context()).Warn("upstream admitted past the allow-list by override", "type", regType,
 				"candidate", policyCandidate, "key", s3Key, "override", o.ID)
 			return decision, true
 		}
 	}
 	if violation && baseline != nil {
 		if _, marked := baseline(); marked {
-			s.logger.Warn("upstream admitted past the allow-list as baseline", "type", regType,
+			s.noteFor(r.Context()).Warn("upstream admitted past the allow-list as baseline", "type", regType,
 				"candidate", policyCandidate, "key", s3Key)
 			return decision, true
 		}
@@ -1208,7 +1421,7 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		}
 		f := allowListRefusal(regType, policyCandidate, discoveryPkgName, versionFromKey(s3Key))
 		blocked = append(blocked, "incident", f.incident)
-		s.logger.Warn("upstream blocked by policy", blocked...)
+		s.logFor(r.Context()).Warn("upstream blocked by policy", blocked...)
 		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL, f.incident)
 		name := discoveryPkgName
 		if name == "" {
@@ -1366,7 +1579,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 	res := admit.Fetch(r.Context(), s.auditDB, checkers, fill.typ, fill.name, ve,
 		allow, admit.Who{Identity: Identity(r)}, notRun)
 	for _, warn := range res.Warns {
-		s.logger.Warn("upstream fetch admitted with a policy warning", "type", fill.typ, "package", fill.name,
+		s.noteFor(r.Context()).Warn("upstream fetch admitted with a policy warning", "type", fill.typ, "package", fill.name,
 			"version", fill.version, "check", warn.Check, "reason", warn.Reason)
 	}
 	s.recordFillPolicyEvent(r, fill, res)
@@ -1375,7 +1588,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 	}
 	f := admitRefusal(fill.typ, fill.name, admitBlock{check: res.Block.Check, version: fill.version,
 		incident: res.Incident, details: res.Block.Details})
-	s.logger.Warn("upstream fetch blocked by policy", "type", fill.typ, "package", fill.name,
+	s.logFor(r.Context()).Warn("upstream fetch blocked by policy", "type", fill.typ, "package", fill.name,
 		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
 	s.queueResult(r, fill.typ, fill.name, fill.version, *res.Block, f)
 	f.write(w, r)
@@ -1458,7 +1671,7 @@ func (s *Server) allowListOverrideLookup(ctx context.Context, regType, name, s3K
 		var err error
 		o, ok, err = admit.ActiveOverride(ctx, s.auditDB, fill.typ, fill.name, version, audit.CheckAllowList, time.Now())
 		if err != nil {
-			s.logger.Warn("overrides not read, so none applied to the allow-list", "type", fill.typ,
+			s.logFor(ctx).Warn("overrides not read, so none applied to the allow-list", "type", fill.typ,
 				"package", fill.name, "version", fill.version, "error", err)
 		}
 		return o, ok
@@ -1493,7 +1706,7 @@ func (s *Server) recordFillPolicyEvent(r *http.Request, fill fillAdmission, res 
 		ClientIP:   ClientIP(r),
 		Identity:   Identity(r),
 	}); err != nil {
-		s.logger.Error("audit write failed, fill policy event not recorded",
+		s.logFor(r.Context()).Error("audit write failed, fill policy event not recorded",
 			"type", fill.typ, "package", fill.name, "version", fill.version, "status", status, "error", err)
 	}
 }
@@ -1536,11 +1749,11 @@ func (s *Server) pinAdmission(ctx context.Context, store storage.ObjectStore, ty
 	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
 	switch {
 	case err != nil:
-		s.logger.Error("admission row not updated with its object key", "type", typ, "package", name,
+		s.logFor(ctx).Error("admission row not updated with its object key", "type", typ, "package", name,
 			"version", version, "key", key, "error", err)
 		return
 	case outcome == audit.PinUnadmitted:
-		s.logger.Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
+		s.noteFor(ctx).Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
 			"type", typ, "package", name, "version", version, "key", key)
 	}
 	s.emitAttestation(ctx, store, attest.Pin{
@@ -1584,7 +1797,7 @@ func (s *Server) proxyMalwareGate(w http.ResponseWriter, r *http.Request, regTyp
 	switch res.Action {
 	case policy.ActionBlock:
 		f := osvRefusal(regType, name, version, res.Details)
-		s.logger.Warn("upstream blocked by OSV malware policy", "type", regType, "package", name, "version", version,
+		s.logFor(r.Context()).Warn("upstream blocked by OSV malware policy", "type", regType, "package", name, "version", version,
 			"reason", res.Reason, "incident", f.incident)
 		s.recordMalwareRefusal(r, regType, name, version, s3Key, res, f.incident)
 		s.queueResult(r, regType, name, version, res, f)
@@ -1599,7 +1812,7 @@ func (s *Server) proxyMalwareGate(w http.ResponseWriter, r *http.Request, regTyp
 		f.write(w, r)
 		return false
 	case policy.ActionWarn:
-		s.logger.Warn("OSV malware check could not clear the fill", "type", regType, "package", name, "version", version, "reason", res.Reason)
+		s.logFor(r.Context()).Warn("OSV malware check could not clear the fill", "type", regType, "package", name, "version", version, "reason", res.Reason)
 	}
 	return true
 }
@@ -1640,7 +1853,7 @@ func (s *Server) recordMalwareRefusal(r *http.Request, regType, name, version, s
 		Status:     audit.CacheMalwareBlocked,
 		Details:    string(details),
 	}); err != nil {
-		s.logger.Error("audit write failed, malware refusal not recorded — still refusing",
+		s.logFor(r.Context()).Error("audit write failed, malware refusal not recorded — still refusing",
 			"event_type", audit.EventCache, "status", audit.CacheMalwareBlocked,
 			"type", regType, "package", name, "version", version, "error", err)
 	}
@@ -1684,7 +1897,7 @@ func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate
 		Status:    audit.CachePolicyViolation,
 		Details:   fmt.Sprintf("url=%s incident=%s", upstreamURL, incident),
 	}); err != nil {
-		s.logger.Error("audit write failed, denial not recorded — still refusing",
+		s.logFor(r.Context()).Error("audit write failed, denial not recorded — still refusing",
 			"event_type", audit.EventCache, "status", audit.CachePolicyViolation,
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL,
 			"incident", incident, "error", err)
@@ -1749,7 +1962,7 @@ func (s *Server) recordCacheEvent(r *http.Request, status, regType, upstreamURL,
 		Status:     status,
 		Details:    string(details),
 	}); err != nil {
-		s.logger.Error("audit write failed, proxy outcome not recorded — still serving",
+		s.logFor(r.Context()).Error("audit write failed, proxy outcome not recorded — still serving",
 			"event_type", audit.EventCache, "status", status,
 			"key", s3Key, "upstream", upstreamURL, "error", err)
 	}
@@ -1795,7 +2008,7 @@ func (s *Server) cachedOrigin(r *http.Request, s3Key string, obj cachedObject) s
 	if err != nil {
 		// Unknown, not guessed. The row says the origin is unrecorded, which
 		// is the honest answer to a lookup that could not run.
-		s.logger.Warn("cache origin lookup failed, the hit row cannot name its upstream",
+		s.logFor(r.Context()).Warn("cache origin lookup failed, the hit row cannot name its upstream",
 			"key", s3Key, "error", err)
 		return ""
 	}
@@ -1820,7 +2033,7 @@ func (s *Server) pendingOrigin(ctx context.Context, s3Key string, obj cachedObje
 	}
 	id, digest, err := identifyObject(ctx, obj.store, s3Key)
 	if err != nil {
-		s.logger.Warn("the cached object could not be read back, a fill in flight cannot be credited with it",
+		s.logFor(ctx).Warn("the cached object could not be read back, a fill in flight cannot be credited with it",
 			"key", s3Key, "error", err)
 		return ""
 	}
@@ -1845,10 +2058,10 @@ func (s *Server) fillCache(ctx context.Context, store storage.ObjectStore, s3Key
 	defer release()
 
 	if err := store.PutFile(ctx, localPath, s3Key); err != nil {
-		s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
+		s.logFor(ctx).Warn("failed to cache object", "key", s3Key, "error", err)
 		return
 	}
-	s.logger.Debug("cached object", "key", s3Key, "bytes", size)
+	s.logFor(ctx).Debug("cached object", "key", s3Key, "bytes", size)
 	s.recordCacheOrigin(ctx, store, s3Key, upstreamURL, digest)
 }
 
@@ -1885,18 +2098,18 @@ func (s *Server) recordCacheOrigin(ctx context.Context, store storage.ObjectStor
 
 	id, stored, err := identifyObject(octx, store, s3Key)
 	if err != nil {
-		s.logger.Warn("cached object could not be identified, a later hit cannot name its upstream",
+		s.logFor(ctx).Warn("cached object could not be identified, a later hit cannot name its upstream",
 			"key", s3Key, "error", err)
 		return
 	}
 	if stored != digest {
-		s.logger.Warn("the cached object is not the one this fetch wrote, origin left unrecorded",
+		s.logFor(ctx).Warn("the cached object is not the one this fetch wrote, origin left unrecorded",
 			"key", s3Key, "upstream", upstreamURL,
 			"fetched", shortDigest(digest), "stored", shortDigest(stored))
 		return
 	}
 	if err := s.auditDB.StoreCacheOrigin(octx, s3Key, upstreamURL, id); err != nil {
-		s.logger.Warn("cache origin not recorded, a later hit on this key cannot name its upstream",
+		s.logFor(ctx).Warn("cache origin not recorded, a later hit on this key cannot name its upstream",
 			"key", s3Key, "upstream", upstreamURL, "error", err)
 	}
 }
@@ -1980,7 +2193,7 @@ func (s *Server) serveCacheHitIf(w http.ResponseWriter, r *http.Request, store s
 	if immutable {
 		noteServed(r, s3Key, "")
 	}
-	s.serveStored(w, s3Key, res)
+	s.serveStored(w, r, s3Key, res)
 }
 
 // cacheFills is the attribution for keys whose proxied bytes have reached the

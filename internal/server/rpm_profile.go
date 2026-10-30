@@ -4,19 +4,24 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -81,22 +86,126 @@ type rpmFilteredFile struct {
 // rpmProfileBuild is one profile's filtered files over one set of upstream
 // files, identified by the profile's fingerprint and the upstream checksums.
 type rpmProfileBuild struct {
-	key   string
-	files map[string]rpmFilteredFile
+	key, fingerprint string
+	files            map[string]rpmFilteredFile
+	kept             int
 }
 
-// rpmProfileBuilds holds each profile view's recent builds. built counts the
-// builds made, which is what a test reads to show a second host on a profile
-// reused the first host's.
+// rpmProfileBuilds holds each profile view's recent builds and the builds
+// running for it. built counts the builds made, which is what a test reads to
+// show a second host on a profile reused the first host's.
 type rpmProfileBuilds struct {
 	mu    sync.Mutex
 	views map[string]*rpmProfileSlot
 	built int
+	// timeout bounds one build, rpmProfileBuildTimeout when zero. wait is how
+	// long a request waits on a running build before answering without it,
+	// rpmProfileBuildWait when zero.
+	timeout, wait time.Duration
+	// running counts the build goroutines alive, so a test can let them end
+	// before its store goes away.
+	running sync.WaitGroup
 }
 
+// rpmProfileBuildWait is how long a request waits on a build before it is
+// answered from the previous build or with a 503. A build that small
+// repositories finish inside it is answered in one request; rpmProfileBudget
+// shortens it for a request that spent part of its budget elsewhere.
+const rpmProfileBuildWait = 3 * time.Second
+
+// rpmProfileBudget is how long a governed host's metadata request may wait,
+// on the upstream repomd.xml's refresh, a running build and the store
+// together, before bodega answers it without what it was waiting for. It sits
+// a second under the 5 seconds a client is promised, and far under dnf's
+// 30-second low-speed cutoff, so the answer is written inside both.
+const rpmProfileBudget = 4 * time.Second
+
+// rpmProfileFallbackReserve is the part of the budget a wait on a build
+// leaves for checking that the previous build is still stored.
+const rpmProfileFallbackReserve = 500 * time.Millisecond
+
+// rpmProfileRetryAfter is the Retry-After a 503 for a running build carries.
+const rpmProfileRetryAfter = "10"
+
+var rpmProfileBuildTimeout = func() time.Duration {
+	d, _ := time.ParseDuration(config.DefaultRpmProfileBuildTimeout)
+	return d
+}()
+
 type rpmProfileSlot struct {
-	mu     sync.Mutex
-	recent []*rpmProfileBuild
+	mu      sync.Mutex
+	recent  []*rpmProfileBuild
+	running map[string]*rpmProfileJob
+	// gen counts the builds published to recent. A request checks the store
+	// with the lock released, and registers a build only while the
+	// generation it checked against still stands: a build that finished in
+	// between is checked first, or the same key is built twice.
+	gen uint64
+}
+
+// rpmProfileJob is one build in progress. b and err are set before done is
+// closed and never written after.
+type rpmProfileJob struct {
+	done chan struct{}
+	b    *rpmProfileBuild
+	err  error
+}
+
+// errRpmProfileBuilding is a request that found its view's build running past
+// its wait with no previous build it could serve.
+var errRpmProfileBuilding = errors.New("the profile's filtered metadata is still being built")
+
+// errRpmProfileSlow is a request whose budget ran out on the upstream
+// repomd.xml or the store before it had what it needed to answer.
+var errRpmProfileSlow = errors.New("the upstream repomd.xml or the store did not answer within the request's budget")
+
+// rpmProfileBuildError is a build that failed. The build logged it, so the
+// requests waiting on it answer without logging it again.
+type rpmProfileBuildError struct {
+	file string
+	err  error
+}
+
+func (e *rpmProfileBuildError) Error() string {
+	return fmt.Sprintf("building the filtered %s: %v", e.file, e.err)
+}
+
+func (e *rpmProfileBuildError) Unwrap() error { return e.err }
+
+type rpmBudgetKey struct{}
+
+// withRpmBudget starts r's budget, unless the request r was read for already
+// started one.
+func withRpmBudget(r *http.Request) *http.Request {
+	if _, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), rpmBudgetKey{}, time.Now().Add(rpmProfileBudget)))
+}
+
+// rpmBudgetEnd is when r's budget runs out.
+func rpmBudgetEnd(r *http.Request) time.Time {
+	if end, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
+		return end
+	}
+	return time.Now().Add(rpmProfileBudget)
+}
+
+// rpmBounded runs f and waits for it until end; ok is false when f had not
+// returned by then. f is left to finish on its own rather than canceled,
+// because a storage backend may ignore its context, so f must write nothing
+// the caller reads after giving up on it.
+func rpmBounded[T any](end time.Time, f func() T) (v T, ok bool) {
+	ch := make(chan T, 1)
+	go func() { ch <- f() }()
+	timer := time.NewTimer(time.Until(end))
+	defer timer.Stop()
+	select {
+	case v = <-ch:
+		return v, true
+	case <-timer.C:
+		return v, false
+	}
 }
 
 func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
@@ -107,10 +216,23 @@ func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
 	}
 	sl := c.views[view]
 	if sl == nil {
-		sl = &rpmProfileSlot{}
+		sl = &rpmProfileSlot{running: map[string]*rpmProfileJob{}}
 		c.views[view] = sl
 	}
 	return sl
+}
+
+// building reports whether a build is running for view.
+func (c *rpmProfileBuilds) building(view string) bool {
+	c.mu.Lock()
+	sl := c.views[view]
+	c.mu.Unlock()
+	if sl == nil {
+		return false
+	}
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return len(sl.running) > 0
 }
 
 func (c *rpmProfileBuilds) count() int {
@@ -135,8 +257,11 @@ func (s *Server) rpmProfileRepomd(r *http.Request, t rpmTree, p *entitle.Profile
 
 // rpmProfileFiles is p's build over the upstream files data names, made when
 // no build for this fingerprint and these checksums is held or one of its
-// files has gone from the store.
+// files has gone from the store. It answers within r's budget: with the
+// build, with the previous build when that one can stand in for it, or with
+// errRpmProfileBuilding or errRpmProfileSlow.
 func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, data []rpmRepomdData) (*rpmProfileBuild, error) {
+	end := rpmBudgetEnd(r)
 	entries := map[string]rpmRepomdData{}
 	for _, d := range data {
 		for _, typ := range rpmFilteredTypes {
@@ -150,8 +275,7 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	if _, ok := entries["primary"]; !ok {
 		return nil, nil
 	}
-	store := s.typeStore(manifest.TypeRpm)
-	if store == nil {
+	if s.typeStore(manifest.TypeRpm) == nil {
 		return nil, errors.New("no storage backend holds the rpm type, so a filtered metadata file has nowhere to live")
 	}
 	stamps := map[string]int64{}
@@ -173,20 +297,217 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 		}
 	}
 
+	fingerprint := p.Fingerprint(manifest.TypeRpm)
 	sl := s.rpmProfileBuilds.slot(rpmProfileView(t, p))
+	var job *rpmProfileJob
+	for job == nil {
+		sl.mu.Lock()
+		recent, gen := slices.Clone(sl.recent), sl.gen
+		sl.mu.Unlock()
+		for _, b := range recent {
+			if b.key != key {
+				continue
+			}
+			stored, ok := s.rpmProfileBuildStored(end, r, t, b)
+			if !ok {
+				return nil, errRpmProfileSlow
+			}
+			if stored {
+				return b, nil
+			}
+		}
+		sl.mu.Lock()
+		if job = sl.running[key]; job == nil && sl.gen == gen {
+			job = s.startRpmProfileBuild(r, sl, t, p, key, fingerprint, entries, stamps)
+		}
+		sl.mu.Unlock()
+	}
+
+	wait := s.rpmProfileBuilds.wait
+	if wait <= 0 {
+		wait = rpmProfileBuildWait
+	}
+	waitEnd := time.Now().Add(wait)
+	if last := end.Add(-rpmProfileFallbackReserve); last.Before(waitEnd) {
+		waitEnd = last
+	}
+	timer := time.NewTimer(time.Until(waitEnd))
+	defer timer.Stop()
+	select {
+	case <-job.done:
+		return job.b, job.err
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	case <-timer.C:
+	}
+	// A previous build under this fingerprint lists what the profile grants
+	// today over an older upstream; one under another fingerprint would list
+	// what an edited profile no longer grants, so it is never served. It
+	// stands in only for a document naming the same filtered types it built:
+	// rpmRewriteRepomd leaves an entry the build has no file for as the
+	// upstream's, which would list the unfiltered file, and cannot add one
+	// the document lacks.
 	sl.mu.Lock()
-	defer sl.mu.Unlock()
-	for _, b := range sl.recent {
-		if b.key == key && s.rpmProfileBuildStored(r, t, b) {
+	recent := slices.Clone(sl.recent)
+	sl.mu.Unlock()
+	for _, b := range recent {
+		if b.fingerprint != fingerprint || !b.coversTypes(entries) {
+			continue
+		}
+		stored, ok := s.rpmProfileBuildStored(end, r, t, b)
+		if !ok {
+			break
+		}
+		if stored {
 			return b, nil
 		}
 	}
+	return nil, errRpmProfileBuilding
+}
 
+// coversTypes reports whether b filtered exactly the types entries names.
+func (b *rpmProfileBuild) coversTypes(entries map[string]rpmRepomdData) bool {
+	if len(b.files) != len(entries) {
+		return false
+	}
+	for typ := range entries {
+		if _, ok := b.files[typ]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// startRpmProfileBuild registers the build of key in sl and starts it. The
+// caller holds sl.mu.
+func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64) *rpmProfileJob {
+	job := &rpmProfileJob{done: make(chan struct{})}
+	sl.running[key] = job
+	timeout := s.rpmProfileBuilds.timeout
+	if timeout <= 0 {
+		timeout = rpmProfileBuildTimeout
+	}
+	// The build belongs to no request: dnf gives up on a repomd.xml after 30
+	// seconds without a byte, and a build of BaseOS's filelists takes longer,
+	// so under the request's context it would be canceled and started over by
+	// every retry. It keeps the request's values (who asked, for the upstream
+	// fetch's records) and drops its cancellation and its budget.
+	ctx := context.WithValue(context.WithoutCancel(r.Context()), rpmBudgetKey{}, nil)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	owner := &rpmBuildOwner{}
+	br := r.Clone(withRpmBuildOwner(ctx, owner))
+	// The job is retired by this goroutine alone, once, when the work returns
+	// or the deadline passes, whichever is first. A store may ignore its
+	// context, so a write or cached read can outlast the deadline; the work is
+	// then abandoned with its result unread, and nothing it does afterwards
+	// reaches recent, running or the log.
+	s.rpmProfileBuilds.running.Add(1)
+	go func() {
+		defer s.rpmProfileBuilds.running.Done()
+		defer cancel()
+		type result struct {
+			b   *rpmProfileBuild
+			err error
+		}
+		var file atomic.Value
+		file.Store("primary")
+		results := make(chan result, 1)
+		s.rpmProfileBuilds.running.Add(1)
+		go func() {
+			defer s.rpmProfileBuilds.running.Done()
+			b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps, &file)
+			results <- result{b, err}
+		}()
+		var res result
+		select {
+		case res = <-results:
+			if res.err == nil && ctx.Err() != nil {
+				res = result{err: ctx.Err()}
+			}
+		case <-ctx.Done():
+			res.err = fmt.Errorf("not finished within the build timeout of %s, so the store or upstream operation it was in is abandoned: %w", timeout, ctx.Err())
+		}
+		if res.err != nil {
+			owner.retire(func() {
+				s.logger.Error("rpm metadata could not be filtered for a profile",
+					"profile", p.Name(), "repository", t.id(), "file", file.Load(), "error", res.err)
+			})
+			res = result{err: &rpmProfileBuildError{file: file.Load().(string), err: res.err}}
+		} else {
+			s.rpmProfileBuilds.mu.Lock()
+			s.rpmProfileBuilds.built++
+			s.rpmProfileBuilds.mu.Unlock()
+			owner.retire(func() {
+				s.logger.Info("filtered an rpm repository's metadata for a profile",
+					"profile", p.Name(), "repository", t.id(), "primary", entries["primary"].Checksum.Value, "kept", res.b.kept)
+			})
+		}
+		sl.mu.Lock()
+		if sl.running[key] == job {
+			delete(sl.running, key)
+		}
+		if res.err == nil {
+			kept := []*rpmProfileBuild{res.b}
+			for _, old := range sl.recent {
+				if old.key != key && len(kept) < rpmProfileBuildsKept {
+					kept = append(kept, old)
+				}
+			}
+			sl.recent = kept
+			sl.gen++
+		}
+		job.b, job.err = res.b, res.err
+		sl.mu.Unlock()
+		close(job.done)
+	}()
+	return job
+}
+
+// rpmBuildProfileFiles reads, filters and stores the files entries names,
+// under r's context, which is the build's own: no read or write is begun past
+// its deadline. file is kept naming the file being built, for the record of a
+// failure, which is the caller's to write.
+func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64, file *atomic.Value) (b *rpmProfileBuild, err error) {
+	ctx := r.Context()
+	defer func() {
+		// A request's handler has net/http's recover behind it; this
+		// goroutine has none, and a panic in a filter would stop the server.
+		if v := recover(); v != nil {
+			b, err = nil, fmt.Errorf("panic: %v", v)
+		}
+	}()
+	store := s.typeStore(manifest.TypeRpm)
 	read := func(e rpmRepomdData) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !rpmMetadataHrefServed(e.Location.Href) {
 			return nil, fmt.Errorf("repomd.xml places %s at %q, outside repodata/, which bodega does not serve", e.Type, e.Location.Href)
 		}
-		return s.rpmRead(r, t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
+		// Every route the read passes through hands its failures to the sink
+		// instead of logging them, so the one record of a failure is this
+		// build's, with the profile and file beside the cause.
+		sink := &upstreamErrSink{owner: rpmBuildOwnerFrom(ctx)}
+		raw, err := s.rpmRead(r.WithContext(withUpstreamErrSink(ctx, sink)), t, e.Type, func(w http.ResponseWriter, req *http.Request) { s.serveRpmMetadataEntry(w, req, t, e) })
+		cause := sink.get()
+		var cut *rpmReadCut
+		switch {
+		case errors.As(err, &cut) && cause != nil:
+			// The cut body fails the read whatever else was sunk beside it,
+			// such as a failed cache write, so both are kept.
+			return nil, fmt.Errorf("reading %s %s: %w", e.Type, e.Location.Href, rpmReadFailures{cause, err})
+		case err != nil && cause != nil:
+			return nil, fmt.Errorf("reading %s %s: %w", e.Type, e.Location.Href, cause)
+		case cause != nil:
+			// The read succeeded around a failure, such as a cache write the
+			// proxy treats as best effort; still worth a record, and still
+			// the build's to write.
+			sink.owner.emit(func() {
+				s.logger.Warn("an rpm metadata read for a profile's build succeeded around a failure",
+					"profile", p.Name(), "repository", t.id(), "file", e.Type, "error", cause)
+			})
+		}
+		return raw, err
 	}
 	primary := entries["primary"]
 	raw, err := read(primary)
@@ -194,44 +515,233 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 		return nil, err
 	}
 	ext := path.Ext(primary.Location.Href)
-	kept, n, err := rpmAdmittedPkgids(raw, ext, p)
+	kept, n, err := rpmAdmittedPkgids(ctx, raw, ext, p)
 	if err != nil {
 		return nil, fmt.Errorf("primary %s of %s: %w", primary.Location.Href, t.id(), err)
 	}
-	b := &rpmProfileBuild{key: key, files: map[string]rpmFilteredFile{}}
+	b = &rpmProfileBuild{key: key, fingerprint: fingerprint, files: map[string]rpmFilteredFile{}, kept: len(kept)}
 	for _, typ := range rpmFilteredTypes {
 		e, ok := entries[typ]
 		if !ok {
 			continue
 		}
+		file.Store(typ)
 		if typ != "primary" {
 			if raw, err = read(e); err != nil {
 				return nil, err
 			}
 			ext = path.Ext(e.Location.Href)
 		}
-		body, open, err := rpmFilterPackages(raw, ext, n, kept, typ == "primary")
+		body, open, err := rpmFilterPackages(ctx, raw, ext, n, kept, typ == "primary")
 		if err != nil {
 			return nil, fmt.Errorf("filter %s %s of %s: %w", typ, e.Location.Href, t.id(), err)
 		}
 		sum := rpmSHA256Hex(body)
 		f := rpmFilteredFile{typ: typ, sum: sum, openSum: open.sum, size: int64(len(body)), openSize: open.size, timestamp: stamps[typ],
 			href: "repodata/" + sum + "-" + typ + ".xml.gz"}
-		if err := store.Put(r.Context(), rpmFilteredKey(t, f), body); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := store.Put(ctx, rpmFilteredKey(t, f), body); err != nil {
 			return nil, fmt.Errorf("store the filtered %s of %s: %w", typ, t.id(), err)
 		}
 		b.files[typ] = f
 	}
-	sl.recent = append([]*rpmProfileBuild{b}, sl.recent...)
-	if len(sl.recent) > rpmProfileBuildsKept {
-		sl.recent = sl.recent[:rpmProfileBuildsKept]
-	}
-	s.rpmProfileBuilds.mu.Lock()
-	s.rpmProfileBuilds.built++
-	s.rpmProfileBuilds.mu.Unlock()
-	s.logger.Info("filtered an rpm repository's metadata for a profile",
-		"profile", p.Name(), "repository", t.id(), "primary", primary.Checksum.Value, "kept", len(kept))
 	return b, nil
+}
+
+// upstreamErrSink collects the failures one read meets, in place of the log
+// records the routes it passes through would write, for a read whose owner
+// logs its outcome with what the read was for. A route either hands its error
+// to the sink directly (sinkUpstreamErr, which keeps the error's type) or logs
+// through logFor, which turns a warning or worse into a sunk failure.
+type upstreamErrSink struct {
+	mu    sync.Mutex
+	errs  []error
+	owner *rpmBuildOwner
+}
+
+type upstreamErrSinkKey struct{}
+
+func withUpstreamErrSink(ctx context.Context, sink *upstreamErrSink) context.Context {
+	return context.WithValue(ctx, upstreamErrSinkKey{}, sink)
+}
+
+func upstreamErrSinkFrom(ctx context.Context) *upstreamErrSink {
+	sink, _ := ctx.Value(upstreamErrSinkKey{}).(*upstreamErrSink)
+	return sink
+}
+
+// sinkUpstreamErr hands err to ctx's sink and reports whether there was one;
+// when there was not, the caller logs err itself.
+func sinkUpstreamErr(ctx context.Context, err error) bool {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return false
+	}
+	sink.set(err)
+	return true
+}
+
+func (k *upstreamErrSink) set(err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.errs = append(k.errs, err)
+}
+
+// get is every failure set, in the order met, or nil when there was none.
+func (k *upstreamErrSink) get() error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	switch len(k.errs) {
+	case 0:
+		return nil
+	case 1:
+		return k.errs[0]
+	}
+	return rpmReadFailures(slices.Clone(k.errs))
+}
+
+// rpmReadFailures is more than one failure met by one read, such as a store
+// read that failed before the upstream fetch that replaced it failed too.
+type rpmReadFailures []error
+
+func (e rpmReadFailures) Error() string {
+	parts := make([]string, len(e))
+	for i, err := range e {
+		parts[i] = err.Error()
+	}
+	return strings.Join(parts, "; then ")
+}
+
+func (e rpmReadFailures) Unwrap() []error { return e }
+
+// logFor is the logger for work done under ctx. Outside a sinked read it is
+// s.logger. Inside one, a record at warning or above is a failure of the read
+// and goes to the sink instead of the log, and the rest reach the log only
+// while the read's owner still holds it. Every route a build-owned read can
+// pass through logs through this, so that a failure has one record, the
+// owner's, however deep in the proxy it happened, and none once the build
+// that started the read has been retired.
+func (s *Server) logFor(ctx context.Context) *slog.Logger {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return s.logger
+	}
+	return slog.New(&sinkHandler{next: s.logger.Handler(), sink: sink})
+}
+
+// noteFor is logFor for a warning that records a decision rather than a
+// failure, such as a fill admitted with a policy warning: it reaches the log
+// at its own level while the read's owner holds it, and is never sunk.
+func (s *Server) noteFor(ctx context.Context) *slog.Logger {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return s.logger
+	}
+	return slog.New(&sinkHandler{next: s.logger.Handler(), sink: sink, notes: true})
+}
+
+// sinkHandler is logFor's and noteFor's handler inside a sinked read.
+type sinkHandler struct {
+	next  slog.Handler
+	sink  *upstreamErrSink
+	attrs []slog.Attr
+	notes bool
+}
+
+func (h *sinkHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return (!h.notes && l >= slog.LevelWarn) || h.next.Enabled(ctx, l)
+}
+
+func (h *sinkHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if !h.notes && rec.Level >= slog.LevelWarn {
+		h.sink.set(newLoggedFailure(rec, h.attrs))
+		return nil
+	}
+	var err error
+	h.sink.owner.emit(func() { err = h.next.Handle(ctx, rec) })
+	return err
+}
+
+func (h *sinkHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return &sinkHandler{next: h.next.WithAttrs(as), sink: h.sink, attrs: append(slices.Clone(h.attrs), as...), notes: h.notes}
+}
+
+func (h *sinkHandler) WithGroup(name string) slog.Handler {
+	return &sinkHandler{next: h.next.WithGroup(name), sink: h.sink, attrs: h.attrs, notes: h.notes}
+}
+
+// loggedFailure is a record a route would have logged, carried as an error:
+// its message and attributes, unwrapping to the error attribute it named.
+type loggedFailure struct {
+	text string
+	err  error
+}
+
+func newLoggedFailure(rec slog.Record, attrs []slog.Attr) *loggedFailure {
+	var b strings.Builder
+	f := &loggedFailure{}
+	b.WriteString(rec.Message)
+	add := func(a slog.Attr) bool {
+		if err, ok := a.Value.Any().(error); ok && f.err == nil {
+			f.err = err
+		}
+		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
+		return true
+	}
+	for _, a := range attrs {
+		add(a)
+	}
+	rec.Attrs(add)
+	f.text = b.String()
+	return f
+}
+
+func (f *loggedFailure) Error() string { return f.text }
+
+func (f *loggedFailure) Unwrap() error { return f.err }
+
+// rpmBuildOwner is a build's claim on the log. The build's supervisor retires
+// it once, writing the build's one outcome record as it does; anything the
+// build's work would log afterwards, having outlived the deadline, is dropped.
+// A nil owner holds the log forever, for a sinked read no build owns.
+type rpmBuildOwner struct {
+	mu      sync.Mutex
+	retired bool
+}
+
+type rpmBuildOwnerKey struct{}
+
+func withRpmBuildOwner(ctx context.Context, o *rpmBuildOwner) context.Context {
+	return context.WithValue(ctx, rpmBuildOwnerKey{}, o)
+}
+
+func rpmBuildOwnerFrom(ctx context.Context) *rpmBuildOwner {
+	o, _ := ctx.Value(rpmBuildOwnerKey{}).(*rpmBuildOwner)
+	return o
+}
+
+// emit runs log unless o is retired. The lock is held across it, so a record
+// is either written before retire's or not at all.
+func (o *rpmBuildOwner) emit(log func()) {
+	if o == nil {
+		log()
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.retired {
+		log()
+	}
+}
+
+// retire writes the build's outcome with log and ends the build's claim.
+func (o *rpmBuildOwner) retire(log func()) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.retired = true
+	log()
 }
 
 // rpmTimestamp is the timestamp an upstream entry gives its file. A filtered
@@ -249,14 +759,19 @@ func rpmTimestamp(d rpmRepomdData) (int64, bool) {
 	return int64(f), true
 }
 
-func (s *Server) rpmProfileBuildStored(r *http.Request, t rpmTree, b *rpmProfileBuild) bool {
+// rpmProfileBuildStored reports whether every file of b is still in the
+// store; ok is false when the store had not answered by end.
+func (s *Server) rpmProfileBuildStored(end time.Time, r *http.Request, t rpmTree, b *rpmProfileBuild) (stored, ok bool) {
 	store := s.typeStore(manifest.TypeRpm)
-	for _, f := range b.files {
-		if info, err := store.Head(r.Context(), rpmFilteredKey(t, f)); err != nil || info == nil || !info.Exists {
-			return false
+	ctx := r.Context()
+	return rpmBounded(end, func() bool {
+		for _, f := range b.files {
+			if info, err := store.Head(ctx, rpmFilteredKey(t, f)); err != nil || info == nil || !info.Exists {
+				return false
+			}
 		}
-	}
-	return true
+		return true
+	})
 }
 
 func rpmFilteredKey(t rpmTree, f rpmFilteredFile) string {
@@ -278,11 +793,24 @@ func rpmSHA256Hex(b []byte) string {
 // current upstream document filters to. A filtered entry is read from the
 // store under its own checksum; any other entry is the upstream's file.
 func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request, t rpmTree, p *entitle.Profile, href string) {
+	r = withRpmBudget(r)
+	end := rpmBudgetEnd(r)
+	type read struct {
+		b   []byte
+		err error
+	}
 	match := func(d rpmRepomdData) bool { return d.Location.Href == href }
 	entry, err := s.rpmHeldEntry(r, t, match)
 	if err != nil {
 		var doc []byte
-		doc, err = s.rpmRead(r, t, "repomd.xml", func(w http.ResponseWriter, req *http.Request) { s.handleRpmRepomd(w, req, t) })
+		got, ok := rpmBounded(end, func() read {
+			d, err := s.rpmRead(r, t, "repomd.xml", func(w http.ResponseWriter, req *http.Request) { s.handleRpmRepomd(w, req, t) })
+			return read{d, err}
+		})
+		doc, err = got.b, got.err
+		if !ok {
+			err = errRpmProfileSlow
+		}
 		if err == nil {
 			doc, err = s.rpmProfileRepomd(r, t, p, doc)
 		}
@@ -291,11 +819,15 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if err != nil {
-		if errors.Is(err, errRpmNotListed) {
+		var failed *rpmProfileBuildError
+		switch {
+		case errors.Is(err, errRpmNotListed):
 			http.Error(w, fmt.Sprintf("the repomd.xml profile %q is served for %s names no %s.", p.Name(), t.id(), href), http.StatusNotFound)
-			return
+		case errors.Is(err, errRpmProfileBuilding), errors.Is(err, errRpmProfileSlow), errors.As(err, &failed):
+			s.writeRpmProfileError(w, t, p, err)
+		default:
+			s.writeRpmReadError(w, r, t, "repomd.xml", err)
 		}
-		s.writeRpmReadError(w, r, t, "repomd.xml", err)
 		return
 	}
 	if !rpmFilteredType(entry.Type) {
@@ -303,14 +835,53 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		return
 	}
 	key := manifest.RpmMetadataKey(t.repo, t.releasever, t.basearch, entry.Checksum.Value, path.Base(entry.Location.Href))
-	body, err := s.typeStore(manifest.TypeRpm).Get(r.Context(), key)
+	store := s.typeStore(manifest.TypeRpm)
+	got, ok := rpmBounded(end, func() read {
+		b, err := store.Get(r.Context(), key)
+		return read{b, err}
+	})
+	if !ok {
+		s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+		return
+	}
+	body, err := got.b, got.err
 	if err != nil || len(body) == 0 {
+		// A rebuild of the same upstream files writes this file back under
+		// the same name, so a client told to retry may find it; one told the
+		// file is gone would fetch repomd.xml again and meet the same build.
+		if s.rpmProfileBuilds.building(rpmProfileView(t, p)) {
+			s.writeRpmProfileError(w, t, p, errRpmProfileBuilding)
+			return
+		}
 		s.logger.Warn("a filtered rpm metadata file the profile's repomd.xml names is not in the store", "profile", p.Name(), "repository", t.id(), "key", key, "error", err)
 		http.Error(w, fmt.Sprintf("bodega no longer holds the filtered %s of %s for profile %q; run `dnf makecache` to fetch a current repomd.xml, which rebuilds it.", entry.Type, t.id(), p.Name()), http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/gzip")
 	http.ServeContent(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, r, "", time.Time{}, bytes.NewReader(body))
+}
+
+// writeRpmProfileError answers a request whose profile's repomd.xml could not
+// be made. It never falls back to the unfiltered document, which lists what
+// the profile withholds.
+func (s *Server) writeRpmProfileError(w http.ResponseWriter, t rpmTree, p *entitle.Profile, err error) {
+	var failed *rpmProfileBuildError
+	switch {
+	case errors.Is(err, errRpmProfileBuilding):
+		w.Header().Set("Retry-After", rpmProfileRetryAfter)
+		http.Error(w, fmt.Sprintf("bodega is still building the metadata of %s for profile %q; dnf retries, and the build continues without it.", t.id(), p.Name()), http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, errRpmProfileSlow):
+		s.logger.Warn("a governed rpm metadata request ran out of its budget waiting on the upstream repomd.xml or the store",
+			"profile", p.Name(), "repository", t.id(), "budget", rpmProfileBudget)
+		w.Header().Set("Retry-After", rpmProfileRetryAfter)
+		http.Error(w, fmt.Sprintf("bodega could not read the metadata of %s for profile %q within %s, from the upstream or its store; dnf retries.", t.id(), p.Name(), rpmProfileBudget), http.StatusServiceUnavailable)
+		return
+	case errors.As(err, &failed):
+	default:
+		s.logger.Error("rpm repomd.xml could not be filtered for a profile", "profile", p.Name(), "repository", t.id(), "error", err)
+	}
+	http.Error(w, fmt.Sprintf("bodega could not filter the metadata of %s for profile %q, so it served no repomd.xml rather than the unfiltered one; the server log names the cause.", t.id(), p.Name()), http.StatusBadGateway)
 }
 
 func rpmFilteredType(typ string) bool {
@@ -400,14 +971,15 @@ func (f rpmFilteredFile) repomdData() string {
 
 // rpmAdmittedPkgids reads primary for the pkgid of every package p admits,
 // by name and by the version primary gives it, and counts them. A package
-// bodega would not serve at all is left out with the rest.
-func rpmAdmittedPkgids(raw []byte, ext string, p *entitle.Profile) (map[string]bool, int, error) {
+// bodega would not serve at all is left out with the rest. It stops with
+// ctx's error once ctx is done.
+func rpmAdmittedPkgids(ctx context.Context, raw []byte, ext string, p *entitle.Profile) (map[string]bool, int, error) {
 	r, closeFn, err := rpmDecompress(raw, ext)
 	if err != nil {
 		return nil, 0, fmt.Errorf("decompress: %w", err)
 	}
 	defer closeFn()
-	lr := &io.LimitedReader{R: r, N: rpmMaxPrimary + 1}
+	lr := &io.LimitedReader{R: rpmCtxReader{ctx: ctx, r: r}, N: rpmMaxPrimary + 1}
 	dec := xml.NewDecoder(lr)
 	kept, n := map[string]bool{}, 0
 	for {
@@ -416,6 +988,9 @@ func rpmAdmittedPkgids(raw []byte, ext string, p *entitle.Profile) (map[string]b
 			return kept, n, nil
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, 0, cerr
+			}
 			if lr.N <= 0 {
 				return nil, 0, fmt.Errorf("expands past %d bytes", int64(rpmMaxPrimary))
 			}
@@ -502,14 +1077,15 @@ func rpmSetPackagesAttr(tag []byte, n int) []byte {
 // nothing the filter does not understand is lost by a re-encode.
 //
 // primary carries the pkgid in a child (<checksum pkgid="YES">); filelists
-// and other carry it as the package's own attribute.
-func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, primary bool) ([]byte, rpmOpen, error) {
+// and other carry it as the package's own attribute. It stops with ctx's
+// error once ctx is done.
+func rpmFilterPackages(ctx context.Context, raw []byte, ext string, n int, kept map[string]bool, primary bool) ([]byte, rpmOpen, error) {
 	r, closeFn, err := rpmDecompress(raw, ext)
 	if err != nil {
 		return nil, rpmOpen{}, fmt.Errorf("decompress: %w", err)
 	}
 	defer closeFn()
-	lr := &io.LimitedReader{R: r, N: rpmMaxPrimary + 1}
+	lr := &io.LimitedReader{R: rpmCtxReader{ctx: ctx, r: r}, N: rpmMaxPrimary + 1}
 	rec := &rpmRecorder{r: bufio.NewReader(lr)}
 	dec := xml.NewDecoder(rec)
 
@@ -531,6 +1107,9 @@ func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, prim
 			break
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, rpmOpen{}, cerr
+			}
 			if lr.N <= 0 {
 				return nil, rpmOpen{}, fmt.Errorf("expands past %d bytes", int64(rpmMaxPrimary))
 			}
@@ -578,6 +1157,20 @@ func rpmFilterPackages(raw []byte, ext string, n int, kept map[string]bool, prim
 		return nil, rpmOpen{}, err
 	}
 	return gz.Bytes(), rpmOpen{sum: hex.EncodeToString(open.Sum(nil)), size: openSize}, nil
+}
+
+// rpmCtxReader fails every read once ctx is done, so decompressing and
+// parsing a file stops at a build's deadline rather than at the file's end.
+type rpmCtxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c rpmCtxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // rpmPkgid reads the pkgid of the <package> se opens, consuming the element.

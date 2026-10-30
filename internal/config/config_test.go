@@ -180,6 +180,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		},
 		"storage_by_type":  map[string]string{"apt": "bulk"},
 		"storage_by_group": map[string]string{"mirror-set": "bulk"},
+		// Load parses each value as a duration.
+		"not_found_ttl": map[string]string{"maven": "720h"},
 		// git_upstreams and binary_upstreams keys and values are both
 		// validated, and an empty mode is defaulted by Load, so the round trip
 		// only measures Save when the filled value is already the shape Load
@@ -204,9 +206,10 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"spool_max_total_bytes":    int64(4 << 20),
 		// Load parses this one, so the string filler's "value-<key>" is
 		// refused before the round trip can measure anything.
-		"osv_db_max_age":           "72h",
-		"upstream_connect_timeout": "2s",
-		"stale_grace":              "1s",
+		"osv_db_max_age":            "72h",
+		"upstream_connect_timeout":  "2s",
+		"stale_grace":               "1s",
+		"rpm_profile_build_timeout": "20m",
 		// Load parses or enumerates these three.
 		"revet_interval": "24h",
 		"revet_rate":     2.5,
@@ -474,6 +477,8 @@ func TestLoad_UpstreamWaitKeys(t *testing.T) {
 		{`{"upstream_connect_timeout": "0s"}`, "", "", `invalid upstream_connect_timeout "0s"`},
 		{`{"stale_grace": "-1s"}`, "", "", `invalid stale_grace "-1s"`},
 		{`{"stale_grace": "soon"}`, "", "", `invalid stale_grace "soon"`},
+		{`{"rpm_profile_build_timeout": "0s"}`, "", "", `invalid rpm_profile_build_timeout "0s"`},
+		{`{"rpm_profile_build_timeout": "15"}`, "", "", `invalid rpm_profile_build_timeout "15"`},
 	} {
 		t.Run(tc.body, func(t *testing.T) {
 			isolateConfig(t)
@@ -486,6 +491,9 @@ func TestLoad_UpstreamWaitKeys(t *testing.T) {
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("Load: %v", err)
+				}
+				if cfg.RpmProfileBuildTimeout != config.DefaultRpmProfileBuildTimeout {
+					t.Errorf("rpm_profile_build_timeout resolved to %q, want %q", cfg.RpmProfileBuildTimeout, config.DefaultRpmProfileBuildTimeout)
 				}
 				if cfg.UpstreamConnectTimeout != tc.connect || cfg.StaleGrace != tc.grace {
 					t.Errorf("resolved %q / %q, want %q / %q", cfg.UpstreamConnectTimeout, cfg.StaleGrace, tc.connect, tc.grace)

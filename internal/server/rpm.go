@@ -153,12 +153,33 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 		serve(w, r)
 		return
 	}
+	p := s.profileFor(r)
+	governed := rpmFilters(p)
+	if governed {
+		r = withRpmBudget(r)
+	}
 	full := r.Clone(r.Context())
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		full.Header.Del(h)
 	}
 	cw := &capturedResponse{header: http.Header{}}
-	serve(cw, full)
+	if governed {
+		// The refresh shares the budget with the build the answer waits on
+		// next. A read given up on keeps running into its own response and
+		// served-object record, which nothing reads after.
+		full = full.WithContext(context.WithValue(full.Context(), servedObjectCtxKey{}, &servedObject{index: true}))
+		var ok bool
+		if cw, ok = rpmBounded(rpmBudgetEnd(r), func() *capturedResponse {
+			own := &capturedResponse{header: http.Header{}}
+			serve(own, full)
+			return own
+		}); !ok {
+			s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+			return
+		}
+	} else {
+		serve(cw, full)
+	}
 	if cw.tooBig {
 		s.logger.Error("rpm repomd.xml exceeds the response buffer", "repository", t.id(), "limit", maxUpstreamBody)
 		http.Error(w, fmt.Sprintf("repomd.xml of %s exceeds bodega's %d-byte buffer; the upstream is not publishing a repository index.", t.id(), maxUpstreamBody), http.StatusBadGateway)
@@ -174,12 +195,10 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 	body := cw.body.Bytes()
 	if status == http.StatusOK {
 		served := body
-		p := s.profileFor(r)
-		if rpmFilters(p) {
+		if governed {
 			filtered, err := s.rpmProfileRepomd(r, t, p, body)
 			if err != nil {
-				s.logger.Error("rpm repomd.xml could not be filtered for a profile", "profile", p.Name(), "repository", t.id(), "error", err)
-				http.Error(w, fmt.Sprintf("bodega could not filter the metadata of %s for profile %q, so it served no repomd.xml rather than the unfiltered one; the server log names the cause.", t.id(), p.Name()), http.StatusBadGateway)
+				s.writeRpmProfileError(w, t, p, err)
 				return
 			}
 			served = filtered
@@ -213,13 +232,31 @@ func (s *Server) handleRpmRepomdSignature(w http.ResponseWriter, r *http.Request
 	doc, ok := s.rpmServed.held(rpmViewID(t, p), rpmClientKey(r), s.rpmServed.now())
 	if !ok {
 		var err error
-		if doc, err = s.rpmCachedRepomd(r, t); err != nil {
+		if rpmFilters(p) {
+			r = withRpmBudget(r)
+			type read struct {
+				doc []byte
+				err error
+			}
+			got, ok := rpmBounded(rpmBudgetEnd(r), func() read {
+				d, err := s.rpmCachedRepomd(r, t)
+				return read{d, err}
+			})
+			if !ok {
+				s.writeRpmProfileError(w, t, p, errRpmProfileSlow)
+				return
+			}
+			doc, err = got.doc, got.err
+		} else {
+			doc, err = s.rpmCachedRepomd(r, t)
+		}
+		if err != nil {
 			s.writeRpmReadError(w, r, t, "repomd.xml", err)
 			return
 		}
 		if rpmFilters(p) {
 			if doc, err = s.rpmProfileRepomd(r, t, p, doc); err != nil {
-				s.writeRpmReadError(w, r, t, "repomd.xml", err)
+				s.writeRpmProfileError(w, t, p, err)
 				return
 			}
 		}
@@ -401,7 +438,7 @@ func (s *Server) rpmCachedRepomd(r *http.Request, t rpmTree) ([]byte, error) {
 // object key from the package's serve_fetch row, which is where
 // reconciliation reads the package's version.
 func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(http.ResponseWriter, *http.Request)) ([]byte, error) {
-	ctx := context.WithValue(withOwnRead(r.Context()), servedObjectCtxKey{}, &servedObject{})
+	ctx, transfer := withBodyTransfer(context.WithValue(withOwnRead(r.Context()), servedObjectCtxKey{}, &servedObject{}))
 	req := r.Clone(ctx)
 	for _, h := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
 		req.Header.Del(h)
@@ -411,6 +448,8 @@ func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(htt
 	switch {
 	case cw.tooBig:
 		return nil, fmt.Errorf("%s of %s exceeds bodega's %d-byte buffer", what, t.id(), maxUpstreamBody)
+	case transfer.failed() != nil:
+		return nil, &rpmReadCut{what: what, tree: t.id(), status: cw.status, n: cw.body.Len(), err: transfer.failed()}
 	case cw.status == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: %s publishes no %s", errUpstreamNotFound, t.base, what)
 	case cw.status != 0 && cw.status != http.StatusOK:
@@ -418,6 +457,20 @@ func (s *Server) rpmRead(r *http.Request, t rpmTree, what string, serve func(htt
 	}
 	return cw.body.Bytes(), nil
 }
+
+// rpmReadCut is a read whose route wrote its status and then failed to
+// deliver the body. The bytes held may still parse, and are not the document.
+type rpmReadCut struct {
+	what, tree string
+	status, n  int
+	err        error
+}
+
+func (e *rpmReadCut) Error() string {
+	return fmt.Sprintf("reading %s of %s was cut short after HTTP %d and %d bytes: %v", e.what, e.tree, e.status, e.n, e.err)
+}
+
+func (e *rpmReadCut) Unwrap() error { return e.err }
 
 // rpmReadStatus is a non-200 answer from one of this file's own routes,
 // relayed to the client whose request needed it.
@@ -779,7 +832,9 @@ func (s *Server) refuseRpmChecksumType(w http.ResponseWriter, r *http.Request, t
 	f := newRefusal(checkChecksum, manifest.TypeRpm, name, version, http.StatusBadGateway)
 	f.reason = fmt.Sprintf("%s gives %s a %q checksum, and bodega verifies only well-formed SHA-2 checksums before it caches a file.", t.id(), href, typ)
 	f.next = "an operator points this repository at a mirror that publishes SHA-256 metadata, which every current RHEL-family repository does."
-	s.logger.Warn("rpm checksum type refused", "repository", t.id(), "href", href, "type", typ, "incident", f.incident)
+	if !sinkUpstreamErr(r.Context(), &resolveRefusal{f: f}) {
+		s.logFor(r.Context()).Warn("rpm checksum type refused", "repository", t.id(), "href", href, "type", typ, "incident", f.incident)
+	}
 	f.write(w, r)
 }
 
