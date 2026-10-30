@@ -82,6 +82,8 @@ type ociRegistry struct {
 	manifests map[string]ociObject // <repo>@<tag or digest>
 	blobs     map[string][]byte
 	tagLists  map[string]string
+	referrers map[string]string // <repo>@<digest> > the referrers index
+	queries   map[string]string // path > the query it was last asked with
 	tamper    map[string][]byte // path > body served in place of the real one
 	failOnce  map[string]bool   // path > answered 503 the next time it is asked for
 	sawBasic  bool
@@ -92,7 +94,7 @@ type ociRegistry struct {
 func newOCIRegistry(t *testing.T, tokens *ociTokenHost) *ociRegistry {
 	t.Helper()
 	g := &ociRegistry{tokens: tokens, hits: map[string]int{}, manifests: map[string]ociObject{},
-		blobs: map[string][]byte{}, tagLists: map[string]string{}, tamper: map[string][]byte{}, failOnce: map[string]bool{},
+		blobs: map[string][]byte{}, tagLists: map[string]string{}, referrers: map[string]string{}, queries: map[string]string{}, tamper: map[string][]byte{}, failOnce: map[string]bool{},
 		hang: make(chan struct{}), resume: make(chan struct{})}
 	g.ts = httptest.NewServer(http.HandlerFunc(g.serve))
 	t.Cleanup(func() {
@@ -128,6 +130,7 @@ func (g *ociRegistry) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	g.mu.Lock()
 	g.hits[r.URL.Path]++
+	g.queries[r.URL.Path] = r.URL.RawQuery
 	tampered, isTampered := g.tamper[r.URL.Path]
 	if g.failOnce[r.URL.Path] {
 		delete(g.failOnce, r.URL.Path)
@@ -148,6 +151,10 @@ func (g *ociRegistry) serve(w http.ResponseWriter, r *http.Request) {
 		var l string
 		l, ok = g.tagLists[name]
 		obj = ociObject{mediaType: "application/json", body: []byte(l)}
+	case ociReferrers:
+		var l string
+		l, ok = g.referrers[name+"@"+ref]
+		obj = ociObject{mediaType: mediaOCIIndex, body: []byte(l)}
 	}
 	g.mu.Unlock()
 	if !ok {
@@ -1207,4 +1214,190 @@ func TestOCITagListRefusesLinksItCannotFollow(t *testing.T) {
 	if n := foreignHits.Load(); n != 0 {
 		t.Errorf("a next link on another host was followed %d times", n)
 	}
+}
+
+const (
+	ociTestSigType  = "application/vnd.dev.cosign.artifact.sig.v1+json"
+	ociTestSBOMType = "application/spdx+json"
+)
+
+// publishReferrers serves a referrers index for digest naming one signature
+// and one SBOM.
+func (g *ociRegistry) publishReferrers(repo, digest string) {
+	idx, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2, "mediaType": mediaOCIIndex,
+		"manifests": []any{
+			map[string]any{"mediaType": mediaOCIManifest, "digest": ociDigest([]byte("sig")), "size": 3, "artifactType": ociTestSigType},
+			map[string]any{"mediaType": mediaOCIManifest, "digest": ociDigest([]byte("sbom")), "size": 4, "artifactType": ociTestSBOMType},
+		},
+	})
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.referrers[repo+"@"+digest] = string(idx)
+}
+
+func (g *ociRegistry) failNext(path string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.failOnce[path] = true
+}
+
+func (g *ociRegistry) queryFor(path string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.queries[path]
+}
+
+// ociReferrersOf holds a response to a referrers answer: 200 under the index
+// media type, and the artifact types its descriptors carry.
+func ociReferrersOf(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("referrers: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != mediaOCIIndex {
+		t.Errorf("referrers Content-Type %q, want %q", ct, mediaOCIIndex)
+	}
+	var idx struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+		Manifests     []struct {
+			ArtifactType string `json:"artifactType"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &idx); err != nil {
+		t.Fatalf("referrers do not parse: %v\n%s", err, rec.Body.String())
+	}
+	if idx.SchemaVersion != 2 || idx.MediaType != mediaOCIIndex || idx.Manifests == nil {
+		t.Errorf("referrers index is not a v2 image index with a manifests array: %s", rec.Body.String())
+	}
+	types := []string{}
+	for _, m := range idx.Manifests {
+		types = append(types, m.ArtifactType)
+	}
+	return types
+}
+
+func TestOCIReferrersServedAndCached(t *testing.T) {
+	f := newOCIFixture(t)
+	f.hub.publishReferrers("library/nginx", f.image.indexDigest)
+	s := ociServer(t, f)
+	path := "/v2/library/nginx/referrers/" + f.image.indexDigest
+	if k := ociKindOf(strings.TrimPrefix(path, "/v2/")); k != ociReferrers {
+		t.Errorf("ociKindOf(%s) = %q, want %q", path, k, ociReferrers)
+	}
+	for i := range 2 {
+		if got := ociReferrersOf(t, doRequest(s, http.MethodGet, path, nil)); len(got) != 2 {
+			t.Fatalf("request %d: %d referrers, want the registry's 2", i+1, len(got))
+		}
+	}
+	if n := f.hub.hitsFor(path); n != 1 {
+		t.Errorf("registry asked for fresh referrers %d times over two requests, want 1", n)
+	}
+	if rec := doRequest(s, http.MethodGet, path, nil); rec.Header().Get(ociFiltersHeader) != "" {
+		t.Errorf("an unfiltered answer carries %s %q", ociFiltersHeader, rec.Header().Get(ociFiltersHeader))
+	}
+	assertOCIError(t, doRequest(s, http.MethodGet, "/v2/library/nginx/referrers/1.27", nil),
+		http.StatusBadRequest, "DIGEST_INVALID", `"1.27"`)
+}
+
+// A registry with no referrers API answers 404, and Docker sends the request
+// to the registry around bodega on anything but a 200.
+func TestOCIReferrersUpstream404IsEmptyIndex(t *testing.T) {
+	f := newOCIFixture(t)
+	s := ociServer(t, f)
+	for _, path := range []string{
+		"/v2/library/nginx/referrers/" + f.image.indexDigest,
+		"/v2/example-corp/api/referrers/" + f.image.amd64Digest + "?ns=ghcr.io",
+	} {
+		rec := doRequest(s, http.MethodGet, path, nil)
+		if got := ociReferrersOf(t, rec); len(got) != 0 {
+			t.Errorf("%s: %d referrers, want none", path, len(got))
+		}
+		if !strings.Contains(rec.Body.String(), `"manifests":[]`) {
+			t.Errorf("%s: the empty index carries no empty manifests array: %s", path, rec.Body.String())
+		}
+	}
+}
+
+func TestOCIReferrersDuringAnOutage(t *testing.T) {
+	f := newOCIFixture(t)
+	f.hub.publishReferrers("library/nginx", f.image.indexDigest)
+	s := ociServer(t, f)
+	cached := "/v2/library/nginx/referrers/" + f.image.indexDigest
+	ociReferrersOf(t, doRequest(s, http.MethodGet, cached, nil))
+
+	s.cache.MetadataTTL = time.Nanosecond
+	f.hub.failNext(cached)
+	if got := ociReferrersOf(t, doRequest(s, http.MethodGet, cached, nil)); len(got) != 2 {
+		t.Errorf("outage with a cached copy: %d referrers, want the cached 2", len(got))
+	}
+	if n := f.hub.hitsFor(cached); n != 2 {
+		t.Errorf("registry asked %d times, want 2: the stale copy was not refreshed", n)
+	}
+
+	uncached := "/v2/library/nginx/referrers/" + f.image.amd64Digest
+	f.hub.failNext(uncached)
+	if got := ociReferrersOf(t, doRequest(s, http.MethodGet, uncached, nil)); len(got) != 0 {
+		t.Errorf("outage with nothing cached: %d referrers, want the empty index", len(got))
+	}
+}
+
+func TestOCIReferrersProfileRefusesTheRepository(t *testing.T) {
+	f := newOCIFixture(t)
+	f.hub.publish("library/redis", "7", f.image)
+	f.hub.publishReferrers("library/redis", f.image.indexDigest)
+	s := ociServer(t, f)
+	pf := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeOCI, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeOCI, Name: "docker.io/library/nginx", Version: "1.27"}})
+
+	if rec := pf.oci("/v2/library/nginx/manifests/1.27"); rec.Code != http.StatusOK {
+		t.Fatalf("the listed tag: %d %s", rec.Code, rec.Body.String())
+	}
+	ociReferrersOf(t, pf.oci("/v2/library/nginx/referrers/"+f.image.indexDigest))
+
+	manifestRec := pf.oci("/v2/library/redis/manifests/" + f.image.indexDigest)
+	refRec := pf.oci("/v2/library/redis/referrers/" + f.image.indexDigest)
+	assertOCIError(t, refRec, manifestRec.Code, "DENIED", `profile "web"`)
+	if n := f.hub.hitsFor("/v2/library/redis/referrers/" + f.image.indexDigest); n != 0 {
+		t.Errorf("a refused repository's referrers reached the registry %d times", n)
+	}
+}
+
+func TestOCIReferrersArtifactTypeFilter(t *testing.T) {
+	f := newOCIFixture(t)
+	f.hub.publishReferrers("library/nginx", f.image.indexDigest)
+	s := ociServer(t, f)
+	path := "/v2/library/nginx/referrers/" + f.image.indexDigest
+	filter := "?artifactType=" + strings.ReplaceAll(ociTestSigType, "+", "%2B")
+
+	// The test registry ignores the filter, as a registry that does not
+	// implement it does, so bodega's own filter is what narrows the answer.
+	rec := doRequest(s, http.MethodGet, path+filter, nil)
+	if got := ociReferrersOf(t, rec); len(got) != 1 || got[0] != ociTestSigType {
+		t.Errorf("filtered referrers %v, want only %s", got, ociTestSigType)
+	}
+	if h := rec.Header().Get(ociFiltersHeader); h != "artifactType" {
+		t.Errorf("%s %q, want artifactType", ociFiltersHeader, h)
+	}
+	if q := f.hub.queryFor(path); q != "artifactType="+strings.ReplaceAll(strings.ReplaceAll(ociTestSigType, "/", "%2F"), "+", "%2B") {
+		t.Errorf("registry was asked with query %q, want the artifactType filter", q)
+	}
+
+	// A filter bodega holds no copy of during an outage is applied to the
+	// unfiltered copy it does hold.
+	ociReferrersOf(t, doRequest(s, http.MethodGet, path, nil))
+	sbom := "?artifactType=" + strings.ReplaceAll(ociTestSBOMType, "+", "%2B")
+	f.hub.failNext(path)
+	rec = doRequest(s, http.MethodGet, path+sbom, nil)
+	if got := ociReferrersOf(t, rec); len(got) != 1 || got[0] != ociTestSBOMType {
+		t.Errorf("filtered cached copy %v, want only %s", got, ociTestSBOMType)
+	}
+	if h := rec.Header().Get(ociFiltersHeader); h != "artifactType" {
+		t.Errorf("cached copy %s %q, want artifactType", ociFiltersHeader, h)
+	}
+
+	assertOCIError(t, doRequest(s, http.MethodGet, path+"?artifactType=not-a-type", nil),
+		http.StatusBadRequest, "UNSUPPORTED", "not-a-type")
 }
