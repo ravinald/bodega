@@ -832,7 +832,7 @@ else
 		e2e_bodega server "policy filter set $eco off" || true
 	done
 	e2e_bodega server "pkg delete pypi $filter_pypi" || true
-	e2e_on server "sudo rm -f /tmp/e2e-filter-pypi.json; sudo rm -f /var/lib/bodega/pypi/wheels/$filter_pypi-*; true" || true
+	e2e_on server "sudo rm -f /tmp/e2e-filter-pypi.json; sudo sh -c 'rm -f /var/lib/bodega/pypi/wheels/$filter_pypi-*'; true" || true
 	e2e_config_set server '.proxy_cache_enabled = false' || true
 	e2e_restart server || true
 	check_eq PXY-FILTER-RESTORE "the server restarts with proxy caching off again" 0 "$E2E_RC" \
