@@ -47,7 +47,9 @@ GOTMP="$GATED_ROOT/tmp"
 # files the panic as a product failure. Sized on 2026-10-28 at 4a00d25 on two
 # pinned cores: internal/audit passed in 787s, internal/server passed 188
 # top-level tests summing 1791s and was still running at a 30m limit.
-GATED_RACE_TIMEOUT="${E2E_GATED_RACE_TIMEOUT:-60m}"
+# Only an unset variable takes the default: an explicitly empty one is a value
+# somebody set, and the check below blocks it by name.
+GATED_RACE_TIMEOUT="${E2E_GATED_RACE_TIMEOUT-60m}"
 
 e2e_on server "test -x $GO" || true
 if [ "$E2E_RC" -ne 0 ]; then
@@ -102,8 +104,11 @@ check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega ins
 # stuck test; ssh's cut prints nothing. -timeout covers only the test binary,
 # not the -race build ahead of it, which on two cores takes minutes of the
 # margin. A value with no whole-minute form has no seconds to add the margin
-# to, and running unbounded is how a stuck test eats the night.
-if [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]*m$ ]]; then
+# to, and running unbounded is how a stuck test eats the night. The ceiling is
+# a day: past it the bound is no bound for a nightly run, and four digits keep
+# the arithmetic below inside bash's 64-bit integers, where a longer value
+# wraps and hands timeout(1) a negative bound.
+if [[ "$GATED_RACE_TIMEOUT" =~ ^[1-9][0-9]{0,3}m$ ]] && [ "${GATED_RACE_TIMEOUT%m}" -le 1440 ]; then
 	race_ssh_timeout=$((${GATED_RACE_TIMEOUT%m} * 60 + 600))
 
 	E2E_SSH_TIMEOUT=$race_ssh_timeout e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 -timeout $GATED_RACE_TIMEOUT ./internal/audit/ 2>&1 | tail -20" || true
@@ -118,7 +123,7 @@ else
 	E2E_HOST=local
 	for id in GAT-06 GAT-07; do
 		e2e_block "$id" "a -race package run on two cores" \
-			"E2E_GATED_RACE_TIMEOUT=\"$GATED_RACE_TIMEOUT\" is not a whole number of minutes ending in m (for example 60m); set it to one and rerun suite 85"
+			"E2E_GATED_RACE_TIMEOUT=\"$GATED_RACE_TIMEOUT\" is not a whole number of minutes from 1m to 1440m (for example 60m); set it to one and rerun suite 85"
 	done
 	E2E_HOST=server
 fi

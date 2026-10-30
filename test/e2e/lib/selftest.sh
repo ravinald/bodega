@@ -887,6 +887,55 @@ t_ok "stanza components: read under a journal prefix" "main contrib non-free non
 t_ok "stanza components: a Suites: line naming one more codename is not this stanza" 1 \
 	"$(e2e_apt_stanza_components "$banner" "resolute resolute-backports resolute-security resolute-updates" >/dev/null && echo 0 || echo 1)"
 
+# ---- suite 85's -race bound -----------------------------------------------
+#
+# The suite is sourced with every guest call stubbed, so what is asserted is the
+# command it would send: go's -timeout and the ssh bound around it, or a block.
+
+# gated_race <value|-> — "<ssh bound> <go -timeout>" per race run, or
+# "BLOCK <id>" per block, space-separated. "-" leaves the override unset.
+gated_race() {
+	(
+		# shellcheck disable=SC2329  # invoked by the sourced suite
+		e2e_on() {
+			E2E_RC=0
+			case "$*" in
+			*'test -race'*)
+				printf '%s %s\n' "$E2E_SSH_TIMEOUT" "$(printf '%s\n' "$*" | sed -n 's/.*-timeout \([^ ]*\).*/\1/p')"
+				;;
+			esac
+		}
+		# shellcheck disable=SC2329
+		e2e_local() { E2E_RC=0; }
+		# shellcheck disable=SC2329
+		e2e_put() { :; }
+		# shellcheck disable=SC2329
+		check_eq() { :; }
+		# shellcheck disable=SC2329
+		e2e_skip() { :; }
+		# shellcheck disable=SC2329
+		e2e_block() {
+			printf 'BLOCK %s\n' "$1" >>"$work/gated.blocks"
+			printf '%s\n' "$3" >"$work/gated.reason"
+		}
+		: >"$work/gated.blocks"
+		if [ "$1" = - ]; then unset E2E_GATED_RACE_TIMEOUT; else export E2E_GATED_RACE_TIMEOUT="$1"; fi
+		E2E_SERVER_UP=yes REPO_ROOT="$work"
+		# shellcheck source=../suites/85-gated.sh
+		. "$E2E_DIR/suites/85-gated.sh"
+		cat "$work/gated.blocks"
+	) | tr '\n' ' ' | sed 's/ $//'
+}
+t_ok "suite 85: unset override runs both -race calls at 60m inside 4200s" "4200 60m 4200 60m" "$(gated_race -)"
+t_ok "suite 85: 45m runs both -race calls inside 3300s" "3300 45m 3300 45m" "$(gated_race 45m)"
+t_ok "suite 85: 1440m is the ceiling and runs" "87000 1440m 87000 1440m" "$(gated_race 1440m)"
+for v in '' 0m 1441m 10000m 153722867280912930m 060m 1h 60 '60m;x' ' 60m'; do
+	t_ok "suite 85: override <$v> blocks GAT-06 and GAT-07 and runs no -race call" \
+		"BLOCK GAT-06 BLOCK GAT-07" "$(gated_race "$v")"
+	t_ok "suite 85: the block for <$v> names the variable and its value" yes \
+		"$(grep -qF "E2E_GATED_RACE_TIMEOUT=\"$v\"" "$work/gated.reason" && echo yes || echo no)"
+done
+
 # ---- verdict ---------------------------------------------------------------
 
 printf '\n%d case(s), %d failure(s)\n' "$cases" "$fails"
