@@ -256,17 +256,23 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// The reason names the upstream URL, which a manifest may write
 			// with userinfo in it, so it stays in the log: this route takes no
 			// token.
-			s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
+			}
 			http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
 			return
 		}
 		var limited *upstreamRateLimited
 		if errors.As(err, &limited) {
-			s.logger.Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logger.Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			}
 			writeRateLimited(w, limited)
 			return
 		}
-		s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)
+		if !sinkUpstreamErr(r.Context(), err) {
+			s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)
+		}
 		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
 		return
 	}
@@ -298,7 +304,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		}
 		var limited *upstreamRateLimited
 		if errors.As(err, &limited) {
-			s.logger.Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logger.Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
+			}
 			writeRateLimited(w, limited)
 			return
 		}
@@ -307,18 +315,20 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// An opener read what the upstream sent and bodega refuses it:
 			// bytes that do not hash to the digest asked for, a token realm
 			// on an unlisted host. Nothing was cached.
-			s.logger.Warn("upstream fetch refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logger.Warn("upstream fetch refused", "key", s3Key, "incident", refused.f.incident, "reason", refused.f.reason)
+			}
 			refused.f.write(w, r)
 			return
 		}
 		if errors.Is(err, errUpstreamNotFound) {
-			s.logger.Debug("upstream has no such object", "url", upstreamURL)
+			if !sinkUpstreamErr(r.Context(), err) {
+				s.logger.Debug("upstream has no such object", "url", upstreamURL)
+			}
 			http.NotFound(w, r)
 			return
 		}
-		if sink := upstreamErrSinkFrom(r.Context()); sink != nil {
-			sink.set(err)
-		} else {
+		if !sinkUpstreamErr(r.Context(), err) {
 			s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		}
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)

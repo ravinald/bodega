@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
@@ -86,6 +87,7 @@ type rpmFilteredFile struct {
 type rpmProfileBuild struct {
 	key, fingerprint string
 	files            map[string]rpmFilteredFile
+	kept             int
 }
 
 // rpmProfileBuilds holds each profile view's recent builds and the builds
@@ -217,6 +219,19 @@ func (c *rpmProfileBuilds) slot(view string) *rpmProfileSlot {
 		c.views[view] = sl
 	}
 	return sl
+}
+
+// building reports whether a build is running for view.
+func (c *rpmProfileBuilds) building(view string) bool {
+	c.mu.Lock()
+	sl := c.views[view]
+	c.mu.Unlock()
+	if sl == nil {
+		return false
+	}
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return len(sl.running) > 0
 }
 
 func (c *rpmProfileBuilds) count() int {
@@ -379,15 +394,54 @@ func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpm
 	ctx := context.WithValue(context.WithoutCancel(r.Context()), rpmBudgetKey{}, nil)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	br := r.Clone(ctx)
+	// The job is retired by this goroutine alone, once, when the work returns
+	// or the deadline passes, whichever is first. A store may ignore its
+	// context, so a write or cached read can outlast the deadline; the work is
+	// then abandoned with its result unread, and nothing it does afterwards
+	// reaches recent, running or the log.
 	s.rpmProfileBuilds.running.Add(1)
 	go func() {
 		defer s.rpmProfileBuilds.running.Done()
 		defer cancel()
-		b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps)
+		type result struct {
+			b   *rpmProfileBuild
+			err error
+		}
+		var file atomic.Value
+		file.Store("primary")
+		results := make(chan result, 1)
+		s.rpmProfileBuilds.running.Add(1)
+		go func() {
+			defer s.rpmProfileBuilds.running.Done()
+			b, err := s.rpmBuildProfileFiles(br, t, p, key, fingerprint, entries, stamps, &file)
+			results <- result{b, err}
+		}()
+		var res result
+		select {
+		case res = <-results:
+			if res.err == nil && ctx.Err() != nil {
+				res = result{err: ctx.Err()}
+			}
+		case <-ctx.Done():
+			res.err = fmt.Errorf("not finished within the build timeout of %s, so the store or upstream operation it was in is abandoned: %w", timeout, ctx.Err())
+		}
+		if res.err != nil {
+			s.logger.Error("rpm metadata could not be filtered for a profile",
+				"profile", p.Name(), "repository", t.id(), "file", file.Load(), "error", res.err)
+			res = result{err: &rpmProfileBuildError{file: file.Load().(string), err: res.err}}
+		} else {
+			s.rpmProfileBuilds.mu.Lock()
+			s.rpmProfileBuilds.built++
+			s.rpmProfileBuilds.mu.Unlock()
+			s.logger.Info("filtered an rpm repository's metadata for a profile",
+				"profile", p.Name(), "repository", t.id(), "primary", entries["primary"].Checksum.Value, "kept", res.b.kept)
+		}
 		sl.mu.Lock()
-		delete(sl.running, key)
-		if err == nil {
-			kept := []*rpmProfileBuild{b}
+		if sl.running[key] == job {
+			delete(sl.running, key)
+		}
+		if res.err == nil {
+			kept := []*rpmProfileBuild{res.b}
 			for _, old := range sl.recent {
 				if old.key != key && len(kept) < rpmProfileBuildsKept {
 					kept = append(kept, old)
@@ -396,7 +450,7 @@ func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpm
 			sl.recent = kept
 			sl.gen++
 		}
-		job.b, job.err = b, err
+		job.b, job.err = res.b, res.err
 		sl.mu.Unlock()
 		close(job.done)
 	}()
@@ -404,24 +458,16 @@ func (s *Server) startRpmProfileBuild(r *http.Request, sl *rpmProfileSlot, t rpm
 }
 
 // rpmBuildProfileFiles reads, filters and stores the files entries names,
-// under r's context, which is the build's own and bounds every step: the
-// reads, the filtering and each store write, which is not begun past the
-// deadline, and a build whose deadline passed during its last write is not
-// published, because a store may ignore its context. A failure is logged
-// here, once for every request waiting on it.
-func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64) (b *rpmProfileBuild, err error) {
+// under r's context, which is the build's own: no read or write is begun past
+// its deadline. file is kept naming the file being built, for the record of a
+// failure, which is the caller's to write.
+func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile, key, fingerprint string, entries map[string]rpmRepomdData, stamps map[string]int64, file *atomic.Value) (b *rpmProfileBuild, err error) {
 	ctx := r.Context()
-	file := "primary"
 	defer func() {
 		// A request's handler has net/http's recover behind it; this
 		// goroutine has none, and a panic in a filter would stop the server.
 		if v := recover(); v != nil {
-			err = fmt.Errorf("panic: %v", v)
-		}
-		if err != nil {
-			s.logger.Error("rpm metadata could not be filtered for a profile",
-				"profile", p.Name(), "repository", t.id(), "file", file, "error", err)
-			b, err = nil, &rpmProfileBuildError{file: file, err: err}
+			b, err = nil, fmt.Errorf("panic: %v", v)
 		}
 	}()
 	store := s.typeStore(manifest.TypeRpm)
@@ -452,13 +498,13 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 	if err != nil {
 		return nil, fmt.Errorf("primary %s of %s: %w", primary.Location.Href, t.id(), err)
 	}
-	b = &rpmProfileBuild{key: key, fingerprint: fingerprint, files: map[string]rpmFilteredFile{}}
+	b = &rpmProfileBuild{key: key, fingerprint: fingerprint, files: map[string]rpmFilteredFile{}, kept: len(kept)}
 	for _, typ := range rpmFilteredTypes {
 		e, ok := entries[typ]
 		if !ok {
 			continue
 		}
-		file = typ
+		file.Store(typ)
 		if typ != "primary" {
 			if raw, err = read(e); err != nil {
 				return nil, err
@@ -480,14 +526,6 @@ func (s *Server) rpmBuildProfileFiles(r *http.Request, t rpmTree, p *entitle.Pro
 		}
 		b.files[typ] = f
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.rpmProfileBuilds.mu.Lock()
-	s.rpmProfileBuilds.built++
-	s.rpmProfileBuilds.mu.Unlock()
-	s.logger.Info("filtered an rpm repository's metadata for a profile",
-		"profile", p.Name(), "repository", t.id(), "primary", primary.Checksum.Value, "kept", len(kept))
 	return b, nil
 }
 
@@ -508,6 +546,17 @@ func withUpstreamErrSink(ctx context.Context, sink *upstreamErrSink) context.Con
 func upstreamErrSinkFrom(ctx context.Context) *upstreamErrSink {
 	sink, _ := ctx.Value(upstreamErrSinkKey{}).(*upstreamErrSink)
 	return sink
+}
+
+// sinkUpstreamErr hands err to ctx's sink and reports whether there was one;
+// when there was not, the caller logs err itself.
+func sinkUpstreamErr(ctx context.Context, err error) bool {
+	sink := upstreamErrSinkFrom(ctx)
+	if sink == nil {
+		return false
+	}
+	sink.set(err)
+	return true
 }
 
 func (k *upstreamErrSink) set(err error) {
@@ -626,6 +675,13 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 	}
 	body, err := got.b, got.err
 	if err != nil || len(body) == 0 {
+		// A rebuild of the same upstream files writes this file back under
+		// the same name, so a client told to retry may find it; one told the
+		// file is gone would fetch repomd.xml again and meet the same build.
+		if s.rpmProfileBuilds.building(rpmProfileView(t, p)) {
+			s.writeRpmProfileError(w, t, p, errRpmProfileBuilding)
+			return
+		}
 		s.logger.Warn("a filtered rpm metadata file the profile's repomd.xml names is not in the store", "profile", p.Name(), "repository", t.id(), "key", key, "error", err)
 		http.Error(w, fmt.Sprintf("bodega no longer holds the filtered %s of %s for profile %q; run `dnf makecache` to fetch a current repomd.xml, which rebuilds it.", entry.Type, t.id(), p.Name()), http.StatusNotFound)
 		return
