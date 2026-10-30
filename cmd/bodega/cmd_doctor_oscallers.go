@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -671,9 +672,12 @@ const oscStepPrompt = "release-upgrade-prompt"
 type promptSetting struct {
 	exists bool
 	text   string
-	// value is the effective value: the first line's and every
-	// continuation's, joined by newlines, as ConfigParser.get returns it.
-	value string
+	// joined is the first line's value and every continuation's, joined by
+	// newlines, as ConfigParser stores it. value is what ConfigParser.get
+	// returns: joined with its %(name)s references to other [DEFAULT] options
+	// resolved, or joined unchanged when resolveErr says they do not resolve.
+	joined, value string
+	resolveErr    error
 	// line is where the Prompt option's first line starts, or -1, and start
 	// and end bound its value, continuations included.
 	line, start, end int
@@ -686,7 +690,17 @@ type promptSetting struct {
 
 func (p promptSetting) found() bool { return p.line >= 0 }
 
-func (p promptSetting) never() bool { return p.found() && strings.EqualFold(p.value, "never") }
+// never is the upgrader's own test: it lowercases what ConfigParser.get
+// returns and skips the check at never or no. A Prompt whose references do
+// not resolve makes get raise, which is not a setting anybody chose, so it
+// counts as on and --quiet-os-callers replaces it.
+func (p promptSetting) never() bool {
+	if !p.found() || p.resolveErr != nil {
+		return false
+	}
+	v := strings.ToLower(p.value)
+	return v == "never" || v == "no"
+}
 
 // raw is the value as the file spells it, which is what the restore writes
 // back.
@@ -705,13 +719,22 @@ func (p promptSetting) shown() string {
 	if !p.found() {
 		return "no Prompt line, which means Prompt=normal"
 	}
-	return "Prompt=" + quoteMultiline(p.value)
+	shown := "Prompt=" + quoteMultiline(p.joined)
+	switch {
+	case p.resolveErr != nil:
+		shown += ", which ConfigParser cannot resolve (" + p.resolveErr.Error() + ")"
+	case p.value != p.joined:
+		shown += ", which resolves to " + quoteMultiline(p.value)
+	}
+	return shown
 }
 
-// promptValue is what the upgrader reads from a raw value. Its continuations
-// were indented past their option's indent, so past none at all here too.
-func promptValue(raw string) string {
-	return parsePrompt("[DEFAULT]\nPrompt=" + raw).value
+// promptJoined is the stored value of a raw one, references unresolved:
+// they name options of the file the raw value came from, and a recorded raw
+// value is shown without it. Its continuations were indented past their
+// option's indent, so past none at all here too.
+func promptJoined(raw string) string {
+	return parsePrompt("[DEFAULT]\nPrompt=" + raw).joined
 }
 
 func quoteMultiline(v string) string {
@@ -727,7 +750,8 @@ func leadingSpace(s string) string {
 
 func parsePrompt(text string) promptSetting {
 	p := promptSetting{exists: true, text: text, line: -1, below: -1}
-	section, inOption, inPrompt, underHeader := "", false, false, false
+	defaults := map[string]string{}
+	section, opt, inOption, inPrompt, underHeader := "", "", false, false, false
 	indent, off := 0, 0
 	for line := range strings.Lines(text) {
 		lineOff := off
@@ -736,16 +760,18 @@ func parsePrompt(text string) promptSetting {
 		v := strings.TrimSpace(content)
 		if v == "" || v[0] == '#' || v[0] == ';' {
 			// A blank line inside a value is part of it; a comment is not.
-			if v == "" && inPrompt {
-				p.value += "\n"
+			if v == "" && opt != "" {
+				defaults[opt] += "\n"
 			}
 			continue
 		}
 		lead := leadingSpace(content)
 		cur := utf8.RuneCountInString(lead)
 		if inOption && cur > indent {
+			if opt != "" {
+				defaults[opt] += "\n" + v
+			}
 			if inPrompt {
-				p.value += "\n" + v
 				p.end = lineOff + len(content)
 			}
 			continue
@@ -756,7 +782,7 @@ func parsePrompt(text string) promptSetting {
 		}
 		if j := strings.LastIndexByte(v, ']'); v[0] == '[' && j > 1 {
 			section = v[1:j]
-			inOption, inPrompt = false, false
+			opt, inOption, inPrompt = "", false, false
 			if section == "DEFAULT" && p.below < 0 {
 				p.below, underHeader = off, true
 			}
@@ -766,18 +792,79 @@ func parsePrompt(text string) promptSetting {
 		if sep < 0 || section == "" || strings.TrimSpace(content[:sep]) == "" {
 			continue // ConfigParser refuses the file, so nothing reads Prompt
 		}
-		inOption = true
-		inPrompt = section == "DEFAULT" && strings.EqualFold(strings.TrimSpace(content[:sep]), "prompt")
+		inOption, opt = true, ""
+		if section == "DEFAULT" {
+			opt = strings.ToLower(strings.TrimSpace(content[:sep]))
+			defaults[opt] = strings.TrimSpace(content[sep+1:])
+		}
+		inPrompt = opt == "prompt"
 		if !inPrompt {
 			continue
 		}
 		p.line = lineOff
 		p.start = lineOff + sep + 1 + len(leadingSpace(content[sep+1:]))
 		p.end = lineOff + len(content)
-		p.value = text[p.start:p.end]
 	}
-	p.value = strings.TrimRightFunc(p.value, unicode.IsSpace)
+	for k, v := range defaults {
+		defaults[k] = strings.TrimRightFunc(v, unicode.IsSpace)
+	}
+	p.joined = defaults["prompt"]
+	p.value = p.joined
+	if p.found() {
+		if v, err := interpolate(p.joined, defaults, 1); err != nil {
+			p.resolveErr = err
+		} else {
+			p.value = v
+		}
+	}
 	return p
+}
+
+// maxInterpolationDepth is configparser's MAX_INTERPOLATION_DEPTH: a chain
+// of references nested deeper, a cycle included, makes get raise.
+const maxInterpolationDepth = 10
+
+var interpolationRef = regexp.MustCompile(`^%\(([^)]+)\)s`)
+
+// interpolate is configparser.BasicInterpolation over the [DEFAULT] options,
+// which is all a get on DEFAULT consults: %% is a literal %, %(name)s is the
+// option name, looked up lowercased, and resolved in turn when it holds a %.
+func interpolate(rest string, defaults map[string]string, depth int) (string, error) {
+	if depth > maxInterpolationDepth {
+		return "", fmt.Errorf("references nest more than %d deep", maxInterpolationDepth)
+	}
+	var b strings.Builder
+	for rest != "" {
+		i := strings.IndexByte(rest, '%')
+		if i < 0 {
+			b.WriteString(rest)
+			break
+		}
+		b.WriteString(rest[:i])
+		rest = rest[i:]
+		if strings.HasPrefix(rest, "%%") {
+			b.WriteByte('%')
+			rest = rest[2:]
+			continue
+		}
+		m := interpolationRef.FindStringSubmatch(rest)
+		if m == nil {
+			return "", fmt.Errorf("%q is not %%%% or a %%(name)s reference", rest)
+		}
+		rest = rest[len(m[0]):]
+		v, ok := defaults[strings.ToLower(m[1])]
+		if !ok {
+			return "", fmt.Errorf("%%(%s)s names no [DEFAULT] option", m[1])
+		}
+		if strings.Contains(v, "%") {
+			var err error
+			if v, err = interpolate(v, defaults, depth+1); err != nil {
+				return "", err
+			}
+		}
+		b.WriteString(v)
+	}
+	return b.String(), nil
 }
 
 func (h *osCallersHost) readPrompt() (promptSetting, error) {
@@ -814,9 +901,8 @@ func (h *osCallersHost) setPrompt(to string) error {
 		return fmt.Errorf("%s has no Prompt line under [DEFAULT] to set to %s; add Prompt=%s under [DEFAULT], then re-run",
 			h.path(releaseUpgrades), quoteMultiline(to), quoteMultiline(to))
 	}
-	want := promptValue(to)
 	return h.writePrompt(p.text[:p.start]+to+p.text[p.end:],
-		func(got promptSetting) bool { return got.found() && got.value == want }, "Prompt="+quoteMultiline(want))
+		func(got promptSetting) bool { return got.found() && got.raw() == to }, "Prompt="+quoteMultiline(promptJoined(to)))
 }
 
 // insertPrompt adds Prompt=never directly under [DEFAULT], and removePrompt
@@ -867,7 +953,7 @@ func (h *osCallersHost) releaseUpgradeStep(name string) (quietStep, bool) {
 	st := quietStep{edit: func() error { return h.setPrompt("never") }}
 	shown := "no Prompt line"
 	if hadLine {
-		shown = "Prompt=" + quoteMultiline(promptValue(found))
+		shown = "Prompt=" + quoteMultiline(promptJoined(found))
 		st.revert = func() error { return h.setPrompt(found) }
 	} else {
 		st.edit = h.insertPrompt
@@ -895,7 +981,7 @@ func (h *osCallersHost) releaseUpgradeCheck() (host.Finding, bool) {
 		f.Detail = "no " + releaseUpgrades + ", so ubuntu-release-upgrader is not installed"
 	case p.never():
 		f.Status = host.StatusOK
-		f.Detail = releaseUpgrades + " has Prompt=never, so the new-release check makes no request"
+		f.Detail = releaseUpgrades + " has " + p.shown() + ", so the new-release check makes no request"
 	default:
 		f.Status = host.StatusWarn
 		f.Detail = releaseUpgrades + " has " + p.shown() + ", so ubuntu-release-upgrader checks changelogs.ubuntu.com " +

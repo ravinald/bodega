@@ -227,6 +227,17 @@ func TestOSCallerRows(t *testing.T) {
 			"release-upgrade-check", host.StatusWarn, []string{`Prompt="never\nnormal"`, "changelogs.ubuntu.com"}, nil},
 		{"release upgrades at never, header with trailing text", map[string]string{releaseUpgrades: "[DEFAULT] # comment\nPrompt=never\n"}, fakeOS{}, nil,
 			"release-upgrade-check", host.StatusOK, []string{"Prompt=never"}, nil},
+		{"release upgrades at no", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=No\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=No"}, nil},
+		{"release upgrades interpolated to never", map[string]string{releaseUpgrades: "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n"}, fakeOS{}, nil,
+			"release-upgrade-check", host.StatusOK, []string{"Prompt=%(Policy)s, which resolves to never"}, nil},
+		{"release upgrades interpolated to lts through a chain", map[string]string{releaseUpgrades: "[DEFAULT]\nPROMPT=%(a)s\nA=%(B)s\nb=lts\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn,
+			[]string{"Prompt=%(a)s, which resolves to lts", "changelogs.ubuntu.com"}, []string{"Prompt=never"}},
+		{"release upgrades interpolated from another section", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=%(p)s\n[x]\np=never\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"cannot resolve", "%(p)s names no [DEFAULT] option"}, nil},
+		{"release upgrades interpolation cycle", map[string]string{releaseUpgrades: "[DEFAULT]\nPrompt=%(a)s\na=%(prompt)s\n"},
+			fakeOS{}, nil, "release-upgrade-check", host.StatusWarn, []string{"cannot resolve", "nest more than 10 deep"}, nil},
 		{"release upgrades absent", nil, fakeOS{}, nil, "release-upgrade-check", host.StatusNA, []string{"not installed"}, nil},
 		{"release upgrades unreadable", map[string]string{releaseUpgrades + "/x": ""}, fakeOS{}, nil,
 			"release-upgrade-check", host.StatusSkip, []string{"could not read", releaseUpgrades}, nil},
@@ -509,6 +520,10 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 		{"value continued past never", "[DEFAULT]\nPrompt=never\n normal\n# c\n\n  lts\nOther=1\n",
 			"release-upgrade-prompt=never\\n normal\\n# c\\n\\n  lts", `found Prompt="never\nnormal\n\nlts"`,
 			"[DEFAULT]\nPrompt=never\nOther=1\n"},
+		{"interpolated to lts", "[DEFAULT]\nPolicy=LTS\nPrompt=%(policy)s\n", "release-upgrade-prompt=%(policy)s", "found Prompt=%(policy)s",
+			"[DEFAULT]\nPolicy=LTS\nPrompt=never\n"},
+		{"interpolation that does not resolve", "[DEFAULT]\nPrompt=%(gone)s %%\n", "release-upgrade-prompt=%(gone)s %%", "found Prompt=%(gone)s %%",
+			"[DEFAULT]\nPrompt=never\n"},
 		{"no Prompt line", "# c\n[DEFAULT]\nOther=1\n", "release-upgrade-prompt", "found no Prompt line", "# c\n[DEFAULT]\nPrompt=never\nOther=1\n"},
 		{"no Prompt line, header unterminated", "[DEFAULT]", "release-upgrade-prompt", "found no Prompt line", "[DEFAULT]\nPrompt=never"},
 		{"no Prompt line, indented options, header with trailing text", "[DEFAULT] # c\n\n  Other=1\n   cont\n",
@@ -567,6 +582,32 @@ func TestDoctorQuietOSCallersReleaseUpgradesRoundTrip(t *testing.T) {
 	}
 }
 
+// Each text makes configparser's get raise, which the upgrader does not
+// catch, so the row counts it as on rather than off.
+func TestParsePromptInterpolationErrors(t *testing.T) {
+	for _, text := range []string{
+		"[DEFAULT]\nPrompt=%(gone)s\n",
+		"[DEFAULT]\nPrompt=50%\n",
+		"[DEFAULT]\nPrompt=%(a\n",
+		"[DEFAULT]\nPrompt=%(prompt)s\n",
+		"[DEFAULT]\nPrompt=%(a)s\nA=%(b)s\nB=%(c)s\nC=%x\n",
+	} {
+		if p := parsePrompt(text); p.resolveErr == nil || p.never() {
+			t.Errorf("parsePrompt(%q) resolved to %q (never %v); configparser raises", text, p.value, p.never())
+		}
+	}
+}
+
+// An interpolated Prompt that resolves to never is already off, so
+// --quiet-os-callers plans no step for it.
+func TestQuietStepsInterpolatedNever(t *testing.T) {
+	h := stubOSCallers(t, map[string]string{releaseUpgrades: "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n"}, &fakeOS{})
+	steps, why, err := h.quietSteps()
+	if err != nil || len(steps) != 0 || !strings.Contains(why, "release-upgrade check is off") {
+		t.Errorf("quietSteps = %q, %q, %v; want none, release-upgrade check off", steps, why, err)
+	}
+}
+
 func TestReleaseUpgradeStepNames(t *testing.T) {
 	h := &osCallersHost{root: t.TempDir()}
 	for name, ok := range map[string]bool{
@@ -588,6 +629,11 @@ func TestParsePromptMatchesConfigParser(t *testing.T) {
 		found            bool
 	}{
 		{"key indented", "[DEFAULT]\n Prompt=never\n", "never", true},
+		{"reference", "[DEFAULT]\nPolicy=never\nPrompt=%(Policy)s\n", "never", true},
+		{"reference defined after Prompt, any case", "[DEFAULT]\nPrompt=%(POLICY)s\npolicy = lts\n", "lts", true},
+		{"chained references and a literal percent", "[DEFAULT]\nPrompt=%(a)s-%%-%(b)s\nA=%(b)s%(b)s\nB=lts\n", "ltslts-%-lts", true},
+		{"reference to a continued option", "[DEFAULT]\nPrompt=%(a)s\na=never\n  normal\n", "never\nnormal", true},
+		{"reference across a repeated DEFAULT", "[DEFAULT]\nPrompt=%(a)s\n[x]\na=lts\n[DEFAULT]\na=never\n", "never", true},
 		{"continued", "[DEFAULT]\nPrompt=never\n normal\n", "never\nnormal", true},
 		{"header with trailing text", "[DEFAULT] # comment\nPrompt=never\n", "never", true},
 		{"blank line inside the value", "[DEFAULT]\nPrompt=never\n\n  normal\n", "never\n\nnormal", true},
