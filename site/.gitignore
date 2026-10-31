@@ -1,0 +1,8 @@
+node_modules/
+.astro/
+dist/
+src/content/docs/
+src/content/i18n/
+scripts/__pycache__/
+public/assets/
+public/data/
