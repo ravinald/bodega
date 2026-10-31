@@ -25,13 +25,13 @@ Level 2 asks for a controlled ingestion path: every dependency enters through on
 
 ### Gaps
 
-These are where bodega falls short of Level 2 as the draft reads today:
+These are where bodega falls short of Level 2 as the draft reads today. Each one is either tracked by an open issue or a boundary bodega keeps by design:
 
-- **Unsigned when the key or the table is missing.** With no attestation key installed, or with `audit_sink` set to `syslog` or `jsonl`, nothing is signed. The server says so once at startup, and the artifact is still served.
-- **Two first fetches pin no digest.** pypi and clone-mode git record no checksum on first fetch; [Threat model](threat-model.md) covers both.
-- **Publisher signatures are verified for npm and GitHub releases only.** PyPI attestations (PEP 740), the Go checksum database and Helm `.prov` files are not checked, so those types always record `unavailable`.
-- **`resolvedFrom` names the parent, not its digest.** It lists, by name, the packages a catalog entry records as requiring the artifact, so an artifact with no catalog entry, such as most proxy fills, records none. The draft now asks for the direct dependency's digest.
-- **The build side is the operator's.** Level 2 also requires the consuming build to resolve only through the platform, with versions pinned. `bodega doctor --configure` and the [setup script](usage.md#setup-script) write that configuration, and `bodega pin` pins a host, but bodega cannot see a build it is not asked to serve.
+- **Unsigned when the key or the table is missing.** With no attestation key installed, or with `audit_sink` set to `syslog` or `jsonl`, nothing is signed. The server says so once at startup, and the artifact is still served. By design: installing the key and choosing the audit store are the operator's decisions.
+- **Clone-mode git carries no upstream digest.** bodega builds the bundle locally at package time, so there are no upstream bytes to pin, and `git bundle create` is not byte-for-byte reproducible. A git entry fetched as a release archive is pinned normally. By design; [Threat model](threat-model.md) explains the boundary.
+- **Publisher signatures are verified for npm and GitHub releases only.** PyPI attestations (PEP 740), the Go checksum database and Helm `.prov` files are not checked at admission, so those types always record `unavailable`. The go command still verifies modules against the checksum database bodega relays. Tracked in [#273](https://github.com/ravinald/bodega/issues/273) (PyPI), [#274](https://github.com/ravinald/bodega/issues/274) (Go) and [#275](https://github.com/ravinald/bodega/issues/275) (Helm).
+- **`resolvedFrom` names the parent, not its digest.** It lists, by name, the packages a catalog entry records as requiring the artifact, so an artifact with no catalog entry, such as most proxy fills, records none. The draft now asks for the direct dependency's digest. Tracked in [#276](https://github.com/ravinald/bodega/issues/276).
+- **The build side is the operator's.** Level 2 also requires the consuming build to resolve only through the platform, with versions pinned. `bodega doctor --configure` and the [setup script](usage.md#setup-script) write that configuration, and `bodega pin` pins a host, but bodega cannot see a build it is not asked to serve. By design: the requirement falls on the ingestor, not the platform.
 
 ## Beyond Level 2: bypass detection
 
@@ -62,7 +62,7 @@ A compromised bodega host is out of scope in the [threat model](threat-model.md)
 
 Releases build on GitHub-hosted runners in a reusable workflow, `.github/workflows/release-build.yml`, which `release.yml` calls only after `ci.yml`'s gate has passed on the tagged commit. The workflow signs `checksums-sha256.txt` with cosign keyless and attests every file it lists with `actions/attest`, so each archive, package and SBOM carries build provenance signed by the platform rather than by a key a maintainer holds. GitHub describes that as Build Level 2; the reusable workflow, which isolates signing from the caller, is the step toward Level 3.
 
-What is not yet proven:
+What is not yet proven, tracked in [#278](https://github.com/ravinald/bodega/issues/278):
 
 - **No release has been cut,** so the provenance has never been produced or verified outside a snapshot build.
 - **The `release` environment carries no protection rule yet.** The build job names it, and GitHub creates an environment with no required reviewer the first time a job does.
@@ -71,7 +71,7 @@ What is not yet proven:
 
 ## Spec drift
 
-The draft changed after bodega's predicate was written. Where they differ today:
+The draft changed after bodega's predicate was written. Where they differ today, tracked in [#277](https://github.com/ravinald/bodega/issues/277):
 
 | The draft now says                                                     | bodega emits                                                                   |
 | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |

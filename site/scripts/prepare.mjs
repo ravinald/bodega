@@ -10,7 +10,7 @@ const root = path.resolve(site, '..');
 export async function prepareDocs() {
   await mkdir(path.join(site, 'src/content/i18n'), { recursive: true });
   await writeFile(path.join(site, 'src/content/i18n/en.json'), '{}\n');
-  const sources = ['docs/quickstart.md', 'docs/usage.md', 'docs/design.md', 'docs/threat-model.md',
+  const sources = ['docs/quickstart.md', 'docs/usage.md', 'docs/design.md', 'docs/threat-model.md', 'docs/slsa.md',
     'docs/slsa.md', 'docs/runbook.md',
     'docs/quarantine/README.md', 'docs/quarantine/cli.md', 'docs/quarantine/api.md', 'docs/quarantine/tui.md',
     'SECURITY.md', 'CONTRIBUTING.md'];

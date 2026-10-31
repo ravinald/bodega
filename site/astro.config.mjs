@@ -16,6 +16,7 @@ export const navigation = [
     ...['Authentication', 'Supply Chain Management', 'Attestations', 'Integrations'].map(label => ({ label, link: `/docs/operator/${label.toLowerCase().replace(/ /g, '-')}/` })),
     { label: 'Threat model', link: '/docs/threat-model/' },
     { label: 'SLSA', link: '/docs/slsa/' },
+    { label: 'SLSA', link: '/docs/slsa/' },
     { label: 'Security', link: '/docs/security/' },
   ] },
   { label: 'Daily operations', items: [
