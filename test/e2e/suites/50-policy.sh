@@ -190,10 +190,12 @@ e2e_on server "cat > /tmp/e2e-ref-toml.json <<'E2EREF'
 E2EREF" || true
 e2e_bodega server "pkg import --merge /tmp/e2e-ref-toml.json" || true
 
+# The store is 0750 and owned by bodega, so the globs expand under sudo: in the
+# login shell they match nothing, stay literal, and rm -rf removes nothing.
 ref_clear_caches() {
-	e2e_on server "sudo rm -rf /var/lib/bodega/npm/left-pad /var/lib/bodega/cargo/index/it/oa/itoa \
+	e2e_on server "sudo sh -c 'rm -rf /var/lib/bodega/npm/left-pad /var/lib/bodega/cargo/index/it/oa/itoa \
 		/var/lib/bodega/cargo/crates/itoa-* /var/lib/bodega/gomod/github.com/kr \
-		/var/lib/bodega/pypi/simple/toml /var/lib/bodega/pypi/wheels/toml-*; true" || true
+		/var/lib/bodega/pypi/simple/toml /var/lib/bodega/pypi/wheels/toml-*'; true" || true
 }
 
 # Each client, from a scratch cache, so a hit from an earlier run cannot stand
