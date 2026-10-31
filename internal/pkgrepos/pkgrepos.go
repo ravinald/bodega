@@ -230,7 +230,8 @@ const (
 // ReleaseSplit is the first FreeBSD major release whose base system defines
 // the ports repository under three tags instead of one.
 //
-// Below it /etc/pkg/FreeBSD.conf holds a single "FreeBSD" definition. From it,
+// Below it /etc/pkg/FreeBSD.conf holds "FreeBSD", plus "FreeBSD-kmods" from
+// 14.3. From it,
 // the same file holds FreeBSD-ports, FreeBSD-ports-kmods and FreeBSD-base.
 // Disabling the wrong one is the failure this package exists to prevent, and
 // it is silent: pkg reports nothing about an upstream repository that stayed
@@ -241,9 +242,11 @@ const ReleaseSplit = 15
 // upstreamTagsPreSplit and upstreamTagsSplit are what each side of
 // ReleaseSplit ships. FreeBSD-base is disabled by default on a stock 15 host
 // and is still named here, because a host that enabled it is exactly the host
-// an override has to reach.
+// an override has to reach. FreeBSD-kmods arrived in 14.3's FreeBSD.conf, so
+// a 14.0 to 14.2 or 13 host defines no such tag; pkg skips a disabled
+// definition with no url and says nothing, so naming it there costs nothing.
 var (
-	upstreamTagsPreSplit = []string{"FreeBSD"}
+	upstreamTagsPreSplit = []string{"FreeBSD", "FreeBSD-kmods"}
 	upstreamTagsSplit    = []string{"FreeBSD-ports", "FreeBSD-ports-kmods", "FreeBSD-base"}
 )
 
