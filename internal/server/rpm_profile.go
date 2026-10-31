@@ -206,21 +206,60 @@ func (e *rpmProfileBuildError) Unwrap() error { return e.err }
 
 type rpmBudgetKey struct{}
 
+// rpmBudget is one governed request's time to answer. It runs rpmProfileBudget
+// from start until the request meets a build no previous build can stand in
+// for; from then on it runs to the cold wait's end and the fallback reserve
+// after it, so the store reads that follow the build are not refused for
+// having outlived the 4 seconds a warm request gets.
+type rpmBudget struct {
+	start time.Time
+	mu    sync.Mutex
+	cold  time.Time
+}
+
+func (b *rpmBudget) end() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.cold.IsZero() {
+		return b.cold.Add(rpmProfileFallbackReserve)
+	}
+	return b.start.Add(rpmProfileBudget)
+}
+
+// goCold moves the budget to the cold wait that ends at coldEnd and returns
+// that end.
+func (b *rpmBudget) goCold(coldEnd time.Time) time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cold.IsZero() {
+		b.cold = coldEnd
+	}
+	return b.cold
+}
+
 // withRpmBudget starts r's budget, unless the request r was read for already
 // started one.
 func withRpmBudget(r *http.Request) *http.Request {
-	if _, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
+	if _, ok := r.Context().Value(rpmBudgetKey{}).(*rpmBudget); ok {
 		return r
 	}
-	return r.WithContext(context.WithValue(r.Context(), rpmBudgetKey{}, time.Now().Add(rpmProfileBudget)))
+	return r.WithContext(context.WithValue(r.Context(), rpmBudgetKey{}, &rpmBudget{start: time.Now()}))
+}
+
+func rpmBudgetOf(r *http.Request) *rpmBudget {
+	if b, ok := r.Context().Value(rpmBudgetKey{}).(*rpmBudget); ok && b != nil {
+		return b
+	}
+	return &rpmBudget{start: time.Now()}
 }
 
 // rpmBudgetEnd is when r's budget runs out.
-func rpmBudgetEnd(r *http.Request) time.Time {
-	if end, ok := r.Context().Value(rpmBudgetKey{}).(time.Time); ok {
-		return end
-	}
-	return time.Now().Add(rpmProfileBudget)
+func rpmBudgetEnd(r *http.Request) time.Time { return rpmBudgetOf(r).end() }
+
+// rpmColdEnd moves r's budget to the cold wait and is when that wait ends.
+func (c *rpmProfileBuilds) rpmColdEnd(r *http.Request) time.Time {
+	b := rpmBudgetOf(r)
+	return b.goCold(c.coldEnd(b.start))
 }
 
 // rpmBounded runs f and waits for it until end; ok is false when f had not
@@ -321,20 +360,26 @@ func (c *rpmProfileBuilds) awaitView(ctx context.Context, view string, until tim
 	}
 }
 
-// coldEnd is when a request whose budget ends at end stops waiting on a build
-// no previous build can stand in for. It counts from the budget's start, so
-// the refresh of the upstream repomd.xml spends from it too and the whole
-// request stays inside dnf's 30-second low-speed cutoff.
-func (c *rpmProfileBuilds) coldEnd(end time.Time) time.Time {
+// coldEnd is when a request whose budget started at start stops waiting on a
+// build no previous build can stand in for. It counts from the budget's
+// start, so the refresh of the upstream repomd.xml spends from it too and the
+// whole request stays inside dnf's 30-second low-speed cutoff.
+func (c *rpmProfileBuilds) coldEnd(start time.Time) time.Time {
 	wait := c.coldWait
 	if wait <= 0 {
 		wait = rpmProfileColdWait
 	}
-	return end.Add(-rpmProfileBudget).Add(wait)
+	return start.Add(wait)
 }
 
-// remember records that a host on profile asked for t.
-func (c *rpmProfileBuilds) remember(profile string, t rpmTree) {
+// remember records that a host bound to p asked for t, whether or not p
+// filters rpm today: a profile that gains its first rpm rule rebuilds what its
+// hosts already asked for. A host bound to no profile is not remembered.
+func (c *rpmProfileBuilds) remember(p *entitle.Profile, t rpmTree) {
+	if p == nil {
+		return
+	}
+	profile := p.Name()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.trees = slices.DeleteFunc(c.trees, func(rt rpmRequestedTree) bool {
@@ -390,7 +435,7 @@ func (s *Server) rpmProfileRepomd(r *http.Request, t rpmTree, p *entitle.Profile
 	if err != nil {
 		return nil, err
 	}
-	s.rpmProfileBuilds.remember(p.Name(), t)
+	s.rpmProfileBuilds.remember(p, t)
 	b, err := s.rpmProfileFiles(r, t, p, data)
 	if err != nil || b == nil {
 		return doc, err
@@ -447,11 +492,25 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	// upstream's, which would list the unfiltered file, and cannot add one
 	// the document lacks.
 	stands := func(b *rpmProfileBuild) bool { return b.fingerprint == fingerprint && b.coversTypes(entries) }
-	sl.mu.Lock()
-	recent := slices.Clone(sl.recent)
-	sl.mu.Unlock()
+	// The warm wait is for a request that has an answer if the build is late:
+	// a build that stands in and whose files are all still stored. A record
+	// of one whose files are gone serves nothing, so it counts as none.
+	servable := func() *rpmProfileBuild {
+		sl.mu.Lock()
+		recent := slices.Clone(sl.recent)
+		sl.mu.Unlock()
+		for _, b := range recent {
+			if !stands(b) {
+				continue
+			}
+			if stored, ok := s.rpmProfileBuildStored(rpmBudgetEnd(r), r, t, b); ok && stored {
+				return b
+			}
+		}
+		return nil
+	}
 	var waitEnd time.Time
-	if slices.ContainsFunc(recent, stands) {
+	if servable() != nil {
 		wait := s.rpmProfileBuilds.wait
 		if wait <= 0 {
 			wait = rpmProfileBuildWait
@@ -463,8 +522,9 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 	} else {
 		// Nothing can answer in the build's place, and dnf does not honor
 		// Retry-After on repomd.xml: a 503 here fails the client's install
-		// outright, so the request holds on for as long as dnf will.
-		waitEnd = s.rpmProfileBuilds.coldEnd(end)
+		// outright, so the request holds on for as long as dnf will, and
+		// what it reads after the build gets the rest of that time.
+		waitEnd = s.rpmProfileBuilds.rpmColdEnd(r)
 	}
 	timer := time.NewTimer(time.Until(waitEnd))
 	defer timer.Stop()
@@ -475,20 +535,8 @@ func (s *Server) rpmProfileFiles(r *http.Request, t rpmTree, p *entitle.Profile,
 		return nil, r.Context().Err()
 	case <-timer.C:
 	}
-	sl.mu.Lock()
-	recent = slices.Clone(sl.recent)
-	sl.mu.Unlock()
-	for _, b := range recent {
-		if !stands(b) {
-			continue
-		}
-		stored, ok := s.rpmProfileBuildStored(end, r, t, b)
-		if !ok {
-			break
-		}
-		if stored {
-			return b, nil
-		}
+	if b := servable(); b != nil {
+		return b, nil
 	}
 	return nil, errRpmProfileBuilding
 }
@@ -668,9 +716,17 @@ func (s *Server) startRpmProfileBuild(parent context.Context, r *http.Request, c
 		}
 		took := time.Since(job.started).Round(time.Millisecond)
 		if res.err != nil {
-			// A failed build's end record is its one failure record, at
-			// error, so the cause is logged once whatever level reads it.
+			// The lifecycle's end record is at info like its start, so an
+			// operator reading the build lines sees every build end. Its
+			// error says only how the build failed: the upstream's own text,
+			// with a refusal's incident, stays in the one error record.
+			summary := fmt.Sprintf("building the filtered %s failed; the error record beside this one names the cause", file.Load())
+			if errors.Is(res.err, context.DeadlineExceeded) {
+				summary = fmt.Sprintf("building the filtered %s ran past the build timeout of %s", file.Load(), timeout)
+			}
 			owner.retire(func() {
+				s.logger.Info("rpm profile build ended", "profile", p.Name(), "repository", t.id(), "cause", cause,
+					"duration", took, "outcome", "failed", "error", summary)
 				s.logger.Error("rpm metadata could not be filtered for a profile",
 					"profile", p.Name(), "repository", t.id(), "cause", cause, "duration", took, "outcome", "failed",
 					"file", file.Load(), "error", res.err)
@@ -1079,7 +1135,7 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 	}
 	key := manifest.RpmMetadataKey(t.repo, t.releasever, t.basearch, entry.Checksum.Value, path.Base(entry.Location.Href))
 	store := s.typeStore(manifest.TypeRpm)
-	got, ok := rpmBounded(end, func() read {
+	got, ok := rpmBounded(rpmBudgetEnd(r), func() read {
 		b, err := store.Get(r.Context(), key)
 		return read{b, err}
 	})
@@ -1095,9 +1151,8 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 		// same build.
 		view := rpmProfileView(t, p)
 		if s.rpmProfileBuilds.building(view) {
-			cold := s.rpmProfileBuilds.coldEnd(end)
-			s.rpmProfileBuilds.awaitView(r.Context(), view, cold)
-			got, ok := rpmBounded(cold.Add(rpmProfileFallbackReserve), func() read {
+			s.rpmProfileBuilds.awaitView(r.Context(), view, s.rpmProfileBuilds.rpmColdEnd(r))
+			got, ok := rpmBounded(rpmBudgetEnd(r), func() read {
 				b, err := store.Get(r.Context(), key)
 				return read{b, err}
 			})

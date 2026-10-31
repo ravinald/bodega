@@ -154,6 +154,7 @@ func (s *Server) handleRpmRepomd(w http.ResponseWriter, r *http.Request, t rpmTr
 		return
 	}
 	p := s.profileFor(r)
+	s.rpmProfileBuilds.remember(p, t)
 	governed := rpmFilters(p)
 	if governed {
 		r = withRpmBudget(r)
