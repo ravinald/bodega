@@ -2,7 +2,7 @@
 
 ## What is it
 
-Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It fetches, builds, and serves ten package types through native package manager protocols: apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd and distfiles. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
+Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It fetches, builds, and serves fifteen package types through native package manager protocols: apt, rpm, git, pypi, binary, gomod, helm, npm, cargo, maven, rubygems, composer, oci, freebsd, and distfiles. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
 
 It replaces the grab bag of internal mirrors, S3 scripts, and "just curl it" patterns that tend to accumulate when you operate package infrastructure at scale. One tool, one config file, and one storage backend by default: a local directory or an S3 bucket, with more added by name when placement needs them.
 
@@ -12,7 +12,7 @@ Three problems kept showing up:
 
 1. **Build reproducibility.** Upstream packages disappear, change, or get compromised. Pinning versions in a manifest and verifying checksums on every fetch means Tuesday's build produces the same artifact as last Tuesday's build.
 
-2. **Air-gapped and restricted networks.** When instances can't reach the internet (or shouldn't), they need a local source for packages. Bodega serves everything over standard protocols that apt, pip, go, helm, npm, cargo, FreeBSD's pkg and the ports tree's `make fetch` already understand.
+2. **Air-gapped and restricted networks.** When instances can't reach the internet (or shouldn't), they need a local source for packages. Bodega serves everything over standard protocols that apt, dnf, pip, go, helm, npm, cargo, Maven and Gradle, gem and Bundler, Composer, the container runtimes, FreeBSD's pkg, and the ports tree's `make fetch` already understand.
 
 3. **Dependency visibility.** Knowing what your infrastructure actually depends on requires more than grepping requirements files. Bodega tracks every package, its source, its checksum, and whether that checksum was verified against the upstream publisher.
 
@@ -27,10 +27,11 @@ Three problems kept showing up:
                     +--------------+--------------+
                     |              |               |
                native clients   REST API     TUI & dashboard
-              (apt, pip, go,   (/api/v1/)  (bodega shell)
-               helm, npm,
-               cargo, pkg,
-               make fetch)
+              (apt, dnf, pip,  (/api/v1/)  (bodega shell)
+               go, helm, npm,
+               cargo, mvn, gem,
+               composer, docker,
+               pkg, make fetch)
                     |              |               |
                     +--------------+--------------+
                                    |
@@ -151,18 +152,23 @@ A fresh object gets none of this, deliberately. It _is_ the staging file, so it 
 
 ## Package types
 
-| Type      | Source                                              | Artifact                          | Client protocol                                                       |
-| --------- | --------------------------------------------------- | --------------------------------- | --------------------------------------------------------------------- |
-| apt       | Package name, git repo, or apt-get source           | .deb in Debian repo layout        | deb822 `.sources` with `Signed-By:`; see below                        |
-| git       | GitHub release tarball or bare clone                | .tar.gz or .bundle                | `curl https://bodega/git/<name>/<file>`                               |
-| pypi      | Wheel build from requirements.txt                   | .whl files                        | `pip install --index-url https://bodega/pypi/simple/`                 |
-| binary    | Direct URL download                                 | Original file                     | `curl https://bodega/binaries/<name>/<ver>/<file>`                    |
-| gomod     | GOPROXY upstream or local build                     | .zip, .mod, .info                 | `GOPROXY=https://bodega/go go get <module>`                           |
-| helm      | Chart repo or direct URL                            | .tgz                              | `helm repo add bodega https://bodega/helm`                            |
-| npm       | Registry upstream or local                          | .tgz                              | `npm install --registry https://bodega/npm/`                          |
-| cargo     | Sparse index and crate download upstream            | .crate                            | `registry = "sparse+https://bodega/cargo/"` in `~/.cargo/config.toml` |
-| freebsd   | pkg repository mirror or generated catalogue        | .pkg and the repository catalogue | `url: "https://bodega/freebsd/${ABI}/latest"` in a pkg repo file      |
-| distfiles | Ports `distinfo`, fetched from `distfiles_upstream` | Original distfile                 | `MASTER_SITE_OVERRIDE` at `https://bodega/distfiles/@<env>/`          |
+| Type      | Source                                                 | Artifact                                     | Client protocol                                                                                       |
+| --------- | ------------------------------------------------------ | -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| apt       | Package name, git repo, or apt-get source              | .deb in Debian repo layout                   | deb822 `.sources` with `Signed-By:`; see below                                                        |
+| git       | GitHub release tarball or bare clone                   | .tar.gz or .bundle                           | `curl https://bodega/git/<name>/<file>`                                                               |
+| pypi      | Wheel build from requirements.txt                      | .whl files                                   | `pip install --index-url https://bodega/pypi/simple/`                                                 |
+| binary    | Direct URL download                                    | Original file                                | `curl https://bodega/binaries/<name>/<ver>/<file>`                                                    |
+| gomod     | GOPROXY upstream or local build                        | .zip, .mod, .info                            | `GOPROXY=https://bodega/go go get <module>`                                                           |
+| helm      | Chart repo or direct URL                               | .tgz                                         | `helm repo add bodega https://bodega/helm`                                                            |
+| npm       | Registry upstream or local                             | .tgz                                         | `npm install --registry https://bodega/npm/`                                                          |
+| cargo     | Sparse index and crate download upstream               | .crate                                       | `registry = "sparse+https://bodega/cargo/"` in `~/.cargo/config.toml`                                 |
+| freebsd   | pkg repository mirror or generated catalogue           | .pkg and the repository catalogue            | `url: "https://bodega/freebsd/${ABI}/latest"` in a pkg repo file                                      |
+| distfiles | Ports `distinfo`, fetched from `distfiles_upstream`    | Original distfile                            | `MASTER_SITE_OVERRIDE` at `https://bodega/distfiles/@<env>/`                                          |
+| maven     | `maven_upstreams`, an ordered list, or hosted          | .jar, .pom and the repository layout         | `<mirror>` at `https://bodega/maven/` in `~/.m2/settings.xml`; a Gradle init script                   |
+| rubygems  | `rubygems_upstream`, or hosted                         | .gem and the registry indexes                | `:sources:` in `~/.gemrc`; Bundler's mirror for rubygems.org                                          |
+| composer  | `composer_upstream` (Packagist)                        | Composer v2 metadata and dist archives       | a `composer` repository at `https://bodega/composer` in Composer's `config.json`                      |
+| oci       | Each registry in `oci_upstreams`, pulled through       | Manifests and blobs                          | Docker `registry-mirrors`, containerd `hosts.toml`, podman `registries.conf`, at `https://bodega/v2/` |
+| rpm       | Each dnf repository in `rpm_upstreams`, pulled through | .rpm and `repodata/`, `repomd.xml` re-signed | `baseurl=https://bodega/rpm/<name>/$releasever/$basearch/` in a `.repo` file                          |
 
 `internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and signs it there with a key `internal/aptsign` loads at startup and re-reads on every `SIGHUP`, held behind an `atomic.Pointer` because the reload writes it while request handlers read it. `InRelease` is the clearsigned `Release`; `Release.gpg` is the armored detached signature; `/apt/bodega-archive-keyring.{asc,gpg}` serve the public key from memory. With no key installed all four 404 and the unsigned `Release` still serves, which is the ordinary fallback apt has always taken. Signed and unsigned coexist at the same URLs indefinitely.
 
@@ -758,32 +764,32 @@ One JSON file, named by `$BODEGA_CONFIG_FILE` when that is set and otherwise the
 
 Key fields:
 
-| Field                  | Default                    | Purpose                                                                                                                                                                                                                   |
-| ---------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `storage_backend`      | local                      | Driver for the default backend: `local` or `s3`                                                                                                                                                                           |
-| `storage_path`         | /var/lib/bodega            | Root directory of the local backend                                                                                                                                                                                       |
-| `bucket`               | (none)                     | S3 bucket name. Required when `storage_backend` is `s3`, ignored otherwise                                                                                                                                                |
-| `storage_backends`     | {}                         | Additional backends, by name                                                                                                                                                                                              |
-| `storage_by_type`      | {}                         | Which named backend each type's next write targets                                                                                                                                                                        |
-| `storage_by_group`     | {}                         | Which named backend each storage group's next write targets                                                                                                                                                               |
-| `storage_policy`       | (per package)              | Manifest field overriding `storage_by_type` for one package                                                                                                                                                               |
-| `storage_groups`       | (per package)              | Manifest field naming the groups a package belongs to, resolved through `storage_by_group`                                                                                                                                |
-| `region`               | us-west-2                  | AWS region of the default backend. A named backend with no `region` takes the AWS SDK's resolution instead                                                                                                                |
-| `build_root`           | /opt/bodega                | Where artifacts are built locally                                                                                                                                                                                         |
-| `manifest_dir`         | {storage_path}/manifests   | Where manifests live on a filesystem backend. Always absolute: a relative value under a unit with no `WorkingDirectory=` resolves against `/`. `bodega serve` creates it when absent and refuses to start when it cannot  |
-| `proxy_cache_enabled`  | false                      | Global proxy/cache toggle                                                                                                                                                                                                 |
-| `metadata_ttl`         | 1h                         | How long mutable proxy resources are cached                                                                                                                                                                               |
-| `deny_list`            | []                         | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny`                                                                                                       |
+| Field                  | Default                    | Purpose                                                                                                                                                                                                                    |
+| ---------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `storage_backend`      | local                      | Driver for the default backend: `local` or `s3`                                                                                                                                                                            |
+| `storage_path`         | /var/lib/bodega            | Root directory of the local backend                                                                                                                                                                                        |
+| `bucket`               | (none)                     | S3 bucket name. Required when `storage_backend` is `s3`, ignored otherwise                                                                                                                                                 |
+| `storage_backends`     | {}                         | Additional backends, by name                                                                                                                                                                                               |
+| `storage_by_type`      | {}                         | Which named backend each type's next write targets                                                                                                                                                                         |
+| `storage_by_group`     | {}                         | Which named backend each storage group's next write targets                                                                                                                                                                |
+| `storage_policy`       | (per package)              | Manifest field overriding `storage_by_type` for one package                                                                                                                                                                |
+| `storage_groups`       | (per package)              | Manifest field naming the groups a package belongs to, resolved through `storage_by_group`                                                                                                                                 |
+| `region`               | us-west-2                  | AWS region of the default backend. A named backend with no `region` takes the AWS SDK's resolution instead                                                                                                                 |
+| `build_root`           | /opt/bodega                | Where artifacts are built locally                                                                                                                                                                                          |
+| `manifest_dir`         | {storage_path}/manifests   | Where manifests live on a filesystem backend. Always absolute: a relative value under a unit with no `WorkingDirectory=` resolves against `/`. `bodega serve` creates it when absent and refuses to start when it cannot   |
+| `proxy_cache_enabled`  | false                      | Global proxy/cache toggle                                                                                                                                                                                                  |
+| `metadata_ttl`         | 1h                         | How long mutable proxy resources are cached                                                                                                                                                                                |
+| `deny_list`            | []                         | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny`                                                                                                        |
 | `admin_permit_cidr`    | [127.0.0.0/8, ::1/128]     | CIDRs allowed to reach the admin surface: mutations and the eight admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
-| `trusted_proxies`      | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start                                                                                     |
-| `tls_min_version`      | 1.3                        | Floor for bodega's own listener; `1.2` or `1.3`                                                                                                                                                                           |
-| `tls_cert` / `tls_key` | (none)                     | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext                                                                                                                                   |
-| `allow_plaintext`      | false                      | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port                                                                                    |
-| `audit_db`             | {log_dir}/audit.db         | Embedded store: the event stream under `audit_sink: sqlite`, and the ACLs, tokens, checksums and policies under every sink                                                                                                |
-| `audit_sink`           | sqlite                     | Where the event stream goes: `sqlite`, `postgres`, `syslog` or `jsonl`. An unknown value is refused at load                                                                                                               |
-| `audit_sink_dsn`       | (none)                     | Destination for the sink: a libpq string, a syslog `scheme://address`, or an absolute JSONL path. Refused with `sqlite` rather than ignored                                                                               |
-| `git_upstreams`        | {}                         | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode                                                                                                                                  |
-| `binary_upstreams`     | {}                         | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before                                                            |
+| `trusted_proxies`      | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start                                                                                      |
+| `tls_min_version`      | 1.3                        | Floor for bodega's own listener; `1.2` or `1.3`                                                                                                                                                                            |
+| `tls_cert` / `tls_key` | (none)                     | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext                                                                                                                                    |
+| `allow_plaintext`      | false                      | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port                                                                                     |
+| `audit_db`             | {log_dir}/audit.db         | Embedded store: the event stream under `audit_sink: sqlite`, and the ACLs, tokens, checksums and policies under every sink                                                                                                 |
+| `audit_sink`           | sqlite                     | Where the event stream goes: `sqlite`, `postgres`, `syslog` or `jsonl`. An unknown value is refused at load                                                                                                                |
+| `audit_sink_dsn`       | (none)                     | Destination for the sink: a libpq string, a syslog `scheme://address`, or an absolute JSONL path. Refused with `sqlite` rather than ignored                                                                                |
+| `git_upstreams`        | {}                         | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode                                                                                                                                   |
+| `binary_upstreams`     | {}                         | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before                                                             |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file, and reports the path `Save` returned rather than a second guess at it.
 
