@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -676,11 +679,14 @@ func TestRpmProfileBuildOutlivesTheRequestThatStartedIt(t *testing.T) {
 	}
 }
 
-// With no previous build to serve, a request during a stalled build is told
-// to come back, inside the 5 seconds a client has before it reads silence as
-// a hang, and is never handed the unfiltered document.
-func TestRpmProfileBuildRunningAnswers503(t *testing.T) {
+// With no previous build to serve, a request meeting a build that outlasts
+// rpm_profile_cold_wait is told to come back once the wait ends, logs why at
+// warn, and is never handed the unfiltered document.
+func TestRpmProfileColdBuildPastTheColdWaitAnswers503(t *testing.T) {
 	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.s.rpmProfileBuilds.coldWait = time.Second
 	f.m.stall(t, f.filelistsHref(t))
 
 	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
@@ -690,11 +696,159 @@ func TestRpmProfileBuildRunningAnswers503(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
 		t.Errorf("repomd.xml during the first build: %d Retry-After=%q, want 503 with Retry-After\n%s", resp.StatusCode, resp.Header.Get("Retry-After"), body)
 	}
-	if took >= 5*time.Second {
-		t.Errorf("answered after %s, want under 5s", took)
+	if took < time.Second || took >= 5*time.Second {
+		t.Errorf("answered after %s, want after the 1s cold wait and under 5s", took)
 	}
 	if strings.Contains(body, "<repomd") {
 		t.Errorf("the 503 carried a repomd.xml:\n%s", body)
+	}
+	var warned string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "answered 503 while the profile's filtered metadata builds") {
+			warned = line
+		}
+	}
+	for _, want := range []string{"profile=web", "repository=" + rpmFixtureRepoID + "/9/x86_64", "build_running_for="} {
+		if !strings.Contains(warned, want) {
+			t.Errorf("the 503's warn record lacks %q:\n%s", want, logs.String())
+		}
+	}
+	if strings.Contains(warned, "build_running_for=0s") {
+		t.Errorf("the warn record says the build has not run:\n%s", warned)
+	}
+}
+
+// With no previous build to serve and the default rpm_profile_cold_wait, a
+// build that takes longer than the 4-second budget but finishes inside the
+// cold wait answers the request that met it with the filtered document: dnf
+// does not retry a 503 on repomd.xml, so that 503 would have failed the
+// install.
+func TestRpmProfileColdBuildIsAnsweredWhenItFinishesInsideTheColdWait(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	if f.s.rpmProfileBuilds.coldWait != 0 {
+		t.Fatalf("the fixture set coldWait %s; this test is of the default", f.s.rpmProfileBuilds.coldWait)
+	}
+	fhref := f.filelistsHref(t)
+	release := f.m.stall(t, fhref)
+	timer := time.AfterFunc(6*time.Second, release)
+	defer timer.Stop()
+
+	resp, doc, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml over a 6s build: %d, want 200\n%s", resp.StatusCode, doc)
+	}
+	if took < 6*time.Second {
+		t.Errorf("answered after %s, before the stall cleared", took)
+	}
+	if doc == string(f.upstream) || rpmEntryHref(t, doc, "filelists") == fhref {
+		t.Errorf("web01 was served the unfiltered repomd.xml:\n%s", doc)
+	}
+}
+
+// A profile edit starts a build for each tree a host on that profile asked
+// for, with no request, and the next request is served it from the store.
+func TestRpmProfileChangePrebuildsTheTreesItsHostsAsked(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	before := f.s.rpmProfileBuilds.count()
+
+	if _, err := f.s.auditDB.PutProfileEntry(context.Background(), audit.ProfileEntry{Profile: "web", Type: manifest.TypeRpm, Name: "httpd"}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.refreshProfiles(context.Background())
+	waitFor(t, func() bool { return f.s.rpmProfileBuilds.count() > before })
+	f.s.rpmProfileBuilds.running.Wait()
+	if got := f.s.rpmProfileBuilds.count() - before; got != 1 {
+		t.Fatalf("builds after the edit = %d, want 1", got)
+	}
+	if !strings.Contains(logs.String(), `msg="rpm profile build started" profile=web repository=`+rpmFixtureRepoID+`/9/x86_64 cause="profile change"`) {
+		t.Errorf("no start record naming the profile change:\n%s", logs.String())
+	}
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	built := sl.recent[0]
+	sl.mu.Unlock()
+
+	resp, doc, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("repomd.xml after the edit: %v %v %s", err, resp, doc)
+	}
+	if took >= time.Second {
+		t.Errorf("answered after %s; the build was meant to be ready", took)
+	}
+	if got, want := rpmEntryHref(t, doc, "primary"), built.files["primary"].href; got != want {
+		t.Errorf("primary after the edit = %s, want the prebuilt %s", got, want)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	if got := f.s.rpmProfileBuilds.count() - before; got != 1 {
+		t.Errorf("builds after the request = %d, want still 1", got)
+	}
+}
+
+// A build logs its start, naming what started it, and its end with its
+// duration and outcome, both at info.
+func TestRpmProfileBuildLogsItsStartAndEnd(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.warm(t)
+	f.s.rpmProfileBuilds.running.Wait()
+	var start, end string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		switch {
+		case strings.Contains(line, `msg="rpm profile build started"`):
+			start = line
+		case strings.Contains(line, `msg="rpm profile build ended"`):
+			end = line
+		}
+	}
+	tree := "repository=" + rpmFixtureRepoID + "/9/x86_64"
+	for _, want := range []string{"level=INFO", "profile=web", tree, "cause=request"} {
+		if !strings.Contains(start, want) {
+			t.Errorf("the start record lacks %q:\n%s", want, logs.String())
+		}
+	}
+	for _, want := range []string{"level=INFO", "profile=web", tree, "cause=request", "duration=", "outcome=stored"} {
+		if !strings.Contains(end, want) {
+			t.Errorf("the end record lacks %q:\n%s", want, logs.String())
+		}
+	}
+}
+
+// rpm_profile_cold_wait past dnf's low-speed window is refused when the
+// config loads, naming the key and the limit.
+func TestRpmProfileColdWaitAboveTheLimitIsRefusedAtLoad(t *testing.T) {
+	t.Setenv(config.EnvBucket, "")
+	t.Setenv(config.EnvRegion, "")
+	t.Setenv(config.EnvBuildRoot, "")
+	t.Setenv(config.EnvListenAddr, "")
+	for _, tc := range []struct{ val, want string }{
+		{"28s", ""},
+		{"28.5s", `invalid rpm_profile_cold_wait "28.5s": the limit is 28s`},
+		{"1m", `invalid rpm_profile_cold_wait "1m": the limit is 28s`},
+	} {
+		t.Run(tc.val, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(`{"rpm_profile_cold_wait": "`+tc.val+`"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+			_, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("Load: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Load error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -977,6 +1131,7 @@ func TestRpmProfileBudgetCoversTheRepomdRefresh(t *testing.T) {
 			f := newRpmBuildFixture(t)
 			f.s.cache.MetadataTTL = time.Nanosecond
 			f.s.cache.StaleGrace = grace
+			f.s.rpmProfileBuilds.coldWait = time.Second
 			f.m.stall(t, f.filelistsHref(t))
 			if resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
 				t.Fatalf("starting the build: %v %v", err, resp)
@@ -1312,6 +1467,7 @@ func TestRpmProfileMissingHeldFileDuringARebuildAnswers503(t *testing.T) {
 	}
 	st := stepStore(t, f.s, func(op, k string) bool { return op == "Put" && k == key })
 	f.s.rpmProfileBuilds.wait = 100 * time.Millisecond
+	f.s.rpmProfileBuilds.coldWait = time.Second
 	if resp, body, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml"); err != nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("repomd.xml during the rebuild: %v %v %s, want 503", err, resp, body)
 	}
@@ -1698,5 +1854,179 @@ func TestRpmMetadataCutBodyToAClientIsUnchanged(t *testing.T) {
 	}
 	if recs := rpmFailureRecords(logs.String()); len(recs) != 0 {
 		t.Errorf("a client's cut read logged:\n%s", strings.Join(recs, "\n"))
+	}
+}
+
+func TestReviewB187ColdFilteredFileUsesRemainingColdBudget(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	doc := f.warm(t)
+	href := rpmEntryHref(t, doc, "filelists")
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	key := rpmFilteredKey(f.tree(), sl.recent[0].files["filelists"])
+	sl.recent = nil
+	sl.mu.Unlock()
+	if err := f.s.typeStore(manifest.TypeRpm).Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	f.s.rpmServed = rpmServedRepomds{}
+	_, release := gateStore(t, f.s, func(_ context.Context, op, k string) bool { return op == "Put" && k == key })
+	timer := time.AfterFunc(6*time.Second, release)
+	defer timer.Stop()
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+href)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cold filtered file: status=%d after %s, want 200: %s", resp.StatusCode, took, body)
+	}
+}
+
+func TestReviewB187MissingPreviousFilesUsesColdWait(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	f.warm(t)
+	sl, _ := f.slot(t)
+	sl.mu.Lock()
+	key := rpmFilteredKey(f.tree(), sl.recent[0].files["filelists"])
+	sl.mu.Unlock()
+	if err := f.s.typeStore(manifest.TypeRpm).Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	_, release := gateStore(t, f.s, func(_ context.Context, op, k string) bool { return op == "Put" && k == key })
+	timer := time.AfterFunc(6*time.Second, release)
+	defer timer.Stop()
+	resp, body, took, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("missing previous files: status=%d after %s, want 200 after rebuild: %s", resp.StatusCode, took, body)
+	}
+}
+
+func TestReviewB187FirstRpmRulePrebuildsRequestedTree(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	pf := bindProfile(t, f.s, "newprofile", "newhost", nil, nil)
+	resp, _, _, err := f.get(context.Background(), pf, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial request: %v %v", resp, err)
+	}
+	rule := closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)
+	rule.Profile = "newprofile"
+	if err := f.s.auditDB.SetProfileTypeRule(context.Background(), rule); err != nil {
+		t.Fatal(err)
+	}
+	f.s.refreshProfiles(context.Background())
+	f.s.rpmProfileBuilds.running.Wait()
+	if got := f.s.rpmProfileBuilds.count(); got != 1 {
+		t.Fatalf("builds after first rpm rule = %d, want 1 without another request", got)
+	}
+}
+
+func TestReviewB187FailedBuildEndsAtInfo(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.m.set(f.filelistsHref(t), []byte("corrupt"))
+	resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("request: %v %v", resp, err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "level=INFO") && strings.Contains(line, "duration=") && strings.Contains(line, "error=") {
+			return
+		}
+	}
+	t.Fatalf("no INFO build end with duration and error:\n%s", logs.String())
+}
+
+func TestReviewB187UsageDoesNotPromiseRequestOnlyRebuilds(t *testing.T) {
+	b, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := "an edit to the profile builds again on the next request"
+	if strings.Contains(string(b), stale) {
+		t.Fatalf("usage still promises %q; R5 requires prebuild on profile change", stale)
+	}
+}
+
+// A build that runs past its timeout ends at info like any other, saying it
+// ran past the timeout, beside its one error record.
+func TestRpmProfileBuildTimeoutEndsAtInfo(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.s.rpmProfileBuilds.timeout = 200 * time.Millisecond
+	release := f.m.stall(t, f.filelistsHref(t))
+	defer release()
+	resp, _, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("request: %v %v, want 502 for the timed-out build", resp, err)
+	}
+	f.s.rpmProfileBuilds.running.Wait()
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "level=INFO") && strings.Contains(line, `msg="rpm profile build ended"`) &&
+			strings.Contains(line, "outcome=failed") && strings.Contains(line, "duration=") && strings.Contains(line, "build timeout of 200ms") {
+			return
+		}
+	}
+	t.Fatalf("no INFO build end naming the timeout:\n%s", logs.String())
+}
+
+func TestReviewB187Slow503IncludesRunningBuildDuration(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.s.rpmProfileBuilds.coldWait = 100 * time.Millisecond
+	f.m.stall(t, f.filelistsHref(t))
+	var hold atomic.Bool
+	key := manifest.RpmRepomdKey(f.tree().repo, f.tree().releasever, f.tree().basearch)
+	gateStore(t, f.s, func(_ context.Context, op, k string) bool {
+		return hold.Load() && k == key && (op == "Get" || op == "Head")
+	})
+	resp, body, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("start build: %v %v %s", resp, err, body)
+	}
+	_, p := f.slot(t)
+	view := rpmProfileView(f.tree(), p)
+	if !f.s.rpmProfileBuilds.building(view) {
+		t.Fatal("no build running")
+	}
+	offset := len(logs.String())
+	hold.Store(true)
+	resp, body, _, err = f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("blocked store: %v %v %s", resp, err, body)
+	}
+	if !f.s.rpmProfileBuilds.building(view) {
+		t.Fatal("build ended before 503")
+	}
+	for _, line := range strings.Split(logs.String()[offset:], "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "profile=web") && strings.Contains(line, "repository="+f.tree().id()) && strings.Contains(line, "build_running_for=") {
+			return
+		}
+	}
+	t.Fatalf("503 while a build runs has no WARN with its elapsed duration:\n%s", logs.String()[offset:])
+}
+
+func TestReviewB187MetadataRequestRemembersTreeForFirstRule(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	pf := bindProfile(t, f.s, "newprofile", "newhost", nil, nil)
+	resp, body, _, err := f.get(context.Background(), pf, rpmRepoPath+f.filelistsHref(t))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial metadata request: %v %v %s", resp, err, body)
+	}
+	rule := closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)
+	rule.Profile = "newprofile"
+	if err := f.s.auditDB.SetProfileTypeRule(context.Background(), rule); err != nil {
+		t.Fatal(err)
+	}
+	f.s.refreshProfiles(context.Background())
+	f.s.rpmProfileBuilds.running.Wait()
+	if got := f.s.rpmProfileBuilds.count(); got != 1 {
+		t.Fatalf("builds after a metadata request and first rpm rule = %d, want 1 without another request", got)
 	}
 }
