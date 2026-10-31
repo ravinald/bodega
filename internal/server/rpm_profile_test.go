@@ -1974,3 +1974,59 @@ func TestRpmProfileBuildTimeoutEndsAtInfo(t *testing.T) {
 	}
 	t.Fatalf("no INFO build end naming the timeout:\n%s", logs.String())
 }
+
+func TestReviewB187Slow503IncludesRunningBuildDuration(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	var logs syncBuffer
+	f.s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.s.rpmProfileBuilds.coldWait = 100 * time.Millisecond
+	f.m.stall(t, f.filelistsHref(t))
+	var hold atomic.Bool
+	key := manifest.RpmRepomdKey(f.tree().repo, f.tree().releasever, f.tree().basearch)
+	gateStore(t, f.s, func(_ context.Context, op, k string) bool {
+		return hold.Load() && k == key && (op == "Get" || op == "Head")
+	})
+	resp, body, _, err := f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("start build: %v %v %s", resp, err, body)
+	}
+	_, p := f.slot(t)
+	view := rpmProfileView(f.tree(), p)
+	if !f.s.rpmProfileBuilds.building(view) {
+		t.Fatal("no build running")
+	}
+	offset := len(logs.String())
+	hold.Store(true)
+	resp, body, _, err = f.get(context.Background(), f.web01, rpmRepoPath+"repodata/repomd.xml")
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("blocked store: %v %v %s", resp, err, body)
+	}
+	if !f.s.rpmProfileBuilds.building(view) {
+		t.Fatal("build ended before 503")
+	}
+	for _, line := range strings.Split(logs.String()[offset:], "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "profile=web") && strings.Contains(line, "repository="+f.tree().id()) && strings.Contains(line, "build_running_for=") {
+			return
+		}
+	}
+	t.Fatalf("503 while a build runs has no WARN with its elapsed duration:\n%s", logs.String()[offset:])
+}
+
+func TestReviewB187MetadataRequestRemembersTreeForFirstRule(t *testing.T) {
+	f := newRpmBuildFixture(t)
+	pf := bindProfile(t, f.s, "newprofile", "newhost", nil, nil)
+	resp, body, _, err := f.get(context.Background(), pf, rpmRepoPath+f.filelistsHref(t))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial metadata request: %v %v %s", resp, err, body)
+	}
+	rule := closedRule(manifest.TypeRpm, audit.VersionFloating, audit.ExpansionBlock)
+	rule.Profile = "newprofile"
+	if err := f.s.auditDB.SetProfileTypeRule(context.Background(), rule); err != nil {
+		t.Fatal(err)
+	}
+	f.s.refreshProfiles(context.Background())
+	f.s.rpmProfileBuilds.running.Wait()
+	if got := f.s.rpmProfileBuilds.count(); got != 1 {
+		t.Fatalf("builds after a metadata request and first rpm rule = %d, want 1 without another request", got)
+	}
+}

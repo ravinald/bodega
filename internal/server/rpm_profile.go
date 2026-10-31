@@ -109,8 +109,9 @@ type rpmProfileBuilds struct {
 	running sync.WaitGroup
 	// ctx is the server's, which a build a profile change starts runs under.
 	ctx context.Context
-	// trees is every (profile, tree) a governed host asked for since the
-	// server started, oldest first, at most rpmProfileTreesRemembered.
+	// trees is every (profile, tree) a host bound to a profile asked for
+	// since the server started, whether or not the profile filters rpm yet,
+	// oldest first, at most rpmProfileTreesRemembered.
 	trees []rpmRequestedTree
 }
 
@@ -435,7 +436,6 @@ func (s *Server) rpmProfileRepomd(r *http.Request, t rpmTree, p *entitle.Profile
 	if err != nil {
 		return nil, err
 	}
-	s.rpmProfileBuilds.remember(p, t)
 	b, err := s.rpmProfileFiles(r, t, p, data)
 	if err != nil || b == nil {
 		return doc, err
@@ -1172,6 +1172,17 @@ func (s *Server) handleRpmProfileMetadata(w http.ResponseWriter, r *http.Request
 	http.ServeContent(&cacheDirectiveWriter{ResponseWriter: w, directive: cachePrivateImmutable}, r, "", time.Time{}, bytes.NewReader(body))
 }
 
+// rpmProfile503Attrs names the profile and tree of a 503, and how long the
+// view's build has run when one is running, so an operator reading a failed
+// client's log can tell a slow build from a slow upstream.
+func (s *Server) rpmProfile503Attrs(t rpmTree, p *entitle.Profile) []any {
+	attrs := []any{"profile", p.Name(), "repository", t.id()}
+	if view := rpmProfileView(t, p); s.rpmProfileBuilds.building(view) {
+		attrs = append(attrs, "build_running_for", s.rpmProfileBuilds.runningFor(view))
+	}
+	return attrs
+}
+
 // writeRpmProfileError answers a request whose profile's repomd.xml could not
 // be made. It never falls back to the unfiltered document, which lists what
 // the profile withholds.
@@ -1180,13 +1191,13 @@ func (s *Server) writeRpmProfileError(w http.ResponseWriter, t rpmTree, p *entit
 	switch {
 	case errors.Is(err, errRpmProfileBuilding):
 		s.logger.Warn("a governed rpm metadata request was answered 503 while the profile's filtered metadata builds",
-			"profile", p.Name(), "repository", t.id(), "build_running_for", s.rpmProfileBuilds.runningFor(rpmProfileView(t, p)))
+			s.rpmProfile503Attrs(t, p)...)
 		w.Header().Set("Retry-After", rpmProfileRetryAfter)
 		http.Error(w, fmt.Sprintf("bodega is still building the metadata of %s for profile %q; dnf retries, and the build continues without it.", t.id(), p.Name()), http.StatusServiceUnavailable)
 		return
 	case errors.Is(err, errRpmProfileSlow):
 		s.logger.Warn("a governed rpm metadata request ran out of its budget waiting on the upstream repomd.xml or the store",
-			"profile", p.Name(), "repository", t.id(), "budget", rpmProfileBudget)
+			append(s.rpmProfile503Attrs(t, p), "budget", rpmProfileBudget)...)
 		w.Header().Set("Retry-After", rpmProfileRetryAfter)
 		http.Error(w, fmt.Sprintf("bodega could not read the metadata of %s for profile %q within %s, from the upstream or its store; dnf retries.", t.id(), p.Name(), rpmProfileBudget), http.StatusServiceUnavailable)
 		return
