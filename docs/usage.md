@@ -54,7 +54,7 @@ It sets SSE-S3 (AES-256) encryption, versioning and a full public access block, 
 
 ### `bodega build fetch [TYPE...] [NAME] [force]`
 
-Downloads raw sources without building or packaging. If no types are given, all ten are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd, distfiles`.
+Downloads raw sources without building or packaging. If no types are given, all fifteen are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles`. composer, oci, and rpm have nothing to fetch: each is pulled through its route on a client's first request, and the command says so.
 
 When a name is given after the type, only that entry is fetched.
 
@@ -228,7 +228,7 @@ A specifier is a filter rather than a fact. An index that answers it with anothe
 
 ### `bodega build run [TYPE...] [NAME]`
 
-Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, git, gomod, helm, npm, cargo, freebsd and distfiles) are fetched if needed and skipped for the build phase.
+Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, git, gomod, helm, npm, cargo, maven, rubygems, freebsd, and distfiles) are fetched if needed and skipped for the build phase. composer, oci, and rpm are pulled through on first request and have neither step.
 
 apt builds only the versions whose `.deb` is not already built, so adding a version to a package leaves its built versions alone. A build that is not byte-reproducible would otherwise produce a `.deb` whose digest disagrees with the one already packaged, and the package stage would refuse it. To rebuild one, run `bodega build fetch apt <name> force`, which discards each version's source tree and the `.deb` its last build left, and then `bodega build run apt <name>`.
 
@@ -667,7 +667,7 @@ apt: no release recorded on these entries: no --suite, and /etc/os-release names
 | `composer` | `composer global show --format=json`                                                                                      |
 | `helm`     | `helm list -o json`                                                                                                       |
 | `freebsd`  | `pkg query '%R\t%q'`                                                                                                      |
-| `rpm`      | `rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n'`                                                  |
+| `rpm`      | `rpm -qa --qf '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n'`                                                     |
 
 **`git` and `binary` have no importer.** Nothing on a host records a `git clone` or a downloaded binary, so there is no inventory to read. Catalog those with `bodega pkg create`, or run the server with `discover_mode` set to `"observe"` and promote what clients reach for.
 
@@ -1035,7 +1035,7 @@ bodega pkg move git widget@v4.5.5 --to bulk
 bodega pkg move gomod example.com/example-corp/widget-sdk@v1.30.0 --to archive --delete-source
 ```
 
-Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`, `freebsd`, `distfiles`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not, and [a freebsd move is a republication](#a-freebsd-move-is-a-republication) for the one that does not follow the order above.
+Every type but pypi is movable: `binary`, `git`, `apt`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `composer`, `oci`, `rpm`, `freebsd`, `distfiles`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not, and [a freebsd move is a republication](#a-freebsd-move-is-a-republication) for the one that does not follow the order above.
 
 Order is the design:
 
@@ -2306,7 +2306,7 @@ The stanza is still the server's rendering of that codename, so this flag decide
 
 `--archive <codename>` adds a vendor archive the server mirrors to `--configure apt`: the vendor's key at `/etc/apt/keyrings/bodega-<codename>.asc` and a stanza at `/etc/apt/sources.list.d/bodega-<codename>.sources` whose `Signed-By:` names it. Repeat it, or comma-separate, for several. It is refused without `--configure`, and with a `--configure` list that does not name `apt`. See [Vendor archives](#vendor-archives) for the server half and the fingerprint the key is checked against.
 
-`--configure apt` also takes the distro's own sources out of apt's path, so apt cannot fetch from a public archive beside bodega. It reads them by the rules the `apt-sources` row uses, `mirror+file` lists included, and plans a step for every enabled source naming a public archive: an `Enabled: no` line at the head of each such deb822 stanza, or its own `Enabled:` field set to `no` where it carries one, and `# ` before each such one-line entry. The files the plan writes, `bodega.sources` among them, are never touched. A source naming neither a public archive nor bodega, such as a vendor's repository, is listed and left in place. Without `--apply` the plan prints each source it would disable:
+`--configure apt` also takes the distro's own sources out of apt's path, so apt cannot fetch from a public archive beside bodega. It reads them by the rules the `apt-sources` row uses, `mirror+file` lists included, and plans a step for every enabled source naming a public archive: an `Enabled: no` line at the head of each such deb822 stanza, or its own `Enabled:` field set to `no` where it carries one, and `#` before each such one-line entry. The files the plan writes, `bodega.sources` among them, are never touched. A source naming neither a public archive nor bodega, such as a vendor's repository, is listed and left in place. Without `--apply` the plan prints each source it would disable:
 
 ```text
 disable    apt        /etc/apt/sources.list.d/ubuntu.sources:9  http://archive.ubuntu.com/ubuntu/ names archive.ubuntu.com; adds Enabled: no
@@ -2592,12 +2592,12 @@ Anything but `y` or `yes` adds nothing and exits non-zero, and so does a stdin t
 
 Every other path that writes an exact rule makes the same comparison, and none writes a near-popular one unconfirmed:
 
-| Path                                                                   | How it confirms                                                                                                  |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| [`bodega discover promote`](#bodega-discover-promote-type-pattern-comment---as-policymanifest) | The same prompt.                                                                                                 |
-| [`bodega discover promote-all`](#bodega-discover-promote-all-type---as-policymanifest)     | It cannot: it holds the name back and prints the `bodega discover promote` command that asks.                    |
-| `POST /api/v1/policies`                                                | 409 with `near_popular` and `distance`; resend with `confirm_near_popular` set to the popular name.              |
-| [`bodega queue approve`](#bodega-queue-listapprovedismiss)                                | Refused, row left open; rerun with `--confirm-near-popular <popular name>` (`confirm_near_popular` in the API). |
+| Path                                                                                           | How it confirms                                                                                                 |
+| ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| [`bodega discover promote`](#bodega-discover-promote-type-pattern-comment---as-policymanifest) | The same prompt.                                                                                                |
+| [`bodega discover promote-all`](#bodega-discover-promote-all-type---as-policymanifest)         | It cannot: it holds the name back and prints the `bodega discover promote` command that asks.                   |
+| `POST /api/v1/policies`                                                                        | 409 with `near_popular` and `distance`; resend with `confirm_near_popular` set to the popular name.             |
+| [`bodega queue approve`](#bodega-queue-listapprovedismiss)                                     | Refused, row left open; rerun with `--confirm-near-popular <popular name>` (`confirm_near_popular` in the API). |
 
 A confirmation naming any other package is refused the same way as none. Repeating the name, rather than passing a yes flag, means the caller read the refusal for this name. A rule that already exists is reported as present before any comparison, on every path: `policy add` and `discover promote` refuse it without asking, `promote-all` counts it as skipped, a queue approval resolves to it, and the API answers 409 with the existing rule's `id`. When the popular list cannot be read, each path writes the rule and says so: the CLI commands on stderr, `bodega queue approve` and the queue API in the resolution's `warning`, and the TUI on its status line.
 
@@ -3685,11 +3685,11 @@ bodega queue approve 12 --reason "INC-4411: vendor needs 1.3.0 today"
 bodega queue dismiss 14 --reason "typo of lodash"
 ```
 
-| Command                                                   | Effect                                                                                                                                       |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list [--type <type>] [--check <check>] [--all] [--json]` | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row. |
+| Command                                                                               | Effect                                                                                                                                                                                             |
+| ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list [--type <type>] [--check <check>] [--all] [--json]`                             | Lists open rows, most recently refused first. `--all` includes approved and dismissed rows. The JSON carries the last 20 requesters per row.                                                       |
 | `approve <id> --reason <text> [--expires <duration>] [--confirm-near-popular <name>]` | Resolves the row by the action its check calls for (below) and records the operator and the reason. `--expires` applies to an override only; `--confirm-near-popular` to an `allow-list` row only. |
-| `dismiss <id> --reason <text>`                            | Closes the row without admitting anything.                                                                                                   |
+| `dismiss <id> --reason <text>`                                                        | Closes the row without admitting anything.                                                                                                                                                         |
 
 **Which refusals write a row.** A row is written on every refusal of a client fetch by one of these checks, whatever `discover_mode` says:
 
@@ -4234,12 +4234,7 @@ The runtime policy is for the service:
     {
       "Sid": "Objects",
       "Effect": "Allow",
-      "Action": [
-        "s3:AbortMultipartUpload",
-        "s3:DeleteObject",
-        "s3:GetObject",
-        "s3:PutObject"
-      ],
+      "Action": ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::example-bodega-artifacts/*"
     }
   ]
@@ -4547,20 +4542,20 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 
 bodega treats Linux and FreeBSD as peers. Both run the server, both are clients of it, and each package type serves the same way whichever operating system the server runs on. They differ in how bodega ships to them in one place, the distribution package, and the following table states where each stands today:
 
-|                                                 | Linux                                                                 | FreeBSD                                                                                                                         |
-| ----------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Run the server                                  | yes                                                                   | yes                                                                                                                             |
-| Storage permissions and extended attributes     | POSIX ACLs, carried in extended attributes                            | NFSv4 ACLs on ZFS, POSIX.1e ACLs on UFS mounted with `acls`, and `extattr`                                                      |
-| Client of the server                            | apt, and every language client                                        | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
-| Client configuration written by `bodega doctor` | apt sources and keyring, credentials                                  | `pkg` repository configuration, credentials                                                                                     |
-| Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, rubygems, maven, GOPROXY | pkg repositories, `make.conf`, pip, npm, cargo, rubygems, maven, GOPROXY                                                        |
-| Profile rules                                   | per package; apt hosts read a filtered codename                       | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))           |
-| Release archive                                 | amd64, arm64                                                          | amd64, arm64                                                                                                                    |
-| Distribution package                            | `.deb` and `.rpm`, with the systemd unit                              | not yet                                                                                                                         |
-| Service definition                              | [bodega.service](bodega.service) (systemd)                            | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
-| `make cross` default targets                    | amd64, arm64                                                          | amd64, arm64                                                                                                                    |
-| CI                                              | builds, vets, lints and runs every unit test                          | runs every unit test on amd64 in a FreeBSD 15.1 VM (`test-freebsd`), and compiles arm64                                         |
-| End-to-end suite                                | a server and a client guest                                           | a client guest (`pkg`, ports, distfiles) and a server guest that runs `internal/storage`'s FreeBSD syscall tests on ZFS and UFS |
+|                                                 | Linux                                                                                                                 | FreeBSD                                                                                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Run the server                                  | yes                                                                                                                   | yes                                                                                                                             |
+| Storage permissions and extended attributes     | POSIX ACLs, carried in extended attributes                                                                            | NFSv4 ACLs on ZFS, POSIX.1e ACLs on UFS mounted with `acls`, and `extattr`                                                      |
+| Client of the server                            | apt, dnf on the RHEL family, Docker, containerd and podman, and every language client                                 | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
+| Client configuration written by `bodega doctor` | `--configure` for apt, rpm, oci and each language client; credentials                                                 | `--configure` for `pkg`, ports distfiles and each language client; credentials                                                  |
+| Host checks in `bodega doctor`                  | apt sources, dnf repositories, container runtimes, snap, flatpak, pip, npm, cargo, rubygems, maven, composer, GOPROXY | pkg repositories, `make.conf`, pip, npm, cargo, rubygems, maven, composer, GOPROXY                                              |
+| Profile rules                                   | per package; apt hosts read a filtered codename                                                                       | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))           |
+| Release archive                                 | amd64, arm64                                                                                                          | amd64, arm64                                                                                                                    |
+| Distribution package                            | `.deb` and `.rpm`, with the systemd unit                                                                              | not yet                                                                                                                         |
+| Service definition                              | [bodega.service](bodega.service) (systemd)                                                                            | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
+| `make cross` default targets                    | amd64, arm64                                                                                                          | amd64, arm64                                                                                                                    |
+| CI                                              | builds, vets, lints and runs every unit test                                                                          | runs every unit test on amd64 in a FreeBSD 15.1 VM (`test-freebsd`), and compiles arm64                                         |
+| End-to-end suite                                | a server and a client guest                                                                                           | a client guest (`pkg`, ports, distfiles) and a server guest that runs `internal/storage`'s FreeBSD syscall tests on ZFS and UFS |
 
 macOS builds and has release archives for amd64 and arm64. It is supported for development and for running the CLI against a remote server, and has no service definition.
 
@@ -5040,7 +5035,7 @@ fetch > run > package > upload
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs are missing. Running `bodega build upload` on a fresh system will cascade through fetch and build stages first.
 
-**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd, distfiles`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
+**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo, maven, rubygems, composer, oci, rpm, freebsd, distfiles`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
 
 **Per-entry failures** are logged but do not abort the run. A non-zero exit code is returned if any entry failed.
 
@@ -5108,7 +5103,7 @@ sh setup.sh --url https://bodega-host:8443 --systems osquery --apply
 
 The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, `~/.gemrc`, `~/.bundle/config`, `~/.m2/settings.xml`, `~/.gradle/init.d/bodega.gradle`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file but `~/.m2/settings.xml` is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first. `settings.xml` keeps everything but its mirrors, as the Maven and Gradle paragraphs below describe.
 
-The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
+The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
 
 The diff redacts before it prints:
 
@@ -5131,7 +5126,7 @@ BODEGA_CODENAME=noble sh setup.sh --url https://bodega-host:8080
 
 An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. With `--systems osquery` the refusal says so for the secret: a rewritten flags file sends osqueryd's enroll secret, in clear, to whoever rewrote it. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
 
-A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
+A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
 
 | Client                         | What bodega composes                                                                                                         |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -5378,7 +5373,7 @@ Attestations and SBOMs name a version `pkg:maven/<groupId>/<artifactId>@<version
 ```yaml
 ---
 :sources:
-- https://bodega-host:8080/rubygems/
+  - https://bodega-host:8080/rubygems/
 ```
 
 ```yaml
@@ -5426,13 +5421,13 @@ Attestations and SBOMs name a gem `pkg:gem/<name>@<version>`, with a platform bu
 
 ```json
 {
-    "repositories": {
-        "bodega": {
-            "type": "composer",
-            "url": "https://bodega-host:8080/composer"
-        },
-        "packagist.org": false
-    }
+  "repositories": {
+    "bodega": {
+      "type": "composer",
+      "url": "https://bodega-host:8080/composer"
+    },
+    "packagist.org": false
+  }
 }
 ```
 
@@ -5469,7 +5464,7 @@ A composer entry records the dist reference in `ref`, which is what names the ar
 
 **OCI images** (Docker Engine, containerd, podman). bodega serves the pull half of the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md) under `/v2/`, the prefix every container client hardcodes, for each registry in [`oci_upstreams`](#upstream-hosts).
 
-`bodega doctor --configure oci --apply` writes every file below for the runtimes a host runs, merging into an existing `daemon.json` and `config.toml`; see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext). By hand, Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
+`bodega doctor --configure oci --apply` writes every file below for the runtimes a host runs, merging into an existing `daemon.json` and `config.toml`; see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext). By hand, Docker Engine, in `/etc/docker/daemon.json` (merge the key into an existing file, then restart `dockerd`):
 
 ```json
 {
@@ -5714,7 +5709,7 @@ bodega identity bind token <id> devbox-3                                # on the
 bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
 ```
 
-The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
 **FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`). Do not hand-write this one; ask the server:
 
@@ -5812,9 +5807,9 @@ Every route takes the same query parameters:
 | `archive`  | no              | `/client/apt` only: serve one vendor archive's stanza, the URL a plan's archive record names                                                                                                                                                           |
 | `file`     | no              | a companion file, the URL a plan's companion record names: `node-mirror` on `/client/npm`, `bundler` on `/client/rubygems`, `gradle` on `/client/maven`, and on `/client/oci` `containerd-config`, `registries-conf` and `containerd-hosts.<registry>` |
 
-The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the twelve package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
+The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the fifteen package types, `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `maven`, `rubygems`, `composer`, `oci`, `rpm`, `freebsd`, `distfiles`, or `osquery`, which configures the osquery daemon rather than a package client.
 
-**Records.** The plan lists all thirteen systems, one record per file, in this column order:
+**Records.** The plan lists all sixteen systems, one record per file, in this column order:
 
 | Column     | Value                                                                                                 |
 | ---------- | ----------------------------------------------------------------------------------------------------- |
@@ -6184,7 +6179,7 @@ Suites: noble noble-updates noble-security
 Components: main restricted universe multiverse
 ```
 
-The pockets in that list are one choice to a client. [`bodega doctor --configure apt`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---write-apt-sources---write-pkg-repo---allow-plaintext) and [`GET /client/plan`](#client-plan-and-per-system-files) group `noble-updates`, `noble-backports` and `noble-security` under `noble` when `noble` is mirrored too, and write the stanza above in Ubuntu's order with whichever pockets are configured. A host is never handed one pocket on its own: `codename=noble-updates` is refused and the reason names `noble`. Mirror the pockets beside the base, because a host reading the base alone cannot install a `-dev` package whose runtime library it already took from `-updates`, and receives no security fixes.
+The pockets in that list are one choice to a client. [`bodega doctor --configure apt`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext) and [`GET /client/plan`](#client-plan-and-per-system-files) group `noble-updates`, `noble-backports` and `noble-security` under `noble` when `noble` is mirrored too, and write the stanza above in Ubuntu's order with whichever pockets are configured. A host is never handed one pocket on its own: `codename=noble-updates` is refused and the reason names `noble`. Mirror the pockets beside the base, because a host reading the base alone cannot install a `-dev` package whose runtime library it already took from `-updates`, and receives no security fixes.
 
 bodega parses no index. The upstream `Release` names the components, architectures and `by-hash` digests, apt reads them, and the next request arrives with the path already composed, so any component the upstream publishes resolves, not only `main`.
 
@@ -7533,11 +7528,11 @@ These mirror [`bodega override`](#bodega-override-requestapproverejectlist), and
 
 ### Queue endpoints
 
-| Method | Path                                  | Description                                                              |
-| ------ | ------------------------------------- | ------------------------------------------------------------------------ |
-| GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open` |
+| Method | Path                                  | Description                                                                                                                                                                                                       |
+| ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/v1/queue[?type=&check=&state=]` | List queue rows, most recently refused first; `state` defaults to `open`                                                                                                                                          |
 | POST   | `/api/v1/queue/{id}/approve`          | Approve (JSON body: `{reason, expires, confirm_near_popular}`); answers what the approval did. An `allow-list` row near a popular name answers 400 and stays open without `confirm_near_popular` naming that name |
-| POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                          |
+| POST   | `/api/v1/queue/{id}/dismiss`          | Dismiss (JSON body: `{reason}`)                                                                                                                                                                                   |
 
 These mirror [`bodega queue`](#bodega-queue-listapprovedismiss). The list needs `admin` or `approve`, because it names each requester and client address. Approving and dismissing need `approve`: approving writes an allow-list rule or a profile pin, which grants an exception the way an override vote does, and a CI token holding `write` must not do that for the package it was refused. A token without the scope gets `403` naming it. The list is an admin read restricted by `admin_permit_cidr`. Both resolutions pass the mutation gate and then, like the override routes, require a bearer token bound to an identity, which is recorded as the actor: approving can file an override request, and the two-person rule needs a name on it. Approving a `malware` row or an `invalid` provenance row answers `409` naming the check; a row that is not open answers `409`, an unknown id `404`.
 
@@ -8033,15 +8028,15 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 
 **Cache outcomes.** A `cache` row's `status` names which of the seven happened. The first two are written on the serving path, one per request, and carry the package type, name and version off the object key with the upstream that answered in `details`:
 
-| Status              | Outcome                                                                                                                                                                                                     |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_miss`        | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed                                      |
-| `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
-| `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                  |
+| Status              | Outcome                                                                                                                                                                                                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cache_miss`        | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed                                                                                                                                 |
+| `cache_hit`         | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts                                                                                            |
+| `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached                                                                                                                                                                                             |
 | `policy_violation`  | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record. A refusal an override or a baseline mark admits past writes none; its admission row records `overridden` or `baseline` |
-| `policy_warn`       | A gate warned on a version a proxy fill admitted anyway. `details` carry the findings. An import or create writes the same status on its `create` row                                                       |
-| `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                    |
-| `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                     |
+| `policy_warn`       | A gate warned on a version a proxy fill admitted anyway. `details` carry the findings. An import or create writes the same status on its `create` row                                                                                                                                                  |
+| `malware_blocked`   | OSV records the version as malware and the ecosystem's malware action is `block`. `details` names the record ids and the reason; see [Malware records](#malware-records)                                                                                                                               |
+| `index_filtered`    | A proxied index went out with versions withheld by [`bodega policy filter`](#bodega-policy-filter-setlist). One row per response, with the counts per gate in `details`                                                                                                                                |
 
 One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.
 
@@ -8563,15 +8558,15 @@ bodega inventory baseline web-01
 
 Worst first. A component gets the first class whose rule holds:
 
-| Class            | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `refused`        | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                                                                                                                                                                                                                                                                                               |
-| `baseline`       | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                                                                                                                                                                                                                                                                                             |
+| Class            | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refused`        | The newest admission decision for this name@version is `policy_blocked` or `invalid`, or the catalog entry for this exact version is hidden. A baseline never hides it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `baseline`       | An accepted baseline covers the name and version (and the digest, where both record one)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `foreign-origin` | The package manager recorded where the component came from, and it is not bodega: for npm and pypi, a host other than `public_url`'s; for FreeBSD, a repository other than the `bodega-<repo>` names the client plan writes, compared whole. Hiding or removing a `freebsd` entry drops its name from that list, so packages a host installed from it read `foreign-origin` until they are reinstalled from a repository bodega still serves: bodega no longer vouches for that source, and the class says so rather than trusting a name it stopped writing. The reason names the source: `npm says it came from registry.npmjs.org, not bodega`. A component with no recorded origin skips this rule, and so does an npm or pypi one when `public_url` is unset |
-| `unknown`        | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row                                                                                                                                                                                                                                                                  |
-| `served`         | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                                                                                                                                                                                                                                                                                              |
-| `unattributed`   | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                                                                                                                                                                                                                                                                                         |
-| `stale`          | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `unknown`        | The ecosystem is one bodega serves no type for (`other`); or bodega served this name@version with a sha256 and the host's sha256 matches none of them; or no catalog entry and no `serve_fetch` row                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `served`         | A `serve_fetch` row for this identity, with a matching digest where both sides have one                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `unattributed`   | Served to another identity, or cataloged at this exact version, and never served to this one                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `stale`          | Per source instance, not per component: see [Staleness](#staleness)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 Classes are displayed worst first: `refused`, `foreign-origin`, `unknown`, `unattributed`, `served`, `baseline`. A `foreign-origin` component alerts like an `unknown` one: `report` exits 1 and the report's `inventory`/`bypass` event counts it. A component of a report stored before reconciliation existed, or while the audit sink could not answer, has no recorded class and reads `unclassified`. An `unclassified` component alerts like an `unknown` one, because nothing has shown it to be anything else.
 
