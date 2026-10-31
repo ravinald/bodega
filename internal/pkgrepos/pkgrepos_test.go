@@ -52,8 +52,8 @@ func TestDisablesTheTagsTheReleaseShips(t *testing.T) {
 		abi  string
 		want []string
 	}{
-		{"FreeBSD:13:amd64", []string{"FreeBSD"}},
-		{"FreeBSD:14:amd64", []string{"FreeBSD"}},
+		{"FreeBSD:13:amd64", []string{"FreeBSD", "FreeBSD-kmods"}},
+		{"FreeBSD:14:amd64", []string{"FreeBSD", "FreeBSD-kmods"}},
 		{"FreeBSD:15:aarch64", []string{"FreeBSD-ports", "FreeBSD-ports-kmods", "FreeBSD-base"}},
 		{"FreeBSD:16:amd64", []string{"FreeBSD-ports", "FreeBSD-ports-kmods", "FreeBSD-base"}},
 	} {

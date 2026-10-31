@@ -173,9 +173,13 @@ bodega_root_only_parent()
 		0\ d????-??-?) ;;
 		*) return 1 ;;
 		esac
-		# getfacl -s prints only a nontrivial ACL; a read error refuses too.
-		_acl=$(getfacl -h -s -q "${_unsafe}") || return 1
-		[ -z "${_acl}" ] || return 1
+		# ls -l marks an ACL beyond the mode bits with a + after the mode,
+		# on every release; getfacl -s, which says the same, is 15 and
+		# later only. A read error refuses too.
+		_mode=$(ls -ldn "${_unsafe}") || return 1
+		case ${_mode} in
+		??????????+*) return 1 ;;
+		esac
 		# An su that fails outright must not read as "cannot write".
 		_w=$(su -m "${bodega_account}" -c "if test -w '${_unsafe}'; then echo yes; else echo no; fi")
 		[ "${_w}" = no ] || return 1
