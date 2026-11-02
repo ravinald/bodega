@@ -921,3 +921,67 @@ func TestCheckDockerMirrorLookupNote(t *testing.T) {
 		t.Errorf("no version reader = %+v, want OK with no note", f)
 	}
 }
+
+func TestCheckDockerMirrorRejectsMalformedVersionToken(t *testing.T) {
+	root, write := ociFixture(t)
+	write(clientconf.DockerDaemonPath, `{"registry-mirrors":["https://bodega.internal/"]}`)
+	baseline := ociCheck(t, OCIHost{Root: root, LookPath: onlyRuntime("dockerd")}, "oci-docker")
+	for _, version := range []string{
+		"Docker version 26.1.5.7, build a72d7cd",
+		"Docker version 26.1.5garbage, build a72d7cd",
+	} {
+		t.Run(version, func(t *testing.T) {
+			h := OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), DockerdVersion: func(string) (string, error) {
+				return version, nil
+			}}
+			got := ociCheck(t, h, "oci-docker")
+			if got != baseline {
+				t.Fatalf("invalid version %q changed finding: got %+v; want %+v", version, got, baseline)
+			}
+		})
+	}
+}
+
+func TestDockerLookupDocumentation(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{"- **`oci-docker`**", "Docker Engine mirrors Docker Hub"} {
+		t.Run(start, func(t *testing.T) {
+			var paragraph string
+			for _, p := range strings.Split(string(data), "\n\n") {
+				if strings.HasPrefix(p, start) {
+					paragraph = p
+					break
+				}
+			}
+			for _, fact := range []string{"dockerd", "docker.io", "26.1.5", "29.1.3", "lookup", "unresolvable", "pulls", "succeed"} {
+				if !strings.Contains(paragraph, fact) {
+					t.Errorf("paragraph %q lacks %q", start, fact)
+				}
+			}
+		})
+	}
+}
+
+// B188 R2: every well-formed suffix still parses, and a prerelease of the
+// measured floor is earlier than it.
+func TestDockerdLookupNoteVersionForms(t *testing.T) {
+	for version, want := range map[string]bool{
+		"Docker version 26.1.5+dfsg1, build a72d7cd": true,
+		"Docker version 18.09.1-ce, build 4c52b90":   true,
+		"Docker version 26.1.5":                      true,
+		"Docker version 29.1.3-rc.1, build f52814d":  true,
+		"Docker version 29.1.3+dfsg1, build f52814d": false,
+		"Docker version 29.1.3, build f52814d":       false,
+		"Docker version 26.1.5+, build a72d7cd":      false,
+		"Docker version 26.1.5-, build a72d7cd":      false,
+		"Docker version 26.1, build a72d7cd":         false,
+	} {
+		got := dockerdLookupNote(func() (string, error) { return version + "\n", nil }) != ""
+		if got != want {
+			t.Errorf("%q: note = %v, want %v", version, got, want)
+		}
+	}
+}

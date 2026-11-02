@@ -1027,7 +1027,11 @@ func RunDockerdVersion(dockerd string) (string, error) {
 // 13) asks systemd-resolved for it once per pull and connects nowhere.
 var dockerdNoLookup = [3]int{29, 1, 3}
 
-var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)`)
+// dockerdVersionRe matches the whole version token, up to the comma before
+// "build", so a fourth component or trailing junk is unparseable rather than
+// truncated to a version dockerd never reported. Debian's +dfsg1 is build
+// metadata and a -rc1 a prerelease, as semver spells them.
+var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:,|$)`)
 
 // dockerdLookupNote is the note a mirrored dockerd's row carries when its
 // version is one that still resolves docker.io, or "" when the version is
@@ -1049,7 +1053,8 @@ func dockerdLookupNote(version func() (string, error)) string {
 		}
 		v[i] = n
 	}
-	if slices.Compare(v[:], dockerdNoLookup[:]) >= 0 {
+	switch c := slices.Compare(v[:], dockerdNoLookup[:]); {
+	case c > 0, c == 0 && m[4] == "":
 		return ""
 	}
 	read := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
