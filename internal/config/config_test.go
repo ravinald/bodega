@@ -210,6 +210,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"upstream_connect_timeout":  "2s",
 		"stale_grace":               "1s",
 		"rpm_profile_build_timeout": "20m",
+		"rpm_profile_cold_wait":     "20s",
 		// Load parses or enumerates these three.
 		"revet_interval": "24h",
 		"revet_rate":     2.5,
@@ -479,6 +480,10 @@ func TestLoad_UpstreamWaitKeys(t *testing.T) {
 		{`{"stale_grace": "soon"}`, "", "", `invalid stale_grace "soon"`},
 		{`{"rpm_profile_build_timeout": "0s"}`, "", "", `invalid rpm_profile_build_timeout "0s"`},
 		{`{"rpm_profile_build_timeout": "15"}`, "", "", `invalid rpm_profile_build_timeout "15"`},
+		{`{"rpm_profile_cold_wait": "0s"}`, "", "", `invalid rpm_profile_cold_wait "0s"`},
+		{`{"rpm_profile_cold_wait": "28s"}`, "5s", "3s", ""},
+		{`{"rpm_profile_cold_wait": "29s"}`, "", "", `invalid rpm_profile_cold_wait "29s": the limit is 28s`},
+		{`{"rpm_profile_cold_wait": "1m"}`, "", "", `invalid rpm_profile_cold_wait "1m": the limit is 28s`},
 	} {
 		t.Run(tc.body, func(t *testing.T) {
 			isolateConfig(t)
@@ -494,6 +499,9 @@ func TestLoad_UpstreamWaitKeys(t *testing.T) {
 				}
 				if cfg.RpmProfileBuildTimeout != config.DefaultRpmProfileBuildTimeout {
 					t.Errorf("rpm_profile_build_timeout resolved to %q, want %q", cfg.RpmProfileBuildTimeout, config.DefaultRpmProfileBuildTimeout)
+				}
+				if tc.body == `{}` && cfg.RpmProfileColdWait != config.DefaultRpmProfileColdWait {
+					t.Errorf("rpm_profile_cold_wait resolved to %q, want %q", cfg.RpmProfileColdWait, config.DefaultRpmProfileColdWait)
 				}
 				if cfg.UpstreamConnectTimeout != tc.connect || cfg.StaleGrace != tc.grace {
 					t.Errorf("resolved %q / %q, want %q / %q", cfg.UpstreamConnectTimeout, cfg.StaleGrace, tc.connect, tc.grace)

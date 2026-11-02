@@ -79,8 +79,9 @@ func (s *Server) profileCached() *profileSet {
 }
 
 func (s *Server) storeProfiles(set *profileSet) *profileSet {
-	s.profiles.Store(set)
+	old := s.profiles.Swap(set)
 	s.profilesAt.Store(time.Now().UnixNano())
+	s.prebuildRpmProfiles(old, set)
 	return set
 }
 

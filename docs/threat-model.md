@@ -875,7 +875,9 @@ draft](https://slsa.dev/spec/draft/dependency-track#dep-enforce-curated-feed)
 requires at L3 that build and developer environments "MUST NOT be able to
 resolve dependencies outside the platform", and that "Network policy or
 equivalent access controls MUST prevent it, not just detect it after the
-fact." Reconciliation is detection after the fact by construction.
+fact." Reconciliation is detection after the fact by construction. It
+supports the path instead: [SLSA](slsa.md#beyond-level-2-bypass-detection)
+says how, and where bodega stands on the Dependency track overall.
 
 The L3 path is **egress control: hosts may reach only bodega.** That is
 infrastructure, not bodega code: default-deny outbound on a network firewall,

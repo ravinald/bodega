@@ -97,6 +97,12 @@ func (s *Server) handleRpm(w http.ResponseWriter, r *http.Request) {
 	}
 	t := rpmTree{repo: segs[0], releasever: segs[1], basearch: segs[2],
 		base: strings.NewReplacer("$releasever", segs[1], "$basearch", segs[2]).Replace(up.URL)}
+	if !isOwnRead(r) {
+		// Every entry point counts: a client whose cached repomd.xml outlived
+		// the server asks for a metadata file or a package first, and its
+		// profile's first rpm rule has to rebuild that tree too.
+		s.rpmProfileBuilds.remember(s.profileFor(r), t)
+	}
 	rest := segs[3]
 	switch {
 	case rest == "repodata/repomd.xml":

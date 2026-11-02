@@ -66,6 +66,13 @@ const (
 	// outlast reading and filtering the largest filelists an upstream
 	// publishes (BaseOS, EPEL) rather than any client's timeout.
 	DefaultRpmProfileBuildTimeout = "15m"
+	// DefaultRpmProfileColdWait is how long a governed host's rpm metadata
+	// request waits on a build when no previous build may stand in for it.
+	DefaultRpmProfileColdWait = "25s"
+	// MaxRpmProfileColdWait caps rpm_profile_cold_wait under dnf's low-speed
+	// cutoff: librepo drops a transfer under 1000 bytes/s for 30 seconds, so a
+	// request held longer is one dnf has already given up on.
+	MaxRpmProfileColdWait = 28 * time.Second
 
 	// DefaultSpoolMaxArtifactBytes is the largest single upstream artifact the
 	// proxy will copy to disk. 8 GiB is roughly twice the biggest thing a real
@@ -158,6 +165,7 @@ type Config struct {
 	OCITokenHosts          []string               `json:"oci_token_hosts,omitempty"`           // hosts a registry's Bearer realm may name besides its own; see DefaultOCITokenHosts
 	RpmUpstreams           map[string]RpmUpstream `json:"rpm_upstreams,omitempty"`             // repository name > base URL with $releasever and $basearch, served under /rpm/; see resolveRpmUpstreams
 	RpmProfileBuildTimeout string                 `json:"rpm_profile_build_timeout,omitempty"` // bound on building one profile's filtered rpm metadata
+	RpmProfileColdWait     string                 `json:"rpm_profile_cold_wait,omitempty"`     // wait on a build no previous build can stand in for; at most MaxRpmProfileColdWait
 	PrivateUpstreamHosts   []string               `json:"private_upstream_hosts,omitempty"`    // hostnames the SSRF guard lets resolve to RFC 1918 / fc00::/7; see validatePrivateUpstreamHosts
 	DiscoverMode           string                 `json:"discover_mode,omitempty"`             // "" or "observe" — see internal/server/discovery.go
 	GomodRoot              string                 `json:"gomod_root,omitempty"`
@@ -1591,16 +1599,21 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.UpstreamConnectTimeout = firstNonEmpty(cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout)
 	cfg.StaleGrace = firstNonEmpty(cfg.StaleGrace, DefaultStaleGrace)
 	cfg.RpmProfileBuildTimeout = firstNonEmpty(cfg.RpmProfileBuildTimeout, DefaultRpmProfileBuildTimeout)
+	cfg.RpmProfileColdWait = firstNonEmpty(cfg.RpmProfileColdWait, DefaultRpmProfileColdWait)
 	// The server parses these with no error path, so a typo here would become
 	// a zero: no connect bound at all, or no grace.
 	for _, d := range []struct{ key, val, example string }{
 		{"upstream_connect_timeout", cfg.UpstreamConnectTimeout, DefaultUpstreamConnectTimeout},
 		{"stale_grace", cfg.StaleGrace, DefaultStaleGrace},
 		{"rpm_profile_build_timeout", cfg.RpmProfileBuildTimeout, DefaultRpmProfileBuildTimeout},
+		{"rpm_profile_cold_wait", cfg.RpmProfileColdWait, DefaultRpmProfileColdWait},
 	} {
 		if v, err := time.ParseDuration(d.val); err != nil || v <= 0 {
 			return nil, fmt.Errorf("invalid %s %q (want a positive Go duration, e.g. %q)", d.key, d.val, d.example)
 		}
+	}
+	if v, _ := time.ParseDuration(cfg.RpmProfileColdWait); v > MaxRpmProfileColdWait {
+		return nil, fmt.Errorf("invalid rpm_profile_cold_wait %q: the limit is %s, because dnf drops a transfer under 1000 bytes/s for 30 seconds and a longer wait answers a client that has already gone; set it to %s or less", cfg.RpmProfileColdWait, MaxRpmProfileColdWait, MaxRpmProfileColdWait)
 	}
 	for typ, val := range cfg.NotFoundTTL {
 		if v, err := time.ParseDuration(val); err != nil || v < 0 {
