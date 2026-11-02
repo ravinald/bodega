@@ -186,30 +186,55 @@ func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time
 			PolicyEvaluations:  pe,
 			ResolvedFrom:       from,
 			UpstreamProvenance: upstream,
-			PublisherSignature: upstream,
+			PublisherSignature: PublisherSignatureOf(upstream),
+			Integrity:          Integrity{Method: IntegrityMethodHash, Result: ResultVerified},
 		},
 	}
 }
 
-// AvailabilityOf reads the upstream_provenance check of a row. A row without
-// one, or whose check did not run, says unavailable: an outcome nobody
-// evaluated is never reported as verified.
+// AvailabilityOf maps the upstream_provenance check of a row onto the
+// draft's upstreamProvenance verdict. A row without one, a check that did not
+// run, and an outcome this table does not name all say not-attempted: an
+// outcome nobody evaluated is never reported as verified.
+//
+// mismatch carries two cases. A bundle that verified but was signed from a
+// repository or builder other than the pinned one names its identity, and is
+// verified here: the signature did verify. A version that published nothing
+// after a pinned version that did names none, and is unavailable. Either way
+// the pin disagreement is the upstream_provenance entry of policyEvaluations,
+// not this field.
 func AvailabilityOf(checks []audit.AdmissionCheck) Availability {
 	for _, c := range checks {
 		if c.Check != audit.CheckUpstreamProvenance || c.Status == audit.CheckNotEvaluated || c.Provenance == nil || c.Provenance.Outcome == "" {
 			continue
 		}
 		p := c.Provenance
-		a := Availability{Status: p.Outcome}
-		if p.Outcome == audit.ProvenanceVerified || p.Outcome == audit.ProvenanceMismatch {
-			a.SourceRepositoryURI, a.WorkflowRef, a.BuilderID = p.SourceRepositoryURI, p.WorkflowRef, p.BuilderID
+		switch {
+		case p.Outcome == audit.ProvenanceVerified,
+			p.Outcome == audit.ProvenanceMismatch && p.SourceRepositoryURI != "":
+			a := Availability{Result: ResultVerified, SourceRepositoryURI: p.SourceRepositoryURI, WorkflowRef: p.WorkflowRef, BuilderID: p.BuilderID}
 			if alg, hex, ok := strings.Cut(p.BundleDigest, ":"); ok && hex != "" {
 				a.BundleDigest = map[string]string{alg: hex}
 			}
+			return a
+		case p.Outcome == audit.ProvenanceMismatch, p.Outcome == audit.ProvenanceUnavailable:
+			return Availability{Availability: AvailabilityUnavailable}
+		case p.Outcome == audit.ProvenanceInvalid:
+			return Availability{Result: ResultFailed}
+		default:
+			return Availability{Result: ResultNotAttempted}
 		}
-		return a
 	}
-	return Availability{Status: StatusUnavailable}
+	return Availability{Result: ResultNotAttempted}
+}
+
+// PublisherSignatureOf is upstream as publisherSignature spells it: the draft
+// gives that field verified, failed and unverified, with no not-attempted.
+func PublisherSignatureOf(upstream Availability) Availability {
+	if upstream.Result == ResultNotAttempted {
+		upstream.Result = ResultUnverified
+	}
+	return upstream
 }
 
 // Evaluations copies a row's checks as recorded and appends each standard

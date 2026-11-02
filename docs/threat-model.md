@@ -985,8 +985,13 @@ because it is still true of the moment it describes.
 It does not prove that the artifact is safe, or that the policy was a good
 one. `upstreamProvenance` and `publisherSignature` say what the admission's
 upstream provenance check concluded about the publisher's own signed
-provenance (`verified`, `unavailable`, `invalid`, `unknown` or `mismatch`,
-with the source repository and builder when a signature verified); they are
+provenance, in the SLSA draft's vocabulary: `result` is `verified`, `failed`,
+or `not-attempted` (`unverified` in `publisherSignature`), or `availability`
+is `unavailable` when the publisher published nothing, with the source
+repository and builder when the result is `verified`. A `verified` there means
+only that the publisher's bundle verified cryptographically. A `mismatch`
+against the pinned publisher is reported in the `upstream_provenance` entry of
+`policyEvaluations`, not in `publisherSignature`. They are
 bodega's report of that check, not the publisher's bundle, so a consumer
 who wants to verify the publisher independently fetches the bundle from the
 registry itself. It also proves nothing about a statement signed after the **bodega host

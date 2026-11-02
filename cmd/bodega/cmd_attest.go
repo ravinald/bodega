@@ -250,10 +250,14 @@ what it observed:
 Any failed check exits non-zero.
 
 It then prints upstream-provenance and publisher-signature: whether the
-publisher's own signed provenance was verified at admission (verified,
-unavailable, invalid, unknown or mismatch), and the source repository,
-workflow, builder and bundle digest it named. Neither fails verify; the
-admission's upstream_provenance evaluation is what the policy check reads.
+publisher's own signed provenance was verified at admission (verified, failed,
+unverified or not-attempted, or unavailable when the publisher published
+none), and the source repository, workflow, builder and bundle digest it
+named. An envelope signed before E27 prints its old status (verified,
+unavailable, invalid, unknown or mismatch) marked as the earlier draft's
+vocabulary. Neither fails verify; the admission's upstream_provenance
+evaluation is what the policy check reads, and it is where a mismatch against
+the pinned publisher shows.
 
 The trusted key IDs come from --key, or from attestation_keyids in the config
 file. Learn them somewhere other than the server being checked: the public key
@@ -346,7 +350,16 @@ func splitPackageSpec(spec string) (typ, name, version string, err error) {
 // mismatch means for a consumer is that consumer's policy, and the admission
 // row already applied bodega's.
 func printAvailability(w io.Writer, label string, a attest.Availability) {
-	status := a.Status
+	var parts []string
+	for _, v := range []string{a.Result, a.Availability} {
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	if len(parts) == 0 && a.LegacyStatus != "" {
+		parts = append(parts, a.LegacyStatus+" (pre-E27 vocabulary, draft of 2026-10-05)")
+	}
+	status := strings.Join(parts, " ")
 	if status == "" {
 		status = "(absent)"
 	}
