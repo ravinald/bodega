@@ -324,6 +324,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		NotFoundTTL: notFound,
 	}
 	s.rpmProfileBuilds.timeout, _ = time.ParseDuration(cfg.RpmProfileBuildTimeout)
+	s.rpmProfileBuilds.coldWait, _ = time.ParseDuration(cfg.RpmProfileColdWait)
 	setPrivateUpstreamHosts(cfg.PrivateUpstreamHosts)
 	if d, _ := time.ParseDuration(cfg.UpstreamConnectTimeout); d > 0 {
 		upstreamConnectTimeout.Store(int64(d))
@@ -650,6 +651,7 @@ func tlsPort(addr string) bool {
 // done it initiates a graceful shutdown, giving in-flight requests up to 30
 // seconds to complete.
 func (s *Server) Start(ctx context.Context) error {
+	s.rpmProfileBuilds.setContext(ctx)
 	srv := &http.Server{
 		Addr:              s.addr,
 		Handler:           s.handler(),
