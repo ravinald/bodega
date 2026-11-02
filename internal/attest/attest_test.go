@@ -9,6 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -554,5 +558,211 @@ func TestPreE27EnvelopeStillVerifies(t *testing.T) {
 				t.Errorf("%s: %s failed: expected %s, observed %s", tc.name, r.Check, r.Expected, r.Observed)
 			}
 		}
+	}
+}
+
+func TestE27LegacyStatusIsDecodeOnly(t *testing.T) {
+	for _, status := range []string{"mismatch", "invalid"} {
+		payload := `{"predicate":{"upstreamProvenance":{"status":"` + status + `"},"publisherSignature":{"status":"` + status + `"}}}`
+		encoded, err := json.Marshal(Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, st, err := ParseEnvelope(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Predicate.UpstreamProvenance.LegacyStatus != status || st.Predicate.PublisherSignature.LegacyStatus != status {
+			t.Fatal("legacy status was not decoded")
+		}
+		signed, err := Sign(newSigner(t), *st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, _, err := ParseEnvelope(signed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := rawPredicate(t, env)
+		for _, field := range []string{"upstreamProvenance", "publisherSignature"} {
+			object, ok := raw[field].(map[string]any)
+			if !ok {
+				t.Fatalf("%s is not an object", field)
+			}
+			if value, exists := object["status"]; exists {
+				t.Errorf("%s re-emitted decode-only status %q", field, value)
+			}
+		}
+	}
+}
+
+// constDoc returns the doc comment of the package-level constant name in
+// attest.go, so a test can hold the comment to what it promises.
+func constDoc(t *testing.T, name string) string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "attest.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range g.Specs {
+			for _, n := range spec.(*ast.ValueSpec).Names {
+				if n.Name == name {
+					return g.Doc.Text()
+				}
+			}
+		}
+	}
+	t.Fatalf("attest.go declares no constant %s", name)
+	return ""
+}
+
+func TestE27DraftRevisionIsPinned(t *testing.T) {
+	if DraftRevision != "https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md" {
+		t.Errorf("DraftRevision = %q", DraftRevision)
+	}
+	if PredicateType != "https://slsa.dev/dependency/v1" {
+		t.Errorf("PredicateType = %q", PredicateType)
+	}
+	if doc := constDoc(t, "DraftRevision"); !strings.Contains(doc, "2026-11-02") || !strings.Contains(doc, "#277") {
+		t.Errorf("DraftRevision comment names neither the read date nor issue #277: %q", doc)
+	}
+	if doc := constDoc(t, "PredicateType"); !strings.Contains(doc, "DraftRevision") {
+		t.Errorf("PredicateType comment does not name DraftRevision: %q", doc)
+	}
+}
+
+// The admission row's outcomes are stored values with override rules keyed on
+// them; the predicate maps them, it never renames them.
+func TestE27AuditVocabularyIsUnchanged(t *testing.T) {
+	for got, want := range map[string]string{
+		audit.ProvenanceVerified:    "verified",
+		audit.ProvenanceUnavailable: "unavailable",
+		audit.ProvenanceInvalid:     "invalid",
+		audit.ProvenanceUnknown:     "unknown",
+		audit.ProvenanceMismatch:    "mismatch",
+	} {
+		if got != want {
+			t.Errorf("audit provenance outcome %q, want %q", got, want)
+		}
+	}
+	if len(map[string]bool{audit.ProvenanceVerified: true, audit.ProvenanceUnavailable: true, audit.ProvenanceInvalid: true,
+		audit.ProvenanceUnknown: true, audit.ProvenanceMismatch: true}) != 5 {
+		t.Error("audit provenance outcomes are no longer five distinct values")
+	}
+}
+
+// readDoc returns a docs page with its whitespace collapsed, so a guard over
+// hard-wrapped prose does not break on a rewrap.
+func readDoc(t *testing.T, name string) (raw, flat string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), strings.Join(strings.Fields(string(b)), " ")
+}
+
+func requireAll(t *testing.T, page, text string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		if !strings.Contains(text, w) {
+			t.Errorf("%s does not say %q", page, w)
+		}
+	}
+}
+
+func TestE27DesignDocumentsTheDraftVocabulary(t *testing.T) {
+	raw, flat := readDoc(t, "design.md")
+	requireAll(t, "design.md", flat,
+		"[Dependency track](https://slsa.dev/spec/draft/dependency-track)",
+		"(https://slsa.dev/spec/draft/dependency-provenance)",
+		DraftRevision, "4d3f9d44", "read on 2026-11-02",
+		"`availability: unavailable` when the publisher published nothing",
+		"`integrity`, always `{\"method\": \"hash\", \"result\": \"verified\"}`",
+		"`mismatch` therefore shows in the `upstream_provenance` entry of `policyEvaluations`")
+	rows := map[string][2]string{
+		"`verified`":                         {"`result: verified`, with the identity fields", "`result: verified`, with the identity fields"},
+		"`invalid`":                          {"`result: failed`", "`result: failed`"},
+		"`unavailable`":                      {"`availability: unavailable`", "`availability: unavailable`"},
+		"`unknown`":                          {"`result: not-attempted`", "`result: unverified`"},
+		"`mismatch`, a bundle that verified": {"`result: verified`, with the identity fields", "`result: verified`, with the identity fields"},
+		"`mismatch`, no bundle after a pinned one":        {"`availability: unavailable`", "`availability: unavailable`"},
+		"`not_evaluated`, no entry, or any other outcome": {"`result: not-attempted`", "`result: unverified`"},
+	}
+	found := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		cells := strings.Split(line, "|")
+		if len(cells) != 5 {
+			continue
+		}
+		outcome := strings.TrimSpace(cells[1])
+		want, ok := rows[outcome]
+		if !ok {
+			continue
+		}
+		found[outcome] = true
+		if up, pub := strings.TrimSpace(cells[2]), strings.TrimSpace(cells[3]); up != want[0] || pub != want[1] {
+			t.Errorf("design.md row %s maps to %q / %q, want %q / %q", outcome, up, pub, want[0], want[1])
+		}
+	}
+	for outcome := range rows {
+		if !found[outcome] {
+			t.Errorf("design.md mapping table has no row for %s", outcome)
+		}
+	}
+}
+
+func TestE27ThreatModelReportsMismatchInPolicyEvaluations(t *testing.T) {
+	_, flat := readDoc(t, "threat-model.md")
+	requireAll(t, "threat-model.md", flat,
+		"`result` is `verified`, `failed`, or `not-attempted` (`unverified` in `publisherSignature`), or `availability` is `unavailable` when the publisher published nothing",
+		"A `verified` there means only that the publisher's bundle verified cryptographically.",
+		"A `mismatch` against the pinned publisher is reported in the `upstream_provenance` entry of `policyEvaluations`, not in `publisherSignature`.")
+}
+
+// section returns the body of the ## heading in page, up to the next ## heading.
+func section(t *testing.T, page, raw, heading string) string {
+	t.Helper()
+	_, body, ok := strings.Cut(raw, "\n"+heading+"\n")
+	if !ok {
+		t.Fatalf("%s has no %q section", page, heading)
+	}
+	body, _, _ = strings.Cut(body, "\n## ")
+	return body
+}
+
+func tableRows(body string) []string {
+	var rows []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "|") {
+			rows = append(rows, line)
+		}
+	}
+	return rows
+}
+
+func TestE27SlsaPageNamesTheRevision(t *testing.T) {
+	raw, _ := readDoc(t, "slsa.md")
+	_, opening, _ := strings.Cut(raw, "The Dependency track is a working draft")
+	opening, _, _ = strings.Cut(opening, "\n")
+	requireAll(t, "slsa.md opening paragraph", opening, DraftRevision, "November 2, 2026")
+	if strings.Contains(opening, "October 5, 2026") {
+		t.Error("slsa.md opening paragraph still names the October 5, 2026 reading")
+	}
+	drift := tableRows(section(t, "slsa.md", raw, "## Spec drift"))
+	if len(drift) != 3 || !strings.Contains(drift[2], "`resolvedFrom`") {
+		t.Errorf("slsa.md Spec drift table should hold only its resolvedFrom row, has:\n%s", strings.Join(drift, "\n"))
+	}
+	level3 := tableRows(section(t, "slsa.md", raw, "## What Level 3 requires that bodega does not provide"))
+	if len(level3) == 0 {
+		t.Fatal("slsa.md Level 3 table missing")
+	}
+	if last := level3[len(level3)-1]; strings.Contains(last, "vocabulary") || strings.Contains(last, "differ") {
+		t.Errorf("slsa.md Level 3 last row still says the vocabulary differs: %s", last)
 	}
 }

@@ -7917,6 +7917,10 @@ info  upstream-provenance verified
                       builder https://github.com/actions/runner/github-hosted
                       bundle sha256:5b0c...
 info  publisher-signature verified
+                      source https://github.com/sigstore/sigstore-js
+                      workflow https://github.com/sigstore/sigstore-js/.github/workflows/release.yml@refs/heads/main
+                      builder https://github.com/actions/runner/github-hosted
+                      bundle sha256:5b0c...
 ```
 
 `cosign verify-attestation` and other in-toto tooling read the same envelope; the key is the PEM from `bodega attest key show`.

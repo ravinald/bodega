@@ -465,3 +465,70 @@ func TestAttestVerifyComposerFromServer(t *testing.T) {
 		}
 	}
 }
+
+func TestE27UsageSampleMatchesPrinter(t *testing.T) {
+	body, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(body), "After the checks, verify prints")
+	if !ok {
+		t.Fatal("attestation output documentation missing")
+	}
+	_, sample, ok := strings.Cut(section, "```text\n")
+	if !ok {
+		t.Fatal("attestation output sample missing")
+	}
+	sample, _, ok = strings.Cut(sample, "```")
+	if !ok {
+		t.Fatal("attestation output sample not closed")
+	}
+	verdict := attest.Availability{
+		Result:              attest.ResultVerified,
+		SourceRepositoryURI: "https://github.com/sigstore/sigstore-js",
+		WorkflowRef:         "https://github.com/sigstore/sigstore-js/.github/workflows/release.yml@refs/heads/main",
+		BuilderID:           "https://github.com/actions/runner/github-hosted",
+		BundleDigest:        map[string]string{"sha256": "5b0c..."},
+	}
+	var actual bytes.Buffer
+	printAvailability(&actual, "upstream-provenance", verdict)
+	printAvailability(&actual, "publisher-signature", verdict)
+	if sample != actual.String() {
+		t.Errorf("usage sample does not match verified output\nwant:\n%s\ngot:\n%s", actual.String(), sample)
+	}
+}
+
+func TestE27VerifyHelpNamesTheDraftVocabulary(t *testing.T) {
+	t.Setenv(config.EnvConfigFile, filepath.Join(t.TempDir(), "config.json"))
+	help := strings.Join(strings.Fields(newAttestVerifyCmd(&globalFlags{}).Long), " ")
+	for _, want := range []string{
+		"(verified, failed, unverified or not-attempted, or unavailable when the publisher published none)",
+		"An envelope signed before E27 prints its old status",
+		"marked as the earlier draft's vocabulary",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("verify help does not say %q", want)
+		}
+	}
+}
+
+func TestE27UsageNamesTheDraftVocabulary(t *testing.T) {
+	body, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(body), "After the checks, verify prints")
+	if !ok {
+		t.Fatal("attestation output documentation missing")
+	}
+	section, _, _ = strings.Cut(section, "\n")
+	for _, want := range []string{
+		"`verified`, `failed`, `not-attempted` (`unverified` on the `publisher-signature` line), or `unavailable` when the publisher published nothing",
+		"An envelope signed before E27",
+		"`info  upstream-provenance mismatch (pre-E27 vocabulary, draft of 2026-10-05)`",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("usage.md attestation output does not say %q", want)
+		}
+	}
+}

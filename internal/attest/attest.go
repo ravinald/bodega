@@ -126,15 +126,32 @@ type Availability struct {
 	Availability string `json:"availability,omitempty"`
 	// LegacyStatus is the single status an envelope signed before E27
 	// carried (verified, unavailable, invalid, unknown or mismatch, from the
-	// draft of 2026-10-05). It is read so those envelopes still verify and
-	// print; NewStatement never sets it, so it is never emitted.
-	LegacyStatus        string `json:"status,omitempty"`
+	// draft of 2026-10-05). UnmarshalJSON reads it so those envelopes still
+	// verify and print; it is never marshaled, so re-signing a decoded
+	// statement cannot put the old vocabulary back on the wire.
+	LegacyStatus        string `json:"-"`
 	SourceRepositoryURI string `json:"sourceRepositoryUri,omitempty"`
 	WorkflowRef         string `json:"workflowRef,omitempty"`
 	BuilderID           string `json:"builderId,omitempty"`
 	// BundleDigest is the digest of the Sigstore bundle that was verified,
 	// as an in-toto digest set.
 	BundleDigest map[string]string `json:"bundleDigest,omitempty"`
+}
+
+// UnmarshalJSON decodes the draft's fields and the pre-E27 status key, which
+// the struct tag keeps out of every encoding.
+func (a *Availability) UnmarshalJSON(data []byte) error {
+	type fields Availability
+	var wire struct {
+		fields
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*a = Availability(wire.fields)
+	a.LegacyStatus = wire.Status
+	return nil
 }
 
 // PolicyEvaluations is the admission decision the statement rests on: the
