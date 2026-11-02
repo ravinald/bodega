@@ -33,19 +33,33 @@ import (
 
 // PredicateType names the SLSA Dependency track's ingestion predicate. The
 // track is a working draft (slsa-framework/slsa main, not v1.2), so this one
-// constant is what changes if the draft renames it.
+// constant is what changes if the draft renames it. The fields and vocabulary
+// bodega emits under it follow the revision DraftRevision names.
 const PredicateType = "https://slsa.dev/dependency/v1"
+
+// DraftRevision is the revision of the SLSA dependency-provenance draft the
+// predicate follows, as read on 2026-11-02. The draft is unapproved and keeps
+// moving; each later change is recorded on issue #277 before this moves.
+const DraftRevision = "https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md"
+
+// The predicate's verdict vocabulary, from DraftRevision. bodega's admission
+// row keeps its own five provenance outcomes (audit.ProvenanceVerified and
+// its siblings), which drive override rules this vocabulary cannot express;
+// AvailabilityOf maps one onto the other at the predicate boundary.
+const (
+	ResultVerified          = "verified"
+	ResultFailed            = "failed"
+	ResultUnverified        = "unverified"
+	ResultNotAttempted      = "not-attempted"
+	AvailabilityUnavailable = "unavailable"
+	IntegrityMethodHash     = "hash"
+)
 
 // StatementType is the in-toto Statement v1 type.
 const StatementType = "https://in-toto.io/Statement/v1"
 
 // PayloadType is the DSSE payload type of an in-toto statement.
 const PayloadType = "application/vnd.in-toto+json"
-
-// StatusUnavailable is what a predicate field says when bodega has nothing to
-// put in it. It is a value rather than an omitted field so a consumer cannot
-// read the absence as a pass.
-const StatusUnavailable = "unavailable"
 
 // ObjectKeyAnnotation names the subject annotation carrying the storage key
 // the digest was pinned under, which is how a verifier finds the bytes.
@@ -76,11 +90,24 @@ type Predicate struct {
 	ResolvedFrom      []ResourceDescriptor `json:"resolvedFrom,omitempty"`
 	// UpstreamProvenance and PublisherSignature are what the admission row's
 	// upstream_provenance check concluded about the publisher's own signed
-	// provenance. Both carry the same status and identity: the provenance and
-	// the signature over it are one Sigstore bundle, verified together. A row
-	// whose check did not run says unavailable; see AvailabilityOf.
+	// provenance. Both carry the same verdict and identity, because the
+	// provenance and the signature over it are one Sigstore bundle verified
+	// together; they differ only in how the draft spells a verdict nobody
+	// reached. See AvailabilityOf and PublisherSignatureOf.
 	UpstreamProvenance Availability `json:"upstreamProvenance"`
 	PublisherSignature Availability `json:"publisherSignature"`
+	// Integrity says the subject digest was checked against the bytes.
+	// NewStatement is reached only after emit refuses a pin with no sha256,
+	// and the pinned sha256 is what the fetch verified the bytes against, so
+	// every statement it builds says verified.
+	Integrity Integrity `json:"integrity"`
+}
+
+// Integrity is the draft's integrity verdict: how the artifact was checked,
+// and what the check concluded.
+type Integrity struct {
+	Method string `json:"method,omitempty"`
+	Result string `json:"result,omitempty"`
 }
 
 // Platform identifies the bodega instance that admitted the artifact.
@@ -88,13 +115,20 @@ type Platform struct {
 	ID string `json:"id"`
 }
 
-// Availability is the outcome of verifying a publisher's provenance:
-// verified, unavailable, invalid, unknown or mismatch. The identity fields are what
-// the signing certificate and the provenance named, set when a signature
-// verified (verified and mismatch) and omitted otherwise, which is also how
-// an envelope signed before they existed reads.
+// Availability is the outcome of verifying a publisher's provenance, in the
+// draft's vocabulary: Result is verified, failed, or not-attempted
+// (unverified in publisherSignature), and Availability is unavailable when the
+// publisher published nothing to verify. Exactly one of the two is set on a
+// statement NewStatement builds. The identity fields are what the signing
+// certificate and the provenance named, set only when Result is verified.
 type Availability struct {
-	Status              string `json:"status"`
+	Result       string `json:"result,omitempty"`
+	Availability string `json:"availability,omitempty"`
+	// LegacyStatus is the single status an envelope signed before E27
+	// carried (verified, unavailable, invalid, unknown or mismatch, from the
+	// draft of 2026-10-05). It is read so those envelopes still verify and
+	// print; NewStatement never sets it, so it is never emitted.
+	LegacyStatus        string `json:"status,omitempty"`
 	SourceRepositoryURI string `json:"sourceRepositoryUri,omitempty"`
 	WorkflowRef         string `json:"workflowRef,omitempty"`
 	BuilderID           string `json:"builderId,omitempty"`

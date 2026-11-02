@@ -172,8 +172,12 @@ func TestEmitSignsWhatTheRowSaysAndVerifies(t *testing.T) {
 	pr := st.Predicate
 	if pr.IngestionPlatform.ID != "https://bodega.example" || pr.PolicyEvaluations.PolicyDigest["sha256"] != strings.Repeat("ab", 32) ||
 		len(pr.ResolvedFrom) != 1 || pr.ResolvedFrom[0].Name != "widget" ||
-		pr.UpstreamProvenance.Status != StatusUnavailable || pr.PublisherSignature.Status != StatusUnavailable {
+		pr.UpstreamProvenance.Result != ResultNotAttempted || pr.PublisherSignature.Result != ResultUnverified {
 		t.Errorf("predicate = %+v", pr)
+	}
+	raw := rawPredicate(t, env)
+	if got, _ := json.Marshal(raw["integrity"]); string(got) != `{"method":"hash","result":"verified"}` {
+		t.Errorf("integrity = %s, want {\"method\":\"hash\",\"result\":\"verified\"}", got)
 	}
 	// The row lacks OSV and upstream provenance entries, so the statement
 	// says so rather than leaving them out.
@@ -348,9 +352,28 @@ func TestEmitNothingWithoutAKeyOrATable(t *testing.T) {
 	}
 }
 
-// The emitter fills upstreamProvenance and publisherSignature from the row's
-// upstream_provenance check, and a check that never ran says unavailable
-// whatever its entry holds.
+// rawPredicate decodes the signed payload of env as untyped JSON, so a test
+// sees the keys a consumer reads rather than what the Go struct tolerates.
+func rawPredicate(t *testing.T, env *Envelope) map[string]any {
+	t.Helper()
+	payload, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(payload, &st); err != nil {
+		t.Fatal(err)
+	}
+	pr, ok := st["predicate"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload has no predicate object: %s", payload)
+	}
+	return pr
+}
+
+// The emitter maps the row's upstream_provenance outcome onto the draft's
+// vocabulary, and a check that never ran says not-attempted (unverified in
+// publisherSignature) whatever its entry holds.
 func TestEmitCarriesTheUpstreamProvenanceOfTheRow(t *testing.T) {
 	ctx := context.Background()
 	verified := audit.UpstreamProvenance{
@@ -360,39 +383,103 @@ func TestEmitCarriesTheUpstreamProvenanceOfTheRow(t *testing.T) {
 		BuilderID:           "https://github.com/actions/runner/github-hosted",
 		BundleDigest:        "sha256:" + strings.Repeat("cd", 32),
 	}
+	mismatched := verified
+	mismatched.Outcome = audit.ProvenanceMismatch
+	mismatched.SourceRepositoryURI = "https://github.com/someone-else/lodash"
+	identity := map[string]any{
+		"sourceRepositoryUri": verified.SourceRepositoryURI, "workflowRef": verified.WorkflowRef,
+		"builderId": verified.BuilderID, "bundleDigest": map[string]any{"sha256": strings.Repeat("cd", 32)},
+	}
+	with := func(base map[string]any, id map[string]any) map[string]any {
+		out := map[string]any{}
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range id {
+			out[k] = v
+		}
+		return out
+	}
+	prov := func(outcome string) *audit.UpstreamProvenance { return &audit.UpstreamProvenance{Outcome: outcome} }
+	entry := func(status string, p *audit.UpstreamProvenance) []audit.AdmissionCheck {
+		return []audit.AdmissionCheck{{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: status, Provenance: p}}
+	}
+	mismatchID := with(identity, map[string]any{"sourceRepositoryUri": mismatched.SourceRepositoryURI})
 	cases := []struct {
-		name  string
-		check audit.AdmissionCheck
-		want  Availability
+		name                string
+		checks              []audit.AdmissionCheck
+		upstream, publisher map[string]any
 	}{
-		{"verified", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckPass, Provenance: &verified},
-			Availability{Status: audit.ProvenanceVerified, SourceRepositoryURI: verified.SourceRepositoryURI, WorkflowRef: verified.WorkflowRef,
-				BuilderID: verified.BuilderID, BundleDigest: map[string]string{"sha256": strings.Repeat("cd", 32)}}},
-		{"invalid", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckWarn,
-			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}},
-			Availability{Status: audit.ProvenanceInvalid}},
-		{"not evaluated", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckNotEvaluated, Provenance: &verified},
-			Availability{Status: StatusUnavailable}},
+		{"verified", entry(audit.CheckPass, &verified),
+			with(map[string]any{"result": "verified"}, identity), with(map[string]any{"result": "verified"}, identity)},
+		{"invalid", entry(audit.CheckWarn, prov(audit.ProvenanceInvalid)),
+			map[string]any{"result": "failed"}, map[string]any{"result": "failed"}},
+		{"unavailable", entry(audit.CheckWarn, prov(audit.ProvenanceUnavailable)),
+			map[string]any{"availability": "unavailable"}, map[string]any{"availability": "unavailable"}},
+		{"unknown", entry(audit.CheckWarn, prov(audit.ProvenanceUnknown)),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"mismatch with a verified bundle", entry(audit.CheckWarn, &mismatched),
+			with(map[string]any{"result": "verified"}, mismatchID), with(map[string]any{"result": "verified"}, mismatchID)},
+		{"npm mismatch with no bundle", entry(audit.CheckWarn, prov(audit.ProvenanceMismatch)),
+			map[string]any{"availability": "unavailable"}, map[string]any{"availability": "unavailable"}},
+		{"not evaluated", entry(audit.CheckNotEvaluated, &verified),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"no entry", nil,
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"unrecognized outcome", entry(audit.CheckWarn, prov("missing")),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
 	}
 	for i, tc := range cases {
 		db := openAudit(t)
 		store := storage.NewMemory()
 		version := "4.17." + string(rune('0'+i))
 		key := manifest.NpmTarballKey("lodash", version)
-		admit(t, db, version, audit.AdmissionAdmitted, append(append([]audit.AdmissionCheck(nil), passing...), tc.check))
+		admit(t, db, version, audit.AdmissionAdmitted, append(append([]audit.AdmissionCheck(nil), passing...), tc.checks...))
 		ek, err := emitter(db, newSigner(t)).Emit(ctx, store, pin(t, db, version, key))
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		data, _ := store.Get(ctx, ek)
-		_, st, err := ParseEnvelope(data)
+		env, _, err := ParseEnvelope(data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for field, got := range map[string]Availability{"upstreamProvenance": st.Predicate.UpstreamProvenance, "publisherSignature": st.Predicate.PublisherSignature} {
-			if got.Status != tc.want.Status || got.SourceRepositoryURI != tc.want.SourceRepositoryURI || got.WorkflowRef != tc.want.WorkflowRef ||
-				got.BuilderID != tc.want.BuilderID || got.BundleDigest["sha256"] != tc.want.BundleDigest["sha256"] {
-				t.Errorf("%s: %s = %+v, want %+v", tc.name, field, got, tc.want)
+		raw := rawPredicate(t, env)
+		for field, want := range map[string]map[string]any{"upstreamProvenance": tc.upstream, "publisherSignature": tc.publisher} {
+			got, _ := json.Marshal(raw[field])
+			exp, _ := json.Marshal(want)
+			if string(got) != string(exp) {
+				t.Errorf("%s: %s = %s, want %s", tc.name, field, got, exp)
+			}
+		}
+	}
+}
+
+// No statement NewStatement builds carries the pre-E27 status key, whatever
+// the row's outcome, in either provenance object.
+func TestEmitNeverWritesALegacyStatus(t *testing.T) {
+	for _, outcome := range []string{audit.ProvenanceVerified, audit.ProvenanceInvalid, audit.ProvenanceUnavailable,
+		audit.ProvenanceUnknown, audit.ProvenanceMismatch, "missing", ""} {
+		checks := []audit.AdmissionCheck{{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckWarn,
+			Provenance: &audit.UpstreamProvenance{Outcome: outcome, SourceRepositoryURI: "https://github.com/lodash/lodash"}}}
+		st := NewStatement(Pin{Type: manifest.TypeNpm, Name: "lodash", Version: "4.17.21", ObjectKey: "k", SHA256: digest},
+			audit.Admission{Decision: audit.AdmissionAdmitted, Checks: checks}, "https://bodega.example", time.Now())
+		data, err := Sign(newSigner(t), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, _, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := rawPredicate(t, env)
+		for _, field := range []string{"upstreamProvenance", "publisherSignature"} {
+			obj, ok := raw[field].(map[string]any)
+			if !ok {
+				t.Fatalf("outcome %q: %s is not an object: %v", outcome, field, raw[field])
+			}
+			if _, has := obj["status"]; has {
+				t.Errorf("outcome %q: %s carries a status key: %v", outcome, field, obj)
 			}
 		}
 	}
@@ -418,12 +505,54 @@ func TestPreF38EnvelopeStillVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Predicate.UpstreamProvenance.Status != StatusUnavailable || st.Predicate.UpstreamProvenance.SourceRepositoryURI != "" {
+	if st.Predicate.UpstreamProvenance.LegacyStatus != AvailabilityUnavailable || st.Predicate.UpstreamProvenance.SourceRepositoryURI != "" {
 		t.Errorf("upstreamProvenance = %+v", st.Predicate.UpstreamProvenance)
 	}
 	for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
 		if !r.OK {
 			t.Errorf("%s failed: expected %s, observed %s", r.Check, r.Expected, r.Observed)
+		}
+	}
+}
+
+// An envelope signed under the pre-E27 vocabulary, a single status per
+// provenance object, still verifies, and its status and identity stay
+// readable.
+func TestPreE27EnvelopeStillVerifies(t *testing.T) {
+	for _, tc := range []struct {
+		name, object, status, source, builder string
+	}{
+		{"mismatch with identity",
+			`{"status":"mismatch","sourceRepositoryUri":"https://github.com/lodash/lodash","builderId":"https://github.com/actions/runner/github-hosted"}`,
+			"mismatch", "https://github.com/lodash/lodash", "https://github.com/actions/runner/github-hosted"},
+		{"invalid", `{"status":"invalid"}`, "invalid", "", ""},
+	} {
+		s := newSigner(t)
+		payload := `{"_type":"` + StatementType + `","subject":[{"name":"pkg:npm/lodash@4.17.21","digest":{"sha256":"` + digest + `"}}],` +
+			`"predicateType":"` + PredicateType + `","predicate":{"ingestionPlatform":{"id":"https://bodega.example"},` +
+			`"ingestedAt":"2026-10-10T12:00:00Z","policyEvaluations":{"policyDigest":{},"decision":"admitted","decidedAt":"2026-10-10T12:00:00Z",` +
+			`"evaluations":[{"check":"allowlist","action":"none","status":"pass"}]},` +
+			`"upstreamProvenance":` + tc.object + `,"publisherSignature":` + tc.object + `}}`
+		sig, err := s.Sign(rand.Reader, PAE(PayloadType, []byte(payload)), crypto.Hash(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload)),
+			Signatures: []Signature{{KeyID: s.KeyID(), Sig: base64.StdEncoding.EncodeToString(sig)}}}
+		data, _ := json.Marshal(env)
+		pe, st, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		for field, got := range map[string]Availability{"upstreamProvenance": st.Predicate.UpstreamProvenance, "publisherSignature": st.Predicate.PublisherSignature} {
+			if got.LegacyStatus != tc.status || got.SourceRepositoryURI != tc.source || got.BuilderID != tc.builder || got.Result != "" || got.Availability != "" {
+				t.Errorf("%s: %s = %+v", tc.name, field, got)
+			}
+		}
+		for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+			if !r.OK {
+				t.Errorf("%s: %s failed: expected %s, observed %s", tc.name, r.Check, r.Expected, r.Observed)
+			}
 		}
 	}
 }

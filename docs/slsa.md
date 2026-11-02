@@ -7,7 +7,7 @@ bodega is built against two tracks of [SLSA](https://slsa.dev), and sits at a di
 | [Dependency track](https://slsa.dev/spec/draft/dependency-track) | the third-party packages bodega admits and serves | Level 2 is the target, met with the gaps listed below. Level 3 is out of scope by design. |
 | [Build track](https://slsa.dev/spec/v1.2/build-track-basics)     | the release binaries of bodega itself             | Level 2 by construction. Level 3 is the aim and is not yet proven.                        |
 
-The Dependency track is a working draft: the page says "This document may be modified, replaced, or discarded at any time", and it is not part of SLSA 1.2. bodega tracks it as it read on October 5, 2026; [Spec drift](#spec-drift) lists where it has moved since.
+The Dependency track is a working draft: the page says "This document may be modified, replaced, or discarded at any time", and it is not part of SLSA 1.2. bodega tracks it at [`4d3f9d44`](https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md) of slsa-framework/slsa, read on November 2, 2026 (`DraftRevision` in `internal/attest/attest.go`); [Spec drift](#spec-drift) lists where bodega still differs.
 
 ## Dependency track Level 2
 
@@ -54,7 +54,7 @@ Level 3 is out of scope because each remaining requirement needs something outsi
 | Signing key unreachable from any process that runs dependency code | `bodega build run` executes upstream build steps on the same host that holds the attestation key. Meeting this takes a separate signer process.                               |
 | Each dependency's ingestion isolated from every other's            | Builds share one host and one filesystem; there is no per-dependency sandbox.                                                                                                 |
 | Signatures recorded in a transparency log                          | Not implemented.                                                                                                                                                              |
-| At least one upstream-attestation verdict per provenance           | Met in form: `upstreamProvenance` is always recorded, as `unavailable` when nothing was published. The vocabulary differs; see [Spec drift](#spec-drift).                     |
+| At least one upstream-attestation verdict per provenance           | Met in form: `upstreamProvenance` is always recorded, with `availability: unavailable` when nothing was published.                                                            |
 
 A compromised bodega host is out of scope in the [threat model](threat-model.md), and Level 3's isolation requirements are the ones that would matter there. [What an attestation proves](threat-model.md#what-an-attestation-proves) states what a verified statement says and what it cannot.
 
@@ -73,11 +73,8 @@ What is not yet proven, tracked in [#278](https://github.com/ravinald/bodega/iss
 
 The draft changed after bodega's predicate was written. Where they differ today, tracked in [#277](https://github.com/ravinald/bodega/issues/277):
 
-| The draft now says                                                     | bodega emits                                                                   |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `publisherSignature.availability`                                      | `publisherSignature.status`                                                    |
-| upstream verdicts `verified`, `failed`, `unavailable`, `not-attempted` | `verified`, `invalid`, `unavailable`, `unknown`, `mismatch`                    |
-| an explicit integrity `verified` verdict in each provenance            | none; integrity is enforced at fetch and the digest is the statement's subject |
-| `resolvedFrom` holds the direct dependency's digest                    | the parent's name                                                              |
+| The draft now says                                  | bodega emits      |
+| --------------------------------------------------- | ----------------- |
+| `resolvedFrom` holds the direct dependency's digest | the parent's name |
 
 The predicate type, `https://slsa.dev/dependency/v1`, is one constant in `internal/attest/attest.go`, so a rename costs one line. Field changes need a re-emit, which the [decision to track the draft](design.md#attestations) accepted as the price of using it before approval.

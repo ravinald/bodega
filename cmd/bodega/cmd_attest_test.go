@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -97,6 +100,80 @@ func signedFixture(t *testing.T, ring *attestsign.KeyRing, named string, artifac
 	_ = os.WriteFile(artFile, artifact, 0o600)
 	_ = os.WriteFile(pubFile, ring.Keys()[0].PublicKeyPEM, 0o600)
 	return envFile, artFile, pubFile
+}
+
+// writeSignedPayload signs payload with ring and writes the envelope to a file.
+func writeSignedPayload(t *testing.T, ring *attestsign.KeyRing, payload string) string {
+	t.Helper()
+	s := ring.Signer()
+	sig, err := s.Sign(rand.Reader, attest.PAE(attest.PayloadType, []byte(payload)), crypto.Hash(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := json.Marshal(attest.Envelope{PayloadType: attest.PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload)),
+		Signatures: []attest.Signature{{KeyID: s.KeyID(), Sig: base64.StdEncoding.EncodeToString(sig)}}})
+	path := filepath.Join(t.TempDir(), "env.json")
+	if err := os.WriteFile(path, env, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// An envelope signed under the pre-E27 vocabulary verifies and prints its old
+// status marked as such; a fresh one prints the draft's vocabulary.
+func TestAttestVerifyPreE27Envelope(t *testing.T) {
+	_, ring := attestInstall(t)
+	id := ring.Signer().KeyID()
+	artifact := []byte("lodash tarball")
+	_, art, pub := signedFixture(t, ring, "4.17.21", artifact)
+	sum := sha256.Sum256(artifact)
+	object := `{"status":"mismatch","sourceRepositoryUri":"https://github.com/lodash/lodash","builderId":"https://github.com/actions/runner/github-hosted"}`
+	payload := `{"_type":"` + attest.StatementType + `","subject":[{"name":"pkg:npm/lodash@4.17.21","digest":{"sha256":"` + hex.EncodeToString(sum[:]) + `"}}],` +
+		`"predicateType":"` + attest.PredicateType + `","predicate":{"ingestionPlatform":{"id":"https://bodega.example"},` +
+		`"ingestedAt":"2026-10-10T12:00:00Z","policyEvaluations":{"policyDigest":{},"decision":"admitted","decidedAt":"2026-10-10T12:00:00Z",` +
+		`"evaluations":[{"check":"allowlist","action":"none","status":"pass"}]},` +
+		`"upstreamProvenance":` + object + `,"publisherSignature":` + object + `}}`
+	legacy := writeSignedPayload(t, ring, payload)
+
+	out, err := runAttest(t, "verify", legacy, "--package", "npm/lodash/4.17.21", "--artifact", art, "--public-key", pub, "--key", id)
+	if err != nil {
+		t.Fatalf("pre-E27 envelope: %v\n%s", err, out)
+	}
+	for _, c := range []string{attest.CheckSignature, attest.CheckPredicateType, attest.CheckSubjectDigest, attest.CheckSubjectName, attest.CheckPolicy} {
+		if !strings.Contains(out, fmt.Sprintf("ok    %-15s", c)) {
+			t.Errorf("pre-E27 envelope: no ok line for %s\n%s", c, out)
+		}
+	}
+	if !strings.Contains(out, "info  upstream-provenance mismatch (pre-E27 vocabulary, draft of 2026-10-05)") {
+		t.Errorf("pre-E27 envelope: legacy status not marked\n%s", out)
+	}
+
+	key := manifest.NpmTarballKey("lodash", "4.17.21")
+	st := attest.NewStatement(attest.Pin{Type: manifest.TypeNpm, Name: "lodash", Version: "4.17.21", ObjectKey: key, SHA256: hex.EncodeToString(sum[:])},
+		audit.Admission{Decision: audit.AdmissionAdmitted, DecidedAt: time.Now(), Checks: []audit.AdmissionCheck{
+			{Check: audit.CheckAllowList, Action: "block", Status: audit.CheckPass},
+			{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckPass, Provenance: &audit.UpstreamProvenance{
+				Outcome: audit.ProvenanceVerified, SourceRepositoryURI: "https://github.com/lodash/lodash"}},
+		}}, "https://bodega.example", time.Now())
+	env, err := attest.Sign(ring.Signer(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(t.TempDir(), "fresh.json")
+	_ = os.WriteFile(fresh, env, 0o600)
+	out, err = runAttest(t, "verify", fresh, "--package", "npm/lodash/4.17.21", "--artifact", art, "--public-key", pub, "--key", id)
+	if err != nil {
+		t.Fatalf("fresh envelope: %v\n%s", err, out)
+	}
+	var line string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "info  upstream-provenance") {
+			line = l
+		}
+	}
+	if line != "info  upstream-provenance verified" || strings.Contains(out, "pre-E27") {
+		t.Errorf("fresh envelope: upstream-provenance line %q\n%s", line, out)
+	}
 }
 
 func TestAttestVerifyFile(t *testing.T) {
