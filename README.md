@@ -120,6 +120,7 @@ Every command takes `--help`, with examples. [Usage](docs/usage.md#commands) cov
 - [Usage](docs/usage.md): the operational reference, covering every command, the config file, policy, the REST API, the audit trail, and running under systemd or rc.d.
 - [Design](docs/design.md): the architecture, and why the proxy and cache sit where they do.
 - [Threat model](docs/threat-model.md): what bodega protects against, what it doesn't, and what each scope can reach.
+- [SLSA](docs/slsa.md): where bodega stands on the Dependency and Build tracks, the gaps against Level 2, and what Level 3 would take.
 - [Quarantining a compromised release](docs/quarantine/): tombstone a bad version, pin a known-good one, and return to normal tracking, through [the shell](docs/quarantine/cli.md), [the TUI](docs/quarantine/tui.md), or [HTTP](docs/quarantine/api.md).
 - [Contributing](CONTRIBUTING.md): the build, the merge gate, and the end-to-end suite.
 - [Security](SECURITY.md): reporting a vulnerability and verifying a release.

@@ -18,7 +18,8 @@ critical (CVSS 9.0+) issues.
 
 Each release signs `checksums-sha256.txt` with cosign keyless and attests
 every file it lists (archives, packages and SBOMs) with SLSA build
-provenance. Both are issued to the reusable workflow
+provenance, which GitHub describes as Build Level 2; [SLSA](docs/slsa.md)
+states what is and is not yet proven. Both are issued to the reusable workflow
 `.github/workflows/release-build.yml`, which `release.yml` calls only after
 `ci.yml`'s gate has passed on the tagged commit. Check the signature, then the
 checksums, then the provenance:
