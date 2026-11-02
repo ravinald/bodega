@@ -411,7 +411,7 @@ else
 		# shellcheck disable=SC2034  # read by the eval'd suite line
 		filter_pypi=iniconfig
 		chmod 000 "$store"
-		eval "$(printf '%s\n' "$filter_line" | sed -e "s|/var/lib/bodega|$store|g" -e "s|/tmp/|$work/clear/|g")"
+		eval "$(printf '%s\n' "$filter_line" | sed -e "s|/tmp/e2e-filter-pypi.json|$work/clear/e2e-filter-pypi.json|g" -e "s|/var/lib/bodega|$store|g")"
 		chmod 755 "$store"
 	)
 	t_ok "suite 65 hands rm no literal glob" none \
