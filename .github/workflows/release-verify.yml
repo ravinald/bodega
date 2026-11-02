@@ -1,0 +1,44 @@
+name: Release verify
+
+# Re-checks the newest published release against its signature and
+# attestations every day, so an asset replaced after publishing, or an
+# attestation that stops verifying, shows up as a failed run rather than as
+# nothing at all.
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.0.6'
+      # Exit 3 is "no release yet", reported as a skip: a pass there would
+      # read as a verified release that does not exist.
+      - name: Verify the newest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rc=0
+          scripts/verify-release.sh --latest | tee "$RUNNER_TEMP/verify.log" || rc=${PIPESTATUS[0]}
+          case $rc in
+          0) tail -n 1 "$RUNNER_TEMP/verify.log" >>"$GITHUB_STEP_SUMMARY" ;;
+          3)
+            echo "::notice::skipped: ravinald/bodega has no published release yet"
+            echo "skipped: no release yet" >>"$GITHUB_STEP_SUMMARY"
+            ;;
+          *) exit "$rc" ;;
+          esac

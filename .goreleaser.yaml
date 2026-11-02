@@ -97,12 +97,30 @@ sboms:
         > "$document"
 
 signs:
-  - cmd: cosign
+  # The Sigstore bundle is the signature verify-release.sh and SECURITY.md
+  # check first. The detached pair is for a cosign too old to read a bundle,
+  # and is its own entry so dropping it means deleting this second block.
+  # --new-bundle-format=false is what keeps cosign v3.1 and later writing the
+  # pair: without it they refuse to sign without --bundle, and with --bundle
+  # they ignore --output-signature and --output-certificate.
+  - id: checksum-bundle
+    cmd: cosign
+    signature: '${artifact}.sigstore.json'
+    args:
+      - sign-blob
+      - '--bundle=${signature}'
+      - '${artifact}'
+      - '--yes'
+    artifacts: checksum
+    output: true
+  - id: checksum-legacy
+    cmd: cosign
     signature: '${artifact}.sig'
     certificate: '${artifact}.pem'
     args:
       - sign-blob
       - '--oidc-issuer=https://token.actions.githubusercontent.com'
+      - '--new-bundle-format=false'
       - '--output-certificate=${certificate}'
       - '--output-signature=${signature}'
       - '${artifact}'
@@ -115,7 +133,11 @@ release:
     owner: ravinald
     name: bodega
   prerelease: auto
-  draft: false
+  # The attest step runs after GoReleaser, so a release published here would
+  # be public before its provenance exists. release.yml publishes the draft
+  # once verify-release.sh passes against it.
+  draft: true
+  replace_existing_draft: true
 
 changelog:
   use: github
