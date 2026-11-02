@@ -1035,7 +1035,9 @@ var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)(-
 
 // dockerdLookupNote is the note a mirrored dockerd's row carries when its
 // version is one that still resolves docker.io, or "" when the version is
-// later, or cannot be read: doctor never guesses one.
+// later, or cannot be read: doctor never guesses one. The note names the
+// version with its prerelease, which is what ranks a 29.1.3-rc below the
+// measured release; build metadata ranks nothing and is left out.
 func dockerdLookupNote(version func() (string, error)) string {
 	out, err := version()
 	if err != nil {
@@ -1057,7 +1059,7 @@ func dockerdLookupNote(version func() (string, error)) string {
 	case c > 0, c == 0 && m[4] == "":
 		return ""
 	}
-	read := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+	read := m[1] + "." + m[2] + "." + m[3] + m[4]
 	floor := fmt.Sprintf("%d.%d.%d", dockerdNoLookup[0], dockerdNoLookup[1], dockerdNoLookup[2])
 	return "; note: dockerd " + read + " resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (" + floor + " is the earliest version measured not to make the lookup)"
 }

@@ -968,20 +968,41 @@ func TestDockerLookupDocumentation(t *testing.T) {
 // B188 R2: every well-formed suffix still parses, and a prerelease of the
 // measured floor is earlier than it.
 func TestDockerdLookupNoteVersionForms(t *testing.T) {
-	for version, want := range map[string]bool{
-		"Docker version 26.1.5+dfsg1, build a72d7cd": true,
-		"Docker version 18.09.1-ce, build 4c52b90":   true,
-		"Docker version 26.1.5":                      true,
-		"Docker version 29.1.3-rc.1, build f52814d":  true,
-		"Docker version 29.1.3+dfsg1, build f52814d": false,
-		"Docker version 29.1.3, build f52814d":       false,
-		"Docker version 26.1.5+, build a72d7cd":      false,
-		"Docker version 26.1.5-, build a72d7cd":      false,
-		"Docker version 26.1, build a72d7cd":         false,
+	for version, named := range map[string]string{
+		"Docker version 26.1.5+dfsg1, build a72d7cd": "26.1.5",
+		"Docker version 18.09.1-ce, build 4c52b90":   "18.09.1-ce",
+		"Docker version 26.1.5":                      "26.1.5",
+		"Docker version 29.1.3-rc.1, build f52814d":  "29.1.3-rc.1",
+		"Docker version 29.1.3+dfsg1, build f52814d": "",
+		"Docker version 29.1.3, build f52814d":       "",
+		"Docker version 26.1.5+, build a72d7cd":      "",
+		"Docker version 26.1.5-, build a72d7cd":      "",
+		"Docker version 26.1, build a72d7cd":         "",
 	} {
-		got := dockerdLookupNote(func() (string, error) { return version + "\n", nil }) != ""
-		if got != want {
-			t.Errorf("%q: note = %v, want %v", version, got, want)
+		note := dockerdLookupNote(func() (string, error) { return version + "\n", nil })
+		if named == "" {
+			if note != "" {
+				t.Errorf("%q: note = %q, want none", version, note)
+			}
+			continue
 		}
+		if !strings.Contains(note, "dockerd "+named+" resolves docker.io") {
+			t.Errorf("%q: note = %q, want it to name dockerd %s", version, note, named)
+		}
+	}
+}
+
+func TestCheckDockerMirrorLookupNoteNamesPrerelease(t *testing.T) {
+	root, write := ociFixture(t)
+	write(clientconf.DockerDaemonPath, `{"registry-mirrors":["https://bodega.internal/"]}`)
+	h := OCIHost{Root: root, LookPath: onlyRuntime("dockerd"), DockerdVersion: func(string) (string, error) {
+		return "Docker version 29.1.3-rc.1, build f52814d", nil
+	}}
+	got := ociCheck(t, h, "oci-docker")
+	if got.Status != StatusOK {
+		t.Fatalf("status = %s, want OK: %+v", got.Status, got)
+	}
+	if !strings.Contains(got.Detail, "dockerd 29.1.3-rc.1 resolves docker.io") {
+		t.Fatalf("note must name the prerelease read from dockerd, not the measured clean release: %q", got.Detail)
 	}
 }
