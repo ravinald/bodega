@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -949,6 +950,9 @@ type OCIHost struct {
 	// the main registries.conf in place of the system one.
 	Home           string
 	RegistriesConf string
+	// DockerdVersion runs the dockerd LookPath found with --version. Nil
+	// reads no version, which adds no note to the oci-docker row.
+	DockerdVersion func(dockerd string) (string, error)
 }
 
 const ociRemedy = "bodega doctor --configure oci --apply --url <bodega base URL>"
@@ -966,10 +970,10 @@ func (t OCIHost) Check(base string) []Finding {
 	}
 	var out []Finding
 	for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
-		present := false
+		present, binPath := false, ""
 		for _, bin := range clientconf.RuntimeBinaries[rt] {
-			if _, err := t.LookPath(bin); err == nil {
-				present = true
+			if p, err := t.LookPath(bin); err == nil {
+				present, binPath = true, p
 			}
 		}
 		if !present {
@@ -978,7 +982,11 @@ func (t OCIHost) Check(base string) []Finding {
 		var f Finding
 		switch rt {
 		case clientconf.RuntimeDocker:
-			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host)
+			version := func() (string, error) { return "", errors.New("no version reader") }
+			if t.DockerdVersion != nil {
+				version = func() (string, error) { return t.DockerdVersion(binPath) }
+			}
+			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host, version)
 		case clientconf.RuntimeContainerd:
 			f = checkContainerdHosts(t.Root, host)
 		case clientconf.RuntimePodman:
@@ -1003,7 +1011,53 @@ func mirrorIsBodega(mirror, host string) bool {
 	return m == host || strings.HasPrefix(m, host+"/")
 }
 
-func checkDockerMirror(path, host string) Finding {
+// RunDockerdVersion asks dockerd for its version string.
+func RunDockerdVersion(dockerd string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, dockerd, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("%s --version: %w", dockerd, err)
+	}
+	return string(out), nil
+}
+
+// dockerdNoLookup is the earliest Docker Engine measured not to resolve
+// docker.io while every pull is served by registry-mirrors; 26.1.5 (Debian
+// 13) asks systemd-resolved for it once per pull and connects nowhere.
+var dockerdNoLookup = [3]int{29, 1, 3}
+
+var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)`)
+
+// dockerdLookupNote is the note a mirrored dockerd's row carries when its
+// version is one that still resolves docker.io, or "" when the version is
+// later, or cannot be read: doctor never guesses one.
+func dockerdLookupNote(version func() (string, error)) string {
+	out, err := version()
+	if err != nil {
+		return ""
+	}
+	m := dockerdVersionRe.FindStringSubmatch(strings.TrimSpace(out))
+	if m == nil {
+		return ""
+	}
+	var v [3]int
+	for i := range v {
+		n, err := strconv.Atoi(m[i+1])
+		if err != nil {
+			return ""
+		}
+		v[i] = n
+	}
+	if slices.Compare(v[:], dockerdNoLookup[:]) >= 0 {
+		return ""
+	}
+	read := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+	floor := fmt.Sprintf("%d.%d.%d", dockerdNoLookup[0], dockerdNoLookup[1], dockerdNoLookup[2])
+	return "; note: dockerd " + read + " resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (" + floor + " is the earliest version measured not to make the lookup)"
+}
+
+func checkDockerMirror(path, host string, version func() (string, error)) Finding {
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -1019,7 +1073,7 @@ func checkDockerMirror(path, host string) Finding {
 	}
 	for _, m := range doc.Mirrors {
 		if mirrorIsBodega(m, host) {
-			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)"}
+			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)" + dockerdLookupNote(version)}
 		}
 	}
 	if len(doc.Mirrors) == 0 {
