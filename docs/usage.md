@@ -7959,6 +7959,8 @@ bodega attest backfill --type npm
 
 `backfill` signs an envelope for every pinned object that has none: each object whose sha256 the checksum table holds and that is present on the backend its version records. It pins each one's admission first, as a fetch would, so an object with no admission on record gets a row whose checks all say `not_evaluated` and is signed that way, and a row written before a check existed carries that check as `not_evaluated`. The refusals above apply, and an object already attested is skipped, so a second run signs nothing.
 
+A Go module's `.zip` or `.mod` gets one more step. When the version's newest admission says the checksum database `verified` it and that row does not already name the object (an import or a lookup after the object was cached, say), `backfill` reads the stored bytes, checks they still hash to the pinned SHA-256, and compares their `h1:` hash with the one the row recorded before signing under it. Bytes that disagree are refused with a `CHECKSUM DATABASE MISMATCH` line naming both hashes, and nothing is attached or signed; delete the object and fetch the version again, which compares what upstream serves with the log. A fetch or pin that names no admission is never attached to a `verified` row at all, so the verdict a statement carries is always about the bytes its subject names.
+
 Run it on the server host, as the user the server runs as: it reads the signing key and writes to the artifact backends. It prints one line per object signed or refused and exits non-zero when any was refused. distfiles are not covered, because their digest lives in the ports tree's distinfo rather than in the checksum table.
 
 ---

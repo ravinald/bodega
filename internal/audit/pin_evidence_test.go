@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -66,6 +67,59 @@ func TestPinKeepsTheFetchsChecksumEvidence(t *testing.T) {
 			stranger := gomod(t0, ProvenanceUnavailable, CheckPass)
 			if got, err := db.PinAdmission(t.Context(), pin("gomod/info", &stranger)); err != nil || got != PinUnadmitted {
 				t.Fatalf("PinAdmission with no matching decision = %v, %v; want PinUnadmitted", got, err)
+			}
+		})
+	}
+}
+
+// A pin naming no admission never attaches a new object to a row whose
+// checksum_database outcome is verified, by setting its key or by copying it
+// for a second key; an object that row already carries still pins.
+func TestUnboundPinCannotTakeVerifiedChecksumEvidence(t *testing.T) {
+	t0 := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	for name, open := range admissionStores(t) {
+		t.Run(name, func(t *testing.T) {
+			db := open(t)
+			verified := passed("v1.2.3", t0)
+			verified.PkgType, verified.PkgName = "gomod", "example.com/widget"
+			verified.Checks = append(verified.Checks, AdmissionCheck{Check: CheckChecksumDatabase, Action: "block", Status: CheckPass,
+				Detail: "verified", ChecksumDatabase: &ChecksumDatabase{Outcome: ProvenanceVerified, ZipHash: "h1:zip", ModHash: "h1:mod"}})
+			if err := db.RecordAdmission(t.Context(), verified); err != nil {
+				t.Fatal(err)
+			}
+			pin := func(key string, admitted *Admission) AdmissionPin {
+				return AdmissionPin{PkgType: "gomod", PkgName: "example.com/widget", PkgVersion: "v1.2.3", ObjectKey: key, Admitted: admitted}
+			}
+			keys := func() []string {
+				rows, err := db.Admissions(t.Context(), AdmissionFilter{PkgType: "gomod", PkgName: "example.com/widget"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out []string
+				for _, r := range rows {
+					out = append(out, r.ObjectKey)
+				}
+				return out
+			}
+
+			if _, err := db.PinAdmission(t.Context(), pin("gomod/zip", nil)); !errors.Is(err, ErrUnboundChecksumEvidence) {
+				t.Fatalf("unbound pin on an unkeyed verified row: err = %v, want ErrUnboundChecksumEvidence", err)
+			}
+			if got := keys(); len(got) != 1 || got[0] != "" {
+				t.Fatalf("refused pin changed the rows: %q", got)
+			}
+
+			if got, err := db.PinAdmission(t.Context(), pin("gomod/zip", &verified)); err != nil || got != PinAttached {
+				t.Fatalf("bound pin = %v, %v", got, err)
+			}
+			if got, err := db.PinAdmission(t.Context(), pin("gomod/zip", nil)); err != nil || got != PinAttached {
+				t.Fatalf("unbound re-pin of the row's own object = %v, %v", got, err)
+			}
+			if _, err := db.PinAdmission(t.Context(), pin("gomod/mod", nil)); !errors.Is(err, ErrUnboundChecksumEvidence) {
+				t.Fatalf("unbound pin copying a keyed verified row: err = %v, want ErrUnboundChecksumEvidence", err)
+			}
+			if got := keys(); len(got) != 1 || got[0] != "gomod/zip" {
+				t.Fatalf("refused copy changed the rows: %q", got)
 			}
 		})
 	}

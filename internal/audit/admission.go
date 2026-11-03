@@ -188,9 +188,18 @@ type AdmissionPin struct {
 	// carry the same checksum_database entry; otherwise the pin attaches to the
 	// newest row that does, or to none. Two fetches of one module version can
 	// overlap, and bytes never compared with the checksum database must not be
-	// pinned, then signed, under another fetch's verified comparison.
+	// pinned, then signed, under another fetch's verified comparison. With
+	// Admitted nil, a row whose checksum_database outcome is verified is never
+	// attached to a new object: ErrUnboundChecksumEvidence.
 	Admitted *Admission
 }
+
+// ErrUnboundChecksumEvidence is PinAdmission refusing to attach an object to a
+// row whose checksum_database outcome is verified when the caller named no
+// admission: verified says the object's bytes were compared with the signed
+// hashes, and a pin that names no admission proves no comparison ran. The
+// caller compares the bytes and names the row, or the object goes unattached.
+var ErrUnboundChecksumEvidence = errors.New("a verified checksum database row is attached only to bytes compared under it, and this pin names no admission")
 
 // admissionPinResult is what a queryable sink found when it tried to attach a
 // pin. Found is false when the version has no admitted row; Attached is true
@@ -469,7 +478,10 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 		}
 	}
 
+	unbound := p.Admitted == nil && key.String != p.ObjectKey && verifiedChecksumEvidence(row.Checks)
 	switch {
+	case unbound:
+		return admissionPinResult{}, fmt.Errorf("%w: %s/%s@%s, object %s", ErrUnboundChecksumEvidence, p.PkgType, p.PkgName, p.PkgVersion, p.ObjectKey)
 	case !key.Valid:
 		//nolint:gosec // G202: only bind placeholders are concatenated; every value is bound.
 		if _, err := tx.ExecContext(ctx, `UPDATE admissions SET object_key = `+ph(1)+` WHERE id = `+ph(2), p.ObjectKey, row.ID); err != nil {
@@ -529,6 +541,17 @@ func pinCandidate(rows *sql.Rows, p AdmissionPin, admitted *Admission, parseTime
 		return row, key, true, rows.Close()
 	}
 	return Admission{}, sql.NullString{}, false, rows.Err()
+}
+
+// verifiedChecksumEvidence reports whether checks carry a checksum_database
+// entry whose outcome is verified.
+func verifiedChecksumEvidence(checks []AdmissionCheck) bool {
+	for _, c := range checks {
+		if c.Check == CheckChecksumDatabase && c.ChecksumDatabase != nil && c.ChecksumDatabase.Outcome == ProvenanceVerified {
+			return true
+		}
+	}
+	return false
 }
 
 // sameChecksumEvidence reports whether a and b carry the same checksum_database

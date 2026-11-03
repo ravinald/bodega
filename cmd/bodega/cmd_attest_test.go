@@ -18,11 +18,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/attestsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/provenance/sumdbtest"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -530,5 +532,177 @@ func TestE27UsageNamesTheDraftVocabulary(t *testing.T) {
 		if !strings.Contains(section, want) {
 			t.Errorf("usage.md attestation output does not say %q", want)
 		}
+	}
+}
+
+func TestReviewGomodBackfillCannotUpgradeUncomparedBytes(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	forged := sumdbtest.NewModule(t, honest.Path, honest.Version, "different bytes")
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.AddModule(honest)
+	for _, tc := range []struct {
+		ext  string
+		body []byte
+	}{
+		{".zip", forged.Zip},
+		{".mod", []byte("module example.com/widget\n\nrequire example.com/evil v1.0.0\n")},
+	} {
+		t.Run(tc.ext, func(t *testing.T) {
+			dir, ring := attestInstall(t)
+			adb, err := audit.Open(filepath.Join(dir, "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adb.Close()
+			pm := &manifest.PackageManifest{Type: manifest.TypeGomod, Name: honest.Path,
+				Versions: []manifest.VersionEntry{{Version: honest.Version}}}
+			cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier, GomodNoSumdb: "example.com"}
+			first := admit.AdmitAs(t.Context(), nil, adb, cfg, pm, admit.Who{Actor: "alice"})
+			if !first.OK() || len(first.Admissions) != 1 {
+				t.Fatalf("excluded admission: %+v", first)
+			}
+			entry := admit.ChecksumDatabaseEntry(first.Admissions[0])
+			if entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceUnavailable {
+				t.Fatalf("excluded evidence: %+v", entry)
+			}
+			key := manifest.GomodKey(honest.Path, honest.Version, tc.ext)
+			st := storage.NewLocal(filepath.Join(dir, "storage"))
+			if err := st.Put(t.Context(), key, tc.body); err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(tc.body)
+			digest := hex.EncodeToString(sum[:])
+			if err := adb.StoreChecksum(t.Context(), key, manifest.TypeGomod, honest.Path, honest.Version, "sha256", digest, "computed"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := adb.PinAdmission(t.Context(), audit.AdmissionPin{PkgType: manifest.TypeGomod, PkgName: honest.Path, PkgVersion: honest.Version, ObjectKey: key, Admitted: &first.Admissions[0]}); err != nil {
+				t.Fatal(err)
+			}
+
+			// An import after removing the exclusion verifies the log, but
+			// does not fetch or compare the already cached artifact.
+			cfg.GomodNoSumdb = ""
+			second := admit.AdmitAs(t.Context(), nil, adb, cfg, pm, admit.Who{Actor: "alice"})
+			if !second.OK() || len(second.Admissions) != 1 {
+				t.Fatalf("verified admission: %+v", second)
+			}
+			entry = admit.ChecksumDatabaseEntry(second.Admissions[0])
+			if entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+				t.Fatalf("verified evidence: %+v", entry)
+			}
+
+			out, runErr := runAttest(t, "backfill", "--type", manifest.TypeGomod)
+			t.Logf("backfill: %v\n%s", runErr, out)
+			ek, err := attest.Newest(t.Context(), st, []string{key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ek == "" {
+				return
+			}
+			raw, err := st.Get(t.Context(), ek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, statement, err := attest.ParseEnvelope(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, check := range attest.Verify(env, statement, attest.VerifyInput{
+				Trusted: trustedKeys(t, ring), ArtifactSHA256: digest,
+				WantPURL: attest.PURL(manifest.TypeGomod, honest.Path, honest.Version, key),
+			}) {
+				if !check.OK {
+					t.Fatalf("invalid envelope for cached bytes: %+v", check)
+				}
+			}
+			for _, evaluation := range statement.Predicate.PolicyEvaluations.Evaluations {
+				if evaluation.Check == audit.CheckChecksumDatabase && evaluation.Status == audit.CheckPass && strings.HasPrefix(evaluation.Detail, "verified:") {
+					t.Errorf("backfill signed uncompared %s as verified against the honest log: %s", tc.ext, evaluation.Detail)
+				}
+			}
+		})
+	}
+}
+
+// Backfill signs a cached Go file under a verified admission no fetch bound it
+// to only after comparing the stored bytes with the log's hash: bytes that
+// match are signed verified, and bytes that do not are refused with both
+// hashes named and no envelope written.
+func TestGomodBackfillComparesStoredBytesBeforeVerified(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	forged := sumdbtest.NewModule(t, honest.Path, honest.Version, "different bytes")
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.AddModule(honest)
+	for _, tc := range []struct {
+		name       string
+		ext        string
+		body       []byte
+		want, have string
+	}{
+		{"zip matches", ".zip", honest.Zip, honest.ZipHash, ""},
+		{"mod matches", ".mod", honest.Mod, honest.ModHash, ""},
+		{"zip differs", ".zip", forged.Zip, honest.ZipHash, forged.ZipHash},
+		{"mod differs", ".mod", []byte("module example.com/widget\n\nrequire example.com/evil v1.0.0\n"), honest.ModHash, "hashes to h1:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, _ := attestInstall(t)
+			adb, err := audit.Open(filepath.Join(dir, "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adb.Close()
+			pm := &manifest.PackageManifest{Type: manifest.TypeGomod, Name: honest.Path,
+				Versions: []manifest.VersionEntry{{Version: honest.Version}}}
+			cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier}
+			if res := admit.AdmitAs(t.Context(), nil, adb, cfg, pm, admit.Who{Actor: "alice"}); !res.OK() {
+				t.Fatalf("admission: %+v", res)
+			}
+			key := manifest.GomodKey(honest.Path, honest.Version, tc.ext)
+			st := storage.NewLocal(filepath.Join(dir, "storage"))
+			if err := st.Put(t.Context(), key, tc.body); err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(tc.body)
+			if err := adb.StoreChecksum(t.Context(), key, manifest.TypeGomod, honest.Path, honest.Version, "sha256", hex.EncodeToString(sum[:]), "computed"); err != nil {
+				t.Fatal(err)
+			}
+			out, runErr := runAttest(t, "backfill", "--type", manifest.TypeGomod)
+			ek, err := attest.Newest(t.Context(), st, []string{key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.have != "" {
+				if runErr == nil || ek != "" {
+					t.Fatalf("differing bytes were signed: err %v, envelope %q\n%s", runErr, ek, out)
+				}
+				for _, s := range []string{"CHECKSUM DATABASE MISMATCH", tc.want, tc.have} {
+					if !strings.Contains(out, s) {
+						t.Errorf("refusal does not name %q:\n%s", s, out)
+					}
+				}
+				return
+			}
+			if runErr != nil || ek == "" {
+				t.Fatalf("matching bytes not signed: err %v, envelope %q\n%s", runErr, ek, out)
+			}
+			raw, err := st.Get(t.Context(), ek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, statement, err := attest.ParseEnvelope(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var detail string
+			for _, ev := range statement.Predicate.PolicyEvaluations.Evaluations {
+				if ev.Check == audit.CheckChecksumDatabase && ev.Status == audit.CheckPass {
+					detail = ev.Detail
+				}
+			}
+			if !strings.HasPrefix(detail, "verified:") || !strings.Contains(detail, tc.want) {
+				t.Fatalf("matching bytes signed without the verified evaluation: %q", detail)
+			}
+		})
 	}
 }
