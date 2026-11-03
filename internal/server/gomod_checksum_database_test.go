@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -293,5 +295,108 @@ func TestReviewConcurrentGomodFillsCannotBorrowVerifiedEvidence(t *testing.T) {
 				t.Errorf("forged zip %s acquired another fill's verified statement for %s: %s", forged.ZipHash, honest.ZipHash, e.Detail)
 			}
 		}
+	}
+}
+
+func TestReviewSameObjectFillCannotBorrowVerifiedStatement(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	forged := sumdbtest.NewModule(t, honest.Path, honest.Version, "different bytes")
+	for _, tc := range []struct {
+		ext            string
+		honest, forged []byte
+	}{
+		{".zip", honest.Zip, forged.Zip},
+		{".mod", honest.Mod, []byte("module example.com/widget\n\nrequire example.com/evil v1.0.0\n")},
+	} {
+		t.Run(tc.ext, func(t *testing.T) {
+			signer := installAttestKey(t)
+			log := sumdbtest.New(t, sumdbtest.NewKey(t))
+			log.AddModule(honest)
+			s := gomodSumdbServer(t, log, newRecordingUpstream(t))
+			s.loadAttestSigner()
+			ctx := t.Context()
+			key := manifest.GomodKey(honest.Path, honest.Version, tc.ext)
+			st := s.typeStore(manifest.TypeGomod)
+			request := httptest.NewRequest(http.MethodGet, "/go/"+honest.Path+"/@v/"+honest.Version+tc.ext, nil)
+			admitFill := func(exclude string) fillAdmission {
+				cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier, GomodNoSumdb: exclude}
+				res := admit.Fetch(ctx, s.auditDB, []policy.VersionChecker{admit.ChecksumDatabaseChecker(cfg, s.auditDB)},
+					manifest.TypeGomod, honest.Path, manifest.VersionEntry{Version: honest.Version},
+					admit.AllowListCheck(false, honest.Path, nil), admit.Who{Actor: "alice"}, "")
+				if res.Block != nil {
+					t.Fatalf("admission blocked: %+v", res)
+				}
+				return fillAdmission{typ: manifest.TypeGomod, name: honest.Path, version: honest.Version, row: res.Admission}
+			}
+			digest := func(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
+			spool := func(b []byte) string {
+				p := filepath.Join(t.TempDir(), "spool"+tc.ext)
+				if err := os.WriteFile(p, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				return p
+			}
+
+			first := admitFill("example.com")
+			firstPin, err := s.verifyProxyChecksum(ctx, key, digest(tc.forged), true)
+			if err != nil || firstPin == nil {
+				t.Fatalf("first digest check: %v", err)
+			}
+			if f := s.checksumDatabaseGate(ctx, request, first, key, spool(tc.forged)); f != nil {
+				t.Fatal("excluded fill refused")
+			}
+
+			// Two cache misses can both pass the absent SHA-256 check. Suspend the
+			// first before its deferred pin; suspend the second between pin and emit.
+			second := admitFill("")
+			secondPin, err := s.verifyProxyChecksum(ctx, key, digest(tc.honest), true)
+			if err != nil || secondPin == nil {
+				t.Fatalf("second digest check: %v", err)
+			}
+			if f := s.checksumDatabaseGate(ctx, request, second, key, spool(tc.honest)); f != nil {
+				t.Fatal("honest fill refused")
+			}
+			secondPin()
+			outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: second.typ, PkgName: second.name,
+				PkgVersion: second.version, ObjectKey: key, Admitted: &second.row})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			firstPin()
+			s.pinFill(ctx, st, first, key, digest(tc.forged), true)
+			s.emitAttestation(ctx, st, attest.Pin{Type: second.typ, Name: second.name, Version: second.version,
+				ObjectKey: key, SHA256: digest(tc.honest), Outcome: outcome})
+
+			ek, err := attest.Newest(ctx, st, []string{key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ek == "" {
+				return
+			}
+			raw, err := st.Get(ctx, ek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, statement, err := attest.ParseEnvelope(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if statement.Subject[0].Digest["sha256"] != digest(tc.forged) {
+				return
+			}
+			for _, check := range attest.Verify(env, statement, attest.VerifyInput{Trusted: trustedBy(t, signer),
+				ArtifactSHA256: digest(tc.forged), WantPURL: attest.PURL(manifest.TypeGomod, honest.Path, honest.Version, key)}) {
+				if !check.OK {
+					t.Fatalf("invalid envelope: %+v", check)
+				}
+			}
+			for _, evaluation := range statement.Predicate.PolicyEvaluations.Evaluations {
+				if evaluation.Check == audit.CheckChecksumDatabase && evaluation.Status == audit.CheckPass && strings.HasPrefix(evaluation.Detail, "verified:") {
+					t.Errorf("excluded %s fill signed differing bytes under the other fill's verified row: %s", tc.ext, evaluation.Detail)
+				}
+			}
+		})
 	}
 }

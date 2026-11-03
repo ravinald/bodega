@@ -706,3 +706,60 @@ func TestGomodBackfillComparesStoredBytesBeforeVerified(t *testing.T) {
 		})
 	}
 }
+
+// A verified row that already names the object proves nothing about the bytes
+// stored under it: a second fill of the same key may have cached other bytes
+// after the first fill pinned. Backfill compares them anyway.
+func TestGomodBackfillComparesBytesUnderARowAlreadyNamingThem(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	forged := sumdbtest.NewModule(t, honest.Path, honest.Version, "different bytes")
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.AddModule(honest)
+	for _, tc := range []struct {
+		ext  string
+		body []byte
+	}{
+		{".zip", forged.Zip},
+		{".mod", []byte("module example.com/widget\n\nrequire example.com/evil v1.0.0\n")},
+	} {
+		t.Run(tc.ext, func(t *testing.T) {
+			dir, _ := attestInstall(t)
+			adb, err := audit.Open(filepath.Join(dir, "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adb.Close()
+			pm := &manifest.PackageManifest{Type: manifest.TypeGomod, Name: honest.Path,
+				Versions: []manifest.VersionEntry{{Version: honest.Version}}}
+			cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier}
+			if res := admit.AdmitAs(t.Context(), nil, adb, cfg, pm, admit.Who{Actor: "alice"}); !res.OK() {
+				t.Fatalf("admission: %+v", res)
+			}
+			rows, err := adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeGomod, PkgName: honest.Path, PkgVersion: honest.Version})
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("admissions: %v, %d rows", err, len(rows))
+			}
+			key := manifest.GomodKey(honest.Path, honest.Version, tc.ext)
+			if _, err := adb.PinAdmission(t.Context(), audit.AdmissionPin{PkgType: manifest.TypeGomod, PkgName: honest.Path,
+				PkgVersion: honest.Version, ObjectKey: key, Admitted: &rows[0]}); err != nil {
+				t.Fatal(err)
+			}
+			st := storage.NewLocal(filepath.Join(dir, "storage"))
+			if err := st.Put(t.Context(), key, tc.body); err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(tc.body)
+			if err := adb.StoreChecksum(t.Context(), key, manifest.TypeGomod, honest.Path, honest.Version, "sha256", hex.EncodeToString(sum[:]), "computed"); err != nil {
+				t.Fatal(err)
+			}
+			out, runErr := runAttest(t, "backfill", "--type", manifest.TypeGomod)
+			ek, err := attest.Newest(t.Context(), st, []string{key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runErr == nil || ek != "" || !strings.Contains(out, "CHECKSUM DATABASE MISMATCH") {
+				t.Fatalf("differing bytes under an already-named verified row were signed: err %v, envelope %q\n%s", runErr, ek, out)
+			}
+		})
+	}
+}

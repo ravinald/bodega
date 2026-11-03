@@ -554,6 +554,54 @@ func verifiedChecksumEvidence(checks []AdmissionCheck) bool {
 	return false
 }
 
+// ChecksumComparison is a caller vouching that the bytes whose SHA-256 is
+// SHA256 were fetched under Checks: compared with the hashes in its
+// checksum_database entry and matched, where that entry is verified.
+type ChecksumComparison struct {
+	SHA256 string
+	Checks []AdmissionCheck
+}
+
+// AdmissionLister is the read DB.Admissions serves.
+type AdmissionLister interface {
+	Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, error)
+}
+
+// ComparedAdmissions is Reader with every row whose checksum_database outcome
+// is verified withheld, unless Compared vouches for SHA256 under that row's
+// evidence. A signer reading the newest row for a version would otherwise sign
+// any digest pinned under the version's object key with whichever fetch
+// verified last: two fetches of one key can carry different bytes and
+// different evidence, and the key names neither. Rows no comparison could
+// support (any other outcome) pass through, because they claim nothing about
+// the bytes.
+type ComparedAdmissions struct {
+	Reader   AdmissionLister
+	SHA256   string
+	Compared *ChecksumComparison
+}
+
+// Admissions reads Reader and drops what the comparison does not support.
+func (c ComparedAdmissions) Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
+	rows, err := c.Reader.Admissions(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	out := rows[:0:0]
+	for _, r := range rows {
+		if verifiedChecksumEvidence(r.Checks) && !c.vouches(r) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (c ComparedAdmissions) vouches(r Admission) bool {
+	return c.Compared != nil && c.SHA256 != "" && strings.EqualFold(c.Compared.SHA256, c.SHA256) &&
+		sameChecksumEvidence(r.Checks, c.Compared.Checks)
+}
+
 // sameChecksumEvidence reports whether a and b carry the same checksum_database
 // entry, status, detail and hashes included, or neither carries one.
 func sameChecksumEvidence(a, b []AdmissionCheck) bool {

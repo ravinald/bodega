@@ -738,13 +738,13 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 			had++
 			continue
 		}
-		compared, err := b.compareGomod(ctx, st, row)
+		admitted, compared, err := b.compareGomod(ctx, st, row)
 		if err != nil {
 			fmt.Fprintf(b.out, "  %s: not signed: %v\n", label, err)
 			refused++
 			continue
 		}
-		outcome, err := b.db.PinAdmission(ctx, audit.AdmissionPin{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion, ObjectKey: row.ObjectKey, Admitted: compared})
+		outcome, err := b.db.PinAdmission(ctx, audit.AdmissionPin{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion, ObjectKey: row.ObjectKey, Admitted: admitted})
 		if errors.Is(err, audit.ErrUnboundChecksumEvidence) {
 			fmt.Fprintf(b.out, "  %s: not signed: %v\n", label, err)
 			refused++
@@ -753,7 +753,11 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 		if err != nil {
 			return fmt.Errorf("pin the admission for %s: %w", row.ObjectKey, err)
 		}
-		ek, err := b.emit.Emit(ctx, st, attest.Pin{
+		// The emitter selects the admission by object key; only the comparison
+		// just made may stand behind a verified checksum database row.
+		emit := *b.emit
+		emit.Admissions = audit.ComparedAdmissions{Reader: b.db, SHA256: row.Value, Compared: compared}
+		ek, err := emit.Emit(ctx, st, attest.Pin{
 			Type: row.PkgType, Name: row.PkgName, Version: row.PkgVersion, ObjectKey: row.ObjectKey,
 			SHA256: row.Value, RequiredBy: requiredBy, Outcome: outcome,
 		})
@@ -776,23 +780,24 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 	return nil
 }
 
-// compareGomod returns the newest admitted row for a Go module's .zip or .mod
-// when that row says the checksum database verified the version and has not
-// yet been attached to this object, after comparing the object's stored bytes
-// with the hash the row recorded. A row like that was decided by a lookup, an
-// import or a fetch of some other file, none of which read these bytes, so
-// signing them under it would claim a comparison nobody made. Any other
-// object, row or outcome returns nil and pins as before. A disagreement, or
-// stored bytes that no longer hash to the pin, is an error and nothing is
-// attached.
-func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row audit.StoredChecksum) (*audit.Admission, error) {
+// compareGomod holds a Go module's stored .zip or .mod to the newest admitted
+// row for its version, when that row says the checksum database verified it,
+// and returns the row to pin under and the comparison the signer may rely on.
+// The row may have been decided by a lookup, an import or a fetch of other
+// bytes under the same key, none of which read these, so the stored bytes are
+// compared with the hash it recorded whether or not it already names this
+// object. A .info is outside the log and stands on the row as it is. Any other
+// object, row or outcome returns nils, and nothing verified is signed for it.
+// A disagreement, or stored bytes that no longer hash to the pin, is an error
+// and nothing is attached.
+func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row audit.StoredChecksum) (*audit.Admission, *audit.ChecksumComparison, error) {
 	ext := path.Ext(row.ObjectKey)
-	if row.PkgType != manifest.TypeGomod || (ext != ".zip" && ext != ".mod") {
-		return nil, nil
+	if row.PkgType != manifest.TypeGomod || (ext != ".zip" && ext != ".mod" && ext != ".info") {
+		return nil, nil, nil
 	}
 	rows, err := b.db.Admissions(ctx, audit.AdmissionFilter{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion})
 	if err != nil {
-		return nil, fmt.Errorf("read the admissions for %s@%s: %w", row.PkgName, row.PkgVersion, err)
+		return nil, nil, fmt.Errorf("read the admissions for %s@%s: %w", row.PkgName, row.PkgVersion, err)
 	}
 	var newest *audit.Admission
 	for i := range rows {
@@ -801,8 +806,8 @@ func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row
 			break
 		}
 	}
-	if newest == nil || newest.ObjectKey == row.ObjectKey {
-		return nil, nil
+	if newest == nil {
+		return nil, nil, nil
 	}
 	var signed *audit.ChecksumDatabase
 	for _, c := range newest.Checks {
@@ -811,7 +816,11 @@ func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row
 		}
 	}
 	if signed == nil {
-		return nil, nil
+		return nil, nil, nil
+	}
+	compared := &audit.ChecksumComparison{SHA256: row.Value, Checks: newest.Checks}
+	if ext == ".info" {
+		return newest, compared, nil
 	}
 	want := signed.ZipHash
 	if ext == ".mod" {
@@ -819,19 +828,15 @@ func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row
 	}
 	got, err := storedGomodHash(ctx, st, row)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if got != want {
-		return nil, fmt.Errorf("CHECKSUM DATABASE MISMATCH: %s@%s: the stored %s hashes to %s, but %s signed %s; nothing was attached or signed. Do not serve it: delete %s and fetch the version again, which compares what upstream serves with the log",
+		return nil, nil, fmt.Errorf("CHECKSUM DATABASE MISMATCH: %s@%s: the stored %s hashes to %s, but %s signed %s; nothing was attached or signed. Do not serve it: delete %s and fetch the version again, which compares what upstream serves with the log",
 			row.PkgName, row.PkgVersion, path.Base(row.ObjectKey), got, signed.Database, want, row.ObjectKey)
 	}
-	return newest, nil
+	return newest, compared, nil
 }
 
-// storedGomodHash is the go command's h1: hash of the stored object, a module
-// zip or a go.mod on its own, after checking the bytes still hash to the
-// SHA-256 the pin recorded: the statement names that digest, so the
-// comparison has to be of those bytes.
 func storedGomodHash(ctx context.Context, st storage.ObjectStore, row audit.StoredChecksum) (string, error) {
 	obj, err := st.GetStream(ctx, row.ObjectKey)
 	if err != nil {

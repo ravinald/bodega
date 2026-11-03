@@ -11,6 +11,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/attestsign"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -205,10 +206,21 @@ func (s *Server) setupAttestation() {
 // to the journal at ERROR naming the pin: those bytes are now served with no
 // signed statement behind them.
 func (s *Server) emitAttestation(ctx context.Context, store storage.ObjectStore, p attest.Pin) {
+	s.emitCompared(ctx, store, p, nil)
+}
+
+// emitCompared is emitAttestation for a pin whose bytes the caller fetched
+// under compared. The emitter re-reads the admission at signing time and
+// selects by object key, which two fetches of one key share, so a row
+// carrying a verified checksum database comparison is offered to it only
+// when compared vouches for this pin's digest under that row's evidence.
+func (s *Server) emitCompared(ctx context.Context, store storage.ObjectStore, p attest.Pin, compared *audit.ChecksumComparison) {
 	if s.attest == nil {
 		return
 	}
-	ek, err := s.attest.Emit(ctx, store, p)
+	e := *s.attest
+	e.Admissions = audit.ComparedAdmissions{Reader: s.auditDB, SHA256: p.SHA256, Compared: compared}
+	ek, err := e.Emit(ctx, store, p)
 	if err != nil {
 		s.logFor(ctx).Error("attestation not signed", "type", p.Type, "package", p.Name, "version", p.Version,
 			"key", p.ObjectKey, "error", err)

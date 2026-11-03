@@ -1769,6 +1769,18 @@ func (s *Server) pinFill(ctx context.Context, store storage.ObjectStore, fill fi
 	s.pinAdmitted(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256, admitted)
 }
 
+// fillComparison is what a fill vouches for at signing: the spooled bytes,
+// under the row it was admitted with. checksumDatabaseGate has compared a
+// .zip or .mod with that row's hashes by the time the fill pins, and refused
+// it on a disagreement; a .info is outside the log, so its row's evidence
+// stands for it as it is.
+func fillComparison(admitted *audit.Admission, sha256 string) *audit.ChecksumComparison {
+	if admitted == nil {
+		return nil
+	}
+	return &audit.ChecksumComparison{SHA256: sha256, Checks: admitted.Checks}
+}
+
 // pinAdmission attaches key to the newest admitted decision for the version,
 // and says so at WARN when there was none to attach to, then signs the
 // attestation for the pin.
@@ -1790,10 +1802,10 @@ func (s *Server) pinAdmitted(ctx context.Context, store storage.ObjectStore, typ
 		s.noteFor(ctx).Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
 			"type", typ, "package", name, "version", version, "key", key)
 	}
-	s.emitAttestation(ctx, store, attest.Pin{
+	s.emitCompared(ctx, store, attest.Pin{
 		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256,
 		RequiredBy: s.requiredBy(ctx, typ, name, version), Outcome: outcome,
-	})
+	}, fillComparison(admitted, sha256))
 }
 
 // proxyMalwareGate refuses a cache fill for a version OSV records as malware,

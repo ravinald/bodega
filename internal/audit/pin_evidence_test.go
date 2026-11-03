@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -120,6 +121,56 @@ func TestUnboundPinCannotTakeVerifiedChecksumEvidence(t *testing.T) {
 			}
 			if got := keys(); len(got) != 1 || got[0] != "gomod/zip" {
 				t.Fatalf("refused copy changed the rows: %q", got)
+			}
+		})
+	}
+}
+
+type fixedAdmissions []Admission
+
+func (f fixedAdmissions) Admissions(context.Context, AdmissionFilter) ([]Admission, error) {
+	return append([]Admission(nil), f...), nil
+}
+
+// A signer reading through ComparedAdmissions sees a verified checksum
+// database row only when the caller compared the digest it signs under that
+// row's evidence; every other row passes through.
+func TestComparedAdmissionsWithholdsVerifiedRowsNoComparisonVouchesFor(t *testing.T) {
+	sumdb := func(outcome, zip string) []AdmissionCheck {
+		return []AdmissionCheck{{Check: CheckChecksumDatabase, Status: CheckPass,
+			ChecksumDatabase: &ChecksumDatabase{Outcome: outcome, ZipHash: zip}}}
+	}
+	verified := Admission{ID: 2, Checks: sumdb(ProvenanceVerified, "h1:a")}
+	other := Admission{ID: 3, Checks: sumdb(ProvenanceVerified, "h1:b")}
+	excluded := Admission{ID: 1, Checks: sumdb(ProvenanceUnavailable, "")}
+	rows := fixedAdmissions{other, verified, excluded}
+	for _, tc := range []struct {
+		name     string
+		sha      string
+		compared *ChecksumComparison
+		want     []int64
+	}{
+		{"no comparison", "aa", nil, []int64{1}},
+		{"compared other bytes", "aa", &ChecksumComparison{SHA256: "bb", Checks: verified.Checks}, []int64{1}},
+		{"compared under other evidence", "aa", &ChecksumComparison{SHA256: "aa", Checks: excluded.Checks}, []int64{1}},
+		{"compared these bytes", "AA", &ChecksumComparison{SHA256: "aa", Checks: verified.Checks}, []int64{2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ComparedAdmissions{Reader: rows, SHA256: tc.sha, Compared: tc.compared}.Admissions(t.Context(), AdmissionFilter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []int64
+			for _, r := range got {
+				ids = append(ids, r.ID)
+			}
+			if len(ids) != len(tc.want) {
+				t.Fatalf("rows %v, want %v", ids, tc.want)
+			}
+			for i := range ids {
+				if ids[i] != tc.want[i] {
+					t.Fatalf("rows %v, want %v", ids, tc.want)
+				}
 			}
 		})
 	}

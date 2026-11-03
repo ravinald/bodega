@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -238,5 +239,38 @@ func TestFetchGomodRefetchesAPartialBuildRootUnderAVerifiedVerdict(t *testing.T)
 	}
 	if c := sumdbEntry(t, newestRow(t, f.adb, m.Path, m.Version)); c.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
 		t.Fatalf("outcome %s, want verified", c.ChecksumDatabase.Outcome)
+	}
+}
+
+// A builder pin vouches for a verified checksum database row only with the
+// SHA-256 compareGomodWithDatabase read for that file; a .info, or a row that
+// verified nothing, vouches with the pin's own digest.
+func TestFetchComparisonBindsTheComparedDigest(t *testing.T) {
+	row := func(outcome string) *audit.Admission {
+		return &audit.Admission{Decision: audit.AdmissionAdmitted, Checks: []audit.AdmissionCheck{{Check: audit.CheckChecksumDatabase,
+			ChecksumDatabase: &audit.ChecksumDatabase{Outcome: outcome}}}}
+	}
+	zip := manifest.GomodKey("example.com/widget", "v1.2.3", ".zip")
+	info := manifest.GomodKey("example.com/widget", "v1.2.3", ".info")
+	compared := withComparedDigests(context.Background(), map[string]string{".zip": "cc"})
+	for _, tc := range []struct {
+		name     string
+		ctx      context.Context
+		admitted *audit.Admission
+		key      string
+		want     string
+	}{
+		{"no admission", compared, nil, zip, ""},
+		{"verified, nothing compared", context.Background(), row(audit.ProvenanceVerified), zip, ""},
+		{"verified, compared", compared, row(audit.ProvenanceVerified), zip, "cc"},
+		{"verified .info", context.Background(), row(audit.ProvenanceVerified), info, "pin"},
+		{"excluded", context.Background(), row(audit.ProvenanceUnavailable), zip, "pin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fetchComparison(tc.ctx, tc.admitted, tc.key, "pin")
+			if (got == nil) != (tc.want == "") || (got != nil && got.SHA256 != tc.want) {
+				t.Fatalf("comparison %+v, want digest %q", got, tc.want)
+			}
+		})
 	}
 }

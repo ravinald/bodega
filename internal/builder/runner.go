@@ -295,8 +295,9 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	if c.AuditDB == nil || key == "" {
 		return
 	}
+	admitted := fetchAdmissionFrom(ctx, typ, name, version)
 	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key,
-		Admitted: fetchAdmissionFrom(ctx, typ, name, version)})
+		Admitted: admitted})
 	switch {
 	case err != nil:
 		c.logf("  WARNING: %s/%s@%s: admission row not updated with object key %s: %v", typ, name, version, key, err)
@@ -304,10 +305,15 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	case outcome == audit.PinUnadmitted:
 		c.logf("  WARNING: %s/%s@%s: pinned %s with no admission decision on record; recorded it as not_evaluated", typ, name, version, key)
 	}
-	e := c.attestEmitter()
-	if e == nil {
+	shared := c.attestEmitter()
+	if shared == nil {
 		return
 	}
+	// The emitter re-reads the admission by object key, which another fetch of
+	// the same key shares; only this fetch's comparison may stand behind a
+	// verified checksum database row (audit.ComparedAdmissions).
+	e := *shared
+	e.Admissions = audit.ComparedAdmissions{Reader: c.AuditDB, SHA256: sha256, Compared: fetchComparison(ctx, admitted, key, sha256)}
 	// The envelope is written into the build tree under the key it is stored
 	// at, and travels with its artifact on upload: the fetch runs before any
 	// backend is chosen for the bytes, so there is nowhere else it could go
