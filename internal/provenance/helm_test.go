@@ -677,3 +677,70 @@ func TestHelmKeyringPacketScanAccountsForEveryByte(t *testing.T) {
 type nopCloser struct{ *bytes.Buffer }
 
 func (nopCloser) Close() error { return nil }
+
+func TestReviewHelmRejectsUnreadContainerBytes(t *testing.T) {
+	key := newHelmKey(t, nil)
+	public, err := os.ReadFile(writeHelmKeyring(t, false, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	if err := key.SerializePrivate(&secret, nil); err != nil {
+		t.Fatal(err)
+	}
+	var armored bytes.Buffer
+	aw, err := armor.EncodeWithChecksumOption(&armored, openpgp.PublicKeyType, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := aw.Write(public); err != nil {
+		t.Fatal(err)
+	}
+	if err := aw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	footer := []byte("-----END PGP PUBLIC KEY BLOCK-----")
+	armorTail := func(tail []byte) []byte {
+		return bytes.Replace(armored.Bytes(), footer, bytes.Join([][]byte{tail, footer}, []byte("\n")), 1)
+	}
+	var compressed bytes.Buffer
+	cw, err := packet.SerializeCompressed(nopCloser{&compressed}, packet.CompressionZLIB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cw.Write(public); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	op, err := packet.NewOpaqueReader(bytes.NewReader(compressed.Bytes())).Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op.Contents = append(op.Contents, secret.Bytes()...)
+	var compressedTail bytes.Buffer
+	compressedTail.Write(public)
+	if err := op.Serialize(&compressedTail); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"private packets after armor checksum", armorTail(secret.Bytes())},
+		{"unread text after armor checksum", armorTail([]byte("this section was never read"))},
+		{"private packets after compressed stream", compressedTail.Bytes()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "keyring.gpg")
+			if err := os.WriteFile(file, tc.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			keys, err := LoadHelmKeyring(file, "https://charts.example.com/")
+			if err == nil || !strings.Contains(err.Error(), file) || !strings.Contains(err.Error(), "helm_keyrings") {
+				t.Fatalf("keyring with unread container bytes: keys=%d error=%v; want refusal naming %s and helm_keyrings", len(keys), err, file)
+			}
+		})
+	}
+}

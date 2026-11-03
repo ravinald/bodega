@@ -2,8 +2,11 @@ package provenance
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,7 +20,6 @@ import (
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
-	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"gopkg.in/yaml.v3"
@@ -80,10 +82,10 @@ func LoadHelmKeyring(file, prefix string) (openpgp.EntityList, error) {
 // in it carries private material.
 //
 // Every byte of the file is accounted for: each armored block is decoded on
-// its own, since armor.Decode stops at the first block's footer, and any bytes
-// outside a block are read as a binary keyring. Reading only the armor would
-// let a private key concatenated before, between or after the blocks load
-// unseen.
+// its own and line by line through its footer, and any bytes outside a block
+// are read as a binary keyring. Reading only the armor would let a private
+// key concatenated before, between or after the blocks, or inside one past
+// its checksum, load unseen.
 func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
 	var keys openpgp.EntityList
 	var parseErr error
@@ -102,22 +104,18 @@ func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
 				label = "binary keyring"
 			}
 		} else {
-			blk, err := armor.Decode(bytes.NewReader(seg.data))
+			blockType, body, err := decodeArmorStrict(seg.data)
 			if err != nil {
 				return nil, false, fmt.Errorf("%s: %w", label, err)
 			}
-			if blk.Type == openpgp.PrivateKeyType {
+			if blockType == openpgp.PrivateKeyType {
 				return nil, true, nil
 			}
-			body, err := io.ReadAll(blk.Body)
-			if err != nil {
-				return nil, false, fmt.Errorf("%s: %w", label, err)
-			}
-			if blk.Type != openpgp.PublicKeyType {
+			if blockType != openpgp.PublicKeyType {
 				if private, _ := packetsHoldPrivate(body); private {
 					return nil, true, nil
 				}
-				note(fmt.Errorf("%s is a %q, not a %q", label, blk.Type, openpgp.PublicKeyType))
+				note(fmt.Errorf("%s is a %q, not a %q", label, blockType, openpgp.PublicKeyType))
 				continue
 			}
 			raw = body
@@ -232,20 +230,139 @@ func scanPackets(r io.Reader, depth int) (bool, error) {
 			if depth >= maxCompressedDepth {
 				return false, fmt.Errorf("compressed packets nest deeper than %d", maxCompressedDepth)
 			}
-			p, err := op.Parse()
+			inner, err := decompressExact(op.Contents)
 			if err != nil {
 				return false, fmt.Errorf("reading compressed packet: %w", err)
 			}
-			c, ok := p.(*packet.Compressed)
-			if !ok {
-				return false, fmt.Errorf("compressed packet did not parse")
-			}
-			private, err := scanPackets(c.Body, depth+1)
+			private, err := scanPackets(bytes.NewReader(inner), depth+1)
 			if private || err != nil {
 				return private, err
 			}
 		}
 	}
+}
+
+// maxKeyringDecompressed caps what one compressed keyring packet may expand
+// to; a public keyring is kilobytes, and the cap stops a small file from
+// expanding without bound.
+const maxKeyringDecompressed = 16 << 20
+
+// decompressExact decompresses one compressed packet's body and refuses it
+// unless the stream consumed every byte of that body. go-crypto's own reader
+// stops at the end of the deflate stream and drops whatever the packet carries
+// after it, so bytes there would load without ever being scanned. The stdlib
+// readers take a bytes.Reader as an io.ByteReader and never read past their
+// stream, which makes the leftover count exact. bzip2 is refused: its reader
+// looks for a further stream after the first, so it cannot show where its
+// input ended, and `gpg --export` writes no compressed packets at all.
+func decompressExact(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return nil, errors.New("the packet names no compression algorithm")
+	}
+	src := bytes.NewReader(body[1:])
+	var r io.Reader
+	switch algo := packet.CompressionAlgo(body[0]); algo {
+	case packet.CompressionNone:
+		r = src
+	case packet.CompressionZIP:
+		fr := flate.NewReader(src)
+		defer fr.Close()
+		r = fr
+	case packet.CompressionZLIB:
+		zr, err := zlib.NewReader(src)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		r = zr
+	default:
+		return nil, fmt.Errorf("compression algorithm %d is not accepted in a keyring; export it again with `gpg --export`, which does not compress", algo)
+	}
+	out, err := io.ReadAll(io.LimitReader(r, maxKeyringDecompressed+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxKeyringDecompressed {
+		return nil, fmt.Errorf("it expands past %d bytes", maxKeyringDecompressed)
+	}
+	if n := src.Len(); n > 0 {
+		return nil, fmt.Errorf("%d bytes follow the end of the compressed stream inside the packet", n)
+	}
+	return out, nil
+}
+
+// decodeArmorStrict decodes one ASCII-armored block, from its header line
+// through its footer, and refuses it unless every line is accounted for:
+// header, armor headers, a blank line, base64 data, an optional CRC-24 line
+// that must match, and a footer naming the same type. armor.Decode stops at
+// the checksum line and never reads what sits between it and the footer, so
+// anything placed there would load unseen.
+func decodeArmorStrict(seg []byte) (string, []byte, error) {
+	lines := strings.Split(string(seg), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t\r")
+	}
+	begin, ok := strings.CutPrefix(lines[0], "-----BEGIN ")
+	blockType, ok2 := strings.CutSuffix(begin, "-----")
+	if !ok || !ok2 || blockType == "" {
+		return "", nil, errors.New("the armor header line is malformed")
+	}
+	footer := "-----END " + blockType + "-----"
+	if len(lines) < 3 || lines[len(lines)-1] != footer {
+		return "", nil, fmt.Errorf("the block does not end on the line %q", footer)
+	}
+	rest := lines[1 : len(lines)-1]
+	i := 0
+	for ; i < len(rest) && rest[i] != ""; i++ {
+		if !strings.Contains(rest[i], ": ") {
+			return "", nil, fmt.Errorf("armor header line %d %q is not a \"Key: value\" header", i+2, rest[i])
+		}
+	}
+	if i == len(rest) {
+		return "", nil, errors.New("no blank line separates the armor headers from the data")
+	}
+	data := rest[i+1:]
+	var crcLine string
+	if n := len(data); n > 0 && len(data[n-1]) == 5 && data[n-1][0] == '=' {
+		crcLine, data = data[n-1], data[:n-1]
+	}
+	var b64 strings.Builder
+	for j, l := range data {
+		if strings.HasPrefix(l, "=") {
+			return "", nil, fmt.Errorf("armor data line %d %q is not base64 data; nothing may sit between the data and the footer but one checksum line", j+1, l)
+		}
+		b64.WriteString(l)
+	}
+	body, err := base64.StdEncoding.Strict().DecodeString(b64.String())
+	if err != nil {
+		return "", nil, fmt.Errorf("armor data is not valid base64: %w", err)
+	}
+	if crcLine != "" {
+		sum, err := base64.StdEncoding.Strict().DecodeString(crcLine[1:])
+		if err != nil || len(sum) != 3 {
+			return "", nil, fmt.Errorf("armor checksum line %q is not valid base64", crcLine)
+		}
+		want := uint32(sum[0])<<16 | uint32(sum[1])<<8 | uint32(sum[2])
+		if got := crc24(body); got != want {
+			return "", nil, fmt.Errorf("armor checksum %06x does not match the data (%06x)", want, got)
+		}
+	}
+	return blockType, body, nil
+}
+
+// crc24 is the OpenPGP armor checksum (RFC 9580 section 6.1).
+func crc24(b []byte) uint32 {
+	crc := uint32(0xB704CE)
+	for _, c := range b {
+		crc ^= uint32(c) << 16
+		for range 8 {
+			crc <<= 1
+			if crc&0x1000000 != 0 {
+				crc ^= 0x1864CFB
+			}
+		}
+	}
+	return crc & 0xFFFFFF
 }
 
 // OpenPGP packet tags (RFC 9580 section 5).
