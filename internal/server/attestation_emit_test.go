@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"log/slog"
@@ -93,6 +94,20 @@ func TestProxyFillSignsTheAttestation(t *testing.T) {
 	}
 	if st.Predicate.PolicyEvaluations.PolicyDigest["sha256"] == "" {
 		t.Errorf("policy digest missing: %+v", st.Predicate.PolicyEvaluations)
+	}
+	// No manifest entry names a parent for a fill, and the fill path looks up
+	// nothing else, so the statement claims no direct dependency.
+	payload, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"resolvedFrom"`, `"requiredBy"`} {
+		if strings.Contains(string(payload), field) {
+			t.Errorf("fill of an uncataloged version carries %s: %s", field, payload)
+		}
+	}
+	if s.attest == nil || s.attest.Checksums == nil {
+		t.Error("server emitter has no checksum table to resolve parents from")
 	}
 }
 

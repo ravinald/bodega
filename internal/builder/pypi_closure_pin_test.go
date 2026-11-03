@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -316,5 +318,89 @@ func TestParsePypiArtifactName(t *testing.T) {
 			t.Errorf("ParsePypiArtifactName(%q) = %q, %q, %v; want %q, %q, %v",
 				tc.base, dist, version, ok, tc.dist, tc.version, tc.ok)
 		}
+	}
+}
+
+// A closure wheel is the parent of each artifact its unconditional
+// Requires-Dist names. A marker-conditioned requirement parents nothing, and a
+// wheel whose METADATA cannot be read parents nothing and says so once. No pip
+// runs: the wheelhouse is written by hand.
+func TestPypiClosureParentsFromWheelMetadata(t *testing.T) {
+	house := t.TempDir()
+	write := func(file string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(house, file), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("app-1.0-py3-none-any.whl", pypiWheelBytes(t, pypiDist{name: "app", requires: []string{"lib>=1", `extra; python_version < "3"`}}, "1.0"))
+	write("lib-2.0-py3-none-any.whl", pypiWheelBytes(t, pypiDist{name: "lib"}, "2.0"))
+	write("extra-3.0-py3-none-any.whl", pypiWheelBytes(t, pypiDist{name: "extra"}, "3.0"))
+	write("broken-0.1-py3-none-any.whl", []byte("not a zip archive"))
+	arts, err := scanPypiWheelhouse(house)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestOf := map[string]string{}
+	for _, a := range arts {
+		digestOf[a.Dist] = a.Digest
+	}
+
+	var out strings.Builder
+	parents := pypiClosureParents(&out, house, arts)
+	want := []attest.Parent{{Ref: "pypi/app@1.0", SHA256: digestOf["app"]}}
+	if got := parents["lib"]; !slices.Equal(got, want) {
+		t.Errorf("lib parents = %+v, want %+v", got, want)
+	}
+	for _, dist := range []string{"extra", "app", "broken"} {
+		if got := parents[dist]; len(got) != 0 {
+			t.Errorf("%s parents = %+v, want none", dist, got)
+		}
+	}
+	if len(parents) != 1 {
+		t.Errorf("parents = %+v, want lib only", parents)
+	}
+	var warnings []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "WARNING") {
+			warnings = append(warnings, line)
+		}
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "broken-0.1-py3-none-any.whl") {
+		t.Errorf("warnings = %q, want one naming broken-0.1-py3-none-any.whl", warnings)
+	}
+
+	// The parents reach the attestation pinPypiClosure signs for lib.
+	attestKey(t)
+	c, _ := admissionConfig(t, true)
+	c.BuildRoot = t.TempDir()
+	c.Stdout = io.Discard
+	if err := c.pinPypiClosure(t.Context(), nil, arts, house, parents); err != nil {
+		t.Fatal(err)
+	}
+	var lib pypiArtifact
+	for _, a := range arts {
+		if a.Dist == "lib" {
+			lib = a
+		}
+	}
+	paths := []ArtifactPath{{Local: "/dev/null", ObjectKey: lib.Key(), Package: "lib", Version: "2.0"}}
+	AttachAttestations(c, manifest.TypePypi, paths)
+	if len(paths[0].Attestations) != 1 {
+		t.Fatalf("attestations beside %s = %v, want 1", lib.Key(), paths[0].Attestations)
+	}
+	data, err := os.ReadFile(paths[0].Attestations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, st, err := attest.ParseEnvelope(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf := st.Predicate.ResolvedFrom; rf == nil || rf.Subject["sha256"] != digestOf["app"] {
+		t.Errorf("lib resolvedFrom = %+v, want app's digest %s", rf, digestOf["app"])
+	}
+	if rb := st.Predicate.RequiredBy; len(rb) != 1 || rb[0].Ref != "pypi/app@1.0" {
+		t.Errorf("lib requiredBy = %+v", rb)
 	}
 }

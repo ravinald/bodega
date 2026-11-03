@@ -7,7 +7,7 @@ bodega is built against two tracks of [SLSA](https://slsa.dev), and sits at a di
 | [Dependency track](https://slsa.dev/spec/draft/dependency-track) | the third-party packages bodega admits and serves | Level 2 is the target, met with the gaps listed below. Level 3 is out of scope by design. |
 | [Build track](https://slsa.dev/spec/v1.2/build-track-basics)     | the release binaries of bodega itself             | Level 2 by construction. Level 3 is the aim and is not yet proven.                        |
 
-The Dependency track is a working draft: the page says "This document may be modified, replaced, or discarded at any time", and it is not part of SLSA 1.2. bodega tracks it at [`4d3f9d44`](https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md) of slsa-framework/slsa, read on November 2, 2026 (`DraftRevision` in `internal/attest/attest.go`); [Spec drift](#spec-drift) lists where bodega still differs.
+The Dependency track is a working draft: the page says "This document may be modified, replaced, or discarded at any time", and it is not part of SLSA 1.2. bodega tracks it at [`4d3f9d44`](https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md) of slsa-framework/slsa, read on November 2, 2026 (`DraftRevision` in `internal/attest/attest.go`); [Spec drift](#spec-drift) says how bodega follows the draft as it changes.
 
 ## Dependency track Level 2
 
@@ -30,7 +30,7 @@ These are where bodega falls short of Level 2 as the draft reads today. Each one
 - **Unsigned when the key or the table is missing.** With no attestation key installed, or with `audit_sink` set to `syslog` or `jsonl`, nothing is signed. The server says so once at startup, and the artifact is still served. By design: installing the key and choosing the audit store are the operator's decisions.
 - **Clone-mode git carries no upstream digest.** bodega builds the bundle locally at package time, so there are no upstream bytes to pin, and `git bundle create` is not byte-for-byte reproducible. A git entry fetched as a release archive is pinned normally. By design; [Threat model](threat-model.md) explains the boundary.
 - **Publisher signatures are verified for npm and GitHub releases only.** PyPI attestations (PEP 740), the Go checksum database and Helm `.prov` files are not checked at admission, so those types always record `unavailable`. The go command still verifies modules against the checksum database bodega relays. Tracked in [#273](https://github.com/ravinald/bodega/issues/273) (PyPI), [#274](https://github.com/ravinald/bodega/issues/274) (Go) and [#275](https://github.com/ravinald/bodega/issues/275) (Helm).
-- **`resolvedFrom` names the parent, not its digest.** It lists, by name, the packages a catalog entry records as requiring the artifact, so an artifact with no catalog entry, such as most proxy fills, records none. The draft now asks for the direct dependency's digest. Tracked in [#276](https://github.com/ravinald/bodega/issues/276).
+- **`resolvedFrom` is absent where bodega cannot establish the parent's digest.** The draft requires it for a transitive dependency at L2. bodega leaves it out of a proxy fill of a version with no manifest entry, whose parent the server never sees; of a child signed before its parent had a SHA-256 pinned, because the envelope is not re-signed and `bodega attest backfill` skips an object that already has one; of a reference whose type and name hold more than one distinct pinned SHA-256; of a pypi closure member whose only parents are source distributions or marker-conditioned requirements; and of every statement signed before parent digests were recorded. `requiredBy` names each such parent with the reason. [Attestations](usage.md#attestations) lists the cases.
 - **The build side is the operator's.** Level 2 also requires the consuming build to resolve only through the platform, with versions pinned. `bodega doctor --configure` and the [setup script](usage.md#setup-script) write that configuration, and `bodega pin` pins a host, but bodega cannot see a build it is not asked to serve. By design: the requirement falls on the ingestor, not the platform.
 
 ## Beyond Level 2: bypass detection
@@ -71,10 +71,6 @@ What is not yet proven, tracked in [#278](https://github.com/ravinald/bodega/iss
 
 ## Spec drift
 
-The draft changed after bodega's predicate was written. Where they differ today, tracked in [#277](https://github.com/ravinald/bodega/issues/277):
-
-| The draft now says                                  | bodega emits      |
-| --------------------------------------------------- | ----------------- |
-| `resolvedFrom` holds the direct dependency's digest | the parent's name |
+The draft changed after bodega's predicate was written. Each change is tracked in [#277](https://github.com/ravinald/bodega/issues/277), and at the revision `DraftRevision` names, every field bodega emits under the draft's name follows the draft. `requiredBy` is bodega's own addition beside them.
 
 The predicate type, `https://slsa.dev/dependency/v1`, is one constant in `internal/attest/attest.go`, so a rename costs one line. Field changes need a re-emit, which the [decision to track the draft](design.md#attestations) accepted as the price of using it before approval.

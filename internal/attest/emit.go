@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +31,24 @@ type AdmissionReader interface {
 	Admissions(ctx context.Context, f audit.AdmissionFilter) ([]audit.Admission, error)
 }
 
+// ChecksumLister is the audit checksum table's read surface: the pinned
+// digests a parent reference resolves against.
+type ChecksumLister interface {
+	ListChecksums(ctx context.Context, pkgType, pkgName string) ([]audit.StoredChecksum, error)
+}
+
+// Parent is a direct dependency whose digest the caller already holds, such
+// as a wheel in the same pypi closure. Ref is pypi/{dist}@{version} or
+// another {type}/{name}@{version}.
+type Parent struct {
+	Ref    string
+	SHA256 string
+}
+
+// noChecksumTable is the reason every catalog reference carries when the
+// emitter has no table to look parents up in.
+const noChecksumTable = "no checksum table to resolve the parent from"
+
 // Pin is one digest pinned under one object key: what an envelope is about.
 type Pin struct {
 	Type, Name, Version string
@@ -37,6 +57,9 @@ type Pin struct {
 	// RequiredBy is the manifest entry's RequiredBy: the packages whose
 	// import brought this version in.
 	RequiredBy []string
+	// Parents are direct dependencies whose digest the caller established
+	// itself; they join requiredBy without a checksum lookup.
+	Parents []Parent
 	// Outcome is what PinAdmission reported for this pin.
 	Outcome audit.PinOutcome
 }
@@ -47,6 +70,9 @@ type Emitter struct {
 	// so a server reload is seen by the next pin.
 	Signer     func() attestsign.Signer
 	Admissions AdmissionReader
+	// Checksums resolves each RequiredBy reference to its parent's pinned
+	// sha256 at signing time. Nil marks every reference unavailable.
+	Checksums  ChecksumLister
 	PlatformID string
 	// Now stamps ingestedAt; nil means time.Now.
 	Now func() time.Time
@@ -102,7 +128,7 @@ func (e *Emitter) emit(ctx context.Context, store storage.ObjectStore, p Pin, de
 	if e.Now != nil {
 		now = e.Now
 	}
-	env, err := Sign(signer, NewStatement(p, row, e.PlatformID, now()))
+	env, err := Sign(signer, newStatement(p, row, e.PlatformID, now(), requiredByOf(ctx, e.Checksums, p)))
 	if err != nil {
 		return "", err
 	}
@@ -154,8 +180,13 @@ func (e *Emitter) admission(ctx context.Context, p Pin, decision string) (audit.
 		ErrRefused, p.Type, p.Name, p.Version, strings.Join(named, ", "), p.ObjectKey)
 }
 
-// NewStatement builds the statement for p under the decision row.
+// NewStatement builds the statement for p under the decision row. It has no
+// checksum table, so each of p.RequiredBy is unavailable; Emit resolves them.
 func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time.Time) Statement {
+	return newStatement(p, row, platformID, ingestedAt, requiredByOf(context.Background(), nil, p))
+}
+
+func newStatement(p Pin, row audit.Admission, platformID string, ingestedAt time.Time, refs []RequiredByRef) Statement {
 	pe := PolicyEvaluations{
 		PolicyDigest: map[string]string{},
 		Decision:     row.Decision,
@@ -168,10 +199,6 @@ func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time
 		pe.PolicyDigest[alg] = hex
 	}
 	upstream := AvailabilityOf(row.Checks)
-	var from []ResourceDescriptor
-	for _, r := range p.RequiredBy {
-		from = append(from, ResourceDescriptor{Name: r})
-	}
 	return Statement{
 		Type: StatementType,
 		Subject: []ResourceDescriptor{{
@@ -184,12 +211,108 @@ func NewStatement(p Pin, row audit.Admission, platformID string, ingestedAt time
 			IngestionPlatform:  Platform{ID: platformID},
 			IngestedAt:         ingestedAt.UTC(),
 			PolicyEvaluations:  pe,
-			ResolvedFrom:       from,
+			ResolvedFrom:       resolvedFromOf(refs),
+			RequiredBy:         refs,
 			UpstreamProvenance: upstream,
 			PublisherSignature: PublisherSignatureOf(upstream),
 			Integrity:          Integrity{Method: IntegrityMethodHash, Result: ResultVerified},
 		},
 	}
+}
+
+// requiredByOf lists p's catalog references in manifest order, each resolved
+// against src, then p.Parents sorted by ref, dropping an entry that repeats an
+// earlier one.
+func requiredByOf(ctx context.Context, src ChecksumLister, p Pin) []RequiredByRef {
+	var out []RequiredByRef
+	seen := map[[2]string]bool{}
+	add := func(r RequiredByRef) {
+		key := [2]string{r.Ref, "unavailable:" + r.Unavailable}
+		if r.Digest != nil {
+			key[1] = "sha256:" + r.Digest["sha256"]
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	for _, ref := range p.RequiredBy {
+		add(resolveRef(ctx, src, ref))
+	}
+	parents := append([]Parent(nil), p.Parents...)
+	sort.SliceStable(parents, func(i, j int) bool { return parents[i].Ref < parents[j].Ref })
+	for _, pa := range parents {
+		if pa.SHA256 == "" {
+			add(RequiredByRef{Ref: pa.Ref, Unavailable: fmt.Sprintf("no sha256 was established for %s", pa.Ref)})
+			continue
+		}
+		add(RequiredByRef{Ref: pa.Ref, Digest: map[string]string{"sha256": strings.ToLower(pa.SHA256)}})
+	}
+	return out
+}
+
+// resolvedFromOf is the digest of the first reference that carries one.
+func resolvedFromOf(refs []RequiredByRef) *ResolvedFromRef {
+	for _, r := range refs {
+		if r.Digest != nil {
+			return &ResolvedFromRef{Subject: map[string]string{"sha256": r.Digest["sha256"]}}
+		}
+	}
+	return nil
+}
+
+// resolveRef finds the one sha256 pinned for a catalog reference. The forms
+// are {type}/{name}@{version}, {type}/{name} for every version (what apt
+// discovery records), and a bare {name}, which reads as git/{name} because a
+// bare required_by is how a git repository is named. Anything that does not
+// give exactly one distinct digest is unavailable, with the reason.
+func resolveRef(ctx context.Context, src ChecksumLister, ref string) RequiredByRef {
+	out := RequiredByRef{Ref: ref}
+	if src == nil {
+		out.Unavailable = noChecksumTable
+		return out
+	}
+	typ, rest, ok := strings.Cut(ref, "/")
+	if !ok {
+		typ, rest = manifest.TypeGit, ref
+	}
+	name, version, versioned := rest, "", false
+	// An npm scope opens with @, so only an @ past the first byte separates
+	// a version.
+	if i := strings.LastIndex(rest, "@"); i > 0 {
+		name, version, versioned = rest[:i], rest[i+1:], true
+	}
+	if typ == "" || name == "" {
+		out.Unavailable = fmt.Sprintf("reference %q names no package type and name to look a parent up by", ref)
+		return out
+	}
+	rows, err := src.ListChecksums(ctx, typ, name)
+	if err != nil {
+		out.Unavailable = fmt.Sprintf("reading the pinned checksums for %q failed: %v", ref, err)
+		return out
+	}
+	var digests []string
+	for _, r := range rows {
+		if r.PkgType != typ || r.PkgName != name || r.Value == "" || !strings.EqualFold(r.Algorithm, "sha256") {
+			continue
+		}
+		if versioned && r.PkgVersion != version {
+			continue
+		}
+		if d := strings.ToLower(r.Value); !slices.Contains(digests, d) {
+			digests = append(digests, d)
+		}
+	}
+	switch len(digests) {
+	case 0:
+		out.Unavailable = fmt.Sprintf("no sha256 is pinned for %q", ref)
+	case 1:
+		out.Digest = map[string]string{"sha256": digests[0]}
+	default:
+		out.Unavailable = fmt.Sprintf("%q matches %d distinct pinned sha256 digests, so none of them names the parent", ref, len(digests))
+	}
+	return out
 }
 
 // AvailabilityOf maps the upstream_provenance check of a row onto the

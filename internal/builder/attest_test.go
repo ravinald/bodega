@@ -77,11 +77,56 @@ func TestHostedPinSignsTheAttestation(t *testing.T) {
 			t.Errorf("%s: expected %s, observed %s", r.Check, r.Expected, r.Observed)
 		}
 	}
-	if rf := st.Predicate.ResolvedFrom; len(rf) != 1 || rf[0].Name != "widget" {
-		t.Errorf("resolvedFrom = %+v, want widget", rf)
+	// No git/widget digest is pinned, so the reference is kept with the reason
+	// and resolvedFrom is left out rather than guessed.
+	if rb := st.Predicate.RequiredBy; len(rb) != 1 || rb[0].Ref != "widget" || rb[0].Digest != nil || rb[0].Unavailable == "" {
+		t.Errorf("requiredBy = %+v, want one unavailable widget entry", rb)
+	}
+	if st.Predicate.ResolvedFrom != nil {
+		t.Errorf("resolvedFrom = %+v with no parent pinned", st.Predicate.ResolvedFrom)
 	}
 	if root := attestationTree(c.BuildRoot); filepath.Base(root)+"/" != manifest.AttestationPrefix {
 		t.Errorf("local tree %s does not mirror the key prefix %s", root, manifest.AttestationPrefix)
+	}
+}
+
+// A hosted pin whose parent is already pinned names the parent's digest in
+// resolvedFrom: the builder's emitter reads the same checksum table the pin
+// writes.
+func TestHostedPinResolvesTheParentDigest(t *testing.T) {
+	attestKey(t)
+	c, out := admissionConfig(t, true)
+	c.BuildRoot = t.TempDir()
+	parent := strings.Repeat("d", 64)
+	if err := c.AuditDB.StoreChecksum(t.Context(), "git/widget/v1.0.0.bundle", manifest.TypeGit, "widget", "v1.0.0", "sha256", parent, "build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnforcePolicy(t.Context(), manifest.TypeNpm, "minimist", manifest.VersionEntry{Version: "1.2.8"}); err != nil {
+		t.Fatal(err)
+	}
+	key := manifest.NpmTarballKey("minimist", "1.2.8")
+	cs := &manifest.Checksum{Algorithm: "sha256", Value: strings.Repeat("c", 64)}
+	if err := c.pinArtifactDigest(t.Context(), key, manifest.TypeNpm, "minimist", "1.2.8", cs, []string{"widget"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "ERROR") {
+		t.Fatalf("pin output: %s", out.String())
+	}
+	paths := []ArtifactPath{{Local: "/dev/null", ObjectKey: key, Package: "minimist", Version: "1.2.8"}}
+	AttachAttestations(c, manifest.TypeNpm, paths)
+	if len(paths[0].Attestations) != 1 {
+		t.Fatalf("attestations beside %s = %v, want 1", key, paths[0].Attestations)
+	}
+	data, err := os.ReadFile(paths[0].Attestations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, st, err := attest.ParseEnvelope(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf := st.Predicate.ResolvedFrom; rf == nil || rf.Subject["sha256"] != parent {
+		t.Errorf("resolvedFrom = %+v, want subject sha256 %s", rf, parent)
 	}
 }
 

@@ -260,7 +260,7 @@ var fetchCheckers = admit.VersionCheckers
 // the attestation for it. A pin no decision preceded is said out loud: those
 // bytes reached the store with no admission behind them, and the row written
 // for them says not_evaluated, which is what the attestation then carries.
-func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha256 string, requiredBy []string) {
+func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha256 string, requiredBy []string, parents []attest.Parent) {
 	if c.AuditDB == nil || key == "" {
 		return
 	}
@@ -281,7 +281,7 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	// backend is chosen for the bytes, so there is nowhere else it could go
 	// that stays beside them.
 	ek, err := e.Emit(ctx, storage.NewLocal(c.rootFor(typ)), attest.Pin{
-		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256, RequiredBy: requiredBy, Outcome: outcome,
+		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256, RequiredBy: requiredBy, Parents: parents, Outcome: outcome,
 	})
 	switch {
 	case err != nil:
@@ -316,6 +316,7 @@ func (c *Config) attestEmitter() *attest.Emitter {
 		c.attester = &attest.Emitter{
 			Signer:     func() attestsign.Signer { return signer },
 			Admissions: c.AuditDB,
+			Checksums:  c.AuditDB,
 			PlatformID: c.app.ResolveAttestationPlatformID(),
 		}
 	})
