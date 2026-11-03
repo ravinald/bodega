@@ -53,6 +53,9 @@ type Evidence struct {
 	// trusted root could be had, so no bundle was checked. The fix is the
 	// operator's, not the package's, and a refusal says so.
 	NoTrustedRoot bool
+	// NoKeyring is set on an unknown outcome for a Helm chart whose .prov
+	// was read and not checked, because no helm_keyrings prefix matches it.
+	NoKeyring bool
 	// PublishedAt is when the registry says the version checked was
 	// published, nil when it does not say. Published is the same for every
 	// version it lists; a version absent from it has an unknown time. Only
@@ -121,6 +124,9 @@ type Verifier struct {
 	GitHubWeb string
 	GitHubAPI string
 	Root      RootFunc
+	// HelmKeyrings is helm_keyrings: a chart repository URL prefix mapped to
+	// the keyring a .prov beside a chart under it is verified against.
+	HelmKeyrings map[string]string
 }
 
 // NewVerifier returns a verifier against the public registries, with the
@@ -344,6 +350,24 @@ var errNotFound = errors.New("not found")
 // get reads url, refusing a body over limit bytes rather than returning a
 // truncated one, which would parse as a document that is not there.
 func (v *Verifier) get(ctx context.Context, url string, header http.Header, limit int64) ([]byte, error) {
+	resp, err := v.open(ctx, url, header)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
+	}
+	return body, nil
+}
+
+// open sends a GET to url and returns the response when it is a 200, for the
+// caller to read and close.
+func (v *Verifier) open(ctx context.Context, url string, header http.Header) (*http.Response, error) {
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
 		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", url)
 	}
@@ -359,19 +383,13 @@ func (v *Verifier) get(ctx context.Context, url string, header http.Header, limi
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
+		resp.Body.Close()
 		return nil, fmt.Errorf("GET %s: %w", url, errNotFound)
 	case resp.StatusCode != http.StatusOK:
+		resp.Body.Close()
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
-	}
-	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
-	}
-	return body, nil
+	return resp, nil
 }

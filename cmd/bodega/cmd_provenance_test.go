@@ -48,6 +48,12 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 			t.Errorf("list does not show %q:\n%s", want, out)
 		}
 	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 0 && f[0] == "helm" && !strings.Contains(line, "warn (default)  yes") {
+			t.Errorf("helm is verified by the check, but list says:\n%s", line)
+		}
+	}
 
 	adb, err := audit.Open(adbPath)
 	if err != nil {
@@ -123,5 +129,26 @@ func TestServeRefusesAnUnusableTrustedRoot(t *testing.T) {
 				t.Errorf("serve with %s trusted root: %v", name, err)
 			}
 		})
+	}
+}
+
+// A keyring serve cannot read would leave every .prov under its prefix
+// unknown at admission, so serve refuses to start on it, naming the file.
+func TestServeRefusesAnUnreadableHelmKeyring(t *testing.T) {
+	dir := t.TempDir()
+	keyring := filepath.Join(dir, "charts.gpg")
+	body, _ := json.Marshal(map[string]any{
+		"storage_backend": "local", "storage_path": filepath.Join(dir, "storage"),
+		"manifest_dir": filepath.Join(dir, "manifests"), "log_dir": dir, "allow_plaintext": true,
+		"listen_addr": "127.0.0.1:0", "helm_keyrings": map[string]string{"https://charts.example.com/": keyring},
+	})
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigFile, cfgPath)
+	_, err := runRoot(t, "serve", "--quiet")
+	if err == nil || !strings.Contains(err.Error(), keyring) || !strings.Contains(err.Error(), "helm_keyrings") {
+		t.Errorf("serve with an unreadable helm keyring: %v", err)
 	}
 }

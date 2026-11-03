@@ -171,6 +171,14 @@ func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) err
 // moment bytes arrive, and an import can be months old: the row a pin attaches
 // its object key to should be the decision made when those bytes were fetched.
 func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve manifest.VersionEntry) error {
+	_, err := c.admitFetch(ctx, regType, name, ve)
+	return err
+}
+
+// admitFetch is EnforcePolicy returning the admission row it wrote, for a
+// fetch that holds its bytes to what the row verified. The row is empty when
+// no audit database is configured or the allow-list refused.
+func (c *Config) admitFetch(ctx context.Context, regType, name string, ve manifest.VersionEntry) (audit.Admission, error) {
 	candidate := policy.CandidateFor(regType, name, ve.URL)
 	version := ve.Version
 	if version == "" {
@@ -211,7 +219,7 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 		})
 	}
 	if c.AuditDB == nil {
-		return err
+		return audit.Admission{}, err
 	}
 
 	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone,
@@ -231,7 +239,7 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 	res := admit.Fetch(ctx, c.AuditDB, fetchCheckers(c.app, c.AuditDB), regType, name, ve, allow,
 		admit.Who{Actor: audit.CurrentActor()}, "")
 	if err != nil {
-		return err
+		return audit.Admission{}, err
 	}
 	for _, w := range res.Warns {
 		c.logf("  policy: %s/%s@%s: %s: %s (warn)", regType, name, version, w.Check, w.Reason)
@@ -245,9 +253,9 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve man
 			Status:     "policy_violation",
 			Details:    res.Block.Check + ": " + res.Block.Reason,
 		})
-		return fmt.Errorf("policy blocked %s@%s: %s: %s", name, version, res.Block.Check, res.Block.Reason)
+		return res.Admission, fmt.Errorf("policy blocked %s@%s: %s: %s", name, version, res.Block.Check, res.Block.Reason)
 	}
-	return nil
+	return res.Admission, nil
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age

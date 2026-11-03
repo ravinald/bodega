@@ -676,8 +676,9 @@ type readOnlyIntegrations struct{ integration.Store }
 func (readOnlyIntegrations) RecordIntegrationError(context.Context, string, string) error { return nil }
 
 // ProvenanceChecker builds the upstream provenance check: npm read from the
-// configured npm upstream when an entry names no registry, and the Sigstore
-// trusted root from sigstore_trusted_root, or TUF when that is unset.
+// configured npm upstream when an entry names no registry, the Sigstore
+// trusted root from sigstore_trusted_root, or TUF when that is unset, and Helm
+// .prov files verified against the keyrings helm_keyrings names.
 func ProvenanceChecker(cfg *config.Config, adb *audit.DB) *provenance.Checker {
 	// A nil *audit.DB inside the interface is not a nil interface.
 	var store provenance.Store
@@ -691,6 +692,9 @@ func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenan
 	v := NewProvenanceVerifier(cfg)
 	if cfg != nil && cfg.NpmUpstream != "" {
 		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
+	}
+	if cfg != nil {
+		v.HelmKeyrings = cfg.HelmKeyrings
 	}
 	return &provenance.Checker{Store: store, Verifier: v}
 }

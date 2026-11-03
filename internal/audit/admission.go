@@ -98,6 +98,11 @@ const (
 // clients.
 const DetailNoTrustedRoot = "no_trusted_root"
 
+// DetailNoKeyring is the Details key, true, on an unknown upstream provenance
+// result for a Helm chart whose .prov file was read and not checked, because
+// helm_keyrings names no keyring for the chart's repository.
+const DetailNoKeyring = "no_keyring"
+
 // UpstreamProvenance is what the upstream_provenance check verified. The
 // identity fields are empty unless a signature verified.
 type UpstreamProvenance struct {
@@ -107,6 +112,12 @@ type UpstreamProvenance struct {
 	BuilderID           string `json:"builder_id,omitempty"`
 	// BundleDigest is "sha256:<hex>" over the Sigstore bundle as fetched.
 	BundleDigest string `json:"bundle_digest,omitempty"`
+	// SignerFingerprint is the 40-hex-digit primary key fingerprint of the
+	// OpenPGP key that made a verified Helm .prov signature.
+	SignerFingerprint string `json:"signer_fingerprint,omitempty"`
+	// SubjectDigest is "sha256:<hex>" as a verified Helm .prov signed it for
+	// the chart archive.
+	SubjectDigest string `json:"subject_digest,omitempty"`
 }
 
 // Admission is one decision on one version.

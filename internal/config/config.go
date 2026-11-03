@@ -143,7 +143,12 @@ type Config struct {
 	// provenance is verified against, for a host that cannot reach Sigstore's
 	// TUF repository. Empty means fetch it through TUF. serve refuses to
 	// start when it names a file that is missing or does not parse.
-	SigstoreTrustedRoot    string                 `json:"sigstore_trusted_root,omitempty"`
+	SigstoreTrustedRoot string `json:"sigstore_trusted_root,omitempty"`
+	// HelmKeyrings maps a chart repository URL prefix to the OpenPGP public
+	// keyring a chart's .prov file beside it is verified against. The longest
+	// matching prefix wins. Load checks the form of each entry and never opens
+	// a file; serve loads every keyring before it binds.
+	HelmKeyrings           map[string]string      `json:"helm_keyrings,omitempty"`
 	ServerURL              string                 `json:"server_url,omitempty"` // bodega server this host pushes catalogs to; see ResolveServerURL
 	Token                  string                 `json:"token,omitempty"`      // bearer token for that server; $BODEGA_TOKEN wins
 	ProxyCacheEnabled      bool                   `json:"proxy_cache_enabled"`
@@ -1165,6 +1170,32 @@ func validateAptSigningKey(codename string, i int, up *AptUpstream) error {
 	return nil
 }
 
+// validateHelmKeyrings refuses a helm_keyrings prefix a chart URL could match
+// by accident, and a keyring path that is not absolute. The files themselves
+// are read where a chart is admitted, so a command that admits none does not
+// fail on one.
+func validateHelmKeyrings(m map[string]string) error {
+	for _, prefix := range slices.Sorted(maps.Keys(m)) {
+		u, err := url.Parse(prefix)
+		switch {
+		case err != nil:
+			return fmt.Errorf("helm_keyrings[%q]: the prefix does not parse as a URL: %v; write it as https://{host}/{path}/", prefix, err)
+		case u.Scheme != "https" && u.Scheme != "http":
+			return fmt.Errorf("helm_keyrings[%q]: the prefix must use the https or http scheme, the one the chart URLs it covers use", prefix)
+		case u.Host == "":
+			return fmt.Errorf("helm_keyrings[%q]: the prefix names no host; write it as https://{host}/{path}/", prefix)
+		case strings.ContainsAny(prefix, "?#"):
+			return fmt.Errorf("helm_keyrings[%q]: the prefix carries a query or fragment, which no chart URL it should cover starts with; drop everything from the ? or #", prefix)
+		case !strings.HasSuffix(prefix, "/"):
+			return fmt.Errorf("helm_keyrings[%q]: the prefix must end in /: without it, https://charts.example.com would also match https://charts.example.com.evil.net/; write %q", prefix, prefix+"/")
+		}
+		if path := m[prefix]; path == "" || !filepath.IsAbs(path) {
+			return fmt.Errorf("helm_keyrings[%q]: keyring path %q is not an absolute path; name the keyring file `gpg --export` wrote, from /", prefix, path)
+		}
+	}
+	return nil
+}
+
 // aptComponentPattern is what a component name may look like: what apt puts in
 // a path segment under dists/<codename>/, which covers "main", "non-free" and
 // "non-free-firmware".
@@ -1575,6 +1606,9 @@ type legacyConfig struct {
 func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig, verbose bool) (*Config, error) {
 	cfg, legacy, snap, err := loadFileConfig()
 	if err != nil {
+		return nil, err
+	}
+	if err := validateHelmKeyrings(cfg.HelmKeyrings); err != nil {
 		return nil, err
 	}
 	cfg.LocalConfig = localConfig

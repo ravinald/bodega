@@ -587,7 +587,7 @@ func TestOversizedBodyIsAnError(t *testing.T) {
 
 func TestUncoveredEcosystemsRecordWhy(t *testing.T) {
 	c := &Checker{Verifier: &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}, GitHubWeb: "https://github.com"}}
-	for _, typ := range []string{manifest.TypePypi, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeHelm,
+	for _, typ := range []string{manifest.TypePypi, manifest.TypeGomod, manifest.TypeCargo,
 		manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles} {
 		got := c.Check(context.Background(), &manifest.PackageManifest{Type: typ, Name: "x"}, &manifest.VersionEntry{Version: "1.0.0"})
 		if got.Provenance == nil || got.Provenance.Outcome != audit.ProvenanceUnavailable {
