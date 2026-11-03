@@ -9,6 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -172,8 +176,12 @@ func TestEmitSignsWhatTheRowSaysAndVerifies(t *testing.T) {
 	pr := st.Predicate
 	if pr.IngestionPlatform.ID != "https://bodega.example" || pr.PolicyEvaluations.PolicyDigest["sha256"] != strings.Repeat("ab", 32) ||
 		len(pr.ResolvedFrom) != 1 || pr.ResolvedFrom[0].Name != "widget" ||
-		pr.UpstreamProvenance.Status != StatusUnavailable || pr.PublisherSignature.Status != StatusUnavailable {
+		pr.UpstreamProvenance.Result != ResultNotAttempted || pr.PublisherSignature.Result != ResultUnverified {
 		t.Errorf("predicate = %+v", pr)
+	}
+	raw := rawPredicate(t, env)
+	if got, _ := json.Marshal(raw["integrity"]); string(got) != `{"method":"hash","result":"verified"}` {
+		t.Errorf("integrity = %s, want {\"method\":\"hash\",\"result\":\"verified\"}", got)
 	}
 	// The row lacks OSV and upstream provenance entries, so the statement
 	// says so rather than leaving them out.
@@ -348,9 +356,28 @@ func TestEmitNothingWithoutAKeyOrATable(t *testing.T) {
 	}
 }
 
-// The emitter fills upstreamProvenance and publisherSignature from the row's
-// upstream_provenance check, and a check that never ran says unavailable
-// whatever its entry holds.
+// rawPredicate decodes the signed payload of env as untyped JSON, so a test
+// sees the keys a consumer reads rather than what the Go struct tolerates.
+func rawPredicate(t *testing.T, env *Envelope) map[string]any {
+	t.Helper()
+	payload, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(payload, &st); err != nil {
+		t.Fatal(err)
+	}
+	pr, ok := st["predicate"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload has no predicate object: %s", payload)
+	}
+	return pr
+}
+
+// The emitter maps the row's upstream_provenance outcome onto the draft's
+// vocabulary, and a check that never ran says not-attempted (unverified in
+// publisherSignature) whatever its entry holds.
 func TestEmitCarriesTheUpstreamProvenanceOfTheRow(t *testing.T) {
 	ctx := context.Background()
 	verified := audit.UpstreamProvenance{
@@ -360,39 +387,103 @@ func TestEmitCarriesTheUpstreamProvenanceOfTheRow(t *testing.T) {
 		BuilderID:           "https://github.com/actions/runner/github-hosted",
 		BundleDigest:        "sha256:" + strings.Repeat("cd", 32),
 	}
+	mismatched := verified
+	mismatched.Outcome = audit.ProvenanceMismatch
+	mismatched.SourceRepositoryURI = "https://github.com/someone-else/lodash"
+	identity := map[string]any{
+		"sourceRepositoryUri": verified.SourceRepositoryURI, "workflowRef": verified.WorkflowRef,
+		"builderId": verified.BuilderID, "bundleDigest": map[string]any{"sha256": strings.Repeat("cd", 32)},
+	}
+	with := func(base map[string]any, id map[string]any) map[string]any {
+		out := map[string]any{}
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range id {
+			out[k] = v
+		}
+		return out
+	}
+	prov := func(outcome string) *audit.UpstreamProvenance { return &audit.UpstreamProvenance{Outcome: outcome} }
+	entry := func(status string, p *audit.UpstreamProvenance) []audit.AdmissionCheck {
+		return []audit.AdmissionCheck{{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: status, Provenance: p}}
+	}
+	mismatchID := with(identity, map[string]any{"sourceRepositoryUri": mismatched.SourceRepositoryURI})
 	cases := []struct {
-		name  string
-		check audit.AdmissionCheck
-		want  Availability
+		name                string
+		checks              []audit.AdmissionCheck
+		upstream, publisher map[string]any
 	}{
-		{"verified", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckPass, Provenance: &verified},
-			Availability{Status: audit.ProvenanceVerified, SourceRepositoryURI: verified.SourceRepositoryURI, WorkflowRef: verified.WorkflowRef,
-				BuilderID: verified.BuilderID, BundleDigest: map[string]string{"sha256": strings.Repeat("cd", 32)}}},
-		{"invalid", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckWarn,
-			Provenance: &audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}},
-			Availability{Status: audit.ProvenanceInvalid}},
-		{"not evaluated", audit.AdmissionCheck{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckNotEvaluated, Provenance: &verified},
-			Availability{Status: StatusUnavailable}},
+		{"verified", entry(audit.CheckPass, &verified),
+			with(map[string]any{"result": "verified"}, identity), with(map[string]any{"result": "verified"}, identity)},
+		{"invalid", entry(audit.CheckWarn, prov(audit.ProvenanceInvalid)),
+			map[string]any{"result": "failed"}, map[string]any{"result": "failed"}},
+		{"unavailable", entry(audit.CheckWarn, prov(audit.ProvenanceUnavailable)),
+			map[string]any{"availability": "unavailable"}, map[string]any{"availability": "unavailable"}},
+		{"unknown", entry(audit.CheckWarn, prov(audit.ProvenanceUnknown)),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"mismatch with a verified bundle", entry(audit.CheckWarn, &mismatched),
+			with(map[string]any{"result": "verified"}, mismatchID), with(map[string]any{"result": "verified"}, mismatchID)},
+		{"npm mismatch with no bundle", entry(audit.CheckWarn, prov(audit.ProvenanceMismatch)),
+			map[string]any{"availability": "unavailable"}, map[string]any{"availability": "unavailable"}},
+		{"not evaluated", entry(audit.CheckNotEvaluated, &verified),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"no entry", nil,
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
+		{"unrecognized outcome", entry(audit.CheckWarn, prov("missing")),
+			map[string]any{"result": "not-attempted"}, map[string]any{"result": "unverified"}},
 	}
 	for i, tc := range cases {
 		db := openAudit(t)
 		store := storage.NewMemory()
 		version := "4.17." + string(rune('0'+i))
 		key := manifest.NpmTarballKey("lodash", version)
-		admit(t, db, version, audit.AdmissionAdmitted, append(append([]audit.AdmissionCheck(nil), passing...), tc.check))
+		admit(t, db, version, audit.AdmissionAdmitted, append(append([]audit.AdmissionCheck(nil), passing...), tc.checks...))
 		ek, err := emitter(db, newSigner(t)).Emit(ctx, store, pin(t, db, version, key))
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		data, _ := store.Get(ctx, ek)
-		_, st, err := ParseEnvelope(data)
+		env, _, err := ParseEnvelope(data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for field, got := range map[string]Availability{"upstreamProvenance": st.Predicate.UpstreamProvenance, "publisherSignature": st.Predicate.PublisherSignature} {
-			if got.Status != tc.want.Status || got.SourceRepositoryURI != tc.want.SourceRepositoryURI || got.WorkflowRef != tc.want.WorkflowRef ||
-				got.BuilderID != tc.want.BuilderID || got.BundleDigest["sha256"] != tc.want.BundleDigest["sha256"] {
-				t.Errorf("%s: %s = %+v, want %+v", tc.name, field, got, tc.want)
+		raw := rawPredicate(t, env)
+		for field, want := range map[string]map[string]any{"upstreamProvenance": tc.upstream, "publisherSignature": tc.publisher} {
+			got, _ := json.Marshal(raw[field])
+			exp, _ := json.Marshal(want)
+			if string(got) != string(exp) {
+				t.Errorf("%s: %s = %s, want %s", tc.name, field, got, exp)
+			}
+		}
+	}
+}
+
+// No statement NewStatement builds carries the pre-E27 status key, whatever
+// the row's outcome, in either provenance object.
+func TestEmitNeverWritesALegacyStatus(t *testing.T) {
+	for _, outcome := range []string{audit.ProvenanceVerified, audit.ProvenanceInvalid, audit.ProvenanceUnavailable,
+		audit.ProvenanceUnknown, audit.ProvenanceMismatch, "missing", ""} {
+		checks := []audit.AdmissionCheck{{Check: audit.CheckUpstreamProvenance, Action: "warn", Status: audit.CheckWarn,
+			Provenance: &audit.UpstreamProvenance{Outcome: outcome, SourceRepositoryURI: "https://github.com/lodash/lodash"}}}
+		st := NewStatement(Pin{Type: manifest.TypeNpm, Name: "lodash", Version: "4.17.21", ObjectKey: "k", SHA256: digest},
+			audit.Admission{Decision: audit.AdmissionAdmitted, Checks: checks}, "https://bodega.example", time.Now())
+		data, err := Sign(newSigner(t), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, _, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := rawPredicate(t, env)
+		for _, field := range []string{"upstreamProvenance", "publisherSignature"} {
+			obj, ok := raw[field].(map[string]any)
+			if !ok {
+				t.Fatalf("outcome %q: %s is not an object: %v", outcome, field, raw[field])
+			}
+			if _, has := obj["status"]; has {
+				t.Errorf("outcome %q: %s carries a status key: %v", outcome, field, obj)
 			}
 		}
 	}
@@ -418,12 +509,260 @@ func TestPreF38EnvelopeStillVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Predicate.UpstreamProvenance.Status != StatusUnavailable || st.Predicate.UpstreamProvenance.SourceRepositoryURI != "" {
+	if st.Predicate.UpstreamProvenance.LegacyStatus != AvailabilityUnavailable || st.Predicate.UpstreamProvenance.SourceRepositoryURI != "" {
 		t.Errorf("upstreamProvenance = %+v", st.Predicate.UpstreamProvenance)
 	}
 	for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
 		if !r.OK {
 			t.Errorf("%s failed: expected %s, observed %s", r.Check, r.Expected, r.Observed)
 		}
+	}
+}
+
+// An envelope signed under the pre-E27 vocabulary, a single status per
+// provenance object, still verifies, and its status and identity stay
+// readable.
+func TestPreE27EnvelopeStillVerifies(t *testing.T) {
+	for _, tc := range []struct {
+		name, object, status, source, builder string
+	}{
+		{"mismatch with identity",
+			`{"status":"mismatch","sourceRepositoryUri":"https://github.com/lodash/lodash","builderId":"https://github.com/actions/runner/github-hosted"}`,
+			"mismatch", "https://github.com/lodash/lodash", "https://github.com/actions/runner/github-hosted"},
+		{"invalid", `{"status":"invalid"}`, "invalid", "", ""},
+	} {
+		s := newSigner(t)
+		payload := `{"_type":"` + StatementType + `","subject":[{"name":"pkg:npm/lodash@4.17.21","digest":{"sha256":"` + digest + `"}}],` +
+			`"predicateType":"` + PredicateType + `","predicate":{"ingestionPlatform":{"id":"https://bodega.example"},` +
+			`"ingestedAt":"2026-10-10T12:00:00Z","policyEvaluations":{"policyDigest":{},"decision":"admitted","decidedAt":"2026-10-10T12:00:00Z",` +
+			`"evaluations":[{"check":"allowlist","action":"none","status":"pass"}]},` +
+			`"upstreamProvenance":` + tc.object + `,"publisherSignature":` + tc.object + `}}`
+		sig, err := s.Sign(rand.Reader, PAE(PayloadType, []byte(payload)), crypto.Hash(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload)),
+			Signatures: []Signature{{KeyID: s.KeyID(), Sig: base64.StdEncoding.EncodeToString(sig)}}}
+		data, _ := json.Marshal(env)
+		pe, st, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		for field, got := range map[string]Availability{"upstreamProvenance": st.Predicate.UpstreamProvenance, "publisherSignature": st.Predicate.PublisherSignature} {
+			if got.LegacyStatus != tc.status || got.SourceRepositoryURI != tc.source || got.BuilderID != tc.builder || got.Result != "" || got.Availability != "" {
+				t.Errorf("%s: %s = %+v", tc.name, field, got)
+			}
+		}
+		for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+			if !r.OK {
+				t.Errorf("%s: %s failed: expected %s, observed %s", tc.name, r.Check, r.Expected, r.Observed)
+			}
+		}
+	}
+}
+
+func TestE27LegacyStatusIsDecodeOnly(t *testing.T) {
+	for _, status := range []string{"mismatch", "invalid"} {
+		payload := `{"predicate":{"upstreamProvenance":{"status":"` + status + `"},"publisherSignature":{"status":"` + status + `"}}}`
+		encoded, err := json.Marshal(Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, st, err := ParseEnvelope(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Predicate.UpstreamProvenance.LegacyStatus != status || st.Predicate.PublisherSignature.LegacyStatus != status {
+			t.Fatal("legacy status was not decoded")
+		}
+		signed, err := Sign(newSigner(t), *st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, _, err := ParseEnvelope(signed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := rawPredicate(t, env)
+		for _, field := range []string{"upstreamProvenance", "publisherSignature"} {
+			object, ok := raw[field].(map[string]any)
+			if !ok {
+				t.Fatalf("%s is not an object", field)
+			}
+			if value, exists := object["status"]; exists {
+				t.Errorf("%s re-emitted decode-only status %q", field, value)
+			}
+		}
+	}
+}
+
+// constDoc returns the doc comment of the package-level constant name in
+// attest.go, so a test can hold the comment to what it promises.
+func constDoc(t *testing.T, name string) string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "attest.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range g.Specs {
+			for _, n := range spec.(*ast.ValueSpec).Names {
+				if n.Name == name {
+					return g.Doc.Text()
+				}
+			}
+		}
+	}
+	t.Fatalf("attest.go declares no constant %s", name)
+	return ""
+}
+
+func TestE27DraftRevisionIsPinned(t *testing.T) {
+	if DraftRevision != "https://github.com/slsa-framework/slsa/blob/4d3f9d44a803aaa52eef08fdafd04a7409c263e7/spec/dependency-provenance.md" {
+		t.Errorf("DraftRevision = %q", DraftRevision)
+	}
+	if PredicateType != "https://slsa.dev/dependency/v1" {
+		t.Errorf("PredicateType = %q", PredicateType)
+	}
+	if doc := constDoc(t, "DraftRevision"); !strings.Contains(doc, "2026-11-02") || !strings.Contains(doc, "#277") {
+		t.Errorf("DraftRevision comment names neither the read date nor issue #277: %q", doc)
+	}
+	if doc := constDoc(t, "PredicateType"); !strings.Contains(doc, "DraftRevision") {
+		t.Errorf("PredicateType comment does not name DraftRevision: %q", doc)
+	}
+}
+
+// The admission row's outcomes are stored values with override rules keyed on
+// them; the predicate maps them, it never renames them.
+func TestE27AuditVocabularyIsUnchanged(t *testing.T) {
+	for got, want := range map[string]string{
+		audit.ProvenanceVerified:    "verified",
+		audit.ProvenanceUnavailable: "unavailable",
+		audit.ProvenanceInvalid:     "invalid",
+		audit.ProvenanceUnknown:     "unknown",
+		audit.ProvenanceMismatch:    "mismatch",
+	} {
+		if got != want {
+			t.Errorf("audit provenance outcome %q, want %q", got, want)
+		}
+	}
+	if len(map[string]bool{audit.ProvenanceVerified: true, audit.ProvenanceUnavailable: true, audit.ProvenanceInvalid: true,
+		audit.ProvenanceUnknown: true, audit.ProvenanceMismatch: true}) != 5 {
+		t.Error("audit provenance outcomes are no longer five distinct values")
+	}
+}
+
+// readDoc returns a docs page with its whitespace collapsed, so a guard over
+// hard-wrapped prose does not break on a rewrap.
+func readDoc(t *testing.T, name string) (raw, flat string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), strings.Join(strings.Fields(string(b)), " ")
+}
+
+func requireAll(t *testing.T, page, text string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		if !strings.Contains(text, w) {
+			t.Errorf("%s does not say %q", page, w)
+		}
+	}
+}
+
+func TestE27DesignDocumentsTheDraftVocabulary(t *testing.T) {
+	raw, flat := readDoc(t, "design.md")
+	requireAll(t, "design.md", flat,
+		"[Dependency track](https://slsa.dev/spec/draft/dependency-track)",
+		"(https://slsa.dev/spec/draft/dependency-provenance)",
+		DraftRevision, "4d3f9d44", "read on 2026-11-02",
+		"`availability: unavailable` when the publisher published nothing",
+		"`integrity`, always `{\"method\": \"hash\", \"result\": \"verified\"}`",
+		"`mismatch` therefore shows in the `upstream_provenance` entry of `policyEvaluations`")
+	rows := map[string][2]string{
+		"`verified`":                         {"`result: verified`, with the identity fields", "`result: verified`, with the identity fields"},
+		"`invalid`":                          {"`result: failed`", "`result: failed`"},
+		"`unavailable`":                      {"`availability: unavailable`", "`availability: unavailable`"},
+		"`unknown`":                          {"`result: not-attempted`", "`result: unverified`"},
+		"`mismatch`, a bundle that verified": {"`result: verified`, with the identity fields", "`result: verified`, with the identity fields"},
+		"`mismatch`, no bundle after a pinned one":        {"`availability: unavailable`", "`availability: unavailable`"},
+		"`not_evaluated`, no entry, or any other outcome": {"`result: not-attempted`", "`result: unverified`"},
+	}
+	found := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		cells := strings.Split(line, "|")
+		if len(cells) != 5 {
+			continue
+		}
+		outcome := strings.TrimSpace(cells[1])
+		want, ok := rows[outcome]
+		if !ok {
+			continue
+		}
+		found[outcome] = true
+		if up, pub := strings.TrimSpace(cells[2]), strings.TrimSpace(cells[3]); up != want[0] || pub != want[1] {
+			t.Errorf("design.md row %s maps to %q / %q, want %q / %q", outcome, up, pub, want[0], want[1])
+		}
+	}
+	for outcome := range rows {
+		if !found[outcome] {
+			t.Errorf("design.md mapping table has no row for %s", outcome)
+		}
+	}
+}
+
+func TestE27ThreatModelReportsMismatchInPolicyEvaluations(t *testing.T) {
+	_, flat := readDoc(t, "threat-model.md")
+	requireAll(t, "threat-model.md", flat,
+		"`result` is `verified`, `failed`, or `not-attempted` (`unverified` in `publisherSignature`), or `availability` is `unavailable` when the publisher published nothing",
+		"A `verified` there means only that the publisher's bundle verified cryptographically.",
+		"A `mismatch` against the pinned publisher is reported in the `upstream_provenance` entry of `policyEvaluations`, not in `publisherSignature`.")
+}
+
+// section returns the body of the ## heading in page, up to the next ## heading.
+func section(t *testing.T, page, raw, heading string) string {
+	t.Helper()
+	_, body, ok := strings.Cut(raw, "\n"+heading+"\n")
+	if !ok {
+		t.Fatalf("%s has no %q section", page, heading)
+	}
+	body, _, _ = strings.Cut(body, "\n## ")
+	return body
+}
+
+func tableRows(body string) []string {
+	var rows []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "|") {
+			rows = append(rows, line)
+		}
+	}
+	return rows
+}
+
+func TestE27SlsaPageNamesTheRevision(t *testing.T) {
+	raw, _ := readDoc(t, "slsa.md")
+	_, opening, _ := strings.Cut(raw, "The Dependency track is a working draft")
+	opening, _, _ = strings.Cut(opening, "\n")
+	requireAll(t, "slsa.md opening paragraph", opening, DraftRevision, "November 2, 2026")
+	if strings.Contains(opening, "October 5, 2026") {
+		t.Error("slsa.md opening paragraph still names the October 5, 2026 reading")
+	}
+	drift := tableRows(section(t, "slsa.md", raw, "## Spec drift"))
+	if len(drift) != 3 || !strings.Contains(drift[2], "`resolvedFrom`") {
+		t.Errorf("slsa.md Spec drift table should hold only its resolvedFrom row, has:\n%s", strings.Join(drift, "\n"))
+	}
+	level3 := tableRows(section(t, "slsa.md", raw, "## What Level 3 requires that bodega does not provide"))
+	if len(level3) == 0 {
+		t.Fatal("slsa.md Level 3 table missing")
+	}
+	if last := level3[len(level3)-1]; strings.Contains(last, "vocabulary") || strings.Contains(last, "differ") {
+		t.Errorf("slsa.md Level 3 last row still says the vocabulary differs: %s", last)
 	}
 }
