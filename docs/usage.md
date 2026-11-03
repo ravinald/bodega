@@ -7856,6 +7856,14 @@ Nothing is signed when:
 
 A pin with no decision behind it, such as a wheel pip pulled in transitively, is signed with the checks its admission row records, which are all `not_evaluated`. It is never signed as a pass.
 
+A statement's `resolvedFrom` holds the SHA-256 of the direct dependency that brought the artifact in, and `requiredBy` lists every parent reference bodega knows, each with its digest or the reason none was found ([design.md](design.md#attestations) gives the resolution rules). A statement carries no `resolvedFrom` when:
+
+- it was signed for a proxy fill of a version with no manifest entry. The server sees the request, not the package that asked for it, so it has no parent to name.
+- the parent had no SHA-256 pinned at the moment the child was signed. The envelope is not re-signed when the parent is pinned later, and `bodega attest backfill` skips an object that already has an envelope.
+- the parent reference's type and name hold more than one distinct pinned SHA-256, so no single digest names the parent.
+- it belongs to a pypi closure member whose only parents are source distributions or requirements carrying an environment marker.
+- it was signed before bodega recorded parent digests, when `resolvedFrom` was a list of names.
+
 ### Where envelopes live
 
 Each envelope is stored under `attestations/<artifact key>/<decided_at>.dsse.json`, on the backend the artifact lives on. A hosted fetch writes it into the build tree at `<type root>/attestations/...` and `bodega build upload` sends it to wherever its artifact went. A proxy fill writes it into the backend it cached the artifact into. `bodega pkg move` copies a version's envelopes with it and, under `--delete-source`, deletes them from the source with it. pypi wheels upload as a directory, so their envelopes do too, from `<pypi root>/attestations/pypi/wheels/`.

@@ -181,6 +181,7 @@ func revetSigner(cfg *config.Config, adb *audit.DB, rv *admit.Revetter) string {
 	rv.Emitter = &attest.Emitter{
 		Signer:     func() attestsign.Signer { return signer },
 		Admissions: adb,
+		Checksums:  adb,
 		PlatformID: cfg.ResolveAttestationPlatformID(),
 	}
 	return ""

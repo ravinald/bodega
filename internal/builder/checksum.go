@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -171,6 +172,12 @@ func (c *Config) pinChecksum(ctx context.Context, pm *manifest.PackageManifest, 
 // one. It is the rule described above, reached either from a manifest entry via
 // pinChecksum or from a key a caller derived itself.
 func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version string, cs *manifest.Checksum, requiredBy []string) error {
+	return c.pinArtifactDigestFrom(ctx, key, typ, name, version, cs, requiredBy, nil)
+}
+
+// pinArtifactDigestFrom is pinArtifactDigest for a caller that also holds the
+// digests of the artifact's direct parents, which its attestation names.
+func (c *Config) pinArtifactDigestFrom(ctx context.Context, key, typ, name, version string, cs *manifest.Checksum, requiredBy []string, parents []attest.Parent) error {
 	if c.AuditDB == nil || key == "" || cs == nil || cs.Value == "" {
 		return nil
 	}
@@ -185,13 +192,13 @@ func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version 
 		}
 		// Bytes that match the pin are the pinned object, so the decision
 		// this fetch was admitted under names it as well.
-		c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy)
+		c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy, parents)
 		return nil
 	}
 	if err := c.AuditDB.StoreChecksum(ctx, key, typ, name, version, cs.Algorithm, cs.Value, checksumSourceBuild); err != nil {
 		return err
 	}
-	c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy)
+	c.pinAdmission(ctx, typ, name, version, key, sha256Of(cs), requiredBy, parents)
 	return nil
 }
 

@@ -690,6 +690,7 @@ when any object was refused.`,
 				emit: &attest.Emitter{
 					Signer:     func() attestsign.Signer { return signer },
 					Admissions: db,
+					Checksums:  db,
 					PlatformID: cfg.ResolveAttestationPlatformID(),
 				},
 			}

@@ -12,6 +12,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,7 +176,8 @@ func TestEmitSignsWhatTheRowSaysAndVerifies(t *testing.T) {
 	}
 	pr := st.Predicate
 	if pr.IngestionPlatform.ID != "https://bodega.example" || pr.PolicyEvaluations.PolicyDigest["sha256"] != strings.Repeat("ab", 32) ||
-		len(pr.ResolvedFrom) != 1 || pr.ResolvedFrom[0].Name != "widget" ||
+		pr.ResolvedFrom != nil || len(pr.RequiredBy) != 1 || pr.RequiredBy[0].Ref != "widget" ||
+		pr.RequiredBy[0].Unavailable != noChecksumTable || pr.RequiredBy[0].Digest != nil ||
 		pr.UpstreamProvenance.Result != ResultNotAttempted || pr.PublisherSignature.Result != ResultUnverified {
 		t.Errorf("predicate = %+v", pr)
 	}
@@ -489,6 +491,211 @@ func TestEmitNeverWritesALegacyStatus(t *testing.T) {
 	}
 }
 
+// stubChecksums answers ListChecksums from fixed rows, filtered the way the
+// audit table filters them, or fails with err.
+type stubChecksums struct {
+	rows []audit.StoredChecksum
+	err  error
+}
+
+func (s stubChecksums) ListChecksums(_ context.Context, pkgType, pkgName string) ([]audit.StoredChecksum, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	var out []audit.StoredChecksum
+	for _, r := range s.rows {
+		if (pkgType == "" || r.PkgType == pkgType) && (pkgName == "" || r.PkgName == pkgName) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func sumRow(typ, name, version, value string) audit.StoredChecksum {
+	return audit.StoredChecksum{PkgType: typ, PkgName: name, PkgVersion: version, Algorithm: "sha256", Value: value,
+		ObjectKey: typ + "/" + name + "/" + version + "/" + value[:4]}
+}
+
+// Each catalog reference resolves to its parent's pinned sha256 at signing
+// time, and the first one that does is what resolvedFrom carries. A reference
+// that resolves to nothing, or to more than one digest, is kept in requiredBy
+// with the reason, and the envelope is signed either way.
+func TestEmitResolvesTheDirectDependencyDigest(t *testing.T) {
+	d1, d2 := strings.Repeat("1", 64), strings.Repeat("2", 64)
+	sha := func(d string) map[string]string { return map[string]string{"sha256": d} }
+	cases := []struct {
+		name     string
+		refs     []string
+		parents  []Parent
+		src      ChecksumLister
+		wantFrom string
+		want     []RequiredByRef // Unavailable is a substring of the reason
+	}{
+		{"versioned reference with one pin", []string{"git/widget@v1.0.0"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1.0.0", d1), sumRow("git", "widget", "v2.0.0", d2)}},
+			d1, []RequiredByRef{{Ref: "git/widget@v1.0.0", Digest: sha(d1)}}},
+		{"bare name reads as git", []string{"widget"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1.0.0", d1), sumRow("npm", "widget", "1.0.0", d2)}},
+			d1, []RequiredByRef{{Ref: "widget", Digest: sha(d1)}}},
+		{"bare name with two pins", []string{"widget"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1.0.0", d1), sumRow("git", "widget", "v2.0.0", d2)}},
+			"", []RequiredByRef{{Ref: "widget", Unavailable: `"widget" matches 2 distinct`}}},
+		{"type and name over every version", []string{"apt/libpq-dev"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("apt", "libpq-dev", "14.9", d2)}},
+			d2, []RequiredByRef{{Ref: "apt/libpq-dev", Digest: sha(d2)}}},
+		{"no pin", []string{"git/widget@v1.0.0"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v2.0.0", d2)}},
+			"", []RequiredByRef{{Ref: "git/widget@v1.0.0", Unavailable: `no sha256 is pinned for "git/widget@v1.0.0"`}}},
+		{"two resolvable references", []string{"git/widget@v1.0.0", "git/gadget"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1.0.0", d1), sumRow("git", "gadget", "v3", d2)}},
+			d1, []RequiredByRef{{Ref: "git/widget@v1.0.0", Digest: sha(d1)}, {Ref: "git/gadget", Digest: sha(d2)}}},
+		{"first reference unresolved", []string{"git/missing", "git/gadget"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "gadget", "v3", d2)}},
+			d2, []RequiredByRef{{Ref: "git/missing", Unavailable: "no sha256 is pinned"}, {Ref: "git/gadget", Digest: sha(d2)}}},
+		{"checksum table error", []string{"widget"}, nil,
+			stubChecksums{err: errors.New("database is locked")},
+			"", []RequiredByRef{{Ref: "widget", Unavailable: "database is locked"}}},
+		{"malformed references", []string{"", "/widget", "git/"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1", d1)}},
+			"", []RequiredByRef{{Ref: "", Unavailable: "names no package type and name"},
+				{Ref: "/widget", Unavailable: "names no package type and name"}, {Ref: "git/", Unavailable: "names no package type and name"}}},
+		{"empty name before a version", []string{"git/@v1", "@v1", "pypi/@1.0", "npm/@1.0"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "@v1", "x", d1), sumRow("git", "", "v1", d1), sumRow("pypi", "", "1.0", d1), sumRow("npm", "", "1.0", d1)}},
+			"", []RequiredByRef{{Ref: "git/@v1", Unavailable: `"git/@v1" names no package`}, {Ref: "@v1", Unavailable: `"@v1" names no package`},
+				{Ref: "pypi/@1.0", Unavailable: `"pypi/@1.0" names no package`}, {Ref: "npm/@1.0", Unavailable: `"npm/@1.0" names no package`}}},
+		{"empty version or broken npm scope", []string{"git/widget@", "npm/@/pkg", "npm/@scope/", "npm/@scope/pkg@"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "", d1), sumRow("npm", "@/pkg", "1", d1), sumRow("npm", "@scope/", "1", d1), sumRow("npm", "@scope/pkg", "", d1)}},
+			"", []RequiredByRef{{Ref: "git/widget@", Unavailable: "names no package"}, {Ref: "npm/@/pkg", Unavailable: "names no package"},
+				{Ref: "npm/@scope/", Unavailable: "names no package"}, {Ref: "npm/@scope/pkg@", Unavailable: "names no package"}}},
+		{"npm scoped package with and without a version", []string{"npm/@scope/pkg@1.0", "npm/@scope/other"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("npm", "@scope/pkg", "1.0", d1), sumRow("npm", "@scope/pkg", "2.0", d2), sumRow("npm", "@scope/other", "3.0", d2)}},
+			d1, []RequiredByRef{{Ref: "npm/@scope/pkg@1.0", Digest: sha(d1)}, {Ref: "npm/@scope/other", Digest: sha(d2)}}},
+		{"caller-held parents after catalog references, sorted, repeats dropped", []string{"git/missing"},
+			[]Parent{{Ref: "pypi/zeta@2", SHA256: d2}, {Ref: "pypi/alpha@1", SHA256: d1}, {Ref: "pypi/zeta@2", SHA256: d2}},
+			stubChecksums{},
+			d1, []RequiredByRef{{Ref: "git/missing", Unavailable: "no sha256 is pinned"},
+				{Ref: "pypi/alpha@1", Digest: sha(d1)}, {Ref: "pypi/zeta@2", Digest: sha(d2)}}},
+		{"repeated catalog reference", []string{"widget", "widget"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1", d1)}},
+			d1, []RequiredByRef{{Ref: "widget", Digest: sha(d1)}}},
+		{"no references and no parents", nil, nil, stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1", d1)}},
+			"", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openAudit(t)
+			s := newSigner(t)
+			store := storage.NewMemory()
+			key := manifest.NpmTarballKey("lodash", "4.17.21")
+			admit(t, db, "4.17.21", audit.AdmissionAdmitted, passing)
+			p := pin(t, db, "4.17.21", key)
+			p.RequiredBy, p.Parents = tc.refs, tc.parents
+			e := emitter(db, s)
+			e.Checksums = tc.src
+			ek, err := e.Emit(ctx, store, p)
+			if err != nil || ek == "" {
+				t.Fatalf("Emit = %q, %v", ek, err)
+			}
+			data, _ := store.Get(ctx, ek)
+			env, st, err := ParseEnvelope(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range Verify(env, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+				if !r.OK {
+					t.Errorf("%s failed: expected %s, observed %s", r.Check, r.Expected, r.Observed)
+				}
+			}
+			payload, _ := base64.StdEncoding.DecodeString(env.Payload)
+			raw := rawPredicate(t, env)
+			if tc.wantFrom == "" {
+				if strings.Contains(string(payload), `"resolvedFrom"`) || st.Predicate.ResolvedFrom != nil {
+					t.Errorf("resolvedFrom present with no parent digest: %s", payload)
+				}
+			} else {
+				got, _ := json.Marshal(raw["resolvedFrom"])
+				if want := `{"subject":{"sha256":"` + tc.wantFrom + `"}}`; string(got) != want {
+					t.Errorf("resolvedFrom = %s, want %s", got, want)
+				}
+			}
+			if tc.want == nil && strings.Contains(string(payload), `"requiredBy"`) {
+				t.Errorf("requiredBy present with nothing to list: %s", payload)
+			}
+			got := st.Predicate.RequiredBy
+			if len(got) != len(tc.want) {
+				t.Fatalf("requiredBy = %+v, want %+v", got, tc.want)
+			}
+			for i, w := range tc.want {
+				g := got[i]
+				if g.Ref != w.Ref || (g.Digest == nil) != (w.Digest == nil) || g.Digest["sha256"] != w.Digest["sha256"] ||
+					(g.Unavailable == "") != (w.Unavailable == "") || !strings.Contains(g.Unavailable, w.Unavailable) {
+					t.Errorf("requiredBy[%d] = %+v, want %+v", i, g, w)
+				}
+			}
+			if entries, _ := raw["requiredBy"].([]any); len(entries) > 0 {
+				for _, e := range entries {
+					obj := e.(map[string]any)
+					_, hasDigest := obj["digest"]
+					_, hasReason := obj["unavailable"]
+					if hasDigest == hasReason {
+						t.Errorf("requiredBy entry %v carries both or neither of digest and unavailable", obj)
+					}
+				}
+			}
+		})
+	}
+}
+
+// An envelope signed while resolvedFrom was an array of name-only
+// descriptors, under either provenance vocabulary, still parses and passes
+// every check, and keeps the names it carried.
+func TestPreE29EnvelopeStillVerifies(t *testing.T) {
+	for _, tc := range []struct{ name, provenance string }{
+		{"pre-E27 status", `"upstreamProvenance":{"status":"unavailable"},"publisherSignature":{"status":"unavailable"}`},
+		{"E27 fields", `"upstreamProvenance":{"result":"not-attempted"},"publisherSignature":{"result":"unverified"},` +
+			`"integrity":{"method":"hash","result":"verified"}`},
+	} {
+		s := newSigner(t)
+		payload := `{"_type":"` + StatementType + `","subject":[{"name":"pkg:npm/lodash@4.17.21","digest":{"sha256":"` + digest + `"}}],` +
+			`"predicateType":"` + PredicateType + `","predicate":{"ingestionPlatform":{"id":"https://bodega.example"},` +
+			`"ingestedAt":"2026-10-10T12:00:00Z","policyEvaluations":{"policyDigest":{},"decision":"admitted","decidedAt":"2026-10-10T12:00:00Z",` +
+			`"evaluations":[{"check":"allowlist","action":"none","status":"pass"}]},` +
+			`"resolvedFrom":[{"name":"widget"}],` + tc.provenance + `}}`
+		sig, err := s.Sign(rand.Reader, PAE(PayloadType, []byte(payload)), crypto.Hash(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := Envelope{PayloadType: PayloadType, Payload: base64.StdEncoding.EncodeToString([]byte(payload)),
+			Signatures: []Signature{{KeyID: s.KeyID(), Sig: base64.StdEncoding.EncodeToString(sig)}}}
+		data, _ := json.Marshal(env)
+		pe, st, err := ParseEnvelope(data)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := st.Predicate.LegacyResolvedFrom; len(got) != 1 || got[0] != "widget" || st.Predicate.ResolvedFrom != nil {
+			t.Errorf("%s: legacy resolvedFrom = %v, ResolvedFrom = %+v", tc.name, got, st.Predicate.ResolvedFrom)
+		}
+		for _, r := range Verify(pe, st, VerifyInput{Trusted: trusted(t, s), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+			if !r.OK {
+				t.Errorf("%s: %s failed: expected %s, observed %s", tc.name, r.Check, r.Expected, r.Observed)
+			}
+		}
+		// Re-signing what was parsed never puts the array back on the wire.
+		resigned, err := Sign(s, *st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		renv, _, err := ParseEnvelope(resigned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw := rawPredicate(t, renv); raw["resolvedFrom"] != nil {
+			t.Errorf("%s: re-signed statement carries resolvedFrom %v", tc.name, raw["resolvedFrom"])
+		}
+	}
+}
+
 // An envelope signed before upstreamProvenance carried anything but a status
 // still parses and passes every check.
 func TestPreF38EnvelopeStillVerifies(t *testing.T) {
@@ -754,9 +961,8 @@ func TestE27SlsaPageNamesTheRevision(t *testing.T) {
 	if strings.Contains(opening, "October 5, 2026") {
 		t.Error("slsa.md opening paragraph still names the October 5, 2026 reading")
 	}
-	drift := tableRows(section(t, "slsa.md", raw, "## Spec drift"))
-	if len(drift) != 3 || !strings.Contains(drift[2], "`resolvedFrom`") {
-		t.Errorf("slsa.md Spec drift table should hold only its resolvedFrom row, has:\n%s", strings.Join(drift, "\n"))
+	if drift := tableRows(section(t, "slsa.md", raw, "## Spec drift")); len(drift) != 0 {
+		t.Errorf("slsa.md Spec drift still lists a difference from the draft:\n%s", strings.Join(drift, "\n"))
 	}
 	level3 := tableRows(section(t, "slsa.md", raw, "## What Level 3 requires that bodega does not provide"))
 	if len(level3) == 0 {
@@ -764,5 +970,145 @@ func TestE27SlsaPageNamesTheRevision(t *testing.T) {
 	}
 	if last := level3[len(level3)-1]; strings.Contains(last, "vocabulary") || strings.Contains(last, "differ") {
 		t.Errorf("slsa.md Level 3 last row still says the vocabulary differs: %s", last)
+	}
+}
+
+// Every Emitter the binaries build hands it the audit checksum table it
+// already passes as Admissions, so no construction path signs every parent
+// reference as unavailable.
+func TestEveryEmitterResolvesParents(t *testing.T) {
+	fset := token.NewFileSet()
+	var found []string
+	for _, root := range []string{"../../cmd", "../../internal"} {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return err
+			}
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				return err
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				lit, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
+				sel, ok := lit.Type.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Emitter" {
+					return true
+				}
+				if x, ok := sel.X.(*ast.Ident); !ok || x.Name != "attest" {
+					return true
+				}
+				fields := map[string]string{}
+				for _, el := range lit.Elts {
+					kv, ok := el.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					fields[kv.Key.(*ast.Ident).Name] = types.ExprString(kv.Value)
+				}
+				pos := fset.Position(lit.Pos())
+				found = append(found, pos.String())
+				if fields["Checksums"] == "" || fields["Checksums"] != fields["Admissions"] {
+					t.Errorf("%s: attest.Emitter sets Checksums %q, want the Admissions value %q", pos, fields["Checksums"], fields["Admissions"])
+				}
+				return true
+			})
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(found) != 4 {
+		t.Errorf("found %d attest.Emitter literals, want 4: %v", len(found), found)
+	}
+}
+
+// The pages describing resolvedFrom say what it is now, how a parent is
+// resolved, and when it is absent.
+func TestE29DocsDescribeResolvedFrom(t *testing.T) {
+	_, design := readDoc(t, "design.md")
+	if strings.Contains(design, "the version's `required_by`)") {
+		t.Error("design.md still says resolvedFrom is the version's required_by")
+	}
+	requireAll(t, "design.md", design,
+		"`ResolvedFromRef` object, `{\"subject\": {\"sha256\": \"<hex>\"}}`",
+		"`requiredBy` is a bodega field outside the draft",
+		"exactly one of `digest` (`{\"sha256\": \"<hex>\"}`) or `unavailable`",
+		"`<type>/<name>@<version>` matches the SHA-256 rows for that type, name and version",
+		"`<type>/<name>`, the form apt discovery records, matches every version",
+		"a reference with no `/` reads as `git/<name>`",
+		"`resolvedFrom` is the digest of the first `requiredBy` entry that carries one")
+
+	_, usage := readDoc(t, "usage.md")
+	requireAll(t, "usage.md", usage,
+		"A statement carries no `resolvedFrom` when:",
+		"proxy fill of a version with no manifest entry",
+		"no SHA-256 pinned at the moment the child was signed",
+		"`bodega attest backfill` skips an object that already has an envelope",
+		"more than one distinct pinned SHA-256",
+		"only parents are source distributions or requirements carrying an environment marker",
+		"signed before bodega recorded parent digests")
+
+	_, threat := readDoc(t, "threat-model.md")
+	requireAll(t, "threat-model.md", threat,
+		"`resolvedFrom` and `requiredBy` are bodega's record of the relationship",
+		"An absent `resolvedFrom` does not prove the artifact was a top-level dependency",
+		"has to refuse statements lacking it")
+
+	raw, _ := readDoc(t, "slsa.md")
+	gaps := section(t, "slsa.md", raw, "## Dependency track Level 2")
+	if strings.Contains(gaps, "names the parent, not its digest") {
+		t.Error("slsa.md Gaps still says resolvedFrom names the parent")
+	}
+	requireAll(t, "slsa.md Gaps", strings.Join(strings.Fields(gaps), " "),
+		"**`resolvedFrom` is absent where bodega cannot establish the parent's digest.**",
+		"proxy fill of a version with no manifest entry",
+		"`bodega attest backfill` skips an object that already has one",
+		"more than one distinct pinned SHA-256",
+		"source distributions or marker-conditioned requirements",
+		"every statement signed before parent digests were recorded")
+}
+
+func TestReviewE29EmptyVersionedNameNeverResolves(t *testing.T) {
+	for _, typ := range []string{"git", "apt", "pypi"} {
+		t.Run(typ, func(t *testing.T) {
+			ctx := context.Background()
+			db := openAudit(t)
+			signer := newSigner(t)
+			store := storage.NewMemory()
+			key := manifest.NpmTarballKey("lodash", "4.17.21")
+			admit(t, db, "4.17.21", audit.AdmissionAdmitted, passing)
+			p := pin(t, db, "4.17.21", key)
+			ref := typ + "/@v1"
+			p.RequiredBy = []string{ref}
+			e := emitter(db, signer)
+			e.Checksums = stubChecksums{rows: []audit.StoredChecksum{
+				sumRow(typ, "@v1", "other", strings.Repeat("1", 64)),
+			}}
+			ek, err := e.Emit(ctx, store, p)
+			if err != nil || ek == "" {
+				t.Fatalf("Emit = %q, %v", ek, err)
+			}
+			data, err := store.Get(ctx, ek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, st, err := ParseEnvelope(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range Verify(env, st, VerifyInput{Trusted: trusted(t, signer), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+				if !r.OK {
+					t.Fatalf("Verify failed: %+v", r)
+				}
+			}
+			rb := st.Predicate.RequiredBy
+			if len(rb) != 1 || rb[0].Ref != ref || rb[0].Digest != nil || rb[0].Unavailable == "" || !strings.Contains(rb[0].Unavailable, ref) || st.Predicate.ResolvedFrom != nil {
+				t.Fatalf("empty name in %q produced requiredBy=%+v resolvedFrom=%+v; want unavailable and no digest", ref, rb, st.Predicate.ResolvedFrom)
+			}
+		})
 	}
 }

@@ -84,10 +84,24 @@ type Statement struct {
 
 // Predicate is the Dependency Ingestion predicate.
 type Predicate struct {
-	IngestionPlatform Platform             `json:"ingestionPlatform"`
-	IngestedAt        time.Time            `json:"ingestedAt"`
-	PolicyEvaluations PolicyEvaluations    `json:"policyEvaluations"`
-	ResolvedFrom      []ResourceDescriptor `json:"resolvedFrom,omitempty"`
+	IngestionPlatform Platform          `json:"ingestionPlatform"`
+	IngestedAt        time.Time         `json:"ingestedAt"`
+	PolicyEvaluations PolicyEvaluations `json:"policyEvaluations"`
+	// ResolvedFrom is the draft's ResolvedFromRef: the digest of the direct
+	// dependency that brought this artifact in, as that parent's own subject
+	// digest. Nil when bodega established none, which is not evidence the
+	// artifact was a top-level dependency.
+	ResolvedFrom *ResolvedFromRef `json:"resolvedFrom,omitempty"`
+	// RequiredBy is a bodega addition outside the SLSA draft: every
+	// direct-dependency reference bodega recorded or established for the pin,
+	// each with the parent's digest or the reason none was found, so a
+	// reference with no digest is kept rather than dropped from ResolvedFrom.
+	RequiredBy []RequiredByRef `json:"requiredBy,omitempty"`
+	// LegacyResolvedFrom holds the names an envelope signed before E29
+	// carried, when resolvedFrom was an array of name-only descriptors.
+	// UnmarshalJSON reads it so those envelopes still verify; it is never
+	// marshaled, so a re-signed statement cannot carry the array form.
+	LegacyResolvedFrom []string `json:"-"`
 	// UpstreamProvenance and PublisherSignature are what the admission row's
 	// upstream_provenance check concluded about the publisher's own signed
 	// provenance. Both carry the same verdict and identity, because the
@@ -101,6 +115,55 @@ type Predicate struct {
 	// and the pinned sha256 is what the fetch verified the bytes against, so
 	// every statement it builds says verified.
 	Integrity Integrity `json:"integrity"`
+}
+
+// UnmarshalJSON decodes resolvedFrom in either form: the draft's
+// ResolvedFromRef object, or the pre-E29 array of name-only descriptors,
+// whose names land in LegacyResolvedFrom.
+func (p *Predicate) UnmarshalJSON(data []byte) error {
+	type fields Predicate
+	var wire struct {
+		fields
+		ResolvedFrom json.RawMessage `json:"resolvedFrom"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*p = Predicate(wire.fields)
+	raw := bytes.TrimSpace(wire.ResolvedFrom)
+	switch {
+	case len(raw) == 0 || bytes.Equal(raw, []byte("null")):
+	case raw[0] == '[':
+		var legacy []ResourceDescriptor
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			return fmt.Errorf("resolvedFrom: %w", err)
+		}
+		for _, d := range legacy {
+			p.LegacyResolvedFrom = append(p.LegacyResolvedFrom, d.Name)
+		}
+	default:
+		var ref ResolvedFromRef
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return fmt.Errorf("resolvedFrom: %w", err)
+		}
+		p.ResolvedFrom = &ref
+	}
+	return nil
+}
+
+// ResolvedFromRef is the draft's resolvedFrom object. Subject is the direct
+// dependency's digest set, matching that parent's own subject digest.
+type ResolvedFromRef struct {
+	Subject map[string]string `json:"subject"`
+}
+
+// RequiredByRef is one direct-dependency reference: Ref as recorded, and
+// exactly one of Digest (the parent's sha256) or Unavailable (why no digest
+// was found).
+type RequiredByRef struct {
+	Ref         string            `json:"ref"`
+	Digest      map[string]string `json:"digest,omitempty"`
+	Unavailable string            `json:"unavailable,omitempty"`
 }
 
 // Integrity is the draft's integrity verdict: how the artifact was checked,

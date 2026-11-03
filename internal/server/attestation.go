@@ -196,6 +196,7 @@ func (s *Server) setupAttestation() {
 			return nil
 		},
 		Admissions: s.auditDB,
+		Checksums:  s.auditDB,
 		PlatformID: s.cfg.ResolveAttestationPlatformID(),
 	}
 }

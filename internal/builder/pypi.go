@@ -1378,7 +1378,7 @@ func fetchPypiClosure(cfg *Config, store *manifest.Store, summary *Summary) *Sum
 		return fail(fmt.Errorf("clear the wheelhouse at %s: %w", house, err))
 	}
 
-	if err := cfg.pinPypiClosure(ctx, store, arts, house); err != nil {
+	if err := cfg.pinPypiClosure(ctx, store, arts, house, pypiClosureParents(out, house, arts)); err != nil {
 		return fail(err)
 	}
 	lock := pypiLockPath(root)

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -331,10 +332,14 @@ func downloadPypiClosure(out io.Writer, pipBin, indexURL, combinedReq, house str
 //
 // store supplies each artifact's RequiredBy for its attestation, when a pypi
 // entry for that version exists; a wheel pip pulled in transitively has none.
-func (c *Config) pinPypiClosure(ctx context.Context, store *manifest.Store, arts []pypiArtifact, house string) error {
+// parents, keyed by canonical distribution name, are the closure wheels that
+// require each artifact, from pypiClosureParents.
+func (c *Config) pinPypiClosure(ctx context.Context, store *manifest.Store, arts []pypiArtifact, house string, parents map[string][]attest.Parent) error {
 	for _, a := range arts {
 		cs := newSHA256Checksum(a.Digest)
-		if err := c.pinArtifactDigest(ctx, a.Key(), manifest.TypePypi, a.Dist, a.Version, cs, pypiRequiredBy(ctx, store, a)); err != nil {
+		err := c.pinArtifactDigestFrom(ctx, a.Key(), manifest.TypePypi, a.Dist, a.Version, cs,
+			pypiRequiredBy(ctx, store, a), parents[manifest.CanonicalPypiName(a.Dist)])
+		if err != nil {
 			// Refused rather than stored: the bytes go before the error does,
 			// so a later build cannot reach them through --find-links.
 			_ = os.Remove(filepath.Join(house, a.File))
@@ -342,6 +347,41 @@ func (c *Config) pinPypiClosure(ctx context.Context, store *manifest.Store, arts
 		}
 	}
 	return nil
+}
+
+// pypiClosureParents reads the METADATA of every wheel in the closure and
+// returns, by canonical distribution name, the wheels whose unconditional
+// Requires-Dist names it. A marker-conditioned line is skipped because the
+// closure was resolved for one interpreter and nothing records which markers
+// held there. A source distribution has no METADATA to read until it is
+// built, so it parents nothing. A wheel whose METADATA cannot be read parents
+// nothing either, with one WARNING, because the pin it would decorate is
+// still sound.
+func pypiClosureParents(out io.Writer, house string, arts []pypiArtifact) map[string][]attest.Parent {
+	parents := map[string][]attest.Parent{}
+	for _, b := range arts {
+		if !strings.HasSuffix(b.File, ".whl") {
+			continue
+		}
+		info, err := readWheelMetadata(filepath.Join(house, b.File))
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "    WARNING: %s: no closure parents read from it: %v\n", b.File, err)
+			continue
+		}
+		self := manifest.CanonicalPypiName(b.Dist)
+		ref := "pypi/" + b.Dist + "@" + b.Version
+		for _, line := range info.Requires {
+			if strings.Contains(line, ";") {
+				continue
+			}
+			child := manifest.CanonicalPypiName(pkgBaseName(line))
+			if child == "" || child == self {
+				continue
+			}
+			parents[child] = append(parents[child], attest.Parent{Ref: ref, SHA256: b.Digest})
+		}
+	}
+	return parents
 }
 
 // pypiRequiredBy is the RequiredBy of the pypi entry for a's version, or nil.

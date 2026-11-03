@@ -974,6 +974,14 @@ verify` checks that digest against the artifact you hold, so the statement
   that needs every check to have run has to read the evaluations itself.
 - **At this time.** `decidedAt` and `ingestedAt` are the bodega host's
   clock. No timestamp authority or transparency log witnesses them.
+- **Required by this parent.** `resolvedFrom` and `requiredBy` are bodega's
+  record of the relationship, read from its own catalog's `required_by` and,
+  for pypi, from the closure's wheel metadata. No upstream attests it. An
+  absent `resolvedFrom` does not prove the artifact was a top-level
+  dependency: bodega may never have seen the parent, or found no single
+  pinned digest for it when the child was signed. A consumer requiring SLSA
+  Dependency L2's `resolvedFrom` for every transitive dependency has to
+  refuse statements lacking it.
 
 A statement is not withdrawn when a later re-vet refuses the version. The
 re-vet signs a newer envelope whose decision is `policy_blocked`, and the
