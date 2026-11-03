@@ -363,32 +363,53 @@ func (v *Verifier) client() *http.Client {
 var errNotFound = errors.New("not found")
 
 // get reads raw, refusing a body over limit bytes rather than returning a
-// truncated one, which would parse as a document that is not there. Userinfo
-// in raw travels as Basic credentials, as the transport would send it anyway,
-// and is kept out of the request URL so no error this returns carries it.
+// truncated one, which would parse as a document that is not there.
 func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limit int64) ([]byte, error) {
+	return v.getWithin(ctx, raw, header, limit, nil)
+}
+
+// getWithin is get with every redirect hop put to allow before it is sent; a
+// hop allow refuses is never requested. Userinfo in raw stays on the request
+// URL, where the client turns it into Basic credentials for that request
+// alone: set as a header here instead, it would be copied onto a redirect to
+// another port of the same host. No error this returns carries the userinfo.
+func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", manifest.PublicURL(raw))
 	}
-	user := u.User
-	u.User = nil
-	target := u.String()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	public := *u
+	public.User = nil
+	target := public.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
-	}
-	if user != nil {
-		pass, _ := user.Password()
-		req.SetBasicAuth(user.Username(), pass)
+		return nil, fmt.Errorf("GET %s: %w", target, redactURLError(err))
 	}
 	for k, vs := range header {
 		req.Header[k] = vs
 	}
 	req.Header.Set("User-Agent", policy.UserAgent)
-	resp, err := v.client().Do(req)
+	client := v.client()
+	if allow != nil {
+		c := *client
+		prior := c.CheckRedirect
+		c.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if err := allow(next.URL); err != nil {
+				return err
+			}
+			if prior != nil {
+				return prior(next, via)
+			}
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return nil
+		}
+		client = &c
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactURLError(err)
 	}
 	defer resp.Body.Close()
 	switch {
@@ -405,4 +426,17 @@ func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limi
 		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", target, limit>>20)
 	}
 	return body, nil
+}
+
+// redactURLError drops the userinfo from the URL a client error names; the
+// client masks only the password and keeps the user name.
+func redactURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		if u, perr := url.Parse(ue.URL); perr == nil {
+			u.User = nil
+			ue.URL = u.String()
+		}
+	}
+	return err
 }

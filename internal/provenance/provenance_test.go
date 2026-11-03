@@ -1282,7 +1282,10 @@ func TestPypiTamperedAttestationIsInvalid(t *testing.T) {
 			}
 			return f
 		}},
-		"no attestation of a known predicate type": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "holds no attestation", prov: func(b map[string]any) {
+		"bundle holds no attestation": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "holds no attestation", prov: func(b map[string]any) {
+			b["attestations"] = []any{}
+		}},
+		"statement of another predicate type": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "did not verify", prov: func(b map[string]any) {
 			env := b["attestations"].([]any)[0].(map[string]any)["envelope"].(map[string]any)
 			st, _ := base64.StdEncoding.DecodeString(env["statement"].(string))
 			env["statement"] = base64.StdEncoding.EncodeToString([]byte(strings.Replace(string(st), PyPIPublishV1, "https://example.com/other/v1", 1)))
@@ -1462,7 +1465,7 @@ func TestVerifyBundleBuilderSource(t *testing.T) {
 	if err := json.Unmarshal(fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"), &prov); err != nil {
 		t.Fatal(err)
 	}
-	raw, _, err := pypiSigstoreBundle(prov.AttestationBundles[0].Attestations[0])
+	raw, err := pypiSigstoreBundle(prov.AttestationBundles[0].Attestations[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1475,4 +1478,124 @@ func TestVerifyBundleBuilderSource(t *testing.T) {
 	if err != nil || id.BuilderID != id.WorkflowRef || id.BuilderID == "" {
 		t.Errorf("builder from the signer: %+v, %v", id, err)
 	}
+}
+
+func TestReviewPypiRedirectCannotEscapeIndex(t *testing.T) {
+	for _, downgrade := range []bool{false, true} {
+		t.Run(fmt.Sprintf("http=%t", downgrade), func(t *testing.T) {
+			var other *registry
+			if downgrade {
+				other = newRegistry(t)
+			} else {
+				other = newTLSRegistry(t)
+			}
+			other.put(pypiWheelPath, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+			r := newTLSRegistry(t)
+			servePypi(t, r, wheelOnly)
+			inner := r.Config.Handler
+			r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == pypiWheelPath {
+					http.Redirect(w, req, other.URL+pypiWheelPath, http.StatusFound)
+					return
+				}
+				inner.ServeHTTP(w, req)
+			})
+			ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+			if n := other.hitsOn(pypiWheelPath); n != 0 {
+				t.Errorf("redirect target requested %d times; want 0", n)
+			}
+			if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, strings.TrimPrefix(strings.TrimPrefix(other.URL, "https://"), "http://")) {
+				t.Errorf("outcome %s (%s); want unknown naming the refused host", ev.Outcome, ev.Detail)
+			}
+		})
+	}
+}
+
+func TestReviewPypiEveryAttestationMustVerify(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	r.put(pypiWheelPath, pypiProvenanceVariant(t, func(b map[string]any) {
+		atts := b["attestations"].([]any)
+		raw, err := json.Marshal(atts[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra map[string]any
+		if err := json.Unmarshal(raw, &extra); err != nil {
+			t.Fatal(err)
+		}
+		env := extra["envelope"].(map[string]any)
+		st, err := base64.StdEncoding.DecodeString(env["statement"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env["statement"] = base64.StdEncoding.EncodeToString([]byte(strings.Replace(string(st), PyPIPublishV1, "https://example.com/other/v1", 1)))
+		env["signature"] = base64.StdEncoding.EncodeToString([]byte("not a valid signature"))
+		b["attestations"] = append(atts, extra)
+	}))
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceInvalid {
+		t.Fatalf("outcome %s (%s); want invalid for the extra unverified attestation", ev.Outcome, ev.Detail)
+	}
+}
+
+func TestReviewGetDoesNotForwardURLCredentials(t *testing.T) {
+	var targetUser, targetPass string
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		targetUser, targetPass, _ = req.BasicAuth()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer other.Close()
+	var originUser, originPass string
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		originUser, originPass, _ = req.BasicAuth()
+		http.Redirect(w, req, other.URL+"/object", http.StatusFound)
+	}))
+	defer origin.Close()
+	v := &Verifier{HTTP: origin.Client()}
+	at := strings.Replace(origin.URL, "https://", "https://user:secret@", 1)
+	if _, err := v.get(context.Background(), at, nil, 1024); err != nil {
+		t.Fatal(err)
+	}
+	if originUser != "user" || originPass != "secret" {
+		t.Fatalf("initial request lost its credentials")
+	}
+	if targetUser != "" || targetPass != "" {
+		t.Fatalf("absolute redirect received URL credentials %q:%q; want no credentials", targetUser, targetPass)
+	}
+}
+
+// The index page is held to the index host on every hop as well, and a
+// redirect that stays on the index host over https is still followed.
+func TestPypiRedirectsStayOnIndex(t *testing.T) {
+	t.Run("page off the index", func(t *testing.T) {
+		other := newTLSRegistry(t)
+		servePypi(t, other, wheelOnly)
+		r := newTLSRegistry(t)
+		r.Config.Handler = http.RedirectHandler(other.URL+pypiPagePath, http.StatusFound)
+		ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+		if n := other.hitsOn(pypiPagePath); n != 0 {
+			t.Errorf("redirect target requested %d times; want 0", n)
+		}
+		if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, strings.TrimPrefix(other.URL, "https://")) {
+			t.Errorf("outcome %s (%s); want unknown naming the refused host", ev.Outcome, ev.Detail)
+		}
+	})
+	t.Run("provenance on the index", func(t *testing.T) {
+		r := newTLSRegistry(t)
+		servePypi(t, r, wheelOnly)
+		const moved = "/moved/provenance"
+		r.put(moved, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+		inner := r.Config.Handler
+		r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == pypiWheelPath {
+				http.Redirect(w, req, moved, http.StatusFound)
+				return
+			}
+			inner.ServeHTTP(w, req)
+		})
+		if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+			t.Errorf("outcome %s (%s); want verified through a same-host redirect", ev.Outcome, ev.Detail)
+		}
+	})
 }
