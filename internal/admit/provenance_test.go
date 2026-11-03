@@ -17,6 +17,7 @@ import (
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 
+	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -255,4 +256,96 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// pypiWithProvenance serves sampleproject 4.0.0's wheel with the PEP 740
+// provenance PyPI recorded for it, over TLS as PyPI serves it, and points the
+// provenance check at the recorded Sigstore trusted root and that server's
+// certificate.
+func pypiWithProvenance(t *testing.T) string {
+	t.Helper()
+	td := filepath.Join("..", "provenance", "testdata")
+	prov, err := os.ReadFile(filepath.Join(td, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wheel = "sampleproject-4.0.0-py3-none-any.whl"
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/simple/sampleproject/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{"api-version": "1.4"}, "name": "sampleproject",
+				"files": []map[string]any{{"filename": wheel,
+					"hashes":     map[string]string{"sha256": "c23e447ea90d796d1e645c35c4b2de125040add12a845825546f91c93f391b6b"},
+					"provenance": srv.URL + "/integrity/sampleproject/4.0.0/" + wheel + "/provenance"}}})
+		case "/integrity/sampleproject/4.0.0/" + wheel + "/provenance":
+			_, _ = w.Write(prov)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr, err := provenance.LoadTrustedRootFile(filepath.Join(td, "trusted_root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := NewProvenanceVerifier
+	NewProvenanceVerifier = func(cfg *config.Config) *provenance.Verifier {
+		v := prev(cfg)
+		v.HTTP = srv.Client()
+		v.Root = func(context.Context) (root.TrustedMaterial, error) { return tr, nil }
+		return v
+	}
+	t.Cleanup(func() { NewProvenanceVerifier = prev })
+	return srv.URL
+}
+
+// A pypi version admitted with no url reads pypi_upstream, records the
+// verified identity in its admission row, and the dependency/v1 statement
+// built from that row carries it as E27's mapping spells verified.
+func TestAdmitRecordsVerifiedPypiProvenance(t *testing.T) {
+	f := newAdmissionFixture(t)
+	if _, err := f.adb.DeleteAgePolicy(t.Context(), manifest.TypePypi); err != nil {
+		t.Fatal(err)
+	}
+	cfg := *f.synced
+	cfg.PypiUpstream = pypiWithProvenance(t) + "/"
+	if got := provenanceCheckerFrom(&cfg, nil).Verifier.PypiIndex; got != strings.TrimRight(cfg.PypiUpstream, "/") {
+		t.Fatalf("PypiIndex = %q, want pypi_upstream %q", got, cfg.PypiUpstream)
+	}
+	pm := &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject",
+		Versions: []manifest.VersionEntry{{Version: "4.0.0"}}}
+	res := Admit(t.Context(), policy.NewChecker(f.adb), f.adb, &cfg, pm, "ravi")
+	if res.Decision != Admitted {
+		t.Fatalf("Decision = %v (%s)", res.Decision, res.Reason)
+	}
+	rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypePypi, PkgName: "sampleproject"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("admissions = %+v, %v", rows, err)
+	}
+	row := rows[0]
+	c := checkOf(t, row, audit.CheckUpstreamProvenance)
+	p := c.Provenance
+	const repo = "https://github.com/pypa/sampleproject"
+	if p == nil || p.Outcome != audit.ProvenanceVerified || p.SourceRepositoryURI != repo ||
+		!strings.HasPrefix(p.WorkflowRef, repo+"/.github/workflows/release.yml@") || p.BuilderID != p.WorkflowRef ||
+		!strings.HasPrefix(p.BundleDigest, "sha256:") {
+		t.Fatalf("upstream_provenance = %+v (%+v)", c, p)
+	}
+	if pin, err := f.adb.GetProvenancePin(t.Context(), manifest.TypePypi, "sampleproject"); err != nil || pin.SourceRepositoryURI != repo {
+		t.Errorf("pin = %+v, %v", pin, err)
+	}
+
+	st := attest.NewStatement(attest.Pin{Type: manifest.TypePypi, Name: "sampleproject", Version: "4.0.0",
+		ObjectKey: "pypi/wheels/sampleproject-4.0.0-py3-none-any.whl", SHA256: strings.Repeat("a", 64)}, row, "test", time.Now())
+	sig := st.Predicate.PublisherSignature
+	_, digest, _ := strings.Cut(p.BundleDigest, ":")
+	if sig.Result != attest.ResultVerified || sig.SourceRepositoryURI != repo || sig.WorkflowRef != p.WorkflowRef ||
+		sig.BuilderID != p.BuilderID || sig.BundleDigest["sha256"] != digest {
+		t.Errorf("publisherSignature = %+v, want verified with the row's identity", sig)
+	}
+	if st.Predicate.UpstreamProvenance.Result != attest.ResultVerified {
+		t.Errorf("upstreamProvenance = %+v", st.Predicate.UpstreamProvenance)
+	}
 }

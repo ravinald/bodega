@@ -216,14 +216,22 @@ risk:
   let an operator quarantine the bad version and pin a known-good replacement
   in seconds. The walkthroughs under `docs/quarantine/` cover one such
   compromise end to end.
-- **A compromised maintainer account publishing outside CI, for npm and
-  GitHub releases.** A maintainer token stolen and used from a laptop
+- **A compromised maintainer account publishing outside CI, for npm, PyPI
+  and GitHub releases.** A maintainer token stolen and used from a laptop
   publishes a version whose checksum bodega would pin as readily as any other.
   The upstream provenance check reads what the publisher signed about who
-  built it: the Sigstore bundle npm serves beside a version built in CI, and
-  the GitHub artifact attestation of a binary or git release asset. The
-  bundle is verified against Sigstore's trusted root, and its subject must be
-  the tarball's published sha512 (npm) or the asset's sha256 (GitHub). The
+  built it: the Sigstore bundle npm serves beside a version built in CI, the
+  PEP 740 attestation PyPI serves for each file uploaded through Trusted
+  Publishing, and the GitHub artifact attestation of a binary or git release
+  asset. The bundle is verified against Sigstore's trusted root, and its
+  subject must be the tarball's published sha512 (npm), the file's name and
+  the sha256 the PyPI index lists for it, or the asset's sha256 (GitHub). A
+  PyPI attestation's certificate must also bind the repository and workflow
+  of the Trusted Publisher PyPI recorded when it accepted the upload, or it is
+  `invalid`. Every file of a PyPI version is verified, and a version whose
+  files disagree (some attested and some not, or attested by different
+  identities) is a `mismatch`: an sdist uploaded by hand beside wheels the
+  project's CI built is the laptop publish inside one release. The
   first admitted version to verify pins its source repository and builder;
   a later version verified from anything else is a `mismatch`. So is an npm
   version with no provenance at all, published after the pinned version by
@@ -233,7 +241,12 @@ risk:
   one the packument gives no publish time for, or whose pinned version it
   gives none for, is `unknown`. `unknown` means the evidence could not be
   read: a lookup that got no answer (a rate limit, an outage), an answer
-  that does not parse, or a packument that no longer lists the version. It
+  that does not parse, or a packument that no longer lists the version. For
+  PyPI it is also a provenance object the index names that cannot be had (a
+  404 included), a provenance URL on a host other than the configured index,
+  which is never requested, and a Trusted Publisher kind other than GitHub and
+  GitLab, which bodega does not verify. So a PyPI outage warns under `warn`,
+  refuses under `block`, and never refuses a version for good. It
   is also `unknown` when bodega has no Sigstore trusted root to check a
   bundle against: TUF unreachable, or a `sigstore_trusted_root` file that
   cannot be read or parsed. `bodega serve` refuses to start when
@@ -499,10 +512,10 @@ defence against:
   else, so a copy taken earlier keeps signing. Retiring is not revocation:
   verifiers stop trusting a stolen key only when they drop its key ID.
 - **A compromised maintainer account publishing outside CI, everywhere
-  else.** pypi, gomod, cargo, helm, apt, freebsd and distfiles record
+  else.** gomod, cargo, helm, apt, freebsd and distfiles record
   `unavailable` on every version, with the reason in the admission row:
-  PEP 740 attestations and helm `.prov` files are not verified yet, and the
-  rest publish no per-package statement of who built them. A binary or git
+  helm `.prov` files are not verified yet, and the rest publish no
+  per-package statement of who built them. A binary or git
   entry not fetched from a GitHub release, a git entry cloned rather than
   fetched as a release archive, and a release asset with no recorded digest
   are `unavailable` too. So is a GitHub release asset whose attestation
@@ -511,9 +524,16 @@ defence against:
   records its sha256 never calls the release API, and a git archive's digest
   comes from `SHA256SUMS`), so it cannot tell a release after the pin from
   one before the repository adopted attestations, and an asset uploaded from
-  a laptop with a stolen GitHub token passes under `warn`. An npm package that never published provenance holds no pin
-  and passes under `warn` the same way. Within npm and GitHub releases the
-  check still stops short of four things. It trusts the first verified version: a package
+  a laptop with a stolen GitHub token passes under `warn`. A PyPI version
+  with no attestation on any of its files is `unavailable` whatever the pin
+  holds: PyPI's page carries no publish time the check compares, so unlike
+  npm a version uploaded with a stolen API token after the pin passes under
+  `warn`. The PyPI publisher's `environment` is not compared either, because
+  the signing certificate does not carry it, so an attestation from the
+  right workflow in another deployment environment verifies. An npm package
+  that never published provenance holds no pin and passes under `warn` the
+  same way. Within npm, PyPI and GitHub releases the check still stops short
+  of four things. It trusts the first verified version: a package
   whose first admitted version was already built by an attacker's CI pins the
   attacker. It cannot tell a compromised CI workflow or source repository from
   an honest one, because the signature is that workflow's. It does not verify

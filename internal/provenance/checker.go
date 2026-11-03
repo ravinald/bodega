@@ -13,15 +13,14 @@ import (
 	"github.com/ravinald/bodega/internal/policy"
 )
 
-// Covered are the types the check verifies anything for: npm, and git and
-// binary entries fetched from GitHub releases. Every other type records
+// Covered are the types the check verifies anything for: npm, pypi, and git
+// and binary entries fetched from GitHub releases. Every other type records
 // unavailable with the reason uncoveredReason gives.
-var Covered = []string{manifest.TypeBinary, manifest.TypeGit, manifest.TypeNpm}
+var Covered = []string{manifest.TypeBinary, manifest.TypeGit, manifest.TypeNpm, manifest.TypePypi}
 
 // uncoveredReason names, per ecosystem, why no provenance is read, so the gap
 // is stated in every admission row rather than inferred from an absence.
 var uncoveredReason = map[string]string{
-	manifest.TypePypi:      "PyPI publishes PEP 740 attestations, which bodega does not verify yet",
 	manifest.TypeGomod:     "Go modules carry no publisher signature; the checksum database proves every client sees the same bytes, not who published them",
 	manifest.TypeCargo:     "crates.io publishes no provenance bodega can verify",
 	manifest.TypeRubygems:  "bodega does not verify the Sigstore attestations RubyGems.org publishes yet",
@@ -100,7 +99,7 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 		r.Reason = "load upstream provenance policy: " + err.Error()
 		return r
 	}
-	if pm.Type == manifest.TypeNpm && policy.UndatableVersion(pm.Type, ve.Version) {
+	if (pm.Type == manifest.TypeNpm || pm.Type == manifest.TypePypi) && policy.UndatableVersion(pm.Type, ve.Version) {
 		r.Action = policy.ActionNotEvaluated
 		r.Reason = "version " + strings.TrimSpace(ve.Version) + " names no single release; checked when a fetch resolves one"
 		return r
@@ -317,6 +316,8 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 	switch pm.Type {
 	case manifest.TypeNpm:
 		return v.Npm(ctx, ve.URL, pm.Name, strings.TrimSpace(ve.Version))
+	case manifest.TypePypi:
+		return v.Pypi(ctx, ve.URL, pm.Name, strings.TrimSpace(ve.Version))
 	case manifest.TypeBinary:
 		rel, ok := v.ParseReleaseAsset(ve.URL)
 		if !ok {

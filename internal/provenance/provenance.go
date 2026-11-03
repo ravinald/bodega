@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/verify"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -116,6 +118,8 @@ type Verifier struct {
 	HTTP *http.Client
 	// NpmRegistry is the registry read when a version names none.
 	NpmRegistry string
+	// PypiIndex is the PEP 503 index root read when a version names none.
+	PypiIndex string
 	// GitHubWeb and GitHubAPI are the GitHub hosts a release URL is matched
 	// against and the API attestations are read from.
 	GitHubWeb string
@@ -130,6 +134,7 @@ func NewVerifier(trustedRootPath string) *Verifier {
 	return &Verifier{
 		HTTP:        &http.Client{Timeout: 20 * time.Second},
 		NpmRegistry: "https://registry.npmjs.org",
+		PypiIndex:   "https://pypi.org",
 		GitHubWeb:   "https://github.com",
 		GitHubAPI:   "https://api.github.com",
 		Root:        SharedRoot(trustedRootPath),
@@ -238,11 +243,24 @@ func predicateTypeOf(raw []byte) string {
 	return st.PredicateType
 }
 
+// builderSource says where verifyBundle reads a builder ID from.
+type builderSource int
+
+const (
+	// builderFromPredicate is the SLSA predicate's builder, and a statement
+	// naming none is refused: SLSA provenance without one says nothing.
+	builderFromPredicate builderSource = iota
+	// builderFromSigner is the certificate's build signer URI, for a
+	// statement whose predicate carries no builder by design, as PyPI's
+	// publish attestation does.
+	builderFromSigner
+)
+
 // verifyBundle verifies one Sigstore bundle against tm: the certificate chain
 // to Fulcio, the transparency log entry, the signature over the DSSE envelope,
 // an issuer matching issuerRegex, and a statement subject carrying digest
 // under alg. It returns the identity the certificate binds and the statement.
-func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, digest []byte) (audit.UpstreamProvenance, *statement, error) {
+func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, digest []byte, from builderSource) (audit.UpstreamProvenance, *statement, error) {
 	var id audit.UpstreamProvenance
 	var b bundle.Bundle
 	if err := b.UnmarshalJSON(raw); err != nil {
@@ -288,6 +306,9 @@ func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, 
 		WorkflowRef:         cert.BuildSignerURI,
 		BuilderID:           builderID(&st),
 		BundleDigest:        "sha256:" + hex.EncodeToString(sum[:]),
+	}
+	if from == builderFromSigner {
+		id.BuilderID = cert.BuildSignerURI
 	}
 	if id.BuilderID == "" {
 		return id, nil, errors.New("the provenance names no builder")
@@ -341,15 +362,25 @@ func (v *Verifier) client() *http.Client {
 // published" rather than "could not tell".
 var errNotFound = errors.New("not found")
 
-// get reads url, refusing a body over limit bytes rather than returning a
-// truncated one, which would parse as a document that is not there.
-func (v *Verifier) get(ctx context.Context, url string, header http.Header, limit int64) ([]byte, error) {
-	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
-		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", url)
+// get reads raw, refusing a body over limit bytes rather than returning a
+// truncated one, which would parse as a document that is not there. Userinfo
+// in raw travels as Basic credentials, as the transport would send it anyway,
+// and is kept out of the request URL so no error this returns carries it.
+func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limit int64) ([]byte, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", manifest.PublicURL(raw))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	user := u.User
+	u.User = nil
+	target := u.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
+	}
+	if user != nil {
+		pass, _ := user.Password()
+		req.SetBasicAuth(user.Username(), pass)
 	}
 	for k, vs := range header {
 		req.Header[k] = vs
@@ -362,16 +393,16 @@ func (v *Verifier) get(ctx context.Context, url string, header http.Header, limi
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("GET %s: %w", url, errNotFound)
+		return nil, fmt.Errorf("GET %s: %w", target, errNotFound)
 	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
+		return nil, fmt.Errorf("GET %s: %w", target, err)
 	}
 	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
+		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", target, limit>>20)
 	}
 	return body, nil
 }

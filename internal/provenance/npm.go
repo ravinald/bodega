@@ -130,7 +130,7 @@ func (v *Verifier) npmVersion(ctx context.Context, registry, name, version strin
 		if a.PredicateType != SLSAProvenanceV1 && a.PredicateType != SLSAProvenanceV02 {
 			continue
 		}
-		id, st, err := verifyBundle(tm, a.Bundle, npmIssuers, "sha512", integrity)
+		id, st, err := verifyBundle(tm, a.Bundle, npmIssuers, "sha512", integrity, builderFromPredicate)
 		if err != nil {
 			return invalid("%s@%s provenance bundle %d did not verify: %v", name, version, i, err)
 		}

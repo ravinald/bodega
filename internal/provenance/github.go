@@ -173,7 +173,7 @@ func (v *Verifier) GitHubAttestations(ctx context.Context, owner, repo, sha256he
 	}
 	var verified *Evidence
 	for i, raw := range raws {
-		id, _, err := verifyBundle(tm, raw, githubIssuer, "sha256", digest)
+		id, _, err := verifyBundle(tm, raw, githubIssuer, "sha256", digest, builderFromPredicate)
 		if err != nil {
 			return invalid("%s/%s provenance bundle %d for sha256:%s did not verify: %v", owner, repo, i, sha256hex, err)
 		}
