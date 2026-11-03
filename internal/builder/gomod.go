@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/mod/sumdb/dirhash"
+
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -68,7 +71,11 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				cfg.logf("  [gomod] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeGomod, name, ve); err != nil {
+			// The module path, not the safe name: the checksum database and the
+			// allow-list's prefix rules key by it, and the digest pin the fetch
+			// takes names the row it attaches to by it.
+			admission, err := cfg.enforceAdmission(ctx, manifest.TypeGomod, pm.Name, ve)
+			if err != nil {
 				cfg.logf("  [gomod] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
@@ -111,6 +118,11 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			// escaped as the proxy protocol requires of an uppercase letter.
 			base := proxy + "/" + manifest.GomodEscapedPath(pm.Name) + "/@v/" + ve.Version
 
+			signed := admit.ChecksumDatabaseEntry(admission.Admission)
+			if signed != nil && signed.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+				_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum database %s, so the fetched bytes are not compared with it\n", name, signed.ChecksumDatabase.Outcome)
+			}
+
 			var fetchErr error
 			for _, ext := range []string{".info", ".mod", ".zip"} {
 				url := base + ext
@@ -122,6 +134,18 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					break
 				}
 				result.Artifacts = append(result.Artifacts, dest)
+
+				// The .mod and .zip are both on disk once the .zip is, and are
+				// held to the database before anything records the zip's digest.
+				if ext == ".zip" && signed != nil && signed.ChecksumDatabase.Outcome == audit.ProvenanceVerified {
+					if err := cfg.compareGomodWithDatabase(ctx, dir, pm.Name, ve.Version, admission.Admission, *signed.ChecksumDatabase); err != nil {
+						_, _ = fmt.Fprintf(out, "  [gomod] %s: %v\n", name, err)
+						result.Artifacts = nil
+						fetchErr = err
+						break
+					}
+					_, _ = fmt.Fprintf(out, "  [gomod] %s: .zip and .mod match the checksum database\n", name)
+				}
 
 				// Verify checksum for the .zip (primary artifact).
 				if ext == ".zip" {
@@ -183,6 +207,47 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 	}
 
 	return summary
+}
+
+// compareGomodWithDatabase holds the fetched .zip and .mod of module@version
+// to the hashes the checksum database signed. On a disagreement it removes
+// the version's three files, so GomodArtifactPaths uploads none of them, and
+// writes the policy_blocked row; no policy or override applies.
+func (cfg *Config) compareGomodWithDatabase(ctx context.Context, dir, module, version string, admitted audit.Admission, signed audit.ChecksumDatabase) error {
+	for _, f := range []struct{ ext, want string }{{".zip", signed.ZipHash}, {".mod", signed.ModHash}} {
+		path := filepath.Join(dir, version+f.ext)
+		got, err := gomodFileHash(path, f.ext)
+		if err != nil {
+			got = "an error (" + err.Error() + ")"
+		}
+		if err == nil && got == f.want {
+			continue
+		}
+		for _, ext := range []string{".info", ".mod", ".zip"} {
+			_ = os.Remove(filepath.Join(dir, version+ext))
+		}
+		_, incident := admit.RecordChecksumMismatch(ctx, cfg.AuditDB, admitted, version+f.ext, got,
+			admit.Who{Actor: audit.CurrentActor()})
+		return fmt.Errorf("CHECKSUM DATABASE MISMATCH: %s@%s: the fetched %s hashes to %s, but %s signed %s; the version's .info, .mod and .zip were removed and nothing was stored. Incident %s: do not fetch around it; compare what the upstream GOPROXY serves with %s/lookup/%s@%s before trusting either",
+			module, version, version+f.ext, got, signed.Database, f.want, incident, cfg.sumdbURL(), manifest.GomodEscapedPath(module), version)
+	}
+	return nil
+}
+
+// gomodFileHash is the go command's h1: hash of a module zip, or of a go.mod
+// on its own.
+func gomodFileHash(path, ext string) (string, error) {
+	if ext == ".zip" {
+		return dirhash.HashZip(path, dirhash.Hash1)
+	}
+	return dirhash.Hash1([]string{"go.mod"}, func(string) (io.ReadCloser, error) { return os.Open(path) }) //nolint:gosec // a build-root path the fetch derived
+}
+
+func (cfg *Config) sumdbURL() string {
+	if cfg.app != nil && cfg.app.GomodSumdbURL != "" {
+		return cfg.app.GomodSumdbURL
+	}
+	return "https://sum.golang.org"
 }
 
 // GomodArtifactPaths returns local/S3 path pairs for upload.

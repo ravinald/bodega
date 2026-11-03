@@ -2,10 +2,12 @@ package admit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -18,8 +20,9 @@ import (
 // bookkeeping that marks them not run.
 var versionChecks = []string{audit.CheckAge, audit.CheckOSV, audit.CheckUpstreamProvenance, audit.CheckNameSimilarity}
 
-// allChecks is every check an admission row names.
-var allChecks = append([]string{audit.CheckAllowList}, versionChecks...)
+// allChecks is every check an admission row names: checksum_database on a
+// gomod row only.
+var allChecks = append([]string{audit.CheckAllowList}, append(slices.Clone(versionChecks), audit.CheckChecksumDatabase)...)
 
 // evaluation accumulates the per-check verdicts of one admission, one list
 // per version, and turns them into the rows it writes. The policy digest, the
@@ -47,6 +50,12 @@ func newEvaluation(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		versionChecks: slices.Clone(versionChecks),
 		actions: map[string]string{audit.CheckAge: audit.ActionNone, audit.CheckOSV: audit.ActionNone,
 			audit.CheckUpstreamProvenance: policy.ActionWarn, audit.CheckNameSimilarity: policy.ActionWarn},
+	}
+	if pm.Type == manifest.TypeGomod {
+		// The action is fixed: see provenance.ChecksumDatabase.
+		at := slices.Index(ev.versionChecks, audit.CheckUpstreamProvenance) + 1
+		ev.versionChecks = slices.Insert(ev.versionChecks, at, audit.CheckChecksumDatabase)
+		ev.actions[audit.CheckChecksumDatabase] = policy.ActionBlock
 	}
 	if adb == nil {
 		return ev
@@ -153,9 +162,18 @@ func (ev *evaluation) notRunCheck(name, detail string) audit.AdmissionCheck {
 func (ev *evaluation) runVersion(ctx context.Context, pm *manifest.PackageManifest, i int, checkers []policy.VersionChecker) []policy.Result {
 	results := make([]policy.Result, 0, len(checkers))
 	for _, c := range checkers {
+		if a, ok := c.(typeScoped); ok && !a.AppliesTo(pm.Type) {
+			continue
+		}
 		results = append(results, ev.setResult(pm, i, c.Check(ctx, pm, &pm.Versions[i])))
 	}
 	return results
+}
+
+// typeScoped is a checker that runs on some types only, and whose check no
+// other type's row names.
+type typeScoped interface {
+	AppliesTo(typ string) bool
 }
 
 // setResult records r as version i's verdict for its check, and returns the
@@ -175,12 +193,13 @@ func (ev *evaluation) setResult(pm *manifest.PackageManifest, i int, r policy.Re
 	if action == "" {
 		action = audit.ActionNone
 	}
-	c := audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance}
+	c := audit.AdmissionCheck{Check: r.Check, Action: action, Status: status, Detail: r.Reason, Provenance: r.Provenance,
+		ChecksumDatabase: r.ChecksumDatabase}
 	if status == audit.CheckBlock {
 		if why := notOverridable(r); why == "" {
 			if oc, ok := ev.admitPast(pm, i, c); ok {
 				ev.set(i, oc)
-				return policy.Result{Check: r.Check, Action: policy.ActionPass, Provenance: r.Provenance}
+				return policy.Result{Check: r.Check, Action: policy.ActionPass, Provenance: r.Provenance, ChecksumDatabase: r.ChecksumDatabase}
 			}
 		} else {
 			c.Unwaivable = why
@@ -330,10 +349,12 @@ func checkRank(name string) int {
 		return 3
 	case audit.CheckUpstreamProvenance:
 		return 4
-	case audit.CheckNameSimilarity:
+	case audit.CheckChecksumDatabase:
 		return 5
+	case audit.CheckNameSimilarity:
+		return 6
 	}
-	return 6
+	return 7
 }
 
 // admissionVersion is the version an admission row is keyed by, and it is
@@ -344,4 +365,58 @@ func admissionVersion(ve manifest.VersionEntry) string {
 		return ve.Version
 	}
 	return ve.Ref
+}
+
+// ChecksumDatabaseEntry is row's checksum_database entry, nil when the row
+// carries none or the check recorded no outcome.
+func ChecksumDatabaseEntry(row audit.Admission) *audit.AdmissionCheck {
+	for i := range row.Checks {
+		if row.Checks[i].Check == audit.CheckChecksumDatabase && row.Checks[i].ChecksumDatabase != nil {
+			return &row.Checks[i]
+		}
+	}
+	return nil
+}
+
+// RecordChecksumMismatch records bytes a fetch brought in for a version
+// admitted as verified by the checksum database, whose file hashes to
+// computed rather than the hash the database signed: a policy_blocked row
+// whose checksum_database entry is invalid and carries both hashes, and an
+// audit event under the incident it returns. No policy or override applies,
+// so the row is written whatever admitted says.
+func RecordChecksumMismatch(ctx context.Context, adb *audit.DB, admitted audit.Admission, file, computed string, who Who) (audit.Admission, string) {
+	incident := audit.NewIncidentID()
+	row := admitted
+	row.ID, row.ObjectKey, row.Decision = 0, "", audit.AdmissionPolicyBlocked
+	row.Actor, row.Identity = who.Actor, who.Identity
+	row.Checks = slices.Clone(admitted.Checks)
+	var signed string
+	for i := range row.Checks {
+		c := &row.Checks[i]
+		if c.Check != audit.CheckChecksumDatabase {
+			continue
+		}
+		rec := audit.ChecksumDatabase{}
+		if c.ChecksumDatabase != nil {
+			rec = *c.ChecksumDatabase
+		}
+		signed = rec.ZipHash
+		if strings.HasSuffix(file, ".mod") {
+			signed = rec.ModHash
+		}
+		rec.Outcome, rec.File, rec.Computed = audit.ProvenanceInvalid, file, computed
+		c.ChecksumDatabase = &rec
+		c.Status, c.Action, c.Override, c.Unwaivable = audit.CheckBlock, policy.ActionBlock, "", ChecksumDatabaseInvalidReason
+		c.Detail = fmt.Sprintf("invalid: the fetched %s of %s@%s hashes to %s, but %s holds %s for it at tree size %d; nothing was stored or served (incident %s)",
+			file, row.PkgName, row.PkgVersion, computed, rec.Database, signed, rec.TreeSize, incident)
+	}
+	if adb == nil {
+		return row, incident
+	}
+	_ = adb.RecordAdmission(ctx, row)
+	details, _ := json.Marshal(map[string]string{"incident": incident, "file": file,
+		"database_hash": signed, "computed_hash": computed})
+	_ = adb.Record(ctx, audit.Event{EventType: audit.EventChecksumDatabase, PkgType: row.PkgType, PkgName: row.PkgName,
+		PkgVersion: row.PkgVersion, Actor: who.Actor, Identity: who.Identity, Status: "policy_violation", Details: string(details)})
+	return row, incident
 }

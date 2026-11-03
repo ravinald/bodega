@@ -27,6 +27,11 @@ const (
 	// verified against the Sigstore trusted root. Its entry carries the
 	// outcome and the identity verified in Provenance.
 	CheckUpstreamProvenance = "upstream_provenance"
+	// CheckChecksumDatabase is a Go module version looked up in the checksum
+	// database and verified against its signed tree head. Only gomod rows
+	// carry it. Its entry carries the outcome, the tree and both hashes in
+	// ChecksumDatabase.
+	CheckChecksumDatabase = "checksum_database"
 	// CheckOverride is the operator answering y to the allow-list prompt
 	// `bodega pkg create` carried before two-person overrides replaced it.
 	// Nothing writes it now; rows decided under the prompt still carry it.
@@ -59,6 +64,9 @@ type AdmissionCheck struct {
 	// Provenance is set on the upstream_provenance entry when the check
 	// ran, and nil everywhere else.
 	Provenance *UpstreamProvenance `json:"provenance,omitempty"`
+	// ChecksumDatabase is set on the checksum_database entry when the check
+	// ran, and nil everywhere else.
+	ChecksumDatabase *ChecksumDatabase `json:"checksum_database,omitempty"`
 	// Override is the ID of the override that admitted past this check's
 	// failure, set when Status is CheckOverridden.
 	Override string `json:"override,omitempty"`
@@ -107,6 +115,24 @@ type UpstreamProvenance struct {
 	BuilderID           string `json:"builder_id,omitempty"`
 	// BundleDigest is "sha256:<hex>" over the Sigstore bundle as fetched.
 	BundleDigest string `json:"bundle_digest,omitempty"`
+}
+
+// ChecksumDatabase is what the checksum_database check read. Outcome is one
+// of the upstream provenance outcomes: verified, invalid, unknown, or
+// unavailable for a module gomod_nosumdb names. The tree and hashes are set
+// when the database answered; File and Computed are set on a refusal at the
+// fetch, naming the file whose bytes disagreed and the hash they computed to.
+type ChecksumDatabase struct {
+	Outcome  string `json:"outcome"`
+	Database string `json:"database,omitempty"`
+	TreeSize int64  `json:"tree_size,omitempty"`
+	TreeHash string `json:"tree_hash,omitempty"`
+	// ZipHash and ModHash are the h1: hashes the database holds for the
+	// module zip and for its go.mod alone.
+	ZipHash  string `json:"zip_hash,omitempty"`
+	ModHash  string `json:"mod_hash,omitempty"`
+	File     string `json:"file,omitempty"`
+	Computed string `json:"computed,omitempty"`
 }
 
 // Admission is one decision on one version.

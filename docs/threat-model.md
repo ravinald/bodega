@@ -1002,7 +1002,14 @@ against the pinned publisher is reported in the `upstream_provenance` entry of
 `policyEvaluations`, not in `publisherSignature`. They are
 bodega's report of that check, not the publisher's bundle, so a consumer
 who wants to verify the publisher independently fetches the bundle from the
-registry itself. It also proves nothing about a statement signed after the **bodega host
+registry itself. For a Go module, the `checksum_database` entry of
+`policyEvaluations` reports the admission's lookup in the Go checksum
+database. A `verified` outcome proves that these bytes are the ones the
+public log recorded for this module version, to every client that asks, and
+that bodega held the bytes it fetched to those hashes before pinning them. It
+does not prove who published them, or that they are safe: the log records
+whatever a version's first fetch produced, so a malicious release its own
+author published verifies like any other. It also proves nothing about a statement signed after the **bodega host
 is compromised**. The key that signs is loaded by the serving process and
 read by `bodega attest backfill` and `bodega build fetch` on the same host,
 so anyone who controls that host can sign a statement admitting anything, at

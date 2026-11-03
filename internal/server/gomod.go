@@ -2,14 +2,21 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"os"
+	pathpkg "path"
 	"strings"
 	"time"
 
 	"net/http"
 
 	modulepath "golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
 
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -235,6 +242,48 @@ func (s *Server) handleGomodSumdb(w http.ResponseWriter, r *http.Request, p stri
 	// lookup under module rules would fail `go` for modules bodega serves.
 	s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), manifest.GomodSumdbKey(gomodSumdbName, rest),
 		s.cfg.GomodSumdbURL+"/"+rest, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, immutable, false)
+}
+
+// checksumDatabaseGate holds a Go module's .zip or .mod, spooled at path, to
+// the hash the checksum database signed for it when the fill's admission
+// recorded the version verified. It returns the refusal to answer on a
+// disagreement, having written the policy_blocked row, and nil otherwise:
+// for any other file, type or outcome there is no signed hash to compare. No
+// policy or override applies.
+func (s *Server) checksumDatabaseGate(ctx context.Context, r *http.Request, fill fillAdmission, s3Key, path string) *refusal {
+	if fill.typ != manifest.TypeGomod {
+		return nil
+	}
+	ext := pathpkg.Ext(s3Key)
+	if ext != ".zip" && ext != ".mod" {
+		return nil
+	}
+	entry := admit.ChecksumDatabaseEntry(fill.row)
+	if entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+		return nil
+	}
+	want := entry.ChecksumDatabase.ZipHash
+	var (
+		got string
+		err error
+	)
+	if ext == ".zip" {
+		got, err = dirhash.HashZip(path, dirhash.Hash1)
+	} else {
+		want = entry.ChecksumDatabase.ModHash
+		got, err = dirhash.Hash1([]string{"go.mod"}, func(string) (io.ReadCloser, error) { return os.Open(path) }) //nolint:gosec // the spool file this fill wrote
+	}
+	if err != nil {
+		got = "an error (" + err.Error() + ")"
+	}
+	if err == nil && got == want {
+		return nil
+	}
+	file := pathpkg.Base(s3Key)
+	_, incident := admit.RecordChecksumMismatch(ctx, s.auditDB, fill.row, file, got, admit.Who{Identity: Identity(r)})
+	s.logFor(ctx).Error("checksum database mismatch", "module", fill.name, "version", fill.version, "file", file,
+		"database_hash", want, "computed_hash", got, "incident", incident)
+	return checksumDatabaseRefusal(fill.name, fill.version, incident)
 }
 
 // gomodSumdbName is the checksum database the go command names by default.

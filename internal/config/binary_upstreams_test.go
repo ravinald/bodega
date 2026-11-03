@@ -412,3 +412,72 @@ func TestLoad_PrivateUpstreamHosts(t *testing.T) {
 		}
 	}
 }
+
+// testSumdbKey is a verifier key naming sum.golang.org that is not the
+// default, so a round trip that kept it proves the file was read.
+const testSumdbKey = "sum.golang.org+675ca2e1+AS3b0H+Oo+3OcNe3EOv5DJFC9ZUzTdWUTU1nHIIMG9+O"
+
+func TestGomodSumdbKeysSurviveSaveLoad(t *testing.T) {
+	isolateConfig(t)
+	writeConfig(t, `{}`)
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GomodSumdbKey != config.DefaultGomodSumdbKey || cfg.GomodNoSumdb != "" {
+		t.Fatalf("defaults: gomod_sumdb_key %q gomod_nosumdb %q, want the Go toolchain's key and none", cfg.GomodSumdbKey, cfg.GomodNoSumdb)
+	}
+	cfg.GomodSumdbKey = testSumdbKey
+	cfg.GomodNoSumdb = "*.corp.example.com,github.com/example-corp/*"
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load after Save: %v", err)
+	}
+	if got.GomodSumdbKey != testSumdbKey {
+		t.Errorf("gomod_sumdb_key after round trip = %q, want %q", got.GomodSumdbKey, testSumdbKey)
+	}
+	if got.GomodNoSumdb != cfg.GomodNoSumdb {
+		t.Errorf("gomod_nosumdb after round trip = %q, want %q", got.GomodNoSumdb, cfg.GomodNoSumdb)
+	}
+	if want := []string{"*.corp.example.com", "github.com/example-corp/*"}; !slices.Equal(got.GomodNoSumdbPatterns(), want) {
+		t.Errorf("GomodNoSumdbPatterns = %q, want %q", got.GomodNoSumdbPatterns(), want)
+	}
+}
+
+func TestLoad_GomodSumdbKeyAndNoSumdb(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		wantErr    []string
+	}{
+		{name: "good key", body: `{"gomod_sumdb_key":"` + testSumdbKey + `"}`},
+		{name: "malformed key", body: `{"gomod_sumdb_key":"sum.golang.org+nothex+AAAA"}`,
+			wantErr: []string{"gomod_sumdb_key", "sum.golang.org+nothex+AAAA", "malformed"}},
+		{name: "key for another name", body: `{"gomod_sumdb_key":"sum.example.com+e886b9d3+AeD5tjFcBapaILLeUmKUti0UOKwQ56kHPy8B1MfT2ErI"}`,
+			wantErr: []string{"gomod_sumdb_key", `"sum.example.com"`, "relay", "/go/sumdb/", "serves only sum.golang.org"}},
+		{name: "good pattern list", body: `{"gomod_nosumdb":"*.corp.example.com, github.com/example-corp/*,,"}`},
+		{name: "bad pattern", body: `{"gomod_nosumdb":"github.com/ok/*,github.com/[bad"}`,
+			wantErr: []string{"gomod_nosumdb", `"github.com/[bad"`, "syntax error in pattern"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, tc.body)
+			_, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("Load refused %s: %v", tc.body, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted %s", tc.body)
+			}
+			for _, w := range tc.wantErr {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not carry %q", err, w)
+				}
+			}
+		})
+	}
+}

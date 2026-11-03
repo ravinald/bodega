@@ -241,6 +241,10 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"oidc_token_ttl": "10m",
 		// Load requires an https URL.
 		"gomod_sumdb_url": "https://sum.example.com",
+		// Load requires a verifier key naming sum.golang.org, and patterns
+		// path.Match reads.
+		"gomod_sumdb_key": testSumdbKey,
+		"gomod_nosumdb":   "*.corp.example.com,github.com/example-corp/*",
 		// Load refuses both Maven keys together and folds the single one
 		// into the list, so the round trip carries the list alone.
 		"maven_upstream":    "",

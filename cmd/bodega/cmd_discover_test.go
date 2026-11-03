@@ -38,6 +38,8 @@ func newDiscoverEnv(t *testing.T) *discoverEnv {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
+	// gomod_nosumdb: the modules these cases import are example.com paths no
+	// checksum database holds, and the test binary reaches none.
 	body := fmt.Sprintf(`{
   "storage_backend": "local",
   "storage_path": %q,
@@ -45,7 +47,8 @@ func newDiscoverEnv(t *testing.T) *discoverEnv {
   "audit_db": %q,
   "log_dir": %q,
   "allow_plaintext": true,
-  "apt_codename": "noble"
+  "apt_codename": "noble",
+  "gomod_nosumdb": "example.com"
 }`, filepath.Join(dir, "storage"), env.manifestDir, env.auditDB, dir)
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
