@@ -423,18 +423,20 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// before a byte reaches the client. A tee straight to the response would
 	// have already handed the client an artifact by the time the mismatch is
 	// known, and a truncated response is not a refusal.
-	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
-		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
-		s.logFor(r.Context()).Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
-		f.write(w, r)
-		return
-	}
+	//
 	// The provenance check read the chart in a request of its own, so these
-	// bytes are held to the digest it verified the publisher signed.
+	// bytes are held to the digest it verified the publisher signed, before
+	// verifyProxyChecksum pins the first digest it sees.
 	if fill.signed != "" && "sha256:"+spool.sha256 != fill.signed {
 		f := signedChartRefusal(regType, fill.name, fill.version)
 		s.logFor(r.Context()).Error("upstream bytes differ from the digest the publisher signed", "key", s3Key,
 			"url", up.url, "signed", fill.signed, "served", "sha256:"+spool.sha256, "incident", f.incident)
+		f.write(w, r)
+		return
+	}
+	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
+		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
+		s.logFor(r.Context()).Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
 		f.write(w, r)
 		return
 	}

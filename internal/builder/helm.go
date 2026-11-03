@@ -71,6 +71,15 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 				stage := CheckHelmStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [helm] %s: already fetched, skipping", name)
+					// Held to the signed digest before verifyFetched, which pins
+					// whatever is on disk when the entry records no checksum.
+					if err := verifySignedChart(helmLocalPath(d, name, ve), ve.URL, admission); err != nil {
+						_ = os.Remove(helmLocalPath(d, name, ve))
+						cfg.logf("  [helm] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeHelm, Name: name, Err: err})
+						continue
+					}
 					if err := cfg.verifyFetched(ctx, store, manifest.TypeHelm, name, ve); err != nil {
 						cfg.logf("  [helm] %s: %v", name, err)
 						summary.Failures++
@@ -175,7 +184,7 @@ func verifySignedChart(dest, chartURL string, a audit.Admission) error {
 		return err
 	}
 	if "sha256:"+got != signed {
-		return fmt.Errorf("the chart downloaded from %s is sha256:%s, but its .prov signed %s at admission; refusing bytes the signature does not cover", chartURL, got, signed)
+		return fmt.Errorf("the chart at %s is sha256:%s, but its .prov at %s.prov signed %s at admission; refusing bytes the signature does not cover and removing them, so the next fetch downloads the chart again", dest, got, chartURL, signed)
 	}
 	return nil
 }

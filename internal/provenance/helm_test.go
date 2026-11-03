@@ -524,3 +524,65 @@ func TestReviewHelmNoKeyringDetailUnderIgnore(t *testing.T) {
 		t.Fatalf("unknown under ignore: Details = %#v; want no_keyring:true", r.Details)
 	}
 }
+
+func TestReviewHelmRejectsBinaryPrivateAfterPublicArmor(t *testing.T) {
+	key := newHelmKey(t, nil)
+	public := writeHelmKeyring(t, true, key)
+	data, err := os.ReadFile(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	if err := key.SerializePrivate(&secret, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(public, append(data, secret.Bytes()...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LoadHelmKeyring(public, "https://charts.example.com/")
+	if err == nil || !strings.Contains(err.Error(), "private key material") {
+		t.Fatalf("public armor followed by binary private key: error = %v; want private-key refusal", err)
+	}
+}
+
+// Every byte of a keyring file is read, wherever it sits relative to the
+// armored blocks, so private material cannot hide outside the armor.
+func TestHelmKeyringReadsBytesOutsideArmor(t *testing.T) {
+	key := newHelmKey(t, nil)
+	armored, err := os.ReadFile(writeHelmKeyring(t, true, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	if err := key.SerializePrivate(&secret, nil); err != nil {
+		t.Fatal(err)
+	}
+	join := func(parts ...[]byte) []byte { return bytes.Join(parts, []byte("\n")) }
+	cases := []struct {
+		name, want string
+		data       []byte
+	}{
+		{"binary private before armor", "private key material", join(secret.Bytes(), armored)},
+		{"binary private between blocks", "private key material", join(armored, secret.Bytes(), armored)},
+		{"text outside any block", "outside any armored block", join([]byte("not a key"), armored)},
+		{"two public blocks", "", join(armored, armored)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "keyring.asc")
+			if err := os.WriteFile(file, tc.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			keys, err := LoadHelmKeyring(file, "")
+			if tc.want == "" {
+				if err != nil || len(keys) != 2 {
+					t.Fatalf("keys=%d err=%v; want 2 keys", len(keys), err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), file) {
+				t.Fatalf("error = %v; want %q naming %s", err, tc.want, file)
+			}
+		})
+	}
+}

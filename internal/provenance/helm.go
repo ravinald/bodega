@@ -79,41 +79,58 @@ func LoadHelmKeyring(file, prefix string) (openpgp.EntityList, error) {
 // readKeyring parses a binary or armored keyring and reports whether any key
 // in it carries private material.
 //
-// An armored file is read block by block to its end: armor.Decode stops at
-// the first block, and a private key concatenated after a public one would
-// otherwise load unseen.
+// Every byte of the file is accounted for: each armored block is decoded on
+// its own, since armor.Decode stops at the first block's footer, and any bytes
+// outside a block are read as a binary keyring. Reading only the armor would
+// let a private key concatenated before, between or after the blocks load
+// unseen.
 func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
-	if !bytes.Contains(data, armorBegin) {
-		keys, err := openpgp.ReadKeyRing(bytes.NewReader(data))
-		if err != nil {
-			return nil, false, err
-		}
-		if holdsPrivate(keys) {
-			return nil, true, nil
-		}
-		return keys, false, nil
-	}
 	var keys openpgp.EntityList
 	var parseErr error
-	for i, block := range armorBlocks(data) {
-		blk, err := armor.Decode(bytes.NewReader(block))
-		if err != nil {
-			return nil, false, fmt.Errorf("armored block %d: %w", i+1, err)
+	note := func(err error) {
+		if parseErr == nil {
+			parseErr = err
 		}
-		if blk.Type == openpgp.PrivateKeyType {
+	}
+	segs := keyringSegments(data)
+	for i, seg := range segs {
+		label := fmt.Sprintf("armored block %d", i+1)
+		raw := seg.data
+		if !seg.armored {
+			label = fmt.Sprintf("bytes outside any armored block (segment %d)", i+1)
+			if len(segs) == 1 {
+				label = "binary keyring"
+			}
+		} else {
+			blk, err := armor.Decode(bytes.NewReader(seg.data))
+			if err != nil {
+				return nil, false, fmt.Errorf("%s: %w", label, err)
+			}
+			if blk.Type == openpgp.PrivateKeyType {
+				return nil, true, nil
+			}
+			body, err := io.ReadAll(blk.Body)
+			if err != nil {
+				return nil, false, fmt.Errorf("%s: %w", label, err)
+			}
+			if blk.Type != openpgp.PublicKeyType {
+				if packetsHoldPrivate(body) {
+					return nil, true, nil
+				}
+				note(fmt.Errorf("%s is a %q, not a %q", label, blk.Type, openpgp.PublicKeyType))
+				continue
+			}
+			raw = body
+		}
+		if packetsHoldPrivate(raw) {
 			return nil, true, nil
 		}
-		if blk.Type != openpgp.PublicKeyType {
-			if parseErr == nil {
-				parseErr = fmt.Errorf("armored block %d is a %q, not a %q", i+1, blk.Type, openpgp.PublicKeyType)
-			}
-			continue
+		got, err := openpgp.ReadKeyRing(bytes.NewReader(raw))
+		if trimmed := bytes.TrimRight(raw, " \t\r\n"); err != nil && !seg.armored && len(trimmed) < len(raw) {
+			got, err = openpgp.ReadKeyRing(bytes.NewReader(trimmed))
 		}
-		got, err := openpgp.ReadKeyRing(blk.Body)
 		if err != nil {
-			if parseErr == nil {
-				parseErr = fmt.Errorf("armored block %d: %w", i+1, err)
-			}
+			note(fmt.Errorf("%s: %w", label, err))
 			continue
 		}
 		if holdsPrivate(got) {
@@ -127,24 +144,69 @@ func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
 	return keys, false, nil
 }
 
-var armorBegin = []byte("-----BEGIN PGP")
+var (
+	armorBegin  = []byte("-----BEGIN PGP")
+	armorEnd    = []byte("-----END PGP")
+	armorDashes = []byte("-----")
+)
 
-// armorBlocks splits data at each armor header, so every block decodes on
-// its own. Text before the first header is dropped, as armor.Decode drops it.
-func armorBlocks(data []byte) [][]byte {
-	var out [][]byte
-	for {
+type keyringSegment struct {
+	data    []byte
+	armored bool
+}
+
+// keyringSegments splits data into armored blocks, each running from its
+// header through its footer, and the bytes between them. Whitespace
+// between blocks is not a segment; anything else is.
+func keyringSegments(data []byte) []keyringSegment {
+	var out []keyringSegment
+	// A packet's tag byte has its high bit set, so leading whitespace is
+	// never packet data. Trailing whitespace can be, and readKeyring retries
+	// without it rather than trimming it here.
+	addBinary := func(b []byte) {
+		if b = bytes.TrimLeft(b, " \t\r\n"); len(b) > 0 {
+			out = append(out, keyringSegment{data: b})
+		}
+	}
+	for len(data) > 0 {
 		start := bytes.Index(data, armorBegin)
 		if start < 0 {
-			return out
+			addBinary(data)
+			break
 		}
+		addBinary(data[:start])
 		data = data[start:]
-		next := bytes.Index(data[len(armorBegin):], armorBegin)
-		if next < 0 {
-			return append(out, data)
+		end := len(data)
+		if e := bytes.Index(data, armorEnd); e >= 0 {
+			// The footer ends at its closing dashes, not at a newline:
+			// encoders write none after it, so whatever follows may start on
+			// the same line.
+			end = e + len(armorEnd)
+			if c := bytes.Index(data[end:], armorDashes); c >= 0 {
+				end += c + len(armorDashes)
+			} else {
+				end = len(data)
+			}
 		}
-		out = append(out, data[:len(armorBegin)+next])
-		data = data[len(armorBegin)+next:]
+		out = append(out, keyringSegment{data: data[:end], armored: true})
+		data = data[end:]
+	}
+	return out
+}
+
+// packetsHoldPrivate reports whether any packet in b is a secret key, read
+// packet by packet so private material is found even where the packets do
+// not form a keyring ReadKeyRing would accept.
+func packetsHoldPrivate(b []byte) bool {
+	r := packet.NewReader(bytes.NewReader(b))
+	for {
+		p, err := r.Next()
+		if err != nil {
+			return false
+		}
+		if _, ok := p.(*packet.PrivateKey); ok {
+			return true
+		}
 	}
 }
 

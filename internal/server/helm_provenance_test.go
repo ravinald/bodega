@@ -147,3 +147,25 @@ func TestHelmProxyFillRefusesBytesTheProvDidNotSign(t *testing.T) {
 		t.Error("the swapped chart was cached")
 	}
 }
+
+func TestReviewHelmRefusedProxyBytesDoNotPoisonChecksum(t *testing.T) {
+	signed := []byte("signed chart bytes")
+	up := newSignedChartUpstream(t, signed, []byte("swapped chart bytes"))
+	s := helmProvenanceServer(t, up)
+	status, _ := getStatusAndBody(t, s, "/helm/charts/podinfo-6.7.0.tgz")
+	if status != http.StatusBadGateway {
+		t.Fatalf("first GET = %d, want 502", status)
+	}
+	pin, err := s.auditDB.GetChecksum(t.Context(), manifest.HelmChartKey("podinfo", "6.7.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pin != nil && pin.Value != "" {
+		t.Errorf("refused bytes left checksum pin sha256:%s; publisher signed %s", pin.Value, up.digest)
+	}
+	up.later = signed
+	status, body := getStatusAndBody(t, s, "/helm/charts/podinfo-6.7.0.tgz")
+	if status != http.StatusOK || body != string(signed) {
+		t.Fatalf("retry with publisher's bytes = %d %q; want 200 and signed chart, without operator clearing a poisoned checksum", status, body)
+	}
+}
