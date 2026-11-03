@@ -55,6 +55,7 @@ CHECK_LEGS := ci-drift pin-check fmt-check tidy-check harness vet build lint tes
 # leave a script there that sources files relative to where it was written.
 E2E_SHELL := $(filter-out test/e2e/results/%,$(shell shfmt -f test/e2e 2>/dev/null))
 SETUP_SHELL := internal/server/client_setup.sh internal/server/osquery_ship.sh
+RELEASE_SHELL := scripts/verify-release.sh scripts/verify-release_test.sh
 
 # ---- Install paths ---------------------------------------------------------
 # `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected
@@ -248,6 +249,9 @@ harness:
 	shellcheck -s sh $(SETUP_SHELL)
 	shfmt -d $(E2E_SHELL) $(SETUP_SHELL)
 	test/e2e/run.sh --self-test
+	shellcheck -x $(RELEASE_SHELL)
+	shfmt -d $(RELEASE_SHELL)
+	scripts/verify-release_test.sh
 
 ## e2e: Drive the full end-to-end suite against the two dev guests
 #
