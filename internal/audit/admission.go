@@ -261,7 +261,7 @@ func (a *DB) PinAdmission(ctx context.Context, p AdmissionPin) (PinOutcome, erro
 		PkgVersion: p.PkgVersion,
 		ObjectKey:  p.ObjectKey,
 		Decision:   AdmissionAdmitted,
-		Checks:     NotEvaluatedChecks("pinned with no admission decision on record for this version"),
+		Checks:     NotEvaluatedChecksFor(p.PkgType, "pinned with no admission decision on record for this version"),
 	})
 }
 
@@ -370,6 +370,26 @@ func NotEvaluatedChecks(detail string) []AdmissionCheck {
 		{Check: CheckNameSimilarity, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail},
 	}
 }
+
+// NotEvaluatedChecksFor is NotEvaluatedChecks for a row of typ: a gomod row
+// also carries checksum_database, after upstream_provenance, as every gomod
+// admission row does.
+func NotEvaluatedChecksFor(typ, detail string) []AdmissionCheck {
+	checks := NotEvaluatedChecks(detail)
+	if typ != gomodType {
+		return checks
+	}
+	for i, c := range checks {
+		if c.Check == CheckUpstreamProvenance {
+			sumdb := AdmissionCheck{Check: CheckChecksumDatabase, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail}
+			return append(checks[:i+1], append([]AdmissionCheck{sumdb}, checks[i+1:]...)...)
+		}
+	}
+	return checks
+}
+
+// gomodType is manifest.TypeGomod, which audit cannot import.
+const gomodType = "gomod"
 
 // ValidAdmissionDecision reports whether d is one of the three decisions.
 func ValidAdmissionDecision(d string) bool {

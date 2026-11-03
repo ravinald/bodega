@@ -3,6 +3,8 @@ package provenance
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -169,9 +171,10 @@ func (d *ChecksumDatabase) Lookup(module, version string) (audit.ChecksumDatabas
 		// keeps a failed lookup, for the client's lifetime; a fresh one
 		// starts again from the stored tree head.
 		d.drop(client)
-		msg := oneLine(err.Error())
+		local := strings.Contains(err.Error(), ops.tag)
+		msg := oneLine(strings.ReplaceAll(err.Error(), ops.tag, ""))
 		misbehaved := strings.Contains(msg, sumdb.ErrSecurity.Error())
-		if !misbehaved && (strings.Contains(msg, errRemoteRead) || strings.Contains(msg, errTreeStore)) {
+		if local && !misbehaved {
 			return unknown("%s", msg)
 		}
 		rec.Outcome = audit.ProvenanceInvalid
@@ -207,7 +210,7 @@ func (d *ChecksumDatabase) acquire() (*sumdb.Client, *sumdbOps) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.client == nil {
-		d.ops = &sumdbOps{d: d}
+		d.ops = &sumdbOps{d: d, tag: newOpsTag()}
 		d.client = sumdb.NewClient(d.ops)
 	}
 	return d.client, d.ops
@@ -234,19 +237,32 @@ func goSumHash(line string) string {
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-// Markers on the errors sumdbOps returns. sumdb.Client formats every error it
-// returns with %v, so no error chain survives to Lookup; these are how a
-// failure to read is told from a failure to verify.
+// Prefixes of the errors sumdbOps returns, for the reader of a row.
 const (
 	errRemoteRead = "checksum database read failed"
 	errTreeStore  = "stored tree head unavailable"
 )
+
+// newOpsTag is the token sumdbOps puts on every error it returns.
+// sumdb.Client formats every error with %v, so no error chain survives to
+// Lookup, and the client quotes the served tree note in its own errors: text
+// the database chose. A fixed marker could be served inside a note to turn a
+// failed verification into an overridable unknown. The tag is random per
+// client and stripped before any detail is written, so the database never
+// sees it and cannot echo it.
+func newOpsTag() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "{local:" + hex.EncodeToString(b[:]) + "}"
+}
 
 var errNotCached = errors.New("not cached")
 
 // sumdbOps is what one sumdb.Client reads and writes through.
 type sumdbOps struct {
 	d *ChecksumDatabase
+	// tag marks an error as this client's own failure to read or store.
+	tag string
 
 	mu sync.Mutex
 	// mem is the tree head a client with no store, or a read-only one,
@@ -265,22 +281,22 @@ func (o *sumdbOps) ReadRemote(path string) ([]byte, error) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s: %v", errRemoteRead, url, err)
+		return nil, fmt.Errorf("%s%s: %s: %v", errRemoteRead, o.tag, url, err)
 	}
 	resp, err := d.cfg.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s: %v", errRemoteRead, url, err)
+		return nil, fmt.Errorf("%s%s: %s: %v", errRemoteRead, o.tag, url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s answered %s", errRemoteRead, url, resp.Status)
+		return nil, fmt.Errorf("%s%s: %s answered %s", errRemoteRead, o.tag, url, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, d.cfg.MaxBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s: %v", errRemoteRead, url, err)
+		return nil, fmt.Errorf("%s%s: %s: %v", errRemoteRead, o.tag, url, err)
 	}
 	if int64(len(body)) > d.cfg.MaxBytes {
-		return nil, fmt.Errorf("%s: %s answered more than %d bytes", errRemoteRead, url, d.cfg.MaxBytes)
+		return nil, fmt.Errorf("%s%s: %s answered more than %d bytes", errRemoteRead, o.tag, url, d.cfg.MaxBytes)
 	}
 	return body, nil
 }
@@ -315,7 +331,7 @@ func (o *sumdbOps) current() ([]byte, error) {
 	defer cancel()
 	data, err := o.d.cfg.Store.GetChecksumDatabaseTree(ctx, o.d.name)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %v", errTreeStore, err)
+		return nil, fmt.Errorf("%s%s: %v", errTreeStore, o.tag, err)
 	}
 	return data, nil
 }
@@ -342,7 +358,7 @@ func (o *sumdbOps) WriteConfig(file string, old, next []byte) error {
 	defer cancel()
 	ok, err := o.d.cfg.Store.SwapChecksumDatabaseTree(ctx, o.d.name, old, next)
 	if err != nil {
-		return fmt.Errorf("%s: %v", errTreeStore, err)
+		return fmt.Errorf("%s%s: %v", errTreeStore, o.tag, err)
 	}
 	if !ok {
 		return sumdb.ErrWriteConflict

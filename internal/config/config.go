@@ -642,7 +642,7 @@ const DefaultGomodSumdbKey = "sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+
 func validateSumdbKey(key string) error {
 	v, err := note.NewVerifier(key)
 	if err != nil {
-		return fmt.Errorf("invalid gomod_sumdb_key %q: %v; want a verifier key of the form name+hash+key, e.g. %q", key, err, DefaultGomodSumdbKey)
+		return fmt.Errorf("invalid gomod_sumdb_key %q: %v; want the verifier key of %s, of the form name+hash+key, e.g. %q, because the relay under /go/sumdb/ serves only %s, from gomod_sumdb_url", key, err, GomodSumdbName, DefaultGomodSumdbKey, GomodSumdbName)
 	}
 	if v.Name() != GomodSumdbName {
 		return fmt.Errorf("invalid gomod_sumdb_key %q: it names the database %q, and the relay under /go/sumdb/ serves only %s, from gomod_sumdb_url; use that database's key", key, v.Name(), GomodSumdbName)

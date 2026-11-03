@@ -211,3 +211,32 @@ func TestFetchGomodWithoutADatabaseHashIsNotCompared(t *testing.T) {
 		})
 	}
 }
+
+// A build root holding the .info but not the .zip, under a verified verdict,
+// is fetched again and compared rather than reused with nothing to compare.
+func TestFetchGomodRefetchesAPartialBuildRootUnderAVerifiedVerdict(t *testing.T) {
+	m := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.AddModule(m)
+	app := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier, GomodNoSumdb: "example.com"}
+	f := fetchGomodFrom(t, app, goproxy(t, m.Path, m.Version, m.Mod, m.Zip), m.Path, m.Version, nil)
+	if f.summary.Failures != 0 {
+		t.Fatalf("excluded initial fetch: %+v", f.summary)
+	}
+	zip := filepath.Join(f.dir, m.Version+".zip")
+	if err := os.Remove(zip); err != nil {
+		t.Fatal(err)
+	}
+	app.GomodNoSumdb = ""
+	f.cfg.Force = false
+	second := FetchGomod(f.cfg, f.store, "")
+	if second.Failures != 0 || second.Total != 1 {
+		t.Fatalf("partial build root not fetched again: %+v", second)
+	}
+	if !fileExists(zip) {
+		t.Fatal("zip not fetched again")
+	}
+	if c := sumdbEntry(t, newestRow(t, f.adb, m.Path, m.Version)); c.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("outcome %s, want verified", c.ChecksumDatabase.Outcome)
+	}
+}

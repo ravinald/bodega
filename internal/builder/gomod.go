@@ -81,10 +81,25 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
 				continue
 			}
+			signed := admit.ChecksumDatabaseEntry(admission.Admission)
+			verified := signed != nil && signed.ChecksumDatabase.Outcome == audit.ProvenanceVerified
 			if !cfg.Force {
 				stage := CheckGomodStage(cfg, name, ve)
-				if stage.Fetched {
+				// Reused bytes are held to a verified verdict before anything
+				// pins or signs them under it. A partial build root has nothing
+				// to compare, so it is fetched again rather than reused.
+				if stage.Fetched && verified && !stage.Built {
+					cfg.logf("  [gomod] %s: build root lacks the .mod or .zip, fetching again to compare with the checksum database", name)
+				} else if stage.Fetched {
 					cfg.logf("  [gomod] %s: already fetched, skipping", name)
+					if verified {
+						if err := cfg.compareGomodWithDatabase(ctx, gomodDir(d, name), pm.Name, ve.Version, admission.Admission, *signed.ChecksumDatabase); err != nil {
+							cfg.logf("  [gomod] %s: %v", name, err)
+							summary.Failures++
+							summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
+							continue
+						}
+					}
 					if err := cfg.verifyFetched(ctx, store, manifest.TypeGomod, name, ve); err != nil {
 						cfg.logf("  [gomod] %s: %v", name, err)
 						summary.Failures++
@@ -118,8 +133,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			// escaped as the proxy protocol requires of an uppercase letter.
 			base := proxy + "/" + manifest.GomodEscapedPath(pm.Name) + "/@v/" + ve.Version
 
-			signed := admit.ChecksumDatabaseEntry(admission.Admission)
-			if signed != nil && signed.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+			if signed != nil && !verified {
 				_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum database %s, so the fetched bytes are not compared with it\n", name, signed.ChecksumDatabase.Outcome)
 			}
 
@@ -137,7 +151,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 
 				// The .mod and .zip are both on disk once the .zip is, and are
 				// held to the database before anything records the zip's digest.
-				if ext == ".zip" && signed != nil && signed.ChecksumDatabase.Outcome == audit.ProvenanceVerified {
+				if ext == ".zip" && verified {
 					if err := cfg.compareGomodWithDatabase(ctx, dir, pm.Name, ve.Version, admission.Admission, *signed.ChecksumDatabase); err != nil {
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: %v\n", name, err)
 						result.Artifacts = nil
