@@ -923,3 +923,18 @@ func TestLoadValidatesHelmKeyrings(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewHelmKeyringPrefixNeedsHostname(t *testing.T) {
+	isolateConfig(t)
+	const prefix = "https://:443/"
+	data, _ := json.Marshal(map[string]any{"helm_keyrings": map[string]string{prefix: "/keyring.gpg"}})
+	file := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigFile, file)
+	_, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err == nil || !strings.Contains(err.Error(), "names no host") {
+		t.Fatalf("helm_keyrings[%q]: error = %v; want missing-host refusal", prefix, err)
+	}
+}

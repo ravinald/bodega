@@ -297,13 +297,18 @@ func verdict(ev Evidence, action string) policy.Result {
 		if ev.NoTrustedRoot {
 			r.Details[audit.DetailNoTrustedRoot] = true
 		}
-		if ev.NoKeyring {
-			r.Details[audit.DetailNoKeyring] = true
-		}
 		if ev.Outcome == audit.ProvenanceMismatch && prov.SourceRepositoryURI == "" {
 			r.Details["publisher"] = publisherName(ev.Publisher)
 			r.Details["pinned_publisher"] = publisherName(ev.PinnedPublisher)
 		}
+	}
+	// Why nothing was concluded is recorded whatever the action, so a row
+	// written under ignore still says no keyring was configured.
+	if ev.NoKeyring {
+		if r.Details == nil {
+			r.Details = map[string]any{"outcome": ev.Outcome}
+		}
+		r.Details[audit.DetailNoKeyring] = true
 	}
 	return r
 }

@@ -484,3 +484,43 @@ func TestHelmIsCovered(t *testing.T) {
 		t.Errorf("helm: covered=%v, uncovered reason %q", IsCovered(manifest.TypeHelm), UncoveredReason(manifest.TypeHelm))
 	}
 }
+
+func TestReviewHelmRejectsPrivateArmorAfterPublicArmor(t *testing.T) {
+	key := newHelmKey(t, nil)
+	public := writeHelmKeyring(t, true, key)
+	data, err := os.ReadFile(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	w, err := armor.Encode(&secret, openpgp.PrivateKeyType, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := key.SerializePrivate(w, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(public, append(data, secret.Bytes()...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LoadHelmKeyring(public, "https://charts.example.com/")
+	if err == nil || !strings.Contains(err.Error(), "private key material") {
+		t.Fatalf("keyring containing public armor followed by private armor: error = %v; want private-key refusal", err)
+	}
+}
+
+func TestReviewHelmNoKeyringDetailUnderIgnore(t *testing.T) {
+	f := newHelmFixture(t)
+	f.v.HelmKeyrings = nil
+	c := &Checker{Verifier: f.v, Store: &fakeStore{actions: map[string]string{manifest.TypeHelm: "ignore"}}}
+	r := c.Check(t.Context(), &manifest.PackageManifest{Type: manifest.TypeHelm, Name: helmChart}, &manifest.VersionEntry{Version: helmVersion, URL: f.repo.URL + "/charts"})
+	if r.Provenance == nil || r.Provenance.Outcome != audit.ProvenanceUnknown {
+		t.Fatalf("outcome: %+v", r)
+	}
+	if r.Details[audit.DetailNoKeyring] != true {
+		t.Fatalf("unknown under ignore: Details = %#v; want no_keyring:true", r.Details)
+	}
+}

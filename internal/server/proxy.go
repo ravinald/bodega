@@ -429,6 +429,15 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		f.write(w, r)
 		return
 	}
+	// The provenance check read the chart in a request of its own, so these
+	// bytes are held to the digest it verified the publisher signed.
+	if fill.signed != "" && "sha256:"+spool.sha256 != fill.signed {
+		f := signedChartRefusal(regType, fill.name, fill.version)
+		s.logFor(r.Context()).Error("upstream bytes differ from the digest the publisher signed", "key", s3Key,
+			"url", up.url, "signed", fill.signed, "served", "sha256:"+spool.sha256, "incident", f.incident)
+		f.write(w, r)
+		return
+	}
 	s.pinFill(ctx, store, fill, s3Key, spool.sha256, immutable)
 
 	// Cache to storage (best-effort — don't fail the response if caching fails).
@@ -1478,6 +1487,9 @@ func datedThroughUpstream(checkers []policy.VersionChecker) {
 // gate to the pin so both name it the same way. Zero when no row was written.
 type fillAdmission struct {
 	typ, name, version string
+	// signed is the sha256:{hex} the admission verified a publisher signed
+	// for these bytes, held against the bytes the fill then fetches.
+	signed string
 }
 
 // fillIdentity names the version an immutable proxy request fetches. The name
@@ -1535,6 +1547,13 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven || fill.typ == manifest.TypeComposer {
 			datedThroughUpstream(checkers)
 		}
+	case fill.typ == manifest.TypeHelm && fill.version != "":
+		// The .prov is the one thing a chart publishes that a check reads;
+		// the age gate cannot date a chart and OSV indexes none.
+		if _, ok := helmFillFrom(r.Context()); ok {
+			checkers = []policy.VersionChecker{admit.ProvenanceChecker(s.cfg, s.auditDB)}
+			notRun = "not run: a helm proxy fill runs the upstream provenance check only"
+		}
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool
 		// is served from storage, and a dists/ key names none.
@@ -1553,7 +1572,11 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	if fill.typ == manifest.TypeRpm {
 		rpmFillFrom(r.Context()).describe(&ve)
 	}
-	_, ok := s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	if hf, ok := helmFillFrom(r.Context()); ok && fill.typ == manifest.TypeHelm && hf.Version == fill.version {
+		ve.URL, ve.SHA256, ve.Checksum = hf.URL, hf.SHA256, hf.Checksum
+	}
+	_, adm, ok := s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	fill.signed = adm.SignedSubjectDigest()
 	return fill, ok
 }
 
@@ -1561,7 +1584,7 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 // check blocked: versionPolicyGate's second half, shared with the oci tag,
 // which names its version in the tag rather than in a storage key. check is
 // the check that blocked, "" when none did.
-func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, ok bool) {
+func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, adm audit.Admission, ok bool) {
 	if baseline != nil {
 		if stored, ok := baseline(); ok {
 			ve.Baseline, ve.BaselineAt = true, stored.BaselineAt
@@ -1584,7 +1607,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 	}
 	s.recordFillPolicyEvent(r, fill, res)
 	if res.Block == nil {
-		return "", true
+		return "", res.Admission, true
 	}
 	f := admitRefusal(fill.typ, fill.name, admitBlock{check: res.Block.Check, version: fill.version,
 		incident: res.Incident, details: res.Block.Details})
@@ -1592,7 +1615,7 @@ func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmi
 		"version", fill.version, "check", res.Block.Check, "reason", res.Block.Reason, "incident", f.incident)
 	s.queueResult(r, fill.typ, fill.name, fill.version, *res.Block, f)
 	f.write(w, r)
-	return res.Block.Check, false
+	return res.Block.Check, res.Admission, false
 }
 
 // baselineLookup answers whether the stored manifest marks what a proxy

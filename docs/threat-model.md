@@ -526,8 +526,9 @@ defence against:
   re-signed by a key the operator did not configure records `invalid`, and so
   does one whose bytes differ from the digest the `.prov` signed: refused
   under `block`, a warning under `warn`, and never admitted by an override. A
-  build's fetch refuses a chart whose bytes differ from that signed digest
-  under any action. What that leaves open: a
+  build's fetch and a proxy fill each refuse a chart whose bytes differ from
+  that signed digest under any action, so an upstream cannot serve the check
+  one archive and the fetch another. What that leaves open: a
   repository that drops its `.prov` records `unavailable`, which only `block`
   refuses, so under `warn` an attacker who can replace a chart can delete its
   signature too and pass. The keyring is only as good as how the operator

@@ -166,12 +166,7 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 // the chart in its own request, so without this the bytes stored could be
 // other bytes than the ones the signature covered.
 func verifySignedChart(dest, chartURL string, a audit.Admission) error {
-	signed := ""
-	for _, c := range a.Checks {
-		if c.Check == audit.CheckUpstreamProvenance && c.Provenance != nil && c.Provenance.Outcome == audit.ProvenanceVerified {
-			signed = c.Provenance.SubjectDigest
-		}
-	}
+	signed := a.SignedSubjectDigest()
 	if signed == "" {
 		return nil
 	}

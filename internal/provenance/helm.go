@@ -78,36 +78,88 @@ func LoadHelmKeyring(file, prefix string) (openpgp.EntityList, error) {
 
 // readKeyring parses a binary or armored keyring and reports whether any key
 // in it carries private material.
+//
+// An armored file is read block by block to its end: armor.Decode stops at
+// the first block, and a private key concatenated after a public one would
+// otherwise load unseen.
 func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
-	var body io.Reader = bytes.NewReader(data)
-	if bytes.Contains(data, []byte("-----BEGIN PGP")) {
-		blk, err := armor.Decode(bytes.NewReader(data))
+	if !bytes.Contains(data, armorBegin) {
+		keys, err := openpgp.ReadKeyRing(bytes.NewReader(data))
 		if err != nil {
 			return nil, false, err
+		}
+		if holdsPrivate(keys) {
+			return nil, true, nil
+		}
+		return keys, false, nil
+	}
+	var keys openpgp.EntityList
+	var parseErr error
+	for i, block := range armorBlocks(data) {
+		blk, err := armor.Decode(bytes.NewReader(block))
+		if err != nil {
+			return nil, false, fmt.Errorf("armored block %d: %w", i+1, err)
 		}
 		if blk.Type == openpgp.PrivateKeyType {
 			return nil, true, nil
 		}
 		if blk.Type != openpgp.PublicKeyType {
-			return nil, false, fmt.Errorf("the armored block is a %q, not a %q", blk.Type, openpgp.PublicKeyType)
+			if parseErr == nil {
+				parseErr = fmt.Errorf("armored block %d is a %q, not a %q", i+1, blk.Type, openpgp.PublicKeyType)
+			}
+			continue
 		}
-		body = blk.Body
+		got, err := openpgp.ReadKeyRing(blk.Body)
+		if err != nil {
+			if parseErr == nil {
+				parseErr = fmt.Errorf("armored block %d: %w", i+1, err)
+			}
+			continue
+		}
+		if holdsPrivate(got) {
+			return nil, true, nil
+		}
+		keys = append(keys, got...)
 	}
-	keys, err := openpgp.ReadKeyRing(body)
-	if err != nil {
-		return nil, false, err
+	if parseErr != nil {
+		return nil, false, parseErr
 	}
+	return keys, false, nil
+}
+
+var armorBegin = []byte("-----BEGIN PGP")
+
+// armorBlocks splits data at each armor header, so every block decodes on
+// its own. Text before the first header is dropped, as armor.Decode drops it.
+func armorBlocks(data []byte) [][]byte {
+	var out [][]byte
+	for {
+		start := bytes.Index(data, armorBegin)
+		if start < 0 {
+			return out
+		}
+		data = data[start:]
+		next := bytes.Index(data[len(armorBegin):], armorBegin)
+		if next < 0 {
+			return append(out, data)
+		}
+		out = append(out, data[:len(armorBegin)+next])
+		data = data[len(armorBegin)+next:]
+	}
+}
+
+func holdsPrivate(keys openpgp.EntityList) bool {
 	for _, e := range keys {
 		if e.PrivateKey != nil {
-			return nil, true, nil
+			return true
 		}
 		for _, sub := range e.Subkeys {
 			if sub.PrivateKey != nil {
-				return nil, true, nil
+				return true
 			}
 		}
 	}
-	return keys, false, nil
+	return false
 }
 
 // helmChartURL is the chart archive an entry names: its url when that is the

@@ -276,6 +276,8 @@ type FetchResult struct {
 // policy_blocked, so a refusal leaves a row like a pass does. checkers nil
 // records them as not evaluated with notRunDetail as the reason: the proxy
 // passes nil for a type whose request names no version the checks could date.
+// With checkers set, notRunDetail is the reason recorded for every check they
+// leave out, such as the age and OSV checks a helm proxy fill does not run.
 func Fetch(
 	ctx context.Context,
 	adb *audit.DB,
@@ -306,6 +308,9 @@ func Fetch(
 		ev.notRunChecks(0, notRunDetail, ev.versionChecks...)
 	default:
 		results := ev.runVersion(ctx, pm, 0, checkers)
+		if notRunDetail != "" {
+			ev.notRunChecks(0, notRunDetail, ev.versionChecks...)
+		}
 		combined := policy.Combine(results)
 		if !combined.Blocked() {
 			if changed := ev.commit(ctx, pm, checkers); changed != nil {

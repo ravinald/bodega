@@ -600,6 +600,16 @@ func checksumRefusal(regType, s3Key, name string, err error) *refusal {
 	return f
 }
 
+// signedChartRefusal answers chart bytes that differ from the digest the
+// chart's .prov signed at admission, at the 502 checksumRefusal answers: the
+// upstream served other bytes than the ones its publisher signed.
+func signedChartRefusal(typ, name, version string) *refusal {
+	f := newRefusal(checkChecksum, typ, name, version, http.StatusBadGateway)
+	f.reason = "the bytes upstream served do not match the digest the chart's .prov signed at admission, so they were not cached or served."
+	f.next = fmt.Sprintf("do not route around it; give an operator incident %s, whose server log line names both digests and the chart URL.", f.incident)
+	return f
+}
+
 // distfileRefusal answers distfile bytes that disagree with the ports tree's
 // distinfo, at the 502 checksumRefusal answers and for its reason: the fault
 // is the bytes upstream served, not the client's request.

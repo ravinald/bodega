@@ -542,7 +542,7 @@ func (s *Server) ociTagPolicyGate(w *ociResponseWriter, r *http.Request, typ str
 	}
 
 	fill := fillAdmission{typ: typ, name: t.name(), version: t.ref}
-	check, ok := s.admitFill(w, r, fill, ve, fetchCheckers(s.cfg, s.auditDB), "", decision, t.name(), baseline, override)
+	check, _, ok := s.admitFill(w, r, fill, ve, fetchCheckers(s.cfg, s.auditDB), "", decision, t.name(), baseline, override)
 	v := ociImageVerdict{Tag: t.ref, State: ociAdmitted, At: time.Now().UTC().Format(time.RFC3339Nano)}
 	if !ok {
 		v.State, v.Check = ociRefused, check

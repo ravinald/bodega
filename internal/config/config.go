@@ -1182,7 +1182,7 @@ func validateHelmKeyrings(m map[string]string) error {
 			return fmt.Errorf("helm_keyrings[%q]: the prefix does not parse as a URL: %v; write it as https://{host}/{path}/", prefix, err)
 		case u.Scheme != "https" && u.Scheme != "http":
 			return fmt.Errorf("helm_keyrings[%q]: the prefix must use the https or http scheme, the one the chart URLs it covers use", prefix)
-		case u.Host == "":
+		case u.Hostname() == "":
 			return fmt.Errorf("helm_keyrings[%q]: the prefix names no host; write it as https://{host}/{path}/", prefix)
 		case strings.ContainsAny(prefix, "?#"):
 			return fmt.Errorf("helm_keyrings[%q]: the prefix carries a query or fragment, which no chart URL it should cover starts with; drop everything from the ? or #", prefix)

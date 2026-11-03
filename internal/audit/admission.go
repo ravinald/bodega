@@ -69,6 +69,18 @@ type AdmissionCheck struct {
 	Unwaivable string `json:"unwaivable,omitempty"`
 }
 
+// SignedSubjectDigest is the digest the upstream provenance check verified a
+// publisher signed for this admission, "" when it verified none. A fetch that
+// stores bytes under this row holds them to it.
+func (a Admission) SignedSubjectDigest() string {
+	for _, c := range a.Checks {
+		if c.Check == CheckUpstreamProvenance && c.Provenance != nil && c.Provenance.Outcome == ProvenanceVerified {
+			return c.Provenance.SubjectDigest
+		}
+	}
+	return ""
+}
+
 // Upstream provenance outcomes: what verifying a publisher's signed
 // provenance concluded, as distinct from what the policy then did about it.
 const (
