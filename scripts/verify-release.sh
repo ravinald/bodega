@@ -152,9 +152,11 @@ fail() {
 }
 
 # Exact element comparison: a directory entry may hold a newline, so no
-# delimited string can stand in for the set of listed names.
+# delimited string can stand in for the set of listed names. Bash 3.2 treats
+# an empty array's elements as unbound under set -u, hence the count first.
 is_listed() {
 	local n
+	[ "${#names[@]}" -gt 0 ] || return 1
 	for n in "${names[@]}"; do
 		[ "$n" = "$1" ] && return 0
 	done

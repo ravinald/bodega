@@ -564,6 +564,15 @@ for l in $'\tshellcheck -x $(RELEASE_SHELL)' $'\tshfmt -d $(RELEASE_SHELL)' $'\t
 	check "harness runs '${l#$'\t'}'" has_line "$l" "$mk"
 done
 
+case_start "R9: good set under the system Bash"
+good_set "$D"
+run /bin/bash "$SCRIPT" v9.9.9 --dir "$D"
+exit_is 0
+says 'verified v9.9.9: 3 files verified, 0 failed'
+for a in "${ASSETS[@]}"; do
+	calls_are "^gh attestation verify $a " 1
+done
+
 if [ "$failures" -ne 0 ]; then
 	echo "verify-release_test: $failures check(s) failed"
 	exit 1
