@@ -62,6 +62,8 @@ A compromised bodega host is out of scope in the [threat model](threat-model.md)
 
 Releases build on GitHub-hosted runners in a reusable workflow, `.github/workflows/release-build.yml`, which `release.yml` calls only after `ci.yml`'s gate has passed on the tagged commit. The workflow signs `checksums-sha256.txt` with cosign keyless and attests every file it lists with `actions/attest`, so each archive, package and SBOM carries build provenance signed by the platform rather than by a key a maintainer holds. GitHub describes that as Build Level 2; the reusable workflow, which isolates signing from the caller, is the step toward Level 3.
 
+GoReleaser creates each release as a draft, and `release.yml` publishes it only after `scripts/verify-release.sh` has passed against that draft: both signature formats on the checksum file, every listed file's SHA-256, and every file's attestation. `release-verify.yml` re-checks the newest published release daily, so an asset replaced or an attestation lost after publishing fails a run.
+
 What is not yet proven, tracked in [#278](https://github.com/ravinald/bodega/issues/278):
 
 - **No release has been cut,** so the provenance has never been produced or verified outside a snapshot build.

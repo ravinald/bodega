@@ -62,3 +62,31 @@ jobs:
       id-token: write       # cosign keyless signing and attestation via OIDC
       attestations: write   # store the build provenance
     uses: ./.github/workflows/release-build.yml
+
+  # GoReleaser leaves the release a draft, so nothing is public until every
+  # asset has been checked against the signature and the attestations the
+  # build job produced. This job holds no id-token: it verifies and publishes,
+  # and can sign nothing.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # read the draft's assets and publish it
+      attestations: read    # gh attestation verify
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.0.6'
+      - name: Verify the draft, then publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! scripts/verify-release.sh "$TAG"; then
+            echo "::error::release $TAG was not published: scripts/verify-release.sh failed against its draft; the per-file ok/FAIL lines above name what failed, and the draft is kept for inspection"
+            exit 1
+          fi
+          gh release edit "$TAG" --repo ravinald/bodega --draft=false
