@@ -79,6 +79,17 @@ type pypiAttestation struct {
 type pypiFileEvidence struct {
 	filename string
 	ev       Evidence
+	// signers is every identity a verified attestation of the file names, in
+	// bundle order. ev carries the first; a file whose bundles name two must
+	// not read as agreeing with whichever one sorted first.
+	signers []audit.UpstreamProvenance
+}
+
+func (f pypiFileEvidence) identities() []audit.UpstreamProvenance {
+	if len(f.signers) == 0 {
+		return []audit.UpstreamProvenance{f.ev.UpstreamProvenance}
+	}
+	return f.signers
 }
 
 // Pypi verifies the PEP 740 attestations PyPI publishes for every file of
@@ -152,8 +163,8 @@ func (v *Verifier) Pypi(ctx context.Context, index, name, version string) Eviden
 	files := make([]pypiFileEvidence, 0, len(withProvenance))
 	for _, i := range withProvenance {
 		f := doc.Files[i]
-		ev := v.pypiFile(ctx, indexRoot, served, f.Filename, *f.Provenance, f.Hashes["sha256"], name, version, trusted)
-		files = append(files, pypiFileEvidence{filename: f.Filename, ev: ev})
+		ev, signers := v.pypiFile(ctx, indexRoot, served, f.Filename, *f.Provenance, f.Hashes["sha256"], name, version, trusted)
+		files = append(files, pypiFileEvidence{filename: f.Filename, ev: ev, signers: signers})
 	}
 	return pypiVersion(files, without, name, version)
 }
@@ -179,10 +190,12 @@ func pypiVersion(files []pypiFileEvidence, without []string, name, version strin
 	identities := map[string]bool{}
 	var named []string
 	for _, f := range files {
-		id := PinnedBuilder(f.ev.BuilderID) + " from " + f.ev.SourceRepositoryURI
-		if !identities[id] {
-			identities[id] = true
-			named = append(named, f.filename+": "+id)
+		for _, s := range f.identities() {
+			id := PinnedBuilder(s.BuilderID) + " from " + s.SourceRepositoryURI
+			if !identities[id] {
+				identities[id] = true
+				named = append(named, f.filename+": "+id)
+			}
 		}
 	}
 	if len(identities) > 1 {
@@ -204,17 +217,18 @@ func pypiFileNames(files []pypiFileEvidence) string {
 	return strings.Join(names, ", ")
 }
 
-// pypiFile verifies one file's provenance object.
+// pypiFile verifies one file's provenance object. Alongside a verified
+// file's evidence it returns the identity of every attestation in it.
 func (v *Verifier) pypiFile(ctx context.Context, index, page *url.URL, filename, provenanceRef, sha256hex, name, version string,
-	trusted func() (root.TrustedMaterial, error)) Evidence {
+	trusted func() (root.TrustedMaterial, error)) (Evidence, []audit.UpstreamProvenance) {
 	ref, err := url.Parse(strings.TrimSpace(provenanceRef))
 	if err != nil || strings.TrimSpace(provenanceRef) == "" {
-		return unknown("%s names a provenance URL %q that does not parse, so whether it is attested is unknown", filename, manifest.PublicURL(provenanceRef))
+		return unknown("%s names a provenance URL %q that does not parse, so whether it is attested is unknown", filename, manifest.PublicURL(provenanceRef)), nil
 	}
 	at := page.ResolveReference(ref)
 	if at.Scheme != "https" || !sameHostPort(at, index) {
 		return unknown("%s names its provenance at %s://%s, which is not the index host %s over https; bodega reads provenance from the configured index only, so it was not requested",
-			filename, at.Scheme, at.Host, index.Host)
+			filename, at.Scheme, at.Host, index.Host), nil
 	}
 	if at.User == nil {
 		at.User = index.User
@@ -222,41 +236,42 @@ func (v *Verifier) pypiFile(ctx context.Context, index, page *url.URL, filename,
 	publicAt := manifest.PublicURL(at.String())
 	digest, err := hex.DecodeString(strings.ToLower(sha256hex))
 	if err != nil || len(digest) != sha256.Size {
-		return unknown("%s publishes provenance, but the index page gives no sha256 for it, so the attestation subject cannot be checked", filename)
+		return unknown("%s publishes provenance, but the index page gives no sha256 for it, so the attestation subject cannot be checked", filename), nil
 	}
 	body, _, err := v.getWithin(ctx, at.String(), http.Header{"Accept": {pypiIntegrityJSON}}, 8<<20, onIndex(index, true))
 	var off *offIndexError
 	if errors.As(err, &off) {
 		return unknown("%s publishes provenance at %s, which redirected to %s, not the index host %s over https; bodega reads provenance from the configured index only, so it was not requested",
-			filename, publicAt, off.where(), index.Host)
+			filename, publicAt, off.where(), index.Host), nil
 	}
 	if err != nil {
-		return unknown("%s publishes provenance at %s, but it could not be read: %v", filename, publicAt, err)
+		return unknown("%s publishes provenance at %s, but it could not be read: %v", filename, publicAt, err), nil
 	}
 	var prov pypiProvenance
 	if err := json.Unmarshal(body, &prov); err != nil {
-		return unknown("%s publishes provenance at %s, but it is not a PEP 740 provenance object: %v", filename, publicAt, err)
+		return unknown("%s publishes provenance at %s, but it is not a PEP 740 provenance object: %v", filename, publicAt, err), nil
 	}
 	if prov.Version != 1 {
-		return unknown("%s's provenance object is version %d, and bodega reads version 1 only", filename, prov.Version)
+		return unknown("%s's provenance object is version %d, and bodega reads version 1 only", filename, prov.Version), nil
 	}
 	if len(prov.AttestationBundles) == 0 {
-		return unknown("%s's provenance object at %s holds no attestation bundle", filename, publicAt)
+		return unknown("%s's provenance object at %s holds no attestation bundle", filename, publicAt), nil
 	}
 	for _, b := range prov.AttestationBundles {
 		for j, a := range b.Attestations {
 			if a.Version != 1 {
-				return unknown("%s attestation %d is version %d, and bodega reads version 1 only", filename, j, a.Version)
+				return unknown("%s attestation %d is version %d, and bodega reads version 1 only", filename, j, a.Version), nil
 			}
 		}
 	}
 	tm, err := trusted()
 	if err != nil {
-		return noRoot(err, "%s publishes provenance", filename)
+		return noRoot(err, "%s publishes provenance", filename), nil
 	}
 
 	sum := sha256.Sum256(body)
 	var verified *Evidence
+	var signers []audit.UpstreamProvenance
 	var unknownKind *Evidence
 	for i, b := range prov.AttestationBundles {
 		pub := b.Publisher
@@ -275,39 +290,40 @@ func (v *Verifier) pypiFile(ctx context.Context, index, page *url.URL, filename,
 		repo := want.forge + pub.Repository
 		issuer := "^" + strings.ReplaceAll(want.issuer, ".", `\.`) + "$"
 		if len(b.Attestations) == 0 {
-			return invalid("%s's attestation bundle %d holds no attestation of predicate type %s or %s", filename, i, PyPIPublishV1, SLSAProvenanceV1)
+			return invalid("%s's attestation bundle %d holds no attestation of predicate type %s or %s", filename, i, PyPIPublishV1, SLSAProvenanceV1), nil
 		}
 		for j, a := range b.Attestations {
 			raw, err := pypiSigstoreBundle(a)
 			if err != nil {
-				return invalid("%s attestation %d is not a Sigstore attestation: %v", filename, j, err)
+				return invalid("%s attestation %d is not a Sigstore attestation: %v", filename, j, err), nil
 			}
 			id, st, err := verifyBundle(tm, raw, issuer, "sha256", digest, builderFromSigner)
 			if err != nil {
-				return invalid("%s attestation %d did not verify: %v", filename, j, err)
+				return invalid("%s attestation %d did not verify: %v", filename, j, err), nil
 			}
 			if st.PredicateType != PyPIPublishV1 && st.PredicateType != SLSAProvenanceV1 {
-				return invalid("%s attestation %d is of predicate type %q, not %s or %s", filename, j, st.PredicateType, PyPIPublishV1, SLSAProvenanceV1)
+				return invalid("%s attestation %d is of predicate type %q, not %s or %s", filename, j, st.PredicateType, PyPIPublishV1, SLSAProvenanceV1), nil
 			}
 			if len(st.Subject) != 1 || st.Subject[0].Name != filename || !strings.EqualFold(st.Subject[0].Digest["sha256"], sha256hex) {
-				return invalid("%s attestation %d is a statement about something other than %s at sha256:%s", filename, j, filename, strings.ToLower(sha256hex))
+				return invalid("%s attestation %d is a statement about something other than %s at sha256:%s", filename, j, filename, strings.ToLower(sha256hex)), nil
 			}
 			if !strings.EqualFold(id.SourceRepositoryURI, repo) || !signerNames(id.WorkflowRef, repo, workflow) {
 				return invalid("%s attestation %d is signed by %s (%s), but PyPI names its %s publisher as %s workflow %s",
-					filename, j, id.SourceRepositoryURI, id.WorkflowRef, pub.Kind, pub.Repository, strings.TrimPrefix(workflow, "/"))
+					filename, j, id.SourceRepositoryURI, id.WorkflowRef, pub.Kind, pub.Repository, strings.TrimPrefix(workflow, "/")), nil
 			}
+			id.Outcome = audit.ProvenanceVerified
+			id.BundleDigest = "sha256:" + hex.EncodeToString(sum[:])
+			signers = append(signers, id)
 			if verified == nil {
-				id.Outcome = audit.ProvenanceVerified
-				id.BundleDigest = "sha256:" + hex.EncodeToString(sum[:])
 				verified = &Evidence{UpstreamProvenance: id,
 					Detail: "built by " + id.BuilderID + " from " + id.SourceRepositoryURI + ", as the " + pub.Kind + " publisher PyPI names"}
 			}
 		}
 	}
 	if unknownKind != nil {
-		return *unknownKind
+		return *unknownKind, nil
 	}
-	return *verified
+	return *verified, signers
 }
 
 // pypiSigstoreBundle assembles a Sigstore v0.3 bundle from a PEP 740

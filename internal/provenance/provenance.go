@@ -441,15 +441,33 @@ func (v *Verifier) fetch(ctx context.Context, raw string, header http.Header, li
 	return body, resp.Request.URL, nil
 }
 
-// userinfo matches the authority's userinfo in any URL inside a rendered
-// error, parsed or not: the client embeds a Location header it could not parse
-// verbatim, in more than one place, so redacting the url.Error's own URL field
-// leaves copies behind.
-var userinfo = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#"'@]*@`)
+// userinfo matches the userinfo of an authority inside rendered error text,
+// whether the reference is absolute (https://u@h) or network-path (//u@h) and
+// whether or not it parsed: the client embeds a Location header it could not
+// parse verbatim, in more than one place, so redacting the url.Error's own URL
+// field leaves copies behind.
+var userinfo = regexp.MustCompile(`//[^\s/?#@]*@`)
 
 // credentialFree renders err with every URL's userinfo removed and keeps the
-// chain intact for errors.Is and errors.As.
+// chain intact for errors.Is and errors.As. Text that still holds an @ after
+// redaction names a reference in a spelling the pattern does not take apart
+// (a backslash authority, a space inside userinfo), so it is withheld rather
+// than trusted.
 type credentialFree struct{ err error }
 
-func (e credentialFree) Error() string { return userinfo.ReplaceAllString(e.err.Error(), "$1") }
+func (e credentialFree) Error() string {
+	s := userinfo.ReplaceAllString(e.err.Error(), "//")
+	if !strings.Contains(s, "@") {
+		return s
+	}
+	const why = "the error text was withheld because it names a URL bodega could not remove credentials from"
+	var ue *url.Error
+	if errors.As(e.err, &ue) {
+		if at := manifest.PublicURL(ue.URL); !strings.Contains(at, "@") {
+			return ue.Op + " " + at + ": " + why
+		}
+	}
+	return why
+}
+
 func (e credentialFree) Unwrap() error { return e.err }

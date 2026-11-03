@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1725,4 +1726,88 @@ func TestF107DocsCoverPypi(t *testing.T) {
 			t.Errorf("the gaps bullet still names PyPI's attestations or #273: %q", gap)
 		}
 	})
+}
+
+func TestAuditPypiNetworkPathRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", strings.TrimPrefix(secret, "https:")+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
+	}
+}
+
+func TestAuditPypiAllVerifiedPublisherIdentitiesMustAgree(t *testing.T) {
+	r := newTLSRegistry(t)
+	local := newLocalSigstore(t)
+	const otherRepo = "https://github.com/example/sampleproject"
+	const sdistPath = "/proof/sdist"
+	r.putJSON(t, pypiPagePath, map[string]any{"files": []map[string]any{
+		{"filename": pypiWheel, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": r.URL + pypiWheelPath},
+		{"filename": pypiSdist, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": r.URL + sdistPath},
+	}})
+	sign := func(filename, repository, repo string) []byte {
+		return local.provenance(filename, pypiWheelSHA256, repository, "release.yml", repo,
+			repo+"/.github/workflows/release.yml@refs/tags/v4.0.0")
+	}
+	r.put(pypiWheelPath, sign(pypiWheel, "pypa/sampleproject", pypiRepo))
+	sdist := sign(pypiSdist, "pypa/sampleproject", pypiRepo)
+	r.put(sdistPath, sdist)
+	v := newPypiVerifier(t, r)
+	v.Root = func(context.Context) (root.TrustedMaterial, error) { return local.Root(), nil }
+	if ev := checkPypi(t, v, "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("same-identity baseline: %s (%s)", ev.Outcome, ev.Detail)
+	}
+	var first, extra map[string]any
+	if err := json.Unmarshal(sdist, &first); err != nil {
+		t.Fatal(err)
+	}
+	other := sign(pypiSdist, "example/sampleproject", otherRepo)
+	if err := json.Unmarshal(other, &extra); err != nil {
+		t.Fatal(err)
+	}
+	r.put(sdistPath, other)
+	if ev := checkPypi(t, v, "4.0.0"); ev.Outcome != audit.ProvenanceMismatch {
+		t.Fatalf("different-identity baseline: %s (%s), want mismatch", ev.Outcome, ev.Detail)
+	}
+	first["attestation_bundles"] = append(first["attestation_bundles"].([]any), extra["attestation_bundles"].([]any)...)
+	r.putJSON(t, sdistPath, first)
+	ev := checkPypi(t, v, "4.0.0")
+	if ev.Outcome != audit.ProvenanceMismatch || !strings.Contains(ev.Detail, pypiRepo) || !strings.Contains(ev.Detail, otherRepo) {
+		t.Fatalf("outcome %s (%s); want mismatch naming both verified identities", ev.Outcome, ev.Detail)
+	}
+}
+
+// Every spelling of a URL carrying credentials renders without them: the
+// pattern strips the authority forms it parses, and anything still holding an
+// @ is withheld rather than printed.
+func TestCredentialFreeRendersNoUserinfo(t *testing.T) {
+	for _, loc := range []string{
+		"https://user:secret@h/%zz",
+		"//user:secret@h/%zz",
+		`\\user:secret@h/%zz`,
+		"//us er:secret@h/%zz",
+		`//us"er:secret@h/%zz`,
+		"HTTPS://user:secret@h",
+	} {
+		inner := fmt.Errorf("failed to parse Location header %q: %v", loc, &url.Error{Op: "parse", URL: loc, Err: errors.New("invalid URL escape")})
+		req := url.URL{Scheme: "https", User: url.UserPassword("user", "***"), Host: "h", Path: "/simple/x/"}
+		err := credentialFree{&url.Error{Op: "Get", URL: req.String(), Err: fmt.Errorf("%w: %w", errNotFound, inner)}}
+		if s := err.Error(); strings.Contains(s, "secret") || strings.Contains(s, "user") {
+			t.Errorf("%q rendered credentials: %s", loc, s)
+		}
+		if !errors.Is(err, errNotFound) {
+			t.Errorf("%q: the chain lost errNotFound", loc)
+		}
+	}
 }
