@@ -106,7 +106,7 @@ func (v *Verifier) Pypi(ctx context.Context, index, name, version string) Eviden
 	page := indexRoot.JoinPath("simple", manifest.CanonicalPypiName(name)) // JoinPath drops the trailing slash PEP 503 wants.
 	page.Path += "/"
 	public := manifest.PublicURL(page.String())
-	body, err := v.getWithin(ctx, page.String(), http.Header{"Accept": {pypiSimpleJSON}}, 32<<20, onIndex(indexRoot, indexRoot.Scheme == "https"))
+	body, served, err := v.getWithin(ctx, page.String(), http.Header{"Accept": {pypiSimpleJSON}}, 32<<20, onIndex(indexRoot, indexRoot.Scheme == "https"))
 	var off *offIndexError
 	if errors.As(err, &off) {
 		return unknown("the index page %s redirected to %s, which is not the index host %s; bodega reads pypi provenance from the configured index only, so it was not requested, and whether %s %s publishes provenance is unknown",
@@ -152,7 +152,7 @@ func (v *Verifier) Pypi(ctx context.Context, index, name, version string) Eviden
 	files := make([]pypiFileEvidence, 0, len(withProvenance))
 	for _, i := range withProvenance {
 		f := doc.Files[i]
-		ev := v.pypiFile(ctx, indexRoot, page, f.Filename, *f.Provenance, f.Hashes["sha256"], name, version, trusted)
+		ev := v.pypiFile(ctx, indexRoot, served, f.Filename, *f.Provenance, f.Hashes["sha256"], name, version, trusted)
 		files = append(files, pypiFileEvidence{filename: f.Filename, ev: ev})
 	}
 	return pypiVersion(files, without, name, version)
@@ -224,7 +224,7 @@ func (v *Verifier) pypiFile(ctx context.Context, index, page *url.URL, filename,
 	if err != nil || len(digest) != sha256.Size {
 		return unknown("%s publishes provenance, but the index page gives no sha256 for it, so the attestation subject cannot be checked", filename)
 	}
-	body, err := v.getWithin(ctx, at.String(), http.Header{"Accept": {pypiIntegrityJSON}}, 8<<20, onIndex(index, true))
+	body, _, err := v.getWithin(ctx, at.String(), http.Header{"Accept": {pypiIntegrityJSON}}, 8<<20, onIndex(index, true))
 	var off *offIndexError
 	if errors.As(err, &off) {
 		return unknown("%s publishes provenance at %s, which redirected to %s, not the index host %s over https; bodega reads provenance from the configured index only, so it was not requested",

@@ -1599,3 +1599,130 @@ func TestPypiRedirectsStayOnIndex(t *testing.T) {
 		}
 	})
 }
+
+func TestAuditPypiRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", secret+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
+	}
+}
+
+func TestAuditPypiRelativeProvenanceAfterPageRedirect(t *testing.T) {
+	r := newTLSRegistry(t)
+	const movedPage = "/mirror/simple/sampleproject/"
+	const movedProof = movedPage + "proof"
+	r.putJSON(t, movedPage, map[string]any{"files": []map[string]any{{
+		"filename": pypiWheel, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": "proof",
+	}}})
+	r.put(movedProof, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+	inner := r.Config.Handler
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == pypiPagePath {
+			http.Redirect(w, req, movedPage, http.StatusFound)
+			return
+		}
+		inner.ServeHTTP(w, req)
+	})
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceVerified || r.hitsOn(movedProof) != 1 {
+		t.Fatalf("outcome %s (%s), proof requested %d times; want verified using the redirected page's relative URL", ev.Outcome, ev.Detail, r.hitsOn(movedProof))
+	}
+}
+
+// The public docs describe what the pypi check reads, verifies and records,
+// and what it leaves undone. Table padding and hard wraps are collapsed before
+// matching, so reformatting a page does not fail this; dropping a sentence does.
+func TestF107DocsCoverPypi(t *testing.T) {
+	read := func(t *testing.T, name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", "..", "docs", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(strings.Fields(string(b)), " ")
+	}
+	// after is the text of doc from marker to the next occurrence of end.
+	after := func(t *testing.T, doc, marker, end string) string {
+		t.Helper()
+		_, rest, ok := strings.Cut(doc, marker)
+		if !ok {
+			t.Fatalf("%q is gone", marker)
+		}
+		head, _, _ := strings.Cut(rest, end)
+		return head
+	}
+	check := func(t *testing.T, doc string, want, refuse []string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(doc, w) {
+				t.Errorf("missing %q", w)
+			}
+		}
+		for _, r := range refuse {
+			if strings.Contains(doc, r) {
+				t.Errorf("still says %q", r)
+			}
+		}
+	}
+	t.Run("usage", func(t *testing.T) {
+		doc := read(t, "usage.md")
+		check(t, doc, []string{
+			"| `pypi` | the PEP 691 JSON page `/simple/<name>/`",
+			"then each file's `provenance` URL, read only when it is https on the same host and port as that index",
+			"every attestation of every file of the version against the Sigstore trusted root, with exactly one subject whose name is the filename and whose sha256 equals the page's `hashes.sha256`",
+			"the certificate against the Trusted Publisher PyPI names in the bundle",
+			"for `pypi` the builder ID is the certificate's build signer URI",
+			"The publisher's `environment` is not compared",
+			"for `pypi`, the page lists files of the version and none of them has a `provenance` URL",
+			"an attestation subject naming another file or digest",
+			"a certificate binding another repository or workflow than the Trusted Publisher PyPI names",
+			"a file's provenance object that could not be fetched (a 404 included, since the index named it), is larger than 8 MiB, does not parse, is not version 1 or holds no attestation bundle",
+			"a Trusted Publisher kind other than GitHub and GitLab",
+			"a `pypi` version some of whose files publish provenance and others do not, or whose files were built by different identities",
+			"a PyPI page listing the version's files with no `provenance` on any of them",
+		}, []string{"PyPI's PEP 740 attestations and helm"})
+		if uncovered := after(t, doc, "**Ecosystems not covered.**", "record `unavailable`"); strings.Contains(uncovered, "pypi") {
+			t.Errorf("pypi is still listed as not covered: %q", uncovered)
+		}
+	})
+	t.Run("threat model", func(t *testing.T) {
+		doc := read(t, "threat-model.md")
+		check(t, doc, []string{
+			"the PEP 740 attestation PyPI serves for each file uploaded through Trusted Publishing",
+			"A PyPI attestation's certificate must also bind the repository and workflow of the Trusted Publisher PyPI recorded when it accepted the upload",
+			"a version whose files disagree (some attested and some not, or attested by different identities) is a `mismatch`",
+			"or that holds no attestation bundle at all",
+			"a GitHub or GitLab publisher's bundle holding no attestation of a predicate type bodega reads",
+			"a Trusted Publisher kind other than GitHub and GitLab, which bodega does not verify",
+			"A PyPI version with no attestation on any of its files is `unavailable` whatever the pin holds",
+			"The PyPI publisher's `environment` is not compared",
+			"Within npm, PyPI and GitHub releases",
+		}, []string{"PEP 740 attestations and helm"})
+		if elsewhere := after(t, doc, "everywhere else.**", "record"); strings.Contains(elsewhere, "pypi") {
+			t.Errorf("pypi is still in the everywhere-else list: %q", elsewhere)
+		}
+	})
+	t.Run("slsa", func(t *testing.T) {
+		doc := read(t, "slsa.md")
+		check(t, doc, []string{
+			"npm Sigstore bundles, PyPI attestations (PEP 740) and GitHub release attestations are verified",
+			"**Publisher signatures are verified for npm, PyPI and GitHub releases only.**",
+		}, nil)
+		gap := after(t, doc, "**Publisher signatures are verified for", " - **")
+		if strings.Contains(gap, "273") || strings.Contains(gap, "PyPI attestations") {
+			t.Errorf("the gaps bullet still names PyPI's attestations or #273: %q", gap)
+		}
+	})
+}

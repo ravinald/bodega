@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -365,25 +366,37 @@ var errNotFound = errors.New("not found")
 // get reads raw, refusing a body over limit bytes rather than returning a
 // truncated one, which would parse as a document that is not there.
 func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limit int64) ([]byte, error) {
-	return v.getWithin(ctx, raw, header, limit, nil)
+	body, _, err := v.getWithin(ctx, raw, header, limit, nil)
+	return body, err
 }
 
 // getWithin is get with every redirect hop put to allow before it is sent; a
-// hop allow refuses is never requested. Userinfo in raw stays on the request
+// hop allow refuses is never requested. It also returns the URL of the
+// response the body came from, which after a redirect is the one a relative
+// reference in the body resolves against. Userinfo in raw stays on the request
 // URL, where the client turns it into Basic credentials for that request
 // alone: set as a header here instead, it would be copied onto a redirect to
-// another port of the same host. No error this returns carries the userinfo.
-func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, error) {
+// another port of the same host. No error this returns renders the userinfo
+// of any URL, raw's or one a redirect named.
+func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
+	body, at, err := v.fetch(ctx, raw, header, limit, allow)
+	if err != nil {
+		return nil, nil, credentialFree{err}
+	}
+	return body, at, nil
+}
+
+func (v *Verifier) fetch(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
-		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", manifest.PublicURL(raw))
+		return nil, nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", manifest.PublicURL(raw))
 	}
 	public := *u
 	public.User = nil
 	target := public.String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", target, redactURLError(err))
+		return nil, nil, fmt.Errorf("GET %s: %w", target, err)
 	}
 	for k, vs := range header {
 		req.Header[k] = vs
@@ -409,34 +422,34 @@ func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, redactURLError(err)
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("GET %s: %w", target, errNotFound)
+		return nil, nil, fmt.Errorf("GET %s: %w", target, errNotFound)
 	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
+		return nil, nil, fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", target, err)
+		return nil, nil, fmt.Errorf("GET %s: %w", target, err)
 	}
 	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", target, limit>>20)
+		return nil, nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", target, limit>>20)
 	}
-	return body, nil
+	return body, resp.Request.URL, nil
 }
 
-// redactURLError drops the userinfo from the URL a client error names; the
-// client masks only the password and keeps the user name.
-func redactURLError(err error) error {
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		if u, perr := url.Parse(ue.URL); perr == nil {
-			u.User = nil
-			ue.URL = u.String()
-		}
-	}
-	return err
-}
+// userinfo matches the authority's userinfo in any URL inside a rendered
+// error, parsed or not: the client embeds a Location header it could not parse
+// verbatim, in more than one place, so redacting the url.Error's own URL field
+// leaves copies behind.
+var userinfo = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#"'@]*@`)
+
+// credentialFree renders err with every URL's userinfo removed and keeps the
+// chain intact for errors.Is and errors.As.
+type credentialFree struct{ err error }
+
+func (e credentialFree) Error() string { return userinfo.ReplaceAllString(e.err.Error(), "$1") }
+func (e credentialFree) Unwrap() error { return e.err }

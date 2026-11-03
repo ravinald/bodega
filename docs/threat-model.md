@@ -228,7 +228,8 @@ risk:
   the sha256 the PyPI index lists for it, or the asset's sha256 (GitHub). A
   PyPI attestation's certificate must also bind the repository and workflow
   of the Trusted Publisher PyPI recorded when it accepted the upload, or it is
-  `invalid`. Every file of a PyPI version is verified, and a version whose
+  `invalid`, and so is a GitHub or GitLab publisher's bundle holding no
+  attestation of a predicate type bodega reads. Every file of a PyPI version is verified, and a version whose
   files disagree (some attested and some not, or attested by different
   identities) is a `mismatch`: an sdist uploaded by hand beside wheels the
   project's CI built is the laptop publish inside one release. The
@@ -243,7 +244,8 @@ risk:
   read: a lookup that got no answer (a rate limit, an outage), an answer
   that does not parse, or a packument that no longer lists the version. For
   PyPI it is also a provenance object the index names that cannot be had (a
-  404 included), a provenance URL on a host other than the configured index,
+  404 included) or that holds no attestation bundle at all, a provenance URL
+  on a host other than the configured index,
   which is never requested, and a Trusted Publisher kind other than GitHub and
   GitLab, which bodega does not verify. So a PyPI outage warns under `warn`,
   refuses under `block`, and never refuses a version for good. It
