@@ -81,6 +81,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
 				continue
 			}
+			vctx := withFetchAdmission(ctx, admission.Admission)
 			signed := admit.ChecksumDatabaseEntry(admission.Admission)
 			verified := signed != nil && signed.ChecksumDatabase.Outcome == audit.ProvenanceVerified
 			if !cfg.Force {
@@ -100,7 +101,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 							continue
 						}
 					}
-					if err := cfg.verifyFetched(ctx, store, manifest.TypeGomod, name, ve); err != nil {
+					if err := cfg.verifyFetched(vctx, store, manifest.TypeGomod, name, ve); err != nil {
 						cfg.logf("  [gomod] %s: %v", name, err)
 						summary.Failures++
 						summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
@@ -174,7 +175,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						}
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum verified (%s)\n", name, ve.Checksum.Algorithm)
 						if !ve.ChecksumVerified {
-							if e := cfg.findAndUpdateGomodChecksum(store, name, ve, ve.Checksum, true); e != nil {
+							if e := cfg.findAndUpdateGomodChecksum(vctx, store, name, ve, ve.Checksum, true); e != nil {
 								_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save verified status: %v\n", name, e)
 							}
 						}
@@ -182,7 +183,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						// Auto-populate checksum on first fetch.
 						cs := newSHA256Checksum(computed)
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum recorded (sha256:%s...)\n", name, computed[:12])
-						if e := cfg.findAndUpdateGomodChecksum(store, name, ve, cs, false); e != nil {
+						if e := cfg.findAndUpdateGomodChecksum(vctx, store, name, ve, cs, false); e != nil {
 							_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save checksum: %v\n", name, e)
 						}
 					}

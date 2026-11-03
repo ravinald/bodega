@@ -183,6 +183,13 @@ type AdmissionPin struct {
 	PkgName    string
 	PkgVersion string
 	ObjectKey  string
+	// Admitted is the decision the pinning fetch was admitted under, when the
+	// caller holds it. The newest admitted row stands in for it only when both
+	// carry the same checksum_database entry; otherwise the pin attaches to the
+	// newest row that does, or to none. Two fetches of one module version can
+	// overlap, and bytes never compared with the checksum database must not be
+	// pinned, then signed, under another fetch's verified comparison.
+	Admitted *Admission
 }
 
 // admissionPinResult is what a queryable sink found when it tried to attach a
@@ -443,26 +450,24 @@ const sqliteDecidedAt = "2006-01-02T15:04:05.000000Z"
 func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string, forUpdate string, parseTime func(any) time.Time) (admissionPinResult, error) {
 	q := `SELECT id, object_key, checks, policy_digest, actor, identity, decided_at FROM admissions
 		WHERE pkg_type = ` + ph(1) + ` AND pkg_name = ` + ph(2) + ` AND pkg_version = ` + ph(3) + ` AND decision = 'admitted'
-		ORDER BY decided_at DESC, id DESC LIMIT 1` + forUpdate
-	var (
-		row     = Admission{PkgType: p.PkgType, PkgName: p.PkgName, PkgVersion: p.PkgVersion, Decision: AdmissionAdmitted}
-		key     sql.NullString
-		checks  string
-		decided any
-	)
-	err := tx.QueryRowContext(ctx, q, p.PkgType, p.PkgName, p.PkgVersion).
-		Scan(&row.ID, &key, &checks, &row.PolicyDigest, &row.Actor, &row.Identity, &decided)
-	if errors.Is(err, sql.ErrNoRows) {
-		return admissionPinResult{}, nil
-	}
+		ORDER BY decided_at DESC, id DESC LIMIT `
+	rows, err := tx.QueryContext(ctx, q+"1"+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
 	if err != nil {
 		return admissionPinResult{}, err
 	}
-	if row.Checks, err = decodeChecks(checks); err != nil {
+	row, key, found, err := pinCandidate(rows, p, nil, parseTime)
+	if err != nil || !found {
 		return admissionPinResult{}, err
 	}
-	row.DecidedAt = parseTime(decided)
-	row.ObjectKey = key.String
+	if p.Admitted != nil && !sameChecksumEvidence(row.Checks, p.Admitted.Checks) {
+		rows, err := tx.QueryContext(ctx, q+"200"+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
+		if err != nil {
+			return admissionPinResult{}, err
+		}
+		if row, key, found, err = pinCandidate(rows, p, p.Admitted, parseTime); err != nil || !found {
+			return admissionPinResult{}, err
+		}
+	}
 
 	switch {
 	case !key.Valid:
@@ -495,6 +500,50 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 	}
 	row.ObjectKey = p.ObjectKey
 	return admissionPinResult{Found: true, Attached: true, Row: row}, nil
+}
+
+// pinCandidate reads rows newest first and returns the first whose
+// checksum_database entry matches admitted's, or the first row at all when
+// admitted is nil. It closes rows.
+func pinCandidate(rows *sql.Rows, p AdmissionPin, admitted *Admission, parseTime func(any) time.Time) (Admission, sql.NullString, bool, error) {
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			row     = Admission{PkgType: p.PkgType, PkgName: p.PkgName, PkgVersion: p.PkgVersion, Decision: AdmissionAdmitted}
+			key     sql.NullString
+			checks  string
+			decided any
+		)
+		if err := rows.Scan(&row.ID, &key, &checks, &row.PolicyDigest, &row.Actor, &row.Identity, &decided); err != nil {
+			return Admission{}, key, false, err
+		}
+		var err error
+		if row.Checks, err = decodeChecks(checks); err != nil {
+			return Admission{}, key, false, err
+		}
+		if admitted != nil && !sameChecksumEvidence(row.Checks, admitted.Checks) {
+			continue
+		}
+		row.DecidedAt = parseTime(decided)
+		row.ObjectKey = key.String
+		return row, key, true, rows.Close()
+	}
+	return Admission{}, sql.NullString{}, false, rows.Err()
+}
+
+// sameChecksumEvidence reports whether a and b carry the same checksum_database
+// entry, status, detail and hashes included, or neither carries one.
+func sameChecksumEvidence(a, b []AdmissionCheck) bool {
+	entry := func(checks []AdmissionCheck) string {
+		for _, c := range checks {
+			if c.Check == CheckChecksumDatabase {
+				raw, _ := json.Marshal(c)
+				return string(raw)
+			}
+		}
+		return ""
+	}
+	return entry(a) == entry(b)
 }
 
 // buildAdmissionQuery renders the newest-first read for f. ph renders the nth

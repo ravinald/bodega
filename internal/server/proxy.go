@@ -1762,14 +1762,25 @@ func (s *Server) pinFill(ctx context.Context, store storage.ObjectStore, fill fi
 	if fill.typ == "" {
 		fill = fillIdentity("", "", s3Key)
 	}
-	s.pinAdmission(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256)
+	var admitted *audit.Admission
+	if fill.row.Decision == audit.AdmissionAdmitted {
+		admitted = &fill.row
+	}
+	s.pinAdmitted(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256, admitted)
 }
 
 // pinAdmission attaches key to the newest admitted decision for the version,
 // and says so at WARN when there was none to attach to, then signs the
 // attestation for the pin.
 func (s *Server) pinAdmission(ctx context.Context, store storage.ObjectStore, typ, name, version, key, sha256 string) {
-	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	s.pinAdmitted(ctx, store, typ, name, version, key, sha256, nil)
+}
+
+// pinAdmitted is pinAdmission for a fill holding the decision it was admitted
+// under, which the pin may not trade for one carrying other checksum database
+// evidence (audit.AdmissionPin.Admitted).
+func (s *Server) pinAdmitted(ctx context.Context, store storage.ObjectStore, typ, name, version, key, sha256 string, admitted *audit.Admission) {
+	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key, Admitted: admitted})
 	switch {
 	case err != nil:
 		s.logFor(ctx).Error("admission row not updated with its object key", "type", typ, "package", name,

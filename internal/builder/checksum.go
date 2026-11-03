@@ -218,8 +218,8 @@ func (c *Config) findAndUpdateGitChecksum(store *manifest.Store, name string, ve
 }
 
 // findAndUpdateGomodChecksum updates Checksum and ChecksumVerified on a gomod VersionEntry and saves.
-func (c *Config) findAndUpdateGomodChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
-	return c.updateVersionChecksum(context.Background(), store, manifest.TypeGomod, name, ve, cs, verified)
+func (c *Config) findAndUpdateGomodChecksum(ctx context.Context, store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return c.updateVersionChecksum(ctx, store, manifest.TypeGomod, name, ve, cs, verified)
 }
 
 // findAndUpdateHelmChecksum updates Checksum and ChecksumVerified on a helm VersionEntry and saves.

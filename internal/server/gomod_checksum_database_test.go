@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/attest"
@@ -187,6 +191,107 @@ func TestGomodAttestationCarriesTheChecksumDatabase(t *testing.T) {
 	for _, want := range []string{"verified", "tree size 1", m.ZipHash, m.ModHash} {
 		if !strings.Contains(got.Detail, want) {
 			t.Errorf("evaluation detail %q does not carry %q", got.Detail, want)
+		}
+	}
+}
+
+func TestReviewConcurrentGomodFillsCannotBorrowVerifiedEvidence(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	forged := sumdbtest.NewModule(t, honest.Path, honest.Version, "different bytes")
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.AddModule(honest)
+	var lookups atomic.Int32
+	log.Wrap = func(w http.ResponseWriter, r *http.Request, db http.Handler) {
+		if strings.HasPrefix(r.URL.Path, "/lookup/") && lookups.Add(1) == 1 {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		db.ServeHTTP(w, r)
+	}
+	signer := installAttestKey(t)
+	s := gomodSumdbServer(t, log, newRecordingUpstream(t))
+	s.loadAttestSigner()
+	now := time.Now()
+	o, err := admit.RequestOverride(t.Context(), s.auditDB, s.cfg, admit.OverrideRequest{
+		Type: manifest.TypeGomod, Name: honest.Path, Version: honest.Version,
+		Check: audit.CheckChecksumDatabase, Reason: "INC-17", Expires: "7d",
+	}, audit.LocalOverrideCaller("alice"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admit.VoteOverride(t.Context(), s.auditDB, o.ID, audit.LocalOverrideCaller("bob"), true, "", now); err != nil {
+		t.Fatal(err)
+	}
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".zip"):
+			close(started)
+			<-release
+			_, _ = w.Write(forged.Zip)
+		case strings.HasSuffix(r.URL.Path, ".mod"):
+			_, _ = w.Write(honest.Mod)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	defer once.Do(func() { close(release) })
+	s.cfg.GomodUpstream = up.URL
+	base := "/go/" + honest.Path + "/@v/" + honest.Version
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- doRequest(s, http.MethodGet, base+".zip", nil) }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("zip fill never reached the upstream")
+	}
+	first := newestGomodRow(t, s, honest.Path, honest.Version)
+	entry := admit.ChecksumDatabaseEntry(first)
+	if entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceUnknown || entry.Status != audit.CheckOverridden {
+		t.Fatalf("first fill was not admitted under the outage override: %+v", entry)
+	}
+	if rec := doRequest(s, http.MethodGet, base+".mod", nil); rec.Code != http.StatusOK {
+		t.Fatalf("mod fill: %d %s", rec.Code, rec.Body.String())
+	}
+	second := newestGomodRow(t, s, honest.Path, honest.Version)
+	if entry := admit.ChecksumDatabaseEntry(second); entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("second fill did not verify: %+v", entry)
+	}
+	once.Do(func() { close(release) })
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusOK && rec.Code != http.StatusBadGateway {
+			t.Fatalf("zip fill: %d %s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("zip fill never finished")
+	}
+	key := manifest.GomodKey(honest.Path, honest.Version, ".zip")
+	for _, path := range envelopesFor(t, s.typeStore(manifest.TypeGomod), key) {
+		raw, err := s.typeStore(manifest.TypeGomod).Get(t.Context(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, st, err := attest.ParseEnvelope(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(forged.Zip)
+		for _, check := range attest.Verify(env, st, attest.VerifyInput{
+			Trusted: trustedBy(t, signer), ArtifactSHA256: hex.EncodeToString(sum[:]),
+			WantPURL: attest.PURL(manifest.TypeGomod, honest.Path, honest.Version, key),
+		}) {
+			if !check.OK {
+				t.Fatalf("statement does not verify for the forged zip: %+v", check)
+			}
+		}
+		for _, e := range st.Predicate.PolicyEvaluations.Evaluations {
+			if e.Check == audit.CheckChecksumDatabase && e.Status == audit.CheckPass && strings.HasPrefix(e.Detail, "verified:") {
+				t.Errorf("forged zip %s acquired another fill's verified statement for %s: %s", forged.ZipHash, honest.ZipHash, e.Detail)
+			}
 		}
 	}
 }

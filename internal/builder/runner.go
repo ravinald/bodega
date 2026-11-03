@@ -264,6 +264,28 @@ func (c *Config) enforceAdmission(ctx context.Context, regType, name string, ve 
 // checkers it controls rather than reaching the internet.
 var fetchCheckers = admit.VersionCheckers
 
+type fetchAdmissionKey struct{}
+
+// withFetchAdmission carries the decision a fetch was admitted under to the
+// pin its digest reaches through the shared checksum path, so the pin cannot
+// attach to a concurrent admission carrying other checksum database evidence.
+func withFetchAdmission(ctx context.Context, row audit.Admission) context.Context {
+	if row.Decision != audit.AdmissionAdmitted {
+		return ctx
+	}
+	return context.WithValue(ctx, fetchAdmissionKey{}, row)
+}
+
+// fetchAdmissionFrom is the admission withFetchAdmission carried, when it is
+// for this version.
+func fetchAdmissionFrom(ctx context.Context, typ, name, version string) *audit.Admission {
+	row, ok := ctx.Value(fetchAdmissionKey{}).(audit.Admission)
+	if !ok || row.PkgType != typ || row.PkgName != name || row.PkgVersion != version {
+		return nil
+	}
+	return &row
+}
+
 // pinAdmission attaches an object key to the admission decision for the
 // version whose digest was just pinned, or verified against the pin, and signs
 // the attestation for it. A pin no decision preceded is said out loud: those
@@ -273,7 +295,8 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	if c.AuditDB == nil || key == "" {
 		return
 	}
-	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key,
+		Admitted: fetchAdmissionFrom(ctx, typ, name, version)})
 	switch {
 	case err != nil:
 		c.logf("  WARNING: %s/%s@%s: admission row not updated with object key %s: %v", typ, name, version, key, err)
