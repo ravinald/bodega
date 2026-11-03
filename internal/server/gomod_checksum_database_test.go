@@ -592,3 +592,55 @@ func TestReviewChecksumEvidenceSearchLimitPreservesNewerDenial(t *testing.T) {
 		})
 	}
 }
+
+// The go command resolves "go install example.com/widget/cmd/widget@v1.2.3"
+// by asking for the .info of every path prefix and moving on at a 404 or
+// 410. The checksum database holds no record for a prefix that is not a
+// module, so the fill must answer the upstream's not-found rather than the
+// fail-closed refusal, which the go command treats as fatal. A version the
+// upstream does publish is still refused when the database cannot confirm it.
+func TestGomodPrefixProbeTheDatabaseDoesNotKnowIsNotFound(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "the published bytes")
+	probe := "/example.com/widget/cmd/widget/@v/v1.2.3.info"
+
+	for _, tc := range []struct {
+		name      string
+		published bool
+		status    int
+	}{
+		{"unpublished prefix", false, http.StatusNotFound},
+		{"published but unknown to the database", true, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := sumdbtest.New(t, sumdbtest.NewKey(t))
+			log.AddModule(honest)
+			up := newRecordingUpstream(t)
+			if tc.published {
+				up.route(probe, `{"Version":"v1.2.3","Time":"2024-01-23T13:54:04Z"}`)
+			}
+			s := gomodSumdbServer(t, log, up)
+
+			rec := doRequest(s, http.MethodGet, "/go"+probe, nil)
+			if rec.Code != tc.status {
+				t.Fatalf("probe = %d %s, want %d", rec.Code, rec.Body.String(), tc.status)
+			}
+			rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeGomod,
+				PkgName: "example.com/widget/cmd/widget", PkgVersion: "v1.2.3"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.published {
+				if len(rows) != 0 {
+					t.Errorf("an unpublished version left admission rows: %+v", rows)
+				}
+				return
+			}
+			if len(rows) == 0 || rows[0].Decision != audit.AdmissionPolicyBlocked {
+				t.Fatalf("a published version the database cannot confirm was not refused on record: %+v", rows)
+			}
+			if c := admit.ChecksumDatabaseEntry(rows[0]); c == nil || c.ChecksumDatabase.Outcome != audit.ProvenanceUnknown {
+				t.Errorf("checksum_database entry %+v, want unknown", c)
+			}
+		})
+	}
+}

@@ -1569,6 +1569,10 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	if fill.typ == manifest.TypeRpm {
 		rpmFillFrom(r.Context()).describe(&ve)
 	}
+	if s.gomodUnpublished(r.Context(), checkers, fill, s3Key, ve) {
+		http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
+		return fill, false
+	}
 	_, row, ok := s.admitFillRow(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
 	fill.row = row
 	return fill, ok

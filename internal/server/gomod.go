@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	pathpkg "path"
@@ -19,6 +20,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // ---- Go module proxy -------------------------------------------------------
@@ -284,6 +286,59 @@ func (s *Server) checksumDatabaseGate(ctx context.Context, r *http.Request, fill
 	s.logFor(ctx).Error("checksum database mismatch", "module", fill.name, "version", fill.version, "file", file,
 		"database_hash", want, "computed_hash", got, "incident", incident)
 	return checksumDatabaseRefusal(fill.name, fill.version, incident)
+}
+
+// gomodUnpublished reports whether a gomod fill names a version the checksum
+// database cannot confirm and the upstream does not publish. The go command
+// resolves a package path by asking for the .info of each prefix and moves
+// on at a 404 or 410, so a prefix that is no module has to get the
+// upstream's not-found: the checksum_database refusal is a 403, which the go
+// command treats as fatal. Only a .info fill is probed, because .mod and .zip
+// are asked for once a module resolved. Only unknown leads to the upstream
+// read, and only a 404 or 410 there skips the admission; any other answer,
+// a failed read included, leaves the refusal standing.
+func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.VersionChecker, fill fillAdmission, s3Key string, ve manifest.VersionEntry) bool {
+	if fill.typ != manifest.TypeGomod || fill.version == "" || pathpkg.Ext(s3Key) != ".info" {
+		return false
+	}
+	var db *provenance.ChecksumDatabase
+	for _, c := range checkers {
+		if d, ok := c.(*provenance.ChecksumDatabase); ok {
+			db = d
+		}
+	}
+	if db == nil {
+		return false
+	}
+	res := db.Check(ctx, &manifest.PackageManifest{Type: manifest.TypeGomod, Name: fill.name}, &ve)
+	if res.ChecksumDatabase == nil || res.ChecksumDatabase.Outcome != audit.ProvenanceUnknown {
+		return false
+	}
+	escaped, err := modulepath.EscapePath(fill.name)
+	if err != nil {
+		return false
+	}
+	ev, err := modulepath.EscapeVersion(fill.version)
+	if err != nil {
+		return false
+	}
+	info := strings.TrimRight(s.cfg.GomodUpstream, "/") + "/" + escaped + "/@v/" + ev + ".info"
+	open := func(ctx context.Context, u string) (*upstreamStream, error) { return openUpstream(ctx, u, false) }
+	if o, ok := ctx.Value(upstreamOpenerKey{}).(upstreamOpener); ok {
+		open = o
+	}
+	up, err := open(ctx, info)
+	if err == nil {
+		up.body.Close()
+		return false
+	}
+	var status *upstreamStatusError
+	unpublished := errors.Is(err, errUpstreamNotFound) || (errors.As(err, &status) && status.status == http.StatusGone)
+	if unpublished {
+		s.logFor(ctx).Info("checksum database and upstream both lack this Go module version, answering not found",
+			"module", fill.name, "version", fill.version, "url", info)
+	}
+	return unpublished
 }
 
 // gomodSumdbName is the checksum database the go command names by default.
