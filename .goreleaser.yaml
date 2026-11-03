@@ -103,6 +103,10 @@ signs:
   # --new-bundle-format=false is what keeps cosign v3.1 and later writing the
   # pair: without it they refuse to sign without --bundle, and with --bundle
   # they ignore --output-signature and --output-certificate.
+  # --use-signing-config=false is what lets --oidc-issuer through: cosign
+  # v3.0.6 defaults signing-config mode on, refuses any service URL beside it
+  # ("cannot specify service URLs and use signing config"), and that mode
+  # writes only the new bundle format. The bundle entry passes no service URL.
   - id: checksum-bundle
     cmd: cosign
     signature: '${artifact}.sigstore.json'
@@ -121,6 +125,7 @@ signs:
       - sign-blob
       - '--oidc-issuer=https://token.actions.githubusercontent.com'
       - '--new-bundle-format=false'
+      - '--use-signing-config=false'
       - '--output-certificate=${certificate}'
       - '--output-signature=${signature}'
       - '${artifact}'

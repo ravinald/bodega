@@ -52,11 +52,6 @@ cosign verify-blob \
   --certificate-identity "https://github.com/ravinald/bodega/.github/workflows/release-build.yml@refs/tags/$VERSION" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums-sha256.txt
-sha256sum --ignore-missing -c checksums-sha256.txt
-gh attestation verify "bodega_${VERSION#v}_linux_amd64.tar.gz" \
-  --repo ravinald/bodega \
-  --signer-workflow ravinald/bodega/.github/workflows/release-build.yml \
-  --source-ref "refs/tags/$VERSION"
 ```
 
 A cosign release that cannot read a Sigstore bundle checks the detached
@@ -69,6 +64,16 @@ cosign verify-blob \
   --certificate-identity "https://github.com/ravinald/bodega/.github/workflows/release-build.yml@refs/tags/$VERSION" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums-sha256.txt
+```
+
+Then check the checksums and the provenance of each file you install:
+
+```bash
+sha256sum --ignore-missing -c checksums-sha256.txt
+gh attestation verify "bodega_${VERSION#v}_linux_amd64.tar.gz" \
+  --repo ravinald/bodega \
+  --signer-workflow ravinald/bodega/.github/workflows/release-build.yml \
+  --source-ref "refs/tags/$VERSION"
 ```
 
 A failure from any of these means the file did not come from this

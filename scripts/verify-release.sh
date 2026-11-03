@@ -6,6 +6,7 @@
 # the newest published release.
 
 set -euo pipefail
+export LC_ALL=C
 
 REPO=ravinald/bodega
 SIGNER_WORKFLOW=.github/workflows/release-build.yml
@@ -57,6 +58,7 @@ die_usage() {
 tag=
 latest=no
 dir=
+dir_given=no
 while [ $# -gt 0 ]; do
 	case $1 in
 	-h | --help)
@@ -67,9 +69,13 @@ while [ $# -gt 0 ]; do
 	--dir)
 		[ $# -ge 2 ] || die_usage "--dir needs a path"
 		dir=$2
+		dir_given=yes
 		shift
 		;;
-	--dir=*) dir=${1#--dir=} ;;
+	--dir=*)
+		dir=${1#--dir=}
+		dir_given=yes
+		;;
 	-*) die_usage "unknown flag '$1'" ;;
 	*)
 		[ -z "$tag" ] || die_usage "one tag only; got '$tag' and '$1'"
@@ -88,7 +94,10 @@ fi
 if [ -n "$tag" ] && ! [[ $tag =~ $TAG_RE ]]; then
 	die_usage "'$tag' is not a release tag; expected vMAJOR.MINOR.PATCH with an optional -prerelease suffix"
 fi
-if [ -n "$dir" ] && ! [ -d "$dir" ]; then
+if [ "$dir_given" = yes ] && [ -z "$dir" ]; then
+	die_usage "--dir needs a non-empty path; omit --dir to download the release instead"
+fi
+if [ "$dir_given" = yes ] && ! [ -d "$dir" ]; then
 	die_usage "--dir '$dir' is not a directory"
 fi
 
@@ -97,9 +106,9 @@ for tool in gh cosign; do
 		die_usage "$tool is not on PATH; install it (https://cli.github.com, https://docs.sigstore.dev/cosign/system_config/installation/) and retry"
 done
 if command -v sha256sum >/dev/null 2>&1; then
-	sha256() { sha256sum -- "$1" | awk '{print $1}'; }
+	sha256() { sha256sum -- "$1"; }
 elif command -v shasum >/dev/null 2>&1; then
-	sha256() { shasum -a 256 -- "$1" | awk '{print $1}'; }
+	sha256() { shasum -a 256 -- "$1"; }
 else
 	die_usage "neither sha256sum nor shasum is on PATH; install coreutils or perl's shasum and retry"
 fi
@@ -110,7 +119,7 @@ if [ "$latest" = yes ]; then
 		exit 1
 	fi
 	if ! [[ $listing =~ \"tagName\":[[:space:]]*\"([^\"]*)\" ]]; then
-		echo "no release yet: $REPO has no published release; nothing was verified"
+		echo "no release yet: $REPO has no published release; nothing was checked"
 		exit 3
 	fi
 	tag=${BASH_REMATCH[1]}
@@ -118,7 +127,7 @@ if [ "$latest" = yes ]; then
 		die_usage "the newest release of $REPO carries the tag '$tag', which is not a release tag"
 fi
 
-if [ -z "$dir" ]; then
+if [ "$dir_given" = no ]; then
 	dir=$(mktemp -d)
 	trap 'rm -rf "$dir"' EXIT
 	if ! gh release download "$tag" --repo "$REPO" --dir "$dir"; then
@@ -131,13 +140,25 @@ cd "$dir"
 verified=0
 failed=0
 
+# Names come from the release and the checksum file, so control characters
+# are masked before they reach a terminal or a CI log.
 pass() {
-	echo "ok    $1"
+	echo "ok    ${1//[[:cntrl:]]/?}"
 }
 
 fail() {
-	echo "FAIL  $1"
+	echo "FAIL  ${1//[[:cntrl:]]/?}"
 	failed=$((failed + 1))
+}
+
+# Exact element comparison: a directory entry may hold a newline, so no
+# delimited string can stand in for the set of listed names.
+is_listed() {
+	local n
+	for n in "${names[@]}"; do
+		[ "$n" = "$1" ] && return 0
+	done
+	return 1
 }
 
 summary() {
@@ -181,9 +202,10 @@ fi
 
 # Parsed in full before any file is touched: a name this rejects never reaches
 # the hash or gh, and nothing downstream has to treat a name as a path.
+# read drops NUL bytes silently, so tr maps each to DEL first, and the line
+# carrying it fails the grammar or the control-character check.
 names=()
 digests=()
-listed=$'\n'
 lineno=0
 bad=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -196,23 +218,20 @@ while IFS= read -r line || [ -n "$line" ]; do
 	digest=${BASH_REMATCH[1]}
 	name=${BASH_REMATCH[3]}
 	case $name in
-	*/* | . | .. | -*)
+	*/* | . | .. | -* | *[[:cntrl:]]*)
 		fail "$CHECKSUMS line $lineno: '$name' is not a plain file name"
 		bad=1
 		continue
 		;;
 	esac
-	case $listed in
-	*$'\n'"$name"$'\n'*)
+	if is_listed "$name"; then
 		fail "$CHECKSUMS line $lineno: '$name' is listed twice"
 		bad=1
 		continue
-		;;
-	esac
+	fi
 	names+=("$name")
 	digests+=("$digest")
-	listed+="$name"$'\n'
-done <"$CHECKSUMS"
+done < <(tr '\000' '\177' <"$CHECKSUMS")
 
 if [ "$bad" -ne 0 ]; then
 	summary
@@ -227,10 +246,8 @@ for entry in *; do
 	case $entry in
 	"$CHECKSUMS" | "$BUNDLE" | "$SIG" | "$PEM") continue ;;
 	esac
-	case $listed in
-	*$'\n'"$entry"$'\n'*) ;;
-	*) fail "$entry: present but not listed in $CHECKSUMS, so nothing attests it" ;;
-	esac
+	is_listed "$entry" ||
+		fail "$entry: present but not listed in $CHECKSUMS, so nothing attests it"
 done
 shopt -u nullglob dotglob
 
@@ -245,23 +262,37 @@ for i in "${!names[@]}"; do
 		fail "$name: not a regular file"
 		continue
 	fi
-	got=$(sha256 "$name")
-	file_ok=yes
-	if [ "$got" != "$want" ]; then
-		fail "$name: SHA-256 mismatch: $CHECKSUMS lists $want, file is $got"
-		file_ok=no
+	reasons=()
+	diag=
+	if ! hashed=$(sha256 "$name" 2>&1); then
+		reasons+=("could not hash it")
+		diag+=$hashed$'\n'
+	else
+		got=${hashed%% *}
+		# GNU sha256sum escapes a name holding a backslash and marks the line
+		# with a leading one.
+		got=${got#\\}
+		if ! [[ $got =~ ^[0-9a-f]{64}$ ]]; then
+			reasons+=("could not hash it: unexpected output from the SHA-256 tool")
+			diag+=$hashed$'\n'
+		elif [ "$got" != "$want" ]; then
+			reasons+=("SHA-256 mismatch: $CHECKSUMS lists $want, file is $got")
+		fi
 	fi
 	if ! out=$(gh attestation verify "$name" --repo "$REPO" \
 		--signer-workflow "$REPO/$SIGNER_WORKFLOW" \
 		--source-ref "refs/tags/$tag" \
 		--deny-self-hosted-runners 2>&1); then
-		fail "$name: attestation did not verify for $SIGNER_WORKFLOW at refs/tags/$tag"
-		printf '%s\n' "$out" | sed 's/^/      /'
-		file_ok=no
+		reasons+=("attestation did not verify for $SIGNER_WORKFLOW at refs/tags/$tag")
+		diag+=$out$'\n'
 	fi
-	if [ "$file_ok" = yes ]; then
+	if [ "${#reasons[@]}" -eq 0 ]; then
 		pass "$name"
 		verified=$((verified + 1))
+	else
+		joined=$(printf '%s; ' "${reasons[@]}")
+		fail "$name: ${joined%; }"
+		printf '%s' "$diag" | sed 's/^/      /'
 	fi
 done
 
