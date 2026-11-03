@@ -114,7 +114,7 @@ func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
 				return nil, false, fmt.Errorf("%s: %w", label, err)
 			}
 			if blk.Type != openpgp.PublicKeyType {
-				if packetsHoldPrivate(body) {
+				if private, _ := packetsHoldPrivate(body); private {
 					return nil, true, nil
 				}
 				note(fmt.Errorf("%s is a %q, not a %q", label, blk.Type, openpgp.PublicKeyType))
@@ -122,8 +122,16 @@ func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
 			}
 			raw = body
 		}
-		if packetsHoldPrivate(raw) {
+		private, err := packetsHoldPrivate(raw)
+		if trimmed := bytes.TrimRight(raw, " \t\r\n"); err != nil && !seg.armored && len(trimmed) < len(raw) {
+			private, err = packetsHoldPrivate(trimmed)
+		}
+		if private {
 			return nil, true, nil
+		}
+		if err != nil {
+			note(fmt.Errorf("%s: %w", label, err))
+			continue
 		}
 		got, err := openpgp.ReadKeyRing(bytes.NewReader(raw))
 		if trimmed := bytes.TrimRight(raw, " \t\r\n"); err != nil && !seg.armored && len(trimmed) < len(raw) {
@@ -194,21 +202,58 @@ func keyringSegments(data []byte) []keyringSegment {
 	return out
 }
 
-// packetsHoldPrivate reports whether any packet in b is a secret key, read
-// packet by packet so private material is found even where the packets do
-// not form a keyring ReadKeyRing would accept.
-func packetsHoldPrivate(b []byte) bool {
-	r := packet.NewReader(bytes.NewReader(b))
+// packetsHoldPrivate reports whether any packet in b is a secret key or
+// secret subkey, judged by packet tag alone. packet.Reader skips packets it
+// cannot parse, so a secret key in a version, algorithm or protection mode
+// this build does not support would pass unseen; the opaque reader yields
+// every packet whatever its body holds. Compressed packets are opened and
+// scanned too. A framing error is returned rather than read as "no private
+// material", since the bytes past it went unread.
+func packetsHoldPrivate(b []byte) (bool, error) {
+	return scanPackets(bytes.NewReader(b), 0)
+}
+
+const maxCompressedDepth = 8
+
+func scanPackets(r io.Reader, depth int) (bool, error) {
+	or := packet.NewOpaqueReader(r)
 	for {
-		p, err := r.Next()
-		if err != nil {
-			return false
+		op, err := or.Next()
+		if err == io.EOF {
+			return false, nil
 		}
-		if _, ok := p.(*packet.PrivateKey); ok {
-			return true
+		if err != nil {
+			return false, fmt.Errorf("reading packet framing: %w", err)
+		}
+		switch op.Tag {
+		case tagSecretKey, tagSecretSubkey:
+			return true, nil
+		case tagCompressed:
+			if depth >= maxCompressedDepth {
+				return false, fmt.Errorf("compressed packets nest deeper than %d", maxCompressedDepth)
+			}
+			p, err := op.Parse()
+			if err != nil {
+				return false, fmt.Errorf("reading compressed packet: %w", err)
+			}
+			c, ok := p.(*packet.Compressed)
+			if !ok {
+				return false, fmt.Errorf("compressed packet did not parse")
+			}
+			private, err := scanPackets(c.Body, depth+1)
+			if private || err != nil {
+				return private, err
+			}
 		}
 	}
 }
+
+// OpenPGP packet tags (RFC 9580 section 5).
+const (
+	tagSecretKey    = 5
+	tagSecretSubkey = 7
+	tagCompressed   = 8
+)
 
 func holdsPrivate(keys openpgp.EntityList) bool {
 	for _, e := range keys {

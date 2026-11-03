@@ -586,3 +586,94 @@ func TestHelmKeyringReadsBytesOutsideArmor(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewHelmRejectsUnsupportedPrivatePackets(t *testing.T) {
+	key := newHelmKey(t, nil)
+	public, err := os.ReadFile(writeHelmKeyring(t, false, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key.PrivateKey.UpgradeToV5()
+	for _, subkey := range []bool{false, true} {
+		for _, armored := range []bool{false, true} {
+			t.Run(fmt.Sprintf("subkey=%v/armored=%v", subkey, armored), func(t *testing.T) {
+				key.PrivateKey.IsSubkey = subkey
+				var raw bytes.Buffer
+				raw.Write(public)
+				if err := key.PrivateKey.Serialize(&raw); err != nil {
+					t.Fatal(err)
+				}
+				body := raw.Bytes()
+				if armored {
+					var out bytes.Buffer
+					w, err := armor.Encode(&out, openpgp.PublicKeyType, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := w.Write(body); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+					body = out.Bytes()
+				}
+				file := filepath.Join(t.TempDir(), "keyring.gpg")
+				if err := os.WriteFile(file, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := LoadHelmKeyring(file, "https://charts.example.com/")
+				if err == nil || !strings.Contains(err.Error(), "private key material") || !strings.Contains(err.Error(), file) {
+					t.Fatalf("keyring holding a v5 private packet: error = %v; want private-key refusal naming %s", err, file)
+				}
+			})
+		}
+	}
+}
+
+func TestHelmKeyringPacketScanAccountsForEveryByte(t *testing.T) {
+	key := newHelmKey(t, nil)
+	public, err := os.ReadFile(writeHelmKeyring(t, false, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	if err := key.PrivateKey.Serialize(&secret); err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	cw, err := packet.SerializeCompressed(nopCloser{&compressed}, packet.CompressionZLIB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cw.Write(secret.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"secret key inside a compressed packet", append(append([]byte{}, public...), compressed.Bytes()...), "private key material"},
+		{"truncated packet after the public key", append(append([]byte{}, public...), secret.Bytes()[:4]...), "parses as neither"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "keyring.gpg")
+			if err := os.WriteFile(file, tc.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadHelmKeyring(file, "https://charts.example.com/")
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), file) {
+				t.Fatalf("error = %v; want %q naming %s", err, tc.want, file)
+			}
+		})
+	}
+}
+
+type nopCloser struct{ *bytes.Buffer }
+
+func (nopCloser) Close() error { return nil }
