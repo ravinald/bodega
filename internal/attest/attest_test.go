@@ -559,6 +559,17 @@ func TestEmitResolvesTheDirectDependencyDigest(t *testing.T) {
 			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "v1", d1)}},
 			"", []RequiredByRef{{Ref: "", Unavailable: "names no package type and name"},
 				{Ref: "/widget", Unavailable: "names no package type and name"}, {Ref: "git/", Unavailable: "names no package type and name"}}},
+		{"empty name before a version", []string{"git/@v1", "@v1", "pypi/@1.0", "npm/@1.0"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "@v1", "x", d1), sumRow("git", "", "v1", d1), sumRow("pypi", "", "1.0", d1), sumRow("npm", "", "1.0", d1)}},
+			"", []RequiredByRef{{Ref: "git/@v1", Unavailable: `"git/@v1" names no package`}, {Ref: "@v1", Unavailable: `"@v1" names no package`},
+				{Ref: "pypi/@1.0", Unavailable: `"pypi/@1.0" names no package`}, {Ref: "npm/@1.0", Unavailable: `"npm/@1.0" names no package`}}},
+		{"empty version or broken npm scope", []string{"git/widget@", "npm/@/pkg", "npm/@scope/", "npm/@scope/pkg@"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("git", "widget", "", d1), sumRow("npm", "@/pkg", "1", d1), sumRow("npm", "@scope/", "1", d1), sumRow("npm", "@scope/pkg", "", d1)}},
+			"", []RequiredByRef{{Ref: "git/widget@", Unavailable: "names no package"}, {Ref: "npm/@/pkg", Unavailable: "names no package"},
+				{Ref: "npm/@scope/", Unavailable: "names no package"}, {Ref: "npm/@scope/pkg@", Unavailable: "names no package"}}},
+		{"npm scoped package with and without a version", []string{"npm/@scope/pkg@1.0", "npm/@scope/other"}, nil,
+			stubChecksums{rows: []audit.StoredChecksum{sumRow("npm", "@scope/pkg", "1.0", d1), sumRow("npm", "@scope/pkg", "2.0", d2), sumRow("npm", "@scope/other", "3.0", d2)}},
+			d1, []RequiredByRef{{Ref: "npm/@scope/pkg@1.0", Digest: sha(d1)}, {Ref: "npm/@scope/other", Digest: sha(d2)}}},
 		{"caller-held parents after catalog references, sorted, repeats dropped", []string{"git/missing"},
 			[]Parent{{Ref: "pypi/zeta@2", SHA256: d2}, {Ref: "pypi/alpha@1", SHA256: d1}, {Ref: "pypi/zeta@2", SHA256: d2}},
 			stubChecksums{},
@@ -1059,4 +1070,45 @@ func TestE29DocsDescribeResolvedFrom(t *testing.T) {
 		"more than one distinct pinned SHA-256",
 		"source distributions or marker-conditioned requirements",
 		"every statement signed before parent digests were recorded")
+}
+
+func TestReviewE29EmptyVersionedNameNeverResolves(t *testing.T) {
+	for _, typ := range []string{"git", "apt", "pypi"} {
+		t.Run(typ, func(t *testing.T) {
+			ctx := context.Background()
+			db := openAudit(t)
+			signer := newSigner(t)
+			store := storage.NewMemory()
+			key := manifest.NpmTarballKey("lodash", "4.17.21")
+			admit(t, db, "4.17.21", audit.AdmissionAdmitted, passing)
+			p := pin(t, db, "4.17.21", key)
+			ref := typ + "/@v1"
+			p.RequiredBy = []string{ref}
+			e := emitter(db, signer)
+			e.Checksums = stubChecksums{rows: []audit.StoredChecksum{
+				sumRow(typ, "@v1", "other", strings.Repeat("1", 64)),
+			}}
+			ek, err := e.Emit(ctx, store, p)
+			if err != nil || ek == "" {
+				t.Fatalf("Emit = %q, %v", ek, err)
+			}
+			data, err := store.Get(ctx, ek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, st, err := ParseEnvelope(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range Verify(env, st, VerifyInput{Trusted: trusted(t, signer), ArtifactSHA256: digest, WantPURL: "pkg:npm/lodash@4.17.21"}) {
+				if !r.OK {
+					t.Fatalf("Verify failed: %+v", r)
+				}
+			}
+			rb := st.Predicate.RequiredBy
+			if len(rb) != 1 || rb[0].Ref != ref || rb[0].Digest != nil || rb[0].Unavailable == "" || !strings.Contains(rb[0].Unavailable, ref) || st.Predicate.ResolvedFrom != nil {
+				t.Fatalf("empty name in %q produced requiredBy=%+v resolvedFrom=%+v; want unavailable and no digest", ref, rb, st.Predicate.ResolvedFrom)
+			}
+		})
+	}
 }

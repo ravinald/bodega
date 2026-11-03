@@ -278,12 +278,16 @@ func resolveRef(ctx context.Context, src ChecksumLister, ref string) RequiredByR
 		typ, rest = manifest.TypeGit, ref
 	}
 	name, version, versioned := rest, "", false
-	// An npm scope opens with @, so only an @ past the first byte separates
-	// a version.
-	if i := strings.LastIndex(rest, "@"); i > 0 {
+	// An npm scoped package opens with @scope/, so that leading @ is part of
+	// the name. Every other leading @ separates a version from an empty name.
+	i := strings.LastIndex(rest, "@")
+	if i == 0 && typ == manifest.TypeNpm && strings.Contains(rest, "/") {
+		i = -1
+	}
+	if i >= 0 {
 		name, version, versioned = rest[:i], rest[i+1:], true
 	}
-	if typ == "" || name == "" {
+	if typ == "" || name == "" || (versioned && version == "") || !wellFormedName(typ, name) {
 		out.Unavailable = fmt.Sprintf("reference %q names no package type and name to look a parent up by", ref)
 		return out
 	}
@@ -313,6 +317,16 @@ func resolveRef(ctx context.Context, src ChecksumLister, ref string) RequiredByR
 		out.Unavailable = fmt.Sprintf("%q matches %d distinct pinned sha256 digests, so none of them names the parent", ref, len(digests))
 	}
 	return out
+}
+
+// wellFormedName rejects an npm scoped name missing its scope or package,
+// which would otherwise be looked up as a name nothing pins.
+func wellFormedName(typ, name string) bool {
+	if typ != manifest.TypeNpm || !strings.HasPrefix(name, "@") {
+		return true
+	}
+	scope, pkg, ok := strings.Cut(name[1:], "/")
+	return ok && scope != "" && pkg != "" && !strings.Contains(pkg, "/")
 }
 
 // AvailabilityOf maps the upstream_provenance check of a row onto the
