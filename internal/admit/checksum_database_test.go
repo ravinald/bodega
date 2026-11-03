@@ -154,3 +154,17 @@ func TestEvaluateWritesNoTreeHead(t *testing.T) {
 		t.Errorf("Evaluate moved the stored tree head:\n%s\nwas\n%s", after, before)
 	}
 }
+
+// A test binary must never read the public database, so a checker built from
+// the defaults is refused at the transport TestMain installs.
+func TestChecksumDatabaseTestBinaryRefusesThePublicDatabase(t *testing.T) {
+	pm := &manifest.PackageManifest{Type: manifest.TypeGomod, Name: "golang.org/x/mod",
+		Versions: []manifest.VersionEntry{{Version: "v0.20.0"}}}
+	got := NewChecksumDatabase(nil, nil, nil, true).Check(t.Context(), pm, &pm.Versions[0])
+	if got.ChecksumDatabase == nil || got.ChecksumDatabase.Outcome != audit.ProvenanceUnknown {
+		t.Fatalf("default checker answered %+v, want unknown", got)
+	}
+	if !strings.Contains(got.Reason, "test binary refuses sum.golang.org") {
+		t.Errorf("default checker was not refused at the test transport: %s", got.Reason)
+	}
+}

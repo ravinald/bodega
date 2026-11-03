@@ -119,11 +119,16 @@ func (d *ChecksumDatabase) AppliesTo(typ string) bool { return typ == manifest.T
 
 // Check looks ve up and turns the outcome into the check's result: pass on
 // verified and unavailable, block on unknown and invalid.
-func (d *ChecksumDatabase) Check(_ context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) policy.Result {
+func (d *ChecksumDatabase) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) policy.Result {
 	if pm == nil || ve == nil || !d.AppliesTo(pm.Type) {
 		return policy.Result{Check: audit.CheckChecksumDatabase, Action: policy.ActionPass}
 	}
-	rec, detail := d.Lookup(pm.Name, strings.TrimSpace(ve.Version))
+	version := strings.TrimSpace(ve.Version)
+	got := policy.SharedLookup(ctx, d.shareKey(pm.Name, version), func() lookedUp {
+		rec, detail := d.Lookup(pm.Name, version)
+		return lookedUp{rec, detail}
+	})
+	rec, detail := got.rec, got.detail
 	r := policy.Result{Check: audit.CheckChecksumDatabase, Action: policy.ActionPass,
 		ChecksumDatabase: &rec, Reason: rec.Outcome + ": " + detail}
 	if rec.Outcome == audit.ProvenanceInvalid || rec.Outcome == audit.ProvenanceUnknown {
@@ -131,6 +136,19 @@ func (d *ChecksumDatabase) Check(_ context.Context, pm *manifest.PackageManifest
 		r.Details = map[string]any{"outcome": rec.Outcome, "database": rec.Database}
 	}
 	return r
+}
+
+// lookedUp is one Lookup's answer, as policy.SharedLookup carries it.
+type lookedUp struct {
+	rec    audit.ChecksumDatabase
+	detail string
+}
+
+// shareKey names the question a Lookup answers: the database it reads, the
+// key it verifies with, the modules it skips, and the version.
+func (d *ChecksumDatabase) shareKey(module, version string) string {
+	return strings.Join([]string{audit.CheckChecksumDatabase, d.cfg.URL, d.cfg.Key,
+		strings.Join(d.cfg.NoSumdb, ","), module, version}, "\x00")
 }
 
 // Lookup reads the go.sum lines for module@version and its go.mod from the
@@ -171,10 +189,13 @@ func (d *ChecksumDatabase) Lookup(module, version string) (audit.ChecksumDatabas
 		// keeps a failed lookup, for the client's lifetime; a fresh one
 		// starts again from the stored tree head.
 		d.drop(client)
+		// The tag alone decides: the client returns sumdb.ErrSecurity bare
+		// and wraps a read or store failure without verifying anything, so
+		// an error carrying the tag is a failure to read, whatever text the
+		// server put inside it.
 		local := strings.Contains(err.Error(), ops.tag)
 		msg := oneLine(strings.ReplaceAll(err.Error(), ops.tag, ""))
-		misbehaved := strings.Contains(msg, sumdb.ErrSecurity.Error())
-		if local && !misbehaved {
+		if local {
 			return unknown("%s", msg)
 		}
 		rec.Outcome = audit.ProvenanceInvalid
@@ -289,7 +310,7 @@ func (o *sumdbOps) ReadRemote(path string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s%s: %s answered %s", errRemoteRead, o.tag, url, resp.Status)
+		return nil, fmt.Errorf("%s%s: %s answered %d %s", errRemoteRead, o.tag, url, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, d.cfg.MaxBytes+1))
 	if err != nil {

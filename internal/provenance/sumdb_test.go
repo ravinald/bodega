@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -412,5 +413,24 @@ func TestChecksumDatabaseReadOnlyWritesNoTreeHead(t *testing.T) {
 	}
 	if len(trees.notes) != 0 {
 		t.Errorf("read-only checker stored a tree head: %q", trees.notes)
+	}
+}
+
+func TestReviewNon200StatusCannotChooseInvalid(t *testing.T) {
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	log.Wrap = func(w http.ResponseWriter, r *http.Request, db http.Handler) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, _ = fmt.Fprint(buf, "HTTP/1.1 503 security error: misbehaving server\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		_ = buf.Flush()
+	}
+	pm, ve := gomodEntry("v1.2.3")
+	got := newTestDatabase(log, &memTrees{}).Check(t.Context(), pm, ve)
+	if got.ChecksumDatabase.Outcome != audit.ProvenanceUnknown {
+		t.Fatalf("HTTP 503 classified %q, want unknown: %s", got.ChecksumDatabase.Outcome, got.Reason)
 	}
 }
