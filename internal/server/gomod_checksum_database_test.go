@@ -400,3 +400,94 @@ func TestReviewSameObjectFillCannotBorrowVerifiedStatement(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewChecksumEvidenceFilterPreservesNewerDenial(t *testing.T) {
+	m := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	for _, tc := range []struct {
+		ext  string
+		body []byte
+	}{{".zip", m.Zip}, {".mod", m.Mod}} {
+		t.Run(tc.ext, func(t *testing.T) {
+			signer := installAttestKey(t)
+			log := sumdbtest.New(t, sumdbtest.NewKey(t))
+			log.AddModule(m)
+			s := gomodSumdbServer(t, log, newRecordingUpstream(t))
+			s.cfg.GomodNoSumdb = "example.com"
+			s.loadAttestSigner()
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/"+m.Path+"/@v/"+m.Version+tc.ext {
+					close(started)
+					<-release
+					_, _ = w.Write(tc.body)
+					return
+				}
+				if r.URL.Path == "/"+m.Path+"/@v/"+m.Version+".info" {
+					_, _ = w.Write([]byte(`{"Version":"v1.2.3","Time":"2026-11-03T00:00:00Z"}`))
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer up.Close()
+			defer once.Do(func() { close(release) })
+			s.cfg.GomodUpstream = up.URL
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() { done <- doRequest(s, http.MethodGet, "/go/"+m.Path+"/@v/"+m.Version+tc.ext, nil) }()
+			select {
+			case <-started:
+			case <-time.After(10 * time.Second):
+				t.Fatal("fill never reached upstream")
+			}
+			first := newestGomodRow(t, s, m.Path, m.Version)
+			if c := admit.ChecksumDatabaseEntry(first); c == nil || c.ChecksumDatabase.Outcome != audit.ProvenanceUnavailable {
+				t.Fatalf("first fill did not use its exclusion: %+v", first)
+			}
+			if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeGomod, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+				t.Fatal(err)
+			}
+			age := policy.NewAgeChecker(s.auditDB)
+			age.GoProxy = up.URL
+			age.Now = func() time.Time { return time.Date(2026, 11, 3, 1, 0, 0, 0, time.UTC) }
+			cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier}
+			second := admit.Fetch(t.Context(), s.auditDB, []policy.VersionChecker{age, admit.ChecksumDatabaseChecker(cfg, s.auditDB)},
+				manifest.TypeGomod, m.Path, manifest.VersionEntry{Version: m.Version}, admit.AllowListCheck(false, m.Path, nil), admit.Who{Actor: "alice"}, "")
+			if second.Block == nil || second.Block.Check != audit.CheckAge || second.Admission.Decision != audit.AdmissionPolicyBlocked {
+				t.Fatalf("new policy did not deny the version: %+v", second)
+			}
+			if c := admit.ChecksumDatabaseEntry(second.Admission); c == nil || c.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+				t.Fatalf("new decision did not verify the log: %+v", second.Admission)
+			}
+			once.Do(func() { close(release) })
+			select {
+			case rec := <-done:
+				if rec.Code != http.StatusOK {
+					t.Fatalf("old fill: %d %s", rec.Code, rec.Body.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("fill did not finish")
+			}
+			if row := newestGomodRow(t, s, m.Path, m.Version); row.Decision != audit.AdmissionPolicyBlocked {
+				t.Fatalf("new denial was lost from the database: %+v", row)
+			}
+			key := manifest.GomodKey(m.Path, m.Version, tc.ext)
+			h := sha256.Sum256(tc.body)
+			for _, ek := range envelopesFor(t, s.typeStore(manifest.TypeGomod), key) {
+				raw, err := s.typeStore(manifest.TypeGomod).Get(t.Context(), ek)
+				if err != nil {
+					t.Fatal(err)
+				}
+				env, statement, err := attest.ParseEnvelope(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, check := range attest.Verify(env, statement, attest.VerifyInput{Trusted: trustedBy(t, signer), ArtifactSHA256: hex.EncodeToString(h[:]), WantPURL: attest.PURL(manifest.TypeGomod, m.Path, m.Version, key)}) {
+					if !check.OK {
+						t.Fatalf("invalid envelope: %+v", check)
+					}
+				}
+				t.Errorf("signed decision %s after newer policy_blocked age decision; checksum evidence filtering hid the denial", statement.Predicate.PolicyEvaluations.Decision)
+			}
+		})
+	}
+}

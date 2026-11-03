@@ -567,14 +567,17 @@ type AdmissionLister interface {
 	Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, error)
 }
 
-// ComparedAdmissions is Reader with every row whose checksum_database outcome
-// is verified withheld, unless Compared vouches for SHA256 under that row's
-// evidence. A signer reading the newest row for a version would otherwise sign
-// any digest pinned under the version's object key with whichever fetch
+// ComparedAdmissions is Reader with every admitted row whose checksum_database
+// outcome is verified withheld, unless Compared vouches for SHA256 under that
+// row's evidence. A signer reading the newest row for a version would otherwise
+// sign any digest pinned under the version's object key with whichever fetch
 // verified last: two fetches of one key can carry different bytes and
 // different evidence, and the key names neither. Rows no comparison could
 // support (any other outcome) pass through, because they claim nothing about
-// the bytes.
+// the bytes. A row of any other decision passes through whatever evidence it
+// carries: the log verifying says nothing about the age, malware or other
+// gates, and withholding a newer denial would hand the signer an older
+// admission as the newest decision.
 type ComparedAdmissions struct {
 	Reader   AdmissionLister
 	SHA256   string
@@ -589,7 +592,7 @@ func (c ComparedAdmissions) Admissions(ctx context.Context, f AdmissionFilter) (
 	}
 	out := rows[:0:0]
 	for _, r := range rows {
-		if verifiedChecksumEvidence(r.Checks) && !c.vouches(r) {
+		if r.Decision == AdmissionAdmitted && verifiedChecksumEvidence(r.Checks) && !c.vouches(r) {
 			continue
 		}
 		out = append(out, r)
