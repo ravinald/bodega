@@ -9,7 +9,7 @@ import (
 
 // A fetch admitted under one checksum database outcome pins under a row
 // carrying that outcome, never under a newer admission that verified bytes
-// this fetch did not compare; with nothing matching it pins under no decision.
+// this fetch did not compare; with nothing matching it declines, writing no row.
 func TestPinKeepsTheFetchsChecksumEvidence(t *testing.T) {
 	t0 := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 	gomod := func(at time.Time, outcome, status string) Admission {
@@ -65,9 +65,21 @@ func TestPinKeepsTheFetchsChecksumEvidence(t *testing.T) {
 				t.Errorf("verified fetch pinned under %v, want the newest row", got)
 			}
 
+			countRows := func(t *testing.T) int {
+				t.Helper()
+				rows, err := db.Admissions(t.Context(), AdmissionFilter{PkgType: "gomod", PkgName: "example.com/widget"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return len(rows)
+			}
+			before := countRows(t)
 			stranger := gomod(t0, ProvenanceUnavailable, CheckPass)
-			if got, err := db.PinAdmission(t.Context(), pin("gomod/info", &stranger)); err != nil || got != PinUnadmitted {
-				t.Fatalf("PinAdmission with no matching decision = %v, %v; want PinUnadmitted", got, err)
+			if _, err := db.PinAdmission(t.Context(), pin("gomod/info", &stranger)); !errors.Is(err, ErrAdmissionNotLocated) {
+				t.Fatalf("PinAdmission with no matching decision: %v; want ErrAdmissionNotLocated", err)
+			}
+			if got := countRows(t); got != before {
+				t.Errorf("a declined pin wrote %d rows; a fetch that was decided gets no new decision", got-before)
 			}
 		})
 	}
@@ -173,6 +185,36 @@ func TestComparedAdmissionsWithholdsVerifiedRowsNoComparisonVouchesFor(t *testin
 				if ids[i] != tc.want[i] {
 					t.Fatalf("rows %v, want %v", ids, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// A pin holding its fetch's admission writes no not_evaluated row when no
+// admitted row is on record: that row would be a new admission, newer than
+// the refusal that is.
+func TestPinHoldingAnAdmissionNeverRecordsANewOne(t *testing.T) {
+	t0 := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	for name, open := range admissionStores(t) {
+		t.Run(name, func(t *testing.T) {
+			db := open(t)
+			fetch := passed("v1.2.3", t0)
+			fetch.PkgType, fetch.PkgName = "gomod", "example.com/widget"
+			denied := fetch
+			denied.Decision, denied.DecidedAt = AdmissionPolicyBlocked, t0.Add(time.Second)
+			if err := db.RecordAdmission(t.Context(), denied); err != nil {
+				t.Fatal(err)
+			}
+			_, err := db.PinAdmission(t.Context(), AdmissionPin{PkgType: "gomod", PkgName: "example.com/widget", PkgVersion: "v1.2.3", ObjectKey: "gomod/zip", Admitted: &fetch})
+			if !errors.Is(err, ErrAdmissionNotLocated) {
+				t.Fatalf("PinAdmission: %v; want ErrAdmissionNotLocated", err)
+			}
+			rows, err := db.Admissions(t.Context(), AdmissionFilter{PkgType: "gomod", PkgName: "example.com/widget"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 || rows[0].Decision != AdmissionPolicyBlocked {
+				t.Errorf("rows after a declined pin: %+v; want the refusal alone", rows)
 			}
 		})
 	}

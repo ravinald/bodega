@@ -745,7 +745,7 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 			continue
 		}
 		outcome, err := b.db.PinAdmission(ctx, audit.AdmissionPin{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion, ObjectKey: row.ObjectKey, Admitted: admitted})
-		if errors.Is(err, audit.ErrUnboundChecksumEvidence) {
+		if errors.Is(err, audit.ErrUnboundChecksumEvidence) || errors.Is(err, audit.ErrAdmissionNotLocated) {
 			fmt.Fprintf(b.out, "  %s: not signed: %v\n", label, err)
 			refused++
 			continue

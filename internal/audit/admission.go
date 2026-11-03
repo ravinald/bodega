@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -201,6 +202,14 @@ type AdmissionPin struct {
 // caller compares the bytes and names the row, or the object goes unattached.
 var ErrUnboundChecksumEvidence = errors.New("a verified checksum database row is attached only to bytes compared under it, and this pin names no admission")
 
+// ErrAdmissionNotLocated is PinAdmission declining a pin whose fetch holds an
+// admission it cannot find on record with the same checksum_database entry.
+// The fetch was decided, so writing the not_evaluated row an undecided pin
+// gets would be a new admitted decision, newer than any refusal recorded
+// since, and the signer would sign it. The object stays unattached and
+// unsigned instead.
+var ErrAdmissionNotLocated = errors.New("the admission this fetch was decided under is not among the newest admitted rows carrying its checksum database evidence, so the object is left unattached and unsigned rather than recorded under a new decision")
+
 // admissionPinResult is what a queryable sink found when it tried to attach a
 // pin. Found is false when the version has no admitted row; Attached is true
 // when the sink wrote something, as opposed to finding the key already there.
@@ -253,7 +262,9 @@ func (a *DB) RecordAdmission(ctx context.Context, row Admission) error {
 // version. With none to attach to, it writes a row for the key whose checks
 // all say not_evaluated, and reports PinUnadmitted so the caller can say so:
 // bytes reached the store with no decision behind them, and a fabricated pass
-// would hide exactly that.
+// would hide exactly that. A pin naming the admission its fetch was decided
+// under never gets that row: it attaches to a row carrying the same checksum
+// evidence, or fails with ErrAdmissionNotLocated.
 func (a *DB) PinAdmission(ctx context.Context, p AdmissionPin) (PinOutcome, error) {
 	if a.readOnly {
 		return PinUnverified, nil
@@ -465,17 +476,24 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 		return admissionPinResult{}, err
 	}
 	row, key, found, err := pinCandidate(rows, p, nil, parseTime)
-	if err != nil || !found {
+	if err != nil {
 		return admissionPinResult{}, err
 	}
-	if p.Admitted != nil && !sameChecksumEvidence(row.Checks, p.Admitted.Checks) {
-		rows, err := tx.QueryContext(ctx, q+"200"+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
+	if found && p.Admitted != nil && !sameChecksumEvidence(row.Checks, p.Admitted.Checks) {
+		rows, err := tx.QueryContext(ctx, q+strconv.Itoa(pinCandidateWindow)+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
 		if err != nil {
 			return admissionPinResult{}, err
 		}
-		if row, key, found, err = pinCandidate(rows, p, p.Admitted, parseTime); err != nil || !found {
+		if row, key, found, err = pinCandidate(rows, p, p.Admitted, parseTime); err != nil {
 			return admissionPinResult{}, err
 		}
+	}
+	if !found {
+		if p.Admitted != nil {
+			return admissionPinResult{}, fmt.Errorf("%w: %s/%s@%s, object %s, searched %d rows; run 'bodega attest backfill' to compare the stored bytes and sign them under the newest decision",
+				ErrAdmissionNotLocated, p.PkgType, p.PkgName, p.PkgVersion, p.ObjectKey, pinCandidateWindow)
+		}
+		return admissionPinResult{}, nil
 	}
 
 	unbound := p.Admitted == nil && key.String != p.ObjectKey && verifiedChecksumEvidence(row.Checks)
@@ -513,6 +531,11 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 	row.ObjectKey = p.ObjectKey
 	return admissionPinResult{Found: true, Attached: true, Row: row}, nil
 }
+
+// pinCandidateWindow bounds how many admitted rows of one version a pin reads
+// looking for its fetch's checksum evidence. Exhausting it declines the pin
+// (ErrAdmissionNotLocated); it never decides anything.
+const pinCandidateWindow = 200
 
 // pinCandidate reads rows newest first and returns the first whose
 // checksum_database entry matches admitted's, or the first row at all when
