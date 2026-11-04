@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1617,6 +1616,7 @@ func TestAuditPypiRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
 		t.Fatalf("URL credentials reached the result: %s", raw)
+
 	}
 }
 
@@ -1745,6 +1745,9 @@ func TestAuditPypiNetworkPathRedirectErrorKeepsCredentialsPrivate(t *testing.T) 
 	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
 		t.Fatalf("URL credentials reached the result: %s", raw)
 	}
+	if true {
+		t.Logf("%s", raw)
+	}
 }
 
 func TestAuditPypiAllVerifiedPublisherIdentitiesMustAgree(t *testing.T) {
@@ -1788,26 +1791,69 @@ func TestAuditPypiAllVerifiedPublisherIdentitiesMustAgree(t *testing.T) {
 	}
 }
 
-// Every spelling of a URL carrying credentials renders without them: the
-// pattern strips the authority forms it parses, and anything still holding an
-// @ is withheld rather than printed.
-func TestCredentialFreeRendersNoUserinfo(t *testing.T) {
+// No spelling of an unparseable redirect carrying credentials reaches a
+// result: the client's error text is classified, never rendered.
+func TestPypiUnparseableRedirectNeverRendersCredentials(t *testing.T) {
+	r := newTLSRegistry(t)
+	host := strings.TrimPrefix(r.URL, "https://")
 	for _, loc := range []string{
-		"https://user:secret@h/%zz",
-		"//user:secret@h/%zz",
-		`\\user:secret@h/%zz`,
-		"//us er:secret@h/%zz",
-		`//us"er:secret@h/%zz`,
-		"HTTPS://user:secret@h",
+		"https://user:secret@" + host + "/%zz",
+		"https://user:secret%40" + host + "/%zz",
+		"https://user:secret%40" + host,
+		"//user:secret@" + host + "/%zz",
+		"//user:secret%40" + host + "/%zz",
+		`\\user:secret@` + host + "/%zz",
+		"https://user:secret%2540" + host + "/%zz",
 	} {
-		inner := fmt.Errorf("failed to parse Location header %q: %v", loc, &url.Error{Op: "parse", URL: loc, Err: errors.New("invalid URL escape")})
-		req := url.URL{Scheme: "https", User: url.UserPassword("user", "***"), Host: "h", Path: "/simple/x/"}
-		err := credentialFree{&url.Error{Op: "Get", URL: req.String(), Err: fmt.Errorf("%w: %w", errNotFound, inner)}}
-		if s := err.Error(); strings.Contains(s, "secret") || strings.Contains(s, "user") {
-			t.Errorf("%q rendered credentials: %s", loc, s)
+		r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Location", loc)
+			w.WriteHeader(http.StatusFound)
+		})
+		v := newPypiVerifier(t, r)
+		v.PypiIndex = "https://user:secret@" + host
+		res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+		raw, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !errors.Is(err, errNotFound) {
-			t.Errorf("%q: the chain lost errNotFound", loc)
+		if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user") {
+			t.Errorf("Location %q put credentials in the result: %s", loc, raw)
 		}
+		if res.Provenance == nil || res.Provenance.Outcome != audit.ProvenanceUnknown {
+			t.Errorf("Location %q: %s, want unknown", loc, raw)
+		}
+	}
+}
+
+// A fetch error renders a fixed sentence and keeps its chain for errors.Is.
+func TestFetchErrorKeepsChainWithoutText(t *testing.T) {
+	r := newTLSRegistry(t)
+	r.Config.Handler = http.NotFoundHandler()
+	v := newPypiVerifier(t, r)
+	_, _, err := v.getWithin(context.Background(), strings.Replace(r.URL, "https://", "https://user:secret@", 1)+"/x", nil, 1<<20, nil)
+	if !errors.Is(err, errNotFound) {
+		t.Fatalf("the chain lost errNotFound: %v", err)
+	}
+	if s := err.Error(); strings.Contains(s, "secret") || strings.Contains(s, "/x") || !strings.Contains(s, "HTTP 404") {
+		t.Fatalf("rendered %q, want scheme, host and the status only", s)
+	}
+}
+
+func TestAuditPypiEncodedAuthorityRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", strings.Replace(secret, "@", "%40", 1)+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
 	}
 }

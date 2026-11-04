@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -376,27 +375,19 @@ func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limi
 // reference in the body resolves against. Userinfo in raw stays on the request
 // URL, where the client turns it into Basic credentials for that request
 // alone: set as a header here instead, it would be copied onto a redirect to
-// another port of the same host. No error this returns renders the userinfo
-// of any URL, raw's or one a redirect named.
+// another port of the same host. Every error it returns is a *fetchError.
 func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
-	body, at, err := v.fetch(ctx, raw, header, limit, allow)
-	if err != nil {
-		return nil, nil, credentialFree{err}
-	}
-	return body, at, nil
-}
-
-func (v *Verifier) fetch(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
-		return nil, nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", manifest.PublicURL(raw))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return nil, nil, &fetchError{what: "refusing to fetch it: not an http(s) URL", err: err}
 	}
-	public := *u
-	public.User = nil
-	target := public.String()
+	at := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	fail := func(what string, err error) ([]byte, *url.URL, error) {
+		return nil, nil, &fetchError{at: manifest.PublicURL(at), what: what, err: err}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GET %s: %w", target, err)
+		return fail("the request could not be built", err)
 	}
 	for k, vs := range header {
 		req.Header[k] = vs
@@ -414,7 +405,7 @@ func (v *Verifier) fetch(ctx context.Context, raw string, header http.Header, li
 				return prior(next, via)
 			}
 			if len(via) >= 10 {
-				return errors.New("stopped after 10 redirects")
+				return errTooManyRedirects
 			}
 			return nil
 		}
@@ -422,52 +413,71 @@ func (v *Verifier) fetch(ctx context.Context, raw string, header http.Header, li
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return fail(transportFailure(err), err)
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, nil, fmt.Errorf("GET %s: %w", target, errNotFound)
+		return fail("HTTP 404", errNotFound)
 	case resp.StatusCode != http.StatusOK:
-		return nil, nil, fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
+		return fail(fmt.Sprintf("HTTP %d", resp.StatusCode), nil)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, nil, fmt.Errorf("GET %s: %w", target, err)
+		return fail("the body could not be read", err)
 	}
 	if int64(len(body)) > limit {
-		return nil, nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", target, limit>>20)
+		return fail(fmt.Sprintf("the body is larger than the %d MiB cap", limit>>20), nil)
 	}
 	return body, resp.Request.URL, nil
 }
 
-// userinfo matches the userinfo of an authority inside rendered error text,
-// whether the reference is absolute (https://u@h) or network-path (//u@h) and
-// whether or not it parsed: the client embeds a Location header it could not
-// parse verbatim, in more than one place, so redacting the url.Error's own URL
-// field leaves copies behind.
-var userinfo = regexp.MustCompile(`//[^\s/?#@]*@`)
+var errTooManyRedirects = errors.New("stopped after 10 redirects")
 
-// credentialFree renders err with every URL's userinfo removed and keeps the
-// chain intact for errors.Is and errors.As. Text that still holds an @ after
-// redaction names a reference in a spelling the pattern does not take apart
-// (a backslash authority, a space inside userinfo), so it is withheld rather
-// than trusted.
-type credentialFree struct{ err error }
-
-func (e credentialFree) Error() string {
-	s := userinfo.ReplaceAllString(e.err.Error(), "//")
-	if !strings.Contains(s, "@") {
-		return s
+// transportFailure names the class of a client.Do error without rendering its
+// text. net/http quotes a Location header it could not parse verbatim, and no
+// rewrite of that text can find every spelling of userinfo in it (a literal
+// or percent-encoded @, a network-path reference, a parser quoting only the
+// port it choked on), so the text is read to classify and never repeated.
+func transportFailure(err error) string {
+	var off *offIndexError
+	switch {
+	case errors.As(err, &off):
+		return off.Error()
+	case errors.Is(err, errTooManyRedirects):
+		return "it redirected more than 10 times"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the request timed out"
+	case errors.Is(err, context.Canceled):
+		return "the request was canceled"
 	}
-	const why = "the error text was withheld because it names a URL bodega could not remove credentials from"
 	var ue *url.Error
-	if errors.As(e.err, &ue) {
-		if at := manifest.PublicURL(ue.URL); !strings.Contains(at, "@") {
-			return ue.Op + " " + at + ": " + why
+	if errors.As(err, &ue) {
+		if strings.Contains(ue.Err.Error(), "Location header") {
+			return "it redirected to a Location that is not a valid URL, so the redirect was not followed"
+		}
+		if ue.Timeout() {
+			return "the request timed out"
 		}
 	}
-	return why
+	return "the connection failed"
 }
 
-func (e credentialFree) Unwrap() error { return e.err }
+// fetchError is a failed provenance fetch. Its text is a fixed sentence for
+// the failure's class and the scheme and host of the URL requested, both
+// known not to carry credentials, and err keeps the original chain for
+// errors.Is and errors.As without ever being rendered.
+type fetchError struct {
+	at   string
+	what string
+	err  error
+}
+
+func (e *fetchError) Error() string {
+	if e.at == "" {
+		return e.what
+	}
+	return "GET " + e.at + ": " + e.what
+}
+
+func (e *fetchError) Unwrap() error { return e.err }
