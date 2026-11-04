@@ -133,8 +133,10 @@ type UpstreamProvenance struct {
 	BuilderID           string `json:"builder_id,omitempty"`
 	// BundleDigest is "sha256:<hex>" over the Sigstore bundle as fetched.
 	BundleDigest string `json:"bundle_digest,omitempty"`
-	// SignerFingerprint is the 40-hex-digit primary key fingerprint of the
-	// OpenPGP key that made a verified Helm .prov signature.
+	// SignerFingerprint is the complete primary key fingerprint of the
+	// OpenPGP key that made a verified Helm .prov signature, in uppercase hex:
+	// 40 digits for a version 4 key and 64 for a version 6 key. It is never
+	// truncated or rehashed to fit one width.
 	SignerFingerprint string `json:"signer_fingerprint,omitempty"`
 	// SubjectDigest is "sha256:<hex>" as a verified Helm .prov signed it for
 	// the chart archive.

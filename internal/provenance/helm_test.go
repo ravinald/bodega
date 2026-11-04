@@ -750,3 +750,47 @@ func TestReviewHelmRejectsUnreadContainerBytes(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewHelmFingerprintWidths(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("v6=%v", v6), func(t *testing.T) {
+			f := newHelmFixture(t)
+			f.key = newHelmKey(t, &packet.Config{V6Keys: v6})
+			f.v.HelmKeyrings[f.repo.URL+"/"] = writeHelmKeyring(t, false, f.key)
+			f.repo.serve("/charts/"+helmFile+".prov", helmProv(t, f.key, nil, f.chartY, map[string]string{helmFile: "sha256:" + sha256Hex(f.chart)}))
+			ev := f.check(t, manifest.VersionEntry{})
+			wantOutcome(t, ev, audit.ProvenanceVerified, helmFile)
+			want := strings.ToUpper(hex.EncodeToString(f.key.PrimaryKey.Fingerprint))
+			width := 40
+			if v6 {
+				width = 64
+			}
+			if ev.SignerFingerprint != want || len(ev.SignerFingerprint) != width {
+				t.Fatalf("signer_fingerprint = %q; want key's own %d-digit fingerprint %q", ev.SignerFingerprint, width, want)
+			}
+		})
+	}
+	t.Run("field comment", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "audit", "admission.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, rest, ok := strings.Cut(string(raw), "// SignerFingerprint")
+		comment, _, end := strings.Cut(rest, "SignerFingerprint string")
+		if !ok || !end || !strings.Contains(comment, "40") || !strings.Contains(comment, "64") {
+			t.Fatalf("SignerFingerprint comment does not state both widths (40 for v4, 64 for v6): %q", comment)
+		}
+	})
+	t.Run("usage guide", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "usage.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, "`signer_fingerprint`") && strings.Contains(line, "40") && strings.Contains(line, "64") {
+				return
+			}
+		}
+		t.Fatal("usage.md does not describe signer_fingerprint with both widths (40 for v4, 64 for v6)")
+	})
+}
