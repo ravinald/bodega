@@ -332,7 +332,7 @@ It also settles an ordering problem. Catalog mode returns 404 against an empty s
 
 `git` and `binary` have no importer, because nothing on a host records a clone or a downloaded binary. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
 
-Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age, OSV and upstream provenance version checks. A manifest's fate does not depend on which surface it arrived through.
+Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age, OSV and upstream provenance version checks, the last of which verifies npm Sigstore bundles, GitHub release attestations, and a classic Helm chart's `.prov` against the keyring `helm_keyrings` names. A manifest's fate does not depend on which surface it arrived through.
 
 ## Apt entry-creation modes
 

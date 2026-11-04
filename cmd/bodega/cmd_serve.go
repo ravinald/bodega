@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -80,7 +82,10 @@ server that publishes an empty Release over a manifest root nothing can read is
 indistinguishable from a healthy one that holds no packages.
 
 When sigstore_trusted_root names a file, serve reads it before binding and
-refuses to start if it is missing or is not a Sigstore trusted root.
+refuses to start if it is missing or is not a Sigstore trusted root. Every
+keyring helm_keyrings names is read the same way, and serve refuses to start
+on the first that is missing, writable by group or others, not an OpenPGP
+public keyring, or holding a private key.
 
 Use --quiet to suppress the startup banner for scripted use; log-level
 output continues to respect log_level in the config.`,
@@ -107,6 +112,13 @@ output continues to respect log_level in the config.`,
 			// overrides each one or fixes the file.
 			if cfg.SigstoreTrustedRoot != "" {
 				if _, err := provenance.LoadTrustedRootFile(cfg.SigstoreTrustedRoot); err != nil {
+					return err
+				}
+			}
+			// The same holds for a chart keyring: unreadable, every .prov
+			// under its prefix records unknown.
+			for _, prefix := range slices.Sorted(maps.Keys(cfg.HelmKeyrings)) {
+				if _, err := provenance.LoadHelmKeyring(cfg.HelmKeyrings[prefix], prefix); err != nil {
 					return err
 				}
 			}

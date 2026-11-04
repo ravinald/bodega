@@ -1,7 +1,10 @@
 package admit
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/sigstore/sigstore-go/pkg/root"
 
 	"github.com/ravinald/bodega/internal/attest"
@@ -256,6 +261,76 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// signedHelmChart serves podinfo-6.7.0.tgz and a .prov clearsigned over it
+// in Helm's format, and returns the repository URL, a keyring holding the
+// signer's public key, and the signer's fingerprint and the chart's digest.
+func signedHelmChart(t *testing.T) (repo, keyring, fingerprint, digest string) {
+	t.Helper()
+	key, err := openpgp.NewEntity("Chart Publisher", "", "charts@example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart := []byte("podinfo chart archive bytes")
+	sum := sha256.Sum256(chart)
+	digest = "sha256:" + hex.EncodeToString(sum[:])
+	var prov bytes.Buffer
+	w, err := clearsign.Encode(&prov, key.PrivateKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("apiVersion: v2\nname: podinfo\nversion: 6.7.0\n\n...\nfiles:\n  podinfo-6.7.0.tgz: " + digest + "\n"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/charts/podinfo-6.7.0.tgz":
+			_, _ = rw.Write(chart)
+		case "/charts/podinfo-6.7.0.tgz.prov":
+			_, _ = rw.Write(prov.Bytes())
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var pub bytes.Buffer
+	if err := key.Serialize(&pub); err != nil {
+		t.Fatal(err)
+	}
+	keyring = filepath.Join(t.TempDir(), "charts.gpg")
+	if err := os.WriteFile(keyring, pub.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return srv.URL + "/charts", keyring, strings.ToUpper(hex.EncodeToString(key.PrimaryKey.Fingerprint)), digest
+}
+
+// An imported chart whose .prov verifies against helm_keyrings records the
+// signer and the signed digest in the row's upstream_provenance entry.
+func TestAdmitRecordsVerifiedHelmProvenance(t *testing.T) {
+	f := newAdmissionFixture(t)
+	repo, keyring, fpr, digest := signedHelmChart(t)
+	cfg := *f.synced
+	cfg.HelmKeyrings = map[string]string{strings.TrimSuffix(repo, "charts"): keyring}
+	pm := &manifest.PackageManifest{Type: manifest.TypeHelm, Name: "podinfo",
+		Versions: []manifest.VersionEntry{{Version: "6.7.0", URL: repo}}}
+
+	res := Admit(t.Context(), policy.NewChecker(f.adb), f.adb, &cfg, pm, "ravi")
+	if res.Decision != Admitted {
+		t.Fatalf("Decision = %v (%s)", res.Decision, res.Reason)
+	}
+	rows, err := f.adb.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeHelm, PkgName: "podinfo"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("admission rows = %d, %v", len(rows), err)
+	}
+	c := checkOf(t, rows[0], audit.CheckUpstreamProvenance)
+	raw, _ := json.Marshal(c.Provenance)
+	var got map[string]string
+	_ = json.Unmarshal(raw, &got)
+	if got["outcome"] != audit.ProvenanceVerified || got["signer_fingerprint"] != fpr || got["subject_digest"] != digest {
+		t.Errorf("upstream_provenance = %s (%s), want verified by %s over %s", raw, c.Detail, fpr, digest)
+	}
 }
 
 // pypiWithProvenance serves sampleproject 4.0.0's wheel with the PEP 740

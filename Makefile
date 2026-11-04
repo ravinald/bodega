@@ -201,10 +201,12 @@ uninstall:
 #
 # GO_TEST_TIMEOUT bounds a hang, not a normal run. internal/server took 308s to
 # 462s on CI with -race and -coverprofile in October 2026, and crossed go test's
-# 10m default once tests were added rather than any one of them hanging. ci.yml
+# 10m default once tests were added rather than any one of them hanging. By
+# November it took about 19.5 minutes, so 20m failed runs that had not hung,
+# with a test 0s into its run named at the timeout. ci.yml
 # runs both targets through make, so CI and a local run share this value.
 # TEST_FLAGS carries what only CI adds, such as -coverprofile.
-GO_TEST_TIMEOUT := 20m
+GO_TEST_TIMEOUT := 30m
 TEST_FLAGS ?=
 
 ## test: Run every package but internal/server, with the race detector

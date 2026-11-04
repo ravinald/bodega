@@ -277,6 +277,8 @@ type FetchResult struct {
 // policy_blocked, so a refusal leaves a row like a pass does. checkers nil
 // records them as not evaluated with notRunDetail as the reason: the proxy
 // passes nil for a type whose request names no version the checks could date.
+// With checkers set, notRunDetail is the reason recorded for every check they
+// leave out, such as the age and OSV checks a helm proxy fill does not run.
 func Fetch(
 	ctx context.Context,
 	adb *audit.DB,
@@ -307,6 +309,9 @@ func Fetch(
 		ev.notRunChecks(0, notRunDetail, ev.versionChecks...)
 	default:
 		results := ev.runVersion(ctx, pm, 0, checkers)
+		if notRunDetail != "" {
+			ev.notRunChecks(0, notRunDetail, ev.versionChecks...)
+		}
 		combined := policy.Combine(results)
 		if !combined.Blocked() {
 			if changed := ev.commit(ctx, pm, checkers); changed != nil {
@@ -682,8 +687,9 @@ type readOnlyIntegrations struct{ integration.Store }
 func (readOnlyIntegrations) RecordIntegrationError(context.Context, string, string) error { return nil }
 
 // ProvenanceChecker builds the upstream provenance check: npm read from the
-// configured npm upstream when an entry names no registry, and the Sigstore
-// trusted root from sigstore_trusted_root, or TUF when that is unset.
+// configured npm upstream when an entry names no registry, the Sigstore
+// trusted root from sigstore_trusted_root, or TUF when that is unset, and Helm
+// .prov files verified against the keyrings helm_keyrings names.
 func ProvenanceChecker(cfg *config.Config, adb *audit.DB) *provenance.Checker {
 	// A nil *audit.DB inside the interface is not a nil interface.
 	var store provenance.Store
@@ -700,6 +706,9 @@ func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenan
 	}
 	if cfg != nil && cfg.PypiUpstream != "" {
 		v.PypiIndex = strings.TrimRight(cfg.PypiUpstream, "/")
+	}
+	if cfg != nil {
+		v.HelmKeyrings = cfg.HelmKeyrings
 	}
 	return &provenance.Checker{Store: store, Verifier: v}
 }

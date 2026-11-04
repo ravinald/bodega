@@ -55,6 +55,9 @@ type Evidence struct {
 	// trusted root could be had, so no bundle was checked. The fix is the
 	// operator's, not the package's, and a refusal says so.
 	NoTrustedRoot bool
+	// NoKeyring is set on an unknown outcome for a Helm chart whose .prov
+	// was read and not checked, because no helm_keyrings prefix matches it.
+	NoKeyring bool
 	// PublishedAt is when the registry says the version checked was
 	// published, nil when it does not say. Published is the same for every
 	// version it lists; a version absent from it has an unknown time. Only
@@ -125,6 +128,9 @@ type Verifier struct {
 	GitHubWeb string
 	GitHubAPI string
 	Root      RootFunc
+	// HelmKeyrings is helm_keyrings: a chart repository URL prefix mapped to
+	// the keyring a .prov beside a chart under it is verified against.
+	HelmKeyrings map[string]string
 }
 
 // NewVerifier returns a verifier against the public registries, with the
@@ -369,21 +375,52 @@ func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limi
 	return body, err
 }
 
+// open sends a GET to raw and returns a 200 response for the caller to read
+// and close, with the same redirect handling and credential-free errors as
+// get. It is for a body hashed as it streams rather than held in memory.
+func (v *Verifier) open(ctx context.Context, raw string, header http.Header) (*http.Response, error) {
+	resp, _, err := v.openWithin(ctx, raw, header, nil)
+	return resp, err
+}
+
 // getWithin is get with every redirect hop put to allow before it is sent; a
 // hop allow refuses is never requested. It also returns the URL of the
 // response the body came from, which after a redirect is the one a relative
-// reference in the body resolves against. Userinfo in raw stays on the request
-// URL, where the client turns it into Basic credentials for that request
-// alone: set as a header here instead, it would be copied onto a redirect to
-// another port of the same host. Every error it returns is a *fetchError.
+// reference in the body resolves against. Every error it returns is a
+// *fetchError.
 func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
+	resp, at, err := v.openWithin(ctx, raw, header, allow)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	fail := func(what string, err error) ([]byte, *url.URL, error) {
+		return nil, nil, &fetchError{at: at, what: what, err: err}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return fail("the body could not be read", err)
+	}
+	if int64(len(body)) > limit {
+		return fail(fmt.Sprintf("the body is larger than the %d MiB cap", limit>>20), nil)
+	}
+	return body, resp.Request.URL, nil
+}
+
+// openWithin sends the request getWithin and open share and returns a 200
+// response unread, with the scheme and host its errors name. Userinfo in raw
+// stays on the request URL, where the client turns it into Basic credentials
+// for that request alone: set as a header here instead, it would be copied
+// onto a redirect to another port of the same host. Every error it returns is
+// a *fetchError.
+func (v *Verifier) openWithin(ctx context.Context, raw string, header http.Header, allow func(*url.URL) error) (*http.Response, string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return nil, nil, &fetchError{what: "refusing to fetch it: not an http(s) URL", err: err}
+		return nil, "", &fetchError{what: "refusing to fetch it: not an http(s) URL", err: err}
 	}
-	at := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
-	fail := func(what string, err error) ([]byte, *url.URL, error) {
-		return nil, nil, &fetchError{at: manifest.PublicURL(at), what: what, err: err}
+	at := manifest.PublicURL((&url.URL{Scheme: u.Scheme, Host: u.Host}).String())
+	fail := func(what string, err error) (*http.Response, string, error) {
+		return nil, at, &fetchError{at: at, what: what, err: err}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -415,21 +452,15 @@ func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header
 	if err != nil {
 		return fail(transportFailure(err), err)
 	}
-	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
+		resp.Body.Close()
 		return fail("HTTP 404", errNotFound)
 	case resp.StatusCode != http.StatusOK:
+		resp.Body.Close()
 		return fail(fmt.Sprintf("HTTP %d", resp.StatusCode), nil)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil {
-		return fail("the body could not be read", err)
-	}
-	if int64(len(body)) > limit {
-		return fail(fmt.Sprintf("the body is larger than the %d MiB cap", limit>>20), nil)
-	}
-	return body, resp.Request.URL, nil
+	return resp, at, nil
 }
 
 var errTooManyRedirects = errors.New("stopped after 10 redirects")

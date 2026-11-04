@@ -78,6 +78,18 @@ type AdmissionCheck struct {
 	Unwaivable string `json:"unwaivable,omitempty"`
 }
 
+// SignedSubjectDigest is the digest the upstream provenance check verified a
+// publisher signed for this admission, "" when it verified none. A fetch that
+// stores bytes under this row holds them to it.
+func (a Admission) SignedSubjectDigest() string {
+	for _, c := range a.Checks {
+		if c.Check == CheckUpstreamProvenance && c.Provenance != nil && c.Provenance.Outcome == ProvenanceVerified {
+			return c.Provenance.SubjectDigest
+		}
+	}
+	return ""
+}
+
 // Upstream provenance outcomes: what verifying a publisher's signed
 // provenance concluded, as distinct from what the policy then did about it.
 const (
@@ -107,6 +119,11 @@ const (
 // clients.
 const DetailNoTrustedRoot = "no_trusted_root"
 
+// DetailNoKeyring is the Details key, true, on an unknown upstream provenance
+// result for a Helm chart whose .prov file was read and not checked, because
+// helm_keyrings names no keyring for the chart's repository.
+const DetailNoKeyring = "no_keyring"
+
 // UpstreamProvenance is what the upstream_provenance check verified. The
 // identity fields are empty unless a signature verified.
 type UpstreamProvenance struct {
@@ -116,6 +133,14 @@ type UpstreamProvenance struct {
 	BuilderID           string `json:"builder_id,omitempty"`
 	// BundleDigest is "sha256:<hex>" over the Sigstore bundle as fetched.
 	BundleDigest string `json:"bundle_digest,omitempty"`
+	// SignerFingerprint is the complete primary key fingerprint of the
+	// OpenPGP key that made a verified Helm .prov signature, in uppercase hex:
+	// 40 digits for a version 4 key and 64 for a version 6 key. It is never
+	// truncated or rehashed to fit one width.
+	SignerFingerprint string `json:"signer_fingerprint,omitempty"`
+	// SubjectDigest is "sha256:<hex>" as a verified Helm .prov signed it for
+	// the chart archive.
+	SubjectDigest string `json:"subject_digest,omitempty"`
 }
 
 // ChecksumDatabase is what the checksum_database check read. Outcome is one

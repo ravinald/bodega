@@ -1,0 +1,564 @@
+package provenance
+
+import (
+	"bytes"
+	"compress/flate"
+	"compress/zlib"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/url"
+	"os"
+	"path"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"gopkg.in/yaml.v3"
+
+	"github.com/ravinald/bodega/internal/audit"
+)
+
+// MaxHelmProvBytes caps a chart's .prov file, which is the chart's Chart.yaml
+// and one digest line under a signature: a few kilobytes in practice.
+// MaxHelmChartBytes caps the chart archive the check downloads to digest when
+// the entry records no sha256. Both are refused past the cap rather than
+// truncated, since a truncated document reads as a different one.
+const (
+	MaxHelmProvBytes  = 1 << 20
+	MaxHelmChartBytes = 64 << 20
+)
+
+var helmProvDigest = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
+
+// LoadHelmKeyring reads the OpenPGP public keyring a helm_keyrings entry
+// names, binary (gpg --export) or armored (gpg --export --armor). prefix is
+// the helm_keyrings key the path was configured under, named in every error
+// when it is not empty.
+//
+// The file decides which chart signatures verify, so one anybody but its
+// owner can write is refused, and so is one carrying private key material,
+// which verifying never needs and which should not sit where the server reads.
+func LoadHelmKeyring(file, prefix string) (openpgp.EntityList, error) {
+	where := "helm keyring " + file
+	if prefix != "" {
+		where = fmt.Sprintf("helm_keyrings[%q]: keyring %s", prefix, file)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be read: %v; export the publisher's public key there with `gpg --export {key ID} > %s`", where, err, file)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode %s); point helm_keyrings at the keyring file itself", where, fi.Mode())
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return nil, fmt.Errorf("%s is writable by group or others (mode %04o), so whoever can write it decides which chart signatures verify; run `chmod go-w %s`", where, perm, file)
+	}
+	data, err := os.ReadFile(file) //nolint:gosec // G304: an operator-configured path.
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be read: %v; make it readable by the user bodega runs as", where, err)
+	}
+	keys, private, err := readKeyring(data)
+	switch {
+	case private:
+		return nil, fmt.Errorf("%s holds private key material, which verifying a .prov never needs; replace it with the public key alone, `gpg --export {key ID} > %s`", where, file)
+	case err != nil:
+		return nil, fmt.Errorf("%s parses as neither a binary keyring (`gpg --export`) nor an armored one (`gpg --export --armor`): %v; export the publisher's public key again", where, err)
+	case len(keys) == 0:
+		return nil, fmt.Errorf("%s holds no public key; export the publisher's public key there with `gpg --export {key ID} > %s`", where, file)
+	}
+	return keys, nil
+}
+
+// readKeyring parses a binary or armored keyring and reports whether any key
+// in it carries private material.
+//
+// Every byte of the file is accounted for: each armored block is decoded on
+// its own and line by line through its footer, and any bytes outside a block
+// are read as a binary keyring. Reading only the armor would let a private
+// key concatenated before, between or after the blocks, or inside one past
+// its checksum, load unseen.
+func readKeyring(data []byte) (openpgp.EntityList, bool, error) {
+	var keys openpgp.EntityList
+	var parseErr error
+	note := func(err error) {
+		if parseErr == nil {
+			parseErr = err
+		}
+	}
+	segs := keyringSegments(data)
+	for i, seg := range segs {
+		label := fmt.Sprintf("armored block %d", i+1)
+		raw := seg.data
+		if !seg.armored {
+			label = fmt.Sprintf("bytes outside any armored block (segment %d)", i+1)
+			if len(segs) == 1 {
+				label = "binary keyring"
+			}
+		} else {
+			blockType, body, err := decodeArmorStrict(seg.data)
+			if err != nil {
+				return nil, false, fmt.Errorf("%s: %w", label, err)
+			}
+			if blockType == openpgp.PrivateKeyType {
+				return nil, true, nil
+			}
+			if blockType != openpgp.PublicKeyType {
+				if private, _ := packetsHoldPrivate(body); private {
+					return nil, true, nil
+				}
+				note(fmt.Errorf("%s is a %q, not a %q", label, blockType, openpgp.PublicKeyType))
+				continue
+			}
+			raw = body
+		}
+		private, err := packetsHoldPrivate(raw)
+		if trimmed := bytes.TrimRight(raw, " \t\r\n"); err != nil && !seg.armored && len(trimmed) < len(raw) {
+			private, err = packetsHoldPrivate(trimmed)
+		}
+		if private {
+			return nil, true, nil
+		}
+		if err != nil {
+			note(fmt.Errorf("%s: %w", label, err))
+			continue
+		}
+		got, err := openpgp.ReadKeyRing(bytes.NewReader(raw))
+		if trimmed := bytes.TrimRight(raw, " \t\r\n"); err != nil && !seg.armored && len(trimmed) < len(raw) {
+			got, err = openpgp.ReadKeyRing(bytes.NewReader(trimmed))
+		}
+		if err != nil {
+			note(fmt.Errorf("%s: %w", label, err))
+			continue
+		}
+		if holdsPrivate(got) {
+			return nil, true, nil
+		}
+		keys = append(keys, got...)
+	}
+	if parseErr != nil {
+		return nil, false, parseErr
+	}
+	return keys, false, nil
+}
+
+var (
+	armorBegin  = []byte("-----BEGIN PGP")
+	armorEnd    = []byte("-----END PGP")
+	armorDashes = []byte("-----")
+)
+
+type keyringSegment struct {
+	data    []byte
+	armored bool
+}
+
+// keyringSegments splits data into armored blocks, each running from its
+// header through its footer, and the bytes between them. Whitespace
+// between blocks is not a segment; anything else is.
+func keyringSegments(data []byte) []keyringSegment {
+	var out []keyringSegment
+	// A packet's tag byte has its high bit set, so leading whitespace is
+	// never packet data. Trailing whitespace can be, and readKeyring retries
+	// without it rather than trimming it here.
+	addBinary := func(b []byte) {
+		if b = bytes.TrimLeft(b, " \t\r\n"); len(b) > 0 {
+			out = append(out, keyringSegment{data: b})
+		}
+	}
+	for len(data) > 0 {
+		start := bytes.Index(data, armorBegin)
+		if start < 0 {
+			addBinary(data)
+			break
+		}
+		addBinary(data[:start])
+		data = data[start:]
+		end := len(data)
+		if e := bytes.Index(data, armorEnd); e >= 0 {
+			// The footer ends at its closing dashes, not at a newline:
+			// encoders write none after it, so whatever follows may start on
+			// the same line.
+			end = e + len(armorEnd)
+			if c := bytes.Index(data[end:], armorDashes); c >= 0 {
+				end += c + len(armorDashes)
+			} else {
+				end = len(data)
+			}
+		}
+		out = append(out, keyringSegment{data: data[:end], armored: true})
+		data = data[end:]
+	}
+	return out
+}
+
+// packetsHoldPrivate reports whether any packet in b is a secret key or
+// secret subkey, judged by packet tag alone. packet.Reader skips packets it
+// cannot parse, so a secret key in a version, algorithm or protection mode
+// this build does not support would pass unseen; the opaque reader yields
+// every packet whatever its body holds. Compressed packets are opened and
+// scanned too. Any other tag outside a key export (encrypted or literal data,
+// session keys) is refused, since its contents cannot be scanned. A framing
+// error is returned rather than read as "no private material", since the
+// bytes past it went unread.
+func packetsHoldPrivate(b []byte) (bool, error) {
+	return scanPackets(bytes.NewReader(b), 0)
+}
+
+const maxCompressedDepth = 8
+
+func scanPackets(r io.Reader, depth int) (bool, error) {
+	or := packet.NewOpaqueReader(r)
+	for {
+		op, err := or.Next()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("reading packet framing: %w", err)
+		}
+		switch op.Tag {
+		case tagSecretKey, tagSecretSubkey:
+			return true, nil
+		case tagPublicKey, tagPublicSubkey, tagUserID, tagUserAttribute,
+			tagSignature, tagTrust, tagMarker, tagPadding:
+		case tagCompressed:
+			if depth >= maxCompressedDepth {
+				return false, fmt.Errorf("compressed packets nest deeper than %d", maxCompressedDepth)
+			}
+			inner, err := decompressExact(op.Contents)
+			if err != nil {
+				return false, fmt.Errorf("reading compressed packet: %w", err)
+			}
+			private, err := scanPackets(bytes.NewReader(inner), depth+1)
+			if private || err != nil {
+				return private, err
+			}
+		default:
+			return false, fmt.Errorf("packet tag %d is not part of a public key export; a keyring holds keys, user IDs and signatures only, so whatever it wraps cannot be checked", op.Tag)
+		}
+	}
+}
+
+// maxKeyringDecompressed caps what one compressed keyring packet may expand
+// to; a public keyring is kilobytes, and the cap stops a small file from
+// expanding without bound.
+const maxKeyringDecompressed = 16 << 20
+
+// decompressExact decompresses one compressed packet's body and refuses it
+// unless the stream consumed every byte of that body. go-crypto's own reader
+// stops at the end of the deflate stream and drops whatever the packet carries
+// after it, so bytes there would load without ever being scanned. The stdlib
+// readers take a bytes.Reader as an io.ByteReader and never read past their
+// stream, which makes the leftover count exact. bzip2 is refused: its reader
+// looks for a further stream after the first, so it cannot show where its
+// input ended, and `gpg --export` writes no compressed packets at all.
+func decompressExact(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return nil, errors.New("the packet names no compression algorithm")
+	}
+	src := bytes.NewReader(body[1:])
+	var r io.Reader
+	switch algo := packet.CompressionAlgo(body[0]); algo {
+	case packet.CompressionNone:
+		r = src
+	case packet.CompressionZIP:
+		fr := flate.NewReader(src)
+		defer fr.Close()
+		r = fr
+	case packet.CompressionZLIB:
+		zr, err := zlib.NewReader(src)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		r = zr
+	default:
+		return nil, fmt.Errorf("compression algorithm %d is not accepted in a keyring; export it again with `gpg --export`, which does not compress", algo)
+	}
+	out, err := io.ReadAll(io.LimitReader(r, maxKeyringDecompressed+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxKeyringDecompressed {
+		return nil, fmt.Errorf("it expands past %d bytes", maxKeyringDecompressed)
+	}
+	if n := src.Len(); n > 0 {
+		return nil, fmt.Errorf("%d bytes follow the end of the compressed stream inside the packet", n)
+	}
+	return out, nil
+}
+
+// decodeArmorStrict decodes one ASCII-armored block, from its header line
+// through its footer, and refuses it unless every line is accounted for:
+// header, armor headers, a blank line, base64 data, an optional CRC-24 line
+// that must match, and a footer naming the same type. armor.Decode stops at
+// the checksum line and never reads what sits between it and the footer, so
+// anything placed there would load unseen.
+func decodeArmorStrict(seg []byte) (string, []byte, error) {
+	lines := strings.Split(string(seg), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t\r")
+	}
+	begin, ok := strings.CutPrefix(lines[0], "-----BEGIN ")
+	blockType, ok2 := strings.CutSuffix(begin, "-----")
+	if !ok || !ok2 || blockType == "" {
+		return "", nil, errors.New("the armor header line is malformed")
+	}
+	footer := "-----END " + blockType + "-----"
+	if len(lines) < 3 || lines[len(lines)-1] != footer {
+		return "", nil, fmt.Errorf("the block does not end on the line %q", footer)
+	}
+	rest := lines[1 : len(lines)-1]
+	i := 0
+	for ; i < len(rest) && rest[i] != ""; i++ {
+		if !strings.Contains(rest[i], ": ") {
+			return "", nil, fmt.Errorf("armor header line %d %q is not a \"Key: value\" header", i+2, rest[i])
+		}
+	}
+	if i == len(rest) {
+		return "", nil, errors.New("no blank line separates the armor headers from the data")
+	}
+	data := rest[i+1:]
+	var crcLine string
+	if n := len(data); n > 0 && len(data[n-1]) == 5 && data[n-1][0] == '=' {
+		crcLine, data = data[n-1], data[:n-1]
+	}
+	var b64 strings.Builder
+	for j, l := range data {
+		if strings.HasPrefix(l, "=") {
+			return "", nil, fmt.Errorf("armor data line %d %q is not base64 data; nothing may sit between the data and the footer but one checksum line", j+1, l)
+		}
+		b64.WriteString(l)
+	}
+	body, err := base64.StdEncoding.Strict().DecodeString(b64.String())
+	if err != nil {
+		return "", nil, fmt.Errorf("armor data is not valid base64: %w", err)
+	}
+	if crcLine != "" {
+		sum, err := base64.StdEncoding.Strict().DecodeString(crcLine[1:])
+		if err != nil || len(sum) != 3 {
+			return "", nil, fmt.Errorf("armor checksum line %q is not valid base64", crcLine)
+		}
+		want := uint32(sum[0])<<16 | uint32(sum[1])<<8 | uint32(sum[2])
+		if got := crc24(body); got != want {
+			return "", nil, fmt.Errorf("armor checksum %06x does not match the data (%06x)", want, got)
+		}
+	}
+	return blockType, body, nil
+}
+
+// crc24 is the OpenPGP armor checksum (RFC 9580 section 6.1).
+func crc24(b []byte) uint32 {
+	crc := uint32(0xB704CE)
+	for _, c := range b {
+		crc ^= uint32(c) << 16
+		for range 8 {
+			crc <<= 1
+			if crc&0x1000000 != 0 {
+				crc ^= 0x1864CFB
+			}
+		}
+	}
+	return crc & 0xFFFFFF
+}
+
+// OpenPGP packet tags (RFC 9580 section 5).
+const (
+	tagSignature     = 2
+	tagSecretKey     = 5
+	tagPublicKey     = 6
+	tagSecretSubkey  = 7
+	tagCompressed    = 8
+	tagMarker        = 10
+	tagTrust         = 12
+	tagUserID        = 13
+	tagPublicSubkey  = 14
+	tagUserAttribute = 17
+	tagPadding       = 21
+)
+
+func holdsPrivate(keys openpgp.EntityList) bool {
+	for _, e := range keys {
+		if e.PrivateKey != nil {
+			return true
+		}
+		for _, sub := range e.Subkeys {
+			if sub.PrivateKey != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// helmChartURL is the chart archive an entry names: its url when that is the
+// archive itself, otherwise the archive under the repository base url names,
+// composed the way the proxy composes it.
+func helmChartURL(entryURL, name, version string) string {
+	if strings.HasSuffix(entryURL, ".tgz") {
+		return entryURL
+	}
+	return strings.TrimSuffix(entryURL, "/") + "/" + name + "-" + version + ".tgz"
+}
+
+// helmKeyringFor is the longest helm_keyrings prefix chartURL starts with,
+// and the keyring it names.
+func (v *Verifier) helmKeyringFor(chartURL string) (prefix, file string) {
+	for p, f := range v.HelmKeyrings {
+		if strings.HasPrefix(chartURL, p) && len(p) > len(prefix) {
+			prefix, file = p, f
+		}
+	}
+	return prefix, file
+}
+
+// Helm verifies the .prov file a classic chart repository publishes beside a
+// chart: its clearsigned signature against the keyring helm_keyrings names for
+// the chart's repository, then the sha256 it signs for the chart archive
+// against entryDigest, or against the archive itself when the entry records
+// none.
+func (v *Verifier) Helm(ctx context.Context, name, version, entryURL, entryDigest string) Evidence {
+	if strings.Contains(name, "/") {
+		return unavailable("bodega does not read the provenance layer of a chart served over OCI yet")
+	}
+	if entryURL == "" {
+		return unavailable("the entry names no chart URL to read a .prov beside")
+	}
+	chartURL := helmChartURL(entryURL, name, version)
+	provURL := chartURL + ".prov"
+	file := path.Base(chartURL)
+	if u, err := url.Parse(chartURL); err == nil {
+		file = path.Base(u.Path)
+	}
+
+	raw, err := v.get(ctx, provURL, nil, MaxHelmProvBytes)
+	switch {
+	case errors.Is(err, errNotFound):
+		return unavailable("%s is not published (HTTP 404), so the chart carries no publisher signature", provURL)
+	case err != nil:
+		return unknown("reading %s failed, so whether the chart is signed is unknown: %v", provURL, err)
+	}
+	block, _ := clearsign.Decode(raw)
+	if block == nil {
+		return unknown("%s is not an OpenPGP clearsigned message, so nothing signed was read", provURL)
+	}
+	sig, err := io.ReadAll(block.ArmoredSignature.Body)
+	if err != nil {
+		return unknown("%s carries a signature block that does not decode, so nothing signed was read: %v", provURL, err)
+	}
+	keyID, err := signingKeyID(sig)
+	if err != nil {
+		return unknown("%s carries no readable signature packet, so nothing signed was read: %v", provURL, err)
+	}
+
+	prefix, keyringFile := v.helmKeyringFor(chartURL)
+	if prefix == "" {
+		ev := unknown("%s is signed by key %s, and helm_keyrings names no keyring for this repository, so the signature was not checked; add the publisher's public key under a helm_keyrings prefix that matches %s", provURL, keyID, chartURL)
+		ev.NoKeyring = true
+		return ev
+	}
+	keyring, err := LoadHelmKeyring(keyringFile, prefix)
+	if err != nil {
+		return unknown("%s is signed by key %s and was not checked: %v", provURL, keyID, err)
+	}
+	_, signer, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(block.Bytes), bytes.NewReader(sig), nil)
+	if err != nil {
+		return invalid("%s is signed by key %s and does not verify against keyring %s (helm_keyrings[%q]): %v; confirm with the publisher that it rotated its signing key, and if it did, add the new public key to %s, because an invalid result admits no override", provURL, keyID, keyringFile, prefix, err, keyringFile)
+	}
+
+	signed, err := helmProvDigestFor(block.Plaintext, file)
+	if err != nil {
+		return invalid("%s verified against keyring %s, but %v", provURL, keyringFile, err)
+	}
+	digest, source := entryDigest, "the entry records"
+	if digest == "" {
+		if digest, err = v.digestURL(ctx, chartURL, MaxHelmChartBytes); err != nil {
+			return unknown("%s verified, but downloading %s to compare its digest failed: %v", provURL, chartURL, err)
+		}
+		source = "the archive at " + chartURL + " hashes to"
+	}
+	if "sha256:"+strings.ToLower(digest) != signed {
+		return invalid("%s signs %s for %s, but %s sha256:%s, so the chart is not the one the publisher signed", provURL, signed, file, source, strings.ToLower(digest))
+	}
+	fpr := strings.ToUpper(hex.EncodeToString(signer.PrimaryKey.Fingerprint))
+	return Evidence{
+		UpstreamProvenance: audit.UpstreamProvenance{Outcome: audit.ProvenanceVerified, SignerFingerprint: fpr, SubjectDigest: signed},
+		Detail:             fmt.Sprintf("%s is signed by %s, a key in %s (helm_keyrings[%q]), and covers %s at %s", provURL, fpr, keyringFile, prefix, file, signed),
+	}
+}
+
+// signingKeyID is the issuer of a detached signature, read without a keyring
+// so a signature nothing verifies can still be named.
+func signingKeyID(sig []byte) (string, error) {
+	p, err := packet.NewReader(bytes.NewReader(sig)).Next()
+	if err != nil {
+		return "", err
+	}
+	s, ok := p.(*packet.Signature)
+	switch {
+	case !ok:
+		return "", fmt.Errorf("the first packet is a %T, not a signature", p)
+	case s.IssuerKeyId != nil:
+		return fmt.Sprintf("%016X", *s.IssuerKeyId), nil
+	case len(s.IssuerFingerprint) > 0:
+		return strings.ToUpper(hex.EncodeToString(s.IssuerFingerprint)), nil
+	}
+	return "", errors.New("the signature names no issuer")
+}
+
+// helmProvDigestFor reads the digest a .prov's signed text records for file.
+// Helm writes the chart's Chart.yaml, a "..." line, then a files map; it
+// splits on that line the same way.
+func helmProvDigestFor(plaintext []byte, file string) (string, error) {
+	text := bytes.ReplaceAll(plaintext, []byte("\r\n"), []byte("\n"))
+	parts := bytes.SplitN(text, []byte("\n...\n"), 2)
+	if len(parts) < 2 {
+		return "", fmt.Errorf("its signed text has no \"...\" line before a files map, so it records no digest for %s", file)
+	}
+	var sums struct {
+		Files map[string]string `yaml:"files"`
+	}
+	if err := yaml.Unmarshal(parts[1], &sums); err != nil {
+		return "", fmt.Errorf("its files section does not parse as YAML, so it records no digest for %s: %v", file, err)
+	}
+	got, ok := sums.Files[file]
+	if !ok {
+		held := "nothing"
+		if len(sums.Files) > 0 {
+			held = strings.Join(slices.Sorted(maps.Keys(sums.Files)), ", ")
+		}
+		return "", fmt.Errorf("its files map has no entry for %s; it names %s", file, held)
+	}
+	if !helmProvDigest.MatchString(got) {
+		return "", fmt.Errorf("its files entry for %s is %q, not sha256: followed by 64 hex digits", file, got)
+	}
+	return strings.ToLower(got), nil
+}
+
+// digestURL is the hex sha256 of what url serves, refusing a body over limit
+// bytes rather than hashing a truncated one.
+func (v *Verifier) digestURL(ctx context.Context, url string, limit int64) (string, error) {
+	resp, err := v.open(ctx, url, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return "", fmt.Errorf("GET %s: %w", url, err)
+	}
+	if n > limit {
+		return "", fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

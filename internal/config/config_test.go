@@ -260,6 +260,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"pypi_upstream":     "https://pypi.example.com",
 		"cargo_upstream":    "https://index.example.com",
 		"cargo_dl_upstream": "https://crates.example.com/crates",
+		// Load requires an http(s) prefix ending in / and an absolute path.
+		"helm_keyrings": map[string]string{"https://charts.example.com/": "/etc/bodega/charts-example.gpg"},
 		// Load requires a bare hostname and stores it lowercased.
 		"private_upstream_hosts": []string{"registry.example.internal", "10.0.0.5"},
 	}
@@ -871,5 +873,72 @@ func TestOverrideKeys(t *testing.T) {
 		if _, err := config.Load("", "", "", "", false, false); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: Load = %v, want %q", body, err, want)
 		}
+	}
+}
+
+// TestLoadValidatesHelmKeyrings holds each helm_keyrings refusal to an error
+// naming the key, the entry and the fix, and holds Load to reading no keyring
+// file: the accepted path does not exist. A bad upstream_connect_timeout rides
+// along to show the keyrings are checked before anything else.
+func TestLoadValidatesHelmKeyrings(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		prefix    string
+		path      string
+		wantParts []string
+	}{
+		{"unparsable", "https://charts example.com/", "/k.gpg", []string{"does not parse as a URL"}},
+		{"scheme", "ftp://charts.example.com/", "/k.gpg", []string{"https or http"}},
+		{"no host", "https:///charts/", "/k.gpg", []string{"names no host"}},
+		{"query", "https://charts.example.com/?x=1/", "/k.gpg", []string{"query or fragment"}},
+		{"fragment", "https://charts.example.com/#a/", "/k.gpg", []string{"query or fragment"}},
+		{"no trailing slash", "https://charts.example.com", "/k.gpg", []string{"must end in /", "charts.example.com.evil.net", `"https://charts.example.com/"`}},
+		{"empty path", "https://charts.example.com/", "", []string{"not an absolute path"}},
+		{"relative path", "https://charts.example.com/", "keys/k.gpg", []string{"not an absolute path", "keys/k.gpg"}},
+		{"accepted", "https://charts.example.com/team/", filepath.Join(t.TempDir(), "absent.gpg"), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			body := map[string]any{"helm_keyrings": map[string]string{tc.prefix: tc.path}}
+			if tc.wantParts != nil {
+				body["upstream_connect_timeout"] = "not-a-duration"
+			}
+			data, _ := json.Marshal(body)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+			cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if tc.wantParts == nil {
+				if err != nil || cfg.HelmKeyrings[tc.prefix] != tc.path {
+					t.Fatalf("Load refused a well-formed entry: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Load accepted the entry")
+			}
+			for _, want := range append([]string{"helm_keyrings", tc.prefix}, tc.wantParts...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error does not name %q: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestReviewHelmKeyringPrefixNeedsHostname(t *testing.T) {
+	isolateConfig(t)
+	const prefix = "https://:443/"
+	data, _ := json.Marshal(map[string]any{"helm_keyrings": map[string]string{prefix: "/keyring.gpg"}})
+	file := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigFile, file)
+	_, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err == nil || !strings.Contains(err.Error(), "names no host") {
+		t.Fatalf("helm_keyrings[%q]: error = %v; want missing-host refusal", prefix, err)
 	}
 }

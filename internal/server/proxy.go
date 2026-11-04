@@ -423,6 +423,17 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// before a byte reaches the client. A tee straight to the response would
 	// have already handed the client an artifact by the time the mismatch is
 	// known, and a truncated response is not a refusal.
+	//
+	// The provenance check read the chart in a request of its own, so these
+	// bytes are held to the digest it verified the publisher signed, before
+	// verifyProxyChecksum pins the first digest it sees.
+	if fill.signed != "" && "sha256:"+spool.sha256 != fill.signed {
+		f := signedChartRefusal(regType, fill.name, fill.version)
+		s.logFor(r.Context()).Error("upstream bytes differ from the digest the publisher signed", "key", s3Key,
+			"url", up.url, "signed", fill.signed, "served", "sha256:"+spool.sha256, "incident", f.incident)
+		f.write(w, r)
+		return
+	}
 	pinDigest, err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable)
 	if err != nil {
 		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
@@ -1500,6 +1511,9 @@ func datedThroughUpstream(checkers []policy.VersionChecker) {
 // gate to the pin so both name it the same way. Zero when no row was written.
 type fillAdmission struct {
 	typ, name, version string
+	// signed is the sha256:{hex} the admission verified a publisher signed
+	// for these bytes, held against the bytes the fill then fetches.
+	signed string
 	// row is the admission the gate wrote, for a fill that holds the bytes
 	// to what a check recorded: the checksum database's hashes for a Go
 	// module. Zero when no row was written.
@@ -1561,6 +1575,13 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven || fill.typ == manifest.TypeComposer {
 			datedThroughUpstream(checkers)
 		}
+	case fill.typ == manifest.TypeHelm && fill.version != "":
+		// The .prov is the one thing a chart publishes that a check reads;
+		// the age gate cannot date a chart and OSV indexes none.
+		if _, ok := helmFillFrom(r.Context()); ok {
+			checkers = []policy.VersionChecker{admit.ProvenanceChecker(s.cfg, s.auditDB)}
+			notRun = "not run: a helm proxy fill runs the upstream provenance check only"
+		}
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool
 		// is served from storage, and a dists/ key names none.
@@ -1579,12 +1600,16 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	if fill.typ == manifest.TypeRpm {
 		rpmFillFrom(r.Context()).describe(&ve)
 	}
+	if hf, ok := helmFillFrom(r.Context()); ok && fill.typ == manifest.TypeHelm && hf.Version == fill.version {
+		ve.URL, ve.SHA256, ve.Checksum = hf.URL, hf.SHA256, hf.Checksum
+	}
 	if s.gomodUnpublished(r.Context(), checkers, fill, s3Key, ve) {
 		http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
 		return fill, false
 	}
 	_, row, ok := s.admitFillRow(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
 	fill.row = row
+	fill.signed = row.SignedSubjectDigest()
 	return fill, ok
 }
 

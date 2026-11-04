@@ -104,12 +104,17 @@ func TestDoctorReportsProvenanceSilencedEverywhere(t *testing.T) {
 	if f := findingFor(t, serverPosture(context.Background(), some, nil), "policy-ignored"); f.IsFinding() {
 		t.Errorf("npm alone on ignore reported %s: %s", f.Status, f.Detail)
 	}
-	noPypi := fakePosture{provs: []audit.ProvenancePolicy{
-		{Ecosystem: "npm", Action: "ignore"}, {Ecosystem: "git", Action: "ignore"}, {Ecosystem: "binary", Action: "ignore"}}}
+	base := []audit.ProvenancePolicy{
+		{Ecosystem: "npm", Action: "ignore"}, {Ecosystem: "git", Action: "ignore"}, {Ecosystem: "binary", Action: "ignore"}}
+	noHelm := fakePosture{provs: append(append([]audit.ProvenancePolicy(nil), base...), audit.ProvenancePolicy{Ecosystem: "pypi", Action: "ignore"})}
+	if f := findingFor(t, serverPosture(context.Background(), noHelm, nil), "policy-ignored"); f.IsFinding() {
+		t.Errorf("helm still verifies .prov files at warn, but doctor reported %s: %s", f.Status, f.Detail)
+	}
+	noPypi := fakePosture{provs: append(append([]audit.ProvenancePolicy(nil), base...), audit.ProvenancePolicy{Ecosystem: "helm", Action: "ignore"})}
 	if f := findingFor(t, serverPosture(context.Background(), noPypi, nil), "policy-ignored"); f.IsFinding() {
 		t.Errorf("pypi still verifying reported provenance silenced: %s", f.Detail)
 	}
-	all := fakePosture{provs: append(noPypi.provs, audit.ProvenancePolicy{Ecosystem: "pypi", Action: "ignore"})}
+	all := fakePosture{provs: append(noHelm.provs, audit.ProvenancePolicy{Ecosystem: "helm", Action: "ignore"})}
 	f := findingFor(t, serverPosture(context.Background(), all, nil), "policy-ignored")
 	if !f.IsFinding() || !strings.Contains(f.Detail, "upstream provenance") || !strings.Contains(f.Remediation, "bodega policy provenance set") {
 		t.Errorf("every covered ecosystem on ignore reported %s: %s / %s", f.Status, f.Detail, f.Remediation)

@@ -13,10 +13,11 @@ import (
 	"github.com/ravinald/bodega/internal/policy"
 )
 
-// Covered are the types the check verifies anything for: npm, pypi, and git
-// and binary entries fetched from GitHub releases. Every other type records
-// unavailable with the reason uncoveredReason gives.
-var Covered = []string{manifest.TypeBinary, manifest.TypeGit, manifest.TypeNpm, manifest.TypePypi}
+// Covered are the types the check verifies anything for: npm, pypi, git and
+// binary entries fetched from GitHub releases, and classic Helm charts that
+// publish a .prov. Every other type records unavailable with the reason
+// uncoveredReason gives.
+var Covered = []string{manifest.TypeBinary, manifest.TypeGit, manifest.TypeHelm, manifest.TypeNpm, manifest.TypePypi}
 
 // uncoveredReason names, per ecosystem, why no provenance is read, so the gap
 // is stated in every admission row rather than inferred from an absence.
@@ -26,7 +27,6 @@ var uncoveredReason = map[string]string{
 	manifest.TypeRubygems:  "bodega does not verify the Sigstore attestations RubyGems.org publishes yet",
 	manifest.TypeComposer:  "Packagist publishes no provenance; a dist archive is a forge's export of a commit the metadata names",
 	manifest.TypeOCI:       "bodega does not verify cosign or Notation signatures yet; a signature is an OCI artifact it serves like any other manifest",
-	manifest.TypeHelm:      "a chart's .prov file is a PGP signature with no key bodega is configured to trust, and is not verified yet",
 	manifest.TypeApt:       "a .deb carries no publisher provenance; the archive's Release signature covers the index, not who built the package",
 	manifest.TypeRpm:       "an RPM's header signature is the vendor's key over the package, which dnf verifies on the host; bodega does not read it",
 	manifest.TypeFreeBSD:   "the pkg repository signature covers the catalogue, not who built the package",
@@ -108,7 +108,10 @@ func (c *Checker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *m
 	key := strings.Join([]string{audit.CheckUpstreamProvenance, pm.Type, pm.Name, ve.Version, ve.URL, ve.Ref,
 		entrySHA256(ve), fmt.Sprint(ve.IsRelease())}, "\x00")
 	ev := policy.SharedLookup(ctx, key, func() Evidence { return c.evaluate(ctx, pm, ve) })
-	if ev.Outcome == audit.ProvenanceVerified || (ev.Outcome == audit.ProvenanceUnavailable && pm.Type == manifest.TypeNpm) {
+	// A helm signature is held to the keyring the operator configured, not to
+	// a pin: a .prov names no repository or builder for one to compare.
+	if (ev.Outcome == audit.ProvenanceVerified && pm.Type != manifest.TypeHelm) ||
+		(ev.Outcome == audit.ProvenanceUnavailable && pm.Type == manifest.TypeNpm) {
 		ev = c.compare(ctx, pm, ve, ev, action)
 	}
 	return verdict(ev, action)
@@ -298,6 +301,14 @@ func verdict(ev Evidence, action string) policy.Result {
 			r.Details["pinned_publisher"] = publisherName(ev.PinnedPublisher)
 		}
 	}
+	// Why nothing was concluded is recorded whatever the action, so a row
+	// written under ignore still says no keyring was configured.
+	if ev.NoKeyring {
+		if r.Details == nil {
+			r.Details = map[string]any{"outcome": ev.Outcome}
+		}
+		r.Details[audit.DetailNoKeyring] = true
+	}
 	return r
 }
 
@@ -354,6 +365,8 @@ func (c *Checker) evaluate(ctx context.Context, pm *manifest.PackageManifest, ve
 			return unavailable("release %s/%s@%s publishes no sha256 for %s, so no attestation can be looked up before the fetch", owner, repo, ve.Ref, asset)
 		}
 		return v.GitHubAttestations(ctx, owner, repo, digest)
+	case manifest.TypeHelm:
+		return v.Helm(ctx, pm.Name, strings.TrimSpace(ve.Version), ve.URL, entrySHA256(ve))
 	}
 	if why, ok := uncoveredReason[pm.Type]; ok {
 		return unavailable("%s", why)

@@ -514,9 +514,9 @@ defence against:
   else, so a copy taken earlier keeps signing. Retiring is not revocation:
   verifiers stop trusting a stolen key only when they drop its key ID.
 - **A compromised maintainer account publishing outside CI, everywhere
-  else.** gomod, cargo, helm, apt, freebsd and distfiles record
+  else.** gomod, cargo, apt, freebsd and distfiles record
   `unavailable` on every version, with the reason in the admission row:
-  helm `.prov` files are not verified yet, and the rest publish no
+  they publish no
   per-package statement of who built them. A binary or git
   entry not fetched from a GitHub release, a git entry cloned rather than
   fetched as a release archive, and a release asset with no recorded digest
@@ -543,6 +543,22 @@ defence against:
   than by a CI identity. And it does not run on versions the proxy caches with
   no admission decision behind them (`PinUnadmitted`), such as a dependency a
   client pulls through an npm proxy route bodega never admitted.
+- **Helm charts, past the keyring.** A classic chart's `.prov` is verified
+  against the keyring `helm_keyrings` names for the chart's URL, so a chart
+  re-signed by a key the operator did not configure records `invalid`, and so
+  does one whose bytes differ from the digest the `.prov` signed: refused
+  under `block`, a warning under `warn`, and never admitted by an override. A
+  build's fetch and a proxy fill each refuse a chart whose bytes differ from
+  that signed digest under any action, so an upstream cannot serve the check
+  one archive and the fetch another. What that leaves open: a
+  repository that drops its `.prov` records `unavailable`, which only `block`
+  refuses, so under `warn` an attacker who can replace a chart can delete its
+  signature too and pass. The keyring is only as good as how the operator
+  obtained it, and a key fetched from the host that serves the charts proves
+  nothing that host could not forge. A `.prov` read with no keyring configured
+  records `unknown`. A chart served over OCI is not checked at all and records
+  `unavailable`. A helm version takes no trust-on-first-use pin, so a
+  publisher's key rotation is the operator's to notice and confirm.
 - **Anything inside an opaque distribution bundle.** When a package format
   bundles its own dependencies in a way bodega cannot inspect (see below),
   the contents of that bundle are outside bodega's allow-list. Bodega may

@@ -590,7 +590,7 @@ func TestOversizedBodyIsAnError(t *testing.T) {
 
 func TestUncoveredEcosystemsRecordWhy(t *testing.T) {
 	c := &Checker{Verifier: &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}, GitHubWeb: "https://github.com"}}
-	for _, typ := range []string{manifest.TypeGomod, manifest.TypeCargo, manifest.TypeHelm,
+	for _, typ := range []string{manifest.TypeGomod, manifest.TypeCargo,
 		manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles} {
 		got := c.Check(context.Background(), &manifest.PackageManifest{Type: typ, Name: "x"}, &manifest.VersionEntry{Version: "1.0.0"})
 		if got.Provenance == nil || got.Provenance.Outcome != audit.ProvenanceUnavailable {
@@ -1719,7 +1719,7 @@ func TestF107DocsCoverPypi(t *testing.T) {
 		doc := read(t, "slsa.md")
 		check(t, doc, []string{
 			"npm Sigstore bundles, PyPI attestations (PEP 740) and GitHub release attestations are verified",
-			"**Publisher signatures are verified for npm, PyPI and GitHub releases only.**",
+			"**Publisher signatures are verified for npm, PyPI, GitHub releases and classic Helm charts only.**",
 		}, nil)
 		gap := after(t, doc, "**Publisher signatures are verified for", " - **")
 		if strings.Contains(gap, "273") || strings.Contains(gap, "PyPI attestations") {

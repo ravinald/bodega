@@ -1,9 +1,9 @@
 package server
 
 import (
-	"strings"
-
+	"context"
 	"net/http"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -78,6 +78,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		for _, ve := range pm.Versions {
 			if ve.URL != "" {
 				upstream := strings.TrimSuffix(ve.URL, "/") + "/" + file
+				r = r.WithContext(withHelmFill(ctx, helmFillEntry(pm, chartVersion, upstream)))
 				s.proxyOrCache(w, r, s.typeStore(manifest.TypeHelm), key, upstream, manifest.TypeHelm, upstream, chartName, true, true)
 				return
 			}
@@ -101,4 +102,33 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxyVersion(w, r, manifest.TypeHelm, chartName, chartVersion, key)
+}
+
+type helmFillKey struct{}
+
+// withHelmFill carries the chart a proxy fill fetches from handleHelmChart to
+// versionPolicyGate, across proxyOrResolve, which reads no manifest: the
+// provenance check needs the chart URL to find the .prov beside it.
+func withHelmFill(ctx context.Context, ve manifest.VersionEntry) context.Context {
+	return context.WithValue(ctx, helmFillKey{}, ve)
+}
+
+func helmFillFrom(ctx context.Context) (manifest.VersionEntry, bool) {
+	ve, ok := ctx.Value(helmFillKey{}).(manifest.VersionEntry)
+	return ve, ok
+}
+
+// helmFillEntry is the entry a helm proxy fill is admitted as: the chart URL
+// the proxy fetches, and the digest the manifest records for that version,
+// when it records one, so the check compares the .prov with it rather than
+// downloading the chart a second time.
+func helmFillEntry(pm *manifest.PackageManifest, version, chartURL string) manifest.VersionEntry {
+	out := manifest.VersionEntry{Version: version, URL: chartURL, Mode: manifest.ModeProxy}
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			out.SHA256, out.Checksum = ve.SHA256, ve.Checksum
+			break
+		}
+	}
+	return out
 }
