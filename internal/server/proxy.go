@@ -708,11 +708,22 @@ func (s *Server) clearNotFound(ctx context.Context, store storage.ObjectStore, s
 // says the upstream had answered 404 for it. Anything else is left to the
 // caller: a path never seen missing is a 502, so an outage invents nothing.
 func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, regType, s3Key string, err error) bool {
-	ttl := s.notFoundTTL(regType)
-	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(r.Context()) {
+	if !s.recordedNotFound(r.Context(), store, regType, s3Key, err) {
 		return false
 	}
-	b, gerr := store.Get(r.Context(), notFoundPrefix+s3Key)
+	http.NotFound(w, r)
+	return true
+}
+
+// recordedNotFound is answerRecordedNotFound's rule without the response: the
+// fetch failed to reach the upstream, and a record younger than the type's
+// TTL says the upstream had answered 404 for s3Key.
+func (s *Server) recordedNotFound(ctx context.Context, store storage.ObjectStore, regType, s3Key string, err error) bool {
+	ttl := s.notFoundTTL(regType)
+	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(ctx) {
+		return false
+	}
+	b, gerr := store.Get(ctx, notFoundPrefix+s3Key)
 	if gerr != nil || b == nil {
 		return false
 	}
@@ -724,8 +735,7 @@ func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, 
 	if age < 0 || age >= ttl {
 		return false
 	}
-	s.logFor(r.Context()).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
-	http.NotFound(w, r)
+	s.logFor(ctx).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
 	return true
 }
 

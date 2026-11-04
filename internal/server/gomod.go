@@ -295,8 +295,12 @@ func (s *Server) checksumDatabaseGate(ctx context.Context, r *http.Request, fill
 // upstream's not-found: the checksum_database refusal is a 403, which the go
 // command treats as fatal. Only a .info fill is probed, because .mod and .zip
 // are asked for once a module resolved. Only unknown leads to the upstream
-// read, and only a 404 or 410 there skips the admission; any other answer,
-// a failed read included, leaves the refusal standing.
+// read, and only a 404 or 410 there skips the admission; any other answer
+// leaves the refusal standing. A read that cannot reach the upstream is
+// answered from the not-found record an earlier 404 left, as every fill is
+// during an outage: the probe skips the fetch path that writes and reads that
+// record, so this does both, or an outage turns every prefix of a command
+// path the cache carries into a refusal.
 func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.VersionChecker, fill fillAdmission, s3Key string, ve manifest.VersionEntry) bool {
 	if fill.typ != manifest.TypeGomod || fill.version == "" || pathpkg.Ext(s3Key) != ".info" {
 		return false
@@ -327,13 +331,23 @@ func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.Version
 	if o, ok := ctx.Value(upstreamOpenerKey{}).(upstreamOpener); ok {
 		open = o
 	}
+	store := s.typeStore(fill.typ)
 	up, err := open(ctx, info)
 	if err == nil {
 		up.body.Close()
+		if store != nil {
+			s.clearNotFound(ctx, store, s3Key)
+		}
 		return false
 	}
 	var status *upstreamStatusError
 	unpublished := errors.Is(err, errUpstreamNotFound) || (errors.As(err, &status) && status.status == http.StatusGone)
+	if errors.Is(err, errUpstreamNotFound) {
+		s.recordNotFound(ctx, store, fill.typ, s3Key)
+	}
+	if !unpublished && s.recordedNotFound(ctx, store, fill.typ, s3Key, err) {
+		return true
+	}
 	if unpublished {
 		s.logFor(ctx).Info("checksum database and upstream both lack this Go module version, answering not found",
 			"module", fill.name, "version", fill.version, "url", info)

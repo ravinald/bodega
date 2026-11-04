@@ -644,3 +644,72 @@ func TestGomodPrefixProbeTheDatabaseDoesNotKnowIsNotFound(t *testing.T) {
 		})
 	}
 }
+
+// A prefix probe the upstream answered 404 for keeps answering 404 once the
+// upstream stops answering at all, as every fill does from its not-found
+// record during an outage. Suite 61 phase 5 reinstalls caddy with every
+// upstream cut: before the record, each prefix of caddy/v2/cmd/caddy was a
+// 403 the go command stopped on. An outage invents no absence: a probe with
+// no record is still refused, and an upstream that publishes the path again
+// clears the record.
+func TestGomodPrefixProbeKeepsItsNotFoundThroughAnOutage(t *testing.T) {
+	honest := sumdbtest.NewModule(t, "example.com/widget/v2", "v2.1.0", "the published bytes")
+	probe := "/example.com/widget/v2/cmd/widget/@v/v2.1.0.info"
+	never := "/example.com/widget/v2/cmd/other/@v/v2.1.0.info"
+	key := manifest.GomodKey("example.com/widget/v2/cmd/widget", "v2.1.0", ".info")
+
+	rowsFor := func(t *testing.T, s *Server, name string) []audit.Admission {
+		t.Helper()
+		rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeGomod, PkgName: name, PkgVersion: "v2.1.0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+
+	t.Run("outage", func(t *testing.T) {
+		log := sumdbtest.New(t, sumdbtest.NewKey(t))
+		log.AddModule(honest)
+		up := newRecordingUpstream(t)
+		s := gomodSumdbServer(t, log, up)
+
+		if rec := doRequest(s, http.MethodGet, "/go"+probe, nil); rec.Code != http.StatusNotFound {
+			t.Fatalf("probe with the upstream answering = %d %s, want 404", rec.Code, rec.Body.String())
+		}
+		up.ts.Close()
+		if rec := doRequest(s, http.MethodGet, "/go"+probe, nil); rec.Code != http.StatusNotFound {
+			t.Fatalf("probe during the outage = %d %s, want the recorded 404", rec.Code, rec.Body.String())
+		}
+		if rows := rowsFor(t, s, "example.com/widget/v2/cmd/widget"); len(rows) != 0 {
+			t.Errorf("a recorded not-found left admission rows: %+v", rows)
+		}
+		if rec := doRequest(s, http.MethodGet, "/go"+never, nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("probe never seen missing during the outage = %d %s, want the 403 refusal", rec.Code, rec.Body.String())
+		}
+		if rows := rowsFor(t, s, "example.com/widget/v2/cmd/other"); len(rows) == 0 || rows[0].Decision != audit.AdmissionPolicyBlocked {
+			t.Errorf("a probe with no record was not refused on record: %+v", rows)
+		}
+	})
+
+	t.Run("published again", func(t *testing.T) {
+		log := sumdbtest.New(t, sumdbtest.NewKey(t))
+		log.AddModule(honest)
+		up := newRecordingUpstream(t)
+		s := gomodSumdbServer(t, log, up)
+
+		if rec := doRequest(s, http.MethodGet, "/go"+probe, nil); rec.Code != http.StatusNotFound {
+			t.Fatalf("probe = %d %s, want 404", rec.Code, rec.Body.String())
+		}
+		store := s.typeStore(manifest.TypeGomod)
+		if b, err := store.Get(t.Context(), notFoundPrefix+key); err != nil || b == nil {
+			t.Fatalf("no not-found record for %s: %v", key, err)
+		}
+		up.route(probe, `{"Version":"v2.1.0","Time":"2024-01-23T13:54:04Z"}`)
+		if rec := doRequest(s, http.MethodGet, "/go"+probe, nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("published probe the database cannot confirm = %d %s, want 403", rec.Code, rec.Body.String())
+		}
+		if b, _ := store.Get(t.Context(), notFoundPrefix+key); b != nil {
+			t.Errorf("the not-found record outlived the upstream publishing %s", key)
+		}
+	})
+}
