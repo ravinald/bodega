@@ -652,11 +652,17 @@ func TestHelmKeyringPacketScanAccountsForEveryByte(t *testing.T) {
 	if err := cw.Close(); err != nil {
 		t.Fatal(err)
 	}
+	var sealed bytes.Buffer
+	if err := (&packet.OpaquePacket{Tag: 18, Contents: secret.Bytes()}).Serialize(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	sealed.Write(public)
 	cases := []struct {
 		name string
 		body []byte
 		want string
 	}{
+		{"encrypted data packet before the public key", sealed.Bytes(), "packet tag 18 is not part of a public key export"},
 		{"secret key inside a compressed packet", append(append([]byte{}, public...), compressed.Bytes()...), "private key material"},
 		{"truncated packet after the public key", append(append([]byte{}, public...), secret.Bytes()[:4]...), "parses as neither"},
 	}

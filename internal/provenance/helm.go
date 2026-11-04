@@ -205,8 +205,10 @@ func keyringSegments(data []byte) []keyringSegment {
 // cannot parse, so a secret key in a version, algorithm or protection mode
 // this build does not support would pass unseen; the opaque reader yields
 // every packet whatever its body holds. Compressed packets are opened and
-// scanned too. A framing error is returned rather than read as "no private
-// material", since the bytes past it went unread.
+// scanned too. Any other tag outside a key export (encrypted or literal data,
+// session keys) is refused, since its contents cannot be scanned. A framing
+// error is returned rather than read as "no private material", since the
+// bytes past it went unread.
 func packetsHoldPrivate(b []byte) (bool, error) {
 	return scanPackets(bytes.NewReader(b), 0)
 }
@@ -226,6 +228,8 @@ func scanPackets(r io.Reader, depth int) (bool, error) {
 		switch op.Tag {
 		case tagSecretKey, tagSecretSubkey:
 			return true, nil
+		case tagPublicKey, tagPublicSubkey, tagUserID, tagUserAttribute,
+			tagSignature, tagTrust, tagMarker, tagPadding:
 		case tagCompressed:
 			if depth >= maxCompressedDepth {
 				return false, fmt.Errorf("compressed packets nest deeper than %d", maxCompressedDepth)
@@ -238,6 +242,8 @@ func scanPackets(r io.Reader, depth int) (bool, error) {
 			if private || err != nil {
 				return private, err
 			}
+		default:
+			return false, fmt.Errorf("packet tag %d is not part of a public key export; a keyring holds keys, user IDs and signatures only, so whatever it wraps cannot be checked", op.Tag)
 		}
 	}
 }
@@ -367,9 +373,17 @@ func crc24(b []byte) uint32 {
 
 // OpenPGP packet tags (RFC 9580 section 5).
 const (
-	tagSecretKey    = 5
-	tagSecretSubkey = 7
-	tagCompressed   = 8
+	tagSignature     = 2
+	tagSecretKey     = 5
+	tagPublicKey     = 6
+	tagSecretSubkey  = 7
+	tagCompressed    = 8
+	tagMarker        = 10
+	tagTrust         = 12
+	tagUserID        = 13
+	tagPublicSubkey  = 14
+	tagUserAttribute = 17
+	tagPadding       = 21
 )
 
 func holdsPrivate(keys openpgp.EntityList) bool {
