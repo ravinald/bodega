@@ -692,6 +692,9 @@ func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenan
 	if cfg != nil && cfg.NpmUpstream != "" {
 		v.NpmRegistry = strings.TrimRight(cfg.NpmUpstream, "/")
 	}
+	if cfg != nil && cfg.PypiUpstream != "" {
+		v.PypiIndex = strings.TrimRight(cfg.PypiUpstream, "/")
+	}
 	return &provenance.Checker{Store: store, Verifier: v}
 }
 

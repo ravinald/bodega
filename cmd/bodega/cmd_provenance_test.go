@@ -29,9 +29,13 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 	if out, err := runRoot(t, "policy", "provenance", "set", "npm", "block"); err != nil || !strings.Contains(out, "npm upstream provenance policy: block") {
 		t.Fatalf("set: %v\n%s", err, out)
 	}
-	out, err := runRoot(t, "policy", "provenance", "set", "pypi", "block")
+	out, err := runRoot(t, "policy", "provenance", "set", "cargo", "block")
 	if err != nil || !strings.Contains(out, "block refuses all of them") {
 		t.Errorf("block on an uncovered ecosystem should say what it does: %v\n%s", err, out)
+	}
+	out, err = runRoot(t, "policy", "provenance", "set", "pypi", "block")
+	if err != nil || strings.Contains(out, "records unavailable") {
+		t.Errorf("block on pypi, which the check verifies, printed the uncovered note: %v\n%s", err, out)
 	}
 	if _, err := runRoot(t, "policy", "provenance", "set", "npm", "allow"); err == nil {
 		t.Error("an action outside warn|block|ignore was accepted")
@@ -46,6 +50,12 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 	for _, want := range []string{"npm", "block", "cargo", "warn (default)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list does not show %q:\n%s", want, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[0] == "pypi" && f[2] != "yes" {
+			t.Errorf("pypi VERIFIES = %q, want yes:\n%s", f[2], out)
 		}
 	}
 
