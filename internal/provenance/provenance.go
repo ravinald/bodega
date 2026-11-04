@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/verify"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -119,6 +121,8 @@ type Verifier struct {
 	HTTP *http.Client
 	// NpmRegistry is the registry read when a version names none.
 	NpmRegistry string
+	// PypiIndex is the PEP 503 index root read when a version names none.
+	PypiIndex string
 	// GitHubWeb and GitHubAPI are the GitHub hosts a release URL is matched
 	// against and the API attestations are read from.
 	GitHubWeb string
@@ -136,6 +140,7 @@ func NewVerifier(trustedRootPath string) *Verifier {
 	return &Verifier{
 		HTTP:        &http.Client{Timeout: 20 * time.Second},
 		NpmRegistry: "https://registry.npmjs.org",
+		PypiIndex:   "https://pypi.org",
 		GitHubWeb:   "https://github.com",
 		GitHubAPI:   "https://api.github.com",
 		Root:        SharedRoot(trustedRootPath),
@@ -244,11 +249,24 @@ func predicateTypeOf(raw []byte) string {
 	return st.PredicateType
 }
 
+// builderSource says where verifyBundle reads a builder ID from.
+type builderSource int
+
+const (
+	// builderFromPredicate is the SLSA predicate's builder, and a statement
+	// naming none is refused: SLSA provenance without one says nothing.
+	builderFromPredicate builderSource = iota
+	// builderFromSigner is the certificate's build signer URI, for a
+	// statement whose predicate carries no builder by design, as PyPI's
+	// publish attestation does.
+	builderFromSigner
+)
+
 // verifyBundle verifies one Sigstore bundle against tm: the certificate chain
 // to Fulcio, the transparency log entry, the signature over the DSSE envelope,
 // an issuer matching issuerRegex, and a statement subject carrying digest
 // under alg. It returns the identity the certificate binds and the statement.
-func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, digest []byte) (audit.UpstreamProvenance, *statement, error) {
+func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, digest []byte, from builderSource) (audit.UpstreamProvenance, *statement, error) {
 	var id audit.UpstreamProvenance
 	var b bundle.Bundle
 	if err := b.UnmarshalJSON(raw); err != nil {
@@ -294,6 +312,9 @@ func verifyBundle(tm root.TrustedMaterial, raw []byte, issuerRegex, alg string, 
 		WorkflowRef:         cert.BuildSignerURI,
 		BuilderID:           builderID(&st),
 		BundleDigest:        "sha256:" + hex.EncodeToString(sum[:]),
+	}
+	if from == builderFromSigner {
+		id.BuilderID = cert.BuildSignerURI
 	}
 	if id.BuilderID == "" {
 		return id, nil, errors.New("the provenance names no builder")
@@ -347,49 +368,147 @@ func (v *Verifier) client() *http.Client {
 // published" rather than "could not tell".
 var errNotFound = errors.New("not found")
 
-// get reads url, refusing a body over limit bytes rather than returning a
+// get reads raw, refusing a body over limit bytes rather than returning a
 // truncated one, which would parse as a document that is not there.
-func (v *Verifier) get(ctx context.Context, url string, header http.Header, limit int64) ([]byte, error) {
-	resp, err := v.open(ctx, url, header)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
-	}
-	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("GET %s: the body is larger than the %d MiB cap", url, limit>>20)
-	}
-	return body, nil
+func (v *Verifier) get(ctx context.Context, raw string, header http.Header, limit int64) ([]byte, error) {
+	body, _, err := v.getWithin(ctx, raw, header, limit, nil)
+	return body, err
 }
 
-// open sends a GET to url and returns the response when it is a 200, for the
-// caller to read and close.
-func (v *Verifier) open(ctx context.Context, url string, header http.Header) (*http.Response, error) {
-	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
-		return nil, fmt.Errorf("refusing to fetch %q: not an http(s) URL", url)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// open sends a GET to raw and returns a 200 response for the caller to read
+// and close, with the same redirect handling and credential-free errors as
+// get. It is for a body hashed as it streams rather than held in memory.
+func (v *Verifier) open(ctx context.Context, raw string, header http.Header) (*http.Response, error) {
+	resp, _, err := v.openWithin(ctx, raw, header, nil)
+	return resp, err
+}
+
+// getWithin is get with every redirect hop put to allow before it is sent; a
+// hop allow refuses is never requested. It also returns the URL of the
+// response the body came from, which after a redirect is the one a relative
+// reference in the body resolves against. Every error it returns is a
+// *fetchError.
+func (v *Verifier) getWithin(ctx context.Context, raw string, header http.Header, limit int64, allow func(*url.URL) error) ([]byte, *url.URL, error) {
+	resp, at, err := v.openWithin(ctx, raw, header, allow)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	fail := func(what string, err error) ([]byte, *url.URL, error) {
+		return nil, nil, &fetchError{at: at, what: what, err: err}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return fail("the body could not be read", err)
+	}
+	if int64(len(body)) > limit {
+		return fail(fmt.Sprintf("the body is larger than the %d MiB cap", limit>>20), nil)
+	}
+	return body, resp.Request.URL, nil
+}
+
+// openWithin sends the request getWithin and open share and returns a 200
+// response unread, with the scheme and host its errors name. Userinfo in raw
+// stays on the request URL, where the client turns it into Basic credentials
+// for that request alone: set as a header here instead, it would be copied
+// onto a redirect to another port of the same host. Every error it returns is
+// a *fetchError.
+func (v *Verifier) openWithin(ctx context.Context, raw string, header http.Header, allow func(*url.URL) error) (*http.Response, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return nil, "", &fetchError{what: "refusing to fetch it: not an http(s) URL", err: err}
+	}
+	at := manifest.PublicURL((&url.URL{Scheme: u.Scheme, Host: u.Host}).String())
+	fail := func(what string, err error) (*http.Response, string, error) {
+		return nil, at, &fetchError{at: at, what: what, err: err}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fail("the request could not be built", err)
 	}
 	for k, vs := range header {
 		req.Header[k] = vs
 	}
 	req.Header.Set("User-Agent", policy.UserAgent)
-	resp, err := v.client().Do(req)
+	client := v.client()
+	if allow != nil {
+		c := *client
+		prior := c.CheckRedirect
+		c.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if err := allow(next.URL); err != nil {
+				return err
+			}
+			if prior != nil {
+				return prior(next, via)
+			}
+			if len(via) >= 10 {
+				return errTooManyRedirects
+			}
+			return nil
+		}
+		client = &c
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return fail(transportFailure(err), err)
 	}
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET %s: %w", url, errNotFound)
+		return fail("HTTP 404", errNotFound)
 	case resp.StatusCode != http.StatusOK:
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		return fail(fmt.Sprintf("HTTP %d", resp.StatusCode), nil)
 	}
-	return resp, nil
+	return resp, at, nil
 }
+
+var errTooManyRedirects = errors.New("stopped after 10 redirects")
+
+// transportFailure names the class of a client.Do error without rendering its
+// text. net/http quotes a Location header it could not parse verbatim, and no
+// rewrite of that text can find every spelling of userinfo in it (a literal
+// or percent-encoded @, a network-path reference, a parser quoting only the
+// port it choked on), so the text is read to classify and never repeated.
+func transportFailure(err error) string {
+	var off *offIndexError
+	switch {
+	case errors.As(err, &off):
+		return off.Error()
+	case errors.Is(err, errTooManyRedirects):
+		return "it redirected more than 10 times"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the request timed out"
+	case errors.Is(err, context.Canceled):
+		return "the request was canceled"
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		if strings.Contains(ue.Err.Error(), "Location header") {
+			return "it redirected to a Location that is not a valid URL, so the redirect was not followed"
+		}
+		if ue.Timeout() {
+			return "the request timed out"
+		}
+	}
+	return "the connection failed"
+}
+
+// fetchError is a failed provenance fetch. Its text is a fixed sentence for
+// the failure's class and the scheme and host of the URL requested, both
+// known not to carry credentials, and err keeps the original chain for
+// errors.Is and errors.As without ever being rendered.
+type fetchError struct {
+	at   string
+	what string
+	err  error
+}
+
+func (e *fetchError) Error() string {
+	if e.at == "" {
+		return e.what
+	}
+	return "GET " + e.at + ": " + e.what
+}
+
+func (e *fetchError) Unwrap() error { return e.err }

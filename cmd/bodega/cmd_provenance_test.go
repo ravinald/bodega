@@ -35,9 +35,13 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 	if out, err := runRoot(t, "policy", "provenance", "set", "npm", "block"); err != nil || !strings.Contains(out, "npm upstream provenance policy: block") {
 		t.Fatalf("set: %v\n%s", err, out)
 	}
-	out, err := runRoot(t, "policy", "provenance", "set", "pypi", "block")
+	out, err := runRoot(t, "policy", "provenance", "set", "cargo", "block")
 	if err != nil || !strings.Contains(out, "block refuses all of them") {
 		t.Errorf("block on an uncovered ecosystem should say what it does: %v\n%s", err, out)
+	}
+	out, err = runRoot(t, "policy", "provenance", "set", "pypi", "block")
+	if err != nil || strings.Contains(out, "records unavailable") {
+		t.Errorf("block on pypi, which the check verifies, printed the uncovered note: %v\n%s", err, out)
 	}
 	if _, err := runRoot(t, "policy", "provenance", "set", "npm", "allow"); err == nil {
 		t.Error("an action outside warn|block|ignore was accepted")
@@ -58,6 +62,9 @@ func TestPolicyProvenanceSetAndList(t *testing.T) {
 		f := strings.Fields(line)
 		if len(f) > 0 && f[0] == "helm" && !strings.Contains(line, "warn (default)  yes") {
 			t.Errorf("helm is verified by the check, but list says:\n%s", line)
+		}
+		if len(f) >= 3 && f[0] == "pypi" && f[2] != "yes" {
+			t.Errorf("pypi VERIFIES = %q, want yes:\n%s", f[2], out)
 		}
 	}
 
@@ -299,7 +306,7 @@ func TestSLSADocDescribesHelmProvenance(t *testing.T) {
 		"Helm `.prov` files", "operator-configured keyring")
 	gap := docParagraph(t, "slsa.md", "- **Publisher signatures are verified for")
 	requireAll(t, "the publisher signatures gap", gap,
-		"**Publisher signatures are verified for npm, GitHub releases and classic Helm charts only.**", "served over OCI")
+		"**Publisher signatures are verified for npm, PyPI, GitHub releases and classic Helm charts only.**", "served over OCI")
 	for _, stale := range []string{"#275", "Helm `.prov` files are", "and Helm `.prov` files"} {
 		if strings.Contains(gap, stale) {
 			t.Errorf("the publisher signatures gap still says %q: %s", stale, gap)
