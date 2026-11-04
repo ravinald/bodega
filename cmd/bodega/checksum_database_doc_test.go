@@ -124,7 +124,7 @@ func TestSLSADocumentsChecksumDatabase(t *testing.T) {
 			t.Errorf("the publisher-signature gap still names %q: %s", banned, bullet)
 		}
 	}
-	if !strings.HasPrefix(bullet, "- **Publisher signatures are verified for npm and GitHub releases only.**") {
+	if !strings.HasPrefix(bullet, "- **Publisher signatures are verified for npm, PyPI and GitHub releases only.**") {
 		t.Errorf("the gap's bold sentence does not list the ecosystems bodega verifies publisher evidence for: %s", bullet)
 	}
 	if !strings.Contains(bullet, "#273") && !strings.Contains(bullet, "#275") {

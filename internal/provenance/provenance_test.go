@@ -2,6 +2,9 @@ package provenance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -587,7 +590,7 @@ func TestOversizedBodyIsAnError(t *testing.T) {
 
 func TestUncoveredEcosystemsRecordWhy(t *testing.T) {
 	c := &Checker{Verifier: &Verifier{HTTP: &http.Client{Transport: loopbackOnly{t}}, GitHubWeb: "https://github.com"}}
-	for _, typ := range []string{manifest.TypePypi, manifest.TypeGomod, manifest.TypeCargo, manifest.TypeHelm,
+	for _, typ := range []string{manifest.TypeGomod, manifest.TypeCargo, manifest.TypeHelm,
 		manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles} {
 		got := c.Check(context.Background(), &manifest.PackageManifest{Type: typ, Name: "x"}, &manifest.VersionEntry{Version: "1.0.0"})
 		if got.Provenance == nil || got.Provenance.Outcome != audit.ProvenanceUnavailable {
@@ -908,5 +911,949 @@ func TestNpmPublisherComesFromThePackument(t *testing.T) {
 	}
 	if p := ev.Publishers["3.5.35"]; p != (Publisher{Name: "GitHub Actions", Trusted: true}) {
 		t.Errorf("3.5.35 publisher %+v, want GitHub Actions through trusted publishing", p)
+	}
+}
+
+// The pypi fixtures, recorded from pypi.org on 2026-11-02:
+//
+//	pypi-sampleproject.simple.json
+//	                   https://pypi.org/simple/sampleproject/ as PEP 691 JSON
+//	pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json
+//	                   https://pypi.org/integrity/sampleproject/4.0.0/sampleproject-4.0.0-py3-none-any.whl/provenance
+//
+// The page lists two files of 4.0.0, the wheel and the sdist, and only the
+// wheel's provenance is recorded, so a test serving the version as attested
+// drops the sdist or gives it no provenance.
+const (
+	pypiWheel       = "sampleproject-4.0.0-py3-none-any.whl"
+	pypiSdist       = "sampleproject-4.0.0.tar.gz"
+	pypiWheelSHA256 = "c23e447ea90d796d1e645c35c4b2de125040add12a845825546f91c93f391b6b"
+	pypiRepo        = "https://github.com/pypa/sampleproject"
+	pypiWheelPath   = "/integrity/sampleproject/4.0.0/" + pypiWheel + "/provenance"
+	pypiPagePath    = "/simple/sampleproject/"
+)
+
+// loopbackVia is loopbackOnly over another transport: the TLS client an
+// httptest server hands out, since PEP 740 provenance is read over https only.
+type loopbackVia struct {
+	t    *testing.T
+	next http.RoundTripper
+}
+
+func (l loopbackVia) RoundTrip(r *http.Request) (*http.Response, error) {
+	if ip := net.ParseIP(r.URL.Hostname()); ip == nil || !ip.IsLoopback() {
+		l.t.Errorf("request to %s left the loopback interface", r.URL)
+		return nil, fmt.Errorf("refused %s", r.URL.Host)
+	}
+	return l.next.RoundTrip(r)
+}
+
+func newTLSRegistry(t *testing.T) *registry {
+	t.Helper()
+	r := &registry{docs: map[string][]byte{}, hits: map[string]int{}}
+	r.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		r.hits[req.URL.Path]++
+		body, ok := r.docs[req.URL.Path]
+		r.mu.Unlock()
+		if !ok {
+			http.NotFound(w, req)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(r.Close)
+	return r
+}
+
+func (r *registry) hitsOn(path string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hits[path]
+}
+
+func newPypiVerifier(t *testing.T, r *registry) *Verifier {
+	return &Verifier{
+		HTTP:      &http.Client{Transport: loopbackVia{t, r.Client().Transport}},
+		PypiIndex: r.URL,
+		Root:      recordedRoot(t),
+	}
+}
+
+// pypiFiles is the recorded page's files, each provenance URL moved from
+// pypi.org onto r.
+func pypiFiles(t *testing.T, r *registry) []map[string]any {
+	t.Helper()
+	var page struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(fixture(t, "pypi-sampleproject.simple.json"), &page); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range page.Files {
+		if p, ok := f["provenance"].(string); ok {
+			f["provenance"] = strings.Replace(p, "https://pypi.org", r.URL, 1)
+		}
+	}
+	return page.Files
+}
+
+// servePypi publishes the page with edit applied to each file of 4.0.0, a
+// file edit returns nil for dropped, and the recorded wheel provenance.
+func servePypi(t *testing.T, r *registry, edit func(f map[string]any) map[string]any) {
+	t.Helper()
+	var files []map[string]any
+	for _, f := range pypiFiles(t, r) {
+		if strings.HasPrefix(f["filename"].(string), "sampleproject-4.0.0") {
+			if f = edit(f); f == nil {
+				continue
+			}
+		}
+		files = append(files, f)
+	}
+	r.putJSON(t, pypiPagePath, map[string]any{"meta": map[string]any{"api-version": "1.4"}, "name": "sampleproject", "files": files})
+	r.put(pypiWheelPath, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+}
+
+// wheelOnly drops the sdist, whose provenance was not recorded.
+func wheelOnly(f map[string]any) map[string]any {
+	if f["filename"] == pypiSdist {
+		return nil
+	}
+	return f
+}
+
+// pypiProvenanceVariant is the recorded provenance object with edit applied.
+func pypiProvenanceVariant(t *testing.T, edit func(bundle map[string]any)) []byte {
+	t.Helper()
+	var prov map[string]any
+	if err := json.Unmarshal(fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"), &prov); err != nil {
+		t.Fatal(err)
+	}
+	edit(prov["attestation_bundles"].([]any)[0].(map[string]any))
+	b, err := json.Marshal(prov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func checkPypi(t *testing.T, v *Verifier, version string) Evidence {
+	t.Helper()
+	return v.Pypi(context.Background(), "", "sampleproject", version)
+}
+
+func TestPypiAttestationVerifies(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("outcome %s (%s), want verified", ev.Outcome, ev.Detail)
+	}
+	if ev.SourceRepositoryURI != pypiRepo {
+		t.Errorf("source repository %q, want %q", ev.SourceRepositoryURI, pypiRepo)
+	}
+	if !strings.HasPrefix(ev.WorkflowRef, pypiRepo+"/.github/workflows/release.yml@") || ev.BuilderID != ev.WorkflowRef {
+		t.Errorf("workflow ref %q, builder %q: want the build signer URI in both", ev.WorkflowRef, ev.BuilderID)
+	}
+	sum := sha256.Sum256(fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+	if want := "sha256:" + hex.EncodeToString(sum[:]); ev.BundleDigest != want {
+		t.Errorf("bundle digest %q, want %q over the provenance object as fetched", ev.BundleDigest, want)
+	}
+}
+
+// The page is read with the PEP 691 media type, and the provenance object
+// with PEP 740's.
+func TestPypiSendsTheIndexMediaTypes(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	var mu sync.Mutex
+	accept := map[string]string{}
+	inner := r.Config.Handler
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		accept[req.URL.Path] = req.Header.Get("Accept")
+		mu.Unlock()
+		inner.ServeHTTP(w, req)
+	})
+	if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("outcome %s (%s)", ev.Outcome, ev.Detail)
+	}
+	if accept[pypiPagePath] != pypiSimpleJSON || accept[pypiWheelPath] != pypiIntegrityJSON {
+		t.Errorf("Accept headers %v", accept)
+	}
+}
+
+// A page that cannot be read, does not parse, or lists no file of the
+// version cannot say provenance is absent.
+func TestPypiPageThatSaysNothingIsUnknown(t *testing.T) {
+	r := newTLSRegistry(t)
+	v := newPypiVerifier(t, r)
+	ev := checkPypi(t, v, "4.0.0")
+	if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, r.URL+pypiPagePath) {
+		t.Errorf("missing page: %s (%s), want unknown naming the page", ev.Outcome, ev.Detail)
+	}
+	r.put(pypiPagePath, []byte("<html>not json</html>"))
+	if ev := checkPypi(t, v, "4.0.0"); ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, r.URL+pypiPagePath) {
+		t.Errorf("HTML page: %s (%s), want unknown naming the page", ev.Outcome, ev.Detail)
+	}
+	servePypi(t, r, wheelOnly)
+	if ev := checkPypi(t, v, "9.9.9"); ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, "lists no file") {
+		t.Errorf("absent version: %s (%s), want unknown", ev.Outcome, ev.Detail)
+	}
+	// PEP 440 equality: 4.0 is 4.0.0.
+	if ev := checkPypi(t, v, "4.0"); ev.Outcome != audit.ProvenanceVerified {
+		t.Errorf("4.0 against files of 4.0.0: %s (%s), want verified", ev.Outcome, ev.Detail)
+	}
+}
+
+func TestPypiWithoutProvenanceIsUnavailable(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, func(f map[string]any) map[string]any {
+		f["provenance"] = nil
+		return f
+	})
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceUnavailable {
+		t.Fatalf("outcome %s (%s), want unavailable", ev.Outcome, ev.Detail)
+	}
+	if !strings.Contains(ev.Detail, r.URL+pypiPagePath) || !strings.Contains(ev.Detail, "no attestation for any file of the version") {
+		t.Errorf("detail %q does not name the page and the absence", ev.Detail)
+	}
+	if n := r.hitsOn(pypiWheelPath); n != 0 {
+		t.Errorf("a file with null provenance was fetched %d times", n)
+	}
+	// An older release the recorded page lists without the key's value.
+	if ev := checkPypi(t, newPypiVerifier(t, r), "3.0.0"); ev.Outcome != audit.ProvenanceUnavailable {
+		t.Errorf("3.0.0: %s (%s), want unavailable", ev.Outcome, ev.Detail)
+	}
+}
+
+// One file attested and one not is what an upload from somewhere other than
+// the publisher's CI beside a release it built looks like.
+func TestPypiPartlyAttestedVersionIsAMismatch(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, func(f map[string]any) map[string]any {
+		if f["filename"] == pypiSdist {
+			f["provenance"] = nil
+		}
+		return f
+	})
+	c := &Checker{Verifier: newPypiVerifier(t, r)}
+	res := c.Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	if res.Provenance == nil || res.Provenance.Outcome != audit.ProvenanceMismatch {
+		t.Fatalf("result %+v, want mismatch", res)
+	}
+	if !strings.Contains(res.Reason, pypiSdist) {
+		t.Errorf("reason %q does not name the file without provenance", res.Reason)
+	}
+	if res.Provenance.SourceRepositoryURI != pypiRepo || res.Action != policy.ActionWarn {
+		t.Errorf("a mismatch carries %+v under %s; want the attested file's identity, warned", res.Provenance, res.Action)
+	}
+}
+
+// Every way the provenance object can fail to arrive is unknown: the index
+// named it, so it exists, and whether it verifies is not known.
+func TestPypiUnreadableProvenanceIsUnknown(t *testing.T) {
+	for name, serve := range map[string]http.HandlerFunc{
+		"404": http.NotFound,
+		"500": func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "boom", http.StatusInternalServerError) },
+		"oversized": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"version":1,"attestation_bundles":[],"pad":"`))
+			_, _ = w.Write([]byte(strings.Repeat("a", 8<<20)))
+			_, _ = w.Write([]byte(`"}`))
+		},
+		"not JSON": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("nope")) },
+		"version 2": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"version":2,"attestation_bundles":[]}`))
+		},
+		"no bundle": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"version":1,"attestation_bundles":[]}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newTLSRegistry(t)
+			servePypi(t, r, wheelOnly)
+			inner := r.Config.Handler
+			r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == pypiWheelPath {
+					serve(w, req)
+					return
+				}
+				inner.ServeHTTP(w, req)
+			})
+			ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+			if ev.Outcome != audit.ProvenanceUnknown {
+				t.Fatalf("outcome %s (%s), want unknown", ev.Outcome, ev.Detail)
+			}
+			if !strings.Contains(ev.Detail, pypiWheel) {
+				t.Errorf("detail %q does not name the file", ev.Detail)
+			}
+		})
+	}
+}
+
+// A provenance URL on another host is not requested: the page alone cannot
+// send bodega to fetch from wherever it names.
+func TestPypiOffHostProvenanceIsNotRequested(t *testing.T) {
+	other := newTLSRegistry(t)
+	other.put(pypiWheelPath, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+	r := newTLSRegistry(t)
+	servePypi(t, r, func(f map[string]any) map[string]any {
+		if f = wheelOnly(f); f != nil {
+			f["provenance"] = other.URL + pypiWheelPath
+		}
+		return f
+	})
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, strings.TrimPrefix(other.URL, "https://")) {
+		t.Errorf("outcome %s (%s), want unknown naming the refused host", ev.Outcome, ev.Detail)
+	}
+	if n := other.hitsOn(pypiWheelPath); n != 0 {
+		t.Errorf("the off-host provenance URL was requested %d times", n)
+	}
+
+	// The recorded page, unmodified, names pypi.org, which is not this index.
+	r.put(pypiPagePath, fixture(t, "pypi-sampleproject.simple.json"))
+	if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, "pypi.org") {
+		t.Errorf("recorded page: %s (%s), want unknown naming pypi.org", ev.Outcome, ev.Detail)
+	}
+
+	// Same host, but http.
+	servePypi(t, r, func(f map[string]any) map[string]any {
+		if f = wheelOnly(f); f != nil {
+			f["provenance"] = strings.Replace(r.URL, "https://", "http://", 1) + pypiWheelPath
+		}
+		return f
+	})
+	if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceUnknown {
+		t.Errorf("http provenance URL: %s (%s), want unknown", ev.Outcome, ev.Detail)
+	}
+}
+
+// A relative provenance URL resolves against the page.
+func TestPypiRelativeProvenanceURLResolvesAgainstThePage(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, func(f map[string]any) map[string]any {
+		if f = wheelOnly(f); f != nil {
+			f["provenance"] = "../../integrity/sampleproject/4.0.0/" + pypiWheel + "/provenance"
+		}
+		return f
+	})
+	if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+		t.Errorf("outcome %s (%s), want verified", ev.Outcome, ev.Detail)
+	}
+}
+
+func TestPypiTamperedAttestationIsInvalid(t *testing.T) {
+	for name, tc := range map[string]struct {
+		page  func(f map[string]any) map[string]any
+		prov  func(b map[string]any)
+		want  string
+		cause string
+	}{
+		"statement subject digest": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "did not verify", prov: func(b map[string]any) {
+			env := b["attestations"].([]any)[0].(map[string]any)["envelope"].(map[string]any)
+			st, _ := base64.StdEncoding.DecodeString(env["statement"].(string))
+			env["statement"] = base64.StdEncoding.EncodeToString([]byte(strings.Replace(string(st), pypiWheelSHA256, "d"+pypiWheelSHA256[1:], 1)))
+		}},
+		"publisher repository": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "pypa/otherproject", prov: func(b map[string]any) {
+			b["publisher"].(map[string]any)["repository"] = "pypa/otherproject"
+		}},
+		"publisher workflow": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "nightly.yml", prov: func(b map[string]any) {
+			b["publisher"].(map[string]any)["workflow"] = "nightly.yml"
+		}},
+		"publisher kind": {page: wheelOnly, want: audit.ProvenanceUnknown, cause: `"Google"`, prov: func(b map[string]any) {
+			b["publisher"].(map[string]any)["kind"] = "Google"
+		}},
+		"publisher kind GitLab against a GitHub certificate": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "did not verify", prov: func(b map[string]any) {
+			b["publisher"].(map[string]any)["kind"] = "GitLab"
+			b["publisher"].(map[string]any)["workflow_filepath"] = ".gitlab-ci.yml"
+		}},
+		"page sha256": {want: audit.ProvenanceInvalid, cause: "did not verify", prov: func(map[string]any) {}, page: func(f map[string]any) map[string]any {
+			if f = wheelOnly(f); f != nil {
+				f["hashes"] = map[string]any{"sha256": strings.Repeat("0", 64)}
+			}
+			return f
+		}},
+		"page gives no sha256": {want: audit.ProvenanceUnknown, cause: "no sha256", prov: func(map[string]any) {}, page: func(f map[string]any) map[string]any {
+			if f = wheelOnly(f); f != nil {
+				f["hashes"] = map[string]any{}
+			}
+			return f
+		}},
+		"bundle holds no attestation": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "holds no attestation", prov: func(b map[string]any) {
+			b["attestations"] = []any{}
+		}},
+		"statement of another predicate type": {page: wheelOnly, want: audit.ProvenanceInvalid, cause: "did not verify", prov: func(b map[string]any) {
+			env := b["attestations"].([]any)[0].(map[string]any)["envelope"].(map[string]any)
+			st, _ := base64.StdEncoding.DecodeString(env["statement"].(string))
+			env["statement"] = base64.StdEncoding.EncodeToString([]byte(strings.Replace(string(st), PyPIPublishV1, "https://example.com/other/v1", 1)))
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newTLSRegistry(t)
+			servePypi(t, r, tc.page)
+			r.put(pypiWheelPath, pypiProvenanceVariant(t, tc.prov))
+			ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+			if ev.Outcome != tc.want {
+				t.Fatalf("outcome %s (%s), want %s", ev.Outcome, ev.Detail, tc.want)
+			}
+			if !strings.Contains(ev.Detail, tc.cause) || !strings.Contains(ev.Detail, pypiWheel) {
+				t.Errorf("detail %q does not name the file and %q", ev.Detail, tc.cause)
+			}
+			if ev.SourceRepositoryURI != "" {
+				t.Errorf("a %s file recorded an identity: %+v", ev.Outcome, ev.UpstreamProvenance)
+			}
+		})
+	}
+}
+
+func TestPypiWithoutTrustedRootIsUnknown(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	v := newPypiVerifier(t, r)
+	v.Root = func(context.Context) (root.TrustedMaterial, error) { return nil, errors.New("TUF unreachable") }
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	if res.Provenance == nil || res.Provenance.Outcome != audit.ProvenanceUnknown || res.Details[audit.DetailNoTrustedRoot] != true {
+		t.Fatalf("result %+v, want unknown with no_trusted_root", res)
+	}
+}
+
+// Two files built by different identities are a mismatch, and every file
+// is verified: a later file's failure is not hidden by an earlier pass.
+func TestPypiCombinesEveryFile(t *testing.T) {
+	ok := audit.UpstreamProvenance{Outcome: audit.ProvenanceVerified, SourceRepositoryURI: pypiRepo, BuilderID: pypiRepo + "/.github/workflows/release.yml@refs/tags/v1"}
+	other := ok
+	other.SourceRepositoryURI = "https://github.com/example/sampleproject"
+	file := func(name string, p audit.UpstreamProvenance) pypiFileEvidence {
+		return pypiFileEvidence{filename: name, ev: Evidence{UpstreamProvenance: p, Detail: name}}
+	}
+	got := pypiVersion([]pypiFileEvidence{file("a.whl", ok), file("b.tar.gz", other)}, nil, "x", "1")
+	if got.Outcome != audit.ProvenanceMismatch || !strings.Contains(got.Detail, "example/sampleproject") || !strings.Contains(got.Detail, pypiRepo) {
+		t.Errorf("two identities: %s (%s), want mismatch naming both", got.Outcome, got.Detail)
+	}
+	sameAtOtherRef := ok
+	sameAtOtherRef.BuilderID = pypiRepo + "/.github/workflows/release.yml@refs/tags/v2"
+	if got := pypiVersion([]pypiFileEvidence{file("a.whl", ok), file("b.tar.gz", sameAtOtherRef)}, nil, "x", "1"); got.Outcome != audit.ProvenanceVerified {
+		t.Errorf("one identity at two refs: %s (%s), want verified", got.Outcome, got.Detail)
+	}
+	bad := audit.UpstreamProvenance{Outcome: audit.ProvenanceInvalid}
+	unk := audit.UpstreamProvenance{Outcome: audit.ProvenanceUnknown}
+	if got := pypiVersion([]pypiFileEvidence{file("a.whl", ok), file("b.whl", unk), file("c.whl", bad)}, []string{"d.zip"}, "x", "1"); got.Outcome != audit.ProvenanceInvalid || got.Detail != "c.whl" {
+		t.Errorf("an invalid file: %s (%s), want invalid from c.whl", got.Outcome, got.Detail)
+	}
+	if got := pypiVersion([]pypiFileEvidence{file("a.whl", unk), file("b.whl", ok), file("c.whl", unk)}, []string{"d.zip"}, "x", "1"); got.Outcome != audit.ProvenanceUnknown || got.Detail != "a.whl" {
+		t.Errorf("an unknown file: %s (%s), want unknown from a.whl", got.Outcome, got.Detail)
+	}
+}
+
+// A verified pypi version takes the pin through Check and Commit, and a later
+// version from another repository is a mismatch.
+func TestPypiFirstVerifiedVersionPinsAndAnotherRepositoryMismatches(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	store := &fakeStore{}
+	c := &Checker{Store: store, Verifier: newPypiVerifier(t, r)}
+	pm := &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}
+	if got := c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "4.0.0"}); got.Provenance.Outcome != audit.ProvenanceVerified || got.Action != policy.ActionPass {
+		t.Fatalf("first check %+v (%s)", got, got.Reason)
+	}
+	c.Commit(context.Background())
+	pin := store.pins["pypi/sampleproject"]
+	if pin.SourceRepositoryURI != pypiRepo || pin.BuilderID != pypiRepo+"/.github/workflows/release.yml" || pin.PinnedVersion != "4.0.0" {
+		t.Fatalf("pin %+v", pin)
+	}
+
+	store.pins["pypi/sampleproject"] = audit.ProvenancePin{PkgType: "pypi", PkgName: "sampleproject",
+		SourceRepositoryURI: "https://github.com/example/sampleproject", BuilderID: "https://github.com/example/sampleproject/.github/workflows/release.yml", PinnedVersion: "3.9.0"}
+	got := c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "4.0.0", URL: r.URL})
+	if got.Provenance.Outcome != audit.ProvenanceMismatch || !strings.Contains(got.Reason, "bodega pkg trust reset pypi sampleproject") {
+		t.Fatalf("outcome %s (%s), want mismatch", got.Provenance.Outcome, got.Reason)
+	}
+
+	// A version without provenance is not compared with the pin.
+	if got := c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "3.0.0"}); got.Provenance.Outcome != audit.ProvenanceUnavailable {
+		t.Errorf("3.0.0 after the pin: %s (%s), want unavailable", got.Provenance.Outcome, got.Reason)
+	}
+}
+
+func TestUnpinnedPypiVersionIsNotEvaluated(t *testing.T) {
+	r := newTLSRegistry(t)
+	c := &Checker{Verifier: newPypiVerifier(t, r)}
+	for _, version := range []string{"", "*", manifest.ConstraintAny} {
+		got := c.Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "x"}, &manifest.VersionEntry{Version: version})
+		if got.Action != policy.ActionNotEvaluated || got.Provenance != nil {
+			t.Errorf("%q: %+v, want not evaluated", version, got)
+		}
+	}
+	if n := r.hitsOn("/simple/x/"); n != 0 {
+		t.Errorf("an undatable version looked the page up %d times", n)
+	}
+}
+
+// The entry's url wins over the verifier's index root, and neither's
+// userinfo reaches a result.
+func TestPypiIndexUserinfoReachesNoResult(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	var auth []string
+	var mu sync.Mutex
+	inner := r.Config.Handler
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		u, p, _ := req.BasicAuth()
+		mu.Lock()
+		auth = append(auth, u+":"+p)
+		mu.Unlock()
+		inner.ServeHTTP(w, req)
+	})
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	c := &Checker{Verifier: v}
+	pm := &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}
+	results := map[string]policy.Result{
+		"verified": c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "4.0.0"}),
+		"absent":   c.Check(context.Background(), pm, &manifest.VersionEntry{Version: "9.9.9"}),
+		"entry url": c.Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "missing"},
+			&manifest.VersionEntry{Version: "1.0", URL: secret + "/"}),
+	}
+	r.put(pypiWheelPath, []byte("nope"))
+	results["unparsable provenance"] = (&Checker{Verifier: v}).Check(context.Background(), pm, &manifest.VersionEntry{Version: "4.0.0", URL: secret})
+	for name, res := range results {
+		b, _ := json.Marshal(res)
+		if strings.Contains(string(b), "secret") || strings.Contains(string(b), "user:") {
+			t.Errorf("%s: the userinfo reached the result: %s", name, b)
+		}
+		if res.Provenance == nil {
+			t.Errorf("%s: no provenance recorded", name)
+		}
+	}
+	if results["verified"].Provenance.Outcome != audit.ProvenanceVerified {
+		t.Errorf("verified through the credentialed index: %s", results["verified"].Reason)
+	}
+	if !strings.Contains(results["entry url"].Reason, r.URL+"/simple/missing/") {
+		t.Errorf("the entry's url was not the index read: %s", results["entry url"].Reason)
+	}
+	for _, a := range auth {
+		if a != "user:secret" {
+			t.Errorf("a request carried credentials %q, want the index's", a)
+		}
+	}
+}
+
+func TestPypiFileVersion(t *testing.T) {
+	for _, tc := range []struct{ project, file, want string }{
+		{"sampleproject", "sampleproject-4.0.0-py3-none-any.whl", "4.0.0"},
+		{"sampleproject", "sampleproject-4.0.0.tar.gz", "4.0.0"},
+		{"python-3parclient", "python-3parclient-4.2.10.tar.gz", "4.2.10"},
+		{"Foo.Bar", "foo_bar-1.0-1-py3-none-any.whl", "1.0"},
+		{"sampleproject", "sampleproject-4.0.0.exe", ""},
+		{"sampleproject", "otherproject-4.0.0.tar.gz", ""},
+	} {
+		if got := pypiFileVersion(tc.project, tc.file); got != tc.want {
+			t.Errorf("pypiFileVersion(%q, %q) = %q, want %q", tc.project, tc.file, got, tc.want)
+		}
+	}
+}
+
+// PyPI's publish attestation carries a null predicate, so the builder comes
+// from the certificate for pypi alone: the npm and GitHub callers, reading
+// the predicate, still refuse a statement naming no builder.
+func TestVerifyBundleBuilderSource(t *testing.T) {
+	var prov pypiProvenance
+	if err := json.Unmarshal(fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"), &prov); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := pypiSigstoreBundle(prov.AttestationBundles[0].Attestations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := hex.DecodeString(pypiWheelSHA256)
+	tm, _ := recordedRoot(t)(context.Background())
+	if _, _, err := verifyBundle(tm, raw, githubIssuer, "sha256", digest, builderFromPredicate); err == nil || !strings.Contains(err.Error(), "names no builder") {
+		t.Errorf("builder from the predicate: %v, want the no-builder refusal", err)
+	}
+	id, _, err := verifyBundle(tm, raw, githubIssuer, "sha256", digest, builderFromSigner)
+	if err != nil || id.BuilderID != id.WorkflowRef || id.BuilderID == "" {
+		t.Errorf("builder from the signer: %+v, %v", id, err)
+	}
+}
+
+func TestReviewPypiRedirectCannotEscapeIndex(t *testing.T) {
+	for _, downgrade := range []bool{false, true} {
+		t.Run(fmt.Sprintf("http=%t", downgrade), func(t *testing.T) {
+			var other *registry
+			if downgrade {
+				other = newRegistry(t)
+			} else {
+				other = newTLSRegistry(t)
+			}
+			other.put(pypiWheelPath, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+			r := newTLSRegistry(t)
+			servePypi(t, r, wheelOnly)
+			inner := r.Config.Handler
+			r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == pypiWheelPath {
+					http.Redirect(w, req, other.URL+pypiWheelPath, http.StatusFound)
+					return
+				}
+				inner.ServeHTTP(w, req)
+			})
+			ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+			if n := other.hitsOn(pypiWheelPath); n != 0 {
+				t.Errorf("redirect target requested %d times; want 0", n)
+			}
+			if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, strings.TrimPrefix(strings.TrimPrefix(other.URL, "https://"), "http://")) {
+				t.Errorf("outcome %s (%s); want unknown naming the refused host", ev.Outcome, ev.Detail)
+			}
+		})
+	}
+}
+
+func TestReviewPypiEveryAttestationMustVerify(t *testing.T) {
+	r := newTLSRegistry(t)
+	servePypi(t, r, wheelOnly)
+	r.put(pypiWheelPath, pypiProvenanceVariant(t, func(b map[string]any) {
+		atts := b["attestations"].([]any)
+		raw, err := json.Marshal(atts[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra map[string]any
+		if err := json.Unmarshal(raw, &extra); err != nil {
+			t.Fatal(err)
+		}
+		env := extra["envelope"].(map[string]any)
+		st, err := base64.StdEncoding.DecodeString(env["statement"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env["statement"] = base64.StdEncoding.EncodeToString([]byte(strings.Replace(string(st), PyPIPublishV1, "https://example.com/other/v1", 1)))
+		env["signature"] = base64.StdEncoding.EncodeToString([]byte("not a valid signature"))
+		b["attestations"] = append(atts, extra)
+	}))
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceInvalid {
+		t.Fatalf("outcome %s (%s); want invalid for the extra unverified attestation", ev.Outcome, ev.Detail)
+	}
+}
+
+func TestReviewGetDoesNotForwardURLCredentials(t *testing.T) {
+	var targetUser, targetPass string
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		targetUser, targetPass, _ = req.BasicAuth()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer other.Close()
+	var originUser, originPass string
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		originUser, originPass, _ = req.BasicAuth()
+		http.Redirect(w, req, other.URL+"/object", http.StatusFound)
+	}))
+	defer origin.Close()
+	v := &Verifier{HTTP: origin.Client()}
+	at := strings.Replace(origin.URL, "https://", "https://user:secret@", 1)
+	if _, err := v.get(context.Background(), at, nil, 1024); err != nil {
+		t.Fatal(err)
+	}
+	if originUser != "user" || originPass != "secret" {
+		t.Fatalf("initial request lost its credentials")
+	}
+	if targetUser != "" || targetPass != "" {
+		t.Fatalf("absolute redirect received URL credentials %q:%q; want no credentials", targetUser, targetPass)
+	}
+}
+
+// The index page is held to the index host on every hop as well, and a
+// redirect that stays on the index host over https is still followed.
+func TestPypiRedirectsStayOnIndex(t *testing.T) {
+	t.Run("page off the index", func(t *testing.T) {
+		other := newTLSRegistry(t)
+		servePypi(t, other, wheelOnly)
+		r := newTLSRegistry(t)
+		r.Config.Handler = http.RedirectHandler(other.URL+pypiPagePath, http.StatusFound)
+		ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+		if n := other.hitsOn(pypiPagePath); n != 0 {
+			t.Errorf("redirect target requested %d times; want 0", n)
+		}
+		if ev.Outcome != audit.ProvenanceUnknown || !strings.Contains(ev.Detail, strings.TrimPrefix(other.URL, "https://")) {
+			t.Errorf("outcome %s (%s); want unknown naming the refused host", ev.Outcome, ev.Detail)
+		}
+	})
+	t.Run("provenance on the index", func(t *testing.T) {
+		r := newTLSRegistry(t)
+		servePypi(t, r, wheelOnly)
+		const moved = "/moved/provenance"
+		r.put(moved, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+		inner := r.Config.Handler
+		r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == pypiWheelPath {
+				http.Redirect(w, req, moved, http.StatusFound)
+				return
+			}
+			inner.ServeHTTP(w, req)
+		})
+		if ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+			t.Errorf("outcome %s (%s); want verified through a same-host redirect", ev.Outcome, ev.Detail)
+		}
+	})
+}
+
+func TestAuditPypiRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", secret+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
+
+	}
+}
+
+func TestAuditPypiRelativeProvenanceAfterPageRedirect(t *testing.T) {
+	r := newTLSRegistry(t)
+	const movedPage = "/mirror/simple/sampleproject/"
+	const movedProof = movedPage + "proof"
+	r.putJSON(t, movedPage, map[string]any{"files": []map[string]any{{
+		"filename": pypiWheel, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": "proof",
+	}}})
+	r.put(movedProof, fixture(t, "pypi-sampleproject-4.0.0-py3-none-any.whl.provenance.json"))
+	inner := r.Config.Handler
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == pypiPagePath {
+			http.Redirect(w, req, movedPage, http.StatusFound)
+			return
+		}
+		inner.ServeHTTP(w, req)
+	})
+	ev := checkPypi(t, newPypiVerifier(t, r), "4.0.0")
+	if ev.Outcome != audit.ProvenanceVerified || r.hitsOn(movedProof) != 1 {
+		t.Fatalf("outcome %s (%s), proof requested %d times; want verified using the redirected page's relative URL", ev.Outcome, ev.Detail, r.hitsOn(movedProof))
+	}
+}
+
+// The public docs describe what the pypi check reads, verifies and records,
+// and what it leaves undone. Table padding and hard wraps are collapsed before
+// matching, so reformatting a page does not fail this; dropping a sentence does.
+func TestF107DocsCoverPypi(t *testing.T) {
+	read := func(t *testing.T, name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", "..", "docs", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(strings.Fields(string(b)), " ")
+	}
+	// after is the text of doc from marker to the next occurrence of end.
+	after := func(t *testing.T, doc, marker, end string) string {
+		t.Helper()
+		_, rest, ok := strings.Cut(doc, marker)
+		if !ok {
+			t.Fatalf("%q is gone", marker)
+		}
+		head, _, _ := strings.Cut(rest, end)
+		return head
+	}
+	check := func(t *testing.T, doc string, want, refuse []string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(doc, w) {
+				t.Errorf("missing %q", w)
+			}
+		}
+		for _, r := range refuse {
+			if strings.Contains(doc, r) {
+				t.Errorf("still says %q", r)
+			}
+		}
+	}
+	t.Run("usage", func(t *testing.T) {
+		doc := read(t, "usage.md")
+		check(t, doc, []string{
+			"| `pypi` | the PEP 691 JSON page `/simple/<name>/`",
+			"then each file's `provenance` URL, read only when it is https on the same host and port as that index",
+			"every attestation of every file of the version against the Sigstore trusted root, with exactly one subject whose name is the filename and whose sha256 equals the page's `hashes.sha256`",
+			"the certificate against the Trusted Publisher PyPI names in the bundle",
+			"for `pypi` the builder ID is the certificate's build signer URI",
+			"The publisher's `environment` is not compared",
+			"for `pypi`, the page lists files of the version and none of them has a `provenance` URL",
+			"an attestation subject naming another file or digest",
+			"a certificate binding another repository or workflow than the Trusted Publisher PyPI names",
+			"a file's provenance object that could not be fetched (a 404 included, since the index named it), is larger than 8 MiB, does not parse, is not version 1 or holds no attestation bundle",
+			"a Trusted Publisher kind other than GitHub and GitLab",
+			"a `pypi` version some of whose files publish provenance and others do not, or whose files were built by different identities",
+			"a PyPI page listing the version's files with no `provenance` on any of them",
+		}, []string{"PyPI's PEP 740 attestations and helm"})
+		if uncovered := after(t, doc, "**Ecosystems not covered.**", "record `unavailable`"); strings.Contains(uncovered, "pypi") {
+			t.Errorf("pypi is still listed as not covered: %q", uncovered)
+		}
+	})
+	t.Run("threat model", func(t *testing.T) {
+		doc := read(t, "threat-model.md")
+		check(t, doc, []string{
+			"the PEP 740 attestation PyPI serves for each file uploaded through Trusted Publishing",
+			"A PyPI attestation's certificate must also bind the repository and workflow of the Trusted Publisher PyPI recorded when it accepted the upload",
+			"a version whose files disagree (some attested and some not, or attested by different identities) is a `mismatch`",
+			"or that holds no attestation bundle at all",
+			"a GitHub or GitLab publisher's bundle holding no attestation of a predicate type bodega reads",
+			"a Trusted Publisher kind other than GitHub and GitLab, which bodega does not verify",
+			"A PyPI version with no attestation on any of its files is `unavailable` whatever the pin holds",
+			"The PyPI publisher's `environment` is not compared",
+			"Within npm, PyPI and GitHub releases",
+		}, []string{"PEP 740 attestations and helm"})
+		if elsewhere := after(t, doc, "everywhere else.**", "record"); strings.Contains(elsewhere, "pypi") {
+			t.Errorf("pypi is still in the everywhere-else list: %q", elsewhere)
+		}
+	})
+	t.Run("slsa", func(t *testing.T) {
+		doc := read(t, "slsa.md")
+		check(t, doc, []string{
+			"npm Sigstore bundles, PyPI attestations (PEP 740) and GitHub release attestations are verified",
+			"**Publisher signatures are verified for npm, PyPI and GitHub releases only.**",
+		}, nil)
+		gap := after(t, doc, "**Publisher signatures are verified for", " - **")
+		if strings.Contains(gap, "273") || strings.Contains(gap, "PyPI attestations") {
+			t.Errorf("the gaps bullet still names PyPI's attestations or #273: %q", gap)
+		}
+	})
+}
+
+func TestAuditPypiNetworkPathRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", strings.TrimPrefix(secret, "https:")+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
+	}
+	if true {
+		t.Logf("%s", raw)
+	}
+}
+
+func TestAuditPypiAllVerifiedPublisherIdentitiesMustAgree(t *testing.T) {
+	r := newTLSRegistry(t)
+	local := newLocalSigstore(t)
+	const otherRepo = "https://github.com/example/sampleproject"
+	const sdistPath = "/proof/sdist"
+	r.putJSON(t, pypiPagePath, map[string]any{"files": []map[string]any{
+		{"filename": pypiWheel, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": r.URL + pypiWheelPath},
+		{"filename": pypiSdist, "hashes": map[string]string{"sha256": pypiWheelSHA256}, "provenance": r.URL + sdistPath},
+	}})
+	sign := func(filename, repository, repo string) []byte {
+		return local.provenance(filename, pypiWheelSHA256, repository, "release.yml", repo,
+			repo+"/.github/workflows/release.yml@refs/tags/v4.0.0")
+	}
+	r.put(pypiWheelPath, sign(pypiWheel, "pypa/sampleproject", pypiRepo))
+	sdist := sign(pypiSdist, "pypa/sampleproject", pypiRepo)
+	r.put(sdistPath, sdist)
+	v := newPypiVerifier(t, r)
+	v.Root = func(context.Context) (root.TrustedMaterial, error) { return local.Root(), nil }
+	if ev := checkPypi(t, v, "4.0.0"); ev.Outcome != audit.ProvenanceVerified {
+		t.Fatalf("same-identity baseline: %s (%s)", ev.Outcome, ev.Detail)
+	}
+	var first, extra map[string]any
+	if err := json.Unmarshal(sdist, &first); err != nil {
+		t.Fatal(err)
+	}
+	other := sign(pypiSdist, "example/sampleproject", otherRepo)
+	if err := json.Unmarshal(other, &extra); err != nil {
+		t.Fatal(err)
+	}
+	r.put(sdistPath, other)
+	if ev := checkPypi(t, v, "4.0.0"); ev.Outcome != audit.ProvenanceMismatch {
+		t.Fatalf("different-identity baseline: %s (%s), want mismatch", ev.Outcome, ev.Detail)
+	}
+	first["attestation_bundles"] = append(first["attestation_bundles"].([]any), extra["attestation_bundles"].([]any)...)
+	r.putJSON(t, sdistPath, first)
+	ev := checkPypi(t, v, "4.0.0")
+	if ev.Outcome != audit.ProvenanceMismatch || !strings.Contains(ev.Detail, pypiRepo) || !strings.Contains(ev.Detail, otherRepo) {
+		t.Fatalf("outcome %s (%s); want mismatch naming both verified identities", ev.Outcome, ev.Detail)
+	}
+}
+
+// No spelling of an unparseable redirect carrying credentials reaches a
+// result: the client's error text is classified, never rendered.
+func TestPypiUnparseableRedirectNeverRendersCredentials(t *testing.T) {
+	r := newTLSRegistry(t)
+	host := strings.TrimPrefix(r.URL, "https://")
+	for _, loc := range []string{
+		"https://user:secret@" + host + "/%zz",
+		"https://user:secret%40" + host + "/%zz",
+		"https://user:secret%40" + host,
+		"//user:secret@" + host + "/%zz",
+		"//user:secret%40" + host + "/%zz",
+		`\\user:secret@` + host + "/%zz",
+		"https://user:secret%2540" + host + "/%zz",
+	} {
+		r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Location", loc)
+			w.WriteHeader(http.StatusFound)
+		})
+		v := newPypiVerifier(t, r)
+		v.PypiIndex = "https://user:secret@" + host
+		res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+		raw, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user") {
+			t.Errorf("Location %q put credentials in the result: %s", loc, raw)
+		}
+		if res.Provenance == nil || res.Provenance.Outcome != audit.ProvenanceUnknown {
+			t.Errorf("Location %q: %s, want unknown", loc, raw)
+		}
+	}
+}
+
+// A fetch error renders a fixed sentence and keeps its chain for errors.Is.
+func TestFetchErrorKeepsChainWithoutText(t *testing.T) {
+	r := newTLSRegistry(t)
+	r.Config.Handler = http.NotFoundHandler()
+	v := newPypiVerifier(t, r)
+	_, _, err := v.getWithin(context.Background(), strings.Replace(r.URL, "https://", "https://user:secret@", 1)+"/x", nil, 1<<20, nil)
+	if !errors.Is(err, errNotFound) {
+		t.Fatalf("the chain lost errNotFound: %v", err)
+	}
+	if s := err.Error(); strings.Contains(s, "secret") || strings.Contains(s, "/x") || !strings.Contains(s, "HTTP 404") {
+		t.Fatalf("rendered %q, want scheme, host and the status only", s)
+	}
+}
+
+func TestAuditPypiEncodedAuthorityRedirectErrorKeepsCredentialsPrivate(t *testing.T) {
+	r := newTLSRegistry(t)
+	secret := strings.Replace(r.URL, "https://", "https://user:secret@", 1)
+	r.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Location", strings.Replace(secret, "@", "%40", 1)+"/%zz")
+		w.WriteHeader(http.StatusFound)
+	})
+	v := newPypiVerifier(t, r)
+	v.PypiIndex = secret
+	res := (&Checker{Verifier: v}).Check(context.Background(), &manifest.PackageManifest{Type: manifest.TypePypi, Name: "sampleproject"}, &manifest.VersionEntry{Version: "4.0.0"})
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") || strings.Contains(string(raw), "user:") {
+		t.Fatalf("URL credentials reached the result: %s", raw)
 	}
 }
