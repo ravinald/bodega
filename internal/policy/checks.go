@@ -30,6 +30,9 @@ type Result struct {
 	// Provenance is what the upstream provenance check verified, carried
 	// into the admission row's entry for it. Nil for every other check.
 	Provenance *audit.UpstreamProvenance
+	// ChecksumDatabase is what the checksum_database check read, carried
+	// into the admission row's entry for it. Nil for every other check.
+	ChecksumDatabase *audit.ChecksumDatabase
 }
 
 // VersionChecker runs a policy check against a specific version. Unlike the

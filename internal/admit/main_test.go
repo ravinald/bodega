@@ -15,9 +15,9 @@ import (
 	"github.com/ravinald/bodega/internal/provenance"
 )
 
-// TestMain stops the upstream provenance check at the loopback interface:
-// these tests run VersionCheckers against manifests, and an entry naming a public registry would otherwise
-// have it read npm, GitHub and Sigstore's TUF repository.
+// TestMain stops the upstream provenance and checksum database checks at the
+// loopback interface: // these tests run VersionCheckers against manifests, and an entry naming a public registry would otherwise
+// have them read npm, GitHub, Sigstore's TUF repository and sum.golang.org.
 func TestMain(m *testing.M) {
 	NewProvenanceVerifier = func(*config.Config) *provenance.Verifier {
 		v := provenance.NewVerifier("")
@@ -26,6 +26,11 @@ func TestMain(m *testing.M) {
 			return nil, errors.New("a test binary fetches no Sigstore trusted root")
 		}
 		return v
+	}
+	NewChecksumDatabase = func(cfg *config.Config, trees provenance.ChecksumDatabaseStore, events provenance.EventRecorder, readOnly bool) *provenance.ChecksumDatabase {
+		c := ChecksumDatabaseConfig(cfg, trees, events, readOnly)
+		c.HTTP = &http.Client{Transport: loopbackOnly{}}
+		return provenance.NewChecksumDatabase(c)
 	}
 	os.Exit(m.Run())
 }

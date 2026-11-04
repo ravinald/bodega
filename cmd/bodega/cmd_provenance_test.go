@@ -234,7 +234,7 @@ func docParagraph(t *testing.T, page, prefix string) string {
 	return ""
 }
 
-func docSection(t *testing.T, page, from, to string) string {
+func docSpan(t *testing.T, page, from, to string) string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", page))
 	if err != nil {
@@ -279,8 +279,8 @@ func TestUsageDocDescribesHelmProvenance(t *testing.T) {
 		"ends in `/`", "evil.net", "chmod go-w", "private key material", "gpg --export", "`bodega serve` loads every keyring before it binds and refuses to start")
 	requireAll(t, "the helm_keyrings key", docParagraph(t, "usage.md", "`helm_keyrings` maps"),
 		"config-file key only", "no CLI flag")
-	requireAll(t, "the full config listing", docSection(t, "usage.md", `  "sigstore_trusted_root": "",`, "\n}"), `"helm_keyrings"`)
-	requireAll(t, "Helm-specific fields", docSection(t, "usage.md", "### Helm-specific fields", "\n### "),
+	requireAll(t, "the full config listing", docSpan(t, "usage.md", `  "sigstore_trusted_root": "",`, "\n}"), `"helm_keyrings"`)
+	requireAll(t, "Helm-specific fields", docSpan(t, "usage.md", "### Helm-specific fields", "\n### "),
 		"`.prov` file beside the chart URL", "verified at admission", "a proxy fill refuses")
 }
 
@@ -288,11 +288,11 @@ func TestUsageDocDescribesHelmProvenance(t *testing.T) {
 // publisher statement, and says what the helm check does and does not stop;
 // docs/design.md names the .prov among the admission checks.
 func TestThreatModelDocDescribesHelmProvenance(t *testing.T) {
-	everywhere := docSection(t, "threat-model.md", "- **A compromised maintainer account publishing outside CI, everywhere", "\n- **")
+	everywhere := docSpan(t, "threat-model.md", "- **A compromised maintainer account publishing outside CI, everywhere", "\n- **")
 	if strings.Contains(everywhere, "helm") {
 		t.Errorf("the threat model still lists helm among the types with no verified publisher statement:\n%s", everywhere)
 	}
-	requireAll(t, "the threat model's helm item", docSection(t, "threat-model.md", "- **Helm charts, past the keyring.**", "\n- **"),
+	requireAll(t, "the threat model's helm item", docSpan(t, "threat-model.md", "- **Helm charts, past the keyring.**", "\n- **"),
 		"did not configure records `invalid`", "drops its `.prov` records `unavailable`", "only `block`",
 		"only as good as how the operator", "served over OCI is not checked")
 	requireAll(t, "docs/design.md's admission checks", docParagraph(t, "design.md", "Every path runs the same admission checks"),

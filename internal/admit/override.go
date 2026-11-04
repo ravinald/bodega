@@ -335,6 +335,11 @@ func reportedBlock(blocks []policy.Result) policy.Result {
 	return blocks[0]
 }
 
+// ChecksumDatabaseInvalidReason is why no override admits a version the
+// checksum database disagrees with: its signed log says every client is
+// served other bytes, or the log itself does not verify.
+const ChecksumDatabaseInvalidReason = "a disagreement with the Go checksum database is never overridden"
+
 // notOverridable says why a failed result admits no override, or "" when it
 // does. These are the verdicts that a version is hostile rather than that it
 // misses a policy: a MAL- record or a malware-list hit says it was published
@@ -347,6 +352,8 @@ func notOverridable(r policy.Result) string {
 		return "known malware is never overridden"
 	case r.Check == audit.CheckUpstreamProvenance && r.Provenance != nil && r.Provenance.Outcome == audit.ProvenanceInvalid:
 		return "invalid upstream provenance is never overridden"
+	case r.Check == audit.CheckChecksumDatabase && r.ChecksumDatabase != nil && r.ChecksumDatabase.Outcome == audit.ProvenanceInvalid:
+		return ChecksumDatabaseInvalidReason
 	}
 	return ""
 }

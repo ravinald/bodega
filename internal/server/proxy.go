@@ -434,11 +434,20 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		f.write(w, r)
 		return
 	}
-	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
+	pinDigest, err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable)
+	if err != nil {
 		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
 		s.logFor(r.Context()).Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
 		f.write(w, r)
 		return
+	}
+	if f := s.checksumDatabaseGate(ctx, r, fill, s3Key, spool.path()); f != nil {
+		s.logFor(r.Context()).Error("Go module bytes disagree with the checksum database", "key", s3Key, "incident", f.incident)
+		f.write(w, r)
+		return
+	}
+	if pinDigest != nil {
+		pinDigest()
 	}
 	s.pinFill(ctx, store, fill, s3Key, spool.sha256, immutable)
 
@@ -710,11 +719,22 @@ func (s *Server) clearNotFound(ctx context.Context, store storage.ObjectStore, s
 // says the upstream had answered 404 for it. Anything else is left to the
 // caller: a path never seen missing is a 502, so an outage invents nothing.
 func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, regType, s3Key string, err error) bool {
-	ttl := s.notFoundTTL(regType)
-	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(r.Context()) {
+	if !s.recordedNotFound(r.Context(), store, regType, s3Key, err) {
 		return false
 	}
-	b, gerr := store.Get(r.Context(), notFoundPrefix+s3Key)
+	http.NotFound(w, r)
+	return true
+}
+
+// recordedNotFound is answerRecordedNotFound's rule without the response: the
+// fetch failed to reach the upstream, and a record younger than the type's
+// TTL says the upstream had answered 404 for s3Key.
+func (s *Server) recordedNotFound(ctx context.Context, store storage.ObjectStore, regType, s3Key string, err error) bool {
+	ttl := s.notFoundTTL(regType)
+	if store == nil || ttl <= 0 || !upstreamUnreachable(err) || pathAnsweredIn(ctx) {
+		return false
+	}
+	b, gerr := store.Get(ctx, notFoundPrefix+s3Key)
 	if gerr != nil || b == nil {
 		return false
 	}
@@ -726,8 +746,7 @@ func (s *Server) answerRecordedNotFound(w http.ResponseWriter, r *http.Request, 
 	if age < 0 || age >= ttl {
 		return false
 	}
-	s.logFor(r.Context()).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
-	http.NotFound(w, r)
+	s.logFor(ctx).Warn("upstream unreachable, answering the 404 it gave for this path earlier", "key", s3Key, "recorded", rec.At, "error", err)
 	return true
 }
 
@@ -1227,28 +1246,30 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 }
 
 // verifyProxyChecksum verifies a fetched artifact's SHA-256 against the stored
-// checksum in the audit DB. On first fetch (no stored checksum), it stores the
-// computed digest. On mismatch, returns an error — the caller must NOT cache
-// or serve the artifact.
+// checksum in the audit DB. On first fetch (no stored checksum) it returns
+// pin, which stores the computed digest, for the caller to run once nothing
+// else refuses the bytes: a pin taken on bytes a later gate refuses would hold
+// every honest fetch after it to those bytes. On mismatch, returns an error —
+// the caller must NOT cache or serve the artifact.
 //
 // It takes the digest rather than the bytes: the artifact is streamed to a
 // spool file and hashed on the way, so nothing here ever holds it.
 //
 // Only runs for immutable resources (versioned artifacts). Mutable resources
 // (list files, indexes) change by design and are not checksummed.
-func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string, immutable bool) error {
+func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string, immutable bool) (pin func(), err error) {
 	if !immutable {
-		return nil // mutable resources are not checksummed
+		return nil, nil // mutable resources are not checksummed
 	}
 	if s.auditDB == nil {
-		return nil // no audit DB, skip verification
+		return nil, nil // no audit DB, skip verification
 	}
 
 	// Look up stored checksum.
 	stored, err := s.auditDB.GetChecksum(ctx, s3Key)
 	if err != nil {
 		s.logFor(ctx).Error("checksum DB unavailable, refusing to serve immutable resource", "key", s3Key, "error", err)
-		return fmt.Errorf("checksum lookup unavailable: %w", err)
+		return nil, fmt.Errorf("checksum lookup unavailable: %w", err)
 	}
 
 	// A row with no value is a digest an operator cleared to escape an upstream
@@ -1258,13 +1279,14 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 	// first-fetch path (#225).
 	if stored == nil || stored.Value == "" {
 		// First fetch — store the computed checksum.
-		pkgType, pkgName, pkgVersion := manifest.ParseKey(s3Key)
-		if err := s.auditDB.StoreChecksum(ctx, s3Key, pkgType, pkgName, pkgVersion, "sha256", computed, "computed"); err != nil {
-			s.logFor(ctx).Warn("failed to store checksum", "key", s3Key, "error", err)
-		} else {
-			s.logFor(ctx).Info("checksum stored", "key", s3Key, "sha256", computed[:12]+"...")
-		}
-		return nil
+		return func() {
+			pkgType, pkgName, pkgVersion := manifest.ParseKey(s3Key)
+			if err := s.auditDB.StoreChecksum(ctx, s3Key, pkgType, pkgName, pkgVersion, "sha256", computed, "computed"); err != nil {
+				s.logFor(ctx).Warn("failed to store checksum", "key", s3Key, "error", err)
+			} else {
+				s.logFor(ctx).Info("checksum stored", "key", s3Key, "sha256", computed[:12]+"...")
+			}
+		}, nil
 	}
 
 	// Verify against stored checksum.
@@ -1287,12 +1309,12 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 				Details:    string(details),
 			})
 		}
-		return &checksumMismatchError{incident: incident,
+		return nil, &checksumMismatchError{incident: incident,
 			msg: fmt.Sprintf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))}
 	}
 
 	s.logFor(ctx).Debug("checksum verified", "key", s3Key)
-	return nil
+	return nil, nil
 }
 
 // shortDigest is the leading hex of a digest, enough to name which two
@@ -1492,6 +1514,10 @@ type fillAdmission struct {
 	// signed is the sha256:{hex} the admission verified a publisher signed
 	// for these bytes, held against the bytes the fill then fetches.
 	signed string
+	// row is the admission the gate wrote, for a fill that holds the bytes
+	// to what a check recorded: the checksum database's hashes for a Go
+	// module. Zero when no row was written.
+	row audit.Admission
 }
 
 // fillIdentity names the version an immutable proxy request fetches. The name
@@ -1577,8 +1603,13 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	if hf, ok := helmFillFrom(r.Context()); ok && fill.typ == manifest.TypeHelm && hf.Version == fill.version {
 		ve.URL, ve.SHA256, ve.Checksum = hf.URL, hf.SHA256, hf.Checksum
 	}
-	_, adm, ok := s.admitFill(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
-	fill.signed = adm.SignedSubjectDigest()
+	if s.gomodUnpublished(r.Context(), checkers, fill, s3Key, ve) {
+		http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
+		return fill, false
+	}
+	_, row, ok := s.admitFillRow(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	fill.row = row
+	fill.signed = row.SignedSubjectDigest()
 	return fill, ok
 }
 
@@ -1586,7 +1617,13 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 // check blocked: versionPolicyGate's second half, shared with the oci tag,
 // which names its version in the tag rather than in a storage key. check is
 // the check that blocked, "" when none did.
-func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, adm audit.Admission, ok bool) {
+func (s *Server) admitFill(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, ok bool) {
+	check, _, ok = s.admitFillRow(w, r, fill, ve, checkers, notRun, decision, policyCandidate, baseline, override)
+	return check, ok
+}
+
+// admitFillRow is admitFill returning the row it wrote as well.
+func (s *Server) admitFillRow(w http.ResponseWriter, r *http.Request, fill fillAdmission, ve manifest.VersionEntry, checkers []policy.VersionChecker, notRun, decision, policyCandidate string, baseline baselineLookup, override overrideLookup) (check string, row audit.Admission, ok bool) {
 	if baseline != nil {
 		if stored, ok := baseline(); ok {
 			ve.Baseline, ve.BaselineAt = true, stored.BaselineAt
@@ -1764,14 +1801,37 @@ func (s *Server) pinFill(ctx context.Context, store storage.ObjectStore, fill fi
 	if fill.typ == "" {
 		fill = fillIdentity("", "", s3Key)
 	}
-	s.pinAdmission(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256)
+	var admitted *audit.Admission
+	if fill.row.Decision == audit.AdmissionAdmitted {
+		admitted = &fill.row
+	}
+	s.pinAdmitted(ctx, store, fill.typ, fill.name, fill.version, s3Key, sha256, admitted)
+}
+
+// fillComparison is what a fill vouches for at signing: the spooled bytes,
+// under the row it was admitted with. checksumDatabaseGate has compared a
+// .zip or .mod with that row's hashes by the time the fill pins, and refused
+// it on a disagreement; a .info is outside the log, so its row's evidence
+// stands for it as it is.
+func fillComparison(admitted *audit.Admission, sha256 string) *audit.ChecksumComparison {
+	if admitted == nil {
+		return nil
+	}
+	return &audit.ChecksumComparison{SHA256: sha256, Checks: admitted.Checks}
 }
 
 // pinAdmission attaches key to the newest admitted decision for the version,
 // and says so at WARN when there was none to attach to, then signs the
 // attestation for the pin.
 func (s *Server) pinAdmission(ctx context.Context, store storage.ObjectStore, typ, name, version, key, sha256 string) {
-	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	s.pinAdmitted(ctx, store, typ, name, version, key, sha256, nil)
+}
+
+// pinAdmitted is pinAdmission for a fill holding the decision it was admitted
+// under, which the pin may not trade for one carrying other checksum database
+// evidence (audit.AdmissionPin.Admitted).
+func (s *Server) pinAdmitted(ctx context.Context, store storage.ObjectStore, typ, name, version, key, sha256 string, admitted *audit.Admission) {
+	outcome, err := s.auditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key, Admitted: admitted})
 	switch {
 	case err != nil:
 		s.logFor(ctx).Error("admission row not updated with its object key", "type", typ, "package", name,
@@ -1781,10 +1841,10 @@ func (s *Server) pinAdmission(ctx context.Context, store storage.ObjectStore, ty
 		s.noteFor(ctx).Warn("pinned an object with no admission decision on record; recorded as not_evaluated",
 			"type", typ, "package", name, "version", version, "key", key)
 	}
-	s.emitAttestation(ctx, store, attest.Pin{
+	s.emitCompared(ctx, store, attest.Pin{
 		Type: typ, Name: name, Version: version, ObjectKey: key, SHA256: sha256,
 		RequiredBy: s.requiredBy(ctx, typ, name, version), Outcome: outcome,
-	})
+	}, fillComparison(admitted, sha256))
 }
 
 // proxyMalwareGate refuses a cache fill for a version OSV records as malware,

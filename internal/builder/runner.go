@@ -171,14 +171,15 @@ func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) err
 // moment bytes arrive, and an import can be months old: the row a pin attaches
 // its object key to should be the decision made when those bytes were fetched.
 func (c *Config) EnforcePolicy(ctx context.Context, regType, name string, ve manifest.VersionEntry) error {
-	_, err := c.admitFetch(ctx, regType, name, ve)
+	_, err := c.enforceAdmission(ctx, regType, name, ve)
 	return err
 }
 
-// admitFetch is EnforcePolicy returning the admission row it wrote, for a
-// fetch that holds its bytes to what the row verified. The row is empty when
-// no audit database is configured or the allow-list refused.
-func (c *Config) admitFetch(ctx context.Context, regType, name string, ve manifest.VersionEntry) (audit.Admission, error) {
+// enforceAdmission is EnforcePolicy returning the admission it decided on as
+// well, for a fetch that holds the bytes it brings in to what a check
+// recorded: the checksum database's hashes for a Go module. The result is
+// zero when no row was written.
+func (c *Config) enforceAdmission(ctx context.Context, regType, name string, ve manifest.VersionEntry) (admit.FetchResult, error) {
 	candidate := policy.CandidateFor(regType, name, ve.URL)
 	version := ve.Version
 	if version == "" {
@@ -219,7 +220,7 @@ func (c *Config) admitFetch(ctx context.Context, regType, name string, ve manife
 		})
 	}
 	if c.AuditDB == nil {
-		return audit.Admission{}, err
+		return admit.FetchResult{}, err
 	}
 
 	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone,
@@ -239,7 +240,7 @@ func (c *Config) admitFetch(ctx context.Context, regType, name string, ve manife
 	res := admit.Fetch(ctx, c.AuditDB, fetchCheckers(c.app, c.AuditDB), regType, name, ve, allow,
 		admit.Who{Actor: audit.CurrentActor()}, "")
 	if err != nil {
-		return audit.Admission{}, err
+		return res, err
 	}
 	for _, w := range res.Warns {
 		c.logf("  policy: %s/%s@%s: %s: %s (warn)", regType, name, version, w.Check, w.Reason)
@@ -253,15 +254,37 @@ func (c *Config) admitFetch(ctx context.Context, regType, name string, ve manife
 			Status:     "policy_violation",
 			Details:    res.Block.Check + ": " + res.Block.Reason,
 		})
-		return res.Admission, fmt.Errorf("policy blocked %s@%s: %s: %s", name, version, res.Block.Check, res.Block.Reason)
+		return res, fmt.Errorf("policy blocked %s@%s: %s: %s", name, version, res.Block.Check, res.Block.Reason)
 	}
-	return res.Admission, nil
+	return res, nil
 }
 
 // fetchCheckers is admit.VersionCheckers, held in a variable because the age
 // gate dates a version against the public registries: a test points it at
 // checkers it controls rather than reaching the internet.
 var fetchCheckers = admit.VersionCheckers
+
+type fetchAdmissionKey struct{}
+
+// withFetchAdmission carries the decision a fetch was admitted under to the
+// pin its digest reaches through the shared checksum path, so the pin cannot
+// attach to a concurrent admission carrying other checksum database evidence.
+func withFetchAdmission(ctx context.Context, row audit.Admission) context.Context {
+	if row.Decision != audit.AdmissionAdmitted {
+		return ctx
+	}
+	return context.WithValue(ctx, fetchAdmissionKey{}, row)
+}
+
+// fetchAdmissionFrom is the admission withFetchAdmission carried, when it is
+// for this version.
+func fetchAdmissionFrom(ctx context.Context, typ, name, version string) *audit.Admission {
+	row, ok := ctx.Value(fetchAdmissionKey{}).(audit.Admission)
+	if !ok || row.PkgType != typ || row.PkgName != name || row.PkgVersion != version {
+		return nil
+	}
+	return &row
+}
 
 // pinAdmission attaches an object key to the admission decision for the
 // version whose digest was just pinned, or verified against the pin, and signs
@@ -272,7 +295,9 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	if c.AuditDB == nil || key == "" {
 		return
 	}
-	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key})
+	admitted := fetchAdmissionFrom(ctx, typ, name, version)
+	outcome, err := c.AuditDB.PinAdmission(ctx, audit.AdmissionPin{PkgType: typ, PkgName: name, PkgVersion: version, ObjectKey: key,
+		Admitted: admitted})
 	switch {
 	case err != nil:
 		c.logf("  WARNING: %s/%s@%s: admission row not updated with object key %s: %v", typ, name, version, key, err)
@@ -280,10 +305,15 @@ func (c *Config) pinAdmission(ctx context.Context, typ, name, version, key, sha2
 	case outcome == audit.PinUnadmitted:
 		c.logf("  WARNING: %s/%s@%s: pinned %s with no admission decision on record; recorded it as not_evaluated", typ, name, version, key)
 	}
-	e := c.attestEmitter()
-	if e == nil {
+	shared := c.attestEmitter()
+	if shared == nil {
 		return
 	}
+	// The emitter re-reads the admission by object key, which another fetch of
+	// the same key shares; only this fetch's comparison may stand behind a
+	// verified checksum database row (audit.ComparedAdmissions).
+	e := *shared
+	e.Admissions = audit.ComparedAdmissions{Reader: c.AuditDB, SHA256: sha256, Compared: fetchComparison(ctx, admitted, key, sha256)}
 	// The envelope is written into the build tree under the key it is stored
 	// at, and travels with its artifact on upload: the fetch runs before any
 	// backend is chosen for the bytes, so there is nowhere else it could go

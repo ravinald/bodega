@@ -295,6 +295,16 @@ func admitRefusal(typ, name string, res admitBlock) *refusal {
 	if res.incident != "" {
 		f.incident = res.incident
 	}
+	if res.check == audit.CheckChecksumDatabase {
+		if fmt.Sprint(res.details["outcome"]) == audit.ProvenanceInvalid {
+			f.reason = fmt.Sprintf("the %s check refused %s: the Go checksum database's signed log does not vouch for what it served.", res.check, f.subjectPhrase())
+			f.next = fmt.Sprintf("an override does not apply to a disagreement with the checksum database; give an operator incident %s.", f.incident)
+			return f
+		}
+		f.reason = fmt.Sprintf("the %s check refused %s: the Go checksum database could not be read for it, and this server does not admit a module it cannot verify.", res.check, f.subjectPhrase())
+		f.next = overrideNext(f, res.check) + " A private module goes in gomod_nosumdb instead."
+		return f
+	}
 	switch f.check {
 	case checkAllowList:
 		f.reason = fmt.Sprintf("%s %q is not on this server's upstream allow-list.", typ, name)
@@ -607,6 +617,17 @@ func signedChartRefusal(typ, name, version string) *refusal {
 	f := newRefusal(checkChecksum, typ, name, version, http.StatusBadGateway)
 	f.reason = "the bytes upstream served do not match the digest the chart's .prov signed at admission, so they were not cached or served."
 	f.next = fmt.Sprintf("do not route around it; give an operator incident %s, whose server log line names both digests and the chart URL.", f.incident)
+	return f
+}
+
+// checksumDatabaseRefusal answers Go module bytes that disagree with what the
+// checksum database signed for the version, at the 502 checksumRefusal
+// answers and for its reason: the fault is the bytes upstream served.
+func checksumDatabaseRefusal(module, version, incident string) *refusal {
+	f := newRefusal(checkChecksum, manifest.TypeGomod, module, version, http.StatusBadGateway)
+	f.incident = incident
+	f.reason = "the bytes upstream served do not match the hash the Go checksum database signed for this version, so they were not cached or served."
+	f.next = fmt.Sprintf("do not route around it; give an operator incident %s, whose audit row holds both hashes.", f.incident)
 	return f
 }
 

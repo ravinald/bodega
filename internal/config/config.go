@@ -29,6 +29,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
+	"golang.org/x/mod/sumdb/note"
 )
 
 const (
@@ -157,6 +158,8 @@ type Config struct {
 	StaleGrace             string                 `json:"stale_grace,omitempty"`              // how long a request holding a stale cached copy waits on the upstream
 	GomodUpstream          string                 `json:"gomod_upstream,omitempty"`
 	GomodSumdbURL          string                 `json:"gomod_sumdb_url,omitempty"` // sum.golang.org, proxied under /go/sumdb/sum.golang.org/ for a host that reaches only bodega
+	GomodSumdbKey          string                 `json:"gomod_sumdb_key,omitempty"` // the verifier key the checksum_database check holds the database's tree heads to
+	GomodNoSumdb           string                 `json:"gomod_nosumdb,omitempty"`   // GONOSUMDB patterns, comma-separated: modules the checksum_database check never looks up
 	NpmUpstream            string                 `json:"npm_upstream,omitempty"`
 	PypiUpstream           string                 `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
 	CargoUpstream          string                 `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
@@ -627,6 +630,53 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 		case UpstreamModeOpen, UpstreamModeCatalog:
 		default:
 			return fmt.Errorf("%s[%q]: invalid mode %q (want %q or %q; empty means %q)", key, ns, up.Mode, UpstreamModeOpen, UpstreamModeCatalog, UpstreamModeCatalog)
+		}
+	}
+	return nil
+}
+
+// DefaultGomodSumdbKey is sum.golang.org's verifier key, as the go command
+// carries it in src/cmd/go/internal/modfetch/key.go.
+const DefaultGomodSumdbKey = "sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8"
+
+// validateSumdbKey refuses a gomod_sumdb_key the checksum_database check
+// could never verify a tree head with, and one for a database other than the
+// one bodega relays: the check reads the same gomod_sumdb_url the relay
+// serves as sum.golang.org, so a key for another name would be checking a
+// database no client behind bodega is told about.
+func validateSumdbKey(key string) error {
+	v, err := note.NewVerifier(key)
+	if err != nil {
+		return fmt.Errorf("invalid gomod_sumdb_key %q: %v; want the verifier key of %s, of the form name+hash+key, e.g. %q, because the relay under /go/sumdb/ serves only %s, from gomod_sumdb_url", key, err, GomodSumdbName, DefaultGomodSumdbKey, GomodSumdbName)
+	}
+	if v.Name() != GomodSumdbName {
+		return fmt.Errorf("invalid gomod_sumdb_key %q: it names the database %q, and the relay under /go/sumdb/ serves only %s, from gomod_sumdb_url; use that database's key", key, v.Name(), GomodSumdbName)
+	}
+	return nil
+}
+
+// GomodSumdbName is the only checksum database name bodega relays and checks.
+const GomodSumdbName = "sum.golang.org"
+
+// GomodNoSumdbPatterns splits gomod_nosumdb into its patterns, dropping
+// empty elements the way the go command reads GONOSUMDB.
+func (c *Config) GomodNoSumdbPatterns() []string {
+	var out []string
+	for _, p := range strings.Split(c.GomodNoSumdb, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// validateNoSumdb refuses a gomod_nosumdb element path.Match cannot read,
+// which the go command would skip silently, leaving a module the operator
+// meant to exclude looked up and refused.
+func validateNoSumdb(c *Config) error {
+	for _, p := range c.GomodNoSumdbPatterns() {
+		if _, err := path.Match(p, ""); err != nil {
+			return fmt.Errorf("invalid gomod_nosumdb pattern %q: %v; patterns use path.Match syntax and match a module path prefix, e.g. \"*.corp.example.com,github.com/example-corp/*\"", p, err)
 		}
 	}
 	return nil
@@ -1657,6 +1707,13 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")
 	cfg.GomodSumdbURL = strings.TrimRight(firstNonEmpty(cfg.GomodSumdbURL, "https://sum.golang.org"), "/")
 	if err := validateSumdbURL(cfg.GomodSumdbURL); err != nil {
+		return nil, err
+	}
+	cfg.GomodSumdbKey = strings.TrimSpace(firstNonEmpty(cfg.GomodSumdbKey, DefaultGomodSumdbKey))
+	if err := validateSumdbKey(cfg.GomodSumdbKey); err != nil {
+		return nil, err
+	}
+	if err := validateNoSumdb(cfg); err != nil {
 		return nil, err
 	}
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
@@ -2702,6 +2759,9 @@ func defaultConfigContent() []byte {
   "stale_grace": "3s",
   "gomod_upstream": "https://proxy.golang.org",
   "gomod_sumdb_url": "https://sum.golang.org",
+  "_comment_gomod_sumdb": "gomod_sumdb_key: the key every Go module version's checksum_database lookup is verified with; it must name sum.golang.org. gomod_nosumdb: comma-separated GONOSUMDB patterns for private modules the database cannot know, which are admitted with no lookup.",
+  "gomod_sumdb_key": "sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8",
+  "gomod_nosumdb": "",
   "npm_upstream": "https://registry.npmjs.org",
   "pypi_upstream": "https://pypi.org",
 

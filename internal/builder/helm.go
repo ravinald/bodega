@@ -60,7 +60,8 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 				cfg.logf("  [helm] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			admission, err := cfg.admitFetch(ctx, manifest.TypeHelm, name, ve)
+			fetched, err := cfg.enforceAdmission(ctx, manifest.TypeHelm, name, ve)
+			admission := fetched.Admission
 			if err != nil {
 				cfg.logf("  [helm] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++

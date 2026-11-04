@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/sumdb/dirhash"
 
 	"github.com/ravinald/bodega/internal/attest"
 	"github.com/ravinald/bodega/internal/attestsign"
@@ -737,11 +738,26 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 			had++
 			continue
 		}
-		outcome, err := b.db.PinAdmission(ctx, audit.AdmissionPin{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion, ObjectKey: row.ObjectKey})
+		admitted, compared, err := b.compareGomod(ctx, st, row)
+		if err != nil {
+			fmt.Fprintf(b.out, "  %s: not signed: %v\n", label, err)
+			refused++
+			continue
+		}
+		outcome, err := b.db.PinAdmission(ctx, audit.AdmissionPin{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion, ObjectKey: row.ObjectKey, Admitted: admitted})
+		if errors.Is(err, audit.ErrUnboundChecksumEvidence) || errors.Is(err, audit.ErrAdmissionNotLocated) {
+			fmt.Fprintf(b.out, "  %s: not signed: %v\n", label, err)
+			refused++
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("pin the admission for %s: %w", row.ObjectKey, err)
 		}
-		ek, err := b.emit.Emit(ctx, st, attest.Pin{
+		// The emitter selects the admission by object key; only the comparison
+		// just made may stand behind a verified checksum database row.
+		emit := *b.emit
+		emit.Admissions = audit.ComparedAdmissions{Reader: b.db, SHA256: row.Value, Compared: compared}
+		ek, err := emit.Emit(ctx, st, attest.Pin{
 			Type: row.PkgType, Name: row.PkgName, Version: row.PkgVersion, ObjectKey: row.ObjectKey,
 			SHA256: row.Value, RequiredBy: requiredBy, Outcome: outcome,
 		})
@@ -762,6 +778,94 @@ func (b *backfill) run(ctx context.Context, typ string) error {
 		return fmt.Errorf("%d object(s) were not signed; see the lines above", refused)
 	}
 	return nil
+}
+
+// compareGomod holds a Go module's stored .zip or .mod to the newest admitted
+// row for its version, when that row says the checksum database verified it,
+// and returns the row to pin under and the comparison the signer may rely on.
+// The row may have been decided by a lookup, an import or a fetch of other
+// bytes under the same key, none of which read these, so the stored bytes are
+// compared with the hash it recorded whether or not it already names this
+// object. A .info is outside the log and stands on the row as it is. Any other
+// object, row or outcome returns nils, and nothing verified is signed for it.
+// A disagreement, or stored bytes that no longer hash to the pin, is an error
+// and nothing is attached.
+func (b *backfill) compareGomod(ctx context.Context, st storage.ObjectStore, row audit.StoredChecksum) (*audit.Admission, *audit.ChecksumComparison, error) {
+	ext := path.Ext(row.ObjectKey)
+	if row.PkgType != manifest.TypeGomod || (ext != ".zip" && ext != ".mod" && ext != ".info") {
+		return nil, nil, nil
+	}
+	rows, err := b.db.Admissions(ctx, audit.AdmissionFilter{PkgType: row.PkgType, PkgName: row.PkgName, PkgVersion: row.PkgVersion})
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the admissions for %s@%s: %w", row.PkgName, row.PkgVersion, err)
+	}
+	var newest *audit.Admission
+	for i := range rows {
+		if rows[i].PkgVersion == row.PkgVersion && rows[i].Decision == audit.AdmissionAdmitted {
+			newest = &rows[i]
+			break
+		}
+	}
+	if newest == nil {
+		return nil, nil, nil
+	}
+	var signed *audit.ChecksumDatabase
+	for _, c := range newest.Checks {
+		if c.Check == audit.CheckChecksumDatabase && c.ChecksumDatabase != nil && c.ChecksumDatabase.Outcome == audit.ProvenanceVerified {
+			signed = c.ChecksumDatabase
+		}
+	}
+	if signed == nil {
+		return nil, nil, nil
+	}
+	compared := &audit.ChecksumComparison{SHA256: row.Value, Checks: newest.Checks}
+	if ext == ".info" {
+		return newest, compared, nil
+	}
+	want := signed.ZipHash
+	if ext == ".mod" {
+		want = signed.ModHash
+	}
+	got, err := storedGomodHash(ctx, st, row)
+	if err != nil {
+		return nil, nil, err
+	}
+	if got != want {
+		return nil, nil, fmt.Errorf("CHECKSUM DATABASE MISMATCH: %s@%s: the stored %s hashes to %s, but %s signed %s; nothing was attached or signed. Do not serve it: delete %s and fetch the version again, which compares what upstream serves with the log",
+			row.PkgName, row.PkgVersion, path.Base(row.ObjectKey), got, signed.Database, want, row.ObjectKey)
+	}
+	return newest, compared, nil
+}
+
+func storedGomodHash(ctx context.Context, st storage.ObjectStore, row audit.StoredChecksum) (string, error) {
+	obj, err := st.GetStream(ctx, row.ObjectKey)
+	if err != nil {
+		return "", fmt.Errorf("read %s to compare it with the checksum database: %w", row.ObjectKey, err)
+	}
+	if obj == nil {
+		return "", fmt.Errorf("read %s to compare it with the checksum database: the object is gone", row.ObjectKey)
+	}
+	defer func() { _ = obj.Body.Close() }()
+	tmp, err := os.CreateTemp("", "bodega-backfill-*"+path.Ext(row.ObjectKey))
+	if err != nil {
+		return "", fmt.Errorf("spool %s: %w", row.ObjectKey, err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	sum := sha256.New()
+	_, err = io.Copy(io.MultiWriter(tmp, sum), obj.Body)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", fmt.Errorf("spool %s: %w", row.ObjectKey, err)
+	}
+	if got := hex.EncodeToString(sum.Sum(nil)); !strings.EqualFold(got, row.Value) {
+		return "", fmt.Errorf("%s hashes to sha256 %s, not the pinned %s; the stored object changed after it was pinned, so nothing was signed", row.ObjectKey, got, row.Value)
+	}
+	if path.Ext(row.ObjectKey) == ".zip" {
+		return dirhash.HashZip(tmp.Name(), dirhash.Hash1)
+	}
+	return dirhash.Hash1([]string{"go.mod"}, func(string) (io.ReadCloser, error) { return os.Open(tmp.Name()) })
 }
 
 // backendFor returns the backend a pinned object lives on and its version's

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -107,6 +108,9 @@ func TestFetchGomodRecordsInfoTime(t *testing.T) {
 		Versions: []manifest.VersionEntry{{Version: version, URL: srv.URL}},
 	})
 	cfg.Stdout = &strings.Builder{}
+	// The stub's zip is no module the checksum database signed; this case is
+	// about the .info time.
+	cfg.app = &config.Config{GomodNoSumdb: mod}
 
 	if s := FetchGomod(cfg, store, ""); s.Failures != 0 {
 		t.Fatalf("fetch reported %d failures: %+v", s.Failures, s.Results)

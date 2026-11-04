@@ -95,6 +95,8 @@ func newPrefetchFixture(t *testing.T, osvAction string) *prefetchFixture {
 
 	f.adbPath = filepath.Join(f.dir, "audit.db")
 	f.manifests = filepath.Join(f.dir, "manifests")
+	// gomod_nosumdb: the stub's modules are example.com paths no checksum
+	// database holds, and the test binary reaches none.
 	body := fmt.Sprintf(`{
   "storage_backend": "local",
   "storage_path": %q,
@@ -105,7 +107,8 @@ func newPrefetchFixture(t *testing.T, osvAction string) *prefetchFixture {
   "osv_db_dir": %q,
   "npm_upstream": %q,
   "gomod_upstream": %q,
-  "allow_plaintext": true
+  "allow_plaintext": true,
+  "gomod_nosumdb": "example.com"
 }`, filepath.Join(f.dir, "storage"), f.manifests, filepath.Join(f.dir, "build"), f.adbPath, f.dir, osvDir, stub.URL, stub.URL)
 	path := filepath.Join(f.dir, "config.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {

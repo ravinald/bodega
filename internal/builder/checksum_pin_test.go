@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -172,5 +173,44 @@ func TestVerifyFetchedPinsAnAlreadyFetchedArtifact(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "podinfo") {
 		t.Errorf("the refusal does not name the package: %v", err)
+	}
+}
+
+// A gomod fetch admitted unknown under an override pins under that decision,
+// not under a newer admission of the same version that verified other bytes.
+func TestGomodPinKeepsTheFetchsAdmission(t *testing.T) {
+	const sum = "3333333333333333333333333333333333333333333333333333333333333333"
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeGomod,
+		Name:     "example.com/widget",
+		Versions: []manifest.VersionEntry{{Version: "v1.2.3"}},
+	}
+	cfg, _, db := pinEnv(t, pm)
+	row := func(outcome, status string) audit.Admission {
+		return audit.Admission{PkgType: manifest.TypeGomod, PkgName: pm.Name, PkgVersion: "v1.2.3", Decision: audit.AdmissionAdmitted,
+			Checks: []audit.AdmissionCheck{{Check: audit.CheckChecksumDatabase, Action: "block", Status: status, Detail: outcome,
+				ChecksumDatabase: &audit.ChecksumDatabase{Outcome: outcome, ZipHash: "h1:zip", ModHash: "h1:mod"}}}}
+	}
+	fetched := row(audit.ProvenanceUnknown, audit.CheckOverridden)
+	fetched.DecidedAt = time.Now().Add(-time.Minute)
+	if err := db.RecordAdmission(t.Context(), fetched); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordAdmission(t.Context(), row(audit.ProvenanceVerified, audit.CheckPass)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := withFetchAdmission(t.Context(), fetched)
+	if err := cfg.pinChecksum(ctx, pm, pm.Versions[0], newSHA256Checksum(sum)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeGomod})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		outcome := r.Checks[0].ChecksumDatabase.Outcome
+		if pinned := r.ObjectKey != ""; pinned != (outcome == audit.ProvenanceUnknown) {
+			t.Errorf("row %s carries key %q; only the fetch's own unknown row may", outcome, r.ObjectKey)
+		}
 	}
 }
