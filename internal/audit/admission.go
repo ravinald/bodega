@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,6 +28,11 @@ const (
 	// verified against the Sigstore trusted root. Its entry carries the
 	// outcome and the identity verified in Provenance.
 	CheckUpstreamProvenance = "upstream_provenance"
+	// CheckChecksumDatabase is a Go module version looked up in the checksum
+	// database and verified against its signed tree head. Only gomod rows
+	// carry it. Its entry carries the outcome, the tree and both hashes in
+	// ChecksumDatabase.
+	CheckChecksumDatabase = "checksum_database"
 	// CheckOverride is the operator answering y to the allow-list prompt
 	// `bodega pkg create` carried before two-person overrides replaced it.
 	// Nothing writes it now; rows decided under the prompt still carry it.
@@ -59,6 +65,9 @@ type AdmissionCheck struct {
 	// Provenance is set on the upstream_provenance entry when the check
 	// ran, and nil everywhere else.
 	Provenance *UpstreamProvenance `json:"provenance,omitempty"`
+	// ChecksumDatabase is set on the checksum_database entry when the check
+	// ran, and nil everywhere else.
+	ChecksumDatabase *ChecksumDatabase `json:"checksum_database,omitempty"`
 	// Override is the ID of the override that admitted past this check's
 	// failure, set when Status is CheckOverridden.
 	Override string `json:"override,omitempty"`
@@ -109,6 +118,24 @@ type UpstreamProvenance struct {
 	BundleDigest string `json:"bundle_digest,omitempty"`
 }
 
+// ChecksumDatabase is what the checksum_database check read. Outcome is one
+// of the upstream provenance outcomes: verified, invalid, unknown, or
+// unavailable for a module gomod_nosumdb names. The tree and hashes are set
+// when the database answered; File and Computed are set on a refusal at the
+// fetch, naming the file whose bytes disagreed and the hash they computed to.
+type ChecksumDatabase struct {
+	Outcome  string `json:"outcome"`
+	Database string `json:"database,omitempty"`
+	TreeSize int64  `json:"tree_size,omitempty"`
+	TreeHash string `json:"tree_hash,omitempty"`
+	// ZipHash and ModHash are the h1: hashes the database holds for the
+	// module zip and for its go.mod alone.
+	ZipHash  string `json:"zip_hash,omitempty"`
+	ModHash  string `json:"mod_hash,omitempty"`
+	File     string `json:"file,omitempty"`
+	Computed string `json:"computed,omitempty"`
+}
+
 // Admission is one decision on one version.
 // The JSON names are the column names, as on the write-only sinks' records.
 type Admission struct {
@@ -157,7 +184,31 @@ type AdmissionPin struct {
 	PkgName    string
 	PkgVersion string
 	ObjectKey  string
+	// Admitted is the decision the pinning fetch was admitted under, when the
+	// caller holds it. The newest admitted row stands in for it only when both
+	// carry the same checksum_database entry; otherwise the pin attaches to the
+	// newest row that does, or to none. Two fetches of one module version can
+	// overlap, and bytes never compared with the checksum database must not be
+	// pinned, then signed, under another fetch's verified comparison. With
+	// Admitted nil, a row whose checksum_database outcome is verified is never
+	// attached to a new object: ErrUnboundChecksumEvidence.
+	Admitted *Admission
 }
+
+// ErrUnboundChecksumEvidence is PinAdmission refusing to attach an object to a
+// row whose checksum_database outcome is verified when the caller named no
+// admission: verified says the object's bytes were compared with the signed
+// hashes, and a pin that names no admission proves no comparison ran. The
+// caller compares the bytes and names the row, or the object goes unattached.
+var ErrUnboundChecksumEvidence = errors.New("a verified checksum database row is attached only to bytes compared under it, and this pin names no admission")
+
+// ErrAdmissionNotLocated is PinAdmission declining a pin whose fetch holds an
+// admission it cannot find on record with the same checksum_database entry.
+// The fetch was decided, so writing the not_evaluated row an undecided pin
+// gets would be a new admitted decision, newer than any refusal recorded
+// since, and the signer would sign it. The object stays unattached and
+// unsigned instead.
+var ErrAdmissionNotLocated = errors.New("the admission this fetch was decided under is not among the newest admitted rows carrying its checksum database evidence, so the object is left unattached and unsigned rather than recorded under a new decision")
 
 // admissionPinResult is what a queryable sink found when it tried to attach a
 // pin. Found is false when the version has no admitted row; Attached is true
@@ -211,7 +262,9 @@ func (a *DB) RecordAdmission(ctx context.Context, row Admission) error {
 // version. With none to attach to, it writes a row for the key whose checks
 // all say not_evaluated, and reports PinUnadmitted so the caller can say so:
 // bytes reached the store with no decision behind them, and a fabricated pass
-// would hide exactly that.
+// would hide exactly that. A pin naming the admission its fetch was decided
+// under never gets that row: it attaches to a row carrying the same checksum
+// evidence, or fails with ErrAdmissionNotLocated.
 func (a *DB) PinAdmission(ctx context.Context, p AdmissionPin) (PinOutcome, error) {
 	if a.readOnly {
 		return PinUnverified, nil
@@ -235,7 +288,7 @@ func (a *DB) PinAdmission(ctx context.Context, p AdmissionPin) (PinOutcome, erro
 		PkgVersion: p.PkgVersion,
 		ObjectKey:  p.ObjectKey,
 		Decision:   AdmissionAdmitted,
-		Checks:     NotEvaluatedChecks("pinned with no admission decision on record for this version"),
+		Checks:     NotEvaluatedChecksFor(p.PkgType, "pinned with no admission decision on record for this version"),
 	})
 }
 
@@ -345,6 +398,26 @@ func NotEvaluatedChecks(detail string) []AdmissionCheck {
 	}
 }
 
+// NotEvaluatedChecksFor is NotEvaluatedChecks for a row of typ: a gomod row
+// also carries checksum_database, after upstream_provenance, as every gomod
+// admission row does.
+func NotEvaluatedChecksFor(typ, detail string) []AdmissionCheck {
+	checks := NotEvaluatedChecks(detail)
+	if typ != gomodType {
+		return checks
+	}
+	for i, c := range checks {
+		if c.Check == CheckUpstreamProvenance {
+			sumdb := AdmissionCheck{Check: CheckChecksumDatabase, Action: ActionNone, Status: CheckNotEvaluated, Detail: detail}
+			return append(checks[:i+1], append([]AdmissionCheck{sumdb}, checks[i+1:]...)...)
+		}
+	}
+	return checks
+}
+
+// gomodType is manifest.TypeGomod, which audit cannot import.
+const gomodType = "gomod"
+
 // ValidAdmissionDecision reports whether d is one of the three decisions.
 func ValidAdmissionDecision(d string) bool {
 	switch d {
@@ -397,28 +470,36 @@ const sqliteDecidedAt = "2006-01-02T15:04:05.000000Z"
 func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string, forUpdate string, parseTime func(any) time.Time) (admissionPinResult, error) {
 	q := `SELECT id, object_key, checks, policy_digest, actor, identity, decided_at FROM admissions
 		WHERE pkg_type = ` + ph(1) + ` AND pkg_name = ` + ph(2) + ` AND pkg_version = ` + ph(3) + ` AND decision = 'admitted'
-		ORDER BY decided_at DESC, id DESC LIMIT 1` + forUpdate
-	var (
-		row     = Admission{PkgType: p.PkgType, PkgName: p.PkgName, PkgVersion: p.PkgVersion, Decision: AdmissionAdmitted}
-		key     sql.NullString
-		checks  string
-		decided any
-	)
-	err := tx.QueryRowContext(ctx, q, p.PkgType, p.PkgName, p.PkgVersion).
-		Scan(&row.ID, &key, &checks, &row.PolicyDigest, &row.Actor, &row.Identity, &decided)
-	if errors.Is(err, sql.ErrNoRows) {
-		return admissionPinResult{}, nil
-	}
+		ORDER BY decided_at DESC, id DESC LIMIT `
+	rows, err := tx.QueryContext(ctx, q+"1"+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
 	if err != nil {
 		return admissionPinResult{}, err
 	}
-	if row.Checks, err = decodeChecks(checks); err != nil {
+	row, key, found, err := pinCandidate(rows, p, nil, parseTime)
+	if err != nil {
 		return admissionPinResult{}, err
 	}
-	row.DecidedAt = parseTime(decided)
-	row.ObjectKey = key.String
+	if found && p.Admitted != nil && !sameChecksumEvidence(row.Checks, p.Admitted.Checks) {
+		rows, err := tx.QueryContext(ctx, q+strconv.Itoa(pinCandidateWindow)+forUpdate, p.PkgType, p.PkgName, p.PkgVersion)
+		if err != nil {
+			return admissionPinResult{}, err
+		}
+		if row, key, found, err = pinCandidate(rows, p, p.Admitted, parseTime); err != nil {
+			return admissionPinResult{}, err
+		}
+	}
+	if !found {
+		if p.Admitted != nil {
+			return admissionPinResult{}, fmt.Errorf("%w: %s/%s@%s, object %s, searched %d rows; run 'bodega attest backfill' to compare the stored bytes and sign them under the newest decision",
+				ErrAdmissionNotLocated, p.PkgType, p.PkgName, p.PkgVersion, p.ObjectKey, pinCandidateWindow)
+		}
+		return admissionPinResult{}, nil
+	}
 
+	unbound := p.Admitted == nil && key.String != p.ObjectKey && verifiedChecksumEvidence(row.Checks)
 	switch {
+	case unbound:
+		return admissionPinResult{}, fmt.Errorf("%w: %s/%s@%s, object %s", ErrUnboundChecksumEvidence, p.PkgType, p.PkgName, p.PkgVersion, p.ObjectKey)
 	case !key.Valid:
 		//nolint:gosec // G202: only bind placeholders are concatenated; every value is bound.
 		if _, err := tx.ExecContext(ctx, `UPDATE admissions SET object_key = `+ph(1)+` WHERE id = `+ph(2), p.ObjectKey, row.ID); err != nil {
@@ -449,6 +530,117 @@ func pinTx(ctx context.Context, tx *sql.Tx, p AdmissionPin, ph func(int) string,
 	}
 	row.ObjectKey = p.ObjectKey
 	return admissionPinResult{Found: true, Attached: true, Row: row}, nil
+}
+
+// pinCandidateWindow bounds how many admitted rows of one version a pin reads
+// looking for its fetch's checksum evidence. Exhausting it declines the pin
+// (ErrAdmissionNotLocated); it never decides anything.
+const pinCandidateWindow = 200
+
+// pinCandidate reads rows newest first and returns the first whose
+// checksum_database entry matches admitted's, or the first row at all when
+// admitted is nil. It closes rows.
+func pinCandidate(rows *sql.Rows, p AdmissionPin, admitted *Admission, parseTime func(any) time.Time) (Admission, sql.NullString, bool, error) {
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			row     = Admission{PkgType: p.PkgType, PkgName: p.PkgName, PkgVersion: p.PkgVersion, Decision: AdmissionAdmitted}
+			key     sql.NullString
+			checks  string
+			decided any
+		)
+		if err := rows.Scan(&row.ID, &key, &checks, &row.PolicyDigest, &row.Actor, &row.Identity, &decided); err != nil {
+			return Admission{}, key, false, err
+		}
+		var err error
+		if row.Checks, err = decodeChecks(checks); err != nil {
+			return Admission{}, key, false, err
+		}
+		if admitted != nil && !sameChecksumEvidence(row.Checks, admitted.Checks) {
+			continue
+		}
+		row.DecidedAt = parseTime(decided)
+		row.ObjectKey = key.String
+		return row, key, true, rows.Close()
+	}
+	return Admission{}, sql.NullString{}, false, rows.Err()
+}
+
+// verifiedChecksumEvidence reports whether checks carry a checksum_database
+// entry whose outcome is verified.
+func verifiedChecksumEvidence(checks []AdmissionCheck) bool {
+	for _, c := range checks {
+		if c.Check == CheckChecksumDatabase && c.ChecksumDatabase != nil && c.ChecksumDatabase.Outcome == ProvenanceVerified {
+			return true
+		}
+	}
+	return false
+}
+
+// ChecksumComparison is a caller vouching that the bytes whose SHA-256 is
+// SHA256 were fetched under Checks: compared with the hashes in its
+// checksum_database entry and matched, where that entry is verified.
+type ChecksumComparison struct {
+	SHA256 string
+	Checks []AdmissionCheck
+}
+
+// AdmissionLister is the read DB.Admissions serves.
+type AdmissionLister interface {
+	Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, error)
+}
+
+// ComparedAdmissions is Reader with every admitted row whose checksum_database
+// outcome is verified withheld, unless Compared vouches for SHA256 under that
+// row's evidence. A signer reading the newest row for a version would otherwise
+// sign any digest pinned under the version's object key with whichever fetch
+// verified last: two fetches of one key can carry different bytes and
+// different evidence, and the key names neither. Rows no comparison could
+// support (any other outcome) pass through, because they claim nothing about
+// the bytes. A row of any other decision passes through whatever evidence it
+// carries: the log verifying says nothing about the age, malware or other
+// gates, and withholding a newer denial would hand the signer an older
+// admission as the newest decision.
+type ComparedAdmissions struct {
+	Reader   AdmissionLister
+	SHA256   string
+	Compared *ChecksumComparison
+}
+
+// Admissions reads Reader and drops what the comparison does not support.
+func (c ComparedAdmissions) Admissions(ctx context.Context, f AdmissionFilter) ([]Admission, error) {
+	rows, err := c.Reader.Admissions(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	out := rows[:0:0]
+	for _, r := range rows {
+		if r.Decision == AdmissionAdmitted && verifiedChecksumEvidence(r.Checks) && !c.vouches(r) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (c ComparedAdmissions) vouches(r Admission) bool {
+	return c.Compared != nil && c.SHA256 != "" && strings.EqualFold(c.Compared.SHA256, c.SHA256) &&
+		sameChecksumEvidence(r.Checks, c.Compared.Checks)
+}
+
+// sameChecksumEvidence reports whether a and b carry the same checksum_database
+// entry, status, detail and hashes included, or neither carries one.
+func sameChecksumEvidence(a, b []AdmissionCheck) bool {
+	entry := func(checks []AdmissionCheck) string {
+		for _, c := range checks {
+			if c.Check == CheckChecksumDatabase {
+				raw, _ := json.Marshal(c)
+				return string(raw)
+			}
+		}
+		return ""
+	}
+	return entry(a) == entry(b)
 }
 
 // buildAdmissionQuery renders the newest-first read for f. ph renders the nth

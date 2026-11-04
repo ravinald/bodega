@@ -22,8 +22,8 @@ import (
 
 // TestMain points the host-wide search paths at a scratch directory before any
 // test builds a Server, and stops the import path's publish-time reads at the
-// loopback interface, so an import test never reaches a public registry, GitHub
-// or Sigstore.
+// loopback interface, so an import test never reaches a public registry, GitHub,
+// Sigstore or sum.golang.org.
 //
 // New() reads the apt signing key from /etc/bodega/apt-signing.key and the
 // token pepper from /etc/bodega/pepper or the user's config directory, none of
@@ -60,6 +60,12 @@ func TestMain(m *testing.M) {
 			return nil, errors.New("a test binary fetches no Sigstore trusted root")
 		}
 		return v
+	}
+
+	admit.NewChecksumDatabase = func(cfg *config.Config, trees provenance.ChecksumDatabaseStore, events provenance.EventRecorder, readOnly bool) *provenance.ChecksumDatabase {
+		c := admit.ChecksumDatabaseConfig(cfg, trees, events, readOnly)
+		c.HTTP = &http.Client{Transport: loopbackOnly{}}
+		return provenance.NewChecksumDatabase(c)
 	}
 
 	code := m.Run()

@@ -6,10 +6,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"golang.org/x/mod/sumdb/dirhash"
+
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -68,17 +72,39 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				cfg.logf("  [gomod] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			if err := cfg.EnforcePolicy(ctx, manifest.TypeGomod, name, ve); err != nil {
+			// The module path, not the safe name: the checksum database and the
+			// allow-list's prefix rules key by it, and the digest pin the fetch
+			// takes names the row it attaches to by it.
+			admission, err := cfg.enforceAdmission(ctx, manifest.TypeGomod, pm.Name, ve)
+			if err != nil {
 				cfg.logf("  [gomod] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
 				summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
 				continue
 			}
+			vctx := withFetchAdmission(ctx, admission.Admission)
+			signed := admit.ChecksumDatabaseEntry(admission.Admission)
+			verified := signed != nil && signed.ChecksumDatabase.Outcome == audit.ProvenanceVerified
 			if !cfg.Force {
 				stage := CheckGomodStage(cfg, name, ve)
-				if stage.Fetched {
+				// Reused bytes are held to a verified verdict before anything
+				// pins or signs them under it. A partial build root has nothing
+				// to compare, so it is fetched again rather than reused.
+				if stage.Fetched && verified && !stage.Built {
+					cfg.logf("  [gomod] %s: build root lacks the .mod or .zip, fetching again to compare with the checksum database", name)
+				} else if stage.Fetched {
 					cfg.logf("  [gomod] %s: already fetched, skipping", name)
-					if err := cfg.verifyFetched(ctx, store, manifest.TypeGomod, name, ve); err != nil {
+					if verified {
+						compared, err := cfg.compareGomodWithDatabase(ctx, gomodDir(d, name), pm.Name, ve.Version, admission.Admission, *signed.ChecksumDatabase)
+						if err != nil {
+							cfg.logf("  [gomod] %s: %v", name, err)
+							summary.Failures++
+							summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
+							continue
+						}
+						vctx = withComparedDigests(vctx, compared)
+					}
+					if err := cfg.verifyFetched(vctx, store, manifest.TypeGomod, name, ve); err != nil {
 						cfg.logf("  [gomod] %s: %v", name, err)
 						summary.Failures++
 						summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
@@ -111,6 +137,10 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			// escaped as the proxy protocol requires of an uppercase letter.
 			base := proxy + "/" + manifest.GomodEscapedPath(pm.Name) + "/@v/" + ve.Version
 
+			if signed != nil && !verified {
+				_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum database %s, so the fetched bytes are not compared with it\n", name, signed.ChecksumDatabase.Outcome)
+			}
+
 			var fetchErr error
 			for _, ext := range []string{".info", ".mod", ".zip"} {
 				url := base + ext
@@ -122,6 +152,20 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					break
 				}
 				result.Artifacts = append(result.Artifacts, dest)
+
+				// The .mod and .zip are both on disk once the .zip is, and are
+				// held to the database before anything records the zip's digest.
+				if ext == ".zip" && verified {
+					compared, err := cfg.compareGomodWithDatabase(ctx, dir, pm.Name, ve.Version, admission.Admission, *signed.ChecksumDatabase)
+					if err != nil {
+						_, _ = fmt.Fprintf(out, "  [gomod] %s: %v\n", name, err)
+						result.Artifacts = nil
+						fetchErr = err
+						break
+					}
+					vctx = withComparedDigests(vctx, compared)
+					_, _ = fmt.Fprintf(out, "  [gomod] %s: .zip and .mod match the checksum database\n", name)
+				}
 
 				// Verify checksum for the .zip (primary artifact).
 				if ext == ".zip" {
@@ -136,7 +180,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						}
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum verified (%s)\n", name, ve.Checksum.Algorithm)
 						if !ve.ChecksumVerified {
-							if e := cfg.findAndUpdateGomodChecksum(store, name, ve, ve.Checksum, true); e != nil {
+							if e := cfg.findAndUpdateGomodChecksum(vctx, store, name, ve, ve.Checksum, true); e != nil {
 								_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save verified status: %v\n", name, e)
 							}
 						}
@@ -144,7 +188,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						// Auto-populate checksum on first fetch.
 						cs := newSHA256Checksum(computed)
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum recorded (sha256:%s...)\n", name, computed[:12])
-						if e := cfg.findAndUpdateGomodChecksum(store, name, ve, cs, false); e != nil {
+						if e := cfg.findAndUpdateGomodChecksum(vctx, store, name, ve, cs, false); e != nil {
 							_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save checksum: %v\n", name, e)
 						}
 					}
@@ -183,6 +227,89 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 	}
 
 	return summary
+}
+
+// compareGomodWithDatabase holds the fetched .zip and .mod of module@version
+// to the hashes the checksum database signed, and returns the SHA-256 of each
+// file it compared, keyed by extension, for the pin to vouch for. On a
+// disagreement it removes the version's three files, so GomodArtifactPaths
+// uploads none of them, and writes the policy_blocked row; no policy or
+// override applies.
+func (cfg *Config) compareGomodWithDatabase(ctx context.Context, dir, module, version string, admitted audit.Admission, signed audit.ChecksumDatabase) (map[string]string, error) {
+	compared := map[string]string{}
+	for _, f := range []struct{ ext, want string }{{".zip", signed.ZipHash}, {".mod", signed.ModHash}} {
+		path := filepath.Join(dir, version+f.ext)
+		// The SHA-256 is read before the h1: hash, so bytes swapped in between
+		// fail the comparison rather than reach the pin under it.
+		digest, err := computeFileSHA256(path)
+		got := ""
+		if err == nil {
+			got, err = gomodFileHash(path, f.ext)
+		}
+		if err == nil && got == f.want {
+			if again, aerr := computeFileSHA256(path); aerr == nil && again == digest {
+				compared[f.ext] = digest
+				continue
+			}
+			err = fmt.Errorf("%s changed while it was compared", path)
+		}
+		if err != nil {
+			got = "an error (" + err.Error() + ")"
+		}
+		for _, ext := range []string{".info", ".mod", ".zip"} {
+			_ = os.Remove(filepath.Join(dir, version+ext))
+		}
+		_, incident := admit.RecordChecksumMismatch(ctx, cfg.AuditDB, admitted, version+f.ext, got,
+			admit.Who{Actor: audit.CurrentActor()})
+		return nil, fmt.Errorf("CHECKSUM DATABASE MISMATCH: %s@%s: the fetched %s hashes to %s, but %s signed %s; the version's .info, .mod and .zip were removed and nothing was stored. Incident %s: do not fetch around it; compare what the upstream GOPROXY serves with %s/lookup/%s@%s before trusting either",
+			module, version, version+f.ext, got, signed.Database, f.want, incident, cfg.sumdbURL(), manifest.GomodEscapedPath(module), version)
+	}
+	return compared, nil
+}
+
+type comparedDigestsKey struct{}
+
+// withComparedDigests carries the SHA-256 of each Go module file
+// compareGomodWithDatabase matched to the pin that signs it.
+func withComparedDigests(ctx context.Context, compared map[string]string) context.Context {
+	return context.WithValue(ctx, comparedDigestsKey{}, compared)
+}
+
+// fetchComparison is what a pin of key may vouch for at signing: the fetch's
+// own admission evidence, over the digest that fetch compared with it. Under a
+// verified checksum database entry that is the SHA-256 compareGomodWithDatabase
+// read for the file, and none when it read none, so a pin of other bytes, or
+// of a file nothing compared, is not signed under the verified row. A .info is
+// outside the log and stands on the row as it is.
+func fetchComparison(ctx context.Context, admitted *audit.Admission, key, sha256 string) *audit.ChecksumComparison {
+	if admitted == nil {
+		return nil
+	}
+	entry := admit.ChecksumDatabaseEntry(*admitted)
+	if entry != nil && entry.ChecksumDatabase.Outcome == audit.ProvenanceVerified && pathpkg.Ext(key) != ".info" {
+		compared, _ := ctx.Value(comparedDigestsKey{}).(map[string]string)
+		sha256 = compared[pathpkg.Ext(key)]
+		if sha256 == "" {
+			return nil
+		}
+	}
+	return &audit.ChecksumComparison{SHA256: sha256, Checks: admitted.Checks}
+}
+
+// gomodFileHash is the go command's h1: hash of a module zip, or of a go.mod
+// on its own.
+func gomodFileHash(path, ext string) (string, error) {
+	if ext == ".zip" {
+		return dirhash.HashZip(path, dirhash.Hash1)
+	}
+	return dirhash.Hash1([]string{"go.mod"}, func(string) (io.ReadCloser, error) { return os.Open(path) }) //nolint:gosec // a build-root path the fetch derived
+}
+
+func (cfg *Config) sumdbURL() string {
+	if cfg.app != nil && cfg.app.GomodSumdbURL != "" {
+		return cfg.app.GomodSumdbURL
+	}
+	return "https://sum.golang.org"
 }
 
 // GomodArtifactPaths returns local/S3 path pairs for upload.

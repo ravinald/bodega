@@ -88,6 +88,9 @@ const (
 	EventShow    EventType = "show"    // bodega show
 	EventPolicy  EventType = "policy"  // a gate's action changed, e.g. bodega policy osv malware set
 	EventRevet   EventType = "revet"   // a re-vet refused an admitted version, or the webhook requested one
+	// EventChecksumDatabase is the Go checksum database serving something
+	// its own key does not vouch for: a forked log or a record outside it.
+	EventChecksumDatabase EventType = "checksum_database"
 
 	// Server lifecycle events.
 	EventServeStart EventType = "serve_start" // bodega serve started
@@ -118,7 +121,7 @@ func EventTypes() []EventType {
 		EventInit, EventReset, EventStatus, EventFetch, EventBuild,
 		EventPackage, EventUpload, EventSync, EventCreate, EventDelete,
 		EventRepair, EventRefresh, EventHide, EventFreeze, EventEdit,
-		EventShow, EventPolicy, EventRevet,
+		EventShow, EventPolicy, EventRevet, EventChecksumDatabase,
 		EventServeStart, EventServeStop,
 		EventServeFetch, EventCache,
 		EventDenied, EventOverride, EventInventory, EventQueue,

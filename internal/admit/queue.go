@@ -30,11 +30,12 @@ const (
 	QueueProfile    = "profile"
 	QueueProvenance = audit.CheckUpstreamProvenance
 	QueueSimilarity = audit.CheckNameSimilarity
+	QueueChecksumDB = audit.CheckChecksumDatabase
 )
 
 // QueueChecks is every check a queue row can name.
 func QueueChecks() []string {
-	return []string{QueueAllowList, QueueAge, QueueOSV, QueueMalware, QueueProfile, QueueProvenance, QueueSimilarity}
+	return []string{QueueAllowList, QueueAge, QueueOSV, QueueMalware, QueueProfile, QueueProvenance, QueueChecksumDB, QueueSimilarity}
 }
 
 // QueueCheckFor is the queue check for a blocking admission result.

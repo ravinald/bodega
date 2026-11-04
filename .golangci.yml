@@ -19,6 +19,7 @@ linters:
         - (*database/sql.DB).Close
         - (*database/sql.Rows).Close
         - (*os.File).Close
+        - (net.Conn).Close
         - (*net/http.Response).Body.Close
         # Project-specific: audit.DB.Close — defer-close pattern across every
         # CLI subcommand. Underlying SQL handle close errors are non-actionable.

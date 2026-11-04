@@ -2,16 +2,25 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	pathpkg "path"
 	"strings"
 	"time"
 
 	"net/http"
 
 	modulepath "golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
 
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance"
 )
 
 // ---- Go module proxy -------------------------------------------------------
@@ -235,6 +244,118 @@ func (s *Server) handleGomodSumdb(w http.ResponseWriter, r *http.Request, p stri
 	// lookup under module rules would fail `go` for modules bodega serves.
 	s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), manifest.GomodSumdbKey(gomodSumdbName, rest),
 		s.cfg.GomodSumdbURL+"/"+rest, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, immutable, false)
+}
+
+// checksumDatabaseGate holds a Go module's .zip or .mod, spooled at path, to
+// the hash the checksum database signed for it when the fill's admission
+// recorded the version verified. It returns the refusal to answer on a
+// disagreement, having written the policy_blocked row, and nil otherwise:
+// for any other file, type or outcome there is no signed hash to compare. No
+// policy or override applies.
+func (s *Server) checksumDatabaseGate(ctx context.Context, r *http.Request, fill fillAdmission, s3Key, path string) *refusal {
+	if fill.typ != manifest.TypeGomod {
+		return nil
+	}
+	ext := pathpkg.Ext(s3Key)
+	if ext != ".zip" && ext != ".mod" {
+		return nil
+	}
+	entry := admit.ChecksumDatabaseEntry(fill.row)
+	if entry == nil || entry.ChecksumDatabase.Outcome != audit.ProvenanceVerified {
+		return nil
+	}
+	want := entry.ChecksumDatabase.ZipHash
+	var (
+		got string
+		err error
+	)
+	if ext == ".zip" {
+		got, err = dirhash.HashZip(path, dirhash.Hash1)
+	} else {
+		want = entry.ChecksumDatabase.ModHash
+		got, err = dirhash.Hash1([]string{"go.mod"}, func(string) (io.ReadCloser, error) { return os.Open(path) }) //nolint:gosec // the spool file this fill wrote
+	}
+	if err != nil {
+		got = "an error (" + err.Error() + ")"
+	}
+	if err == nil && got == want {
+		return nil
+	}
+	file := pathpkg.Base(s3Key)
+	_, incident := admit.RecordChecksumMismatch(ctx, s.auditDB, fill.row, file, got, admit.Who{Identity: Identity(r)})
+	s.logFor(ctx).Error("checksum database mismatch", "module", fill.name, "version", fill.version, "file", file,
+		"database_hash", want, "computed_hash", got, "incident", incident)
+	return checksumDatabaseRefusal(fill.name, fill.version, incident)
+}
+
+// gomodUnpublished reports whether a gomod fill names a version the checksum
+// database cannot confirm and the upstream does not publish. The go command
+// resolves a package path by asking for the .info of each prefix and moves
+// on at a 404 or 410, so a prefix that is no module has to get the
+// upstream's not-found: the checksum_database refusal is a 403, which the go
+// command treats as fatal. Only a .info fill is probed, because .mod and .zip
+// are asked for once a module resolved. Only unknown leads to the upstream
+// read, and only a 404 or 410 there skips the admission; any other answer
+// leaves the refusal standing. A read that cannot reach the upstream is
+// answered from the not-found record an earlier 404 left, as every fill is
+// during an outage: the probe skips the fetch path that writes and reads that
+// record, so this does both, or an outage turns every prefix of a command
+// path the cache carries into a refusal. Any 2xx, served or not, proves the
+// path exists and clears that record, as the ordinary fill does.
+func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.VersionChecker, fill fillAdmission, s3Key string, ve manifest.VersionEntry) bool {
+	if fill.typ != manifest.TypeGomod || fill.version == "" || pathpkg.Ext(s3Key) != ".info" {
+		return false
+	}
+	var db *provenance.ChecksumDatabase
+	for _, c := range checkers {
+		if d, ok := c.(*provenance.ChecksumDatabase); ok {
+			db = d
+		}
+	}
+	if db == nil {
+		return false
+	}
+	res := db.Check(ctx, &manifest.PackageManifest{Type: manifest.TypeGomod, Name: fill.name}, &ve)
+	if res.ChecksumDatabase == nil || res.ChecksumDatabase.Outcome != audit.ProvenanceUnknown {
+		return false
+	}
+	escaped, err := modulepath.EscapePath(fill.name)
+	if err != nil {
+		return false
+	}
+	ev, err := modulepath.EscapeVersion(fill.version)
+	if err != nil {
+		return false
+	}
+	info := strings.TrimRight(s.cfg.GomodUpstream, "/") + "/" + escaped + "/@v/" + ev + ".info"
+	open := func(ctx context.Context, u string) (*upstreamStream, error) { return openUpstream(ctx, u, false) }
+	if o, ok := ctx.Value(upstreamOpenerKey{}).(upstreamOpener); ok {
+		open = o
+	}
+	store := s.typeStore(fill.typ)
+	up, err := open(ctx, info)
+	if err == nil {
+		up.body.Close()
+	}
+	if err == nil || upstreamAnsweredIn(err) {
+		if store != nil {
+			s.clearNotFound(ctx, store, s3Key)
+		}
+		return false
+	}
+	var status *upstreamStatusError
+	unpublished := errors.Is(err, errUpstreamNotFound) || (errors.As(err, &status) && status.status == http.StatusGone)
+	if errors.Is(err, errUpstreamNotFound) {
+		s.recordNotFound(ctx, store, fill.typ, s3Key)
+	}
+	if !unpublished && s.recordedNotFound(ctx, store, fill.typ, s3Key, err) {
+		return true
+	}
+	if unpublished {
+		s.logFor(ctx).Info("checksum database and upstream both lack this Go module version, answering not found",
+			"module", fill.name, "version", fill.version, "url", info)
+	}
+	return unpublished
 }
 
 // gomodSumdbName is the checksum database the go command names by default.

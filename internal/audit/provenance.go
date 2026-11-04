@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -139,4 +140,48 @@ func (a *DB) ResetProvenancePin(ctx context.Context, pkgType, pkgName string) (P
 		return old, err
 	}
 	return old, nil
+}
+
+// GetChecksumDatabaseTree returns the signed tree head stored for the
+// checksum database name, or nil with no error when none is stored yet.
+func (a *DB) GetChecksumDatabaseTree(ctx context.Context, name string) ([]byte, error) {
+	var note []byte
+	// The writer, not the read pool: SwapChecksumDatabaseTree compares
+	// against what this returns, and the read pool can lag the write
+	// connection.
+	err := a.writer().QueryRowContext(ctx, `SELECT note FROM checksum_database_tree WHERE name = ?`, name).Scan(&note)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return note, err
+}
+
+// SwapChecksumDatabaseTree replaces the stored tree head for name with next
+// when what is stored is old, an empty old meaning nothing is stored. It
+// reports false, writing nothing, when the stored head is anything else.
+func (a *DB) SwapChecksumDatabaseTree(ctx context.Context, name string, old, next []byte) (bool, error) {
+	tx, err := a.writer().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var held []byte
+	err = tx.QueryRowContext(ctx, `SELECT note FROM checksum_database_tree WHERE name = ?`, name).Scan(&held)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		held = nil
+	case err != nil:
+		return false, err
+	}
+	if !bytes.Equal(held, old) {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO checksum_database_tree (name, note, updated_at)
+		VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		ON CONFLICT(name) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
+	`, name, next); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }

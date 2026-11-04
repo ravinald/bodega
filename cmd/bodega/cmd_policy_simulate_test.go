@@ -16,6 +16,7 @@ import (
 	"github.com/ravinald/bodega/internal/integration/malwarelist"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/provenance/sumdbtest"
 )
 
 // simulateFixture stores minimist 1.2.0 (named by the OSV database) and lodash
@@ -293,5 +294,44 @@ func TestPolicySimulateIgnoresTransientIntegrationError(t *testing.T) {
 	}
 	if sim.Evaluated != 3 || len(sim.Changes) != 0 {
 		t.Fatalf("evaluated=%d changes=%+v; a no-op proposal moves nothing", sim.Evaluated, sim.Changes)
+	}
+}
+
+func TestReviewSimulationDoesNotInventChecksumPolicyChanges(t *testing.T) {
+	f := simulateFixture(t, policy.ActionWarn)
+	adb := f.open(t)
+	defer adb.Close()
+	log := sumdbtest.New(t, sumdbtest.NewKey(t))
+	m := sumdbtest.NewModule(t, "example.com/widget", "v1.2.3", "published")
+	log.AddModule(m)
+	var lookups atomic.Int32
+	log.Wrap = func(w http.ResponseWriter, r *http.Request, db http.Handler) {
+		if strings.HasPrefix(r.URL.Path, "/lookup/") && lookups.Add(1) == 1 {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		db.ServeHTTP(w, r)
+	}
+	store := manifest.NewLocalStore(f.manifests)
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Type: manifest.TypeGomod, Name: m.Path,
+		Versions: []manifest.VersionEntry{{Version: m.Version, Mode: manifest.ModeProxy}}}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	proposed := newPolicyOverlay(adb)
+	proposed.provenance[manifest.TypeGomod] = &audit.ProvenancePolicy{Ecosystem: manifest.TypeGomod, Action: policy.ActionWarn}
+	cfg := &config.Config{GomodSumdbURL: log.URL, GomodSumdbKey: log.Key.Verifier}
+	sim, err := simulatePolicy(t.Context(), cfg, adb, store, proposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sim.Evaluated != 1 {
+		t.Fatalf("evaluated %d versions, want 1", sim.Evaluated)
+	}
+	if len(sim.Changes) != 0 {
+		t.Errorf("unchanged policy invented a decision change: %+v", sim.Changes)
+	}
+	if got := lookups.Load(); got != 1 {
+		t.Errorf("simulation fetched the same checksum record %d times, want one shared answer", got)
 	}
 }

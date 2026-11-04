@@ -18,6 +18,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -616,7 +617,7 @@ func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker 
 		store = adb
 	}
 	out := []policy.VersionChecker{ageChecker(cfg, adb), OSVChecker(cfg, adb), ProvenanceChecker(cfg, adb),
-		policy.NewNameSimilarityChecker(similarity)}
+		ChecksumDatabaseChecker(cfg, adb), policy.NewNameSimilarityChecker(similarity)}
 	return appendIntegrations(out, cfg, store)
 }
 
@@ -645,8 +646,13 @@ type PolicyStore interface {
 // and passes integrations through readOnlyIntegrations, since an integration
 // records its lookup errors as it checks.
 func VersionCheckersFrom(cfg *config.Config, store PolicyStore, integrations integration.Store) []policy.VersionChecker {
+	// A nil store inside the interface is not a nil interface.
+	var trees provenance.ChecksumDatabaseStore
+	if t, ok := store.(provenance.ChecksumDatabaseStore); ok && !isNilDB(store) {
+		trees = t
+	}
 	out := []policy.VersionChecker{ageChecker(cfg, store), osvCheckerFrom(cfg, store),
-		provenanceCheckerFrom(cfg, store), policy.NewNameSimilarityChecker(store)}
+		provenanceCheckerFrom(cfg, store), NewChecksumDatabase(cfg, trees, nil, true), policy.NewNameSimilarityChecker(store)}
 	return appendIntegrations(out, cfg, integrations)
 }
 
@@ -696,6 +702,75 @@ func provenanceCheckerFrom(cfg *config.Config, store provenance.Store) *provenan
 		v.PypiIndex = strings.TrimRight(cfg.PypiUpstream, "/")
 	}
 	return &provenance.Checker{Store: store, Verifier: v}
+}
+
+// ChecksumDatabaseChecker is the checksum_database check every admission
+// that writes shares, one per database and audit store in a process, so the
+// tree head and record cache its client holds serve every concurrent
+// admission. The tree head persists in adb.
+func ChecksumDatabaseChecker(cfg *config.Config, adb *audit.DB) *provenance.ChecksumDatabase {
+	k := sharedSumdbKey{adb: adb}
+	if cfg != nil {
+		k.url, k.key, k.nosumdb = cfg.GomodSumdbURL, cfg.GomodSumdbKey, cfg.GomodNoSumdb
+	}
+	sharedSumdbMu.Lock()
+	defer sharedSumdbMu.Unlock()
+	if d, ok := sharedSumdb[k]; ok {
+		return d
+	}
+	// A nil *audit.DB inside the interface is not a nil interface.
+	var (
+		trees  provenance.ChecksumDatabaseStore
+		events provenance.EventRecorder
+	)
+	if adb != nil {
+		trees, events = adb, adb
+	}
+	d := NewChecksumDatabase(cfg, trees, events, false)
+	sharedSumdb[k] = d
+	return d
+}
+
+type sharedSumdbKey struct {
+	url, key, nosumdb string
+	adb               *audit.DB
+}
+
+var (
+	sharedSumdbMu sync.Mutex
+	sharedSumdb   = map[sharedSumdbKey]*provenance.ChecksumDatabase{}
+)
+
+// NewChecksumDatabase builds a checksum_database check reading
+// gomod_sumdb_url with gomod_sumdb_key, skipping gomod_nosumdb. readOnly
+// reads the stored tree head and writes none. A test binary replaces it, so
+// the suite never reads sum.golang.org.
+var NewChecksumDatabase = func(cfg *config.Config, trees provenance.ChecksumDatabaseStore, events provenance.EventRecorder, readOnly bool) *provenance.ChecksumDatabase {
+	return provenance.NewChecksumDatabase(ChecksumDatabaseConfig(cfg, trees, events, readOnly))
+}
+
+// ChecksumDatabaseConfig is what NewChecksumDatabase builds from, for a
+// replacement that changes only the transport. A nil cfg reads
+// sum.golang.org with its own key.
+func ChecksumDatabaseConfig(cfg *config.Config, trees provenance.ChecksumDatabaseStore, events provenance.EventRecorder, readOnly bool) provenance.ChecksumDatabaseConfig {
+	c := provenance.ChecksumDatabaseConfig{URL: "https://sum.golang.org", Key: config.DefaultGomodSumdbKey,
+		Store: trees, Events: events, ReadOnly: readOnly}
+	if cfg != nil {
+		if cfg.GomodSumdbURL != "" {
+			c.URL = cfg.GomodSumdbURL
+		}
+		if cfg.GomodSumdbKey != "" {
+			c.Key = cfg.GomodSumdbKey
+		}
+		c.NoSumdb = cfg.GomodNoSumdbPatterns()
+	}
+	return c
+}
+
+// isNilDB reports whether store is a nil *audit.DB.
+func isNilDB(store any) bool {
+	db, ok := store.(*audit.DB)
+	return ok && db == nil
 }
 
 // NewProvenanceVerifier builds the verifier the provenance check fetches

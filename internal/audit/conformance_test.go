@@ -338,7 +338,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 				return
 			}
 			pins := h.pins(t)
-			want := wireAdmissionPin(pin)
+			want := wireAdmissionPin{PkgType: pin.PkgType, PkgName: pin.PkgName, PkgVersion: pin.PkgVersion, ObjectKey: pin.ObjectKey}
 			if len(pins) != 1 || pins[0] != want {
 				t.Fatalf("write-only sink emitted %+v for one pin, want [%+v]", pins, want)
 			}

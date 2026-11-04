@@ -17,9 +17,9 @@ import (
 	"github.com/ravinald/bodega/internal/provenance"
 )
 
-// TestMain stops the import path's publish-time and upstream provenance reads
-// at the loopback interface, so a test that imports a manifest never reaches a
-// public registry, GitHub or Sigstore, and never depends on one.
+// TestMain stops the import path's publish-time, upstream provenance and
+// checksum database reads at the loopback interface, so a test that imports a
+// manifest never reaches a public registry, GitHub, Sigstore or sum.golang.org, and never depends on one.
 func TestMain(m *testing.M) {
 	admit.NewPublishReader = func() *policy.AgeChecker {
 		ac := policy.NewAgeChecker(nil)
@@ -33,6 +33,11 @@ func TestMain(m *testing.M) {
 			return nil, errors.New("a test binary fetches no Sigstore trusted root")
 		}
 		return v
+	}
+	admit.NewChecksumDatabase = func(cfg *config.Config, trees provenance.ChecksumDatabaseStore, events provenance.EventRecorder, readOnly bool) *provenance.ChecksumDatabase {
+		c := admit.ChecksumDatabaseConfig(cfg, trees, events, readOnly)
+		c.HTTP = &http.Client{Transport: loopbackOnly{}}
+		return provenance.NewChecksumDatabase(c)
 	}
 	os.Exit(m.Run())
 }
