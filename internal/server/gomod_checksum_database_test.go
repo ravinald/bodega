@@ -713,3 +713,35 @@ func TestGomodPrefixProbeKeepsItsNotFoundThroughAnOutage(t *testing.T) {
 		}
 	})
 }
+
+func TestReviewGomodProbeSuccessInvalidatesRecordedAbsence(t *testing.T) {
+	for _, code := range []int{http.StatusCreated, http.StatusNoContent, http.StatusPartialContent} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			log := sumdbtest.New(t, sumdbtest.NewKey(t))
+			up := newStatusUpstream(t)
+			s := gomodSumdbServer(t, log, newRecordingUpstream(t))
+			s.cfg.GomodUpstream = up.ts.URL
+			module, version := "example.com/widget/cmd/widget", "v1.2.3"
+			url := "/go/" + module + "/@v/" + version + ".info"
+			key := manifest.GomodKey(module, version, ".info")
+			if rec := doRequest(s, http.MethodGet, url, nil); rec.Code != http.StatusNotFound {
+				t.Fatalf("initial absence = %d, want 404", rec.Code)
+			}
+			store := s.typeStore(manifest.TypeGomod)
+			if b, err := store.Get(t.Context(), notFoundPrefix+key); err != nil || b == nil {
+				t.Fatalf("initial 404 left no record: %v", err)
+			}
+			up.code.Store(int64(code))
+			if rec := doRequest(s, http.MethodGet, url, nil); rec.Code != http.StatusForbidden {
+				t.Fatalf("unconfirmed published path = %d, want 403", rec.Code)
+			}
+			if b, err := store.Get(t.Context(), notFoundPrefix+key); err != nil || b != nil {
+				t.Errorf("upstream %d left the old absence record: %q, %v", code, b, err)
+			}
+			up.ts.Close()
+			if rec := doRequest(s, http.MethodGet, url, nil); rec.Code != http.StatusForbidden {
+				t.Errorf("outage after upstream %d = %d, want 403; the successful response invalidated the earlier 404", code, rec.Code)
+			}
+		})
+	}
+}

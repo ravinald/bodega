@@ -300,7 +300,8 @@ func (s *Server) checksumDatabaseGate(ctx context.Context, r *http.Request, fill
 // answered from the not-found record an earlier 404 left, as every fill is
 // during an outage: the probe skips the fetch path that writes and reads that
 // record, so this does both, or an outage turns every prefix of a command
-// path the cache carries into a refusal.
+// path the cache carries into a refusal. Any 2xx, served or not, proves the
+// path exists and clears that record, as the ordinary fill does.
 func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.VersionChecker, fill fillAdmission, s3Key string, ve manifest.VersionEntry) bool {
 	if fill.typ != manifest.TypeGomod || fill.version == "" || pathpkg.Ext(s3Key) != ".info" {
 		return false
@@ -335,6 +336,8 @@ func (s *Server) gomodUnpublished(ctx context.Context, checkers []policy.Version
 	up, err := open(ctx, info)
 	if err == nil {
 		up.body.Close()
+	}
+	if err == nil || upstreamAnsweredIn(err) {
 		if store != nil {
 			s.clearNotFound(ctx, store, s3Key)
 		}
