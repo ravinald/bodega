@@ -1577,14 +1577,15 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 		if fill.typ == manifest.TypeRubygems || fill.typ == manifest.TypeMaven || fill.typ == manifest.TypeComposer {
 			datedThroughUpstream(checkers)
 		}
-	case fill.typ == manifest.TypeHelm && fill.version != "":
+	case fill.typ == manifest.TypeHelm && fill.name != "":
 		// The .prov and the chart's name are the two things a check can read
 		// of a chart: the age gate cannot date one and OSV indexes none. The
-		// .prov sits beside the chart URL, which only a manifest-backed fill
-		// carries; the name every fill has.
+		// .prov sits beside the chart URL of a named version, which only a
+		// manifest-backed fill whose archive names one carries; the name every
+		// fill has, so an archive without a version is judged by it too.
 		checkers = []policy.VersionChecker{policy.NewNameSimilarityChecker(s.auditDB)}
 		notRun = "not run: a helm proxy fill runs the name similarity check only"
-		if _, ok := helmFillFrom(r.Context()); ok {
+		if _, ok := helmFillFrom(r.Context()); ok && fill.version != "" {
 			checkers = append([]policy.VersionChecker{admit.ProvenanceChecker(s.cfg, s.auditDB)}, checkers...)
 			notRun = "not run: a helm proxy fill runs the upstream provenance and name similarity checks only"
 		}

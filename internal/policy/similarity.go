@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -48,12 +49,21 @@ func SimilarityEcosystems() []string {
 func GitSimilarityName(upstream string) string {
 	u := strings.TrimSpace(upstream)
 	if _, rest, ok := strings.Cut(u, "://"); ok {
-		_, u, _ = strings.Cut(rest, "/")
+		// The remote decodes the path before it resolves a repository, so
+		// %6bubernetes is kubernetes there and has to be here. A path that
+		// will not parse is compared as written.
+		if parsed, err := url.Parse(u); err == nil {
+			u = parsed.Path
+		} else {
+			_, u, _ = strings.Cut(rest, "/")
+			u, _, _ = strings.Cut(u, "?")
+			u, _, _ = strings.Cut(u, "#")
+		}
 	} else if host, rest, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
 		u = rest
+		u, _, _ = strings.Cut(u, "?")
+		u, _, _ = strings.Cut(u, "#")
 	}
-	u, _, _ = strings.Cut(u, "?")
-	u, _, _ = strings.Cut(u, "#")
 	u = strings.TrimSuffix(strings.Trim(u, "/"), ".git")
 	var segs []string
 	for seg := range strings.SplitSeq(u, "/") {

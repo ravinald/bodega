@@ -231,3 +231,21 @@ func TestHelmProxyFillWarnsNearMissNameByDefault(t *testing.T) {
 		t.Errorf("name_similarity = %s %q, want a warn naming ingress-nginx", c.Status, c.Detail)
 	}
 }
+
+func TestReviewHelmVersionlessFillSimilarity(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/charts/ingres-nginx.tgz", "squat chart")
+	seedProxyHelm(t, s, "ingres-nginx", "4.11.0", up.ts.URL+"/charts")
+	if err := s.auditDB.SetSimilarityPolicy(t.Context(), audit.SimilarityPolicy{Ecosystem: manifest.TypeHelm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+	rec := doRequest(s, http.MethodGet, "/helm/charts/ingres-nginx.tgz", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403; upstream fetched=%v; body=%q", rec.Code, up.sawPath("/charts/ingres-nginx.tgz"), rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkSimilarity)
+	if up.sawPath("/charts/ingres-nginx.tgz") {
+		t.Error("held chart was fetched")
+	}
+}

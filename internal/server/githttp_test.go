@@ -1668,3 +1668,12 @@ func TestGitSmartWarnsNearMissOnceForANewMirror(t *testing.T) {
 		t.Errorf("name_similarity rows = %d after a clone from the mirror, want the first mirror's one", len(rows))
 	}
 }
+
+func TestReviewGitImportEscapedNearMiss(t *testing.T) {
+	s := newDiscoveryServer(t)
+	blockGitSimilarity(t, s)
+	_, res := postImport(t, s, `[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":"https://github.com/kubernetse/%6bubernetes.git"}]}]`, "")
+	if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for encoded near miss; results=%+v", res.Imported, res.Results)
+	}
+}

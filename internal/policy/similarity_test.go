@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -651,5 +652,57 @@ func TestEmbeddedHelmAndGitLists(t *testing.T) {
 		if !ok || len(p.Names) < least || p.Source == "" || p.Date == "" {
 			t.Errorf("%s list = %d names, source %q, date %q; want at least %d with a source and date", eco, len(p.Names), p.Source, p.Date, least)
 		}
+	}
+}
+
+func TestReviewGitSimilarityEscapedURL(t *testing.T) {
+	for _, tc := range []struct{ upstream, action string }{
+		{"https://github.com/kubernetse/%6bubernetes.git", ActionBlock},
+		{"https://github.com/%6bubernetse/%6bubernetes.git", ActionBlock},
+		{"https://github.com/kubernetes/%6bubernetes.git", ActionPass},
+	} {
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", tc.upstream)
+		if r.Action != tc.action {
+			t.Errorf("%s: action=%s, want %s; %s", tc.upstream, r.Action, tc.action, r.Reason)
+		}
+	}
+}
+
+func TestReviewSimilarityUsageDocumentation(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(data)
+	_, section, ok := strings.Cut(doc, "### `bodega policy similarity")
+	if !ok {
+		t.Fatal("missing similarity section")
+	}
+	section, _, _ = strings.Cut(section, "\n### ")
+	for _, prefix := range []string{"| `similarity`", "Catches a typosquat", "The check runs at the same points"} {
+		var found bool
+		content := section
+		if prefix == "| `similarity`" {
+			content = doc
+		}
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, prefix) {
+				found = true
+				for _, eco := range []string{"helm", "git"} {
+					if !strings.Contains(line, eco) {
+						t.Errorf("%q omits %s", prefix, eco)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("missing documentation paragraph %q", prefix)
+		}
+	}
+	if !strings.Contains(doc, "once per new mirror rather than on every fetch, because") {
+		t.Error("missing git mirror admission lifetime and reason")
+	}
+	if strings.Contains(doc, "A proxy fill runs the provenance check only: the age, OSV and name-similarity checks record `not_evaluated` for a helm chart fetched through the proxy.") {
+		t.Error("Helm usage still says proxy fills do not evaluate name similarity")
 	}
 }
