@@ -706,3 +706,37 @@ func TestReviewSimilarityUsageDocumentation(t *testing.T) {
 		t.Error("Helm usage still says proxy fills do not evaluate name similarity")
 	}
 }
+
+func TestReviewGitLiteralSCPPath(t *testing.T) {
+	for _, upstream := range []string{
+		"git@forge.example:archive#2026/kubernetse/kubernetes.git",
+		"git@forge.example:archive?2026/kubernetse/kubernetes.git",
+	} {
+		if got := GitSimilarityName(upstream); got != "kubernetse/kubernetes" {
+			t.Errorf("GitSimilarityName(%q) = %q, want kubernetse/kubernetes", upstream, got)
+		}
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream)
+		if r.Action != ActionBlock {
+			t.Errorf("%s: action=%s, want block; %s", upstream, r.Action, r.Reason)
+		}
+	}
+}
+
+func TestReviewSimilarityAdmissionDocs(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(data)
+	_, section, ok := strings.Cut(doc, "**The proxy runs import's checks.**")
+	if !ok {
+		t.Fatal("missing admission documentation")
+	}
+	paragraph, _, _ := strings.Cut(section, "\n\n")
+	if !strings.Contains(paragraph, "helm") || !strings.Contains(paragraph, "git") {
+		t.Error("admission documentation omits Helm similarity fills and Git first-mirror similarity admission")
+	}
+	if strings.Contains(paragraph, "A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks") {
+		t.Error("admission documentation still says all types other than npm, pypi, gomod and cargo skip version checks")
+	}
+}

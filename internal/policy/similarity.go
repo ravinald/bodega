@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"sync"
@@ -60,11 +61,13 @@ func GitSimilarityName(upstream string) string {
 			u, _, _ = strings.Cut(u, "#")
 		}
 	} else if host, rest, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
+		// scp-like and local paths reach the remote as written: ? and # are
+		// path characters there, not delimiters.
 		u = rest
-		u, _, _ = strings.Cut(u, "?")
-		u, _, _ = strings.Cut(u, "#")
 	}
-	u = strings.TrimSuffix(strings.Trim(u, "/"), ".git")
+	// Git resolves . and .. before it opens a repository, so owner/repo.git/.
+	// is owner/repo.git and has to be compared as that.
+	u = strings.TrimSuffix(strings.Trim(path.Clean("/"+u), "/"), ".git")
 	var segs []string
 	for seg := range strings.SplitSeq(u, "/") {
 		if seg != "" {

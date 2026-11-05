@@ -1677,3 +1677,35 @@ func TestReviewGitImportEscapedNearMiss(t *testing.T) {
 		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for encoded near miss; results=%+v", res.Imported, res.Results)
 	}
 }
+
+func TestReviewGitImportLiteralSCPPath(t *testing.T) {
+	for _, upstream := range []string{
+		"git@forge.example:archive#2026/kubernetse/kubernetes.git",
+		"git@forge.example:archive?2026/kubernetse/kubernetes.git",
+	} {
+		t.Run(upstream, func(t *testing.T) {
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+				t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}
+
+func TestReviewGitImportDotPath(t *testing.T) {
+	root := newGitUpstreamAt(t, "kubernetse/kubernetes.git")
+	upstream := "file://" + root + "/kubernetse/kubernetes.git/."
+	if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+		t.Fatalf("git did not resolve the repository: %q", refs)
+	}
+	s := newDiscoveryServer(t)
+	blockGitSimilarity(t, s)
+	body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+	_, res := postImport(t, s, body, "")
+	if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for a dot-path alias; results=%+v", res.Imported, res.Results)
+	}
+}
