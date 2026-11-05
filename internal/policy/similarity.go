@@ -50,11 +50,11 @@ func SimilarityEcosystems() []string {
 func GitSimilarityName(upstream string) string {
 	u := strings.TrimSpace(upstream)
 	if scheme, rest, ok := strings.Cut(u, "://"); ok && gitNativeScheme(scheme) {
-		// Git's own transports decode %XX in the path and keep ? and # as
-		// path characters; only the http transports read them as a query
-		// and a fragment.
-		_, u, _ = strings.Cut(rest, "/")
-		u = gitURLDecode(u)
+		// Git's own transports decode %XX across the whole URL before they
+		// find where the host ends, so an encoded / separates host and path
+		// as a literal one does, and ? and # stay path characters; only the
+		// http transports read them as a query and a fragment.
+		_, u, _ = strings.Cut(gitURLDecode(rest), "/")
 	} else if ok {
 		// The remote decodes the path before it resolves a repository, so
 		// %6bubernetes is kubernetes there and has to be here. A path that

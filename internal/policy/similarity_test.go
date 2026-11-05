@@ -754,3 +754,15 @@ func TestReviewGitNativeURLPath(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewGitNativeEncodedBoundary(t *testing.T) {
+	for _, scheme := range []string{"file", "ssh", "git", "git+ssh", "ssh+git"} {
+		upstream := scheme + "://forge.example%2Fkubernetse%2Fkubernetes.git"
+		if got := GitSimilarityName(upstream); got != "kubernetse/kubernetes" {
+			t.Errorf("GitSimilarityName(%q) = %q, want kubernetse/kubernetes", upstream, got)
+		}
+		if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != ActionBlock {
+			t.Errorf("%s: action=%s, want block; %s", upstream, r.Action, r.Reason)
+		}
+	}
+}
