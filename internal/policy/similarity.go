@@ -66,10 +66,10 @@ func GitSimilarityName(upstream string) string {
 			u, _, _ = strings.Cut(u, "?")
 			u, _, _ = strings.Cut(u, "#")
 		}
-	} else if host, rest, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
+	} else if host, _, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
 		// scp-like and local paths reach the remote as written: ? and # are
 		// path characters there, not delimiters.
-		u = rest
+		u = gitSCPPath(u)
 	}
 	// Git resolves . and .. before it opens a repository, so owner/repo.git/.
 	// is owner/repo.git and has to be compared as that.
@@ -84,6 +84,29 @@ func GitSimilarityName(upstream string) string {
 		segs = segs[len(segs)-2:]
 	}
 	return strings.Join(segs, "/")
+}
+
+// gitSCPPath returns the path of an scp-like upstream, [user@]host:path.
+// A bracketed host, [::1] or git@[2001:db8::1], holds colons of its own, so
+// the separator is the first colon after the closing bracket, as Git's
+// host_end finds it; anywhere else it is the first colon.
+func gitSCPPath(u string) string {
+	start := 0
+	if i := strings.Index(u, "@["); i >= 0 {
+		start = i + 1
+	}
+	end := start
+	if strings.HasPrefix(u[start:], "[") {
+		if j := strings.IndexByte(u[start:], ']'); j >= 0 {
+			end = start + j
+		}
+	} else {
+		end = 0
+	}
+	if k := strings.IndexByte(u[end:], ':'); k >= 0 {
+		return u[end+k+1:]
+	}
+	return u
 }
 
 // gitNativeScheme reports whether Git opens a URL with this scheme through

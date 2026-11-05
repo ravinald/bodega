@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"testing"
@@ -805,6 +807,93 @@ func TestReviewSimilarityPopularListDocumentation(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("similarity Popular lists table omits %s", eco)
+		}
+	}
+}
+
+func TestReviewGitSCPEndpointDoesNotChangeIdentity(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"kubernetes/kubernetes.git", ActionPass},
+		{"kubernetse/kubernetes.git", ActionBlock},
+	} {
+		for _, endpoint := range []string{"git@forge.example:", "git@[2001:db8::1]:", "[::1]:"} {
+			upstream := endpoint + tc.path
+			wantName := strings.TrimSuffix(tc.path, ".git")
+			if got := GitSimilarityName(upstream); got != wantName {
+				t.Errorf("GitSimilarityName(%q) = %q, want %q", upstream, got, wantName)
+			}
+			if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != tc.want {
+				t.Errorf("%s: action=%s, want %s; %s", upstream, r.Action, tc.want, r.Reason)
+			}
+		}
+	}
+}
+
+// TestGitSimilarityNameMatchesGit holds GitSimilarityName to the path Git
+// itself extracts from each spelling, through fetch-pack --diag-url, which
+// parses without connecting. A hand-written parser drifts from Git one
+// spelling at a time; this compares every spelling at once.
+func TestGitSimilarityNameMatchesGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	for _, upstream := range []string{
+		"git@github.com:kubernetes/kubernetes.git",
+		"github.com:kubernetes/kubernetes.git",
+		"git@github.com:kubernetes/kubernetes",
+		"git@github.com:/kubernetes/kubernetes.git",
+		"git@[2001:db8::1]:kubernetes/kubernetes.git",
+		"[::1]:kubernetes/kubernetes.git",
+		"[git@host]:kubernetes/kubernetes.git",
+		"git@[host.example]:kubernetes/kubernetes.git",
+		"user@host:~user/kubernetes/kubernetes.git",
+		"host:kubernetes/kube?rnetes.git",
+		"host:kubernetes/kube#rnetes.git",
+		"host:kubernetes/kubernetes%41.git",
+		"host:kubernetes/kubernetes.git/",
+		"host:kubernetes/kubernetes.git/.",
+		"host:kubernetes/x/../kubernetes.git",
+		"ssh://git@github.com/kubernetes/kubernetes.git",
+		"ssh://git@github.com:22/kubernetes/kubernetes.git",
+		"ssh://git@[2001:db8::1]:22/kubernetes/kubernetes.git",
+		"ssh://[::1]/kubernetes/kubernetes.git",
+		"ssh://git@github.com/~user/kubernetes/kubernetes.git",
+		"ssh://host/kubernetes/%6bubernetes.git",
+		"ssh://host%2Fkubernetes%2Fkubernetes.git",
+		"ssh://host/kubernetes/kubernetes%00.git",
+		"ssh://host/kubernetes/kubernetes%2500.git",
+		"ssh://host/kubernetes/kube?rnetes.git",
+		"ssh://host/kubernetes/kube#rnetes.git",
+		"ssh://host/kubernetes/kubernetes.git/.",
+		"ssh://user@host:2222/a/b/kubernetes/kubernetes.git",
+		"git+ssh://host/kubernetes/kubernetes.git",
+		"ssh+git://host/kubernetes/kubernetes.git",
+		"git://github.com/kubernetes/kubernetes.git",
+		"git://github.com:9418/kubernetes/kubernetes.git",
+		"git://[::1]:9418/kubernetes/kubernetes.git",
+		"file:///srv/git/kubernetes/kubernetes.git",
+		"file://host/srv/git/kubernetes/kubernetes.git",
+		"file:///srv/git/kubernetes/kubernetes%2Egit",
+		"/srv/git/kubernetes/kubernetes.git",
+		"./kubernetes/kubernetes.git",
+		"../repos/kubernetes/kubernetes.git",
+		"srv/git:x/kubernetes/kubernetes.git",
+	} {
+		out, err := exec.Command("git", "fetch-pack", "--diag-url", upstream).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git fetch-pack --diag-url %q: %v\n%s", upstream, err, out)
+		}
+		var want string
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if p, ok := strings.CutPrefix(line, "Diag: path="); ok {
+				want = strings.TrimSuffix(strings.Trim(path.Clean("/"+p), "/"), ".git")
+				if segs := strings.Split(want, "/"); len(segs) > 2 {
+					want = strings.Join(segs[len(segs)-2:], "/")
+				}
+			}
+		}
+		if got := GitSimilarityName(upstream); got != want {
+			t.Errorf("GitSimilarityName(%q) = %q, Git opens %q", upstream, got, want)
 		}
 	}
 }

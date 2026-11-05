@@ -1785,3 +1785,28 @@ func TestReviewGitImportNativeLiteralNullEscape(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewGitImportPopularSCPIPv6(t *testing.T) {
+	const repo = "kubernetes/kubernetes.git"
+	root := newGitUpstreamAt(t, repo)
+	helper := filepath.Join(t.TempDir(), "ssh-fixture")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nfor last do :; done\nexec /bin/sh -c \"$last\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"git@forge.example:", "git@[2001:db8::1]:", "[::1]:"} {
+		t.Run(endpoint, func(t *testing.T) {
+			upstream := endpoint + repo
+			refs := runGitCLI(t, root, "-c", "core.sshCommand="+helper, "-c", "ssh.variant=ssh", "ls-remote", upstream)
+			if !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("Git did not open the popular repository: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 1 || len(res.Results) != 1 || res.Results[0].Outcome != ImportImported {
+				t.Fatalf("imported=%d, want 1 for the exact popular path %s; results=%+v", res.Imported, repo, res.Results)
+			}
+		})
+	}
+}
