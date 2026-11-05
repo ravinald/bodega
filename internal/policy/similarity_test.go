@@ -570,3 +570,86 @@ func TestNameSimilarityRpm(t *testing.T) {
 		}
 	}
 }
+
+// A helm chart a character from a popular one is held under block, and the
+// popular chart itself, and a baselined near name, are not. The warn default
+// records a warn rather than refusing.
+func TestNameSimilarityHelm(t *testing.T) {
+	r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeHelm, "ingres-nginx")
+	if r.Action != ActionBlock || r.Details["nearest"] != "ingress-nginx" || r.Details["distance"] != 1 {
+		t.Errorf("ingres-nginx = %+v, want a block naming ingress-nginx at distance 1", r)
+	}
+	if r := checkName(t, &similarityStore{}, manifest.TypeHelm, "ingres-nginx"); r.Action != ActionWarn {
+		t.Errorf("ingres-nginx under the default = %+v, want a warn", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeHelm, "ingress-nginx"); r.Action != ActionPass {
+		t.Errorf("ingress-nginx = %+v, want a pass", r)
+	}
+	inUse := &similarityStore{action: ActionBlock, taken: true, baseline: map[string]bool{"helm/ingres-nginx": true}}
+	if r := checkName(t, inUse, manifest.TypeHelm, "ingres-nginx"); r.Action != ActionPass || !strings.Contains(r.Reason, "baseline") {
+		t.Errorf("baselined ingres-nginx = %+v, want a pass naming the baseline", r)
+	}
+}
+
+func checkGit(t *testing.T, store SimilarityStore, name, upstream string) Result {
+	t.Helper()
+	pm := &manifest.PackageManifest{Type: manifest.TypeGit, Name: name, Versions: []manifest.VersionEntry{{URL: upstream, Ref: "main"}}}
+	return NewNameSimilarityChecker(store).Check(t.Context(), pm, &pm.Versions[0])
+}
+
+// A git repository is compared by its upstream's {owner}/{repo} path, not by
+// the catalog name: a popular repo under a lookalike or unrelated owner is
+// distance 1, and the popular path itself passes.
+func TestNameSimilarityGit(t *testing.T) {
+	for _, tc := range []struct{ upstream, nearest string }{
+		{"https://github.com/kubernetse/kubernetes.git", "kubernetes/kubernetes"},
+		{"https://github.com/acme/kubernetes", "kubernetes/kubernetes"},
+		{"git@github.com:kubernetes/kubernetse.git", "kubernetes/kubernetes"},
+	} {
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", tc.upstream)
+		if r.Action != ActionBlock || r.Details["nearest"] != tc.nearest || r.Details["distance"] != 1 {
+			t.Errorf("%s = %+v, want a block naming %s at distance 1", tc.upstream, r, tc.nearest)
+		}
+	}
+	if r := checkGit(t, &similarityStore{}, "k8s", "https://github.com/kubernetse/kubernetes.git"); r.Action != ActionWarn {
+		t.Errorf("default = %+v, want a warn", r)
+	}
+	// The catalog name is a popular path's lookalike, the upstream is the
+	// popular path: the upstream decides.
+	if r := checkGit(t, &similarityStore{action: ActionBlock}, "kubernetse/kubernetes", "https://github.com/kubernetes/kubernetes.git"); r.Action != ActionPass {
+		t.Errorf("the popular path = %+v, want a pass", r)
+	}
+	inUse := &similarityStore{action: ActionBlock, taken: true, baseline: map[string]bool{"git/k8s": true}}
+	if r := checkGit(t, inUse, "k8s", "https://github.com/kubernetse/kubernetes.git"); r.Action != ActionPass {
+		t.Errorf("baselined = %+v, want a pass", r)
+	}
+	if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", ""); r.Action != ActionNotEvaluated {
+		t.Errorf("no upstream = %+v, want not evaluated", r)
+	}
+}
+
+func TestGitSimilarityName(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://github.com/kubernetes/kubernetes.git":   "kubernetes/kubernetes",
+		"https://github.com/kubernetes/kubernetes/":      "kubernetes/kubernetes",
+		"git@github.com:torvalds/linux.git":              "torvalds/linux",
+		"ssh://git@gitlab.com/group/sub/project.git":     "sub/project",
+		"file:///srv/upstreams/team/tool.git":            "team/tool",
+		"https://example.com/repo.git?ref=main#fragment": "repo",
+		"https://example.com/":                           "",
+	} {
+		if got := GitSimilarityName(in); got != want {
+			t.Errorf("GitSimilarityName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// helm and git ship lists of the size the item names.
+func TestEmbeddedHelmAndGitLists(t *testing.T) {
+	for eco, least := range map[string]int{manifest.TypeHelm: 500, manifest.TypeGit: 1000} {
+		p, ok := EmbeddedPopularNames(eco)
+		if !ok || len(p.Names) < least || p.Source == "" || p.Date == "" {
+			t.Errorf("%s list = %d names, source %q, date %q; want at least %d with a source and date", eco, len(p.Names), p.Source, p.Date, least)
+		}
+	}
+}

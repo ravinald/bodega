@@ -17,6 +17,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // signedChartUpstream is a classic chart repository publishing one chart and
@@ -116,7 +117,7 @@ func TestHelmProxyFillVerifiesProv(t *testing.T) {
 	for _, other := range []string{audit.CheckAge, audit.CheckOSV} {
 		rows, _ := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeHelm, PkgName: "podinfo"})
 		for _, rc := range rows[0].Checks {
-			if rc.Check == other && (rc.Status != audit.CheckNotEvaluated || !strings.Contains(rc.Detail, "provenance check only")) {
+			if rc.Check == other && (rc.Status != audit.CheckNotEvaluated || !strings.Contains(rc.Detail, "provenance and name similarity checks only")) {
 				t.Errorf("%s = %s %q, want not_evaluated naming why", other, rc.Status, rc.Detail)
 			}
 		}
@@ -167,5 +168,66 @@ func TestReviewHelmRefusedProxyBytesDoNotPoisonChecksum(t *testing.T) {
 	status, body := getStatusAndBody(t, s, "/helm/charts/podinfo-6.7.0.tgz")
 	if status != http.StatusOK || body != string(signed) {
 		t.Fatalf("retry with publisher's bytes = %d %q; want 200 and signed chart, without operator clearing a poisoned checksum", status, body)
+	}
+}
+
+func helmSimilarityRow(t *testing.T, s *Server, chart string) audit.AdmissionCheck {
+	t.Helper()
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeHelm, PkgName: chart})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("admissions for %s: %d rows, %v", chart, len(rows), err)
+	}
+	for _, c := range rows[0].Checks {
+		if c.Check == audit.CheckNameSimilarity {
+			return c
+		}
+	}
+	t.Fatalf("the admission row has no name_similarity check: %+v", rows[0].Checks)
+	return audit.AdmissionCheck{}
+}
+
+// A chart one edit from a popular one is refused by the similarity check
+// before the proxy fetches it, and the popular chart is admitted.
+func TestHelmProxyFillHoldsNearMissName(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/charts/ingres-nginx-4.11.0.tgz", "squat chart")
+	up.route("/charts/ingress-nginx-4.11.0.tgz", "real chart")
+	seedProxyHelm(t, s, "ingres-nginx", "4.11.0", up.ts.URL+"/charts")
+	seedProxyHelm(t, s, "ingress-nginx", "4.11.0", up.ts.URL+"/charts")
+	if err := s.auditDB.SetSimilarityPolicy(t.Context(), audit.SimilarityPolicy{Ecosystem: manifest.TypeHelm, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := doRequest(s, http.MethodGet, "/helm/charts/ingres-nginx-4.11.0.tgz", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("ingres-nginx: status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkSimilarity)
+	if up.sawPath("/charts/ingres-nginx-4.11.0.tgz") {
+		t.Error("the upstream was asked for a held chart")
+	}
+	if c := helmSimilarityRow(t, s, "ingres-nginx"); c.Status != audit.CheckBlock {
+		t.Errorf("name_similarity = %s %q, want block", c.Status, c.Detail)
+	}
+
+	if status, body := getStatusAndBody(t, s, "/helm/charts/ingress-nginx-4.11.0.tgz"); status != http.StatusOK || body != "real chart" {
+		t.Fatalf("ingress-nginx = %d %q, want 200 with the chart", status, body)
+	}
+}
+
+// Under the warn default a near-miss chart is served, and its admission row
+// records the warn.
+func TestHelmProxyFillWarnsNearMissNameByDefault(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/charts/ingres-nginx-4.11.0.tgz", "squat chart")
+	seedProxyHelm(t, s, "ingres-nginx", "4.11.0", up.ts.URL+"/charts")
+
+	if status, body := getStatusAndBody(t, s, "/helm/charts/ingres-nginx-4.11.0.tgz"); status != http.StatusOK || body != "squat chart" {
+		t.Fatalf("ingres-nginx = %d %q, want 200 under warn", status, body)
+	}
+	if c := helmSimilarityRow(t, s, "ingres-nginx"); c.Status != audit.CheckWarn || !strings.Contains(c.Detail, "ingress-nginx") {
+		t.Errorf("name_similarity = %s %q, want a warn naming ingress-nginx", c.Status, c.Detail)
 	}
 }

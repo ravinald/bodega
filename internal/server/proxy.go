@@ -1379,15 +1379,17 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 // proxyOrResolve does not call this. It cannot name its upstream URL until
 // after the gate has run, so it drives upstreamPolicyGate and
 // recordUpstreamAttempt directly.
-func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
+//
+// It returns the decision it recorded, for an admission row written after it.
+func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) (string, bool) {
 	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record, nil, nil)
 	if !ok {
-		return false
+		return "", false
 	}
 	if record {
 		s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 	}
-	return true
+	return decision, true
 }
 
 // upstreamPolicyGate is the refusal half of enforceUpstreamPolicyRecording: the verdict,
@@ -1576,11 +1578,15 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 			datedThroughUpstream(checkers)
 		}
 	case fill.typ == manifest.TypeHelm && fill.version != "":
-		// The .prov is the one thing a chart publishes that a check reads;
-		// the age gate cannot date a chart and OSV indexes none.
+		// The .prov and the chart's name are the two things a check can read
+		// of a chart: the age gate cannot date one and OSV indexes none. The
+		// .prov sits beside the chart URL, which only a manifest-backed fill
+		// carries; the name every fill has.
+		checkers = []policy.VersionChecker{policy.NewNameSimilarityChecker(s.auditDB)}
+		notRun = "not run: a helm proxy fill runs the name similarity check only"
 		if _, ok := helmFillFrom(r.Context()); ok {
-			checkers = []policy.VersionChecker{admit.ProvenanceChecker(s.cfg, s.auditDB)}
-			notRun = "not run: a helm proxy fill runs the upstream provenance check only"
+			checkers = append([]policy.VersionChecker{admit.ProvenanceChecker(s.cfg, s.auditDB)}, checkers...)
+			notRun = "not run: a helm proxy fill runs the upstream provenance and name similarity checks only"
 		}
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool

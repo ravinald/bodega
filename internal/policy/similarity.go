@@ -32,8 +32,39 @@ var popularFS embed.FS
 // anyone can publish to. rpm is the exception in kind: a vendor's
 // repositories are curated, but a host takes packages from any repository
 // rpm_upstreams names, and a third-party one names its packages as it likes.
+// helm and git are reached through rules no one reviews name by name: a helm
+// repository rule admits every chart it serves, and a git org prefix every
+// repository under it.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGit, manifest.TypeHelm, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
+}
+
+// GitSimilarityName is the {owner}/{repo} path a git repository is compared
+// under: the last two segments of its upstream URL's path, with the host and
+// a .git suffix dropped. That is the identity a squat imitates; the catalog
+// name an operator gave the entry is not. It accepts a URL with a scheme and
+// the scp-like git@host:owner/repo form, and returns "" for an upstream with
+// no path to compare.
+func GitSimilarityName(upstream string) string {
+	u := strings.TrimSpace(upstream)
+	if _, rest, ok := strings.Cut(u, "://"); ok {
+		_, u, _ = strings.Cut(rest, "/")
+	} else if host, rest, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
+		u = rest
+	}
+	u, _, _ = strings.Cut(u, "?")
+	u, _, _ = strings.Cut(u, "#")
+	u = strings.TrimSuffix(strings.Trim(u, "/"), ".git")
+	var segs []string
+	for seg := range strings.SplitSeq(u, "/") {
+		if seg != "" {
+			segs = append(segs, seg)
+		}
+	}
+	if len(segs) > 2 {
+		segs = segs[len(segs)-2:]
+	}
+	return strings.Join(segs, "/")
 }
 
 // SimilarityName is the part of a package name the check compares. An oci
@@ -139,7 +170,7 @@ func ParsePopularNames(ecosystem string, data []byte) (PopularNames, error) {
 	switch ecosystem {
 	case manifest.TypeMaven:
 		p.sharedArtifacts = sharedMavenArtifacts(p.keys)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		p.sharedArtifacts = sharedComposerPackages(p.keys)
 	}
 	return p, nil
@@ -309,6 +340,11 @@ func (p PopularNames) Label() string {
 // vendor, so the common squat is a lookalike vendor over a real package name:
 // symfont/console is 1 from symfony/console by spelling, and acme/guzzle is 1
 // from guzzlehttp/guzzle by the vendor replaced whole.
+//
+// A git {owner}/{repo} path is split and counted as a composer name is, owner
+// for vendor: anyone can register an owner on a forge, so
+// kubernetse/kubernetes is 1 from kubernetes/kubernetes, and so is
+// acme/kubernetes.
 func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 	switch ecosystem {
 	case manifest.TypeNpm:
@@ -325,7 +361,7 @@ func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 			return 1
 		}
 		return damerauLevenshtein(ag, bg) + damerauLevenshtein(aa, ba)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		av, ap := splitComposerName(a)
 		bv, bp := splitComposerName(b)
 		if ap == bp && av != bv && !shared[ap] {
@@ -383,7 +419,7 @@ func distanceFloor(ecosystem, a, b string) int {
 			return 0
 		}
 		return lengthGap(ag, bg) + lengthGap(aa, ba)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		av, ap := splitComposerName(a)
 		bv, bp := splitComposerName(b)
 		if ap == bp {
@@ -549,17 +585,25 @@ func NewNameSimilarityChecker(store SimilarityStore) *NameSimilarityChecker {
 // Check compares pm's name with the ecosystem's popular names. A name within
 // MaxSimilarityDistance of one it is not equal to fails under the configured
 // action, unless an exact allow-list rule names it or the store held it when
-// the baseline was taken.
-func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageManifest, _ *manifest.VersionEntry) Result {
+// the baseline was taken. A git entry is compared by its version's upstream
+// URL (GitSimilarityName) and exempted under its catalog name.
+func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Result {
 	r := Result{Check: audit.CheckNameSimilarity, Action: ActionPass}
 	if pm == nil {
 		return r
 	}
-	key := pm.Type + "\x00" + pm.Name
+	compared := SimilarityName(pm.Type, pm.Name)
+	if pm.Type == manifest.TypeGit {
+		compared = ""
+		if ve != nil {
+			compared = GitSimilarityName(ve.URL)
+		}
+	}
+	key := pm.Type + "\x00" + pm.Name + "\x00" + compared
 	if prev, ok := c.seen[key]; ok {
 		return prev
 	}
-	r = c.check(ctx, pm.Type, pm.Name)
+	r = c.check(ctx, pm.Type, pm.Name, compared)
 	if c.seen == nil {
 		c.seen = map[string]Result{}
 	}
@@ -567,7 +611,7 @@ func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageM
 	return r
 }
 
-func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Result {
+func (c *NameSimilarityChecker) check(ctx context.Context, typ, name, compared string) Result {
 	r := Result{Check: audit.CheckNameSimilarity, Action: ActionPass}
 	if !slices.Contains(SimilarityEcosystems(), typ) {
 		r.Action = ActionNotEvaluated
@@ -593,9 +637,16 @@ func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Res
 		r.Action, r.Reason = ActionNotEvaluated, "no popular-name list for "+typ
 		return r
 	}
-	compared := SimilarityName(typ, name)
+	if compared == "" {
+		r.Action, r.Reason = ActionNotEvaluated, "not run: "+name+" names no upstream URL with an {owner}/{repo} path to compare"
+		return r
+	}
+	subject := name
+	if compared != SimilarityName(typ, name) {
+		subject = name + " (" + compared + ")"
+	}
 	if list.Contains(compared) {
-		r.Reason = name + " is itself on the popular " + typ + " list (" + list.Label() + ")"
+		r.Reason = subject + " is itself on the popular " + typ + " list (" + list.Label() + ")"
 		return r
 	}
 	popular, distance, near := list.Near(compared)
@@ -603,7 +654,7 @@ func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Res
 		r.Reason = fmt.Sprintf("no popular %s name within distance %d (%s)", typ, MaxSimilarityDistance, list.Label())
 		return r
 	}
-	hit := fmt.Sprintf("%s is distance %d from the popular %s name %s (%s)", name, distance, typ, popular, list.Label())
+	hit := fmt.Sprintf("%s is distance %d from the popular %s name %s (%s)", subject, distance, typ, popular, list.Label())
 	r.Details = map[string]any{"nearest": popular, "distance": distance}
 
 	exempt, err := c.exemption(ctx, typ, name)
