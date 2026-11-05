@@ -49,7 +49,13 @@ func SimilarityEcosystems() []string {
 // no path to compare.
 func GitSimilarityName(upstream string) string {
 	u := strings.TrimSpace(upstream)
-	if _, rest, ok := strings.Cut(u, "://"); ok {
+	if scheme, rest, ok := strings.Cut(u, "://"); ok && gitNativeScheme(scheme) {
+		// Git's own transports decode %XX in the path and keep ? and # as
+		// path characters; only the http transports read them as a query
+		// and a fragment.
+		_, u, _ = strings.Cut(rest, "/")
+		u = gitURLDecode(u)
+	} else if ok {
 		// The remote decodes the path before it resolves a repository, so
 		// %6bubernetes is kubernetes there and has to be here. A path that
 		// will not parse is compared as written.
@@ -78,6 +84,45 @@ func GitSimilarityName(upstream string) string {
 		segs = segs[len(segs)-2:]
 	}
 	return strings.Join(segs, "/")
+}
+
+// gitNativeScheme reports whether Git opens a URL with this scheme through
+// its own transport rather than a remote helper.
+func gitNativeScheme(scheme string) bool {
+	switch scheme {
+	case "file", "ssh", "git", "git+ssh", "ssh+git":
+		return true
+	}
+	return false
+}
+
+// gitURLDecode decodes %XX escapes as Git does for a native URL's path: a
+// malformed escape is kept as written, and + stays a plus.
+func gitURLDecode(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c <= '9':
+		return c - '0'
+	case c <= 'F':
+		return c - 'A' + 10
+	}
+	return c - 'a' + 10
 }
 
 // SimilarityName is the part of a package name the check compares. An oci

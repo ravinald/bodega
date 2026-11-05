@@ -1709,3 +1709,44 @@ func TestReviewGitImportDotPath(t *testing.T) {
 		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for a dot-path alias; results=%+v", res.Imported, res.Results)
 	}
 }
+
+func TestReviewGitImportNativeURLPath(t *testing.T) {
+	for _, marker := range []string{"#", "?"} {
+		t.Run(marker, func(t *testing.T) {
+			root := newGitUpstreamAt(t, "archive"+marker+"2026/kubernetse/kubernetes.git")
+			upstream := "file://" + root + "/archive" + marker + "2026/kubernetse/%6bubernetes.git/."
+			if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("git did not resolve the repository: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+				t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}
+
+func TestReviewGitSmartNativeURLPath(t *testing.T) {
+	for _, marker := range []string{"#", "?"} {
+		t.Run(marker, func(t *testing.T) {
+			const repo = "kubernetse/kubernetes.git"
+			prefix := "archive" + marker + "2026"
+			root := newGitUpstreamAt(t, prefix+"/"+repo)
+			s := newGitServer(t, root+"/"+prefix)
+			blockGitSimilarity(t, s)
+			rec := gitInfoRefs(t, s, "corp", repo)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status=%d, want 403 with similarity refusal", rec.Code)
+			} else {
+				refusalIncident(t, rec.Header(), checkSimilarity)
+			}
+			dir := filepath.Join(s.gitTool.root, "corp", filepath.FromSlash(repo))
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("mirror directory exists or cannot be inspected: %v; want no mirror", err)
+			}
+		})
+	}
+}
