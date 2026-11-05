@@ -766,3 +766,45 @@ func TestReviewGitNativeEncodedBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewGitNativeLiteralNullEscape(t *testing.T) {
+	for _, scheme := range []string{"file", "ssh", "git", "git+ssh", "ssh+git"} {
+		for _, suffix := range []string{"%00", "%2500"} {
+			upstream := scheme + "://forge.example/kubernetes/kubernetes" + suffix + ".git"
+			if got := GitSimilarityName(upstream); got != "kubernetes/kubernetes%00" {
+				t.Errorf("GitSimilarityName(%q) = %q, want kubernetes/kubernetes%%00", upstream, got)
+			}
+			if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != ActionPass {
+				t.Errorf("%s: action=%s, want pass for the literal repository name; %s", upstream, r.Action, r.Reason)
+			}
+		}
+	}
+}
+
+func TestReviewSimilarityPopularListDocumentation(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(data), "### `bodega policy similarity")
+	if !ok {
+		t.Fatal("missing similarity section")
+	}
+	section, _, _ = strings.Cut(section, "\n### ")
+	_, lists, ok := strings.Cut(section, "**Popular lists.**")
+	if !ok {
+		t.Fatal("missing popular-list documentation")
+	}
+	lists, _, _ = strings.Cut(lists, "`load` replaces")
+	for _, eco := range []string{"helm", "git"} {
+		found := false
+		for _, line := range strings.Split(lists, "\n") {
+			if strings.HasPrefix(line, "| `"+eco+"`") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("similarity Popular lists table omits %s", eco)
+		}
+	}
+}

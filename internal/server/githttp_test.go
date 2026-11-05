@@ -1765,3 +1765,23 @@ func TestReviewGitImportNativeEncodedBoundary(t *testing.T) {
 		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
 	}
 }
+
+func TestReviewGitImportNativeLiteralNullEscape(t *testing.T) {
+	const repo = "kubernetes/kubernetes%00.git"
+	root := newGitUpstreamAt(t, repo)
+	for _, suffix := range []string{"%00", "%2500"} {
+		t.Run(suffix, func(t *testing.T) {
+			upstream := "file://" + root + "/kubernetes/kubernetes" + suffix + ".git"
+			if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("git did not resolve the literal repository name: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 1 || len(res.Results) != 1 || res.Results[0].Outcome != ImportImported {
+				t.Fatalf("imported=%d, want 1 for kubernetes/kubernetes%%00 (three literal characters from kubernetes/kubernetes); results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}

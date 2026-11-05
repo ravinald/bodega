@@ -97,14 +97,18 @@ func gitNativeScheme(scheme string) bool {
 }
 
 // gitURLDecode decodes %XX escapes as Git does for a native URL's path: a
-// malformed escape is kept as written, and + stays a plus.
+// malformed escape is kept as written, + stays a plus, and %00 stays %00,
+// since Git never puts a NUL into the path it opens and resolves a
+// repository with those three characters in its name instead.
 func gitURLDecode(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
-			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
-			i += 2
-			continue
+			if c := unhex(s[i+1])<<4 | unhex(s[i+2]); c != 0 {
+				b.WriteByte(c)
+				i += 2
+				continue
+			}
 		}
 		b.WriteByte(s[i])
 	}
