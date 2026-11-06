@@ -1,16 +1,29 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func (u *recordingUpstream) hits(p string) int {
@@ -254,5 +267,452 @@ func TestRustupRecipeRevalidates(t *testing.T) {
 		if got := revalidates(patterns, p); got != want {
 			t.Errorf("recipe %q: revalidates(%s) = %v, want %v", patterns, p, got, want)
 		}
+	}
+}
+
+// sumdbTileBytes is a hash tile of width hashes, each one distinct so that a
+// slice taken at the wrong offset cannot match.
+func sumdbTileBytes(width int) []byte {
+	b := make([]byte, width*sumdbHashSize)
+	for i := range b {
+		b[i] = byte(i*7 + i/sumdbHashSize)
+	}
+	return b
+}
+
+// cutSumdbUpstream points the checksum database at an address nothing
+// listens on, as an egress lock or an outage leaves it.
+func cutSumdbUpstream(t *testing.T, s *Server) {
+	t.Helper()
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+	s.cfg.GomodSumdbURL = dead.URL
+}
+
+const sumdbTileDir = "tile/8/1/x001/081"
+
+func TestSumdbPartialTileFromWiderCachedTile(t *testing.T) {
+	for _, src := range []struct {
+		name  string
+		path  string
+		width int
+	}{
+		{"wider partial", sumdbTileDir + ".p/5", 5},
+		{"full tile", sumdbTileDir, 256},
+	} {
+		t.Run(src.name, func(t *testing.T) {
+			s, up := sumdbServer(t)
+			body := sumdbTileBytes(src.width)
+			up.route("/"+src.path, string(body))
+			if status, _ := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+src.path); status != http.StatusOK {
+				t.Fatalf("filling %s = %d", src.path, status)
+			}
+			cutSumdbUpstream(t, s)
+			status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+			if status != http.StatusOK || got != string(body[:3*sumdbHashSize]) {
+				t.Fatalf(".p/3 with the upstream down = %d (%d bytes), want 200 and the first 96 bytes of the cached %s", status, len(got), src.path)
+			}
+			if up.hits("/"+sumdbTileDir+".p/3") != 0 {
+				t.Errorf(".p/3 reached the upstream")
+			}
+			if info, err := s.typeStore(manifest.TypeGomod).Head(t.Context(), manifest.GomodSumdbKey(gomodSumdbName, sumdbTileDir+".p/3")); err != nil || info.Exists {
+				t.Errorf("the derived .p/3 was written under its own key (head %+v, %v)", info, err)
+			}
+		})
+	}
+}
+
+func TestSumdbPartialTileNarrowerCachedGoesUpstream(t *testing.T) {
+	s, up := sumdbServer(t)
+	up.route("/"+sumdbTileDir+".p/2", string(sumdbTileBytes(2)))
+	want := sumdbTileBytes(3)
+	up.route("/"+sumdbTileDir+".p/3", string(want))
+	getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/2")
+	status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+	if status != http.StatusOK || got != string(want) {
+		t.Fatalf(".p/3 = %d, want 200 with the upstream bytes", status)
+	}
+	if n := up.hits("/" + sumdbTileDir + ".p/3"); n != 1 {
+		t.Errorf(".p/3 reached the upstream %d times with only .p/2 cached, want 1", n)
+	}
+}
+
+// A corrupt source is not sliced: a client handed it would fail the tree head
+// check and report a checksum-database security error rather than an outage.
+func TestSumdbPartialTileCorruptSourceGoesUpstream(t *testing.T) {
+	for _, src := range []struct {
+		name  string
+		path  string
+		width int
+	}{
+		{"wider partial", sumdbTileDir + ".p/5", 5},
+		{"full tile", sumdbTileDir, 256},
+	} {
+		t.Run(src.name, func(t *testing.T) {
+			s, up := sumdbServer(t)
+			up.route("/"+src.path, string(sumdbTileBytes(src.width)))
+			want := sumdbTileBytes(3)
+			up.route("/"+sumdbTileDir+".p/3", string(want))
+			getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+src.path)
+			live := s.cfg.GomodSumdbURL
+			cutSumdbUpstream(t, s)
+			if status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3"); status != http.StatusOK || got != string(want) {
+				t.Fatalf(".p/3 from the intact %s with the upstream down = %d, want 200 and its prefix", src.path, status)
+			}
+			s.cfg.GomodSumdbURL = live
+			corrupt := sumdbTileBytes(src.width)
+			corrupt[0] ^= 0xff
+			if err := s.typeStore(manifest.TypeGomod).Put(t.Context(), manifest.GomodSumdbKey(gomodSumdbName, src.path), corrupt); err != nil {
+				t.Fatal(err)
+			}
+			status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+			if status != http.StatusOK || got != string(want) {
+				t.Fatalf(".p/3 = %d, want 200 with the upstream bytes, not a slice of the corrupt %s", status, src.path)
+			}
+			if n := up.hits("/" + sumdbTileDir + ".p/3"); n != 1 {
+				t.Errorf(".p/3 reached the upstream %d times past a corrupt source, want 1", n)
+			}
+		})
+	}
+}
+
+// countingStore counts every call that reads the store.
+type countingStore struct {
+	storage.ObjectStore
+	reads atomic.Int64
+}
+
+func (c *countingStore) Get(ctx context.Context, key string) ([]byte, error) {
+	c.reads.Add(1)
+	return c.ObjectStore.Get(ctx, key)
+}
+
+func (c *countingStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	c.reads.Add(1)
+	return c.ObjectStore.GetStream(ctx, key)
+}
+
+func (c *countingStore) Head(ctx context.Context, key string) (*storage.ObjectInfo, error) {
+	c.reads.Add(1)
+	return c.ObjectStore.Head(ctx, key)
+}
+
+func (c *countingStore) List(ctx context.Context, prefix string) ([]string, error) {
+	c.reads.Add(1)
+	return c.ObjectStore.List(ctx, prefix)
+}
+
+// fakeS3 is enough of the S3 object API for the storage.S3 driver to get,
+// head and put objects, counting the requests that read.
+type fakeS3 struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	reads   atomic.Int64
+	ts      *httptest.Server
+}
+
+func newFakeS3(t *testing.T) *fakeS3 {
+	t.Helper()
+	f := &fakeS3{objects: map[string][]byte{}}
+	f.ts = httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/bucket"), "/")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch r.Method {
+	case http.MethodPut:
+		b, _ := io.ReadAll(r.Body)
+		f.objects[key] = b
+		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(b)))
+	case http.MethodGet, http.MethodHead:
+		f.reads.Add(1)
+		if r.URL.Query().Get("list-type") == "2" {
+			f.list(w, r.URL.Query().Get("prefix"))
+			return
+		}
+		b, ok := f.objects[key]
+		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			if r.Method == http.MethodGet {
+				_, _ = io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>no such key</Message></Error>`)
+			}
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(b)))
+		w.Header().Set("Last-Modified", time.Unix(1700000000, 0).UTC().Format(http.TimeFormat))
+		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(b)
+		}
+	default:
+		w.WriteHeader(http.StatusNotImplemented)
+	}
+}
+
+// list answers ListObjectsV2 with every key under prefix in one page. The
+// caller holds f.mu.
+func (f *fakeS3) list(w http.ResponseWriter, prefix string) {
+	var keys []string
+	for k := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	fmt.Fprintf(&b, "<Name>bucket</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>", prefix, len(keys))
+	for _, k := range keys {
+		fmt.Fprintf(&b, "<Contents><Key>%s</Key><Size>%d</Size></Contents>", k, len(f.objects[k]))
+	}
+	b.WriteString("</ListBucketResult>")
+	w.Header().Set("Content-Type", "application/xml")
+	_, _ = io.WriteString(w, b.String())
+}
+
+func (f *fakeS3) store() storage.ObjectStore {
+	cfg := aws.Config{
+		Region:                     "us-east-1",
+		Credentials:                aws.AnonymousCredentials{},
+		BaseEndpoint:               aws.String(f.ts.URL),
+		HTTPClient:                 f.ts.Client(),
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	}
+	return storage.NewS3(bos3.NewClientFromConfig(cfg, "bucket", "us-east-1"))
+}
+
+// Finding the widest cached partial reads the store a fixed number of times,
+// whatever the requested width: probing every width above it would cost up to
+// 255 reads on a miss, each one a request on S3.
+func TestSumdbPartialTileStoreReadsBounded(t *testing.T) {
+	const maxReads = 5
+	backends := []struct {
+		name  string
+		store func(t *testing.T) (storage.ObjectStore, func() int64)
+	}{
+		{"filesystem", func(t *testing.T) (storage.ObjectStore, func() int64) {
+			c := &countingStore{ObjectStore: storage.NewLocal(t.TempDir())}
+			return c, c.reads.Load
+		}},
+		{"s3", func(t *testing.T) (storage.ObjectStore, func() int64) {
+			f := newFakeS3(t)
+			return f.store(), f.reads.Load
+		}},
+	}
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			s, up := sumdbServer(t)
+			store, reads := b.store(t)
+			s.stores = storage.NewSingle(store)
+			const wide = 250
+			body := sumdbTileBytes(wide)
+			up.route("/"+sumdbTileDir+".p/250", string(body))
+			if status, _ := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/250"); status != http.StatusOK {
+				t.Fatalf("filling .p/250 = %d", status)
+			}
+			cutSumdbUpstream(t, s)
+			var costs []int64
+			for _, w := range []int{1, 3, 128, 249} {
+				before := reads()
+				p := fmt.Sprintf("%s.p/%d", sumdbTileDir, w)
+				status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+p)
+				if status != http.StatusOK || got != string(body[:w*sumdbHashSize]) {
+					t.Fatalf("%s = %d (%d bytes), want the prefix of .p/250", p, status, len(got))
+				}
+				costs = append(costs, reads()-before)
+			}
+			for i, c := range costs {
+				if c != costs[0] || c > maxReads {
+					t.Fatalf("store reads per miss %v (index %d), want one constant at most %d", costs, i, maxReads)
+				}
+			}
+		})
+	}
+}
+
+// A partial cached before digests were kept is checked against the store
+// identity its fill recorded, so bytes rewritten since are not sliced.
+func TestSumdbPartialTilePreDigestCorruptSourceGoesUpstream(t *testing.T) {
+	for _, backend := range []string{"filesystem", "s3"} {
+		t.Run(backend, func(t *testing.T) {
+			s, up := sumdbServer(t)
+			var store storage.ObjectStore = storage.NewLocal(t.TempDir())
+			if backend == "s3" {
+				store = newFakeS3(t).store()
+			}
+			s.stores = storage.NewSingle(store)
+			source := sumdbTileDir + ".p/5"
+			up.route("/"+source, string(sumdbTileBytes(5)))
+			want := sumdbTileBytes(3)
+			up.route("/"+sumdbTileDir+".p/3", string(want))
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/go/sumdb/sum.golang.org/"+source, nil)
+			s.proxyOrCache(rec, req, store, manifest.GomodSumdbKey(gomodSumdbName, source),
+				s.cfg.GomodSumdbURL+"/"+source, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, false, false)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("filling %s without a digest record = %d", source, rec.Code)
+			}
+			corrupt := sumdbTileBytes(5)
+			corrupt[0] ^= 0xff
+			if err := store.Put(t.Context(), manifest.GomodSumdbKey(gomodSumdbName, source), corrupt); err != nil {
+				t.Fatal(err)
+			}
+			status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+			if status != http.StatusOK || got != string(want) {
+				t.Fatalf(".p/3 = %d, want 200 with the upstream bytes, not a slice of the rewritten %s", status, source)
+			}
+			if n := up.hits("/" + sumdbTileDir + ".p/3"); n != 1 {
+				t.Errorf(".p/3 reached the upstream %d times past a rewritten source, want 1", n)
+			}
+		})
+	}
+}
+
+func TestB194ReviewExistingCachedPartial(t *testing.T) {
+	for _, backend := range []string{"filesystem", "s3"} {
+		t.Run(backend, func(t *testing.T) {
+			s, up := sumdbServer(t)
+			var store storage.ObjectStore = storage.NewLocal(t.TempDir())
+			if backend == "s3" {
+				store = newFakeS3(t).store()
+			}
+			s.stores = storage.NewSingle(store)
+			source := sumdbTileDir + ".p/5"
+			want := sumdbTileBytes(5)
+			up.route("/"+source, string(want))
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/go/sumdb/sum.golang.org/"+source, nil)
+			s.proxyOrCache(rec, req, store, manifest.GomodSumdbKey(gomodSumdbName, source),
+				s.cfg.GomodSumdbURL+"/"+source, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, false, false)
+			if rec.Code != http.StatusOK || rec.Body.String() != string(want) {
+				t.Fatalf("pre-upgrade fill = %d, want 200 with source bytes", rec.Code)
+			}
+			cfg := *s.cfg
+			cfg.ProxyCacheEnabled = true
+			restarted := newServer(&cfg, s.store, s.stores, "127.0.0.1:0", nil)
+			restarted.cache = s.cache
+			t.Cleanup(func() { _ = restarted.auditDB.Close() })
+			s = restarted
+			cutSumdbUpstream(t, s)
+			if status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+source); status != http.StatusOK || got != string(want) {
+				t.Fatalf("existing cached .p/5 = %d, want 200 and source bytes", status)
+			}
+			status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+			if status != http.StatusOK || got != string(want[:3*sumdbHashSize]) {
+				t.Fatalf("pre-upgrade .p/5 cached: .p/3 = %d (%d bytes), want 200 and its 96-byte prefix", status, len(got))
+			}
+		})
+	}
+}
+
+type b194DelayedWidestStore struct {
+	storage.ObjectStore
+	narrowWaiting chan struct{}
+	releaseNarrow chan struct{}
+	wideWritten   chan struct{}
+}
+
+func (s *b194DelayedWidestStore) Put(ctx context.Context, key string, data []byte) error {
+	if !strings.Contains(key, "/widest/") {
+		return s.ObjectStore.Put(ctx, key, data)
+	}
+	var rec struct{ Width int }
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return err
+	}
+	if rec.Width == 2 {
+		close(s.narrowWaiting)
+		select {
+		case <-s.releaseNarrow:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	err := s.ObjectStore.Put(ctx, key, data)
+	if rec.Width == 5 {
+		close(s.wideWritten)
+	}
+	return err
+}
+
+func TestB194ReviewConcurrentWidths(t *testing.T) {
+	s, up := sumdbServer(t)
+	store := &b194DelayedWidestStore{
+		ObjectStore:   storage.NewLocal(t.TempDir()),
+		narrowWaiting: make(chan struct{}),
+		releaseNarrow: make(chan struct{}),
+		wideWritten:   make(chan struct{}),
+	}
+	s.stores = storage.NewSingle(store)
+	up.route("/"+sumdbTileDir+".p/2", string(sumdbTileBytes(2)))
+	up.route("/"+sumdbTileDir+".p/5", string(sumdbTileBytes(5)))
+	handler := s.Handler()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	request := func(width int, done chan<- *httptest.ResponseRecorder) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/go/sumdb/sum.golang.org/%s.p/%d", sumdbTileDir, width), nil).WithContext(ctx)
+		handler.ServeHTTP(rec, req)
+		done <- rec
+	}
+	narrowDone := make(chan *httptest.ResponseRecorder, 1)
+	wideDone := make(chan *httptest.ResponseRecorder, 1)
+	go request(2, narrowDone)
+	pending := []chan *httptest.ResponseRecorder{narrowDone, wideDone}
+	select {
+	case <-store.narrowWaiting:
+		go request(5, wideDone)
+		select {
+		case <-store.wideWritten:
+		case <-time.After(3 * time.Second):
+			// A serialized index writer must let the narrow fill finish first.
+		}
+		close(store.releaseNarrow)
+	case rec := <-narrowDone:
+		// An implementation without a shared index has no write to hold.
+		if rec.Code != http.StatusOK {
+			t.Fatalf("narrow fill = %d, want 200", rec.Code)
+		}
+		pending = []chan *httptest.ResponseRecorder{wideDone}
+		go request(5, wideDone)
+	case <-ctx.Done():
+		t.Fatal("narrow fill did not finish or reach the index write")
+	}
+	for _, done := range pending {
+		select {
+		case rec := <-done:
+			if rec.Code != http.StatusOK {
+				t.Fatalf("fill = %d, want 200", rec.Code)
+			}
+		case <-ctx.Done():
+			t.Fatal("fill did not finish")
+		}
+	}
+	cutSumdbUpstream(t, s)
+	status, got := getStatusAndBody(t, s, "/go/sumdb/sum.golang.org/"+sumdbTileDir+".p/3")
+	if status != http.StatusOK || got != string(sumdbTileBytes(3)) {
+		t.Fatalf("both .p/2 and .p/5 cached after concurrent fills: .p/3 = %d (%d bytes), want 200 and the 96-byte prefix of .p/5", status, len(got))
+	}
+}
+
+func TestB194ReviewOfflineDocsHeightBound(t *testing.T) {
+	usage, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(usage), "With `gomod_sumdb_url` unreachable")
+	if !ok {
+		t.Fatal("missing checksum-database offline documentation")
+	}
+	section, _, _ = strings.Cut(section, "bodega also checks every Go module")
+	bound := fmt.Sprintf("H <= %d", sumdbMaxTileHeight)
+	if !strings.Contains(section, bound) {
+		t.Fatalf("offline partial-tile table promises all heights; document the derivation bound %q and that taller tiles need the exact cached path or upstream", bound)
 	}
 }
