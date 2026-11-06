@@ -337,6 +337,13 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	}
 	key := manifest.PypiWheelPrefix + p
 	file := path.Base(p)
+	// No page bodega publishes promises a PEP 658 .metadata file, so a request
+	// for one is a client reading a key the republish missed. Gating it would
+	// record the filename as a package, since wheelIdentity cannot place it.
+	if strings.HasSuffix(file, ".metadata") {
+		http.NotFound(w, r)
+		return
+	}
 	// Wrapped rather than set: proxyOrResolve and proxyVersion below can both
 	// answer 403 or 404, and http.Error leaves the header map alone.
 	w = cachePrivateOn200(w, file)
@@ -727,9 +734,18 @@ func republishPypiJSON(body []byte, pkg, indexURL string, permit func(string) bo
 	return buf.Bytes(), nil
 }
 
+// pypiJSONMetadataKeys are the PEP 691 spellings of the PEP 658 metadata
+// promise. pypi.org sends data-dist-info-metadata beside core-metadata (PEP
+// 714 kept the legacy key for older clients), and uv reads whichever it finds,
+// so leaving any one of them sends a client to a .metadata file bodega 404s.
+var pypiJSONMetadataKeys = []string{"core-metadata", "data-dist-info-metadata", "dist-info-metadata"}
+
 // rewritePypiJSONFile points one PEP 691 file at bodega's wheel route. A url
 // that names no file is left as it stands, as rewritePypiIndex leaves an href.
 func rewritePypiJSONFile(entry map[string]any, base *url.URL) {
+	for _, k := range pypiJSONMetadataKeys {
+		delete(entry, k)
+	}
 	raw, _ := entry["url"].(string)
 	u, err := base.Parse(raw)
 	if err != nil {
@@ -744,8 +760,6 @@ func rewritePypiJSONFile(entry map[string]any, base *url.URL) {
 		href += "#" + u.Fragment
 	}
 	entry["url"] = href
-	delete(entry, "core-metadata")
-	delete(entry, "dist-info-metadata")
 }
 
 // pypiHrefFilename recovers the filename one href names, unescaped. An href
