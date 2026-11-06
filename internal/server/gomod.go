@@ -3,11 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	pathpkg "path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,12 +19,14 @@ import (
 
 	modulepath "golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
+	"golang.org/x/mod/sumdb/tlog"
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/provenance"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ---- Go module proxy -------------------------------------------------------
@@ -240,11 +246,210 @@ func (s *Server) handleGomodSumdb(w http.ResponseWriter, r *http.Request, p stri
 		http.NotFound(w, r)
 		return
 	}
+	store := s.typeStore(manifest.TypeGomod)
+	key := manifest.GomodSumdbKey(gomodSumdbName, rest)
+	upstream := s.cfg.GomodSumdbURL + "/" + rest
 	// No allow-list candidate: the database is not a package, and refusing a
 	// lookup under module rules would fail `go` for modules bodega serves.
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), manifest.GomodSumdbKey(gomodSumdbName, rest),
-		s.cfg.GomodSumdbURL+"/"+rest, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, immutable, false)
+	proxy := func(w http.ResponseWriter) {
+		s.proxyOrCache(w, r, store, key, upstream, manifest.TypeGomod, "", "sumdb/"+gomodSumdbName, immutable, false)
+	}
+	tile, ok := sumdbPartialHashTile(rest)
+	if !ok || store == nil {
+		proxy(w)
+		return
+	}
+	if info, err := store.Head(r.Context(), key); err != nil || info == nil || info.Exists {
+		proxy(w)
+		return
+	}
+	if s.serveSumdbTilePrefix(w, r, store, tile) {
+		return
+	}
+	// Before the status line rather than after the body: proxyOrCache writes
+	// the 200 once the tile is cached, and a client that goes on to ask for a
+	// narrower width of the same tile must find the record already there.
+	proxy(&beforeOK{ResponseWriter: w, hook: func() { s.recordWidestSumdbPartial(r.Context(), store, tile) }})
 }
+
+// sumdbMaxTileHeight bounds the tiles bodega slices. sum.golang.org uses 8,
+// and a full tile is 2^H hashes, so the bound is also what caps the read of a
+// cached source at 8 KiB rather than whatever height a request names.
+const sumdbMaxTileHeight = 8
+
+// sumdbHashSize is the width of one entry in a hash tile.
+const sumdbHashSize = 32
+
+// sumdbPartialHashTile parses rest as a partial hash tile. Data tiles
+// (tile/H/data/...) are excluded: their entries are records of varying
+// length, so the first W of them is not the first W*32 bytes.
+func sumdbPartialHashTile(rest string) (tlog.Tile, bool) {
+	tile, err := tlog.ParseTilePath(rest)
+	if err != nil || tile.L < 0 || tile.H > sumdbMaxTileHeight || tile.W >= 1<<tile.H {
+		return tlog.Tile{}, false
+	}
+	return tile, true
+}
+
+// sumdbWidest is the record of the widest partial bodega holds for one tile,
+// kept beside the tiles because finding it by probing would cost up to 2^H-1
+// store reads per miss. SHA256 is what the partial hashed to when it was
+// cached: partial tiles are mutable objects, so the audit store pins no
+// digest for them, and slicing bytes nothing vouches for would hand a client
+// a corrupt tile it reports as a checksum-database security error.
+type sumdbWidest struct {
+	Width  int    `json:"width"`
+	SHA256 string `json:"sha256"`
+}
+
+// sumdbWidestKey is where the sumdbWidest record for tile's position lives.
+// "widest/" is not a path the handler answers, so a client cannot read it.
+func sumdbWidestKey(tile tlog.Tile) string {
+	full := tile
+	full.W = 1 << tile.H
+	return manifest.GomodSumdbKey(gomodSumdbName, "widest/"+full.Path())
+}
+
+// serveSumdbTilePrefix answers a missing partial tile with the first W hashes
+// of the same tile cached complete, or of the widest partial cached wider,
+// as the go command slices its own cache (sumdb.Client.readTile in
+// golang.org/x/mod). The client checks every hash against a tree head it
+// already holds, so the slice is no less authenticated than the source; it is
+// what lets `go` verify with the upstream unreachable. It reports false, having
+// written nothing, when no verified source is cached.
+//
+// The slice is never stored under its own key: it would be a copy of bytes
+// already held, and a write here is a write per request for every width.
+func (s *Server) serveSumdbTilePrefix(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, tile tlog.Tile) bool {
+	ctx := r.Context()
+	full := tile
+	full.W = 1 << tile.H
+	fullKey := manifest.GomodSumdbKey(gomodSumdbName, full.Path())
+	src, obj, ok := s.readSumdbTile(ctx, store, fullKey, full.W, func(digest string) bool {
+		if s.auditDB == nil {
+			return false
+		}
+		stored, err := s.auditDB.GetChecksum(ctx, fullKey)
+		return err == nil && stored != nil && stored.Value == digest
+	})
+	srcKey := fullKey
+	if !ok {
+		widest, found := readSumdbWidest(ctx, store, tile)
+		if !found || widest.Width <= tile.W || widest.Width >= full.W {
+			return false
+		}
+		wide := tile
+		wide.W = widest.Width
+		srcKey = manifest.GomodSumdbKey(gomodSumdbName, wide.Path())
+		src, obj, ok = s.readSumdbTile(ctx, store, srcKey, wide.W, func(digest string) bool { return digest == widest.SHA256 })
+		if !ok {
+			return false
+		}
+	}
+	s.logFor(ctx).Info("sumdb partial tile served from a wider cached tile",
+		"key", manifest.GomodSumdbKey(gomodSumdbName, tile.Path()), "source", srcKey)
+	s.recordCacheHit(ctx, r, manifest.TypeGomod, s.cfg.GomodSumdbURL+"/"+tile.Path(), "", "sumdb/"+gomodSumdbName, srcKey, obj)
+	body := src[:tile.W*sumdbHashSize]
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		_ = failBodyTransfer(ctx, fmt.Errorf("write %s sliced from %s: %w", tile.Path(), srcKey, err))
+	}
+	return true
+}
+
+// readSumdbTile reads the cached tile at key, which must hold exactly width
+// hashes and pass verified on its sha256. A source that is absent, the wrong
+// length or fails verified is not one to slice, and the caller falls through
+// to the next source or the upstream.
+func (s *Server) readSumdbTile(ctx context.Context, store storage.ObjectStore, key string, width int, verified func(digest string) bool) ([]byte, cachedObject, bool) {
+	res, err := store.GetStream(ctx, key)
+	if err != nil || res == nil {
+		return nil, cachedObject{}, false
+	}
+	defer func() { _ = res.Body.Close() }()
+	want := width * sumdbHashSize
+	data, err := io.ReadAll(io.LimitReader(res.Body, int64(want)+1))
+	if err != nil || len(data) != want {
+		s.logFor(ctx).Warn("cached sumdb tile is not the length its width names, not slicing it",
+			"key", key, "bytes", len(data), "want", want, "error", err)
+		return nil, cachedObject{}, false
+	}
+	sum := sha256.Sum256(data)
+	if !verified(hex.EncodeToString(sum[:])) {
+		s.logFor(ctx).Warn("cached sumdb tile does not match its stored checksum, not slicing it; the request goes upstream",
+			"key", key)
+		return nil, cachedObject{}, false
+	}
+	return data, cachedObject{store: store, id: streamIdentity(store, res)}, true
+}
+
+// readSumdbWidest reads tile's sumdbWidest record; found is false when there
+// is none or it does not parse.
+func readSumdbWidest(ctx context.Context, store storage.ObjectStore, tile tlog.Tile) (sumdbWidest, bool) {
+	data, err := store.Get(ctx, sumdbWidestKey(tile))
+	if err != nil || data == nil {
+		return sumdbWidest{}, false
+	}
+	var rec sumdbWidest
+	if json.Unmarshal(data, &rec) != nil || rec.Width <= 0 || len(rec.SHA256) != sha256.Size*2 {
+		return sumdbWidest{}, false
+	}
+	return rec, true
+}
+
+// recordWidestSumdbPartial raises tile's sumdbWidest record to the partial
+// just cached, when it is wider than the one recorded. It reads the cached
+// object back rather than trusting the response, so the digest describes what
+// a later slice will read. Two fills racing can leave the narrower one
+// recorded; that costs a later miss the wider source, never a wrong answer.
+func (s *Server) recordWidestSumdbPartial(ctx context.Context, store storage.ObjectStore, tile tlog.Tile) {
+	key := manifest.GomodSumdbKey(gomodSumdbName, tile.Path())
+	data, err := store.Get(ctx, key)
+	if err != nil || len(data) != tile.W*sumdbHashSize {
+		return
+	}
+	if cur, ok := readSumdbWidest(ctx, store, tile); ok && cur.Width >= tile.W {
+		return
+	}
+	sum := sha256.Sum256(data)
+	rec, err := json.Marshal(sumdbWidest{Width: tile.W, SHA256: hex.EncodeToString(sum[:])})
+	if err != nil {
+		return
+	}
+	if err := store.Put(ctx, sumdbWidestKey(tile), rec); err != nil {
+		s.logFor(ctx).Warn("could not record the widest cached sumdb partial; a narrower miss for this tile will need the upstream",
+			"key", key, "error", err)
+	}
+}
+
+// beforeOK runs hook once, ahead of a 200 status line, and passes everything
+// else through.
+type beforeOK struct {
+	http.ResponseWriter
+	hook    func()
+	written bool
+}
+
+func (b *beforeOK) WriteHeader(code int) {
+	if !b.written {
+		b.written = true
+		if code == http.StatusOK {
+			b.hook()
+		}
+	}
+	b.ResponseWriter.WriteHeader(code)
+}
+
+func (b *beforeOK) Write(p []byte) (int, error) {
+	if !b.written {
+		b.WriteHeader(http.StatusOK)
+	}
+	return b.ResponseWriter.Write(p)
+}
+
+func (b *beforeOK) Unwrap() http.ResponseWriter { return b.ResponseWriter }
 
 // checksumDatabaseGate holds a Go module's .zip or .mod, spooled at path, to
 // the hash the checksum database signed for it when the fill's admission
