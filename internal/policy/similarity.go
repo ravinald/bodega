@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"sync"
@@ -32,8 +34,122 @@ var popularFS embed.FS
 // anyone can publish to. rpm is the exception in kind: a vendor's
 // repositories are curated, but a host takes packages from any repository
 // rpm_upstreams names, and a third-party one names its packages as it likes.
+// helm and git are reached through rules no one reviews name by name: a helm
+// repository rule admits every chart it serves, and a git org prefix every
+// repository under it.
 func SimilarityEcosystems() []string {
-	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
+	return []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGit, manifest.TypeHelm, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
+}
+
+// GitSimilarityName is the {owner}/{repo} path a git repository is compared
+// under: the last two segments of its upstream URL's path, with the host and
+// a .git suffix dropped. That is the identity a squat imitates; the catalog
+// name an operator gave the entry is not. It accepts a URL with a scheme and
+// the scp-like git@host:owner/repo form, and returns "" for an upstream with
+// no path to compare.
+func GitSimilarityName(upstream string) string {
+	u := strings.TrimSpace(upstream)
+	if scheme, rest, ok := strings.Cut(u, "://"); ok && gitNativeScheme(scheme) {
+		// Git's own transports decode %XX across the whole URL before they
+		// find where the host ends, so an encoded / separates host and path
+		// as a literal one does, and ? and # stay path characters; only the
+		// http transports read them as a query and a fragment.
+		_, u, _ = strings.Cut(gitURLDecode(rest), "/")
+	} else if ok {
+		// The remote decodes the path before it resolves a repository, so
+		// %6bubernetes is kubernetes there and has to be here. A path that
+		// will not parse is compared as written.
+		if parsed, err := url.Parse(u); err == nil {
+			u = parsed.Path
+		} else {
+			_, u, _ = strings.Cut(rest, "/")
+			u, _, _ = strings.Cut(u, "?")
+			u, _, _ = strings.Cut(u, "#")
+		}
+	} else if host, _, ok := strings.Cut(u, ":"); ok && !strings.Contains(host, "/") {
+		// scp-like and local paths reach the remote as written: ? and # are
+		// path characters there, not delimiters.
+		u = gitSCPPath(u)
+	}
+	// Git resolves . and .. before it opens a repository, so owner/repo.git/.
+	// is owner/repo.git and has to be compared as that.
+	u = strings.TrimSuffix(strings.Trim(path.Clean("/"+u), "/"), ".git")
+	var segs []string
+	for seg := range strings.SplitSeq(u, "/") {
+		if seg != "" {
+			segs = append(segs, seg)
+		}
+	}
+	if len(segs) > 2 {
+		segs = segs[len(segs)-2:]
+	}
+	return strings.Join(segs, "/")
+}
+
+// gitSCPPath returns the path of an scp-like upstream, [user@]host:path.
+// A bracketed host, [::1] or git@[2001:db8::1], holds colons of its own, so
+// the separator is the first colon after the closing bracket, as Git's
+// host_end finds it; anywhere else it is the first colon.
+func gitSCPPath(u string) string {
+	start := 0
+	if i := strings.Index(u, "@["); i >= 0 {
+		start = i + 1
+	}
+	end := start
+	if strings.HasPrefix(u[start:], "[") {
+		if j := strings.IndexByte(u[start:], ']'); j >= 0 {
+			end = start + j
+		}
+	} else {
+		end = 0
+	}
+	if k := strings.IndexByte(u[end:], ':'); k >= 0 {
+		return u[end+k+1:]
+	}
+	return u
+}
+
+// gitNativeScheme reports whether Git opens a URL with this scheme through
+// its own transport rather than a remote helper.
+func gitNativeScheme(scheme string) bool {
+	switch scheme {
+	case "file", "ssh", "git", "git+ssh", "ssh+git":
+		return true
+	}
+	return false
+}
+
+// gitURLDecode decodes %XX escapes as Git does for a native URL's path: a
+// malformed escape is kept as written, + stays a plus, and %00 stays %00,
+// since Git never puts a NUL into the path it opens and resolves a
+// repository with those three characters in its name instead.
+func gitURLDecode(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			if c := unhex(s[i+1])<<4 | unhex(s[i+2]); c != 0 {
+				b.WriteByte(c)
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c <= '9':
+		return c - '0'
+	case c <= 'F':
+		return c - 'A' + 10
+	}
+	return c - 'a' + 10
 }
 
 // SimilarityName is the part of a package name the check compares. An oci
@@ -139,7 +255,7 @@ func ParsePopularNames(ecosystem string, data []byte) (PopularNames, error) {
 	switch ecosystem {
 	case manifest.TypeMaven:
 		p.sharedArtifacts = sharedMavenArtifacts(p.keys)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		p.sharedArtifacts = sharedComposerPackages(p.keys)
 	}
 	return p, nil
@@ -309,6 +425,11 @@ func (p PopularNames) Label() string {
 // vendor, so the common squat is a lookalike vendor over a real package name:
 // symfont/console is 1 from symfony/console by spelling, and acme/guzzle is 1
 // from guzzlehttp/guzzle by the vendor replaced whole.
+//
+// A git {owner}/{repo} path is split and counted as a composer name is, owner
+// for vendor: anyone can register an owner on a forge, so
+// kubernetse/kubernetes is 1 from kubernetes/kubernetes, and so is
+// acme/kubernetes.
 func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 	switch ecosystem {
 	case manifest.TypeNpm:
@@ -325,7 +446,7 @@ func nameDistance(ecosystem, a, b string, shared map[string]bool) int {
 			return 1
 		}
 		return damerauLevenshtein(ag, bg) + damerauLevenshtein(aa, ba)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		av, ap := splitComposerName(a)
 		bv, bp := splitComposerName(b)
 		if ap == bp && av != bv && !shared[ap] {
@@ -383,7 +504,7 @@ func distanceFloor(ecosystem, a, b string) int {
 			return 0
 		}
 		return lengthGap(ag, bg) + lengthGap(aa, ba)
-	case manifest.TypeComposer:
+	case manifest.TypeComposer, manifest.TypeGit:
 		av, ap := splitComposerName(a)
 		bv, bp := splitComposerName(b)
 		if ap == bp {
@@ -549,17 +670,25 @@ func NewNameSimilarityChecker(store SimilarityStore) *NameSimilarityChecker {
 // Check compares pm's name with the ecosystem's popular names. A name within
 // MaxSimilarityDistance of one it is not equal to fails under the configured
 // action, unless an exact allow-list rule names it or the store held it when
-// the baseline was taken.
-func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageManifest, _ *manifest.VersionEntry) Result {
+// the baseline was taken. A git entry is compared by its version's upstream
+// URL (GitSimilarityName) and exempted under its catalog name.
+func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Result {
 	r := Result{Check: audit.CheckNameSimilarity, Action: ActionPass}
 	if pm == nil {
 		return r
 	}
-	key := pm.Type + "\x00" + pm.Name
+	compared := SimilarityName(pm.Type, pm.Name)
+	if pm.Type == manifest.TypeGit {
+		compared = ""
+		if ve != nil {
+			compared = GitSimilarityName(ve.URL)
+		}
+	}
+	key := pm.Type + "\x00" + pm.Name + "\x00" + compared
 	if prev, ok := c.seen[key]; ok {
 		return prev
 	}
-	r = c.check(ctx, pm.Type, pm.Name)
+	r = c.check(ctx, pm.Type, pm.Name, compared)
 	if c.seen == nil {
 		c.seen = map[string]Result{}
 	}
@@ -567,7 +696,7 @@ func (c *NameSimilarityChecker) Check(ctx context.Context, pm *manifest.PackageM
 	return r
 }
 
-func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Result {
+func (c *NameSimilarityChecker) check(ctx context.Context, typ, name, compared string) Result {
 	r := Result{Check: audit.CheckNameSimilarity, Action: ActionPass}
 	if !slices.Contains(SimilarityEcosystems(), typ) {
 		r.Action = ActionNotEvaluated
@@ -593,9 +722,16 @@ func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Res
 		r.Action, r.Reason = ActionNotEvaluated, "no popular-name list for "+typ
 		return r
 	}
-	compared := SimilarityName(typ, name)
+	if compared == "" {
+		r.Action, r.Reason = ActionNotEvaluated, "not run: "+name+" names no upstream URL with an {owner}/{repo} path to compare"
+		return r
+	}
+	subject := name
+	if compared != SimilarityName(typ, name) {
+		subject = name + " (" + compared + ")"
+	}
 	if list.Contains(compared) {
-		r.Reason = name + " is itself on the popular " + typ + " list (" + list.Label() + ")"
+		r.Reason = subject + " is itself on the popular " + typ + " list (" + list.Label() + ")"
 		return r
 	}
 	popular, distance, near := list.Near(compared)
@@ -603,7 +739,7 @@ func (c *NameSimilarityChecker) check(ctx context.Context, typ, name string) Res
 		r.Reason = fmt.Sprintf("no popular %s name within distance %d (%s)", typ, MaxSimilarityDistance, list.Label())
 		return r
 	}
-	hit := fmt.Sprintf("%s is distance %d from the popular %s name %s (%s)", name, distance, typ, popular, list.Label())
+	hit := fmt.Sprintf("%s is distance %d from the popular %s name %s (%s)", subject, distance, typ, popular, list.Label())
 	r.Details = map[string]any{"nearest": popular, "distance": distance}
 
 	exempt, err := c.exemption(ctx, typ, name)

@@ -3,6 +3,9 @@ package policy
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"testing"
@@ -567,6 +570,330 @@ func TestNameSimilarityRpm(t *testing.T) {
 	for _, name := range []string{"openssl-libs", "NetworkManager", "acme-billing-agent"} {
 		if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeRpm, name); r.Action != ActionPass {
 			t.Errorf("%s = %+v, want a pass", name, r)
+		}
+	}
+}
+
+// A helm chart a character from a popular one is held under block, and the
+// popular chart itself, and a baselined near name, are not. The warn default
+// records a warn rather than refusing.
+func TestNameSimilarityHelm(t *testing.T) {
+	r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeHelm, "ingres-nginx")
+	if r.Action != ActionBlock || r.Details["nearest"] != "ingress-nginx" || r.Details["distance"] != 1 {
+		t.Errorf("ingres-nginx = %+v, want a block naming ingress-nginx at distance 1", r)
+	}
+	if r := checkName(t, &similarityStore{}, manifest.TypeHelm, "ingres-nginx"); r.Action != ActionWarn {
+		t.Errorf("ingres-nginx under the default = %+v, want a warn", r)
+	}
+	if r := checkName(t, &similarityStore{action: ActionBlock}, manifest.TypeHelm, "ingress-nginx"); r.Action != ActionPass {
+		t.Errorf("ingress-nginx = %+v, want a pass", r)
+	}
+	inUse := &similarityStore{action: ActionBlock, taken: true, baseline: map[string]bool{"helm/ingres-nginx": true}}
+	if r := checkName(t, inUse, manifest.TypeHelm, "ingres-nginx"); r.Action != ActionPass || !strings.Contains(r.Reason, "baseline") {
+		t.Errorf("baselined ingres-nginx = %+v, want a pass naming the baseline", r)
+	}
+}
+
+func checkGit(t *testing.T, store SimilarityStore, name, upstream string) Result {
+	t.Helper()
+	pm := &manifest.PackageManifest{Type: manifest.TypeGit, Name: name, Versions: []manifest.VersionEntry{{URL: upstream, Ref: "main"}}}
+	return NewNameSimilarityChecker(store).Check(t.Context(), pm, &pm.Versions[0])
+}
+
+// A git repository is compared by its upstream's {owner}/{repo} path, not by
+// the catalog name: a popular repo under a lookalike or unrelated owner is
+// distance 1, and the popular path itself passes.
+func TestNameSimilarityGit(t *testing.T) {
+	for _, tc := range []struct{ upstream, nearest string }{
+		{"https://github.com/kubernetse/kubernetes.git", "kubernetes/kubernetes"},
+		{"https://github.com/acme/kubernetes", "kubernetes/kubernetes"},
+		{"git@github.com:kubernetes/kubernetse.git", "kubernetes/kubernetes"},
+	} {
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", tc.upstream)
+		if r.Action != ActionBlock || r.Details["nearest"] != tc.nearest || r.Details["distance"] != 1 {
+			t.Errorf("%s = %+v, want a block naming %s at distance 1", tc.upstream, r, tc.nearest)
+		}
+	}
+	if r := checkGit(t, &similarityStore{}, "k8s", "https://github.com/kubernetse/kubernetes.git"); r.Action != ActionWarn {
+		t.Errorf("default = %+v, want a warn", r)
+	}
+	// The catalog name is a popular path's lookalike, the upstream is the
+	// popular path: the upstream decides.
+	if r := checkGit(t, &similarityStore{action: ActionBlock}, "kubernetse/kubernetes", "https://github.com/kubernetes/kubernetes.git"); r.Action != ActionPass {
+		t.Errorf("the popular path = %+v, want a pass", r)
+	}
+	inUse := &similarityStore{action: ActionBlock, taken: true, baseline: map[string]bool{"git/k8s": true}}
+	if r := checkGit(t, inUse, "k8s", "https://github.com/kubernetse/kubernetes.git"); r.Action != ActionPass {
+		t.Errorf("baselined = %+v, want a pass", r)
+	}
+	if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", ""); r.Action != ActionNotEvaluated {
+		t.Errorf("no upstream = %+v, want not evaluated", r)
+	}
+}
+
+func TestGitSimilarityName(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://github.com/kubernetes/kubernetes.git":   "kubernetes/kubernetes",
+		"https://github.com/kubernetes/kubernetes/":      "kubernetes/kubernetes",
+		"git@github.com:torvalds/linux.git":              "torvalds/linux",
+		"ssh://git@gitlab.com/group/sub/project.git":     "sub/project",
+		"file:///srv/upstreams/team/tool.git":            "team/tool",
+		"https://example.com/repo.git?ref=main#fragment": "repo",
+		"https://example.com/":                           "",
+	} {
+		if got := GitSimilarityName(in); got != want {
+			t.Errorf("GitSimilarityName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// helm and git ship lists of the size the item names.
+func TestEmbeddedHelmAndGitLists(t *testing.T) {
+	for eco, least := range map[string]int{manifest.TypeHelm: 500, manifest.TypeGit: 1000} {
+		p, ok := EmbeddedPopularNames(eco)
+		if !ok || len(p.Names) < least || p.Source == "" || p.Date == "" {
+			t.Errorf("%s list = %d names, source %q, date %q; want at least %d with a source and date", eco, len(p.Names), p.Source, p.Date, least)
+		}
+	}
+}
+
+func TestReviewGitSimilarityEscapedURL(t *testing.T) {
+	for _, tc := range []struct{ upstream, action string }{
+		{"https://github.com/kubernetse/%6bubernetes.git", ActionBlock},
+		{"https://github.com/%6bubernetse/%6bubernetes.git", ActionBlock},
+		{"https://github.com/kubernetes/%6bubernetes.git", ActionPass},
+	} {
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", tc.upstream)
+		if r.Action != tc.action {
+			t.Errorf("%s: action=%s, want %s; %s", tc.upstream, r.Action, tc.action, r.Reason)
+		}
+	}
+}
+
+func TestReviewSimilarityUsageDocumentation(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(data)
+	_, section, ok := strings.Cut(doc, "### `bodega policy similarity")
+	if !ok {
+		t.Fatal("missing similarity section")
+	}
+	section, _, _ = strings.Cut(section, "\n### ")
+	for _, prefix := range []string{"| `similarity`", "Catches a typosquat", "The check runs at the same points"} {
+		var found bool
+		content := section
+		if prefix == "| `similarity`" {
+			content = doc
+		}
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, prefix) {
+				found = true
+				for _, eco := range []string{"helm", "git"} {
+					if !strings.Contains(line, eco) {
+						t.Errorf("%q omits %s", prefix, eco)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("missing documentation paragraph %q", prefix)
+		}
+	}
+	if !strings.Contains(doc, "once per new mirror rather than on every fetch, because") {
+		t.Error("missing git mirror admission lifetime and reason")
+	}
+	if strings.Contains(doc, "A proxy fill runs the provenance check only: the age, OSV and name-similarity checks record `not_evaluated` for a helm chart fetched through the proxy.") {
+		t.Error("Helm usage still says proxy fills do not evaluate name similarity")
+	}
+}
+
+func TestReviewGitLiteralSCPPath(t *testing.T) {
+	for _, upstream := range []string{
+		"git@forge.example:archive#2026/kubernetse/kubernetes.git",
+		"git@forge.example:archive?2026/kubernetse/kubernetes.git",
+	} {
+		if got := GitSimilarityName(upstream); got != "kubernetse/kubernetes" {
+			t.Errorf("GitSimilarityName(%q) = %q, want kubernetse/kubernetes", upstream, got)
+		}
+		r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream)
+		if r.Action != ActionBlock {
+			t.Errorf("%s: action=%s, want block; %s", upstream, r.Action, r.Reason)
+		}
+	}
+}
+
+func TestReviewSimilarityAdmissionDocs(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(data)
+	_, section, ok := strings.Cut(doc, "**The proxy runs import's checks.**")
+	if !ok {
+		t.Fatal("missing admission documentation")
+	}
+	paragraph, _, _ := strings.Cut(section, "\n\n")
+	if !strings.Contains(paragraph, "helm") || !strings.Contains(paragraph, "git") {
+		t.Error("admission documentation omits Helm similarity fills and Git first-mirror similarity admission")
+	}
+	if strings.Contains(paragraph, "A fill of any other type records the allow-list's verdict and `not_evaluated` for the version checks") {
+		t.Error("admission documentation still says all types other than npm, pypi, gomod and cargo skip version checks")
+	}
+}
+
+func TestReviewGitNativeURLPath(t *testing.T) {
+	for _, scheme := range []string{"file", "ssh", "git"} {
+		for _, marker := range []string{"#", "?"} {
+			upstream := scheme + "://forge.example/archive" + marker + "2026/kubernetse/%6bubernetes.git/."
+			if got := GitSimilarityName(upstream); got != "kubernetse/kubernetes" {
+				t.Errorf("GitSimilarityName(%q) = %q, want kubernetse/kubernetes", upstream, got)
+			}
+			if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != ActionBlock {
+				t.Errorf("%s: action=%s, want block; %s", upstream, r.Action, r.Reason)
+			}
+		}
+	}
+}
+
+func TestReviewGitNativeEncodedBoundary(t *testing.T) {
+	for _, scheme := range []string{"file", "ssh", "git", "git+ssh", "ssh+git"} {
+		upstream := scheme + "://forge.example%2Fkubernetse%2Fkubernetes.git"
+		if got := GitSimilarityName(upstream); got != "kubernetse/kubernetes" {
+			t.Errorf("GitSimilarityName(%q) = %q, want kubernetse/kubernetes", upstream, got)
+		}
+		if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != ActionBlock {
+			t.Errorf("%s: action=%s, want block; %s", upstream, r.Action, r.Reason)
+		}
+	}
+}
+
+func TestReviewGitNativeLiteralNullEscape(t *testing.T) {
+	for _, scheme := range []string{"file", "ssh", "git", "git+ssh", "ssh+git"} {
+		for _, suffix := range []string{"%00", "%2500"} {
+			upstream := scheme + "://forge.example/kubernetes/kubernetes" + suffix + ".git"
+			if got := GitSimilarityName(upstream); got != "kubernetes/kubernetes%00" {
+				t.Errorf("GitSimilarityName(%q) = %q, want kubernetes/kubernetes%%00", upstream, got)
+			}
+			if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != ActionPass {
+				t.Errorf("%s: action=%s, want pass for the literal repository name; %s", upstream, r.Action, r.Reason)
+			}
+		}
+	}
+}
+
+func TestReviewSimilarityPopularListDocumentation(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, ok := strings.Cut(string(data), "### `bodega policy similarity")
+	if !ok {
+		t.Fatal("missing similarity section")
+	}
+	section, _, _ = strings.Cut(section, "\n### ")
+	_, lists, ok := strings.Cut(section, "**Popular lists.**")
+	if !ok {
+		t.Fatal("missing popular-list documentation")
+	}
+	lists, _, _ = strings.Cut(lists, "`load` replaces")
+	for _, eco := range []string{"helm", "git"} {
+		found := false
+		for _, line := range strings.Split(lists, "\n") {
+			if strings.HasPrefix(line, "| `"+eco+"`") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("similarity Popular lists table omits %s", eco)
+		}
+	}
+}
+
+func TestReviewGitSCPEndpointDoesNotChangeIdentity(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"kubernetes/kubernetes.git", ActionPass},
+		{"kubernetse/kubernetes.git", ActionBlock},
+	} {
+		for _, endpoint := range []string{"git@forge.example:", "git@[2001:db8::1]:", "[::1]:"} {
+			upstream := endpoint + tc.path
+			wantName := strings.TrimSuffix(tc.path, ".git")
+			if got := GitSimilarityName(upstream); got != wantName {
+				t.Errorf("GitSimilarityName(%q) = %q, want %q", upstream, got, wantName)
+			}
+			if r := checkGit(t, &similarityStore{action: ActionBlock}, "k8s", upstream); r.Action != tc.want {
+				t.Errorf("%s: action=%s, want %s; %s", upstream, r.Action, tc.want, r.Reason)
+			}
+		}
+	}
+}
+
+// TestGitSimilarityNameMatchesGit holds GitSimilarityName to the path Git
+// itself extracts from each spelling, through fetch-pack --diag-url, which
+// parses without connecting. A hand-written parser drifts from Git one
+// spelling at a time; this compares every spelling at once.
+func TestGitSimilarityNameMatchesGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	for _, upstream := range []string{
+		"git@github.com:kubernetes/kubernetes.git",
+		"github.com:kubernetes/kubernetes.git",
+		"git@github.com:kubernetes/kubernetes",
+		"git@github.com:/kubernetes/kubernetes.git",
+		"git@[2001:db8::1]:kubernetes/kubernetes.git",
+		"[::1]:kubernetes/kubernetes.git",
+		"[git@host]:kubernetes/kubernetes.git",
+		"git@[host.example]:kubernetes/kubernetes.git",
+		"user@host:~user/kubernetes/kubernetes.git",
+		"host:kubernetes/kube?rnetes.git",
+		"host:kubernetes/kube#rnetes.git",
+		"host:kubernetes/kubernetes%41.git",
+		"host:kubernetes/kubernetes.git/",
+		"host:kubernetes/kubernetes.git/.",
+		"host:kubernetes/x/../kubernetes.git",
+		"ssh://git@github.com/kubernetes/kubernetes.git",
+		"ssh://git@github.com:22/kubernetes/kubernetes.git",
+		"ssh://git@[2001:db8::1]:22/kubernetes/kubernetes.git",
+		"ssh://[::1]/kubernetes/kubernetes.git",
+		"ssh://git@github.com/~user/kubernetes/kubernetes.git",
+		"ssh://host/kubernetes/%6bubernetes.git",
+		"ssh://host%2Fkubernetes%2Fkubernetes.git",
+		"ssh://host/kubernetes/kubernetes%00.git",
+		"ssh://host/kubernetes/kubernetes%2500.git",
+		"ssh://host/kubernetes/kube?rnetes.git",
+		"ssh://host/kubernetes/kube#rnetes.git",
+		"ssh://host/kubernetes/kubernetes.git/.",
+		"ssh://user@host:2222/a/b/kubernetes/kubernetes.git",
+		"git+ssh://host/kubernetes/kubernetes.git",
+		"ssh+git://host/kubernetes/kubernetes.git",
+		"git://github.com/kubernetes/kubernetes.git",
+		"git://github.com:9418/kubernetes/kubernetes.git",
+		"git://[::1]:9418/kubernetes/kubernetes.git",
+		"file:///srv/git/kubernetes/kubernetes.git",
+		"file://host/srv/git/kubernetes/kubernetes.git",
+		"file:///srv/git/kubernetes/kubernetes%2Egit",
+		"/srv/git/kubernetes/kubernetes.git",
+		"./kubernetes/kubernetes.git",
+		"../repos/kubernetes/kubernetes.git",
+		"srv/git:x/kubernetes/kubernetes.git",
+	} {
+		out, err := exec.Command("git", "fetch-pack", "--diag-url", upstream).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git fetch-pack --diag-url %q: %v\n%s", upstream, err, out)
+		}
+		var want string
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if p, ok := strings.CutPrefix(line, "Diag: path="); ok {
+				want = strings.TrimSuffix(strings.Trim(path.Clean("/"+p), "/"), ".git")
+				if segs := strings.Split(want, "/"); len(segs) > 2 {
+					want = strings.Join(segs[len(segs)-2:], "/")
+				}
+			}
+		}
+		if got := GitSimilarityName(upstream); got != want {
+			t.Errorf("GitSimilarityName(%q) = %q, Git opens %q", upstream, got, want)
 		}
 	}
 }

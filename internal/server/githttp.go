@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // ---- Git smart-HTTP --------------------------------------------------------
@@ -324,7 +325,8 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// Recorded on the info/refs leg only. Both legs of one clone pass through
 	// here and RecordDiscovery upserts, so recording both would file one clone
 	// as two requests against a table every other type fills per request.
-	if !s.enforceUpstreamPolicyRecording(w, r, manifest.TypeGit, upstream, upstream, pkgName, "", service == gitServiceInfoRefs) {
+	decision, ok := s.enforceUpstreamPolicyRecording(w, r, manifest.TypeGit, upstream, upstream, pkgName, "", service == gitServiceInfoRefs)
+	if !ok {
 		return
 	}
 
@@ -355,6 +357,9 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 		s.logger.Warn("could not set a write deadline for this git request's mirror steps; the server-wide write timeout bounds them instead",
 			"namespace", ns, "repo", repo, "error", err)
 	}
+	if usable, _ := s.gitMirrorUsable(ctx, dir, upstream); !usable && !s.gitNameGate(w, r, pkgName, upstream, decision) {
+		return
+	}
 	if err := s.ensureGitMirror(ctx, ns+"/"+repo, dir, upstream); err != nil {
 		switch {
 		case errors.Is(err, errGitMirrorPending):
@@ -379,6 +384,27 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	}
 
 	s.runGitBackend(w, r, ns, repo, pathInfo, query)
+}
+
+// gitNameGate runs the name similarity check on a repository about to be
+// mirrored for the first time, comparing its upstream's {owner}/{repo} path,
+// and writes the admission row. It returns false once it has written the
+// refusal.
+//
+// It judges a new mirror rather than every fetch: a clone negotiates over refs
+// and names no version, so every fetch of one repository would get the same
+// verdict, and the refusal that matters is the one before its first clone
+// puts the bytes on disk.
+func (s *Server) gitNameGate(w http.ResponseWriter, r *http.Request, pkgName, upstream, decision string) bool {
+	if s.auditDB == nil {
+		return true
+	}
+	fill := fillAdmission{typ: manifest.TypeGit, name: pkgName}
+	ve := manifest.VersionEntry{URL: upstream, Mode: manifest.ModeProxy}
+	checkers := []policy.VersionChecker{policy.NewNameSimilarityChecker(s.auditDB)}
+	_, ok := s.admitFill(w, r, fill, ve, checkers, "not run: a git repository's first mirror runs the name similarity check only",
+		decision, upstream, nil, nil)
+	return ok
 }
 
 // gitQueryString is the QUERY_STRING the CGI child gets. It is rebuilt from

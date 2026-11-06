@@ -23,6 +23,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // The repository every end-to-end test in this file clones. "team/tool.git"
@@ -1567,5 +1568,245 @@ func TestGitProfileUnlistablePathIs404(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("denied rows = %+v, want none for a path no entry can name", rows)
+	}
+}
+
+// newGitUpstreamAt is newGitUpstream with the bare repository also published
+// at repo, a path under the root such as "kubernetes/kubernetes.git", so the
+// similarity check sees the {owner}/{repo} a test chooses.
+func newGitUpstreamAt(t *testing.T, repo string) string {
+	t.Helper()
+	root := newGitUpstream(t)
+	runGitCLI(t, root, "clone", "--bare", "-q", filepath.Join(root, filepath.FromSlash(gitTestRepo)), filepath.Join(root, filepath.FromSlash(repo)))
+	return root
+}
+
+func gitInfoRefs(t *testing.T, s *Server, ns, repo string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doRequest(s, http.MethodGet, "/git/"+ns+"/"+repo+"/info/refs?service=git-upload-pack", nil)
+}
+
+func gitSimilarityRows(t *testing.T, s *Server, pkgName string) []audit.AdmissionCheck {
+	t.Helper()
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeGit, PkgName: pkgName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []audit.AdmissionCheck
+	for _, row := range rows {
+		for _, c := range row.Checks {
+			if c.Check == audit.CheckNameSimilarity {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+func blockGitSimilarity(t *testing.T, s *Server) {
+	t.Helper()
+	if err := s.auditDB.SetSimilarityPolicy(t.Context(), audit.SimilarityPolicy{Ecosystem: manifest.TypeGit, Action: policy.ActionBlock}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A popular repository under a lookalike owner is refused by the similarity
+// check before its first mirror, and nothing is cloned.
+func TestGitSmartHoldsNearMissRepoBeforeMirroring(t *testing.T) {
+	const repo = "kubernetse/kubernetes.git"
+	s := newGitServer(t, newGitUpstreamAt(t, repo))
+	blockGitSimilarity(t, s)
+
+	rec := gitInfoRefs(t, s, "corp", repo)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	refusalIncident(t, rec.Header(), checkSimilarity)
+	dir := filepath.Join(s.gitTool.root, "corp", filepath.FromSlash(repo))
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("mirror directory %s: %v, want it never created", dir, err)
+	}
+	if rows := gitSimilarityRows(t, s, "corp/kubernetse/kubernetes"); len(rows) != 1 || rows[0].Status != audit.CheckBlock ||
+		!strings.Contains(rows[0].Detail, "kubernetes/kubernetes") {
+		t.Errorf("name_similarity rows = %+v, want one block naming kubernetes/kubernetes", rows)
+	}
+}
+
+// The popular {owner}/{repo} path itself is mirrored and served under block.
+func TestGitSmartAdmitsPopularRepo(t *testing.T) {
+	const repo = "kubernetes/kubernetes.git"
+	s := newGitServer(t, newGitUpstreamAt(t, repo))
+	blockGitSimilarity(t, s)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	dest := filepath.Join(t.TempDir(), "k")
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+repo, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+		t.Errorf("cloned HEAD subject = %q, want %q", got, "first")
+	}
+}
+
+// Under the warn default a near-miss repository is mirrored and its admission
+// row records the warn. Once mirrored it is not judged again: a block set
+// afterwards leaves the next clone served from the mirror.
+func TestGitSmartWarnsNearMissOnceForANewMirror(t *testing.T) {
+	const repo = "kubernetse/kubernetes.git"
+	s := newGitServer(t, newGitUpstreamAt(t, repo))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+repo, filepath.Join(t.TempDir(), "first"))
+	rows := gitSimilarityRows(t, s, "corp/kubernetse/kubernetes")
+	if len(rows) != 1 || rows[0].Status != audit.CheckWarn {
+		t.Fatalf("name_similarity rows = %+v, want one warn", rows)
+	}
+
+	blockGitSimilarity(t, s)
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+repo, filepath.Join(t.TempDir(), "second"))
+	if rows := gitSimilarityRows(t, s, "corp/kubernetse/kubernetes"); len(rows) != 1 {
+		t.Errorf("name_similarity rows = %d after a clone from the mirror, want the first mirror's one", len(rows))
+	}
+}
+
+func TestReviewGitImportEscapedNearMiss(t *testing.T) {
+	s := newDiscoveryServer(t)
+	blockGitSimilarity(t, s)
+	_, res := postImport(t, s, `[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":"https://github.com/kubernetse/%6bubernetes.git"}]}]`, "")
+	if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for encoded near miss; results=%+v", res.Imported, res.Results)
+	}
+}
+
+func TestReviewGitImportLiteralSCPPath(t *testing.T) {
+	for _, upstream := range []string{
+		"git@forge.example:archive#2026/kubernetse/kubernetes.git",
+		"git@forge.example:archive?2026/kubernetse/kubernetes.git",
+	} {
+		t.Run(upstream, func(t *testing.T) {
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+				t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}
+
+func TestReviewGitImportDotPath(t *testing.T) {
+	root := newGitUpstreamAt(t, "kubernetse/kubernetes.git")
+	upstream := "file://" + root + "/kubernetse/kubernetes.git/."
+	if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+		t.Fatalf("git did not resolve the repository: %q", refs)
+	}
+	s := newDiscoveryServer(t)
+	blockGitSimilarity(t, s)
+	body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+	_, res := postImport(t, s, body, "")
+	if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result for a dot-path alias; results=%+v", res.Imported, res.Results)
+	}
+}
+
+func TestReviewGitImportNativeURLPath(t *testing.T) {
+	for _, marker := range []string{"#", "?"} {
+		t.Run(marker, func(t *testing.T) {
+			root := newGitUpstreamAt(t, "archive"+marker+"2026/kubernetse/kubernetes.git")
+			upstream := "file://" + root + "/archive" + marker + "2026/kubernetse/%6bubernetes.git/."
+			if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("git did not resolve the repository: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+				t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}
+
+func TestReviewGitSmartNativeURLPath(t *testing.T) {
+	for _, marker := range []string{"#", "?"} {
+		t.Run(marker, func(t *testing.T) {
+			const repo = "kubernetse/kubernetes.git"
+			prefix := "archive" + marker + "2026"
+			root := newGitUpstreamAt(t, prefix+"/"+repo)
+			s := newGitServer(t, root+"/"+prefix)
+			blockGitSimilarity(t, s)
+			rec := gitInfoRefs(t, s, "corp", repo)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status=%d, want 403 with similarity refusal", rec.Code)
+			} else {
+				refusalIncident(t, rec.Header(), checkSimilarity)
+			}
+			dir := filepath.Join(s.gitTool.root, "corp", filepath.FromSlash(repo))
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("mirror directory exists or cannot be inspected: %v; want no mirror", err)
+			}
+		})
+	}
+}
+
+func TestReviewGitImportNativeEncodedBoundary(t *testing.T) {
+	root := newGitUpstreamAt(t, "kubernetse/kubernetes.git")
+	upstream := "file://" + strings.ReplaceAll(root+"/kubernetse/kubernetes.git", "/", "%2F")
+	if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+		t.Fatalf("git did not resolve the repository: %q", refs)
+	}
+	s := newDiscoveryServer(t)
+	blockGitSimilarity(t, s)
+	body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+	_, res := postImport(t, s, body, "")
+	if res.Imported != 0 || len(res.Results) != 1 || res.Results[0].Outcome != ImportPolicyBlocked || !strings.Contains(res.Results[0].Reason, "name_similarity") {
+		t.Fatalf("imported=%d, want 0 and a name_similarity policy_blocked result; results=%+v", res.Imported, res.Results)
+	}
+}
+
+func TestReviewGitImportNativeLiteralNullEscape(t *testing.T) {
+	const repo = "kubernetes/kubernetes%00.git"
+	root := newGitUpstreamAt(t, repo)
+	for _, suffix := range []string{"%00", "%2500"} {
+		t.Run(suffix, func(t *testing.T) {
+			upstream := "file://" + root + "/kubernetes/kubernetes" + suffix + ".git"
+			if refs := runGitCLI(t, t.TempDir(), "ls-remote", upstream); !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("git did not resolve the literal repository name: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 1 || len(res.Results) != 1 || res.Results[0].Outcome != ImportImported {
+				t.Fatalf("imported=%d, want 1 for kubernetes/kubernetes%%00 (three literal characters from kubernetes/kubernetes); results=%+v", res.Imported, res.Results)
+			}
+		})
+	}
+}
+
+func TestReviewGitImportPopularSCPIPv6(t *testing.T) {
+	const repo = "kubernetes/kubernetes.git"
+	root := newGitUpstreamAt(t, repo)
+	helper := filepath.Join(t.TempDir(), "ssh-fixture")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nfor last do :; done\nexec /bin/sh -c \"$last\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"git@forge.example:", "git@[2001:db8::1]:", "[::1]:"} {
+		t.Run(endpoint, func(t *testing.T) {
+			upstream := endpoint + repo
+			refs := runGitCLI(t, root, "-c", "core.sshCommand="+helper, "-c", "ssh.variant=ssh", "ls-remote", upstream)
+			if !strings.Contains(refs, "refs/heads/main") {
+				t.Fatalf("Git did not open the popular repository: %q", refs)
+			}
+			s := newDiscoveryServer(t)
+			blockGitSimilarity(t, s)
+			body := fmt.Sprintf(`[{"config_version":1,"name":"k8s","type":"git","versions":[{"ref":"main","url":%q}]}]`, upstream)
+			_, res := postImport(t, s, body, "")
+			if res.Imported != 1 || len(res.Results) != 1 || res.Results[0].Outcome != ImportImported {
+				t.Fatalf("imported=%d, want 1 for the exact popular path %s; results=%+v", res.Imported, repo, res.Results)
+			}
+		})
 	}
 }
