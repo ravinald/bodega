@@ -1,5 +1,5 @@
 // sitegen renders bodega's README, docs/ and coverage feed into the static
-// site at bodega.cow.org. site/scripts/deploy.py runs it; see site/README.md.
+// project website. site/scripts/deploy.py runs it; see site/README.md.
 package main
 
 import (

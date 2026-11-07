@@ -1,6 +1,6 @@
 # Bodega website
 
-`sitegen` (`main.go`) renders bodega.cow.org from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
+`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
 
 | Path            | What it holds                                                                                |
 | --------------- | -------------------------------------------------------------------------------------------- |
