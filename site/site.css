@@ -64,7 +64,7 @@ body.page .frame, body.colophon .frame, body.\34 04 .frame { grid-template-colum
 .contents li.here a { color: var(--accent); font-weight: 650; }
 ol.contents { list-style: none; padding: 0; margin: 0 0 1rem; }
 /* The 36-entry column sits above the page once the grid collapses, so a phone gets one collapsed line instead. Two elements, because one <details> cannot stay open on wide screens and closed on narrow ones without script. */
-.contents-compact { display: none; font-size: .9rem; line-height: 1.4; border-block: 1px solid var(--rule); }
+.contents-compact { display: none; margin: 0 0 1.75rem; font-size: .9rem; line-height: 1.4; border-block: 1px solid var(--rule); }
 .contents-compact summary { cursor: pointer; padding: .7rem 0; font: 650 .72rem/1.4 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--quiet); }
 .contents-compact > summary span { margin-left: .6rem; font: 600 .9rem/1.4 var(--serif); letter-spacing: 0; text-transform: none; color: var(--accent); }
 .contents-compact details { margin-left: .2rem; }

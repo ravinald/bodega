@@ -4,6 +4,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -54,6 +56,7 @@ type group struct {
 
 type siteInfo struct {
 	Base, Version, Commit string
+	CSSVersion            string // content hash of site.css, so a changed stylesheet gets a URL no browser has cached
 }
 
 // A doc source and the contents group it is listed under. Usage sections are
@@ -280,7 +283,12 @@ func main() {
 	if *version == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(*commit) {
 		log.Fatal("-version and a full 40-hex -commit are required; site/scripts/deploy.py supplies both from git")
 	}
-	info := siteInfo{Base: *base, Version: *version, Commit: *commit}
+	css, err := os.ReadFile(filepath.Join(*tmplDir, "site.css"))
+	if err != nil {
+		log.Fatalf("read the stylesheet: %v", err)
+	}
+	cssSum := sha256.Sum256(css)
+	info := siteInfo{Base: *base, Version: *version, Commit: *commit, CSSVersion: hex.EncodeToString(cssSum[:6])}
 
 	g := &generator{repo: *repo, base: *base, commit: info.Commit, outOf: map[string]string{}, usageSection: map[string]string{}}
 	for _, c := range contents {
