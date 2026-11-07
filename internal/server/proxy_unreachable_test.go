@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -417,6 +421,165 @@ func TestB192AuditOCIReadFailureNamesHostAndCause(t *testing.T) {
 			s.proxyOrResolve(rec, req, store, manifest.OCIManifestKey(targetInfo.registry, targetInfo.repo, targetInfo.ref), resolve, rawURL, nil, manifest.TypeOCI, targetInfo.name(), targetInfo.name(), true, true)
 			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": "+wantClass+".") {
 				t.Fatalf("status=%d body=%q; want answering host %s and %s", rec.Code, rec.Body.String(), hostPort(target.URL), wantClass)
+			}
+		})
+	}
+}
+
+func TestB192ReauditOCIResponseBoundaries(t *testing.T) {
+	for _, kind := range []string{"later 404", "tags JSON", "referrers JSON", "manifest limit"} {
+		t.Run(kind, func(t *testing.T) {
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch kind {
+				case "later 404":
+					if r.URL.Path == "/second" {
+						http.NotFound(w, r)
+						return
+					}
+					w.Header().Set("Link", `</second>; rel="next"`)
+					_, _ = w.Write([]byte(`{"schemaVersion":2,"manifests":[]}`))
+				case "manifest limit":
+					_, _ = w.Write([]byte(strings.Repeat(" ", ociMaxManifest+1)))
+				default:
+					_, _ = w.Write([]byte("invalid JSON"))
+				}
+			}))
+			t.Cleanup(target.Close)
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				//nolint:gosec // G710: the destination is the local fixture; only the path comes from the request.
+				http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+			}))
+			t.Cleanup(first.Close)
+			s := notFoundServer(t, storage.NewMemory(), first.URL)
+			targetInfo := ociTarget{registry: "registry.test", repo: "test", upstream: first.URL, ref: "sha256:" + strings.Repeat("0", 64)}
+			store := s.typeStore(manifest.TypeOCI)
+			var open upstreamOpener
+			switch kind {
+			case "manifest limit":
+				open = s.ociManifestOpener(targetInfo, store, manifest.TypeOCI, nil)
+			case "tags JSON":
+				open = s.ociTagListOpener(targetInfo)
+			default:
+				open = s.ociReferrersOpener(targetInfo)
+			}
+			rawURL := first.URL + "/object"
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v2/registry.test/test/referrers/"+targetInfo.ref, nil)
+			req = req.WithContext(withUpstreamOpener(req.Context(), open))
+			resolve := func(context.Context) (string, error) { return rawURL, nil }
+			s.proxyOrResolve(rec, req, store, manifest.OCIManifestKey(targetInfo.registry, targetInfo.repo, targetInfo.ref), resolve, rawURL, nil, manifest.TypeOCI, targetInfo.name(), targetInfo.name(), true, true)
+			wantClass := "unreachable"
+			if kind == "later 404" {
+				wantClass = "upstream answered HTTP 404 Not Found"
+			}
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": "+wantClass+".") {
+				t.Fatalf("status=%d body=%q; want answering host %s and %s", rec.Code, rec.Body.String(), hostPort(target.URL), wantClass)
+			}
+		})
+	}
+}
+
+func TestB192ReauditUnusedTLSFailureDoesNotClassifyReusedConnection(t *testing.T) {
+	started, release, failed, serving := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releases sync.Once
+	unblock := func() { releases.Do(func() { close(release) }) }
+	var handshakes atomic.Int32
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/warm" {
+			w.Header().Set("Content-Length", "4")
+			_, _ = w.Write([]byte("warm"))
+			w.(http.Flusher).Flush()
+			return
+		}
+		close(serving)
+		<-r.Context().Done()
+	}))
+	up.TLS = &tls.Config{MinVersion: tls.VersionTLS12, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		if handshakes.Add(1) == 2 {
+			close(started)
+			<-release
+			return nil, fmt.Errorf("fixture rejects the unused connection")
+		}
+		return nil, nil
+	}}
+	up.StartTLS()
+	t.Cleanup(up.Close)
+	t.Cleanup(unblock)
+	s := notFoundServer(t, storage.NewMemory(), up.URL)
+	allowLoopbackHost(t)
+	transport := up.Client().Transport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.ResponseHeaderTimeout = time.Second
+	client := *upstreamClient
+	client.Transport = transport
+	saved := upstreamClient
+	upstreamClient = &client
+	t.Cleanup(func() { upstreamClient = saved; transport.CloseIdleConnections() })
+	warm, err := client.Get(up.URL + "/warm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = warm.Body.Close() })
+	wait := func(c <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-c:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("waiting for %s", what)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+		if err != nil {
+			close(failed)
+		}
+	}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil).WithContext(ctx)
+	resolve := func(context.Context) (string, error) { return up.URL + "/artifact", nil }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", nil, manifest.TypeMaven, "", "", true, false)
+	}()
+	wait(started, "second connection's TLS handshake")
+	if _, err := io.ReadAll(warm.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = warm.Body.Close()
+	wait(serving, "artifact request on the reused connection")
+	unblock()
+	wait(failed, "unused connection's failed TLS handshake")
+	wait(done, "proxy timeout")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(up.URL)+": timed out.") {
+		t.Fatalf("status=%d body=%q; want reused connection's response timeout, not the unused dial's TLS failure", rec.Code, rec.Body.String())
+	}
+}
+
+func TestB192ReauditComposerResolutionRetainsDiagnosis(t *testing.T) {
+	for _, kind := range []string{"closed port", "redirected 503"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newPackagistFixture(t)
+			s := composerServer(t, f)
+			upstream := closedLoopbackURL(t)
+			wantHost, wantClass := hostPort(upstream), "connection refused"
+			if kind == "redirected 503" {
+				target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}))
+				t.Cleanup(target.Close)
+				first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, target.URL+"/metadata", http.StatusFound)
+				}))
+				t.Cleanup(first.Close)
+				upstream = first.URL
+				wantHost, wantClass = hostPort(target.URL), "upstream answered HTTP 503 Service Unavailable"
+			}
+			s.cfg.ComposerUpstream = upstream
+			rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.5", consoleRef515), nil)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), wantHost+": "+wantClass+".") {
+				t.Fatalf("status=%d body=%q; want metadata host %s and %s", rec.Code, rec.Body.String(), wantHost, wantClass)
 			}
 		})
 	}

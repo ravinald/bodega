@@ -295,7 +295,7 @@ func (s *Server) composerMetadataDocument(r *http.Request, name string, dev bool
 	case cw.status == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: Packagist lists no package %s", errUpstreamNotFound, name)
 	case cw.status != 0 && cw.status != http.StatusOK:
-		return nil, fmt.Errorf("composer metadata for %s answered HTTP %d", name, cw.status)
+		return nil, capturedDiagnosis(cw, fmt.Errorf("composer metadata for %s answered HTTP %d", name, cw.status))
 	}
 	return cw.body.Bytes(), nil
 }

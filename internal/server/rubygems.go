@@ -235,6 +235,9 @@ type capturedResponse struct {
 	status int
 	body   bytes.Buffer
 	tooBig bool
+	// upstreamErr is the failure a 502 written here names, for a caller
+	// that has to report the upstream behind the response it captured.
+	upstreamErr error
 }
 
 func (c *capturedResponse) Header() http.Header { return c.header }

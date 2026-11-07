@@ -985,10 +985,10 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, typ s
 		}
 		body, ct, answered := f.body, f.contentType, f.answered
 		if got := ociDigest(body); got != t.ref {
-			return nil, afterAnswer(ociMismatch(t, got))
+			return nil, afterAnswer(atUpstream(answered, ociMismatch(t, got)))
 		}
 		if got := ociArtifactType(body); got != typ {
-			return nil, afterAnswer(ociTypeChanged(t, typ, got))
+			return nil, afterAnswer(atUpstream(answered, ociTypeChanged(t, typ, got)))
 		}
 		mediaType := ociMediaType(ct, body)
 		if typ == manifest.TypeHelm {
@@ -1020,11 +1020,11 @@ func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL strin
 		return nil, afterAnswer(fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err))
 	}
 	if len(body) > ociMaxManifest {
-		return nil, afterAnswer(fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest))
+		return nil, afterAnswer(atUpstream(answered, fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)))
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if ociIsSchema1(contentType, body) {
-		return nil, afterAnswer(s.ociSchema1Refusal(t))
+		return nil, afterAnswer(atUpstream(answered, s.ociSchema1Refusal(t)))
 	}
 	return &ociFetched{body: body, contentType: contentType, sentDigest: resp.Header.Get(ociDigestHeader), answered: answered}, nil
 }
@@ -1061,10 +1061,10 @@ func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
 		list.Tags = []string{}
 		seen := map[string]bool{}
 		budget := ociMaxTagList
-		answered := ""
+		answered, latest := "", ""
 		defer func() {
 			if answered != "" {
-				err = afterAnswer(err)
+				err = afterAnswer(atUpstream(latest, err))
 			}
 		}()
 		for next := rawURL; next != ""; {
@@ -1076,8 +1076,9 @@ func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
 			if err != nil {
 				return nil, err
 			}
+			latest = answeredURL(resp, next)
 			if answered == "" {
-				answered = answeredURL(resp, next)
+				answered = latest
 			}
 			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
 			link := resp.Header.Get("Link")
@@ -1128,10 +1129,10 @@ func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
 		idx := emptyOCIReferrers()
 		seen := map[string]bool{}
 		budget := ociMaxManifest
-		answered := ""
+		answered, latest := "", ""
 		defer func() {
 			if answered != "" {
-				err = afterAnswer(err)
+				err = afterAnswer(atUpstream(latest, err))
 			}
 		}()
 		for next := rawURL; next != ""; {
@@ -1150,8 +1151,9 @@ func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
 			case err != nil:
 				return nil, err
 			}
+			latest = answeredURL(resp, next)
 			if answered == "" {
-				answered = answeredURL(resp, next)
+				answered = latest
 			}
 			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
 			link := resp.Header.Get("Link")
@@ -1452,7 +1454,7 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		return resp, nil
 	case http.StatusNotFound:
 		drainClose(resp)
-		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
+		return nil, answeredStatus(answeredURL(resp, rawURL), resp.StatusCode, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL))
 	default:
 		drainClose(resp)
 		return nil, atUpstream(answeredURL(resp, rawURL), &upstreamStatusError{url: rawURL, status: resp.StatusCode})

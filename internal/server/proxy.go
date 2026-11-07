@@ -1212,13 +1212,11 @@ func (b *endpointBody) Read(p []byte) (int, error) {
 // alert as a net.OpError around an unexported type, so the error alone cannot
 // say a version or cipher mismatch was a handshake failure; the trace can.
 func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
-	var handshakeFailed atomic.Bool
+	var handshake connWait
 	trace := &httptrace.ClientTrace{
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
-			if err != nil {
-				handshakeFailed.Store(true)
-			}
-		},
+		GetConn:          func(string) { handshake.waiting() },
+		GotConn:          func(httptrace.GotConnInfo) { handshake.served() },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) { handshake.done(err) },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
@@ -1232,7 +1230,46 @@ func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) 
 	if errors.As(err, &uerr) && hostPort(uerr.URL) != "" {
 		endpoint = uerr.URL
 	}
-	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshakeFailed.Load(), err: err}
+	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshake.failed(), err: err}
+}
+
+// connWait tells whether a request's failure came from a TLS handshake for
+// the connection it was waiting on. The transport fires TLS callbacks for
+// every dial a request started, and hands the request a pooled connection
+// when one frees up first, so a dial it never used can fail its handshake
+// after the request is already being served elsewhere. Once a connection has
+// been handed over its handshake is done, so a TLS failure counts only while
+// the request is still waiting and it ends still waiting.
+type connWait struct {
+	mu      sync.Mutex
+	pending bool
+	tlsErr  bool
+}
+
+func (c *connWait) waiting() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending, c.tlsErr = true, false
+}
+
+func (c *connWait) served() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending, c.tlsErr = false, false
+}
+
+func (c *connWait) done(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil && c.pending {
+		c.tlsErr = true
+	}
+}
+
+func (c *connWait) failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pending && c.tlsErr
 }
 
 // writeUpstreamUnreachable answers a client whose upstream could not be read
@@ -1243,16 +1280,46 @@ func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) 
 // carry userinfo, so it is built from parsed parts and never from err's text:
 // the host and port, one fixed cause, and the next step.
 func writeUpstreamUnreachable(w http.ResponseWriter, what string, err error, fallbackURL string) {
+	if c, ok := w.(*capturedResponse); ok {
+		c.upstreamErr = err
+	}
 	host := upstreamHostIn(err, fallbackURL)
 	cause, step := upstreamFailureCause(err)
 	http.Error(w, fmt.Sprintf("%s: %s: %s. Nothing is cached for this request; %s.", what, host, cause, step),
 		http.StatusBadGateway)
 }
 
+// capturedDiagnosis is err, as a handler's caller reports a response it
+// captured, carrying the upstream failure that response's 502 was built from.
+// Only the public body reads it: err's text and identity are what the caller
+// logs and tests, and the captured status is bodega's own, never upstream's.
+func capturedDiagnosis(c *capturedResponse, err error) error {
+	if c.upstreamErr == nil {
+		return err
+	}
+	return &upstreamEndpointError{endpoint: upstreamHostFrom(c.upstreamErr), diag: c.upstreamErr, err: err}
+}
+
 // upstreamHostIn is host:port of the upstream err failed against, taken from
 // the error where it carries an address, since a fallback in the fetch order or
 // a resolver's index read may be a different host from fallbackURL.
 func upstreamHostIn(err error, fallbackURL string) string {
+	if h := upstreamHostFrom(err); h != "" {
+		return h
+	}
+	if h := hostPort(fallbackURL); h != "" {
+		return h
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) && dns.Name != "" && !strings.ContainsAny(dns.Name, "/@ ") {
+		return dns.Name
+	}
+	return "the upstream"
+}
+
+// upstreamHostFrom is the host:port err itself records, or "" when it names
+// none.
+func upstreamHostFrom(err error) string {
 	var at *upstreamEndpointError
 	if errors.As(err, &at) && at.endpoint != "" {
 		return at.endpoint
@@ -1269,14 +1336,7 @@ func upstreamHostIn(err error, fallbackURL string) string {
 			return h
 		}
 	}
-	if h := hostPort(fallbackURL); h != "" {
-		return h
-	}
-	var dns *net.DNSError
-	if errors.As(err, &dns) && dns.Name != "" && !strings.ContainsAny(dns.Name, "/@ ") {
-		return dns.Name
-	}
-	return "the upstream"
+	return ""
 }
 
 // hostPort is rawURL's host and port, the scheme's port filled in when the URL
