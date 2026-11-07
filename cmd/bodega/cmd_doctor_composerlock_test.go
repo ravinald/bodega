@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,5 +135,27 @@ func TestUsageDocumentsComposerLock(t *testing.T) {
 		if !strings.Contains(section, want) {
 			t.Errorf("the Composer section of docs/usage.md does not say %q", want)
 		}
+	}
+}
+
+func TestComposerLockDotSegmentOutsideRouteWarns(t *testing.T) {
+	const base = "https://bodega.internal"
+	const archive = base + "/composer/../npm/acme/-/acme-1.0.0.tgz"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /composer/{path...}", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the escaped path reached the Composer handler")
+	})
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, archive, nil))
+	if (response.Code < 300 || response.Code >= 400) || response.Header().Get("Location") != "/npm/acme/-/acme-1.0.0.tgz" {
+		t.Fatalf("router = %d, Location %q", response.Code, response.Header().Get("Location"))
+	}
+	body := `{"packages":[{"name":"acme/tool","dist":{"url":"` + archive + `"}}]}`
+	finding, err := checkComposerLock(writeLock(t, body), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finding.Status != host.StatusWarn {
+		t.Fatalf("router redirects outside /composer/ to %q, but doctor reports %+v; want WARN", response.Header().Get("Location"), finding)
 	}
 }

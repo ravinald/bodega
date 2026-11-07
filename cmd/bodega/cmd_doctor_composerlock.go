@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path"
 	"slices"
 	"strings"
 
@@ -45,7 +46,7 @@ func checkComposerLock(path, baseURL string) (host.Finding, error) {
 	if err := json.Unmarshal(data, &lock); err != nil {
 		return f, fmt.Errorf("--composer-lock %s is not JSON composer can read: %w; pass the project's composer.lock", path, err)
 	}
-	route := base.Path + "/composer/"
+	route := strings.TrimSuffix(routePath(base.Path), "/") + "/composer/"
 
 	total := 0
 	foreign := map[string]int{}
@@ -60,7 +61,7 @@ func checkComposerLock(path, baseURL string) (host.Finding, error) {
 			foreign["an unparseable dist.url"]++
 		case !sameOrigin(u, base):
 			foreign[strings.ToLower(u.Host)]++
-		case !strings.HasPrefix(u.Path, route):
+		case !strings.HasPrefix(routePath(u.Path), route):
 			foreign[strings.ToLower(u.Host)+" outside "+route]++
 		}
 	}
@@ -106,4 +107,19 @@ func sameOrigin(a, b *url.URL) bool {
 	return strings.EqualFold(a.Scheme, b.Scheme) &&
 		strings.EqualFold(a.Hostname(), b.Hostname()) &&
 		port(a) == port(b)
+}
+
+// routePath is the path bodega's ServeMux dispatches a request for p to: it
+// cleans the decoded path and redirects to the result, so a dist.url reading
+// /composer/../npm/x is served by /npm/, and a prefix test on the raw path would
+// count it as Composer's. The result always ends in a slash or a file name.
+func routePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	cleaned := path.Clean("/" + p)
+	if strings.HasSuffix(p, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
 }
