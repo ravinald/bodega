@@ -1,10 +1,21 @@
 # Bodega website
 
-Astro builds the showcase and coverage explorer. Starlight builds searchable operator documentation from the repository's Markdown. nginx serves the static output.
+`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
 
-## Local configuration
+| Path            | What it holds                                                                                |
+| --------------- | -------------------------------------------------------------------------------------------- |
+| `main.go`       | The generator: Markdown rendering, link rewriting, the contents column, the coverage tables  |
+| `layout.html`   | The page template every page shares                                                         |
+| `site.css`      | The stylesheet, including the light, dark and color-vision palettes                          |
+| `pages/`        | Pages with no Markdown source: the colophon and the 404 page                                 |
+| `static/fonts/` | Self-hosted Archivo and Source Serif 4 woff2 files and their SIL Open Font License texts     |
+| `scripts/`      | Coverage export, deployment and their tests                                                  |
 
-Keep deployment settings in `docs-internal/site-deploy.json`, which belongs to the private attic overlay and is ignored by Git. The config contains exactly these four keys:
+The generator is its own Go module (`site/go.mod`), so its Markdown dependency stays out of bodega's `go.mod` and out of `go list ./...`.
+
+## Configuration
+
+Deployment settings live in `docs-internal/site-deploy.json`, which is not committed. It holds exactly these four keys:
 
 ```json
 {
@@ -15,23 +26,21 @@ Keep deployment settings in `docs-internal/site-deploy.json`, which belongs to t
 }
 ```
 
-These are example values. `coverage_report` resolves relative to the config file, or accepts an absolute path or `~/` path. Configure SSH keys, ports, and jump hosts in your SSH config. Keep actual nginx and scheduler configurations in the overlay too. Never force-add the overlay, generated site output, or private reports.
+These are example values. `coverage_report` resolves relative to the config file, or accepts an absolute or `~/` path. Configure SSH keys, ports and jump hosts in your SSH config. Pass `--config PATH` to the deployment commands, or set `BODEGA_SITE_CONFIG`; without either they read `docs-internal/site-deploy.json` in this checkout.
 
-Pass `--config PATH` to deployment commands, or set `BODEGA_SITE_CONFIG`. Without either, they read `docs-internal/site-deploy.json` in this checkout. The build uses the same default config and accepts `BODEGA_SITE_URL` and `BODEGA_COVERAGE_REPORT` overrides. Without config, the build defaults to localhost and requires an explicit coverage report.
-
-## Build and preview
+## Build locally
 
 ```sh
 cd site
-npm ci
-npm run build
-npm run check
-npm run preview
+python3 scripts/coverage.py ~/path/to/report.html /tmp/coverage.json
+go build -o /tmp/sitegen .
+/tmp/sitegen -repo .. -tmpl . -out /tmp/bodega-site -base / \
+  -coverage /tmp/coverage.json -version "$(git describe --tags --always)" -commit "$(git rev-parse HEAD)"
 ```
 
-Use `npm run dev` during development. Dependencies are pinned in the lockfile. The build refuses coverage reports missing expected columns or evidence metadata.
+The generator checks every internal link and anchor it wrote and exits non-zero on a miss, naming the page and the target. A link to a repository path that is not a page goes to GitHub at the commit passed in `-commit`, so the footer, the source links and the text all name the same commit.
 
-`scripts/prepare.mjs` copies public assets, prepares documentation, and exports coverage data. Generated files under `public/assets`, `public/data`, and `src/content/docs` are ignored. Edit the original documents under [docs](../docs), including the [operations runbook](../docs/runbook.md). The build splits the operations reference into topics and retains the complete reference for cross-links.
+`docs/usage.md` sections are listed by heading in the `contents` table in `main.go`. Renaming or adding a `##` heading there needs the same change in that table, or the build stops with `docs/usage.md has no section "<heading>"`.
 
 ## Deploy
 
@@ -42,27 +51,35 @@ sh site/scripts/deploy.sh --config docs-internal/site-deploy.json --dry-run
 sh site/scripts/deploy.sh --config docs-internal/site-deploy.json
 ```
 
-The dry run validates config and prints the destination without building, connecting, or writing. An actual deployment requires a clean Git working tree, including untracked files. It installs locked dependencies, builds, checks local links, and uploads an immutable timestamped release. A manifest records the full source commit and artifact checksums. A server-side lock covers upload and activation; an atomic symlink replacement activates the release. Old releases remain available for rollback. Interrupted deployments can leave a lock: inspect its owner and confirm the deployment has stopped before removing it.
+The dry run validates the config and prints the destination without building, connecting or writing. A deployment requires a clean working tree, including untracked files. It exports the coverage feed, builds and runs the generator, uploads an immutable timestamped release with a manifest of the source commit and file checksums, and activates it by replacing the `current` symlink with `mv -Tf`, all under a server-side lock. It then republishes the coverage feed and page, described next.
 
-The workstation needs Node, npm, Python 3.9 or newer, SSH, and rsync. The server needs SSH, rsync, a POSIX shell, and GNU `mv` for atomic symlink replacement. Provision nginx, HTTPS, and the writable site directory separately. nginx should serve `<remote_root>/current`, with `/data/coverage.json` mapped to `<remote_root>/data/coverage.json` and caching disabled for that feed. Create the data directory before publishing coverage. The deployment account must own the release directory and symlink; deployment does not use sudo or reload nginx.
+The workstation needs Go, Python 3.9 or newer, SSH and rsync. The server needs SSH, rsync, a POSIX shell and GNU `mv`. Provision nginx, HTTPS and the writable site directory separately; deployment does not use sudo or reload nginx.
 
-Build artifacts contain the public origin by design. They remain ignored locally and are uploaded to the web server, not committed to source control. Deployment config stays outside the artifact. Keep passwords and private keys in SSH facilities, not in this JSON file.
-
-## Coverage feed
-
-`scripts/coverage.py` extracts evaluated feature evidence and test results from the report. It does not import the report's layout, publish private backlog rows, or recalculate readiness. The explorer renders native HTML disclosure controls, with client-side filtering and a fetch of the current JSON feed. The bundled snapshot remains readable without JavaScript or when the feed fails.
+## Coverage feed and page
 
 ```sh
-sh site/scripts/sync-coverage.sh --config docs-internal/site-deploy.json --dry-run
 sh site/scripts/sync-coverage.sh --config docs-internal/site-deploy.json
 ```
 
-Coverage publication exports JSON, uploads a uniquely named temporary file, and renames it into place. It operates independently of website releases; deploying or rolling back the website does not overwrite this feed. Keep the JSON schema compatible across releases. A private scheduler can invoke this command after report generation. The existing report producer remains responsible for evaluating evidence. If publication stops, the public site retains the last snapshot and shows its age; the explorer warns once the snapshot is over 48 hours old.
+`scripts/coverage.py` extracts feature evidence and test results from the report into `coverage.json`. It does not import the report's layout, publish private backlog rows or recalculate readiness. Publication uploads the feed under a temporary name and renames it into `<remote_root>/data/coverage.json`.
 
-The report producer's scoring rules are described on the coverage page. Update that explanation if the producer changes its scoring contract. The exporter checks structure; it does not establish the truth of report evidence itself. Review exported data before making a new report source public.
+It then renders `/coverage.html` again from the new feed. The page is built from the commit the active release names in its `deployment.json`, not from this checkout, so its layout and contents links match the pages around it; a checkout that lacks that commit refuses with a message to `git fetch`. The page lands in `<remote_root>/data/coverage.html`. A scheduler can run this command after each report; website releases and rollbacks do not touch either file.
 
-## Roll back and verify
+nginx serves both files from the data directory with caching disabled:
 
-Read `<remote_root>/previous-release` on the server and inspect that release directory. Point a temporary symlink at it, then replace `current` with `mv -Tf`. Coordinate rollback with deployments using the same deployment lock. nginx needs no reload for a release switch. Coverage remains independently updated.
+```nginx
+location = /data/coverage.json { alias <remote_root>/data/coverage.json; expires -1; }
+location = /coverage.html      { alias <remote_root>/data/coverage.html; expires -1; }
+```
 
-Run `python3 -m unittest discover -s site/scripts -p 'test_*.py'` to check deployment safeguards without contacting a server. The production build indexes documentation with Pagefind. Check the homepage, client selector, coverage filters and evidence disclosures, documentation search, narrow layouts, HTTPS redirect, and a genuine 404 after deployment. Do not expose source trees, private reports, or backend package routes from this vhost.
+## Roll back
+
+Read `<remote_root>/previous-release` on the server, point a temporary symlink at that release, and replace `current` with `mv -Tf`, holding the same deployment lock. nginx needs no reload. Run the coverage publication afterwards so `/coverage.html` matches the restored release.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s site/scripts -p 'test_*.py'
+```
+
+The tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
