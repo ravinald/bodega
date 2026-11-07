@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
@@ -244,4 +246,66 @@ func TestFailedStartReleasesSpoolLock(t *testing.T) {
 		t.Fatalf("spool lock still held after a failed Start: %v", err)
 	}
 	_ = lock.Close()
+}
+
+func TestStartRefusesUnsupportedSpoolLock(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin flock on a FIFO returns EOPNOTSUPP")
+	}
+	root := t.TempDir()
+	cfg := &config.Config{
+		LogDir: t.TempDir(), StoragePath: root,
+		AuditDB: filepath.Join(root, "audit.db"), AllowPlaintext: true,
+	}
+	var buf syncBuffer
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
+		slog.New(slog.NewTextHandler(&buf, nil)))
+	s.SetQuiet(true)
+	if s.auditDB != nil {
+		t.Cleanup(func() { _ = s.auditDB.Close() })
+	}
+	if s.spoolErr != nil {
+		t.Fatal(s.spoolErr)
+	}
+	leftover := filepath.Join(s.spool.dir, "bodega-upstream-abandoned")
+	if err := os.WriteFile(leftover, []byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(s.spool.dir, spoolLockName), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	var startErr error
+	returned := false
+	t.Cleanup(func() {
+		cancel()
+		if !returned {
+			<-done
+		}
+	})
+	waitFor(t, func() bool {
+		select {
+		case startErr = <-done:
+			returned = true
+			return true
+		default:
+			return strings.Contains(buf.String(), "bodega server listening")
+		}
+	})
+	cancel()
+	if !returned {
+		startErr = <-done
+		returned = true
+	}
+	if startErr == nil {
+		t.Errorf("Start accepted an unsupported spool lock; want refusal before listen")
+	}
+	if strings.Contains(buf.String(), "bodega server listening") {
+		t.Errorf("listener opened without spool ownership:\n%s", buf.String())
+	}
+	if got, err := os.ReadFile(leftover); err != nil || string(got) != "12345" {
+		t.Errorf("startup without ownership changed a spool file: %q, %v", got, err)
+	}
 }

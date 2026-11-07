@@ -271,11 +271,6 @@ const spoolFilePrefix = "bodega-upstream-"
 // owns the directory.
 const spoolLockName = ".bodega-spool.lock"
 
-// errSpoolLockUnsupported marks a filesystem that refuses flock outright
-// (some NFS and FUSE mounts). Start serves anyway and skips the sweep, since
-// without the lock nothing proves no other server is streaming there.
-var errSpoolLockUnsupported = errors.New("the spool filesystem does not support flock")
-
 // lockSpoolDir takes the exclusive lock that entitles this process to sweep
 // dir. Closing the returned file releases it, and so does the process dying,
 // which is what lets the next start after a SIGKILL sweep.
@@ -300,10 +295,9 @@ func lockSpoolDir(dir string) (*os.File, error) {
 			return nil, fmt.Errorf("spool_dir %s is in use by another bodega server (it holds %s)\n"+
 				"two servers sharing a spool would delete each other's in-flight fetches. Stop the other server, or give this one its own spool_dir", dir, path)
 		}
-		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOLCK) || errors.Is(err, syscall.EINVAL) {
-			return nil, fmt.Errorf("%w: %s: %w", errSpoolLockUnsupported, path, err)
-		}
-		return nil, fmt.Errorf("lock spool %s: %w", path, err)
+		return nil, fmt.Errorf("lock spool %s: %w\n"+
+			"without that lock nothing proves no other server is streaming into %s, so this one will not serve. "+
+			"Point spool_dir at a local filesystem that supports flock (NFS and FUSE mounts often do not); on ENOLCK, retry once lock resources free up", path, err, dir)
 	}
 	return f, nil
 }

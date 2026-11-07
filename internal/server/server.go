@@ -679,16 +679,12 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.spoolErr != nil {
 		return s.spoolErr
 	}
-	switch spoolLock, err := lockSpoolDir(s.spool.dir); {
-	case err == nil:
-		defer func() { _ = spoolLock.Close() }()
-		sweepSpoolLeftovers(s.spool.dir, s.logger)
-	case errors.Is(err, errSpoolLockUnsupported):
-		s.logger.Error("proxy spool leftovers not swept; spool files from a killed process stay on disk until removed by hand",
-			"spool_dir", s.spool.dir, "error", err)
-	default:
+	spoolLock, err := lockSpoolDir(s.spool.dir)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = spoolLock.Close() }()
+	sweepSpoolLeftovers(s.spool.dir, s.logger)
 
 	if s.inventoryErr != nil {
 		return s.inventoryErr
