@@ -1,8 +1,11 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
@@ -310,7 +314,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		if !sinkUpstreamErr(r.Context(), err) {
 			s.logFor(r.Context()).Error("upstream resolution failed", "key", s3Key, "error", err)
 		}
-		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
+		writeUpstreamUnreachable(w, "upstream resolution failed", err, cmp.Or(upstreamURL, knownUpstream))
 		return
 	}
 	s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
@@ -380,7 +384,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		if !sinkUpstreamErr(r.Context(), err) {
 			s.logFor(r.Context()).Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		}
-		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		writeUpstreamUnreachable(w, "upstream fetch failed", err, upstreamURL)
 	}
 
 	if graced {
@@ -1130,6 +1134,106 @@ type upstreamStatusError struct {
 
 func (e *upstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned %d: %s", e.status, e.url)
+}
+
+// writeUpstreamUnreachable answers a client whose upstream could not be read
+// with a 502 naming the host and why, so the person at the client can tell an
+// outage from a DNS or firewall fault without the server log.
+//
+// The body goes to anyone who can reach the route, and an upstream URL may
+// carry userinfo, so it is built from parsed parts and never from err's text:
+// the host and port, one fixed cause, and the next step.
+func writeUpstreamUnreachable(w http.ResponseWriter, what string, err error, fallbackURL string) {
+	host := upstreamHostIn(err, fallbackURL)
+	cause, step := upstreamFailureCause(err)
+	http.Error(w, fmt.Sprintf("%s: %s: %s. Nothing is cached for this request; %s.", what, host, cause, step),
+		http.StatusBadGateway)
+}
+
+// upstreamHostIn is host:port of the upstream err failed against, taken from
+// the error where it carries an address, since a fallback in the fetch order or
+// a resolver's index read may be a different host from fallbackURL.
+func upstreamHostIn(err error, fallbackURL string) string {
+	var status *upstreamStatusError
+	if errors.As(err, &status) {
+		if h := hostPort(status.url); h != "" {
+			return h
+		}
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		if h := hostPort(uerr.URL); h != "" {
+			return h
+		}
+	}
+	if h := hostPort(fallbackURL); h != "" {
+		return h
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) && dns.Name != "" && !strings.ContainsAny(dns.Name, "/@ ") {
+		return dns.Name
+	}
+	return "the upstream"
+}
+
+// hostPort is rawURL's host and port, the scheme's port filled in when the URL
+// names none. Userinfo, path and query are dropped by construction.
+func hostPort(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return u.Hostname()
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// upstreamFailureCause classifies err into a fixed phrase and the step that
+// phrase calls for. DNS is tested ahead of the timeout because a lookup that
+// timed out is still a resolver fault, and TLS ahead of it for the same reason.
+func upstreamFailureCause(err error) (cause, step string) {
+	const route = "check this server's route to that host (DNS, firewall, proxy), or retry once it is back"
+	var status *upstreamStatusError
+	if errors.As(err, &status) {
+		text := http.StatusText(status.status)
+		if text == "" {
+			return fmt.Sprintf("upstream answered HTTP %d", status.status), "retry once it is back"
+		}
+		return fmt.Sprintf("upstream answered HTTP %d %s", status.status, text), "retry once it is back"
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "DNS lookup failed", route
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection refused", route
+	}
+	var (
+		recordErr  tls.RecordHeaderError
+		alertErr   tls.AlertError
+		verifyErr  *tls.CertificateVerificationError
+		unknownCA  x509.UnknownAuthorityError
+		hostErr    x509.HostnameError
+		invalidErr x509.CertificateInvalidError
+	)
+	if errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
+		errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &invalidErr) {
+		return "TLS handshake failed", route
+	}
+	var nerr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()) {
+		return "timed out", route
+	}
+	return "unreachable", route
 }
 
 // defaultRateLimitRetryAfter is the interval bodega tells a client to wait
