@@ -218,3 +218,40 @@ func TestComposerLockEscapedVersionInsideRouteIsOK(t *testing.T) {
 		t.Fatalf("doctor reports %+v for an archive the Composer handler serves; want OK", finding)
 	}
 }
+
+func TestComposerLockCleanupRedirectOutsideRouteWarns(t *testing.T) {
+	const base = "https://bodega.internal"
+	for _, archivePath := range []string{
+		"/%63omposer/./dist/acme/tool/1.0.0/a.zip",
+		"//%63omposer/dist/acme/tool/1.0.0/a.zip",
+	} {
+		t.Run(archivePath, func(t *testing.T) {
+			mux := http.NewServeMux()
+			reached := false
+			mux.HandleFunc("GET /composer/{path...}", func(w http.ResponseWriter, r *http.Request) {
+				reached = true
+				w.WriteHeader(http.StatusNoContent)
+			})
+			redirect := httptest.NewRecorder()
+			mux.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, base+archivePath, nil))
+			location := redirect.Header().Get("Location")
+			if redirect.Code < 300 || redirect.Code >= 400 || !strings.HasPrefix(location, "/") || reached {
+				t.Fatalf("router = %d, Location %q, reached %v; want a cleanup redirect", redirect.Code, location, reached)
+			}
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, base+location, nil))
+			if response.Header().Get("Location") != "" || (response.Code != http.StatusNoContent && response.Code != http.StatusNotFound) {
+				t.Fatalf("redirect destination = %d, Location %q", response.Code, response.Header().Get("Location"))
+			}
+			body := `{"packages":[{"name":"acme/tool","dist":{"url":"` + base + archivePath + `"}}]}`
+			finding, err := checkComposerLock(writeLock(t, body), base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("%s redirects to %s: HTTP %d, reached Composer %v, doctor %s", archivePath, location, response.Code, reached, finding.Status)
+			if !reached && finding.Status != host.StatusWarn {
+				t.Fatalf("router redirects to %q (HTTP %d), outside Composer, but doctor reports %+v; want WARN", location, response.Code, finding)
+			}
+		})
+	}
+}

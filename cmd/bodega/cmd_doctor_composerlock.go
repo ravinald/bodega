@@ -69,6 +69,8 @@ func checkComposerLock(path, baseURL string) (host.Finding, error) {
 			foreign["an unparseable dist.url"]++
 		case !sameOrigin(u, base):
 			foreign[strings.ToLower(u.Host)]++
+		case !canonicalPath(u.EscapedPath()):
+			foreign[strings.ToLower(u.Host)+" with a path the router redirects"]++
 		case !inRoute(u.EscapedPath(), route):
 			foreign[strings.ToLower(u.Host)+" outside "+routeName]++
 		}
@@ -144,6 +146,24 @@ func routeSegments(p string) (segs []string, ok bool) {
 		segs[i] = u
 	}
 	return segs, true
+}
+
+// canonicalPath reports whether bodega's http.ServeMux routes p as sent, rather
+// than answering with a cleanup redirect. Where the redirect lands depends on
+// the server's Go version: go1.26 re-escapes the already escaped path, so
+// /%63omposer/./x redirects to /%2563omposer/x and misses /composer/, while
+// later versions keep %63. Only a path the mux never redirects routes the same
+// on every toolchain the server builds with, so nothing else can be called
+// bodega's.
+func canonicalPath(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	cleaned := path.Clean(p)
+	if strings.HasSuffix(p, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned == p
 }
 
 // inRoute reports whether the mux would hand escapedPath to the pattern
