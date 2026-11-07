@@ -159,3 +159,62 @@ func TestComposerLockDotSegmentOutsideRouteWarns(t *testing.T) {
 		t.Fatalf("router redirects outside /composer/ to %q, but doctor reports %+v; want WARN", response.Header().Get("Location"), finding)
 	}
 }
+
+func TestComposerLockEscapedSegmentsOutsideRouteWarns(t *testing.T) {
+	const base = "https://bodega.internal"
+	for _, tc := range []struct {
+		name, path, handler string
+		status              int
+	}{
+		{"escaped_parent", "/npm/%2e%2e/composer/dist/acme/tool/1.0.0/a.zip", "npm", http.StatusNoContent},
+		{"escaped_separator", "/composer%2fdist/acme/tool/1.0.0/a.zip", "", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			reached := ""
+			mux.HandleFunc("GET /composer/{path...}", func(w http.ResponseWriter, r *http.Request) {
+				reached = "composer"
+				w.WriteHeader(http.StatusNoContent)
+			})
+			mux.HandleFunc("GET /npm/{path...}", func(w http.ResponseWriter, r *http.Request) {
+				reached = "npm"
+				w.WriteHeader(http.StatusNoContent)
+			})
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, base+tc.path, nil))
+			if response.Code != tc.status || reached != tc.handler || response.Header().Get("Location") != "" {
+				t.Fatalf("router = %d, handler %q, Location %q; want %d, handler %q without redirect", response.Code, reached, response.Header().Get("Location"), tc.status, tc.handler)
+			}
+			body := `{"packages":[{"name":"acme/tool","dist":{"url":"` + base + tc.path + `"}}]}`
+			finding, err := checkComposerLock(writeLock(t, body), base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if finding.Status != host.StatusWarn {
+				t.Fatalf("%s reaches handler %q (HTTP %d), but doctor reports %+v; want WARN", tc.path, reached, response.Code, finding)
+			}
+		})
+	}
+}
+
+func TestComposerLockEscapedVersionInsideRouteIsOK(t *testing.T) {
+	const base = "https://bodega.internal"
+	const archive = base + "/composer/dist/acme/tool/dev-feature%2Fx/a.zip"
+	mux := http.NewServeMux()
+	reached := false
+	mux.HandleFunc("GET /composer/{path...}", func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+	})
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, archive, nil))
+	if !reached {
+		t.Fatal("the escaped version did not reach the Composer handler")
+	}
+	body := `{"packages":[{"name":"acme/tool","dist":{"url":"` + archive + `"}}]}`
+	finding, err := checkComposerLock(writeLock(t, body), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finding.Status != host.StatusOK {
+		t.Fatalf("doctor reports %+v for an archive the Composer handler serves; want OK", finding)
+	}
+}

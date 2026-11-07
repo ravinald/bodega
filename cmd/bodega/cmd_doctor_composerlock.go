@@ -46,7 +46,15 @@ func checkComposerLock(path, baseURL string) (host.Finding, error) {
 	if err := json.Unmarshal(data, &lock); err != nil {
 		return f, fmt.Errorf("--composer-lock %s is not JSON composer can read: %w; pass the project's composer.lock", path, err)
 	}
-	route := strings.TrimSuffix(routePath(base.Path), "/") + "/composer/"
+	route, ok := routeSegments(base.EscapedPath())
+	if !ok {
+		return f, fmt.Errorf("--composer-lock %s: bodega base URL %q has a path that does not decode; pass --url with the address clients use", path, baseURL)
+	}
+	if len(route) > 0 && route[len(route)-1] == "" {
+		route = route[:len(route)-1]
+	}
+	route = append(route, "composer")
+	routeName := "/" + strings.Join(route, "/") + "/"
 
 	total := 0
 	foreign := map[string]int{}
@@ -61,14 +69,14 @@ func checkComposerLock(path, baseURL string) (host.Finding, error) {
 			foreign["an unparseable dist.url"]++
 		case !sameOrigin(u, base):
 			foreign[strings.ToLower(u.Host)]++
-		case !strings.HasPrefix(routePath(u.Path), route):
-			foreign[strings.ToLower(u.Host)+" outside "+route]++
+		case !inRoute(u.EscapedPath(), route):
+			foreign[strings.ToLower(u.Host)+" outside "+routeName]++
 		}
 	}
 
 	if len(foreign) == 0 {
 		f.Status = host.StatusOK
-		f.Detail = fmt.Sprintf("%s: all %d dist.url entries are at %s%s", path, total, base.Host, route)
+		f.Detail = fmt.Sprintf("%s: all %d dist.url entries are at %s%s", path, total, base.Host, routeName)
 		return f, nil
 	}
 	hosts := make([]string, 0, len(foreign))
@@ -109,17 +117,39 @@ func sameOrigin(a, b *url.URL) bool {
 		port(a) == port(b)
 }
 
-// routePath is the path bodega's ServeMux dispatches a request for p to: it
-// cleans the decoded path and redirects to the result, so a dist.url reading
-// /composer/../npm/x is served by /npm/, and a prefix test on the raw path would
-// count it as Composer's. The result always ends in a slash or a file name.
-func routePath(p string) string {
+// routeSegments splits p the way bodega's http.ServeMux reads it for
+// routing: it cleans the escaped path, so %2e%2e is a name rather than a parent
+// and literal dot segments resolve (the mux redirects there), then splits on
+// literal slashes only and unescapes each segment on its own, so %2f stays
+// inside its segment. A trailing slash leaves a final empty segment, as in the
+// mux. ok is false when a segment does not unescape.
+func routeSegments(p string) (segs []string, ok bool) {
 	if p == "" {
-		return "/"
+		p = "/"
 	}
 	cleaned := path.Clean("/" + p)
 	if strings.HasSuffix(p, "/") && cleaned != "/" {
 		cleaned += "/"
 	}
-	return cleaned
+	raw := strings.Split(strings.TrimPrefix(cleaned, "/"), "/")
+	if cleaned == "/" {
+		raw = []string{""}
+	}
+	segs = make([]string, len(raw))
+	for i, s := range raw {
+		u, err := url.PathUnescape(s)
+		if err != nil {
+			return nil, false
+		}
+		segs[i] = u
+	}
+	return segs, true
+}
+
+// inRoute reports whether the mux would hand escapedPath to the pattern
+// route/{path...}: every route segment matches, and at least one segment, empty
+// for a bare trailing slash, follows.
+func inRoute(escapedPath string, route []string) bool {
+	segs, ok := routeSegments(escapedPath)
+	return ok && len(segs) > len(route) && slices.Equal(segs[:len(route)], route)
 }
