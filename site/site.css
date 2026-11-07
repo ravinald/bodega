@@ -63,6 +63,17 @@ body.page .frame, body.colophon .frame, body.\34 04 .frame { grid-template-colum
 .contents a { text-decoration: none; }
 .contents li.here a { color: var(--accent); font-weight: 650; }
 ol.contents { list-style: none; padding: 0; margin: 0 0 1rem; }
+/* The 36-entry column sits above the page once the grid collapses, so a phone gets one collapsed line instead. Two elements, because one <details> cannot stay open on wide screens and closed on narrow ones without script. */
+.contents-compact { display: none; font-size: .9rem; line-height: 1.4; border-block: 1px solid var(--rule); }
+.contents-compact summary { cursor: pointer; padding: .7rem 0; font: 650 .72rem/1.4 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--quiet); }
+.contents-compact > summary span { margin-left: .6rem; font: 600 .9rem/1.4 var(--serif); letter-spacing: 0; text-transform: none; color: var(--accent); }
+.contents-compact details { margin-left: .2rem; }
+.contents-compact details summary { padding: .45rem 0; }
+.contents-compact ol { list-style: none; margin: 0 0 .5rem; padding: 0; }
+.contents-compact li { display: grid; grid-template-columns: 2.2rem 1fr; }
+.contents-compact li span { font: 600 .72rem/2.6 var(--sans); font-variant-numeric: tabular-nums; color: var(--quiet); }
+.contents-compact li a { display: block; padding: .5rem 0; text-decoration: none; }
+.contents-compact li.here a { color: var(--accent); font-weight: 650; }
 
 /* Running text. */
 .prose h1 { font: 800 3rem/1.02 var(--sans); font-stretch: 72%; letter-spacing: -.005em; margin: 0 0 1.4rem; }
@@ -152,7 +163,8 @@ main.colophon sup a { text-decoration: none; color: var(--quiet); font: 600 .68r
   .head { flex-wrap: wrap; gap: .8rem 1.5rem; }
   .head nav { flex-wrap: wrap; gap: .8rem 1.2rem; }
   .frame, body.doc .frame { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
-  .contents { position: static; max-height: none; }
+  .contents { display: none; }
+  .contents-compact { display: block; }
   .mark img { width: 96px; }
   .table:has(> table.coverage) { overflow-x: auto; }
   body.home .prose h1 { font-size: 3.6rem; }

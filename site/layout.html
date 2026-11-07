@@ -46,6 +46,19 @@ try {
     </ol>
   {{- end }}
   </aside>
+  <details class="contents-compact">
+    <summary>Contents{{ if .Here.Title }} <span>{{ .Here.Num }} · {{ .Here.Title }}</span>{{ end }}</summary>
+  {{- range .Contents }}
+    <details{{ if .Here }} open{{ end }}>
+      <summary>{{ .Name }}</summary>
+      <ol>
+      {{- range .Entries }}
+        <li{{ if .Here }} class="here"{{ end }}><span>{{ .Num }}</span><a href="{{ .Href }}"{{ if .Here }} aria-current="page"{{ end }}>{{ .Title }}</a></li>
+      {{- end }}
+      </ol>
+    </details>
+  {{- end }}
+  </details>
 {{- else if eq .Kind "home" }}
   <aside class="mark"><img src="{{ .Site.Base }}assets/emblem/emblem-256.png" width="256" height="256" alt="A pixel-art depot with a blue lowercase b above one open bay and a parcel on its threshold"></aside>
 {{- end }}

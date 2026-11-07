@@ -49,6 +49,7 @@ type entry struct {
 type group struct {
 	Name    string
 	Entries []entry
+	Here    bool
 }
 
 type siteInfo struct {
@@ -372,6 +373,7 @@ func main() {
 	}).ParseFiles(filepath.Join(*tmplDir, "layout.html")))
 	for _, p := range pages {
 		var groups []group
+		var here entry
 		n := 0
 		for _, c := range contents {
 			n++
@@ -380,14 +382,19 @@ func main() {
 				groups = append(groups, group{Name: c.group})
 			}
 			gr := &groups[len(groups)-1]
-			gr.Entries = append(gr.Entries, entry{Num: fmt.Sprintf("%02d", n), Title: target.Title, Href: *base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p})
+			e := entry{Num: fmt.Sprintf("%02d", n), Title: target.Title, Href: *base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p}
+			gr.Entries = append(gr.Entries, e)
+			if e.Here {
+				gr.Here, here = true, e
+			}
 		}
 		var buf bytes.Buffer
 		if err := layout.Execute(&buf, struct {
 			*page
 			Site     siteInfo
 			Contents []group
-		}{p, info, groups}); err != nil {
+			Here     entry
+		}{p, info, groups, here}); err != nil {
 			log.Fatal(err)
 		}
 		write(filepath.Join(*out, p.Out), buf.Bytes())
@@ -399,7 +406,8 @@ func main() {
 		*page
 		Site     siteInfo
 		Contents []group
-	}{docsIndex, info, nil}); err != nil {
+		Here     entry
+	}{docsIndex, info, nil, entry{}}); err != nil {
 		log.Fatal(err)
 	}
 	write(filepath.Join(*out, docsIndex.Out), buf.Bytes())
