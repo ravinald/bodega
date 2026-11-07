@@ -17,7 +17,7 @@ import (
 // carries, and each one decides a different assertion below.
 func upstreamSimpleIndex(fixtureURL string) string {
 	return fmt.Sprintf(
-		`<!DOCTYPE html><html><body><a href="%s%s#sha256=deadbeef" data-dist-info-metadata="sha256=cafe" data-requires-python="&gt;=2.7">%s</a><br/></body></html>`,
+		`<!DOCTYPE html><html><body><a href="%s%s#sha256=`+wheelSHA256()+`" data-dist-info-metadata="sha256=cafe" data-requires-python="&gt;=2.7">%s</a><br/></body></html>`,
 		fixtureURL, testWheelRel, testWheel)
 }
 
@@ -36,7 +36,7 @@ func TestProxiedPypiIndexRepublishesOntoBodega(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %q)", status, body)
 	}
-	if want := `href="/pypi/wheels/` + testWheel + `#sha256=deadbeef"`; !strings.Contains(body, want) {
+	if want := `href="/pypi/wheels/` + testWheel + `#sha256=` + wheelSHA256() + `"`; !strings.Contains(body, want) {
 		t.Errorf("body = %q, want an href %s: the link has to come back through bodega, fragment intact", body, want)
 	}
 	if strings.Contains(body, up.ts.URL) {
@@ -172,7 +172,7 @@ func TestRepublishedIndexSurvivesTheFirstCachedWheel(t *testing.T) {
 	s := proxyingServer(t)
 	up := newRecordingUpstream(t)
 	up.route("/simple/six/", fmt.Sprintf(
-		`<!DOCTYPE html><html><body><a href="%s%s#sha256=deadbeef">%s</a><br/><a href="%s%s#sha256=feedface">%s</a><br/></body></html>`,
+		`<!DOCTYPE html><html><body><a href="%s%s#sha256=`+wheelSHA256()+`">%s</a><br/><a href="%s%s#sha256=`+wheelSHA256()+`">%s</a><br/></body></html>`,
 		up.ts.URL, testWheelRel, testWheel, up.ts.URL, olderRel, olderWheel))
 	up.route(testWheelRel, wheelBytes)
 	up.route(olderRel, wheelBytes)
@@ -191,8 +191,8 @@ func TestRepublishedIndexSurvivesTheFirstCachedWheel(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (body %q)", status, body)
 	}
 	for _, want := range []string{
-		`href="/pypi/wheels/` + testWheel + `#sha256=deadbeef"`,
-		`href="/pypi/wheels/` + olderWheel + `#sha256=feedface"`,
+		`href="/pypi/wheels/` + testWheel + `#sha256=` + wheelSHA256() + `"`,
+		`href="/pypi/wheels/` + olderWheel + `#sha256=` + wheelSHA256() + `"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body = %q, want %s: a cached wheel must not shrink the index to what the cache holds", body, want)

@@ -147,8 +147,8 @@ func TestPypiWheelResolvesThroughSimpleIndex(t *testing.T) {
 	s := proxyingServer(t)
 	up := newRecordingUpstream(t)
 	up.route("/simple/six/", fmt.Sprintf(
-		`<!DOCTYPE html><html><body><a href="%s%s#sha256=deadbeef">%s</a><br/></body></html>`,
-		up.ts.URL, testWheelRel, testWheel))
+		`<!DOCTYPE html><html><body><a href="%s%s#sha256=%s">%s</a><br/></body></html>`,
+		up.ts.URL, testWheelRel, wheelSHA256(), testWheel))
 	up.route(testWheelRel, wheelBytes)
 
 	s.cfg.PypiUpstream = up.ts.URL

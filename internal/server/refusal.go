@@ -620,6 +620,19 @@ func signedChartRefusal(typ, name, version string) *refusal {
 	return f
 }
 
+// indexDigestRefusal answers a file whose bytes differ from the sha256 the
+// upstream's own index lists for it. The index URL is the one upstream value a
+// body carries, in its public form: it is the document the person refused has
+// to take to the upstream, and naming it is the report.
+func indexDigestRefusal(typ, name, filename, listed, computed, indexURL string) *refusal {
+	f := newRefusal(checkChecksum, typ, name, "", http.StatusBadGateway)
+	f.reason = fmt.Sprintf("%s hashes to sha256 %s but the index lists sha256 %s, so the upstream served bytes its own index does not vouch for; nothing was cached.",
+		filename, computed, listed)
+	f.next = fmt.Sprintf("report it to the upstream that publishes %s, naming %s and both digests; give an operator incident %s.",
+		manifest.PublicURL(indexURL), filename, f.incident)
+	return f
+}
+
 // checksumDatabaseRefusal answers Go module bytes that disagree with what the
 // checksum database signed for the version, at the 502 checksumRefusal
 // answers and for its reason: the fault is the bytes upstream served.
