@@ -5491,7 +5491,16 @@ doctor writes the file in the directory Composer reads it from, resolved as Comp
 
 The [setup script](#setup-script) with `--systems composer` writes the file where none exists, in the directory doctor resolves by the same rule, so a host whose Composer home is an existing `~/.composer` keeps it rather than gaining a `~/.config/composer` that Composer would read instead. An existing `config.json` it leaves untouched and says so, because merging one takes a JSON parser the script does not carry; run `bodega doctor --configure composer` there instead.
 
-`bodega doctor` reports a `composer` row on a host with `composer` on `PATH`, and none on a host without it. It warns when the global `config.json` is missing, names no composer repository at a bodega `/composer` route, leaves `packagist.org` enabled, or lists a composer repository on `packagist.org` under another name, which Composer reads as Packagist itself. `--configure composer` clears the first three; it keeps every repository the operator added, so the row names a Packagist alias for removal by hand. A project's own `composer.json` can still name repositories of its own, Packagist's URL included, and those reach their hosts directly; doctor reads no project.
+`bodega doctor` reports a `composer` row on a host with `composer` on `PATH`, and none on a host without it. It warns when the global `config.json` is missing, names no composer repository at a bodega `/composer` route, leaves `packagist.org` enabled, or lists a composer repository on `packagist.org` under another name, which Composer reads as Packagist itself. `--configure composer` clears the first three; it keeps every repository the operator added, so the row names a Packagist alias for removal by hand. A project's own `composer.json` can still name repositories of its own, Packagist's URL included, and those reach their hosts directly. doctor reads no project unless `--composer-lock <path>` names one lock file, which adds a `composer-lock` row: OK when every `dist.url` under `packages` and `packages-dev` is at this host's bodega (`--url`, or `public_url`) under `/composer/`, WARN otherwise, naming each other host with the number of packages it serves and the `composer update --lock` step below. A path that is not JSON fails the run with the path named.
+
+A committed `composer.lock` bypasses all of this. `composer install` fetches each archive from the `dist.url` the lock records and never consults the global repository, so a lock written against Packagist downloads from `api.github.com` with bodega configured: the install fails where egress is locked to bodega, and passes no gate and leaves no audit row where it is not. Run `composer update --lock` once in the project with bodega configured. It keeps every locked version and rewrites each `dist.url` to bodega's `/composer/dist/` route, and every later `composer install` fetches through bodega. The rewritten `composer.lock` is the change to review and commit:
+
+```sh
+bodega doctor --composer-lock composer.lock --url https://bodega-host:8080   # WARN: api.github.com (68)
+composer update --lock
+git diff composer.lock                                                       # only dist.url lines change
+git commit -m 'composer: fetch locked archives through bodega' composer.lock
+```
 
 bodega serves a Composer v2 repository under `/composer/`, proxied from [`composer_upstream`](#upstream-hosts):
 
