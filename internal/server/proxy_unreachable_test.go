@@ -267,3 +267,157 @@ func TestB192ReviewTLSProtocolFailure(t *testing.T) {
 		t.Fatalf("status=%d body=%q; want host and TLS handshake failed", rec.Code, rec.Body.String())
 	}
 }
+
+func TestB192AuditArtifactReadFailureNamesHost(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "100")
+				_, _ = w.Write([]byte("short"))
+			}))
+			t.Cleanup(target.Close)
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if fallback {
+					http.NotFound(w, r)
+					return
+				}
+				http.Redirect(w, r, target.URL+"/a.jar", http.StatusFound)
+			}))
+			t.Cleanup(first.Close)
+			s := notFoundServer(t, storage.NewMemory(), first.URL)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil)
+			resolve := func(context.Context) (string, error) { return first.URL + "/a.jar", nil }
+			var order *upstreamOrder
+			if fallback {
+				order = &upstreamOrder{fallbacks: []string{target.URL + "/a.jar"}}
+			}
+			s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", order, manifest.TypeMaven, "", "", true, false)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": unreachable.") {
+				t.Fatalf("status=%d body=%q; want failing body host %s and unreachable", rec.Code, rec.Body.String(), hostPort(target.URL))
+			}
+		})
+	}
+}
+
+func TestB192AuditOCITokenFailureNamesHostAndCause(t *testing.T) {
+	for _, kind := range []string{"status", "dns", "tls"} {
+		t.Run(kind, func(t *testing.T) {
+			token := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			if kind == "tls" {
+				token.TLS = &tls.Config{MaxVersion: tls.VersionTLS12} //nolint:gosec // G402: the fixture rejects the client's TLS version
+				token.StartTLS()
+			} else {
+				token.Start()
+			}
+			t.Cleanup(token.Close)
+			realm := token.URL + "/token"
+			wantClass := "upstream answered HTTP 503 Service Unavailable"
+			//nolint:staticcheck // QF1003: the review's test, committed as written.
+			if kind == "dns" {
+				realm = "https://auth.example:8443/token"
+				wantClass = "DNS lookup failed"
+			} else if kind == "tls" {
+				wantClass = "TLS handshake failed"
+			}
+			registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s",service="registry.test",scope="repository:test:pull"`, realm))
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			t.Cleanup(registry.Close)
+			s := notFoundServer(t, storage.NewMemory(), registry.URL)
+			s.cfg.OCITokenHosts = []string{"127.0.0.1", "auth.example"}
+			allowLoopbackHost(t)
+			//nolint:staticcheck // QF1003: the review's test, committed as written.
+			if kind == "dns" {
+				saved := upstreamLookupHost
+				upstreamLookupHost = func(host string) ([]string, error) {
+					if host == "auth.example" {
+						return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+					}
+					return saved(host)
+				}
+				t.Cleanup(func() { upstreamLookupHost = saved })
+			} else if kind == "tls" {
+				saved := ociTokenClient
+				transport := upstreamTransport.Clone()
+				transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+				client := *saved
+				client.Transport = transport
+				ociTokenClient = &client
+				t.Cleanup(func() { ociTokenClient = saved; transport.CloseIdleConnections() })
+			}
+			target := ociTarget{registry: "registry.test", repo: "test", upstream: registry.URL, kind: ociBlobs, ref: "sha256:" + strings.Repeat("0", 64)}
+			rawURL := target.url("blobs/" + target.ref)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v2/registry.test/test/blobs/"+target.ref, nil)
+			req = req.WithContext(withUpstreamOpener(req.Context(), s.ociDigestOpener(target)))
+			resolve := func(context.Context) (string, error) { return rawURL, nil }
+			s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeOCI), manifest.OCIBlobKey(target.ref), resolve, rawURL, nil, manifest.TypeOCI, target.name(), target.name(), true, true)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(realm)+": "+wantClass+".") {
+				t.Fatalf("status=%d body=%q; want token host %s and %s", rec.Code, rec.Body.String(), hostPort(realm), wantClass)
+			}
+		})
+	}
+}
+
+func TestB192AuditOCIReadFailureNamesHostAndCause(t *testing.T) {
+	for _, kind := range []string{"manifest", "tags", "referrers", "later status", "unauthorized"} {
+		t.Run(kind, func(t *testing.T) {
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if kind == "unauthorized" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if kind == "later status" {
+					if r.URL.Path == "/second" {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					w.Header().Set("Link", `</second>; rel="next"`)
+					_, _ = w.Write([]byte(`{"schemaVersion":2,"manifests":[]}`))
+					return
+				}
+				w.Header().Set("Content-Length", "100")
+				_, _ = w.Write([]byte("short"))
+			}))
+			t.Cleanup(target.Close)
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				//nolint:gosec // G710: the destination is this test's own fixture; only the path comes from the request.
+				http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+			}))
+			t.Cleanup(first.Close)
+			rawURL := first.URL + "/object"
+			wantClass := "unreachable"
+			//nolint:staticcheck // QF1003: the review's test, committed as written.
+			if kind == "later status" {
+				rawURL = target.URL + "/object"
+				wantClass = "upstream answered HTTP 503 Service Unavailable"
+			} else if kind == "unauthorized" {
+				wantClass = "upstream answered HTTP 401 Unauthorized"
+			}
+			s := notFoundServer(t, storage.NewMemory(), first.URL)
+			targetInfo := ociTarget{registry: "registry.test", repo: "test", upstream: first.URL, ref: "sha256:" + strings.Repeat("0", 64)}
+			store := s.typeStore(manifest.TypeOCI)
+			var open upstreamOpener
+			switch kind {
+			case "manifest", "unauthorized":
+				open = s.ociManifestOpener(targetInfo, store, manifest.TypeOCI, nil)
+			case "tags":
+				open = s.ociTagListOpener(targetInfo)
+			default:
+				open = s.ociReferrersOpener(targetInfo)
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v2/registry.test/test/manifests/"+targetInfo.ref, nil)
+			req = req.WithContext(withUpstreamOpener(req.Context(), open))
+			resolve := func(context.Context) (string, error) { return rawURL, nil }
+			s.proxyOrResolve(rec, req, store, manifest.OCIManifestKey(targetInfo.registry, targetInfo.repo, targetInfo.ref), resolve, rawURL, nil, manifest.TypeOCI, targetInfo.name(), targetInfo.name(), true, true)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": "+wantClass+".") {
+				t.Fatalf("status=%d body=%q; want answering host %s and %s", rec.Code, rec.Body.String(), hostPort(target.URL), wantClass)
+			}
+		})
+	}
+}

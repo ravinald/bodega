@@ -1142,9 +1142,16 @@ func (e *upstreamStatusError) Error() string {
 //
 // Error and Unwrap pass err through unchanged, so log lines and every
 // errors.Is and errors.As test read the failure as they would unwrapped.
+//
+// status is an HTTP answer the public body names that no upstreamStatusError
+// carries, because that type steers not-found and stale-cache handling and a
+// token service's or a challenge's status must not. diag, when set, is the
+// error the body is classified from where err deliberately drops its identity.
 type upstreamEndpointError struct {
 	endpoint string
 	tls      bool
+	status   int
+	diag     error
 	err      error
 }
 
@@ -1164,6 +1171,42 @@ func atUpstream(rawURL string, err error) error {
 	return &upstreamEndpointError{endpoint: hostPort(rawURL), err: err}
 }
 
+// answeredStatus is err recorded as rawURL answering HTTP status, for the
+// public body alone: no errors.As test that steers the fetch can see it.
+func answeredStatus(rawURL string, status int, err error) error {
+	return &upstreamEndpointError{endpoint: hostPort(rawURL), status: status, err: err}
+}
+
+// detachUpstream is cause's text inside msg with none of its identity, so a
+// caller suppressing errUpstreamNotFound or a rate limit still hands the
+// public body the endpoint and cause it would have named.
+func detachUpstream(cause error, msg string) error {
+	flat := errors.New(msg + ": " + cause.Error())
+	var at *upstreamEndpointError
+	if !errors.As(cause, &at) {
+		return flat
+	}
+	return &upstreamEndpointError{endpoint: at.endpoint, diag: cause, err: flat}
+}
+
+// endpointBody tags every failed read of a response body with the endpoint
+// that sent it. A body is read long after the request returns, by callers that
+// no longer hold the response, so this is the only place that still knows
+// which server a cut transfer came from. io.EOF passes untouched: readers
+// compare it with ==.
+type endpointBody struct {
+	io.ReadCloser
+	endpoint string
+}
+
+func (b *endpointBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		err = atUpstream(b.endpoint, err)
+	}
+	return n, err
+}
+
 // doUpstream sends req through client and, on failure, records the endpoint
 // that failed and whether its TLS handshake did. crypto/tls reports a peer's
 // alert as a net.OpError around an unexported type, so the error alone cannot
@@ -1181,6 +1224,7 @@ func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) 
 	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
 	resp, err := client.Do(req)
 	if err == nil {
+		resp.Body = &endpointBody{ReadCloser: resp.Body, endpoint: answeredURL(resp, req.URL.String())}
 		return resp, nil
 	}
 	endpoint := req.URL.String()
@@ -1261,13 +1305,18 @@ func hostPort(rawURL string) string {
 // timed out is still a resolver fault, and TLS ahead of it for the same reason.
 func upstreamFailureCause(err error) (cause, step string) {
 	const route = "check this server's route to that host (DNS, firewall, proxy), or retry once it is back"
+	var at *upstreamEndpointError
+	if errors.As(err, &at) {
+		if at.diag != nil {
+			return upstreamFailureCause(at.diag)
+		}
+		if at.status != 0 {
+			return answeredStatusCause(at.status)
+		}
+	}
 	var status *upstreamStatusError
 	if errors.As(err, &status) {
-		text := http.StatusText(status.status)
-		if text == "" {
-			return fmt.Sprintf("upstream answered HTTP %d", status.status), "retry once it is back"
-		}
-		return fmt.Sprintf("upstream answered HTTP %d %s", status.status, text), "retry once it is back"
+		return answeredStatusCause(status.status)
 	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
@@ -1284,8 +1333,7 @@ func upstreamFailureCause(err error) (cause, step string) {
 		hostErr    x509.HostnameError
 		invalidErr x509.CertificateInvalidError
 	)
-	var at *upstreamEndpointError
-	if (errors.As(err, &at) && at.tls) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
+	if (at != nil && at.tls) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
 		errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &invalidErr) {
 		return "TLS handshake failed", route
 	}
@@ -1294,6 +1342,13 @@ func upstreamFailureCause(err error) (cause, step string) {
 		return "timed out", route
 	}
 	return "unreachable", route
+}
+
+func answeredStatusCause(status int) (cause, step string) {
+	if text := http.StatusText(status); text != "" {
+		return fmt.Sprintf("upstream answered HTTP %d %s", status, text), "retry once it is back"
+	}
+	return fmt.Sprintf("upstream answered HTTP %d", status), "retry once it is back"
 }
 
 // defaultRateLimitRetryAfter is the interval bodega tells a client to wait
@@ -1400,12 +1455,12 @@ func (s *Server) spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
 		// declared-length check below ever runs, so this message has to carry
 		// the same fact: the spool is removed and nothing was cached.
 		sp.close()
-		return nil, fmt.Errorf("read upstream body from %s after %d bytes: %w — nothing was cached; retry, and check the upstream if it repeats", up.url, n, err)
+		return nil, atUpstream(up.url, fmt.Errorf("read upstream body from %s after %d bytes: %w — nothing was cached; retry, and check the upstream if it repeats", up.url, n, err))
 	}
 	if up.contentLength >= 0 && n != up.contentLength {
 		sp.close()
-		return nil, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
-			n, up.contentLength, up.url)
+		return nil, atUpstream(up.url, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			n, up.contentLength, up.url))
 	}
 	sp.sha256 = hex.EncodeToString(h.Sum(nil))
 	return sp, nil

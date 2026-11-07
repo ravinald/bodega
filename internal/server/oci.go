@@ -1146,7 +1146,7 @@ func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
 				next = ""
 				continue
 			case answered != "" && err != nil:
-				return nil, fmt.Errorf("the referrers of %s@%s: page %s failed after an earlier page answered, so bodega serves none of them rather than part: %v", t.name(), t.ref, next, err)
+				return nil, detachUpstream(err, fmt.Sprintf("the referrers of %s@%s: page %s failed after an earlier page answered, so bodega serves none of them rather than part", t.name(), t.ref, next))
 			case err != nil:
 				return nil, err
 			}
@@ -1429,7 +1429,8 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		drainClose(resp)
 		params, ok := parseBearerChallenge(challenge)
 		if !ok {
-			return nil, fmt.Errorf("upstream %s answered 401 with no Bearer challenge bodega can follow (WWW-Authenticate %q)", rawURL, challenge)
+			return nil, answeredStatus(answeredURL(resp, rawURL), resp.StatusCode,
+				fmt.Errorf("upstream %s answered 401 with no Bearer challenge bodega can follow (WWW-Authenticate %q)", rawURL, challenge))
 		}
 		scope := params["scope"]
 		if scope == "" {
@@ -1511,7 +1512,7 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 	q.Set("scope", scope)
 	ru.RawQuery = q.Encode()
 	if err := upstreamGuard(ru.String()); err != nil {
-		return ociTokenEntry{}, err
+		return ociTokenEntry{}, atUpstream(ru.String(), err)
 	}
 	//nolint:gosec // G704: the realm passed the host list and upstreamGuard above.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ru.String(), nil)
@@ -1523,8 +1524,7 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		pw, _ := up.User.Password()
 		req.SetBasicAuth(up.User.Username(), pw)
 	}
-	//nolint:gosec // G704: see above.
-	resp, err := ociTokenClient.Do(req)
+	resp, err := doUpstream(ociTokenClient, req)
 	if err != nil {
 		return ociTokenEntry{}, fmt.Errorf("token request to %s for %s: %w", ru.Hostname(), t.registry, err)
 	}
@@ -1534,7 +1534,8 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		if up.User == nil {
 			next = "the registry may need a credential in its oci_upstreams URL"
 		}
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered %d for %s scope %q; %s", ru.Hostname(), resp.StatusCode, t.registry, scope, next)
+		return ociTokenEntry{}, answeredStatus(ru.String(), resp.StatusCode,
+			fmt.Errorf("token service %s answered %d for %s scope %q; %s", ru.Hostname(), resp.StatusCode, t.registry, scope, next))
 	}
 	var body struct {
 		Token       string `json:"token"`
@@ -1542,14 +1543,14 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered with a body that does not parse: %w", ru.Hostname(), err)
+		return ociTokenEntry{}, atUpstream(ru.String(), fmt.Errorf("token service %s answered with a body that does not parse: %w", ru.Hostname(), err))
 	}
 	tok := ociTokenEntry{value: body.Token}
 	if tok.value == "" {
 		tok.value = body.AccessToken
 	}
 	if tok.value == "" {
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered with no token", ru.Hostname())
+		return ociTokenEntry{}, atUpstream(ru.String(), fmt.Errorf("token service %s answered with no token", ru.Hostname()))
 	}
 	life := ociDefaultTokenLifetime
 	if body.ExpiresIn > 0 {
