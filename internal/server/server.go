@@ -679,6 +679,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.spoolErr != nil {
 		return s.spoolErr
 	}
+	sweepSpoolLeftovers(s.spool.dir, s.logger)
 
 	if s.inventoryErr != nil {
 		return s.inventoryErr

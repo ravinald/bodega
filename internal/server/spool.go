@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -255,4 +258,49 @@ func ensureSpoolDir(dir string) error {
 	name := f.Name()
 	_ = f.Close()
 	return os.Remove(name)
+}
+
+// spoolFilePrefix names every file a proxy fill spools into. Nothing else in
+// the spool directory starts with it, which is what lets startup sweep it.
+const spoolFilePrefix = "bodega-upstream-"
+
+// sweepSpoolLeftovers removes the spool files a killed or crashed process
+// never reached its own removal for. It runs before the listener opens, when
+// no request of this process can own one. A second server sharing the
+// directory loses nothing either: an unlinked file stays readable and writable
+// through the descriptor already holding it.
+//
+// Only regular files go. A symlink is skipped rather than followed, and if a
+// file is swapped for one between the check and the removal, os.Remove unlinks
+// the link itself and never touches its target. The move-*.part files bodega
+// move writes here, and anything else, are left alone.
+func sweepSpoolLeftovers(dir string, logger *slog.Logger) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		logger.Warn("proxy spool leftovers not swept; spool files from a killed process stay on disk until removed by hand",
+			"spool_dir", dir, "error", err)
+		return
+	}
+	var removed int
+	var total int64
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), spoolFilePrefix) || !e.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		var size int64
+		if info, err := e.Info(); err == nil {
+			size = info.Size()
+		}
+		if err := os.Remove(path); err != nil {
+			logger.Warn("proxy spool leftover not removed; delete it by hand", "path", path, "error", err)
+			continue
+		}
+		removed++
+		total += size
+	}
+	if removed > 0 {
+		logger.Info("removed proxy spool files left by an earlier process",
+			"spool_dir", dir, "files", removed, "bytes", total)
+	}
 }
