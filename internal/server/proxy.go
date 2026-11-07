@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
@@ -1041,7 +1042,7 @@ func openUpstream(ctx context.Context, rawURL string, identity bool) (*upstreamS
 // distfilesGuard.
 func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string) error, rawURL string, identity bool) (*upstreamStream, error) {
 	if err := guard(rawURL); err != nil {
-		return nil, err
+		return nil, atUpstream(rawURL, err)
 	}
 	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -1058,11 +1059,15 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 
-	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
-	resp, err := client.Do(req)
+	resp, err := doUpstream(client, req)
 	if err != nil {
 		return nil, err
 	}
+
+	// resp.Request is the last request in the chain, so its URL is the server
+	// that produced this answer. It is nil for no response net/http returns, but
+	// the fallback keeps a future transport from leaving the field empty.
+	answered := answeredURL(resp, rawURL)
 
 	// Ahead of the identity check: a rate-limit answer has no artifact body to
 	// protect, and a CDN that gzips its error page would otherwise turn
@@ -1070,16 +1075,16 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if resp.StatusCode == http.StatusTooManyRequests ||
 		(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
 		resp.Body.Close()
-		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
+		return nil, atUpstream(answered, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")})
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
+		return nil, atUpstream(answered, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL))
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+		return nil, atUpstream(answered, &upstreamStatusError{url: rawURL, status: resp.StatusCode})
 	}
 
 	// After the status: the identity rule protects artifact bytes, and only a
@@ -1088,18 +1093,10 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if identity {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			resp.Body.Close()
-			return nil, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+			return nil, atUpstream(answered, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
 				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
-				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL))
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)))
 		}
-	}
-
-	// resp.Request is the last request in the chain, so its URL is the server
-	// that produced this body. It is nil for no response net/http returns, but
-	// the fallback keeps a future transport from leaving the field empty.
-	answered := rawURL
-	if resp.Request != nil && resp.Request.URL != nil {
-		answered = resp.Request.URL.String()
 	}
 
 	return &upstreamStream{
@@ -1136,6 +1133,64 @@ func (e *upstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned %d: %s", e.status, e.url)
 }
 
+// upstreamEndpointError carries the host:port an upstream failure happened at,
+// and whether it happened in the TLS handshake, beside the error itself. The
+// public 502 is built from these fields, never from err's text, so the
+// endpoint is recorded where the attempt is made: after a fallback or a
+// redirect, or inside a resolver's own read, nothing downstream can recover
+// which server was being talked to.
+//
+// Error and Unwrap pass err through unchanged, so log lines and every
+// errors.Is and errors.As test read the failure as they would unwrapped.
+type upstreamEndpointError struct {
+	endpoint string
+	tls      bool
+	err      error
+}
+
+func (e *upstreamEndpointError) Error() string { return e.err.Error() }
+func (e *upstreamEndpointError) Unwrap() error { return e.err }
+
+// atUpstream records rawURL's endpoint on err. An error that already names
+// one keeps it: the innermost attempt is the one that failed.
+func atUpstream(rawURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var known *upstreamEndpointError
+	if errors.As(err, &known) {
+		return err
+	}
+	return &upstreamEndpointError{endpoint: hostPort(rawURL), err: err}
+}
+
+// doUpstream sends req through client and, on failure, records the endpoint
+// that failed and whether its TLS handshake did. crypto/tls reports a peer's
+// alert as a net.OpError around an unexported type, so the error alone cannot
+// say a version or cipher mismatch was a handshake failure; the trace can.
+func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
+	var handshakeFailed atomic.Bool
+	trace := &httptrace.ClientTrace{
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err != nil {
+				handshakeFailed.Store(true)
+			}
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
+	resp, err := client.Do(req)
+	if err == nil {
+		return resp, nil
+	}
+	endpoint := req.URL.String()
+	var uerr *url.Error
+	if errors.As(err, &uerr) && hostPort(uerr.URL) != "" {
+		endpoint = uerr.URL
+	}
+	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshakeFailed.Load(), err: err}
+}
+
 // writeUpstreamUnreachable answers a client whose upstream could not be read
 // with a 502 naming the host and why, so the person at the client can tell an
 // outage from a DNS or firewall fault without the server log.
@@ -1154,6 +1209,10 @@ func writeUpstreamUnreachable(w http.ResponseWriter, what string, err error, fal
 // the error where it carries an address, since a fallback in the fetch order or
 // a resolver's index read may be a different host from fallbackURL.
 func upstreamHostIn(err error, fallbackURL string) string {
+	var at *upstreamEndpointError
+	if errors.As(err, &at) && at.endpoint != "" {
+		return at.endpoint
+	}
 	var status *upstreamStatusError
 	if errors.As(err, &status) {
 		if h := hostPort(status.url); h != "" {
@@ -1225,7 +1284,8 @@ func upstreamFailureCause(err error) (cause, step string) {
 		hostErr    x509.HostnameError
 		invalidErr x509.CertificateInvalidError
 	)
-	if errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
+	var at *upstreamEndpointError
+	if (errors.As(err, &at) && at.tls) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
 		errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &invalidErr) {
 		return "TLS handshake failed", route
 	}
@@ -1363,8 +1423,8 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 
 	// A declared length over the cap is refusable before a byte is read.
 	if up.contentLength > maxUpstreamBody {
-		return nil, "", fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; this response has to be parsed in memory and cannot carry that much",
-			up.contentLength, maxUpstreamBody, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; this response has to be parsed in memory and cannot carry that much",
+			up.contentLength, maxUpstreamBody, rawURL))
 	}
 
 	// One byte past the cap. Anything read there means the body was longer
@@ -1372,18 +1432,18 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	// checksum would then bless.
 	data, err := io.ReadAll(io.LimitReader(up.body, maxUpstreamBody+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("read upstream body: %w", err)
+		return nil, "", atUpstream(up.url, fmt.Errorf("read upstream body: %w", err))
 	}
 	if int64(len(data)) > maxUpstreamBody {
-		return nil, "", fmt.Errorf("upstream body exceeds bodega's %d-byte buffer: %s — nothing was cached; fetch this artifact out of band or serve it from storage",
-			maxUpstreamBody, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream body exceeds bodega's %d-byte buffer: %s — nothing was cached; fetch this artifact out of band or serve it from storage",
+			maxUpstreamBody, rawURL))
 	}
 	// A body shorter than the length the upstream declared is a cut transfer.
 	// Chunked and transparently-decompressed responses report -1 and are
 	// exempt, so this only fires where the upstream stated a number.
 	if up.contentLength >= 0 && int64(len(data)) != up.contentLength {
-		return nil, "", fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
-			len(data), up.contentLength, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			len(data), up.contentLength, rawURL))
 	}
 
 	return data, up.contentType, nil

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -167,5 +168,102 @@ func TestHostPortFillsTheSchemePort(t *testing.T) {
 		if got := hostPort(raw); got != want {
 			t.Errorf("hostPort(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+func TestB192ReviewPypiIndexReadFailureNamesHost(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte("short"))
+	}))
+	t.Cleanup(up.Close)
+	s := proxyingServer(t)
+	s.cfg.PypiUpstream = up.URL
+	seedProxyPypi(t, s, "six", up.URL)
+	status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel)
+	if status != http.StatusBadGateway || !strings.Contains(body, hostPort(up.URL)+": unreachable.") {
+		t.Fatalf("status=%d body=%q; want index host and unreachable", status, body)
+	}
+}
+
+func TestB192ReviewFallbackGuardFailureNamesHost(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(up.Close)
+	s := notFoundServer(t, storage.NewMemory(), up.URL)
+	saved := upstreamLookupHost
+	upstreamLookupHost = func(host string) ([]string, error) {
+		if host == "mirror.example" {
+			return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+		}
+		return saved(host)
+	}
+	t.Cleanup(func() { upstreamLookupHost = saved })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil)
+	resolve := func(context.Context) (string, error) { return up.URL + "/a.jar", nil }
+	order := &upstreamOrder{fallbacks: []string{"https://mirror.example:8443/a.jar"}}
+	s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", order, manifest.TypeMaven, "", "", true, false)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "mirror.example:8443: DNS lookup failed.") {
+		t.Fatalf("status=%d body=%q; want mirror.example:8443 and DNS lookup failed", rec.Code, rec.Body.String())
+	}
+}
+
+func TestB192ReviewRedirectStatusNamesAnsweringHost(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/a.jar", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+	s := notFoundServer(t, storage.NewMemory(), redirector.URL)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil)
+	resolve := func(context.Context) (string, error) { return redirector.URL + "/a.jar", nil }
+	s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", nil, manifest.TypeMaven, "", "", true, false)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": upstream answered HTTP 503 Service Unavailable.") {
+		t.Fatalf("status=%d body=%q; want answering host %s and HTTP 503", rec.Code, rec.Body.String(), hostPort(target.URL))
+	}
+}
+
+func TestB192ReviewPypiDNSFailurePreservesPort(t *testing.T) {
+	s := proxyingServer(t)
+	s.cfg.PypiUpstream = "https://pypi.example:8443"
+	seedProxyPypi(t, s, "six", s.cfg.PypiUpstream)
+	saved := upstreamLookupHost
+	upstreamLookupHost = func(host string) ([]string, error) {
+		if host == "pypi.example" {
+			return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+		}
+		return saved(host)
+	}
+	t.Cleanup(func() { upstreamLookupHost = saved })
+	status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel)
+	if status != http.StatusBadGateway || !strings.Contains(body, "pypi.example:8443: DNS lookup failed.") {
+		t.Fatalf("status=%d body=%q; want pypi.example:8443 and DNS lookup failed", status, body)
+	}
+}
+
+func TestB192ReviewTLSProtocolFailure(t *testing.T) {
+	up := httptest.NewUnstartedServer(http.NotFoundHandler())
+	up.TLS = &tls.Config{MaxVersion: tls.VersionTLS12} //nolint:gosec // G402: the fixture is a server capped below what the client accepts
+	up.StartTLS()
+	t.Cleanup(up.Close)
+	s := notFoundServer(t, storage.NewMemory(), up.URL)
+	allowLoopbackHost(t)
+	saved := upstreamClient
+	transport := upstreamTransport.Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	client := *saved
+	client.Transport = transport
+	upstreamClient = &client
+	t.Cleanup(func() { upstreamClient = saved; transport.CloseIdleConnections() })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil)
+	resolve := func(context.Context) (string, error) { return up.URL + "/a.jar", nil }
+	s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", nil, manifest.TypeMaven, "", "", true, false)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(up.URL)+": TLS handshake failed.") {
+		t.Fatalf("status=%d body=%q; want host and TLS handshake failed", rec.Code, rec.Body.String())
 	}
 }

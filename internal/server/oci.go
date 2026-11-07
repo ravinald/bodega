@@ -1417,7 +1417,7 @@ func answeredURL(resp *http.Response, rawURL string) string {
 // openUpstream would give, so proxyOrResolve tells a 404 from an outage.
 func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string) (*http.Response, error) {
 	if err := upstreamGuard(rawURL); err != nil {
-		return nil, err
+		return nil, atUpstream(rawURL, err)
 	}
 	pullScope := "repository:" + t.repo + ":pull"
 	resp, err := ociDo(ctx, rawURL, accept, s.ociTokens.get(t.registry, pullScope))
@@ -1454,7 +1454,7 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	default:
 		drainClose(resp)
-		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+		return nil, atUpstream(answeredURL(resp, rawURL), &upstreamStatusError{url: rawURL, status: resp.StatusCode})
 	}
 }
 
@@ -1471,8 +1471,7 @@ func ociDo(ctx context.Context, rawURL, accept, token string) (*http.Response, e
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	//nolint:gosec // G704: see above; the redirect hops are guarded by upstreamClient.
-	return upstreamClient.Do(req)
+	return doUpstream(upstreamClient, req)
 }
 
 func drainClose(resp *http.Response) {
