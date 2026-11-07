@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/ravinald/bodega/internal/audit"
 )
@@ -264,20 +265,66 @@ func ensureSpoolDir(dir string) error {
 // the spool directory starts with it, which is what lets startup sweep it.
 const spoolFilePrefix = "bodega-upstream-"
 
+// spoolLockName is the file a serving process holds an exclusive flock on
+// for as long as Start runs. It is never removed: unlinking a held lock lets
+// the next process lock a fresh inode while the old holder still believes it
+// owns the directory.
+const spoolLockName = ".bodega-spool.lock"
+
+// errSpoolLockUnsupported marks a filesystem that refuses flock outright
+// (some NFS and FUSE mounts). Start serves anyway and skips the sweep, since
+// without the lock nothing proves no other server is streaming there.
+var errSpoolLockUnsupported = errors.New("the spool filesystem does not support flock")
+
+// lockSpoolDir takes the exclusive lock that entitles this process to sweep
+// dir. Closing the returned file releases it, and so does the process dying,
+// which is what lets the next start after a SIGKILL sweep.
+//
+// The unlinked file a sweep would remove is not safe to lose while a request
+// streams into it: the fill reopens it by path to publish it to storage and to
+// verify go module checksums, so a second server sweeping the directory would
+// fail the first server's live fetches. Hence a competing start refuses here,
+// before anything is deleted, rather than relying on open descriptors.
+func lockSpoolDir(dir string) (*os.File, error) {
+	path := filepath.Join(dir, spoolLockName)
+	// O_NOFOLLOW: a spool directory other users can write must not let a
+	// planted symlink make this process create or truncate a file elsewhere.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open spool lock %s: %w\n"+
+			"the proxy spool cannot be claimed for this server. Remove whatever sits at that path if it is not a regular file, or point spool_dir somewhere this user owns", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("spool_dir %s is in use by another bodega server (it holds %s)\n"+
+				"two servers sharing a spool would delete each other's in-flight fetches. Stop the other server, or give this one its own spool_dir", dir, path)
+		}
+		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOLCK) || errors.Is(err, syscall.EINVAL) {
+			return nil, fmt.Errorf("%w: %s: %w", errSpoolLockUnsupported, path, err)
+		}
+		return nil, fmt.Errorf("lock spool %s: %w", path, err)
+	}
+	return f, nil
+}
+
 // sweepSpoolLeftovers removes the spool files a killed or crashed process
-// never reached its own removal for. It runs before the listener opens, when
-// no request of this process can own one. A second server sharing the
-// directory loses nothing either: an unlinked file stays readable and writable
-// through the descriptor already holding it.
+// never reached its own removal for. Callers hold the lockSpoolDir lock and
+// call it before the listener opens, so no request of any live server can own
+// one.
 //
 // Only regular files go. A symlink is skipped rather than followed, and if a
 // file is swapped for one between the check and the removal, os.Remove unlinks
 // the link itself and never touches its target. The move-*.part files bodega
 // move writes here, and anything else, are left alone.
+//
+// Every record is at Error: the shipped default log_level maps to
+// slog.LevelError, and a sweep reported at Info or Warn printed nothing on the
+// installs whose disk it frees.
 func sweepSpoolLeftovers(dir string, logger *slog.Logger) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		logger.Warn("proxy spool leftovers not swept; spool files from a killed process stay on disk until removed by hand",
+		logger.Error("proxy spool leftovers not swept; spool files from a killed process stay on disk until removed by hand",
 			"spool_dir", dir, "error", err)
 		return
 	}
@@ -293,14 +340,14 @@ func sweepSpoolLeftovers(dir string, logger *slog.Logger) {
 			size = info.Size()
 		}
 		if err := os.Remove(path); err != nil {
-			logger.Warn("proxy spool leftover not removed; delete it by hand", "path", path, "error", err)
+			logger.Error("proxy spool leftover not removed; delete it by hand", "path", path, "error", err)
 			continue
 		}
 		removed++
 		total += size
 	}
 	if removed > 0 {
-		logger.Info("removed proxy spool files left by an earlier process",
+		logger.Error("removed proxy spool files left by an earlier process",
 			"spool_dir", dir, "files", removed, "bytes", total)
 	}
 }
