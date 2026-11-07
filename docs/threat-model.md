@@ -161,6 +161,14 @@ risk:
   pass it. The trust anchor moves to the ports tree the server reads, so a
   tampered tree on the server is served faithfully. Keep it at the revision
   the clients build from, from the same source they take it from.
+- **A PyPI file whose bytes its own index does not vouch for.** The simple
+  index lists each file with a `#sha256=` fragment, and a proxied fill holds
+  the fetched bytes to it before the first-fetch pin, the cache write or the
+  response: a mismatch answers `502` naming the file, both digests and the
+  index URL, and nothing is cached or pinned. An entry that names no sha256
+  fills unchecked, and the server log says so. The index and the file come
+  from the same upstream, so this catches a files host or path that disagrees
+  with the index, not an index rewritten to match.
 - **A restricted distfile served on a guess about the client.** A port's
   redistribution terms, and the `distinfo` its fetch checks against, can
   depend on files and variables on the client host rather than in the ports
