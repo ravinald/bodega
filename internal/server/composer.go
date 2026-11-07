@@ -240,17 +240,17 @@ func (s *Server) handleComposerDist(w http.ResponseWriter, r *http.Request, d co
 // errUpstreamNotFound, and no archive host is contacted for it.
 func (s *Server) composerDistUpstream(r *http.Request, d composerDist) (string, error) {
 	dev := composerDevVersion(d.version)
-	doc, err := s.composerMetadataDocument(r, d.name, dev)
+	doc, respondent, err := s.composerMetadataDocument(r, d.name, dev)
 	if err != nil {
 		return "", err
 	}
 	named, err := composerDistURL(doc, d)
 	if err != nil {
-		return "", err
+		return "", sentBy(respondent, err)
 	}
 	fetch, err := composerFetchURL(named)
 	if err != nil {
-		return "", err
+		return "", sentBy(respondent, err)
 	}
 	for _, raw := range []string{named, fetch} {
 		u, _ := url.Parse(raw)
@@ -278,7 +278,10 @@ func (s *Server) composerDistHostListed(host string) bool {
 // route would fetch it, unrewritten. The read is marked as bodega's own
 // (withOwnRead), so it writes no audit or discovery row in the client's name;
 // the dist request has written its own.
-func (s *Server) composerMetadataDocument(r *http.Request, name string, dev bool) ([]byte, error) {
+//
+// respondent is the server that answered, empty for a cached copy: a document
+// that fails the caller's checks is that server's fault, not the archive's.
+func (s *Server) composerMetadataDocument(r *http.Request, name string, dev bool) (doc []byte, respondent string, err error) {
 	req := r.Clone(withOwnRead(r.Context()))
 	req.URL.Path = "/composer" + composerMetadataPath(name, dev)
 	req.URL.RawPath = ""
@@ -291,13 +294,13 @@ func (s *Server) composerMetadataDocument(r *http.Request, name string, dev bool
 		s.cfg.ComposerUpstream+composerMetadataPath(name, dev), manifest.TypeComposer, name, name, false, false)
 	switch {
 	case cw.tooBig:
-		return nil, fmt.Errorf("composer metadata for %s exceeds bodega's %d-byte buffer", name, maxUpstreamBody)
+		return nil, "", sentBy(cw.respondent, fmt.Errorf("composer metadata for %s exceeds bodega's %d-byte buffer", name, maxUpstreamBody))
 	case cw.status == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: Packagist lists no package %s", errUpstreamNotFound, name)
+		return nil, "", fmt.Errorf("%w: Packagist lists no package %s", errUpstreamNotFound, name)
 	case cw.status != 0 && cw.status != http.StatusOK:
-		return nil, capturedDiagnosis(cw, fmt.Errorf("composer metadata for %s answered HTTP %d", name, cw.status))
+		return nil, "", capturedDiagnosis(cw, fmt.Errorf("composer metadata for %s answered HTTP %d", name, cw.status))
 	}
-	return cw.body.Bytes(), nil
+	return cw.body.Bytes(), cw.respondent, nil
 }
 
 // composerDistURL finds the dist URL the metadata names for d, matched on the

@@ -1428,10 +1428,11 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		challenge := resp.Header.Get("WWW-Authenticate")
+		challenger := answeredURL(resp, rawURL)
 		drainClose(resp)
 		params, ok := parseBearerChallenge(challenge)
 		if !ok {
-			return nil, answeredStatus(answeredURL(resp, rawURL), resp.StatusCode,
+			return nil, answeredStatus(challenger, resp.StatusCode,
 				fmt.Errorf("upstream %s answered 401 with no Bearer challenge bodega can follow (WWW-Authenticate %q)", rawURL, challenge))
 		}
 		scope := params["scope"]
@@ -1439,6 +1440,10 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 			scope = pullScope
 		}
 		token, err := s.ociToken(ctx, t, params["realm"], params["service"], scope)
+		var unusable unusableRealmError
+		if errors.As(err, &unusable) {
+			return nil, answeredStatus(challenger, resp.StatusCode, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1482,6 +1487,10 @@ func drainClose(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
+// unusableRealmError is a challenge whose realm names no endpoint bodega can
+// ask, so the failure is the challenging response's and no token request's.
+type unusableRealmError struct{ error }
+
 // ociTokenClient is the upstream client with redirects refused. A token
 // request carries the credential, and a realm that redirects would choose
 // where it goes next.
@@ -1498,7 +1507,7 @@ var ociTokenClient = &http.Client{
 func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scope string) (ociTokenEntry, error) {
 	ru, err := url.Parse(realm)
 	if err != nil || ru.Host == "" {
-		return ociTokenEntry{}, fmt.Errorf("registry %s named a token realm %q that is not an absolute URL", t.registry, realm)
+		return ociTokenEntry{}, unusableRealmError{fmt.Errorf("registry %s named a token realm %q that is not an absolute URL", t.registry, realm)}
 	}
 	up, _ := url.Parse(t.upstream)
 	if !strings.EqualFold(ru.Host, up.Host) && !s.ociTokenHostListed(ru.Hostname()) {

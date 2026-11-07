@@ -584,3 +584,155 @@ func TestB192ReauditComposerResolutionRetainsDiagnosis(t *testing.T) {
 		})
 	}
 }
+
+func TestB192FourthRedirectedInvalidRealm(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="relative-token",service="registry.test",scope="repository:test:pull"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(target.Close)
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/object", http.StatusFound)
+	}))
+	t.Cleanup(first.Close)
+	s := notFoundServer(t, storage.NewMemory(), first.URL)
+	targetInfo := ociTarget{registry: "registry.test", repo: "test", upstream: first.URL, ref: "sha256:" + strings.Repeat("0", 64)}
+	rawURL := first.URL + "/object"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v2/registry.test/test/blobs/"+targetInfo.ref, nil)
+	req = req.WithContext(withUpstreamOpener(req.Context(), s.ociDigestOpener(targetInfo)))
+	resolve := func(context.Context) (string, error) { return rawURL, nil }
+	s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeOCI), manifest.OCIBlobKey(targetInfo.ref), resolve, rawURL, nil, manifest.TypeOCI, targetInfo.name(), targetInfo.name(), true, true)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": upstream answered HTTP 401 Unauthorized.") {
+		t.Fatalf("status=%d body=%q; want respondent %s and HTTP 401", rec.Code, rec.Body.String(), hostPort(target.URL))
+	}
+}
+
+func TestB192FourthComposerInvalidMetadata(t *testing.T) {
+	for _, kind := range []string{"invalid JSON", "relative dist URL", "capture limit"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newPackagistFixture(t)
+			s := composerServer(t, f)
+			body := "invalid JSON"
+			switch kind {
+			case "relative dist URL":
+				body = `{"packages":{"symfony/console":[{"name":"symfony/console","version":"v7.1.5","dist":{"url":"relative.zip","type":"zip","reference":"` + consoleRef515 + `"}}]}}`
+			case "capture limit":
+				saved := maxUpstreamBody
+				maxUpstreamBody = 64
+				t.Cleanup(func() { maxUpstreamBody = saved })
+				body = strings.Repeat(" ", 128)
+			}
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			t.Cleanup(target.Close)
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+"/metadata", http.StatusFound)
+			}))
+			t.Cleanup(first.Close)
+			s.cfg.ComposerUpstream = first.URL
+			rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.5", consoleRef515), nil)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(target.URL)+": unreachable.") {
+				t.Fatalf("status=%d body=%q; want metadata respondent %s and unreachable", rec.Code, rec.Body.String(), hostPort(target.URL))
+			}
+		})
+	}
+}
+
+func TestB192FourthUnusedTLSFailureAfterRedirect(t *testing.T) {
+	started, release, failed, redirected := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releases sync.Once
+	unblock := func() { releases.Do(func() { close(release) }) }
+	var handshakes atomic.Int32
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4")
+		_, _ = w.Write([]byte("busy"))
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(busy.Close)
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/warm" {
+			w.Header().Set("Content-Length", "4")
+			_, _ = w.Write([]byte("warm"))
+			w.(http.Flusher).Flush()
+			return
+		}
+		http.Redirect(w, r, busy.URL+"/artifact", http.StatusFound)
+	}))
+	up.TLS = &tls.Config{MinVersion: tls.VersionTLS12, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		if handshakes.Add(1) == 2 {
+			close(started)
+			<-release
+			return nil, fmt.Errorf("fixture rejects the unused connection")
+		}
+		return nil, nil
+	}}
+	up.StartTLS()
+	t.Cleanup(up.Close)
+	t.Cleanup(unblock)
+	s := notFoundServer(t, storage.NewMemory(), up.URL)
+	allowLoopbackHost(t)
+	transport := up.Client().Transport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.MaxConnsPerHost = 2
+	client := *upstreamClient
+	client.Transport = transport
+	saved := upstreamClient
+	upstreamClient = &client
+	t.Cleanup(func() { upstreamClient = saved; transport.CloseIdleConnections() })
+	for i := 0; i < 2; i++ {
+		resp, err := client.Get(busy.URL + "/held")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = resp.Body.Close() })
+	}
+	warm, err := client.Get(up.URL + "/warm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = warm.Body.Close() })
+	wait := func(c <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-c:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("waiting for %s", what)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn: func(host string) {
+			if host == hostPort(busy.URL) {
+				close(redirected)
+			}
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err != nil {
+				close(failed)
+			}
+		},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil).WithContext(ctx)
+	resolve := func(context.Context) (string, error) { return up.URL + "/artifact", nil }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", nil, manifest.TypeMaven, "", "", true, false)
+	}()
+	wait(started, "unused TLS dial")
+	if _, err := io.ReadAll(warm.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = warm.Body.Close()
+	wait(redirected, "redirect waiting for a connection to the HTTP origin")
+	unblock()
+	wait(failed, "the old origin's unused TLS failure")
+	wait(done, "timeout waiting for the redirected connection")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), hostPort(busy.URL)+": timed out.") {
+		t.Fatalf("status=%d body=%q; want HTTP origin %s and timed out", rec.Code, rec.Body.String(), hostPort(busy.URL))
+	}
+}

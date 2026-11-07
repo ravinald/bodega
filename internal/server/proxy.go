@@ -453,6 +453,9 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	defer spool.close()
+	if c, ok := w.(*capturedResponse); ok {
+		c.respondent = up.url
+	}
 
 	// Verification comes off the digest computed during the copy, and it comes
 	// before a byte reaches the client. A tee straight to the response would
@@ -1171,6 +1174,15 @@ func atUpstream(rawURL string, err error) error {
 	return &upstreamEndpointError{endpoint: hostPort(rawURL), err: err}
 }
 
+// sentBy is atUpstream for a document whose respondent may be unknown, as a
+// cached copy is: with none it leaves err for an outer caller to place.
+func sentBy(respondent string, err error) error {
+	if hostPort(respondent) == "" {
+		return err
+	}
+	return atUpstream(respondent, err)
+}
+
 // answeredStatus is err recorded as rawURL answering HTTP status, for the
 // public body alone: no errors.As test that steers the fetch can see it.
 func answeredStatus(rawURL string, status int, err error) error {
@@ -1212,11 +1224,9 @@ func (b *endpointBody) Read(p []byte) (int, error) {
 // alert as a net.OpError around an unexported type, so the error alone cannot
 // say a version or cipher mismatch was a handshake failure; the trace can.
 func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
-	var handshake connWait
+	var handshakes tlsFailures
 	trace := &httptrace.ClientTrace{
-		GetConn:          func(string) { handshake.waiting() },
-		GotConn:          func(httptrace.GotConnInfo) { handshake.served() },
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) { handshake.done(err) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) { handshakes.record(err) },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
@@ -1230,46 +1240,40 @@ func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) 
 	if errors.As(err, &uerr) && hostPort(uerr.URL) != "" {
 		endpoint = uerr.URL
 	}
-	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshake.failed(), err: err}
+	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshakes.caused(err), err: err}
 }
 
-// connWait tells whether a request's failure came from a TLS handshake for
-// the connection it was waiting on. The transport fires TLS callbacks for
-// every dial a request started, and hands the request a pooled connection
-// when one frees up first, so a dial it never used can fail its handshake
-// after the request is already being served elsewhere. Once a connection has
-// been handed over its handshake is done, so a TLS failure counts only while
-// the request is still waiting and it ends still waiting.
-type connWait struct {
-	mu      sync.Mutex
-	pending bool
-	tlsErr  bool
+// tlsFailures holds the handshake errors a request's trace reported. The
+// transport fires TLS callbacks for every dial a request starts, across every
+// redirect hop, and serves the request from whichever connection is ready
+// first, so a callback's timing says nothing about which connection failed.
+// Its error value does: the transport returns the same value it handed the
+// callback, so a request failed in a handshake only when its error is one of
+// these. A bare context error is left out because it is a shared sentinel
+// that an unrelated deadline also returns.
+type tlsFailures struct {
+	mu   sync.Mutex
+	errs []error
 }
 
-func (c *connWait) waiting() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.pending, c.tlsErr = true, false
-}
-
-func (c *connWait) served() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.pending, c.tlsErr = false, false
-}
-
-func (c *connWait) done(err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err != nil && c.pending {
-		c.tlsErr = true
+func (f *tlsFailures) record(err error) {
+	if err == nil || err == context.Canceled || err == context.DeadlineExceeded {
+		return
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = append(f.errs, err)
 }
 
-func (c *connWait) failed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.pending && c.tlsErr
+func (f *tlsFailures) caused(err error) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, hs := range f.errs {
+		if errors.Is(err, hs) {
+			return true
+		}
+	}
+	return false
 }
 
 // writeUpstreamUnreachable answers a client whose upstream could not be read
