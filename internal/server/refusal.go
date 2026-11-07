@@ -66,12 +66,12 @@ const maxReasonPhrase = 400
 // refusal is one answer bodega gives a client it will not serve, readable at
 // the terminal of whoever hit it with no access to the server's journal.
 //
-// Every field a body carries is built by the server from the package the
-// client named and the check that refused it. None is copied from an upstream
-// URL, a storage key or a config value: those carry credentials, internal
-// hostnames and bucket names, and the body goes to anyone who can reach the
-// route. The incident is the bridge to everything withheld: the audit row the
-// refusal wrote carries it in its details, beside the URL and the key.
+// Bodies name the package the client requested and why a check refused it.
+// Raw upstream URLs, storage keys and config values stay out of bodies: they
+// can carry credentials, internal hostnames and bucket names. An index-digest
+// refusal includes the public index URL so the client can report the mismatch
+// to its publisher. The incident connects the response to the operator's log
+// or audit row, where the withheld details belong.
 type refusal struct {
 	check    string
 	pkgType  string
