@@ -51,16 +51,16 @@ class DeploymentTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_changed_revision_refuses_before_remote_access(self):
-        with patch.object(deploy, 'clean_revision', side_effect=['a' * 40, 'b' * 40]), patch.object(deploy, 'run'), patch.object(deploy, 'remote') as remote:
+        with patch.object(deploy, 'clean_revision', side_effect=['a' * 40, 'b' * 40]), patch.object(deploy, 'export_coverage'), patch.object(deploy, 'render'), patch.object(deploy, 'remote') as remote:
             with self.assertRaisesRegex(ValueError, 'revision changed'):
                 deploy.deploy(self.config)
             remote.assert_not_called()
 
     def exercise_upload(self, fail=False):
-        site = self.root / 'site'
-        (site / 'dist').mkdir(parents=True)
-        (site / 'dist/index.html').write_text('ready')
-        with patch.object(deploy, 'SITE', site), patch.object(deploy, 'clean_revision', return_value='a' * 40), patch.object(deploy, 'run'), patch.object(deploy, 'remote') as remote, patch.object(deploy, 'upload') as upload:
+        def render(root, output, coverage, revision):
+            output.mkdir()
+            (output / 'index.html').write_text('ready')
+        with patch.object(deploy, 'clean_revision', return_value='a' * 40), patch.object(deploy, 'export_coverage'), patch.object(deploy, 'render', side_effect=render), patch.object(deploy, 'remote') as remote, patch.object(deploy, 'upload') as upload:
             if fail:
                 upload.side_effect = subprocess.CalledProcessError(1, 'rsync')
                 with self.assertRaises(subprocess.CalledProcessError):
@@ -91,3 +91,43 @@ class DeploymentTests(unittest.TestCase):
         manifest = json.loads((output / 'deployment.json').read_text())
         self.assertEqual(manifest['sourceRevision'], 'a' * 40)
         self.assertEqual(manifest['sha256']['index.html'], hashlib.sha256(b'ready').hexdigest())
+
+    def test_render_builds_for_the_root_with_the_given_commit(self):
+        with patch.object(deploy, 'run') as run, patch.object(deploy, 'git', return_value='v1.2.3'):
+            deploy.render(self.root, self.root / 'out', self.root / 'coverage.json', 'a' * 40)
+        generate = run.call_args_list[-1].args[0]
+        self.assertEqual(generate[generate.index('-base') + 1], '/')
+        self.assertEqual(generate[generate.index('-commit') + 1], 'a' * 40)
+        self.assertEqual(generate[generate.index('-version') + 1], 'v1.2.3')
+
+    def test_coverage_page_renders_from_the_deployed_commit_after_the_feed(self):
+        revision = 'c' * 40
+        uploads = []
+        rendered = []
+
+        def render(root, output, coverage, rev):
+            rendered.append(rev)
+            output.mkdir()
+            (output / 'coverage.html').write_text('page')
+
+        def remote(config, script, *args, capture=False):
+            return subprocess.CompletedProcess([], 0, stdout=json.dumps({'sourceRevision': revision}) if capture else '')
+
+        def export(config, output):
+            output.write_text('{}')
+
+        with patch.object(deploy, 'export_coverage', side_effect=export), patch.object(deploy, 'remote', side_effect=remote), \
+                patch.object(deploy, 'upload', side_effect=lambda c, src, dst: uploads.append(dst)), \
+                patch.object(deploy, 'render', side_effect=render), patch.object(deploy, 'run') as run, \
+                patch.object(deploy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            run.return_value = subprocess.CompletedProcess([], 0, stdout=b'')
+            deploy.publish_coverage(self.config)
+        self.assertEqual(rendered, [revision])
+        self.assertTrue(uploads[0].endswith('.json'))
+        self.assertTrue(uploads[1].endswith('.html'))
+
+    def test_deployed_revision_refuses_a_manifest_without_a_full_commit(self):
+        reply = subprocess.CompletedProcess([], 0, stdout=json.dumps({'sourceRevision': 'abc123'}))
+        with patch.object(deploy, 'remote', return_value=reply):
+            with self.assertRaisesRegex(ValueError, 'no full sourceRevision'):
+                deploy.deployed_revision(self.config)
