@@ -502,9 +502,15 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 		return nil, nil, fmt.Errorf("the %s index was written before rpm advisories were kept per release, so it cannot tell %s's records from another release's; run `bodega policy osv sync rpm`", index, ecosystem)
 	}
 	order := osvVersionOrder(ecosystem)
-	candidates := idx.Packages[key]
+	// pkg audit compares a glob-free VuXML name with strcmp and any other one
+	// with fnmatch alone, so a name spelled like a pattern is not matched by
+	// equality.
+	var candidates []*osvRecord
+	if index != VuXMLEcosystem || !isVuXMLPattern(key) {
+		candidates = idx.Packages[key]
+	}
 	for _, p := range idx.Patterns {
-		if p != key && vuxmlNameMatches(p, name) {
+		if vuxmlNameMatches(p, name) {
 			candidates = append(candidates[:len(candidates):len(candidates)], idx.Packages[p]...)
 		}
 	}

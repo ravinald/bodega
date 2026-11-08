@@ -409,3 +409,87 @@ func TestVuXMLMatch_PatternNames(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewVuXMLBracketLiterals(t *testing.T) {
+	for _, tc := range []struct{ pattern, name string }{
+		{"libfoo[-ab]*", "libfoo-devel"},
+		{"libfoo[ab-]*", "libfoo-devel"},
+		{"libfoo[]a]*", "libfooa"},
+		{"libfoo[!]-]*", "libfooa"},
+	} {
+		t.Run(tc.pattern, func(t *testing.T) {
+			doc := `<vuxml><vuln vid="bracket-vid"><topic>libfoo affected</topic><affects><package><name>` + tc.pattern + `</name><range><lt>2.0</lt></range></package></affects></vuln></vuxml>`
+			db, _, err := vuxmlDB(t, []byte(doc))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(tc.name), freeBSDEntry("1.0"))
+			if r.Action != ActionBlock {
+				t.Fatalf("%s advisory against %s@1.0: action=%s; want block (FreeBSD fnmatch returns 0)", tc.pattern, tc.name, r.Action)
+			}
+			r = freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(tc.name), freeBSDEntry("2.0"))
+			if r.Action != ActionPass {
+				t.Fatalf("fixed version: %+v; want pass", r)
+			}
+		})
+	}
+}
+
+// Each want is FreeBSD 14.3 libc fnmatch(pattern, name, 0) == 0, run in the
+// C locale.
+func TestVuXMLNameMatches_FollowsFreeBSDFnmatch(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, name string
+		want          bool
+	}{
+		{"openssl", "openssl", true},
+		{"openssl", "OpenSSL", false},
+		{"openssl*", "openssl-devel", true},
+		{"py3?-django", "py311-django", false},
+		{"py3??-django", "py311-django", true},
+		{"*", "", true},
+		{"a*b*c", "aXbYbc", true},
+		{"a*b*c", "aXbYbd", false},
+		{"lib[a-c]x", "libbx", true},
+		{"lib[a-c]x", "libdx", false},
+		{"lib[!a-c]x", "libdx", true},
+		{"lib[^a-c]x", "libbx", false},
+		{"lib[-ab]", "lib-", true},
+		{"lib[ab-]", "lib-", true},
+		{"lib[]a]", "lib]", true},
+		{"lib[!]a]", "lib]", false},
+		{"lib[!]a]", "libz", true},
+		{"lib[a-]", "lib-", true},
+		{"lib[\\]]", "lib]", true},
+		{"lib[a-\\z]", "liby", true},
+		{"lib[", "lib[", true},
+		{"lib[ab", "lib[ab", true},
+		{"lib[ab", "liba", false},
+		{"lib[]", "lib[]", true},
+		{"lib[!]", "lib[!]", true},
+		{"lib\\*", "lib*", true},
+		{"lib\\*", "libx", false},
+		{"lib\\", "lib\\", false},
+		{"a/b*", "a/bc", true},
+		{"*.x", ".x", true},
+		{"[[:alpha:]]", "a]", true},
+		{"[[:alpha:]]", "a", false},
+	} {
+		if got := vuxmlNameMatches(tc.pattern, tc.name); got != tc.want {
+			t.Errorf("vuxmlNameMatches(%q, %q) = %v; want %v", tc.pattern, tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestVuXMLMatch_PatternKeyIsNotMatchedByEquality(t *testing.T) {
+	doc := `<vuxml><vuln vid="eq-vid"><topic>bracket name</topic><affects><package><name>lib[x]</name><range><lt>2.0</lt></range></package></affects></vuln></vuxml>`
+	db, _, err := vuxmlDB(t, []byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"libx": ActionBlock, "lib[x]": ActionPass} {
+		if r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(name), freeBSDEntry("1.0")); r.Action != want {
+			t.Errorf("lib[x] advisory against %s@1.0: action=%s; want %s", name, r.Action, want)
+		}
+	}
+}

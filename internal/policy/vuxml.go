@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -193,31 +192,139 @@ func isVuXMLPattern(name string) bool {
 	return strings.ContainsAny(name, `*?[\`)
 }
 
-// vuxmlNameMatches is pkg audit's fnmatch(pattern, name, 0): case-sensitive,
-// and with no special meaning for '/', which no package name carries. A
-// malformed pattern matches nothing, as fnmatch's refusal does in pkg.
+// vuxmlNameMatches is pkg audit's fnmatch(pattern, name, 0), ported from
+// FreeBSD 14's lib/libc/gen/fnmatch.c in the C locale. It is a port rather
+// than a translation into path.Match because the two disagree on bracket
+// expressions fnmatch accepts and path.Match rejects as malformed ("[]a]",
+// "[-ab]", "[ab-]"), and a rejected pattern would read as no advisory. With
+// flags 0 the match is case-sensitive, '/' and a leading '.' are ordinary, a
+// backslash escapes the byte after it, and a pattern ending in a lone
+// backslash matches nothing.
 func vuxmlNameMatches(pattern, name string) bool {
-	ok, err := path.Match(fnmatchToGo(pattern), name)
-	return err == nil && ok
+	p, s := 0, 0
+	btP, btS := -1, 0
+	for {
+		sEnd := s >= len(name)
+		var sc byte
+		if !sEnd {
+			sc = name[s]
+		}
+		ok := false
+		if p >= len(pattern) {
+			if sEnd {
+				return true
+			}
+		} else {
+			pc := pattern[p]
+			p++
+			switch pc {
+			case '?':
+				if sEnd {
+					return false
+				}
+				s++
+				continue
+			case '*':
+				for p < len(pattern) && pattern[p] == '*' {
+					p++
+				}
+				if p == len(pattern) {
+					return true
+				}
+				btP, btS = p, s
+				continue
+			case '[':
+				if sEnd {
+					return false
+				}
+				next, res := fnmatchBracket(pattern, p, sc)
+				if res == bracketMatch {
+					p, s = next, s+1
+					continue
+				}
+				ok = res == bracketMalformed && sc == '['
+			case '\\':
+				if p == len(pattern) {
+					return false
+				}
+				pc = pattern[p]
+				p++
+				ok = !sEnd && pc == sc
+			default:
+				ok = !sEnd && pc == sc
+			}
+		}
+		if ok {
+			s++
+			continue
+		}
+		if btP < 0 || btS >= len(name) {
+			return false
+		}
+		btS++
+		p, s = btP, btS
+	}
 }
 
-// fnmatchToGo rewrites fnmatch's "[!" class negation as path.Match's "[^",
-// which fnmatch also accepts; every other construct means the same in both.
-func fnmatchToGo(pattern string) string {
-	var b strings.Builder
-	for i := 0; i < len(pattern); i++ {
-		c := pattern[i]
-		b.WriteByte(c)
-		switch {
-		case c == '\\' && i+1 < len(pattern):
-			i++
-			b.WriteByte(pattern[i])
-		case c == '[' && i+1 < len(pattern) && pattern[i+1] == '!':
-			i++
-			b.WriteByte('^')
+type bracketResult int
+
+const (
+	bracketNoMatch bracketResult = iota
+	bracketMatch
+	// bracketMalformed is an unterminated expression, which fnmatch reads
+	// as a literal '['.
+	bracketMalformed
+)
+
+// fnmatchBracket is fnmatch.c's rangematch: it reads the bracket expression
+// starting at pattern[p], just past the '[', against test and returns the
+// index past its closing ']'. A leading '!' or '^' negates it; a ']' first in
+// the list (after any negation) is a literal; a '-' first or last is a
+// literal; a backslash escapes the byte after it, inside a range too.
+func fnmatchBracket(pattern string, p int, test byte) (int, bracketResult) {
+	negate := p < len(pattern) && (pattern[p] == '!' || pattern[p] == '^')
+	if negate {
+		p++
+	}
+	matched := false
+	first := p
+	for {
+		if p >= len(pattern) {
+			return 0, bracketMalformed
+		}
+		if pattern[p] == ']' && p > first {
+			p++
+			break
+		}
+		if pattern[p] == '\\' {
+			p++
+			if p >= len(pattern) {
+				return 0, bracketMalformed
+			}
+		}
+		lo := pattern[p]
+		p++
+		if p+1 < len(pattern) && pattern[p] == '-' && pattern[p+1] != ']' {
+			p++
+			if pattern[p] == '\\' {
+				p++
+			}
+			if p >= len(pattern) {
+				return 0, bracketMalformed
+			}
+			hi := pattern[p]
+			p++
+			if lo <= test && test <= hi {
+				matched = true
+			}
+		} else if lo == test {
+			matched = true
 		}
 	}
-	return b.String()
+	if matched == negate {
+		return p, bracketNoMatch
+	}
+	return p, bracketMatch
 }
 
 // pkgVersion is a FreeBSD package version split as pkg-version(8) splits it:
