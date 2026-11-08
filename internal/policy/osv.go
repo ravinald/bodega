@@ -36,6 +36,10 @@ type OSVStore interface {
 // their own advisories against their own builds, so the ecosystem is the one
 // the package's repository belongs to, carried on the entry under
 // RpmOSVEcosystemKey.
+//
+// freebsd is covered from VuXML, which is not an OSV ecosystem, and its
+// manifest entries are repositories rather than packages: see VuXMLEcosystem
+// and FreeBSDABIKey.
 var osvEcosystemFor = map[string]string{
 	manifest.TypeNpm:      "npm",
 	manifest.TypePypi:     "PyPI",
@@ -64,12 +68,15 @@ func OSVCovers(registryType string) bool {
 }
 
 // OSVEcosystems returns the registry types the OSV gate can query, sorted.
+// freebsd is among them and OSVCovers still answers false for it: a policy row
+// and a sync are per type, and a freebsd manifest entry, which is what
+// OSVCovers is asked about, names a repository that no advisory covers.
 func OSVEcosystems() []string {
-	out := make([]string, 0, len(osvEcosystemFor)+2)
+	out := make([]string, 0, len(osvEcosystemFor)+3)
 	for eco := range osvEcosystemFor {
 		out = append(out, eco)
 	}
-	out = append(out, manifest.TypeApt, manifest.TypeRpm)
+	out = append(out, manifest.TypeApt, manifest.TypeRpm, manifest.TypeFreeBSD)
 	sort.Strings(out)
 	return out
 }
@@ -172,7 +179,8 @@ func (c *OSVChecker) check(ctx context.Context, pm *manifest.PackageManifest, ve
 		// as a scan nobody ran.
 		return Result{Check: "osv", Action: ActionNotEvaluated, Reason: OSVNotRunOCI}
 	}
-	if !OSVCovers(pm.Type) {
+	freeBSDPackage := pm.Type == manifest.TypeFreeBSD && ve.Metadata[FreeBSDABIKey] != ""
+	if !OSVCovers(pm.Type) && !freeBSDPackage {
 		return Result{Check: "osv", Action: ActionPass}
 	}
 	// An apt entry with no version is a stub whose .deb nothing has resolved
@@ -274,8 +282,20 @@ func (c *OSVChecker) check(ctx context.Context, pm *manifest.PackageManifest, ve
 		ids := vulnIDs(advisories)
 		details["vulns"] = ids
 		details["count"] = len(advisories)
-		parts = append(parts, fmt.Sprintf("%s@%s has %d OSV record(s): %s",
-			pm.Name, ve.Version, len(advisories), strings.Join(ids, ", ")))
+		if freeBSDPackage {
+			// A vid is a UUID, which tells the person refused nothing, so the
+			// topic travels with it into the row and the refusal.
+			topics := map[string]string{}
+			for _, v := range advisories {
+				topics[v.ID] = v.Summary
+			}
+			details["topics"] = topics
+			parts = append(parts, fmt.Sprintf("%s@%s has %d VuXML record(s): %s",
+				pm.Name, ve.Version, len(advisories), describeMalware(advisories)))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s@%s has %d OSV record(s): %s",
+				pm.Name, ve.Version, len(advisories), strings.Join(ids, ", ")))
+		}
 	}
 
 	reason := strings.Join(parts, "; ")
@@ -545,7 +565,7 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 		}
 		stale := fmt.Sprintf("local OSV database for %s is %s old (synced %s); run `bodega policy osv sync`",
 			osvEco, ShortDuration(age), meta.FetchedAt.UTC().Format(time.RFC3339))
-		if c.AllowAPIFallback {
+		if c.apiFallback(osvEco) {
 			if fresh, apiErr := c.query(ctx, osvEco, name, version); apiErr == nil {
 				return osvAnswer{vulns: fresh, answered: true}
 			}
@@ -564,6 +584,9 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 		unusable = fmt.Sprintf("local OSV database for %s is unreadable (%v); run `bodega policy osv sync`", osvEco, err)
 	}
 
+	if osvEco == VuXMLEcosystem {
+		return osvAnswer{degraded: unusable + "; VuXML has no query API, so only a synced copy can answer"}
+	}
 	if !c.AllowAPIFallback {
 		return osvAnswer{degraded: unusable + "; osv_api_fallback is off, so nothing was queried"}
 	}
@@ -597,6 +620,13 @@ func unevaluatedReason(name, version string, skipped []string) string {
 // version string cannot be ordered skips every record naming it, and torch
 // alone carries 30-odd.
 const osvSkipListLimit = 5
+
+// apiFallback reports whether a lookup in ecosystem may go to api.osv.dev.
+// Never for VuXML: OSV knows no FreeBSD ecosystem and answers an empty list
+// for one, which the gate would read as clean.
+func (c *OSVChecker) apiFallback(ecosystem string) bool {
+	return c.AllowAPIFallback && ecosystem != VuXMLEcosystem
+}
 
 func (c *OSVChecker) now() time.Time {
 	if c.Now != nil {

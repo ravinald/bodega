@@ -209,10 +209,12 @@ type Config struct {
 	// default because a restricted network should fail visibly rather than
 	// stall for the client timeout once per version. osv_db_max_age is how
 	// old a synced ecosystem may be before a clean answer warns instead of
-	// passing.
-	OSVDBDir       string `json:"osv_db_dir,omitempty"`
-	OSVAPIFallback bool   `json:"osv_api_fallback,omitempty"`
-	OSVDBMaxAge    string `json:"osv_db_max_age,omitempty"`
+	// passing. freebsd_vuxml_url is where sync fetches FreeBSD's VuXML feed,
+	// which is not an OSV export; unset is FreeBSD's own.
+	OSVDBDir        string `json:"osv_db_dir,omitempty"`
+	OSVAPIFallback  bool   `json:"osv_api_fallback,omitempty"`
+	OSVDBMaxAge     string `json:"osv_db_max_age,omitempty"`
+	FreeBSDVuXMLURL string `json:"freebsd_vuxml_url,omitempty"`
 
 	// Re-vet. revet_interval is how often `bodega serve` re-runs the
 	// per-version checks over every admitted version, cataloged or proxy
@@ -1789,6 +1791,15 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	if cfg.OSVDBMaxAge != "" {
 		if d, err := time.ParseDuration(cfg.OSVDBMaxAge); err != nil || d <= 0 {
 			return nil, fmt.Errorf("invalid osv_db_max_age %q (want a positive Go duration, e.g. \"168h\")", cfg.OSVDBMaxAge)
+		}
+	}
+
+	// VuXML is not signed on this path, so TLS to the feed is all that stands
+	// between sync and an advisory database written by whoever is on the wire.
+	if cfg.FreeBSDVuXMLURL != "" {
+		u, err := url.Parse(cfg.FreeBSDVuXMLURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			return nil, fmt.Errorf("invalid freebsd_vuxml_url %q: want an https URL naming a host and no userinfo (default https://vuxml.freebsd.org/freebsd/vuln.xml.xz)", cfg.FreeBSDVuXMLURL)
 		}
 	}
 

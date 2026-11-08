@@ -238,7 +238,10 @@ type OSVDatabase struct {
 
 	// ExportBase is the bucket Sync fetches from; overridden in tests.
 	ExportBase string
-	HTTP       *http.Client
+	// VuXMLURL is where the FreeBSD ecosystem is fetched from, which is not
+	// OSV's bucket: VuXML is FreeBSD's own feed. freebsd_vuxml_url sets it.
+	VuXMLURL string
+	HTTP     *http.Client
 
 	mu     sync.Mutex
 	loaded map[string]cachedIndex
@@ -291,6 +294,7 @@ func NewOSVDatabase(dir string) *OSVDatabase {
 	return &OSVDatabase{
 		dir:        dir,
 		ExportBase: DefaultOSVExportBase,
+		VuXMLURL:   DefaultVuXMLURL,
 		// Generous next to the 15s admission timeout: this is one operator
 		// command pulling a few hundred megabytes, not a per-version query.
 		HTTP:   &http.Client{Timeout: 10 * time.Minute},
@@ -368,6 +372,22 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 	for _, source := range sources {
 		group := bySource[source]
 		src := fmt.Sprintf("%s/%s/all.zip", strings.TrimSuffix(d.ExportBase, "/"), source)
+		read := func(path string) (map[string]*osvIndex, map[string]int, error) {
+			return distill(group, path, trimEnumerated)
+		}
+		if source == VuXMLEcosystem {
+			src = d.VuXMLURL
+			if src == "" {
+				src = DefaultVuXMLURL
+			}
+			read = func(path string) (map[string]*osvIndex, map[string]int, error) {
+				idx, n, err := distillVuXML(path)
+				if err != nil {
+					return nil, nil, err
+				}
+				return map[string]*osvIndex{VuXMLEcosystem: idx}, map[string]int{VuXMLEcosystem: n}, nil
+			}
+		}
 		zipPath, err := d.download(ctx, src)
 		if err != nil {
 			for _, eco := range group {
@@ -375,7 +395,7 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 			}
 			continue
 		}
-		indexes, records, err := distill(group, zipPath, trimEnumerated)
+		indexes, records, err := read(zipPath)
 		os.Remove(zipPath)
 		if err != nil {
 			for _, eco := range group {
@@ -553,7 +573,8 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 func (d *OSVDatabase) download(ctx context.Context, src string) (string, error) {
 	//nolint:gosec // G704: src is ExportBase (operator config, defaulting to
 	// OSV's bucket) plus an ecosystem validEcosystemFile has already refused a
-	// path separator in. Nothing from a manifest or a request reaches it.
+	// path separator in, or VuXMLURL, which is operator config alone. Nothing
+	// from a manifest or a request reaches it.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 	if err != nil {
 		return "", err

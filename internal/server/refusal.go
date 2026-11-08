@@ -476,12 +476,37 @@ func osvReason(f *refusal, d map[string]any) {
 		f.next = "do not install this version; remove it from any lockfile that names it and pick another release. An override does not apply to known malware; give an operator incident " + f.incident + " if this is wrong."
 		return
 	}
+	topics := osvTopics(d["topics"])
+	named := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if t := topics[id]; t != "" {
+			id += " (" + t + ")"
+		}
+		named = append(named, id)
+	}
 	if len(ids) == 0 {
 		f.reason = "this version has a known vulnerability record."
 	} else {
-		f.reason = "this version has known vulnerability records: " + strings.Join(ids, ", ") + "."
+		f.reason = "this version has known vulnerability records: " + strings.Join(named, ", ") + "."
 	}
 	f.next = "pick a version without those records, or ask an operator to review `bodega policy osv list`."
+}
+
+// osvTopics reads the VuXML topic per vid, which a freebsd check carries
+// because a vid alone is a UUID. It arrives as the checker built it or, off a
+// stored row, as decoded JSON.
+func osvTopics(v any) map[string]string {
+	switch x := v.(type) {
+	case map[string]string:
+		return x
+	case map[string]any:
+		out := make(map[string]string, len(x))
+		for k, t := range x {
+			out[k] = fmt.Sprint(t)
+		}
+		return out
+	}
+	return nil
 }
 
 func anyStrings(v any) []string {

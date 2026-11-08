@@ -2547,7 +2547,7 @@ The mutation API answers its own JSON, `{"error": "<summary> Next step: <next st
 
 #### Limits
 
-- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod, cargo, rubygems or maven version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. A `.deb` served from a mirrored apt codename is the exception: the OSV gate checks it on the miss and on every cache hit, against the release the mirrored codename belongs to, because no manifest entry holds it for `bodega policy osv rescan` to revisit. A release with no synced export is served unchecked and logged once; see [apt](#apt) under the OSV gate. The age gate does not run on apt, and proxied helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
+- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod, cargo, rubygems or maven version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. A `.deb` served from a mirrored apt codename is the exception: the OSV gate checks it on the miss and on every cache hit, against the release the mirrored codename belongs to, because no manifest entry holds it for `bodega policy osv rescan` to revisit. A release with no synced export is served unchecked and logged once; see [apt](#apt) under the OSV gate. A FreeBSD package is the same kind of exception: with a `freebsd` OSV action set, every package fetch, miss or hit, is checked against VuXML by the name and version its catalogue record declares; see [FreeBSD](#freebsd-vuxml) under the OSV gate. The age gate does not run on apt or freebsd, and proxied helm, binary and git fetches are not checked at all: the age gate cannot date them, and OSV indexes none of them.
 - **The reason phrase is HTTP/1.1's.** HTTP/2 has none, so a pip, helm or apt client that negotiates HTTP/2 with bodega's TLS listener, or a reverse proxy that rewrites the status line, shows the bare `403 Forbidden`. The header and body still carry the refusal.
 - **Other refusals keep their own text.** The middleware gates (deny list, admin network, tokens), the `/client/` routes, a git push, the spool bounds and the distfiles license and environment refusals are not package checks and answer as they did.
 
@@ -2630,11 +2630,12 @@ bodega policy osv malware set pypi ignore --reason "internal index, vetted by se
 
 `sync` is the only OSV subcommand that reaches the network. Admission reads the synced directory and nothing else, unless `osv_api_fallback` is on.
 
-| Key                | Default              | Meaning                                                                          |
-| ------------------ | -------------------- | -------------------------------------------------------------------------------- |
-| `osv_db_dir`       | `{storage_path}/osv` | Directory holding one archive and one metadata file per ecosystem                |
-| `osv_api_fallback` | `false`              | Authorize a live `api.osv.dev` query when the local copy cannot answer           |
-| `osv_db_max_age`   | `168h`               | How old a synced ecosystem may be before a clean answer warns instead of passing |
+| Key                 | Default                                         | Meaning                                                                          |
+| ------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------- |
+| `osv_db_dir`        | `{storage_path}/osv`                            | Directory holding one archive and one metadata file per ecosystem                |
+| `osv_api_fallback`  | `false`                                         | Authorize a live `api.osv.dev` query when the local copy cannot answer           |
+| `osv_db_max_age`    | `168h`                                          | How old a synced ecosystem may be before a clean answer warns instead of passing |
+| `freebsd_vuxml_url` | `https://vuxml.freebsd.org/freebsd/vuln.xml.xz` | Where `sync` fetches FreeBSD's VuXML feed, xz-compressed or plain; https only    |
 
 The fallback is off by default because the deployment this gate exists for cannot reach `api.osv.dev`: with it on, every version stalls for the 15-second client timeout against a host that never answers, once per version, which a 635-package import pays 635 times.
 
@@ -2762,8 +2763,9 @@ Coverage is the set of registry types the gate can query, which is also the set 
 | composer | `Packagist`, the package named `<vendor>/<package>`                                                                                 |
 | apt      | one per release (`Ubuntu:22.04:LTS`, `Debian:12`); see [apt](#apt)                                                                  |
 | rpm      | the one its repository's upstream belongs to (`Rocky Linux`, `AlmaLinux`, `Red Hat`); see [RPM repositories](#client-configuration) |
+| freebsd  | `FreeBSD`, distilled from VuXML rather than an OSV export, ordered as pkg-version(8) orders; see [FreeBSD](#freebsd-vuxml)          |
 
-`binary`, `git`, `helm`, `freebsd`, `distfiles` and `oci` have no OSV identifier. `set` refuses them:
+`binary`, `git`, `helm`, `distfiles` and `oci` have no OSV identifier. `set` refuses them:
 
 ```bash
 $ bodega policy osv set helm block
@@ -2781,6 +2783,14 @@ An rpm package is matched by its name at `epoch:version-release`, in the OSV eco
 An oci image is not passed for that reason. OSV has no container image ecosystem, and an image carries whole distributions of packages OSV does cover, so a pass would read as a scan that ran. The gate does not run on any image and the admission row's `osv` check is `not_evaluated` with the reason `not run: OSV has no container image ecosystem, so no advisory or malware record can be looked up for an image`, which is what `bodega audit admissions oci <registry>/<repository> <tag>` shows. Scan the image with a tool that reads its layers.
 
 Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the form shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
+
+#### FreeBSD (VuXML)
+
+A FreeBSD package is matched against VuXML, FreeBSD's own advisory feed and the document `pkg audit` reads, because OSV publishes no FreeBSD ecosystem. `sync freebsd` fetches it from `freebsd_vuxml_url` and distills it into the same directory under the ecosystem `FreeBSD`, keeping each entry's `vid`, its topic and its ranges; the base-system (`<system>`) entries and cancelled entries are dropped. The staleness rules are the OSV ones: a database older than `osv_db_max_age`, a missing one, or a feed that distills to no packages warns rather than passes, and `osv_api_fallback` never applies, because there is no query API to fall back to.
+
+A package is matched by the name its catalogue record declares, and each `<range>` matches when all of its `lt`, `le`, `eq`, `ge` and `gt` bounds hold, with versions ordered as pkg-version(8) orders them: the epoch after the comma first, then the version component by component, then the port revision after the underscore. So `3.0.15_1,1` sorts above `3.0.15,1` and below `3.0.16,1`, `1.0alpha1`, `1.0beta2` and `1.0rc1` sort below `1.0` in that order, and a patch letter sorts above it (`1.1.1w` above `1.1.1`).
+
+With a `freebsd` action of `warn` or `block`, every fetch of a package under `/freebsd/` or a profile's view, cached or not, goes through that decision before it is served: `block` refuses it, `warn` serves it, and both write the admission row and the `policy_violation` or `policy_warn` row, naming the `vid` and its topic, as in `openssl@3.0.15,1 has 1 VuXML record(s): 9c4a8b1e-6b31-11ef-a6d3-a0369f7c1e01 (OpenSSL -- denial of service in X.509 name checks)`. A fetch whose path no catalogue record names is served unchecked to a host no profile governs, and logged. A freebsd manifest entry is a repository at an ABI rather than a package, so the gate never looks one up, `show pkg` reads `n/a` on it, and `rescan` refuses `--type freebsd`. Distfiles are not checked: a distfile carries no package name or port version for an entry to match.
 
 #### apt
 
@@ -2992,7 +3002,7 @@ Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
 ```
 
-The `OSV` cell reads `n/a` on `binary`, `git`, `helm`, `freebsd` and `distfiles`. Those five have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
+The `OSV` cell reads `n/a` on `binary`, `git`, `helm`, `freebsd` and `distfiles`. Four of them have no OSV ecosystem identifier, and a `freebsd` entry is a repository at an ABI whose packages are checked against VuXML as each is fetched, so no rescan can ever answer for any of the five, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
 `GET /api/v1/packages/{type}/{name}/{version}` carries the same keys on the version's `metadata`, plus `vetting.osv.malware`, which lists the stamped ids that are malware records.
 
@@ -8244,7 +8254,7 @@ bodega audit admissions npm minimist
 bodega audit admissions npm minimist 1.2.8 --json
 ```
 
-**Not yet covered.** The pypi build admits a package by name before pip resolves a version, so its wheels, and every transitive dependency in the closure, pin with a `not_evaluated` row and a WARN on first fetch. A FreeBSD proxy fill records age and OSV as `not_evaluated`. An apt proxy fill records age as `not_evaluated`, and OSV too unless an apt OSV policy is set, in which case the fill carries the OSV verdict described under [apt](#apt).
+**Not yet covered.** The pypi build admits a package by name before pip resolves a version, so its wheels, and every transitive dependency in the closure, pin with a `not_evaluated` row and a WARN on first fetch. A FreeBSD proxy fill records age and OSV as `not_evaluated`; with a `freebsd` OSV action set, a package that warns or blocks also gets the row described under [FreeBSD](#freebsd-vuxml). An apt proxy fill records age as `not_evaluated`, and OSV too unless an apt OSV policy is set, in which case the fill carries the OSV verdict described under [apt](#apt).
 
 ---
 

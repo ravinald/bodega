@@ -436,6 +436,11 @@ names: Rocky Linux, AlmaLinux or Red Hat, by each repository's
 osv_ecosystem or its base URL's host. A repository belonging to none, EPEL
 among them, adds nothing, and its packages record the check not run.
 
+freebsd is not an OSV export. It is fetched from FreeBSD's VuXML feed,
+the document pkg audit reads, at freebsd_vuxml_url (default
+https://vuxml.freebsd.org/freebsd/vuln.xml.xz), and distilled into the
+same directory under the ecosystem FreeBSD.
+
 This is the only OSV subcommand that reaches the network. On an
 air-gapped host, run it where the network is, copy the directory over,
 and point osv_db_dir at the copy.`,
@@ -457,6 +462,9 @@ and point osv_db_dir at the copy.`,
 			}
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
 			db.ExportBase = osvExportBase
+			if cfg.FreeBSDVuXMLURL != "" {
+				db.VuXMLURL = cfg.FreeBSDVuXMLURL
+			}
 
 			// Read only when apt is in the set: a manifest store that will
 			// not load has nothing to say about npm, and making 'sync npm'
@@ -563,7 +571,7 @@ type osvState struct {
 // content, and a column reading "never" or an age warning would tell an
 // operator their advisories are old when they are current.
 func osvDBState(db *policy.OSVDatabase, cfg *config.Config, ecosystem string, aptSuites []string) osvState {
-	if !policy.OSVCovers(ecosystem) {
+	if !slices.Contains(policy.OSVEcosystems(), ecosystem) {
 		// A stored row for a type the gate cannot query. "never" would read as
 		// a sync nobody has run yet, and there is no sync that would fix it;
 		// reportUncovered names the row under the table.
@@ -681,11 +689,17 @@ than gaining an invented date.
 			if err := ensureMutable(cfg); err != nil {
 				return err
 			}
-			types := policy.OSVEcosystems()
+			// A freebsd manifest entry is a repository at an ABI, and VuXML
+			// names packages, which the gate checks as each is fetched; no
+			// stored version is one rescan could look up.
+			types := slices.DeleteFunc(policy.OSVEcosystems(), func(t string) bool { return t == manifest.TypeFreeBSD })
 			if typeFlag != "" {
 				if err := requireEcosystem(typeFlag, policy.OSVEcosystems(), "OSV gate",
 					"there are no OSV records to re-check it against"); err != nil {
 					return err
+				}
+				if typeFlag == manifest.TypeFreeBSD {
+					return fmt.Errorf("rescan has no freebsd version to re-check: a freebsd manifest entry is a repository at an ABI, and each package in it is checked against VuXML as it is fetched")
 				}
 				types = []string{typeFlag}
 			}
