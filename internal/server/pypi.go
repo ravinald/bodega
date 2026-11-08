@@ -378,10 +378,10 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			if s.refuseWithheld(w, r, manifest.TypePypi, normalized, distVersion) {
 				return
 			}
-			resolve := func(ctx context.Context) (string, error) {
+			resolve := func(ctx context.Context) (resolvedUpstream, error) {
 				return s.resolvePypiWheel(ctx, normalized, file)
 			}
-			s.proxyOrResolve(w, r, s.typeStore(manifest.TypePypi), key, resolve, "", nil, manifest.TypePypi, normalized, normalized, true, true)
+			s.proxyOrResolveIndexed(w, r, s.typeStore(manifest.TypePypi), key, resolve, "", nil, manifest.TypePypi, normalized, normalized, true, true)
 			return
 		}
 		if pkg == nil {
@@ -791,15 +791,19 @@ var pypiHrefPattern = regexp.MustCompile(`href="([^"]*)"`)
 // index is the only document that carries the mapping, so resolution is a
 // lookup rather than a concatenation, and a filename the index does not list
 // is refused here instead of becoming a fetch of a URL nobody can check.
-func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename string) (string, error) {
+//
+// The entry's #sha256= fragment comes back as indexSHA256, for the fill to
+// hold the bytes to. PEP 503 lets an index name another hash or none; that
+// file fills unchecked, and the log says so.
+func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename string) (resolvedUpstream, error) {
 	indexURL := s.pypiSimpleURL(normalized)
 	body, _, err := fetchUpstream(ctx, indexURL)
 	if err != nil {
-		return "", fmt.Errorf("read the pypi simple index %s: %w", indexURL, err)
+		return resolvedUpstream{}, fmt.Errorf("read the pypi simple index %s: %w", indexURL, err)
 	}
 	base, err := url.Parse(indexURL)
 	if err != nil {
-		return "", fmt.Errorf("parse the pypi simple index URL %s: %w", indexURL, err)
+		return resolvedUpstream{}, fmt.Errorf("parse the pypi simple index URL %s: %w", indexURL, err)
 	}
 
 	listed := 0
@@ -814,12 +818,19 @@ func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename stri
 		if err != nil || name != filename {
 			continue
 		}
-		// The #sha256= fragment is the publisher's checksum, not part of the
-		// object; dropping it keeps the logged URL the thing that was fetched.
+		// The fragment is the publisher's checksum, not part of the object;
+		// dropping it from the URL keeps the logged URL the thing fetched.
+		res := resolvedUpstream{indexURL: indexURL, filename: filename}
+		if algo, sum, ok := strings.Cut(u.Fragment, "="); ok && algo == "sha256" && sum != "" {
+			res.indexSHA256 = sum
+		} else {
+			s.logFor(ctx).Warn("the pypi index named no sha256 for this file, filling it without comparing", "file", filename, "index", redactedURL(indexURL))
+		}
 		u.Fragment = ""
-		return u.String(), nil
+		res.url = u.String()
+		return res, nil
 	}
-	return "", fmt.Errorf("%w: %s lists %d file(s) and none of them is %s — the index is authoritative for what pypi publishes, so check the filename and the version against it",
+	return resolvedUpstream{}, fmt.Errorf("%w: %s lists %d file(s) and none of them is %s — the index is authoritative for what pypi publishes, so check the filename and the version against it",
 		errUpstreamNotFound, indexURL, listed, filename)
 }
 

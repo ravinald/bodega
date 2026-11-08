@@ -679,6 +679,12 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.spoolErr != nil {
 		return s.spoolErr
 	}
+	spoolLock, err := lockSpoolDir(s.spool.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = spoolLock.Close() }()
+	sweepSpoolLeftovers(s.spool.dir, s.logger)
 
 	if s.inventoryErr != nil {
 		return s.inventoryErr

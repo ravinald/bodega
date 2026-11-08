@@ -355,6 +355,8 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 			{"fresh-1.0.0-py3-none-any.whl", 48 * time.Hour},
 		},
 	}
+	// The index lists the digest of what /files/ serves, so a fill holds.
+	const filterWheelSHA256 = "67c0d8f7de19e30c2d5891030a0b37cbfcdd240852b53055c0b28290ad52290b"
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/files/") {
 			_, _ = w.Write([]byte("wheel bytes"))
@@ -389,7 +391,7 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 		var b strings.Builder
 		b.WriteString("<!DOCTYPE html><html><body>\n")
 		for _, f := range files {
-			fmt.Fprintf(&b, "<a href=\"/files/%s#sha256=00\">%s</a><br/>\n", f.name, f.name)
+			fmt.Fprintf(&b, "<a href=\"/files/%s#sha256=%s\">%s</a><br/>\n", f.name, filterWheelSHA256, f.name)
 		}
 		b.WriteString("</body></html>\n")
 		_, _ = w.Write([]byte(b.String()))

@@ -114,6 +114,22 @@ func (s *Server) proxyOrCacheOrdered(w http.ResponseWriter, r *http.Request, sto
 // failure to look.
 type upstreamResolver func(ctx context.Context) (string, error)
 
+// resolvedUpstream is what an indexed resolver found: the URL to fetch and the
+// sha256 hex the upstream's own index lists for that file, "" when it lists
+// none. The fill holds the spooled bytes to a non-empty indexSHA256 before
+// anything is pinned, cached or served.
+type resolvedUpstream struct {
+	url         string
+	indexSHA256 string
+	// indexURL is the document that listed the digest, for the refusal.
+	indexURL string
+	filename string
+}
+
+// indexedResolver is an upstreamResolver whose answer comes from an index that
+// also publishes the file's digest.
+type indexedResolver func(ctx context.Context) (resolvedUpstream, error)
+
 // knownUpstream is the URL a miss would fetch when the caller already holds it,
 // and "" when only the resolver can produce it. It exists for the cache-hit
 // path, which records a discovery row and must not pay for a resolution it will
@@ -123,6 +139,19 @@ type upstreamResolver func(ctx context.Context) (string, error)
 // order, when not nil, is the URLs the fetch falls back to after the resolved
 // one; see proxyOrCacheOrdered.
 func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, knownUpstream string, order *upstreamOrder, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+	var indexed indexedResolver
+	if resolve != nil {
+		indexed = func(ctx context.Context) (resolvedUpstream, error) {
+			u, err := resolve(ctx)
+			return resolvedUpstream{url: u}, err
+		}
+	}
+	s.proxyOrResolveIndexed(w, r, store, s3Key, indexed, knownUpstream, order, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+}
+
+// proxyOrResolveIndexed is proxyOrResolve for a resolver that also reports the
+// digest its index lists for the file.
+func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve indexedResolver, knownUpstream string, order *upstreamOrder, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
 	if !s.requireStorage(w, store) {
 		return
 	}
@@ -229,7 +258,8 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	}
 	s.logFor(r.Context()).Info("cache miss, fetching upstream", miss...)
 
-	upstreamURL, err := resolve(ctx)
+	resolved, err := resolve(ctx)
+	upstreamURL := resolved.url
 	if err != nil {
 		var refused *resolveRefusal
 		if errors.As(err, &refused) {
@@ -431,6 +461,16 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		f := signedChartRefusal(regType, fill.name, fill.version)
 		s.logFor(r.Context()).Error("upstream bytes differ from the digest the publisher signed", "key", s3Key,
 			"url", up.url, "signed", fill.signed, "served", "sha256:"+spool.sha256, "incident", f.incident)
+		f.write(w, r)
+		return
+	}
+	//
+	// The index digest is the same kind of promise, made by the index that
+	// named the file, and is held at the same point for the same reason.
+	if want := strings.ToLower(resolved.indexSHA256); want != "" && want != spool.sha256 {
+		f := indexDigestRefusal(regType, discoveryPkgName, resolved.filename, want, spool.sha256, resolved.indexURL)
+		s.logFor(r.Context()).Error("upstream bytes differ from the sha256 the index lists", "key", s3Key,
+			"url", redactedURL(up.url), "index", redactedURL(resolved.indexURL), "listed", want, "served", spool.sha256, "incident", f.incident)
 		f.write(w, r)
 		return
 	}
