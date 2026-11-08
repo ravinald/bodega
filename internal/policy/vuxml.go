@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -109,6 +111,7 @@ func distillVuXML(path string) (*osvIndex, int, error) {
 
 	idx := &osvIndex{Ecosystem: VuXMLEcosystem, Packages: map[string]osvRecordList{}}
 	records := 0
+	patterns := map[string]bool{}
 	//nolint:gosec // G709: the feed decodes into vuxmlVuln's fixed fields and
 	// nothing else; no type is chosen by the document, and every value it
 	// yields is a string compared, never executed or used as a path.
@@ -163,6 +166,10 @@ func distillVuXML(path string) (*osvIndex, int, error) {
 					continue
 				}
 				byKey[key] = append(byKey[key], osvAffected{VuXML: ranges})
+				if isVuXMLPattern(key) && !patterns[key] {
+					patterns[key] = true
+					idx.Patterns = append(idx.Patterns, key)
+				}
 			}
 		}
 		if len(byKey) == 0 {
@@ -176,7 +183,41 @@ func distillVuXML(path string) (*osvIndex, int, error) {
 	if !sawVuln {
 		return nil, 0, fmt.Errorf("%s holds no <vuln> entry, so it is not a VuXML document", path)
 	}
+	sort.Strings(idx.Patterns)
 	return idx, records, nil
+}
+
+// isVuXMLPattern reports whether a VuXML <name> holds a character fnmatch(3)
+// reads as a glob, the set pkg's pkg_audit_str_noglob_len stops at.
+func isVuXMLPattern(name string) bool {
+	return strings.ContainsAny(name, `*?[\`)
+}
+
+// vuxmlNameMatches is pkg audit's fnmatch(pattern, name, 0): case-sensitive,
+// and with no special meaning for '/', which no package name carries. A
+// malformed pattern matches nothing, as fnmatch's refusal does in pkg.
+func vuxmlNameMatches(pattern, name string) bool {
+	ok, err := path.Match(fnmatchToGo(pattern), name)
+	return err == nil && ok
+}
+
+// fnmatchToGo rewrites fnmatch's "[!" class negation as path.Match's "[^",
+// which fnmatch also accepts; every other construct means the same in both.
+func fnmatchToGo(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		b.WriteByte(c)
+		switch {
+		case c == '\\' && i+1 < len(pattern):
+			i++
+			b.WriteByte(pattern[i])
+		case c == '[' && i+1 < len(pattern) && pattern[i+1] == '!':
+			i++
+			b.WriteByte('^')
+		}
+	}
+	return b.String()
 }
 
 // pkgVersion is a FreeBSD package version split as pkg-version(8) splits it:
@@ -259,16 +300,18 @@ type pkgComponent struct {
 
 // pkgStages are the words pkg reads as one letter: "pl" sorts below every
 // letter and the rest as their initial's place in the alphabet, which puts
-// alpha below beta below pre below rc.
+// alpha below beta below pre below rc below snap. Each still sorts below the
+// release, because a stage opens a component whose number is -1.
 var pkgStages = []struct {
 	name  string
 	value int64
 }{
 	{"pl", 0},
+	{"snap", 's' - 'a' + 1},
 	{"alpha", 1},
-	{"beta", 2},
-	{"pre", 16},
-	{"rc", 18},
+	{"beta", 'b' - 'a' + 1},
+	{"pre", 'p' - 'a' + 1},
+	{"rc", 'r' - 'a' + 1},
 }
 
 func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }

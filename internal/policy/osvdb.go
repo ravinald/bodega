@@ -173,6 +173,10 @@ type osvIndex struct {
 	// release; see osvIndexFor. One without it is keyed by name alone, which
 	// no rpm lookup reads, so Match refuses it rather than answer clean.
 	ByRelease bool `json:"by_release,omitempty"`
+	// Patterns lists the Packages keys that are fnmatch patterns rather than
+	// names. Only VuXML writes them: pkg audit matches a <name> as a glob, so
+	// a lookup reads every pattern that matches as well as its own key.
+	Patterns []string `json:"patterns,omitempty"`
 }
 
 // osvRecordList is the records one package key carries, shared across the keys
@@ -498,7 +502,16 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 		return nil, nil, fmt.Errorf("the %s index was written before rpm advisories were kept per release, so it cannot tell %s's records from another release's; run `bodega policy osv sync rpm`", index, ecosystem)
 	}
 	order := osvVersionOrder(ecosystem)
-	for _, rec := range idx.Packages[key] {
+	candidates := idx.Packages[key]
+	for _, p := range idx.Patterns {
+		if p != key && vuxmlNameMatches(p, name) {
+			candidates = append(candidates[:len(candidates):len(candidates)], idx.Packages[p]...)
+		}
+	}
+	// One advisory can reach a package through a name and a pattern both, so
+	// a record is reported once, and an evaluated hit outranks a skip.
+	hits, skips := map[string]bool{}, map[string]bool{}
+	for _, rec := range candidates {
 		hit, unorderable := false, ""
 		for _, aff := range rec.Affected {
 			matched, bad := aff.affects(order, version)
@@ -511,11 +524,22 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 			}
 		}
 		switch {
-		case hit:
+		case hit && !hits[rec.ID]:
+			hits[rec.ID] = true
 			vulns = append(vulns, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity, Malicious: rec.Malicious})
-		case unorderable != "":
+		case !hit && unorderable != "" && !skips[rec.ID]:
+			skips[rec.ID] = true
 			skipped = append(skipped, fmt.Sprintf("%s (bound %q)", rec.ID, unorderable))
 		}
+	}
+	if len(skips) > 0 && len(hits) > 0 {
+		kept := skipped[:0]
+		for _, s := range skipped {
+			if id, _, _ := strings.Cut(s, " "); !hits[id] {
+				kept = append(kept, s)
+			}
+		}
+		skipped = kept
 	}
 	sort.Slice(vulns, func(i, j int) bool { return vulns[i].ID < vulns[j].ID })
 	sort.Strings(skipped)
@@ -861,12 +885,13 @@ func validEcosystemFile(ecosystem string) error {
 
 // osvPackageKey normalizes a package name to the form the index is keyed by.
 // PyPI matches per PEP 503, npm and crates.io are case-insensitive, and Go
-// module paths are case-sensitive and are left alone.
+// module paths and FreeBSD package names (pkg audit compares them with a
+// case-sensitive fnmatch) are left alone.
 func osvPackageKey(ecosystem, name string) string {
 	switch ecosystem {
 	case "PyPI":
 		return manifest.CanonicalPypiName(name)
-	case "Go":
+	case "Go", VuXMLEcosystem:
 		return name
 	}
 	return strings.ToLower(name)

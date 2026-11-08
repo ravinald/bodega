@@ -265,7 +265,7 @@ func TestVuXMLMatch_RangeOperators(t *testing.T) {
 		{"openssl", "3.1.7,1", false},    // ge+lt: the second range's fix
 		{"openssl", "3.9", true},         // epoch 0 sorts below every bound carrying epoch 1
 		{"openssl-quictls", "3.0.1,1", true},
-		{"OpenSSL", "3.0.1,1", true},   // names compare as pkg's index keys them
+		{"OpenSSL", "3.0.1,1", false},  // pkg audit compares names case-sensitively
 		{"curl", "8.9.1", true},        // eq
 		{"curl", "8.9.1_1", false},     // eq: another revision
 		{"nginx", "1.20", false},       // gt: the bound itself
@@ -305,6 +305,8 @@ func TestComparePkgVersions(t *testing.T) {
 		{"1.0beta2", "1.0pre1", -1},
 		{"1.0rc1", "1.0beta2", 1},
 		{"1.0rc", "1.0", -1},
+		{"1.0snap1", "1.0rc1", 1},
+		{"1.0snap20240101", "1.0.1", -1},
 		{"1.0.r", "1.0rc", 0},
 		// A patch letter sorts above the release; pl below it.
 		{"1.0a", "1.0", 1},
@@ -337,5 +339,73 @@ func TestComparePkgVersions(t *testing.T) {
 func TestDistillVuXML_MissingFile(t *testing.T) {
 	if _, _, err := distillVuXML(t.TempDir() + "/absent.xml"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("distillVuXML(missing) = %v, want ErrNotExist", err)
+	}
+}
+
+func TestReviewVuXMLNamePatterns(t *testing.T) {
+	doc := strings.Replace(vuxmlFixture, "<name>openssl</name>", "<name>openssl*</name>", 1)
+	db, _, err := vuxmlDB(t, []byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg("openssl"), freeBSDEntry("3.0.15,1"))
+	if r.Action != ActionBlock {
+		t.Fatalf("openssl* advisory against openssl@3.0.15,1: action=%s; want block", r.Action)
+	}
+}
+
+func TestReviewVuXMLNamesAreCaseSensitive(t *testing.T) {
+	db, _, err := vuxmlDB(t, []byte(vuxmlFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg("OpenSSL"), freeBSDEntry("3.0.15,1"))
+	if r.Action != ActionPass {
+		t.Fatalf("openssl advisory against distinct package OpenSSL: action=%s; want pass", r.Action)
+	}
+}
+
+func TestReviewPkgSnapOrdering(t *testing.T) {
+	if got, ok := comparePkgVersions("1.0snap1", "1.0"); !ok || got != -1 {
+		t.Fatalf("comparePkgVersions(1.0snap1, 1.0) = %d, %v; pkg 2.8.4 returns -1", got, ok)
+	}
+}
+
+// A vid naming a package both literally and through a pattern is one record,
+// and fnmatch's "[!" negation and '?' read as pkg reads them.
+func TestVuXMLMatch_PatternNames(t *testing.T) {
+	const doc = `<vuxml>
+<vuln vid="pat-1"><topic>both</topic><affects><package><name>libfoo</name><name>libfoo*</name><range><lt>2.0</lt></range></package></affects></vuln>
+<vuln vid="pat-2"><topic>class</topic><affects><package><name>py3[!8]-bar</name><range><lt>1.0</lt></range></package></affects></vuln>
+<vuln vid="pat-3"><topic>one char</topic><affects><package><name>php8?-baz</name></package></affects></vuln>
+</vuxml>`
+	db, _, err := vuxmlDB(t, []byte(doc))
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	for _, tc := range []struct {
+		name, version string
+		want          []string
+	}{
+		{"libfoo", "1.0", []string{"pat-1"}},
+		{"libfoo-devel", "1.0", []string{"pat-1"}},
+		{"libfoo", "2.0", nil},
+		{"LibFoo", "1.0", nil},
+		{"py39-bar", "0.5", []string{"pat-2"}},
+		{"py38-bar", "0.5", nil},
+		{"php83-baz", "8.3.1", []string{"pat-3"}},
+		{"php8-baz", "8.3.1", nil},
+	} {
+		vulns, skipped, err := db.Match(VuXMLEcosystem, tc.name, tc.version)
+		if err != nil || len(skipped) != 0 {
+			t.Fatalf("Match(%s, %s) = %v, skipped %v", tc.name, tc.version, err, skipped)
+		}
+		var got []string
+		for _, v := range vulns {
+			got = append(got, v.ID)
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("Match(%s, %s) = %v, want %v", tc.name, tc.version, got, tc.want)
+		}
 	}
 }
