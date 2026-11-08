@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ if eq .Kind "home" }}bodega{{ else }}{{ .Title }} · bodega{{ end }}</title>
+<script>
+/* Applies the saved theme before the first paint, so a reader who chose dark
+   or a color-vision palette never sees a flash of the default. */
+try {
+  var d = document.documentElement, m = localStorage.getItem("bodega-mode"), v = localStorage.getItem("bodega-vision");
+  if (m === "light" || m === "dark") d.dataset.mode = m;
+  if (v === "protan" || v === "tritan") d.dataset.vision = v;
+} catch (e) {}
+</script>
+<link rel="stylesheet" href="{{ .Site.Base }}site.css?v={{ .Site.CSSVersion }}">
+<link rel="icon" href="{{ .Site.Base }}favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="{{ .Site.Base }}icon-180.png">
+<link rel="preload" href="{{ .Site.Base }}fonts/source-serif-4-latin-opsz-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="{{ .Site.Base }}fonts/archivo-latin-wdth-normal.woff2" as="font" type="font/woff2" crossorigin>
+</head>
+<body class="{{ .Kind }}">
+<header class="head">
+  <a class="wordmark" href="{{ .Site.Base }}">bodega</a>
+  <nav>
+    <a href="{{ .Site.Base }}docs/"{{ if or (eq .Kind "doc") (eq .Out "docs/index.html") }} class="here"{{ end }}>Docs</a>
+    <a href="{{ .Site.Base }}docs/quickstart.html">Quick start</a>
+    <a href="{{ .Site.Base }}coverage.html"{{ if eq .Out "coverage.html" }} class="here"{{ end }}>Package support</a>
+    <a href="https://github.com/ravinald/bodega">Source</a>
+  </nav>
+  <form class="prefs" hidden aria-label="Display preferences">
+    <label>Theme <select name="mode"><option value="">Auto</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+    <label>Color vision <select name="vision"><option value="">Standard</option><option value="protan">Protanopia &amp; deuteranopia</option><option value="tritan">Tritanopia</option></select></label>
+  </form>
+</header>
+<div class="frame">
+{{- if eq .Kind "doc" }}
+  <aside class="contents" aria-label="Contents">
+  {{- range .Contents }}
+    <h2>{{ .Name }}</h2>
+    <ol>
+    {{- range .Entries }}
+      <li{{ if .Here }} class="here"{{ end }}><span>{{ .Num }}</span><a href="{{ .Href }}"{{ if .Here }} aria-current="page"{{ end }}>{{ .Title }}</a></li>
+    {{- end }}
+    </ol>
+  {{- end }}
+  </aside>
+{{- else if eq .Kind "home" }}
+  <aside class="mark"><img src="{{ .Site.Base }}assets/emblem/emblem-256.png" width="256" height="256" alt="A pixel-art depot with a blue lowercase b above one open bay and a parcel on its threshold"></aside>
+{{- end }}
+  <main class="prose{{ if eq .Kind "colophon" }} colophon{{ end }}">
+{{- if eq .Kind "doc" }}
+  <details class="contents-compact">
+    <summary>Contents{{ if .Here.Title }} <span>{{ .Here.Num }} · {{ .Here.Title }}</span>{{ end }}</summary>
+  {{- range .Contents }}
+    <details{{ if .Here }} open{{ end }}>
+      <summary>{{ .Name }}</summary>
+      <ol>
+      {{- range .Entries }}
+        <li{{ if .Here }} class="here"{{ end }}><span>{{ .Num }}</span><a href="{{ .Href }}"{{ if .Here }} aria-current="page"{{ end }}>{{ .Title }}</a></li>
+      {{- end }}
+      </ol>
+    </details>
+  {{- end }}
+  </details>
+{{- end }}
+{{ .Body }}
+  </main>
+</div>
+<footer class="foot">
+  <span>Built from bodega {{ .Site.Version }}, commit <a href="https://github.com/ravinald/bodega/commit/{{ .Site.Commit }}">{{ printf "%.12s" .Site.Commit }}</a>.</span>
+  {{- if .Src }} <a href="https://github.com/ravinald/bodega/blob/{{ .Site.Commit }}/{{ .Src }}">This page's source</a>{{ end }}
+  <a href="https://github.com/ravinald/bodega/blob/main/LICENSE">Apache 2.0</a>
+  <a href="{{ .Site.Base }}colophon.html">Colophon</a>
+</footer>
+<script>
+(function () {
+  var form = document.querySelector(".prefs"), d = document.documentElement;
+  if (!form) return;
+  var keys = { mode: "bodega-mode", vision: "bodega-vision" };
+  Object.keys(keys).forEach(function (name) {
+    var select = form.elements[name];
+    select.value = d.dataset[name] || "";
+    select.addEventListener("change", function () {
+      if (select.value) d.dataset[name] = select.value; else delete d.dataset[name];
+      try {
+        if (select.value) localStorage.setItem(keys[name], select.value); else localStorage.removeItem(keys[name]);
+      } catch (e) {}
+    });
+  });
+  form.hidden = false;
+})();
+</script>
+</body>
+</html>
