@@ -1,12 +1,14 @@
 package policy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -472,8 +474,20 @@ func TestVuXMLNameMatches_FollowsFreeBSDFnmatch(t *testing.T) {
 		{"lib\\", "lib\\", false},
 		{"a/b*", "a/bc", true},
 		{"*.x", ".x", true},
-		{"[[:alpha:]]", "a]", true},
-		{"[[:alpha:]]", "a", false},
+		{"[[:alpha:]]", "a", true},
+		{"[[:alpha:]]", "a]", false},
+		{"lib[[:digit:]-]", "lib-", true},
+		{"[[:alpha:]a-z]", "b", true},
+		{"[[:digit:]a-z]", "b", false},
+		{"[[:digit:]a-z]", "[:a-z]", true},
+		{"[[:bogus:]]", "[:]", true},
+		{"[[:bogus:]]", "[:bogus:]]", false},
+		{"[[.a.]-c]", "b", true},
+		{"[[=a=]-c]", "b", false},
+		{"lib[a\\]]", "liba", false},
+		{"lib[a\\]]", "liba]", true},
+		{"[\xe9]", "\xe9", true},
+		{"[[:alpha:]]", "\xe9", false},
 	} {
 		if got := vuxmlNameMatches(tc.pattern, tc.name); got != tc.want {
 			t.Errorf("vuxmlNameMatches(%q, %q) = %v; want %v", tc.pattern, tc.name, got, tc.want)
@@ -491,5 +505,68 @@ func TestVuXMLMatch_PatternKeyIsNotMatchedByEquality(t *testing.T) {
 		if r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(name), freeBSDEntry("1.0")); r.Action != want {
 			t.Errorf("lib[x] advisory against %s@1.0: action=%s; want %s", name, r.Action, want)
 		}
+	}
+}
+
+// TestVuXMLNameMatches_AgreesWithFreeBSD15Libc replays fnmatch results
+// measured on FreeBSD 15.1 libc, so the port is held to the reference rather
+// than to cases somebody thought to write down.
+func TestVuXMLNameMatches_AgreesWithFreeBSD15Libc(t *testing.T) {
+	f, err := os.Open("testdata/vuxml/fnmatch15.tsv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	cases := 0
+	for line := 1; sc.Scan(); line++ {
+		if strings.HasPrefix(sc.Text(), "#") {
+			continue
+		}
+		fields := strings.Split(sc.Text(), "\t")
+		if len(fields) != 3 {
+			t.Fatalf("fnmatch15.tsv:%d: %d fields; want 3", line, len(fields))
+		}
+		pattern, perr := strconv.Unquote(fields[0])
+		name, nerr := strconv.Unquote(fields[1])
+		if perr != nil || nerr != nil {
+			t.Fatalf("fnmatch15.tsv:%d: unquote: %v %v", line, perr, nerr)
+		}
+		cases++
+		if got, want := vuxmlNameMatches(pattern, name), fields[2] == "1"; got != want {
+			t.Errorf("fnmatch15.tsv:%d: vuxmlNameMatches(%q, %q) = %v; FreeBSD 15 libc says %v", line, pattern, name, got, want)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if cases < 3000 {
+		t.Fatalf("read %d cases; the reference holds over 3000", cases)
+	}
+}
+
+func TestReviewVuXMLFreeBSD15CharacterClasses(t *testing.T) {
+	for _, tc := range []struct{ pattern, name string }{
+		{"lib[[:alpha:]]", "liba"},
+		{"lib[[:digit:]]", "lib3"},
+	} {
+		t.Run(tc.pattern, func(t *testing.T) {
+			doc := `<vuxml><vuln vid="class-vid"><topic>class package affected</topic><affects><package><name>` + tc.pattern + `</name><range><lt>2.0</lt></range></package></affects></vuln></vuxml>`
+			db, _, err := vuxmlDB(t, []byte(doc))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ve := freeBSDEntry("1.0")
+			ve.Metadata[FreeBSDABIKey] = "FreeBSD:15:amd64"
+			r := freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(tc.name), ve)
+			if r.Action != ActionBlock {
+				t.Fatalf("%s advisory against %s@1.0 for %s: action=%s; want block (FreeBSD 15 fnmatch returns 0)", tc.pattern, tc.name, ve.Metadata[FreeBSDABIKey], r.Action)
+			}
+			ve.Version = "2.0"
+			r = freeBSDChecker(db, ActionBlock).Check(context.Background(), freeBSDPkg(tc.name), ve)
+			if r.Action != ActionPass {
+				t.Fatalf("fixed version: %+v; want pass", r)
+			}
+		})
 	}
 }

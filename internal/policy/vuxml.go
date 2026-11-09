@@ -193,66 +193,68 @@ func isVuXMLPattern(name string) bool {
 }
 
 // vuxmlNameMatches is pkg audit's fnmatch(pattern, name, 0), ported from
-// FreeBSD 14's lib/libc/gen/fnmatch.c in the C locale. It is a port rather
-// than a translation into path.Match because the two disagree on bracket
-// expressions fnmatch accepts and path.Match rejects as malformed ("[]a]",
-// "[-ab]", "[ab-]"), and a rejected pattern would read as no advisory. With
-// flags 0 the match is case-sensitive, '/' and a leading '.' are ordinary, a
-// backslash escapes the byte after it, and a pattern ending in a lone
-// backslash matches nothing.
+// FreeBSD 15's lib/libc/gen/fnmatch.c in the C locale and used for every ABI,
+// so sync, fetch checks and simulation agree on one dialect. It is a port
+// rather than a translation into path.Match because the two disagree on
+// bracket expressions fnmatch accepts and path.Match rejects as malformed
+// ("[]a]", "[-ab]", "[ab-]"), and a rejected pattern would read as no
+// advisory. With flags 0 the match is case-sensitive, '/' and a leading '.'
+// are ordinary, a backslash escapes the byte after it, and a pattern ending in
+// a lone backslash matches nothing. The C locale reads every byte as one
+// character, so bytes above 0x7f compare as themselves and belong to no
+// character class. FreeBSD 14 does not read
+// "[:class:]", "[=c=]" or "[.c.]" inside a bracket expression, so a 14 host's
+// pkg audit can disagree on a pattern that uses one.
 func vuxmlNameMatches(pattern, name string) bool {
+	pattern, name = cString(pattern), cString(name)
 	p, s := 0, 0
 	btP, btS := -1, 0
 	for {
-		sEnd := s >= len(name)
-		var sc byte
-		if !sEnd {
-			sc = name[s]
+		pc := byteAt(pattern, p)
+		if pc != 0 {
+			p++
 		}
+		sc := byteAt(name, s)
 		ok := false
-		if p >= len(pattern) {
-			if sEnd {
+		switch pc {
+		case 0:
+			if sc == 0 {
 				return true
 			}
-		} else {
-			pc := pattern[p]
-			p++
-			switch pc {
-			case '?':
-				if sEnd {
-					return false
-				}
-				s++
-				continue
-			case '*':
-				for p < len(pattern) && pattern[p] == '*' {
-					p++
-				}
-				if p == len(pattern) {
-					return true
-				}
-				btP, btS = p, s
-				continue
-			case '[':
-				if sEnd {
-					return false
-				}
-				next, res := fnmatchBracket(pattern, p, sc)
-				if res == bracketMatch {
-					p, s = next, s+1
-					continue
-				}
-				ok = res == bracketMalformed && sc == '['
-			case '\\':
-				if p == len(pattern) {
-					return false
-				}
-				pc = pattern[p]
-				p++
-				ok = !sEnd && pc == sc
-			default:
-				ok = !sEnd && pc == sc
+		case '?':
+			if sc == 0 {
+				return false
 			}
+			s++
+			continue
+		case '*':
+			for byteAt(pattern, p) == '*' {
+				p++
+			}
+			if p == len(pattern) {
+				return true
+			}
+			btP, btS = p, s
+			continue
+		case '[':
+			if sc == 0 {
+				return false
+			}
+			next, res := fnmatchBracket(pattern, p, sc)
+			if res == bracketMatch {
+				p, s = next, s+1
+				continue
+			}
+			ok = res == bracketMalformed && sc == '['
+		case '\\':
+			pc = byteAt(pattern, p)
+			if pc == 0 {
+				return false
+			}
+			p++
+			ok = sc != 0 && pc == sc
+		default:
+			ok = sc != 0 && pc == sc
 		}
 		if ok {
 			s++
@@ -266,65 +268,207 @@ func vuxmlNameMatches(pattern, name string) bool {
 	}
 }
 
+// cString cuts s at its first NUL, where C stops reading it.
+func cString(s string) string {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func byteAt(s string, i int) byte {
+	if i < len(s) {
+		return s[i]
+	}
+	return 0
+}
+
 type bracketResult int
 
 const (
 	bracketNoMatch bracketResult = iota
 	bracketMatch
-	// bracketMalformed is an unterminated expression, which fnmatch reads
-	// as a literal '['.
+	// bracketMalformed is fnmatch.c's RANGE_ERROR, which fnmatch reads as a
+	// literal '['.
 	bracketMalformed
 )
 
-// fnmatchBracket is fnmatch.c's rangematch: it reads the bracket expression
-// starting at pattern[p], just past the '[', against test and returns the
-// index past its closing ']'. A leading '!' or '^' negates it; a ']' first in
-// the list (after any negation) is a literal; a '-' first or last is a
-// literal; a backslash escapes the byte after it, inside a range too.
+// fnmatchCClasses is wctype(3)'s class set in FreeBSD's C locale, each test
+// measured against releng/15.0 libc for bytes 1-255. "ideogram", "special"
+// and "phonogram" are valid names that select nothing there.
+var fnmatchCClasses = map[string]func(byte) bool{
+	"alnum":     func(b byte) bool { return isCAlpha(b) || isCDigit(b) },
+	"alpha":     isCAlpha,
+	"blank":     func(b byte) bool { return b == ' ' || b == '\t' },
+	"cntrl":     func(b byte) bool { return b < 0x20 || b == 0x7f },
+	"digit":     isCDigit,
+	"graph":     func(b byte) bool { return b > ' ' && b < 0x7f },
+	"lower":     func(b byte) bool { return b >= 'a' && b <= 'z' },
+	"print":     func(b byte) bool { return b >= ' ' && b < 0x7f },
+	"punct":     func(b byte) bool { return b > ' ' && b < 0x7f && !isCAlpha(b) && !isCDigit(b) },
+	"space":     func(b byte) bool { return b == ' ' || (b >= '\t' && b <= '\r') },
+	"upper":     func(b byte) bool { return b >= 'A' && b <= 'Z' },
+	"xdigit":    func(b byte) bool { return isCDigit(b) || (b|0x20 >= 'a' && b|0x20 <= 'f') },
+	"ideogram":  func(byte) bool { return false },
+	"special":   func(byte) bool { return false },
+	"phonogram": func(byte) bool { return false },
+	"number":    isCDigit,
+	"rune":      func(b byte) bool { return b < 0x80 },
+}
+
+func isCAlpha(b byte) bool { return b|0x20 >= 'a' && b|0x20 <= 'z' }
+func isCDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// fnmatchBracket is FreeBSD 15 fnmatch.c's rangematch in the C locale: it
+// reads the bracket expression starting at pattern[p], just past the '[',
+// against test and returns the index past its closing ']'. A leading '!' or
+// '^' negates it; a ']' first in the list (after any negation) is a literal;
+// a '-' first or last is a literal; a backslash escapes the byte after it.
+// "[:name:]" is a character class, and "[.c.]" and "[=c=]" each name the one
+// ASCII byte c. A class or "[=c=]" cannot bound a range, and because
+// rangematch keeps the last such opener in one variable, every range after
+// one in the same expression is malformed too ("[[:alpha:]a-z]"). After the
+// first element that matches, the rest of the expression is skipped without
+// honoring backslashes, as rangematch skips it. releng/15.0 leaves that
+// variable uninitialized, so a range in an expression with no earlier '['
+// element reads whatever the previous call left behind, and one pkg process
+// can answer the same pattern differently over its life; this port takes the
+// answer a fresh process gives, with nothing remembered.
 func fnmatchBracket(pattern string, p int, test byte) (int, bracketResult) {
-	negate := p < len(pattern) && (pattern[p] == '!' || pattern[p] == '^')
+	at := func(i int) byte { return byteAt(pattern, i) }
+	negate := at(p) == '!' || at(p) == '^'
 	if negate {
 		p++
 	}
 	matched := false
 	first := p
+	var special byte
+scan:
 	for {
-		if p >= len(pattern) {
+		var c byte
+		switch b := at(p); {
+		case b == ']' && p > first:
+			break scan
+		case b == 0:
 			return 0, bracketMalformed
-		}
-		if pattern[p] == ']' && p > first {
+		case b == '\\':
 			p++
-			break
-		}
-		if pattern[p] == '\\' {
-			p++
-			if p >= len(pattern) {
+		case b == '[':
+			special = at(p + 1)
+			if special != '.' && special != '=' && special != ':' {
+				break
+			}
+			p += 2
+			cp := fnmatchSpecialEnd(pattern, p, special)
+			if cp < 0 {
 				return 0, bracketMalformed
 			}
+			if special == ':' {
+				if at(cp+2) == '-' && at(cp+3) != 0 && at(cp+3) != ']' {
+					return 0, bracketMalformed
+				}
+				class, known := fnmatchCClasses[pattern[p:cp]]
+				if !known {
+					return 0, bracketMalformed
+				}
+				p = cp + 2
+				if class(test) {
+					matched = true
+					break scan
+				}
+				continue
+			}
+			if cp-p != 1 || pattern[p] >= 0x80 {
+				return 0, bracketMalformed
+			}
+			c = pattern[p]
+			p = cp + 2
 		}
-		lo := pattern[p]
-		p++
-		if p+1 < len(pattern) && pattern[p] == '-' && pattern[p+1] != ']' {
-			p++
-			if pattern[p] == '\\' {
+		if c == 0 {
+			c = at(p)
+			if c != 0 {
 				p++
 			}
-			if p >= len(pattern) {
+		}
+		if at(p) == '-' && at(p+1) != 0 && at(p+1) != ']' {
+			p++
+			if at(p) == '\\' {
+				p++
+			}
+			c2 := at(p)
+			if c2 == 0 {
 				return 0, bracketMalformed
 			}
-			hi := pattern[p]
 			p++
-			if lo <= test && test <= hi {
-				matched = true
+			if c2 == '[' {
+				special = at(p)
 			}
-		} else if lo == test {
+			if (c2 == '[' && special == '.') || special == '=' || special == ':' {
+				if special != '.' {
+					return 0, bracketMalformed
+				}
+				p++
+				cp := fnmatchSpecialEnd(pattern, p, '.')
+				if cp < 0 || cp-p != 1 || pattern[p] >= 0x80 {
+					return 0, bracketMalformed
+				}
+				c2 = pattern[p]
+				p = cp + 2
+			}
+			if c <= test && test <= c2 {
+				matched = true
+				break
+			}
+		} else if c == test {
 			matched = true
+			break
+		}
+	}
+	special = 0
+	for at(p) != ']' {
+		b := at(p)
+		switch {
+		case b == 0:
+			return 0, bracketMalformed
+		case b == special:
+			p++
+			if at(p) == ']' {
+				special = 0
+				p++
+			}
+		case special == 0 && b == '[':
+			p++
+			special = at(p)
+			if special != '.' && special != '=' && special != ':' {
+				special = 0
+			} else {
+				p++
+			}
+		default:
+			p++
 		}
 	}
 	if matched == negate {
-		return p, bracketNoMatch
+		return p + 1, bracketNoMatch
 	}
-	return p, bracketMatch
+	return p + 1, bracketMatch
+}
+
+// fnmatchSpecialEnd returns the index of the first special byte at or after
+// p that a ']' follows, searching to the end of the pattern as rangematch's
+// strchr does, or -1.
+func fnmatchSpecialEnd(pattern string, p int, special byte) int {
+	for p < len(pattern) {
+		i := strings.IndexByte(pattern[p:], special)
+		if i < 0 {
+			return -1
+		}
+		if byteAt(pattern, p+i+1) == ']' {
+			return p + i
+		}
+		p += i + 1
+	}
+	return -1
 }
 
 // pkgVersion is a FreeBSD package version split as pkg-version(8) splits it:
