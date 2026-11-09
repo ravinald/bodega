@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -148,9 +150,13 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	fetched := &aptFetchedIndexes{observe: func(ctx context.Context, raw []byte) {
 		s.observeAptMirrorDists(ctx, codename, rest, raw)
 	}}
-	s.serveAptMirror(capture, withFetchObserver(r, fetched.add), s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	ctx, transfer := withBodyTransfer(r.Context())
+	s.serveAptMirror(capture, withFetchObserver(r.WithContext(ctx), fetched.add), s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 	var served []byte
-	if capture.status == http.StatusOK && !capture.over {
+	if err := capture.incomplete(transfer); err != nil {
+		s.logFor(r.Context()).Warn("a mirrored apt index reached the client incomplete, so the age gate records only what bodega read in full",
+			"codename", codename, "path", rest, "error", err)
+	} else if capture.status == http.StatusOK && !capture.over {
 		served = capture.body.Bytes()
 		s.observeAptMirrorDists(r.Context(), codename, rest, served)
 	}
@@ -736,11 +742,37 @@ func aptClearsignedBody(raw []byte) []byte {
 // aptIndexCapture keeps a copy of a dists/ response so the age gate can record
 // the exact bytes a client got, whichever of cache, upstream or by-hash
 // served them. Past maxUpstreamBody it stops copying and reports over.
+//
+// The copy is evidence only when the whole object went out. A Release cut
+// after its Date: line still parses, and recorded as the codename's first
+// Release it would publish no index digests and date the entire archive by
+// that line, permanently.
 type aptIndexCapture struct {
 	http.ResponseWriter
-	status int
-	body   bytes.Buffer
-	over   bool
+	status   int
+	body     bytes.Buffer
+	written  int64
+	over     bool
+	writeErr error
+}
+
+// incomplete says why the captured body is not the whole object the handler
+// meant to send, or nil when it is: a write the client did not take, a copy
+// the handler reported cut short, or fewer bytes than the declared
+// Content-Length.
+func (c *aptIndexCapture) incomplete(transfer *bodyTransfer) error {
+	if c.writeErr != nil {
+		return c.writeErr
+	}
+	if err := transfer.failed(); err != nil {
+		return err
+	}
+	if cl := c.Header().Get("Content-Length"); cl != "" && c.status == http.StatusOK {
+		if want, err := strconv.ParseInt(cl, 10, 64); err == nil && want != c.written {
+			return fmt.Errorf("wrote %d of a declared %d bytes", c.written, want)
+		}
+	}
+	return nil
 }
 
 func (c *aptIndexCapture) WriteHeader(code int) {
@@ -755,6 +787,13 @@ func (c *aptIndexCapture) Write(b []byte) (int, error) {
 		c.status = http.StatusOK
 	}
 	n, err := c.ResponseWriter.Write(b)
+	c.written += int64(n)
+	if err == nil && n < len(b) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && c.writeErr == nil {
+		c.writeErr = err
+	}
 	if !c.over {
 		if int64(c.body.Len()+n) > maxUpstreamBody {
 			c.over = true

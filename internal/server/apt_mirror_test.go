@@ -2203,3 +2203,57 @@ func TestReviewF112BackgroundRefreshRecordsTheIndexItReads(t *testing.T) {
 		t.Errorf("age admission = %+v; want block", c)
 	}
 }
+
+type reviewF112ShortWriter struct {
+	*httptest.ResponseRecorder
+	remaining int
+}
+
+func (w *reviewF112ShortWriter) Write(p []byte) (int, error) {
+	n := min(len(p), w.remaining)
+	w.remaining -= n
+	_, _ = w.ResponseRecorder.Write(p[:n])
+	return n, io.ErrClosedPipe
+}
+
+func TestReviewF112IncompleteDeliveryCannotSetInitialRelease(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	dateLine := "Date: " + now.Add(-time.Hour).Format(time.RFC1123) + "\n"
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	for rel, body := range objects {
+		if strings.HasSuffix(rel, "/Release") {
+			body = dateLine + body
+			objects[rel] = body
+		}
+		archive.setObject(rel, body)
+	}
+	w := &reviewF112ShortWriter{ResponseRecorder: httptest.NewRecorder(), remaining: len(dateLine)}
+	r := httptest.NewRequest(http.MethodGet, "/apt/dists/fixture/Release", nil)
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK || w.Body.String() != dateLine {
+		t.Fatalf("partial response = %d %q; want only the Date line", w.Code, w.Body.String())
+	}
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	if got := cachedBody(t, store, manifest.AptKey("dists/fixture/Release")); got != objects["dists/fixture/Release"] {
+		t.Fatal("the proxy did not finish reading and caching the full Release")
+	}
+	const rest = "universe/binary-amd64/Packages.gz"
+	sum := sha256.Sum256([]byte(objects["dists/fixture/"+rest]))
+	if snap, ok, err := s.auditDB.LookupAptIndex(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !ok || !snap.Initial {
+		t.Errorf("completed first Release: snapshot=%+v ok=%v err=%v; want initial=true", snap, ok, err)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/"+rest); code != http.StatusOK {
+		t.Fatalf("first Packages = %d; want 200", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("first index version = %+v; want predating", d)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebSeed); code != http.StatusOK {
+		t.Errorf("first index's version under 7d block = %d %q; want 200", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.3-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, "listed before bodega first read "+mirroredCodename) {
+		t.Errorf("age admission = %+v; want pass naming the initial read", c)
+	}
+}
