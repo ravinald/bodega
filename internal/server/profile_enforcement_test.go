@@ -1127,6 +1127,49 @@ func TestProfileRefusesAnUnplaceableWheelFilename(t *testing.T) {
 	}
 }
 
+// No page bodega serves promises a PEP 658 .metadata file, and wheelIdentity
+// cannot place one, so gating it records the bare filename as a package. The
+// django request after it is the control: the recorder drains in order, so
+// once django's reach row lands any row the .metadata request queued has too.
+func TestPypiWheelMetadataAnswers404AndRecordsNothing(t *testing.T) {
+	s := proxyingServer(t)
+	const meta = "markdown-3.11-py3-none-any.whl.metadata"
+	seed(t, s, manifest.TypePypi, map[string]string{"pypi/wheels/" + meta: "Metadata-Version: 2.1"})
+	f := bindProfile(t, s, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		nil)
+
+	if status, body := f.get(t, "/pypi/wheels/"+meta); status != http.StatusNotFound {
+		t.Fatalf("%s answered %d, want 404: %s", meta, status, body)
+	}
+	if status, body := f.get(t, "/pypi/wheels/django-5.0.0-py3-none-any.whl"); status != http.StatusForbidden {
+		t.Fatalf("the control wheel answered %d, want 403: %s", status, body)
+	}
+	waitForDecision(t, s, audit.DecisionDenied, 1)
+
+	rows, err := s.auditDB.ListDiscovery(context.Background(), audit.DiscoveryFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if strings.HasSuffix(r.PkgName, ".metadata") {
+			t.Errorf("discovery row names %q", r.PkgName)
+		}
+	}
+	denials, err := s.auditDB.Query(context.Background(), audit.Filter{EventType: audit.EventDenied})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range denials {
+		if strings.HasSuffix(d.PkgName, ".metadata") || strings.Contains(d.Details, ".metadata") {
+			t.Errorf("denial row names the .metadata request: %+v", d)
+		}
+	}
+	if len(denials) != 1 {
+		t.Errorf("denial rows = %d, want 1 for the control alone: %+v", len(denials), denials)
+	}
+}
+
 // helmAnnotatedIndex is the shape `helm repo index` writes for a chart
 // carrying Artifact Hub annotations. sigs.k8s.io/yaml sorts mapping keys, so
 // annotations opens the release and the opening line is a key with no value

@@ -9,7 +9,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,8 @@ import uuid
 SITE = Path(__file__).resolve().parents[1]
 REPO = SITE.parent
 DEFAULT_CONFIG = REPO / 'docs-internal/site-deploy.json'
+# Every repository path the generator reads.
+RENDERED = ('site', 'docs', 'assets', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md')
 
 
 @dataclass(frozen=True)
@@ -58,9 +59,6 @@ class DeploymentConfig:
             raise ValueError('coverage_report does not exist')
         return cls(source, data['site_url'].rstrip('/'), data['ssh_host'], remote, report)
 
-    def build_environment(self):
-        return dict(os.environ, BODEGA_SITE_CONFIG=str(self.source),
-                    BODEGA_SITE_URL=self.site_url, BODEGA_COVERAGE_REPORT=str(self.coverage_report))
 
 
 def run(argv, **kwargs):
@@ -77,10 +75,10 @@ def clean_revision():
     return git('rev-parse', 'HEAD')
 
 
-def remote(config, script, *args):
+def remote(config, script, *args, capture=False):
     command = 'sh -s -- ' + shlex.join([config.remote_root, *args])
     return run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                '--', config.ssh_host, command], input=script, text=True)
+                '--', config.ssh_host, command], input=script, text=True, capture_output=capture)
 
 
 def upload(config, source, destination):
@@ -97,21 +95,33 @@ def artifact_manifest(directory, revision):
     (directory / 'deployment.json').write_text(json.dumps(manifest, indent=2) + '\n')
 
 
+def export_coverage(config, output):
+    run([sys.executable, '-I', str(SITE / 'scripts/coverage.py'), str(config.coverage_report), str(output)])
+    json.loads(output.read_text())
+
+
+def render(root, output, coverage, revision):
+    """Build the generator from root/site and render root's README and docs into output.
+
+    The generator checks every internal link and anchor and exits non-zero on a miss."""
+    generator = output.parent / 'sitegen'
+    run(['go', 'build', '-trimpath', '-o', str(generator), '.'], cwd=root / 'site')
+    version = git('describe', '--tags', '--always', revision)
+    run([str(generator), '-repo', str(root), '-tmpl', str(root / 'site'), '-out', str(output), '-base', '/',
+         '-coverage', str(coverage), '-version', version, '-commit', revision])
+
+
 def deploy(config):
     revision = clean_revision()
     release = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + revision[:12] + '-' + uuid.uuid4().hex[:8]
     with tempfile.TemporaryDirectory(prefix='bodega-site-') as temporary:
         staging = Path(temporary)
-        report = staging / 'report.html'
-        shutil.copyfile(config.coverage_report, report)
-        env = dict(config.build_environment(), BODEGA_COVERAGE_REPORT=str(report))
-        run(['npm', 'ci'], cwd=SITE, env=env)
-        run(['npm', 'run', 'build'], cwd=SITE, env=env)
-        run(['npm', 'run', 'check'], cwd=SITE, env=env)
+        coverage = staging / 'coverage.json'
+        export_coverage(config, coverage)
+        artifact = staging / 'artifact'
+        render(REPO, artifact, coverage, revision)
         if clean_revision() != revision:
             raise ValueError('Source revision changed during the build; nothing uploaded')
-        artifact = staging / 'artifact'
-        shutil.copytree(SITE / 'dist', artifact)
         artifact_manifest(artifact, revision)
         # Hold the server-side lock through upload and activation, not just rename.
         remote(config, """set -eu
@@ -146,18 +156,43 @@ test "$(cat "$1/.deploy-lock/owner")" = "$2"
 rm "$1/.deploy-lock/owner"
 rmdir "$1/.deploy-lock"
 """, release)
-    print(f'Activated {release} at {config.site_url}. Independent coverage feed unchanged.')
+    print(f'Activated {release} at {config.site_url}.')
+
+
+def deployed_revision(config):
+    """The commit the active release was built from, read from its manifest on the server."""
+    manifest = remote(config, 'set -eu\ncat "$1/current/deployment.json"\n', capture=True).stdout
+    revision = json.loads(manifest).get('sourceRevision', '')
+    if not re.fullmatch(r'[0-9a-f]{40}', revision):
+        raise ValueError(f'{config.remote_root}/current/deployment.json names no full sourceRevision')
+    if subprocess.run(['git', '-C', str(REPO), 'cat-file', '-e', revision + '^{commit}'], capture_output=True).returncode:
+        raise ValueError(f'The active release was built from {revision}, which this checkout lacks; run git fetch')
+    return revision
 
 
 def publish_coverage(config):
+    """Publish the feed, then re-render /coverage.html from it with the active release's own sources.
+
+    The page is rendered from the deployed commit rather than this checkout, so its
+    layout, stylesheet and contents links match the release nginx serves around it."""
     with tempfile.TemporaryDirectory(prefix='bodega-coverage-') as temporary:
-        output = Path(temporary) / 'coverage.json'
-        run([sys.executable, '-I', str(SITE / 'scripts/coverage.py'), str(config.coverage_report), str(output)])
-        json.loads(output.read_text())
-        name = 'coverage.' + uuid.uuid4().hex + '.json'
-        upload(config, output, f'{config.remote_root}/data/{name}')
-        remote(config, 'set -eu\nmv -f "$1/data/$2" "$1/data/coverage.json"\n', name)
-    print('Public coverage updated')
+        staging = Path(temporary)
+        output = staging / 'coverage.json'
+        export_coverage(config, output)
+        name = 'coverage.' + uuid.uuid4().hex
+        upload(config, output, f'{config.remote_root}/data/{name}.json')
+        remote(config, 'set -eu\nmv -f "$1/data/$2.json" "$1/data/coverage.json"\n', name)
+        print('Public coverage feed updated')
+
+        revision = deployed_revision(config)
+        source = staging / 'source'
+        source.mkdir()
+        archive = run(['git', '-C', str(REPO), 'archive', revision, *RENDERED], capture_output=True).stdout
+        run(['tar', '-x', '-C', str(source)], input=archive)
+        render(source, staging / 'site', output, revision)
+        upload(config, staging / 'site/coverage.html', f'{config.remote_root}/data/{name}.html')
+        remote(config, 'set -eu\nmv -f "$1/data/$2.html" "$1/data/coverage.html"\n', name)
+    print(f'Public coverage page updated from release commit {revision[:12]}')
 
 
 def main():
@@ -171,9 +206,12 @@ def main():
         config = DeploymentConfig.load(args.config)
         if args.dry_run:
             print(f'{args.command}: {config.site_url} via {config.ssh_host}, root {config.remote_root}')
-            print('No commands executed. Deployment requires committed source; coverage publication is independent.')
+            print('No commands executed. Deployment requires committed source and republishes the coverage feed and page.')
         elif args.command == 'deploy':
             deploy(config)
+            # nginx serves /coverage.html from the data directory, so a new release
+            # shows its own layout there only once the page is rendered again.
+            publish_coverage(config)
         else:
             publish_coverage(config)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

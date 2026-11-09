@@ -30,7 +30,7 @@ jobs:
       # Pinned because the installer's default moves with the action, and the
       # signs entries in .goreleaser.yaml are written for this cosign. The
       # jobs in release.yml and release-verify.yml verify with the same one.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: 'v3.0.6'
 

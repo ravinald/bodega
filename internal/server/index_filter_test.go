@@ -573,6 +573,55 @@ func TestIndexFilterPypiJSON(t *testing.T) {
 	})
 }
 
+// pypi.org sends data-dist-info-metadata beside core-metadata on every file
+// with metadata, and uv follows either one to a .metadata file bodega 404s.
+func TestRepublishPypiJSONDropsEveryMetadataKey(t *testing.T) {
+	const page = `{"meta":{"api-version":"1.1"},"name":"markdown","versions":["3.11"],"files":[
+{"filename":"markdown-3.11-py3-none-any.whl","url":"https://files.pythonhosted.org/packages/ab/markdown-3.11-py3-none-any.whl",
+ "hashes":{"sha256":"84a4"},"requires-python":">=3.9","yanked":false,
+ "core-metadata":{"sha256":"84a4d674"},"data-dist-info-metadata":{"sha256":"84a4d674"}},
+{"filename":"markdown-3.11.tar.gz","url":"https://files.pythonhosted.org/packages/cd/markdown-3.11.tar.gz",
+ "hashes":{"sha256":"99"},"requires-python":">=3.9","yanked":"broken","dist-info-metadata":true},
+{"filename":"markdown-3.11-py2-none-any.whl","url":"https://files.pythonhosted.org/",
+ "hashes":{"sha256":"77"},"core-metadata":true,"data-dist-info-metadata":true}]}`
+
+	out, err := republishPypiJSON([]byte(page), "markdown", "https://pypi.org/simple/markdown/", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Files) != 3 {
+		t.Fatalf("files = %d, want 3: %s", len(doc.Files), out)
+	}
+	for _, f := range doc.Files {
+		for _, k := range []string{"core-metadata", "data-dist-info-metadata", "dist-info-metadata"} {
+			if _, ok := f[k]; ok {
+				t.Errorf("%s still carries %s: %s", f["filename"], k, out)
+			}
+		}
+		for _, k := range []string{"hashes", "url", "filename"} {
+			if _, ok := f[k]; !ok {
+				t.Errorf("%s lost %s: %s", f["filename"], k, out)
+			}
+		}
+	}
+	first := doc.Files[0]
+	if first["url"] != "/pypi/wheels/markdown-3.11-py3-none-any.whl" {
+		t.Errorf("url = %v, want the wheel route", first["url"])
+	}
+	if first["requires-python"] != ">=3.9" || first["yanked"] != false {
+		t.Errorf("requires-python or yanked changed: %v", first)
+	}
+	if doc.Files[1]["yanked"] != "broken" {
+		t.Errorf("yanked reason lost: %v", doc.Files[1])
+	}
+}
+
 // An upstream that ignores ?format= answers HTML, and the client asking for
 // JSON gets that HTML, filtered and rewritten, rather than an error.
 func TestIndexFilterPypiJSONUpstreamAnswersHTML(t *testing.T) {

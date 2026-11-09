@@ -50,7 +50,7 @@ var doctorExit = os.Exit
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
 	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS, restoreApt bool
-	var token, baseURL, pkgABI, aptSuite string
+	var token, baseURL, pkgABI, aptSuite, composerLock string
 	var configure, ntpServers, aptArchives []string
 	var pkgRelease int
 	c := &cobra.Command{
@@ -66,7 +66,8 @@ outside bodega's allow-list. Common findings:
   - gem sources or Bundler's mirror still naming rubygems.org
   - Maven or Gradle with no bodega mirror or init script
   - Composer's global config naming no bodega repository, or leaving
-    packagist.org enabled
+    packagist.org enabled; with --composer-lock <path>, a composer.lock
+    whose dist.url entries fetch from anywhere but bodega
   - GOPROXY unset or falling through to proxy.golang.org
   - on FreeBSD, a pkg repository still enabled at pkg.FreeBSD.org, or a
     make.conf that does not send distfiles through bodega
@@ -208,6 +209,9 @@ See docs/threat-model.md for the rationale behind each check.`,
 				systems = append(systems, manifest.TypeFreeBSD)
 			}
 			configuring := len(systems) > 0 || cmd.Flags().Changed("configure")
+			if composerLock != "" && (writeCreds || configuring || restorePro || restoreOS || restoreApt) {
+				return fmt.Errorf("--composer-lock adds a row to doctor's report and writes nothing; run it without --configure, --write-credentials or a --restore flag")
+			}
 			if restorePro && (writeCreds || configuring || restoreOS || restoreApt) {
 				return fmt.Errorf("run one write at a time: --restore-ubuntu-pro undoes what --quiet-ubuntu-pro ran, and nothing else")
 			}
@@ -256,6 +260,14 @@ See docs/threat-model.md for the rationale behind each check.`,
 					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
 				})
 			}
+			var lockFinding *host.Finding
+			if composerLock != "" {
+				f, err := checkComposerLock(composerLock, doctorBaseURL(gf, baseURL))
+				if err != nil {
+					return err
+				}
+				lockFinding = &f
+			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
 				findings = append(findings, fn())
@@ -268,6 +280,9 @@ See docs/threat-model.md for the rationale behind each check.`,
 			}
 			if f, ok := host.CheckComposer(); ok {
 				findings = append(findings, f)
+			}
+			if lockFinding != nil {
+				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
 			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, DockerdVersion: doctorDockerdVersion, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
@@ -327,6 +342,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Undo the steps --quiet-os-callers recorded, and nothing else")
 	c.Flags().BoolVar(&restoreApt, "restore-apt-sources", false,
 		"Undo the edits --configure apt --apply made to the distro's apt sources, and nothing else")
+	c.Flags().StringVar(&composerLock, "composer-lock", "",
+		"Also report whether the dist.url entries of this composer.lock are at bodega's /composer/ route")
 	c.Flags().StringSliceVar(&ntpServers, "ntp-server", nil,
 		"An internal time source the chrony-nts row accepts beside the bodega server (comma-separated or repeated)")
 	c.Flags().StringVar(&aptSuite, "suite", "",
