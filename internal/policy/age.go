@@ -72,7 +72,7 @@ const (
 	RpmDatedByFile = "file"
 )
 
-// A mirrored apt version is dated by the first index bodega read that lists
+// A mirrored apt version is dated by the earliest recorded index that lists
 // it: a Packages paragraph carries no date, and the Release it belongs to says
 // when that index was generated, which bounds when the version was published.
 // PublishedAt holds that Date:, AptDatedByKey says whether it is one, and
@@ -80,11 +80,11 @@ const (
 const (
 	AptDatedByKey  = "apt_dated_by"
 	AptCodenameKey = "apt_codename"
-	// AptDatedByRelease is the Date: of the Release of the first index bodega
-	// read that listed the version.
+	// AptDatedByRelease is the Date: of the earliest recorded Release whose
+	// index listed the version.
 	AptDatedByRelease = audit.AptDatedByRelease
-	// AptDatedByPredates is a version the first index bodega ever read for the
-	// codename already listed. Debian and Ubuntu regenerate Release daily, so
+	// AptDatedByPredates is a version the codename's earliest recorded
+	// Release, its baseline, already listed. Debian and Ubuntu regenerate Release daily, so
 	// dating a whole archive by that read would hold every package on a fresh
 	// install; such a version passes.
 	AptDatedByPredates = audit.AptDatedByPredates
@@ -279,7 +279,7 @@ func aptDated(ve *manifest.VersionEntry) (time.Time, string, error) {
 		}
 		return t, by, nil
 	}
-	return time.Time{}, "", errors.New("an apt version is dated by the first mirrored index bodega read that lists it, and this entry carries no such record: it was not fetched through a mirrored codename's pool")
+	return time.Time{}, "", errors.New("an apt version is dated by the earliest mirrored index bodega recorded that lists it, and this entry carries no such record: it was not fetched through a mirrored codename's pool")
 }
 
 // ociDated reads the time bodega's registry recorded for an oci tag off its
@@ -394,7 +394,7 @@ func (c *AgeChecker) ociPublishedAt(_ context.Context, name, tag string) (time.T
 // aptPublishedAt is the apt entry in agePublishers, which makes the gate
 // settable for apt. The date itself arrives on the entry; see aptDated.
 func (c *AgeChecker) aptPublishedAt(_ context.Context, name, version string) (time.Time, error) {
-	return time.Time{}, fmt.Errorf("apt %s %s is dated by the first mirrored index bodega read that lists it, not by a lookup", name, version)
+	return time.Time{}, fmt.Errorf("apt %s %s is dated by the earliest mirrored index bodega recorded that lists it, not by a lookup", name, version)
 }
 
 // rpmPublishedAt is the rpm entry in agePublishers, which makes the gate

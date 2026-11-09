@@ -59,7 +59,7 @@ func TestRequireEcosystem_AcceptsCovered(t *testing.T) {
 			t.Errorf("%s is dated but was refused: %v", eco, err)
 		}
 	}
-	// apt is dated by the first mirrored index that lists a version (F112).
+	// apt is dated by the earliest mirrored index that lists a version (F112).
 	if err := requireEcosystem("apt", policy.AgeEcosystems(), "age gate", "x"); err != nil {
 		t.Errorf("apt is dated by its mirrored Release but was refused: %v", err)
 	}

@@ -1,48 +1,49 @@
--- When a mirrored apt index first listed each source package version, for the
--- age gate (F112). A Packages paragraph carries no date; the Release it belongs
--- to does, and a version first listed under a Release generated at T was
--- published no later than T. Keyed on the source package and its version,
--- epoch included, which is what the OSV gate already reads off a paragraph.
+-- When mirrored apt indexes listed each source package version, for the age
+-- gate (F112). A Packages paragraph carries no date; the Release it belongs to
+-- does, and a version listed under a Release generated at T was published no
+-- later than T. Keyed on the source package and its version, epoch included,
+-- which is what the OSV gate already reads off a paragraph.
 --
--- dated_by is 'release' when published_at is that Release's Date:, and
--- 'predates' when the version was in an index the codename's first recorded
--- Release published, so nothing says when it appeared. A row is written once and never updated: a later
--- index listing the version again says nothing new about it.
+-- Every date here is a minimum over what bodega has recorded, so the order in
+-- which readers record their observations cannot change the result: recording
+-- an older snapshot late moves a date earlier, to the Date: of a Release that
+-- listed the version, and nothing ever moves one later.
+
+-- published_at is the earliest Date: among the recorded Releases whose
+-- Packages bodega read and found listing the version. It predates bodega when
+-- it is no later than the codename's baseline.
 CREATE TABLE IF NOT EXISTS apt_version_dates (
     source       TEXT NOT NULL,
     version      TEXT NOT NULL,
     codename     TEXT NOT NULL,
-    dated_by     TEXT NOT NULL,
-    published_at TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL,
     recorded_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (source, version)
+    PRIMARY KEY (source, version, codename)
 );
 
--- The first Release bodega recorded for each mirrored codename. Its indexes
--- are the archive as bodega first found it, so their versions predate bodega;
--- every later Release only dates what it adds. One row per codename, written
--- once: which reader or architecture comes next cannot move the boundary.
-CREATE TABLE IF NOT EXISTS apt_codename_first_release (
+-- The earliest Release Date: recorded for each mirrored codename: the archive
+-- as bodega first found it. Debian and Ubuntu regenerate Release daily, so the
+-- versions it lists are recorded as predating bodega rather than dated by it.
+CREATE TABLE IF NOT EXISTS apt_codename_baseline (
     codename     TEXT PRIMARY KEY,
-    release_date TEXT NOT NULL DEFAULT '',
-    recorded_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    release_date TEXT NOT NULL
 );
 
 -- Every binary Packages file a recorded Release digests, keyed by its SHA256,
--- so an index bodega serves or reads is tied to the Release that published
+-- so an index bodega serves or reads is tied to the Releases that published
 -- those exact bytes, by-hash and cached copies included. idx is the logical
--- index (component/binary-arch) the three compressions share. initial is 1
--- when the codename's first Release listed it. observed is 1 once the
--- versions of the first Release's copy of idx were recorded, or a later copy
--- of idx was, after which nothing can say what the first one held.
+-- index (component/binary-arch) the compressions share. release_date is the
+-- earliest Date: of a recorded Release listing the file. observed_date is the
+-- release_date the file's versions were last recorded under, '' when never:
+-- one later than release_date means an older Release listing the same bytes
+-- was recorded afterwards, and the versions are recorded again at its date.
 CREATE TABLE IF NOT EXISTS apt_release_indexes (
-    codename     TEXT NOT NULL,
-    sha256       TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    idx          TEXT NOT NULL,
-    release_date TEXT NOT NULL DEFAULT '',
-    initial      INTEGER NOT NULL DEFAULT 0,
-    observed     INTEGER NOT NULL DEFAULT 0,
+    codename      TEXT NOT NULL,
+    sha256        TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    idx           TEXT NOT NULL,
+    release_date  TEXT NOT NULL,
+    observed_date TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (codename, sha256, path)
 );
 CREATE INDEX IF NOT EXISTS apt_release_indexes_idx ON apt_release_indexes (codename, idx);

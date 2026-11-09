@@ -248,12 +248,9 @@ type Server struct {
 	// adding twenty entries would refetch the base's Packages twenty times
 	// from an archive that republishes it daily.
 	aptUpstreamIdx sync.Map
-	// aptIndexDated holds, per codename/component/binary-arch, the SHA256 of
-	// the last Packages file whose versions reached the audit database, so the
-	// readers sharing one index do not rewrite tens of thousands of rows for
-	// bytes that have not changed. aptReleaseRecorded does the same per
-	// codename for the last Release whose digests were recorded.
-	aptIndexDated      sync.Map
+	// aptReleaseRecorded holds, per codename, the identity of the last
+	// Release whose digests reached the audit database, so the readers
+	// sharing one Release do not rewrite its rows on every read.
 	aptReleaseRecorded sync.Map
 
 	// aptRoutes remembers which configured archive answered for each pool
