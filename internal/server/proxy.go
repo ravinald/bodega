@@ -1,8 +1,11 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
@@ -304,13 +308,13 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 			if !sinkUpstreamErr(r.Context(), err) {
 				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
 			}
-			writeRateLimited(w, limited)
+			writeRateLimited(w, err, limited)
 			return
 		}
 		if !sinkUpstreamErr(r.Context(), err) {
 			s.logFor(r.Context()).Error("upstream resolution failed", "key", s3Key, "error", err)
 		}
-		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
+		writeUpstreamUnreachable(w, "upstream resolution failed", err, cmp.Or(upstreamURL, knownUpstream))
 		return
 	}
 	s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
@@ -351,7 +355,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 			if !sinkUpstreamErr(r.Context(), err) {
 				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
 			}
-			writeRateLimited(w, limited)
+			writeRateLimited(w, err, limited)
 			return
 		}
 		var refused *resolveRefusal
@@ -380,7 +384,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		if !sinkUpstreamErr(r.Context(), err) {
 			s.logFor(r.Context()).Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		}
-		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		writeUpstreamUnreachable(w, "upstream fetch failed", err, upstreamURL)
 	}
 
 	if graced {
@@ -448,6 +452,9 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	defer spool.close()
+	if c, ok := w.(*capturedResponse); ok {
+		c.respondent = up.url
+	}
 
 	// Verification comes off the digest computed during the copy, and it comes
 	// before a byte reaches the client. A tee straight to the response would
@@ -1037,7 +1044,7 @@ func openUpstream(ctx context.Context, rawURL string, identity bool) (*upstreamS
 // distfilesGuard.
 func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string) error, rawURL string, identity bool) (*upstreamStream, error) {
 	if err := guard(rawURL); err != nil {
-		return nil, err
+		return nil, atUpstream(rawURL, err)
 	}
 	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -1054,11 +1061,15 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 
-	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
-	resp, err := client.Do(req)
+	resp, err := doUpstream(client, req)
 	if err != nil {
 		return nil, err
 	}
+
+	// resp.Request is the last request in the chain, so its URL is the server
+	// that produced this answer. It is nil for no response net/http returns, but
+	// the fallback keeps a future transport from leaving the field empty.
+	answered := answeredURL(resp, rawURL)
 
 	// Ahead of the identity check: a rate-limit answer has no artifact body to
 	// protect, and a CDN that gzips its error page would otherwise turn
@@ -1066,16 +1077,16 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if resp.StatusCode == http.StatusTooManyRequests ||
 		(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
 		resp.Body.Close()
-		return nil, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
+		return nil, atUpstream(answered, &upstreamRateLimited{url: rawURL, status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")})
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
+		return nil, atUpstream(answered, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL))
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+		return nil, atUpstream(answered, &upstreamStatusError{url: rawURL, status: resp.StatusCode})
 	}
 
 	// After the status: the identity rule protects artifact bytes, and only a
@@ -1084,18 +1095,10 @@ func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string
 	if identity {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			resp.Body.Close()
-			return nil, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+			return nil, atUpstream(answered, afterAnswer(fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
 				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
-				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL))
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)))
 		}
-	}
-
-	// resp.Request is the last request in the chain, so its URL is the server
-	// that produced this body. It is nil for no response net/http returns, but
-	// the fallback keeps a future transport from leaving the field empty.
-	answered := rawURL
-	if resp.Request != nil && resp.Request.URL != nil {
-		answered = resp.Request.URL.String()
 	}
 
 	return &upstreamStream{
@@ -1132,6 +1135,291 @@ func (e *upstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned %d: %s", e.status, e.url)
 }
 
+// upstreamEndpointError carries the host:port an upstream failure happened at
+// beside the error itself. The
+// public 502 is built from these fields, never from err's text, so the
+// endpoint is recorded where the attempt is made: after a fallback or a
+// redirect, or inside a resolver's own read, nothing downstream can recover
+// which server was being talked to.
+//
+// Error and Unwrap pass err through unchanged, so log lines and every
+// errors.Is and errors.As test read the failure as they would unwrapped.
+//
+// status is an HTTP answer the public body names that no upstreamStatusError
+// carries, because that type steers not-found and stale-cache handling and a
+// token service's or a challenge's status must not. diag, when set, is the
+// error the body is classified from where err deliberately drops its identity.
+type upstreamEndpointError struct {
+	endpoint string
+	status   int
+	diag     error
+	err      error
+}
+
+func (e *upstreamEndpointError) Error() string { return e.err.Error() }
+func (e *upstreamEndpointError) Unwrap() error { return e.err }
+
+// atUpstream records rawURL's endpoint on err. An error that already names
+// one keeps it: the innermost attempt is the one that failed.
+func atUpstream(rawURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var known *upstreamEndpointError
+	if errors.As(err, &known) {
+		return err
+	}
+	return &upstreamEndpointError{endpoint: hostPort(rawURL), err: err}
+}
+
+// sentBy is atUpstream for a document whose respondent may be unknown, as a
+// cached copy is: with none it leaves err for an outer caller to place.
+func sentBy(respondent string, err error) error {
+	if hostPort(respondent) == "" {
+		return err
+	}
+	return atUpstream(respondent, err)
+}
+
+// answeredStatus is err recorded as rawURL answering HTTP status, for the
+// public body alone: no errors.As test that steers the fetch can see it.
+func answeredStatus(rawURL string, status int, err error) error {
+	return &upstreamEndpointError{endpoint: hostPort(rawURL), status: status, err: err}
+}
+
+// detachUpstream is cause's text inside msg with none of its identity, so a
+// caller suppressing errUpstreamNotFound or a rate limit still hands the
+// public body the endpoint and cause it would have named.
+func detachUpstream(cause error, msg string) error {
+	flat := errors.New(msg + ": " + cause.Error())
+	var at *upstreamEndpointError
+	if !errors.As(cause, &at) {
+		return flat
+	}
+	return &upstreamEndpointError{endpoint: at.endpoint, diag: cause, err: flat}
+}
+
+// endpointBody tags every failed read of a response body with the endpoint
+// that sent it. A body is read long after the request returns, by callers that
+// no longer hold the response, so this is the only place that still knows
+// which server a cut transfer came from. io.EOF passes untouched: readers
+// compare it with ==.
+type endpointBody struct {
+	io.ReadCloser
+	endpoint string
+}
+
+func (b *endpointBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		err = atUpstream(b.endpoint, err)
+	}
+	return n, err
+}
+
+// doUpstream sends req through client and, on failure, records the endpoint
+// that failed. A refused redirect carries the raw Location header in
+// url.Error.URL, which may be relative, so it is resolved against the request
+// that received the redirect rather than the one bodega sent first.
+func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
+	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body = &endpointBody{ReadCloser: resp.Body, endpoint: answeredURL(resp, req.URL.String())}
+		return resp, nil
+	}
+	return nil, &upstreamEndpointError{endpoint: hostPort(failedURL(req, resp, err)), err: err}
+}
+
+// failedURL is the URL of the hop err failed on. net/http returns the
+// redirecting response alongside a CheckRedirect refusal, and that response's
+// request is the hop the Location is relative to.
+func failedURL(req *http.Request, resp *http.Response, err error) string {
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		return req.URL.String()
+	}
+	base := req.URL
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		base = resp.Request.URL
+	}
+	ref, perr := url.Parse(uerr.URL)
+	if perr != nil {
+		return base.String()
+	}
+	return base.ResolveReference(ref).String()
+}
+
+// writeUpstreamUnreachable answers a client whose upstream could not be read
+// with a 502 naming the host and why, so the person at the client can tell an
+// outage from a DNS or firewall fault without the server log.
+//
+// The body goes to anyone who can reach the route, and an upstream URL may
+// carry userinfo, so it is built from parsed parts and never from err's text:
+// the host and port, one fixed cause, and the next step.
+func writeUpstreamUnreachable(w http.ResponseWriter, what string, err error, fallbackURL string) {
+	if c, ok := w.(*capturedResponse); ok {
+		c.upstreamErr = err
+	}
+	host := upstreamHostIn(err, fallbackURL)
+	cause, step := upstreamFailureCause(err)
+	http.Error(w, fmt.Sprintf("%s: %s: %s. Nothing is cached for this request; %s.", what, host, cause, step),
+		http.StatusBadGateway)
+}
+
+// capturedDiagnosis is err, as a handler's caller reports a response it
+// captured, carrying the upstream failure that response's 502 was built from.
+// Only the public body reads it: err's text and identity are what the caller
+// logs and tests, and the captured status is bodega's own, never upstream's.
+func capturedDiagnosis(c *capturedResponse, err error) error {
+	if c.upstreamErr == nil {
+		return err
+	}
+	return &upstreamEndpointError{endpoint: upstreamHostFrom(c.upstreamErr), diag: c.upstreamErr, err: err}
+}
+
+// upstreamHostIn is host:port of the upstream err failed against, taken from
+// the error where it carries an address, since a fallback in the fetch order or
+// a resolver's index read may be a different host from fallbackURL.
+func upstreamHostIn(err error, fallbackURL string) string {
+	if h := upstreamHostFrom(err); h != "" {
+		return h
+	}
+	if h := hostPort(fallbackURL); h != "" {
+		return h
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) && dns.Name != "" && !strings.ContainsAny(dns.Name, "/@ ") {
+		return dns.Name
+	}
+	return "the upstream"
+}
+
+// upstreamHostFrom is the host:port err itself records, or "" when it names
+// none.
+func upstreamHostFrom(err error) string {
+	var at *upstreamEndpointError
+	if errors.As(err, &at) && at.endpoint != "" {
+		return at.endpoint
+	}
+	var status *upstreamStatusError
+	if errors.As(err, &status) {
+		if h := hostPort(status.url); h != "" {
+			return h
+		}
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		if h := hostPort(uerr.URL); h != "" {
+			return h
+		}
+	}
+	return ""
+}
+
+// hostPort is rawURL's host and port, the scheme's port filled in when the URL
+// names none. Userinfo, path and query are dropped by construction.
+func hostPort(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return u.Hostname()
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// upstreamFailureCause classifies err into a fixed phrase and the step that
+// phrase calls for. DNS is tested ahead of the timeout because a lookup that
+// timed out is still a resolver fault, and TLS ahead of it for the same reason.
+func upstreamFailureCause(err error) (cause, step string) {
+	const route = "check this server's route to that host (DNS, firewall, proxy), or retry once it is back"
+	var at *upstreamEndpointError
+	if errors.As(err, &at) {
+		if at.diag != nil {
+			return upstreamFailureCause(at.diag)
+		}
+		if at.status != 0 {
+			return answeredStatusCause(at.status)
+		}
+	}
+	var status *upstreamStatusError
+	if errors.As(err, &status) {
+		return answeredStatusCause(status.status)
+	}
+	var limited *upstreamRateLimited
+	if errors.As(err, &limited) {
+		return answeredStatusCause(limited.status)
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "DNS lookup failed", route
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection refused", route
+	}
+	var (
+		recordErr  tls.RecordHeaderError
+		alertErr   tls.AlertError
+		verifyErr  *tls.CertificateVerificationError
+		unknownCA  x509.UnknownAuthorityError
+		hostErr    x509.HostnameError
+		invalidErr x509.CertificateInvalidError
+	)
+	if isTLSAlert(err) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
+		errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &invalidErr) {
+		return "TLS handshake failed", route
+	}
+	var nerr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()) {
+		return "timed out", route
+	}
+	return "unreachable", route
+}
+
+// isTLSAlert reports an alert crypto/tls sent or received during a handshake.
+// It returns those as a net.OpError around an unexported alert type, so the
+// op names it: these two are written by crypto/tls alone. Every node of the
+// chain is visited because errors.As stops at the first net.OpError, and
+// net/http wraps a TLS failure to an HTTPS proxy in a "proxyconnect" one. A
+// bare io.EOF is never TLS here: every read on every connection returns the
+// same value.
+func isTLSAlert(err error) bool {
+	if err == nil {
+		return false
+	}
+	if op, ok := err.(*net.OpError); ok && (op.Op == "remote error" || op.Op == "local error") {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return isTLSAlert(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if isTLSAlert(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func answeredStatusCause(status int) (cause, step string) {
+	if text := http.StatusText(status); text != "" {
+		return fmt.Sprintf("upstream answered HTTP %d %s", status, text), "retry once it is back"
+	}
+	return fmt.Sprintf("upstream answered HTTP %d", status), "retry once it is back"
+}
+
 // defaultRateLimitRetryAfter is the interval bodega tells a client to wait
 // when the upstream rate-limited it without saying for how long.
 const defaultRateLimitRetryAfter = "60"
@@ -1158,7 +1446,10 @@ func isDeltaSeconds(v string) bool {
 // The body quotes the interval only in one of RFC 9110's two forms. Anything
 // else is upstream text that may name a host, and the body goes to whoever
 // can reach the route, so it points at the header instead.
-func writeRateLimited(w http.ResponseWriter, limited *upstreamRateLimited) {
+func writeRateLimited(w http.ResponseWriter, err error, limited *upstreamRateLimited) {
+	if c, ok := w.(*capturedResponse); ok {
+		c.upstreamErr = err
+	}
 	retry := limited.clientRetryAfter()
 	wait := "the interval in its Retry-After header"
 	if isDeltaSeconds(retry) {
@@ -1236,12 +1527,12 @@ func (s *Server) spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
 		// declared-length check below ever runs, so this message has to carry
 		// the same fact: the spool is removed and nothing was cached.
 		sp.close()
-		return nil, fmt.Errorf("read upstream body from %s after %d bytes: %w — nothing was cached; retry, and check the upstream if it repeats", up.url, n, err)
+		return nil, atUpstream(up.url, fmt.Errorf("read upstream body from %s after %d bytes: %w — nothing was cached; retry, and check the upstream if it repeats", up.url, n, err))
 	}
 	if up.contentLength >= 0 && n != up.contentLength {
 		sp.close()
-		return nil, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
-			n, up.contentLength, up.url)
+		return nil, atUpstream(up.url, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			n, up.contentLength, up.url))
 	}
 	sp.sha256 = hex.EncodeToString(h.Sum(nil))
 	return sp, nil
@@ -1259,8 +1550,8 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 
 	// A declared length over the cap is refusable before a byte is read.
 	if up.contentLength > maxUpstreamBody {
-		return nil, "", fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; this response has to be parsed in memory and cannot carry that much",
-			up.contentLength, maxUpstreamBody, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; this response has to be parsed in memory and cannot carry that much",
+			up.contentLength, maxUpstreamBody, rawURL))
 	}
 
 	// One byte past the cap. Anything read there means the body was longer
@@ -1268,18 +1559,18 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	// checksum would then bless.
 	data, err := io.ReadAll(io.LimitReader(up.body, maxUpstreamBody+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("read upstream body: %w", err)
+		return nil, "", atUpstream(up.url, fmt.Errorf("read upstream body: %w", err))
 	}
 	if int64(len(data)) > maxUpstreamBody {
-		return nil, "", fmt.Errorf("upstream body exceeds bodega's %d-byte buffer: %s — nothing was cached; fetch this artifact out of band or serve it from storage",
-			maxUpstreamBody, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream body exceeds bodega's %d-byte buffer: %s — nothing was cached; fetch this artifact out of band or serve it from storage",
+			maxUpstreamBody, rawURL))
 	}
 	// A body shorter than the length the upstream declared is a cut transfer.
 	// Chunked and transparently-decompressed responses report -1 and are
 	// exempt, so this only fires where the upstream stated a number.
 	if up.contentLength >= 0 && int64(len(data)) != up.contentLength {
-		return nil, "", fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
-			len(data), up.contentLength, rawURL)
+		return nil, "", atUpstream(up.url, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			len(data), up.contentLength, rawURL))
 	}
 
 	return data, up.contentType, nil

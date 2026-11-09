@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -185,8 +186,8 @@ func TestMissFromSilentUpstreamStillFails(t *testing.T) {
 	rec := serveStale(s, ctx, store, key, up.url)
 	elapsed := time.Since(start)
 
-	if rec.Code != http.StatusBadGateway || rec.Body.String() != "upstream fetch failed\n" {
-		t.Fatalf("got %d %q, want the existing 502 upstream fetch failed", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway || !strings.HasPrefix(rec.Body.String(), "upstream fetch failed: ") || !strings.Contains(rec.Body.String(), ": timed out.") {
+		t.Fatalf("got %d %q, want the 502 upstream fetch failed, timed out", rec.Code, rec.Body.String())
 	}
 	if elapsed < clientTimeout {
 		t.Errorf("miss answered after %s, before the client gave up at %s", elapsed, clientTimeout)

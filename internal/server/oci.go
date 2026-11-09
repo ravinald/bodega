@@ -985,10 +985,10 @@ func (s *Server) ociManifestOpener(t ociTarget, store storage.ObjectStore, typ s
 		}
 		body, ct, answered := f.body, f.contentType, f.answered
 		if got := ociDigest(body); got != t.ref {
-			return nil, afterAnswer(ociMismatch(t, got))
+			return nil, afterAnswer(atUpstream(answered, ociMismatch(t, got)))
 		}
 		if got := ociArtifactType(body); got != typ {
-			return nil, afterAnswer(ociTypeChanged(t, typ, got))
+			return nil, afterAnswer(atUpstream(answered, ociTypeChanged(t, typ, got)))
 		}
 		mediaType := ociMediaType(ct, body)
 		if typ == manifest.TypeHelm {
@@ -1020,11 +1020,11 @@ func (s *Server) ociFetchManifest(ctx context.Context, t ociTarget, rawURL strin
 		return nil, afterAnswer(fmt.Errorf("read the manifest for %s:%s from %s: %w", t.name(), t.ref, answered, err))
 	}
 	if len(body) > ociMaxManifest {
-		return nil, afterAnswer(fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest))
+		return nil, afterAnswer(atUpstream(answered, fmt.Errorf("the manifest for %s:%s is over %d bytes, which no registry accepts on push", t.name(), t.ref, ociMaxManifest)))
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if ociIsSchema1(contentType, body) {
-		return nil, afterAnswer(s.ociSchema1Refusal(t))
+		return nil, afterAnswer(atUpstream(answered, s.ociSchema1Refusal(t)))
 	}
 	return &ociFetched{body: body, contentType: contentType, sentDigest: resp.Header.Get(ociDigestHeader), answered: answered}, nil
 }
@@ -1061,10 +1061,10 @@ func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
 		list.Tags = []string{}
 		seen := map[string]bool{}
 		budget := ociMaxTagList
-		answered := ""
+		answered, latest := "", ""
 		defer func() {
 			if answered != "" {
-				err = afterAnswer(err)
+				err = afterAnswer(atUpstream(latest, err))
 			}
 		}()
 		for next := rawURL; next != ""; {
@@ -1076,8 +1076,9 @@ func (s *Server) ociTagListOpener(t ociTarget) upstreamOpener {
 			if err != nil {
 				return nil, err
 			}
+			latest = answeredURL(resp, next)
 			if answered == "" {
-				answered = answeredURL(resp, next)
+				answered = latest
 			}
 			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
 			link := resp.Header.Get("Link")
@@ -1128,10 +1129,10 @@ func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
 		idx := emptyOCIReferrers()
 		seen := map[string]bool{}
 		budget := ociMaxManifest
-		answered := ""
+		answered, latest := "", ""
 		defer func() {
 			if answered != "" {
-				err = afterAnswer(err)
+				err = afterAnswer(atUpstream(latest, err))
 			}
 		}()
 		for next := rawURL; next != ""; {
@@ -1146,12 +1147,13 @@ func (s *Server) ociReferrersOpener(t ociTarget) upstreamOpener {
 				next = ""
 				continue
 			case answered != "" && err != nil:
-				return nil, fmt.Errorf("the referrers of %s@%s: page %s failed after an earlier page answered, so bodega serves none of them rather than part: %v", t.name(), t.ref, next, err)
+				return nil, detachUpstream(err, fmt.Sprintf("the referrers of %s@%s: page %s failed after an earlier page answered, so bodega serves none of them rather than part", t.name(), t.ref, next))
 			case err != nil:
 				return nil, err
 			}
+			latest = answeredURL(resp, next)
 			if answered == "" {
-				answered = answeredURL(resp, next)
+				answered = latest
 			}
 			b, err := io.ReadAll(io.LimitReader(resp.Body, int64(budget)+1))
 			link := resp.Header.Get("Link")
@@ -1417,7 +1419,7 @@ func answeredURL(resp *http.Response, rawURL string) string {
 // openUpstream would give, so proxyOrResolve tells a 404 from an outage.
 func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string) (*http.Response, error) {
 	if err := upstreamGuard(rawURL); err != nil {
-		return nil, err
+		return nil, atUpstream(rawURL, err)
 	}
 	pullScope := "repository:" + t.repo + ":pull"
 	resp, err := ociDo(ctx, rawURL, accept, s.ociTokens.get(t.registry, pullScope))
@@ -1426,16 +1428,22 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		challenge := resp.Header.Get("WWW-Authenticate")
+		challenger := answeredURL(resp, rawURL)
 		drainClose(resp)
 		params, ok := parseBearerChallenge(challenge)
 		if !ok {
-			return nil, fmt.Errorf("upstream %s answered 401 with no Bearer challenge bodega can follow (WWW-Authenticate %q)", rawURL, challenge)
+			return nil, answeredStatus(challenger, resp.StatusCode,
+				fmt.Errorf("upstream %s answered 401 with no Bearer challenge bodega can follow (WWW-Authenticate %q)", rawURL, challenge))
 		}
 		scope := params["scope"]
 		if scope == "" {
 			scope = pullScope
 		}
 		token, err := s.ociToken(ctx, t, params["realm"], params["service"], scope)
+		var unusable unusableRealmError
+		if errors.As(err, &unusable) {
+			return nil, answeredStatus(challenger, resp.StatusCode, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1451,10 +1459,10 @@ func (s *Server) ociGet(ctx context.Context, t ociTarget, rawURL, accept string)
 		return resp, nil
 	case http.StatusNotFound:
 		drainClose(resp)
-		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
+		return nil, answeredStatus(answeredURL(resp, rawURL), resp.StatusCode, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL))
 	default:
 		drainClose(resp)
-		return nil, &upstreamStatusError{url: rawURL, status: resp.StatusCode}
+		return nil, atUpstream(answeredURL(resp, rawURL), &upstreamStatusError{url: rawURL, status: resp.StatusCode})
 	}
 }
 
@@ -1471,14 +1479,17 @@ func ociDo(ctx context.Context, rawURL, accept, token string) (*http.Response, e
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	//nolint:gosec // G704: see above; the redirect hops are guarded by upstreamClient.
-	return upstreamClient.Do(req)
+	return doUpstream(upstreamClient, req)
 }
 
 func drainClose(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
 }
+
+// unusableRealmError is a challenge whose realm names no endpoint bodega can
+// ask, so the failure is the challenging response's and no token request's.
+type unusableRealmError struct{ error }
 
 // ociTokenClient is the upstream client with redirects refused. A token
 // request carries the credential, and a realm that redirects would choose
@@ -1496,7 +1507,7 @@ var ociTokenClient = &http.Client{
 func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scope string) (ociTokenEntry, error) {
 	ru, err := url.Parse(realm)
 	if err != nil || ru.Host == "" {
-		return ociTokenEntry{}, fmt.Errorf("registry %s named a token realm %q that is not an absolute URL", t.registry, realm)
+		return ociTokenEntry{}, unusableRealmError{fmt.Errorf("registry %s named a token realm %q that is not an absolute URL", t.registry, realm)}
 	}
 	up, _ := url.Parse(t.upstream)
 	if !strings.EqualFold(ru.Host, up.Host) && !s.ociTokenHostListed(ru.Hostname()) {
@@ -1512,7 +1523,7 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 	q.Set("scope", scope)
 	ru.RawQuery = q.Encode()
 	if err := upstreamGuard(ru.String()); err != nil {
-		return ociTokenEntry{}, err
+		return ociTokenEntry{}, atUpstream(ru.String(), err)
 	}
 	//nolint:gosec // G704: the realm passed the host list and upstreamGuard above.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ru.String(), nil)
@@ -1524,8 +1535,7 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		pw, _ := up.User.Password()
 		req.SetBasicAuth(up.User.Username(), pw)
 	}
-	//nolint:gosec // G704: see above.
-	resp, err := ociTokenClient.Do(req)
+	resp, err := doUpstream(ociTokenClient, req)
 	if err != nil {
 		return ociTokenEntry{}, fmt.Errorf("token request to %s for %s: %w", ru.Hostname(), t.registry, err)
 	}
@@ -1535,7 +1545,8 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		if up.User == nil {
 			next = "the registry may need a credential in its oci_upstreams URL"
 		}
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered %d for %s scope %q; %s", ru.Hostname(), resp.StatusCode, t.registry, scope, next)
+		return ociTokenEntry{}, answeredStatus(ru.String(), resp.StatusCode,
+			fmt.Errorf("token service %s answered %d for %s scope %q; %s", ru.Hostname(), resp.StatusCode, t.registry, scope, next))
 	}
 	var body struct {
 		Token       string `json:"token"`
@@ -1543,14 +1554,14 @@ func (s *Server) ociToken(ctx context.Context, t ociTarget, realm, service, scop
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered with a body that does not parse: %w", ru.Hostname(), err)
+		return ociTokenEntry{}, atUpstream(ru.String(), fmt.Errorf("token service %s answered with a body that does not parse: %w", ru.Hostname(), err))
 	}
 	tok := ociTokenEntry{value: body.Token}
 	if tok.value == "" {
 		tok.value = body.AccessToken
 	}
 	if tok.value == "" {
-		return ociTokenEntry{}, fmt.Errorf("token service %s answered with no token", ru.Hostname())
+		return ociTokenEntry{}, atUpstream(ru.String(), fmt.Errorf("token service %s answered with no token", ru.Hostname()))
 	}
 	life := ociDefaultTokenLifetime
 	if body.ExpiresIn > 0 {

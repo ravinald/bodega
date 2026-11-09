@@ -235,6 +235,13 @@ type capturedResponse struct {
 	status int
 	body   bytes.Buffer
 	tooBig bool
+	// upstreamErr is the failure a 502 or rate-limit 503 written here names, for a caller
+	// that has to report the upstream behind the response it captured.
+	upstreamErr error
+	// respondent is the URL of the server whose answer was captured, empty
+	// when it came from the cache, so a caller rejecting the document can
+	// name who sent it.
+	respondent string
 }
 
 func (c *capturedResponse) Header() http.Header { return c.header }
