@@ -24,6 +24,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -2003,5 +2004,143 @@ func TestReviewF112RemovedVersionUsesPersistedDate(t *testing.T) {
 	}
 	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
 		t.Errorf("persisted version's age check = %+v; want block", c)
+	}
+}
+
+func TestReviewF112ByHashDatesTheIndexActuallyServed(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	oldBody := objects["dists/fixture/universe/binary-amd64/Packages.gz"]
+	sum := sha256.Sum256([]byte(oldBody))
+	byHash := fmt.Sprintf("dists/fixture/universe/binary-amd64/by-hash/SHA256/%x", sum)
+	for rel, body := range objects {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		archive.setObject(rel, body)
+	}
+	archive.setObject(byHash, oldBody)
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK {
+		t.Fatalf("first Release = %d", code)
+	}
+	// The archive rotates after apt fetched Release; by-hash still serves its index.
+	for rel, body := range mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2")) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		archive.setObject(rel, body)
+	}
+	if code, body := mirrorGet(t, s, "/apt/"+byHash); code != http.StatusOK || string(body) != oldBody {
+		t.Fatalf("by-hash = %d; want the old index's exact bytes", code)
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("served first index's version = %+v ok=%v err=%v; want predating", d, ok, err)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version only in the later index = %d %q; want 403 under 7d block", code, body)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease {
+		t.Errorf("later index's version = %+v; want Release dated", d)
+	}
+}
+
+func TestReviewF112LaterArchitectureCannotGrandfatherNewSource(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, version string) {
+		release := "Date: " + date.Format(time.RFC1123) + "\nCodename: fixture\nComponents: universe\nArchitectures: amd64 arm64\nSHA256:\n"
+		for _, arch := range []string{"amd64", "arm64"} {
+			pool := "pool/universe/p/php8.5/php8.5-fpm_" + version + "_" + arch + ".deb"
+			body := fmt.Sprintf("Package: php8.5-fpm\nSource: php8.5\nVersion: %s\nArchitecture: %s\nFilename: %s\n\n", version, arch, pool)
+			gz := gzipFixture(body)
+			sum := sha256.Sum256(gz)
+			rest := "universe/binary-" + arch + "/Packages.gz"
+			release += fmt.Sprintf(" %x %d %s\n", sum, len(gz), rest)
+			archive.setObject("dists/fixture/"+rest, string(gz))
+			archive.setObject(pool, "deb "+version)
+		}
+		archive.setObject("dists/fixture/Release", release)
+	}
+	publish(now.Add(-24*time.Hour), "8.5.3-0ubuntu1")
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-amd64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("first amd64 index = %d", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Fatalf("first version = %+v; want predating", d)
+	}
+	fresh := now.Add(-time.Hour)
+	publish(fresh, "8.5.4-0ubuntu2")
+	for _, arch := range []string{"arm64", "amd64"} {
+		if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-"+arch+"/Packages.gz"); code != http.StatusOK {
+			t.Fatalf("second %s index = %d", arch, code)
+		}
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("source added after the codename's first read = %+v; want Release date %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new amd64 build after arm64's first read = %d %q; want 403 under 7d block", code, body)
+	}
+}
+
+// A version only an architecture nobody read listed when bodega found the
+// codename still predates bodega: the first Release's copy of that index is
+// read by hash before a later copy dates anything in it.
+func TestAptVersionDatesBackfillTheFirstReleasesUnreadIndex(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, versions map[string]string) {
+		release := "Date: " + date.Format(time.RFC1123) + "\nCodename: fixture\nComponents: universe\nArchitectures: amd64 arm64\nSHA256:\n"
+		for _, arch := range []string{"amd64", "arm64"} {
+			body := ""
+			if v := versions[arch]; v != "" {
+				body = fmt.Sprintf("Package: php8.5-fpm\nSource: php8.5\nVersion: %s\nArchitecture: %s\nFilename: pool/universe/p/php8.5/php8.5-fpm_%s_%s.deb\n\n", v, arch, v, arch)
+			}
+			gz := gzipFixture(body)
+			sum := sha256.Sum256(gz)
+			rest := "universe/binary-" + arch + "/Packages.gz"
+			release += fmt.Sprintf(" %x %d %s\n", sum, len(gz), rest)
+			archive.setObject("dists/fixture/"+rest, string(gz))
+			archive.setObject(fmt.Sprintf("dists/fixture/universe/binary-%s/by-hash/SHA256/%x", arch, sum), string(gz))
+		}
+		archive.setObject("dists/fixture/Release", release)
+	}
+	publish(now.Add(-24*time.Hour), map[string]string{"arm64": "8.5.3-0ubuntu1"})
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-amd64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("first amd64 index = %d", code)
+	}
+	fresh := now.Add(-time.Hour)
+	publish(fresh, map[string]string{"arm64": "8.5.4-0ubuntu2"})
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-arm64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("second arm64 index = %d", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("a version the first Release's unread arm64 index listed = %+v, want predating", d)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("a version the later arm64 index added = %+v, want Release date %s", d, fresh)
+	}
+}
+
+// An InRelease a client fetches records its Release like a plain one.
+func TestAptClearsignedBodyReadsInRelease(t *testing.T) {
+	in := "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nDate: Sun, 08 Nov 2026 06:00:00 UTC\nCodename: fixture\nSHA256:\n abc 1 universe/binary-amd64/Packages.gz\n-----BEGIN PGP SIGNATURE-----\n\nsig\n-----END PGP SIGNATURE-----\n"
+	release, err := deb822.ParseSingle(aptClearsignedBody([]byte(in)))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, err := aptReleaseDate(release); err != nil || !got.Equal(time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)) {
+		t.Errorf("Date = %v %v", got, err)
+	}
+	if got := aptReleaseDigests(release)["universe/binary-amd64/Packages.gz"]; got != "abc" {
+		t.Errorf("digest = %q, want abc", got)
+	}
+	if plain := []byte("Codename: x\n"); string(aptClearsignedBody(plain)) != string(plain) {
+		t.Error("a plain Release was rewritten")
 	}
 }

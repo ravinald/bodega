@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"path"
-	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -109,10 +110,12 @@ func (c *aptRouteCache) put(poolPath, upstreamURL string) {
 // handleAptMirrorDists proxies one path under a mirrored codename's dists/
 // tree.
 //
-// Nothing about the bytes is interpreted. The upstream Release names the
-// components, architectures and by-hash digests, apt reads them, and the next
-// request arrives with the path already composed — so an index bodega does not
-// parse is an index bodega cannot get wrong.
+// Nothing about the bytes is interpreted for the client. The upstream Release
+// names the components, architectures and by-hash digests, apt reads them, and
+// the next request arrives with the path already composed — so an index bodega
+// does not parse is an index bodega cannot get wrong. The age gate keeps a
+// copy of a Release or Packages response and records it once the client has
+// it, so what it dates is what the client was served.
 func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, codename, rest string) {
 	if rest == "" {
 		http.NotFound(w, r)
@@ -135,8 +138,15 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	immutable := aptDistsImmutable(rest)
 	markIndexResponse(r)
 
-	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
-	s.observeAptMirrorDists(context.WithoutCancel(r.Context()), codename, rest)
+	if r.Method != http.MethodGet || s.auditDB == nil || !aptDistsObserved(rest) {
+		s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+		return
+	}
+	capture := &aptIndexCapture{ResponseWriter: w}
+	s.serveAptMirror(capture, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	if capture.status == http.StatusOK && !capture.over {
+		s.observeAptMirrorDists(r.Context(), codename, rest, capture.body.Bytes())
+	}
 }
 
 // aptMirrorPkgName is the discovery row's package name for a path under a
@@ -440,73 +450,286 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[s
 	return nil
 }
 
-// recordAptVersionDates gives the age gate a date for each version one read of
-// codename's component/arch Packages lists that has none yet, and a source
-// version for each pool path. An index that does not parse records nothing:
-// marking it read on half its paragraphs would date the other half by this
-// Release on the next read, as if they had just appeared. A failure is logged
-// and costs only
-// those versions' coverage: the gate finds no record and leaves them
-// unchecked, and the next read tries again.
-func (s *Server) recordAptVersionDates(ctx context.Context, codename, component, arch string, release map[string]string, body []byte) {
+// The age gate's record of a mirrored codename is built from observations: a
+// Packages file bodega read or served, tied by its SHA256 to the recorded
+// Release that published those bytes. The codename's first recorded Release is
+// the archive as bodega found it, so the versions its indexes list predate
+// bodega; an index any later Release published dates the versions it adds by
+// that Release. Which reader comes first, which architecture a host asks for,
+// and whether the bytes came from cache or by-hash cannot move that boundary,
+// because it is a property of the bytes and not of the read.
+
+// recordAptRelease records the Packages files a Release of codename digests,
+// once per distinct Release.
+func (s *Server) recordAptRelease(ctx context.Context, codename string, release map[string]string) error {
+	ident := sha256.Sum256([]byte(release["Date"] + "\n" + release["SHA256"]))
+	if last, ok := s.aptReleaseRecorded.Load(codename); ok && last.([sha256.Size]byte) == ident {
+		return nil
+	}
+	date, _ := aptReleaseDate(release)
+	if _, err := s.auditDB.RecordAptRelease(context.WithoutCancel(ctx), codename, date, aptReleaseIndexes(release)); err != nil {
+		return err
+	}
+	s.aptReleaseRecorded.Store(codename, ident)
+	return nil
+}
+
+// aptReleaseIndexes is every binary Packages file a Release digests.
+func aptReleaseIndexes(release map[string]string) []audit.AptReleaseIndex {
+	var out []audit.AptReleaseIndex
+	for rel, sum := range aptReleaseDigests(release) {
+		component, arch, ok := aptPackagesIndexPath(rel)
+		if !ok || aptByHash(rel) {
+			continue
+		}
+		out = append(out, audit.AptReleaseIndex{Path: rel, Index: component + "/binary-" + arch, SHA256: sum})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// observeAptUpstreamIndex records one Packages file aptUpstreamRead checked
+// against release: rest is its Release-relative path and body its
+// decompressed bytes.
+func (s *Server) observeAptUpstreamIndex(ctx context.Context, codename, component, arch, rest string, release map[string]string, body []byte) {
 	if s.auditDB == nil {
 		return
 	}
-	key := codename + "/" + component + "/" + arch
-	sum := sha256.Sum256(body)
-	if last, ok := s.aptIndexDated.Load(key); ok && last.([sha256.Size]byte) == sum {
+	sum := aptReleaseDigests(release)[rest]
+	idx := component + "/binary-" + arch
+	if sum == "" || s.aptIndexDatedAs(codename, idx, sum) {
 		return
 	}
-	var entries []audit.AptIndexEntry
-	if err := deb822.ParseStreamRaw(bytes.NewReader(body), func(_ []byte, fields map[string]string) error {
-		entries = append(entries, audit.AptIndexEntry{Filename: strings.TrimSpace(fields["Filename"]),
-			Source: deb822.SourceName(fields), Version: aptSourceVersion(fields)})
-		return nil
-	}); err != nil {
-		s.logger.Warn("a mirrored apt index does not parse, so the age gate records nothing from it until a read that does",
-			"index", key, "error", err)
+	err := s.recordAptRelease(ctx, codename, release)
+	var snap audit.AptIndexSnapshot
+	var ok bool
+	if err == nil {
+		snap, ok, err = s.auditDB.LookupAptIndex(context.WithoutCancel(ctx), codename, sum)
+	}
+	if err == nil && !ok {
+		err = audit.ErrAptIndexUnknown
+	}
+	if err != nil {
+		s.logger.Warn("could not tie a mirrored apt index to its Release, so the age gate has not dated the versions it adds; the next read tries again",
+			"codename", codename, "index", rest, "error", err)
 		return
 	}
-	date, dateErr := aptReleaseDate(release)
-	datedBy, err := s.auditDB.RecordAptIndexVersions(context.WithoutCancel(ctx), codename, component, arch, date, entries)
-	switch {
-	case err != nil:
-		s.logger.Warn("could not record when mirrored apt versions were first listed, so the age gate leaves the new ones unchecked until the next read",
-			"index", key, "error", err)
-	case datedBy == "":
-		s.logger.Warn("a mirrored Release carries no usable Date:, so the versions its index adds stay undated until a read that has one",
-			"index", key, "error", dateErr)
-	default:
-		s.aptIndexDated.Store(key, sum)
-	}
+	s.recordAptIndex(ctx, codename, snap, body)
 }
 
-// observeAptMirrorDists records the versions behind one client read of a
-// mirrored codename's dists/ tree, when rest is a component/arch Packages
-// index or a by-hash path under one. The bytes the client got are not parsed
-// in place: they are read again through aptUpstreamRead, which checks them
-// against the Release they belong to and answers from metadata_ttl's cache, so
-// an index read within that window costs no second fetch.
-func (s *Server) observeAptMirrorDists(ctx context.Context, codename, rest string) {
-	component, arch, ok := aptPackagesIndexPath(rest)
-	if !ok || s.auditDB == nil {
+// observeAptMirrorDists records what one client read of a mirrored codename's
+// dists/ tree served: a Release or InRelease is recorded as a Release, and a
+// Packages file, named or by hash, is tied to the recorded Release that
+// publishes the exact bytes the client got. A digest no recorded Release
+// publishes sends bodega to the archive's current Release once; when that
+// does not publish it either, the bytes are of a Release bodega never saw and
+// nothing is recorded from them.
+func (s *Server) observeAptMirrorDists(ctx context.Context, codename, rest string, raw []byte) {
+	ctx = context.WithoutCancel(ctx)
+	if rest == "Release" || rest == "InRelease" {
+		release, err := deb822.ParseSingle(aptClearsignedBody(raw))
+		if err == nil {
+			err = s.recordAptRelease(ctx, codename, release)
+		}
+		if err != nil {
+			s.logger.Warn("could not record a mirrored Release a client fetched, so the age gate dates its indexes when it next reads one",
+				"codename", codename, "path", rest, "error", err)
+		}
 		return
 	}
-	release, err := s.aptUpstreamRelease(ctx, codename)
-	if err == nil {
-		var layout []aptUpstreamComponent
-		if layout, err = s.aptUpstreamComponents(codename, release); err == nil {
-			for _, comp := range layout {
-				if comp.name == component && slices.Contains(comp.arches, arch) {
-					_, err = s.aptUpstreamRead(ctx, codename, comp, arch, release, map[string]aptIndexRead{})
-				}
+	component, arch, ok := aptPackagesIndexPath(rest)
+	if !ok {
+		return
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	idx := component + "/binary-" + arch
+	if s.aptIndexDatedAs(codename, idx, digest) {
+		return
+	}
+	snap, ok, err := s.auditDB.LookupAptIndex(ctx, codename, digest)
+	if err == nil && !ok {
+		var release map[string]string
+		if release, err = s.aptUpstreamRelease(ctx, codename); err == nil {
+			if err = s.recordAptRelease(ctx, codename, release); err == nil {
+				snap, ok, err = s.auditDB.LookupAptIndex(ctx, codename, digest)
 			}
 		}
 	}
-	if err != nil {
-		s.logger.Warn("could not read a mirrored apt index a client fetched, so the age gate has not dated the versions it adds",
-			"codename", codename, "path", rest, "error", err)
+	var body []byte
+	if err == nil && ok {
+		body, err = aptDecompressIndex(codename, snap.Path, raw)
 	}
+	switch {
+	case err != nil:
+		s.logger.Warn("could not tie a mirrored apt index a client fetched to its Release, so the age gate has not dated the versions it adds",
+			"codename", codename, "path", rest, "error", err)
+	case !ok:
+		// apt's pdiffs reach here: a by-hash patch is no Packages file, and
+		// the pool index's own read dates the versions the patched index adds.
+		s.logger.Debug("no Release bodega recorded publishes the apt index a client fetched, so the age gate records nothing from these bytes",
+			"codename", codename, "path", rest, "sha256", digest)
+	default:
+		s.recordAptIndex(ctx, codename, snap, body)
+	}
+}
+
+// aptIndexDatedAs reports whether the versions of the Packages file whose
+// SHA256 is sum were the last ones recorded for codename's logical index idx,
+// so the readers sharing one index do not rewrite tens of thousands of rows
+// for bytes that have not changed.
+func (s *Server) aptIndexDatedAs(codename, idx, sum string) bool {
+	last, ok := s.aptIndexDated.Load(codename + "/" + idx)
+	return ok && last.(string) == sum
+}
+
+// recordAptIndex gives the age gate a date for each version one Packages file
+// of codename lists that has none yet, and a source version for each pool
+// path. An index that does not parse records nothing: dating half its
+// paragraphs would leave the other half to whatever reads it next. A failure
+// is logged and costs only those versions' coverage: the gate finds no record
+// and leaves them unchecked, and the next read tries again.
+//
+// A file a later Release published is preceded by the first Release's copy of
+// the same index when nothing has read that copy yet, fetched by hash, so a
+// version the archive already listed when bodega found it is not dated by the
+// first index of its architecture bodega happens to read afterwards.
+func (s *Server) recordAptIndex(ctx context.Context, codename string, snap audit.AptIndexSnapshot, body []byte) {
+	ctx = context.WithoutCancel(ctx)
+	entries, err := aptIndexEntries(body)
+	if err != nil {
+		s.logger.Warn("a mirrored apt index does not parse, so the age gate records nothing from it until a read that does",
+			"codename", codename, "index", snap.Path, "error", err)
+		return
+	}
+	if !snap.Initial {
+		s.backfillAptInitialIndex(ctx, codename, snap.Index)
+	}
+	datedBy, err := s.auditDB.RecordAptIndexVersions(ctx, codename, snap.SHA256, entries)
+	switch {
+	case err != nil:
+		s.logger.Warn("could not record when mirrored apt versions were first listed, so the age gate leaves the new ones unchecked until the next read",
+			"codename", codename, "index", snap.Path, "error", err)
+	case datedBy == "":
+		s.logger.Warn("the mirrored Release that publishes this index carries no usable Date:, so the versions it adds stay undated until a read that has one",
+			"codename", codename, "index", snap.Path)
+	default:
+		s.aptIndexDated.Store(codename+"/"+snap.Index, snap.SHA256)
+	}
+}
+
+// backfillAptInitialIndex records the versions of the first Release's copy of
+// codename's logical index idx when nothing has, reading it by hash from the
+// archive. When the archive no longer has it, the versions it listed are
+// dated by whichever later index bodega reads them in: later than they
+// appeared, so the gate errs toward holding them.
+func (s *Server) backfillAptInitialIndex(ctx context.Context, codename, idx string) {
+	ix, ok, err := s.auditDB.UnobservedAptInitialIndex(ctx, codename, idx, aptPackagesCompressions)
+	if err != nil || !ok {
+		if err != nil {
+			s.logger.Warn("could not check whether the first mirrored apt index was read", "codename", codename, "index", idx, "error", err)
+		}
+		return
+	}
+	raw, err := s.aptUpstreamFetch(ctx, codename, path.Dir(ix.Path)+"/by-hash/SHA256/"+ix.SHA256)
+	if err == nil {
+		if sum := sha256.Sum256(raw); hex.EncodeToString(sum[:]) != ix.SHA256 {
+			err = errors.New("the archive's by-hash path served bytes of another digest")
+		}
+	}
+	var body []byte
+	if err == nil {
+		body, err = aptDecompressIndex(codename, ix.Path, raw)
+	}
+	var entries []audit.AptIndexEntry
+	if err == nil {
+		entries, err = aptIndexEntries(body)
+	}
+	if err == nil {
+		_, err = s.auditDB.RecordAptIndexVersions(ctx, codename, ix.SHA256, entries)
+	}
+	if err != nil {
+		s.logger.Info("the first mirrored Release's copy of this apt index was never read and cannot be now, so the versions it listed are dated by the later Release bodega reads them under",
+			"codename", codename, "index", ix.Path, "error", err)
+	}
+}
+
+// aptIndexEntries is the pool Filename and source version of every paragraph
+// of one decompressed Packages file.
+func aptIndexEntries(body []byte) ([]audit.AptIndexEntry, error) {
+	var entries []audit.AptIndexEntry
+	err := deb822.ParseStreamRaw(bytes.NewReader(body), func(_ []byte, fields map[string]string) error {
+		entries = append(entries, audit.AptIndexEntry{Filename: strings.TrimSpace(fields["Filename"]),
+			Source: deb822.SourceName(fields), Version: aptSourceVersion(fields)})
+		return nil
+	})
+	return entries, err
+}
+
+// aptClearsignedBody is the signed text of an InRelease, or raw unchanged when
+// it is not clearsigned. bodega checks no signature here: the Release is read
+// only for the digests and Date: it publishes.
+func aptClearsignedBody(raw []byte) []byte {
+	const begin, sig = "-----BEGIN PGP SIGNED MESSAGE-----", "\n-----BEGIN PGP SIGNATURE-----"
+	if !bytes.HasPrefix(bytes.TrimLeft(raw, "\r\n"), []byte(begin)) {
+		return raw
+	}
+	_, text, ok := bytes.Cut(raw, []byte("\n\n"))
+	if !ok {
+		return raw
+	}
+	text, _, _ = bytes.Cut(text, []byte(sig))
+	lines := bytes.Split(text, []byte("\n"))
+	for i, l := range lines {
+		lines[i] = bytes.TrimPrefix(l, []byte("- "))
+	}
+	return bytes.Join(lines, []byte("\n"))
+}
+
+// aptIndexCapture keeps a copy of a dists/ response so the age gate can record
+// the exact bytes a client got, whichever of cache, upstream or by-hash
+// served them. Past maxUpstreamBody it stops copying and reports over.
+type aptIndexCapture struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+	over   bool
+}
+
+func (c *aptIndexCapture) WriteHeader(code int) {
+	if c.status == 0 {
+		c.status = code
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *aptIndexCapture) Write(b []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	n, err := c.ResponseWriter.Write(b)
+	if !c.over {
+		if int64(c.body.Len()+n) > maxUpstreamBody {
+			c.over = true
+			c.body = bytes.Buffer{}
+		} else {
+			c.body.Write(b[:n])
+		}
+	}
+	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the connection underneath.
+func (c *aptIndexCapture) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+// aptDistsObserved reports whether the age gate records what a client read of
+// dists/<codename>/rest served.
+func aptDistsObserved(rest string) bool {
+	if rest == "Release" || rest == "InRelease" {
+		return true
+	}
+	_, _, ok := aptPackagesIndexPath(rest)
+	return ok
 }
 
 // aptPackagesIndexPath is the component and architecture of a dists/ path
