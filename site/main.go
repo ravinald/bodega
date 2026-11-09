@@ -26,6 +26,7 @@ import (
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	east "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer/html"
 	"github.com/yuin/goldmark/text"
@@ -40,12 +41,21 @@ type page struct {
 	Group string
 	Kind  string // home, doc, page, colophon
 	Body  template.HTML
+	// Outline is the page's h2 headings, each with the h3s under it: the two
+	// levels the contents column opens below the page's own entry.
+	Outline []heading
+}
+
+type heading struct {
+	Title, ID string
+	Children  []heading
 }
 
 type entry struct {
 	Num         string
 	Title, Href string
 	Here        bool
+	Children    []heading
 }
 
 type group struct {
@@ -243,6 +253,11 @@ func (g *generator) render(src []byte, srcPath string) (string, string) {
 		}
 		return ast.WalkContinue, nil
 	})
+	sectionLevel := 2
+	if srcPath == "docs/usage.md" {
+		sectionLevel = 3 // demote makes each ### a page's h2
+	}
+	g.addIcons(doc, src, sectionLevel)
 	var buf bytes.Buffer
 	if err := md.Renderer().Render(&buf, src, doc); err != nil {
 		log.Fatal(err)
@@ -360,6 +375,7 @@ func main() {
 			p.Out, p.Title = indexed(docOut(c.src)), t
 			p.Body = template.HTML(b)
 		}
+		p.Outline = outline(string(p.Body))
 		pages = append(pages, p)
 		byKey[key(c)] = p
 	}
@@ -390,7 +406,7 @@ func main() {
 				groups = append(groups, group{Name: c.group})
 			}
 			gr := &groups[len(groups)-1]
-			e := entry{Num: fmt.Sprintf("%02d", n), Title: target.Title, Href: *base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p}
+			e := entry{Num: strconv.Itoa(n), Title: target.Title, Href: *base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p, Children: target.Outline}
 			gr.Entries = append(gr.Entries, e)
 			if e.Here {
 				gr.Here, here = true, e
@@ -460,10 +476,28 @@ func contentsPage(pages []*page, byKey map[string]*page, base string) *page {
 			fmt.Fprintf(&b, "<h2>%s</h2>\n<ol class=\"contents\">\n", template.HTMLEscapeString(c.group))
 		}
 		p := byKey[c.src+"#"+c.section]
-		fmt.Fprintf(&b, "<li><span>%02d</span><a href=\"%s%s\">%s</a></li>\n", n, base, strings.TrimSuffix(p.Out, "index.html"), template.HTMLEscapeString(p.Title))
+		fmt.Fprintf(&b, "<li><span>%d</span><a href=\"%s%s\">%s</a></li>\n", n, base, strings.TrimSuffix(p.Out, "index.html"), template.HTMLEscapeString(p.Title))
 	}
 	b.WriteString("</ol>\n")
 	return &page{Out: "docs/index.html", Title: "Documentation", Kind: "page", Body: template.HTML(b.String())}
+}
+
+var outlineHeading = regexp.MustCompile(`<h([23]) id="([^"]+)">(.*?)</h[23]>`)
+
+// outline nests each h3 under the h2 before it. An h3 with no h2 above it is
+// listed at the top level rather than dropped.
+func outline(body string) []heading {
+	var out []heading
+	for _, m := range outlineHeading.FindAllStringSubmatch(body, -1) {
+		h := heading{ID: m[2], Title: stdhtml.UnescapeString(stripTags(m[3]))}
+		if m[1] == "2" || len(out) == 0 {
+			out = append(out, h)
+			continue
+		}
+		last := &out[len(out)-1]
+		last.Children = append(last.Children, h)
+	}
+	return out
 }
 
 var tags = regexp.MustCompile(`<[^>]+>`)
@@ -528,7 +562,7 @@ func renderCoverage(file, base string) string {
 	marks := map[string]string{"yes": "yes", "no": "no", "partial": "part", "n/a": "–"}
 	for _, p := range f.Packages {
 		fmt.Fprintf(&b, "<tr data-type=\"%s\" data-rank=\"%d\" data-coverage=\"%d\"><th scope=\"row\">", e(p.ID), verdictRank(p.Verdict), coveragePercent(p.Coverage))
-		fmt.Fprintf(&b, "<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s</td><td class=\"num\">%s</td>", e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage))
+		fmt.Fprintf(&b, "%s<a href=\"#%s\">%s</a></th><td class=\"verdict %s\">%s</td><td class=\"num\">%s</td>", labelIcon(base, p.ID), e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage))
 		for _, ft := range p.Features {
 			mark, ok := marks[ft.Value]
 			if !ok {
@@ -542,7 +576,7 @@ func renderCoverage(file, base string) string {
 
 	b.WriteString("<h2 id=\"evidence\">Evidence</h2>\n<dl class=\"evidence\">\n")
 	for _, p := range f.Packages {
-		fmt.Fprintf(&b, "<dt id=\"%s\">%s <span class=\"verdict %s\">%s</span> <span>%s</span></dt>\n<dd><p>%s.</p>", e(p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage), e(capitalize(p.Reason)))
+		fmt.Fprintf(&b, "<dt id=\"%s\">%s%s <span class=\"verdict %s\">%s</span> <span>%s</span></dt>\n<dd><p>%s.</p>", e(p.ID), labelIcon(base, p.ID), e(p.ID), verdictClass(p.Verdict), e(p.Verdict), e(p.Coverage), e(capitalize(p.Reason)))
 		if len(p.Runs) > 0 {
 			b.WriteString("<ul class=\"runs\">")
 			for _, r := range p.Runs {
@@ -750,4 +784,150 @@ func copyTree(from, to string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// iconTerms maps a word naming an operating system or package ecosystem to
+// the Simple Icons slug drawn before it. Words with an everyday meaning (go,
+// binary, ports) are left out: an icon before "ports" in a sentence about TCP
+// would be wrong more often than right.
+var iconTerms = map[string]string{
+	"apt": "debian", "Debian": "debian", "Ubuntu": "ubuntu",
+	"rpm": "redhat", "dnf": "redhat", "RHEL": "redhat", "Rocky": "rockylinux", "Rocky Linux": "rockylinux",
+	"Linux": "linux", "FreeBSD": "freebsd", "freebsd": "freebsd", "pkg": "freebsd", "macOS": "apple",
+	"pypi": "pypi", "PyPI": "pypi", "pip": "pypi", "npm": "npm", "cargo": "rust", "Cargo": "rust",
+	"gomod": "go", "GOPROXY": "go", "git": "git", "Git": "git", "helm": "helm", "Helm": "helm",
+	"oci": "opencontainersinitiative", "OCI": "opencontainersinitiative", "Docker": "docker",
+	"maven": "apachemaven", "Maven": "apachemaven", "rubygems": "rubygems", "RubyGems": "rubygems",
+}
+
+var iconWord = func() *regexp.Regexp {
+	words := make([]string, 0, len(iconTerms))
+	for w := range iconTerms {
+		words = append(words, regexp.QuoteMeta(w))
+	}
+	// Longest first, so "Rocky Linux" wins over "Rocky".
+	sort.Slice(words, func(i, j int) bool {
+		return len(words[i]) > len(words[j]) || len(words[i]) == len(words[j]) && words[i] < words[j]
+	})
+	return regexp.MustCompile(strings.Join(words, "|"))
+}()
+
+func iconSVG(base, slug string) string {
+	return fmt.Sprintf(`<svg class="ico ico-%s" aria-hidden="true" focusable="false"><use href="%sicons.svg#i-%s"></use></svg>`, slug, base, slug)
+}
+
+// standalone reports whether the match at val[i:j] is a word on its own:
+// apt-get, npm/lodash, go.mod and GitHub are not the terms they start with,
+// while a sentence ending "...for apt." is.
+func standalone(val []byte, i, j int) bool {
+	glued := func(r byte) bool {
+		return r == '-' || r == '_' || r == '/' || r == '@' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
+	}
+	if i > 0 && (glued(val[i-1]) || val[i-1] == '.') {
+		return false
+	}
+	if j < len(val) && glued(val[j]) {
+		return false
+	}
+	if j+1 < len(val) && val[j] == '.' && glued(val[j+1]) {
+		return false
+	}
+	return true
+}
+
+// addIcons draws an icon before the first plain-text mention of each
+// ecosystem in each section, the part of a page under one rendered h2. Code,
+// headings and link text never get one: code is a literal someone pastes, and
+// a heading or link already stands out. A table cell holding nothing but a
+// term is a row label, so it gets one wherever it sits.
+func (g *generator) addIcons(doc ast.Node, src []byte, sectionLevel int) {
+	var events []ast.Node
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch n := n.(type) {
+		case *ast.Heading:
+			if n.Level <= sectionLevel {
+				events = append(events, n)
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.CodeSpan, *ast.Link, *ast.AutoLink, *ast.Image, *ast.FencedCodeBlock, *ast.CodeBlock, *ast.HTMLBlock, *ast.RawHTML:
+			return ast.WalkSkipChildren, nil
+		case *east.TableCell:
+			events = append(events, n)
+			return ast.WalkSkipChildren, nil
+		case *ast.Text:
+			events = append(events, n)
+		}
+		return ast.WalkContinue, nil
+	})
+	seen := map[string]bool{}
+	for _, ev := range events {
+		switch n := ev.(type) {
+		case *ast.Heading:
+			seen = map[string]bool{}
+		case *east.TableCell:
+			g.labelCell(n, src)
+		case *ast.Text:
+			g.iconText(n, src, seen)
+		}
+	}
+}
+
+func (g *generator) iconNode(slug string) ast.Node {
+	s := ast.NewString([]byte(iconSVG(g.base, slug)))
+	s.SetCode(true) // goldmark writes a code String unescaped
+	return s
+}
+
+func (g *generator) iconText(n *ast.Text, src []byte, seen map[string]bool) {
+	if n.IsRaw() {
+		return
+	}
+	seg := n.Segment
+	val := seg.Value(src)
+	parent, cur := n.Parent(), 0
+	for _, m := range iconWord.FindAllIndex(val, -1) {
+		slug := iconTerms[string(val[m[0]:m[1]])]
+		if seen[slug] || !standalone(val, m[0], m[1]) {
+			continue
+		}
+		seen[slug] = true
+		if m[0] > cur {
+			parent.InsertBefore(parent, n, ast.NewTextSegment(text.NewSegment(seg.Start+cur, seg.Start+m[0])))
+		}
+		parent.InsertBefore(parent, n, g.iconNode(slug))
+		cur = m[0]
+	}
+	n.Segment = seg.WithStart(seg.Start + cur)
+}
+
+func (g *generator) labelCell(cell *east.TableCell, src []byte) {
+	only := cell.FirstChild()
+	if only == nil || only.NextSibling() != nil {
+		return
+	}
+	inner := ast.Node(only)
+	if cs, ok := only.(*ast.CodeSpan); ok {
+		if inner = cs.FirstChild(); inner == nil || inner.NextSibling() != nil {
+			return
+		}
+	}
+	t, ok := inner.(*ast.Text)
+	if !ok {
+		return
+	}
+	if slug, ok := iconTerms[strings.TrimSpace(string(t.Segment.Value(src)))]; ok {
+		cell.InsertBefore(cell, only, g.iconNode(slug))
+	}
+}
+
+// labelIcon is the icon for a coverage row named by a package type, or nothing
+// for a type with no mark.
+func labelIcon(base, id string) string {
+	if slug, ok := iconTerms[id]; ok {
+		return iconSVG(base, slug)
+	}
+	return ""
 }
