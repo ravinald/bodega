@@ -2144,3 +2144,62 @@ func TestAptClearsignedBodyReadsInRelease(t *testing.T) {
 		t.Error("a plain Release was rewritten")
 	}
 }
+
+func TestReviewF112BackgroundRefreshRecordsTheIndexItReads(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, deb mirrorOSVDeb) map[string]string {
+		objects := mirrorOSVDists(mirroredCodename, deb)
+		for rel, body := range objects {
+			if strings.HasSuffix(rel, "/Release") {
+				body = "Date: " + date.Format(time.RFC1123) + "\n" + body
+				objects[rel] = body
+			}
+			archive.setObject(rel, body)
+		}
+		return objects
+	}
+	get := func(rest string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/apt/dists/fixture/"+rest, nil)
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", rest, w.Code, w.Body.String())
+		}
+		return w
+	}
+	const rest = "universe/binary-amd64/Packages.gz"
+	first := publish(now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	get("Release")
+	get(rest)
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Fatalf("first version = %+v; want predating", d)
+	}
+	fresh := now.Add(-time.Hour)
+	second := publish(fresh, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	get("Release")
+	s.cache.StaleGrace = time.Millisecond
+	release := archive.hold(t)
+	w := get(rest)
+	release()
+	if w.Body.String() != first["dists/fixture/"+rest] {
+		t.Fatal("the request did not take the stale response path")
+	}
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	key := manifest.AptKey("dists/fixture/" + rest)
+	waitFor(t, func() bool { return cachedBody(t, store, key) == second["dists/fixture/"+rest] })
+	waitFor(t, refreshIdle(s, key))
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("completed background index read: record=%+v ok=%v err=%v; want Release date %s", d, ok, err, fresh)
+	}
+	// Rotation must not erase a version the completed refresh already read.
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("young version read by the refresh, then rotated out = %d %q; want 403 under 7d block", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("age admission = %+v; want block", c)
+	}
+}

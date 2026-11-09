@@ -505,6 +505,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 	if store != nil {
 		s.fillCache(ctx, store, s3Key, spool.path(), up.url, spool.sha256, spool.size)
 	}
+	s.noteFetched(ctx, spool)
 
 	// After the store write and before the body: by here the fetch has been
 	// verified and cached, so the row names an upstream that actually answered
@@ -714,7 +715,35 @@ func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstream
 	}
 	defer res.spool.close()
 	s.fillCache(ctx, store, s3Key, res.spool.path(), res.up.url, res.spool.sha256, res.spool.size)
+	s.noteFetched(ctx, res.spool)
 	s.logFor(ctx).Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
+}
+
+// fetchObserverCtxKey carries a func a handler wants called with the bytes of
+// every upstream fetch proxyOrCache completes for its request, including a
+// stale refresh that finishes after the response went out. What the client
+// was served and what bodega read can differ, and a handler that records what
+// bodega read cannot learn of the second from the response alone.
+type fetchObserverCtxKey struct{}
+
+func withFetchObserver(r *http.Request, observe func(ctx context.Context, raw []byte)) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), fetchObserverCtxKey{}, observe))
+}
+
+// noteFetched hands a completed fetch's bytes to the request's observer. A
+// body past maxUpstreamBody is not read into memory, and the observer is not
+// called for it.
+func (s *Server) noteFetched(ctx context.Context, spool *spooledUpstream) {
+	observe, ok := ctx.Value(fetchObserverCtxKey{}).(func(context.Context, []byte))
+	if !ok || spool == nil || spool.size > maxUpstreamBody {
+		return
+	}
+	raw, err := os.ReadFile(spool.path())
+	if err != nil {
+		s.logFor(ctx).Warn("could not reread a fetched upstream body for its observer, so what bodega read goes unrecorded", "path", spool.path(), "error", err)
+		return
+	}
+	observe(context.WithoutCancel(ctx), raw)
 }
 
 // notFoundPrefix holds one record per path every upstream answered 404 for.

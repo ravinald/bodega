@@ -115,7 +115,9 @@ func (c *aptRouteCache) put(poolPath, upstreamURL string) {
 // the next request arrives with the path already composed — so an index bodega
 // does not parse is an index bodega cannot get wrong. The age gate keeps a
 // copy of a Release or Packages response and records it once the client has
-// it, so what it dates is what the client was served.
+// it, so what it dates is what the client was served, and records every body
+// bodega fetched for the request as well, including a stale_grace refresh
+// that completes after the client was answered from the older copy.
 func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, codename, rest string) {
 	if rest == "" {
 		http.NotFound(w, r)
@@ -143,9 +145,54 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 		return
 	}
 	capture := &aptIndexCapture{ResponseWriter: w}
-	s.serveAptMirror(capture, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	fetched := &aptFetchedIndexes{observe: func(ctx context.Context, raw []byte) {
+		s.observeAptMirrorDists(ctx, codename, rest, raw)
+	}}
+	s.serveAptMirror(capture, withFetchObserver(r, fetched.add), s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	var served []byte
 	if capture.status == http.StatusOK && !capture.over {
-		s.observeAptMirrorDists(r.Context(), codename, rest, capture.body.Bytes())
+		served = capture.body.Bytes()
+		s.observeAptMirrorDists(r.Context(), codename, rest, served)
+	}
+	fetched.served(r.Context(), served)
+}
+
+// aptFetchedIndexes records the dists/ bodies bodega fetched for one request
+// in the order the gate needs: what the client was served first, then any
+// body a fetch read that differs from it. A fetch that completes while the
+// request is still serving is held until the served copy is recorded, because
+// a stale response is the older snapshot and recording the refresh first would
+// date the versions it adds as predating the one the client got. A fetch that
+// completes after the request returned, a stale_grace refresh, is recorded the
+// moment it completes, since nothing else will.
+type aptFetchedIndexes struct {
+	observe func(ctx context.Context, raw []byte)
+	mu      sync.Mutex
+	done    bool
+	pending [][]byte
+}
+
+func (f *aptFetchedIndexes) add(ctx context.Context, raw []byte) {
+	f.mu.Lock()
+	if !f.done {
+		f.pending = append(f.pending, raw)
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+	f.observe(ctx, raw)
+}
+
+func (f *aptFetchedIndexes) served(ctx context.Context, served []byte) {
+	f.mu.Lock()
+	f.done = true
+	pending := f.pending
+	f.pending = nil
+	f.mu.Unlock()
+	for _, raw := range pending {
+		if !bytes.Equal(raw, served) {
+			f.observe(context.WithoutCancel(ctx), raw)
+		}
 	}
 }
 
