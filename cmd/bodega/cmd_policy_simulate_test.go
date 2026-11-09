@@ -335,3 +335,57 @@ func TestReviewSimulationDoesNotInventChecksumPolicyChanges(t *testing.T) {
 		t.Errorf("simulation fetched the same checksum record %d times, want one shared answer", got)
 	}
 }
+
+func TestReviewFreeBSDSimulationDoesNotReportFalseNoChange(t *testing.T) {
+	f := newPrefetchFixture(t, policy.ActionWarn)
+	adb := f.open(t)
+	defer adb.Close()
+	if err := adb.SetOSVPolicy(t.Context(), audit.OSVPolicy{Ecosystem: manifest.TypeFreeBSD, Action: policy.ActionWarn}); err != nil {
+		t.Fatal(err)
+	}
+	if err := adb.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeFreeBSD, PkgName: "openssl", PkgVersion: "3.0.15,1",
+		Decision: audit.AdmissionAdmitted, DecidedAt: time.Now(),
+		Checks: []audit.AdmissionCheck{{Check: audit.CheckOSV, Action: policy.ActionWarn, Status: audit.CheckWarn}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proposed, err := parsePolicyChange(adb, []string{"freebsd=block"}, nil, nil, nil, "")
+	if err != nil {
+		if !strings.Contains(err.Error(), "freebsd") {
+			t.Fatal(err)
+		}
+		return
+	}
+	cfg, err := loadConfig(&globalFlags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<vuxml><vuln vid="review-vid"><topic>OpenSSL affected</topic><affects><package><name>openssl</name><range><lt>3.0.16,1</lt></range></package></affects></vuln></vuxml>`))
+	}))
+	defer feed.Close()
+	db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+	db.VuXMLURL = feed.URL
+	if _, err := db.Sync(t.Context(), policy.VuXMLEcosystem); err != nil {
+		t.Fatal(err)
+	}
+	ck := policy.NewOSVChecker(proposed)
+	ck.LocalDB = db
+	actual := ck.Check(t.Context(), &manifest.PackageManifest{Type: manifest.TypeFreeBSD, Name: "openssl"},
+		&manifest.VersionEntry{Version: "3.0.15,1", Metadata: map[string]string{policy.FreeBSDABIKey: "FreeBSD:14:amd64"}})
+	if actual.Action != policy.ActionBlock {
+		t.Fatalf("fetch decision = %+v; want block", actual)
+	}
+	store, err := loadStore(&globalFlags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim, err := simulatePolicy(t.Context(), cfg, adb, store, proposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sim.Evaluated != 1 || len(sim.Changes) != 1 || sim.Changes[0].Name != "openssl" || sim.Changes[0].After != audit.AdmissionPolicyBlocked {
+		t.Fatalf("freebsd warn -> block: simulation=%+v; fetch action=%s", sim, actual.Action)
+	}
+}

@@ -207,6 +207,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		// Load parses this one, so the string filler's "value-<key>" is
 		// refused before the round trip can measure anything.
 		"osv_db_max_age":            "72h",
+		"freebsd_vuxml_url":         "https://vuxml.example.org/freebsd/vuln.xml.xz",
 		"upstream_connect_timeout":  "2s",
 		"stale_grace":               "1s",
 		"rpm_profile_build_timeout": "20m",
@@ -940,5 +941,16 @@ func TestReviewHelmKeyringPrefixNeedsHostname(t *testing.T) {
 	_, err := config.Load(t.TempDir(), "", "", "", false, false)
 	if err == nil || !strings.Contains(err.Error(), "names no host") {
 		t.Fatalf("helm_keyrings[%q]: error = %v; want missing-host refusal", prefix, err)
+	}
+}
+
+// freebsd_vuxml_url is the one source of the FreeBSD advisory database, and
+// VuXML is not signed on that path, so a plain-http URL is refused at Load.
+func TestLoadRefusesAVuXMLURLThatIsNotHTTPS(t *testing.T) {
+	for _, raw := range []string{"http://vuxml.freebsd.org/freebsd/vuln.xml.xz", "vuln.xml.xz", "https://user:pw@mirror/vuln.xml"} {
+		writeConfig(t, `{"freebsd_vuxml_url":"`+raw+`"}`)
+		if _, err := config.Load(t.TempDir(), "", "", "", false, false); err == nil || !strings.Contains(err.Error(), "freebsd_vuxml_url") {
+			t.Errorf("Load(freebsd_vuxml_url=%q) = %v, want a refusal naming the key", raw, err)
+		}
 	}
 }

@@ -173,6 +173,10 @@ type osvIndex struct {
 	// release; see osvIndexFor. One without it is keyed by name alone, which
 	// no rpm lookup reads, so Match refuses it rather than answer clean.
 	ByRelease bool `json:"by_release,omitempty"`
+	// Patterns lists the Packages keys that are fnmatch patterns rather than
+	// names. Only VuXML writes them: pkg audit matches a <name> as a glob, so
+	// a lookup reads every pattern that matches as well as its own key.
+	Patterns []string `json:"patterns,omitempty"`
 }
 
 // osvRecordList is the records one package key carries, shared across the keys
@@ -238,7 +242,10 @@ type OSVDatabase struct {
 
 	// ExportBase is the bucket Sync fetches from; overridden in tests.
 	ExportBase string
-	HTTP       *http.Client
+	// VuXMLURL is where the FreeBSD ecosystem is fetched from, which is not
+	// OSV's bucket: VuXML is FreeBSD's own feed. freebsd_vuxml_url sets it.
+	VuXMLURL string
+	HTTP     *http.Client
 
 	mu     sync.Mutex
 	loaded map[string]cachedIndex
@@ -291,6 +298,7 @@ func NewOSVDatabase(dir string) *OSVDatabase {
 	return &OSVDatabase{
 		dir:        dir,
 		ExportBase: DefaultOSVExportBase,
+		VuXMLURL:   DefaultVuXMLURL,
 		// Generous next to the 15s admission timeout: this is one operator
 		// command pulling a few hundred megabytes, not a per-version query.
 		HTTP:   &http.Client{Timeout: 10 * time.Minute},
@@ -368,6 +376,22 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 	for _, source := range sources {
 		group := bySource[source]
 		src := fmt.Sprintf("%s/%s/all.zip", strings.TrimSuffix(d.ExportBase, "/"), source)
+		read := func(path string) (map[string]*osvIndex, map[string]int, error) {
+			return distill(group, path, trimEnumerated)
+		}
+		if source == VuXMLEcosystem {
+			src = d.VuXMLURL
+			if src == "" {
+				src = DefaultVuXMLURL
+			}
+			read = func(path string) (map[string]*osvIndex, map[string]int, error) {
+				idx, n, err := distillVuXML(path)
+				if err != nil {
+					return nil, nil, err
+				}
+				return map[string]*osvIndex{VuXMLEcosystem: idx}, map[string]int{VuXMLEcosystem: n}, nil
+			}
+		}
 		zipPath, err := d.download(ctx, src)
 		if err != nil {
 			for _, eco := range group {
@@ -375,7 +399,7 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 			}
 			continue
 		}
-		indexes, records, err := distill(group, zipPath, trimEnumerated)
+		indexes, records, err := read(zipPath)
 		os.Remove(zipPath)
 		if err != nil {
 			for _, eco := range group {
@@ -478,7 +502,22 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 		return nil, nil, fmt.Errorf("the %s index was written before rpm advisories were kept per release, so it cannot tell %s's records from another release's; run `bodega policy osv sync rpm`", index, ecosystem)
 	}
 	order := osvVersionOrder(ecosystem)
-	for _, rec := range idx.Packages[key] {
+	// pkg audit compares a glob-free VuXML name with strcmp and any other one
+	// with fnmatch alone, so a name spelled like a pattern is not matched by
+	// equality.
+	var candidates []*osvRecord
+	if index != VuXMLEcosystem || !isVuXMLPattern(key) {
+		candidates = idx.Packages[key]
+	}
+	for _, p := range idx.Patterns {
+		if vuxmlNameMatches(p, name) {
+			candidates = append(candidates[:len(candidates):len(candidates)], idx.Packages[p]...)
+		}
+	}
+	// One advisory can reach a package through a name and a pattern both, so
+	// a record is reported once, and an evaluated hit outranks a skip.
+	hits, skips := map[string]bool{}, map[string]bool{}
+	for _, rec := range candidates {
 		hit, unorderable := false, ""
 		for _, aff := range rec.Affected {
 			matched, bad := aff.affects(order, version)
@@ -491,11 +530,22 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 			}
 		}
 		switch {
-		case hit:
+		case hit && !hits[rec.ID]:
+			hits[rec.ID] = true
 			vulns = append(vulns, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity, Malicious: rec.Malicious})
-		case unorderable != "":
+		case !hit && unorderable != "" && !skips[rec.ID]:
+			skips[rec.ID] = true
 			skipped = append(skipped, fmt.Sprintf("%s (bound %q)", rec.ID, unorderable))
 		}
+	}
+	if len(skips) > 0 && len(hits) > 0 {
+		kept := skipped[:0]
+		for _, s := range skipped {
+			if id, _, _ := strings.Cut(s, " "); !hits[id] {
+				kept = append(kept, s)
+			}
+		}
+		skipped = kept
 	}
 	sort.Slice(vulns, func(i, j int) bool { return vulns[i].ID < vulns[j].ID })
 	sort.Strings(skipped)
@@ -553,7 +603,8 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 func (d *OSVDatabase) download(ctx context.Context, src string) (string, error) {
 	//nolint:gosec // G704: src is ExportBase (operator config, defaulting to
 	// OSV's bucket) plus an ecosystem validEcosystemFile has already refused a
-	// path separator in. Nothing from a manifest or a request reaches it.
+	// path separator in, or VuXMLURL, which is operator config alone. Nothing
+	// from a manifest or a request reaches it.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 	if err != nil {
 		return "", err
@@ -840,12 +891,13 @@ func validEcosystemFile(ecosystem string) error {
 
 // osvPackageKey normalizes a package name to the form the index is keyed by.
 // PyPI matches per PEP 503, npm and crates.io are case-insensitive, and Go
-// module paths are case-sensitive and are left alone.
+// module paths and FreeBSD package names (pkg audit compares them with a
+// case-sensitive fnmatch) are left alone.
 func osvPackageKey(ecosystem, name string) string {
 	switch ecosystem {
 	case "PyPI":
 		return manifest.CanonicalPypiName(name)
-	case "Go":
+	case "Go", VuXMLEcosystem:
 		return name
 	}
 	return strings.ToLower(name)

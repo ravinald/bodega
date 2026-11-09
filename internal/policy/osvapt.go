@@ -100,6 +100,9 @@ func aptServedReleases(suites []string) []string {
 // exports. unmapped is returned rather than dropped so a sync reports the
 // suites it skipped instead of fetching a smaller set in silence.
 func OSVExportsFor(registryType string, aptSuites []string) (exports, unmapped []string) {
+	if registryType == manifest.TypeFreeBSD {
+		return []string{VuXMLEcosystem}, nil
+	}
 	if registryType != manifest.TypeApt {
 		if eco := osvEcosystemFor[registryType]; eco != "" {
 			return []string{eco}, nil
@@ -212,6 +215,13 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 		}
 		return osvLookup{targets: []osvTarget{{ecosystem: eco, name: pm.Name}},
 			queried: fmt.Sprintf("%s in %s", pm.Name, eco)}
+	}
+	if pm.Type == manifest.TypeFreeBSD {
+		if ve.Metadata[FreeBSDABIKey] == "" {
+			return osvLookup{reason: fmt.Sprintf("freebsd entry %s is a repository, and VuXML advisories name packages; each package is checked as it is fetched", pm.Name)}
+		}
+		return osvLookup{targets: []osvTarget{{ecosystem: VuXMLEcosystem, name: pm.Name}},
+			queried: fmt.Sprintf("%s in VuXML for %s", pm.Name, ve.Metadata[FreeBSDABIKey])}
 	}
 	if pm.Type != manifest.TypeApt {
 		eco := osvEcosystemFor[pm.Type]
