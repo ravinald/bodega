@@ -131,3 +131,28 @@ func TestSLSADocumentsChecksumDatabase(t *testing.T) {
 		t.Errorf("the gap names no remaining gap and should be removed: %s", bullet)
 	}
 }
+
+// usage.md has to describe FreeBSD as covered by VuXML, with pkg's version
+// order, and no longer list it among the types no advisory source covers.
+func TestUsageDoc_FreeBSDAdvisoriesComeFromVuXML(t *testing.T) {
+	doc := readDoc(t, "usage.md")
+	row := tableRow(docSection(t, doc, "### `bodega policy osv <sync|set|list|remove|rescan|malware>`"), "freebsd")
+	if !strings.Contains(row, "VuXML") || !strings.Contains(row, "pkg-version(8)") {
+		t.Errorf("the OSV ecosystem table's freebsd row must name VuXML and pkg-version(8) ordering: %q", row)
+	}
+	section := docSection(t, doc, "#### FreeBSD (VuXML)")
+	for _, want := range []string{"`3.0.15_1,1` sorts above `3.0.15,1` and below `3.0.16,1`", "epoch after the comma first", "port revision after the underscore", "case-sensitively"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("FreeBSD (VuXML) section lacks %q", want)
+		}
+	}
+	for _, stale := range []string{
+		"`binary`, `git`, `helm`, `freebsd`, `distfiles` and `oci` have no OSV identifier",
+		"Those five have no OSV ecosystem identifier",
+		"proxied helm, binary, git and freebsd fetches are not checked at all",
+	} {
+		if strings.Contains(doc, stale) {
+			t.Errorf("usage.md still says FreeBSD has no advisory source: %q", stale)
+		}
+	}
+}

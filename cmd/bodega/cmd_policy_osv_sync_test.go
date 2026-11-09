@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,10 @@ func syncInstall(t *testing.T, aptCodename string, aptSuites ...string) string {
 		"apt_codename": aptCodename,
 		"apt_suites":   aptSuites,
 		"bucket":       "",
+		// freebsd is in the no-argument set, and its feed is not OSV's
+		// bucket; left at the default, every sync here would fetch the
+		// public VuXML.
+		"freebsd_vuxml_url": vuxmlFeed(t),
 	}
 	blob, err := json.Marshal(cfg)
 	if err != nil {
@@ -51,6 +56,37 @@ func syncInstall(t *testing.T, aptCodename string, aptSuites ...string) string {
 	osvExportBase = osvBucket(t).URL
 	t.Cleanup(func() { osvExportBase = old })
 	return root
+}
+
+// vuxmlFeed stands in for vuxml.freebsd.org with one advisory, over TLS
+// because freebsd_vuxml_url must be https. The default transport is wrapped,
+// not replaced, so a guard a test installed first still sees every other
+// request.
+func vuxmlFeed(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<vuxml><vuln vid="stand-in-vid"><topic>expat -- stand-in</topic>` +
+			`<affects><package><name>expat</name><range><lt>9.9.9</lt></range></package></affects></vuln></vuxml>`))
+	}))
+	t.Cleanup(srv.Close)
+	old := http.DefaultTransport
+	http.DefaultTransport = fixtureTransport{host: srv.Listener.Addr().String(), fixture: srv.Client().Transport, base: old}
+	t.Cleanup(func() { http.DefaultTransport = old })
+	return srv.URL + "/freebsd/vuln.xml"
+}
+
+// fixtureTransport sends requests for one test server through the transport
+// that trusts its certificate, and everything else to base.
+type fixtureTransport struct {
+	host          string
+	fixture, base http.RoundTripper
+}
+
+func (f fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == f.host {
+		return f.fixture.RoundTrip(req)
+	}
+	return f.base.RoundTrip(req)
 }
 
 // osvBucket stands in for OSV's export bucket, answering each ecosystem's
@@ -482,5 +518,23 @@ func TestSyncCommand_MirroredCodenameFetchesItsRelease(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "never") || !strings.Contains(stdout, "No synced OSV export for apt: Ubuntu:26.04:LTS.") {
 		t.Errorf("list must name the mirrored release with no index:\n%s", stdout)
+	}
+}
+
+type reviewLocalOnlyTransport struct{ base http.RoundTripper }
+
+func (r reviewLocalOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if host := req.URL.Hostname(); host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return nil, fmt.Errorf("unexpected external request: %s", req.URL)
+	}
+	return r.base.RoundTrip(req)
+}
+func TestReviewSyncFixtureStaysLocal(t *testing.T) {
+	old := http.DefaultTransport
+	http.DefaultTransport = reviewLocalOnlyTransport{base: old}
+	t.Cleanup(func() { http.DefaultTransport = old })
+	syncInstall(t, "internal", "internal")
+	if _, _, err := runSync(t); err != nil {
+		t.Fatalf("no-argument sync with local fixtures: %v", err)
 	}
 }

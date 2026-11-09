@@ -21,14 +21,20 @@ const (
 	orderRubyGems = "rubygems"
 	orderMaven    = "maven"
 	orderRpm      = "rpm"
+	orderPkg      = "pkg"
 )
 
 // osvAffected is the subset of an OSV record's `affected` entry the matcher
 // reads. GIT ranges are dropped at sync: they carry commit hashes, which no
 // version string an import supplies can be compared against.
+//
+// VuXML carries FreeBSD's ranges in its own form, a conjunction of lt, le, eq,
+// ge and gt bounds, which OSV's introduced/fixed events cannot express (gt has
+// no event), so they are kept as written rather than translated.
 type osvAffected struct {
-	Versions osvVersions `json:"versions,omitempty"`
-	Ranges   []osvRange  `json:"ranges,omitempty"`
+	Versions osvVersions  `json:"versions,omitempty"`
+	Ranges   []osvRange   `json:"ranges,omitempty"`
+	VuXML    []vuxmlRange `json:"vuxml,omitempty"`
 }
 
 // osvAffectedList is a record's `affected` entries, shared across the records
@@ -116,7 +122,7 @@ func (e *osvEvent) UnmarshalJSON(b []byte) error {
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
 // ecosystem. PyPI orders by PEP 440, RubyGems by Gem::Version, Maven by
 // Maven's ComparableVersion, Ubuntu and Debian by dpkg's ordering, the
-// Enterprise Linux vendors by rpm's, and the rest of what bodega maps order by
+// Enterprise Linux vendors by rpm's, FreeBSD's VuXML by pkg's, and the rest of what bodega maps order by
 // semver, so an unknown ecosystem gets semver rather than an error.
 func osvVersionOrder(ecosystem string) string {
 	switch {
@@ -130,6 +136,8 @@ func osvVersionOrder(ecosystem string) string {
 		return orderDebian
 	case isRpmEcosystem(ecosystem):
 		return orderRpm
+	case ecosystem == VuXMLEcosystem:
+		return orderPkg
 	}
 	return orderSemver
 }
@@ -265,6 +273,15 @@ func (a osvAffected) affects(order, version string) (matched bool, unorderable s
 		}
 	}
 	for _, r := range a.Ranges {
+		hit, bad := r.affects(order, version)
+		if hit {
+			return true, ""
+		}
+		if bad != "" && unorderable == "" {
+			unorderable = bad
+		}
+	}
+	for _, r := range a.VuXML {
 		hit, bad := r.affects(order, version)
 		if hit {
 			return true, ""
@@ -427,6 +444,8 @@ func compareVersions(order, a, b string) (int, bool) {
 		return compareMavenVersions(a, b)
 	case orderRpm:
 		return compareRpmEVR(a, b)
+	case orderPkg:
+		return comparePkgVersions(a, b)
 	}
 	return compareSemver(a, b)
 }
@@ -548,6 +567,8 @@ func orderable(order, v string) bool {
 	case orderRpm:
 		_, _, _, ok := splitRpmEVR(v)
 		return ok
+	case orderPkg:
+		return v != ""
 	}
 	return parseSemver(v).ok
 }

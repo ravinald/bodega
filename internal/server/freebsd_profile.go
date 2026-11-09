@@ -17,9 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -147,14 +150,31 @@ func (s *Server) freeBSDCatalogGate(w http.ResponseWriter, r *http.Request, abi,
 // alias a package whose version the path does not carry, and any object an
 // operator stored outside the catalogue.
 //
-// A host whose profile does not govern freebsd never reaches the catalogue
-// read, so the published repository costs it nothing.
+// The same record is what the advisory check reads, since VuXML names a
+// package and a version and the path names neither reliably. A host whose
+// profile does not govern freebsd, on a server whose freebsd OSV action is
+// unset, never reaches the catalogue read, so the published repository costs
+// it nothing.
 func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, src freeBSDCatalogSource, rest string) bool {
 	p := s.profileFor(r)
-	if !p.Governs(manifest.TypeFreeBSD) {
+	governed := p.Governs(manifest.TypeFreeBSD)
+	advised := s.freeBSDOSVOn(r.Context())
+	if !governed && !advised {
 		return true
 	}
 	id, listed, status, errBody := s.freeBSDObjectRecord(r, src, rest)
+	if !governed {
+		if status != http.StatusOK || !listed {
+			// Served as it was before the advisory check covered freebsd:
+			// refusing here would stop every install on a host whose
+			// catalogue is momentarily unreadable, and nothing names a
+			// package to check.
+			s.logger.Warn("freebsd: served a package fetch the advisory check could not place in the catalogue",
+				"abi", src.abi, "repo", src.repo, "path", rest, "status", status, "error", strings.TrimSpace(errBody))
+			return true
+		}
+		return s.freeBSDOSVGate(w, r, src, id)
+	}
 	if status != http.StatusOK {
 		s.logger.Error("freebsd: the catalogue that decides a governed host's package fetch could not be read; refusing the fetch",
 			"profile", p.Name(), "abi", src.abi, "repo", src.repo, "path", rest, "status", status, "error", strings.TrimSpace(errBody))
@@ -164,7 +184,10 @@ func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, src f
 		return false
 	}
 	if listed {
-		return s.entitleGate(w, r, manifest.TypeFreeBSD, id.name, id.version)
+		if !s.entitleGate(w, r, manifest.TypeFreeBSD, id.name, id.version) {
+			return false
+		}
+		return !advised || s.freeBSDOSVGate(w, r, src, id)
 	}
 	d := entitle.Decision{
 		Governed: true,
@@ -177,6 +200,61 @@ func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, src f
 	f.next = fmt.Sprintf("pkg fetches the path a record names, and an alias such as Latest/pkg.pkg is not one; see what the catalogue lists with `pkg search -r %s%s -x '.*'`.",
 		pkgrepos.TagPrefix, src.repo)
 	s.recordProfileRefusal(r, p, manifest.TypeFreeBSD, rest, "", d, f.incident)
+	f.write(w, r)
+	return false
+}
+
+// freeBSDOSVOn reports whether the freebsd advisory action asks for a check:
+// warn or block, or a row that cannot be read, which the checker reports
+// rather than reading as off. The malware action alone does not turn it on,
+// because VuXML carries no malware records and a check that cannot find any
+// would warn on every fetch of an unsynced install.
+func (s *Server) freeBSDOSVOn(ctx context.Context) bool {
+	if s.auditDB == nil {
+		return false
+	}
+	p, err := s.auditDB.GetOSVPolicy(ctx, manifest.TypeFreeBSD)
+	switch {
+	case errors.Is(err, audit.ErrOSVPolicyNotFound):
+		return false
+	case err != nil:
+		return true
+	}
+	return p.Action == policy.ActionWarn || p.Action == policy.ActionBlock
+}
+
+// freeBSDOSVGate is the OSV decision on one package a catalogue record names,
+// against the synced VuXML: block refuses it, warn serves it and records the
+// advisories, pass serves it with nothing written. It runs on every fetch,
+// cached or not, because a package object is immutable and a cache hit would
+// otherwise serve a version whose advisory was published after it was filled.
+func (s *Server) freeBSDOSVGate(w http.ResponseWriter, r *http.Request, src freeBSDCatalogSource, id freeBSDIdentity) bool {
+	ve := manifest.VersionEntry{Version: id.version, Mode: manifest.ModeProxy,
+		Metadata: map[string]string{policy.FreeBSDABIKey: src.abi}}
+	res := admit.OSVChecker(s.cfg, s.auditDB).Check(r.Context(), &manifest.PackageManifest{Type: manifest.TypeFreeBSD, Name: id.name}, &ve)
+	if res.Action != policy.ActionWarn && res.Action != policy.ActionBlock {
+		return true
+	}
+	fill := fillAdmission{typ: manifest.TypeFreeBSD, name: id.name, version: id.version}
+	allow := audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckNotEvaluated,
+		Detail: "not run: the advisory check on a freebsd package runs before the fetch the allow-list rules on"}
+	ctx, cancel := auditContext(r)
+	fr := admit.Fetch(ctx, s.auditDB, []policy.VersionChecker{verdict{res}}, fill.typ, fill.name,
+		manifest.VersionEntry{Version: id.version, Mode: manifest.ModeProxy}, allow, admit.Who{Identity: Identity(r)}, "")
+	cancel()
+	s.recordFillPolicyEvent(r, fill, fr)
+	if fr.Block == nil {
+		for _, warn := range fr.Warns {
+			s.logger.Warn("freebsd package served with a policy warning", "abi", src.abi, "repo", src.repo,
+				"package", id.name, "version", id.version, "check", warn.Check, "reason", warn.Reason)
+		}
+		return true
+	}
+	f := admitRefusal(fill.typ, id.name, admitBlock{check: fr.Block.Check, version: id.version,
+		incident: fr.Incident, details: fr.Block.Details})
+	s.logger.Warn("freebsd package fetch blocked by policy", "abi", src.abi, "repo", src.repo, "package", id.name,
+		"version", id.version, "check", fr.Block.Check, "reason", fr.Block.Reason, "incident", f.incident)
+	s.queueResult(r, fill.typ, id.name, id.version, *fr.Block, f)
 	f.write(w, r)
 	return false
 }

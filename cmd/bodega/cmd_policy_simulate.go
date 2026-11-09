@@ -437,10 +437,22 @@ func admittedVersions(ctx context.Context, adb *audit.DB, store *manifest.Store,
 			byName[r.PkgName] = pm
 			out = append(out, pm)
 		}
-		pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: r.PkgVersion, Mode: manifest.ModeProxy})
+		ve := manifest.VersionEntry{Version: r.PkgVersion, Mode: manifest.ModeProxy}
+		if t == manifest.TypeFreeBSD && !strings.Contains(r.PkgVersion, ":") {
+			// A freebsd admission row names a package the gate fetched, not a
+			// repository at an ABI (whose version is "FreeBSD:14:amd64"), and
+			// the checker answers a package only when the entry carries an
+			// ABI. The row records none; VuXML is one feed for every ABI.
+			ve.Metadata = map[string]string{policy.FreeBSDABIKey: freeBSDSimulatedABI}
+		}
+		pm.Versions = append(pm.Versions, ve)
 	}
 	return out, nil
 }
+
+// freeBSDSimulatedABI stands in for the ABI a freebsd admission row does not
+// record; it appears only in the lookup's description.
+const freeBSDSimulatedABI = "any ABI"
 
 // responsibleChecks names the checks whose verdict moved into or out of a
 // block, which is what moved the decision.
