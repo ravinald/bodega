@@ -38,6 +38,7 @@ var agePublishers = map[string]func(*AgeChecker, context.Context, string, string
 	manifest.TypeComposer: (*AgeChecker).composerPublishedAt,
 	manifest.TypeOCI:      (*AgeChecker).ociPublishedAt,
 	manifest.TypeRpm:      (*AgeChecker).rpmPublishedAt,
+	manifest.TypeApt:      (*AgeChecker).aptPublishedAt,
 }
 
 // An oci tag is dated by bodega's registry when it resolves the tag, from the
@@ -71,12 +72,35 @@ const (
 	RpmDatedByFile = "file"
 )
 
-// LookupDatedEcosystems is AgeEcosystems less oci and rpm: the types whose
-// publish time a lookup by name and version reads, which is what recording one
-// on a manifest entry needs. An oci tag is dated only as bodega resolves it,
-// and an rpm package only as /rpm/ reads it from primary.
+// A mirrored apt version is dated by the first index bodega read that lists
+// it: a Packages paragraph carries no date, and the Release it belongs to says
+// when that index was generated, which bounds when the version was published.
+// PublishedAt holds that Date:, AptDatedByKey says whether it is one, and
+// AptCodenameKey names the codename whose index it was.
+const (
+	AptDatedByKey  = "apt_dated_by"
+	AptCodenameKey = "apt_codename"
+	// AptDatedByRelease is the Date: of the Release of the first index bodega
+	// read that listed the version.
+	AptDatedByRelease = audit.AptDatedByRelease
+	// AptDatedByPredates is a version the first index bodega ever read for the
+	// codename already listed. Debian and Ubuntu regenerate Release daily, so
+	// dating a whole archive by that read would hold every package on a fresh
+	// install; such a version passes.
+	AptDatedByPredates = audit.AptDatedByPredates
+	// AptDateErrorKey is why no record dates the version.
+	AptDateErrorKey = "apt_date_error"
+)
+
+// LookupDatedEcosystems is AgeEcosystems less oci, rpm and apt: the types
+// whose publish time a lookup by name and version reads, which is what
+// recording one on a manifest entry needs. An oci tag is dated only as bodega
+// resolves it, an rpm package only as /rpm/ reads it from primary, and an apt
+// version only as bodega reads a mirrored index listing it.
 func LookupDatedEcosystems() []string {
-	return slices.DeleteFunc(AgeEcosystems(), func(t string) bool { return t == manifest.TypeOCI || t == manifest.TypeRpm })
+	return slices.DeleteFunc(AgeEcosystems(), func(t string) bool {
+		return t == manifest.TypeOCI || t == manifest.TypeRpm || t == manifest.TypeApt
+	})
 }
 
 // AgeEcosystems returns the registry types the age gate can date, sorted.
@@ -91,7 +115,7 @@ func AgeEcosystems() []string {
 
 // AgeChecker rejects (or warns on) versions whose upstream publish timestamp
 // is newer than the ecosystem's min-age policy. Ecosystems where an upstream
-// timestamp isn't reliably retrievable (apt/binary/git/helm) have no entry in
+// timestamp isn't reliably retrievable (binary/git/helm) have no entry in
 // agePublishers, and `bodega policy age set` refuses one.
 type AgeChecker struct {
 	store AgeStore
@@ -174,6 +198,18 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		publishedAt, datedBy, err = ociDated(ve)
 	case manifest.TypeRpm:
 		publishedAt, datedBy, err = rpmDated(ve)
+	case manifest.TypeApt:
+		publishedAt, datedBy, err = aptDated(ve)
+		if err != nil {
+			// No record is an index bodega has not read, or could not: the
+			// fetch is served unchecked and the row says why, as the OSV gate
+			// treats the same index. A warn per .deb would bury the real ones.
+			return Result{Check: "age", Action: ActionNotEvaluated, Reason: "not run: " + err.Error()}
+		}
+		if datedBy == AptDatedByPredates {
+			return Result{Check: "age", Action: ActionPass, Reason: datedPhrase(datedBy, ve),
+				Details: map[string]any{"dated_by": datedBy}}
+		}
 	default:
 		type dated struct {
 			at  time.Time
@@ -199,7 +235,7 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			Details: map[string]any{"published_at": publishedAt.UTC().Format(time.RFC3339), "age_seconds": int64(age.Seconds())}}
 		if datedBy != "" {
 			r.Details["dated_by"] = datedBy
-			r.Reason = datedPhrase(datedBy)
+			r.Reason = datedPhrase(datedBy, ve)
 		}
 		return r
 	}
@@ -215,11 +251,35 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			"min_age_seconds": policy.MinAgeSeconds,
 		},
 	}
-	if datedBy != "" {
+	switch {
+	case pm.Type == manifest.TypeApt:
+		// Last, so the reason ends on the date an operator checks first.
 		r.Details["dated_by"] = datedBy
-		r.Reason += " (" + datedPhrase(datedBy) + ")"
+		r.Reason += ", " + datedPhrase(datedBy, ve)
+	case datedBy != "":
+		r.Details["dated_by"] = datedBy
+		r.Reason += " (" + datedPhrase(datedBy, ve) + ")"
 	}
 	return r
+}
+
+// aptDated reads the date bodega recorded for a mirrored apt version off its
+// entry, and how it was set.
+func aptDated(ve *manifest.VersionEntry) (time.Time, string, error) {
+	if msg := ve.Metadata[AptDateErrorKey]; msg != "" {
+		return time.Time{}, "", errors.New(msg)
+	}
+	switch by := ve.Metadata[AptDatedByKey]; by {
+	case AptDatedByPredates:
+		return time.Time{}, by, nil
+	case AptDatedByRelease:
+		t, err := time.Parse(time.RFC3339Nano, ve.PublishedAt)
+		if err != nil {
+			return time.Time{}, "", fmt.Errorf("the Release date recorded for the version does not parse: %w", err)
+		}
+		return t, by, nil
+	}
+	return time.Time{}, "", errors.New("an apt version is dated by the first mirrored index bodega read that lists it, and this entry carries no such record: it was not fetched through a mirrored codename's pool")
 }
 
 // ociDated reads the time bodega's registry recorded for an oci tag off its
@@ -253,9 +313,13 @@ func rpmDated(ve *manifest.VersionEntry) (time.Time, string, error) {
 	return t, by, nil
 }
 
-// datedPhrase says which time an oci or rpm verdict used.
-func datedPhrase(datedBy string) string {
+// datedPhrase says which time an oci, rpm or apt verdict used.
+func datedPhrase(datedBy string, ve *manifest.VersionEntry) string {
 	switch datedBy {
+	case AptDatedByRelease:
+		return "dated by the Release of " + ve.Metadata[AptCodenameKey] + " generated " + ve.PublishedAt
+	case AptDatedByPredates:
+		return "listed before bodega first read " + ve.Metadata[AptCodenameKey]
 	case OCIDatedByFirstSeen:
 		return "dated by when bodega first resolved the tag: the image config carries no created time, or the Unix epoch"
 	case RpmDatedByBuild:
@@ -325,6 +389,12 @@ func UndatableVersion(typ, version string) bool {
 // settable for oci. The time itself arrives on the entry; see ociDated.
 func (c *AgeChecker) ociPublishedAt(_ context.Context, name, tag string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("oci %s:%s is dated by bodega's registry from the image config when it resolves the tag, not by a lookup", name, tag)
+}
+
+// aptPublishedAt is the apt entry in agePublishers, which makes the gate
+// settable for apt. The date itself arrives on the entry; see aptDated.
+func (c *AgeChecker) aptPublishedAt(_ context.Context, name, version string) (time.Time, error) {
+	return time.Time{}, fmt.Errorf("apt %s %s is dated by the first mirrored index bodega read that lists it, not by a lookup", name, version)
 }
 
 // rpmPublishedAt is the rpm entry in agePublishers, which makes the gate

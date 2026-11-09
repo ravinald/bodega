@@ -3027,6 +3027,7 @@ Coverage is the set of registry types with an upstream endpoint that carries a p
 
 | Type     | Source                                                                                                                                         |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| apt      | `Date:` of the `Release` of the first mirrored index bodega read that lists the source version, or predating bodega (see below)                |
 | npm      | packument `time[<version>]` on `registry.npmjs.org`                                                                                            |
 | pypi     | earliest `urls[].upload_time_iso_8601` on `pypi.org`                                                                                           |
 | gomod    | `Time` in the proxy's `@v/<version>.info`                                                                                                      |
@@ -3037,16 +3038,27 @@ Coverage is the set of registry types with an upstream endpoint that carries a p
 | oci      | the image config's `created` for the requesting platform; at the Unix epoch or absent, when bodega first resolved the tag (see below)          |
 | rpm      | `<time build>` of the package in its repository's `primary`, or `<time file>` when build is 0, read as `/rpm/` serves the package              |
 
-`apt`, `binary`, `git`, `helm`, `freebsd` and `distfiles` have no such source. `set` refuses them:
+`binary`, `git`, `helm`, `freebsd` and `distfiles` have no such source. `set` refuses them:
 
 ```bash
-$ bodega policy age set apt 7d warn
-Error: the age gate does not cover ecosystem "apt": there is no upstream publish timestamp to date a version against, so every version would warn; set one of cargo, composer, gomod, maven, npm, oci, pypi, rpm, rubygems instead
+$ bodega policy age set helm 7d warn
+Error: the age gate does not cover ecosystem "helm": there is no upstream publish timestamp to date a version against, so every version would warn; set one of apt, cargo, composer, gomod, maven, npm, oci, pypi, rpm, rubygems instead
+```
+
+A Debian or Ubuntu `Packages` paragraph carries no date, so apt is dated by what bodega sees of the archive. Each time bodega reads a mirrored codename's `Packages` (on the first `.deb` the age or OSV gate checks after `metadata_ttl` lapses), it records every source package version that has no record yet with the `Date:` of the `Release` that index belongs to: a version first listed in an index generated at that time was published no later than it. The record is kept in the audit database, so a restart or a later index that drops the version leaves it alone. The first index bodega ever reads for a codename is the archive's whole history rather than what changed, and Debian and Ubuntu regenerate `Release` daily, so its versions are recorded as predating bodega and always pass; dating them by that read would hold every package on a fresh install. The gate runs on a `.deb` fetched through a mirrored codename's pool, never on bodega's own suites, and looks the version up by the source package and version the mirrored paragraph names, epoch included. The verdict's detail ends `dated by the Release of <codename> generated <date>` or `listed before bodega first read <codename>`. A `.deb` no record dates, because its index has not been read or could not be, is served and its admission row records the age check as not evaluated with the reason, never `warn` and never `block`. A cached `.deb` keeps the verdict its fetch recorded and costs no index read.
+
+Two limits follow from dating by the index:
+
+- The date is an upper bound, set by the first index bodega read after the version appeared. bodega reads the index at most once per `metadata_ttl`, and only when a mirrored `.deb` is fetched, so a version can read as younger than it is by that interval or longer, and the gate holds it that much longer.
+- A `block` rule holds security updates too. A fix published to `-security` is as new as any other version, so under `block` every host waits the minimum age for it. Use `warn` for apt: it records the young versions without delaying a fix.
+
+```bash
+bodega policy age set apt 7d warn
 ```
 
 An oci tag has no upstream lookup: no registry answers "when was this tag published". bodega dates the image itself from the `created` field of the image config, and keeps the time on the platform manifest's record, so the gate reads no registry on a cache hit once that platform has been dated. For an index that is the config of the child manifest for the platform Docker Engine names in its `User-Agent` (`os/linux arch/arm64`), else the first `linux/amd64` child, else the first child; clients that name no platform get `linux/amd64`. A config with no `created`, or one at or before the Unix epoch, is dated by when bodega first resolved the tag to that digest, also kept in the tag's record. Reproducible builds write `1970-01-01T00:00:00Z` in place of a build time, and taking it at its word would pass every such image under any floor. A tag that moves to a new digest starts the first-seen clock again. The verdict says which time it used: its detail ends `dated by the image config's created time` or `dated by when bodega first resolved the tag`, and a refusal of a first-seen image says the config carries no build time. An image bodega could not date, because the child or the config fetch failed, warns and is dated again at the tag's next request. The check runs on manifest-by-tag requests; a blob or a manifest by digest takes the verdict of the tag that resolved it (see **OCI images** under [Setup script](#setup-script)).
 
-The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
+The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so a helm policy made every helm version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
 
 `set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands mark the row's action and name it again under the table, and `bodega doctor` reports it as `policy-ecosystem`:
 
@@ -3066,7 +3078,7 @@ Nothing else counts such a row as enforcement. The `bodega serve` startup banner
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
-The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod, cargo, rubygems, maven, composer or rpm artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from, except for rubygems, maven and composer: a gem is dated at `rubygems_upstream`, a Maven artifact at the first of `maven_upstreams` that answers for its POM (a 404 passes to the next), and a Composer archive at `composer_upstream`, the hosts they are fetched from or described by, through the proxy's own upstream client, so `upstream_connect_timeout` bounds the read. A registry bodega cannot reach makes every miss warn rather than block, and so does a gem version or platform build the versions API does not list, a Maven POM that is missing or answers with no `Last-Modified`, and a Composer version Packagist's metadata does not list or lists with no `time`. A cache hit is not checked again. The OSV gate runs at the same points.
+The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod, cargo, rubygems, maven, composer or rpm artifact or a mirrored apt `.deb`, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from, except for rubygems, maven and composer: a gem is dated at `rubygems_upstream`, a Maven artifact at the first of `maven_upstreams` that answers for its POM (a 404 passes to the next), and a Composer archive at `composer_upstream`, the hosts they are fetched from or described by, through the proxy's own upstream client, so `upstream_connect_timeout` bounds the read. A registry bodega cannot reach makes every miss warn rather than block, and so does a gem version or platform build the versions API does not list, a Maven POM that is missing or answers with no `Last-Modified`, and a Composer version Packagist's metadata does not list or lists with no `time`. A cache hit is not checked again. The OSV gate runs at the same points.
 
 #### Publish times in the hosted indexes
 

@@ -269,6 +269,46 @@ func (s *Server) aptMirrorOSV(ctx context.Context, poolPath string) (policy.Resu
 	return res, true
 }
 
+// aptMirrorAge is the age gate's verdict on one .deb a mirrored codename
+// serves, and false when no apt age policy is set or it is ignore.
+//
+// The date is the one recordAptVersionDates gave the source version the
+// mirrored paragraph names, for the epoch reason aptMirrorOSV gives. A path no
+// paragraph names, or a version nothing recorded, comes back not evaluated
+// with the reason, the way aptMirrorOSV treats an index it cannot read.
+func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Result, bool) {
+	if s.auditDB == nil {
+		return policy.Result{}, false
+	}
+	switch p, err := s.auditDB.GetAgePolicy(ctx, manifest.TypeApt); {
+	case errors.Is(err, audit.ErrAgePolicyNotFound):
+		return policy.Result{}, false
+	case err == nil && p.Action == policy.ActionIgnore:
+		return policy.Result{}, false
+	}
+	name, version := manifest.AptDebIdentity(path.Base(poolPath))
+	if name == "" {
+		return policy.Result{}, false
+	}
+	ve := manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy, Metadata: map[string]string{}}
+	if stanza, why := s.aptMirrorStanza(ctx, poolPath); why != "" {
+		ve.Metadata[policy.AptDateErrorKey] = why
+	} else if d, ok, err := s.auditDB.GetAptVersionDate(ctx, stanza.source, stanza.version); err != nil {
+		ve.Metadata[policy.AptDateErrorKey] = err.Error()
+	} else if !ok {
+		ve.Metadata[policy.AptDateErrorKey] = fmt.Sprintf(
+			"bodega holds no record of a mirrored index listing source %s %s; it records one each time it reads the mirrored Packages, so this one has failed to read or to record since it was listed",
+			stanza.source, stanza.version)
+	} else {
+		ve.Metadata[policy.AptDatedByKey] = d.DatedBy
+		ve.Metadata[policy.AptCodenameKey] = d.Codename
+		if !d.PublishedAt.IsZero() {
+			ve.PublishedAt = d.PublishedAt.UTC().Format(time.RFC3339)
+		}
+	}
+	return policy.NewAgeChecker(s.auditDB).Check(ctx, &manifest.PackageManifest{Type: manifest.TypeApt, Name: name}, &ve), true
+}
+
 // aptPoolIndexRetry is how soon a pool index that could not read every
 // mirrored codename is rebuilt. Short, because each path the failure hides is
 // served unchecked until then; not zero, because the build refetches every
@@ -353,11 +393,21 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 // agree. A parse break keeps what came before it, since each entry is a
 // paragraph that did parse and a path missing past the break goes unchecked
 // rather than misjudged.
+//
+// Every source version a paragraph names is also recorded for the age gate,
+// dated by this Release, whatever happened to the rest of the read.
 func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[string]aptPoolStanza, reads map[string]aptIndexRead) error {
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
 		return fmt.Errorf("read the Release for %s: %w", codename, err)
 	}
+	seen := map[audit.AptSourceVersion]bool{}
+	err = s.indexAptPoolRelease(ctx, codename, release, byPath, reads, seen)
+	s.recordAptVersionDates(ctx, codename, release, seen, err == nil)
+	return err
+}
+
+func (s *Server) indexAptPoolRelease(ctx context.Context, codename string, release map[string]string, byPath map[string]aptPoolStanza, reads map[string]aptIndexRead, seen map[audit.AptSourceVersion]bool) error {
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
 		return err
@@ -372,9 +422,11 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[s
 				continue
 			}
 			err = deb822.ParseStreamRaw(bytes.NewReader(read.body), func(_ []byte, fields map[string]string) error {
+				st := aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields)}
+				seen[audit.AptSourceVersion{Source: st.source, Version: st.version}] = true
 				filename := strings.TrimSpace(fields["Filename"])
-				if _, seen := byPath[filename]; filename != "" && !seen {
-					byPath[filename] = aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields)}
+				if _, dup := byPath[filename]; filename != "" && !dup {
+					byPath[filename] = st
 				}
 				return nil
 			})
@@ -384,6 +436,44 @@ func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[s
 		}
 	}
 	return nil
+}
+
+// recordAptVersionDates gives the age gate a date for each version one read of
+// codename listed that has none yet. A failure is logged and costs only those
+// versions' coverage: the gate finds no record and leaves them unchecked.
+func (s *Server) recordAptVersionDates(ctx context.Context, codename string, release map[string]string, seen map[audit.AptSourceVersion]bool, complete bool) {
+	if s.auditDB == nil {
+		return
+	}
+	date, dateErr := aptReleaseDate(release)
+	versions := make([]audit.AptSourceVersion, 0, len(seen))
+	for v := range seen {
+		versions = append(versions, v)
+	}
+	datedBy, err := s.auditDB.RecordAptIndexVersions(ctx, codename, date, versions, complete)
+	switch {
+	case err != nil:
+		s.logger.Warn("could not record when mirrored apt versions were first listed, so the age gate leaves the new ones unchecked",
+			"codename", codename, "error", err)
+	case datedBy == "" && dateErr != nil:
+		s.logger.Warn("a mirrored Release carries no usable Date:, so the versions its index adds stay undated until a read that has one",
+			"codename", codename, "error", dateErr)
+	}
+}
+
+// aptReleaseDate parses a Release's Date:, which Debian and Ubuntu write in
+// RFC 1123 form with the zone as UTC or a numeric offset.
+func aptReleaseDate(release map[string]string) (time.Time, error) {
+	raw := strings.TrimSpace(release["Date"])
+	if raw == "" {
+		return time.Time{}, errors.New("the Release has no Date: field")
+	}
+	for _, layout := range []string{time.RFC1123Z, time.RFC1123} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("the Release Date: %q is not an RFC 1123 time", raw)
 }
 
 // aptSourceVersion is the version of the source a paragraph was built from.
@@ -449,6 +539,10 @@ func (s *Server) aptMirrorUnchecked(release, reason string) policy.Result {
 // advisory was published would otherwise be served for as long as the cache
 // holds it. A row is written only for a finding: one per cached install would
 // bury the decisions the rows exist for.
+//
+// The age gate is not run here. A version's age only grows, so the fill's
+// verdict stands for the bytes it admitted, as an oci blob takes its tag's,
+// and a hit costs no index read for it.
 func (s *Server) aptMirrorHitGate(w http.ResponseWriter, r *http.Request, poolPath string) bool {
 	res, on := s.aptMirrorOSV(r.Context(), poolPath)
 	if !on || (res.Action != policy.ActionWarn && res.Action != policy.ActionBlock) {

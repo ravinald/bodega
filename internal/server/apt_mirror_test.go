@@ -1680,3 +1680,209 @@ func TestGeneratedPoolRefusalKeepsTheBinaryName(t *testing.T) {
 		t.Errorf("hint = %q, want %q", rows[0].PatternHint, want)
 	}
 }
+
+// The age gate on mirrored apt dates a source version by the Release of the
+// first index bodega read that lists it. These fixtures publish php8.5-fpm
+// builds under the fixture codename, one index at a time.
+const (
+	ageDebOld    = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu1_amd64.deb"
+	ageDebNew    = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu2_amd64.deb"
+	ageDebSeed   = "pool/universe/p/php8.5/php8.5-fpm_8.5.3-0ubuntu1_amd64.deb"
+	ageDebLatest = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu3_amd64.deb"
+)
+
+func ageDeb(pool, version string) mirrorOSVDeb {
+	return mirrorOSVDeb{pool, "php8.5-fpm", "php8.5", version, "deb " + version}
+}
+
+// publishAptIndex has the archive serve one index for the fixture codename,
+// its Release dated generated, and has bodega read it as its next rebuild
+// would: the cached Release and Packages and the pool index are dropped first.
+func publishAptIndex(t *testing.T, s *Server, archive *fixtureArchive, generated time.Time, debs ...mirrorOSVDeb) {
+	t.Helper()
+	for rel, body := range mirrorOSVDists(mirroredCodename, debs...) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = strings.Replace(body, "Codename: ", "Date: "+generated.UTC().Format(time.RFC1123)+"\nCodename: ", 1)
+		}
+		archive.setObject(rel, body)
+	}
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	if idx := s.buildAptPoolIndex(t.Context(), s.cfg.MirroredAptCodenames()); len(idx.failed) > 0 {
+		t.Fatalf("read the fixture index: %v", idx.failed)
+	}
+}
+
+func ageMirrorServer(t *testing.T) (*Server, *fixtureArchive) {
+	t.Helper()
+	archive := newFixtureArchive(t, map[string]string{})
+	return mirrorServer(t, archive), archive
+}
+
+func aptDateOf(t *testing.T, s *Server, version string) audit.AptVersionDate {
+	t.Helper()
+	d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", version)
+	if err != nil || !ok {
+		t.Fatalf("no date recorded for php8.5 %s (ok=%v, err=%v)", version, ok, err)
+	}
+	return d
+}
+
+func setAptAge(t *testing.T, s *Server, action string) {
+	t.Helper()
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeApt,
+		MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: action}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+}
+
+// ageChecksFor is the age entry of every admission row for php8.5-fpm@version.
+func ageChecksFor(t *testing.T, s *Server, version string) []audit.AdmissionCheck {
+	t.Helper()
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeApt, PkgName: "php8.5-fpm", PkgVersion: version})
+	if err != nil {
+		t.Fatalf("Admissions: %v", err)
+	}
+	var out []audit.AdmissionCheck
+	for _, r := range rows {
+		for _, c := range r.Checks {
+			if c.Check == audit.CheckAge {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+func lastAgeCheck(t *testing.T, s *Server, version string) audit.AdmissionCheck {
+	t.Helper()
+	checks := ageChecksFor(t, s, version)
+	if len(checks) == 0 {
+		t.Fatalf("no admission row for php8.5-fpm@%s carries an age check", version)
+	}
+	return checks[len(checks)-1]
+}
+
+// TestAptVersionDatesKeepTheFirstIndexThatListedThem is F112 requirement 1.
+func TestAptVersionDatesKeepTheFirstIndexThatListedThem(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	first := time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)
+
+	publishAptIndex(t, s, archive, first, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebOld, "8.5.4-0ubuntu1"))
+	publishAptIndex(t, s, archive, second, ageDeb(ageDebOld, "8.5.4-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates || d.Codename != mirroredCodename {
+		t.Errorf("a version only the first index listed = %+v, want predating %s", d, mirroredCodename)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates || !d.PublishedAt.IsZero() {
+		t.Errorf("a version both indexes listed = %+v, want the first index's record kept: predating, not dated by the second Release", d)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(second) {
+		t.Errorf("a version new in the second index = %+v, want dated by the second Release's Date: %s", d, second)
+	}
+
+	// The records are the audit database's, not the pool index's: a third
+	// index dropping a version and a restarted server both leave them alone.
+	publishAptIndex(t, s, archive, second.Add(24*time.Hour), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatalf("reopen the audit db: %v", err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || !d.PublishedAt.Equal(second) {
+		t.Errorf("after a third index and a reopen = %+v ok=%v err=%v, want the second Release's date", d, ok, err)
+	}
+	if _, ok, _ := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); !ok {
+		t.Error("a version the latest index no longer lists lost its record")
+	}
+}
+
+// TestAptMirrorAgeBlockRefusesTheNewVersionAndServesTheOld is F112
+// requirement 2, through the pool route.
+func TestAptMirrorAgeBlockRefusesTheNewVersionAndServesTheOld(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	old, fresh := now.Add(-30*24*time.Hour), now.Add(-time.Hour)
+
+	publishAptIndex(t, s, archive, old.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	publishAptIndex(t, s, archive, old, ageDeb(ageDebOld, "8.5.4-0ubuntu1"))
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebOld, "8.5.4-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	archive.setObject(ageDebLatest, "unlisted deb")
+
+	code, body := mirrorOSVGet(t, s, ageDebNew)
+	if code != http.StatusForbidden || !strings.Contains(body, "age") {
+		t.Fatalf("a version an hour old under 7d block = %d %q, want a 403 age refusal", code, body)
+	}
+	if archive.count(ageDebNew) != 0 {
+		t.Error("the refused .deb was fetched from the archive")
+	}
+	wantNew := "dated by the Release of " + mirroredCodename + " generated " + fresh.Format(time.RFC3339)
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock || !strings.HasSuffix(c.Detail, wantNew) {
+		t.Errorf("age check = %+v, want a block ending %q", c, wantNew)
+	}
+
+	if code, body := mirrorOSVGet(t, s, ageDebOld); code != http.StatusOK || body != "deb 8.5.4-0ubuntu1" {
+		t.Fatalf("a version 30 days old = %d %q, want 200 and the archive's bytes", code, body)
+	}
+	wantOld := "dated by the Release of " + mirroredCodename + " generated " + old.Format(time.RFC3339)
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, wantOld) {
+		t.Errorf("age check = %+v, want a pass ending %q", c, wantOld)
+	}
+
+	if code, _ := mirrorOSVGet(t, s, ageDebSeed); code != http.StatusOK {
+		t.Fatalf("a version the first index listed = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.3-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, "listed before bodega first read "+mirroredCodename) {
+		t.Errorf("age check = %+v, want a pass naming the first read", c)
+	}
+
+	// No paragraph lists it, so no record dates it: served, never warn or block.
+	if code, _ := mirrorOSVGet(t, s, ageDebLatest); code != http.StatusOK {
+		t.Fatalf("an undated version = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu3"); c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "no Packages paragraph") {
+		t.Errorf("age check = %+v, want not evaluated with the reason", c)
+	}
+}
+
+// TestAptMirrorAgeCachedDebTakesItsFillsVerdict is F112 requirement 3: the
+// hit neither re-judges the version nor reads the index to do it.
+func TestAptMirrorAgeCachedDebTakesItsFillsVerdict(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionWarn)
+	now := time.Now().UTC().Truncate(time.Second)
+	publishAptIndex(t, s, archive, now.Add(-48*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	publishAptIndex(t, s, archive, now.Add(-time.Hour), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+
+	if code, _ := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Fatalf("a new version under warn = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckWarn {
+		t.Fatalf("the fill's age check = %+v, want warn", c)
+	}
+
+	setAptAge(t, s, policy.ActionBlock)
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	release := "dists/" + mirroredCodename + "/Release"
+	reads, checks := archive.count(release), len(ageChecksFor(t, s, "8.5.4-0ubuntu2"))
+
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK || body != "deb 8.5.4-0ubuntu2" {
+		t.Fatalf("the cached .deb = %d %q, want 200: its fill admitted it", code, body)
+	}
+	if got := archive.count(release); got != reads {
+		t.Errorf("Release reads = %d after the hit, want %d: a hit read the index", got, reads)
+	}
+	if got := len(ageChecksFor(t, s, "8.5.4-0ubuntu2")); got != checks {
+		t.Errorf("age checks = %d after the hit, want %d: the hit re-judged the version", got, checks)
+	}
+	if archive.count(ageDebNew) != 1 {
+		t.Errorf("the .deb was fetched %d times, want once", archive.count(ageDebNew))
+	}
+}
