@@ -247,6 +247,11 @@ type Server struct {
 	// adding twenty entries would refetch the base's Packages twenty times
 	// from an archive that republishes it daily.
 	aptUpstreamIdx sync.Map
+	// aptIndexDated holds, per codename/component/arch, the digest of the last
+	// Packages body whose versions reached the audit database, so the readers
+	// sharing aptUpstreamRead do not rewrite tens of thousands of rows for an
+	// index that has not changed.
+	aptIndexDated sync.Map
 
 	// aptRoutes remembers which configured archive answered for each pool
 	// path, because a pool request carries no codename to resolve it by.

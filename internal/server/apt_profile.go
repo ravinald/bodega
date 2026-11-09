@@ -391,6 +391,11 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 // aptUpstreamRead reads one (base, component, architecture) Packages through
 // cache, recording a 404 as an architecture the archive does not carry rather
 // than as a failure, for the reason aptFilteredPackages gives.
+//
+// Every body it reads is also recorded for the age gate, dated by the Release
+// it was checked against. This is the one reader the pool index, the profile
+// rebuild, the hide filter and a client's dists read all go through, so none
+// of them can read an index the gate does not see.
 func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstreamComponent, arch string, release map[string]string, cache map[string]aptIndexRead) (aptIndexRead, error) {
 	component := comp.name
 	key := base + "/" + component + "/" + arch
@@ -408,6 +413,7 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 		return aptIndexRead{}, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", base, component, arch, err)
 	default:
 		read = aptIndexRead{body: body}
+		s.recordAptVersionDates(ctx, base, component, arch, release, body)
 	}
 	cache[key] = read
 	return read, nil

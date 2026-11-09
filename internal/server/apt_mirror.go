@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +136,7 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	markIndexResponse(r)
 
 	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	s.observeAptMirrorDists(context.WithoutCancel(r.Context()), codename, rest)
 }
 
 // aptMirrorPkgName is the discovery row's package name for a path under a
@@ -273,9 +276,12 @@ func (s *Server) aptMirrorOSV(ctx context.Context, poolPath string) (policy.Resu
 // serves, and false when no apt age policy is set or it is ignore.
 //
 // The date is the one recordAptVersionDates gave the source version the
-// mirrored paragraph names, for the epoch reason aptMirrorOSV gives. A path no
-// paragraph names, or a version nothing recorded, comes back not evaluated
-// with the reason, the way aptMirrorOSV treats an index it cannot read.
+// mirrored paragraph names, for the epoch reason aptMirrorOSV gives. A path the
+// current index no longer lists is looked up by the source version an earlier
+// index listed it under, so an upgrade rotating it out keeps it gated. A path
+// no index bodega read has named, or a version nothing recorded, comes back
+// not evaluated with the reason, the way aptMirrorOSV treats an index it
+// cannot read.
 func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Result, bool) {
 	if s.auditDB == nil {
 		return policy.Result{}, false
@@ -291,7 +297,15 @@ func (s *Server) aptMirrorAge(ctx context.Context, poolPath string) (policy.Resu
 		return policy.Result{}, false
 	}
 	ve := manifest.VersionEntry{Version: version, Mode: manifest.ModeProxy, Metadata: map[string]string{}}
-	if stanza, why := s.aptMirrorStanza(ctx, poolPath); why != "" {
+	stanza, why := s.aptMirrorStanza(ctx, poolPath)
+	if why != "" {
+		if e, ok, err := s.auditDB.GetAptPoolPath(ctx, poolPath); err != nil {
+			why += "; " + err.Error()
+		} else if ok {
+			stanza, why = aptPoolStanza{source: e.Source, version: e.Version}, ""
+		}
+	}
+	if why != "" {
 		ve.Metadata[policy.AptDateErrorKey] = why
 	} else if d, ok, err := s.auditDB.GetAptVersionDate(ctx, stanza.source, stanza.version); err != nil {
 		ve.Metadata[policy.AptDateErrorKey] = err.Error()
@@ -393,21 +407,11 @@ func (s *Server) buildAptPoolIndex(ctx context.Context, codenames []string) *apt
 // agree. A parse break keeps what came before it, since each entry is a
 // paragraph that did parse and a path missing past the break goes unchecked
 // rather than misjudged.
-//
-// Every source version a paragraph names is also recorded for the age gate,
-// dated by this Release, whatever happened to the rest of the read.
 func (s *Server) indexAptPool(ctx context.Context, codename string, byPath map[string]aptPoolStanza, reads map[string]aptIndexRead) error {
 	release, err := s.aptUpstreamRelease(ctx, codename)
 	if err != nil {
 		return fmt.Errorf("read the Release for %s: %w", codename, err)
 	}
-	seen := map[audit.AptSourceVersion]bool{}
-	err = s.indexAptPoolRelease(ctx, codename, release, byPath, reads, seen)
-	s.recordAptVersionDates(ctx, codename, release, seen, err == nil)
-	return err
-}
-
-func (s *Server) indexAptPoolRelease(ctx context.Context, codename string, release map[string]string, byPath map[string]aptPoolStanza, reads map[string]aptIndexRead, seen map[audit.AptSourceVersion]bool) error {
 	layout, err := s.aptUpstreamComponents(codename, release)
 	if err != nil {
 		return err
@@ -422,11 +426,9 @@ func (s *Server) indexAptPoolRelease(ctx context.Context, codename string, relea
 				continue
 			}
 			err = deb822.ParseStreamRaw(bytes.NewReader(read.body), func(_ []byte, fields map[string]string) error {
-				st := aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields)}
-				seen[audit.AptSourceVersion{Source: st.source, Version: st.version}] = true
 				filename := strings.TrimSpace(fields["Filename"])
-				if _, dup := byPath[filename]; filename != "" && !dup {
-					byPath[filename] = st
+				if _, seen := byPath[filename]; filename != "" && !seen {
+					byPath[filename] = aptPoolStanza{source: deb822.SourceName(fields), version: aptSourceVersion(fields)}
 				}
 				return nil
 			})
@@ -439,26 +441,90 @@ func (s *Server) indexAptPoolRelease(ctx context.Context, codename string, relea
 }
 
 // recordAptVersionDates gives the age gate a date for each version one read of
-// codename listed that has none yet. A failure is logged and costs only those
-// versions' coverage: the gate finds no record and leaves them unchecked.
-func (s *Server) recordAptVersionDates(ctx context.Context, codename string, release map[string]string, seen map[audit.AptSourceVersion]bool, complete bool) {
+// codename's component/arch Packages lists that has none yet, and a source
+// version for each pool path. An index that does not parse records nothing:
+// marking it read on half its paragraphs would date the other half by this
+// Release on the next read, as if they had just appeared. A failure is logged
+// and costs only
+// those versions' coverage: the gate finds no record and leaves them
+// unchecked, and the next read tries again.
+func (s *Server) recordAptVersionDates(ctx context.Context, codename, component, arch string, release map[string]string, body []byte) {
 	if s.auditDB == nil {
 		return
 	}
-	date, dateErr := aptReleaseDate(release)
-	versions := make([]audit.AptSourceVersion, 0, len(seen))
-	for v := range seen {
-		versions = append(versions, v)
+	key := codename + "/" + component + "/" + arch
+	sum := sha256.Sum256(body)
+	if last, ok := s.aptIndexDated.Load(key); ok && last.([sha256.Size]byte) == sum {
+		return
 	}
-	datedBy, err := s.auditDB.RecordAptIndexVersions(ctx, codename, date, versions, complete)
+	var entries []audit.AptIndexEntry
+	if err := deb822.ParseStreamRaw(bytes.NewReader(body), func(_ []byte, fields map[string]string) error {
+		entries = append(entries, audit.AptIndexEntry{Filename: strings.TrimSpace(fields["Filename"]),
+			Source: deb822.SourceName(fields), Version: aptSourceVersion(fields)})
+		return nil
+	}); err != nil {
+		s.logger.Warn("a mirrored apt index does not parse, so the age gate records nothing from it until a read that does",
+			"index", key, "error", err)
+		return
+	}
+	date, dateErr := aptReleaseDate(release)
+	datedBy, err := s.auditDB.RecordAptIndexVersions(context.WithoutCancel(ctx), codename, component, arch, date, entries)
 	switch {
 	case err != nil:
-		s.logger.Warn("could not record when mirrored apt versions were first listed, so the age gate leaves the new ones unchecked",
-			"codename", codename, "error", err)
-	case datedBy == "" && dateErr != nil:
+		s.logger.Warn("could not record when mirrored apt versions were first listed, so the age gate leaves the new ones unchecked until the next read",
+			"index", key, "error", err)
+	case datedBy == "":
 		s.logger.Warn("a mirrored Release carries no usable Date:, so the versions its index adds stay undated until a read that has one",
-			"codename", codename, "error", dateErr)
+			"index", key, "error", dateErr)
+	default:
+		s.aptIndexDated.Store(key, sum)
 	}
+}
+
+// observeAptMirrorDists records the versions behind one client read of a
+// mirrored codename's dists/ tree, when rest is a component/arch Packages
+// index or a by-hash path under one. The bytes the client got are not parsed
+// in place: they are read again through aptUpstreamRead, which checks them
+// against the Release they belong to and answers from metadata_ttl's cache, so
+// an index read within that window costs no second fetch.
+func (s *Server) observeAptMirrorDists(ctx context.Context, codename, rest string) {
+	component, arch, ok := aptPackagesIndexPath(rest)
+	if !ok || s.auditDB == nil {
+		return
+	}
+	release, err := s.aptUpstreamRelease(ctx, codename)
+	if err == nil {
+		var layout []aptUpstreamComponent
+		if layout, err = s.aptUpstreamComponents(codename, release); err == nil {
+			for _, comp := range layout {
+				if comp.name == component && slices.Contains(comp.arches, arch) {
+					_, err = s.aptUpstreamRead(ctx, codename, comp, arch, release, map[string]aptIndexRead{})
+				}
+			}
+		}
+	}
+	if err != nil {
+		s.logger.Warn("could not read a mirrored apt index a client fetched, so the age gate has not dated the versions it adds",
+			"codename", codename, "path", rest, "error", err)
+	}
+}
+
+// aptPackagesIndexPath is the component and architecture of a dists/ path
+// naming a binary Packages index, compressed or by hash.
+func aptPackagesIndexPath(rest string) (component, arch string, ok bool) {
+	component, tail, ok := strings.Cut(rest, "/binary-")
+	if !ok || component == "" {
+		return "", "", false
+	}
+	arch, file, ok := strings.Cut(tail, "/")
+	if !ok || arch == "" {
+		return "", "", false
+	}
+	switch {
+	case file == "Packages", file == "Packages.gz", file == "Packages.xz", strings.HasPrefix(file, "by-hash/"):
+		return strings.TrimPrefix(component, "updates/"), arch, true
+	}
+	return "", "", false
 }
 
 // aptReleaseDate parses a Release's Date:, which Debian and Ubuntu write in
