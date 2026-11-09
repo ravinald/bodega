@@ -14,7 +14,6 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
@@ -1136,8 +1135,8 @@ func (e *upstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned %d: %s", e.status, e.url)
 }
 
-// upstreamEndpointError carries the host:port an upstream failure happened at,
-// and whether it happened in the TLS handshake, beside the error itself. The
+// upstreamEndpointError carries the host:port an upstream failure happened at
+// beside the error itself. The
 // public 502 is built from these fields, never from err's text, so the
 // endpoint is recorded where the attempt is made: after a fallback or a
 // redirect, or inside a resolver's own read, nothing downstream can recover
@@ -1152,7 +1151,6 @@ func (e *upstreamStatusError) Error() string {
 // error the body is classified from where err deliberately drops its identity.
 type upstreamEndpointError struct {
 	endpoint string
-	tls      bool
 	status   int
 	diag     error
 	err      error
@@ -1220,60 +1218,36 @@ func (b *endpointBody) Read(p []byte) (int, error) {
 }
 
 // doUpstream sends req through client and, on failure, records the endpoint
-// that failed and whether its TLS handshake did. crypto/tls reports a peer's
-// alert as a net.OpError around an unexported type, so the error alone cannot
-// say a version or cipher mismatch was a handshake failure; the trace can.
+// that failed. A refused redirect carries the raw Location header in
+// url.Error.URL, which may be relative, so it is resolved against the request
+// that received the redirect rather than the one bodega sent first.
 func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
-	var handshakes tlsFailures
-	trace := &httptrace.ClientTrace{
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) { handshakes.record(err) },
-	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	//nolint:gosec // G704: every caller passed rawURL through its upstream guard, and the client guards each redirect hop.
 	resp, err := client.Do(req)
 	if err == nil {
 		resp.Body = &endpointBody{ReadCloser: resp.Body, endpoint: answeredURL(resp, req.URL.String())}
 		return resp, nil
 	}
-	endpoint := req.URL.String()
+	return nil, &upstreamEndpointError{endpoint: hostPort(failedURL(req, resp, err)), err: err}
+}
+
+// failedURL is the URL of the hop err failed on. net/http returns the
+// redirecting response alongside a CheckRedirect refusal, and that response's
+// request is the hop the Location is relative to.
+func failedURL(req *http.Request, resp *http.Response, err error) string {
 	var uerr *url.Error
-	if errors.As(err, &uerr) && hostPort(uerr.URL) != "" {
-		endpoint = uerr.URL
+	if !errors.As(err, &uerr) {
+		return req.URL.String()
 	}
-	return nil, &upstreamEndpointError{endpoint: hostPort(endpoint), tls: handshakes.caused(err), err: err}
-}
-
-// tlsFailures holds the handshake errors a request's trace reported. The
-// transport fires TLS callbacks for every dial a request starts, across every
-// redirect hop, and serves the request from whichever connection is ready
-// first, so a callback's timing says nothing about which connection failed.
-// Its error value does: the transport returns the same value it handed the
-// callback, so a request failed in a handshake only when its error is one of
-// these. A bare context error is left out because it is a shared sentinel
-// that an unrelated deadline also returns.
-type tlsFailures struct {
-	mu   sync.Mutex
-	errs []error
-}
-
-func (f *tlsFailures) record(err error) {
-	if err == nil || err == context.Canceled || err == context.DeadlineExceeded {
-		return
+	base := req.URL
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		base = resp.Request.URL
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.errs = append(f.errs, err)
-}
-
-func (f *tlsFailures) caused(err error) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, hs := range f.errs {
-		if errors.Is(err, hs) {
-			return true
-		}
+	ref, perr := url.Parse(uerr.URL)
+	if perr != nil {
+		return base.String()
 	}
-	return false
+	return base.ResolveReference(ref).String()
 }
 
 // writeUpstreamUnreachable answers a client whose upstream could not be read
@@ -1397,7 +1371,7 @@ func upstreamFailureCause(err error) (cause, step string) {
 		hostErr    x509.HostnameError
 		invalidErr x509.CertificateInvalidError
 	)
-	if (at != nil && at.tls) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
+	if isTLSAlert(err) || errors.As(err, &recordErr) || errors.As(err, &alertErr) || errors.As(err, &verifyErr) ||
 		errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &invalidErr) {
 		return "TLS handshake failed", route
 	}
@@ -1406,6 +1380,15 @@ func upstreamFailureCause(err error) (cause, step string) {
 		return "timed out", route
 	}
 	return "unreachable", route
+}
+
+// isTLSAlert reports an alert crypto/tls sent or received during a handshake.
+// It returns those as a net.OpError around an unexported alert type, so the
+// op names it: these two are written by crypto/tls alone. A bare io.EOF is
+// never TLS here: every read on every connection returns the same value.
+func isTLSAlert(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && (op.Op == "remote error" || op.Op == "local error")
 }
 
 func answeredStatusCause(status int) (cause, step string) {
