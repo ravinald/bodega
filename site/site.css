@@ -163,7 +163,7 @@ main.colophon sup a { text-decoration: none; color: var(--quiet); font: 600 .68r
   .head { flex-wrap: wrap; gap: .8rem 1.5rem; }
   .head nav { flex-wrap: wrap; gap: .8rem 1.2rem; }
   .frame, body.doc .frame { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
-  .contents { display: none; }
+  aside.contents { display: none; }
   .contents-compact { display: block; }
   .mark img { width: 96px; }
   .table:has(> table.coverage) { overflow-x: auto; }
