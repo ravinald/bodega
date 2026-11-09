@@ -719,23 +719,35 @@ func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstream
 	s.logFor(ctx).Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
 }
 
-// fetchObserverCtxKey carries a func a handler wants called with the bytes of
-// every upstream fetch proxyOrCache completes for its request, including a
-// stale refresh that finishes after the response went out. What the client
-// was served and what bodega read can differ, and a handler that records what
-// bodega read cannot learn of the second from the response alone.
-type fetchObserverCtxKey struct{}
+// inputObserverCtxKey carries the funcs a handler wants called with every
+// object bodega reads in full for its request: fetched for each upstream
+// fetch proxyOrCache completes, including a stale refresh that finishes after
+// the response went out, and stored for each cached object serveStored reads
+// to its end. Both fire on the completed read, never on what reached the
+// client: a client that hangs up ends the delivery, not the read, and a
+// handler recording what bodega read cannot learn it from the response.
+type inputObserverCtxKey struct{}
 
-func withFetchObserver(r *http.Request, observe func(ctx context.Context, raw []byte)) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), fetchObserverCtxKey{}, observe))
+type inputObserver struct {
+	fetched func(ctx context.Context, raw []byte)
+	stored  func(ctx context.Context, raw []byte)
+}
+
+func withInputObserver(r *http.Request, obs *inputObserver) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), inputObserverCtxKey{}, obs))
+}
+
+func inputObserverFor(ctx context.Context) *inputObserver {
+	obs, _ := ctx.Value(inputObserverCtxKey{}).(*inputObserver)
+	return obs
 }
 
 // noteFetched hands a completed fetch's bytes to the request's observer. A
 // body past maxUpstreamBody is not read into memory, and the observer is not
 // called for it.
 func (s *Server) noteFetched(ctx context.Context, spool *spooledUpstream) {
-	observe, ok := ctx.Value(fetchObserverCtxKey{}).(func(context.Context, []byte))
-	if !ok || spool == nil || spool.size > maxUpstreamBody {
+	obs := inputObserverFor(ctx)
+	if obs == nil || obs.fetched == nil || spool == nil || spool.size > maxUpstreamBody {
 		return
 	}
 	raw, err := os.ReadFile(spool.path())
@@ -743,7 +755,7 @@ func (s *Server) noteFetched(ctx context.Context, spool *spooledUpstream) {
 		s.logFor(ctx).Warn("could not reread a fetched upstream body for its observer, so what bodega read goes unrecorded", "path", spool.path(), "error", err)
 		return
 	}
-	observe(context.WithoutCancel(ctx), raw)
+	obs.fetched(context.WithoutCancel(ctx), raw)
 }
 
 // notFoundPrefix holds one record per path every upstream answered 404 for.

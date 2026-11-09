@@ -2257,3 +2257,65 @@ func TestReviewF112IncompleteDeliveryCannotSetInitialRelease(t *testing.T) {
 		t.Errorf("age admission = %+v; want pass naming the initial read", c)
 	}
 }
+
+type reviewF112ObservedShortWriter struct {
+	*httptest.ResponseRecorder
+	offered bytes.Buffer
+}
+
+func (w *reviewF112ObservedShortWriter) Write(p []byte) (int, error) {
+	_, _ = w.offered.Write(p)
+	return 0, io.ErrClosedPipe
+}
+
+func TestReviewF112CompletedReadsSurviveResponseChoice(t *testing.T) {
+	for _, mode := range []string{"head-fetch", "cached-disconnect"} {
+		t.Run(mode, func(t *testing.T) {
+			s, archive := ageMirrorServer(t)
+			setAptAge(t, s, policy.ActionBlock)
+			now := time.Now().UTC().Truncate(time.Second)
+			first := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+			store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+			for rel, body := range first {
+				if strings.HasSuffix(rel, "/Release") {
+					body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+					first[rel] = body
+				}
+				archive.setObject(rel, body)
+				if mode == "cached-disconnect" {
+					store.Seed(manifest.AptKey(rel), body)
+				}
+			}
+			for _, rest := range []string{"Release", "universe/binary-amd64/Packages.gz"} {
+				rel := "dists/fixture/" + rest
+				if mode == "head-fetch" {
+					w := httptest.NewRecorder()
+					s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/apt/"+rel, nil))
+					if w.Code != http.StatusOK || archive.count(rel) != 1 || cachedBody(t, store, manifest.AptKey(rel)) != first[rel] {
+						t.Fatalf("HEAD %s did not fetch and cache the complete body: status=%d upstream_reads=%d", rest, w.Code, archive.count(rel))
+					}
+				} else {
+					w := &reviewF112ObservedShortWriter{ResponseRecorder: httptest.NewRecorder()}
+					s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apt/"+rel, nil))
+					if w.Code != http.StatusOK || w.offered.String() != first[rel] || archive.count(rel) != 0 {
+						t.Fatalf("GET %s did not read the complete cached body before delivery failed: status=%d offered=%d want=%d upstream_reads=%d", rest, w.Code, w.offered.Len(), len(first[rel]), archive.count(rel))
+					}
+				}
+			}
+			if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+				t.Errorf("completed first Packages read: record=%+v ok=%v err=%v; want predating", d, ok, err)
+			}
+			fresh := now.Add(-time.Hour)
+			publishAptIndex(t, s, archive, fresh, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+				t.Errorf("new version after completed first read = %+v; want Release date %s", d, fresh)
+			}
+			if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+				t.Errorf("new version under 7d block = %d %q; want 403", code, body)
+			}
+			if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+				t.Errorf("new version's admission = %+v; want block", c)
+			}
+		})
+	}
+}

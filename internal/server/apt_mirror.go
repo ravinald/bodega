@@ -7,11 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -115,11 +113,12 @@ func (c *aptRouteCache) put(poolPath, upstreamURL string) {
 // Nothing about the bytes is interpreted for the client. The upstream Release
 // names the components, architectures and by-hash digests, apt reads them, and
 // the next request arrives with the path already composed — so an index bodega
-// does not parse is an index bodega cannot get wrong. The age gate keeps a
-// copy of a Release or Packages response and records it once the client has
-// it, so what it dates is what the client was served, and records every body
-// bodega fetched for the request as well, including a stale_grace refresh
-// that completes after the client was answered from the older copy.
+// does not parse is an index bodega cannot get wrong. The age gate records
+// every Release or Packages object bodega reads in full for the request, from
+// the cache or the archive, including a stale_grace refresh that completes
+// after the client was answered from the older copy. It records the read, not
+// the delivery: a client that hangs up or sent HEAD still made bodega read
+// the whole object, and a prefix that reached a client is never evidence.
 func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, codename, rest string) {
 	if rest == "" {
 		http.NotFound(w, r)
@@ -142,43 +141,43 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	immutable := aptDistsImmutable(rest)
 	markIndexResponse(r)
 
-	if r.Method != http.MethodGet || s.auditDB == nil || !aptDistsObserved(rest) {
+	if s.auditDB == nil || !aptDistsObserved(rest) {
 		s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 		return
 	}
-	capture := &aptIndexCapture{ResponseWriter: w}
-	fetched := &aptFetchedIndexes{observe: func(ctx context.Context, raw []byte) {
+	reads := &aptIndexReads{observe: func(ctx context.Context, raw []byte) {
 		s.observeAptMirrorDists(ctx, codename, rest, raw)
 	}}
-	ctx, transfer := withBodyTransfer(r.Context())
-	s.serveAptMirror(capture, withFetchObserver(r.WithContext(ctx), fetched.add), s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
-	var served []byte
-	if err := capture.incomplete(transfer); err != nil {
-		s.logFor(r.Context()).Warn("a mirrored apt index reached the client incomplete, so the age gate records only what bodega read in full",
-			"codename", codename, "path", rest, "error", err)
-	} else if capture.status == http.StatusOK && !capture.over {
-		served = capture.body.Bytes()
-		s.observeAptMirrorDists(r.Context(), codename, rest, served)
-	}
-	fetched.served(r.Context(), served)
+	r = withInputObserver(r, &inputObserver{fetched: reads.fetched, stored: reads.stored})
+	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+	reads.settle(r.Context())
 }
 
-// aptFetchedIndexes records the dists/ bodies bodega fetched for one request
-// in the order the gate needs: what the client was served first, then any
-// body a fetch read that differs from it. A fetch that completes while the
-// request is still serving is held until the served copy is recorded, because
-// a stale response is the older snapshot and recording the refresh first would
-// date the versions it adds as predating the one the client got. A fetch that
+// aptIndexReads records the dists/ objects bodega read in full for one
+// request, whatever the method and whether or not the client took the
+// response, in the order the gate needs: the cached copy first, then any
+// fetched body that differs from it. A fetch that completes while the request
+// is still serving is held until the handler returns, because a stale cached
+// copy is the older snapshot and recording the refresh first would date the
+// versions it adds as predating the one bodega already held. A fetch that
 // completes after the request returned, a stale_grace refresh, is recorded the
 // moment it completes, since nothing else will.
-type aptFetchedIndexes struct {
+type aptIndexReads struct {
 	observe func(ctx context.Context, raw []byte)
 	mu      sync.Mutex
 	done    bool
+	cached  []byte
 	pending [][]byte
 }
 
-func (f *aptFetchedIndexes) add(ctx context.Context, raw []byte) {
+func (f *aptIndexReads) stored(ctx context.Context, raw []byte) {
+	f.mu.Lock()
+	f.cached = raw
+	f.mu.Unlock()
+	f.observe(ctx, raw)
+}
+
+func (f *aptIndexReads) fetched(ctx context.Context, raw []byte) {
 	f.mu.Lock()
 	if !f.done {
 		f.pending = append(f.pending, raw)
@@ -189,14 +188,14 @@ func (f *aptFetchedIndexes) add(ctx context.Context, raw []byte) {
 	f.observe(ctx, raw)
 }
 
-func (f *aptFetchedIndexes) served(ctx context.Context, served []byte) {
+func (f *aptIndexReads) settle(ctx context.Context) {
 	f.mu.Lock()
 	f.done = true
-	pending := f.pending
+	pending, cached := f.pending, f.cached
 	f.pending = nil
 	f.mu.Unlock()
 	for _, raw := range pending {
-		if !bytes.Equal(raw, served) {
+		if !bytes.Equal(raw, cached) {
 			f.observe(context.WithoutCancel(ctx), raw)
 		}
 	}
@@ -738,75 +737,6 @@ func aptClearsignedBody(raw []byte) []byte {
 	}
 	return bytes.Join(lines, []byte("\n"))
 }
-
-// aptIndexCapture keeps a copy of a dists/ response so the age gate can record
-// the exact bytes a client got, whichever of cache, upstream or by-hash
-// served them. Past maxUpstreamBody it stops copying and reports over.
-//
-// The copy is evidence only when the whole object went out. A Release cut
-// after its Date: line still parses, and recorded as the codename's first
-// Release it would publish no index digests and date the entire archive by
-// that line, permanently.
-type aptIndexCapture struct {
-	http.ResponseWriter
-	status   int
-	body     bytes.Buffer
-	written  int64
-	over     bool
-	writeErr error
-}
-
-// incomplete says why the captured body is not the whole object the handler
-// meant to send, or nil when it is: a write the client did not take, a copy
-// the handler reported cut short, or fewer bytes than the declared
-// Content-Length.
-func (c *aptIndexCapture) incomplete(transfer *bodyTransfer) error {
-	if c.writeErr != nil {
-		return c.writeErr
-	}
-	if err := transfer.failed(); err != nil {
-		return err
-	}
-	if cl := c.Header().Get("Content-Length"); cl != "" && c.status == http.StatusOK {
-		if want, err := strconv.ParseInt(cl, 10, 64); err == nil && want != c.written {
-			return fmt.Errorf("wrote %d of a declared %d bytes", c.written, want)
-		}
-	}
-	return nil
-}
-
-func (c *aptIndexCapture) WriteHeader(code int) {
-	if c.status == 0 {
-		c.status = code
-	}
-	c.ResponseWriter.WriteHeader(code)
-}
-
-func (c *aptIndexCapture) Write(b []byte) (int, error) {
-	if c.status == 0 {
-		c.status = http.StatusOK
-	}
-	n, err := c.ResponseWriter.Write(b)
-	c.written += int64(n)
-	if err == nil && n < len(b) {
-		err = io.ErrShortWrite
-	}
-	if err != nil && c.writeErr == nil {
-		c.writeErr = err
-	}
-	if !c.over {
-		if int64(c.body.Len()+n) > maxUpstreamBody {
-			c.over = true
-			c.body = bytes.Buffer{}
-		} else {
-			c.body.Write(b[:n])
-		}
-	}
-	return n, err
-}
-
-// Unwrap lets http.ResponseController reach the connection underneath.
-func (c *aptIndexCapture) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 // aptDistsObserved reports whether the age gate records what a client read of
 // dists/<codename>/rest served.

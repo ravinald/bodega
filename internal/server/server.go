@@ -6,6 +6,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	cryptoRand "crypto/rand"
 	"crypto/tls"
@@ -2398,9 +2399,74 @@ func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, s3Key strin
 	}
 
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, result.Body); err != nil {
+	obs := inputObserverFor(r.Context())
+	if obs == nil || obs.stored == nil || result.ContentLength > maxUpstreamBody {
+		if _, err := io.Copy(w, result.Body); err != nil {
+			_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
+		}
+		return
+	}
+	in := &storedInput{r: result.Body}
+	if _, err := io.Copy(w, in); err != nil {
 		_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
 	}
+	raw, err := in.finish(result.ContentLength)
+	if err != nil {
+		s.logFor(r.Context()).Warn("could not read a stored object to its end for its observer, so what bodega read goes unrecorded", "key", s3Key, "error", err)
+		return
+	}
+	obs.stored(context.WithoutCancel(r.Context()), raw)
+}
+
+// storedInput keeps a copy of what serveStored reads from storage, so an
+// observer can be handed the whole object whether or not the client took it.
+// Past maxUpstreamBody it stops copying and the read is not offered.
+type storedInput struct {
+	r    io.Reader
+	buf  bytes.Buffer
+	err  error
+	eof  bool
+	over bool
+}
+
+func (i *storedInput) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	if !i.over {
+		if int64(i.buf.Len()+n) > maxUpstreamBody {
+			i.over = true
+			i.buf = bytes.Buffer{}
+		} else {
+			i.buf.Write(p[:n])
+		}
+	}
+	switch {
+	case err == io.EOF:
+		i.eof = true
+	case err != nil && i.err == nil:
+		i.err = err
+	}
+	return n, err
+}
+
+// finish reads whatever a refused write left unread, then returns the object
+// when the read reached its end intact: no read error, within the buffer, and
+// as long as the stored length says. A prefix is never returned.
+func (i *storedInput) finish(want int64) ([]byte, error) {
+	scratch := make([]byte, 32*1024)
+	for !i.eof && i.err == nil && !i.over {
+		_, _ = i.Read(scratch)
+	}
+	switch {
+	case i.err != nil:
+		return nil, i.err
+	case i.over:
+		return nil, fmt.Errorf("the object runs past bodega's %d-byte buffer", maxUpstreamBody)
+	case !i.eof:
+		return nil, io.ErrUnexpectedEOF
+	case want > 0 && int64(i.buf.Len()) != want:
+		return nil, fmt.Errorf("read %d of a stored %d bytes", i.buf.Len(), want)
+	}
+	return i.buf.Bytes(), nil
 }
 
 // bodyTransfer is the outcome of copying a response body, for a read bodega
