@@ -308,7 +308,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 			if !sinkUpstreamErr(r.Context(), err) {
 				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega's resolution", "key", s3Key, "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
 			}
-			writeRateLimited(w, limited)
+			writeRateLimited(w, err, limited)
 			return
 		}
 		if !sinkUpstreamErr(r.Context(), err) {
@@ -355,7 +355,7 @@ func (s *Server) proxyOrResolveIndexed(w http.ResponseWriter, r *http.Request, s
 			if !sinkUpstreamErr(r.Context(), err) {
 				s.logFor(r.Context()).Warn("upstream is rate-limiting bodega", "url", limited.url, "status", limited.status, "retry_after", limited.retryAfter)
 			}
-			writeRateLimited(w, limited)
+			writeRateLimited(w, err, limited)
 			return
 		}
 		var refused *resolveRefusal
@@ -1356,6 +1356,10 @@ func upstreamFailureCause(err error) (cause, step string) {
 	if errors.As(err, &status) {
 		return answeredStatusCause(status.status)
 	}
+	var limited *upstreamRateLimited
+	if errors.As(err, &limited) {
+		return answeredStatusCause(limited.status)
+	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
 		return "DNS lookup failed", route
@@ -1384,11 +1388,29 @@ func upstreamFailureCause(err error) (cause, step string) {
 
 // isTLSAlert reports an alert crypto/tls sent or received during a handshake.
 // It returns those as a net.OpError around an unexported alert type, so the
-// op names it: these two are written by crypto/tls alone. A bare io.EOF is
-// never TLS here: every read on every connection returns the same value.
+// op names it: these two are written by crypto/tls alone. Every node of the
+// chain is visited because errors.As stops at the first net.OpError, and
+// net/http wraps a TLS failure to an HTTPS proxy in a "proxyconnect" one. A
+// bare io.EOF is never TLS here: every read on every connection returns the
+// same value.
 func isTLSAlert(err error) bool {
-	var op *net.OpError
-	return errors.As(err, &op) && (op.Op == "remote error" || op.Op == "local error")
+	if err == nil {
+		return false
+	}
+	if op, ok := err.(*net.OpError); ok && (op.Op == "remote error" || op.Op == "local error") {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return isTLSAlert(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if isTLSAlert(e) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func answeredStatusCause(status int) (cause, step string) {
@@ -1424,7 +1446,10 @@ func isDeltaSeconds(v string) bool {
 // The body quotes the interval only in one of RFC 9110's two forms. Anything
 // else is upstream text that may name a host, and the body goes to whoever
 // can reach the route, so it points at the header instead.
-func writeRateLimited(w http.ResponseWriter, limited *upstreamRateLimited) {
+func writeRateLimited(w http.ResponseWriter, err error, limited *upstreamRateLimited) {
+	if c, ok := w.(*capturedResponse); ok {
+		c.upstreamErr = err
+	}
 	retry := limited.clientRetryAfter()
 	wait := "the interval in its Retry-After header"
 	if isDeltaSeconds(retry) {

@@ -235,7 +235,7 @@ type capturedResponse struct {
 	status int
 	body   bytes.Buffer
 	tooBig bool
-	// upstreamErr is the failure a 502 written here names, for a caller
+	// upstreamErr is the failure a 502 or rate-limit 503 written here names, for a caller
 	// that has to report the upstream behind the response it captured.
 	upstreamErr error
 	// respondent is the URL of the server whose answer was captured, empty

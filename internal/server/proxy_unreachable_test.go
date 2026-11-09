@@ -848,3 +848,58 @@ func TestB192FifthUnusedTLSFailureMatchesHTTPEOF(t *testing.T) {
 		t.Fatalf("status=%d body=%q; want HTTP origin %s and unreachable", rec.Code, rec.Body.String(), hostPort(target.URL))
 	}
 }
+
+func TestB192SixthComposerRateLimitedCapture(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			f := newPackagistFixture(t)
+			s := composerServer(t, f)
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(status)
+			}))
+			t.Cleanup(target.Close)
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+"/metadata", http.StatusFound)
+			}))
+			t.Cleanup(first.Close)
+			s.cfg.ComposerUpstream = first.URL
+			rec := doRequest(s, http.MethodGet, consoleDistPath("v7.1.5", consoleRef515), nil)
+			want := fmt.Sprintf("%s: upstream answered HTTP %d %s.", hostPort(target.URL), status, http.StatusText(status))
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), want) {
+				t.Fatalf("status=%d body=%q; want 502 containing %q", rec.Code, rec.Body.String(), want)
+			}
+		})
+	}
+}
+
+func TestB192SixthTLSAlertInsideProxyConnect(t *testing.T) {
+	proxy := httptest.NewUnstartedServer(http.NotFoundHandler())
+	proxy.TLS = &tls.Config{MaxVersion: tls.VersionTLS12} //nolint:gosec // G402: the fixture rejects the client's TLS version
+	proxy.StartTLS()
+	t.Cleanup(proxy.Close)
+	origin := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(origin.Close)
+	s := notFoundServer(t, storage.NewMemory(), origin.URL)
+	allowLoopbackHost(t)
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := upstreamClient
+	transport := upstreamTransport.Clone()
+	transport.Proxy = http.ProxyURL(proxyURL)
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	client := *saved
+	client.Transport = transport
+	upstreamClient = &client
+	t.Cleanup(func() { upstreamClient = saved; transport.CloseIdleConnections() })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/maven/"+markerJar, nil)
+	resolve := func(context.Context) (string, error) { return origin.URL + "/artifact", nil }
+	s.proxyOrResolve(rec, req, s.typeStore(manifest.TypeMaven), manifest.MavenKey(markerJar), resolve, "", nil, manifest.TypeMaven, "", "", true, false)
+	want := hostPort(origin.URL) + ": TLS handshake failed."
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("status=%d body=%q; want 502 containing %q", rec.Code, rec.Body.String(), want)
+	}
+}
