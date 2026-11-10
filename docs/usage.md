@@ -7051,7 +7051,7 @@ level=INFO msg="TLS certificate loaded" subject="CN=bodega.example.com" issuer="
 A reload never takes the certificate away. bodega keeps serving the loaded pair, and logs the file and the reason at `ERROR`, when the new pair:
 
 - cannot be read,
-- does not parse,
+- does not parse, in the leaf or in any later certificate of the chain,
 - has a key that does not match the certificate, or
 - carries a certificate that has already expired.
 

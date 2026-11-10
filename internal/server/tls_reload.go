@@ -141,9 +141,12 @@ func modTime(path string) (time.Time, bool) {
 	return fi.ModTime(), true
 }
 
-// loadCertPair reads and pairs the two files. The certificate is parsed on
-// its own first so a failure can be attributed: once it parses, whatever
-// tls.X509KeyPair refuses is the key, unparseable or not matching.
+// loadCertPair reads and pairs the two files. Every certificate in the file
+// is parsed first, for two reasons. tls.X509KeyPair parses only the leaf and
+// carries the rest of the chain as opaque bytes, so a damaged intermediate
+// would be installed and then refused by every client. And once the whole
+// chain parses, whatever tls.X509KeyPair refuses is the key, unparseable or
+// not matching, which is how a failure gets attributed to a file.
 func loadCertPair(certFile, keyFile string) (*tls.Certificate, error) {
 	certPEM, err := os.ReadFile(certFile) //nolint:gosec // operator-configured path
 	if err != nil {
@@ -153,7 +156,7 @@ func loadCertPair(certFile, keyFile string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, &certLoadError{file: keyFile, err: err}
 	}
-	if err := parseLeaf(certPEM); err != nil {
+	if err := parseChain(certPEM); err != nil {
 		return nil, &certLoadError{file: certFile, err: err}
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -163,17 +166,27 @@ func loadCertPair(certFile, keyFile string) (*tls.Certificate, error) {
 	return &cert, nil
 }
 
-func parseLeaf(certPEM []byte) error {
+// parseChain parses each CERTIFICATE block, the set tls.X509KeyPair sends to
+// clients. It checks syntax only: whether the chain leads to a root is the
+// client's judgment.
+func parseChain(certPEM []byte) error {
+	n := 0
 	for {
 		var block *pem.Block
 		block, certPEM = pem.Decode(certPEM)
 		if block == nil {
-			return errors.New("no PEM certificate found")
+			break
 		}
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		_, err := x509.ParseCertificate(block.Bytes)
-		return err
+		n++
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return fmt.Errorf("certificate %d in the file: %w", n, err)
+		}
 	}
+	if n == 0 {
+		return errors.New("no PEM certificate found")
+	}
+	return nil
 }
