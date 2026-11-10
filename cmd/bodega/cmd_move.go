@@ -164,9 +164,10 @@ func splitVersionArg(arg string) (name, version string) {
 // object, so the verify that follows re-reads what it just overwrote and
 // passes; --delete-source then removes the artifact the manifest points at,
 // and both backends answer a missing object with "not found", so nothing
-// afterwards can tell it ever existed. Label is the identity because it is the
-// only thing an ObjectStore exposes about where it writes, and it is what
-// dedupByLabel already compares.
+// afterwards can tell it ever existed. storage.SameLocation answers it: the
+// Label dedupByLabel compares, and for two s3 stores also the URL the SDK
+// sends a key to, because two configurations with different labels can
+// address one object.
 func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifest.PackageManifest, version, dstName string) ([]int, error) {
 	if directoryPlaced(pm.Type) {
 		return nil, fmt.Errorf("%s is not movable: %s; "+
@@ -205,7 +206,7 @@ func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifes
 			frozen = append(frozen, versionLabel(ve))
 		case effectiveStorage(ve.Storage) == dstName:
 			already = append(already, versionLabel(ve))
-		case src.Label() == dst.Label():
+		case storage.SameLocation(src, dst):
 			collision = effectiveStorage(ve.Storage)
 		default:
 			out = append(out, i)
@@ -233,7 +234,7 @@ func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifes
 // Both names are in the message because the configuration is deliberate —
 // staging a migration through a second name for one bucket is documented — so
 // the operator needs to know which half to repoint, not to be told the setup
-// is wrong. The location is the Label both resolve to, which is what makes the
+// is wrong. The location is the destination's Label, which is what makes the
 // pair identifiable in a config file where the two entries need not be spelled
 // alike.
 func sameLocationError(srcName, dstName, location string) error {
@@ -270,7 +271,7 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 	// destroys the artifact: a caller assembling a mover without going through
 	// selection would copy every object onto itself, verify what it overwrote,
 	// and then delete the only copy.
-	if src.Label() == m.dst.Label() {
+	if storage.SameLocation(src, m.dst) {
 		return fmt.Errorf("%s: %w", label, sameLocationError(srcName, m.dstName, m.dst.Label()))
 	}
 

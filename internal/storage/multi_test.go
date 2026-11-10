@@ -486,8 +486,8 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000/b"},
 		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net/b"},
 		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443/b"},
-		{"path", "https://gw.example.net/tenant-a/", "s3+https://tenant-a.gw.example.net/b"},
-		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://tenant-b.gw.example.net/b"},
+		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a|b"},
+		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b|b"},
 		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000/b"},
 		{"AWS regional endpoint is AWS", "https://s3.us-west-2.amazonaws.com", "s3://b"},
 		{"AWS global endpoint", "https://s3.amazonaws.com/", "s3://b"},
@@ -499,7 +499,7 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		{"AWS interface VPC endpoint", "https://bucket.vpce-0a1b2c-abcd.s3.us-east-1.vpce.amazonaws.com", "s3://b"},
 		{"AWS over plaintext is still AWS", "http://s3.us-west-2.amazonaws.com", "s3://b"},
 		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000/b"},
-		{"the first path segment on an AWS host is the bucket", "https://s3.us-west-2.amazonaws.com/x", "s3://x/b"},
+		{"a path on an AWS host is not the bucket namespace", "https://s3.us-west-2.amazonaws.com/x", "s3+https://s3.us-west-2.amazonaws.com/x|b"},
 		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com/b"},
 		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net/b"},
 		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com/b"},
@@ -580,8 +580,8 @@ func TestS3BucketLabelDropsTheEndpoint(t *testing.T) {
 	}
 	want := map[string][2]string{
 		"aws":    {"s3://artifacts", "s3://artifacts"},
-		"linode": {"s3+https://artifacts.us-ord-1.linodeobjects.com", "s3://artifacts"},
-		"cold":   {"s3+https://cold.artifacts.us-ord-1.linodeobjects.com", "s3://artifacts/cold"},
+		"linode": {"s3+https://us-ord-1.linodeobjects.com/artifacts", "s3://artifacts"},
+		"cold":   {"s3+https://us-ord-1.linodeobjects.com/artifacts/cold", "s3://artifacts/cold"},
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -621,8 +621,8 @@ func TestS3RecordLabelNamesAWS(t *testing.T) {
 		"aws":      "s3+aws://artifacts",
 		"regional": "s3+aws://artifacts",
 		"nested":   "s3+aws://artifacts/cold",
-		"linode":   "s3+https://artifacts.us-ord-1.linodeobjects.com",
-		"cold":     "s3+https://cold.artifacts.us-ord-1.linodeobjects.com",
+		"linode":   "s3+https://us-ord-1.linodeobjects.com/artifacts",
+		"cold":     "s3+https://us-ord-1.linodeobjects.com/artifacts/cold",
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -707,70 +707,70 @@ func sdkNamespace(t *testing.T, client *bos3.Client, bucket, prefix string) stri
 }
 
 // TestS3LabelsKeepComponentBoundaries: two (endpoint, bucket, prefix) tuples
-// share a location label, and a record label, exactly when the SDK sends
-// their keys under one URL, whichever component a separator is moved into,
-// and a record label is never another location's label. The names here are
-// ones the SDK does not address as a host label, so the SDK's route is the
-// whole of the identity; TestS3LocationIsTheSDKRoute covers the ones it does.
+// share a location label, and a record label, exactly when each component is
+// the same one, whichever component a separator is moved into, and a record
+// label is never another location's label. Each group is one tuple under the
+// spellings a component has; no component of one group is another group's.
+// Tuples in one group also send one URL, so sharing a label never hides a
+// store the SDK reaches somewhere else.
 func TestS3LabelsKeepComponentBoundaries(t *testing.T) {
 	isolateS3Env(t)
-	tuples := [][3]string{
-		{"", "a", ""}, {"", "a", "b"}, {"", "a", "b/"}, {"", "a/b", ""}, {"", "a", "b#c"}, {"", "a#b", "c"},
-		{"https://gw.example.net", "a", ""}, {"https://gw.example.net", "a", "b"}, {"https://gw.example.net", "a", "b/"},
-		{"https://gw.example.net", "a/b", ""}, {"https://gw.example.net", "a#b", ""},
-		{"https://gw.example.net/a", "b", ""}, {"https://gw.example.net/a", "b", "c"},
-		{"https://gw.example.net/a/b", "c", ""}, {"https://gw.example.net/a%2Fb", "c", ""},
-		{"https://gw.example.net/a", "b", "c/"}, {"https://gw.example.net/a//", "b", "c/"},
-		{"aws://a", "b", ""}, {"aws://a/b", "c", ""},
+	const gw = "https://gw.example.net"
+	groups := [][][3]string{
+		{{"", "a", ""}}, {{"", "a", "b/"}}, {{"", "a", "b"}}, {{"", "a/b", ""}}, {{"", "a", "b#c"}}, {{"", "a#b", "c"}},
+		{{gw, "a", ""}, {gw + "/", "a", ""}},
+		{{gw, "a", "b/"}}, {{gw, "a", "b"}}, {{gw, "a/b", ""}}, {{gw, "a#b", ""}},
+		{{gw + "/a", "b", ""}, {gw + "/a/", "b", ""}, {gw + "/%61", "b", ""}},
+		{{gw + "/a", "b", "c/"}}, {{gw + "/a//", "b", "c/"}},
+		{{gw + "/a/b", "c", ""}, {gw + "/a%2Fb", "c", ""}, {gw + "/a%2Fb/", "c", ""}},
+		{{gw + "/a%7Cb", "c", ""}}, {{gw + "/a", "b|c", ""}}, {{gw + "/a", "b", "c*"}},
+		{{"aws://a", "b", ""}}, {{"aws://a/b", "c", ""}},
 	}
 	type seen struct {
+		group     int
 		tuple     [3]string
 		namespace string
 	}
 	labels, records := map[string]seen{}, map[string]seen{}
-	var shared int
-	for _, tuple := range tuples {
-		client, err := bos3.NewClient(t.Context(), tuple[1], "us-east-1", bos3.Options{Endpoint: tuple[0]})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var store ObjectStore = &S3{client: client}
-		if tuple[2] != "" {
-			store = &prefixed{inner: store, prefix: tuple[2]}
-		}
-		this := seen{tuple, sdkNamespace(t, client, tuple[1], tuple[2])}
-		for label, into := range map[string]map[string]seen{store.Label(): labels, S3RecordLabel(store): records} {
-			for prevLabel, prev := range into {
-				if (prevLabel == label) != (prev.namespace == this.namespace) {
-					t.Errorf("%q is %q under %s and %q is %q under %s", prev.tuple, prevLabel, prev.namespace, tuple, label, this.namespace)
+	for i, group := range groups {
+		for _, tuple := range group {
+			client, err := bos3.NewClient(t.Context(), tuple[1], "us-east-1", bos3.Options{Endpoint: tuple[0]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var store ObjectStore = &S3{client: client}
+			if tuple[2] != "" {
+				store = &prefixed{inner: store, prefix: tuple[2]}
+			}
+			this := seen{i, tuple, sdkNamespace(t, client, tuple[1], tuple[2])}
+			for label, into := range map[string]map[string]seen{store.Label(): labels, S3RecordLabel(store): records} {
+				for prevLabel, prev := range into {
+					if (prevLabel == label) != (prev.group == i) {
+						t.Errorf("%q is %q and %q is %q", prev.tuple, prevLabel, tuple, label)
+					}
+					if prevLabel == label && prev.namespace != this.namespace {
+						t.Errorf("%q and %q share %q and the SDK sends them to %s and %s", prev.tuple, tuple, label, prev.namespace, this.namespace)
+					}
 				}
+				into[label] = this
 			}
-			if _, dup := into[label]; dup {
-				shared++
-			}
-			into[label] = this
 		}
-	}
-	// Each of "/a/b", its encoded spelling and the same path split across
-	// bucket and prefix is one namespace, so the list has to hold aliases or
-	// it only shows that different strings differ.
-	if shared < 6 {
-		t.Errorf("the tuples hold %d aliases, want at least 6", shared)
 	}
 	for record, r := range records {
-		if l, dup := labels[record]; dup && l.namespace != r.namespace {
+		if l, dup := labels[record]; dup && l.group != r.group {
 			t.Errorf("the record label of %q is the label %q of %q", r.tuple, record, l.tuple)
 		}
 	}
 }
 
-// TestS3LocationIsTheSDKRoute: every consumer of an s3 identity reads one
-// location, and it follows where the SDK sends a request and not how the
-// configuration spelled it. Each group is one object namespace under several
-// spellings (the addressing style, an encoded endpoint path, a path segment
-// moved between endpoint, bucket and prefix) and no two groups are the same
-// place.
-func TestS3LocationIsTheSDKRoute(t *testing.T) {
+// TestS3LocationIsItsConfiguredComponents: every consumer of an s3 identity
+// reads one location, built from the endpoint, the bucket and the prefix as
+// configured. Each group is one such triple under the spellings that do not
+// change it (the addressing style, the endpoint's case, port, trailing slash
+// and encoding, AWS's own hosts) and no two groups share a label, including
+// the pairs the SDK sends to one URL: an endpoint path segment against a
+// bucket, a dotted bucket against a bucket and prefix.
+func TestS3LocationIsItsConfiguredComponents(t *testing.T) {
 	isolateS3Env(t)
 	type spelling struct {
 		endpoint  string
@@ -778,44 +778,58 @@ func TestS3LocationIsTheSDKRoute(t *testing.T) {
 		bucket    string
 		prefix    string
 	}
-	const gw = "https://gw.example.net"
+	const (
+		gw  = "https://gw.example.net"
+		arn = "arn:aws:s3:us-east-1:111111111111:accesspoint/first"
+	)
 	groups := []struct {
 		label, record string
 		spellings     []spelling
 	}{
-		{"s3+https://artifacts.gw.example.net", "", []spelling{
+		{"s3+https://gw.example.net/artifacts", "", []spelling{
 			{gw, false, "artifacts", ""}, {gw, true, "artifacts", ""}, {"HTTPS://GW.Example.NET:443/", true, "artifacts", ""},
 		}},
-		{"s3+https://cold.artifacts.gw.example.net", "", []spelling{
-			{gw, false, "artifacts", "cold/"}, {gw, true, "artifacts", "cold"},
+		{"s3+https://gw.example.net/artifacts/cold", "", []spelling{{gw, false, "artifacts", "cold/"}, {gw, true, "artifacts", "cold"}}},
+		{"s3+https://artifacts.gw.example.net/cold", "", []spelling{
 			{"https://artifacts.gw.example.net", true, "cold", ""}, {"https://artifacts.gw.example.net", false, "cold", ""},
-			{gw + "/artifacts", true, "cold", ""}, {gw + "/%61rtifacts/", true, "cold", ""},
 		}},
-		{"s3+https://tenant.artifacts.gw.example.net", "", []spelling{
-			{gw + "/tenant", false, "artifacts", ""}, {gw, true, "artifacts", "tenant/"},
+		{"s3+https://gw.example.net/artifacts|cold", "", []spelling{
+			{gw + "/artifacts", true, "cold", ""}, {gw + "/%61rtifacts/", true, "cold", ""}, {gw + "/artifacts", false, "cold", ""},
 		}},
-		{"s3+https://artifacts.tenant.gw.example.net", "", []spelling{
-			{gw + "/tenant", true, "artifacts", ""}, {gw, false, "tenant", "artifacts/"},
+		{"s3+https://gw.example.net/tenant|artifacts", "", []spelling{{gw + "/tenant", false, "artifacts", ""}, {gw + "/tenant", true, "artifacts", ""}}},
+		{"s3+https://gw.example.net/tenant/artifacts", "", []spelling{{gw, false, "tenant", "artifacts/"}, {gw, true, "tenant", "artifacts/"}}},
+		{"s3+https://tenant.gw.example.net/artifacts", "", []spelling{{"https://tenant.gw.example.net", true, "artifacts", ""}}},
+		{"s3+https://gw.example.net/a/b|artifacts", "", []spelling{{gw + "/a/b", true, "artifacts", ""}, {gw + "/a%2Fb", true, "artifacts", ""}}},
+		{"s3+https://gw.example.net/a|b/artifacts", "", []spelling{{gw + "/a", true, "b", "artifacts/"}}},
+		{"s3+http://gw.example.net/cold.artifacts", "", []spelling{
+			{"http://gw.example.net", false, "cold.artifacts", ""}, {"http://gw.example.net:80", true, "cold.artifacts", ""},
 		}},
-		{"s3+https://gw.example.net/a/b/artifacts", "", []spelling{
-			{gw + "/a/b", true, "artifacts", ""}, {gw + "/a%2Fb", true, "artifacts", ""}, {gw + "/a", true, "b", "artifacts/"},
-		}},
+		{"s3+http://gw.example.net/artifacts/cold", "", []spelling{{"http://gw.example.net", false, "artifacts", "cold"}}},
 		{"s3+https://gw.example.net/Cold", "", []spelling{{gw, true, "Cold", ""}, {gw, false, "Cold", ""}}},
-		{"s3+https://cold.artifacts.gw.example.net/", "", []spelling{{gw, true, "artifacts", "cold//"}, {gw, false, "artifacts", "cold//"}}},
-		{"s3+http://artifacts.gw.example.net", "", []spelling{{"http://gw.example.net", false, "artifacts", ""}}},
+		{"s3+https://gw.example.net/artifacts/cold/", "", []spelling{{gw, true, "artifacts", "cold//"}, {gw, false, "artifacts", "cold//"}}},
 		{"s3+https://10.0.0.1/artifacts", "", []spelling{{"https://10.0.0.1", false, "artifacts", ""}, {"https://10.0.0.1", true, "artifacts", ""}}},
 		{"s3://artifacts", "s3+aws://artifacts", []spelling{
 			{"", false, "artifacts", ""}, {"", true, "artifacts", ""}, {"https://s3.eu-west-1.amazonaws.com", true, "artifacts", ""},
 		}},
 		{"s3://artifacts/cold", "s3+aws://artifacts/cold", []spelling{
 			{"", false, "artifacts", "cold/"}, {"https://s3.us-west-2.amazonaws.com", false, "artifacts", "cold/"},
-			{"https://s3.us-west-2.amazonaws.com/artifacts", true, "cold", ""}, {"https://s3.us-west-2.amazonaws.com/cold", false, "artifacts", ""},
 		}},
+		{"s3://cold", "s3+aws://cold", []spelling{{"", false, "cold", ""}}},
+		{"s3+https://s3.us-west-2.amazonaws.com/artifacts|cold", "", []spelling{{"https://s3.us-west-2.amazonaws.com/artifacts", true, "cold", ""}}},
 		{"s3://my.dotted.bucket/cold", "s3+aws://my.dotted.bucket/cold", []spelling{
 			{"", false, "my.dotted.bucket", "cold/"}, {"http://s3.us-west-2.amazonaws.com", false, "my.dotted.bucket", "cold/"},
 		}},
+		{"s3://arn:aws:s3:us-east-1:111111111111:accesspoint%2Ffirst", "s3+aws://arn:aws:s3:us-east-1:111111111111:accesspoint%2Ffirst", []spelling{{"", false, arn, ""}}},
+		{"s3://arn:aws:s3:us-east-1:111111111111:accesspoint%2Ffirst/cold", "s3+aws://arn:aws:s3:us-east-1:111111111111:accesspoint%2Ffirst/cold", []spelling{
+			{"", false, arn, "cold"}, {"https://s3.us-east-1.amazonaws.com", false, arn, "cold/"},
+		}},
 	}
+	labels := map[string]bool{}
 	for _, g := range groups {
+		if labels[g.label] {
+			t.Fatalf("two groups expect %q", g.label)
+		}
+		labels[g.label] = true
 		if g.record == "" {
 			g.record = g.label
 		}
@@ -831,5 +845,108 @@ func TestS3LocationIsTheSDKRoute(t *testing.T) {
 				t.Errorf("%+v: S3RecordLabel = %q, want %q", sp, got, g.record)
 			}
 		}
+	}
+}
+
+// TestSameLocationAlsoComparesTheSDKRoute: the question a move asks is wider
+// than the identity. Two stores with one label are the same location, and so
+// are two whose labels differ and whose keys the SDK sends to one URL; the
+// second never makes them one label.
+func TestSameLocationAlsoComparesTheSDKRoute(t *testing.T) {
+	isolateS3Env(t)
+	s3 := func(endpoint string, pathStyle bool, bucket, prefix string) ObjectStore {
+		t.Helper()
+		store, err := NewFromSpec(t.Context(), Spec{Driver: "s3", Bucket: bucket, Region: "us-east-1", Prefix: prefix, Endpoint: endpoint, PathStyle: pathStyle})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	const gw = "https://gw.example.net"
+	local := NewLocal(t.TempDir())
+	cases := []struct {
+		name      string
+		a, b      ObjectStore
+		same, one bool
+	}{
+		{"one endpoint and bucket in two styles", s3(gw, false, "artifacts", ""), s3(gw, true, "artifacts", ""), true, true},
+		{"an endpoint path segment spelled as a bucket", s3(gw+"/tenant", true, "artifacts", ""), s3(gw, true, "tenant", "artifacts"), true, false},
+		{"a dotted bucket spelled as a host", s3("http://gw.example.net", false, "cold.artifacts", ""), s3("http://artifacts.gw.example.net", false, "cold", ""), true, false},
+		{"a bucket spelled as a host", s3(gw, false, "artifacts", "cold"), s3("https://artifacts.gw.example.net", true, "cold", ""), true, false},
+		{"a dotted bucket and a bucket under a prefix", s3("http://gw.example.net", false, "cold.artifacts", ""), s3("http://gw.example.net", false, "artifacts", "cold"), false, false},
+		{"a gateway path and a subdomain", s3(gw+"/tenant", true, "artifacts", ""), s3("https://tenant.gw.example.net", true, "artifacts", ""), false, false},
+		{"a prefix inside the bucket", s3(gw, false, "artifacts", ""), s3(gw, false, "artifacts", "cold"), false, false},
+		{"AWS under two regions' hosts", s3("", false, "artifacts", ""), s3("https://s3.us-west-2.amazonaws.com", false, "artifacts", ""), true, true},
+		{"another driver", local, s3(gw, false, "artifacts", ""), false, false},
+		{"one local directory", local, NewLocal(local.Label()[len("file://"):]), true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a.Label() == tc.b.Label(); got != tc.one {
+				t.Errorf("labels %q and %q: equal = %v, want %v", tc.a.Label(), tc.b.Label(), got, tc.one)
+			}
+			if got := SameLocation(tc.a, tc.b); got != tc.same {
+				t.Errorf("SameLocation(%q, %q) = %v, want %v", tc.a.Label(), tc.b.Label(), got, tc.same)
+			}
+			if got := SameLocation(tc.b, tc.a); got != tc.same {
+				t.Errorf("SameLocation(%q, %q) = %v, want %v", tc.b.Label(), tc.a.Label(), got, tc.same)
+			}
+		})
+	}
+}
+
+func TestReviewF113ResolvedRoutesStayDistinct(t *testing.T) {
+	isolateS3Env(t)
+	cases := []struct {
+		name string
+		a, b Spec
+	}{
+		{"dotted bucket is not a key prefix",
+			Spec{Driver: "s3", Region: "us-east-1", Endpoint: "http://gw.example.net", Bucket: "cold.artifacts"},
+			Spec{Driver: "s3", Region: "us-east-1", Endpoint: "http://gw.example.net", Bucket: "artifacts", Prefix: "cold"}},
+		{"path is not a subdomain",
+			Spec{Driver: "s3", Region: "us-east-1", Endpoint: "https://gw.example.net/tenant", Bucket: "artifacts", PathStyle: true},
+			Spec{Driver: "s3", Region: "us-east-1", Endpoint: "https://tenant.gw.example.net", Bucket: "artifacts", PathStyle: true}},
+		{"access point prefixes retain the account and access point",
+			Spec{Driver: "s3", Region: "us-east-1", Bucket: "arn:aws:s3:us-east-1:111111111111:accesspoint/first", Prefix: "cold"},
+			Spec{Driver: "s3", Region: "us-east-1", Bucket: "arn:aws:s3:us-east-1:222222222222:accesspoint/second", Prefix: "cold"}},
+		{"access point prefix is not an ordinary bucket",
+			Spec{Driver: "s3", Region: "us-east-1", Bucket: "arn:aws:s3:us-east-1:111111111111:accesspoint/first", Prefix: "cold"},
+			Spec{Driver: "s3", Region: "us-east-1", Bucket: "cold"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stores []ObjectStore
+			var routes []string
+			for _, spec := range []Spec{tc.a, tc.b} {
+				client, err := bos3.NewClient(t.Context(), spec.Bucket, spec.Region, spec.S3Options())
+				if err != nil {
+					t.Fatal(err)
+				}
+				prefix := strings.Trim(spec.Prefix, "/")
+				if prefix != "" {
+					prefix += "/"
+				}
+				routes = append(routes, sdkNamespace(t, client, spec.Bucket, prefix))
+				store, err := NewFromSpec(t.Context(), spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stores = append(stores, store)
+			}
+			if routes[0] == routes[1] {
+				t.Fatalf("invalid fixture: both routes are %s", routes[0])
+			}
+			t.Logf("SDK routes: %s and %s", routes[0], routes[1])
+			if a, b := stores[0].Label(), stores[1].Label(); a == b {
+				t.Errorf("distinct routes share location %q", a)
+			}
+			if a, b := S3RecordLabel(stores[0]), S3RecordLabel(stores[1]); a == b {
+				t.Errorf("distinct routes share cache-record identity %q", a)
+			}
+			if got := dedupByLabel([]NamedStore{{Name: "one", Store: stores[0]}, {Name: "two", Store: stores[1]}}); len(got) != 2 {
+				t.Errorf("fan-out retained %d of two distinct locations", len(got))
+			}
+		})
 	}
 }

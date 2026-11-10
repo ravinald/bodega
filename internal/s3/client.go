@@ -157,10 +157,10 @@ type Route struct {
 // nothing without it, and which region is no part of where an AWS bucket is:
 // the answer would otherwise change with AWS_REGION.
 func (c *Client) Route(ctx context.Context) (Route, error) {
-	region, endpoint, pathStyle := c.region, "", false
+	region, endpoint, pathStyle := c.region, c.Endpoint(), false
 	if c.raw != nil {
 		opts := c.raw.Options()
-		region, endpoint, pathStyle = opts.Region, aws.ToString(opts.BaseEndpoint), opts.UsePathStyle
+		region, pathStyle = opts.Region, opts.UsePathStyle
 	}
 	if region == "" && endpoint == "" {
 		region = "us-east-1"
@@ -185,6 +185,16 @@ func ResolveRoute(ctx context.Context, region, endpoint, bucket string, pathStyl
 	}
 	route.URL = ep.URI
 	return route, nil
+}
+
+// Endpoint is the base URL the client dials, from the endpoint key or from
+// whatever the SDK read for it (AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, the
+// profile), and "" when the SDK derives AWS's own host from the region.
+func (c *Client) Endpoint() string {
+	if c.raw == nil {
+		return ""
+	}
+	return aws.ToString(c.raw.Options().BaseEndpoint)
 }
 
 // Bucket returns the configured bucket name.

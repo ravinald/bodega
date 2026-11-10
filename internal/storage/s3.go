@@ -148,7 +148,7 @@ func (s *S3) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix str
 }
 
 // Label is the store's location (see s3Location): "s3://<bucket>" on AWS and
-// "s3+<scheme>://<host>[/<path>]" on any other store.
+// "s3+<scheme>://<host>/[<path>|]<bucket>" on any other store.
 func (s *S3) Label() string {
 	return s.location("").label()
 }
@@ -171,86 +171,97 @@ var awsS3Endpoint = regexp.MustCompile(`^(?:bucket\.vpce-[a-z0-9-]+\.)?s3(?:-fip
 // consumer compares: the fan-out's dedup and both 'pkg move' guards through
 // Label, and a cache-origin record through S3RecordLabel.
 //
-// It is derived from the route the pinned SDK resolves, never from the
-// configured strings. One object namespace has many spellings in a config
-// file (an encoded endpoint path, or a path segment moved between endpoint,
-// bucket and prefix under path-style addressing), the SDK sends all of them to
-// one URL, and 'pkg move --delete-source' between two names for one URL
-// deletes the only copy. So two stores whose requests for a key reach one URL
-// are one location.
+// It is the three things the store was configured with, each kept whole: the
+// endpoint, the bucket and the key prefix. Nothing moves between them. A
+// bucket with a dot in it is not a bucket under a prefix, an endpoint path is
+// not a subdomain, and an access-point ARN stays the ARN whatever prefix
+// follows it, because only the service knows where its own boundaries are and
+// the route a request takes does not say: path-style
+// "https://gw/tenant" + "artifacts" and "https://gw" + "tenant" under prefix
+// "artifacts" send one URL, and so do a dotted bucket and a bucket plus prefix
+// on a virtual-hosted store that are two buckets.
 //
-// One equivalence is added to the SDK's: a name the SDK addresses as
-// <name>.<host> is the same place as <host>/<name>, which is how every S3
-// service reads the two addressing styles, and what makes path_style a
-// setting of the client and not part of where the store is. Taken with the
-// first rule it cannot stop at the bucket. "https://b.gw" with path-style
-// bucket "x" and "https://gw" with bucket "b" under prefix "x" send one URL,
-// and the first is "https://b.gw" with bucket "x" either way, so a leading
-// path segment the SDK would address as a host label is one wherever the
-// configuration put it. The location is that normal form: every such leading
-// segment in the host, the rest as the path.
+// Two spellings of one component are one location: the endpoint's case,
+// default port, trailing slash and percent-encoding, and any of AWS's own
+// hosts for AWS. The addressing style is no component at all. path_style
+// chooses how the client writes the bucket into a request for the same
+// endpoint and bucket.
 //
-// AWS is the exception, because its hosts are known: whatever precedes one of
-// them is a bucket name, dots included, and the region, the partition and the
-// FIPS, dual-stack and accelerate variants all reach one global namespace. An
-// AWS location is the bucket and the path under it, with no host.
-//
-// What this cannot equate is two hostnames for one compatible service (a DNS
-// name and its address, a CNAME): nothing short of a request tells them
-// apart from two services, and they are kept apart.
+// Two configurations with different components can still reach one object.
+// They are two locations here, which costs a fan-out a duplicate listing and
+// lets either read the other's cache origin for bytes they share. What it may
+// not cost is the object, so a move asks SameLocation, which also compares
+// the routes.
 type s3Location struct {
 	aws bool
-	// root is "<scheme>://<host>[:<port>]" for a compatible store, or
-	// "unresolved-<digest>" where the SDK resolves no route at all. Empty on
-	// AWS.
-	root string
-	// segs are the percent-decoded path segments below root, and on AWS the
-	// bucket then the segments below it.
+	// root is "<scheme>://<host>[:<port>]/", then the endpoint's path as
+	// escaped segments closed by a "|" when it has one. An endpoint that does
+	// not parse is "unresolved-<digest>/". Empty on AWS.
+	root   string
+	bucket string
+	// segs are the complete segments of the key prefix.
 	segs []string
 	// tail is the start of the segment a key continues. It is empty for every
 	// store built from configuration, whose prefix ends at a "/".
 	tail string
 }
 
-// s3LocationOf is the location of an s3 store or of prefixes over one, and
+// s3Under unwraps prefixes down to the s3 store they are over, and reports
 // false for any other store.
-func s3LocationOf(store ObjectStore) (s3Location, bool) {
-	var prefix string
+func s3Under(store ObjectStore) (s3 *S3, prefix string, ok bool) {
 	for {
 		switch s := store.(type) {
 		case *prefixed:
 			prefix, store = s.prefix+prefix, s.inner
 		case *S3:
-			return s.location(prefix), true
+			return s, prefix, true
 		default:
-			return s3Location{}, false
+			return nil, "", false
 		}
 	}
 }
 
-// location is the one place an s3 identity is built: the SDK's route for the
-// bucket, the key prefix appended as the SDK appends a key, then the normal
-// form s3Location describes.
-func (s *S3) location(prefix string) s3Location {
-	ctx := context.Background()
-	bucket := s.client.Bucket()
-	route, err := s.client.Route(ctx)
-	if err != nil {
-		// No request for this store resolves, so there is no URL to share
-		// with another. A digest keeps the endpoint's text, which nothing
-		// validated when the SDK read it from the environment, out of logs.
-		sum := sha256.Sum256([]byte(route.Endpoint + "\x00" + bucket))
-		loc := s3Location{root: fmt.Sprintf("unresolved-%x", sum[:8])}
-		loc.segs, loc.tail = splitKeyPath(prefix)
-		return loc
+// s3LocationOf is the location of an s3 store or of prefixes over one, and
+// false for any other store.
+func s3LocationOf(store ObjectStore) (s3Location, bool) {
+	s, prefix, ok := s3Under(store)
+	if !ok {
+		return s3Location{}, false
 	}
-	u := route.URL
-	hostname := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	return s.location(prefix), true
+}
+
+// location is the one place an s3 identity is built.
+func (s *S3) location(prefix string) s3Location {
+	loc := s3Location{bucket: s.client.Bucket()}
+	loc.aws, loc.root = endpointRoot(s.client.Endpoint())
+	loc.segs, loc.tail = splitKeyPath(prefix)
+	return loc
+}
+
+// endpointRoot normalizes the endpoint a client dials, whether the endpoint
+// key supplied it or the SDK read it from the environment, and reports AWS
+// for no endpoint and for any of AWS's own hosts.
+//
+// The path is the decoded one, opened and closed by a "/" as the SDK's rules
+// normalize it, so "/a/b", "/a/b/" and "/a%2Fb" are one root and "/a//" is
+// another. Userinfo and a query are dropped: neither is part of where the
+// store is, and a label is printed.
+func endpointRoot(endpoint string) (aws bool, root string) {
+	if endpoint == "" {
+		return true, ""
+	}
+	u, hostname, ok := parseEndpoint(endpoint)
+	if !ok {
+		// Nothing validated this text when the SDK read it from the
+		// environment, so a digest keeps it out of logs.
+		sum := sha256.Sum256([]byte(endpoint))
+		return false, fmt.Sprintf("unresolved-%x/", sum[:8])
+	}
 	port := u.Port()
 	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
 		port = ""
 	}
-	// smithy's JoinPath, which is how the SDK puts a key under the route.
 	path := u.Path
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -258,46 +269,35 @@ func (s *S3) location(prefix string) s3Location {
 	if !strings.HasSuffix(path, "/") {
 		path += "/"
 	}
-	segs, tail := splitKeyPath(path[1:] + prefix)
-
-	if route.Endpoint == "" {
-		// The SDK derived the host, so it is AWS's whether or not
-		// awsS3Endpoint knows the partition.
-		under, known := awsBucketHost(hostname)
-		switch {
-		case known:
-		case len(segs) > 0 && segs[0] == bucket:
-		case strings.HasPrefix(hostname, bucket+"."):
-			under = bucket
-		}
-		if under != "" {
-			segs = append([]string{under}, segs...)
-		}
-		if len(segs) > 0 && segs[0] != "" {
-			return s3Location{aws: true, segs: segs, tail: tail}
-		}
+	root = u.Scheme + "://" + hostPort(hostname, port) + "/"
+	if path == "/" {
+		return port == "" && awsS3Endpoint.MatchString(hostname), root
 	}
-	for {
-		if under, ok := awsBucketHost(hostname); ok && port == "" && route.Endpoint != "" {
-			all := segs
-			if under != "" {
-				all = append([]string{under}, segs...)
-			}
-			if len(all) > 0 && all[0] != "" {
-				return s3Location{aws: true, segs: all, tail: tail}
-			}
-		}
-		if len(segs) == 0 || !virtualHosted(ctx, s.client.Region(), u.Scheme, hostPort(hostname, port), segs[0]) {
-			break
-		}
-		hostname, segs = segs[0]+"."+hostname, segs[1:]
+	segs := strings.Split(path[1:len(path)-1], "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
 	}
-	return s3Location{root: u.Scheme + "://" + hostPort(hostname, port), segs: segs, tail: tail}
+	return false, root + strings.Join(segs, "/") + "|"
 }
 
-// splitKeyPath splits the path a key is appended to into its complete
-// segments and the start of the segment the key continues. Nothing is cleaned:
-// "a//b" and "a/b" are two prefixes of one bucket.
+// parseEndpoint reads an endpoint as an http or https URL with a hostname,
+// which it returns lowercased and without a trailing dot.
+func parseEndpoint(endpoint string) (u *url.URL, hostname string, ok bool) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, "", false
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	hostname = strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if (u.Scheme != "http" && u.Scheme != "https") || hostname == "" || strings.ContainsAny(hostname, "/|* ") {
+		return nil, "", false
+	}
+	return u, hostname, true
+}
+
+// splitKeyPath splits a key prefix into its complete segments and the start
+// of the segment the key continues. Nothing is cleaned: "a//b" and "a/b" are
+// two prefixes of one bucket.
 func splitKeyPath(p string) (segs []string, tail string) {
 	segs = strings.Split(p, "/")
 	return segs[:len(segs)-1], segs[len(segs)-1]
@@ -313,45 +313,22 @@ func hostPort(hostname, port string) string {
 	return hostname
 }
 
-// awsBucketHost reports whether host is one AWS serves the S3 API on, alone
-// or behind a bucket name, and returns that name.
-func awsBucketHost(host string) (bucket string, ok bool) {
-	for i := 0; ; {
-		if awsS3Endpoint.MatchString(host[i:]) {
-			return strings.TrimSuffix(host[:i], "."), true
-		}
-		dot := strings.IndexByte(host[i:], '.')
-		if dot < 0 {
-			return "", false
-		}
-		i += dot + 1
-	}
-}
-
-// virtualHosted asks the SDK whether it addresses name on host as
-// <name>.<host>. Its rules decide (a name's length and characters, a host
-// that is an address), so the normal form moves a segment exactly where a
-// configuration could have.
-func virtualHosted(ctx context.Context, region, scheme, host, name string) bool {
-	route, err := bos3.ResolveRoute(ctx, region, scheme+"://"+host, name, false)
-	return err == nil && route.URL.Host == name+"."+host
-}
-
 // label serializes the location so that two labels are equal exactly when
-// two locations are: each segment is escaped, so a "/" separates segments and
-// nothing else, and a tail is marked with a "*" no escaped segment holds.
+// two locations are. Every component is escaped, so a "/" separates
+// components and prefix segments and nothing else, the "|" closing an
+// endpoint path and the "*" marking a tail are bytes no escaped component
+// holds, and a "/" inside a bucket (an access-point ARN has one) is "%2F".
 func (l s3Location) label() string {
 	if l.aws {
 		return s3BucketScheme + l.path()
 	}
-	if p := l.path(); p != "" || len(l.segs) > 0 {
-		return "s3+" + l.root + "/" + p
-	}
-	return "s3+" + l.root
+	return "s3+" + l.root + l.path()
 }
 
+// path is the bucket and the prefix under it.
 func (l s3Location) path() string {
-	escaped := make([]string, 0, len(l.segs)+1)
+	escaped := make([]string, 0, len(l.segs)+2)
+	escaped = append(escaped, url.PathEscape(l.bucket))
 	for _, seg := range l.segs {
 		escaped = append(escaped, url.PathEscape(seg))
 	}
@@ -359,6 +336,54 @@ func (l s3Location) path() string {
 		escaped = append(escaped, url.PathEscape(l.tail)+"*")
 	}
 	return strings.Join(escaped, "/")
+}
+
+// SameLocation reports whether writing a key to one store overwrites that key
+// in the other. It is what a move asks before it copies or deletes anything,
+// and it is wider than the identity: two stores are the same location when
+// their labels are equal, and also when the pinned SDK sends a key for each
+// to one URL. The second holds for configurations whose components differ (an
+// endpoint path segment spelled as a bucket under path-style addressing, a
+// dotted bucket spelled as a bucket and a prefix), which stay two identities
+// everywhere else. The route only ever refuses here; it never names a store.
+func SameLocation(a, b ObjectStore) bool {
+	if a.Label() == b.Label() {
+		return true
+	}
+	ra, ok := s3ObjectRoute(a)
+	if !ok {
+		return false
+	}
+	rb, ok := s3ObjectRoute(b)
+	return ok && ra == rb
+}
+
+// s3ObjectRoute is the URL the SDK puts a key under for an s3 store: the
+// resolved scheme and host, the decoded path closed by a "/" as the request
+// middleware joins it, then the prefix. False for another driver and for a
+// store the SDK resolves no route for.
+func s3ObjectRoute(store ObjectStore) (string, bool) {
+	s, prefix, ok := s3Under(store)
+	if !ok {
+		return "", false
+	}
+	route, err := s.client.Route(context.Background())
+	if err != nil {
+		return "", false
+	}
+	u := route.URL
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	path := u.Path
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	return u.Scheme + "://" + hostPort(strings.TrimSuffix(strings.ToLower(u.Hostname()), "."), port) + path + prefix, true
 }
 
 // S3BucketLabel returns an s3 store's location as "s3://<bucket>" or
