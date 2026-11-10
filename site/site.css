@@ -59,9 +59,23 @@ body.page .frame, body.colophon .frame, body.\34 04 .frame { grid-template-colum
 .contents h2:first-child { margin-top: .5rem; }
 .contents ol { list-style: none; margin: 0; padding: 0; }
 .contents li, ol.contents li { display: grid; grid-template-columns: 1.9rem 1fr; padding: .2rem 0; }
-.contents li span, ol.contents li span { font: 600 .68rem/1.75 var(--sans); font-variant-numeric: tabular-nums; color: var(--quiet); }
+.contents li span, ol.contents li span { font: 600 .68rem/1.75 var(--sans); font-variant-numeric: tabular-nums; color: var(--quiet); text-align: right; padding-right: .65rem; }
 .contents a { text-decoration: none; }
-.contents li.here a { color: var(--accent); font-weight: 650; }
+.contents li.here > a, .contents li.here > details > summary > a { color: var(--accent); font-weight: 650; }
+/* A page with headings opens two levels deeper. The number and the chevron
+   toggle it; the title still navigates. The current page starts open. */
+.contents li.tree { display: block; padding: 0; }
+.contents li.tree summary { display: grid; grid-template-columns: 1.9rem 1fr .9rem; padding: .2rem 0; cursor: pointer; list-style: none; font: inherit; color: inherit; margin: 0; }
+.contents li.tree summary::-webkit-details-marker { display: none; }
+.contents li.tree summary::after { content: "\203A"; font: 600 .95rem/1.2 var(--sans); color: var(--quiet); text-align: center; transition: transform .12s; }
+.contents li.tree details[open] > summary::after { transform: rotate(90deg); }
+.contents li.tree summary:hover::after, .contents li.tree summary:focus-visible::after { color: var(--accent); }
+.contents li.tree summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.contents ol.sub { margin: .1rem 0 .45rem 1.9rem; font-size: .78rem; line-height: 1.35; }
+.contents ol.sub li { display: block; padding: .14rem 0; }
+.contents ol.sub ol { margin: .1rem 0 .1rem .75rem; padding-left: .55rem; border-left: 1px solid var(--rule); }
+.contents ol.sub a { color: var(--quiet); }
+.contents ol.sub a:hover { color: var(--accent); }
 ol.contents { list-style: none; padding: 0; margin: 0 0 1rem; }
 /* The 36-entry column sits above the page once the grid collapses, so a phone gets one collapsed line instead. Two elements, because one <details> cannot stay open on wide screens and closed on narrow ones without script. */
 .contents-compact { display: none; margin: 0 0 1.75rem; font-size: .9rem; line-height: 1.4; border-block: 1px solid var(--rule); }
@@ -74,6 +88,28 @@ ol.contents { list-style: none; padding: 0; margin: 0 0 1rem; }
 .contents-compact li span { font: 600 .72rem/2.6 var(--sans); font-variant-numeric: tabular-nums; color: var(--quiet); }
 .contents-compact li a { display: block; padding: .5rem 0; text-decoration: none; }
 .contents-compact li.here a { color: var(--accent); font-weight: 650; }
+
+/* OS and ecosystem marks, drawn before the first plain mention in a section.
+   Brand colors by default; text color under either color-vision palette,
+   where a brand red or green is the very thing the reader cannot tell apart,
+   and whenever the reader picks it. An explicit "Brand colors" wins over the
+   palette, since that reader chose it knowing which palette is on. */
+.ico { width: 1em; height: 1em; vertical-align: -.14em; margin-right: .22em; fill: var(--brand, currentColor); }
+.ico-apachemaven { --brand: #c71a36; } .ico-debian { --brand: #a81d33; } .ico-docker { --brand: #2496ed; }
+.ico-freebsd { --brand: #ab2b28; } .ico-git { --brand: #f03c2e; } .ico-go { --brand: #00add8; }
+.ico-helm { --brand: #0f1689; } .ico-npm { --brand: #cb3837; } .ico-opencontainersinitiative { --brand: #262261; }
+.ico-pypi { --brand: #3775a9; } .ico-redhat { --brand: #ee0000; } .ico-rockylinux { --brand: #10b981; }
+.ico-rubygems { --brand: #e9573f; } .ico-ubuntu { --brand: #e95420; }
+/* Apple and Rust are black marks and Linux's yellow vanishes on white, so
+   those follow the text; on dark paper the navy marks do too, and Linux
+   gets its yellow back. */
+.ico-apple, .ico-rust, .ico-linux { --brand: currentColor; }
+@media (prefers-color-scheme: dark) { :root:not([data-mode="light"]) :is(.ico-helm, .ico-opencontainersinitiative) { --brand: currentColor; } :root:not([data-mode="light"]) .ico-linux { --brand: #fcc624; } }
+:root[data-mode="dark"] :is(.ico-helm, .ico-opencontainersinitiative) { --brand: currentColor; }
+:root[data-mode="dark"] .ico-linux { --brand: #fcc624; }
+:root[data-vision] .ico, :root[data-icons="mono"] .ico { fill: currentColor; }
+:root[data-icons="brand"] .ico { fill: var(--brand, currentColor); }
+.prose :is(td, th) .ico { vertical-align: -.16em; }
 
 /* Running text. */
 .prose h1 { font: 800 3rem/1.02 var(--sans); font-stretch: 72%; letter-spacing: -.005em; margin: 0 0 1.4rem; }

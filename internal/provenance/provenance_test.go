@@ -1711,7 +1711,7 @@ func TestF107DocsCoverPypi(t *testing.T) {
 			"The PyPI publisher's `environment` is not compared",
 			"Within npm, PyPI and GitHub releases",
 		}, []string{"PEP 740 attestations and helm"})
-		if elsewhere := after(t, doc, "everywhere else.**", "record"); strings.Contains(elsewhere, "pypi") {
+		if elsewhere := after(t, doc, "publishing outside CI, everywhere else", "record"); strings.Contains(elsewhere, "pypi") {
 			t.Errorf("pypi is still in the everywhere-else list: %q", elsewhere)
 		}
 	})

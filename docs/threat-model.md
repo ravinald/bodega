@@ -13,334 +13,375 @@ allow-list, verified against a stored checksum, and recorded in the audit DB.
 That gives operators leverage against the following classes of supply-chain
 risk:
 
-- **Typosquatting and namespace confusion.** Allow-list rules are exact-match
-  by registry type (package name for pypi/npm/cargo, prefix for gomod/git,
-  hostname for apt). A request for `reqeusts` does not match an allow rule for
-  `requests`, and the fetch is rejected before any bytes leave the network.
-  That holds while the operator types the rule correctly. It fails when the
-  operator allow-lists the typo, and a broad rule (a gomod or git prefix, an
-  npm `@scope/*`, a type with no rules at all) admits names nobody reviewed.
-  The `name_similarity` check covers that gap for npm, pypi and cargo: every
-  admission compares the name with the ecosystem's top 1000 by downloads, and
-  a name one or two Damerau-Levenshtein edits from a popular name it is not
-  equal to warns, or refuses under `bodega policy similarity set <eco> block`.
-  pypi is compared after PEP 503 normalization, npm with the scope and the
-  bare name compared separately. A name an exact allow-list rule names, or
-  one in use when the check first ran (in the manifest store, or admitted,
-  which is the only record a pass-through proxy fill leaves), is exempt, and
-  `bodega policy add` asks before writing an exact rule near a popular name.
-  The check knows only the names on its list: a squat of an unpopular
-  package is not caught, nor is a squat of a gomod, git, helm or binary name,
-  and short legitimate names collide often enough that `block` wants a few
-  weeks of `warn` rows read first. See
-  [`bodega policy similarity`](usage.md#bodega-policy-similarity-setlistload).
-- **Silent version drift.** Manifest entries pin a concrete version, an npm
-  dist-tag being the exception named below. The first
-  fetch records that version's SHA-256 in the audit database, keyed by the
-  object key the server serves it under, and a later fetch producing different
-  bytes is refused rather than stored. Both halves of the pipeline write that
-  one record: `build fetch` pins what it downloads, and the proxy pins what it
-  caches on behalf of a client. `build upload` reaches upstream through that
-  same fetch when a stage is missing, so the one-command install pins as it
-  cascades rather than uploading artifacts nothing is pinned against.
-  Tuesday's build produces the same bytes as last Tuesday's build, and
-  `bodega pkg checksum list` is the record of which versions are pinned.
+### Typosquatting and namespace confusion
 
-  One artifact is not covered, and the gap is in the nature of the artifact
-  rather than in the check. **Clone-mode git** ships a bundle this instance
-  generates locally at package time, so there are no upstream bytes for a
-  digest to attest to, and `git bundle create` is not reproducible
-  byte-for-byte: a pin would fail the next repackage rather than catch
-  anything. A git entry fetched as a release tarball is covered normally.
+Allow-list rules are exact-match
+by registry type (package name for pypi/npm/cargo, prefix for gomod/git,
+hostname for apt). A request for `reqeusts` does not match an allow rule for
+`requests`, and the fetch is rejected before any bytes leave the network.
+That holds while the operator types the rule correctly. It fails when the
+operator allow-lists the typo, and a broad rule (a gomod or git prefix, an
+npm `@scope/*`, a type with no rules at all) admits names nobody reviewed.
+The `name_similarity` check covers that gap for npm, pypi and cargo: every
+admission compares the name with the ecosystem's top 1000 by downloads, and
+a name one or two Damerau-Levenshtein edits from a popular name it is not
+equal to warns, or refuses under `bodega policy similarity set <eco> block`.
+pypi is compared after PEP 503 normalization, npm with the scope and the
+bare name compared separately. A name an exact allow-list rule names, or
+one in use when the check first ran (in the manifest store, or admitted,
+which is the only record a pass-through proxy fill leaves), is exempt, and
+`bodega policy add` asks before writing an exact rule near a popular name.
+The check knows only the names on its list: a squat of an unpopular
+package is not caught, nor is a squat of a gomod, git, helm or binary name,
+and short legitimate names collide often enough that `block` wants a few
+weeks of `warn` rows read first. See
+[`bodega policy similarity`](usage.md#bodega-policy-similarity-setlistload).
 
-  A **pypi** entry pins per closure artifact rather than per manifest entry.
-  One approved version installs everything it depends on, and those transitive
-  bytes answer to no entry, so the fetch resolves the whole closure, downloads
-  it into a wheelhouse of its own, and records a digest per file keyed by
-  `pypi/wheels/<filename>` — the key the server serves that wheel under. Every
-  file of the closure shows as its own row in `bodega pkg checksum list`, and a
-  later fetch producing different bytes for a version already on record is
-  refused. The build then reaches no index at all: pip runs with `--no-index`
-  and a `--find-links` naming that wheelhouse, under `--require-hashes` against
-  the digests the fetch recorded. Redirecting it needs bytes that already hash
-  to what was approved.
+### Silent version drift
 
-  An **npm dist-tag** (`latest`, or an entry left without a version) pins per
-  resolved version rather than per manifest entry. The tag is meant to move, so
-  a digest written onto the entry would refuse the next legitimate release; the
-  digest goes on the resolved version's own object key instead. Every concrete
-  version the tag has ever resolved to is on record and shows as its own row in
-  `bodega pkg checksum list`, and a later resolution to one of them is refused
-  if the bytes changed. The tag advancing to a new release is not a mismatch;
-  an existing version being republished under it is.
+Manifest entries pin a concrete version, an npm
+dist-tag being the exception named below. The first
+fetch records that version's SHA-256 in the audit database, keyed by the
+object key the server serves it under, and a later fetch producing different
+bytes is refused rather than stored. Both halves of the pipeline write that
+one record: `build fetch` pins what it downloads, and the proxy pins what it
+caches on behalf of a client. `build upload` reaches upstream through that
+same fetch when a stage is missing, so the one-command install pins as it
+cascades rather than uploading artifacts nothing is pinned against.
+Tuesday's build produces the same bytes as last Tuesday's build, and
+`bodega pkg checksum list` is the record of which versions are pinned.
 
-  An **apt** entry pins at whichever stage first holds the `.deb`. A direct URL
-  or an `apt-get download` produces the artifact during fetch, so the digest and
-  the pool key the server will publish it under are both recorded there, and a
-  later fetch returning different bytes under the same filename is refused
-  rather than stored. An entry carrying a `build_cmd` has no `.deb` until the
-  build runs: its digest is recorded at package time off what this instance
-  compiled, because no upstream download happened for an earlier stage to
-  attest to.
+One artifact is not covered, and the gap is in the nature of the artifact
+rather than in the check. **Clone-mode git** ships a bundle this instance
+generates locally at package time, so there are no upstream bytes for a
+digest to attest to, and `git bundle create` is not reproducible
+byte-for-byte: a pin would fail the next repackage rather than catch
+anything. A git entry fetched as a release tarball is covered normally.
 
-  Nothing else is exempt: binary, apt, gomod, helm, npm and cargo all pin.
+A **pypi** entry pins per closure artifact rather than per manifest entry.
+One approved version installs everything it depends on, and those transitive
+bytes answer to no entry, so the fetch resolves the whole closure, downloads
+it into a wheelhouse of its own, and records a digest per file keyed by
+`pypi/wheels/<filename>` — the key the server serves that wheel under. Every
+file of the closure shows as its own row in `bodega pkg checksum list`, and a
+later fetch producing different bytes for a version already on record is
+refused. The build then reaches no index at all: pip runs with `--no-index`
+and a `--find-links` naming that wheelhouse, under `--require-hashes` against
+the digests the fetch recorded. Redirecting it needs bytes that already hash
+to what was approved.
 
-- **A mirrored FreeBSD pkg repository, which pins nothing of bodega's.** A
-  `freebsd` entry copies a repository byte for byte, and the attestation it
-  carries is FreeBSD's rather than this instance's: `packagesite.pkg` holds
-  `packagesite.yaml.sig` and `packagesite.yaml.pub` as tar members, so the
-  client verifies the catalogue against the fingerprint of whoever signed it
-  upstream — `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301` for
-  ports, `/usr/share/keys/pkgbase-15/trusted/` for a `base_release_<n>`
-  repository — and every package against the digest that catalogue publishes. bodega records a digest for the
-  catalogue archive it fetched and none for the packages under it. That is a
-  stronger claim than bodega could make about the same bytes and a narrower
-  one than pinning: it says the repository is FreeBSD's, and it says nothing
-  about which point in time this mirror is holding.
+An **npm dist-tag** (`latest`, or an entry left without a version) pins per
+resolved version rather than per manifest entry. The tag is meant to move, so
+a digest written onto the entry would refuse the next legitimate release; the
+digest goes on the resolved version's own object key instead. Every concrete
+version the tag has ever resolved to is on record and shows as its own row in
+`bodega pkg checksum list`, and a later resolution to one of them is refused
+if the bytes changed. The tag advancing to a new release is not a mismatch;
+an existing version being republished under it is.
 
-- **A generated FreeBSD pkg repository, whose attestation is this instance's.**
-  A `freebsd` entry marked `generated` holds packages the operator built, so
-  there is no upstream catalogue to copy and bodega produces one. It carries
-  bodega's signature or none, and the claim shrinks accordingly: the catalogue
-  came from this mirror and has not been altered since, and nothing at all is
-  said about who built the packages or from what. Generating the catalogue is
-  the act that discards FreeBSD's attestation, and no configuration puts it
-  back. The per-package digest in a generated catalogue is bodega's own, taken
-  over the object as it was stored.
+An **apt** entry pins at whichever stage first holds the `.deb`. A direct URL
+or an `apt-get download` produces the artifact during fetch, so the digest and
+the pool key the server will publish it under are both recorded there, and a
+later fetch returning different bytes under the same filename is refused
+rather than stored. An entry carrying a `build_cmd` has no `.deb` until the
+build runs: its digest is recorded at package time off what this instance
+compiled, because no upstream download happened for an earlier stage to
+attest to.
 
-- **FreeBSD distfiles, which carry neither attestation.** The digest that
-  protects a distfile is pinned in the client's own ports tree: a port's
-  `distinfo` records a SHA-256 and a size for each distfile, and `make checksum`
-  refuses bytes that disagree, wherever they came from. The `distfiles` type
-  admits a fetch against that same `distinfo`, read from a ports tree on the
-  server, so bodega and the client check one digest from two copies of the
-  tree; the poisoned-first-fetch entry below covers the admission. A distfile
-  proxied through a `binary_upstreams` namespace instead is pinned on first
-  fetch like any other binary, which says only that later fetches match the
-  first. What the check is worth is what the tree is worth: `ports.txz`
-  served as a `binary` entry is pinned to the digest the release `MANIFEST`
-  publishes, and a tree cloned through a `git_upstreams` mirror is as
-  trustworthy as the forge it mirrors.
+Nothing else is exempt: binary, apt, gomod, helm, npm and cargo all pin.
 
-  That makes three trust stories for one operating system, and a reader should
-  not assume one covers another. A mirrored pkg repository carries FreeBSD's
-  signature and bodega adds nothing to it. A generated repository carries
-  bodega's and nothing of FreeBSD's. Distfiles carry no signature from either:
-  they rest on the `distinfo` digest in the client's ports tree, and are as
-  sound as the route that tree arrived by.
+### A mirrored FreeBSD pkg repository, which pins nothing of bodega's
 
-- **A malicious release inside its own withdrawal window.** A fresh install is
-  seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
-  and `bodega serve` names it at startup. The npm and PyPI campaigns of
-  2025-2026 were caught and the versions pulled within days of publication, so
-  an import that waits a week gets the withdrawal rather than the payload.
-  Checksum pinning is the wrong tool for this one: it guarantees today's fetch
-  matches the first one, so a compromised _first_ fetch is served faithfully
-  and forever with `checksum_verified` beside it. The cooldown is what makes
-  the first fetch late enough to be safe.
-- **A package already reported as malware.** OSV carries OpenSSF's
-  malicious-packages records under `MAL-` ids, and bodega blocks a version any
-  of them names, along with any record whose `database_specific` marks the
-  package malicious, on every OSV-covered ecosystem with no configuration: at
-  import, on a proxy cache miss for `npm`, `pypi`, `gomod` and `cargo`, and on
-  `bodega policy osv rescan`, which hides a version a newly published record
-  names. The limit is in what the feed is: only malware someone has already
-  identified and reported is caught. A package published an hour ago that
-  nobody has examined is not on the list, and bodega does not look inside a
-  package to decide for itself; the cooldown above is what covers that window.
-  When the OSV source is unreachable or stale, a version with no earlier
-  malware verdict is admitted with a warning rather than refused, so an outage
-  does not stop every install. See [Malware
-  records](usage.md#malware-records).
-- **A poisoned first fetch of a ports distfile.** The `distfiles` type does
-  not pin what it first fetched. Every distfile's SHA-256 and size are already
-  in the ports tree's `distinfo`, which bodega did not write, and a fetch is
-  admitted only when both match; a name no `distinfo` lists is refused rather
-  than pinned. That is why its default upstream can be plain `http`: an
-  attacker on the path can make a fetch fail the check and cannot make one
-  pass it. The trust anchor moves to the ports tree the server reads, so a
-  tampered tree on the server is served faithfully. Keep it at the revision
-  the clients build from, from the same source they take it from.
-- **A PyPI file whose bytes its own index does not vouch for.** The simple
-  index lists each file with a `#sha256=` fragment, and a proxied fill holds
-  the fetched bytes to it before the first-fetch pin, the cache write or the
-  response: a mismatch answers `502` naming the file, both digests and the
-  index URL, and nothing is cached or pinned. An entry that names no sha256
-  fills unchecked, and the server log says so. The index and the file come
-  from the same upstream, so this catches a files host or path that disagrees
-  with the index, not an index rewritten to match.
-- **A restricted distfile served on a guess about the client.** A port's
-  redistribution terms, and the `distinfo` its fetch checks against, can
-  depend on files and variables on the client host rather than in the ports
-  tree: the aspell dictionaries include `${LOCALBASE}/etc/aspell.ver`, and
-  base `make` lets that file move `DISTINFO_FILE` to another port's `distinfo`
-  and set `NO_CDROM`. bodega reads every port against the environment the
-  operator declares in `distfiles_environment_variables` and
-  `distfiles_environment_files`, and against nothing else. A port that reads a
-  path or a variable the declaration does not cover is refused, and when its
-  `distinfo` then cannot be placed, every distfile is refused. That includes a
-  `?=` default on an undeclared variable, which a client's `make.conf` may
-  preempt, a relative include the tree does not hold, which base `make` looks
-  for in the client's `/usr/share/mk`, and a line such as `.READONLY`, `.PATH`
-  or `.CURDIR=` that changes how `make` reads the rest of the port. The
-  server's own filesystem never stands in for a client's, and a path missing
-  on the server is not evidence that it is missing on a client. Paths inside
-  the tree are resolved as the kernel resolves them, symlink before `..`,
-  whether `:tA` resolves them or `:H` leaves the `..` for `open(2)`, and one
-  that leaves the tree on the way refuses the port. A `.MAKEFLAGS:` line is
-  expanded whole before it is split, as base `make` splits it, so an
-  assignment its expansion carries is read. A command `make` runs while it
-  parses (`!=` under any name, a computed one such as `_${N}!=` included,
-  `:sh`, `:!cmd!`) may write any file, so a port that runs one before it
-  includes a client-host path is refused; the framework runs commands a port
-  chooses at every framework include, so a snapshot read after one is refused
-  as well. Inside the tree the same command could write a file the port then
-  includes, and the scan reads the server's copy of that path, so the tree is
-  held still instead: the client check names no environment unless the ports
-  tree and `/usr/share/mk` each sit on a read-only mount that `make` cannot
-  lift and no writable path reaches. A command a port runs then fails to write either, and `make` reads
-  the bytes the scan read. The declaration is bound to the client by a check
-  the client runs: bodega generates a `make` fragment from it
-  (`/distfiles/@environment.mk`), the client includes it at the end of
-  `/etc/make.conf`, and it names the declaration's digest only while every
-  declared file and variable holds a declared value, no restriction or
-  ownership variable is set outside the tree, the command line carries no
-  undeclared variable, `make` looks for includes where the scan does, every
-  makefile it reads is under `/usr/share/mk`, in the tree, or declared, and
-  both of those directories are read-only to it. It measures all of that
-  again after the port has been read, where the fetch expands the digest.
-  The HTTP route serves only `/distfiles/@<digest>/<name>` for the digest the
-  server admitted against, answering anything else `451` before
-  storage or upstream is touched, and the builder writes each environment's
-  `DISTDIR` under `@<digest>`. A client that drifts names `unsupported` and is
-  served by neither. The server holds the first digest it read for its life,
-  the builder holds its first for the life of the command, and a snapshot that
-  changes or cannot be read refuses rather than being adopted. See [The client
-  environment](usage.md#the-client-environment) and [The client
-  check](usage.md#the-client-check).
-- **Compromised upstream releases.** When an upstream package is replaced with
-  a malicious version (the canonical example being the npm or PyPI account
-  takeovers of recent years), bodega's `pkg hide` and `pkg freeze` operations
-  let an operator quarantine the bad version and pin a known-good replacement
-  in seconds. The walkthroughs under `docs/quarantine/` cover one such
-  compromise end to end.
-- **A compromised maintainer account publishing outside CI, for npm, PyPI
-  and GitHub releases.** A maintainer token stolen and used from a laptop
-  publishes a version whose checksum bodega would pin as readily as any other.
-  The upstream provenance check reads what the publisher signed about who
-  built it: the Sigstore bundle npm serves beside a version built in CI, the
-  PEP 740 attestation PyPI serves for each file uploaded through Trusted
-  Publishing, and the GitHub artifact attestation of a binary or git release
-  asset. The bundle is verified against Sigstore's trusted root, and its
-  subject must be the tarball's published sha512 (npm), the file's name and
-  the sha256 the PyPI index lists for it, or the asset's sha256 (GitHub). A
-  PyPI attestation's certificate must also bind the repository and workflow
-  of the Trusted Publisher PyPI recorded when it accepted the upload, or it is
-  `invalid`, and so is a GitHub or GitLab publisher's bundle holding no
-  attestation of a predicate type bodega reads. Every file of a PyPI version is verified, and a version whose
-  files disagree (some attested and some not, or attested by different
-  identities) is a `mismatch`: an sdist uploaded by hand beside wheels the
-  project's CI built is the laptop publish inside one release. The
-  first admitted version to verify pins its source repository and builder;
-  a later version verified from anything else is a `mismatch`. So is an npm
-  version with no provenance at all, published after the pinned version by
-  the packument's `time` map: that is the laptop publish, which carries no
-  CI provenance to compare. An npm version published before the pinned one
-  predates the project's adoption of provenance and stays `unavailable`, and
-  one the packument gives no publish time for, or whose pinned version it
-  gives none for, is `unknown`. `unknown` means the evidence could not be
-  read: a lookup that got no answer (a rate limit, an outage), an answer
-  that does not parse, or a packument that no longer lists the version. For
-  PyPI it is also a provenance object the index names that cannot be had (a
-  404 included) or that holds no attestation bundle at all, a provenance URL
-  on a host other than the configured index,
-  which is never requested, and a Trusted Publisher kind other than GitHub and
-  GitLab, which bodega does not verify. So a PyPI outage warns under `warn`,
-  refuses under `block`, and never refuses a version for good. It
-  is also `unknown` when bodega has no Sigstore trusted root to check a
-  bundle against: TUF unreachable, or a `sigstore_trusted_root` file that
-  cannot be read or parsed. `bodega serve` refuses to start when
-  `sigstore_trusted_root` names a file that is missing or does not parse,
-  so a bad file yields `unknown` only on a CLI admission, or after the file
-  breaks under a running server. Only a bundle checked against a root and
-  failing is `invalid`.
-  Nothing was verified, so it claims neither that provenance is absent nor
-  that it failed, and unlike `invalid` an override may admit it. Under
-  `bodega policy provenance set <type> block`, `mismatch`, `invalid`,
-  `unknown` and `unavailable` are all refused, so the laptop publish gets no
-  further than the admission row that names it. Under the default `warn`, a
-  `mismatch` or an `invalid` bundle is a warning, a lookup failure
-  (`unknown`) admits with a warning, and only a registry's answer that the
-  version publishes nothing (`unavailable`) passes silently: the outcome is
-  recorded in every admission row and attestation, but nothing is refused.
-  A maintainer publishing by hand leaves the same trace as the laptop
-  publish, and the registry cannot tell the two apart, so the `mismatch`
-  names who published the version and the pinned one (npm's `_npmUser`) and
-  leaves the call to the operator. It is common: on 2026-10-12, reading the
-  packuments of 29 popular npm packages, 11 had a release version (no
-  prerelease tag) without provenance published after their first version
-  that had it, mostly backport lines and some mainline releases. Under
-  `block` this outcome refuses those maintainer publishes; keep npm at
-  `warn` unless you vet each package's release process.
-  See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
-- **Transitive dependency poisoning.** When a top-level package (e.g. a git
-  repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega
-  records every dependency it discovers and creates manifest entries for
-  them. Subsequent builds resolve dependencies against those pinned entries
-  rather than re-querying public registries.
-- **An out-of-band edit to a manifest.** The manifest is the record of what was
-  approved, and it is a JSON file an operator can open in an editor. Every
-  manifest write emits an MD5 sidecar in the same operation, and
-  `bodega pkg verify` compares each manifest against its own and exits non-zero
-  on a mismatch. A manifest carrying no sidecar is reported `UNVERIFIABLE`
-  rather than passed: nothing was compared, and a run that counted that as a
-  pass would answer yes to every edited manifest in the store. The limit is
-  worth stating plainly: MD5 and a sidecar in the same directory detect an
-  edit, not an attacker, because whoever can rewrite the manifest can rewrite
-  the sidecar beside it. It catches a hand-edit, a partial restore and a
-  half-finished write; it is not a signature. On an S3 backend the earlier
-  version is what survives an attacker: `bodega init` turns on bucket
-  versioning, and the runtime policy that `bodega init --print-policy=runtime`
-  prints grants `s3:DeleteObject` without `s3:DeleteObjectVersion`, so a
-  compromised service can overwrite a manifest and its sidecar but cannot
-  remove the versions before them. The local backend has no equivalent.
-- **A manifest field that becomes a path.** A manifest is written by an
-  operator, through `pkg create`, `pkg edit`, `pkg import` or the mutation API
-  behind its token, or by hand in the store. No anonymous route writes one.
-  It is trusted to name what to fetch and where to serve it from, and not
-  trusted to choose where on disk or in storage a write lands. A binary
-  entry's `filename` override is joined into the build root and the object
-  key, so it must be a clean relative path: every manifest write refuses one
-  with a `..` or `.` segment, an empty segment, a leading `/`, a `\` or a
-  NUL, and the fetch, the upload, the download alias and the key a delete or
-  move derives refuse it again for a manifest written before the check. The
-  fetch also refuses a version that is not one directory, a package name that
-  is not a clean relative path, and a destination that resolves through a
-  symlink to outside the configured build root, a link at `binaries/` included. Unchecked, a `filename` of
-  `../../../../escaped` writes outside the build root and reports success, and
-  planting one takes manifest-write access: an operator's token, or write
-  access to the store itself. See [usage.md](usage.md#binary-specific-fields)
-  for what an upgrade does with a manifest that already carries one.
-- **A secret an operator writes into a manifest.** The rule, in every field:
+A
+`freebsd` entry copies a repository byte for byte, and the attestation it
+carries is FreeBSD's rather than this instance's: `packagesite.pkg` holds
+`packagesite.yaml.sig` and `packagesite.yaml.pub` as tar members, so the
+client verifies the catalogue against the fingerprint of whoever signed it
+upstream — `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301` for
+ports, `/usr/share/keys/pkgbase-15/trusted/` for a `base_release_<n>`
+repository — and every package against the digest that catalogue publishes. bodega records a digest for the
+catalogue archive it fetched and none for the packages under it. That is a
+stronger claim than bodega could make about the same bytes and a narrower
+one than pinning: it says the repository is FreeBSD's, and it says nothing
+about which point in time this mirror is holding.
 
-  - **`url` is the one field bodega holds a credential in.** bodega has no
-    other place to configure one per upstream, so a `url` may carry userinfo
-    or a query-string token, and the builder and the proxy routes fetch with
-    it as written. The store keeps it as written. Every response a caller
-    with no token can reach carries it through `manifest.PublicURL`, which
-    removes the userinfo, username included, and the whole query and
-    fragment. The query goes whole because no parameter name says whether
-    its value is a secret. Where URL readers disagree about where the
-    authority ends (a scheme-relative `//user@host`, a browser reading
-    `https:\\user@host`, curl reading past a `\`, git handing ssh
-    everything before the host of `ssh://a#b@host/` or `a?b@host:repo`,
-    and decoding `%40` first), it cuts at the widest reading.
-  - **`metadata` is public by contract.** bodega never fetches with a
-    metadata value. Every value is published, except that a value written
-    as a URL (a scheme followed by `/` or `\`, `http:` or `https:`, or
-    `//host`) goes through the same cut as `url`, whatever its key, except
-    the five apt keys below, which are refused rather than cut. The test is
-    on the whole value: a URL inside longer text (`see
+### A generated FreeBSD pkg repository, whose attestation is this instance's
+
+A `freebsd` entry marked `generated` holds packages the operator built, so
+there is no upstream catalogue to copy and bodega produces one. It carries
+bodega's signature or none, and the claim shrinks accordingly: the catalogue
+came from this mirror and has not been altered since, and nothing at all is
+said about who built the packages or from what. Generating the catalogue is
+the act that discards FreeBSD's attestation, and no configuration puts it
+back. The per-package digest in a generated catalogue is bodega's own, taken
+over the object as it was stored.
+
+### FreeBSD distfiles, which carry neither attestation
+
+The digest that
+protects a distfile is pinned in the client's own ports tree: a port's
+`distinfo` records a SHA-256 and a size for each distfile, and `make checksum`
+refuses bytes that disagree, wherever they came from. The `distfiles` type
+admits a fetch against that same `distinfo`, read from a ports tree on the
+server, so bodega and the client check one digest from two copies of the
+tree; the poisoned-first-fetch entry below covers the admission. A distfile
+proxied through a `binary_upstreams` namespace instead is pinned on first
+fetch like any other binary, which says only that later fetches match the
+first. What the check is worth is what the tree is worth: `ports.txz`
+served as a `binary` entry is pinned to the digest the release `MANIFEST`
+publishes, and a tree cloned through a `git_upstreams` mirror is as
+trustworthy as the forge it mirrors.
+
+That makes three trust stories for one operating system, and a reader should
+not assume one covers another. A mirrored pkg repository carries FreeBSD's
+signature and bodega adds nothing to it. A generated repository carries
+bodega's and nothing of FreeBSD's. Distfiles carry no signature from either:
+they rest on the `distinfo` digest in the client's ports tree, and are as
+sound as the route that tree arrived by.
+
+### A malicious release inside its own withdrawal window
+
+A fresh install is
+seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
+and `bodega serve` names it at startup. The npm and PyPI campaigns of
+2025-2026 were caught and the versions pulled within days of publication, so
+an import that waits a week gets the withdrawal rather than the payload.
+Checksum pinning is the wrong tool for this one: it guarantees today's fetch
+matches the first one, so a compromised _first_ fetch is served faithfully
+and forever with `checksum_verified` beside it. The cooldown is what makes
+the first fetch late enough to be safe.
+
+### A package already reported as malware
+
+OSV carries OpenSSF's
+malicious-packages records under `MAL-` ids, and bodega blocks a version any
+of them names, along with any record whose `database_specific` marks the
+package malicious, on every OSV-covered ecosystem with no configuration: at
+import, on a proxy cache miss for `npm`, `pypi`, `gomod` and `cargo`, and on
+`bodega policy osv rescan`, which hides a version a newly published record
+names. The limit is in what the feed is: only malware someone has already
+identified and reported is caught. A package published an hour ago that
+nobody has examined is not on the list, and bodega does not look inside a
+package to decide for itself; the cooldown above is what covers that window.
+When the OSV source is unreachable or stale, a version with no earlier
+malware verdict is admitted with a warning rather than refused, so an outage
+does not stop every install. See [Malware
+records](usage.md#malware-records).
+
+### A poisoned first fetch of a ports distfile
+
+The `distfiles` type does
+not pin what it first fetched. Every distfile's SHA-256 and size are already
+in the ports tree's `distinfo`, which bodega did not write, and a fetch is
+admitted only when both match; a name no `distinfo` lists is refused rather
+than pinned. That is why its default upstream can be plain `http`: an
+attacker on the path can make a fetch fail the check and cannot make one
+pass it. The trust anchor moves to the ports tree the server reads, so a
+tampered tree on the server is served faithfully. Keep it at the revision
+the clients build from, from the same source they take it from.
+
+### A PyPI file whose bytes its own index does not vouch for
+
+The simple
+index lists each file with a `#sha256=` fragment, and a proxied fill holds
+the fetched bytes to it before the first-fetch pin, the cache write or the
+response: a mismatch answers `502` naming the file, both digests and the
+index URL, and nothing is cached or pinned. An entry that names no sha256
+fills unchecked, and the server log says so. The index and the file come
+from the same upstream, so this catches a files host or path that disagrees
+with the index, not an index rewritten to match.
+
+### A restricted distfile served on a guess about the client
+
+A port's
+redistribution terms, and the `distinfo` its fetch checks against, can
+depend on files and variables on the client host rather than in the ports
+tree: the aspell dictionaries include `${LOCALBASE}/etc/aspell.ver`, and
+base `make` lets that file move `DISTINFO_FILE` to another port's `distinfo`
+and set `NO_CDROM`. bodega reads every port against the environment the
+operator declares in `distfiles_environment_variables` and
+`distfiles_environment_files`, and against nothing else. A port that reads a
+path or a variable the declaration does not cover is refused, and when its
+`distinfo` then cannot be placed, every distfile is refused. That includes a
+`?=` default on an undeclared variable, which a client's `make.conf` may
+preempt, a relative include the tree does not hold, which base `make` looks
+for in the client's `/usr/share/mk`, and a line such as `.READONLY`, `.PATH`
+or `.CURDIR=` that changes how `make` reads the rest of the port. The
+server's own filesystem never stands in for a client's, and a path missing
+on the server is not evidence that it is missing on a client. Paths inside
+the tree are resolved as the kernel resolves them, symlink before `..`,
+whether `:tA` resolves them or `:H` leaves the `..` for `open(2)`, and one
+that leaves the tree on the way refuses the port. A `.MAKEFLAGS:` line is
+expanded whole before it is split, as base `make` splits it, so an
+assignment its expansion carries is read. A command `make` runs while it
+parses (`!=` under any name, a computed one such as `_${N}!=` included,
+`:sh`, `:!cmd!`) may write any file, so a port that runs one before it
+includes a client-host path is refused; the framework runs commands a port
+chooses at every framework include, so a snapshot read after one is refused
+as well. Inside the tree the same command could write a file the port then
+includes, and the scan reads the server's copy of that path, so the tree is
+held still instead: the client check names no environment unless the ports
+tree and `/usr/share/mk` each sit on a read-only mount that `make` cannot
+lift and no writable path reaches. A command a port runs then fails to write either, and `make` reads
+the bytes the scan read. The declaration is bound to the client by a check
+the client runs: bodega generates a `make` fragment from it
+(`/distfiles/@environment.mk`), the client includes it at the end of
+`/etc/make.conf`, and it names the declaration's digest only while every
+declared file and variable holds a declared value, no restriction or
+ownership variable is set outside the tree, the command line carries no
+undeclared variable, `make` looks for includes where the scan does, every
+makefile it reads is under `/usr/share/mk`, in the tree, or declared, and
+both of those directories are read-only to it. It measures all of that
+again after the port has been read, where the fetch expands the digest.
+The HTTP route serves only `/distfiles/@<digest>/<name>` for the digest the
+server admitted against, answering anything else `451` before
+storage or upstream is touched, and the builder writes each environment's
+`DISTDIR` under `@<digest>`. A client that drifts names `unsupported` and is
+served by neither. The server holds the first digest it read for its life,
+the builder holds its first for the life of the command, and a snapshot that
+changes or cannot be read refuses rather than being adopted. See [The client
+environment](usage.md#the-client-environment) and [The client
+check](usage.md#the-client-check).
+
+### Compromised upstream releases
+
+When an upstream package is replaced with
+a malicious version (the canonical example being the npm or PyPI account
+takeovers of recent years), bodega's `pkg hide` and `pkg freeze` operations
+let an operator quarantine the bad version and pin a known-good replacement
+in seconds. The walkthroughs under `docs/quarantine/` cover one such
+compromise end to end.
+
+### A compromised maintainer account publishing outside CI, for npm, PyPI and GitHub releases
+
+A maintainer token stolen and used from a laptop
+publishes a version whose checksum bodega would pin as readily as any other.
+The upstream provenance check reads what the publisher signed about who
+built it: the Sigstore bundle npm serves beside a version built in CI, the
+PEP 740 attestation PyPI serves for each file uploaded through Trusted
+Publishing, and the GitHub artifact attestation of a binary or git release
+asset. The bundle is verified against Sigstore's trusted root, and its
+subject must be the tarball's published sha512 (npm), the file's name and
+the sha256 the PyPI index lists for it, or the asset's sha256 (GitHub). A
+PyPI attestation's certificate must also bind the repository and workflow
+of the Trusted Publisher PyPI recorded when it accepted the upload, or it is
+`invalid`, and so is a GitHub or GitLab publisher's bundle holding no
+attestation of a predicate type bodega reads. Every file of a PyPI version is verified, and a version whose
+files disagree (some attested and some not, or attested by different
+identities) is a `mismatch`: an sdist uploaded by hand beside wheels the
+project's CI built is the laptop publish inside one release. The
+first admitted version to verify pins its source repository and builder;
+a later version verified from anything else is a `mismatch`. So is an npm
+version with no provenance at all, published after the pinned version by
+the packument's `time` map: that is the laptop publish, which carries no
+CI provenance to compare. An npm version published before the pinned one
+predates the project's adoption of provenance and stays `unavailable`, and
+one the packument gives no publish time for, or whose pinned version it
+gives none for, is `unknown`. `unknown` means the evidence could not be
+read: a lookup that got no answer (a rate limit, an outage), an answer
+that does not parse, or a packument that no longer lists the version. For
+PyPI it is also a provenance object the index names that cannot be had (a
+404 included) or that holds no attestation bundle at all, a provenance URL
+on a host other than the configured index,
+which is never requested, and a Trusted Publisher kind other than GitHub and
+GitLab, which bodega does not verify. So a PyPI outage warns under `warn`,
+refuses under `block`, and never refuses a version for good. It
+is also `unknown` when bodega has no Sigstore trusted root to check a
+bundle against: TUF unreachable, or a `sigstore_trusted_root` file that
+cannot be read or parsed. `bodega serve` refuses to start when
+`sigstore_trusted_root` names a file that is missing or does not parse,
+so a bad file yields `unknown` only on a CLI admission, or after the file
+breaks under a running server. Only a bundle checked against a root and
+failing is `invalid`.
+Nothing was verified, so it claims neither that provenance is absent nor
+that it failed, and unlike `invalid` an override may admit it. Under
+`bodega policy provenance set <type> block`, `mismatch`, `invalid`,
+`unknown` and `unavailable` are all refused, so the laptop publish gets no
+further than the admission row that names it. Under the default `warn`, a
+`mismatch` or an `invalid` bundle is a warning, a lookup failure
+(`unknown`) admits with a warning, and only a registry's answer that the
+version publishes nothing (`unavailable`) passes silently: the outcome is
+recorded in every admission row and attestation, but nothing is refused.
+A maintainer publishing by hand leaves the same trace as the laptop
+publish, and the registry cannot tell the two apart, so the `mismatch`
+names who published the version and the pinned one (npm's `_npmUser`) and
+leaves the call to the operator. It is common: on 2026-10-12, reading the
+packuments of 29 popular npm packages, 11 had a release version (no
+prerelease tag) without provenance published after their first version
+that had it, mostly backport lines and some mainline releases. Under
+`block` this outcome refuses those maintainer publishes; keep npm at
+`warn` unless you vet each package's release process.
+See [The upstream provenance check](usage.md#bodega-policy-provenance-setlist).
+
+### Transitive dependency poisoning
+
+When a top-level package (e.g. a git
+repo with `dep_policy: "direct"` or `"transitive"`) is fetched, bodega
+records every dependency it discovers and creates manifest entries for
+them. Subsequent builds resolve dependencies against those pinned entries
+rather than re-querying public registries.
+
+### An out-of-band edit to a manifest
+
+The manifest is the record of what was
+approved, and it is a JSON file an operator can open in an editor. Every
+manifest write emits an MD5 sidecar in the same operation, and
+`bodega pkg verify` compares each manifest against its own and exits non-zero
+on a mismatch. A manifest carrying no sidecar is reported `UNVERIFIABLE`
+rather than passed: nothing was compared, and a run that counted that as a
+pass would answer yes to every edited manifest in the store. The limit is
+worth stating plainly: MD5 and a sidecar in the same directory detect an
+edit, not an attacker, because whoever can rewrite the manifest can rewrite
+the sidecar beside it. It catches a hand-edit, a partial restore and a
+half-finished write; it is not a signature. On an S3 backend the earlier
+version is what survives an attacker: `bodega init` turns on bucket
+versioning, and the runtime policy that `bodega init --print-policy=runtime`
+prints grants `s3:DeleteObject` without `s3:DeleteObjectVersion`, so a
+compromised service can overwrite a manifest and its sidecar but cannot
+remove the versions before them. The local backend has no equivalent.
+
+### A manifest field that becomes a path
+
+A manifest is written by an
+operator, through `pkg create`, `pkg edit`, `pkg import` or the mutation API
+behind its token, or by hand in the store. No anonymous route writes one.
+It is trusted to name what to fetch and where to serve it from, and not
+trusted to choose where on disk or in storage a write lands. A binary
+entry's `filename` override is joined into the build root and the object
+key, so it must be a clean relative path: every manifest write refuses one
+with a `..` or `.` segment, an empty segment, a leading `/`, a `\` or a
+NUL, and the fetch, the upload, the download alias and the key a delete or
+move derives refuse it again for a manifest written before the check. The
+fetch also refuses a version that is not one directory, a package name that
+is not a clean relative path, and a destination that resolves through a
+symlink to outside the configured build root, a link at `binaries/` included. Unchecked, a `filename` of
+`../../../../escaped` writes outside the build root and reports success, and
+planting one takes manifest-write access: an operator's token, or write
+access to the store itself. See [usage.md](usage.md#binary-specific-fields)
+for what an upgrade does with a manifest that already carries one.
+
+### A secret an operator writes into a manifest
+
+The rule, in every field:
+
+- **`url` is the one field bodega holds a credential in.** bodega has no
+  other place to configure one per upstream, so a `url` may carry userinfo
+  or a query-string token, and the builder and the proxy routes fetch with
+  it as written. The store keeps it as written. Every response a caller
+  with no token can reach carries it through `manifest.PublicURL`, which
+  removes the userinfo, username included, and the whole query and
+  fragment. The query goes whole because no parameter name says whether
+  its value is a secret. Where URL readers disagree about where the
+  authority ends (a scheme-relative `//user@host`, a browser reading
+  `https:\\user@host`, curl reading past a `\`, git handing ssh
+  everything before the host of `ssh://a#b@host/` or `a?b@host:repo`,
+  and decoding `%40` first), it cuts at the widest reading.
+- **`metadata` is public by contract.** bodega never fetches with a
+  metadata value. Every value is published, except that a value written
+  as a URL (a scheme followed by `/` or `\`, `http:` or `https:`, or
+  `//host`) goes through the same cut as `url`, whatever its key, except
+  the five apt keys below, which are refused rather than cut. The test is
+  on the whole value: a URL inside longer text (`see
 https://user:secret@host/`), a schemeless `user:secret@host/x` and a
     secret that is not part of a URL are published as written.
   - **`metadata.attestation_uri` takes no credential.** Its endpoint answers
@@ -377,499 +418,568 @@ https://user:secret@host/`), a schemeless `user:secret@host/x` and a
   header separately, since that is a different code path carrying the same
   string.
 
-- **A secret an operator writes into configuration.** `gomod_upstream`,
-  `npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream`
-  and each `apt_upstreams` `url` accept userinfo, so a private index can be
-  configured as `https://user:secret@pypi.internal`, and bodega fetches with
-  it as written. `git_upstreams` and `binary_upstreams` refuse userinfo, a
-  query and a fragment when the config loads. The manifest `url` rule
-  applies unchanged: a response a caller with no token can reach names a
-  configured upstream only through `manifest.PublicURL`. One route quotes
-  one today: a pypi wheel no manifest names answers 404 naming the simple
-  index bodega would have read, cut, and logs the refusal with the index
-  through `url.Redacted`, which masks the password and keeps the username.
-  Every other configured upstream reaches the operator log (the fetch
-  failure lines carry it as written), the discovery row and the audit
-  record, and no response body. `/api/v1/audit` and `/api/v1/config`
-  answer inside `admin_permit_cidr` only, so the stored URL is behind the
-  same boundary as a stored manifest `url`.
+### A secret an operator writes into configuration
 
-  What a caller sees depends on which of four boundaries the response sits
-  behind, and a bearer token decides only the last of them:
+`gomod_upstream`,
+`npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream`
+and each `apt_upstreams` `url` accept userinfo, so a private index can be
+configured as `https://user:secret@pypi.internal`, and bodega fetches with
+it as written. `git_upstreams` and `binary_upstreams` refuse userinfo, a
+query and a fragment when the config loads. The manifest `url` rule
+applies unchanged: a response a caller with no token can reach names a
+configured upstream only through `manifest.PublicURL`. One route quotes
+one today: a pypi wheel no manifest names answers 404 naming the simple
+index bodega would have read, cut, and logs the refusal with the index
+through `url.Redacted`, which masks the password and keeps the username.
+Every other configured upstream reaches the operator log (the fetch
+failure lines carry it as written), the discovery row and the audit
+record, and no response body. `/api/v1/audit` and `/api/v1/config`
+answer inside `admin_permit_cidr` only, so the stored URL is behind the
+same boundary as a stored manifest `url`.
 
-  - **Anonymous: every caller.** The four `/api/v1/packages` read routes and
-    the web UI that reads them; the attestation route; the apt `Packages`
-    stanza, which copies every metadata key, and `Release` and `InRelease`,
-    which name every architecture; `/api/v1/status`, which blanks
-    `freebsd.refused[].error` (it quotes the url), `spool.dir`, `version`,
-    `freebsd.key_error` and `backend_entries[].error` outside
-    `admin_permit_cidr` (see [usage.md](usage.md)); and the package routes
-    (`/apt/`, `/freebsd/`, `/binaries/` and the rest), which answer a
-    failure with a fixed body and put the reason, url included, in the log.
-    npm, cargo and helm indexes are built from bodega's own base URL and
-    carry no manifest `url` or metadata. One anonymous body quotes a
-    config value rather than a manifest one: the pypi 404 for a
-    distribution no manifest names prints the distribution and the simple
-    index under `pypi_upstream`, cut through `manifest.PublicURL`, so a
-    private index's userinfo, query and fragment never reach the body; the
-    refusal log names the index with the password masked.
-  - **Admin range: no token needed.** Inside `admin_permit_cidr` the
-    `/api/v1/status` fields above are returned in full with no
-    `Authorization` header. `/api/v1/audit` is gated the same way and
-    returns the before and after manifest JSON a mutation recorded, as
-    written; `/api/v1/config`, `/api/v1/policies`,
-    `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins` and
-    `GET /api/v1/queue` share the gate and emit no version `url`.
-    `admin_permit_cidr` is therefore the boundary for the stored credential
-    on reads, not the token. The token list (`GET /api/v1/tokens`) is not
-    among them: it needs a token holding `superadmin` as well as an address
-    in the range, in either posture, and answers `401` to a request that
-    presents none.
-  - **Mutations: the existing CIDR and token rules.** Create and the hide and
-    freeze toggles return the whole manifest as stored. A mutation needs an
-    address in `admin_permit_cidr`, and a bearer token holding `write` for
-    the package's type only once that range reaches past loopback; a
-    loopback-only server takes mutations from localhost with no token,
-    except on the token routes. Minting, listing and revoking a token
-    (`/api/v1/tokens`) need a token holding `superadmin` on every server,
-    loopback-only included. Every override route, queue approve and
-    dismiss, and `POST /api/v1/tokens` also need a token bound to an
-    identity on every server.
-  - **Operator host and backend.** `bodega show pkg`, `pkg export`,
-    `pkg edit`, the TUI, the builder's output, repair and validation
-    diagnostics and the server log print or serialize the manifest as
-    written. They read the store or the log directly, so filesystem and
-    backend permissions are the boundary. A binary entry with no `filename`
-    is stored under its url's last segment, so for a url with no path, or a
-    query-string token, the object key carries the credential and anyone who
-    can list that bucket or directory reads it. The read routes publish
-    every binary entry with a download alias of its own, `~/<tag>/<display>`,
-    since a stored name is served from whichever entry of its version comes
-    first and so does not stay with one entry. The display part comes from
-    the published url and the tag is an HMAC of the version, the recorded
-    backend and the stored name keyed by the server's token pepper, and
-    `/binaries/` maps it back to that entry's key on that entry's backend
-    without publishing the key. The key is there so that the published name
-    cannot be used to confirm a guessed credential offline. An alias spans
-    three path segments and a stored name is one, so the route never reads
-    either as the other: an alias whose entry is gone or has moved backend,
-    or whose pepper has been rotated away, is a 404, never a request for an
-    object stored under that spelling or for another entry holding the same
-    key on another backend. A server with no pepper publishes no binary
-    download link: every entry gets the all-zero withheld alias, which is a
-    404, because a stored name would follow the order of the manifest rather
-    than the entry. The TUI links by the same alias, so it reads the pepper
-    file as well as the manifest store; where it cannot, it links a stored
-    name only when the route serves that name from the entry's own backend,
-    and otherwise shows no link.
+What a caller sees depends on which of four boundaries the response sits
+behind, and a bearer token decides only the last of them:
 
-  A manifest read from the API and pushed back through an import arrives
-  without the userinfo, query and fragment of its `url`.
+- **Anonymous: every caller.** The four `/api/v1/packages` read routes and
+  the web UI that reads them; the attestation route; the apt `Packages`
+  stanza, which copies every metadata key, and `Release` and `InRelease`,
+  which name every architecture; `/api/v1/status`, which blanks
+  `freebsd.refused[].error` (it quotes the url), `spool.dir`, `version`,
+  `freebsd.key_error` and `backend_entries[].error` outside
+  `admin_permit_cidr` (see [usage.md](usage.md)); and the package routes
+  (`/apt/`, `/freebsd/`, `/binaries/` and the rest), which answer a
+  failure with a fixed body and put the reason, url included, in the log.
+  npm, cargo and helm indexes are built from bodega's own base URL and
+  carry no manifest `url` or metadata. One anonymous body quotes a
+  config value rather than a manifest one: the pypi 404 for a
+  distribution no manifest names prints the distribution and the simple
+  index under `pypi_upstream`, cut through `manifest.PublicURL`, so a
+  private index's userinfo, query and fragment never reach the body; the
+  refusal log names the index with the password masked.
+- **Admin range: no token needed.** Inside `admin_permit_cidr` the
+  `/api/v1/status` fields above are returned in full with no
+  `Authorization` header. `/api/v1/audit` is gated the same way and
+  returns the before and after manifest JSON a mutation recorded, as
+  written; `/api/v1/config`, `/api/v1/policies`,
+  `/api/v1/inventory/{identity}`, `/api/v1/profiles/{name}/pins` and
+  `GET /api/v1/queue` share the gate and emit no version `url`.
+  `admin_permit_cidr` is therefore the boundary for the stored credential
+  on reads, not the token. The token list (`GET /api/v1/tokens`) is not
+  among them: it needs a token holding `superadmin` as well as an address
+  in the range, in either posture, and answers `401` to a request that
+  presents none.
+- **Mutations: the existing CIDR and token rules.** Create and the hide and
+  freeze toggles return the whole manifest as stored. A mutation needs an
+  address in `admin_permit_cidr`, and a bearer token holding `write` for
+  the package's type only once that range reaches past loopback; a
+  loopback-only server takes mutations from localhost with no token,
+  except on the token routes. Minting, listing and revoking a token
+  (`/api/v1/tokens`) need a token holding `superadmin` on every server,
+  loopback-only included. Every override route, queue approve and
+  dismiss, and `POST /api/v1/tokens` also need a token bound to an
+  identity on every server.
+- **Operator host and backend.** `bodega show pkg`, `pkg export`,
+  `pkg edit`, the TUI, the builder's output, repair and validation
+  diagnostics and the server log print or serialize the manifest as
+  written. They read the store or the log directly, so filesystem and
+  backend permissions are the boundary. A binary entry with no `filename`
+  is stored under its url's last segment, so for a url with no path, or a
+  query-string token, the object key carries the credential and anyone who
+  can list that bucket or directory reads it. The read routes publish
+  every binary entry with a download alias of its own, `~/<tag>/<display>`,
+  since a stored name is served from whichever entry of its version comes
+  first and so does not stay with one entry. The display part comes from
+  the published url and the tag is an HMAC of the version, the recorded
+  backend and the stored name keyed by the server's token pepper, and
+  `/binaries/` maps it back to that entry's key on that entry's backend
+  without publishing the key. The key is there so that the published name
+  cannot be used to confirm a guessed credential offline. An alias spans
+  three path segments and a stored name is one, so the route never reads
+  either as the other: an alias whose entry is gone or has moved backend,
+  or whose pepper has been rotated away, is a 404, never a request for an
+  object stored under that spelling or for another entry holding the same
+  key on another backend. A server with no pepper publishes no binary
+  download link: every entry gets the all-zero withheld alias, which is a
+  404, because a stored name would follow the order of the manifest rather
+  than the entry. The TUI links by the same alias, so it reads the pepper
+  file as well as the manifest store; where it cannot, it links a stored
+  name only when the route serves that name from the entry's own backend,
+  and otherwise shows no link.
 
-- **A replacement read while it is being written.** On a `local` backend a
-  replacement is written to a staging file inside a directory of its own, and
-  both are reduced to their mode bits before the first byte lands: every ACL
-  entry the storage root handed down is taken away, so the body is readable by
-  the server's own user and nobody else until the rename publishes it under
-  the object's own access state. On ZFS a `chmod` alone does that only at some
-  settings of the dataset's `aclmode`, which bodega's config does not set and
-  no error reports: `discard`, the default, drops the inherited entries,
-  `restricted` refuses the `chmod`, and `passthrough` keeps them, which would
-  let `www` read a replacement mid-write from a root carrying
-  `user:www:rx:fd:allow`, including one whose object denies `www`. Bodega
-  therefore sets the trivial NFSv4 ACL itself and reads it back, whatever the
-  property says, and a staging inode that still carries a named or inheritable
-  entry fails the write and leaves the previous object as it was.
-  `zfs get aclmode,aclinherit <dataset>` shows what a dataset has. The
-  property still decides what a published object carries: under
-  `aclinherit=passthrough` a fresh object keeps what its directory hands down,
-  as a file created there by hand would. On FreeBSD a filesystem that keeps
-  no ACL at all, a UFS mounted without `acls` or `nfsv4acls`, gives that
-  read-back nothing to confirm, so every replacement there fails before its
-  body is written and leaves the previous object in place; a fresh object
-  still lands. Keep a FreeBSD storage root on ZFS or on a UFS mounted with
-  either option.
-- **Opaque CI fetches.** A `bodega serve` instance is the single place to look
-  when answering "what did our build pull from the internet?" The audit DB
-  records every fetch event with client IP, package name, version, and
-  outcome.
+A manifest read from the API and pushed back through an import arrives
+without the userinfo, query and fragment of its `url`.
+
+### A replacement read while it is being written
+
+On a `local` backend a
+replacement is written to a staging file inside a directory of its own, and
+both are reduced to their mode bits before the first byte lands: every ACL
+entry the storage root handed down is taken away, so the body is readable by
+the server's own user and nobody else until the rename publishes it under
+the object's own access state. On ZFS a `chmod` alone does that only at some
+settings of the dataset's `aclmode`, which bodega's config does not set and
+no error reports: `discard`, the default, drops the inherited entries,
+`restricted` refuses the `chmod`, and `passthrough` keeps them, which would
+let `www` read a replacement mid-write from a root carrying
+`user:www:rx:fd:allow`, including one whose object denies `www`. Bodega
+therefore sets the trivial NFSv4 ACL itself and reads it back, whatever the
+property says, and a staging inode that still carries a named or inheritable
+entry fails the write and leaves the previous object as it was.
+`zfs get aclmode,aclinherit <dataset>` shows what a dataset has. The
+property still decides what a published object carries: under
+`aclinherit=passthrough` a fresh object keeps what its directory hands down,
+as a file created there by hand would. On FreeBSD a filesystem that keeps
+no ACL at all, a UFS mounted without `acls` or `nfsv4acls`, gives that
+read-back nothing to confirm, so every replacement there fails before its
+body is written and leaves the previous object in place; a fresh object
+still lands. Keep a FreeBSD storage root on ZFS or on a UFS mounted with
+either option.
+
+### Opaque CI fetches
+
+A `bodega serve` instance is the single place to look
+when answering "what did our build pull from the internet?" The audit DB
+records every fetch event with client IP, package name, version, and
+outcome.
 
 ## What bodega does not protect against
 
 The chokepoint only protects what flows through it. Bodega makes no claim of
 defence against:
 
-- **Host-level compromise.** A root-owned process on a CI host can edit
-  `/etc/hosts`, replace `/usr/bin/pip`, or simply ignore bodega entirely.
-  Bodega's controls assume the host itself is trustworthy.
-- **Bodega-server compromise.** A compromised bodega instance can serve any
-  artifact it likes. Operate the server like any other piece of internal
-  infrastructure: principle of least privilege on the bucket IAM role (the
-  [runtime policy](usage.md#s3-setup) `bodega init --print-policy=runtime`
-  prints is the minimum), short-lived credentials, audit-log forwarding
-  off-box.
-- **A stolen attestation signing key.** Whoever holds `attest-signing.key`
-  can sign an attestation saying bodega admitted any artifact under any
-  policy, and every verifier that pins that key ID accepts it. That gets an
-  artifact bodega never saw past a CI gate or an audit that trusts bodega's
-  attestations. It does not sign an apt `InRelease` or a pkg catalogue, which
-  use separate keys, and it changes nothing bodega serves. The key is loaded
-  into the serving process, so a compromised bodega server is a stolen
-  attestation key, and so is a `bodega build run` that executes upstream build
-  steps on the same host; keeping the key from any process that runs
-  dependency code needs a separate signer, which bodega does not have.
-  `bodega attest key retire` erases the private half from the file and nowhere
-  else, so a copy taken earlier keeps signing. Retiring is not revocation:
-  verifiers stop trusting a stolen key only when they drop its key ID.
-- **A compromised maintainer account publishing outside CI, everywhere
-  else.** gomod, cargo, apt, freebsd and distfiles record
-  `unavailable` on every version, with the reason in the admission row:
-  they publish no
-  per-package statement of who built them. A binary or git
-  entry not fetched from a GitHub release, a git entry cloned rather than
-  fetched as a release archive, and a release asset with no recorded digest
-  are `unavailable` too. So is a GitHub release asset whose attestation
-  lookup finds none, even when earlier releases of the same package verified
-  and pinned. The check reads no publish time for a release (an entry that
-  records its sha256 never calls the release API, and a git archive's digest
-  comes from `SHA256SUMS`), so it cannot tell a release after the pin from
-  one before the repository adopted attestations, and an asset uploaded from
-  a laptop with a stolen GitHub token passes under `warn`. A PyPI version
-  with no attestation on any of its files is `unavailable` whatever the pin
-  holds: PyPI's page carries no publish time the check compares, so unlike
-  npm a version uploaded with a stolen API token after the pin passes under
-  `warn`. The PyPI publisher's `environment` is not compared either, because
-  the signing certificate does not carry it, so an attestation from the
-  right workflow in another deployment environment verifies. An npm package
-  that never published provenance holds no pin and passes under `warn` the
-  same way. Within npm, PyPI and GitHub releases the check still stops short
-  of four things. It trusts the first verified version: a package
-  whose first admitted version was already built by an attacker's CI pins the
-  attacker. It cannot tell a compromised CI workflow or source repository from
-  an honest one, because the signature is that workflow's. It does not verify
-  npm's own publish attestation, which is signed by the registry's key rather
-  than by a CI identity. And it does not run on versions the proxy caches with
-  no admission decision behind them (`PinUnadmitted`), such as a dependency a
-  client pulls through an npm proxy route bodega never admitted.
-- **Helm charts, past the keyring.** A classic chart's `.prov` is verified
-  against the keyring `helm_keyrings` names for the chart's URL, so a chart
-  re-signed by a key the operator did not configure records `invalid`, and so
-  does one whose bytes differ from the digest the `.prov` signed: refused
-  under `block`, a warning under `warn`, and never admitted by an override. A
-  build's fetch and a proxy fill each refuse a chart whose bytes differ from
-  that signed digest under any action, so an upstream cannot serve the check
-  one archive and the fetch another. What that leaves open: a
-  repository that drops its `.prov` records `unavailable`, which only `block`
-  refuses, so under `warn` an attacker who can replace a chart can delete its
-  signature too and pass. The keyring is only as good as how the operator
-  obtained it, and a key fetched from the host that serves the charts proves
-  nothing that host could not forge. A `.prov` read with no keyring configured
-  records `unknown`. A chart served over OCI is not checked at all and records
-  `unavailable`. A helm version takes no trust-on-first-use pin, so a
-  publisher's key rotation is the operator's to notice and confirm.
-- **Anything inside an opaque distribution bundle.** When a package format
-  bundles its own dependencies in a way bodega cannot inspect (see below),
-  the contents of that bundle are outside bodega's allow-list. Bodega may
-  see the request for the outer artifact and may even cache it, but it has
-  no visibility into the libraries linked or interpreted inside.
-- **Anything the shipped defaults do not reach.** The seeded cooldown covers
-  `npm` and `pypi` and reports rather than refuses. It says nothing about
-  `gomod` or `cargo`, which can be dated and get no seed; it cannot cover
-  `apt`, `binary`, `git` or `helm` at all, because those have no upstream
-  publish timestamp to date a version against. Every other control is off on a
-  new install: the upstream allow-list is empty, which accepts every
-  candidate, and the OSV gate checks no advisory until an operator adds a row.
-  An install created before the seed shipped gains nothing on upgrade, by
-  design: a new default must not change what a running fleet enforces. The OSV
-  malware action is the one exception. It blocks on an upgraded install as on
-  a new one, because serving a package already reported as malware is not a
-  posture anyone chose, and an install with nothing synced warns on every
-  import until `bodega policy osv sync` runs.
-- **An advisory published after admission, until the next re-vet.** Admission
-  checks a version once. An advisory or malware record published later changes
-  nothing until a re-vet reads it: the schedule `revet_interval` sets in
-  `bodega serve`, `bodega policy revet` run by hand, or a signed call to the
-  re-vet webhook. Until then the version is served as admitted and its newest
-  attestation says `admitted`. On the schedule alone, the window is OSV's own
-  publication lag, plus the wait for the next `bodega policy osv sync`, plus
-  up to one `revet_interval`, plus the walk to that version at `revet_rate`.
-  `revet_interval` is off by default, so on a new install the window has no
-  bound. Under `revet_on_block: report` the re-vet does not close it either:
-  the version is reported and stays served until an operator hides it, and a
-  frozen version is never hidden under either setting. Neither is a version
-  served only from the proxy cache: it is re-vetted, reported and revoked on
-  the same schedule, but has no catalog entry to hide, so it stays served
-  until an operator imports and hides it or refuses the package. A cached
-  object whose key names no version, a distfile or an unversioned binary, is
-  re-vetted per object key on the allow-list alone, so a narrowed list reports
-  and revokes it, and no advisory reaches it. The webhook narrows the
-  window to the feed's own latency, and only for the packages the feed names.
-  See
-  [`bodega policy revet`](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
-- **A ports build reaching the internet through `MASTER_SITE_OVERRIDE`.**
-  Serving distfiles over HTTP preempts a port's own sites; it does not replace
-  them. `do-fetch.sh` falls through to the port's `MASTER_SITES` on any answer
-  other than the bytes, including bodega's refusals, and no `bsd.port.mk`
-  setting stops it. Only a `DISTDIR` bodega wrote isolates a build, because
-  `do-fetch.sh` skips a file already present before it consults any site. See
-  [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles).
-- **A ports client that does not run the check, or lies to it.** bodega has
-  no view of a client host; the client check is the client measuring itself,
-  and bodega believes the digest a request carries. A client that hard-codes a
-  digest into `MASTER_SITE_OVERRIDE` or `DISTDIR` instead of
-  `${BODEGA_DISTFILES_ENV}`, or edits the check, asserts the declared
-  environment by hand, and is served as if it held it. What it can obtain that
-  way is only what bodega admitted for the declared environment, which the
-  operator decided may be redistributed under the declared terms. The check
-  trusts the client's own `/bin/sh`, `/sbin/sha256`, `/usr/bin/timeout`,
-  `/usr/bin/env`, `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/id`,
-  `/sbin/sysctl`, `/sbin/mount`, `/bin/realpath`, `/usr/bin/awk` and base
-  system makefiles under `/usr/share/mk`.
-- **What the check measures, and when.** It measures the declared files as
-  `make` starts and again where the fetch expands the digest. Two measurements
-  cannot see bytes `make` read in between that someone wrote and put back, so
-  neither is what binds them. A path declared absent is bound by
-  `.MAKE.MAKEFILES`, the list `make` keeps of every makefile it read: a
-  declared-absent path on it names `unsupported`, and nothing a writer undoes
-  takes a name off it. A path declared with a snapshot is bound by who can
-  write it: it and every directory above it must be owned by root or the user
-  running `make`, writable by neither group nor others, and not a symlink, so
-  only the parties the check already trusts can change it unmeasured. A
-  command in the port runs as that user, which is why the scan refuses a
-  snapshot read after any command, the framework's included. The check marks
-  every variable it sets `.READONLY`, which base `make` holds against every
-  assignment form a port has, and captures `PORTSDIR` before the port can move
-  it; the scan refuses `.NOREADONLY` and any write to a variable `make` sets
-  itself, such as `.MAKE.MAKEFILES`. It compares a declared variable where
-  `make.conf`, the environment or the command line sets it and where the fetch
-  expands its sites; bodega reads one as possibly unset above the framework,
-  so what a port sees there is covered. It forbids `LICENSE_PERMS_<license>`
-  in the environment by name, on the command line with every other undeclared
-  variable, and in `make.conf` and what it includes by any mention of
-  `LICENSE`, which also refuses a `make.conf` that mentions
-  `LICENSES_ACCEPTED`. Variables the declaration does not name, set in
-  `make.conf` or the environment, are not checked: a port whose include,
-  master, `distinfo` or `.MAKEFLAGS` line reads one through `?=` or `+=` is
-  refused on the server instead, and one that reads one with no default
-  already was. The variables the framework passes on its own command line
-  (`OSVERSION` and the rest of `_EXPORTED_VARS`) are allowed there unchecked,
-  and a port reading one undeclared is refused. It trusts `/usr/share/mk` to
-  be the base system's, because the framework and every relative include the
-  tree does not hold reach it.
-- **What holds the tree still, and what it costs.** The stock framework runs
-  commands before nearly every port's first include, and a port chooses them
-  through the variables they are built from, so refusing every include after
-  a command refuses most of the tree (34,282 ports went unplaced when that
-  was tried). The check holds the tree instead: `/sbin/mount -p` must show the
-  ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each
-  served by a read-only mount that no path the fetch user can write reaches,
-  with no writable mount beneath it, and `make` must be unable to lift one:
-  not root, unless jailed without `allow.mount`, and `vfs.usermount` off. A
-  read-only mount says nothing about its source, so the check reads the
-  whole mount table. The rules below hold for every mount that serves a file
-  at or beneath the tree or `/usr/share/mk`: the one covering the path and
-  every mount beneath it made after that one. A read-only view of
-  `/home/u/misc` at `/usr/ports/misc` serves those files as surely as a view
-  of `/home/u/ports` at `/usr/ports`. The check refuses (`aliased:<source>`)
-  when a writable mount anywhere takes its source at, under or above the
-  tree, when a serving `nullfs` takes its source from another directory (a
-  read-only view of `/home/u/ports` leaves `/home/u/ports` writable, and a
-  `nullfs` over itself serves whatever it covers), and when any serving
-  mount is a `unionfs`. The store under each serving mount must be `ufs`,
-  `zfs`, `cd9660` or `tmpfs` (`fstype:<type>` otherwise: the mount table
-  cannot say who writes an `nfs` export), and neither an `md` device, whose
-  backing file it does not show, nor a device the fetch user can write
-  (`device:<source>`).
-  Anything else names `unsupported` (`remountable:root`, `writable:<mount>`).
-  A root `make` outside a jail is refused however the tree is mounted,
-  because a command it runs could remount it. Measuring files would not do:
-  a file written, read and removed between two measurements looks unchanged
-  to both. The cost falls on the client: serve both from a `nullfs` over
-  itself or a read-only `ufs` or `zfs` mount, keep `DISTDIR`,
-  `WRKDIRPREFIX` and `PACKAGES` outside the tree, and run `make fetch` as an
-  unprivileged user or in a jail. A jail that receives the tree as a
-  `nullfs` of a host directory is refused, because the source the jail sees
-  is not its mount point; give it a read-only `zfs` dataset instead.
-- **What the stable-view check cannot see.** It reads the mount table and
-  the fetch user's uid. A privilege held outside that uid, such as a `sudo`
-  or `doas` grant or a `zfs allow` delegation of `readonly` or `mount`, can
-  lift the view, and a hard link made to a tree file before the view was
-  mounted still reaches it; keep the tree's files owned by root and grant
-  the fetch user nothing that mounts. A `mount -p` source is the name the
-  directory had when the mount was made, so a directory renamed afterwards
-  is compared under its old name. Another device node for the same disk
-  (a GPT label beside the partition) is not compared with the one mounted;
-  the base system leaves disk nodes writable by root alone.
-- **A client tree that differs from the server's before `make` starts.**
-  bodega reads the server's copy of the tree and believes the client's holds
-  the same bytes. The check holds the client's tree still while `make` runs;
-  it measures no file in it, so it cannot tell a tree at another revision, or
-  one edited before it was mounted, from the one bodega read. Keeping the
-  client's tree equal to the server's is the operator's, as it was before any
-  environment was declared.
-- **A client that holds a file only a snapshot could describe.** A snapshot is
-  read only where nothing can have changed it first: before the port's first
-  framework include and before any command. The stock ports that read
-  client-host files (`textproc/aspell/Makefile.inc`, `lang/perl5.*`) read them
-  after a framework include, so a declaration that describes a client holding
-  one refuses every distfile. Such a client can be served only by declaring
-  the file absent, and then names `unsupported` itself until the file is gone.
-- **A declaration that does not describe the fleet.** The declaration covers
-  the fleet only if the operator makes it: a value or an alternative left out
-  is one bodega never reads, and a client holding it names `unsupported` and
-  is refused rather than served. The scan does not evaluate conditions, so
-  where it errs it refuses a file a client could have had, not the reverse.
-- **Build-time code execution by trusted packages.** A `setup.py` that
-  `os.system`s out, an `npm install` lifecycle script, a `cargo build` script
-  — all of these run with the build user's privileges and can do anything
-  that user can. Bodega controls _which_ packages run; it does not sandbox
-  what they do once they run.
-- **What a token's scopes limit, and what they do not.** Every token carries
-  one or more of six scopes: `read`, `write`, `admin`, `approve`,
-  `superadmin` and `inventory`. Only `read` and `write` take package types;
-  the other four reach the same routes whatever the type. `inventory`
-  combines with no other scope. A token presented on a route its scopes do
-  not reach is refused with `403` on reads and mutations alike, so a `read`
-  token written to a client host by `bodega doctor --write-credentials`
-  cannot `POST` or `DELETE` from that host even inside
-  `admin_permit_cidr`. `admin` covers the policy, audit, config, inventory
-  and profile routes: `/api/v1/policies`, `/api/v1/audit`,
-  `/api/v1/config`, `/api/v1/inventory/{identity}` and
-  `/api/v1/profiles/{name}/pins`. The token routes (`/api/v1/tokens`) need
-  `superadmin`. Override votes (`/api/v1/overrides/{id}/approve` and
-  `/reject`) and queue approve and dismiss (`/api/v1/queue/{id}/approve`
-  and `/dismiss`) need `approve`, so a CI token refused a package cannot
-  approve its own queue row into an allow-list rule. The override and
-  queue lists (`GET /api/v1/overrides`, `GET /api/v1/queue`) take either
-  `admin` or `approve`. `admin` implies neither `approve` nor
-  `superadmin`. What scopes do not limit:
-  - _A request that presents no token._ The read path stays open. Inside
-    `admin_permit_cidr` a request with no token gets the admin reads
-    (audit, config, policies, `inventory/{identity}`,
-    `profiles/{name}/pins` and the queue list), and a loopback-only server
-    takes mutations from localhost with no token. `admin_permit_cidr` stays
-    the boundary for those. The token routes are the exception in either
-    posture: listing, minting and revoking a token (`/api/v1/tokens`)
-    answer `401` to a request with no token, one that matches no token or
-    an expired one, because whoever reaches them can mint a second override
-    voter. Every override route, the override list included, queue approve
-    and dismiss, and minting a token also refuse a request that presents no
-    token bound to an identity, on every server. Off the token routes, a
-    credential that matches no token on a read is no credential, as it was
-    before.
-  - _Routes tied to no type._ `write:npm` reaches only npm's write routes,
-    but a narrowed `read` reaches every untyped read, such as the
-    `/api/v1/packages` listing, `/api/v1/status` and `/client/`, which name
-    packages of every type.
-  - _Tokens minted before scopes._ Migrations 036 and 037 gave them
-    `read,write,admin,approve,superadmin` so nothing in use broke, and they
-    stay that broad until replaced. Migration 037 also widened every token
-    holding `admin` to `admin,approve,superadmin`. `bodega doctor` names
-    each one under `token-scope`.
-  - _The mapping an exchange applies._ An exchanged token is as narrow as
-    the rule that matched. A rule matching `repository_owner` grants every
-    repository in the organization, and one naming `repository` without
-    `ref` grants every branch, including one any contributor can push.
-  - _The identity provider after the exchange._ bodega verifies the ID token
-    once, at the exchange. A person removed from a group, or a workflow
-    whose access is pulled, keeps the bodega token until `oidc_token_ttl`
-    runs out or an operator runs `bodega token revoke`.
-  - _A captured ID token._ It is a bearer credential until its own `exp`,
-    and whoever holds it can exchange it. Its audience binds it to this
-    server (the `aud` must name the provider's `audience` or `client_id`),
-    not to the job that requested it.
-  - _The issuer itself._ An issuer, or anyone holding its signing key, mints
-    whatever claims it likes. Discovery and key fetches require `https`, so
-    the path to the issuer cannot substitute keys, but the issuer's own
-    compromise is outside this model.
-- **A profile's apt codename being an authorization boundary.** It is a
-  scoping one. A profile that scopes apt is served a filtered `Packages` under
-  a codename of its own, and the host reads that codename because its
-  `sources.list` names it — a file the host can edit. Nothing stops a host from
-  writing the unfiltered mirrored codename into that file and reading the
-  archive whole, and nothing about the filtered codename's name is a secret:
-  it is `<base>-<profile>`, it appears in the startup banner and in
-  `GET /api/v1/status`, and it is served to whoever asks for it. What the
-  filtered index buys is that a _correctly configured_ host is never offered a
-  package outside its class, which is what turns a refusal into `kept back`
-  instead of an aborted transaction. What refuses the artifacts behind it is
-  the request predicate at `/apt/pool/`, which runs on identity rather than on
-  what the client's sources say. Read the two together: the index decides what
-  a host is told exists, the predicate decides what it may fetch. A suite
-  bodega generates from its own catalog is the narrower case: its filtered view
-  is served under the suite's own name and picked on identity, so editing the
-  file does not reach around it, and what a host reaches by editing is the
-  mirrored codename, which is the archive's document and is filtered for
-  nobody. The gap
-  closes when the token that identifies a host also gates the codename, which
-  is not shipped.
-- **The chain of trust behind a filtered apt codename.** bodega re-signs it
-  with bodega's own key, and what bodega verified before signing is the
-  archive's TLS certificate and the SHA256 that the archive's own `Release`
-  publishes for the `Packages` beside it. It does not verify the archive's
-  `InRelease` signature, because it holds no distro keyring to check one
-  against. So a filtered codename's trust ends at the archive's certificate,
-  where a _mirrored_ codename forwards the archive's signature untouched and
-  the client checks it against the distro keyring already on the host. That is
-  a real difference and it is the price of filtering: one URL serves one
-  `Release`, and an index bodega narrowed cannot carry a signature over the
-  index it narrowed. An operator who wants the upstream signature end to end
-  points the host at the mirrored codename and accepts that it is unfiltered.
-  Which is why a filtered codename that would filter nothing is refused rather
-  than served: an apt rule with a base needs closed membership _and_ `block`
-  expansion, because `warn` and `ignore` permit every package the profile does
-  not list and the filter then copies the upstream index through verbatim. That
-  document is the trust downgrade above paid for no filtering, and it is the
-  one case where a control the operator believes they set makes the host
-  strictly less safe than having written no profile at all.
-- **An apt entry naming a binary package.** Membership for apt closes on the
-  source, so an entry spelled `nginx-common` or `libexpat1` matches no
-  paragraph in the index it governs and the host is told the package does not
-  exist. The failure is availability rather than disclosure, since nothing outside
-  the class is offered, but it is silent, arrives as `kept back` on a package
-  the operator listed themselves, and is the case most likely to get a control
-  turned off. `--from-origin` writes source names and `bodega profile check`
-  reports the divergence; neither is a runtime gate, so an entry hand-written
-  under a binary name is caught at `check` time or not at all.
-- **What a cache miss tells the upstream.** `proxy_cache_enabled: true` makes
-  bodega a cache, and a miss is a request from bodega's egress address to the
-  entry's `url` with the missing path appended. Whoever runs that host learns
-  what this instance asked for and when. For `freebsd` the `url` is a
-  repository root with the ABI already in it, so a miss on
-  `https://pkg.FreeBSD.org/FreeBSD:15:aarch64/base_release_1` discloses this
-  instance's ABI, the repository name and the package path. What reaches
-  upstream depends on the entry's mode:
-  - A `proxy` entry fetches every miss, with or without
-    `proxy_cache_enabled`: the catalogue on every `pkg update` once
-    `metadata_ttl` lapses, and each package on first install.
-  - A hosted `freebsd` entry, mirrored or generated, never fetches the
-    repository-root names pkg asks for by default. `meta.conf`, `data.pkg`
-    and `packagesite.pkg` come from the store, or from the build for a
-    generated entry, or answer 404, and so do the names pkg falls back to when
-    they are missing (`meta.txz`, and `data` or `packagesite` under a
-    `packing_format` extension). A `pkg update` that asks only for those
-    names sends nothing upstream, finished mirror or not. A package the store
-    does not hold is still fetched on a miss when `proxy_cache_enabled` is
-    `true`, which sends the ABI, the repository and that package's path.
-  - The names are pkg's defaults, not fixed. pkg asks for its catalogue
-    archives by the `data` and `manifests` keys of the `meta.conf` it read,
-    as `<name>.pkg` then `<name>.<packing_format>`. A generated entry writes
-    the defaults, so its clients ask for nothing else. A mirrored entry serves
-    upstream's `meta.conf` as stored, so a mirror of a repository whose
-    `meta.conf` renames either archive sends its clients to names bodega does
-    not guard. With `proxy_cache_enabled: true` each of those is a cache miss:
-    it discloses the ABI and repository on every `pkg update`, and if
-    upstream serves the name, the client reads upstream's catalogue rather
-    than the mirror's. No `pkg.FreeBSD.org` repository renames either
-    archive; a private one might.
-  - With `proxy_cache_enabled: false`, a hosted entry sends nothing upstream
-    at request time. The mirror run that fills it (`bodega build fetch`) still
-    fetches the catalogue and every object it names, on the operator's
-    schedule rather than a client's.
+### Host-level compromise
 
-  An operator who wants a mirror no client request can make phone home sets
-  `proxy_cache_enabled: false` and accepts that a package the mirror lacks is
-  a 404.
+A root-owned process on a CI host can edit
+`/etc/hosts`, replace `/usr/bin/pip`, or simply ignore bodega entirely.
+Bodega's controls assume the host itself is trustworthy.
+
+### Bodega-server compromise
+
+A compromised bodega instance can serve any
+artifact it likes. Operate the server like any other piece of internal
+infrastructure: principle of least privilege on the bucket IAM role (the
+[runtime policy](usage.md#s3-setup) `bodega init --print-policy=runtime`
+prints is the minimum), short-lived credentials, audit-log forwarding
+off-box.
+
+### A stolen attestation signing key
+
+Whoever holds `attest-signing.key`
+can sign an attestation saying bodega admitted any artifact under any
+policy, and every verifier that pins that key ID accepts it. That gets an
+artifact bodega never saw past a CI gate or an audit that trusts bodega's
+attestations. It does not sign an apt `InRelease` or a pkg catalogue, which
+use separate keys, and it changes nothing bodega serves. The key is loaded
+into the serving process, so a compromised bodega server is a stolen
+attestation key, and so is a `bodega build run` that executes upstream build
+steps on the same host; keeping the key from any process that runs
+dependency code needs a separate signer, which bodega does not have.
+`bodega attest key retire` erases the private half from the file and nowhere
+else, so a copy taken earlier keeps signing. Retiring is not revocation:
+verifiers stop trusting a stolen key only when they drop its key ID.
+
+### A compromised maintainer account publishing outside CI, everywhere else
+
+gomod, cargo, apt, freebsd and distfiles record
+`unavailable` on every version, with the reason in the admission row:
+they publish no
+per-package statement of who built them. A binary or git
+entry not fetched from a GitHub release, a git entry cloned rather than
+fetched as a release archive, and a release asset with no recorded digest
+are `unavailable` too. So is a GitHub release asset whose attestation
+lookup finds none, even when earlier releases of the same package verified
+and pinned. The check reads no publish time for a release (an entry that
+records its sha256 never calls the release API, and a git archive's digest
+comes from `SHA256SUMS`), so it cannot tell a release after the pin from
+one before the repository adopted attestations, and an asset uploaded from
+a laptop with a stolen GitHub token passes under `warn`. A PyPI version
+with no attestation on any of its files is `unavailable` whatever the pin
+holds: PyPI's page carries no publish time the check compares, so unlike
+npm a version uploaded with a stolen API token after the pin passes under
+`warn`. The PyPI publisher's `environment` is not compared either, because
+the signing certificate does not carry it, so an attestation from the
+right workflow in another deployment environment verifies. An npm package
+that never published provenance holds no pin and passes under `warn` the
+same way. Within npm, PyPI and GitHub releases the check still stops short
+of four things. It trusts the first verified version: a package
+whose first admitted version was already built by an attacker's CI pins the
+attacker. It cannot tell a compromised CI workflow or source repository from
+an honest one, because the signature is that workflow's. It does not verify
+npm's own publish attestation, which is signed by the registry's key rather
+than by a CI identity. And it does not run on versions the proxy caches with
+no admission decision behind them (`PinUnadmitted`), such as a dependency a
+client pulls through an npm proxy route bodega never admitted.
+
+### Helm charts, past the keyring
+
+A classic chart's `.prov` is verified
+against the keyring `helm_keyrings` names for the chart's URL, so a chart
+re-signed by a key the operator did not configure records `invalid`, and so
+does one whose bytes differ from the digest the `.prov` signed: refused
+under `block`, a warning under `warn`, and never admitted by an override. A
+build's fetch and a proxy fill each refuse a chart whose bytes differ from
+that signed digest under any action, so an upstream cannot serve the check
+one archive and the fetch another. What that leaves open: a
+repository that drops its `.prov` records `unavailable`, which only `block`
+refuses, so under `warn` an attacker who can replace a chart can delete its
+signature too and pass. The keyring is only as good as how the operator
+obtained it, and a key fetched from the host that serves the charts proves
+nothing that host could not forge. A `.prov` read with no keyring configured
+records `unknown`. A chart served over OCI is not checked at all and records
+`unavailable`. A helm version takes no trust-on-first-use pin, so a
+publisher's key rotation is the operator's to notice and confirm.
+
+### Anything inside an opaque distribution bundle
+
+When a package format
+bundles its own dependencies in a way bodega cannot inspect (see below),
+the contents of that bundle are outside bodega's allow-list. Bodega may
+see the request for the outer artifact and may even cache it, but it has
+no visibility into the libraries linked or interpreted inside.
+
+### Anything the shipped defaults do not reach
+
+The seeded cooldown covers
+`npm` and `pypi` and reports rather than refuses. It says nothing about
+`gomod` or `cargo`, which can be dated and get no seed; it cannot cover
+`apt`, `binary`, `git` or `helm` at all, because those have no upstream
+publish timestamp to date a version against. Every other control is off on a
+new install: the upstream allow-list is empty, which accepts every
+candidate, and the OSV gate checks no advisory until an operator adds a row.
+An install created before the seed shipped gains nothing on upgrade, by
+design: a new default must not change what a running fleet enforces. The OSV
+malware action is the one exception. It blocks on an upgraded install as on
+a new one, because serving a package already reported as malware is not a
+posture anyone chose, and an install with nothing synced warns on every
+import until `bodega policy osv sync` runs.
+
+### An advisory published after admission, until the next re-vet
+
+Admission
+checks a version once. An advisory or malware record published later changes
+nothing until a re-vet reads it: the schedule `revet_interval` sets in
+`bodega serve`, `bodega policy revet` run by hand, or a signed call to the
+re-vet webhook. Until then the version is served as admitted and its newest
+attestation says `admitted`. On the schedule alone, the window is OSV's own
+publication lag, plus the wait for the next `bodega policy osv sync`, plus
+up to one `revet_interval`, plus the walk to that version at `revet_rate`.
+`revet_interval` is off by default, so on a new install the window has no
+bound. Under `revet_on_block: report` the re-vet does not close it either:
+the version is reported and stays served until an operator hides it, and a
+frozen version is never hidden under either setting. Neither is a version
+served only from the proxy cache: it is re-vetted, reported and revoked on
+the same schedule, but has no catalog entry to hide, so it stays served
+until an operator imports and hides it or refuses the package. A cached
+object whose key names no version, a distfile or an unversioned binary, is
+re-vetted per object key on the allow-list alone, so a narrowed list reports
+and revokes it, and no advisory reaches it. The webhook narrows the
+window to the feed's own latency, and only for the packages the feed names.
+See
+[`bodega policy revet`](usage.md#bodega-policy-revet---type-type---name-name---version-version---older-than-duration).
+
+### A ports build reaching the internet through `MASTER_SITE_OVERRIDE`
+
+Serving distfiles over HTTP preempts a port's own sites; it does not replace
+them. `do-fetch.sh` falls through to the port's `MASTER_SITES` on any answer
+other than the bytes, including bodega's refusals, and no `bsd.port.mk`
+setting stops it. Only a `DISTDIR` bodega wrote isolates a build, because
+`do-fetch.sh` skips a file already present before it consults any site. See
+[Mirroring ports distfiles](usage.md#mirroring-ports-distfiles).
+
+### A ports client that does not run the check, or lies to it
+
+bodega has
+no view of a client host; the client check is the client measuring itself,
+and bodega believes the digest a request carries. A client that hard-codes a
+digest into `MASTER_SITE_OVERRIDE` or `DISTDIR` instead of
+`${BODEGA_DISTFILES_ENV}`, or edits the check, asserts the declared
+environment by hand, and is served as if it held it. What it can obtain that
+way is only what bodega admitted for the declared environment, which the
+operator decided may be redistributed under the declared terms. The check
+trusts the client's own `/bin/sh`, `/sbin/sha256`, `/usr/bin/timeout`,
+`/usr/bin/env`, `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/id`,
+`/sbin/sysctl`, `/sbin/mount`, `/bin/realpath`, `/usr/bin/awk` and base
+system makefiles under `/usr/share/mk`.
+
+### What the check measures, and when
+
+It measures the declared files as
+`make` starts and again where the fetch expands the digest. Two measurements
+cannot see bytes `make` read in between that someone wrote and put back, so
+neither is what binds them. A path declared absent is bound by
+`.MAKE.MAKEFILES`, the list `make` keeps of every makefile it read: a
+declared-absent path on it names `unsupported`, and nothing a writer undoes
+takes a name off it. A path declared with a snapshot is bound by who can
+write it: it and every directory above it must be owned by root or the user
+running `make`, writable by neither group nor others, and not a symlink, so
+only the parties the check already trusts can change it unmeasured. A
+command in the port runs as that user, which is why the scan refuses a
+snapshot read after any command, the framework's included. The check marks
+every variable it sets `.READONLY`, which base `make` holds against every
+assignment form a port has, and captures `PORTSDIR` before the port can move
+it; the scan refuses `.NOREADONLY` and any write to a variable `make` sets
+itself, such as `.MAKE.MAKEFILES`. It compares a declared variable where
+`make.conf`, the environment or the command line sets it and where the fetch
+expands its sites; bodega reads one as possibly unset above the framework,
+so what a port sees there is covered. It forbids `LICENSE_PERMS_<license>`
+in the environment by name, on the command line with every other undeclared
+variable, and in `make.conf` and what it includes by any mention of
+`LICENSE`, which also refuses a `make.conf` that mentions
+`LICENSES_ACCEPTED`. Variables the declaration does not name, set in
+`make.conf` or the environment, are not checked: a port whose include,
+master, `distinfo` or `.MAKEFLAGS` line reads one through `?=` or `+=` is
+refused on the server instead, and one that reads one with no default
+already was. The variables the framework passes on its own command line
+(`OSVERSION` and the rest of `_EXPORTED_VARS`) are allowed there unchecked,
+and a port reading one undeclared is refused. It trusts `/usr/share/mk` to
+be the base system's, because the framework and every relative include the
+tree does not hold reach it.
+
+### What holds the tree still, and what it costs
+
+The stock framework runs
+commands before nearly every port's first include, and a port chooses them
+through the variables they are built from, so refusing every include after
+a command refuses most of the tree (34,282 ports went unplaced when that
+was tried). The check holds the tree instead: `/sbin/mount -p` must show the
+ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each
+served by a read-only mount that no path the fetch user can write reaches,
+with no writable mount beneath it, and `make` must be unable to lift one:
+not root, unless jailed without `allow.mount`, and `vfs.usermount` off. A
+read-only mount says nothing about its source, so the check reads the
+whole mount table. The rules below hold for every mount that serves a file
+at or beneath the tree or `/usr/share/mk`: the one covering the path and
+every mount beneath it made after that one. A read-only view of
+`/home/u/misc` at `/usr/ports/misc` serves those files as surely as a view
+of `/home/u/ports` at `/usr/ports`. The check refuses (`aliased:<source>`)
+when a writable mount anywhere takes its source at, under or above the
+tree, when a serving `nullfs` takes its source from another directory (a
+read-only view of `/home/u/ports` leaves `/home/u/ports` writable, and a
+`nullfs` over itself serves whatever it covers), and when any serving
+mount is a `unionfs`. The store under each serving mount must be `ufs`,
+`zfs`, `cd9660` or `tmpfs` (`fstype:<type>` otherwise: the mount table
+cannot say who writes an `nfs` export), and neither an `md` device, whose
+backing file it does not show, nor a device the fetch user can write
+(`device:<source>`).
+Anything else names `unsupported` (`remountable:root`, `writable:<mount>`).
+A root `make` outside a jail is refused however the tree is mounted,
+because a command it runs could remount it. Measuring files would not do:
+a file written, read and removed between two measurements looks unchanged
+to both. The cost falls on the client: serve both from a `nullfs` over
+itself or a read-only `ufs` or `zfs` mount, keep `DISTDIR`,
+`WRKDIRPREFIX` and `PACKAGES` outside the tree, and run `make fetch` as an
+unprivileged user or in a jail. A jail that receives the tree as a
+`nullfs` of a host directory is refused, because the source the jail sees
+is not its mount point; give it a read-only `zfs` dataset instead.
+
+### What the stable-view check cannot see
+
+It reads the mount table and
+the fetch user's uid. A privilege held outside that uid, such as a `sudo`
+or `doas` grant or a `zfs allow` delegation of `readonly` or `mount`, can
+lift the view, and a hard link made to a tree file before the view was
+mounted still reaches it; keep the tree's files owned by root and grant
+the fetch user nothing that mounts. A `mount -p` source is the name the
+directory had when the mount was made, so a directory renamed afterwards
+is compared under its old name. Another device node for the same disk
+(a GPT label beside the partition) is not compared with the one mounted;
+the base system leaves disk nodes writable by root alone.
+
+### A client tree that differs from the server's before `make` starts
+
+bodega reads the server's copy of the tree and believes the client's holds
+the same bytes. The check holds the client's tree still while `make` runs;
+it measures no file in it, so it cannot tell a tree at another revision, or
+one edited before it was mounted, from the one bodega read. Keeping the
+client's tree equal to the server's is the operator's, as it was before any
+environment was declared.
+
+### A client that holds a file only a snapshot could describe
+
+A snapshot is
+read only where nothing can have changed it first: before the port's first
+framework include and before any command. The stock ports that read
+client-host files (`textproc/aspell/Makefile.inc`, `lang/perl5.*`) read them
+after a framework include, so a declaration that describes a client holding
+one refuses every distfile. Such a client can be served only by declaring
+the file absent, and then names `unsupported` itself until the file is gone.
+
+### A declaration that does not describe the fleet
+
+The declaration covers
+the fleet only if the operator makes it: a value or an alternative left out
+is one bodega never reads, and a client holding it names `unsupported` and
+is refused rather than served. The scan does not evaluate conditions, so
+where it errs it refuses a file a client could have had, not the reverse.
+
+### Build-time code execution by trusted packages
+
+A `setup.py` that
+`os.system`s out, an `npm install` lifecycle script, a `cargo build` script
+— all of these run with the build user's privileges and can do anything
+that user can. Bodega controls _which_ packages run; it does not sandbox
+what they do once they run.
+
+### What a token's scopes limit, and what they do not
+
+Every token carries
+one or more of six scopes: `read`, `write`, `admin`, `approve`,
+`superadmin` and `inventory`. Only `read` and `write` take package types;
+the other four reach the same routes whatever the type. `inventory`
+combines with no other scope. A token presented on a route its scopes do
+not reach is refused with `403` on reads and mutations alike, so a `read`
+token written to a client host by `bodega doctor --write-credentials`
+cannot `POST` or `DELETE` from that host even inside
+`admin_permit_cidr`. `admin` covers the policy, audit, config, inventory
+and profile routes: `/api/v1/policies`, `/api/v1/audit`,
+`/api/v1/config`, `/api/v1/inventory/{identity}` and
+`/api/v1/profiles/{name}/pins`. The token routes (`/api/v1/tokens`) need
+`superadmin`. Override votes (`/api/v1/overrides/{id}/approve` and
+`/reject`) and queue approve and dismiss (`/api/v1/queue/{id}/approve`
+and `/dismiss`) need `approve`, so a CI token refused a package cannot
+approve its own queue row into an allow-list rule. The override and
+queue lists (`GET /api/v1/overrides`, `GET /api/v1/queue`) take either
+`admin` or `approve`. `admin` implies neither `approve` nor
+`superadmin`. What scopes do not limit:
+- _A request that presents no token._ The read path stays open. Inside
+  `admin_permit_cidr` a request with no token gets the admin reads
+  (audit, config, policies, `inventory/{identity}`,
+  `profiles/{name}/pins` and the queue list), and a loopback-only server
+  takes mutations from localhost with no token. `admin_permit_cidr` stays
+  the boundary for those. The token routes are the exception in either
+  posture: listing, minting and revoking a token (`/api/v1/tokens`)
+  answer `401` to a request with no token, one that matches no token or
+  an expired one, because whoever reaches them can mint a second override
+  voter. Every override route, the override list included, queue approve
+  and dismiss, and minting a token also refuse a request that presents no
+  token bound to an identity, on every server. Off the token routes, a
+  credential that matches no token on a read is no credential, as it was
+  before.
+- _Routes tied to no type._ `write:npm` reaches only npm's write routes,
+  but a narrowed `read` reaches every untyped read, such as the
+  `/api/v1/packages` listing, `/api/v1/status` and `/client/`, which name
+  packages of every type.
+- _Tokens minted before scopes._ Migrations 036 and 037 gave them
+  `read,write,admin,approve,superadmin` so nothing in use broke, and they
+  stay that broad until replaced. Migration 037 also widened every token
+  holding `admin` to `admin,approve,superadmin`. `bodega doctor` names
+  each one under `token-scope`.
+- _The mapping an exchange applies._ An exchanged token is as narrow as
+  the rule that matched. A rule matching `repository_owner` grants every
+  repository in the organization, and one naming `repository` without
+  `ref` grants every branch, including one any contributor can push.
+- _The identity provider after the exchange._ bodega verifies the ID token
+  once, at the exchange. A person removed from a group, or a workflow
+  whose access is pulled, keeps the bodega token until `oidc_token_ttl`
+  runs out or an operator runs `bodega token revoke`.
+- _A captured ID token._ It is a bearer credential until its own `exp`,
+  and whoever holds it can exchange it. Its audience binds it to this
+  server (the `aud` must name the provider's `audience` or `client_id`),
+  not to the job that requested it.
+- _The issuer itself._ An issuer, or anyone holding its signing key, mints
+  whatever claims it likes. Discovery and key fetches require `https`, so
+  the path to the issuer cannot substitute keys, but the issuer's own
+  compromise is outside this model.
+
+### A profile's apt codename being an authorization boundary
+
+It is a
+scoping one. A profile that scopes apt is served a filtered `Packages` under
+a codename of its own, and the host reads that codename because its
+`sources.list` names it — a file the host can edit. Nothing stops a host from
+writing the unfiltered mirrored codename into that file and reading the
+archive whole, and nothing about the filtered codename's name is a secret:
+it is `<base>-<profile>`, it appears in the startup banner and in
+`GET /api/v1/status`, and it is served to whoever asks for it. What the
+filtered index buys is that a _correctly configured_ host is never offered a
+package outside its class, which is what turns a refusal into `kept back`
+instead of an aborted transaction. What refuses the artifacts behind it is
+the request predicate at `/apt/pool/`, which runs on identity rather than on
+what the client's sources say. Read the two together: the index decides what
+a host is told exists, the predicate decides what it may fetch. A suite
+bodega generates from its own catalog is the narrower case: its filtered view
+is served under the suite's own name and picked on identity, so editing the
+file does not reach around it, and what a host reaches by editing is the
+mirrored codename, which is the archive's document and is filtered for
+nobody. The gap
+closes when the token that identifies a host also gates the codename, which
+is not shipped.
+
+### The chain of trust behind a filtered apt codename
+
+bodega re-signs it
+with bodega's own key, and what bodega verified before signing is the
+archive's TLS certificate and the SHA256 that the archive's own `Release`
+publishes for the `Packages` beside it. It does not verify the archive's
+`InRelease` signature, because it holds no distro keyring to check one
+against. So a filtered codename's trust ends at the archive's certificate,
+where a _mirrored_ codename forwards the archive's signature untouched and
+the client checks it against the distro keyring already on the host. That is
+a real difference and it is the price of filtering: one URL serves one
+`Release`, and an index bodega narrowed cannot carry a signature over the
+index it narrowed. An operator who wants the upstream signature end to end
+points the host at the mirrored codename and accepts that it is unfiltered.
+Which is why a filtered codename that would filter nothing is refused rather
+than served: an apt rule with a base needs closed membership _and_ `block`
+expansion, because `warn` and `ignore` permit every package the profile does
+not list and the filter then copies the upstream index through verbatim. That
+document is the trust downgrade above paid for no filtering, and it is the
+one case where a control the operator believes they set makes the host
+strictly less safe than having written no profile at all.
+
+### An apt entry naming a binary package
+
+Membership for apt closes on the
+source, so an entry spelled `nginx-common` or `libexpat1` matches no
+paragraph in the index it governs and the host is told the package does not
+exist. The failure is availability rather than disclosure, since nothing outside
+the class is offered, but it is silent, arrives as `kept back` on a package
+the operator listed themselves, and is the case most likely to get a control
+turned off. `--from-origin` writes source names and `bodega profile check`
+reports the divergence; neither is a runtime gate, so an entry hand-written
+under a binary name is caught at `check` time or not at all.
+
+### What a cache miss tells the upstream
+
+`proxy_cache_enabled: true` makes
+bodega a cache, and a miss is a request from bodega's egress address to the
+entry's `url` with the missing path appended. Whoever runs that host learns
+what this instance asked for and when. For `freebsd` the `url` is a
+repository root with the ABI already in it, so a miss on
+`https://pkg.FreeBSD.org/FreeBSD:15:aarch64/base_release_1` discloses this
+instance's ABI, the repository name and the package path. What reaches
+upstream depends on the entry's mode:
+- A `proxy` entry fetches every miss, with or without
+  `proxy_cache_enabled`: the catalogue on every `pkg update` once
+  `metadata_ttl` lapses, and each package on first install.
+- A hosted `freebsd` entry, mirrored or generated, never fetches the
+  repository-root names pkg asks for by default. `meta.conf`, `data.pkg`
+  and `packagesite.pkg` come from the store, or from the build for a
+  generated entry, or answer 404, and so do the names pkg falls back to when
+  they are missing (`meta.txz`, and `data` or `packagesite` under a
+  `packing_format` extension). A `pkg update` that asks only for those
+  names sends nothing upstream, finished mirror or not. A package the store
+  does not hold is still fetched on a miss when `proxy_cache_enabled` is
+  `true`, which sends the ABI, the repository and that package's path.
+- The names are pkg's defaults, not fixed. pkg asks for its catalogue
+  archives by the `data` and `manifests` keys of the `meta.conf` it read,
+  as `<name>.pkg` then `<name>.<packing_format>`. A generated entry writes
+  the defaults, so its clients ask for nothing else. A mirrored entry serves
+  upstream's `meta.conf` as stored, so a mirror of a repository whose
+  `meta.conf` renames either archive sends its clients to names bodega does
+  not guard. With `proxy_cache_enabled: true` each of those is a cache miss:
+  it discloses the ABI and repository on every `pkg update`, and if
+  upstream serves the name, the client reads upstream's catalogue rather
+  than the mirror's. No `pkg.FreeBSD.org` repository renames either
+  archive; a private one might.
+- With `proxy_cache_enabled: false`, a hosted entry sends nothing upstream
+  at request time. The mirror run that fills it (`bodega build fetch`) still
+  fetches the catalogue and every object it names, on the operator's
+  schedule rather than a client's.
+
+An operator who wants a mirror no client request can make phone home sets
+`proxy_cache_enabled: false` and accepts that a package the mirror lacks is
+a 404.
 
 ## Host inventory reconciliation
 
