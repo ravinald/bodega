@@ -428,11 +428,12 @@ func jsonFields(t *testing.T, rt reflect.Type) map[string]reflect.Type {
 	return out
 }
 
-var releaseTag = regexp.MustCompile(`^v(\d+\.\d+\.\d+)(-[0-9A-Za-z.-]+)?$`)
+var releaseTag = regexp.MustCompile(`^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$`)
 
 // specVersionMismatch reports why a release tag may not ship a document whose
-// info.version is specVersion, or nil when it may. A pre-release tag ships the
-// document of the release it leads to, so v0.2.0-rc.1 carries 0.2.0.
+// info.version is specVersion, or nil when it may. The whole version after the
+// tag's v is compared, pre-release suffix included: the reference published
+// from v0.2.0-rc.1 names 0.2.0-rc.1, never the release it leads to.
 func specVersionMismatch(tag, specVersion string) error {
 	m := releaseTag.FindStringSubmatch(tag)
 	if m == nil {
@@ -455,7 +456,10 @@ func TestOpenAPIVersionMatchesReleaseTag(t *testing.T) {
 		refused   bool
 	}{
 		{"v0.2.0", "0.2.0", false},
-		{"v0.2.0-rc.1", "0.2.0", false},
+		{"v0.2.0-rc.1", "0.2.0", true},
+		{"v0.2.0-rc.1", "0.2.0-rc.1", false},
+		{"v0.2.0", "0.2.0-rc.1", true},
+		{"v0.2.0-", "0.2.0-", true},
 		{"v0.2.0", "0.1.0", true},
 		{"v0.2.1", "0.2.0", true},
 		{"v0.20.0", "0.2.0", true},
@@ -470,7 +474,7 @@ func TestOpenAPIVersionMatchesReleaseTag(t *testing.T) {
 
 	version := loadSpec(t).Info.Version
 	if err := specVersionMismatch("v"+version, version); err != nil {
-		t.Errorf("api/openapi.yaml info.version %q is not MAJOR.MINOR.PATCH, so no release tag can match it", version)
+		t.Errorf("api/openapi.yaml info.version %q is not MAJOR.MINOR.PATCH with an optional -prerelease, so no release tag can match it", version)
 	}
 	if tag := os.Getenv("BODEGA_RELEASE_TAG"); tag != "" {
 		if err := specVersionMismatch(tag, version); err != nil {
@@ -503,5 +507,22 @@ func TestOpenAPIServerIsAPlaceholder(t *testing.T) {
 	}
 	if !strings.Contains(servers[0].Description, "base URL") || !strings.Contains(servers[0].Description, "placeholder") {
 		t.Errorf("servers[0].description = %q, want it to say the URL is a placeholder for the operator's base URL", servers[0].Description)
+	}
+}
+
+func TestReviewReleaseVersionPreservesPrerelease(t *testing.T) {
+	for _, tc := range []struct {
+		tag, spec string
+		refused   bool
+	}{
+		{"v0.2.0-rc.1", "0.2.0", true},
+		{"v0.2.0-rc.1", "0.2.0-rc.1", false},
+		{"v0.2.0-rc.2", "0.2.0-rc.1", true},
+		{"v0.2.0", "0.2.0-rc.1", true},
+	} {
+		err := specVersionMismatch(tc.tag, tc.spec)
+		if (err != nil) != tc.refused {
+			t.Errorf("tag %q vs info.version %q: refused=%v, want %v (err=%v)", tc.tag, tc.spec, err != nil, tc.refused, err)
+		}
 	}
 }

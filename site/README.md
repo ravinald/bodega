@@ -26,7 +26,7 @@ A doc that links `api/openapi.yaml` by its repository path lands on `/api/` here
 
 A `$ref` to a schema renders as a link into `/api/schemas.html`, so one that names a missing schema is a broken link and stops the build like any other. A `$ref` to a parameter or a response is resolved in place, and one that names nothing stops the build with the operation and the `$ref` in the message.
 
-The renderer reads the OpenAPI keywords the document uses today. It does not render response headers, `example` values, links, callbacks or a `discriminator`; a document that starts using one builds, and the page omits it.
+The renderer reads the OpenAPI keywords the document uses today. A schema's `description`, `enum`, `default`, `pattern`, `minimum` and `maximum` appear wherever the document puts them: on a request or response body, a named schema, a property, a parameter, or the element of an array or a map. It does not render response headers, `example` values, links, callbacks or a `discriminator`; a document that starts using one builds, and the page omits it.
 
 ## Platform icons
 

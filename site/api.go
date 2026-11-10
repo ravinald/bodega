@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/yuin/goldmark/ast"
@@ -101,6 +102,8 @@ type apiSchema struct {
 	Nullable             bool
 	Enum                 []any
 	Default              any
+	Pattern              string
+	Minimum, Maximum     *float64
 	Items                *apiSchema
 	Properties           ordered[*apiSchema]
 	Required             []string
@@ -259,7 +262,7 @@ func renderAPI(src []byte, base string) ([]*page, error) {
 		if s == nil {
 			continue
 		}
-		fmt.Fprintf(&sch, "<p><span class=\"api-type\">%s</span></p>\n%s%s", a.typeOf(s), a.markdown(s.Description), a.members(s))
+		fmt.Fprintf(&sch, "<p><span class=\"api-type\">%s</span></p>\n%s%s", a.typeOf(s), a.detail(s), a.members(s))
 	}
 	return append(pages, a.page(apiSchemasOut, "Schemas", sch.String())), nil
 }
@@ -343,10 +346,7 @@ func (a *apiRenderer) content(content map[string]apiMedia) string {
 		if s != nil {
 			fmt.Fprintf(&b, " <span class=\"api-type\">%s</span>", a.typeOf(s))
 		}
-		b.WriteString("</p>\n")
-		if s != nil {
-			b.WriteString(a.members(s))
-		}
+		b.WriteString("</p>\n" + a.detail(s) + a.members(s))
 	}
 	return b.String()
 }
@@ -417,10 +417,32 @@ func (a *apiRenderer) constraints(s *apiSchema) string {
 	if s.Default != nil {
 		parts = append(parts, "Default <code>"+e(fmt.Sprint(s.Default))+"</code>.")
 	}
+	for _, bound := range []struct {
+		word string
+		v    *float64
+	}{{"At least", s.Minimum}, {"At most", s.Maximum}} {
+		if bound.v != nil {
+			parts = append(parts, bound.word+" <code>"+strconv.FormatFloat(*bound.v, 'f', -1, 64)+"</code>.")
+		}
+	}
+	if s.Pattern != "" {
+		parts = append(parts, "Matches <code>"+e(s.Pattern)+"</code>.")
+	}
 	if len(parts) == 0 {
 		return ""
 	}
 	return "<p class=\"api-limits\">" + strings.Join(parts, " ") + "</p>"
+}
+
+// detail is what a schema says about itself beyond its type: its description
+// and its limits. Every place a schema is rendered writes it, so a keyword the
+// renderer reads appears wherever the document puts it: on a body, a named
+// schema, a property, or the element of an array or a map.
+func (a *apiRenderer) detail(s *apiSchema) string {
+	if s == nil {
+		return ""
+	}
+	return a.markdown(s.Description) + a.constraints(s)
 }
 
 // members lists an object's properties, and under each the properties of any
@@ -444,17 +466,15 @@ func (a *apiRenderer) members(s *apiSchema) string {
 				b.WriteString(" <span class=\"api-required\">required</span>")
 			}
 			if p != nil {
-				b.WriteString(a.markdown(p.Description) + a.constraints(p) + a.members(p))
+				b.WriteString(a.detail(p) + a.members(p))
 			}
 			b.WriteString("</li>\n")
 		}
 		b.WriteString("</ul>\n")
 	}
-	b.WriteString(a.members(s.Items) + a.members(s.valueSchema()))
-	for _, parts := range [][]*apiSchema{s.AllOf, s.OneOf, s.AnyOf} {
-		for _, part := range parts {
-			b.WriteString(a.members(part))
-		}
+	nested := []*apiSchema{s.Items, s.valueSchema()}
+	for _, part := range append(append(append(nested, s.AllOf...), s.OneOf...), s.AnyOf...) {
+		b.WriteString(a.detail(part) + a.members(part))
 	}
 	return b.String()
 }

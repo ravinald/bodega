@@ -238,3 +238,77 @@ func TestBuildPublishesAPIReference(t *testing.T) {
 		"the rendered API reference": `documented in the <a href="/api/">API reference</a>`,
 	})
 }
+
+// A schema's description and limits are rendered wherever the document puts
+// them, not only on a property: each row is a position that once dropped them.
+func TestSchemaDetailRendersAtEveryPosition(t *testing.T) {
+	const spec = `
+openapi: "3.0.3"
+info: {title: gauge API, version: 1.2.3}
+paths:
+  /gauges:
+    post:
+      summary: Set gauges
+      tags: [gauges]
+      parameters:
+        - name: level
+          in: query
+          schema: {type: integer, minimum: 22, maximum: 30.5}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: array
+              description: The body's own description
+              items:
+                type: string
+                description: One gauge name
+                pattern: "^[a-z]{1,8}$"
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: string
+                  enum: [open, shut]
+                properties:
+                  mode:
+                    allOf:
+                      - type: string
+                        pattern: "^m<[0-9]>$"
+components:
+  schemas:
+    Level:
+      type: integer
+      description: A named level
+      minimum: 0
+      default: 7
+`
+	bodies := renderFixture(t, spec)
+	wantAll(t, "the tag page", bodies["api/gauges.html"], map[string]string{
+		"the parameter's bounds":    `<p class="api-limits">At least <code>22</code>. At most <code>30.5</code>.</p>`,
+		"the body's description":    `<p>The body's own description</p>`,
+		"the element's description": `<p>One gauge name</p>`,
+		"the element's pattern":     `Matches <code>^[a-z]{1,8}$</code>.`,
+		"the map value's enum":      `One of <code>open</code>, <code>shut</code>.`,
+		"the allOf part's pattern":  `Matches <code>^m&lt;[0-9]&gt;$</code>.`,
+	})
+	wantAll(t, "the schemas page", bodies["api/schemas.html"], map[string]string{
+		"the named schema's limits": `<p>A named level</p>` + "\n" + `<p class="api-limits">Default <code>7</code>. At least <code>0</code>.</p>`,
+	})
+}
+
+func TestReviewPublishedSchemaDetails(t *testing.T) {
+	bodies := renderFixture(t, string(read("..", "api/openapi.yaml")))
+	for _, tc := range []struct{ page, detail string }{
+		{"api/inventory.html", "The source's own document format"},
+		{"api/status.html", "^(allowlist|age|osv|upstream_provenance|name_similarity|integration:[a-z0-9][a-z0-9_-]{0,62})$"},
+	} {
+		if !strings.Contains(bodies[tc.page], tc.detail) {
+			t.Errorf("%s omits schema detail %q from api/openapi.yaml", tc.page, tc.detail)
+		}
+	}
+}
