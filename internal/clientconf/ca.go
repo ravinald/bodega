@@ -210,6 +210,57 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 	return out
 }
 
+// ignored is the error for a plan file the environment tells its client not
+// to load, or to load settings beside that no file holds: writing the file
+// would report an install the client never reads. An environment variable
+// naming an existing file is not one of these; shadows gives that file the
+// edit.
+func (h CAHost) ignored(rec PlanRecord, target string) error {
+	env := func(key string) string {
+		if h.Getenv == nil {
+			return ""
+		}
+		return h.Getenv(key)
+	}
+	// selects is the error for a variable naming, in place of target, a file
+	// the client finds nothing in.
+	selects := func(client string, keys ...string) error {
+		for _, key := range keys {
+			v := env(key)
+			if v == "" {
+				continue
+			}
+			abs, err := filepath.Abs(v)
+			if err == nil && abs == target {
+				return nil
+			}
+			if _, ok := regularFile(abs); ok && err == nil && v != os.DevNull {
+				return nil
+			}
+			return fmt.Errorf("%s: %s is set to %s, which is not a file %s reads settings from, and it reads that in place of %s, so it would load neither the settings nor the CA written there. "+
+				"Unset %s or point it at a configuration file, then re-run", rec.System, key, v, client, target, key)
+		}
+		return nil
+	}
+	user := strings.HasPrefix(rec.Path, "~/")
+	switch {
+	case rec.System == manifest.TypePypi && env("PIP_CONFIG_FILE") == os.DevNull:
+		return fmt.Errorf("%s: PIP_CONFIG_FILE is set to %s, which tells pip to load no configuration file, so it would read neither the index nor the CA written to %s. "+
+			"Unset PIP_CONFIG_FILE, then re-run", rec.System, os.DevNull, target)
+	case rec.System == manifest.TypeNpm && user && rec.Path != NodeMirrorUserPath:
+		return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
+	case rec.System == manifest.TypeGit:
+		if unread := GitUnread(h.Getenv, nil); len(unread) > 0 {
+			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so whether git would apply the CA written to %s cannot be told. "+
+				"Unset the variable, then re-run", rec.System, unread[0], target)
+		}
+		if user {
+			return selects("git", "GIT_CONFIG_GLOBAL")
+		}
+	}
+	return nil
+}
+
 // CAInstall is a plan with a CA added to it.
 type CAInstall struct {
 	// Changes is the plan's changes with the CA setting merged into each
@@ -559,10 +610,18 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	jvm := false
 	for i, c := range in.Changes {
 		rec := c.Record
+		if err := h.ignored(rec, c.Target); err != nil {
+			return CAInstall{}, err
+		}
 		if c.Existed && c.planned != nil {
 			switch {
 			case rec.System == manifest.TypeMaven && rec.Path == MavenSettingsPath:
-				c.New = mergeMavenMirror(c.Old, c.planned)
+				merged, err := mergeMavenMirror(c.Old, c.planned)
+				if err != nil {
+					return CAInstall{}, fmt.Errorf("%s: cannot merge bodega's mirror into %s: %w. "+
+						"Write that mirror with plain <id>, <mirrorOf> and <url> elements, once, or move the file aside, then re-run", rec.System, c.Target, err)
+				}
+				c.New = merged
 			case rec.System == manifest.TypeComposer:
 				merged, err := mergeComposer(c.Old, c.planned, true)
 				if err != nil {
@@ -615,7 +674,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			line = func(caPath string) string { return "cert = " + caPath }
 		case rec.System == manifest.TypeGit:
 			header = fmt.Sprintf("[http %q]", trim(h.Base)+"/")
-			line = func(caPath string) string { return "\tsslCAInfo = " + caPath }
+			line = func(caPath string) string { return "\tsslCAInfo = " + gitQuote(caPath) }
 		case rec.System == manifest.TypeOCI && strings.HasSuffix(rec.Path, "/hosts.toml"):
 			header = "[host." + jsonString(trim(h.Base)) + "]"
 			line = func(caPath string) string { return "  ca = " + jsonString(caPath) }
@@ -636,6 +695,18 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			if err := addFile(rec.System, filepath.Join(dir, "ca.crt"), ca.PEM); err != nil {
 				return CAInstall{}, err
 			}
+		}
+		// unreadSection refuses a file holding a section header the merge
+		// does not match sections by, before any edit is built on it.
+		unreadSection := func(target string, body []string) error {
+			if kind.unread == nil {
+				return nil
+			}
+			if stray := kind.unread(body); stray != "" {
+				return fmt.Errorf("%s: %s holds the line %q, which opens a section in a form this merge does not match sections by, so a setting under it could outrank or repeat the plan's unseen. "+
+					"Write the header as [name] alone on its line (git also takes [name \"subsection\"] and a trailing comment), or move the file aside, then re-run", rec.System, target, stray)
+			}
+			return nil
 		}
 		refuse := func(target string, err error) error {
 			return fmt.Errorf("%s: %s with bodega's settings merged in would not read as the plan sets it (%w). "+
@@ -679,6 +750,9 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		edit := func(target string, old, planned []byte, existed bool) ([]byte, error) {
 			body := splitBody(planned)
 			if existed {
+				if err := unreadSection(target, splitBody(old)); err != nil {
+					return nil, err
+				}
 				// planned holds the plan's file and nothing of the host's but
 				// a credential; the host's file is what the settings join.
 				body = mergeSettings(splitBody(old), body, *kind.rules)
@@ -696,6 +770,20 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			if kind.holds != nil {
 				if err := kind.holds(merged, planned); err != nil {
 					return nil, refuse(target, err)
+				}
+			}
+			if existed {
+				// What the plan sets here is its file and the CA setting, under
+				// whichever section carries one.
+				sets := append(splitBody(planned), set...)
+				if err := linesKeep(splitBody(old), body, sets, *kind.rules); err != nil {
+					return nil, refuse(target, err)
+				}
+				if kind.keeps != nil {
+					withCA := joinBody(setSection(splitBody(planned), header, set, *kind.rules, header != ""))
+					if err := kind.keeps(old, merged, withCA); err != nil {
+						return nil, refuse(target, err)
+					}
 				}
 			}
 			return merged, nil
@@ -732,6 +820,9 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				}
 			} else {
 				body := splitBody(old)
+				if err := unreadSection(sh.path, body); err != nil {
+					return CAInstall{}, err
+				}
 				for _, other := range outranking(body, true) {
 					body = setSection(body, other, set, *kind.rules, false)
 				}

@@ -1,6 +1,7 @@
 package clientconf
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -169,13 +170,19 @@ type GitCA struct {
 	Header, Pattern string
 }
 
-var gitSection = regexp.MustCompile(`^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]$`)
+// gitSection is a section header as git reads one: the name, an optional
+// quoted subsection, and after the closing bracket nothing but a # or ;
+// comment. git also takes a setting on the header's own line and the dotted
+// [section.subsection] form; neither is matched, and a file holding one is
+// reported by gitCAInfos rather than read past.
+var gitSection = regexp.MustCompile(`^\[\s*([A-Za-z0-9-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*(?:[#;].*)?$`)
 
 // gitCAInfos reads every http.sslCAInfo out of a git config body, in order,
 // telling settings from continuation lines by the rule the merge edits the
-// file with.
-func gitCAInfos(lines []string, file, home string) []GitCA {
-	var out []GitCA
+// file with. unread lists each line that opens a section in a form this
+// reader does not follow: what it scopes is unknown, so neither an edit nor a
+// verdict can be built on the settings under it.
+func gitCAInfos(lines []string, file, home string) (out []GitCA, unread []string) {
 	scan := lineScan{rules: slashRules, keyIndent: -1}
 	var header, pattern string
 	inHTTP := false
@@ -186,6 +193,9 @@ func gitCAInfos(lines []string, file, home string) []GitCA {
 		t := strings.TrimSpace(l)
 		if strings.HasPrefix(t, "[") {
 			m := gitSection.FindStringSubmatch(t)
+			if m == nil {
+				unread = append(unread, t)
+			}
 			inHTTP = m != nil && strings.EqualFold(m[1], "http")
 			if inHTTP {
 				header, pattern = t, strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(m[2])
@@ -195,17 +205,97 @@ func gitCAInfos(lines []string, file, home string) []GitCA {
 		if !inHTTP || slashRules.key(l) != "sslcainfo" {
 			continue
 		}
-		_, v, _ := strings.Cut(t, "=")
-		for _, mark := range []string{" #", " ;", "\t#", "\t;"} {
-			if i := strings.Index(v, mark); i >= 0 && !strings.Contains(v[:i], `"`) {
-				v = v[:i]
-			}
+		_, raw, _ := strings.Cut(t, "=")
+		v, whole := gitValue(raw)
+		if !whole {
+			// The value runs on into the next line, which this reader steps
+			// over: what git reads there is not what stands on this line.
+			unread = append(unread, t)
+			continue
 		}
-		v = strings.Trim(strings.TrimSpace(v), `"`)
 		if rest, ok := strings.CutPrefix(v, "~/"); ok && home != "" {
 			v = filepath.Join(home, rest)
 		}
 		out = append(out, GitCA{Value: v, File: file, Header: header, Pattern: pattern})
+	}
+	return out, unread
+}
+
+// gitValue reads the value of a setting from what follows its equals sign,
+// as git does: quotes group and are dropped, a backslash escapes the next
+// character, and outside quotes a # or ; opens a comment wherever it stands,
+// not only after a space. whole is false for a value the line does not end,
+// one a trailing backslash or an open quote carries on.
+func gitValue(raw string) (value string, whole bool) {
+	var sb strings.Builder
+	quoted := false
+	// kept is the length the value keeps once trailing blanks outside quotes
+	// are dropped.
+	kept := 0
+	raw = strings.TrimLeft(raw, " \t")
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		switch {
+		case c == '\\':
+			if i++; i >= len(raw) {
+				return "", false
+			}
+			switch raw[i] {
+			case 'n':
+				sb.WriteByte('\n')
+			case 't':
+				sb.WriteByte('\t')
+			case 'b':
+				sb.WriteByte('\b')
+			default:
+				sb.WriteByte(raw[i])
+			}
+			kept = sb.Len()
+		case c == '"':
+			quoted = !quoted
+			kept = sb.Len()
+		case !quoted && (c == '#' || c == ';'):
+			return sb.String()[:kept], true
+		default:
+			sb.WriteByte(c)
+			if quoted || c != ' ' && c != '\t' {
+				kept = sb.Len()
+			}
+		}
+	}
+	return sb.String()[:kept], !quoted
+}
+
+// gitQuote writes value as a git config file reads it back: bare where git
+// takes it whole, and quoted where a # or ; would open a comment or a blank
+// at either end would be trimmed.
+func gitQuote(value string) string {
+	if !strings.ContainsAny(value, "#;\"\\\n\t") && value == strings.TrimSpace(value) {
+		return value
+	}
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\t", `\t`).Replace(value) + `"`
+}
+
+// GitUnread names what in git's configuration this package does not follow,
+// each as a phrase a diagnostic can carry: a section header in a form
+// gitCAInfos does not read, by file, and the environment variables that hand
+// git configuration no file holds. With any of them present, which
+// http.sslCAInfo git applies cannot be told from the files.
+func GitUnread(getenv func(string) string, files []string) []string {
+	var out []string
+	for _, key := range []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
+		if getenv != nil && getenv(key) != "" {
+			out = append(out, "the environment's "+key+", which hands git settings no file holds")
+		}
+	}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if _, unread := gitCAInfos(splitBody(data), f, ""); len(unread) > 0 {
+			out = append(out, fmt.Sprintf("the section header %s in %s, written in a form other than [name] or [name \"subsection\"]", unread[0], f))
+		}
 	}
 	return out
 }
@@ -276,7 +366,8 @@ func GitCAInfo(files []string, base, home string) (own *GitCA, narrower []GitCA)
 		if err != nil {
 			continue
 		}
-		for _, ca := range gitCAInfos(splitBody(data), f, home) {
+		cas, _ := gitCAInfos(splitBody(data), f, home)
+		for _, ca := range cas {
 			rank := [3]int{}
 			if ca.Pattern != "" {
 				p, ok := parseGitURL(ca.Pattern)
@@ -322,7 +413,8 @@ func gitShadowHeaders(lines []string, base string) []string {
 		return nil
 	}
 	var out []string
-	for _, ca := range gitCAInfos(lines, "", "") {
+	cas, _ := gitCAInfos(lines, "", "")
+	for _, ca := range cas {
 		if ca.Pattern != "" && b.under(ca.Pattern) && !slices.Contains(out, ca.Header) {
 			out = append(out, ca.Header)
 		}

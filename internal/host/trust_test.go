@@ -141,8 +141,11 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 	}
 
 	// The system store verifying settles every row here: npm's cafile is
-	// the right CA, and each other client reads the system store.
+	// the right CA, and each other client reads the system store, pip
+	// because it says it does. A pip that cannot be asked is unchecked, and
+	// TestTrustProbeAsksNodeAndPipForTheirDefaults holds that it warns.
 	probe.System = func([]*x509.Certificate, string) error { return nil }
+	probe.Pip = func() (PipDefault, error) { return PipDefault{Version: "26.2", Truststore: true}, nil }
 	for _, f := range probe.Apply(rows, base) {
 		if f.Check != "goproxy-env" && f.Status != StatusOK {
 			t.Errorf("%s = %s with the system store verifying: %s", f.Check, f.Status, f.Detail)
@@ -353,8 +356,8 @@ func TestTrustProbeReadsTheJVMStoreForMaven(t *testing.T) {
 		t.Errorf("JVM store holding the CA = %+v; want the row as the check wrote it", f)
 	}
 	storeErr = errors.New("keytool: exit status 1")
-	if f := probe.Apply(row, base)[0]; f.Status != StatusOK || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, "exit status 1") {
-		t.Errorf("unreadable JVM store = %+v; want OK saying the certificate is unchecked", f)
+	if f := probe.Apply(row, base)[0]; f.Status != StatusWarn || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, "exit status 1") {
+		t.Errorf("unreadable JVM store = %+v; want a warning saying the certificate is unchecked", f)
 	}
 	// Not pointed at bodega: nothing is listed and nothing is dialed.
 	probe.JVM = func() (string, []*x509.Certificate, error) {
@@ -445,7 +448,7 @@ func TestTrustProbeAsksNodeAndPipForTheirDefaults(t *testing.T) {
 		{"node cannot be asked, system store trusts it", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
 			p.System = trusted
 			p.Node = func() (NodeRoots, error) { return NodeRoots{}, errors.New("no node on PATH") }
-		}, StatusOK, "no node on PATH"},
+		}, StatusWarn, "no node on PATH"},
 		{"NODE_EXTRA_CA_CERTS holds the CA beside the bundled roots", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
 			extra := filepath.Join(p.Root, "ca.pem")
 			p.Getenv = func(k string) string {
@@ -470,10 +473,10 @@ func TestTrustProbeAsksNodeAndPipForTheirDefaults(t *testing.T) {
 		}, StatusWarn, "the certifi bundle"},
 		{"pip cannot be asked, system store trusts it", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
 			p.System = trusted
-		}, StatusOK, "unchecked"},
+		}, StatusWarn, "unchecked"},
 		{"pip loads no file under PIP_CONFIG_FILE=/dev/null", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
 			p.Getenv = func(k string) string { return map[string]string{"PIP_CONFIG_FILE": os.DevNull}[k] }
-		}, StatusOK, ""},
+		}, StatusWarn, "PIP_CONFIG_FILE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, caFile, base := reviewTrust(t)
@@ -828,5 +831,137 @@ func TestTrustProbeJudgesGitAndHelm(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFinalGitProbeAcceptsNativeSectionSyntax(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	target := filepath.Join(p.Home, ".gitconfig")
+	writeTrustFile(t, target, "[url \""+base+"/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http \""+base+"/\"]\n\tsslCAInfo = "+ca+"\n[http \""+base+"/git/gh/\"] # corporate roots\n\tsslCAInfo = /missing/corporate.pem\n")
+	out, err := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", base+"/git/gh/repo").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "/missing/corporate.pem" {
+		t.Fatalf("native git: %v: %s", err, out)
+	}
+	f := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/corporate.pem") {
+		t.Fatalf("native git reads /missing/corporate.pem; probe returned %+v", f)
+	}
+}
+
+func TestFinalNpmRegistryEnvironmentStillChecksTrust(t *testing.T) {
+	for _, key := range []string{"npm_config_registry", "NPM_CONFIG_REGISTRY"} {
+		t.Run(key, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			other, _ := trustFixture(t)
+			wrong := filepath.Join(p.Root, "unrelated-ca.pem")
+			writeTrustFile(t, wrong, string(other))
+			p.Getenv = func(k string) string {
+				switch k {
+				case key:
+					return base + "/npm/"
+				case "NPM_CONFIG_CAFILE":
+					return wrong
+				}
+				return ""
+			}
+			f := p.Apply([]Finding{checkNpmConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, wrong) || !strings.Contains(f.Remediation, "--ca-file") {
+				t.Fatalf("npm's environment selects bodega and an unrelated CA; probe returned %+v", f)
+			}
+		})
+	}
+}
+
+// F116 R2: a row whose client cannot be judged warns naming the input that
+// stood in the way, and whether a client reaches bodega is read from its
+// effective settings, not from the text of a file it may not load.
+func TestTrustProbeJudgesEffectiveConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, check string
+		set         func(t *testing.T, p *TrustProbe, base string)
+		warn        string
+	}{
+		{"git header in a form the reader does not follow", "git-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Home, ".gitconfig"), "[url \""+base+"/git/gh/\"] insteadOf = https://github.com/\n")
+		}, "insteadOf = https://github.com/"},
+		{"git configured through the environment", "git-config", func(_ *testing.T, p *TrustProbe, _ string) {
+			p.Getenv = func(k string) string { return map[string]string{"GIT_CONFIG_COUNT": "2"}[k] }
+		}, "GIT_CONFIG_COUNT"},
+		{"npm registry in a file the environment outranks", "npm-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\n")
+			p.Getenv = func(k string) string {
+				return map[string]string{"npm_config_registry": "https://registry.corp.example/"}[k]
+			}
+		}, ""},
+		{"npm registry named only in a comment", "npm-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "; registry="+base+"/npm/\nregistry=https://registry.corp.example/\n")
+		}, ""},
+		{"npm scope sent to bodega", "npm-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "@corp:registry="+base+"/npm/\n")
+		}, "does not verify"},
+		{"pip index named only in a comment", "pip-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\n# index-url = "+base+"/pypi/simple/\nindex-url = https://pypi.corp.example/simple/\n")
+		}, ""},
+		{"pip index replaced by the environment", "pip-config", func(t *testing.T, p *TrustProbe, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url = "+base+"/pypi/simple/\n")
+			p.Getenv = func(k string) string {
+				return map[string]string{"PIP_INDEX_URL": "https://pypi.corp.example/simple/"}[k]
+			}
+		}, ""},
+		{"pip extra index from the environment alone", "pip-config", func(_ *testing.T, p *TrustProbe, base string) {
+			p.Getenv = func(k string) string { return map[string]string{"PIP_EXTRA_INDEX_URL": base + "/pypi/simple/"}[k] }
+		}, "does not verify"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, base := reviewTrust(t)
+			if tc.check == "git-config" {
+				p.Home = filepath.Join(p.Root, "home")
+			}
+			tc.set(t, &p, base)
+			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK, Detail: "as the check wrote it"}}, base)[0]
+			switch {
+			case tc.warn == "" && (f.Status != StatusOK || f.Detail != "as the check wrote it"):
+				t.Errorf("a client whose effective settings do not reach bodega was judged: %+v", f)
+			case tc.warn != "" && (f.Status != StatusWarn || !strings.Contains(f.Detail, tc.warn) || !strings.Contains(f.Remediation, "--ca-file")):
+				t.Errorf("row = %+v; want a warning naming %q and --ca-file", f, tc.warn)
+			}
+		})
+	}
+}
+
+// F116 R1: Judge owes a verdict for every check it is handed, and tells a
+// client that verifies from one that fails, one that could not be judged and
+// one nothing points at bodega: only the first is a pass.
+func TestJudgeTellsVerifiedFromEverythingElse(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	gitHome := filepath.Join(p.Root, "githome")
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url = "+base+"/pypi/simple/\ncert = /missing/ca.pem\n")
+	got, err := p.Judge([]string{"npm-config", "pip-config", "cargo-config", "no-such-check"}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]TrustState{"npm-config": TrustVerified, "pip-config": TrustFailed, "cargo-config": TrustAbsent}
+	if len(got) != len(want) {
+		t.Fatalf("Judge returned %d verdicts for %d known checks: %+v", len(got), len(want), got)
+	}
+	for _, v := range got {
+		if v.State != want[v.Check] || (v.State == TrustFailed) != strings.Contains(v.Detail, "/missing/ca.pem") {
+			t.Errorf("%s = %+v; want state %d", v.Check, v, want[v.Check])
+		}
+	}
+	p.Home = gitHome
+	p.Getenv = func(k string) string { return map[string]string{"GIT_CONFIG_PARAMETERS": "'http.sslCAInfo=/x'"}[k] }
+	got, err = p.Judge([]string{"git-config"}, base)
+	if err != nil || len(got) != 1 || got[0].State != TrustUnchecked || !strings.Contains(got[0].Detail, "GIT_CONFIG_PARAMETERS") || got[0].System != "git" {
+		t.Errorf("git configured by the environment = %+v, %v; want unchecked naming the variable", got, err)
+	}
+	p.Chain = func(string) ([]*x509.Certificate, error) { return nil, errors.New("connection refused") }
+	if _, err := p.Judge([]string{"git-config"}, base); err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("a server that does not answer = %v; want an error, not a set of passes", err)
+	}
+	if _, err := p.Judge([]string{"git-config"}, "http://bodega.internal"); err == nil {
+		t.Error("a plaintext base was judged")
 	}
 }

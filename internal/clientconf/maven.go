@@ -1,9 +1,12 @@
 package clientconf
 
 import (
+	"bytes"
+	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -244,28 +247,117 @@ func MergeMavenSettings(existing, planned []byte) []byte {
 	return []byte(out)
 }
 
-var (
-	xmlLeaf     = regexp.MustCompile(`<([A-Za-z][\w.-]*)>([^<]*)</([A-Za-z][\w.-]*)>`)
-	mirrorOpen  = "<mirror>"
-	mirrorClose = "</mirror>"
-)
+// mavenLeaf is one child element of a <mirror>: where its tags stand and the
+// character data between them.
+type mavenLeaf struct {
+	name string
+	// open and close are the byte ranges of the start and end tags.
+	open, close [2]int
+	text        string
+	// simple says the element holds character data and nothing else, CDATA
+	// included, so replacing what stands between its tags replaces its value
+	// and nothing more.
+	simple bool
+}
 
-// mirrorElements lists where each <mirror> element of masked stands, opening
-// tag through closing tag.
-func mirrorElements(masked string) [][2]int {
-	var out [][2]int
-	for at := 0; ; {
-		i := strings.Index(masked[at:], mirrorOpen)
-		if i < 0 {
-			return out
+// mavenMirrorAt is one <mirror> of a settings.xml and where it stands.
+type mavenMirrorAt struct {
+	open, close [2]int
+	leaves      []mavenLeaf
+}
+
+func (m mavenMirrorAt) named(name string) []mavenLeaf {
+	var out []mavenLeaf
+	for _, l := range m.leaves {
+		if l.name == name {
+			out = append(out, l)
 		}
-		j := strings.Index(masked[at+i:], mirrorClose)
-		if j < 0 {
-			return out
-		}
-		out = append(out, [2]int{at + i, at + i + j + len(mirrorClose)})
-		at += i + j + len(mirrorClose)
 	}
+	return out
+}
+
+// mavenDoc is where the parts of a settings.xml a mirror edit touches stand,
+// as an XML tokenizer reads them: comments, CDATA, namespaces and entity
+// references are its to tell apart, not a text search's.
+type mavenDoc struct {
+	// settingsClose is where </settings> opens.
+	settingsClose int
+	// mirrors are the tags of <settings><mirrors>, nil for a file without
+	// one. The end tag of <mirrors/> is empty.
+	mirrors *[2][2]int
+	mirror  []mavenMirrorAt
+}
+
+// readMavenSettings locates the mirrors of a settings.xml. It refuses a
+// document the tokenizer does not read to its end, one whose root is not
+// <settings>, and one holding a second <mirrors>.
+func readMavenSettings(data []byte) (mavenDoc, error) {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	var doc mavenDoc
+	var path []string
+	closed := false
+	for {
+		from := int(dec.InputOffset())
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return doc, fmt.Errorf("it is not XML this merge reads to its end: %w", err)
+		}
+		to := int(dec.InputOffset())
+		at := [2]int{from, to}
+		// leaf is the <mirror> child the token stands in, when it stands in one.
+		var leaf *mavenLeaf
+		if len(path) >= 4 && path[1] == "mirrors" && path[2] == "mirror" {
+			m := &doc.mirror[len(doc.mirror)-1]
+			leaf = &m.leaves[len(m.leaves)-1]
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			path = append(path, t.Name.Local)
+			switch {
+			case len(path) == 1 && t.Name.Local != "settings":
+				return doc, fmt.Errorf("its root element is <%s>, not <settings>", t.Name.Local)
+			case len(path) == 2 && t.Name.Local == "mirrors":
+				if doc.mirrors != nil {
+					return doc, errors.New("it holds more than one <mirrors> element")
+				}
+				doc.mirrors = &[2][2]int{at}
+			case len(path) == 3 && path[1] == "mirrors" && t.Name.Local == "mirror":
+				doc.mirror = append(doc.mirror, mavenMirrorAt{open: at})
+			case len(path) == 4 && path[1] == "mirrors" && path[2] == "mirror":
+				m := &doc.mirror[len(doc.mirror)-1]
+				m.leaves = append(m.leaves, mavenLeaf{name: t.Name.Local, open: at, simple: true})
+			case leaf != nil:
+				leaf.simple = false
+			}
+		case xml.EndElement:
+			switch {
+			case len(path) == 1:
+				doc.settingsClose, closed = from, true
+			case len(path) == 2 && t.Name.Local == "mirrors":
+				doc.mirrors[1] = at
+			case len(path) == 3 && path[1] == "mirrors" && t.Name.Local == "mirror":
+				doc.mirror[len(doc.mirror)-1].close = at
+			case len(path) == 4 && leaf != nil:
+				leaf.close = at
+			}
+			path = path[:len(path)-1]
+		case xml.CharData:
+			if leaf != nil && len(path) == 4 {
+				leaf.text += string(t)
+			}
+		case xml.Comment, xml.ProcInst, xml.Directive:
+			if leaf != nil {
+				leaf.simple = false
+			}
+		}
+	}
+	if !closed {
+		return doc, errors.New("it holds no <settings> element")
+	}
+	return doc, nil
 }
 
 // mergeMavenMirror is MergeMavenSettings for a plan that edits the mirror
@@ -274,84 +366,173 @@ func mirrorElements(masked string) [][2]int {
 // name), and the host's other mirrors stay, bodega's ahead of them when it is
 // new, since Maven takes the first mirror that matches a repository. A
 // <blocked>true</blocked> in bodega's mirror is removed on its own: Maven
-// refuses every request through a blocked mirror. A bodega mirror written with
-// CDATA or nested elements is replaced whole, the other mirrors still kept.
-func mergeMavenMirror(existing, planned []byte) []byte {
-	old, plan := string(existing), string(planned)
-	block, ok := mirrorsBlock(plan)
-	planMirrors := mirrorElements(block)
-	masked := maskXMLComments(old)
-	i := strings.Index(masked, mirrorsOpen)
-	if !ok || len(planMirrors) != 1 || i < 0 {
-		return MergeMavenSettings(existing, planned)
+// refuses every request through a blocked mirror.
+//
+// Every edit is a splice at a position the XML tokenizer gave, so the bytes
+// outside the values the plan sets are the host's own. A value written as
+// CDATA is character data like any other and is replaced between its tags. A
+// file the edit cannot be placed in that way is refused, naming what stands
+// in the way, and never replaced: a mirror named bodega twice, one of the
+// plan's elements given twice or holding markup of its own, a document the
+// tokenizer does not read.
+func mergeMavenMirror(existing, planned []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(existing)) == 0 {
+		return planned, nil
 	}
-	k := strings.Index(masked[i:], mirrorsClose)
-	if k < 0 {
-		return MergeMavenSettings(existing, planned)
+	plan, err := readMavenSettings(planned)
+	if err != nil || len(plan.mirror) != 1 {
+		return nil, fmt.Errorf("the planned settings.xml does not hold one mirror (%v)", err)
 	}
-	inner := i + len(mirrorsOpen)
+	block := string(planned[plan.mirrors[0][0]:plan.mirrors[1][1]])
 	// own is the plan's mirror with the whitespace leading it, as it stands
 	// under <mirrors>.
-	own := block[len(mirrorsOpen):planMirrors[0][1]]
-	want := xmlLeaf.FindAllStringSubmatch(own, -1)
-	id := ""
-	for _, w := range want {
-		if w[1] == "id" {
-			id = strings.TrimSpace(w[2])
+	own := string(planned[plan.mirrors[0][1]:plan.mirror[0].close[1]])
+	want := plan.mirror[0].leaves
+	ids := plan.mirror[0].named("id")
+	if len(ids) != 1 {
+		return nil, errors.New("the planned mirror does not hold one id")
+	}
+	id := strings.TrimSpace(ids[0].text)
+
+	doc, err := readMavenSettings(existing)
+	if err != nil {
+		return nil, err
+	}
+	old := string(existing)
+	type edit struct {
+		from, to int
+		text     string
+	}
+	var edits []edit
+	added := 0
+	switch {
+	case doc.mirrors == nil:
+		edits, added = []edit{{doc.settingsClose, doc.settingsClose, "  " + block + "\n"}}, 1
+	case doc.mirrors[1][0] == doc.mirrors[1][1]:
+		edits, added = []edit{{doc.mirrors[0][0], doc.mirrors[0][1], block}}, 1
+	default:
+		var mine []mavenMirrorAt
+		for _, m := range doc.mirror {
+			for _, l := range m.named("id") {
+				if !l.simple {
+					return nil, errors.New("a mirror's <id> holds markup, so which mirror is bodega's cannot be told")
+				}
+				if strings.TrimSpace(l.text) == id {
+					mine = append(mine, m)
+					break
+				}
+			}
+		}
+		if len(mine) > 1 {
+			return nil, fmt.Errorf("it defines the mirror %s %d times, and which one Maven's other settings were written for cannot be told", id, len(mine))
+		}
+		if len(mine) == 0 {
+			edits, added = []edit{{doc.mirrors[0][1], doc.mirrors[0][1], own}}, 1
+			break
+		}
+		m := mine[0]
+		lead, last := "", m.open[1]
+		if len(m.leaves) > 0 {
+			last = m.leaves[len(m.leaves)-1].close[1]
+			if gap := old[m.open[1]:m.leaves[0].open[0]]; strings.TrimSpace(gap) == "" {
+				lead = gap
+			}
+		}
+		for _, l := range m.named("blocked") {
+			switch {
+			case !l.simple:
+				return nil, fmt.Errorf("the mirror %s holds a <blocked> element with markup inside it", id)
+			case strings.TrimSpace(l.text) == "true":
+				from := l.open[0]
+				for from > 0 && strings.ContainsRune(" \t", rune(old[from-1])) {
+					from--
+				}
+				if from > 0 && old[from-1] == '\n' {
+					from--
+				}
+				edits = append(edits, edit{max(from, m.open[1]), l.close[1], ""})
+			}
+		}
+		var missing string
+		for _, w := range want {
+			raw := string(planned[w.open[1]:w.close[0]])
+			switch have := m.named(w.name); {
+			case len(have) == 0:
+				missing += lead + string(planned[w.open[0]:w.close[1]])
+			case len(have) > 1:
+				return nil, fmt.Errorf("the mirror %s holds <%s> %d times", id, w.name, len(have))
+			case !have[0].simple:
+				return nil, fmt.Errorf("the <%s> of the mirror %s holds markup other than its text", w.name, id)
+			case strings.TrimSpace(have[0].text) != strings.TrimSpace(w.text):
+				edits = append(edits, edit{have[0].open[1], have[0].close[0], raw})
+			}
+		}
+		if missing != "" {
+			edits = append(edits, edit{last, last, missing})
 		}
 	}
-	for _, at := range mirrorElements(masked[inner : i+k]) {
-		start, end := inner+at[0], inner+at[1]
-		have := xmlLeaf.FindAllStringSubmatchIndex(masked[start:end], -1)
-		isOwn := false
-		for _, h := range have {
-			tag, text := masked[start+h[2]:start+h[3]], strings.TrimSpace(masked[start+h[4]:start+h[5]])
-			isOwn = isOwn || tag == "id" && text == id
-		}
-		if !isOwn {
+	slices.SortStableFunc(edits, func(a, b edit) int { return b.from - a.from })
+	out := old
+	for _, e := range edits {
+		out = out[:e.from] + e.text + out[e.to:]
+	}
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	if err := mavenKeeps(doc, []byte(out), want, id, added); err != nil {
+		return nil, err
+	}
+	return []byte(out), nil
+}
+
+// mavenKeeps checks a merged settings.xml against the document it was merged
+// from: the mirror named id reads as the plan sets it, once, and every other
+// element of every mirror the host had reads as it did.
+func mavenKeeps(old mavenDoc, merged []byte, want []mavenLeaf, id string, added int) error {
+	now, err := readMavenSettings(merged)
+	if err != nil {
+		return fmt.Errorf("with bodega's mirror merged in %w", err)
+	}
+	if len(now.mirror) != len(old.mirror)+added {
+		return fmt.Errorf("the merge would leave %d mirrors where the host had %d", len(now.mirror), len(old.mirror))
+	}
+	isOwn := func(m mavenMirrorAt) bool {
+		return slices.ContainsFunc(m.named("id"), func(l mavenLeaf) bool { return strings.TrimSpace(l.text) == id })
+	}
+	owned := 0
+	for _, m := range now.mirror {
+		if !isOwn(m) {
 			continue
 		}
-		elem := old[start:end]
-		if strings.Count(masked[start:end], "<") != 2+2*len(have) {
-			return []byte(old[:start] + strings.TrimSpace(own) + old[end:])
-		}
-		lead := elem[len(mirrorOpen) : len(mirrorOpen)+len(elem[len(mirrorOpen):])-len(strings.TrimLeft(elem[len(mirrorOpen):], " \t\r\n"))]
-		last := len(mirrorOpen)
-		var missing string
-		type edit struct {
-			from, to int
-			text     string
-		}
-		var edits []edit
-		for _, h := range have {
-			last = h[1]
-			if tag := elem[h[2]:h[3]]; tag == "blocked" && strings.TrimSpace(elem[h[4]:h[5]]) == "true" {
-				from := h[0]
-				for from > 0 && strings.ContainsRune(" \t", rune(elem[from-1])) {
-					from--
-				}
-				if from > 0 && elem[from-1] == '\n' {
-					from--
-				}
-				edits = append(edits, edit{from, h[1], ""})
+		owned++
+		for _, w := range want {
+			if have := m.named(w.name); len(have) != 1 || strings.TrimSpace(have[0].text) != strings.TrimSpace(w.text) {
+				return fmt.Errorf("the mirror %s would not read <%s> as the plan sets it", id, w.name)
 			}
 		}
-		for _, w := range want {
-			at := slices.IndexFunc(have, func(h []int) bool { return elem[h[2]:h[3]] == w[1] && elem[h[2]:h[3]] == elem[h[6]:h[7]] })
-			if at < 0 {
-				missing += lead + w[0]
+		if slices.ContainsFunc(m.named("blocked"), func(l mavenLeaf) bool { return strings.TrimSpace(l.text) == "true" }) {
+			return fmt.Errorf("the mirror %s would stay blocked", id)
+		}
+	}
+	if owned != 1 {
+		return fmt.Errorf("the mirror %s would be defined %d times", id, owned)
+	}
+	planned := func(name string) bool {
+		return name == "blocked" || slices.ContainsFunc(want, func(w mavenLeaf) bool { return w.name == name })
+	}
+	for i, m := range old.mirror {
+		// A mirror added by the merge leads the host's.
+		after := now.mirror[i+added]
+		for _, l := range m.leaves {
+			if isOwn(m) && planned(l.name) {
 				continue
 			}
-			edits = append(edits, edit{have[at][4], have[at][5], w[2]})
+			if !slices.ContainsFunc(after.named(l.name), func(n mavenLeaf) bool { return n.text == l.text }) {
+				return fmt.Errorf("the merge would not keep <%s>%s</%s> of the host's mirror %d", l.name, strings.TrimSpace(l.text), l.name, i+1)
+			}
 		}
-		edits = append(edits, edit{last, last, missing})
-		slices.SortStableFunc(edits, func(a, b edit) int { return b.from - a.from })
-		for _, e := range edits {
-			elem = elem[:e.from] + e.text + elem[e.to:]
-		}
-		return []byte(old[:start] + elem + old[end:])
 	}
-	return []byte(old[:inner] + own + old[inner:])
+	return nil
 }
 
 // mirrorsBlock is the <mirrors>...</mirrors> element in a planned settings.xml.

@@ -969,7 +969,7 @@ var doctorCAGOOS = runtime.GOOS
 var doctorTrustProbe = func() host.TrustProbe {
 	home, _ := os.UserHomeDir()
 	return host.TrustProbe{
-		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir,
+		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, ConfigDir: doctorConfigDir,
 		DnfConf: doctorDnfConf, DnfDirs: doctorYumReposDirs,
 		JVM: func() (string, []*x509.Certificate, error) {
 			store, certs, err := doctorJVM()
@@ -977,6 +977,26 @@ var doctorTrustProbe = func() host.TrustProbe {
 		},
 		Node: doctorNode, Pip: doctorPip,
 	}
+}
+
+// doctorConfigDir is the per-user configuration directory of the platform
+// doctorCAGOOS names, which is where that platform's go keeps its env file.
+// It is os.UserConfigDir except where a test plans another platform's
+// install from this one.
+func doctorConfigDir() (string, error) {
+	if doctorCAGOOS == runtime.GOOS {
+		return os.UserConfigDir()
+	}
+	home, err := os.UserHomeDir()
+	switch {
+	case err != nil:
+		return "", err
+	case doctorCAGOOS == clientconf.OSDarwin:
+		return filepath.Join(home, "Library", "Application Support"), nil
+	case os.Getenv("XDG_CONFIG_HOME") != "":
+		return os.Getenv("XDG_CONFIG_HOME"), nil
+	}
+	return filepath.Join(home, ".config"), nil
 }
 
 // doctorNode and doctorPip ask the host's Node and pip what each verifies
@@ -989,10 +1009,23 @@ var (
 )
 
 // unreadCA is the error for each of systems whose client, after this run
-// installed the CA, still reads a store that does not hold it: an
-// environment variable or a setting in a file the plan does not edit,
-// outranking what the plan wrote. A run that leaves one exits non-zero,
-// because for that client nothing was installed.
+// installed the CA, was not shown to verify bodega's certificate. Every
+// selected system owes a verdict, and only a verified one passes:
+//
+//   - a client still reading a store without the CA (an environment variable
+//     or a setting in a file the plan does not edit, outranking what the plan
+//     wrote);
+//   - a client whose trust could not be determined, which is not a pass.
+//
+// A run that leaves either exits non-zero, because for that client no install
+// was established. A system with no trust check of its own owes nothing here.
+//
+// A client that reads nothing pointing it at bodega is a third outcome, and
+// is printed as unverified rather than counted as either: the plan names
+// where each file goes, and this host's client may load its configuration
+// from somewhere this command does not look. The cases where it is known not
+// to load the plan's file (configuration the environment turns off or
+// points elsewhere) are refused before anything is written, in AddCA.
 //
 // osStore names the systems whose anchors the plan put in the operating
 // system's trust store. For those the store counts as holding the CA, since
@@ -1002,34 +1035,64 @@ var (
 // the files the plan wrote for it.
 func unreadCA(systems, osStore []string, base string) error {
 	checks := host.TrustSystems()
-	var rebuilt, own []host.Finding
+	var rebuilt, own []string
 	for _, check := range slices.Sorted(maps.Keys(checks)) {
-		row := host.Finding{Check: check, Status: host.StatusOK}
 		switch sys := checks[check]; {
 		case !slices.Contains(systems, sys):
 		case slices.Contains(osStore, sys):
-			rebuilt = append(rebuilt, row)
+			rebuilt = append(rebuilt, check)
 		default:
-			own = append(own, row)
+			own = append(own, check)
 		}
 	}
 	probe := doctorTrustProbe()
-	found := probe.Apply(own, base)
+	verdicts, err := probe.Judge(own, base)
+	if err != nil {
+		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+	}
 	probe.System = func([]*x509.Certificate, string) error { return nil }
-	found = append(found, probe.Apply(rebuilt, base)...)
-	var left []string
-	for _, f := range found {
-		if f.Status == host.StatusWarn {
-			left = append(left, fmt.Sprintf("  %s: %s", checks[f.Check], f.Detail))
+	more, err := probe.Judge(rebuilt, base)
+	if err != nil {
+		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
+	}
+	// A system with several checks (one per container runtime) is judged on
+	// the worst of them, and reaches bodega when any of them does.
+	worst := map[string]host.TrustVerdict{}
+	for _, v := range append(verdicts, more...) {
+		if have, ok := worst[v.System]; !ok || v.State > have.State {
+			worst[v.System] = v
 		}
 	}
-	if len(left) == 0 {
+	var refused, unchecked []string
+	var absent []string
+	for _, sys := range slices.Sorted(maps.Keys(worst)) {
+		switch v := worst[sys]; v.State {
+		case host.TrustFailed:
+			refused = append(refused, fmt.Sprintf("  %s: %s", sys, v.Detail))
+		case host.TrustUnchecked:
+			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", sys, v.Detail))
+		case host.TrustAbsent:
+			absent = append(absent, sys)
+		}
+	}
+	for _, sys := range absent {
+		fmt.Printf("unverified %-10s nothing this command finds its client reading points it at %s, so whether it loads what was written, and verifies bodega's certificate with it, is unconfirmed\n", sys, base)
+	}
+	var parts []string
+	if len(refused) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) still read a store without it, so they still refuse bodega's certificate:\n%s\n"+
+			"  Unset the variable or correct the setting that names that store, then re-run: this command edits the configuration files a client reads, not its environment",
+			len(refused), strings.Join(refused, "\n")))
+	}
+	if len(unchecked) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) could not be checked, which is not a pass:\n%s\n"+
+			"  Remove what keeps this command from reading that client's trust, then re-run",
+			len(unchecked), strings.Join(unchecked, "\n")))
+	}
+	if len(parts) == 0 {
 		return nil
 	}
-	slices.Sort(left)
-	return fmt.Errorf("the CA is written, and %d client(s) still read a store without it, so they still refuse bodega's certificate:\n%s\n"+
-		"  Unset the variable or correct the setting that names that store, then re-run: this command edits the configuration files a client reads, not its environment",
-		len(left), strings.Join(left, "\n"))
+	return fmt.Errorf("the CA is written, and %s", strings.Join(parts, "\nAlso, "))
 }
 
 // doctorJVM resolves the trust store of the JVM Maven and Gradle run on and

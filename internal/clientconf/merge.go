@@ -2,6 +2,7 @@ package clientconf
 
 import (
 	"fmt"
+	"maps"
 	"path"
 	"reflect"
 	"regexp"
@@ -80,13 +81,102 @@ type fileKind struct {
 	// holds reports how merged fails to read as planned sets it, for a
 	// format a line merge can leave saying something else.
 	holds func(merged, planned []byte) error
+	// keeps reports what of old merged no longer gives that the plan did not
+	// set: holds reads the plan's side of a merge, and this reads the
+	// host's, so a merger that drops what it does not follow is refused
+	// rather than trusted.
+	keeps func(old, merged, planned []byte) error
+	// unread returns the first line of a body that opens a section in a form
+	// the merge does not match sections by, "" for none. The client reads
+	// such a section, so a setting under it can outrank or duplicate the
+	// plan's without the merge seeing it.
+	unread func(lines []string) string
+}
+
+var plainSection = regexp.MustCompile(`^\[[^\[\]]+\]$`)
+
+// strayHeader is unread for a format whose sections open on a line holding
+// [name] and nothing else.
+func strayHeader(rules lineRules) func(lines []string) string {
+	return func(lines []string) string {
+		scan := lineScan{rules: rules, keyIndent: -1}
+		for _, l := range lines {
+			if scan.continues(l) {
+				continue
+			}
+			t := strings.TrimSpace(l)
+			switch {
+			case strings.HasPrefix(t, "[") && !plainSection.MatchString(t):
+				return t
+			case strings.HasPrefix(t, "["):
+				scan.keyIndent = -1
+			case rules.key(l) != "":
+				scan.keyIndent = indentOf(l)
+			}
+		}
+		return ""
+	}
+}
+
+// gitUnread is unread for a git config file.
+func gitUnread(lines []string) string {
+	if _, unread := gitCAInfos(lines, "", ""); len(unread) > 0 {
+		return unread[0]
+	}
+	return ""
+}
+
+// linesKeep reports the first line of old that merged dropped without the
+// plan setting its key: a header, a comment, or a setting of the host's own.
+// A setting the plan gives goes with the lines continuing it.
+func linesKeep(old, merged, planned []string, rules lineRules) error {
+	left := map[string]int{}
+	for _, l := range merged {
+		left[l]++
+	}
+	set := map[string]bool{}
+	for _, l := range planned {
+		if k := rules.key(l); k != "" {
+			set[k] = true
+		}
+	}
+	scan := lineScan{rules: rules, keyIndent: -1}
+	replaced := false
+	for _, l := range old {
+		cont := scan.continues(l)
+		t := strings.TrimSpace(l)
+		k := ""
+		if !cont {
+			switch k = rules.key(l); {
+			case strings.HasPrefix(t, "["):
+				scan.keyIndent = -1
+			case k != "":
+				scan.keyIndent = indentOf(l)
+			}
+		}
+		if left[l] > 0 {
+			left[l]--
+			if k != "" {
+				replaced = false
+			}
+			continue
+		}
+		switch {
+		case t == "", cont && replaced:
+		case k != "" && set[k]:
+			replaced = true
+		default:
+			return fmt.Errorf("the merge would drop the line %q, which the plan does not set", t)
+		}
+	}
+	return nil
 }
 
 func kindOf(rec PlanRecord) fileKind {
 	name := path.Base(rec.Path)
 	switch rec.System {
 	case manifest.TypeGomod:
-		return fileKind{rules: &plainRules}
+		return fileKind{rules: &plainRules, unread: strayHeader(plainRules)}
 	case manifest.TypeNpm:
 		// An npmrc takes no continuation, under whatever name the
 		// environment gives it; the environment files NodeMirror writes take
@@ -94,35 +184,35 @@ func kindOf(rec PlanRecord) fileKind {
 		if rec.Path == NodeMirrorSystemPath || rec.Path == NodeMirrorUserPath {
 			return fileKind{rules: &slashRules}
 		}
-		return fileKind{rules: &plainRules}
+		return fileKind{rules: &plainRules, unread: strayHeader(plainRules)}
 	case manifest.TypePypi:
-		return fileKind{rules: &pipRules}
+		return fileKind{rules: &pipRules, unread: strayHeader(pipRules)}
 	case manifest.TypeGit:
-		return fileKind{rules: &slashRules}
+		return fileKind{rules: &slashRules, unread: gitUnread}
 	case manifest.TypeRpm:
 		if strings.HasSuffix(name, ".repo") {
-			return fileKind{rules: &dnfRules}
+			return fileKind{rules: &dnfRules, unread: strayHeader(dnfRules)}
 		}
 	case manifest.TypeCargo:
-		return fileKind{rules: &plainRules, holds: tomlHolds}
+		return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
 	case manifest.TypeOCI:
 		switch {
 		case name == "hosts.toml":
-			return fileKind{rules: &plainRules, holds: tomlHolds}
+			return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
 		case OCIRuntimeOf(rec.Path) == RuntimePodman:
-			return fileKind{blocks: mergeRegistries, holds: registriesHold}
+			return fileKind{blocks: mergeRegistries, holds: registriesHold, keeps: registriesKeep}
 		}
 	case manifest.TypeRubygems:
-		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "") }, holds: yamlHolds("")}
+		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "") }, holds: yamlHolds(""), keeps: yamlKeeps("")}
 	case manifest.TypeHelm:
-		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "repositories") }, holds: yamlHolds("repositories")}
+		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "repositories") }, holds: yamlHolds("repositories"), keeps: yamlKeeps("repositories")}
 	case manifest.TypeApt:
 		if strings.HasSuffix(name, ".sources") {
 			return fileKind{blocks: mergeDeb822}
 		}
 	case manifest.TypeFreeBSD:
 		if strings.HasSuffix(name, ".conf") {
-			return fileKind{blocks: mergeUCL, holds: uclHolds}
+			return fileKind{blocks: mergeUCL, holds: uclHolds, keeps: uclKeeps}
 		}
 	case manifest.TypeDistfiles:
 		if name == "make.conf" {
@@ -136,9 +226,17 @@ func kindOf(rec PlanRecord) fileKind {
 // result would not read as planned sets it.
 func (k fileKind) merge(old, planned []byte) ([]byte, error) {
 	var lines []string
+	if k.unread != nil {
+		if line := k.unread(splitBody(old)); line != "" {
+			return nil, fmt.Errorf("the line %q opens a section in a form this merge does not match sections by", line)
+		}
+	}
 	switch {
 	case k.rules != nil:
 		lines = mergeSettings(splitBody(old), splitBody(planned), *k.rules)
+		if err := linesKeep(splitBody(old), lines, splitBody(planned), *k.rules); err != nil {
+			return nil, err
+		}
 	case k.blocks != nil:
 		lines = k.blocks(splitBody(old), splitBody(planned))
 	default:
@@ -150,7 +248,222 @@ func (k fileKind) merge(old, planned []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if k.keeps != nil {
+		if err := k.keeps(old, merged, planned); err != nil {
+			return nil, err
+		}
+	}
 	return merged, nil
+}
+
+// treeKeeps reports the first value of old, a decoded document, that merged
+// gives differently and planned does not set. Tables are walked; anything
+// else, a list included, is one value.
+func treeKeeps(old, merged, planned map[string]any, at string) error {
+	for key, o := range old {
+		m, ok := merged[key]
+		p, set := planned[key]
+		osub, isTable := o.(map[string]any)
+		msub, _ := m.(map[string]any)
+		switch {
+		case isTable && msub != nil:
+			psub, _ := p.(map[string]any)
+			if err := treeKeeps(osub, msub, psub, at+key+"."); err != nil {
+				return err
+			}
+		case set, ok && reflect.DeepEqual(o, m):
+		default:
+			return fmt.Errorf("the merge would not keep %s%s, which the plan does not set", at, key)
+		}
+	}
+	return nil
+}
+
+// tomlKeeps is keeps for a TOML file merged setting by setting.
+func tomlKeeps(old, merged, planned []byte) error {
+	var o, m, p map[string]any
+	if _, err := toml.Decode(string(old), &o); err != nil {
+		return fmt.Errorf("the file as it stands does not read as TOML: %w", err)
+	}
+	if _, err := toml.Decode(string(merged), &m); err != nil {
+		return err
+	}
+	if _, err := toml.Decode(string(planned), &p); err != nil {
+		return err
+	}
+	return treeKeeps(o, m, p, "")
+}
+
+// registriesKeep is keeps for a containers-registries.conf drop-in: every
+// top-level key and every registry the plan does not name reads as it did,
+// and a registry the plan names keeps its own keys and its other mirrors in
+// their order. insecure in the plan's own mirror is the plan's to give.
+func registriesKeep(old, merged, planned []byte) error {
+	var o, m, p map[string]any
+	if _, err := toml.Decode(string(old), &o); err != nil {
+		return fmt.Errorf("the file as it stands does not read as TOML: %w", err)
+	}
+	if _, err := toml.Decode(string(merged), &m); err != nil {
+		return err
+	}
+	if _, err := toml.Decode(string(planned), &p); err != nil {
+		return err
+	}
+	tables := func(v any) []map[string]any {
+		list, _ := v.([]map[string]any)
+		return list
+	}
+	byID := func(list []map[string]any, id string) map[string]any {
+		for _, r := range list {
+			if registryID(r) == id {
+				return r
+			}
+		}
+		return nil
+	}
+	location := func(r map[string]any) string { s, _ := r["location"].(string); return s }
+	rest := func(doc map[string]any) map[string]any {
+		out := maps.Clone(doc)
+		delete(out, "registry")
+		return out
+	}
+	if err := treeKeeps(rest(o), rest(m), rest(p), ""); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, r := range tables(o["registry"]) {
+		id := registryID(r)
+		want := byID(tables(p["registry"]), id)
+		if want == nil {
+			if !slices.ContainsFunc(tables(m["registry"]), func(h map[string]any) bool { return reflect.DeepEqual(h, r) }) {
+				return fmt.Errorf("the merge would not keep the registry %q as the host wrote it", id)
+			}
+			continue
+		}
+		// A second entry of one prefix is a second definition of the one
+		// registry, which containers/image refuses; the merge keeps the first.
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		have := byID(tables(m["registry"]), id)
+		planned := func(loc string) map[string]any {
+			for _, w := range tables(want["mirror"]) {
+				if location(w) == loc {
+					return w
+				}
+			}
+			return nil
+		}
+		for key, v := range r {
+			if _, set := want[key]; set || key == "mirror" {
+				continue
+			}
+			if !reflect.DeepEqual(have[key], v) {
+				return fmt.Errorf("the merge would not keep %s of the registry %q", key, id)
+			}
+		}
+		var was, now []map[string]any
+		for _, om := range tables(r["mirror"]) {
+			w := planned(location(om))
+			if w == nil {
+				was = append(was, om)
+				continue
+			}
+			hm := byID(tables(have["mirror"]), location(om))
+			for key, v := range om {
+				if _, set := w[key]; set || key == "insecure" {
+					continue
+				}
+				if !reflect.DeepEqual(hm[key], v) {
+					return fmt.Errorf("the merge would not keep %s of the mirror %q of the registry %q", key, location(om), id)
+				}
+			}
+		}
+		for _, hm := range tables(have["mirror"]) {
+			if planned(location(hm)) == nil {
+				now = append(now, hm)
+			}
+		}
+		if !reflect.DeepEqual(was, now) {
+			return fmt.Errorf("the merge would not keep the other mirrors of the registry %q in the order the host tries them", id)
+		}
+	}
+	return nil
+}
+
+// yamlKeeps is keeps for a YAML mapping merged key by key: every top-level
+// key the plan does not render reads as it did, and under items every entry
+// the plan does not name is still there, while the entry the plan names keeps
+// each field the plan does not give it. caFile is the plan's to remove from
+// its own entry, and a second entry of the plan's name is a second definition
+// of the one repository, which the merge drops.
+func yamlKeeps(items string) func(old, merged, planned []byte) error {
+	return func(old, merged, planned []byte) error {
+		var o, m, p map[string]any
+		if err := yaml.Unmarshal(old, &o); err != nil {
+			return fmt.Errorf("the file as it stands does not read as YAML: %w", err)
+		}
+		if err := yaml.Unmarshal(merged, &m); err != nil {
+			return err
+		}
+		if err := yaml.Unmarshal(planned, &p); err != nil {
+			return err
+		}
+		named := func(v any, name any) map[string]any {
+			list, _ := v.([]any)
+			for _, e := range list {
+				if em, _ := e.(map[string]any); em != nil && reflect.DeepEqual(em["name"], name) {
+					return em
+				}
+			}
+			return nil
+		}
+		for key, was := range o {
+			if _, set := p[key]; !set {
+				if !reflect.DeepEqual(m[key], was) {
+					return fmt.Errorf("the merge would not keep %s, which the plan does not set", key)
+				}
+				continue
+			}
+			if key != items {
+				continue
+			}
+			list, isList := was.([]any)
+			if !isList && was != nil {
+				return fmt.Errorf("%s is not a sequence of entries, so what it holds cannot be kept entry by entry", key)
+			}
+			seen := map[any]bool{}
+			for _, e := range list {
+				em, _ := e.(map[string]any)
+				var want map[string]any
+				if name, ok := em["name"].(string); ok {
+					want = named(p[key], name)
+				}
+				if want == nil {
+					now, _ := m[key].([]any)
+					if !slices.ContainsFunc(now, func(h any) bool { return reflect.DeepEqual(h, e) }) {
+						return fmt.Errorf("the merge would not keep the entry %v of %s", e, key)
+					}
+					continue
+				}
+				if seen[em["name"]] {
+					continue
+				}
+				seen[em["name"]] = true
+				have := named(m[key], em["name"])
+				for field, v := range em {
+					if _, set := want[field]; set || field == "caFile" {
+						continue
+					}
+					if !reflect.DeepEqual(have[field], v) {
+						return fmt.Errorf("the merge would not keep %s of the entry %v of %s", field, em["name"], key)
+					}
+				}
+			}
+		}
+		return nil
+	}
 }
 
 // block is a run of lines that stays or goes together. id names an entry a
@@ -1049,6 +1362,47 @@ func uclHolds(merged, planned []byte) error {
 				}) {
 					return fmt.Errorf("the object %s would not read %s as the plan sets it", tag, plan[w.start:w.end])
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// uclKeeps is keeps for a pkg repository file: an object the plan does not
+// render reads as it did, and one it renders keeps every field the plan does
+// not give it.
+func uclKeeps(old, merged, planned []byte) error {
+	objects := func(body []byte) map[string][]string {
+		out := map[string][]string{}
+		for _, b := range uclEntries(splitBody(body)) {
+			if b.id != "" {
+				out[b.id] = append(out[b.id], strings.Join(dropLead(b.lines), "\n"))
+			}
+		}
+		return out
+	}
+	have, plan := objects(merged), objects(planned)
+	for tag, texts := range objects(old) {
+		if len(plan[tag]) == 0 {
+			if !slices.Equal(have[tag], texts) {
+				return fmt.Errorf("the merge would not keep the object %s as the host wrote it", tag)
+			}
+			continue
+		}
+		if len(have[tag]) == 0 {
+			return fmt.Errorf("the merge would drop the object %s", tag)
+		}
+		was, _, _ := uclFields(texts[0])
+		now, _, _ := uclFields(have[tag][0])
+		want, _, _ := uclFields(plan[tag][0])
+		for _, f := range was {
+			if slices.ContainsFunc(want, func(w uclField) bool { return w.key == f.key }) {
+				continue
+			}
+			if !slices.ContainsFunc(now, func(n uclField) bool {
+				return n.key == f.key && have[tag][0][n.start:n.end] == texts[0][f.start:f.end]
+			}) {
+				return fmt.Errorf("the merge would not keep %s of the object %s", f.key, tag)
 			}
 		}
 	}

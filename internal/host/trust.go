@@ -116,6 +116,10 @@ type trustStore struct {
 	// resolve replaces the store with the one a command names. Like load it
 	// runs only once bodega has answered.
 	resolve func() trustStore
+	// blind is why nothing can be said about this store at all: the client
+	// takes its configuration from an input this probe does not read, or is
+	// told to read none. It names that input. No verification settles it.
+	blind string
 }
 
 // trustRow is one doctor row's client.
@@ -488,6 +492,19 @@ func (t TrustProbe) dnfRepos() []clientconf.YumRepo {
 	return loaded.Repos
 }
 
+// home is the home directory on disk. Home names it as the host does, so it
+// sits under Root with every other absolute path, unless it is already a
+// directory inside Root: a caller that rooted it has said where it is.
+func (t TrustProbe) home() string {
+	if t.Home == "" || t.Root == "" {
+		return t.Home
+	}
+	if rel, err := filepath.Rel(t.Root, t.Home); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return t.Home
+	}
+	return filepath.Join(t.Root, t.Home)
+}
+
 func (t TrustProbe) env(key string) string {
 	if t.Getenv == nil {
 		return ""
@@ -503,7 +520,7 @@ func (t TrustProbe) env(key string) string {
 func pipFiles(t TrustProbe, ask func() (PipDefault, error)) []string {
 	h := clientconf.PipHost{GOOS: t.GOOS, Root: t.Root, Getenv: t.Getenv}
 	if t.Home != "" {
-		h.Home = filepath.Join(t.Root, t.Home)
+		h.Home = t.home()
 	}
 	if ask != nil && t.env("VIRTUAL_ENV") == "" {
 		if d, err := ask(); err == nil {
@@ -529,8 +546,23 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		ask = sync.OnceValues(t.Pip)
 	}
 	files := pipFiles(t, ask)
-	if !mention(u.Host, files...) && !strings.Contains(t.env("PIP_INDEX_URL"), u.Host) {
-		return nil
+	if !pipReaches(t, files, u) {
+		if t.env("PIP_CONFIG_FILE") != os.DevNull {
+			return nil
+		}
+		// The null device turns every configuration file off. A file naming
+		// bodega is then one pip was configured with and does not read.
+		loaded := t
+		loaded.Getenv = func(key string) string {
+			if key == "PIP_CONFIG_FILE" {
+				return ""
+			}
+			return t.env(key)
+		}
+		if !pipReaches(loaded, pipFiles(loaded, ask), u) {
+			return nil
+		}
+		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("the environment's PIP_CONFIG_FILE is %s, which tells pip to load no configuration file, so the pip.conf pointing at bodega is not read and whether pip reaches bodega or verifies its certificate is unchecked", os.DevNull)}}
 	}
 	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
 		if v := t.env(key); v != "" {
@@ -579,6 +611,63 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		system.unsure = fmt.Sprintf("pip could not say which bundle it reads (%s), and a pip before 24.2 reads certifi's, which the system trust store's answer says nothing about, so whether pip verifies bodega's certificate is unchecked", reason)
 		return system
 	}}}
+}
+
+// sameHost reports whether raw is a URL at u's host and port, a scheme's
+// default port standing for none.
+func sameHost(raw string, u *url.URL) bool {
+	p, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || p.Host == "" {
+		return false
+	}
+	port := func(x *url.URL) string {
+		if x.Port() == "" && x.Scheme == "https" {
+			return "443"
+		}
+		if x.Port() == "" && x.Scheme == "http" {
+			return "80"
+		}
+		return x.Port()
+	}
+	return strings.EqualFold(p.Hostname(), u.Hostname()) && port(p) == port(u)
+}
+
+// pipReaches reports whether pip, as its effective configuration stands,
+// fetches from bodega at u: an index-url or extra-index-url there, from the
+// last of files to set it in any section, or from the environment, which
+// outranks every file. A file that names bodega only in a comment, or in an
+// option a later file replaces, configures nothing.
+func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
+	effective := map[string]string{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for key, v := range clientconf.PipOptions(data) {
+			if _, option, _ := strings.Cut(key, "."); option == "index-url" || option == "extra-index-url" {
+				effective[key] = v
+			}
+		}
+	}
+	for option, env := range map[string]string{"index-url": "PIP_INDEX_URL", "extra-index-url": "PIP_EXTRA_INDEX_URL"} {
+		v := t.env(env)
+		if v == "" {
+			continue
+		}
+		for key := range effective {
+			if strings.HasSuffix(key, "."+option) {
+				delete(effective, key)
+			}
+		}
+		effective["env."+option] = v
+	}
+	for _, v := range effective {
+		if slices.ContainsFunc(strings.Fields(v), func(one string) bool { return sameHost(one, u) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeCAFlags reads the options that choose Node's root store. The last of
@@ -633,7 +722,7 @@ func npmFiles(t TrustProbe) []string {
 	case v != "":
 		files = append(files, v)
 	case t.Home != "":
-		files = append(files, filepath.Join(t.Root, t.Home, ".npmrc"))
+		files = append(files, filepath.Join(t.home(), ".npmrc"))
 	}
 	return files
 }
@@ -682,6 +771,65 @@ func npmFileLayer(path string) npmLayer {
 	return l
 }
 
+var npmEnvRef = regexp.MustCompile(`\$\{([^}]+)\}`)
+
+// npmRegistries lists the registries npm fetches from as its effective
+// configuration names them: the default registry, which the environment's
+// npm_config_registry gives ahead of every npmrc and the last npmrc to set it
+// gives otherwise, and each scope's own registry. A registry named only in an
+// npmrc the environment outranks is not one npm asks. Scoped registries set
+// through the environment are not read: a variable of unknown name cannot be
+// asked for.
+func npmRegistries(t TrustProbe, files []string) []string {
+	def := ""
+	scoped := map[string]string{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || line[0] == '#' || line[0] == ';' {
+				continue
+			}
+			if line[0] == '[' {
+				break
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+				v = v[1 : len(v)-1]
+			}
+			v = npmEnvRef.ReplaceAllStringFunc(v, func(ref string) string { return t.env(ref[2 : len(ref)-1]) })
+			switch {
+			case k == "registry":
+				def = v
+			case strings.HasSuffix(k, ":registry"):
+				scoped[k] = v
+			}
+		}
+	}
+	out := []string{def}
+	// npm reads the variable under either spelling, so both are candidates.
+	var env []string
+	for _, key := range []string{"npm_config_registry", "NPM_CONFIG_REGISTRY"} {
+		if v := t.env(key); v != "" {
+			env = append(env, v)
+		}
+	}
+	if len(env) > 0 {
+		out = env
+	}
+	for _, v := range scoped {
+		out = append(out, v)
+	}
+	return out
+}
+
 // npmStores resolves the CAs npm verifies its registry against. npm keeps
 // one CA list: each source that sets ca replaces it, and each source whose
 // cafile names a file npm can read replaces it with that file's certificates,
@@ -700,7 +848,7 @@ func npmFileLayer(path string) npmLayer {
 // row only where Node reads that store, and Node lists what it trusts.
 func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	files := npmFiles(t)
-	if !mention(u.Host, files...) {
+	if !slices.ContainsFunc(npmRegistries(t, files), func(r string) bool { return sameHost(r, u) }) {
 		return nil
 	}
 	var layers []npmLayer
@@ -734,7 +882,7 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 		}
 		if file := l.cafile; file != "" {
 			if rest, ok := strings.CutPrefix(file, "~/"); ok {
-				file = filepath.Join(t.Root, t.Home, rest)
+				file = filepath.Join(t.home(), rest)
 			}
 			if data, err := os.ReadFile(file); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 				store = &trustStore{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", file, l.from), files: []string{file}}
@@ -834,6 +982,11 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 				prefixes = append(prefixes, string(m[1]))
 			}
 		}
+	}
+	// Ahead of everything else: with configuration this probe does not read,
+	// neither "git is not pointed at bodega" nor any setting below is known.
+	if unread := clientconf.GitUnread(t.Getenv, files); len(unread) > 0 {
+		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git takes configuration from %s, which doctor does not read, so which http.sslCAInfo git applies to bodega and whether it verifies bodega's certificate is unchecked", strings.Join(unread, "; and from "))}}
 	}
 	if len(prefixes) == 0 {
 		return nil
@@ -997,6 +1150,116 @@ func mention(host string, files ...string) bool {
 	return false
 }
 
+// TrustState is what a probe could establish about one client.
+type TrustState int
+
+const (
+	// TrustAbsent: nothing the client reads sends it to bodega.
+	TrustAbsent TrustState = iota
+	// TrustVerified: every store the client reads for bodega verifies the
+	// certificate bodega serves.
+	TrustVerified
+	// TrustUnchecked: what the client reads could not be determined. It is
+	// not a pass.
+	TrustUnchecked
+	// TrustFailed: a store the client reads does not verify the certificate.
+	TrustFailed
+)
+
+// TrustVerdict is the outcome for one check's client, with the reason for
+// one that is unchecked or failed.
+type TrustVerdict struct {
+	Check, System string
+	State         TrustState
+	Detail        string
+}
+
+// served dials base once and holds what it presented and how the system
+// store judged it.
+type served struct {
+	t         TrustProbe
+	u         *url.URL
+	done      bool
+	chain     []*x509.Certificate
+	systemErr error
+	err       error
+}
+
+func (s *served) get() error {
+	if s.done {
+		return s.err
+	}
+	s.done = true
+	hostport := s.u.Host
+	if s.u.Port() == "" {
+		hostport = net.JoinHostPort(s.u.Hostname(), "443")
+	}
+	dial, system := s.t.Chain, s.t.System
+	if dial == nil {
+		dial = dialChain
+	}
+	if system == nil {
+		system = func(chain []*x509.Certificate, name string) error { return verifyChain(chain, name, nil) }
+	}
+	if s.chain, s.err = dial(hostport); s.err == nil && len(s.chain) == 0 {
+		s.err = errors.New("the server presented no certificate")
+	}
+	if s.err == nil {
+		s.systemErr = system(s.chain, s.u.Hostname())
+	}
+	return s.err
+}
+
+// weigh verifies the served chain against each store. failed names the
+// stores that do not verify it, and unread the ones nothing could be said
+// about, each with its reason.
+func (s *served) weigh(stores []trustStore) (failed, unread []string) {
+	for _, st := range stores {
+		if st.blind != "" {
+			unread = append(unread, st.blind)
+			continue
+		}
+		if st.resolve != nil {
+			st = st.resolve()
+		}
+		if st.system && s.systemErr == nil && st.unsure == "" {
+			continue
+		}
+		pool := poolOf(st.files)
+		for _, p := range st.pem {
+			pool.AppendCertsFromPEM([]byte(p))
+		}
+		if st.load != nil {
+			name, certs, err := st.load()
+			st.name = name
+			if err != nil {
+				unread = append(unread, fmt.Sprintf("%s was not read (%v), so whether this client verifies bodega's certificate is unchecked", strings.TrimSuffix(st.name, ","), err))
+				continue
+			}
+			for _, c := range certs {
+				pool.AddCert(c)
+			}
+		}
+		verr := verifyChain(s.chain, s.u.Hostname(), pool)
+		if verr == nil {
+			continue
+		}
+		if st.system && s.systemErr == nil {
+			unread = append(unread, st.unsure)
+			continue
+		}
+		switch {
+		case !st.system:
+			failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", st.name, verr))
+		case st.name == systemStoreName || strings.HasPrefix(st.name, systemStoreName+","):
+			failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", st.name, s.systemErr))
+		default:
+			failed = append(failed, fmt.Sprintf("neither %s nor %s verifies the certificate it serves (%v)", systemStoreName, st.name, s.systemErr))
+		}
+	}
+	return failed, unread
+}
+
 // Apply returns findings with a warning on each row whose client is
 // configured for bodega at base and cannot verify the certificate base
 // serves, judged against the stores that client reads as this host
@@ -1006,6 +1269,12 @@ func mention(host string, files ...string) bool {
 // gains this one, since a client can both bypass bodega for one scope and
 // refuse its certificate for the rest.
 //
+// A row whose client could not be judged warns too, naming the input that
+// stood in the way: a store no command would list, a client that could not
+// say which store it reads, configuration the environment turns off or
+// supplies from where this probe does not look. Unchecked is not verified,
+// and a row reading OK would say it was.
+//
 // The rows come back unchanged when base is not https, and when the server
 // does not answer: an unreachable bodega is not a certificate nobody trusts.
 func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
@@ -1013,9 +1282,7 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return findings
 	}
-	var chain []*x509.Certificate
-	var systemErr error
-	probed := false
+	srv := &served{t: t, u: u}
 	out := make([]Finding, len(findings))
 	for i, f := range findings {
 		out[i] = f
@@ -1027,89 +1294,71 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 		if len(stores) == 0 {
 			continue
 		}
-		if !probed {
-			probed = true
-			hostport := u.Host
-			if u.Port() == "" {
-				hostport = net.JoinHostPort(u.Hostname(), "443")
-			}
-			dial, system := t.Chain, t.System
-			if dial == nil {
-				dial = dialChain
-			}
-			if system == nil {
-				system = func(chain []*x509.Certificate, name string) error { return verifyChain(chain, name, nil) }
-			}
-			if chain, err = dial(hostport); err != nil || len(chain) == 0 {
-				return findings
-			}
-			systemErr = system(chain, u.Hostname())
+		if srv.get() != nil {
+			return findings
 		}
-		var failed, unread []string
-		for _, s := range stores {
-			if s.resolve != nil {
-				s = s.resolve()
-			}
-			if s.system && systemErr == nil && s.unsure == "" {
-				continue
-			}
-			pool := poolOf(s.files)
-			for _, p := range s.pem {
-				pool.AppendCertsFromPEM([]byte(p))
-			}
-			if s.load != nil {
-				name, certs, err := s.load()
-				s.name = name
-				if err != nil {
-					unread = append(unread, fmt.Sprintf("%s was not read (%v), so whether this client verifies bodega's certificate is unchecked", strings.TrimSuffix(s.name, ","), err))
-					continue
-				}
-				for _, c := range certs {
-					pool.AddCert(c)
-				}
-			}
-			verr := verifyChain(chain, u.Hostname(), pool)
-			if verr == nil {
-				continue
-			}
-			if s.system && systemErr == nil {
-				unread = append(unread, s.unsure)
-				continue
-			}
-			switch {
-			case !s.system:
-				failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", s.name, verr))
-			case s.name == systemStoreName || strings.HasPrefix(s.name, systemStoreName+","):
-				failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", s.name, systemErr))
-			default:
-				failed = append(failed, fmt.Sprintf("neither %s nor %s verifies the certificate it serves (%v)", systemStoreName, s.name, systemErr))
-			}
+		failed, unread := srv.weigh(stores)
+		if len(failed)+len(unread) == 0 {
+			continue
 		}
-		var detail, remedy string
+		install := fmt.Sprintf("bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s", row.system, strings.TrimRight(base, "/"))
+		detail := strings.Join(unread, "; ")
+		remedy := "remove what keeps doctor from reading this client's trust (named above) and re-run doctor; where the client then refuses bodega's certificate, install the CA that issued it: " + install
 		if len(failed) > 0 {
-			detail = fmt.Sprintf("configured for bodega at %s, and %s, so every fetch fails on the certificate", u.Host, strings.Join(failed, "; and "))
-			remedy = fmt.Sprintf("install the CA that issued bodega's certificate: bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s",
-				row.system, strings.TrimRight(base, "/"))
-			out[i].Status = StatusWarn
+			detail = strings.TrimPrefix(detail+"; ", "; ") + fmt.Sprintf("configured for bodega at %s, and %s, so every fetch fails on the certificate", u.Host, strings.Join(failed, "; and "))
+			remedy = "install the CA that issued bodega's certificate: " + install
 		}
-		if len(unread) > 0 {
-			detail = strings.Join(append(unread, detail), "; ")
-			detail = strings.TrimSuffix(detail, "; ")
-		}
+		out[i].Status = StatusWarn
 		switch {
-		case detail == "":
 		case f.Status == StatusWarn:
 			out[i].Detail = f.Detail + "; also " + detail
-			if remedy != "" {
-				out[i].Remediation = strings.TrimPrefix(f.Remediation+"; "+remedy, "; ")
-			}
+			out[i].Remediation = strings.TrimPrefix(f.Remediation+"; "+remedy, "; ")
 		case len(failed) == 0:
 			out[i].Detail = strings.TrimPrefix(f.Detail+"; "+detail, "; ")
+			out[i].Remediation = remedy
 		default:
 			out[i].Detail, out[i].Remediation = detail, remedy
 		}
 	}
 	return out
+}
+
+// Judge returns a verdict for the client of each named check, for a caller
+// that owes one whether or not the client turns out to be configured: after
+// a CA install, a client reading nothing that names bodega is a client the
+// install did not reach, which Apply, reporting on rows, has no row to say.
+// It errs when base is not https or its server does not answer, where
+// nothing was judged.
+func (t TrustProbe) Judge(checks []string, base string) ([]TrustVerdict, error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return nil, fmt.Errorf("%s is not an https URL, so no client verifies a certificate there", base)
+	}
+	srv := &served{t: t, u: u}
+	var out []TrustVerdict
+	for _, check := range checks {
+		row, ok := trustRows[check]
+		if !ok {
+			continue
+		}
+		v := TrustVerdict{Check: check, System: row.system}
+		if stores := row.stores(t, u); len(stores) > 0 {
+			if err := srv.get(); err != nil {
+				return nil, fmt.Errorf("%s did not present a certificate to verify: %w", u.Host, err)
+			}
+			failed, unread := srv.weigh(stores)
+			switch {
+			case len(failed) > 0:
+				v.State, v.Detail = TrustFailed, strings.Join(append(failed, unread...), "; ")
+			case len(unread) > 0:
+				v.State, v.Detail = TrustUnchecked, strings.Join(unread, "; ")
+			default:
+				v.State = TrustVerified
+			}
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // poolOf reads the PEM files into a pool. A file that will not read, or

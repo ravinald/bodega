@@ -1589,3 +1589,197 @@ func TestTrustSourceSelection(t *testing.T) {
 		t.Errorf("pip on macOS loads %s", rel(files))
 	}
 }
+
+func TestFinalCAPreservesAlternateSyntax(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"helm-dash", Helm(testBase), "repositories:\n  -\n    name: bodega\n    url: https://old.example/helm\n    certFile: /corp/client.pem\n    keyFile: /corp/client.key\n", "certFile: /corp/client.pem"},
+		{"maven-cdata", Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url><![CDATA[https://old.example/maven/]]></url><mirrorOf>*</mirrorOf><mirrorOfLayouts>default</mirrorOfLayouts></mirror></mirrors></settings>\n", "<mirrorOfLayouts>default</mirrorOfLayouts>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0600); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				return
+			} // Refusing an unsupported form before writing preserves the file.
+			if _, err := Apply(in.Changes, ".audit"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("successful apply discarded %q:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestFinalGitCAAcceptsNativeSectionSyntax(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{" # corporate roots", "; corporate roots"} {
+		t.Run(suffix, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".gitconfig")
+			old := "[http \"" + testBase + "/git/gh/\"]" + suffix + "\n\tsslCAInfo = /missing/corporate.pem\n\textraHeader = X-Corp: keep\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			native := func() string {
+				t.Helper()
+				out, err := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+				if err != nil {
+					t.Fatalf("native git: %v: %s", err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if got := native(); got != "/missing/corporate.pem" {
+				t.Fatalf("fixture: git reads %q", got)
+			}
+			in, err := AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+			if err != nil {
+				return
+			}
+			if _, err := Apply(in.Changes, ".audit"); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(home, ".config/bodega/ca.pem")
+			if got := native(); got != want {
+				t.Fatalf("git still reads %q after successful CA apply; want %q", got, want)
+			}
+		})
+	}
+}
+
+// F116 R1: a file the plan cannot be placed in field by field is refused
+// before anything is written, naming the file and what stands in the way, and
+// so is a plan file the environment tells its client not to load. None of
+// them is replaced, and none is reported installed.
+func TestCARefusesWhatItCannotEditExactly(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	for name, tc := range map[string]struct {
+		file   File
+		before string
+		env    map[string]string
+		want   string
+	}{
+		"maven mirror named twice":      {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://a/</url></mirror><mirror><id>bodega</id><url>https://b/</url><name>second</name></mirror></mirrors></settings>\n", nil, "2 times"},
+		"maven url holding markup":      {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://a/<!-- was b --></url></mirror></mirrors></settings>\n", nil, "markup"},
+		"maven file that is not XML":    {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id>\n", nil, "not XML"},
+		"maven second mirrors element":  {Maven(testBase, nil)[0], "<settings><mirrors/><mirrors><mirror><id>corp</id></mirror></mirrors></settings>\n", nil, "more than one <mirrors>"},
+		"pip header with a comment":     {Pip(testBase), "[global] ; site policy\nindex-url = https://corp.example/simple\n", nil, "[global] ; site policy"},
+		"git setting on a header line":  {git, "[http \"" + testBase + "/\"] sslCAInfo = /corp.pem\n", nil, "opens a section"},
+		"git value continued":           {git, "[http \"" + testBase + "/git/\"]\n\tsslCAInfo = /corp\\\n.pem\n", nil, "opens a section"},
+		"helm flow sequence of entries": {Helm(testBase), "repositories: [{name: corp, url: \"https://corp.example\", certFile: /c.pem}]\n", nil, "move the file aside"},
+		"pip told to load no file":      {Pip(testBase), "", map[string]string{"PIP_CONFIG_FILE": os.DevNull}, "PIP_CONFIG_FILE"},
+		"git told to load no file":      {git, "", map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull}, "GIT_CONFIG_GLOBAL"},
+		"git configured by environment": {git, "", map[string]string{"GIT_CONFIG_COUNT": "1"}, "GIT_CONFIG_COUNT"},
+		"npm pointed at a missing file": {Npm(testBase, nil), "", map[string]string{"NPM_CONFIG_USERCONFIG": "/missing/work.npmrc"}, "NPM_CONFIG_USERCONFIG"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(tc.file.Path(OSLinux), "~"), "/"))
+			if tc.before != "" {
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(k string) string { return tc.env[k] }})
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), target) {
+				t.Fatalf("AddCA = %v; want a refusal naming %s and %q", err, target, tc.want)
+			}
+		})
+	}
+}
+
+// F116 R1: bodega's Maven mirror is edited where the XML tokenizer finds
+// it. A CDATA value is replaced between its tags, a blocked flag goes on its
+// own, every other element and mirror stays byte for byte, a commented-out
+// mirror is not the live one, and a second merge changes nothing.
+func TestMavenMirrorEditsInPlace(t *testing.T) {
+	planned := []byte(Maven(testBase, nil)[0].Content)
+	decoy := "<!-- <mirrors><mirror><id>bodega</id><url>https://decoy/</url></mirror></mirrors> -->"
+	corp := "<mirror><id>corp</id><url>https://corp.example/</url><mirrorOf>central</mirrorOf></mirror>"
+	old := "<?xml version=\"1.0\"?>\n<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">\n  " + decoy + "\n  <servers><server><id>corp</id></server></servers>\n  <mirrors>\n    <mirror>\n      <id> bodega </id>\n      <url><![CDATA[https://old.example/maven/]]></url>\n      <blocked>true</blocked>\n      <mirrorOfLayouts>default</mirrorOfLayouts>\n    </mirror>\n    " + corp + "\n  </mirrors>\n</settings>\n"
+	got, err := mergeMavenMirror([]byte(old), planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{decoy, corp, "<servers><server><id>corp</id></server></servers>", "<id> bodega </id>",
+		"<url>" + testBase + "/maven/</url>", "<mirrorOfLayouts>default</mirrorOfLayouts>\n      <mirrorOf>*</mirrorOf>\n    </mirror>"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("the merge lost or misplaced %q:\n%s", want, got)
+		}
+	}
+	for _, gone := range []string{"blocked", "old.example", "CDATA"} {
+		if strings.Contains(string(got), gone) {
+			t.Errorf("the merge kept %q:\n%s", gone, got)
+		}
+	}
+	again, err := mergeMavenMirror(got, planned)
+	if err != nil || string(again) != string(got) {
+		t.Errorf("a second merge changed the file (%v):\n%s", err, again)
+	}
+	// A CDATA value already the plan's is left as the host wrote it.
+	same := "<settings><mirrors><mirror><id>bodega</id><mirrorOf>*</mirrorOf><url><![CDATA[" + testBase + "/maven/]]></url></mirror></mirrors></settings>\n"
+	if got, err := mergeMavenMirror([]byte(same), planned); err != nil || string(got) != same {
+		t.Errorf("a mirror already reading as the plan sets it was rewritten (%v):\n%s", err, got)
+	}
+}
+
+// F116 R1, R2: a git value is read and written by git's own grammar, so a
+// path holding # or ; is not cut short at it, and the reader agrees with the
+// writer.
+func TestGitValueGrammar(t *testing.T) {
+	for raw, want := range map[string]string{
+		" /etc/ca.pem":           "/etc/ca.pem",
+		" /etc/ca.pem # roots":   "/etc/ca.pem",
+		" /etc/ca#1.pem":         "/etc/ca",
+		" \"/etc/ca#1.pem\" ; x": "/etc/ca#1.pem",
+		" /a\\\\b \"c d\"  ":     "/a\\b c d",
+		" \"say \\\"hi\\\"\"":    "say \"hi\"",
+	} {
+		if got, whole := gitValue(raw); got != want || !whole {
+			t.Errorf("gitValue(%q) = %q, %v; want %q", raw, got, whole, want)
+		}
+	}
+	for _, raw := range []string{" /etc/ca\\", " \"/etc/ca"} {
+		if got, whole := gitValue(raw); whole {
+			t.Errorf("gitValue(%q) = %q, read as a whole value", raw, got)
+		}
+	}
+	for _, v := range []string{"/etc/ca.pem", "/tmp/a_#_b/ca.pem", "/tmp/a;b", `C:\certs\ca.pem`, `/q"uote`, " lead"} {
+		if got, whole := gitValue(" " + gitQuote(v)); got != v || !whole {
+			t.Errorf("gitQuote(%q) = %s, which reads back as %q", v, gitQuote(v), got)
+		}
+	}
+}

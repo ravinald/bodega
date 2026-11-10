@@ -1681,3 +1681,74 @@ func TestStaffDoctorPodmanInstallsIntoSelectedCertDirectory(t *testing.T) {
 		t.Fatalf("successful apply left podman's selected cert directory without the CA: %v\n%s", err, out)
 	}
 }
+
+func TestFinalDoctorRejectsPipIgnoringEveryConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PIP_CONFIG_FILE", os.DevNull)
+	t.Setenv("PIP_INDEX_URL", "")
+	stubRuntimes(t)
+	prevRoot, prevOS := doctorOCIRoot, doctorCAGOOS
+	doctorOCIRoot, doctorCAGOOS = home, clientconf.OSLinux
+	t.Cleanup(func() { doctorOCIRoot, doctorCAGOOS = prevRoot, prevOS })
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err := runDoctor(t, "--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("apply %d succeeded with PIP_CONFIG_FILE=/dev/null; pip consumes none of the installed settings or CA", i+1)
+		}
+	}
+}
+
+// F116 R1: after an install every selected system owes a verdict, and only a
+// client shown to verify bodega's certificate passes. One that still reads a
+// store without the CA fails the run, and so does one that could not be
+// judged; one nothing points at bodega is reported apart and fails nothing.
+func TestUnreadCAOwesAVerdictPerSystem(t *testing.T) {
+	srv, caPEM, _ := caPlanServer(t)
+	root := t.TempDir()
+	caFile := filepath.Join(root, "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pipConf := filepath.Join(root, "etc/pip.conf")
+	if err := os.MkdirAll(filepath.Dir(pipConf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := doctorTrustProbe
+	t.Cleanup(func() { doctorTrustProbe = prev })
+	doctorTrustProbe = func() host.TrustProbe {
+		return host.TrustProbe{Root: root, Home: "/home/u", GOOS: "linux", Getenv: func(string) string { return "" },
+			System: func([]*x509.Certificate, string) error { return nil }}
+	}
+	systems := []string{manifest.TypePypi, manifest.TypeCargo}
+	for _, tc := range []struct {
+		name, cert, want string
+	}{
+		{"pip cannot say which bundle it reads", "", "could not be checked"},
+		{"pip reads a bundle without the CA", "cert = /missing/site.pem\n", "still read a store without it"},
+		{"pip reads the installed CA", "cert = " + caFile + "\n", ""},
+	} {
+		if err := os.WriteFile(pipConf, []byte("[global]\nindex-url = "+srv.URL+"/pypi/simple/\n"+tc.cert), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := unreadCA(systems, nil, srv.URL)
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s: %v; want a pass", tc.name, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "pypi: ") || strings.Contains(err.Error(), "cargo")):
+			t.Errorf("%s: %v; want a failure naming pypi alone and %q", tc.name, err, tc.want)
+		}
+	}
+	if err := unreadCA([]string{manifest.TypeCargo}, nil, srv.URL); err != nil {
+		t.Errorf("a client nothing points at bodega failed the run: %v", err)
+	}
+	srv.Close()
+	if err := unreadCA(systems, nil, srv.URL); err == nil || !strings.Contains(err.Error(), "could not be checked") {
+		t.Errorf("a bodega that stopped answering = %v; want the run to say nothing was checked", err)
+	}
+}
