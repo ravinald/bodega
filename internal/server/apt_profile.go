@@ -391,11 +391,6 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, la
 // aptUpstreamRead reads one (base, component, architecture) Packages through
 // cache, recording a 404 as an architecture the archive does not carry rather
 // than as a failure, for the reason aptFilteredPackages gives.
-//
-// Every body it reads is also recorded for the age gate, under the Release it
-// was checked against. This is the one reader the pool index, the profile
-// rebuild, the hide filter and a client's dists read all go through, so none
-// of them can read an index the gate does not see.
 func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstreamComponent, arch string, release map[string]string, cache map[string]aptIndexRead) (aptIndexRead, error) {
 	component := comp.name
 	key := base + "/" + component + "/" + arch
@@ -413,7 +408,6 @@ func (s *Server) aptUpstreamRead(ctx context.Context, base string, comp aptUpstr
 		return aptIndexRead{}, fmt.Errorf("read the upstream Packages for %s/%s/%s: %w", base, component, arch, err)
 	default:
 		read = aptIndexRead{body: body}
-		s.observeAptUpstreamIndex(ctx, base, component, arch, comp.index[arch], release, body)
 	}
 	cache[key] = read
 	return read, nil
@@ -678,9 +672,16 @@ func aptDecompressIndex(base, rest string, body []byte) ([]byte, error) {
 // answer later has already made the request the rule forbids. Nothing is
 // recorded as discovery here — this is bodega reading its own index on a
 // timer, not a host reaching for a package.
+//
+// Every complete body is handed to observeAptMirrorDists before it is
+// returned, from the cache or the archive. The pool index, the profile
+// rebuild and the hide filter have no other way to these bytes, so the age
+// gate holds the evidence before any of them can fail a digest check or a
+// parse.
 func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byte, error) {
 	key := base + "/" + rest
 	if body, ok := s.aptUpstreamCached(key); ok {
+		s.observeAptMirrorDists(ctx, base, rest, body)
 		return body, nil
 	}
 	ups := s.cfg.AptUpstreams[base]
@@ -704,6 +705,7 @@ func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byt
 		return nil, err
 	}
 	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: time.Now()})
+	s.observeAptMirrorDists(ctx, base, rest, body)
 	return body, nil
 }
 

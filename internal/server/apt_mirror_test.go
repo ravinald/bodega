@@ -2538,3 +2538,78 @@ func TestAptMirrorAgeNamesAnIndexReadWithNoRelease(t *testing.T) {
 		t.Errorf("admission = %+v; want not evaluated, naming the index read with no Release", c)
 	}
 }
+
+func TestReviewF112PoolReleaseReconcilesWithoutPackagesRefetch(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	earlier, later := now.Add(-8*24*time.Hour), now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-30*24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	olderRelease := "Date: " + earlier.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, later, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	archive.setObject("dists/fixture/Release", olderRelease)
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	before := archive.count("dists/fixture/Release")
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Errorf("version listed eight days ago under 7d block = %d %q; want 200", code, body)
+	}
+	if archive.count("dists/fixture/Release") != before+1 {
+		t.Fatal("pool check did not read the older Release")
+	}
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(earlier) {
+		t.Errorf("completed pool Release with membership already recorded = %+v ok=%v err=%v; want %s after reopen", d, ok, err, earlier)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckPass {
+		t.Errorf("admission = %+v; want pass", c)
+	}
+}
+
+func TestReviewF112PoolMismatchedPackagesRetainsMembership(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	objects["dists/fixture/Release"] = "Date: " + fresh.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	const rel = "dists/fixture/universe/binary-amd64/Packages.gz"
+	archive.setObject(rel, objects[rel])
+	archive.setObject(ageDebNew, "deb 8.5.4-0ubuntu2")
+	s.aptUpstreamIdx.Clear()
+	idx := s.buildAptPoolIndex(t.Context(), s.cfg.MirroredAptCodenames())
+	if len(idx.failed) == 0 {
+		t.Fatal("fixture must fail its Release digest check")
+	}
+	raw, ok := s.aptUpstreamCached("fixture/universe/binary-amd64/Packages.gz")
+	if !ok || string(raw) != objects[rel] {
+		t.Fatal("pool rebuild did not complete the Packages read")
+	}
+	sum := sha256.Sum256(raw)
+	if seen, err := s.auditDB.AptIndexObserved(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !seen {
+		t.Errorf("complete Packages with no matching Release: observed=%v err=%v; want persisted membership", seen, err)
+	}
+	s.typeStore(manifest.TypeApt).(*storage.Memory).Seed(manifest.AptKey("dists/fixture/Release"), objects["dists/fixture/Release"])
+	if code, body := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK || string(body) != objects["dists/fixture/Release"] {
+		t.Fatal("matching cached Release was not read completely")
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("completed pool Packages then its Release = %+v ok=%v err=%v; want %s", d, ok, err, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version listed one hour ago under 7d block = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
