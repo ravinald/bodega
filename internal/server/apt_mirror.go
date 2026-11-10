@@ -148,7 +148,7 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 		return
 	}
 	observe := func(ctx context.Context, raw []byte) { s.observeAptMirrorDists(ctx, codename, rest, raw) }
-	r = withInputObserver(r, &inputObserver{fetched: observe, stored: observe})
+	r = withInputObserver(r, &inputObserver{observe: observe})
 	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
 }
 
