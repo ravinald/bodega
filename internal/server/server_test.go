@@ -1,16 +1,23 @@
 package server_test
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1398,5 +1405,95 @@ func TestAptIndexWithholdsAnEntryWithACredentialInAnIdentityField(t *testing.T) 
 				}
 			})
 		}
+	}
+}
+
+// TestSIGHUPServesTheRenewedCertificate starts a TLS listener, replaces both
+// files, sends the reload, and asserts the next handshake is handed the new
+// certificate while a connection that completed its handshake under the old
+// one goes on answering requests.
+func TestSIGHUPServesTheRenewedCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	server.WriteTestCertPair(t, certPath, keyPath, "before-renewal", time.Now().Add(time.Hour))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	cfg := &config.Config{
+		TLSCert:     certPath,
+		TLSKey:      keyPath,
+		LogDir:      t.TempDir(),
+		StoragePath: t.TempDir(),
+		AuditDB:     filepath.Join(t.TempDir(), "audit.db"),
+	}
+	srv := server.New(cfg, manifest.NewLocalStore(t.TempDir()), nil, addr,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetQuiet(true)
+	sig := make(chan os.Signal, 1)
+	srv.SetReloadSignals(sig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("Start did not return within 30s of cancellation")
+		}
+	})
+	eventually := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not within 10s", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	eventually("listener presents the first certificate", func() bool {
+		return server.ServedCommonName(addr) == "before-renewal"
+	})
+
+	held, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // self-signed fixture
+	if err != nil {
+		t.Fatalf("open the connection that predates the reload: %v", err)
+	}
+	defer func() { _ = held.Close() }()
+	heldReader := bufio.NewReader(held)
+	healthz := func(when string) {
+		t.Helper()
+		_ = held.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.WriteString(held, "GET /healthz HTTP/1.1\r\nHost: "+addr+"\r\n\r\n"); err != nil {
+			t.Fatalf("%s: write on the held connection: %v", when, err)
+		}
+		resp, err := http.ReadResponse(heldReader, nil)
+		if err != nil {
+			t.Fatalf("%s: read on the held connection: %v", when, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: /healthz on the held connection answered %d", when, resp.StatusCode)
+		}
+	}
+	healthz("before the reload")
+
+	server.WriteTestCertPair(t, certPath, keyPath, "after-renewal", time.Now().Add(time.Hour))
+	sig <- syscall.SIGHUP
+	eventually("a new handshake receives the renewed certificate", func() bool {
+		return server.ServedCommonName(addr) == "after-renewal"
+	})
+
+	healthz("after the reload")
+	if got := held.ConnectionState().PeerCertificates[0].Subject.CommonName; got != "before-renewal" {
+		t.Errorf("the held connection reports certificate %q, want the one it handshook with", got)
 	}
 }

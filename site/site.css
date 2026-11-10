@@ -54,7 +54,9 @@ body.page .frame, body.colophon .frame, body.\34 04 .frame { grid-template-colum
 .mark img { width: 160px; height: auto; image-rendering: pixelated; margin-top: .6rem; }
 
 /* The contents column reads like a book's contents page. */
-.contents { position: sticky; top: 1.25rem; align-self: start; max-height: calc(100vh - 2.5rem); overflow-y: auto; padding-right: .5rem; font-size: .84rem; line-height: 1.4; }
+.contents { font-size: .84rem; line-height: 1.4; }
+/* Only the sidebar sticks: /docs/ sets the same lists in the page body, where seven sticky lists pile up under one another. */
+aside.contents { position: sticky; top: 1.25rem; align-self: start; max-height: calc(100vh - 2.5rem); overflow-y: auto; padding-right: .5rem; }
 .contents h2 { font: 650 .66rem/1 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--quiet); margin: 1.5rem 0 .55rem; }
 .contents h2:first-child { margin-top: .5rem; }
 .contents ol { list-style: none; margin: 0; padding: 0; }
@@ -205,3 +207,14 @@ main.colophon sup a { text-decoration: none; color: var(--quiet); font: 600 .68r
   .table:has(> table.coverage) { overflow-x: auto; }
   body.home .prose h1 { font-size: 3.6rem; }
 }
+
+/* API reference. */
+.api-method { font: 650 .68rem/1 var(--sans); letter-spacing: .08em; color: var(--quiet); border: 1px solid var(--rule); border-radius: 2px; padding: .2em .45em; white-space: nowrap; }
+.api-call code { font-size: .92em; }
+.api-type { font: .84em/1.4 var(--mono); color: var(--quiet); }
+.api-required { font: 650 .68rem/1 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--quiet); }
+.api-members { list-style: none; padding: 0 0 0 1rem; border-left: 1px solid var(--rule); font-size: .92rem; }
+.api-members li { margin: .5rem 0; }
+.api-members p, .api-responses dd p, table.api td p { margin: .2rem 0; }
+.api-responses dt { margin-top: .8rem; }
+.api-responses dd { margin: 0 0 0 1rem; }
