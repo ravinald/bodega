@@ -986,3 +986,81 @@ func TestRevetAllowListRefusalSkipsIntegrations(t *testing.T) {
 		t.Errorf("entry = %+v", c)
 	}
 }
+
+// TestCacheOriginReadsAPreEndpointRowOnlyForItsOneStore: a row written when
+// an s3 label was "s3://<bucket>" belongs to the store that spelling can
+// still mean. With one such store it is read back; with two services holding
+// a bucket of that name it is refused by name for both, never credited to
+// either; and a row recorded under one endpoint is not read for another.
+func TestCacheOriginReadsAPreEndpointRowOnlyForItsOneStore(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	ctx := t.Context()
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+
+	spec := func(endpoint, prefix string) config.StorageSpec {
+		return config.StorageSpec{Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: endpoint, Prefix: prefix}
+	}
+	resolver := func(backends map[string]config.StorageSpec) storage.Resolver {
+		t.Helper()
+		r, err := storage.NewResolver(ctx, &config.Config{
+			StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+			Endpoint: "https://one.example.net", StorageBackends: backends,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const origin = "https://upstream.example.net/tool.tgz"
+	identity := func(store storage.ObjectStore) audit.ObjectIdentity {
+		return StreamIdentity(store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	}
+	record := func(backend string) {
+		t.Helper()
+		id := audit.ObjectIdentity{Backend: backend, Size: 10, ETag: `"same"`}
+		if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	record("s3://artifacts")
+	// A second name for the same location, and a prefix inside it, are not a
+	// second claimant to the bucket-wide spelling.
+	alone := resolver(map[string]config.StorageSpec{
+		"alias": spec("https://ONE.example.net/", ""),
+		"sub":   spec("https://one.example.net", "nested"),
+	})
+	if got, err := CacheOrigin(ctx, adb, alone, alone.Default(), binaryKey, identity(alone.Default())); err != nil || got != origin {
+		t.Errorf("one store spelled s3://artifacts: origin = %q, %v; want %q", got, err, origin)
+	}
+	sub, _ := alone.ByName("sub")
+	if got, err := CacheOrigin(ctx, adb, alone, sub, binaryKey, identity(sub)); err != nil || got != "" {
+		t.Errorf("a prefix of the bucket read the bucket's row: %q, %v", got, err)
+	}
+
+	two := resolver(map[string]config.StorageSpec{"other": spec("https://two.example.net", "")})
+	for _, ns := range two.All() {
+		got, err := CacheOrigin(ctx, adb, two, ns.Store, binaryKey, identity(ns.Store))
+		if got != "" || err == nil || !strings.Contains(err.Error(), "s3://artifacts") ||
+			!strings.Contains(err.Error(), "one.example.net") || !strings.Contains(err.Error(), "two.example.net") {
+			t.Errorf("%s with two services holding the bucket: origin = %q, %v; want no origin and an error naming both", ns.Name, got, err)
+		}
+	}
+
+	record(two.Default().Label())
+	other, _ := two.ByName("other")
+	if got, err := CacheOrigin(ctx, adb, two, other, binaryKey, identity(other)); err != nil || got != "" {
+		t.Errorf("a row recorded under %s was read for %s: %q, %v", two.Default().Label(), other.Label(), got, err)
+	}
+	if got, err := CacheOrigin(ctx, adb, two, two.Default(), binaryKey, identity(two.Default())); err != nil || got != origin {
+		t.Errorf("a row under the current identity: origin = %q, %v; want %q", got, err, origin)
+	}
+}

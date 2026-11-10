@@ -488,6 +488,20 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a/b"},
 		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b/b"},
 		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000/b"},
+		{"AWS regional endpoint is AWS", "https://s3.us-west-2.amazonaws.com", "s3://b"},
+		{"AWS global endpoint", "https://s3.amazonaws.com/", "s3://b"},
+		{"AWS dash-region endpoint", "https://s3-us-west-2.amazonaws.com", "s3://b"},
+		{"AWS dual-stack endpoint", "https://S3.dualstack.eu-west-1.amazonaws.com:443", "s3://b"},
+		{"AWS FIPS endpoint", "https://s3-fips.us-gov-west-1.amazonaws.com", "s3://b"},
+		{"AWS accelerate endpoint", "https://s3-accelerate.amazonaws.com", "s3://b"},
+		{"AWS China endpoint", "https://s3.cn-north-1.amazonaws.com.cn", "s3://b"},
+		{"AWS interface VPC endpoint", "https://bucket.vpce-0a1b2c-abcd.s3.us-east-1.vpce.amazonaws.com", "s3://b"},
+		{"AWS over plaintext is still AWS", "http://s3.us-west-2.amazonaws.com", "s3://b"},
+		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000/b"},
+		{"a path on an AWS name is not the bucket namespace", "https://s3.us-west-2.amazonaws.com/x", "s3+https://s3.us-west-2.amazonaws.com/x/b"},
+		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com/b"},
+		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net/b"},
+		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com/b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

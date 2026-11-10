@@ -2427,7 +2427,7 @@ func (s *Server) recordCacheServed(r *http.Request, regType, policyCandidate, di
 func (s *Server) cachedOrigin(r *http.Request, s3Key string, obj cachedObject) string {
 	ctx, cancel := auditContext(r)
 	defer cancel()
-	origin, err := s.auditDB.CacheOrigin(ctx, s3Key, obj.id)
+	origin, err := admit.CacheOrigin(ctx, s.auditDB, s.stores, obj.store, s3Key, obj.id)
 	if err != nil {
 		// Unknown, not guessed. The row says the origin is unrecorded, which
 		// is the honest answer to a lookup that could not run.

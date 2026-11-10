@@ -407,7 +407,7 @@ func (s *Server) sumdbPartialVerifier(ctx context.Context, store storage.ObjectS
 		if s.auditDB == nil {
 			return false
 		}
-		origin, err := s.auditDB.CacheOrigin(ctx, key, obj.id)
+		origin, err := admit.CacheOrigin(ctx, s.auditDB, s.stores, obj.store, key, obj.id)
 		return err == nil && origin != ""
 	}
 }

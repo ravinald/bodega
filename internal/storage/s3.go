@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 	"strings"
 
 	bos3 "github.com/ravinald/bodega/internal/s3"
@@ -146,14 +147,24 @@ func (s *S3) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix str
 	return s.client.SyncDir(ctx, out, localDir, keyPrefix)
 }
 
-// Label is "s3://<bucket>" on AWS and "s3+<endpoint>/<bucket>" on a store
-// reached through an endpoint, because a bucket name is unique only within
-// one service: two MinIO instances can each hold "artifacts", and a label
-// that said only the bucket made them one location, so the fan-out dropped
-// one and 'pkg move' refused a real copy as a copy onto itself.
+// Label is "s3://<bucket>" on AWS and "s3+<endpoint>/<bucket>" on any other
+// store reached through an endpoint, because a bucket name is unique only
+// within one service: two MinIO instances can each hold "artifacts", and a
+// label that said only the bucket made them one location, so the fan-out
+// dropped one and 'pkg move' refused a real copy as a copy onto itself.
+//
+// The split is by which service answers, not by whether an endpoint was
+// written down. An endpoint naming AWS's own S3 service is the bucket the SDK
+// reaches with no endpoint at all, and 'pkg move --delete-source' between two
+// labels for one bucket deletes the only copy, so those collapse to the AWS
+// form (see awsS3Endpoint).
 //
 // The region stays out of it. An AWS bucket name is global, so two entries
 // naming one bucket under different regions are one location.
+//
+// What this cannot equate is two hostnames for one compatible service (a DNS
+// name and its address, a CNAME): nothing short of a request tells them
+// apart from two services, and they are kept apart.
 func (s *S3) Label() string {
 	ns := endpointNamespace(s.client.Endpoint())
 	if ns == "" {
@@ -164,8 +175,21 @@ func (s *S3) Label() string {
 
 const s3BucketScheme = "s3://"
 
+// awsS3Endpoint matches the hosts AWS serves the S3 API on: the global and
+// regional endpoints with their dual-stack, FIPS and accelerate variants, the
+// dash-region form older regions keep, the China partition's suffix, and an
+// interface VPC endpoint. All of them reach the buckets the SDK reaches with
+// no endpoint configured.
+//
+// Partitions are not told apart, which matches a bucket reached with no
+// endpoint: the label never carried the region that would say which one.
+// Outposts, access-point and control hosts are left out because the name
+// they take is not a bucket in that namespace.
+var awsS3Endpoint = regexp.MustCompile(`^(?:bucket\.vpce-[a-z0-9-]+\.)?s3(?:-fips|-accelerate)?(?:\.dualstack)?(?:\.[a-z0-9-]+|-[a-z]{2}(?:-[a-z]+)+-\d+)?(?:\.vpce)?\.amazonaws\.com(?:\.cn)?$`)
+
 // endpointNamespace reduces an endpoint to the part that says which service
-// it is, so two spellings of one endpoint are one namespace: the scheme, the
+// it is, and to "" for AWS's own, so two spellings of one endpoint are one
+// namespace: the scheme, the
 // host in lower case with no trailing dot, the port unless it is the scheme's
 // default, and the path with no trailing slash. Addressing style and
 // checksums are how a client talks to the store, not where it is.
@@ -189,6 +213,9 @@ func endpointNamespace(endpoint string) string {
 	port := u.Port()
 	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
 		port = ""
+	}
+	if port == "" && strings.Trim(u.Path, "/") == "" && awsS3Endpoint.MatchString(host) {
+		return ""
 	}
 	if port != "" {
 		host += ":" + port

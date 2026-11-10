@@ -580,3 +580,36 @@ func TestMoveCarriesAttestations(t *testing.T) {
 		t.Error("--delete-source left the envelope on the source")
 	}
 }
+
+func TestReviewF113MoveRefusesAWSRegionalEndpointAlias(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-west-2",
+		StorageBackends: map[string]config.StorageSpec{
+			"alias": {Driver: "s3", Bucket: "artifacts", Region: "us-west-2", Endpoint: "https://s3.us-west-2.amazonaws.com"},
+		},
+	}
+	r, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := r.ByName("alias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+	}
+	selected, err := selectForMove(r, dst, pm, "", "alias")
+	if err == nil || !strings.Contains(err.Error(), "same location") {
+		t.Errorf("selectForMove = %v, %v for %q -> %q; want same-location refusal before --delete-source can remove the only copy", selected, err, r.Default().Label(), dst.Label())
+	}
+	if got := r.Fanout(t.Context(), "apt", []string{"alias"}); len(got) != 1 {
+		t.Errorf("Fanout returned %d locations for one AWS bucket", len(got))
+	}
+}

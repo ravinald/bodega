@@ -546,7 +546,61 @@ func (r *Revetter) cacheOrigin(ctx context.Context, ve manifest.VersionEntry, ca
 		return "", errors.New("the object is no longer in the store")
 	}
 	_ = res.Body.Close()
-	return r.DB.CacheOrigin(ctx, key, StreamIdentity(store, res))
+	return CacheOrigin(ctx, r.DB, r.Stores, store, key, StreamIdentity(store, res))
+}
+
+// CacheOrigin is the upstream recorded for the object id identifies at key in
+// store, or "" when none is. Every reader goes through it rather than through
+// the audit store, because it is what keeps a row written before an s3
+// store's identity carried its endpoint attached to its object.
+//
+// Such a row names the store as "s3://<bucket>", which is all a label said
+// then. It is read as this store's only when this is the one configured
+// location that spelling can mean: the process that wrote it had a single
+// endpoint for every s3 backend, so one candidate today is that store. Two
+// candidates are two services holding a bucket of one name, and the row
+// cannot say which it described. That is an error rather than an empty
+// answer, so a re-vet reports why it could not rule on the upstream instead
+// of reporting that none was recorded; crediting either store would hand one
+// service's bytes the other's origin.
+//
+// A row found this way is left as written. The next fill of the key replaces
+// it under the current identity.
+func CacheOrigin(ctx context.Context, db *audit.DB, stores storage.Resolver, store storage.ObjectStore, key string, id audit.ObjectIdentity) (string, error) {
+	origin, err := db.CacheOrigin(ctx, key, id)
+	if err != nil || origin != "" {
+		return origin, err
+	}
+	bucket, ok := storage.S3BucketLabel(store)
+	if !ok || bucket == id.Backend {
+		return "", nil
+	}
+	old := id
+	old.Backend = bucket
+	origin, err = db.CacheOrigin(ctx, key, old)
+	if err != nil || origin == "" {
+		return "", err
+	}
+	if claimants := locationsSpelled(stores, bucket); len(claimants) > 1 {
+		return "", fmt.Errorf("an upstream was recorded for %s before a store's endpoint was part of its identity, and %d configured stores now answer to that name (%s): refill the object to record which one holds it",
+			bucket, len(claimants), strings.Join(claimants, ", "))
+	}
+	return origin, nil
+}
+
+// locationsSpelled returns the distinct locations among the configured
+// stores whose endpoint-less spelling is bucket.
+func locationsSpelled(stores storage.Resolver, bucket string) []string {
+	if stores == nil {
+		return nil
+	}
+	var labels []string
+	for _, ns := range stores.All() {
+		if got, ok := storage.S3BucketLabel(ns.Store); ok && got == bucket && !slices.Contains(labels, ns.Store.Label()) {
+			labels = append(labels, ns.Store.Label())
+		}
+	}
+	return labels
 }
 
 // objectStore is the backend an object of the version lives in: the one the
