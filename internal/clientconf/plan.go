@@ -198,6 +198,9 @@ type Change struct {
 	// and containerd's config.toml, Old with the fetched file's settings
 	// merged in.
 	New []byte
+	// planned is the fetched file as the plan rendered it, which a merge
+	// other than the one New came from starts over from.
+	planned []byte
 }
 
 // Unchanged reports whether the host already holds what Apply would write.
@@ -222,7 +225,7 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 	if err != nil {
 		return Change{}, fmt.Errorf("%s: %w", rec.System, err)
 	}
-	c := Change{Record: rec, Target: target, New: content}
+	c := Change{Record: rec, Target: target, New: content, planned: content}
 	info, err := os.Stat(target)
 	switch {
 	case errors.Is(err, os.ErrNotExist):

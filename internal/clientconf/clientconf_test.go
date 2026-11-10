@@ -16,6 +16,7 @@ import (
 	"maps"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -1120,8 +1121,8 @@ func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
 		{"bundler", gems[1], "---\nBUNDLE_JOBS: \"4\"\n", []string{"BUNDLE_JOBS"}, []string{"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/"}, nil},
 		{"helm", Helm(testBase), "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n  - name: corp\n    url: https://charts.corp.example\n  - name: bodega\n    url: https://old.example/helm\n",
 			[]string{"name: corp", "url: https://charts.corp.example"}, []string{testBase + "/helm"}, []string{"old.example"}},
-		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: https://corp.example/apt\nSuites: stable\nComponents: main\n\n# ours\nTypes: deb\nURIs: " + testBase + "/apt/\nSuites: jammy\nComponents: main\nTrusted: yes\n",
-			[]string{"URIs: https://corp.example/apt", "Suites: stable"}, []string{"Suites: noble", "Signed-By: "}, []string{"Suites: jammy", "Trusted: yes"}},
+		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: https://corp.example/apt\nSuites: stable\nComponents: main\n\n# ours\nTypes: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nTrusted: yes\n",
+			[]string{"URIs: https://corp.example/apt", "Suites: stable"}, []string{"Suites: noble", "Signed-By: "}, []string{"Components: main\nTrusted", "Trusted: yes"}},
 		{"pkg", at(File{System: manifest.TypeFreeBSD, Content: pkgConf}, pkgrepos.ClientConfPath),
 			"# bodega pkg repository. Install as x.\n# written for FreeBSD 14\n\ncorp: {\n  url: \"https://pkg.corp.example\", # {\n  enabled: yes\n}\nbodega: { url: \"https://old.example\" }\n",
 			[]string{"corp: {", "https://pkg.corp.example"}, []string{"written for FreeBSD 15", "FreeBSD: { enabled: no }", testBase + "/freebsd/${ABI}"}, []string{"old.example", "FreeBSD 14"}},
@@ -1338,7 +1339,7 @@ func TestEntryMergeIsFieldLevel(t *testing.T) {
 			"repositories:\n  - caFile: /old/ca.pem\n    name: bodega\n    url: https://old/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n  - name: bodega\n    url: https://dup\n", "repositories:\n" + HelmRepository("https://b"),
 			"repositories:\n  - name: bodega\n    url: https://b/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n"},
 		{"helm empty flow sequence", helm, "repositories: []\n", "repositories:\n" + HelmRepository("https://b"), "repositories:\n- name: bodega\n  url: https://b/helm\n"},
-		{"apt stanza", fileKind{blocks: mergeDeb822}, "# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: jammy\nEnabled: no\nArchitectures: amd64\n arm64\nTrusted: yes\n",
+		{"apt stanza", fileKind{blocks: mergeDeb822}, "# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: noble\nEnabled: no\nArchitectures: amd64\n arm64\nTrusted: yes\n",
 			"Types: deb\nURIs: https://b/apt/\nSuites: noble\nSigned-By: /k.asc\n",
 			"# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: noble\nArchitectures: amd64\n arm64\nSigned-By: /k.asc\n"},
 	} {
@@ -1369,5 +1370,222 @@ func TestPipOptionsReadsPipsGrammar(t *testing.T) {
 	want := map[string]string{"global.index-url": "https://b/simple", "global.cert": "/b.pem", "global.find-links": "cert=/not.pem\n/srv/wheels", "install.no-compile": "true"}
 	if !maps.Equal(got, want) {
 		t.Fatalf("PipOptions = %q, want %q", got, want)
+	}
+}
+
+func TestStaffCAKeepsRepositoryPolicy(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"composer", Composer(testBase), `{"repositories":{"bodega":{"type":"composer","url":"https://old.example/composer/","only":["corp/*"],"options":{"http":{"timeout":45}}}}}`, `"corp/*"`},
+		{"maven", Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://old.example/maven/</url><mirrorOf>*</mirrorOf><mirrorOfLayouts>default</mirrorOfLayouts></mirror></mirrors></settings>\n", "<mirrorOfLayouts>default</mirrorOfLayouts>"},
+		{"apt-distinct-stanza", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n\nTypes: deb-src\nURIs: " + testBase + "/apt/\nSuites: jammy\nComponents: main\nArchitectures: arm64\n", "Types: deb-src\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".staff-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA apply removed unrelated policy %q:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestStaffGitCAReachesEffectiveURL(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	old := "[http \"" + testBase + "/git/gh/\"]\n\tsslCAInfo = /missing/old-git-ca.pem\n\textraHeader = X-Corp: keep\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	in, err := AddCA(caPlan(t, home, file), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(in.Changes, ".staff-backup"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.Command(git, "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git config: %v: %s", err, got)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if strings.TrimSpace(string(got)) != want {
+		t.Fatalf("git reads %q after successful CA apply; want %q", strings.TrimSpace(string(got)), want)
+	}
+}
+
+// F116 R1: the files a CA plan reaches through a client's own selection rules
+// are idle on a second plan, and the selection follows each client's order.
+func TestCASelectionSecondPlanIsIdle(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home, root := t.TempDir(), t.TempDir()
+	venv := filepath.Join(root, "venv")
+	// The copy a setting names sits beside the file naming it: git's is per
+	// user, pip's is under /etc.
+	caPath, pipCA := filepath.Join(home, ".config/bodega/ca.pem"), filepath.Join(root, "usr/local/share/bodega/ca.pem")
+	// git: a longer section in another file git reads, and a wildcard host
+	// that never outranks the plan's. pip: a file loaded before the plan's
+	// whose command section sets cert, and the virtualenv's, loaded after.
+	xdgGit := filepath.Join(home, ".config/git/config")
+	write(xdgGit, "[http \""+testBase+"/git/gh/corp/\"]\n\tsslCAInfo = /old/corp.pem\n\tproxy = http://p\n[http \"https://*.example.com/\"]\n\tsslCAInfo = /old/wild.pem\n")
+	write(filepath.Join(home, ".gitconfig"), "[http \""+testBase+"\"]\n\tsslCAInfo = /old/base.pem\n[user]\n\tname = x\n")
+	early := filepath.Join(root, "etc/xdg/pip/pip.conf")
+	write(early, "[global]\ncert = /old/global.pem\n[install]\ncert = /old/install.pem\ntimeout = 9\n")
+	write(filepath.Join(venv, "pip.conf"), "[global]\ncert = /old/venv.pem\nretries = 2\n")
+	write(filepath.Join(home, ".config/composer/config.json"), `{"repositories":[{"type":"composer","url":"`+testBase+`/composer","only":["a/*"]},{"type":"composer","url":"`+testBase+`/composer","only":["b/*"]},{"packagist.org":false}]}`)
+	write(filepath.Join(home, ".m2/settings.xml"), "<settings>\n  <mirrors>\n    <mirror>\n      <id>corp</id>\n      <mirrorOf>central</mirrorOf>\n      <url>https://corp/</url>\n    </mirror>\n    <mirror>\n      <id>bodega</id>\n      <blocked>true</blocked>\n      <name>ours</name>\n    </mirror>\n  </mirrors>\n</settings>\n")
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string {
+		if k == "VIRTUAL_ENV" {
+			return venv
+		}
+		return ""
+	}}
+	pip := Pip(testBase)
+	pip.Paths = everywhere(filepath.Join(root, "etc/pip.conf"))
+	plan := func() CAInstall {
+		t.Helper()
+		var changes []Change
+		for _, f := range []File{Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), pip, Composer(testBase), Maven(testBase, nil)[0]} {
+			sum := sha256.Sum256([]byte(f.Content))
+			c, err := NewChange(PlanRecord{System: f.System, Action: PlanInstall, Path: f.Path(OSLinux), SHA256: hex.EncodeToString(sum[:])}, []byte(f.Content), home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes = append(changes, c)
+		}
+		in, err := AddCA(changes, ca, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+	if _, err := Apply(plan().Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string][]string{
+		xdgGit:                            {"sslCAInfo = " + caPath + "\n\tproxy = http://p", "sslCAInfo = /old/wild.pem"},
+		filepath.Join(home, ".gitconfig"): {"[http \"" + testBase + "\"]\n\tsslCAInfo = " + caPath, "name = x"},
+		early:                             {"[global]\ncert = /old/global.pem", "[install]\ncert = " + pipCA + "\ntimeout = 9"},
+		filepath.Join(venv, "pip.conf"):   {"cert = " + pipCA, "retries = 2", "index-url = " + testBase},
+		filepath.Join(home, ".config/composer/config.json"): {`"name": "bodega"`, `"a/*"`, `"b/*"`},
+		filepath.Join(home, ".m2/settings.xml"):             {"<id>corp</id>", "<name>ours</name>", "<url>" + testBase + "/maven/</url>", "<mirrorOf>*</mirrorOf>"},
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range want {
+			if !strings.Contains(string(got), w) {
+				t.Errorf("%s does not hold %q:\n%s", path, w, got)
+			}
+		}
+		if strings.Contains(string(got), "<blocked>") {
+			t.Errorf("%s keeps bodega's mirror blocked:\n%s", path, got)
+		}
+	}
+	own, narrower := GitCAInfo(GitConfigFiles(h.Getenv, home, root), testBase+"/git/gh/", home)
+	if own == nil || own.Value != caPath || len(narrower) != 1 || narrower[0].Value != caPath {
+		t.Errorf("git resolves %+v and %+v after the apply; want %s for the prefix and for the one section below it", own, narrower, caPath)
+	}
+	for _, c := range plan().Changes {
+		if !c.Unchanged() {
+			d, _ := c.Diff()
+			t.Errorf("a second plan still changes %s:\n%s", c.Target, d)
+		}
+	}
+}
+
+// F116 R1, R2: podman reads the first certs.d directory that exists for a
+// host, and pip loads its files in one order, with PIP_CONFIG_FILE displacing
+// the per-user ones.
+func TestTrustSourceSelection(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	const host = "bodega.internal:8443"
+	dirs := []string{filepath.Join(root, "etc/docker/certs.d", host), filepath.Join(root, "etc/containers/certs.d", host), filepath.Join(home, ".config/containers/certs.d", host)}
+	if got := PodmanCertDir(home, root, host); got != "" {
+		t.Errorf("no directory exists and podman is given %s", got)
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := PodmanCertDir(home, root, host); got != d {
+			t.Errorf("podman reads %s; want %s, the first that exists", got, d)
+		}
+	}
+	env := map[string]string{"VIRTUAL_ENV": "/venv"}
+	h := PipHost{GOOS: OSLinux, Root: root, Home: home, Getenv: func(k string) string { return env[k] }}
+	rel := func(files []string) string {
+		return strings.NewReplacer(root, "R", home, "H").Replace(strings.Join(files, " "))
+	}
+	files, global := PipConfigFiles(h)
+	if got, want := rel(files), "R/etc/xdg/pip/pip.conf R/etc/pip.conf H/.pip/pip.conf H/.config/pip/pip.conf /venv/pip.conf"; got != want || global != 2 {
+		t.Errorf("pip on Linux loads %s (%d global); want %s", got, global, want)
+	}
+	explicit := filepath.Join(root, "explicit.conf")
+	if err := os.WriteFile(explicit, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env["PIP_CONFIG_FILE"] = explicit
+	if files, _ = PipConfigFiles(h); rel(files) != "R/etc/xdg/pip/pip.conf R/etc/pip.conf /venv/pip.conf R/explicit.conf" {
+		t.Errorf("with PIP_CONFIG_FILE pip loads %s; want no per-user file and the named one last", rel(files))
+	}
+	env["PIP_CONFIG_FILE"] = os.DevNull
+	if files, _ = PipConfigFiles(h); len(files) != 0 {
+		t.Errorf("with PIP_CONFIG_FILE the null device pip loads %v; want none", files)
+	}
+	delete(env, "PIP_CONFIG_FILE")
+	delete(env, "VIRTUAL_ENV")
+	h.GOOS, h.Prefix = OSDarwin, "/opt/py"
+	if files, _ = PipConfigFiles(h); rel(files) != "R/Library/Application Support/pip/pip.conf H/.pip/pip.conf H/.config/pip/pip.conf /opt/py/pip.conf" {
+		t.Errorf("pip on macOS loads %s", rel(files))
 	}
 }

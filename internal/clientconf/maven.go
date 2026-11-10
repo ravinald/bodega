@@ -3,6 +3,8 @@ package clientconf
 import (
 	"fmt"
 	"net/url"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -240,6 +242,116 @@ func MergeMavenSettings(existing, planned []byte) []byte {
 		out += "\n"
 	}
 	return []byte(out)
+}
+
+var (
+	xmlLeaf     = regexp.MustCompile(`<([A-Za-z][\w.-]*)>([^<]*)</([A-Za-z][\w.-]*)>`)
+	mirrorOpen  = "<mirror>"
+	mirrorClose = "</mirror>"
+)
+
+// mirrorElements lists where each <mirror> element of masked stands, opening
+// tag through closing tag.
+func mirrorElements(masked string) [][2]int {
+	var out [][2]int
+	for at := 0; ; {
+		i := strings.Index(masked[at:], mirrorOpen)
+		if i < 0 {
+			return out
+		}
+		j := strings.Index(masked[at+i:], mirrorClose)
+		if j < 0 {
+			return out
+		}
+		out = append(out, [2]int{at + i, at + i + j + len(mirrorClose)})
+		at += i + j + len(mirrorClose)
+	}
+}
+
+// mergeMavenMirror is MergeMavenSettings for a plan that edits the mirror
+// named bodega and leaves the rest of <mirrors> alone: that mirror takes the
+// plan's id, mirrorOf and url and keeps its other elements (mirrorOfLayouts,
+// name), and the host's other mirrors stay, bodega's ahead of them when it is
+// new, since Maven takes the first mirror that matches a repository. A
+// <blocked>true</blocked> in bodega's mirror is removed on its own: Maven
+// refuses every request through a blocked mirror. A bodega mirror written with
+// CDATA or nested elements is replaced whole, the other mirrors still kept.
+func mergeMavenMirror(existing, planned []byte) []byte {
+	old, plan := string(existing), string(planned)
+	block, ok := mirrorsBlock(plan)
+	planMirrors := mirrorElements(block)
+	masked := maskXMLComments(old)
+	i := strings.Index(masked, mirrorsOpen)
+	if !ok || len(planMirrors) != 1 || i < 0 {
+		return MergeMavenSettings(existing, planned)
+	}
+	k := strings.Index(masked[i:], mirrorsClose)
+	if k < 0 {
+		return MergeMavenSettings(existing, planned)
+	}
+	inner := i + len(mirrorsOpen)
+	// own is the plan's mirror with the whitespace leading it, as it stands
+	// under <mirrors>.
+	own := block[len(mirrorsOpen):planMirrors[0][1]]
+	want := xmlLeaf.FindAllStringSubmatch(own, -1)
+	id := ""
+	for _, w := range want {
+		if w[1] == "id" {
+			id = strings.TrimSpace(w[2])
+		}
+	}
+	for _, at := range mirrorElements(masked[inner : i+k]) {
+		start, end := inner+at[0], inner+at[1]
+		have := xmlLeaf.FindAllStringSubmatchIndex(masked[start:end], -1)
+		isOwn := false
+		for _, h := range have {
+			tag, text := masked[start+h[2]:start+h[3]], strings.TrimSpace(masked[start+h[4]:start+h[5]])
+			isOwn = isOwn || tag == "id" && text == id
+		}
+		if !isOwn {
+			continue
+		}
+		elem := old[start:end]
+		if strings.Count(masked[start:end], "<") != 2+2*len(have) {
+			return []byte(old[:start] + strings.TrimSpace(own) + old[end:])
+		}
+		lead := elem[len(mirrorOpen) : len(mirrorOpen)+len(elem[len(mirrorOpen):])-len(strings.TrimLeft(elem[len(mirrorOpen):], " \t\r\n"))]
+		last := len(mirrorOpen)
+		var missing string
+		type edit struct {
+			from, to int
+			text     string
+		}
+		var edits []edit
+		for _, h := range have {
+			last = h[1]
+			if tag := elem[h[2]:h[3]]; tag == "blocked" && strings.TrimSpace(elem[h[4]:h[5]]) == "true" {
+				from := h[0]
+				for from > 0 && strings.ContainsRune(" \t", rune(elem[from-1])) {
+					from--
+				}
+				if from > 0 && elem[from-1] == '\n' {
+					from--
+				}
+				edits = append(edits, edit{from, h[1], ""})
+			}
+		}
+		for _, w := range want {
+			at := slices.IndexFunc(have, func(h []int) bool { return elem[h[2]:h[3]] == w[1] && elem[h[2]:h[3]] == elem[h[6]:h[7]] })
+			if at < 0 {
+				missing += lead + w[0]
+				continue
+			}
+			edits = append(edits, edit{have[at][4], have[at][5], w[2]})
+		}
+		edits = append(edits, edit{last, last, missing})
+		slices.SortStableFunc(edits, func(a, b edit) int { return b.from - a.from })
+		for _, e := range edits {
+			elem = elem[:e.from] + e.text + elem[e.to:]
+		}
+		return []byte(old[:start] + elem + old[end:])
+	}
+	return []byte(old[:inner] + own + old[inner:])
 }
 
 // mirrorsBlock is the <mirrors>...</mirrors> element in a planned settings.xml.

@@ -95,30 +95,59 @@ type CAHost struct {
 	// name a configuration file a client reads in place of, or after, the
 	// one the plan writes. Nil is an environment naming none.
 	Getenv func(string) string
+	// PipPrefix is the sys.prefix of the interpreter pip runs under, "" when
+	// pip was not asked: its pip.conf outranks the global and per-user files.
+	PipPrefix string
 }
 
-// selectedConfig is the existing configuration file the environment has the
-// client of rec read that outranks the plan's file at target, "" for none. npm
-// and git read the file the variable names in place of the per-user one, so
-// the plan's file is then never opened; pip reads PIP_CONFIG_FILE after every
-// other file, so it outranks the plan's only for the options it sets itself.
-func (h CAHost) selectedConfig(rec PlanRecord, target string, planned []byte) string {
-	if h.Getenv == nil {
-		return ""
-	}
+// shadow is an existing configuration file, other than the one a plan
+// writes, whose settings the client reads ahead of the plan's. whole says the
+// client reads it for everything the plan sets, so it takes the plan's whole
+// edit; otherwise only its CA setting outranks the plan's, and only that is
+// corrected.
+type shadow struct {
+	path  string
+	whole bool
+}
+
+func regularFile(path string) (os.FileInfo, bool) {
+	info, err := os.Stat(path)
+	return info, err == nil && info.Mode().IsRegular()
+}
+
+// shadows lists the files that would leave the client of rec on its old
+// settings once the plan's file at target is written, resolved by the rules
+// the client loads its configuration by. npm and git read the file an
+// environment variable names in place of the per-user one, so the plan's file
+// is then never opened. pip loads every file in PipConfigFiles, a later one
+// replacing an earlier one's options and a command's own section outranking
+// [global] from any file. git reads sslCAInfo from the section whose URL
+// matches longest, whichever file holds it.
+func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow {
 	env := func(keys ...string) string {
 		for _, k := range keys {
+			if h.Getenv == nil {
+				break
+			}
 			if v := h.Getenv(k); v != "" {
 				return v
 			}
 		}
 		return ""
 	}
+	own, _ := os.Stat(target)
+	same := func(path string, info os.FileInfo) bool {
+		return path == target || own != nil && os.SameFile(info, own)
+	}
+	var out []shadow
+	add := func(path string, whole bool) {
+		if !slices.ContainsFunc(out, func(s shadow) bool { return s.path == path }) {
+			out = append(out, shadow{path, whole})
+		}
+	}
 	user := strings.HasPrefix(rec.Path, "~/")
 	var sel string
 	switch {
-	case rec.System == manifest.TypePypi:
-		sel = env("PIP_CONFIG_FILE")
 	case rec.System == manifest.TypeNpm && user:
 		sel = env("npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
 	case rec.System == manifest.TypeNpm:
@@ -128,35 +157,57 @@ func (h CAHost) selectedConfig(rec PlanRecord, target string, planned []byte) st
 	case rec.System == manifest.TypeGit:
 		sel = env("GIT_CONFIG_SYSTEM")
 	}
-	if sel == "" || sel == os.DevNull {
-		return ""
-	}
-	sel, err := filepath.Abs(sel)
-	if err != nil {
-		return ""
-	}
-	info, err := os.Stat(sel)
-	if err != nil || !info.Mode().IsRegular() {
-		return ""
-	}
-	if own, err := os.Stat(target); sel == target || err == nil && os.SameFile(info, own) {
-		return ""
-	}
-	if rec.System != manifest.TypePypi {
-		return sel
-	}
-	data, err := os.ReadFile(sel)
-	if err != nil {
-		return ""
-	}
-	want := PipOptions(append(slices.Clone(planned), "\ncert = x\n"...))
-	for key := range PipOptions(data) {
-		_, option, _ := strings.Cut(key, ".")
-		if _, shadows := want["global."+option]; shadows {
-			return sel
+	if sel != "" && sel != os.DevNull {
+		if abs, err := filepath.Abs(sel); err == nil {
+			if info, ok := regularFile(abs); ok && !same(abs, info) {
+				add(abs, true)
+			}
 		}
 	}
-	return ""
+	switch rec.System {
+	case manifest.TypeGit:
+		for _, f := range GitConfigFiles(h.Getenv, h.Home, h.Root) {
+			info, ok := regularFile(f)
+			if !ok || same(f, info) {
+				continue
+			}
+			if data, err := os.ReadFile(f); err == nil && len(gitShadowHeaders(splitBody(data), h.Base)) > 0 {
+				add(f, false)
+			}
+		}
+	case manifest.TypePypi:
+		files, global := PipConfigFiles(PipHost{GOOS: h.GOOS, Root: h.Root, Home: h.Home, Getenv: h.Getenv, Prefix: h.PipPrefix})
+		// A target pip's own list does not name is a global file under another
+		// root, so it sits where the global files do.
+		at := global - 1
+		for i, f := range files {
+			if info, ok := regularFile(f); ok && same(f, info) {
+				at = i
+			}
+		}
+		want := PipOptions(append(slices.Clone(planned), "\ncert = x\n"...))
+		for i, f := range files {
+			info, ok := regularFile(f)
+			if !ok || same(f, info) {
+				continue
+			}
+			data, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			for key := range PipOptions(data) {
+				section, option, _ := strings.Cut(key, ".")
+				_, set := want["global."+option]
+				switch {
+				case i > at && set:
+					add(f, true)
+				case i < at && option == "cert" && section != "global":
+					add(f, false)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // CAInstall is a plan with a CA added to it.
@@ -174,6 +225,10 @@ type CAInstall struct {
 	Imports [][]string
 	// Notes name what the operator still does by hand, one per system.
 	Notes map[string]string
+	// System lists the systems whose anchors went into the operating
+	// system's trust store. For every other system the plan left that store
+	// as it was.
+	System []string
 }
 
 // systemStore is where one operating system family reads trust anchors, one
@@ -436,10 +491,14 @@ var ownStoreSystems = []string{manifest.TypeNpm, manifest.TypePypi, manifest.Typ
 // per registry host, an import into the JVM trust store for Maven and Gradle,
 // and for every other system an anchor in the operating system's trust store.
 //
-// A client whose environment names an existing configuration file that
-// outranks the plan's (PIP_CONFIG_FILE, npm's userconfig, GIT_CONFIG_GLOBAL)
-// gets the same edit in that file, as a change of its own: the plan's file
-// alone would leave the client reading its old settings.
+// A client that reads an existing configuration file ahead of the plan's (a
+// pip.conf pip loads later, npm's userconfig, GIT_CONFIG_GLOBAL, a git section
+// scoped to a longer URL) gets the edit in that file too, as a change of its
+// own: the plan's file alone would leave the client reading its old settings.
+//
+// Maven's settings.xml and Composer's config.json, which NewChange merges for
+// any plan, are merged again here so bodega's own mirror and repository keep
+// the fields the plan does not set.
 //
 // Every file the plan edits that already exists keeps what the plan does not
 // set, whether its client reads a CA setting or the system store: kindOf
@@ -500,6 +559,19 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	jvm := false
 	for i, c := range in.Changes {
 		rec := c.Record
+		if c.Existed && c.planned != nil {
+			switch {
+			case rec.System == manifest.TypeMaven && rec.Path == MavenSettingsPath:
+				c.New = mergeMavenMirror(c.Old, c.planned)
+			case rec.System == manifest.TypeComposer:
+				merged, err := mergeComposer(c.Old, c.planned, true)
+				if err != nil {
+					return CAInstall{}, fmt.Errorf("%s: cannot merge bodega's repository into %s: %w", rec.System, c.Target, err)
+				}
+				c.New = merged
+			}
+			in.Changes[i].New = c.New
+		}
 		// header and line are the CA setting and the section it belongs
 		// under.
 		kind := kindOf(rec)
@@ -554,8 +626,14 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimePodman:
-			// /etc/containers/certs.d, two levels above the drop-in.
-			if err := addFile(rec.System, filepath.Join(filepath.Dir(filepath.Dir(c.Target)), "certs.d", base.Host, "ca.crt"), ca.PEM); err != nil {
+			// The one directory podman reads for this host, which hides the
+			// others even when it is empty; with none yet, the certs.d two
+			// levels above the drop-in, which then becomes that directory.
+			dir := PodmanCertDir(h.Home, h.Root, base.Host)
+			if dir == "" {
+				dir = filepath.Join(filepath.Dir(filepath.Dir(c.Target)), "certs.d", base.Host)
+			}
+			if err := addFile(rec.System, filepath.Join(dir, "ca.crt"), ca.PEM); err != nil {
 				return CAInstall{}, err
 			}
 		}
@@ -577,6 +655,25 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
 		}
+		set := []string{line(caPath)}
+		// outranking lists the sections of body whose own CA setting the
+		// client reads ahead of the one under header: for pip a command's
+		// section, which outranks [global] (every section but [global] when
+		// the file loads before the plan's), and for git a section scoped to
+		// a URL at or below bodega's.
+		outranking := func(body []string, earlier bool) []string {
+			switch rec.System {
+			case manifest.TypePypi:
+				all := sectionsSetting(body, "cert", *kind.rules)
+				if earlier {
+					all = slices.DeleteFunc(all, func(s string) bool { return s == header })
+				}
+				return all
+			case manifest.TypeGit:
+				return gitShadowHeaders(body, h.Base)
+			}
+			return nil
+		}
 		// edit is the plan's file with the CA setting in it, merged into old
 		// when the host holds a file there.
 		edit := func(target string, old, planned []byte, existed bool) ([]byte, error) {
@@ -589,15 +686,10 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			// A setting in a section leads it, so it reads beside the header
 			// that scopes it; npm's file has no sections, and it ends the
 			// file.
-			set := []string{line(caPath)}
 			body = setSection(body, header, set, *kind.rules, header != "")
-			if rec.System == manifest.TypePypi {
-				// A command's own section outranks [global], so a cert left
-				// in one would keep pip on the bundle it named.
-				for _, other := range sectionsSetting(body, "cert", *kind.rules) {
-					if other != header {
-						body = setSection(body, other, set, *kind.rules, false)
-					}
+			for _, other := range outranking(body, false) {
+				if other != header {
+					body = setSection(body, other, set, *kind.rules, false)
 				}
 			}
 			merged := joinBody(body)
@@ -611,32 +703,43 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if in.Changes[i].New, err = edit(c.Target, c.Old, c.New, c.Existed); err != nil {
 			return CAInstall{}, err
 		}
-		// The file the environment has this client read ahead of the plan's
-		// takes the same edit, or the client never reads what was installed.
-		// It keeps its own credential: the one the plan carried over belongs
-		// to the file it came from.
-		if sel := h.selectedConfig(rec, c.Target, c.New); sel != "" && !slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sel }) {
-			old, err := os.ReadFile(sel)
-			if err != nil {
-				return CAInstall{}, fmt.Errorf("%s: read %s, which the environment has this client read ahead of %s: %w", rec.System, sel, c.Target, err)
+		// Each file this client reads ahead of the plan's takes the edit too,
+		// or the client never reads what was installed. A file read in the
+		// plan's place keeps its own credential: the one the plan carried
+		// over belongs to the file it came from.
+		for _, sh := range h.shadows(rec, c.Target, c.New) {
+			if slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sh.path }) {
+				continue
 			}
-			planned := c.New
-			if kept := npmCredential(splitLines(string(planned))); rec.System == manifest.TypeNpm && len(kept) > 0 {
-				var lines []string
-				for _, l := range splitLines(string(planned)) {
-					if !slices.Contains(kept, l) {
-						lines = append(lines, l)
+			old, err := os.ReadFile(sh.path)
+			if err != nil {
+				return CAInstall{}, fmt.Errorf("%s: read %s, which this client reads ahead of %s: %w", rec.System, sh.path, c.Target, err)
+			}
+			var merged []byte
+			if sh.whole {
+				planned := c.New
+				if kept := npmCredential(splitLines(string(planned))); rec.System == manifest.TypeNpm && len(kept) > 0 {
+					var lines []string
+					for _, l := range splitLines(string(planned)) {
+						if !slices.Contains(kept, l) {
+							lines = append(lines, l)
+						}
 					}
+					planned = joinBody(lines)
 				}
-				planned = joinBody(lines)
-			}
-			merged, err := edit(sel, old, planned, true)
-			if err != nil {
-				return CAInstall{}, err
+				if merged, err = edit(sh.path, old, planned, true); err != nil {
+					return CAInstall{}, err
+				}
+			} else {
+				body := splitBody(old)
+				for _, other := range outranking(body, true) {
+					body = setSection(body, other, set, *kind.rules, false)
+				}
+				merged = joinBody(body)
 			}
 			also := rec
-			also.Path = sel
-			selected = append(selected, Change{Record: also, Target: sel, Old: old, Existed: true, New: merged})
+			also.Path = sh.path
+			selected = append(selected, Change{Record: also, Target: sh.path, Old: old, Existed: true, New: merged})
 		}
 	}
 
@@ -665,6 +768,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if slices.ContainsFunc(files[before:], func(c Change) bool { return !c.Unchanged() }) || !store.holds(h.Root, ca.Certs) {
 			in.Step = store.step
 		}
+		in.System = system
 	}
 	in.Changes = append(append(in.Changes, selected...), files...)
 	return in, nil

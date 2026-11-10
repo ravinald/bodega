@@ -712,9 +712,15 @@ func yamlHolds(items string) func(merged, planned []byte) error {
 	}
 }
 
-// mergeDeb822 merges an apt .sources file: the plan's stanza joins the
-// host's stanza for the same URIs field by field, and the host's other
-// stanzas stay.
+// mergeDeb822 merges an apt .sources file. A stanza is one or more sources,
+// each a type at a URI for a suite, so the URIs alone do not name it: a
+// deb-src stanza, or one for another suite, at bodega's URIs is a different
+// source than the plan's and stays as it is. The plan's stanza joins every
+// host stanza that already gives one of its sources (the same URIs, a type
+// and a suite in common) field by field, and is added last when none does.
+// Two host stanzas giving the same source can differ in what they filter by,
+// such as Architectures, so both take the plan's fields and neither is
+// dropped.
 func mergeDeb822(old, planned []string) []string {
 	split := func(lines []string) []block {
 		return splitEntries(lines,
@@ -726,30 +732,92 @@ func mergeDeb822(old, planned []string) []string {
 				}
 				return end
 			},
-			func(entry []string) string {
-				for _, l := range entry {
-					if fieldRules.key(l) == "uris" {
-						return strings.Join(strings.Fields(l[len("uris:"):]), " ")
-					}
-				}
-				return ""
-			})
+			func(entry []string) string { return strings.Join(stanzaWords(entry, "uris"), " ") })
 	}
-	return mergeBlocks(split(old), split(planned), true, mergeStanza)
+	// shares reports whether two stanzas name a value of field in common. A
+	// stanza without the field is one apt does not read, and takes the
+	// plan's.
+	shares := func(a, b []string, field string) bool {
+		x, y := stanzaWords(a, field), stanzaWords(b, field)
+		return len(x) == 0 || len(y) == 0 || slices.ContainsFunc(x, func(w string) bool { return slices.Contains(y, w) })
+	}
+	now := split(planned)
+	placed := make([]bool, len(now))
+	var out []string
+	for _, b := range split(old) {
+		lines := b.lines
+		for i, p := range now {
+			if b.id != "" && p.id == b.id && shares(lines, p.lines, "types") && shares(lines, p.lines, "suites") {
+				placed[i] = true
+				lines = mergeStanza(lines, p.lines)
+			}
+		}
+		out = append(out, lines...)
+	}
+	for i, p := range now {
+		if placed[i] || p.id == "" {
+			continue
+		}
+		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
+			out = append(out, "")
+		}
+		out = append(out, p.lines...)
+	}
+	return out
+}
+
+// stanzaWords is the words a deb822 stanza gives field, over the lines
+// continuing it.
+func stanzaWords(entry []string, field string) []string {
+	_, byKey := settings(entry, fieldRules)
+	lines := byKey[field]
+	if len(lines) == 0 {
+		return nil
+	}
+	_, first, _ := strings.Cut(lines[0], ":")
+	return strings.Fields(first + " " + strings.Join(lines[1:], " "))
+}
+
+// stanzaUnion is the plan's line for field carrying the host's words ahead
+// of any the plan adds, so a stanza that gives more types or suites than the
+// plan's keeps them.
+func stanzaUnion(old, planned []string, field string) []string {
+	_, byKey := settings(planned, fieldRules)
+	if len(byKey[field]) == 0 {
+		return nil
+	}
+	words := stanzaWords(old, field)
+	for _, w := range stanzaWords(planned, field) {
+		if !slices.Contains(words, w) {
+			words = append(words, w)
+		}
+	}
+	name, _, _ := strings.Cut(byKey[field][0], ":")
+	return []string{name + ": " + strings.Join(words, " ")}
 }
 
 // mergeStanza sets the plan's fields in the host's stanza and keeps its
-// others, such as Architectures. Two fields cannot stand beside the plan's
+// others, such as Architectures. Types and Suites are what the stanza was
+// matched by, and keep the values the host gives beyond the plan's: narrowing
+// them would delete a source the plan never named. Two fields cannot stand beside the plan's
 // and are removed on their own: a Trusted: yes beside the plan's Signed-By
 // would turn off the verification that key is for, and an Enabled: no would
 // leave the source the plan configures unread.
 func mergeStanza(old, planned []string) []string {
-	_, sets := settings(planned, fieldRules)
+	keys, sets := settings(planned, fieldRules)
 	says := func(line, word string) bool {
 		_, v, _ := strings.Cut(line, ":")
 		return strings.EqualFold(strings.TrimSpace(v), word)
 	}
-	return setFields(old, planned, fieldRules, func(key, line string) bool {
+	var plan []string
+	for _, key := range keys {
+		if key == "types" || key == "suites" {
+			plan = append(plan, stanzaUnion(old, planned, key)...)
+			continue
+		}
+		plan = append(plan, sets[key]...)
+	}
+	return setFields(old, plan, fieldRules, func(key, line string) bool {
 		_, signed := sets["signed-by"]
 		return key == "trusted" && signed && says(line, "yes") || key == "enabled" && says(line, "no")
 	})

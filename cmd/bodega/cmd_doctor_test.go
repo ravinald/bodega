@@ -1565,10 +1565,10 @@ func TestDoctorConfigureFailsWhenAnotherStoreOutranksTheCA(t *testing.T) {
 	t.Setenv("HOME", home)
 	stubRuntimes(t)
 	// The plan's pip.conf is rooted under home, so that is the root the
-	// report reads /etc from.
-	prevRoot := doctorOCIRoot
-	doctorOCIRoot = home
-	t.Cleanup(func() { doctorOCIRoot = prevRoot })
+	// report reads /etc from, as Linux: pip on macOS never opens /etc/pip.conf.
+	prevRoot, prevGOOS := doctorOCIRoot, doctorCAGOOS
+	doctorOCIRoot, doctorCAGOOS = home, clientconf.OSLinux
+	t.Cleanup(func() { doctorOCIRoot, doctorCAGOOS = prevRoot, prevGOOS })
 	srv, caPEM, _ := caPlanServer(t)
 	caFile := filepath.Join(t.TempDir(), "ca.pem")
 	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
@@ -1642,5 +1642,42 @@ func TestIndependentPipInstallSelectedConfig(t *testing.T) {
 	f := probe.Apply([]host.Finding{{Check: "pip-config", Status: host.StatusOK}}, srv.URL)[0]
 	if f.Status != host.StatusOK {
 		t.Fatalf("successful install left selected pip store untrusted: %+v", f)
+	}
+}
+
+func TestStaffDoctorPodmanInstallsIntoSelectedCertDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "podman")
+	oldRoot := doctorOCIRoot
+	doctorOCIRoot = home
+	t.Cleanup(func() { doctorOCIRoot = oldRoot })
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(home, ".config/containers/certs.d", strings.TrimPrefix(srv.URL, "https://"))
+	if err := os.MkdirAll(selected, 0755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	pool := x509.NewCertPool()
+	files, err := filepath.Glob(filepath.Join(selected, "*.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.AppendCertsFromPEM(data)
+	}
+	if _, err := srv.Certificate().Verify(x509.VerifyOptions{Roots: pool}); err != nil {
+		t.Fatalf("successful apply left podman's selected cert directory without the CA: %v\n%s", err, out)
 	}
 }

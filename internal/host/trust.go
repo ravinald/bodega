@@ -17,9 +17,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -85,6 +87,10 @@ type PipDefault struct {
 	// installation carries none, as a distribution's pip patched onto the
 	// system bundle does not.
 	Certifi string
+	// Prefix is the sys.prefix of the interpreter this pip runs under, whose
+	// pip.conf it loads after the global and per-user files, "" when pip did
+	// not say.
+	Prefix string
 }
 
 // trustStore is one place a client, as this host configures it, takes trust
@@ -263,6 +269,10 @@ var trustRows = map[string]trustRow{
 		file, err := goEnvFile(t.env, t.ConfigDir)
 		return err == nil && file != "" && mention(host, file)
 	}, nil),
+	// git and helm have no row in the report; these judge them after a CA
+	// install, which answers for every client it configured.
+	"git-config":                          {system: manifest.TypeGit, stores: gitStores},
+	"helm-repos":                          {system: manifest.TypeHelm, stores: helmStores},
 	"pip-config":                          {system: manifest.TypePypi, stores: pipStores},
 	"npm-config":                          {system: manifest.TypeNpm, stores: npmStores},
 	"maven":                               {system: manifest.TypeMaven, stores: mavenStores},
@@ -283,11 +293,14 @@ var trustRows = map[string]trustRow{
 		if !configured {
 			return nil
 		}
-		store := certsDir(filepath.Join(t.Root, "/etc/containers/certs.d", u.Host))
-		if t.Home != "" {
-			more, _ := filepath.Glob(filepath.Join(user, "certs.d", u.Host, "*.crt"))
-			store.files = append(store.files, more...)
+		// The one directory containers/image picks, not every candidate: an
+		// existing per-user directory hides the system one even when it holds
+		// no certificate.
+		dir := clientconf.PodmanCertDir(t.Home, t.Root, u.Host)
+		if dir == "" {
+			return []trustStore{{name: systemStoreName + ", which podman reads alone while no certs.d directory exists for " + u.Host + ",", system: true}}
 		}
+		store := certsDir(dir)
 		return []trustStore{store}
 	}},
 }
@@ -483,22 +496,21 @@ func (t TrustProbe) env(key string) string {
 }
 
 // pipFiles lists the configuration files pip loads, in the order it loads
-// them. PIP_CONFIG_FILE names one more, loaded last; when that file exists
-// pip skips the per-user files, and when it is the null device pip loads no
-// file at all.
-func pipFiles(t TrustProbe) []string {
-	global := pipPaths(t.GOOS, "")
-	files := rooted(t.Root, pipPaths(t.GOOS, t.Home))
-	explicit := t.env("PIP_CONFIG_FILE")
-	switch explicit {
-	case "":
-	case os.DevNull:
-		return nil
-	default:
-		if _, err := os.Stat(explicit); err == nil {
-			files = append(files[:len(global):len(global)], explicit)
+// them: clientconf.PipConfigFiles, which a CA install resolves the same way.
+// The files checkPipConfig scans for a public index are a wider inventory and
+// say nothing here, since it shows an operator files pip never opens. ask
+// names the interpreter's prefix when VIRTUAL_ENV does not.
+func pipFiles(t TrustProbe, ask func() (PipDefault, error)) []string {
+	h := clientconf.PipHost{GOOS: t.GOOS, Root: t.Root, Getenv: t.Getenv}
+	if t.Home != "" {
+		h.Home = filepath.Join(t.Root, t.Home)
+	}
+	if ask != nil && t.env("VIRTUAL_ENV") == "" {
+		if d, err := ask(); err == nil {
+			h.Prefix = d.Prefix
 		}
 	}
+	files, _ := clientconf.PipConfigFiles(h)
 	return files
 }
 
@@ -512,7 +524,11 @@ func pipFiles(t TrustProbe) []string {
 // no private CA whatever the system store holds. Which of the two is pip's
 // own to say, so Pip asks it.
 func pipStores(t TrustProbe, u *url.URL) []trustStore {
-	files := pipFiles(t)
+	var ask func() (PipDefault, error)
+	if t.Pip != nil {
+		ask = sync.OnceValues(t.Pip)
+	}
+	files := pipFiles(t, ask)
 	if !mention(u.Host, files...) && !strings.Contains(t.env("PIP_INDEX_URL"), u.Host) {
 		return nil
 	}
@@ -528,10 +544,10 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 			continue
 		}
 		vals := clientconf.PipOptions(data)
-		if v := vals["global.cert"]; v != "" {
+		if v, ok := vals["global.cert"]; ok {
 			global = [2]string{v, f}
 		}
-		if v := vals["install.cert"]; v != "" {
+		if v, ok := vals["install.cert"]; ok {
 			install = [2]string{v, f}
 		}
 	}
@@ -548,8 +564,8 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	system := trustStore{name: systemStoreName + ", which pip reads while no cert setting names a bundle,", system: true}
 	return []trustStore{{name: system.name, resolve: func() trustStore {
 		reason := "pip is not asked on this host"
-		if t.Pip != nil {
-			d, err := t.Pip()
+		if ask != nil {
+			d, err := ask()
 			legacy := strings.Contains(t.env("PIP_USE_DEPRECATED"), "legacy-certs")
 			switch {
 			case err != nil:
@@ -795,6 +811,106 @@ func mavenStores(t TrustProbe, u *url.URL) []trustStore {
 		name, certs, err := jvm()
 		return name + ", which Maven and Gradle read in place of the system trust store,", certs, err
 	}}}
+}
+
+var gitInsteadOf = regexp.MustCompile(`(?mi)^\s*\[url\s+"([^"]+)"\]`)
+
+// gitStores resolves what git verifies bodega at u against, for a host whose
+// configuration rewrites a URL to it: the file the effective http.sslCAInfo
+// names, which git reads in place of the system trust store. One store per
+// setting git can pick for a URL under each rewritten prefix, since a section
+// scoped to a longer URL outranks one scoped to bodega's base for the
+// repositories below it. GIT_SSL_CAINFO outranks every file.
+func gitStores(t TrustProbe, u *url.URL) []trustStore {
+	files := clientconf.GitConfigFiles(t.Getenv, t.Home, t.Root)
+	var prefixes []string
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, m := range gitInsteadOf.FindAllSubmatch(data, -1) {
+			if p, err := url.Parse(string(m[1])); err == nil && p.Host == u.Host && !slices.Contains(prefixes, string(m[1])) {
+				prefixes = append(prefixes, string(m[1]))
+			}
+		}
+	}
+	if len(prefixes) == 0 {
+		return nil
+	}
+	if s := envCA(t, "GIT_SSL_CAINFO"); s != nil {
+		return []trustStore{*s}
+	}
+	var out []trustStore
+	system := false
+	for _, prefix := range prefixes {
+		own, narrower := clientconf.GitCAInfo(files, prefix, t.Home)
+		if own == nil {
+			system = true
+		} else {
+			narrower = append([]clientconf.GitCA{*own}, narrower...)
+		}
+		for _, ca := range narrower {
+			s := *named(ca.Value, "http.sslCAInfo of "+ca.Header+" in "+ca.File, true)
+			if !slices.ContainsFunc(out, func(o trustStore) bool { return o.name == s.name }) {
+				out = append(out, s)
+			}
+		}
+	}
+	if system {
+		out = append(out, trustStore{name: systemStoreName, system: true})
+	}
+	return out
+}
+
+// helmStores resolves what helm verifies bodega at u against: the caFile of
+// each repository entry at that host, which helm reads in place of the system
+// trust store, and that store for an entry naming none.
+func helmStores(t TrustProbe, u *url.URL) []trustStore {
+	path := t.env("HELM_REPOSITORY_CONFIG")
+	if path == "" {
+		dir := t.env("HELM_CONFIG_HOME")
+		switch {
+		case dir != "":
+		case t.Home == "":
+			return nil
+		case t.GOOS == "darwin":
+			dir = filepath.Join(t.Home, "Library", "Preferences", "helm")
+		case t.env("XDG_CONFIG_HOME") != "":
+			dir = filepath.Join(t.env("XDG_CONFIG_HOME"), "helm")
+		default:
+			dir = filepath.Join(t.Home, ".config", "helm")
+		}
+		path = filepath.Join(dir, "repositories.yaml")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Repositories []struct {
+			Name   string `yaml:"name"`
+			URL    string `yaml:"url"`
+			CAFile string `yaml:"caFile"`
+		} `yaml:"repositories"`
+	}
+	if yaml.Unmarshal(data, &doc) != nil {
+		return nil
+	}
+	var out []trustStore
+	for _, r := range doc.Repositories {
+		if p, err := url.Parse(r.URL); err != nil || p.Host != u.Host {
+			continue
+		}
+		s := trustStore{name: systemStoreName, system: true}
+		if r.CAFile != "" {
+			s = *named(r.CAFile, "caFile of the repository "+r.Name+" in "+path, true)
+		}
+		if !slices.ContainsFunc(out, func(o trustStore) bool { return o.name == s.name }) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // containerdStores is one store per registry whose hosts.toml sends pulls to
@@ -1092,9 +1208,34 @@ func AskPip() (PipDefault, error) {
 		if err != nil {
 			return PipDefault{}, fmt.Errorf("%s --version: %w", path, err)
 		}
-		return pipDefaultFrom(string(out))
+		d, err := pipDefaultFrom(string(out))
+		if err != nil {
+			return d, err
+		}
+		// config debug lists each file pip would load; the one under "site"
+		// sits in the interpreter's prefix. A pip too old for the command
+		// leaves the prefix unknown.
+		if out, err := exec.CommandContext(ctx, path, "config", "debug").Output(); err == nil {
+			d.Prefix = pipSitePrefix(string(out))
+		}
+		return d, nil
 	}
 	return PipDefault{}, errors.New("no pip on PATH")
+}
+
+// pipSitePrefix reads the directory of the site configuration file out of
+// `pip config debug`, "" when the output names none.
+func pipSitePrefix(debug string) string {
+	lines := strings.Split(debug, "\n")
+	for i, l := range lines[:max(len(lines)-1, 0)] {
+		if strings.TrimSpace(l) != "site:" {
+			continue
+		}
+		if file, _, ok := strings.Cut(strings.TrimSpace(lines[i+1]), ", exists:"); ok && filepath.IsAbs(file) {
+			return filepath.Dir(file)
+		}
+	}
+	return ""
 }
 
 // pipDefaultFrom reads a `pip --version` line. pip verifies through the

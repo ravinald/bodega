@@ -83,6 +83,11 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 	writeTrustFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"registry-mirrors":["`+base+`"]}`)
 	writeTrustFile(t, filepath.Join(root, "etc/docker/certs.d", hostport, "ca.crt"), string(caPEM))
 	writeTrustFile(t, filepath.Join(root, "etc/containers/registries.conf.d/bodega.conf"), "[[registry]]\nprefix = \"docker.io\"\n[[registry.mirror]]\nlocation = \""+hostport+"\"\n")
+	// podman reads the first certs.d directory that exists for the host and
+	// no other, so this empty one hides Docker's, which holds the CA.
+	if err := os.MkdirAll(filepath.Join(root, "etc/containers/certs.d", hostport), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	writeTrustFile(t, filepath.Join(root, "etc/containerd/certs.d/docker.io/hosts.toml"),
 		"server = \"https://registry-1.docker.io\"\n\n[host.\""+base+"\"]\n  ca = \""+ca+"\"\n  capabilities = [\"pull\", \"resolve\"]\n")
 
@@ -728,6 +733,99 @@ func TestTrustFollowsEachClientsOwnPrecedence(t *testing.T) {
 			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
 			if f.Status != tc.want || tc.want == StatusOK && f.Detail != "" {
 				t.Fatalf("got %+v; want %s", f, tc.want)
+			}
+		})
+	}
+}
+
+func TestStaffPipVirtualenvOverridesGlobalCA(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\ncert="+ca+"\n")
+	venv := filepath.Join(p.Root, "venv")
+	writeTrustFile(t, filepath.Join(venv, "pip.conf"), "[global]\ncert=/missing/venv-ca.pem\n")
+	p.Getenv = func(k string) string {
+		if k == "VIRTUAL_ENV" {
+			return venv
+		}
+		return ""
+	}
+	f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/venv-ca.pem") {
+		t.Fatalf("pip virtualenv overrides global cert: got %+v; want WARN naming venv-ca.pem", f)
+	}
+}
+
+func TestStaffPodmanUserStoreShadowsSystemDirectory(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	good, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := trustFixture(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containers/registries.conf"), "[[registry]]\nprefix=\"docker.io\"\nlocation=\"docker.io\"\n[[registry.mirror]]\nlocation=\"bodega.internal:8443/docker.io\"\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containers/certs.d/bodega.internal:8443/ca.crt"), string(good))
+	own := filepath.Join(p.Home, ".config/containers/certs.d/bodega.internal:8443/ca.crt")
+	writeTrustFile(t, own, string(other))
+	f := p.Apply([]Finding{{Check: "oci-podman", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn {
+		t.Fatalf("podman user certs.d shadows system certs.d: got %+v; want WARN", f)
+	}
+}
+
+func TestStaffPipIgnoresConfigFilesFromOtherPlatforms(t *testing.T) {
+	for _, tc := range []struct{ goos, unused string }{
+		{"linux", "home/test/Library/Application Support/pip/pip.conf"},
+		{"freebsd", "usr/local/etc/pip.conf"},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			p.GOOS = tc.goos
+			writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\ncert=/missing/effective-pip-ca.pem\n")
+			writeTrustFile(t, filepath.Join(p.Root, tc.unused), "[global]\ncert="+ca+"\n")
+			f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/effective-pip-ca.pem") {
+				t.Fatalf("pip %s never loads %s: got %+v; want WARN for effective-pip-ca.pem", tc.goos, tc.unused, f)
+			}
+		})
+	}
+}
+
+// F116 R1: git and helm, which have no row in the report, are judged after a
+// CA install by the setting each one reads: git the sslCAInfo of the longest
+// URL match, helm the caFile of bodega's repository entry.
+func TestTrustProbeJudgesGitAndHelm(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	gitconfig := filepath.Join(p.Home, ".gitconfig")
+	repos := filepath.Join(p.Home, ".config/helm/repositories.yaml")
+	rows := []Finding{{Check: "git-config", Status: StatusOK}, {Check: "helm-repos", Status: StatusOK}}
+	rewrite := "[url \"" + base + "/git/gh/\"]\n\tinsteadOf = https://github.com/\n"
+	scoped := "[http \"" + base + "/\"]\n\tsslCAInfo = " + ca + "\n"
+	for _, tc := range []struct {
+		name, git, helm string
+		env             map[string]string
+		warn            map[string]string
+	}{
+		{name: "not configured", git: scoped, helm: "repositories:\n  - name: corp\n    url: https://charts.example\n      caFile: /x\n"},
+		{name: "own settings hold the CA", git: rewrite + scoped, helm: "repositories:\n  - name: bodega\n    url: " + base + "/helm\n    caFile: " + ca + "\n"},
+		{name: "a longer section and a caFile name another store", git: rewrite + scoped + "[http \"" + base + "/git/gh/corp/\"]\n\tsslCAInfo = /missing/corp.pem\n",
+			helm: "repositories:\n  - name: bodega\n    url: " + base + "/helm\n    caFile: /missing/helm.pem\n",
+			warn: map[string]string{"git-config": "/missing/corp.pem", "helm-repos": "/missing/helm.pem"}},
+		{name: "no setting leaves the system store", git: rewrite, helm: "repositories:\n  - name: bodega\n    url: " + base + "/helm\n",
+			warn: map[string]string{"git-config": systemStoreName, "helm-repos": systemStoreName}},
+		{name: "the environment outranks the file", git: rewrite + scoped, env: map[string]string{"GIT_SSL_CAINFO": "/missing/env.pem"},
+			helm: "repositories: []\n", warn: map[string]string{"git-config": "GIT_SSL_CAINFO"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeTrustFile(t, gitconfig, tc.git)
+			writeTrustFile(t, repos, tc.helm)
+			p.Getenv = func(k string) string { return tc.env[k] }
+			for _, f := range p.Apply(rows, base) {
+				want, warns := tc.warn[f.Check]
+				if warns != (f.Status == StatusWarn) || !strings.Contains(f.Detail, want) {
+					t.Errorf("%s = %s %q; want a warning naming %q: %v", f.Check, f.Status, f.Detail, want, warns)
+				}
 			}
 		})
 	}

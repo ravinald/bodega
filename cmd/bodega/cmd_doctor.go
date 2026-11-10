@@ -152,7 +152,8 @@ that is not a CA, or anything else. Every file the plan edits keeps its
 other settings under --ca-file. Pass the flag on every --configure run: a
 run without it replaces .npmrc and pip.conf whole. pip names the pypi system.
 After --apply, a client still reading a store without the CA (PIP_CERT, a
-setting in another file) is named in a warning line.
+setting in a file the run could not edit) is named in the error the run
+exits with.
 
   sudo bodega doctor --configure apt,pip,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
 
@@ -717,7 +718,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	var caStep []string
 	var caImports [][]string
-	var caSystems []string
+	var caSystems, caOSStore []string
 	for _, rec := range records {
 		if !slices.Contains(caSystems, rec.System) {
 			caSystems = append(caSystems, rec.System)
@@ -737,11 +738,21 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 				return fmt.Errorf("--ca-file: maven: the JVM trust store Maven and Gradle read could not be listed: %w. Nothing was written", err)
 			}
 		}
+		if os.Getenv("VIRTUAL_ENV") == "" && slices.ContainsFunc(records, func(r clientconf.PlanRecord) bool { return r.System == manifest.TypePypi }) {
+			// Which pip.conf the interpreter's prefix adds is pip's to say; a
+			// host whose pip cannot be asked falls back to the packaged one's.
+			// A nil doctorPip is a probe told not to ask.
+			if doctorPip != nil {
+				if d, err := doctorPip(); err == nil {
+					h.PipPrefix = d.Prefix
+				}
+			}
+		}
 		in, err := clientconf.AddCA(changes, *ca, h)
 		if err != nil {
 			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
 		}
-		changes, caStep, caImports = in.Changes, in.Step, in.Imports
+		changes, caStep, caImports, caOSStore = in.Changes, in.Step, in.Imports, in.System
 		for _, sys := range slices.Sorted(maps.Keys(in.Notes)) {
 			fmt.Printf("note       %-10s %s\n", sys, in.Notes[sys])
 		}
@@ -803,7 +814,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		if ca != nil && req.apply {
-			return unreadCA(caSystems, client.BaseURL)
+			return unreadCA(caSystems, caOSStore, client.BaseURL)
 		}
 		return nil
 	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
@@ -868,7 +879,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	// remaining steps have run: they do not depend on it.
 	var unread error
 	if ca != nil {
-		unread = unreadCA(caSystems, client.BaseURL)
+		unread = unreadCA(caSystems, caOSStore, client.BaseURL)
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -947,8 +958,10 @@ var (
 	doctorDockerdVersion = host.RunDockerdVersion
 )
 
-// doctorCAGOOS is the operating system whose trust store --ca-file installs
-// into, so a test can plan each family's install from one host.
+// doctorCAGOOS is the operating system whose trust stores --ca-file installs
+// into and the report reads, so a test can plan each family's install from
+// one host. The install and the report share it: which files a client loads
+// depends on the platform, and the two have to agree on them.
 var doctorCAGOOS = runtime.GOOS
 
 // doctorTrustProbe is how the report reads the certificate bodega serves and
@@ -956,7 +969,7 @@ var doctorCAGOOS = runtime.GOOS
 var doctorTrustProbe = func() host.TrustProbe {
 	home, _ := os.UserHomeDir()
 	return host.TrustProbe{
-		Root: doctorOCIRoot, Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir,
+		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir,
 		DnfConf: doctorDnfConf, DnfDirs: doctorYumReposDirs,
 		JVM: func() (string, []*x509.Certificate, error) {
 			store, certs, err := doctorJVM()
@@ -979,21 +992,33 @@ var (
 // installed the CA, still reads a store that does not hold it: an
 // environment variable or a setting in a file the plan does not edit,
 // outranking what the plan wrote. A run that leaves one exits non-zero,
-// because for that client nothing was installed. The system trust store
-// counts as holding the CA, since the plan put it there and checked; the
-// process's own copy of that store predates the rebuild.
-func unreadCA(systems []string, base string) error {
+// because for that client nothing was installed.
+//
+// osStore names the systems whose anchors the plan put in the operating
+// system's trust store. For those the store counts as holding the CA, since
+// the plan checked the rebuilt store and the process's own copy predates the
+// rebuild. For every other system the plan left that store alone, so the
+// client is judged against what it reads today: the store as it stands and
+// the files the plan wrote for it.
+func unreadCA(systems, osStore []string, base string) error {
 	checks := host.TrustSystems()
-	var rows []host.Finding
+	var rebuilt, own []host.Finding
 	for _, check := range slices.Sorted(maps.Keys(checks)) {
-		if slices.Contains(systems, checks[check]) {
-			rows = append(rows, host.Finding{Check: check, Status: host.StatusOK})
+		row := host.Finding{Check: check, Status: host.StatusOK}
+		switch sys := checks[check]; {
+		case !slices.Contains(systems, sys):
+		case slices.Contains(osStore, sys):
+			rebuilt = append(rebuilt, row)
+		default:
+			own = append(own, row)
 		}
 	}
 	probe := doctorTrustProbe()
+	found := probe.Apply(own, base)
 	probe.System = func([]*x509.Certificate, string) error { return nil }
+	found = append(found, probe.Apply(rebuilt, base)...)
 	var left []string
-	for _, f := range probe.Apply(rows, base) {
+	for _, f := range found {
 		if f.Status == host.StatusWarn {
 			left = append(left, fmt.Sprintf("  %s: %s", checks[f.Check], f.Detail))
 		}
@@ -1001,6 +1026,7 @@ func unreadCA(systems []string, base string) error {
 	if len(left) == 0 {
 		return nil
 	}
+	slices.Sort(left)
 	return fmt.Errorf("the CA is written, and %d client(s) still read a store without it, so they still refuse bodega's certificate:\n%s\n"+
 		"  Unset the variable or correct the setting that names that store, then re-run: this command edits the configuration files a client reads, not its environment",
 		len(left), strings.Join(left, "\n"))
