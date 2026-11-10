@@ -971,3 +971,294 @@ func TestReviewMavenCAPlansTrustInstallation(t *testing.T) {
 		t.Fatalf("--ca-file added no trust write or step; only notes: %v", in.Notes)
 	}
 }
+
+func TestAuditCAPreservesExistingSettings(t *testing.T) {
+	pem, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"pip-indented", Pip(testBase), "[global]\n  index-url = https://pypi.org/simple/\n  timeout = 120\n", "timeout = 120"},
+		{"go", Gomod(testBase), "GOPROXY=https://proxy.golang.org\nGOPRIVATE=corp.example/*\n", "GOPRIVATE=corp.example/*"},
+		{"cargo", Cargo(testBase), "[build]\njobs = 7\n", "jobs = 7"},
+		{"podman", RegistriesConf(testBase, []string{"docker.io"}), "unqualified-search-registries = [\"registry.corp.example\"]\n", "unqualified-search-registries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".audit-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestAuditJVMSelectsJSSEStore(t *testing.T) {
+	home := t.TempDir()
+	jsse := filepath.Join(home, "lib/security/jssecacerts")
+	if err := os.MkdirAll(filepath.Dir(jsse), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsse, []byte("store fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := ResolveJVMStore(func(k string) string {
+		if k == "JAVA_HOME" {
+			return home
+		}
+		return ""
+	}, func(string) (string, error) { return "", os.ErrNotExist })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Keystore != jsse || slices.Contains(s.ImportCommand("bodega", "ca.pem"), "-cacerts") {
+		t.Fatalf("JSSE store exists, but resolved store=%q and import=%v; want %s", s.Keystore, s.ImportCommand("bodega", "ca.pem"), jsse)
+	}
+}
+
+//nolint:gosec // G101: the review's fixture password, set only in this test's environment
+func TestAuditJVMErrorsDoNotPrintTrustStorePassword(t *testing.T) {
+	const secret = "audit-only-keystore-password"
+	t.Setenv("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStorePassword="+secret)
+	keytool := filepath.Join(t.TempDir(), "keytool")
+	script := "#!/bin/sh\nprintf '%s\\n' \"Picked up JAVA_TOOL_OPTIONS: $JAVA_TOOL_OPTIONS\"\nexit 1\n"
+	if err := os.WriteFile(keytool, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (JVMStore{Keytool: keytool, Password: secret}).Trusted()
+	if err == nil {
+		t.Fatal("fixture command must fail")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("keytool failure leaked trustStorePassword: %v", err)
+	}
+}
+
+func TestAuditFreeBSDHashCollisionsRemainIdempotent(t *testing.T) {
+	first, _, _ := testCA(t, "bodega.example.com")
+	second, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(append(slices.Clone(first), second...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSFreeBSD}
+	plan := func() []Change { return caPlan(t, home, Gomod(testBase)) }
+	in, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(in.Changes, ".audit-backup"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "etc/ssl/certs")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"12345678.0": first, "12345678.1": second} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Step) != 0 {
+		t.Fatalf("both CAs are in FreeBSD's hashed store, but second apply runs %v", again.Step)
+	}
+}
+
+// F116 R1: under a CA plan every existing file keeps what the plan does not
+// set, in each format a plan edits, takes what the plan does set, and reads
+// the same after a second plan over the applied host.
+func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(f File, path string) File {
+		f.Paths = map[string]string{OSLinux: path}
+		return f
+	}
+	gems := Rubygems(testBase)
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	pkgConf := "# bodega pkg repository. Install as x.\n# written for FreeBSD 15\n\nFreeBSD: { enabled: no }\n\nbodega: {\n  url: \"" + testBase + "/freebsd/${ABI}\",\n  enabled: yes\n}\n"
+	for _, tc := range []struct {
+		name   string
+		file   File
+		before string
+		// keep stays, want arrives and gone leaves.
+		keep, want, gone []string
+	}{
+		{"gemrc", gems[0], "---\n# house style\ngem: --no-document\n:sources:\n- https://rubygems.org/\n",
+			[]string{"# house style", "gem: --no-document"}, []string{"- " + testBase + "/rubygems/"}, []string{"rubygems.org"}},
+		{"bundler", gems[1], "---\nBUNDLE_JOBS: \"4\"\n", []string{"BUNDLE_JOBS"}, []string{"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/"}, nil},
+		{"helm", Helm(testBase), "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n  - name: corp\n    url: https://charts.corp.example\n  - name: bodega\n    url: https://old.example/helm\n",
+			[]string{"name: corp", "url: https://charts.corp.example"}, []string{testBase + "/helm"}, []string{"old.example"}},
+		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: https://corp.example/apt\nSuites: stable\nComponents: main\n\n# ours\nTypes: deb\nURIs: " + testBase + "/apt/\nSuites: jammy\nComponents: main\nTrusted: yes\n",
+			[]string{"URIs: https://corp.example/apt", "Suites: stable"}, []string{"Suites: noble", "Signed-By: "}, []string{"Suites: jammy", "Trusted: yes"}},
+		{"pkg", at(File{System: manifest.TypeFreeBSD, Content: pkgConf}, pkgrepos.ClientConfPath),
+			"# bodega pkg repository. Install as x.\n# written for FreeBSD 14\n\ncorp: {\n  url: \"https://pkg.corp.example\", # {\n  enabled: yes\n}\nbodega: { url: \"https://old.example\" }\n",
+			[]string{"corp: {", "https://pkg.corp.example"}, []string{"written for FreeBSD 15", "FreeBSD: { enabled: no }", testBase + "/freebsd/${ABI}"}, []string{"old.example", "FreeBSD 14"}},
+		{"make.conf", at(MakeConf(testBase), "/etc/make.conf"), "WITH_PKGNG=yes\nMASTER_SITE_OVERRIDE= https://old.example/ \\\n\thttps://older.example/\n.include \"" + DistfilesCheckPath + "\"\nCFLAGS+= -O2\n",
+			[]string{"WITH_PKGNG=yes", "CFLAGS+= -O2"}, []string{"MASTER_SITE_OVERRIDE?= " + testBase, "MASTER_SITE_BACKUP?= ", "CFLAGS+= -O2\n.include \"" + DistfilesCheckPath + "\"\n"}, []string{"old.example", "older.example"}},
+		{"dnf", Rpm(testBase, []string{"baseos"}), "[bodega-baseos]\nname=old\nbaseurl=https://old.example/a\n    https://old.example/b\nproxy=http://proxy.corp.example\n\n[corp]\nbaseurl=https://rpm.corp.example\n",
+			[]string{"proxy=http://proxy.corp.example", "[corp]", "baseurl=https://rpm.corp.example"}, []string{"baseurl=" + testBase + "/rpm/baseos/"}, []string{"old.example"}},
+		{"cargo", Cargo(testBase), "[source.crates-io]\nreplace-with = \"corp\" # was\n\n[net]\nretry = 3\n",
+			[]string{"[net]", "retry = 3"}, []string{"replace-with = \"bodega\"", "sparse+" + testBase}, []string{"corp"}},
+		{"node mirror", at(File{System: manifest.TypeNpm, Content: "NODEJS_ORG_MIRROR=" + testBase + "/binaries/node/dist\n"}, NodeMirrorUserPath),
+			"EDITOR=vi\nNODEJS_ORG_MIRROR=https://nodejs.org/dist\n", []string{"EDITOR=vi"}, []string{testBase + "/binaries/node/dist"}, []string{"nodejs.org"}},
+		{"pip", Pip(testBase), "[global]\n  index_url: https://pypi.org/simple/\n  find-links =\n    cert = not-a-setting\n    /srv/wheels\n[install]\ncert = /old/ca.pem\nno-compile = true\n[download]\ncert:/old/ca.pem\n",
+			[]string{"  find-links =\n    cert = not-a-setting\n    /srv/wheels\n", "no-compile = true"},
+			[]string{"  index-url = " + testBase + "/pypi/simple/", "[install]\ncert = ", "[download]\ncert = "}, []string{"pypi.org", "/old/ca.pem"}},
+		{"git", git, "[url \"https://old.example/git/gh/\"]\n\tinsteadOf = https://github.com/\n[alias]\n\tlg = log \\\n\t\t--oneline = x\n",
+			[]string{"[alias]\n\tlg = log \\\n\t\t--oneline = x\n", "[url \"https://old.example/git/gh/\"]"}, []string{strings.TrimSpace(git.Content), "sslCAInfo = "}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".merge-backup"); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(raw)
+			for _, s := range append(slices.Clone(tc.keep), tc.want...) {
+				if !strings.Contains(got, s) {
+					t.Errorf("merged file lacks %q:\n%s", s, got)
+				}
+			}
+			for _, s := range tc.gone {
+				if strings.Contains(got, s) {
+					t.Errorf("merged file still holds %q:\n%s", s, got)
+				}
+			}
+			again, err := AddCA(caPlan(t, home, tc.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c := changeAt(t, again.Changes, target); !c.Unchanged() {
+				t.Errorf("a second plan rewrites the file:\n%s\nfrom\n%s", c.New, c.Old)
+			}
+		})
+	}
+}
+
+// F116 R1: a file whose form the merge cannot edit is refused with the next
+// step, never written saying something other than the plan.
+func TestAddCARefusesAMergeThatWouldNotHold(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		file   File
+		before string
+	}{
+		"cargo inline table": {Cargo(testBase), "source = { crates-io = { replace-with = \"corp\" } }\n"},
+		"gemrc flow mapping": {Rubygems(testBase)[0], "{ \":sources\": [\"https://rubygems.org/\"] }\n"},
+		"podman dotted keys": {RegistriesConf(testBase, []string{"docker.io"}), "registry = [ { prefix = \"docker.io\", location = \"corp.example\" } ]\n"},
+	} {
+		home := t.TempDir()
+		target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+		if err == nil || !strings.Contains(err.Error(), "move the file aside") || !strings.Contains(err.Error(), target) {
+			t.Errorf("%s: AddCA = %v, want a refusal naming %s and the next step", name, err, target)
+		}
+	}
+}
+
+// F116 R1, R2: the store ResolveJVMStore names is the one keytool lists and
+// imports into, and a failed keytool reports its own error with nothing that
+// reads as a password in it.
+func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
+	const secret = "hunter2-keystore"
+	jdk := t.TempDir()
+	jsse, args := filepath.Join(jdk, "lib/security/jssecacerts"), filepath.Join(jdk, "args")
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	script := "#!/bin/sh\necho \"$@\" >> " + args + "\ncase \"$*\" in *-importcert*) echo 'Picked up JAVA_TOOL_OPTIONS: -Dx.password=" + secret + "'; echo 'keytool error: storepass=" + secret + " refused for " + secret + "'; exit 1;; esac\ncat " + filepath.Join(jdk, "listing") + "\n"
+	for path, content := range map[string]string{jsse: "store", filepath.Join(jdk, "bin/keytool"): script, filepath.Join(jdk, "listing"): "Alias name: a\n" + string(caPEM)} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := map[string]string{"JAVA_HOME": jdk, "MAVEN_OPTS": "-Djavax.net.ssl.trustStorePassword=" + secret}
+	store, err := ResolveJVMStore(func(k string) string { return env[k] }, func(string) (string, error) { return "", os.ErrNotExist })
+	if err != nil {
+		t.Fatal(err)
+	}
+	certs, err := store.Trusted()
+	if err != nil || len(certs) != 1 {
+		t.Fatalf("Trusted = %d certificates, %v", len(certs), err)
+	}
+	other, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	in, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, JVM: store, JVMTrusted: certs})
+	if err != nil || len(in.Imports) != 1 {
+		t.Fatalf("AddCA = %d imports, %v", len(in.Imports), err)
+	}
+	err = RunJVMCommand(in.Imports[0])
+	if err == nil || !strings.Contains(err.Error(), "keytool error") || strings.Contains(err.Error(), secret) {
+		t.Errorf("failed import = %v, want keytool's own error without the password", err)
+	}
+	ran, _ := os.ReadFile(args)
+	for _, line := range strings.Split(strings.TrimSpace(string(ran)), "\n") {
+		if !strings.Contains(line, "-keystore "+jsse) || strings.Contains(line, "-cacerts") {
+			t.Errorf("keytool ran %q, want the JSSE store %s", line, jsse)
+		}
+	}
+	if !strings.Contains(string(ran), "-list") || !strings.Contains(string(ran), "-importcert") {
+		t.Errorf("keytool ran %q, want a listing and an import", ran)
+	}
+}

@@ -359,3 +359,205 @@ func TestTrustProbeReadsTheJVMStoreForMaven(t *testing.T) {
 	probe.Home = t.TempDir()
 	probe.Apply(row, base)
 }
+
+func TestAuditNpmBundledRootsAreNotSystemStore(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\n")
+	p.Getenv = func(k string) string {
+		if k == "NODE_OPTIONS" {
+			return "--use-bundled-ca"
+		}
+		return ""
+	}
+	p.System = func([]*x509.Certificate, string) error { return nil }
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") {
+		t.Fatalf("private CA only in system store, Node uses bundled roots: %+v; want WARN and --ca-file", f)
+	}
+}
+
+func TestAuditPipUsesExplicitConfigFile(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	config := filepath.Join(p.Root, "custom-pip.conf")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\ncert="+ca+"\n")
+	writeTrustFile(t, config, "[global]\ncert=/missing/ca.pem\n")
+	p.Getenv = func(k string) string {
+		if k == "PIP_CONFIG_FILE" {
+			return config
+		}
+		return ""
+	}
+	f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/ca.pem") {
+		t.Fatalf("PIP_CONFIG_FILE overrides global cert: %+v; want WARN naming /missing/ca.pem", f)
+	}
+}
+
+func TestAuditNpmCAArrayRetainsAllRoots(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	trusted, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := trustFixture(t)
+	escape := func(b []byte) string {
+		return "\"" + strings.ReplaceAll(strings.TrimSpace(string(b)), "\n", `\n`) + "\""
+	}
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\nca[]="+escape(trusted)+"\nca[]="+escape(other)+"\n")
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusOK {
+		t.Fatalf("valid first CA in npm's ca[] array: %+v; want OK", f)
+	}
+}
+
+// F116 R2: with no CA setting, npm and pip are judged against what Node and
+// pip say they read. The system store settles the row only where the client
+// reads it, and a client that cannot be asked leaves the row saying so.
+func TestTrustProbeAsksNodeAndPipForTheirDefaults(t *testing.T) {
+	trusted := func([]*x509.Certificate, string) error { return nil }
+	certifi := func(t *testing.T, p TrustProbe, pem string) string {
+		path := filepath.Join(p.Root, "site-packages/pip/_vendor/certifi/cacert.pem")
+		writeTrustFile(t, path, pem)
+		return path
+	}
+	for _, tc := range []struct {
+		name, check string
+		set         func(t *testing.T, p *TrustProbe, ca string)
+		status      Status
+		detail      string
+	}{
+		{"node lists its defaults and they hold the CA", "npm-config", func(t *testing.T, p *TrustProbe, ca string) {
+			p.Node = func() (NodeRoots, error) { return NodeRoots{PEM: []string{ca}, Effective: true}, nil }
+		}, StatusOK, ""},
+		{"node lists its defaults without the CA, system store trusts it", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			p.Node = func() (NodeRoots, error) { return NodeRoots{Effective: true}, nil }
+		}, StatusWarn, "the CA certificates Node trusts by default"},
+		{"node built on OpenSSL's store", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			p.Node = func() (NodeRoots, error) { return NodeRoots{OpenSSLDefault: true}, nil }
+		}, StatusOK, ""},
+		{"node cannot be asked, system store trusts it", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			p.Node = func() (NodeRoots, error) { return NodeRoots{}, errors.New("no node on PATH") }
+		}, StatusOK, "no node on PATH"},
+		{"NODE_EXTRA_CA_CERTS holds the CA beside the bundled roots", "npm-config", func(t *testing.T, p *TrustProbe, _ string) {
+			extra := filepath.Join(p.Root, "ca.pem")
+			p.Getenv = func(k string) string {
+				return map[string]string{"NODE_OPTIONS": "--use-bundled-ca", "NODE_EXTRA_CA_CERTS": extra}[k]
+			}
+		}, StatusOK, ""},
+		{"an old pip reads certifi, system store trusts it", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			bundle := certifi(t, *p, "")
+			p.Pip = func() (PipDefault, error) { return PipDefault{Version: "23.3", Certifi: bundle}, nil }
+		}, StatusWarn, "the certifi bundle pip 23.3 reads"},
+		{"a pip on truststore", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			bundle := certifi(t, *p, "")
+			p.Pip = func() (PipDefault, error) { return PipDefault{Version: "26.2", Truststore: true, Certifi: bundle}, nil }
+		}, StatusOK, ""},
+		{"a pip on truststore told to use certifi", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+			bundle := certifi(t, *p, "")
+			p.Getenv = func(k string) string { return map[string]string{"PIP_USE_DEPRECATED": "legacy-certs"}[k] }
+			p.Pip = func() (PipDefault, error) { return PipDefault{Version: "26.2", Truststore: true, Certifi: bundle}, nil }
+		}, StatusWarn, "the certifi bundle"},
+		{"pip cannot be asked, system store trusts it", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.System = trusted
+		}, StatusOK, "unchecked"},
+		{"pip loads no file under PIP_CONFIG_FILE=/dev/null", "pip-config", func(t *testing.T, p *TrustProbe, _ string) {
+			p.Getenv = func(k string) string { return map[string]string{"PIP_CONFIG_FILE": os.DevNull}[k] }
+		}, StatusOK, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, caFile, base := reviewTrust(t)
+			ca, err := os.ReadFile(caFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\n")
+			tc.set(t, &p, string(ca))
+			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
+			if f.Status != tc.status || !strings.Contains(f.Detail, tc.detail) || (tc.detail == "" && f.Detail != "") {
+				t.Errorf("%s = %s %q; want %s naming %q", tc.check, f.Status, f.Detail, tc.status, tc.detail)
+			}
+		})
+	}
+}
+
+// F116 R2: a client that verifies through the system store is judged against
+// the file its own setting names instead, where it names one.
+func TestTrustProbeReadsTheStoreAClientIsPointedAt(t *testing.T) {
+	trusted := func([]*x509.Certificate, string) error { return nil }
+	for _, tc := range []struct {
+		name, check string
+		// set configures the client for bodega with a CA setting naming
+		// file, and returns the probe to judge it with.
+		set func(t *testing.T, p *TrustProbe, base, file string)
+		// additive says the setting adds to the system store.
+		additive bool
+	}{
+		{"apt Acquire::https::CAInfo", "apt-sources", func(t *testing.T, p *TrustProbe, base, file string) {
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/apt.conf.d/99ca"), "Acquire::https::CAInfo \""+file+"\";\n")
+		}, false},
+		{"dnf sslcacert", "dnf-repos", func(t *testing.T, p *TrustProbe, base, file string) {
+			p.DnfConf, p.DnfDirs = filepath.Join(p.Root, "etc/dnf/dnf.conf"), []string{filepath.Join(p.Root, "etc/yum.repos.d")}
+			writeTrustFile(t, p.DnfConf, "[main]\nsslcacert="+file+"\n")
+			writeTrustFile(t, filepath.Join(p.DnfDirs[0], "bodega.repo"), "[bodega-baseos]\nbaseurl="+base+"/rpm/baseos/\n")
+		}, false},
+		{"cargo http.cainfo", "cargo-config", func(t *testing.T, p *TrustProbe, base, file string) {
+			p.Home = filepath.Join(p.Root, "home")
+			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[http]\ncainfo = \""+file+"\"\n")
+		}, false},
+		{"pkg SSL_CA_CERT_FILE", "pkg-repos", func(t *testing.T, p *TrustProbe, base, file string) {
+			writeTrustFile(t, filepath.Join(p.Root, "usr/local/etc/pkg/repos/bodega.conf"), "bodega: { url: \""+base+"/freebsd\" }\n")
+			p.Getenv = func(k string) string { return map[string]string{"SSL_CA_CERT_FILE": file}[k] }
+		}, false},
+		{"gem ssl_ca_cert", "rubygems", func(t *testing.T, p *TrustProbe, base, file string) {
+			p.Home = filepath.Join(p.Root, "home")
+			writeTrustFile(t, filepath.Join(p.Home, ".gemrc"), "---\n:sources:\n- "+base+"/rubygems/\n:ssl_ca_cert: "+file+"\n")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The named file holds the CA and the system store does not.
+			p, ca, base := reviewTrust(t)
+			tc.set(t, &p, base, ca)
+			if f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]; f.Status != StatusOK {
+				t.Errorf("the file the setting names holds the CA: %s %q; want OK", f.Status, f.Detail)
+			}
+			// The named file lacks it and the system store holds it.
+			p, _, base = reviewTrust(t)
+			other, _ := trustFixture(t)
+			wrong := filepath.Join(p.Root, "wrong.pem")
+			writeTrustFile(t, wrong, string(other))
+			tc.set(t, &p, base, wrong)
+			p.System = trusted
+			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
+			if want := map[bool]Status{true: StatusOK, false: StatusWarn}[tc.additive]; f.Status != want || (!tc.additive && !strings.Contains(f.Detail, wrong)) {
+				t.Errorf("the system store holds the CA and the named file does not: %s %q; want %s", f.Status, f.Detail, want)
+			}
+		})
+	}
+}
+
+func TestPipDefaultFrom(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "site-packages", "pip")
+	bundle := filepath.Join(dir, "_vendor/certifi/cacert.pem")
+	writeTrustFile(t, bundle, "")
+	for line, want := range map[string]PipDefault{
+		"pip 23.3.2 from " + dir + " (python 3.12)\n":                    {Version: "23.3", Certifi: bundle},
+		"pip 24.2 from " + dir + " (python 3.9)":                         {Version: "24.2", Certifi: bundle},
+		"pip 26.2.1 from " + dir + " (python 3.15)":                      {Version: "26.2", Truststore: true, Certifi: bundle},
+		"pip 24.0 from /usr/lib/python3/dist-packages/pip (python 3.12)": {Version: "24.0"},
+	} {
+		if got, err := pipDefaultFrom(line); err != nil || got != want {
+			t.Errorf("pipDefaultFrom(%q) = %+v, %v; want %+v", line, got, err, want)
+		}
+	}
+	if _, err := pipDefaultFrom("Usage: pip <command>"); err == nil {
+		t.Error("a line naming no version was read as one")
+	}
+}

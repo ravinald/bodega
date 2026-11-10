@@ -148,9 +148,11 @@ setting for npm (cafile), pip (cert), git (http.<url>.sslCAInfo), Docker and
 podman (certs.d/<host>/ca.crt) and containerd (ca in each hosts.toml), and
 the JVM trust store for maven (keytool -importcert). The file is refused
 before anything is written when it holds no CA certificate, a certificate
-that is not a CA, or anything else. A file that takes a CA setting keeps its
+that is not a CA, or anything else. Every file the plan edits keeps its
 other settings under --ca-file. Pass the flag on every --configure run: a
 run without it replaces .npmrc and pip.conf whole. pip names the pypi system.
+After --apply, a client still reading a store without the CA (PIP_CERT, a
+setting in another file) is named in a warning line.
 
   sudo bodega doctor --configure apt,pip,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
 
@@ -715,6 +717,12 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	var caStep []string
 	var caImports [][]string
+	var caSystems []string
+	for _, rec := range records {
+		if !slices.Contains(caSystems, rec.System) {
+			caSystems = append(caSystems, rec.System)
+		}
+	}
 	if ca != nil {
 		osRelease, _ := os.ReadFile(doctorOSRelease)
 		h := clientconf.CAHost{
@@ -793,6 +801,9 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	switch {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
+		if ca != nil && req.apply {
+			warnUnreadCA(caSystems, client.BaseURL)
+		}
 		return nil
 	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
 		var runs []string
@@ -845,12 +856,15 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	for _, imp := range caImports {
 		shown := clientconf.RedactJVMCommand(imp)
-		if err := doctorRun(imp[0], imp[1:]...); err != nil {
+		if err := doctorRunJVM(imp); err != nil {
 			return fmt.Errorf("%s failed: %w.\n"+
 				"  The certificate file is written and the JVM trust store does not hold it, so Maven and Gradle still refuse bodega's certificate.\n"+
 				"  keytool needs to write the keystore, which takes root for a JDK's own cacerts. Re-run this command as that account: it lists the store and runs the import again", shown, err)
 		}
 		fmt.Printf("ran        %s\n", shown)
+	}
+	if ca != nil {
+		warnUnreadCA(caSystems, client.BaseURL)
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -944,6 +958,38 @@ var doctorTrustProbe = func() host.TrustProbe {
 			store, certs, err := doctorJVM()
 			return store.Name(), certs, err
 		},
+		Node: doctorNode, Pip: doctorPip,
+	}
+}
+
+// doctorNode and doctorPip ask the host's Node and pip what each verifies
+// against by default, and doctorRunJVM runs a keytool import, so a test can
+// stand in for each.
+var (
+	doctorNode   = host.AskNode
+	doctorPip    = host.AskPip
+	doctorRunJVM = clientconf.RunJVMCommand
+)
+
+// warnUnreadCA names each of systems whose client, after this run installed
+// the CA, still reads a store that does not hold it: a setting or an
+// environment variable outranking the one the plan wrote. The system trust
+// store counts as holding it, since the plan put it there and checked; the
+// process's own copy of that store predates the rebuild.
+func warnUnreadCA(systems []string, base string) {
+	checks := host.TrustSystems()
+	var rows []host.Finding
+	for _, check := range slices.Sorted(maps.Keys(checks)) {
+		if slices.Contains(systems, checks[check]) {
+			rows = append(rows, host.Finding{Check: check, Status: host.StatusOK})
+		}
+	}
+	probe := doctorTrustProbe()
+	probe.System = func([]*x509.Certificate, string) error { return nil }
+	for _, f := range probe.Apply(rows, base) {
+		if f.Status == host.StatusWarn {
+			fmt.Printf("warning    %-10s the CA is installed, and this client still reads a store without it: %s\n", checks[f.Check], f.Detail)
+		}
 	}
 }
 

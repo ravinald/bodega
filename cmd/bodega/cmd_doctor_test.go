@@ -1008,6 +1008,10 @@ func TestPrintRemediationListsSkipWithoutRemedy(t *testing.T) {
 	}
 }
 
+// No test asks the node or pip that happens to be on the machine running it:
+// what those trust is the machine's, and the rows would follow it.
+func init() { doctorNode, doctorPip = nil, nil }
+
 // caPlanServer is a bodega served over TLS under a certificate no store on
 // this host trusts. It answers /client/plan with npm's, pip's and go's files
 // and the oci set, each path rooted under the caller's home, and counts the
@@ -1319,8 +1323,9 @@ func TestDoctorConfigureImportsIntoTheJVMTrustStore(t *testing.T) {
 	var stored []*x509.Certificate
 	var ran [][]string
 	fail := true
-	prevJVM, prevRun, prevExit := doctorJVM, doctorRun, doctorExit
+	prevJVM, prevRun, prevExit, prevImport := doctorJVM, doctorRun, doctorExit, doctorRunJVM
 	doctorExit = func(int) {}
+	doctorRunJVM = func(cmd []string) error { return doctorRun(cmd[0], cmd[1:]...) }
 	doctorJVM = func() (clientconf.JVMStore, []*x509.Certificate, error) {
 		return clientconf.JVMStore{Keytool: "/jdk/bin/keytool"}, stored, nil
 	}
@@ -1336,7 +1341,7 @@ func TestDoctorConfigureImportsIntoTheJVMTrustStore(t *testing.T) {
 		stored = append(stored, clientconf.ParseKeytoolList(data)...)
 		return nil
 	}
-	t.Cleanup(func() { doctorJVM, doctorRun, doctorExit = prevJVM, prevRun, prevExit })
+	t.Cleanup(func() { doctorJVM, doctorRun, doctorExit, doctorRunJVM = prevJVM, prevRun, prevExit, prevImport })
 	mavenRow := func() string {
 		out, err := runDoctor(t, "--url", srv.URL)
 		if err != nil {
@@ -1517,5 +1522,66 @@ func TestReviewDoctorRetriesFailedTrustRebuild(t *testing.T) {
 	out, err := runDoctor(t, args...)
 	if err != nil || attempts != 2 {
 		t.Fatalf("retry after failed trust rebuild: attempts=%d err=%v output=%s", attempts, err, out)
+	}
+}
+
+func TestAuditPipInstallUsesTheInstalledCA(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t)
+	srv, pem, _ := caPlanServer(t)
+	cafile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(cafile, pem, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pip := filepath.Join(home, "etc/pip.conf")
+	if err := os.MkdirAll(filepath.Dir(pip), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pip, []byte("[global]\nindex-url=https://pypi.org/simple/\n[install]\ncert=/missing/old-ca.pem\nno-compile=true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runDoctor(t, "--configure", "pip", "--ca-file", cafile, "--url", srv.URL, "--apply")
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	probe := host.TrustProbe{Root: home, GOOS: "linux", Getenv: func(string) string { return "" },
+		Chain:  func(string) ([]*x509.Certificate, error) { return []*x509.Certificate{srv.Certificate()}, nil },
+		System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} },
+	}
+	f := probe.Apply([]host.Finding{{Check: "pip-config", Status: host.StatusOK}}, srv.URL)[0]
+	if f.Status != host.StatusOK {
+		t.Fatalf("successful --ca-file left pip install untrusted: %+v", f)
+	}
+}
+
+// F116 R1: a CA written where a client no longer looks is not an install.
+// The run says which client still reads another store, and why.
+func TestDoctorConfigureWarnsWhenAnotherStoreOutranksTheCA(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t)
+	// The plan's pip.conf is rooted under home, so that is the root the
+	// report reads /etc from.
+	prevRoot := doctorOCIRoot
+	doctorOCIRoot = home
+	t.Cleanup(func() { doctorOCIRoot = prevRoot })
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply"}
+	out, err := runDoctor(t, args...)
+	if err != nil || strings.Contains(out, "warning ") {
+		t.Fatalf("--apply on a host with nothing outranking the plan = %v:\n%s", err, out)
+	}
+	t.Setenv("PIP_CERT", "/missing/site-ca.pem")
+	out, err = runDoctor(t, args...)
+	if err != nil || !strings.Contains(out, "Nothing to change") {
+		t.Fatalf("second --apply = %v:\n%s", err, out)
+	}
+	if !strings.Contains(out, "warning    pypi") || !strings.Contains(out, "the environment's PIP_CERT") {
+		t.Errorf("PIP_CERT outranks the cert setting the plan wrote; want a warning for pypi naming it:\n%s", out)
 	}
 }

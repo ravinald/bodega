@@ -209,6 +209,9 @@ type YumRepo struct {
 	// each baseurl, then mirrorlist and metalink. dnf prefers the last two
 	// over baseurl when either is set.
 	URLs []string
+	// CACert is the sslcacert the repository verifies its server against in
+	// place of the system trust store: its own, or else [main]'s.
+	CACert string
 }
 
 // DnfConfig is the repository configuration dnf loads on a host: the
@@ -246,6 +249,7 @@ func (c DnfConfig) ReadsDir(dir string) bool {
 func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 	c := DnfConfig{ReposDirs: defaultDirs}
 	var sections []iniSection
+	mainCA := ""
 	if mainConf != "" {
 		data, err := os.ReadFile(mainConf)
 		switch {
@@ -264,13 +268,18 @@ func ReadDnfConfig(mainConf string, defaultDirs []string) (DnfConfig, error) {
 		if v, ok := sec.values["reposdir"]; ok {
 			c.ReposDirs = dnfList(v)
 		}
+		mainCA = strings.TrimSpace(sec.values["sslcacert"])
 	}
 	add := func(path string, secs []iniSection) {
 		for _, sec := range secs {
 			if sec.name == "main" || slices.ContainsFunc(c.Repos, func(r YumRepo) bool { return r.ID == sec.name }) {
 				continue
 			}
-			c.Repos = append(c.Repos, sec.repo(path))
+			r := sec.repo(path)
+			if r.CACert == "" {
+				r.CACert = mainCA
+			}
+			c.Repos = append(c.Repos, r)
 		}
 	}
 	add(mainConf, sections)
@@ -313,6 +322,7 @@ func (s iniSection) repo(path string) YumRepo {
 	if v, ok := s.values["enabled"]; ok {
 		r.Enabled = !slices.Contains([]string{"0", "no", "false", "off"}, strings.ToLower(v))
 	}
+	r.CACert = strings.TrimSpace(s.values["sslcacert"])
 	r.URLs = dnfList(s.values["baseurl"])
 	for _, k := range []string{"mirrorlist", "metalink"} {
 		if v := strings.TrimSpace(s.values[k]); v != "" && v != "None" {

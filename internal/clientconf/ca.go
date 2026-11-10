@@ -12,11 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -122,11 +121,13 @@ type systemStore struct {
 
 // systemStoreFor resolves the trust store of the host. certctl before FreeBSD
 // 14 reads only *.pem from its trust path, so that is the extension there,
-// and before 15 it writes hashed links and no bundle, so both are read.
+// and before 15 it writes hashed links and no bundle, so both are read. Two
+// certificates of one subject hash to one name and take suffixes .0 and .1,
+// so every numbered entry is read, not the first.
 func systemStoreFor(h CAHost) (systemStore, error) {
 	if h.GOOS == OSFreeBSD {
 		return systemStore{"/usr/local/share/certs", ".pem", []string{"certctl", "rehash"},
-			[]string{"/etc/ssl/cert.pem", "/etc/ssl/certs/*.0"}}, nil
+			[]string{"/etc/ssl/cert.pem", "/etc/ssl/certs/*.[0-9]*"}}, nil
 	}
 	if h.GOOS == OSLinux {
 		for _, id := range osReleaseFamily(h.OSRelease) {
@@ -174,8 +175,8 @@ func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
 type JVMStore struct {
 	// Keytool is the keytool of the JVM, "" for the one on PATH.
 	Keytool string
-	// Keystore is the file javax.net.ssl.trustStore names, "" for the
-	// cacerts of the JDK Keytool belongs to.
+	// Keystore is the file javax.net.ssl.trustStore names, or the JDK's
+	// jssecacerts, and "" for the cacerts of the JDK Keytool belongs to.
 	Keystore string
 	// Password is javax.net.ssl.trustStorePassword, "" for the JDK's default.
 	Password string
@@ -186,8 +187,10 @@ const jvmDefaultPassword = "changeit"
 // ResolveJVMStore finds the trust store of the JVM Maven and Gradle start:
 // the JDK at JAVA_HOME, or else the one whose keytool is on PATH, and the
 // keystore a -Djavax.net.ssl.trustStore in JAVA_TOOL_OPTIONS or MAVEN_OPTS
-// names in place of that JDK's cacerts. MAVEN_OPTS is read last because the
-// JVM takes it after JAVA_TOOL_OPTIONS and the later definition wins.
+// names. MAVEN_OPTS is read last because the JVM takes it after
+// JAVA_TOOL_OPTIONS and the later definition wins. With no such property JSSE
+// loads lib/security/jssecacerts when the JDK holds one and cacerts only
+// otherwise, so a JDK with a jssecacerts never reads its cacerts.
 func ResolveJVMStore(getenv func(string) string, lookPath func(string) (string, error)) (JVMStore, error) {
 	var s JVMStore
 	for _, opt := range strings.Fields(getenv("JAVA_TOOL_OPTIONS") + " " + getenv("MAVEN_OPTS")) {
@@ -198,15 +201,29 @@ func ResolveJVMStore(getenv func(string) string, lookPath func(string) (string, 
 			s.Password = v
 		}
 	}
-	if home := getenv("JAVA_HOME"); home != "" {
+	home := getenv("JAVA_HOME")
+	if home != "" {
 		s.Keytool = filepath.Join(home, "bin", "keytool")
-		return s, nil
+	} else {
+		path, err := lookPath("keytool")
+		if err != nil {
+			return JVMStore{}, fmt.Errorf("no keytool on PATH and JAVA_HOME is unset, so the JVM Maven and Gradle run on is not known; set JAVA_HOME to its JDK")
+		}
+		s.Keytool = path
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			home = filepath.Dir(filepath.Dir(real))
+		}
 	}
-	path, err := lookPath("keytool")
-	if err != nil {
-		return JVMStore{}, fmt.Errorf("no keytool on PATH and JAVA_HOME is unset, so the JVM Maven and Gradle run on is not known; set JAVA_HOME to its JDK")
+	if s.Keystore == "" {
+		// The second directory is a JDK 8, whose JRE sits a level down.
+		for _, dir := range []string{"lib/security", "jre/lib/security"} {
+			jsse := filepath.Join(home, dir, "jssecacerts")
+			if info, err := os.Stat(jsse); err == nil && info.Mode().IsRegular() {
+				s.Keystore = jsse
+				break
+			}
+		}
 	}
-	s.Keytool = path
 	return s, nil
 }
 
@@ -251,11 +268,48 @@ func (s JVMStore) Trusted() ([]*x509.Certificate, error) {
 	cmd := s.command("-list", "-rfc")
 	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
 	if err != nil {
-		first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
 		return nil, fmt.Errorf("%s: %w (%s). keytool lists a JDK's own cacerts from JDK 9 on, with the password %q unless -Djavax.net.ssl.trustStorePassword in MAVEN_OPTS names another",
-			RedactJVMCommand(cmd), err, first, jvmDefaultPassword)
+			RedactJVMCommand(cmd), err, jvmDiagnostic(out, cmd), jvmDefaultPassword)
 	}
 	return ParseKeytoolList(out), nil
+}
+
+// RunJVMCommand runs a keytool command and returns what it said when it
+// failed. Its output is captured, never passed through: a JVM opens with a
+// banner echoing JAVA_TOOL_OPTIONS, which is where a keystore password sits.
+func RunJVMCommand(cmd []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, jvmDiagnostic(out, cmd))
+	}
+	return nil
+}
+
+var jvmSecret = regexp.MustCompile(`(?i)(pass(?:word|phrase)?[^\s=:]*[=:]\s*)\S+`)
+
+// jvmDiagnostic is the first line of a failed keytool's output that is its
+// own, with anything that reads as a password blanked. The JVM's "Picked up"
+// banners are skipped whole: they print the environment, not the failure.
+func jvmDiagnostic(out []byte, cmd []string) string {
+	var secret string
+	for i := 1; i < len(cmd); i++ {
+		if cmd[i-1] == "-storepass" && cmd[i] != jvmDefaultPassword {
+			secret = cmd[i]
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "Picked up ") {
+			continue
+		}
+		if secret != "" {
+			line = strings.ReplaceAll(line, secret, "<trustStorePassword>")
+		}
+		return jvmSecret.ReplaceAllString(line, "${1}<redacted>")
+	}
+	return "it printed nothing of its own"
 }
 
 // ParseKeytoolList reads the certificates out of keytool -list -rfc output.
@@ -316,9 +370,10 @@ var ownStoreSystems = []string{manifest.TypeNpm, manifest.TypePypi, manifest.Typ
 // per registry host, an import into the JVM trust store for Maven and Gradle,
 // and for every other system an anchor in the operating system's trust store.
 //
-// A file that takes a CA setting and already exists keeps every setting the
-// plan does not set: the plan's settings and the CA are merged into it, where
-// a plan without a CA replaces it whole.
+// Every file the plan edits that already exists keeps what the plan does not
+// set, whether its client reads a CA setting or the system store: kindOf
+// names how each format takes the plan's settings, where a plan without a CA
+// replaces the file whole.
 //
 // The certificate files follow the plan's own changes, because Apply writes
 // last to first: a setting naming a CA file is written only after that file.
@@ -374,10 +429,10 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	for i, c := range in.Changes {
 		rec := c.Record
 		// header and line are the CA setting and the section it belongs
-		// under; continues says an indented line continues the value above.
+		// under.
+		kind := kindOf(rec)
 		var header string
 		var line func(caPath string) string
-		continues, isTOML := false, false
 		switch {
 		case rec.System == manifest.TypeMaven:
 			if jvm {
@@ -412,13 +467,13 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		case rec.System == manifest.TypeNpm && rec.Path != NodeMirrorSystemPath && rec.Path != NodeMirrorUserPath:
 			line = func(caPath string) string { return "cafile=" + caPath }
 		case rec.System == manifest.TypePypi:
-			header, continues = "[global]", true
+			header = "[global]"
 			line = func(caPath string) string { return "cert = " + caPath }
 		case rec.System == manifest.TypeGit:
 			header = fmt.Sprintf("[http %q]", trim(h.Base)+"/")
 			line = func(caPath string) string { return "\tsslCAInfo = " + caPath }
 		case rec.System == manifest.TypeOCI && strings.HasSuffix(rec.Path, "/hosts.toml"):
-			header, isTOML = "[host."+jsonString(trim(h.Base))+"]", true
+			header = "[host." + jsonString(trim(h.Base)) + "]"
 			line = func(caPath string) string { return "  ca = " + jsonString(caPath) }
 		case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimeDocker:
 			// Docker reads certs.d beside daemon.json, keyed by the host and
@@ -432,7 +487,18 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		}
+		refuse := func(err error) error {
+			return fmt.Errorf("%s: %s with bodega's settings merged in would not read as the plan sets it (%w). "+
+				"It holds a form this merge does not edit, such as a value spanning several lines or a table spelled another way; move the file aside and re-run to have it written whole", rec.System, c.Target, err)
+		}
 		if line == nil {
+			if c.Existed && !c.Unchanged() {
+				merged, err := kind.merge(c.Old, c.New)
+				if err != nil {
+					return CAInstall{}, refuse(err)
+				}
+				in.Changes[i].New = merged
+			}
 			continue
 		}
 		caPath, err := shared(rec.Path)
@@ -443,16 +509,25 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if c.Existed {
 			// New holds the plan's file and nothing of the host's but a
 			// credential; the host's file is what the settings join.
-			body = mergeSettings(splitBody(c.Old), body, continues)
+			body = mergeSettings(splitBody(c.Old), body, *kind.rules)
 		}
 		// A setting in a section leads it, so it reads beside the header
 		// that scopes it; npm's file has no sections, and it ends the file.
-		merged := joinBody(setSection(body, header, []string{line(caPath)}, continues, header != ""))
-		if isTOML {
-			var doc map[string]any
-			if _, err := toml.Decode(string(merged), &doc); err != nil {
-				return CAInstall{}, fmt.Errorf("%s: %s with bodega's settings and the CA merged in is not TOML containerd can load (%w). "+
-					"It holds a value this merge does not edit, such as one spanning several lines; move the file aside and re-run to have it written whole", rec.System, c.Target, err)
+		set := []string{line(caPath)}
+		body = setSection(body, header, set, *kind.rules, header != "")
+		if rec.System == manifest.TypePypi {
+			// A command's own section outranks [global], so a cert left in
+			// one would keep pip on the bundle it named.
+			for _, other := range sectionsSetting(body, "cert", *kind.rules) {
+				if other != header {
+					body = setSection(body, other, set, *kind.rules, false)
+				}
+			}
+		}
+		merged := joinBody(body)
+		if kind.holds != nil {
+			if err := kind.holds(merged, c.New); err != nil {
+				return CAInstall{}, refuse(err)
 			}
 		}
 		in.Changes[i].New = merged
@@ -517,7 +592,7 @@ func settingKey(line string) string {
 // mergeSettings sets every setting of planned in old, section by section,
 // and keeps every other line of old: its other settings, sections, comments
 // and their order. planned's own comments are not carried.
-func mergeSettings(old, planned []string, continues bool) []string {
+func mergeSettings(old, planned []string, rules lineRules) []string {
 	var headers []string
 	bySection := map[string][]string{}
 	header := ""
@@ -526,7 +601,7 @@ func mergeSettings(old, planned []string, continues bool) []string {
 			header = t
 			continue
 		}
-		if settingKey(l) == "" {
+		if rules.key(l) == "" {
 			continue
 		}
 		if _, ok := bySection[header]; !ok {
@@ -535,25 +610,74 @@ func mergeSettings(old, planned []string, continues bool) []string {
 		bySection[header] = append(bySection[header], l)
 	}
 	for _, h := range headers {
-		old = setSection(old, h, bySection[h], continues, false)
+		old = setSection(old, h, bySection[h], rules, false)
 	}
 	return old
 }
 
-// setSection sets the lines of set, each "key = value", under header: every
-// line in a section of that name giving one of their keys is dropped, with
-// the indented lines continuing it when continues is set, and set goes where
-// the first of them stood. With none there it goes first in the section when
-// lead is set, and after the section's last line otherwise. A body with no
-// such section gains it at the end. An empty header is the lines above the
-// first section, the whole body of a file that has none.
+func indentOf(line string) int { return len(line) - len(strings.TrimLeft(line, " \t")) }
+
+// lineScan walks a body telling the lines that open a setting from the lines
+// that continue the one above.
+type lineScan struct {
+	rules lineRules
+	// keyIndent is the indentation of the setting a deeper line continues,
+	// -1 under a header before its first setting.
+	keyIndent int
+	slash     bool
+}
+
+// continues reports whether l continues the line above it.
+func (s *lineScan) continues(l string) bool {
+	t := strings.TrimSpace(l)
+	cont := s.slash || s.rules.indent && s.keyIndent >= 0 && t != "" && indentOf(l) > s.keyIndent
+	s.slash = s.rules.backslash && strings.HasSuffix(t, `\`)
+	return cont
+}
+
+// sectionsSetting lists the headers of the sections of lines that set key.
+func sectionsSetting(lines []string, key string, rules lineRules) []string {
+	var out []string
+	scan := lineScan{rules: rules, keyIndent: -1}
+	header := ""
+	for _, l := range lines {
+		if scan.continues(l) {
+			continue
+		}
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "[") {
+			header, scan.keyIndent = t, -1
+			continue
+		}
+		k := rules.key(l)
+		if k == "" {
+			continue
+		}
+		scan.keyIndent = indentOf(l)
+		if k == key && !slices.Contains(out, header) {
+			out = append(out, header)
+		}
+	}
+	return out
+}
+
+// setSection sets the lines of set, each a setting, under header: every line
+// in a section of that name giving one of their keys is dropped, with the
+// lines continuing it, and set goes where the first of them stood. With none
+// there it goes first in the section when lead is set, and after the
+// section's last line otherwise. A body with no such section gains it at the
+// end. An empty header is the lines above the first section, the whole body
+// of a file that has none.
+//
+// Where indentation continues a value, set takes the indentation of the
+// section's own settings: a setting written shallower than the one under it
+// would swallow that one as its continuation.
 //
 // A key may repeat in set (git's insteadOf does), which is why the keys are
 // replaced as a group rather than line by line.
-func setSection(lines []string, header string, set []string, continues, lead bool) []string {
+func setSection(lines []string, header string, set []string, rules lineRules, lead bool) []string {
 	keys := map[string]bool{}
 	for _, l := range set {
-		keys[settingKey(l)] = true
+		keys[rules.key(l)] = true
 	}
 	var out []string
 	in := header == ""
@@ -568,22 +692,32 @@ func setSection(lines []string, header string, set []string, continues, lead boo
 		for end = len(out); end > start && strings.TrimSpace(out[end-1]) == ""; end-- {
 		}
 	}
-	dropping := false
+	scan := lineScan{rules: rules, keyIndent: -1}
+	margin, dropping := "", false
 	for _, l := range lines {
+		if scan.continues(l) {
+			if !dropping {
+				out = append(out, l)
+			}
+			continue
+		}
 		if t := strings.TrimSpace(l); strings.HasPrefix(t, "[") {
 			closeSection()
-			in, dropping = header != "" && t == header, false
+			in, dropping, scan.keyIndent = header != "" && t == header, false, -1
 			out = append(out, l)
 			if in && start < 0 {
 				start = len(out)
 			}
 			continue
 		}
-		if in {
-			if dropping && continues && l != strings.TrimLeft(l, " \t") && strings.TrimSpace(l) != "" {
-				continue
+		// A blank line or a comment opens nothing: the lines under it still
+		// continue the setting above it.
+		if k := rules.key(l); k != "" {
+			if in && scan.keyIndent < 0 {
+				margin = l[:indentOf(l)]
 			}
-			if dropping = keys[settingKey(l)] && settingKey(l) != ""; dropping {
+			scan.keyIndent = indentOf(l)
+			if dropping = in && keys[k]; dropping {
 				if at < 0 {
 					at = len(out)
 				}
@@ -593,6 +727,12 @@ func setSection(lines []string, header string, set []string, continues, lead boo
 		out = append(out, l)
 	}
 	closeSection()
+	if rules.indent && margin != "" {
+		set = slices.Clone(set)
+		for i, l := range set {
+			set[i] = margin + strings.TrimLeft(l, " \t")
+		}
+	}
 	if start < 0 {
 		return append(append(out, header), set...)
 	}
