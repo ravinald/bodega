@@ -19,7 +19,7 @@ SITE = Path(__file__).resolve().parents[1]
 REPO = SITE.parent
 DEFAULT_CONFIG = REPO / 'docs-internal/site-deploy.json'
 # Every repository path the generator reads.
-RENDERED = ('site', 'docs', 'assets', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md')
+RENDERED = ('site', 'docs', 'api', 'assets', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md')
 
 
 @dataclass(frozen=True)
