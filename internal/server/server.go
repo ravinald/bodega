@@ -268,6 +268,12 @@ type Server struct {
 	// reloadSignals, when set, is a SIGHUP channel the caller registered
 	// before New. Start otherwise registers its own.
 	reloadSignals chan os.Signal
+
+	// certs is the listener's certificate while Start serves TLS, and nil
+	// otherwise. Start writes it and the reload goroutine reads it.
+	certs atomic.Pointer[certReloader]
+	// certPollEvery overrides certPollInterval when positive.
+	certPollEvery time.Duration
 }
 
 // SetReloadSignals hands Start a channel already registered for SIGHUP.
@@ -706,7 +712,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Configure TLS if cert/key are provided.
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
-		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		certs, err := newCertReloader(s.cfg.TLSCert, s.cfg.TLSKey, s.logger)
 		if err != nil {
 			return fmt.Errorf("load TLS certificate: %w", err)
 		}
@@ -715,9 +721,16 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 		srv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   minVer,
+			GetCertificate: certs.GetCertificate,
+			MinVersion:     minVer,
 		}
+		s.certs.Store(certs)
+		defer s.certs.Store(nil)
+		every := s.certPollEvery
+		if every <= 0 {
+			every = certPollInterval
+		}
+		go certs.poll(ctx, every)
 	}
 
 	// Before the PID file and READY=1, either of which invites a SIGHUP.
@@ -905,8 +918,19 @@ const reloadRequested = "reload requested, re-reading manifests, the apt, pkg an
 // non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
 	s.logger.Info(reloadRequested)
+	s.reloadCertificate()
 	s.refreshAdmission(ctx)
 	s.reloadIndex(ctx)
+}
+
+// reloadCertificate rereads the TLS pair on a server that terminates TLS. It
+// runs on the signal's own goroutine, ahead of the rebuild, for the reason the
+// access lists do: it is cheap, and a renewed certificate waiting behind an
+// apt rebuild is an expired one served for that long.
+func (s *Server) reloadCertificate() {
+	if certs := s.certs.Load(); certs != nil {
+		certs.reload()
+	}
 }
 
 // refreshAdmission installs the state that decides who is served what.
@@ -957,6 +981,7 @@ func (s *Server) serveReloads(sig <-chan os.Signal, stop <-chan struct{}) {
 			return
 		case <-sig:
 			s.logger.Info(reloadRequested)
+			s.reloadCertificate()
 			s.refreshAdmission(ctx)
 			select {
 			case rebuild <- struct{}{}:
