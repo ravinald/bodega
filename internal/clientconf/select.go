@@ -131,7 +131,8 @@ func PodmanCertDir(home, root, hostPort string) string {
 // GIT_CONFIG_NOSYSTEM turns it off, then the per-user files, the XDG one
 // ahead of ~/.gitconfig. GIT_CONFIG_SYSTEM and GIT_CONFIG_GLOBAL each name a
 // file read in place of those. A repository's own config, the entries
-// GIT_CONFIG_COUNT carries and files an [include] names are not listed.
+// GIT_CONFIG_COUNT carries and files an [include] names are not listed;
+// GitUnread reports the last two.
 func GitConfigFiles(getenv func(string) string, home, root string) []string {
 	env := func(key string) string {
 		if getenv == nil {
@@ -297,7 +298,59 @@ func GitUnread(getenv func(string) string, files []string) []string {
 			out = append(out, fmt.Sprintf("the section header %s in %s, written in a form other than [name] or [name \"subsection\"]", unread[0], f))
 		}
 	}
+	return append(out, GitIncludes(files)...)
+}
+
+// GitIncludes names each [include] and [includeIf] section the files hold,
+// as a phrase a diagnostic can carry. git reads the files such a section
+// names where the section stands, so a setting in one can outrank any this
+// package reads, and none of them is opened here: a file holding one is
+// refused by the install and left unchecked by the probe.
+func GitIncludes(files []string) []string {
+	var out []string
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		scan := lineScan{rules: slashRules, keyIndent: -1}
+		for _, l := range splitBody(data) {
+			if scan.continues(l) {
+				continue
+			}
+			m := gitSection.FindStringSubmatch(strings.TrimSpace(l))
+			if m != nil && (strings.EqualFold(m[1], "include") || strings.EqualFold(m[1], "includeIf")) {
+				out = append(out, fmt.Sprintf("the include section %s in %s, which has git read another file there", strings.TrimSpace(l), f))
+				break
+			}
+		}
+	}
 	return out
+}
+
+// NpmInlineCA returns the first top-level ca or ca[] key the npmrc at path
+// assigns, "" when it assigns neither or cannot be read. npm keeps one CA
+// list that ca and cafile both replace, in the order a file sets them, so a
+// file holding either key beside cafile does not read the cafile alone.
+func NpmInlineCA(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		if line[0] == '[' && strings.HasSuffix(line, "]") {
+			break
+		}
+		key, _, _ := strings.Cut(line, "=")
+		if key = strings.TrimSpace(key); key == "ca" || key == "ca[]" {
+			return key
+		}
+	}
+	return ""
 }
 
 // gitURL is a URL as git's urlmatch compares one: scheme and host lowercased,

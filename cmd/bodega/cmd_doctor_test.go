@@ -1046,6 +1046,16 @@ func caPlanServer(t *testing.T) (srv *httptest.Server, caPEM []byte, requests *i
 	})
 	srv = httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
+	// The plan below writes each system path as Linux names it, under the
+	// home directory, so the probe judging the install reads the host's
+	// files from there and by Linux's layout too.
+	prev := doctorTrustProbe
+	doctorTrustProbe = func() host.TrustProbe {
+		p := prev()
+		p.Root, p.GOOS = p.Home, clientconf.OSLinux
+		return p
+	}
+	t.Cleanup(func() { doctorTrustProbe = prev })
 	files = []planFile{
 		{manifest.TypeNpm, "~/.npmrc", "", clientconf.Npm(srv.URL, nil).Content},
 		{manifest.TypePypi, "~/etc/pip.conf", "", clientconf.Pip(srv.URL).Content},
@@ -1704,10 +1714,10 @@ func TestFinalDoctorRejectsPipIgnoringEveryConfig(t *testing.T) {
 	}
 }
 
-// F116 R1: after an install every selected system owes a verdict, and only a
+// F116 R1: after an install every owed check gets a verdict, and only a
 // client shown to verify bodega's certificate passes. One that still reads a
-// store without the CA fails the run, and so does one that could not be
-// judged; one nothing points at bodega is reported apart and fails nothing.
+// store without the CA fails the run, and so do one that could not be judged
+// and one nothing points at bodega.
 func TestUnreadCAOwesAVerdictPerSystem(t *testing.T) {
 	srv, caPEM, _ := caPlanServer(t)
 	root := t.TempDir()
@@ -1725,7 +1735,7 @@ func TestUnreadCAOwesAVerdictPerSystem(t *testing.T) {
 		return host.TrustProbe{Root: root, Home: "/home/u", GOOS: "linux", Getenv: func(string) string { return "" },
 			System: func([]*x509.Certificate, string) error { return nil }}
 	}
-	systems := []string{manifest.TypePypi, manifest.TypeCargo}
+	systems := []string{"pip-config"}
 	for _, tc := range []struct {
 		name, cert, want string
 	}{
@@ -1744,11 +1754,89 @@ func TestUnreadCAOwesAVerdictPerSystem(t *testing.T) {
 			t.Errorf("%s: %v; want a failure naming pypi alone and %q", tc.name, err, tc.want)
 		}
 	}
-	if err := unreadCA([]string{manifest.TypeCargo}, nil, srv.URL); err != nil {
-		t.Errorf("a client nothing points at bodega failed the run: %v", err)
+	err := unreadCA([]string{"cargo-config", "pip-config"}, nil, srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "unverified") || !strings.Contains(err.Error(), "cargo: ") || strings.Contains(err.Error(), "pypi: ") {
+		t.Errorf("a selected client nothing points at bodega = %v; want a failure naming cargo alone as unverified", err)
+	}
+	if got := owedTrustChecks([]clientconf.PlanRecord{{System: manifest.TypeOCI, Path: clientconf.DockerDaemonPath}, {System: manifest.TypeNpm, Path: "~/.npmrc"}}); !slices.Equal(got, []string{"npm-config", "oci-docker"}) {
+		t.Errorf("owed checks = %v; want npm's and the one runtime the plan writes for", got)
 	}
 	srv.Close()
 	if err := unreadCA(systems, nil, srv.URL); err == nil || !strings.Contains(err.Error(), "could not be checked") {
 		t.Errorf("a bodega that stopped answering = %v; want the run to say nothing was checked", err)
+	}
+}
+
+func TestAudit6DoctorCannotSucceedWithoutSelectedTrust(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_CA", "npm_config_ca", "npm_config_cafile"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NPM_CONFIG_REGISTRY", "https://registry.corp.example/")
+	stubRuntimes(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile, wrong := filepath.Join(home, "ca.pem"), filepath.Join(home, "unrelated-ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: "unrelated CA"}, IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrong, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NPM_CONFIG_CAFILE", wrong)
+	for i := 0; i < 2; i++ {
+		out, err := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("apply %d returned success with selected npm unverified and NPM_CONFIG_CAFILE pointing at an unrelated CA (unverified line: %v)", i+1, strings.Contains(out, "unverified"))
+		}
+	}
+}
+
+// F116 R1: a selected client the install did not reach fails the run. With
+// the environment naming another registry, npm reads nothing pointing it at
+// bodega, and each apply says so and exits non-zero. A cafile the environment
+// sets ahead of the installed one is refused before .npmrc is written.
+func TestDoctorFailsASelectedClientLeftUnverified(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_CA", "npm_config_ca", "npm_config_cafile", "NPM_CONFIG_CAFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NPM_CONFIG_REGISTRY", "https://registry.corp.example/")
+	stubRuntimes(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(home, "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply"}
+
+	t.Setenv("NPM_CONFIG_CAFILE", filepath.Join(home, "elsewhere.pem"))
+	if _, err := runDoctor(t, args...); err == nil || !strings.Contains(err.Error(), "NPM_CONFIG_CAFILE") {
+		t.Errorf("apply under NPM_CONFIG_CAFILE = %v; want a refusal naming the variable", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".npmrc")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the refusal wrote .npmrc: %v", err)
+	}
+
+	t.Setenv("NPM_CONFIG_CAFILE", "")
+	for i := 0; i < 2; i++ {
+		_, err := runDoctor(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "unverified") || !strings.Contains(err.Error(), "npm: ") {
+			t.Errorf("apply %d with npm's registry set elsewhere = %v; want a failure naming npm as unverified", i+1, err)
+		}
+	}
+	t.Setenv("NPM_CONFIG_REGISTRY", "")
+	if out, err := runDoctor(t, args...); err != nil {
+		t.Errorf("apply once npm reads the registry written = %v:\n%s", err, out)
 	}
 }

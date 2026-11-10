@@ -1783,3 +1783,167 @@ func TestGitValueGrammar(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit6CAHandlesGitIncludes(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target, included := filepath.Join(home, ".gitconfig"), filepath.Join(home, "corporate.gitconfig")
+	if err := os.WriteFile(included, []byte("[http \""+testBase+"/git/gh/\"]\n\tsslCAInfo = /missing/corporate.pem\n\textraHeader = X-Corp: keep\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("[include]\n\tpath = "+included+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	native := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "config", "--includes", "--file", target, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+		if err != nil {
+			t.Fatalf("native git: %v: %s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := native(); got != "/missing/corporate.pem" {
+		t.Fatalf("fixture: git reads %q", got)
+	}
+	in, err := AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "include") {
+			t.Fatalf("refusal must identify the unread include: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if got := native(); got != want {
+		t.Fatalf("successful CA apply leaves native git reading %q; want %q or a pre-write refusal of the include", got, want)
+	}
+}
+
+func TestAudit6NpmInlineCAAfterCAFile(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	raw, leaf, _ := testCA(t, "bodega.example.com")
+	other, _, _ := testCA(t, "other.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	old := "registry=" + testBase + "/npm/\ncafile=/missing/previous.pem\nca[]=\"" + strings.ReplaceAll(strings.TrimSpace(string(other)), "\n", `\n`) + "\"\nsave-exact=true\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux})
+	if err != nil {
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "get", "ca", "--json", "--userconfig", target, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = home
+	for _, entry := range os.Environ() {
+		k, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(strings.ToLower(k), "npm_config_") && k != "HOME" && k != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("native npm: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(out) {
+		t.Fatalf("native npm returned no CA: %s", out)
+	}
+	block, _ := pem.Decode(leaf)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: pool, DNSName: "bodega.example.com"}); err != nil {
+		t.Fatalf("successful apply leaves npm's effective inline CA without bodega's issuer: %v", err)
+	}
+}
+
+// F116 R1: what AddCA detects in a client's configuration and does not
+// interpret is refused while the plan is built, naming it, so nothing is
+// written; an environment cafile naming the installed copy is not one.
+func TestCARefusesWhatItDoesNotInterpret(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	for _, tc := range []struct {
+		name  string
+		file  File
+		files map[string]string
+		env   map[string]string
+		want  []string
+	}{
+		{"git includeIf in the per-user file", git, map[string]string{"~/.gitconfig": "[user]\n\tname = kept\n[includeIf \"gitdir:~/work/\"]\n\tpath = ~/work.gitconfig\n"}, nil, []string{"includeIf", ".gitconfig"}},
+		{"git include in the system file", git, map[string]string{"/etc/gitconfig": "[Include]\n\tpath = /etc/corp.gitconfig\n"}, nil, []string{"[Include]", "etc/gitconfig"}},
+		{"npm inline ca ahead of cafile", Npm(testBase, nil), map[string]string{"~/.npmrc": "ca=\ncafile=/old.pem\n"}, nil, []string{"sets ca,", ".npmrc"}},
+		{"npm ca[] in the file the environment selects", Npm(testBase, nil), map[string]string{"~/corp.npmrc": "ca[]=\"x\"\n"}, map[string]string{"NPM_CONFIG_USERCONFIG": "~/corp.npmrc"}, []string{"ca[]", "corp.npmrc"}},
+		{"npm inline ca from the environment", Npm(testBase, nil), nil, map[string]string{"npm_config_ca": "x"}, []string{"npm_config_ca"}},
+		{"npm cafile from the environment", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "/etc/ssl/corp.pem"}, []string{"NPM_CONFIG_CAFILE", "/etc/ssl/corp.pem"}},
+		{"npm cafile from the environment naming the installed copy", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "~/.config/bodega/ca.pem"}, nil},
+	} {
+		home, root := t.TempDir(), t.TempDir()
+		at := func(p string) string {
+			if rest, ok := strings.CutPrefix(p, "~/"); ok {
+				return filepath.Join(home, rest)
+			}
+			return filepath.Join(root, p)
+		}
+		for p, content := range tc.files {
+			if err := os.MkdirAll(filepath.Dir(at(p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(at(p), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		getenv := func(key string) string {
+			if v, ok := tc.env[key]; ok && strings.HasPrefix(v, "~/") {
+				return at(v)
+			}
+			return tc.env[key]
+		}
+		_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, Getenv: getenv})
+		if tc.want == nil {
+			if err != nil {
+				t.Errorf("%s: %v; want a plan", tc.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: planned an install", tc.name)
+			continue
+		}
+		for _, want := range append(tc.want, "Nothing was written") {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: refusal does not name %q: %v", tc.name, want, err)
+			}
+		}
+		for p, content := range tc.files {
+			if got, _ := os.ReadFile(at(p)); string(got) != content {
+				t.Errorf("%s: the refusal changed %s", tc.name, p)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Errorf("%s: the refusal left a CA copy behind: %v", tc.name, err)
+		}
+	}
+}

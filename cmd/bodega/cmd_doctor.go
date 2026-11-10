@@ -718,12 +718,8 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	var caStep []string
 	var caImports [][]string
-	var caSystems, caOSStore []string
-	for _, rec := range records {
-		if !slices.Contains(caSystems, rec.System) {
-			caSystems = append(caSystems, rec.System)
-		}
-	}
+	var caOSStore []string
+	caOwed := owedTrustChecks(records)
 	if ca != nil {
 		osRelease, _ := os.ReadFile(doctorOSRelease)
 		h := clientconf.CAHost{
@@ -814,7 +810,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		if ca != nil && req.apply {
-			return unreadCA(caSystems, caOSStore, client.BaseURL)
+			return unreadCA(caOwed, caOSStore, client.BaseURL)
 		}
 		return nil
 	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
@@ -879,7 +875,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	// remaining steps have run: they do not depend on it.
 	var unread error
 	if ca != nil {
-		unread = unreadCA(caSystems, caOSStore, client.BaseURL)
+		unread = unreadCA(caOwed, caOSStore, client.BaseURL)
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -1008,24 +1004,41 @@ var (
 	doctorRunJVM = clientconf.RunJVMCommand
 )
 
-// unreadCA is the error for each of systems whose client, after this run
+// owedTrustChecks lists the trust checks the plan's records owe a verdict
+// on after a CA install: every check of each system the plan writes for,
+// and for OCI only the runtimes it writes a file for, so a runtime this host
+// does not run owes nothing and one it does cannot pass on another's verdict.
+func owedTrustChecks(records []clientconf.PlanRecord) []string {
+	checks := host.TrustSystems()
+	var owed []string
+	for _, check := range slices.Sorted(maps.Keys(checks)) {
+		if slices.ContainsFunc(records, func(rec clientconf.PlanRecord) bool {
+			if rec.System != checks[check] {
+				return false
+			}
+			return rec.System != manifest.TypeOCI || check == "oci-"+clientconf.OCIRuntimeOf(rec.Path)
+		}) {
+			owed = append(owed, check)
+		}
+	}
+	return owed
+}
+
+// unreadCA is the error for each owed check whose client, after this run
 // installed the CA, was not shown to verify bodega's certificate. Every
-// selected system owes a verdict, and only a verified one passes:
+// check owes a verdict, and only a verified one passes:
 //
 //   - a client still reading a store without the CA (an environment variable
 //     or a setting in a file the plan does not edit, outranking what the plan
 //     wrote);
-//   - a client whose trust could not be determined, which is not a pass.
+//   - a client whose trust could not be determined, which is not a pass;
+//   - a client that reads nothing pointing it at bodega (a registry the
+//     environment names elsewhere, configuration loaded from where this
+//     command does not look), which the install therefore did not reach.
 //
-// A run that leaves either exits non-zero, because for that client no install
-// was established. A system with no trust check of its own owes nothing here.
-//
-// A client that reads nothing pointing it at bodega is a third outcome, and
-// is printed as unverified rather than counted as either: the plan names
-// where each file goes, and this host's client may load its configuration
-// from somewhere this command does not look. The cases where it is known not
-// to load the plan's file (configuration the environment turns off or
-// points elsewhere) are refused before anything is written, in AddCA.
+// A run that leaves any of them exits non-zero, because for that client no
+// install was established. A system with no trust check of its own owes
+// nothing here.
 //
 // osStore names the systems whose anchors the plan put in the operating
 // system's trust store. For those the store counts as holding the CA, since
@@ -1033,15 +1046,13 @@ var (
 // rebuild. For every other system the plan left that store alone, so the
 // client is judged against what it reads today: the store as it stands and
 // the files the plan wrote for it.
-func unreadCA(systems, osStore []string, base string) error {
+func unreadCA(owed, osStore []string, base string) error {
 	checks := host.TrustSystems()
 	var rebuilt, own []string
-	for _, check := range slices.Sorted(maps.Keys(checks)) {
-		switch sys := checks[check]; {
-		case !slices.Contains(systems, sys):
-		case slices.Contains(osStore, sys):
+	for _, check := range owed {
+		if slices.Contains(osStore, checks[check]) {
 			rebuilt = append(rebuilt, check)
-		default:
+		} else {
 			own = append(own, check)
 		}
 	}
@@ -1055,28 +1066,23 @@ func unreadCA(systems, osStore []string, base string) error {
 	if err != nil {
 		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
 	}
-	// A system with several checks (one per container runtime) is judged on
-	// the worst of them, and reaches bodega when any of them does.
-	worst := map[string]host.TrustVerdict{}
-	for _, v := range append(verdicts, more...) {
-		if have, ok := worst[v.System]; !ok || v.State > have.State {
-			worst[v.System] = v
+	verdicts = append(verdicts, more...)
+	slices.SortFunc(verdicts, func(a, b host.TrustVerdict) int { return strings.Compare(a.Check, b.Check) })
+	var refused, unchecked, absent []string
+	for _, v := range verdicts {
+		// One system with several clients names the client, not the system.
+		name := v.System
+		if v.System == manifest.TypeOCI {
+			name = v.Check
 		}
-	}
-	var refused, unchecked []string
-	var absent []string
-	for _, sys := range slices.Sorted(maps.Keys(worst)) {
-		switch v := worst[sys]; v.State {
+		switch v.State {
 		case host.TrustFailed:
-			refused = append(refused, fmt.Sprintf("  %s: %s", sys, v.Detail))
+			refused = append(refused, fmt.Sprintf("  %s: %s", name, v.Detail))
 		case host.TrustUnchecked:
-			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", sys, v.Detail))
+			unchecked = append(unchecked, fmt.Sprintf("  %s: %s", name, v.Detail))
 		case host.TrustAbsent:
-			absent = append(absent, sys)
+			absent = append(absent, fmt.Sprintf("  %s: nothing this command finds its client reading points it at %s", name, base))
 		}
-	}
-	for _, sys := range absent {
-		fmt.Printf("unverified %-10s nothing this command finds its client reading points it at %s, so whether it loads what was written, and verifies bodega's certificate with it, is unconfirmed\n", sys, base)
 	}
 	var parts []string
 	if len(refused) > 0 {
@@ -1088,6 +1094,11 @@ func unreadCA(systems, osStore []string, base string) error {
 		parts = append(parts, fmt.Sprintf("%d client(s) could not be checked, which is not a pass:\n%s\n"+
 			"  Remove what keeps this command from reading that client's trust, then re-run",
 			len(unchecked), strings.Join(unchecked, "\n")))
+	}
+	if len(absent) > 0 {
+		parts = append(parts, fmt.Sprintf("%d client(s) are unverified, so whether each loads what was written is not established:\n%s\n"+
+			"  Unset the variable or correct the setting that sends the client elsewhere (a registry or index the environment names, a configuration file read in place of the one written), then re-run",
+			len(absent), strings.Join(absent, "\n")))
 	}
 	if len(parts) == 0 {
 		return nil

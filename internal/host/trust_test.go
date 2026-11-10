@@ -965,3 +965,19 @@ func TestJudgeTellsVerifiedFromEverythingElse(t *testing.T) {
 		t.Error("a plaintext base was judged")
 	}
 }
+
+func TestAudit6GitIncludeProbe(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	target, included := filepath.Join(p.Home, ".gitconfig"), filepath.Join(p.Home, "corporate.gitconfig")
+	writeTrustFile(t, included, "[http \""+base+"/git/gh/\"]\n\tsslCAInfo = /missing/corporate.pem\n")
+	writeTrustFile(t, target, "[url \""+base+"/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http \""+base+"/\"]\n\tsslCAInfo = "+ca+"\n[include]\n\tpath = "+included+"\n")
+	out, err := exec.Command("git", "config", "--includes", "--file", target, "--get-urlmatch", "http.sslCAInfo", base+"/git/gh/repo").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "/missing/corporate.pem" {
+		t.Fatalf("native git: %v: %s", err, out)
+	}
+	f := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || (!strings.Contains(f.Detail, "/missing/corporate.pem") && !strings.Contains(strings.ToLower(f.Detail), "include")) || !strings.Contains(f.Remediation, "--ca-file") {
+		t.Fatalf("native git selects the included missing CA; probe returned %+v", f)
+	}
+}

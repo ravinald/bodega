@@ -214,7 +214,9 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 // to load, or to load settings beside that no file holds: writing the file
 // would report an install the client never reads. An environment variable
 // naming an existing file is not one of these; shadows gives that file the
-// edit.
+// edit. It also refuses what this package detects and does not interpret: a
+// git file with an include, and anything beside cafile that assigns npm's CA
+// list.
 func (h CAHost) ignored(rec PlanRecord, target string) error {
 	env := func(key string) string {
 		if h.Getenv == nil {
@@ -247,18 +249,72 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 	case rec.System == manifest.TypePypi && env("PIP_CONFIG_FILE") == os.DevNull:
 		return fmt.Errorf("%s: PIP_CONFIG_FILE is set to %s, which tells pip to load no configuration file, so it would read neither the index nor the CA written to %s. "+
 			"Unset PIP_CONFIG_FILE, then re-run", rec.System, os.DevNull, target)
-	case rec.System == manifest.TypeNpm && user && rec.Path != NodeMirrorUserPath:
-		return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
+	case rec.System == manifest.TypeNpm && rec.Path != NodeMirrorSystemPath && rec.Path != NodeMirrorUserPath:
+		// npm keeps one CA list, which ca, ca[] and cafile each replace, the
+		// environment after every file. The install writes cafile alone, so
+		// anything else assigning that list is refused rather than reordered.
+		for _, key := range []string{"NPM_CONFIG_CA", "npm_config_ca"} {
+			if env(key) != "" {
+				return fmt.Errorf("%s: %s is set, and npm reads the certificates it holds in place of the cafile this command writes to %s, so npm would not verify bodega's certificate with the CA installed. "+
+					"Nothing was written. Unset %s, then re-run", rec.System, key, target, key)
+			}
+		}
+		installed, err := h.caTarget(rec.Path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", rec.System, err)
+		}
+		for _, key := range []string{"NPM_CONFIG_CAFILE", "npm_config_cafile"} {
+			v := env(key)
+			if abs, err := filepath.Abs(v); v != "" && (err != nil || abs != installed) {
+				return fmt.Errorf("%s: %s is set to %s, and npm reads that file in place of the cafile this command writes to %s, so npm would not verify bodega's certificate with the CA installed. "+
+					"Nothing was written. Unset %s, or add the CA to that file yourself and re-run without --ca-file", rec.System, key, v, target, key)
+			}
+		}
+		files := []string{target}
+		if user {
+			for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG"} {
+				if v := env(key); v != "" {
+					files = append(files, v)
+				}
+			}
+		}
+		for _, f := range files {
+			if key := NpmInlineCA(f); key != "" {
+				return fmt.Errorf("%s: %s sets %s, and npm keeps one CA list that %s and cafile each replace in the order the file sets them, so the cafile this command writes there would not be read alone. "+
+					"Nothing was written. Move the certificates %s holds into a file of your own named by cafile, or remove the key, then re-run", rec.System, f, key, key, key)
+			}
+		}
+		if user {
+			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
+		}
 	case rec.System == manifest.TypeGit:
 		if unread := GitUnread(h.Getenv, nil); len(unread) > 0 {
 			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so whether git would apply the CA written to %s cannot be told. "+
 				"Unset the variable, then re-run", rec.System, unread[0], target)
+		}
+		if includes := GitIncludes(append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)); len(includes) > 0 {
+			return fmt.Errorf("%s: git takes configuration from %s, and this command does not open the files it names, so a setting there could outrank the CA written to %s unseen. "+
+				"Nothing was written. Move the included settings into the file itself or remove the include, then re-run", rec.System, includes[0], target)
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")
 		}
 	}
 	return nil
+}
+
+// caTarget is where this host keeps the copy of the CA that a setting in the
+// file a plan writes at planPath names: under the home directory for a
+// per-user file, under Root otherwise.
+func (h CAHost) caTarget(planPath string) (string, error) {
+	if strings.HasPrefix(planPath, "~/") {
+		return TargetPath(CAUserPath, h.Home)
+	}
+	target, err := TargetPath(CASharedPath, h.Home)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(h.Root, target), nil
 }
 
 // CAInstall is a plan with a CA added to it.
@@ -591,12 +647,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	}
 	// sharedPath is where the copy a setting in the file at planPath names
 	// goes, and shared installs it.
-	sharedPath := func(planPath string) (string, error) {
-		if strings.HasPrefix(planPath, "~/") {
-			return resolve(CAUserPath)
-		}
-		return resolve(CASharedPath)
-	}
+	sharedPath := h.caTarget
 	shared := func(planPath string) (string, error) {
 		target, err := sharedPath(planPath)
 		if err != nil {
