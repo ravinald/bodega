@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,7 +53,7 @@ var doctorExit = os.Exit
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
 	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext, quietPro, restorePro, quietOS, restoreOS, restoreApt bool
-	var token, baseURL, pkgABI, aptSuite, composerLock string
+	var token, baseURL, pkgABI, aptSuite, composerLock, caFile string
 	var configure, ntpServers, aptArchives []string
 	var pkgRelease int
 	c := &cobra.Command{
@@ -137,6 +140,21 @@ restart stay with the served setup script (--systems osquery).
 --write-apt-sources and --write-pkg-repo are --configure apt --apply and
 --configure freebsd --apply. They combine with each other and with
 --configure.
+
+--ca-file, with --configure, installs a private CA where each named system's
+client reads one, for a bodega whose certificate no public CA issued: the
+system trust store for apt, dnf, go, helm, cargo and pkg, and the client's
+own setting for npm (cafile), pip (cert), git (http.<url>.sslCAInfo), Docker
+and podman (certs.d/<host>/ca.crt) and containerd (ca in each hosts.toml).
+The file is refused before anything is written when it holds no CA
+certificate, a certificate that is not a CA, or anything else. Pass it on
+every --configure run: the plan replaces .npmrc and pip.conf whole.
+
+  sudo bodega doctor --configure apt,pypi,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
+
+The report checks the same stores: a row whose client is configured for
+bodega warns when neither the system trust store nor that client's own
+verifies the certificate bodega serves.
 
 --token is optional: a host bound with "bodega identity bind cidr" is
 identified by its address and needs none. A host bodega cannot identify is
@@ -238,7 +256,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if !configuring {
-				for _, f := range []string{"apply", "suite", "archive", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers"} {
+				for _, f := range []string{"apply", "suite", "archive", "abi", "release", "quiet-ubuntu-pro", "quiet-os-callers", "ca-file"} {
 					if cmd.Flags().Changed(f) {
 						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
 							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
@@ -257,7 +275,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				return configureFromPlan(gf, planRequest{
 					token: token, baseURL: baseURL, systems: systems,
 					suite: aptSuite, archives: aptArchives, abi: pkgABI, release: pkgRelease, quietPro: quietPro, quietOS: quietOS,
-					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
+					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext, caFile: caFile,
 				})
 			}
 			var lockFinding *host.Finding
@@ -294,6 +312,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 			}
 			findings = append(findings, osCallers.findings(internalTimeSources(gf, baseURL, ntpServers))...)
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
+			findings = doctorTrustProbe().Apply(findings, base)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -342,6 +361,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Undo the steps --quiet-os-callers recorded, and nothing else")
 	c.Flags().BoolVar(&restoreApt, "restore-apt-sources", false,
 		"Undo the edits --configure apt --apply made to the distro's apt sources, and nothing else")
+	c.Flags().StringVar(&caFile, "ca-file", "",
+		"With --configure: also install the CA certificates in this PEM file into the trust store each named system's client reads")
 	c.Flags().StringVar(&composerLock, "composer-lock", "",
 		"Also report whether the dist.url entries of this composer.lock are at bodega's /composer/ route")
 	c.Flags().StringSliceVar(&ntpServers, "ntp-server", nil,
@@ -520,6 +541,33 @@ type planRequest struct {
 	allowPlaintext bool
 	quietPro       bool
 	quietOS        bool
+	caFile         string
+}
+
+// readCAFile reads and checks --ca-file before the run reaches the server, so
+// a file doctor will not install stops it with nothing fetched or written.
+func readCAFile(path string) (clientconf.CA, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return clientconf.CA{}, fmt.Errorf("--ca-file: %w. Nothing was written", err)
+	}
+	ca, err := clientconf.ParseCA(data)
+	if err != nil {
+		return clientconf.CA{}, fmt.Errorf("--ca-file %s is refused, and nothing was written: %w", path, err)
+	}
+	return ca, nil
+}
+
+// planBase is the URL the plan's files name bodega by: the server's
+// public_url, read off a record's file URL, which is what a client's trust
+// has to cover. It need not be the --url this command reached the server at.
+func planBase(records []clientconf.PlanRecord, fallback string) string {
+	for _, r := range records {
+		if base, _, ok := strings.Cut(r.URL, "/client/"); ok {
+			return base
+		}
+	}
+	return fallback
 }
 
 // configureFromPlan applies the plan GET /client/plan returns for this host,
@@ -532,6 +580,14 @@ type planRequest struct {
 // has always let the server choose when it could, and a host on an instance
 // that generates one suite under its own name would lose that choice.
 func configureFromPlan(gf *globalFlags, req planRequest) error {
+	var ca *clientconf.CA
+	if req.caFile != "" {
+		parsed, err := readCAFile(req.caFile)
+		if err != nil {
+			return err
+		}
+		ca = &parsed
+	}
 	if req.baseURL == "" {
 		cfg, err := loadConfig(gf)
 		if err != nil {
@@ -546,6 +602,20 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	client, err := NewClient(req.baseURL, req.token, req.allowPlaintext)
 	if err != nil {
 		return err
+	}
+	if ca != nil {
+		// This run fetches the plan from the server the CA is for, on a host
+		// that by definition does not trust it yet.
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		for _, cert := range ca.Certs {
+			pool.AddCert(cert)
+		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		client.HTTP.Transport = tr
 	}
 	q := url.Values{"os": {runtime.GOOS}}
 	if req.abi == "" && runtime.GOOS == clientconf.OSFreeBSD {
@@ -582,7 +652,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		return err
 	}
 	if slices.Contains(req.systems, clientconf.SystemOsquery) {
-		if len(req.systems) > 1 || req.quietPro || req.quietOS {
+		if len(req.systems) > 1 || req.quietPro || req.quietOS || ca != nil {
 			return fmt.Errorf("--configure osquery installs bodega's osquery extension and runs alone; configure the other systems in a second run")
 		}
 		return configureOsqueryExtension(os.Stdout, plan, req.apply)
@@ -631,6 +701,20 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		changes = append(changes, c)
 	}
+	var caStep []string
+	if ca != nil {
+		osRelease, _ := os.ReadFile(doctorOSRelease)
+		in, err := clientconf.AddCA(changes, *ca, clientconf.CAHost{
+			Base: planBase(records, client.BaseURL), Home: home, Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease,
+		})
+		if err != nil {
+			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
+		}
+		changes, caStep = in.Changes, in.Step
+		for _, sys := range slices.Sorted(maps.Keys(in.Notes)) {
+			fmt.Printf("note       %-10s %s\n", sys, in.Notes[sys])
+		}
+	}
 	changed := 0
 	for _, c := range changes {
 		if c.Unchanged() {
@@ -651,6 +735,10 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	if dnfStep != nil {
 		fmt.Printf("\nrun        %-10s %s\n", manifest.TypeRpm, strings.Join(dnfStep, " "))
 		fmt.Println("           (turns off the vendor repositories bodega.repo replaces)")
+	}
+	if caStep != nil {
+		fmt.Printf("\nrun        %-10s %s\n", clientconf.SystemCA, strings.Join(caStep, " "))
+		fmt.Println("           (rebuilds the system trust store with the CA above in it)")
 	}
 	bodegaSources, aptWritten := bodegaAptSources(changes)
 	var aptPlan []string
@@ -680,8 +768,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		return nil
-	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil:
+	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
 		var runs []string
+		if caStep != nil {
+			runs = append(runs, "the trust store step")
+		}
 		if dnfStep != nil {
 			runs = append(runs, "the dnf step")
 		}
@@ -712,6 +803,16 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		if err != nil {
 			return err
 		}
+	}
+	// Ahead of every step that fetches from bodega: apt-get update against a
+	// certificate the store does not yet trust fails on the certificate.
+	if caStep != nil {
+		if err := doctorRun(caStep[0], caStep[1:]...); err != nil {
+			return fmt.Errorf("%s failed: %w.\n"+
+				"  The CA is written and the system trust store was not rebuilt, so clients reading it still refuse bodega's certificate.\n"+
+				"  It needs root. Run it by hand: a second --apply finds the file in place and does not run it again", strings.Join(caStep, " "), err)
+		}
+		fmt.Printf("ran        %s\n", strings.Join(caStep, " "))
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -789,6 +890,17 @@ var (
 	doctorOCIRoot        = ""
 	doctorDockerdVersion = host.RunDockerdVersion
 )
+
+// doctorCAGOOS is the operating system whose trust store --ca-file installs
+// into, so a test can plan each family's install from one host.
+var doctorCAGOOS = runtime.GOOS
+
+// doctorTrustProbe is how the report reads the certificate bodega serves and
+// the trust stores on this host, so a test can stand in for both.
+var doctorTrustProbe = func() host.TrustProbe {
+	home, _ := os.UserHomeDir()
+	return host.TrustProbe{Root: doctorOCIRoot, Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir}
+}
 
 // doctorDnfConf and doctorYumReposDirs are where doctor reads dnf's
 // configuration, and doctorRun how it runs the dnf step, so a test can stand

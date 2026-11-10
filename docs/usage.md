@@ -2244,6 +2244,10 @@ A `daemon.json` that is not JSON, or one this account cannot read, reports `oci-
 
 On a host with `dnf` on `PATH`, a **`dnf-repos`** row warns for every enabled repository dnf loads that can fetch from anywhere but bodega's `/rpm/` route: a `baseurl`, `mirrorlist` or `metalink` whose host and path do not start with the one in `--url` (or `public_url`), or a repository with none of the three, naming the repository, its file and the URL. dnf prefers a `mirrorlist` or `metalink` to `baseurl`, so any one of them leaving bodega counts. doctor reads repositories where dnf does: the sections of `/etc/dnf/dnf.conf` other than `[main]`, then every `.repo` file in the `reposdir` that file sets, or in `/etc/yum.repos.d`, `/etc/yum/repos.d` and `/etc/distro.repos.d` when it sets none. Values are read with dnf's rules: one pair of matching quotes is stripped, so `enabled="1"` is enabled; an indented line continues the value above it; and an `enabled` value dnf cannot parse leaves the repository enabled, as dnf does. A repository's id proves nothing about where it fetches from. With no bodega URL known, a URL whose path holds no `/rpm/` segment still warns, and a repository whose URLs could be bodega's is named in a `SKIPPED` row, since doctor has nothing to compare it against; pass `--url` to settle it. The remediation is `bodega doctor --configure rpm --apply --url <bodega base URL>`, and `dnf config-manager --set-disabled <id>` for a repository bodega does not serve. A `.repo` file dnf's parser rejects (a section header missing its `]`, a line with no `=`, a key before any section, an indented line with no value above it) is skipped whole, as dnf skips it, so no section in it hides a later definition of the same id; the row warns and names the file and the line, because dnf warns about it on every run and its repositories come back unchecked once it is repaired. A `dnf.conf` that does not parse reports `SKIPPED`, since dnf will not run at all until it is fixed. A host with no `dnf` gets no row, and a `.repo` file that cannot be read reports it `SKIPPED`.
 
+When `--url` (or `public_url`) is `https`, each of these rows whose client is configured for bodega also checks that the client can verify the certificate bodega serves: `apt-sources`, `dnf-repos`, `pkg-repos`, `make-conf`, `pip-config`, `npm-config`, `cargo-config`, `goproxy-env`, `rubygems`, `composer` and the three `oci-` rows. A client counts as configured when its row is `OK` and a file it reads names bodega's host. Doctor completes one TLS handshake with bodega, without verifying it, and verifies the chain it was served against the system trust store. A chain that store verifies settles every row. When it does not, a client with a store of its own is checked against that: the file `cafile` names in an `.npmrc`, the file `cert` names in a `pip.conf`, `/etc/docker/certs.d/<host>/*.crt`, `/etc/containers/certs.d/<host>/*.crt`, and the `ca` of each containerd `hosts.toml` naming bodega. A row no store verifies turns to `WARN`, names the store or stores it read with the verification error, and carries `bodega doctor --configure <system> --ca-file <CA certificate PEM> --apply` as its remediation. A bodega that does not answer the handshake leaves every row as its check wrote it.
+
+Three limits. npm verifies against the Mozilla roots Node bundles and never reads the system store, and doctor cannot read that bundle, so an `npm-config` row stays `OK` on a host whose system store holds a private CA that `.npmrc` does not name; pip reading certifi's bundle has the same gap. The `maven` row is not checked, because the JVM reads a keystore. And the system store doctor verifies against is the one its own process reads, so `SSL_CERT_FILE` in doctor's environment changes the answer.
+
 `--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason. `osquery` is left out otherwise, and named it runs alone and does one thing: for a host whose `server`-mode source sets `origins`, it links this binary as bodega's osquery extension, lists it in the autoload file osqueryd reads, and sets `--extensions_autoload` in osqueryd's flagfile when that names none (see [Package origins](#package-origins)). For any other host it writes nothing and refuses. The other flags, the enroll secret and the restart stay with the setup script, since the flags file alone points at a secret nothing wrote and a daemon nothing installed.
 
 ```bash
@@ -2277,6 +2281,42 @@ sudo bodega doctor --configure oci --url https://bodega.internal --apply
 ```
 
 `--configure rpm` writes `/etc/yum.repos.d/bodega.repo` and bodega's key for the repositories the host's distribution reads, and disables the vendor repositories it replaces with `dnf config-manager --set-disabled`; see **RPM repositories** under [Client configuration](#client-configuration) for the table, the files and the disable step.
+
+`--ca-file <path>` adds a private CA to the plan, for a bodega whose certificate no public CA issued. Every package manager keeps its own trust store, so a host behind an internal CA otherwise needs one hand edit per client. The file is PEM and may hold several certificates. Doctor reads it before it contacts the server and refuses it, with nothing fetched or written, when it holds no certificate, a certificate whose basic constraints do not set `CA:TRUE` (bodega's own certificate rather than its issuer's), or any block that is not a certificate, since a private key in it would be copied to a world-readable path. Only the certificates are installed, re-encoded.
+
+```bash
+bodega doctor --configure apt,pypi,oci --ca-file internal-ca.pem --url https://bodega.internal
+sudo bodega doctor --configure apt,pypi,oci --ca-file internal-ca.pem --url https://bodega.internal --apply
+```
+
+The CA goes where each system named in `--configure` reads one, as part of the same plan: the preview shows each setting in the diff of the file it joins and each certificate file as a new file, and `--apply` backs up and writes them with the rest.
+
+| System                        | Store the client reads                                                         | What doctor writes                                                                                                  |
+| ----------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `npm`                         | `cafile` in `.npmrc`, in place of the Mozilla roots Node bundles               | `cafile=<copy>` in the `.npmrc` the plan writes                                                                     |
+| `pypi`                        | `cert` in `pip.conf`, in place of certifi's bundle or the system store         | `cert = <copy>` under `[global]` in the `pip.conf` the plan writes                                                  |
+| `git`                         | `http.<url>.sslCAInfo`                                                         | `[http "<bodega base URL>/"]` with `sslCAInfo = <copy>`, scoped to bodega so every other remote keeps its own trust |
+| `oci`, Docker Engine          | `/etc/docker/certs.d/<host>/ca.crt`                                            | that file                                                                                                           |
+| `oci`, containerd             | `ca` in each `hosts.toml`                                                      | `ca = "<copy>"` in the `[host."<bodega base URL>"]` table of each `hosts.toml` the plan writes                      |
+| `oci`, podman, buildah, CRI-O | `/etc/containers/certs.d/<host>/ca.crt`                                        | that file                                                                                                           |
+| `maven`                       | the JVM's `cacerts` keystore                                                   | nothing: the plan prints a note with the `keytool -importcert -cacerts` command                                     |
+| every other system            | the system trust store (`apt`, `rpm`, `gomod`, `helm`, `cargo`, `freebsd` pkg) | one anchor file per certificate, then the command that rebuilds the store (below)                                   |
+
+`<host>` is bodega's host as the plan's files name it, with its port when `public_url` carries one. `<copy>` is the one copy of the CA those settings share: `/usr/local/share/bodega/ca.pem` for a file under `/etc`, and `~/.config/bodega/ca.pem` for a file in a home directory, which an account without root can write.
+
+The system trust store takes one file per certificate, named `bodega-ca` and then `bodega-ca-2` and up, and one command, which the preview prints as a `run` line and `--apply` runs once the files are written and before any step that fetches from bodega:
+
+| Host                                   | Anchor                                           | Command                   |
+| -------------------------------------- | ------------------------------------------------ | ------------------------- |
+| Debian, Ubuntu                         | `/usr/local/share/ca-certificates/bodega-ca.crt` | `update-ca-certificates`  |
+| RHEL, Rocky, AlmaLinux, CentOS, Fedora | `/etc/pki/ca-trust/source/anchors/bodega-ca.pem` | `update-ca-trust extract` |
+| FreeBSD                                | `/usr/local/share/certs/bodega-ca.pem`           | `certctl rehash`          |
+
+The Linux family comes from `ID` and `ID_LIKE` in `/etc/os-release`. On any other host, macOS included, a `--configure` list naming a system that reads the system store is refused with nothing written; name only the systems that read their own, or add the CA to that host's store by hand.
+
+A second `--apply` with the same file changes nothing and runs no command. The command runs only when an anchor file changed, so if it failed (it needs root), run it by hand: the next `--apply` finds the anchor in place and does not run it again.
+
+Pass `--ca-file` on every `--configure` run for such a host. The plan replaces `.npmrc`, `pip.conf` and `.gitconfig` whole, so a run without the flag writes them without the CA setting, and the diff shows that line removed. For the run itself, doctor trusts the certificates in `--ca-file` beside the system store, so it can fetch the plan from a server the host does not trust yet. `--ca-file` is refused without `--configure`, with `--configure osquery`, and for a plain `http` base. Certificate files from an earlier, longer `--ca-file` are left in place: a second anchor a shorter file no longer carries stays trusted until it is deleted and the store rebuilt.
 
 `--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
 
@@ -7035,6 +7075,8 @@ Or set in config:
 ```json
 { "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem" }
 ```
+
+A certificate from a private or self-signed CA is refused by every client until that client trusts the CA, and each package manager reads its own trust store. [`bodega doctor --configure <systems> --ca-file <CA certificate PEM>`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n---quiet-ubuntu-pro---quiet-os-callers---restore-ubuntu-pro---restore-os-callers---restore-apt-sources---ntp-server-host---write-apt-sources---write-pkg-repo---allow-plaintext) installs the CA where each client reads it, and bare `bodega doctor` warns for each configured client that cannot verify the certificate bodega serves.
 
 #### Certificate renewal
 

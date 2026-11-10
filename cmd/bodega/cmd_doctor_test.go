@@ -2,8 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"io"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,8 +28,10 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
+	"github.com/ravinald/bodega/internal/manifest"
 
 	_ "modernc.org/sqlite" // the audit store's driver, for the raw handles below
 )
@@ -990,5 +1005,280 @@ func TestPrintRemediationListsSkipWithoutRemedy(t *testing.T) {
 	}
 	if strings.Contains(out, "pip-conf") {
 		t.Errorf("output lists a row the predicate drops:\n%s", out)
+	}
+}
+
+// caPlanServer is a bodega served over TLS under a certificate no store on
+// this host trusts. It answers /client/plan with npm's, pip's and go's files
+// and the oci set, each path rooted under the caller's home, and counts the
+// requests it took. The returned PEM is the certificate it serves, which
+// httptest mints as its own CA.
+func caPlanServer(t *testing.T) (srv *httptest.Server, caPEM []byte, requests *int) {
+	t.Helper()
+	requests = new(int)
+	type planFile struct{ system, path, key, content string }
+	var files []planFile
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, _ *http.Request) {
+		*requests++
+		var plan clientconf.Plan
+		for _, f := range files {
+			sum := sha256.Sum256([]byte(f.content))
+			plan.Records = append(plan.Records, clientconf.PlanRecord{
+				Identity: "web-host", Match: "cidr:192.0.2.1/32", System: f.system, Action: clientconf.PlanInstall,
+				Path: f.path, URL: srv.URL + "/client/" + f.system + "?file=" + f.key, SHA256: hex.EncodeToString(sum[:]),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /client/{system}", func(w http.ResponseWriter, r *http.Request) {
+		*requests++
+		for _, f := range files {
+			if f.system == r.PathValue("system") && f.key == r.URL.Query().Get("file") {
+				_, _ = io.WriteString(w, f.content)
+			}
+		}
+	})
+	srv = httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	files = []planFile{
+		{manifest.TypeNpm, "~/.npmrc", "", clientconf.Npm(srv.URL, nil).Content},
+		{manifest.TypePypi, "~/etc/pip.conf", "", clientconf.Pip(srv.URL).Content},
+	}
+	goEnv := clientconf.Gomod(srv.URL)
+	files = append(files, planFile{manifest.TypeGomod, goEnv.Path(clientconf.OSLinux), "", goEnv.Content})
+	for _, f := range clientconf.OCIClient(srv.URL, map[string]string{"docker.io": "https://registry-1.docker.io"}) {
+		files = append(files, planFile{manifest.TypeOCI, "~" + f.Path(clientconf.OSLinux), f.Key + "x", f.Content})
+	}
+	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), requests
+}
+
+// F116 R1, R3: --configure npm,pip,oci --ca-file previews the CA beside the
+// plan, writes it where each client reads it with every other setting kept,
+// and changes nothing on a second --apply.
+func TestDoctorConfigureInstallsACA(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd", "containerd", "podman")
+	srv, caPEM, _ := caPlanServer(t)
+	host := strings.TrimPrefix(srv.URL, "https://")
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	npmrc, daemon := filepath.Join(home, ".npmrc"), filepath.Join(home, "etc/docker/daemon.json")
+	token := "//" + host + "/npm/:_authToken=bodega_ak_kept"
+	for path, content := range map[string]string{
+		caFile: string(caPEM),
+		npmrc:  "registry=https://registry.npmjs.org/\n" + token + "\n",
+		daemon: `{"log-driver":"journald"}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+	certs := []string{
+		userCA,
+		filepath.Join(home, "etc/docker/certs.d", host, "ca.crt"),
+		filepath.Join(home, "etc/containers/certs.d", host, "ca.crt"),
+	}
+	args := []string{"--configure", "npm,pypi,oci", "--ca-file", caFile, "--url", srv.URL}
+
+	out, err := runDoctor(t, args...)
+	if err != nil {
+		t.Fatalf("dry run = %v:\n%s", err, out)
+	}
+	for _, want := range []string{"+cafile=" + userCA, "+cert = " + userCA, `+  ca = "` + userCA + `"`, "+-----BEGIN CERTIFICATE-----", "Dry run: nothing was written"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the dry run does not show %q:\n%s", want, out)
+		}
+	}
+	for _, p := range certs {
+		if !strings.Contains(out, p) {
+			t.Errorf("the dry run does not name %s:\n%s", p, out)
+		}
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the dry run wrote %s: %v", p, err)
+		}
+	}
+
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	for _, p := range certs {
+		if got, _ := os.ReadFile(p); string(got) != string(caPEM) {
+			t.Errorf("%s = %q, want the CA", p, got)
+		}
+	}
+	if got, _ := os.ReadFile(npmrc); string(got) != "registry="+srv.URL+"/npm/\n"+token+"\ncafile="+userCA+"\n" {
+		t.Errorf(".npmrc after --apply = %q, want the registry, the kept token and cafile", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "etc/pip.conf")); string(got) != "[global]\ncert = "+userCA+"\nindex-url = "+srv.URL+"/pypi/simple/\n" {
+		t.Errorf("pip.conf after --apply = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml")); !strings.Contains(string(got), `  ca = "`+userCA+`"`) || !strings.Contains(string(got), "capabilities") {
+		t.Errorf("hosts.toml after --apply = %q", got)
+	}
+	if got, _ := os.ReadFile(daemon); !strings.Contains(string(got), `"log-driver": "journald"`) || !strings.Contains(string(got), srv.URL) {
+		t.Errorf("daemon.json after --apply = %s", got)
+	}
+
+	out, err = runDoctor(t, append(args, "--apply")...)
+	if err != nil || !strings.Contains(out, "Nothing to change") {
+		t.Errorf("second --apply = %v:\n%s", err, out)
+	}
+	if backups, _ := filepath.Glob(npmrc + ".bodega-*"); len(backups) != 1 {
+		t.Errorf("backups of .npmrc = %v, want the one the first --apply made", backups)
+	}
+}
+
+// F116 R1: a --ca-file that holds no CA is refused before the server is
+// asked for anything, and --ca-file means nothing without --configure.
+func TestDoctorConfigureRefusesAFileThatIsNoCA(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd")
+	srv, caPEM, requests := caPlanServer(t)
+	dir := t.TempDir()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "bodega.internal"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+	}, srv.Certificate(), &key.PublicKey, srv.TLS.Certificates[0].PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ content, want string }{
+		"empty.pem": {"", "holds no PEM certificate"},
+		"leaf.pem":  {string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})), "is not a CA"},
+		"key.pem":   {string(caPEM) + "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", "certificates only"},
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := runDoctor(t, "--configure", "npm,pypi,oci", "--ca-file", path, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "nothing was written") {
+			t.Errorf("%s: --ca-file = %v, want a refusal naming %q", name, err, tc.want)
+		}
+	}
+	_, err = runDoctor(t, "--configure", "npm", "--ca-file", filepath.Join(dir, "absent.pem"), "--url", srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "--ca-file") {
+		t.Errorf("an absent --ca-file = %v, want a refusal", err)
+	}
+	if *requests != 0 {
+		t.Errorf("the server took %d request(s) for a refused --ca-file", *requests)
+	}
+	if entries, _ := os.ReadDir(home); len(entries) != 0 {
+		t.Errorf("a refused --ca-file left %d entries in the home directory", len(entries))
+	}
+	if _, err := runDoctor(t, "--ca-file", filepath.Join(dir, "leaf.pem")); err == nil || !strings.Contains(err.Error(), "--ca-file applies to --configure") {
+		t.Errorf("--ca-file without --configure = %v, want the orphaned-flag refusal", err)
+	}
+}
+
+// F116 R2: the report warns on a client configured for a bodega whose
+// certificate no store it reads verifies, and stops once --ca-file has put
+// the CA in that client's own.
+func TestDoctorReportsAClientThatCannotVerifyBodega(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t)
+	srv, caPEM, _ := caPlanServer(t)
+	prevExit := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = prevExit })
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	npmrc := filepath.Join(home, ".npmrc")
+	if err := os.WriteFile(npmrc, []byte("registry="+srv.URL+"/npm/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	npmRow := func(out string) string {
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "npm-config") {
+				return line
+			}
+		}
+		return ""
+	}
+
+	out, err := runDoctor(t, "--url", srv.URL)
+	if err != nil {
+		t.Fatalf("doctor = %v:\n%s", err, out)
+	}
+	if row := npmRow(out); !strings.Contains(row, "WARN") || !strings.Contains(row, "neither the system trust store nor npm's cafile setting verifies") {
+		t.Errorf("npm-config row = %q, want a warning naming both stores:\n%s", row, out)
+	}
+	if want := "bodega doctor --configure npm --ca-file <CA certificate PEM> --apply --url " + srv.URL; !strings.Contains(out, want) {
+		t.Errorf("the remediation does not read %q:\n%s", want, out)
+	}
+
+	if out, err := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply"); err != nil {
+		t.Fatalf("--configure npm --ca-file = %v:\n%s", err, out)
+	}
+	out, err = runDoctor(t, "--url", srv.URL)
+	if err != nil {
+		t.Fatalf("doctor = %v:\n%s", err, out)
+	}
+	if row := npmRow(out); !strings.Contains(row, "OK") || strings.Contains(row, "WARN") {
+		t.Errorf("npm-config row after --ca-file = %q, want OK:\n%s", row, out)
+	}
+}
+
+// F116 R1: a system that verifies through the system trust store gets an
+// anchor there and the command that rebuilds the store, previewed as a step,
+// run once under --apply and not again when nothing changed.
+func TestDoctorConfigureRebuildsTheSystemTrustStore(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	osRelease := filepath.Join(t.TempDir(), "os-release")
+	for path, content := range map[string]string{caFile: string(caPEM), osRelease: "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"26.04\"\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ran []string
+	prevGOOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, osRelease
+	doctorRun = func(name string, args ...string) error {
+		ran = append(ran, strings.Join(append([]string{name}, args...), " "))
+		return nil
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevGOOS, prevRoot, prevRelease, prevRun
+	})
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	args := []string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL}
+
+	out, err := runDoctor(t, args...)
+	if err != nil || !strings.Contains(out, "update-ca-certificates") || !strings.Contains(out, "the trust store step") || !strings.Contains(out, anchor) {
+		t.Fatalf("dry run = %v, want the anchor and the step previewed:\n%s", err, out)
+	}
+	if _, err := os.Stat(anchor); !errors.Is(err, os.ErrNotExist) || len(ran) != 0 {
+		t.Fatalf("the dry run wrote the anchor (%v) or ran %v", err, ran)
+	}
+
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(anchor); string(got) != string(caPEM) {
+		t.Errorf("%s = %q, want the CA", anchor, got)
+	}
+	if !slices.Equal(ran, []string{"update-ca-certificates"}) {
+		t.Errorf("--apply ran %v, want update-ca-certificates once", ran)
+	}
+
+	out, err = runDoctor(t, append(args, "--apply")...)
+	if err != nil || !strings.Contains(out, "Nothing to change") || len(ran) != 1 {
+		t.Errorf("second --apply = %v, ran %v:\n%s", err, ran, out)
 	}
 }
