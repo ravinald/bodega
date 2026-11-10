@@ -55,8 +55,33 @@ jobs:
             sleep 30
           done
 
+  # The site publishes api/openapi.yaml as the API reference and prints its
+  # info.version, so a tag naming another version is refused before anything
+  # is built or signed. go test exits 0 when -run matches no test, so the grep
+  # is what fails this job if the test is ever renamed or removed.
+  api-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Refuse a tag whose version differs from api/openapi.yaml's
+        env:
+          BODEGA_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -o pipefail
+          go test ./internal/server -count=1 -v -run '^TestOpenAPIVersionMatchesReleaseTag$' | tee api-version.log
+          grep -q '^--- PASS: TestOpenAPIVersionMatchesReleaseTag' api-version.log
+
   build:
-    needs: ci-gate
+    needs: [ci-gate, api-version]
     permissions:
       contents: write       # create the GitHub release
       id-token: write       # cosign keyless signing and attestation via OIDC

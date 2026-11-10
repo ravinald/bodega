@@ -1,21 +1,32 @@
 # Bodega website
 
-`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
+`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, [`api/openapi.yaml`](../api/openapi.yaml) becomes the API reference under `/api/`, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
 
-| Path            | What it holds                                                                                |
-| --------------- | -------------------------------------------------------------------------------------------- |
-| `main.go`       | The generator: Markdown rendering, link rewriting, the contents column, the coverage tables  |
+| Path            | What it holds                                                                               |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| `main.go`       | The generator: Markdown rendering, link rewriting, the contents column, the coverage tables |
+| `api.go`        | The API reference: reads the OpenAPI document and writes the pages under `/api/`            |
 | `layout.html`   | The page template every page shares                                                         |
-| `site.css`      | The stylesheet, including the light, dark and color-vision palettes                          |
-| `pages/`        | Pages with no Markdown source: the colophon and the 404 page                                 |
-| `static/fonts/` | Self-hosted Archivo and Source Serif 4 woff2 files and their SIL Open Font License texts     |
-| `scripts/`      | Coverage export, deployment and their tests                                                  |
+| `site.css`      | The stylesheet, including the light, dark and color-vision palettes                         |
+| `pages/`        | Pages with no Markdown source: the colophon and the 404 page                                |
+| `static/fonts/` | Self-hosted Archivo and Source Serif 4 woff2 files and their SIL Open Font License texts    |
+| `scripts/`      | Coverage export, deployment and their tests                                                 |
 
 The generator is its own Go module (`site/go.mod`), so its Markdown dependency stays out of bodega's `go.mod` and out of `go list ./...`.
 
 ## Contents column
 
 Every doc page lists the whole contents in the left column, numbered serially. An entry for a page with headings opens to that page's `h2`s and, under each, its `h3`s, read from the rendered page, so a split usage section lists its own `###` headings as its first level. The current page's entry starts open; the others start closed and open on a click on the number or the chevron, with no script. The narrow-screen contents lists pages only.
+
+## API reference
+
+`api.go` renders `api/openapi.yaml` with no viewer script: `/api/` lists every tag with its operations, `/api/<tag>.html` holds one tag's operations (method, path, description, parameters, request body and responses), and `/api/schemas.html` holds every schema under `components.schemas`. The pages sit in the contents column under their own group, placed by the `api` row of the `contents` table in `main.go`.
+
+A doc that links `api/openapi.yaml` by its repository path lands on `/api/` here, and on the raw YAML when read on GitHub.
+
+A `$ref` to a schema renders as a link into `/api/schemas.html`, so one that names a missing schema is a broken link and stops the build like any other. A `$ref` to a parameter or a response is resolved in place, and one that names nothing stops the build with the operation and the `$ref` in the message.
+
+The renderer reads the OpenAPI keywords the document uses today. A schema's `description`, `enum`, `default`, `pattern`, `minimum` and `maximum` appear wherever the document puts them: on a request or response body, a named schema, a property, a parameter, or the element of an array or a map. It does not render response headers, `example` values, links, callbacks or a `discriminator`; a document that starts using one builds, and the page omits it.
 
 ## Platform icons
 
@@ -94,7 +105,8 @@ Read `<remote_root>/previous-release` on the server, point a temporary symlink a
 ## Tests
 
 ```sh
+make test
 python3 -m unittest discover -s site/scripts -p 'test_*.py'
 ```
 
-The tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
+`make test` runs the generator's Go tests after bodega's own: they render a fixture OpenAPI document, and build the whole site from this checkout and fail on a broken link. The Python tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.

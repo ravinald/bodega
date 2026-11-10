@@ -70,7 +70,8 @@ type siteInfo struct {
 }
 
 // A doc source and the contents group it is listed under. Usage sections are
-// named by their ## heading and become pages of their own.
+// named by their ## heading and become pages of their own. The "api" source
+// stands for every page renderAPI returns, each named by its output path.
 type source struct{ group, src, section string }
 
 var contents = []source{
@@ -107,6 +108,7 @@ var contents = []source{
 	{"Reference", "docs/usage.md", "REST API"},
 	{"Reference", "docs/usage.md", ""},
 	{"Reference", "coverage", ""},
+	{"API reference", "api", ""},
 	{"Project", "docs/design.md", ""},
 	{"Project", "CONTRIBUTING.md", ""},
 	{"Project", "docs/usage.md", "Development"},
@@ -295,25 +297,54 @@ func main() {
 	coverage := flag.String("coverage", "", "coverage.json exported by site/scripts/coverage.py")
 	flag.Parse()
 
-	if *version == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(*commit) {
+	if broken := build(*repo, *out, *tmplDir, *version, *commit, *base, *coverage); broken > 0 {
+		log.Fatalf("%d broken internal links", broken)
+	}
+}
+
+// build writes the whole site under out and returns how many internal links
+// and anchors in it resolve to nothing.
+func build(repo, out, tmplDir, version, commit, base, coverage string) int {
+	if version == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) {
 		log.Fatal("-version and a full 40-hex -commit are required; site/scripts/deploy.py supplies both from git")
 	}
-	css, err := os.ReadFile(filepath.Join(*tmplDir, "site.css"))
+	css, err := os.ReadFile(filepath.Join(tmplDir, "site.css"))
 	if err != nil {
 		log.Fatalf("read the stylesheet: %v", err)
 	}
 	cssSum := sha256.Sum256(css)
-	info := siteInfo{Base: *base, Version: *version, Commit: *commit, CSSVersion: hex.EncodeToString(cssSum[:6])}
+	info := siteInfo{Base: base, Version: version, Commit: commit, CSSVersion: hex.EncodeToString(cssSum[:6])}
 
-	g := &generator{repo: *repo, base: *base, commit: info.Commit, outOf: map[string]string{}, usageSection: map[string]string{}}
+	apiPages, err := renderAPI(read(repo, "api/openapi.yaml"), base)
+	if err != nil {
+		log.Fatalf("api/openapi.yaml: %v; fix the document, then rebuild", err)
+	}
+	apiByOut := map[string]*page{}
+	var expanded []source
 	for _, c := range contents {
-		if c.src != "coverage" && c.src != "docs/usage.md" {
+		if c.src != "api" {
+			expanded = append(expanded, c)
+			continue
+		}
+		for _, p := range apiPages {
+			apiByOut[p.Out] = p
+			expanded = append(expanded, source{c.group, c.src, p.Out})
+		}
+	}
+	contents := expanded
+
+	g := &generator{repo: repo, base: base, commit: info.Commit, outOf: map[string]string{}, usageSection: map[string]string{}}
+	for _, c := range contents {
+		if c.src != "coverage" && c.src != "docs/usage.md" && c.src != "api" {
 			g.outOf[c.src] = docOut(c.src)
 		}
 	}
 	g.outOf["README.md"] = ""
+	// A doc links the OpenAPI document by its repository path, which is the
+	// raw YAML on GitHub and the rendered reference here.
+	g.outOf["api/openapi.yaml"] = apiDir
 
-	usageSrc := read(*repo, "docs/usage.md")
+	usageSrc := read(repo, "docs/usage.md")
 	section := ""
 	_ = ast.Walk(parse(usageSrc), func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if h, ok := n.(*ast.Heading); ok && entering {
@@ -331,7 +362,7 @@ func main() {
 	byKey := map[string]*page{}
 	key := func(c source) string { return c.src + "#" + c.section }
 
-	readme := read(*repo, "README.md")
+	readme := read(repo, "README.md")
 	readme = badges.ReplaceAll(readme, nil)
 	readme = readmeImage.ReplaceAll(readme, nil)
 	body, title := g.render(readme, "README.md")
@@ -354,9 +385,12 @@ func main() {
 	for _, c := range contents {
 		p := &page{Src: c.src, Group: c.group, Kind: "doc"}
 		switch {
+		case c.src == "api":
+			*p = *apiByOut[c.section]
+			p.Group = c.group
 		case c.src == "coverage":
 			p.Out, p.Title, p.Src = "coverage.html", "Package support", ""
-			p.Body = template.HTML("<h1>Package support</h1>\n" + renderCoverage(*coverage, *base))
+			p.Body = template.HTML("<h1>Package support</h1>\n" + renderCoverage(coverage, base))
 		case c.src == "docs/usage.md" && c.section == "":
 			p.Out, p.Title = "docs/usage/index.html", "Usage"
 			toc := demote(chunks["Table of Contents"])
@@ -371,7 +405,7 @@ func main() {
 			p.Out, p.Title = usageOut(c.section), c.section
 			p.Body = template.HTML(demote(chunk))
 		default:
-			b, t := g.render(read(*repo, c.src), c.src)
+			b, t := g.render(read(repo, c.src), c.src)
 			p.Out, p.Title = indexed(docOut(c.src)), t
 			p.Body = template.HTML(b)
 		}
@@ -380,10 +414,10 @@ func main() {
 		byKey[key(c)] = p
 	}
 
-	extra, _ := filepath.Glob(filepath.Join(*tmplDir, "pages", "*.html"))
+	extra, _ := filepath.Glob(filepath.Join(tmplDir, "pages", "*.html"))
 	for _, e := range extra {
 		b := read("", e)
-		b = bytes.ReplaceAll(b, []byte("{{base}}"), []byte(*base))
+		b = bytes.ReplaceAll(b, []byte("{{base}}"), []byte(base))
 		t := "bodega"
 		if m := regexp.MustCompile(`<h1[^>]*>(.*?)</h1>`).FindSubmatch(b); m != nil {
 			t = stdhtml.UnescapeString(string(m[1]))
@@ -394,7 +428,8 @@ func main() {
 
 	layout := template.Must(template.New("layout.html").Funcs(template.FuncMap{
 		"titleCase": strings.ToUpper,
-	}).ParseFiles(filepath.Join(*tmplDir, "layout.html")))
+		"hasPrefix": strings.HasPrefix,
+	}).ParseFiles(filepath.Join(tmplDir, "layout.html")))
 	for _, p := range pages {
 		var groups []group
 		var here entry
@@ -406,7 +441,7 @@ func main() {
 				groups = append(groups, group{Name: c.group})
 			}
 			gr := &groups[len(groups)-1]
-			e := entry{Num: strconv.Itoa(n), Title: target.Title, Href: *base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p, Children: target.Outline}
+			e := entry{Num: strconv.Itoa(n), Title: target.Title, Href: base + strings.TrimSuffix(target.Out, "index.html"), Here: target == p, Children: target.Outline}
 			gr.Entries = append(gr.Entries, e)
 			if e.Here {
 				gr.Here, here = true, e
@@ -421,10 +456,10 @@ func main() {
 		}{p, info, groups, here}); err != nil {
 			log.Fatal(err)
 		}
-		write(filepath.Join(*out, p.Out), buf.Bytes())
+		write(filepath.Join(out, p.Out), buf.Bytes())
 	}
 
-	docsIndex := contentsPage(pages, byKey, *base)
+	docsIndex := contentsPage(contents, byKey, base)
 	var buf bytes.Buffer
 	if err := layout.Execute(&buf, struct {
 		*page
@@ -434,22 +469,20 @@ func main() {
 	}{docsIndex, info, nil, entry{}}); err != nil {
 		log.Fatal(err)
 	}
-	write(filepath.Join(*out, docsIndex.Out), buf.Bytes())
+	write(filepath.Join(out, docsIndex.Out), buf.Bytes())
 
-	copyTree(filepath.Join(*repo, "docs", "images"), filepath.Join(*out, "docs", "images"))
-	copyTree(filepath.Join(*repo, "assets", "emblem"), filepath.Join(*out, "assets", "emblem"))
-	copyTree(filepath.Join(*tmplDir, "static"), *out)
-	copyFile(filepath.Join(*tmplDir, "site.css"), filepath.Join(*out, "site.css"))
-	copyFile(filepath.Join(*repo, "assets", "favicon.ico"), filepath.Join(*out, "favicon.ico"))
-	copyFile(filepath.Join(*repo, "assets", "app", "icon-180.png"), filepath.Join(*out, "icon-180.png"))
+	copyTree(filepath.Join(repo, "docs", "images"), filepath.Join(out, "docs", "images"))
+	copyTree(filepath.Join(repo, "assets", "emblem"), filepath.Join(out, "assets", "emblem"))
+	copyTree(filepath.Join(tmplDir, "static"), out)
+	copyFile(filepath.Join(tmplDir, "site.css"), filepath.Join(out, "site.css"))
+	copyFile(filepath.Join(repo, "assets", "favicon.ico"), filepath.Join(out, "favicon.ico"))
+	copyFile(filepath.Join(repo, "assets", "app", "icon-180.png"), filepath.Join(out, "icon-180.png"))
 	// The snapshot the coverage page was rendered from. nginx answers /data/coverage.json
 	// from the live feed instead, so this copy only serves a local build and the link check.
-	copyFile(*coverage, filepath.Join(*out, "data", "coverage.json"))
+	copyFile(coverage, filepath.Join(out, "data", "coverage.json"))
 
 	fmt.Printf("%d pages, bodega %s (%s)\n", len(pages)+1, info.Version, info.Commit)
-	if broken := checkLinks(*out, *base); broken > 0 {
-		log.Fatalf("%d broken internal links", broken)
-	}
+	return checkLinks(out, base)
 }
 
 func indexed(out string) string {
@@ -461,7 +494,7 @@ func indexed(out string) string {
 
 // contentsPage is /docs/: the contents column set as a page of its own, the
 // way a book's contents page reads.
-func contentsPage(pages []*page, byKey map[string]*page, base string) *page {
+func contentsPage(contents []source, byKey map[string]*page, base string) *page {
 	var b strings.Builder
 	b.WriteString("<h1>Documentation</h1>\n<p>Every page below is generated from the Markdown in the repository, so it matches the source at the commit named in the footer.</p>\n")
 	cur := ""

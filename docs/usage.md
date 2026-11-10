@@ -7417,7 +7417,7 @@ Both are approver routes, so they also need the engineer's address inside `admin
 
 ## REST API
 
-All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](../api/openapi.yaml).
+All API responses are JSON. The full API is documented in the [API reference](../api/openapi.yaml), an OpenAPI 3.0 document.
 
 ### Read endpoints
 
