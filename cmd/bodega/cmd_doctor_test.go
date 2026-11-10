@@ -1011,7 +1011,8 @@ func TestPrintRemediationListsSkipWithoutRemedy(t *testing.T) {
 // caPlanServer is a bodega served over TLS under a certificate no store on
 // this host trusts. It answers /client/plan with npm's, pip's and go's files
 // and the oci set, each path rooted under the caller's home, and counts the
-// requests it took. The returned PEM is the certificate it serves, which
+// requests it took. Maven's two files are in the plan too, for the tests that
+// name maven. The returned PEM is the certificate it serves, which
 // httptest mints as its own CA.
 func caPlanServer(t *testing.T) (srv *httptest.Server, caPEM []byte, requests *int) {
 	t.Helper()
@@ -1049,6 +1050,9 @@ func caPlanServer(t *testing.T) (srv *httptest.Server, caPEM []byte, requests *i
 	files = append(files, planFile{manifest.TypeGomod, goEnv.Path(clientconf.OSLinux), "", goEnv.Content})
 	for _, f := range clientconf.OCIClient(srv.URL, map[string]string{"docker.io": "https://registry-1.docker.io"}) {
 		files = append(files, planFile{manifest.TypeOCI, "~" + f.Path(clientconf.OSLinux), f.Key + "x", f.Content})
+	}
+	for _, f := range clientconf.Maven(srv.URL, nil) {
+		files = append(files, planFile{manifest.TypeMaven, f.Path(clientconf.OSLinux), filepath.Base(f.Path(clientconf.OSLinux)), f.Content})
 	}
 	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), requests
 }
@@ -1213,8 +1217,8 @@ func TestDoctorReportsAClientThatCannotVerifyBodega(t *testing.T) {
 	if err != nil {
 		t.Fatalf("doctor = %v:\n%s", err, out)
 	}
-	if row := npmRow(out); !strings.Contains(row, "WARN") || !strings.Contains(row, "neither the system trust store nor npm's cafile setting verifies") {
-		t.Errorf("npm-config row = %q, want a warning naming both stores:\n%s", row, out)
+	if row := npmRow(out); !strings.Contains(row, "WARN") || !strings.Contains(row, "the system trust store, standing in for the roots Node bundles while no cafile setting names a file, does not verify") {
+		t.Errorf("npm-config row = %q, want a warning naming the store npm reads:\n%s", row, out)
 	}
 	if want := "bodega doctor --configure npm --ca-file <CA certificate PEM> --apply --url " + srv.URL; !strings.Contains(out, want) {
 		t.Errorf("the remediation does not read %q:\n%s", want, out)
@@ -1234,7 +1238,8 @@ func TestDoctorReportsAClientThatCannotVerifyBodega(t *testing.T) {
 
 // F116 R1: a system that verifies through the system trust store gets an
 // anchor there and the command that rebuilds the store, previewed as a step,
-// run once under --apply and not again when nothing changed.
+// run once under --apply and not again once the store the clients read holds
+// the CA.
 func TestDoctorConfigureRebuildsTheSystemTrustStore(t *testing.T) {
 	home, root := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
@@ -1249,14 +1254,24 @@ func TestDoctorConfigureRebuildsTheSystemTrustStore(t *testing.T) {
 	var ran []string
 	prevGOOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
 	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, osRelease
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	// update-ca-certificates, as far as doctor reads it: the anchors
+	// concatenated into the bundle every client on the host opens.
 	doctorRun = func(name string, args ...string) error {
 		ran = append(ran, strings.Join(append([]string{name}, args...), " "))
-		return nil
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0o644)
 	}
 	t.Cleanup(func() {
 		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevGOOS, prevRoot, prevRelease, prevRun
 	})
-	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
 	args := []string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL}
 
 	out, err := runDoctor(t, args...)
@@ -1280,5 +1295,227 @@ func TestDoctorConfigureRebuildsTheSystemTrustStore(t *testing.T) {
 	out, err = runDoctor(t, append(args, "--apply")...)
 	if err != nil || !strings.Contains(out, "Nothing to change") || len(ran) != 1 {
 		t.Errorf("second --apply = %v, ran %v:\n%s", err, ran, out)
+	}
+}
+
+// F116 R1, R2: --configure maven --ca-file imports the CA into the JVM trust
+// store with keytool, reading the file the plan wrote. An import that fails
+// is run again by the next --apply, the maven row warns naming that store
+// until it holds the CA, and a run after that changes nothing.
+func TestDoctorConfigureImportsIntoTheJVMTrustStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A distribution the wrapper downloaded is what makes Maven installed
+	// for the report, on a host with no mvn on PATH.
+	if err := os.MkdirAll(filepath.Join(home, ".m2/wrapper/dists/apache-maven"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var stored []*x509.Certificate
+	var ran [][]string
+	fail := true
+	prevJVM, prevRun, prevExit := doctorJVM, doctorRun, doctorExit
+	doctorExit = func(int) {}
+	doctorJVM = func() (clientconf.JVMStore, []*x509.Certificate, error) {
+		return clientconf.JVMStore{Keytool: "/jdk/bin/keytool"}, stored, nil
+	}
+	doctorRun = func(name string, args ...string) error {
+		ran = append(ran, append([]string{name}, args...))
+		if fail {
+			return errors.New("keytool error: java.io.FileNotFoundException: cacerts (Permission denied)")
+		}
+		data, err := os.ReadFile(args[len(args)-1])
+		if err != nil {
+			return err
+		}
+		stored = append(stored, clientconf.ParseKeytoolList(data)...)
+		return nil
+	}
+	t.Cleanup(func() { doctorJVM, doctorRun, doctorExit = prevJVM, prevRun, prevExit })
+	mavenRow := func() string {
+		out, err := runDoctor(t, "--url", srv.URL)
+		if err != nil {
+			t.Fatalf("doctor = %v:\n%s", err, out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "maven ") {
+				return line
+			}
+		}
+		t.Fatalf("no maven row:\n%s", out)
+		return ""
+	}
+	args := []string{"--configure", "maven", "--ca-file", caFile, "--url", srv.URL}
+
+	out, err := runDoctor(t, args...)
+	if err != nil || !strings.Contains(out, "/jdk/bin/keytool -importcert -noprompt -trustcacerts -cacerts -storepass changeit -alias bodega-ca-") ||
+		!strings.Contains(out, "1 JVM trust store import(s)") || len(ran) != 0 {
+		t.Fatalf("dry run = %v, ran %v; want the import previewed and not run:\n%s", err, ran, out)
+	}
+
+	if out, err = runDoctor(t, append(args, "--apply")...); err == nil || !strings.Contains(err.Error(), "runs the import again") || len(ran) != 1 {
+		t.Fatalf("--apply with keytool failing = %v, ran %v:\n%s", err, ran, out)
+	}
+	if got, _ := os.ReadFile(ran[0][len(ran[0])-1]); string(got) != string(caPEM) {
+		t.Errorf("the file keytool was handed = %q, want the CA", got)
+	}
+	if row := mavenRow(); !strings.Contains(row, "WARN") || !strings.Contains(row, "the cacerts keystore of the JDK /jdk/bin/keytool belongs to") {
+		t.Errorf("maven row with the import failed = %q, want a warning naming the JVM store", row)
+	}
+
+	fail = false
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil || len(ran) != 2 || len(stored) != 1 {
+		t.Fatalf("retry = %v, ran %v, store holds %d:\n%s", err, ran, len(stored), out)
+	}
+	if row := mavenRow(); !strings.Contains(row, "OK") || strings.Contains(row, "WARN") {
+		t.Errorf("maven row with the CA imported = %q, want OK", row)
+	}
+	out, err = runDoctor(t, append(args, "--apply")...)
+	if err != nil || !strings.Contains(out, "Nothing to change") || len(ran) != 2 {
+		t.Errorf("third --apply = %v, ran %v:\n%s", err, ran, out)
+	}
+}
+
+func TestReviewDoctorConfigureNpmPipOCI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t, "dockerd", "containerd", "podman")
+	srv, caPEM, _ := caPlanServer(t)
+	host := strings.TrimPrefix(srv.URL, "https://")
+	caFile := filepath.Join(t.TempDir(), "internal-ca.pem")
+	npmrc, daemon := filepath.Join(home, ".npmrc"), filepath.Join(home, "etc/docker/daemon.json")
+	token := "//" + host + "/npm/:_authToken=bodega_ak_kept"
+	for path, content := range map[string]string{
+		caFile: string(caPEM),
+		npmrc:  "registry=https://registry.npmjs.org/\n" + token + "\n",
+		daemon: `{"log-driver":"journald"}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+	certs := []string{
+		userCA,
+		filepath.Join(home, "etc/docker/certs.d", host, "ca.crt"),
+		filepath.Join(home, "etc/containers/certs.d", host, "ca.crt"),
+	}
+	args := []string{"--configure", "npm,pip,oci", "--ca-file", caFile, "--url", srv.URL}
+
+	out, err := runDoctor(t, args...)
+	if err != nil {
+		t.Fatalf("dry run = %v:\n%s", err, out)
+	}
+	for _, want := range []string{"+cafile=" + userCA, "+cert = " + userCA, `+  ca = "` + userCA + `"`, "+-----BEGIN CERTIFICATE-----", "Dry run: nothing was written"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the dry run does not show %q:\n%s", want, out)
+		}
+	}
+	for _, p := range certs {
+		if !strings.Contains(out, p) {
+			t.Errorf("the dry run does not name %s:\n%s", p, out)
+		}
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the dry run wrote %s: %v", p, err)
+		}
+	}
+
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil {
+		t.Fatalf("--apply = %v:\n%s", err, out)
+	}
+	for _, p := range certs {
+		if got, _ := os.ReadFile(p); string(got) != string(caPEM) {
+			t.Errorf("%s = %q, want the CA", p, got)
+		}
+	}
+	if got, _ := os.ReadFile(npmrc); string(got) != "registry="+srv.URL+"/npm/\n"+token+"\ncafile="+userCA+"\n" {
+		t.Errorf(".npmrc after --apply = %q, want the registry, the kept token and cafile", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "etc/pip.conf")); string(got) != "[global]\ncert = "+userCA+"\nindex-url = "+srv.URL+"/pypi/simple/\n" {
+		t.Errorf("pip.conf after --apply = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml")); !strings.Contains(string(got), `  ca = "`+userCA+`"`) || !strings.Contains(string(got), "capabilities") {
+		t.Errorf("hosts.toml after --apply = %q", got)
+	}
+	if got, _ := os.ReadFile(daemon); !strings.Contains(string(got), `"log-driver": "journald"`) || !strings.Contains(string(got), srv.URL) {
+		t.Errorf("daemon.json after --apply = %s", got)
+	}
+
+	out, err = runDoctor(t, append(args, "--apply")...)
+	if err != nil || !strings.Contains(out, "Nothing to change") {
+		t.Errorf("second --apply = %v:\n%s", err, out)
+	}
+	if backups, _ := filepath.Glob(npmrc + ".bodega-*"); len(backups) != 1 {
+		t.Errorf("backups of .npmrc = %v, want the one the first --apply made", backups)
+	}
+}
+
+func TestUsageDocDescribesPrivateCA(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := string(data)
+	_, doctor, ok := strings.Cut(usage, "### `bodega doctor ")
+	if !ok {
+		t.Fatal("no doctor section")
+	}
+	doctor, _, _ = strings.Cut(doctor, "\n### ")
+	_, configure, ok := strings.Cut(doctor, "`--configure` applies")
+	if !ok {
+		t.Fatal("no --configure documentation")
+	}
+	for _, want := range []string{"--ca-file", "Store the client reads", "What doctor writes", "`npm`", "`pypi`", "`git`", "Docker", "containerd", "podman", "update-ca-certificates", "update-ca-trust", "certctl rehash"} {
+		if !strings.Contains(configure, want) {
+			t.Errorf("--configure documentation lacks %q", want)
+		}
+	}
+	_, tls, ok := strings.Cut(usage, "\n### TLS\n")
+	if !ok {
+		t.Fatal("no TLS section")
+	}
+	tls, _, _ = strings.Cut(tls, "\n### ")
+	if !strings.Contains(tls, "--ca-file") || !strings.Contains(tls, "](#bodega-doctor-") {
+		t.Error("TLS documentation does not link to doctor's private-CA instructions")
+	}
+}
+
+func TestReviewDoctorRetriesFailedTrustRebuild(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	attempts := 0
+	doctorRun = func(string, ...string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("temporary trust rebuild failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	args := []string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL, "--apply"}
+	if out, err := runDoctor(t, args...); err == nil {
+		t.Fatalf("first rebuild should fail: %s", out)
+	}
+	out, err := runDoctor(t, args...)
+	if err != nil || attempts != 2 {
+		t.Fatalf("retry after failed trust rebuild: attempts=%d err=%v output=%s", attempts, err, out)
 	}
 }

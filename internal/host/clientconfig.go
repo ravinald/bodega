@@ -292,7 +292,9 @@ func CheckPipConfig() Finding {
 	return checkPipConfig("", runtime.GOOS, home)
 }
 
-// pipPaths lists the files pip reads, system-wide first. On FreeBSD pip's
+// pipPaths lists the files pip reads, system-wide first, in the order pip
+// loads them, so a later file's setting replaces an earlier one's. macOS
+// adds the global file under /Library, where the plan writes. On FreeBSD pip's
 // global search is /etc/xdg/pip/pip.conf, /etc/pip.conf and
 // sys.prefix/pip.conf (measured with `pip config debug`, py312-pip 23.3.2 on
 // 15.1-RELEASE). /usr/local/etc/pip.conf is read by nothing, and is scanned
@@ -302,6 +304,9 @@ func pipPaths(goos, home string) []string {
 	paths := []string{"/etc/pip.conf"}
 	if goos == "freebsd" {
 		paths = append(paths, "/etc/xdg/pip/pip.conf", "/usr/local/pip.conf", "/usr/local/etc/pip.conf")
+	}
+	if goos == "darwin" {
+		paths = append(paths, "/Library/Application Support/pip/pip.conf")
 	}
 	if home != "" {
 		paths = append(paths,

@@ -656,6 +656,23 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 	if _, err := Apply(in.Changes, ".bak"); err != nil {
 		t.Fatal(err)
 	}
+	// The anchor is written and the store the clients read is not rebuilt
+	// yet, which is where a failed update-ca-certificates leaves a host: the
+	// step is still owed.
+	owed, err := AddCA(plan(), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(owed.Step, []string{"update-ca-certificates"}) {
+		t.Errorf("step with the anchor written and the store not rebuilt = %v, want update-ca-certificates again", owed.Step)
+	}
+	bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+	if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle, caPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	again, err := AddCA(plan(), ca, h)
 	if err != nil {
 		t.Fatal(err)
@@ -666,7 +683,7 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 		}
 	}
 	if again.Step != nil {
-		t.Errorf("a second plan runs %v with no anchor changed", again.Step)
+		t.Errorf("a second plan runs %v with the store holding the anchor", again.Step)
 	}
 }
 
@@ -723,10 +740,145 @@ func TestAddCAFollowsTheHost(t *testing.T) {
 	if _, err := AddCA([]Change{apt}, ca, CAHost{Base: "http://bodega.example.com", GOOS: OSLinux}); err == nil {
 		t.Error("a plaintext base took a CA")
 	}
-	mvn := Change{Record: PlanRecord{System: manifest.TypeMaven, Path: MavenSettingsPath}}
-	in, err := AddCA([]Change{mvn}, ca, CAHost{Base: testBase, GOOS: OSDarwin})
-	if err != nil || !strings.Contains(in.Notes[manifest.TypeMaven], "keytool") || len(in.Changes) != 1 {
-		t.Errorf("maven = %v, notes %v, %d changes; want the keytool note and no file", err, in.Notes, len(in.Changes))
+}
+
+// F116 R1: Maven's CA goes into the JVM trust store, one keytool import per
+// certificate that store lacks, each reading a file the plan writes; a store
+// already holding the CA takes no import, and a keystore the JVM is pointed
+// at is the one edited.
+func TestAddCAImportsIntoTheJVMTrustStore(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	otherPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(append(slices.Clone(caPEM), otherPEM...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	// macOS, where no system store install exists: Maven needs none.
+	h := CAHost{Base: testBase, Home: home, GOOS: OSDarwin, JVM: JVMStore{Keytool: "/jdk/bin/keytool"}}
+	in, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(in.Imports) != 2 || in.Step != nil || !strings.Contains(in.Notes[manifest.TypeMaven], "gradle --stop") {
+		t.Fatalf("imports = %v, step %v, notes %v; want one import per certificate, no system step and the daemon note", in.Imports, in.Step, in.Notes)
+	}
+	for i, cmd := range in.Imports {
+		alias, file := cmd[len(cmd)-3], cmd[len(cmd)-1]
+		want := []string{"/jdk/bin/keytool", "-importcert", "-noprompt", "-trustcacerts", "-cacerts", "-storepass", "changeit", "-alias", alias, "-file", file}
+		if !slices.Equal(cmd, want) || !strings.HasPrefix(alias, "bodega-ca-") || filepath.Dir(file) != filepath.Join(home, ".config/bodega") {
+			t.Errorf("import %d = %v", i, cmd)
+		}
+		// What keytool reads is what the plan writes: one certificate.
+		if got := changeAt(t, in.Changes, file); string(got.New) != string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Certs[i].Raw})) {
+			t.Errorf("%s = %s, want certificate %d alone", file, got.New, i+1)
+		}
+	}
+	if in.Imports[0][8] == in.Imports[1][8] {
+		t.Errorf("two certificates share the alias %s", in.Imports[0][8])
+	}
+
+	// A failed import leaves the file written and the store without the CA:
+	// the import is planned again. Once the store holds both, nothing is.
+	if _, err := Apply(in.Changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	h.JVMTrusted = ca.Certs[:1]
+	retry, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
+	if err != nil || len(retry.Imports) != 1 || retry.Imports[0][8] != in.Imports[1][8] {
+		t.Errorf("retry with one certificate imported = %v, %v; want the other's import alone", retry.Imports, err)
+	}
+	h.JVMTrusted = ca.Certs
+	done, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
+	if err != nil || len(done.Imports) != 0 || len(done.Notes) != 0 {
+		t.Errorf("a store holding the CA = imports %v, notes %v, %v; want none", done.Imports, done.Notes, err)
+	}
+	for _, c := range done.Changes {
+		if !c.Unchanged() {
+			t.Errorf("a store holding the CA still changes %s", c.Target)
+		}
+	}
+}
+
+// F116 R1: the JVM store is the JDK at JAVA_HOME's, or the keystore
+// MAVEN_OPTS points the JVM at, and a password an operator set is not printed.
+func TestResolveJVMStore(t *testing.T) {
+	env := map[string]string{"JAVA_HOME": "/opt/jdk"}
+	getenv := func(k string) string { return env[k] }
+	none := func(string) (string, error) { return "", os.ErrNotExist }
+	s, err := ResolveJVMStore(getenv, none)
+	if err != nil || s.Keytool != "/opt/jdk/bin/keytool" || !slices.Contains(s.ImportCommand("a", "f"), "-cacerts") {
+		t.Errorf("JAVA_HOME = %+v, %v", s, err)
+	}
+	env["JAVA_TOOL_OPTIONS"] = "-Djavax.net.ssl.trustStore=/etc/a.jks"
+	env["MAVEN_OPTS"] = "-Xmx1g -Djavax.net.ssl.trustStore=/etc/b.p12 -Djavax.net.ssl.trustStorePassword=hunter2"
+	s, _ = ResolveJVMStore(getenv, none)
+	cmd := s.ImportCommand("a", "f")
+	if s.Keystore != "/etc/b.p12" || slices.Contains(cmd, "-cacerts") || !slices.Contains(cmd, "hunter2") {
+		t.Errorf("MAVEN_OPTS keystore = %+v, %v", s, cmd)
+	}
+	if shown := RedactJVMCommand(cmd); strings.Contains(shown, "hunter2") || !strings.Contains(shown, "-keystore /etc/b.p12") {
+		t.Errorf("printed command = %q", shown)
+	}
+	delete(env, "JAVA_HOME")
+	if _, err := ResolveJVMStore(getenv, none); err == nil || !strings.Contains(err.Error(), "JAVA_HOME") {
+		t.Errorf("no keytool and no JAVA_HOME = %v, want a refusal naming JAVA_HOME", err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	if got := ParseKeytoolList(append([]byte("Alias name: x\nnot a cert\n"), caPEM...)); len(got) != 1 {
+		t.Errorf("ParseKeytoolList = %d certificates, want 1", len(got))
+	}
+}
+
+// F116 R1: merging into an existing file replaces a repeated key as a group,
+// drops the lines continuing a replaced value, and refuses a hosts.toml the
+// line merge would corrupt rather than writing it.
+func TestAddCAMergesWithoutCorrupting(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(home string, f File, content string) string {
+		target := filepath.Join(home, strings.TrimPrefix(f.Path(OSLinux), "~"))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return target
+	}
+	home := t.TempDir()
+	h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux}
+	userCA := filepath.Join(home, ".config/bodega/ca.pem")
+
+	pip := Pip(testBase)
+	target := write(home, pip, "# site policy\n[global]\nINDEX-URL =\n    https://pypi.org/simple/\ntimeout = 5\ncert = /old/ca.pem\n")
+	in, err := AddCA(caPlan(t, home, pip), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# site policy\n[global]\nindex-url = https://bodega.example.com/pypi/simple/\ntimeout = 5\ncert = " + userCA + "\n"
+	if got := string(changeAt(t, in.Changes, target).New); got != want {
+		t.Errorf("pip.conf =\n%s\nwant\n%s", got, want)
+	}
+
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}, "gl": {URL: "https://gitlab.com/"}})
+	target = write(home, git, "[core]\n\teditor = vi\n"+git.Content+"[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /old/ca.pem\n\tproxy = http://p\n")
+	in, err = AddCA(caPlan(t, home, git), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "[core]\n\teditor = vi\n" + git.Content + "[http \"https://bodega.example.com/\"]\n\tsslCAInfo = " + userCA + "\n\tproxy = http://p\n"
+	if got := string(changeAt(t, in.Changes, target).New); got != want {
+		t.Errorf(".gitconfig =\n%s\nwant\n%s", got, want)
+	}
+
+	hosts := ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")
+	write(home, hosts, "server = \"https://registry-1.docker.io\"\n[host.\""+testBase+"\"]\n  capabilities = [\n    \"pull\",\n  ]\n")
+	if _, err := AddCA(caPlan(t, home, hosts), ca, h); err == nil || !strings.Contains(err.Error(), "move the file aside") {
+		t.Errorf("a hosts.toml with a value over several lines = %v, want a refusal naming the next step", err)
 	}
 }
 
@@ -751,5 +903,71 @@ func TestParseCARefusesWhatIsNotACA(t *testing.T) {
 	ca, err := ParseCA(append([]byte("subject=CN=bodega test CA\n"), caPEM...))
 	if err != nil || len(ca.Certs) != 1 || string(ca.PEM) != string(caPEM) {
 		t.Errorf("a CA under a text header = %v, %d certs; want it accepted and re-encoded alone", err, len(ca.Certs))
+	}
+}
+
+func TestReviewCAKeepsExistingSettings(t *testing.T) {
+	pem, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		file File
+		keep string
+	}{
+		{"npm", Npm(testBase, nil), "save-exact=true\n"},
+		{"pip", Pip(testBase), "[install]\nno-compile = true\n"},
+		{"git", Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), "[user]\n\tname = Existing User\n"},
+		{"containerd", ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"), "[host.\"" + testBase + "\".header]\n  X-Existing = [\"kept\"]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := tc.file.Path(OSLinux)
+			path = strings.TrimPrefix(path, "~")
+			target := filepath.Join(home, path)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.file.Content+tc.keep), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".review-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Errorf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestReviewMavenCAPlansTrustInstallation(t *testing.T) {
+	pem, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	plan := caPlan(t, home, Maven(testBase, nil)...)
+	in, err := AddCA(plan, ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := len(in.Changes) != len(plan) || len(in.Step) > 0
+	for i := range plan {
+		changed = changed || string(plan[i].New) != string(in.Changes[i].New)
+	}
+	if !changed {
+		t.Fatalf("--ca-file added no trust write or step; only notes: %v", in.Notes)
 	}
 }

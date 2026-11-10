@@ -2,15 +2,21 @@ package clientconf
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -81,6 +87,11 @@ type CAHost struct {
 	// OSRelease is the content of /etc/os-release, which names the Linux
 	// family whose trust store command applies.
 	OSRelease []byte
+	// JVM is the trust store of the JVM Maven and Gradle run on, and
+	// JVMTrusted the certificates it holds now. The zero JVM is the cacerts
+	// of the keytool on PATH, and a nil JVMTrusted an empty store.
+	JVM        JVMStore
+	JVMTrusted []*x509.Certificate
 }
 
 // CAInstall is a plan with a CA added to it.
@@ -89,36 +100,188 @@ type CAInstall struct {
 	// file a client reads one from, followed by the certificate files.
 	Changes []Change
 	// Step is the command that rebuilds the system trust store from the
-	// anchors in Changes, or nil when no anchor differs from the host's.
+	// anchors in Changes, or nil when the store the host's clients read
+	// already holds every one of them.
 	Step []string
+	// Imports are the keytool commands that add to the JVM trust store each
+	// certificate it lacks, run after Changes are written: each names a file
+	// among them.
+	Imports [][]string
 	// Notes name what the operator still does by hand, one per system.
 	Notes map[string]string
 }
 
 // systemStore is where one operating system family reads trust anchors, one
-// certificate to a file, and the command that rebuilds its store from them.
+// certificate to a file, the command that rebuilds its store from them, and
+// the files that command writes, which are what the host's clients read.
 type systemStore struct {
 	dir, ext string
 	step     []string
+	live     []string
 }
 
 // systemStoreFor resolves the trust store of the host. certctl before FreeBSD
-// 14 reads only *.pem from its trust path, so that is the extension there.
+// 14 reads only *.pem from its trust path, so that is the extension there,
+// and before 15 it writes hashed links and no bundle, so both are read.
 func systemStoreFor(h CAHost) (systemStore, error) {
 	if h.GOOS == OSFreeBSD {
-		return systemStore{"/usr/local/share/certs", ".pem", []string{"certctl", "rehash"}}, nil
+		return systemStore{"/usr/local/share/certs", ".pem", []string{"certctl", "rehash"},
+			[]string{"/etc/ssl/cert.pem", "/etc/ssl/certs/*.0"}}, nil
 	}
 	if h.GOOS == OSLinux {
 		for _, id := range osReleaseFamily(h.OSRelease) {
 			switch id {
 			case "debian", "ubuntu":
-				return systemStore{"/usr/local/share/ca-certificates", ".crt", []string{"update-ca-certificates"}}, nil
+				return systemStore{"/usr/local/share/ca-certificates", ".crt", []string{"update-ca-certificates"},
+					[]string{"/etc/ssl/certs/ca-certificates.crt"}}, nil
 			case "rhel", "fedora", "centos":
-				return systemStore{"/etc/pki/ca-trust/source/anchors", ".pem", []string{"update-ca-trust", "extract"}}, nil
+				return systemStore{"/etc/pki/ca-trust/source/anchors", ".pem", []string{"update-ca-trust", "extract"},
+					[]string{"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"}}, nil
 			}
 		}
 	}
 	return systemStore{}, fmt.Errorf("doctor installs into the system trust store on Debian and Ubuntu, the RHEL family and FreeBSD, and this host is none of them")
+}
+
+// holds reports whether the store the rebuild command last wrote under root
+// carries every certificate. An anchor file in place proves nothing on its
+// own: the command may have failed after the file was written.
+func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
+	have := map[[sha256.Size]byte]bool{}
+	for _, pattern := range s.live {
+		files, _ := filepath.Glob(filepath.Join(root, pattern))
+		for _, f := range files {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
+				have[sha256.Sum256(block.Bytes)] = true
+			}
+		}
+	}
+	for _, c := range certs {
+		if !have[sha256.Sum256(c.Raw)] {
+			return false
+		}
+	}
+	return true
+}
+
+// JVMStore is the keystore a JVM reads its trust anchors from, and the
+// keytool that reads and edits it. The JVM reads nothing else: neither the
+// system trust store nor any setting in Maven's or Gradle's own files.
+type JVMStore struct {
+	// Keytool is the keytool of the JVM, "" for the one on PATH.
+	Keytool string
+	// Keystore is the file javax.net.ssl.trustStore names, "" for the
+	// cacerts of the JDK Keytool belongs to.
+	Keystore string
+	// Password is javax.net.ssl.trustStorePassword, "" for the JDK's default.
+	Password string
+}
+
+const jvmDefaultPassword = "changeit"
+
+// ResolveJVMStore finds the trust store of the JVM Maven and Gradle start:
+// the JDK at JAVA_HOME, or else the one whose keytool is on PATH, and the
+// keystore a -Djavax.net.ssl.trustStore in JAVA_TOOL_OPTIONS or MAVEN_OPTS
+// names in place of that JDK's cacerts. MAVEN_OPTS is read last because the
+// JVM takes it after JAVA_TOOL_OPTIONS and the later definition wins.
+func ResolveJVMStore(getenv func(string) string, lookPath func(string) (string, error)) (JVMStore, error) {
+	var s JVMStore
+	for _, opt := range strings.Fields(getenv("JAVA_TOOL_OPTIONS") + " " + getenv("MAVEN_OPTS")) {
+		if v, ok := strings.CutPrefix(opt, "-Djavax.net.ssl.trustStore="); ok {
+			s.Keystore = v
+		}
+		if v, ok := strings.CutPrefix(opt, "-Djavax.net.ssl.trustStorePassword="); ok {
+			s.Password = v
+		}
+	}
+	if home := getenv("JAVA_HOME"); home != "" {
+		s.Keytool = filepath.Join(home, "bin", "keytool")
+		return s, nil
+	}
+	path, err := lookPath("keytool")
+	if err != nil {
+		return JVMStore{}, fmt.Errorf("no keytool on PATH and JAVA_HOME is unset, so the JVM Maven and Gradle run on is not known; set JAVA_HOME to its JDK")
+	}
+	s.Keytool = path
+	return s, nil
+}
+
+// Name is how a message names the store.
+func (s JVMStore) Name() string {
+	if s.Keystore != "" {
+		return "the JVM trust store " + s.Keystore
+	}
+	return "the cacerts keystore of the JDK " + s.keytool() + " belongs to"
+}
+
+func (s JVMStore) keytool() string {
+	if s.Keytool == "" {
+		return "keytool"
+	}
+	return s.Keytool
+}
+
+func (s JVMStore) command(verb ...string) []string {
+	cmd := append([]string{s.keytool()}, verb...)
+	if s.Keystore != "" {
+		cmd = append(cmd, "-keystore", s.Keystore)
+	} else {
+		cmd = append(cmd, "-cacerts")
+	}
+	pass := s.Password
+	if pass == "" {
+		pass = jvmDefaultPassword
+	}
+	return append(cmd, "-storepass", pass)
+}
+
+// ImportCommand adds the certificate in file to the store as alias.
+func (s JVMStore) ImportCommand(alias, file string) []string {
+	return append(s.command("-importcert", "-noprompt", "-trustcacerts"), "-alias", alias, "-file", file)
+}
+
+// Trusted lists the certificates the store holds, by running keytool.
+func (s JVMStore) Trusted() ([]*x509.Certificate, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := s.command("-list", "-rfc")
+	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	if err != nil {
+		first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+		return nil, fmt.Errorf("%s: %w (%s). keytool lists a JDK's own cacerts from JDK 9 on, with the password %q unless -Djavax.net.ssl.trustStorePassword in MAVEN_OPTS names another",
+			RedactJVMCommand(cmd), err, first, jvmDefaultPassword)
+	}
+	return ParseKeytoolList(out), nil
+}
+
+// ParseKeytoolList reads the certificates out of keytool -list -rfc output.
+// An entry keytool prints that does not parse is no trust anchor and is left
+// out.
+func ParseKeytoolList(out []byte) []*x509.Certificate {
+	var certs []*x509.Certificate
+	for block, rest := pem.Decode(out); block != nil; block, rest = pem.Decode(rest) {
+		if cert, err := x509.ParseCertificate(block.Bytes); err == nil && block.Type == "CERTIFICATE" {
+			certs = append(certs, cert)
+		}
+	}
+	return certs
+}
+
+// RedactJVMCommand renders a keytool command for a message, without a
+// keystore password an operator set: the JDK's default is public, any other
+// is theirs.
+func RedactJVMCommand(cmd []string) string {
+	out := slices.Clone(cmd)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] == "-storepass" && out[i] != jvmDefaultPassword {
+			out[i] = "<trustStorePassword>"
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // osReleaseFamily is ID followed by each ID_LIKE entry, the order os-release
@@ -144,14 +307,18 @@ func osReleaseFamily(data []byte) []string {
 
 // ownStoreSystems are the systems whose client reads a CA from its own
 // setting. Every other system verifies through the system trust store, apart
-// from Maven, whose JVM reads a keystore doctor does not write.
+// from Maven, whose JVM reads a keystore of its own.
 var ownStoreSystems = []string{manifest.TypeNpm, manifest.TypePypi, manifest.TypeOCI, manifest.TypeGit}
 
 // AddCA plans the install of ca for every system changes configures: the
 // client's own setting merged into the file the plan already writes for npm,
 // pip, git and containerd, a ca.crt in the directory Docker and podman read
-// per registry host, and for every other system an anchor in the operating
-// system's trust store.
+// per registry host, an import into the JVM trust store for Maven and Gradle,
+// and for every other system an anchor in the operating system's trust store.
+//
+// A file that takes a CA setting and already exists keeps every setting the
+// plan does not set: the plan's settings and the CA are merged into it, where
+// a plan without a CA replaces it whole.
 //
 // The certificate files follow the plan's own changes, because Apply writes
 // last to first: a setting naming a CA file is written only after that file.
@@ -186,14 +353,16 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		files = append(files, c)
 		return nil
 	}
-	// shared installs the copy a setting in the file at planPath names, and
-	// returns where that copy is.
-	shared := func(planPath string) (string, error) {
-		p := CASharedPath
+	// sharedPath is where the copy a setting in the file at planPath names
+	// goes, and shared installs it.
+	sharedPath := func(planPath string) (string, error) {
 		if strings.HasPrefix(planPath, "~/") {
-			p = CAUserPath
+			return resolve(CAUserPath)
 		}
-		target, err := resolve(p)
+		return resolve(CASharedPath)
+	}
+	shared := func(planPath string) (string, error) {
+		target, err := sharedPath(planPath)
 		if err != nil {
 			return "", err
 		}
@@ -201,29 +370,56 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	}
 
 	var system []string
+	jvm := false
 	for i, c := range in.Changes {
 		rec := c.Record
-		var edit func(body []byte, caPath string) []byte
+		// header and line are the CA setting and the section it belongs
+		// under; continues says an indented line continues the value above.
+		var header string
+		var line func(caPath string) string
+		continues, isTOML := false, false
 		switch {
 		case rec.System == manifest.TypeMaven:
-			in.Notes[rec.System] = "the JVM reads its own keystore, which doctor does not write. Import the CA there: " +
-				"keytool -importcert -cacerts -alias bodega -file <ca.pem>"
+			if jvm {
+				continue
+			}
+			jvm = true
+			for _, cert := range ca.Certs {
+				if slices.ContainsFunc(h.JVMTrusted, func(have *x509.Certificate) bool { return bytes.Equal(have.Raw, cert.Raw) }) {
+					continue
+				}
+				// The fingerprint keeps a rotated CA from colliding with the
+				// alias of the one it replaces, which keytool refuses.
+				sum := sha256.Sum256(cert.Raw)
+				alias := "bodega-ca-" + hex.EncodeToString(sum[:6])
+				dir, err := sharedPath(rec.Path)
+				if err != nil {
+					return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
+				}
+				target := filepath.Join(filepath.Dir(dir), alias+".pem")
+				if err := addFile(rec.System, target, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})); err != nil {
+					return CAInstall{}, err
+				}
+				in.Imports = append(in.Imports, h.JVM.ImportCommand(alias, target))
+			}
+			if len(in.Imports) > 0 {
+				in.Notes[rec.System] = "a JVM already running keeps the trust store it started with; stop Gradle's daemons (gradle --stop) and Maven's (mvnd --stop) once the import has run"
+			}
 		case !slices.Contains(ownStoreSystems, rec.System):
 			if !slices.Contains(system, rec.System) {
 				system = append(system, rec.System)
 			}
 		case rec.System == manifest.TypeNpm && rec.Path != NodeMirrorSystemPath && rec.Path != NodeMirrorUserPath:
-			edit = func(body []byte, caPath string) []byte { return setLine(body, "", "cafile=", "cafile="+caPath) }
+			line = func(caPath string) string { return "cafile=" + caPath }
 		case rec.System == manifest.TypePypi:
-			edit = func(body []byte, caPath string) []byte { return setLine(body, "[global]", "cert =", "cert = "+caPath) }
+			header, continues = "[global]", true
+			line = func(caPath string) string { return "cert = " + caPath }
 		case rec.System == manifest.TypeGit:
-			edit = func(body []byte, caPath string) []byte {
-				return setLine(body, fmt.Sprintf("[http %q]", trim(h.Base)+"/"), "sslCAInfo =", "\tsslCAInfo = "+caPath)
-			}
+			header = fmt.Sprintf("[http %q]", trim(h.Base)+"/")
+			line = func(caPath string) string { return "\tsslCAInfo = " + caPath }
 		case rec.System == manifest.TypeOCI && strings.HasSuffix(rec.Path, "/hosts.toml"):
-			edit = func(body []byte, caPath string) []byte {
-				return setLine(body, "[host."+jsonString(trim(h.Base))+"]", "ca =", "  ca = "+jsonString(caPath))
-			}
+			header, isTOML = "[host."+jsonString(trim(h.Base))+"]", true
+			line = func(caPath string) string { return "  ca = " + jsonString(caPath) }
 		case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimeDocker:
 			// Docker reads certs.d beside daemon.json, keyed by the host and
 			// port of the registry or mirror it is talking to.
@@ -236,14 +432,30 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		}
-		if edit == nil {
+		if line == nil {
 			continue
 		}
 		caPath, err := shared(rec.Path)
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
 		}
-		in.Changes[i].New = edit(c.New, caPath)
+		body := splitBody(c.New)
+		if c.Existed {
+			// New holds the plan's file and nothing of the host's but a
+			// credential; the host's file is what the settings join.
+			body = mergeSettings(splitBody(c.Old), body, continues)
+		}
+		// A setting in a section leads it, so it reads beside the header
+		// that scopes it; npm's file has no sections, and it ends the file.
+		merged := joinBody(setSection(body, header, []string{line(caPath)}, continues, header != ""))
+		if isTOML {
+			var doc map[string]any
+			if _, err := toml.Decode(string(merged), &doc); err != nil {
+				return CAInstall{}, fmt.Errorf("%s: %s with bodega's settings and the CA merged in is not TOML containerd can load (%w). "+
+					"It holds a value this merge does not edit, such as one spanning several lines; move the file aside and re-run to have it written whole", rec.System, c.Target, err)
+			}
+		}
+		in.Changes[i].New = merged
 	}
 
 	if len(system) > 0 {
@@ -251,7 +463,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s verify through the system trust store: %w.\n"+
 				"  Add the CA to this host's store by hand, then re-run without --ca-file, or name only the systems that read their own: %s",
-				strings.Join(system, ", "), err, strings.Join(ownStoreSystems, ", "))
+				strings.Join(system, ", "), err, strings.Join(append(slices.Clone(ownStoreSystems), manifest.TypeMaven), ", "))
 		}
 		before := len(files)
 		for i, cert := range ca.Certs {
@@ -268,7 +480,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		}
-		if slices.ContainsFunc(files[before:], func(c Change) bool { return !c.Unchanged() }) {
+		if slices.ContainsFunc(files[before:], func(c Change) bool { return !c.Unchanged() }) || !store.holds(h.Root, ca.Certs) {
 			in.Step = store.step
 		}
 	}
@@ -276,46 +488,119 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	return in, nil
 }
 
-// setLine sets one "key = value" line of an INI, TOML or git config body: the
-// first line under header opening with key is replaced by line, and with none
-// there line is added as the section's first. A body lacking the header gains
-// it at the end. An empty header means the file has no sections. Every other
-// line is kept as it is.
-func setLine(body []byte, header, key, line string) []byte {
-	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		lines = nil
+func splitBody(body []byte) []string {
+	s := strings.TrimRight(string(body), "\n")
+	if s == "" {
+		return nil
 	}
-	start, end := 0, len(lines)
-	if header != "" {
-		start = -1
-		for i, l := range lines {
-			t := strings.TrimSpace(l)
-			switch {
-			case start < 0 && t == header:
-				start = i + 1
-			case start >= 0 && strings.HasPrefix(t, "["):
-				end = i
-			}
-			if start >= 0 && end < len(lines) {
-				break
-			}
-		}
-		if start < 0 {
-			lines = append(lines, header)
-			start, end = len(lines), len(lines)
-		}
-	}
-	for i := start; i < end; i++ {
-		if strings.HasPrefix(strings.TrimSpace(lines[i]), key) {
-			lines[i] = line
-			return []byte(strings.Join(lines, "\n") + "\n")
-		}
-	}
-	at := start
-	if header == "" {
-		at = end
-	}
-	lines = slices.Insert(lines, at, line)
+	return strings.Split(s, "\n")
+}
+
+func joinBody(lines []string) []byte {
 	return bytes.TrimLeft([]byte(strings.Join(lines, "\n")+"\n"), "\n")
+}
+
+// settingKey is the key of a "key = value" line of an INI, TOML or git
+// config body, lowercased, and "" for a comment, a header or a blank line.
+func settingKey(line string) string {
+	t := strings.TrimSpace(line)
+	if t == "" || strings.ContainsRune("#;[", rune(t[0])) {
+		return ""
+	}
+	key, _, ok := strings.Cut(t, "=")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(key))
+}
+
+// mergeSettings sets every setting of planned in old, section by section,
+// and keeps every other line of old: its other settings, sections, comments
+// and their order. planned's own comments are not carried.
+func mergeSettings(old, planned []string, continues bool) []string {
+	var headers []string
+	bySection := map[string][]string{}
+	header := ""
+	for _, l := range planned {
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "[") {
+			header = t
+			continue
+		}
+		if settingKey(l) == "" {
+			continue
+		}
+		if _, ok := bySection[header]; !ok {
+			headers = append(headers, header)
+		}
+		bySection[header] = append(bySection[header], l)
+	}
+	for _, h := range headers {
+		old = setSection(old, h, bySection[h], continues, false)
+	}
+	return old
+}
+
+// setSection sets the lines of set, each "key = value", under header: every
+// line in a section of that name giving one of their keys is dropped, with
+// the indented lines continuing it when continues is set, and set goes where
+// the first of them stood. With none there it goes first in the section when
+// lead is set, and after the section's last line otherwise. A body with no
+// such section gains it at the end. An empty header is the lines above the
+// first section, the whole body of a file that has none.
+//
+// A key may repeat in set (git's insteadOf does), which is why the keys are
+// replaced as a group rather than line by line.
+func setSection(lines []string, header string, set []string, continues, lead bool) []string {
+	keys := map[string]bool{}
+	for _, l := range set {
+		keys[settingKey(l)] = true
+	}
+	var out []string
+	in := header == ""
+	start, end, at := -1, -1, -1
+	if in {
+		start = 0
+	}
+	closeSection := func() {
+		if !in || end >= 0 {
+			return
+		}
+		for end = len(out); end > start && strings.TrimSpace(out[end-1]) == ""; end-- {
+		}
+	}
+	dropping := false
+	for _, l := range lines {
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "[") {
+			closeSection()
+			in, dropping = header != "" && t == header, false
+			out = append(out, l)
+			if in && start < 0 {
+				start = len(out)
+			}
+			continue
+		}
+		if in {
+			if dropping && continues && l != strings.TrimLeft(l, " \t") && strings.TrimSpace(l) != "" {
+				continue
+			}
+			if dropping = keys[settingKey(l)] && settingKey(l) != ""; dropping {
+				if at < 0 {
+					at = len(out)
+				}
+				continue
+			}
+		}
+		out = append(out, l)
+	}
+	closeSection()
+	if start < 0 {
+		return append(append(out, header), set...)
+	}
+	if at < 0 {
+		at = end
+		if lead {
+			at = start
+		}
+	}
+	return slices.Insert(out, at, set...)
 }

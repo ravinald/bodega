@@ -143,18 +143,20 @@ restart stay with the served setup script (--systems osquery).
 
 --ca-file, with --configure, installs a private CA where each named system's
 client reads one, for a bodega whose certificate no public CA issued: the
-system trust store for apt, dnf, go, helm, cargo and pkg, and the client's
-own setting for npm (cafile), pip (cert), git (http.<url>.sslCAInfo), Docker
-and podman (certs.d/<host>/ca.crt) and containerd (ca in each hosts.toml).
-The file is refused before anything is written when it holds no CA
-certificate, a certificate that is not a CA, or anything else. Pass it on
-every --configure run: the plan replaces .npmrc and pip.conf whole.
+system trust store for apt, dnf, go, helm, cargo and pkg, the client's own
+setting for npm (cafile), pip (cert), git (http.<url>.sslCAInfo), Docker and
+podman (certs.d/<host>/ca.crt) and containerd (ca in each hosts.toml), and
+the JVM trust store for maven (keytool -importcert). The file is refused
+before anything is written when it holds no CA certificate, a certificate
+that is not a CA, or anything else. A file that takes a CA setting keeps its
+other settings under --ca-file. Pass the flag on every --configure run: a
+run without it replaces .npmrc and pip.conf whole. pip names the pypi system.
 
-  sudo bodega doctor --configure apt,pypi,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
+  sudo bodega doctor --configure apt,pip,oci --ca-file /root/internal-ca.pem --apply --url https://bodega.internal
 
 The report checks the same stores: a row whose client is configured for
-bodega warns when neither the system trust store nor that client's own
-verifies the certificate bodega serves.
+bodega warns when the store that client reads, as this host configures it,
+does not verify the certificate bodega serves.
 
 --token is optional: a host bound with "bodega identity bind cidr" is
 identified by its address and needs none. A host bodega cannot identify is
@@ -219,7 +221,17 @@ is the operator's to choose. --restore-os-callers undoes the recorded steps.
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			systems := slices.Clone(configure)
+			// pip is the client and pypi the plan's name for it; both select
+			// the one system.
+			var systems []string
+			for _, name := range configure {
+				if name == "pip" {
+					name = manifest.TypePypi
+				}
+				if !slices.Contains(systems, name) {
+					systems = append(systems, name)
+				}
+			}
 			if writeAptSources && !slices.Contains(systems, manifest.TypeApt) {
 				systems = append(systems, manifest.TypeApt)
 			}
@@ -702,15 +714,25 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		changes = append(changes, c)
 	}
 	var caStep []string
+	var caImports [][]string
 	if ca != nil {
 		osRelease, _ := os.ReadFile(doctorOSRelease)
-		in, err := clientconf.AddCA(changes, *ca, clientconf.CAHost{
+		h := clientconf.CAHost{
 			Base: planBase(records, client.BaseURL), Home: home, Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease,
-		})
+		}
+		if slices.ContainsFunc(records, func(r clientconf.PlanRecord) bool { return r.System == manifest.TypeMaven }) {
+			// Read before anything is written: which certificates the JVM
+			// lacks decides the imports, and a store keytool cannot list is
+			// one it cannot import into either.
+			if h.JVM, h.JVMTrusted, err = doctorJVM(); err != nil {
+				return fmt.Errorf("--ca-file: maven: the JVM trust store Maven and Gradle read could not be listed: %w. Nothing was written", err)
+			}
+		}
+		in, err := clientconf.AddCA(changes, *ca, h)
 		if err != nil {
 			return fmt.Errorf("--ca-file: %w. Nothing was written", err)
 		}
-		changes, caStep = in.Changes, in.Step
+		changes, caStep, caImports = in.Changes, in.Step, in.Imports
 		for _, sys := range slices.Sorted(maps.Keys(in.Notes)) {
 			fmt.Printf("note       %-10s %s\n", sys, in.Notes[sys])
 		}
@@ -740,6 +762,10 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		fmt.Printf("\nrun        %-10s %s\n", clientconf.SystemCA, strings.Join(caStep, " "))
 		fmt.Println("           (rebuilds the system trust store with the CA above in it)")
 	}
+	for _, imp := range caImports {
+		fmt.Printf("\nrun        %-10s %s\n", manifest.TypeMaven, clientconf.RedactJVMCommand(imp))
+		fmt.Println("           (adds the CA to the trust store of the JVM Maven and Gradle run on)")
+	}
 	bodegaSources, aptWritten := bodegaAptSources(changes)
 	var aptPlan []string
 	if bodegaSources != "" {
@@ -765,13 +791,16 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osPlan = steps
 	}
 	switch {
-	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil:
+	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		return nil
-	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
+	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
 		var runs []string
 		if caStep != nil {
 			runs = append(runs, "the trust store step")
+		}
+		if len(caImports) > 0 {
+			runs = append(runs, fmt.Sprintf("%d JVM trust store import(s)", len(caImports)))
 		}
 		if dnfStep != nil {
 			runs = append(runs, "the dnf step")
@@ -810,9 +839,18 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		if err := doctorRun(caStep[0], caStep[1:]...); err != nil {
 			return fmt.Errorf("%s failed: %w.\n"+
 				"  The CA is written and the system trust store was not rebuilt, so clients reading it still refuse bodega's certificate.\n"+
-				"  It needs root. Run it by hand: a second --apply finds the file in place and does not run it again", strings.Join(caStep, " "), err)
+				"  It needs root. Re-run this command as root: it finds the store still without the CA and runs the step again", strings.Join(caStep, " "), err)
 		}
 		fmt.Printf("ran        %s\n", strings.Join(caStep, " "))
+	}
+	for _, imp := range caImports {
+		shown := clientconf.RedactJVMCommand(imp)
+		if err := doctorRun(imp[0], imp[1:]...); err != nil {
+			return fmt.Errorf("%s failed: %w.\n"+
+				"  The certificate file is written and the JVM trust store does not hold it, so Maven and Gradle still refuse bodega's certificate.\n"+
+				"  keytool needs to write the keystore, which takes root for a JDK's own cacerts. Re-run this command as that account: it lists the store and runs the import again", shown, err)
+		}
+		fmt.Printf("ran        %s\n", shown)
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -899,7 +937,25 @@ var doctorCAGOOS = runtime.GOOS
 // the trust stores on this host, so a test can stand in for both.
 var doctorTrustProbe = func() host.TrustProbe {
 	home, _ := os.UserHomeDir()
-	return host.TrustProbe{Root: doctorOCIRoot, Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir}
+	return host.TrustProbe{
+		Root: doctorOCIRoot, Home: home, GOOS: runtime.GOOS, Getenv: os.Getenv, ConfigDir: os.UserConfigDir,
+		DnfConf: doctorDnfConf, DnfDirs: doctorYumReposDirs,
+		JVM: func() (string, []*x509.Certificate, error) {
+			store, certs, err := doctorJVM()
+			return store.Name(), certs, err
+		},
+	}
+}
+
+// doctorJVM resolves the trust store of the JVM Maven and Gradle run on and
+// lists the certificates it holds, so a test can stand in for keytool.
+var doctorJVM = func() (clientconf.JVMStore, []*x509.Certificate, error) {
+	store, err := clientconf.ResolveJVMStore(os.Getenv, exec.LookPath)
+	if err != nil {
+		return store, nil, err
+	}
+	certs, err := store.Trusted()
+	return store, certs, err
 }
 
 // doctorDnfConf and doctorYumReposDirs are where doctor reads dnf's

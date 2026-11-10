@@ -7,9 +7,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -29,97 +34,357 @@ type TrustProbe struct {
 	GOOS      string
 	Getenv    func(string) string
 	ConfigDir func() (string, error)
+	// DnfConf is dnf's main configuration file and DnfDirs the directories
+	// it reads .repo files from when that file sets no reposdir. Empty reads
+	// dnf's own, under Root.
+	DnfConf string
+	DnfDirs []string
 	// Chain returns the certificates the server at hostport presents, leaf
 	// first, without verifying them. Nil dials it.
 	Chain func(hostport string) ([]*x509.Certificate, error)
 	// System verifies a chain for dnsName against the operating system's
 	// trust store. Nil uses the store this process reads.
 	System func(chain []*x509.Certificate, dnsName string) error
+	// JVM names the trust store of the JVM Maven and Gradle run on and lists
+	// its certificates. Nil asks that JVM's keytool.
+	JVM func() (name string, certs []*x509.Certificate, err error)
 }
 
-// trustRow is one doctor row's client: how to tell it is configured for
-// bodega, and where it reads CAs beside the system trust store.
+// trustStore is one place a client, as this host configures it, takes trust
+// anchors from when it connects to bodega.
+type trustStore struct {
+	// name is how a warning names the store.
+	name string
+	// system says the client also accepts what the operating system's store
+	// accepts here. False is a store read in place of it: a setting that
+	// replaces the client's defaults, or a keystore.
+	system bool
+	// files are the PEM files the store reads, and pem certificates a
+	// setting carries inline.
+	files []string
+	pem   []string
+	// load names and lists a store only a command can read. It runs after
+	// bodega has answered, so a host with nothing to verify starts no command.
+	load func() (name string, certs []*x509.Certificate, err error)
+}
+
+// trustRow is one doctor row's client.
 type trustRow struct {
 	// system is the --configure name the remediation carries.
 	system string
-	// mentions reports whether the client's configuration names host. Nil
-	// means the row's own OK already says so.
-	mentions func(t TrustProbe, host string) bool
-	// own names the client's own CA setting and the PEM files it resolves
-	// to on this host. Nil for a client that reads the system store alone.
-	own func(t TrustProbe, host string) (name string, files []string)
+	// stores resolves the stores the client reads for bodega at u, one per
+	// route it reaches bodega by. None means the client's configuration
+	// does not name bodega, and the row is left as its check wrote it.
+	stores func(t TrustProbe, u *url.URL) []trustStore
 }
 
-// trustRows maps a row's check name to its client. Maven has no entry: the
-// JVM reads a keystore, and its row is left as the check wrote it.
-var trustRows = map[string]trustRow{
-	"apt-sources": {system: manifest.TypeApt, mentions: func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*")
-	}},
-	"dnf-repos": {system: manifest.TypeRpm, mentions: func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/etc/yum.repos.d/*.repo")
-	}},
-	"pkg-repos": {system: manifest.TypeFreeBSD, mentions: func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/usr/local/etc/pkg/repos/*.conf")
-	}},
-	"make-conf": {system: manifest.TypeDistfiles, mentions: func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/etc/make.conf")
-	}},
-	"cargo-config": {system: manifest.TypeCargo, mentions: func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(t.Home, ".cargo", "config.toml"), filepath.Join(t.Home, ".cargo", "config"))
-	}},
-	"rubygems": {system: manifest.TypeRubygems, mentions: func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(t.Home, ".gemrc"), filepath.Join(t.Home, ".bundle", "config"))
-	}},
-	"composer": {system: manifest.TypeComposer, mentions: func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(clientconf.HostComposerHome(t.Home), "config.json"))
-	}},
-	"goproxy-env": {system: manifest.TypeGomod, mentions: func(t TrustProbe, host string) bool {
-		if strings.Contains(t.Getenv("GOPROXY"), host) {
-			return true
+const systemStoreName = "the system trust store"
+
+// systemOnly is the row of a client that verifies through the system trust
+// store alone, configured when mentions says its configuration names host.
+func systemOnly(system string, mentions func(t TrustProbe, host string) bool) trustRow {
+	return trustRow{system: system, stores: func(t TrustProbe, u *url.URL) []trustStore {
+		if !mentions(t, u.Host) {
+			return nil
 		}
-		file, err := goEnvFile(t.Getenv, t.ConfigDir)
-		return err == nil && file != "" && mention(host, file)
-	}},
-	"pip-config": {
-		system: manifest.TypePypi,
-		mentions: func(t TrustProbe, host string) bool {
-			return mention(host, rooted(t.Root, pipPaths(t.GOOS, t.Home))...)
-		},
-		own: func(t TrustProbe, _ string) (string, []string) {
-			return "pip's cert setting", settingValues("cert", rooted(t.Root, pipPaths(t.GOOS, t.Home)))
-		},
-	},
-	"npm-config": {
-		system: manifest.TypeNpm,
-		mentions: func(t TrustProbe, host string) bool {
-			return mention(host, rooted(t.Root, npmPaths(t.GOOS, t.Home))...)
-		},
-		own: func(t TrustProbe, _ string) (string, []string) {
-			return "npm's cafile setting", settingValues("cafile", rooted(t.Root, npmPaths(t.GOOS, t.Home)))
-		},
-	},
-	"oci-" + clientconf.RuntimeDocker: {system: manifest.TypeOCI, own: func(t TrustProbe, host string) (string, []string) {
-		dir := filepath.Join(t.Root, "/etc/docker/certs.d", host)
-		files, _ := filepath.Glob(filepath.Join(dir, "*.crt"))
-		return dir, files
-	}},
-	"oci-" + clientconf.RuntimePodman: {system: manifest.TypeOCI, own: func(t TrustProbe, host string) (string, []string) {
-		dir := filepath.Join(t.Root, "/etc/containers/certs.d", host)
-		files, _ := filepath.Glob(filepath.Join(dir, "*.crt"))
-		return dir, files
-	}},
-	"oci-" + clientconf.RuntimeContainerd: {system: manifest.TypeOCI, own: func(t TrustProbe, host string) (string, []string) {
-		dir := filepath.Join(t.Root, clientconf.ContainerdCertsDir)
-		hosts, _ := filepath.Glob(filepath.Join(dir, "*", "hosts.toml"))
-		var mentioning []string
-		for _, h := range hosts {
-			if mention(host, h) {
-				mentioning = append(mentioning, h)
+		return []trustStore{{name: systemStoreName, system: true}}
+	}}
+}
+
+// trustRows maps a row's check name to its client.
+var trustRows = map[string]trustRow{
+	"apt-sources": systemOnly(manifest.TypeApt, func(t TrustProbe, host string) bool {
+		return t.filesMention(host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*")
+	}),
+	"dnf-repos": systemOnly(manifest.TypeRpm, func(t TrustProbe, host string) bool {
+		conf, dirs := t.DnfConf, t.DnfDirs
+		if conf == "" {
+			conf = filepath.Join(t.Root, clientconf.DnfMainConf)
+		}
+		if dirs == nil {
+			dirs = rooted(t.Root, clientconf.YumReposDirs)
+		}
+		// The repositories dnf loads, reposdir included, not a directory
+		// scan: a .repo file dnf never reads configures nothing.
+		loaded, err := clientconf.ReadDnfConfig(conf, dirs)
+		if err != nil {
+			return false
+		}
+		for _, r := range loaded.Repos {
+			if r.Enabled && slices.ContainsFunc(r.URLs, func(u string) bool { return strings.Contains(u, host) }) {
+				return true
 			}
 		}
-		return "the ca of each hosts.toml under " + dir, settingValues("ca", mentioning)
+		return false
+	}),
+	"pkg-repos": systemOnly(manifest.TypeFreeBSD, func(t TrustProbe, host string) bool {
+		return t.filesMention(host, "/usr/local/etc/pkg/repos/*.conf")
+	}),
+	"make-conf": systemOnly(manifest.TypeDistfiles, func(t TrustProbe, host string) bool {
+		return t.filesMention(host, "/etc/make.conf")
+	}),
+	"cargo-config": systemOnly(manifest.TypeCargo, func(t TrustProbe, host string) bool {
+		return mention(host, filepath.Join(t.Home, ".cargo", "config.toml"), filepath.Join(t.Home, ".cargo", "config"))
+	}),
+	"rubygems": systemOnly(manifest.TypeRubygems, func(t TrustProbe, host string) bool {
+		return mention(host, filepath.Join(t.Home, ".gemrc"), filepath.Join(t.Home, ".bundle", "config"))
+	}),
+	"composer": systemOnly(manifest.TypeComposer, func(t TrustProbe, host string) bool {
+		return mention(host, filepath.Join(clientconf.HostComposerHome(t.Home), "config.json"))
+	}),
+	"goproxy-env": systemOnly(manifest.TypeGomod, func(t TrustProbe, host string) bool {
+		if strings.Contains(t.env("GOPROXY"), host) {
+			return true
+		}
+		if t.ConfigDir == nil {
+			return false
+		}
+		file, err := goEnvFile(t.env, t.ConfigDir)
+		return err == nil && file != "" && mention(host, file)
+	}),
+	"pip-config":                          {system: manifest.TypePypi, stores: pipStores},
+	"npm-config":                          {system: manifest.TypeNpm, stores: npmStores},
+	"maven":                               {system: manifest.TypeMaven, stores: mavenStores},
+	"oci-" + clientconf.RuntimeContainerd: {system: manifest.TypeOCI, stores: containerdStores},
+	"oci-" + clientconf.RuntimeDocker: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
+		if !t.filesMention(u.Host, clientconf.DockerDaemonPath) {
+			return nil
+		}
+		return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
 	}},
+	"oci-" + clientconf.RuntimePodman: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
+		user := filepath.Join(t.Home, ".config", "containers")
+		configured := t.filesMention(u.Host, "/etc/containers/registries.conf", "/etc/containers/registries.conf.d/*.conf")
+		if !configured && t.Home != "" {
+			drop, _ := filepath.Glob(filepath.Join(user, "registries.conf.d", "*.conf"))
+			configured = mention(u.Host, append(drop, filepath.Join(user, "registries.conf"))...)
+		}
+		if !configured {
+			return nil
+		}
+		store := certsDir(filepath.Join(t.Root, "/etc/containers/certs.d", u.Host))
+		if t.Home != "" {
+			more, _ := filepath.Glob(filepath.Join(user, "certs.d", u.Host, "*.crt"))
+			store.files = append(store.files, more...)
+		}
+		return []trustStore{store}
+	}},
+}
+
+// certsDir is a certs.d directory for one registry host, whose *.crt files
+// Docker and podman add to the system store.
+func certsDir(dir string) trustStore {
+	files, _ := filepath.Glob(filepath.Join(dir, "*.crt"))
+	return trustStore{name: dir, system: true, files: files}
+}
+
+func (t TrustProbe) env(key string) string {
+	if t.Getenv == nil {
+		return ""
+	}
+	return t.Getenv(key)
+}
+
+// iniValues reads the settings of an INI file as "section.key", both
+// lowercased, to its last value there; a file with no sections keys them
+// ".key". A file that will not read sets nothing.
+func iniValues(path string) map[string]string {
+	out := map[string]string{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	section := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "" || line[0] == '#' || line[0] == ';':
+		case line[0] == '[' && strings.HasSuffix(line, "]"):
+			section = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+		default:
+			if k, v, ok := strings.Cut(line, "="); ok {
+				out[section+"."+strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+			}
+		}
+	}
+	return out
+}
+
+// pipStores resolves the bundle pip verifies an install against. cert, from
+// the last file pip loads that sets it or from PIP_CERT, replaces pip's
+// default; a per-command section outranks [global] whichever file holds it.
+// With none set, requests falls back to REQUESTS_CA_BUNDLE and then
+// CURL_CA_BUNDLE, and only then does pip read its default: the system store
+// through truststore, or certifi's bundle on an older pip, which doctor
+// cannot tell from the system store.
+func pipStores(t TrustProbe, u *url.URL) []trustStore {
+	files := rooted(t.Root, pipPaths(t.GOOS, t.Home))
+	if !mention(u.Host, files...) {
+		return nil
+	}
+	var global, install [2]string
+	for _, f := range files {
+		vals := iniValues(f)
+		if v := vals["global.cert"]; v != "" {
+			global = [2]string{v, f}
+		}
+		if v := vals["install.cert"]; v != "" {
+			install = [2]string{v, f}
+		}
+	}
+	cert := global
+	if install[0] != "" {
+		cert = install
+	}
+	for _, key := range []string{"PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
+		if v := t.env(key); v != "" && (key == "PIP_CERT" || cert[0] == "") {
+			cert = [2]string{v, "the environment's " + key}
+			break
+		}
+	}
+	if cert[0] == "" {
+		return []trustStore{{name: systemStoreName + ", which pip reads while no cert setting names a bundle,", system: true}}
+	}
+	return []trustStore{{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}}
+}
+
+// npmStores resolves the CAs npm verifies its registry against. cafile or ca,
+// from the last npmrc npm loads that sets one or from npm_config_cafile,
+// replaces the roots Node bundles, and NODE_EXTRA_CA_CERTS no longer adds to
+// them. With neither set npm reads those bundled roots plus
+// NODE_EXTRA_CA_CERTS; doctor cannot read the bundle, and the system store
+// stands in for it, both being the public roots.
+func npmStores(t TrustProbe, u *url.URL) []trustStore {
+	files := rooted(t.Root, npmPaths(t.GOOS, t.Home))
+	if !mention(u.Host, files...) {
+		return nil
+	}
+	unquote := func(v string) string { return strings.Trim(v, `"'`) }
+	var cafile, from string
+	var inline []string
+	for _, f := range files {
+		vals := iniValues(f)
+		if v := unquote(vals[".cafile"]); v != "" {
+			cafile, from = v, f
+		}
+		for _, key := range []string{".ca", ".ca[]"} {
+			if v := unquote(vals[key]); v != "" {
+				inline, from = append(inline, strings.ReplaceAll(v, `\n`, "\n")), f
+			}
+		}
+	}
+	for _, key := range []string{"npm_config_cafile", "NPM_CONFIG_CAFILE"} {
+		if v := t.env(key); v != "" {
+			cafile, from = v, "the environment's "+key
+		}
+	}
+	if rest, ok := strings.CutPrefix(cafile, "~/"); ok {
+		cafile = filepath.Join(t.Root, t.Home, rest)
+	}
+	switch {
+	case cafile != "":
+		return []trustStore{{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", cafile, from), files: []string{cafile}, pem: inline}}
+	case len(inline) > 0:
+		return []trustStore{{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", from), pem: inline}}
+	}
+	store := trustStore{name: systemStoreName + ", standing in for the roots Node bundles while no cafile setting names a file,", system: true}
+	if extra := t.env("NODE_EXTRA_CA_CERTS"); extra != "" {
+		store.name, store.files = "NODE_EXTRA_CA_CERTS ("+extra+")", []string{extra}
+	}
+	return []trustStore{store}
+}
+
+// mavenStores is the one store the JVM reads, for a host whose Maven mirror
+// or Gradle init script names bodega.
+func mavenStores(t TrustProbe, u *url.URL) []trustStore {
+	if t.Home == "" {
+		return nil
+	}
+	gradleHome := t.env("GRADLE_USER_HOME")
+	if gradleHome == "" {
+		gradleHome = filepath.Join(t.Home, ".gradle")
+	}
+	mirror, _, _ := mavenMirror(filepath.Join(t.Home, ".m2", "settings.xml"))
+	repo, _ := gradleInitURL(filepath.Join(gradleHome, "init.d", "bodega.gradle"))
+	if !strings.Contains(mirror, u.Host) && !strings.Contains(repo, u.Host) {
+		return nil
+	}
+	jvm := t.JVM
+	if jvm == nil {
+		jvm = func() (string, []*x509.Certificate, error) {
+			store, err := clientconf.ResolveJVMStore(t.env, exec.LookPath)
+			if err != nil {
+				return "the JVM trust store", nil, err
+			}
+			certs, err := store.Trusted()
+			return store.Name(), certs, err
+		}
+	}
+	return []trustStore{{name: "the JVM trust store", load: func() (string, []*x509.Certificate, error) {
+		name, certs, err := jvm()
+		return name + ", which Maven and Gradle read in place of the system trust store,", certs, err
+	}}}
+}
+
+// containerdStores is one store per registry whose hosts.toml sends pulls to
+// bodega: containerd adds the ca of that host table to the system store, and
+// a ca set for docker.io verifies nothing for ghcr.io. The hosts.toml files
+// are the ones containerd loads: under each root of the effective
+// config_path, the first root holding a directory for the registry.
+func containerdStores(t TrustProbe, u *url.URL) []trustStore {
+	roots := []string{clientconf.ContainerdCertsDir}
+	if data, err := os.ReadFile(filepath.Join(t.Root, clientconf.ContainerdConfigPath)); err == nil {
+		if cfg, err := clientconf.ResolveContainerdConfig(t.Root, clientconf.ContainerdConfigPath, data); err == nil && cfg.ConfigPath != "" {
+			roots = strings.Split(cfg.ConfigPath, ":")
+		}
+	}
+	var out []trustStore
+	seen := map[string]bool{}
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		dirs, _ := filepath.Glob(filepath.Join(t.Root, r, "*"))
+		for _, dir := range dirs {
+			if info, err := os.Stat(dir); err != nil || !info.IsDir() || seen[filepath.Base(dir)] {
+				continue
+			}
+			seen[filepath.Base(dir)] = true
+			path := filepath.Join(dir, "hosts.toml")
+			var doc struct {
+				Host map[string]struct {
+					CA any `toml:"ca"`
+				} `toml:"host"`
+			}
+			if _, err := toml.DecodeFile(path, &doc); err != nil {
+				continue
+			}
+			for name, table := range doc.Host {
+				if !mirrorIsBodega(name, u.Host) {
+					continue
+				}
+				var cas []string
+				switch v := table.CA.(type) {
+				case string:
+					cas = []string{v}
+				case []any:
+					for _, e := range v {
+						if s, ok := e.(string); ok {
+							cas = append(cas, s)
+						}
+					}
+				}
+				for i, ca := range cas {
+					if !filepath.IsAbs(ca) {
+						cas[i] = filepath.Join(dir, ca)
+					}
+				}
+				out = append(out, trustStore{name: "the ca of " + path, system: true, files: cas})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
 }
 
 // filesMention reports whether a file matching one of the patterns, each
@@ -145,34 +410,14 @@ func mention(host string, files ...string) bool {
 	return false
 }
 
-// settingValues collects the value every "key = value" line gives key across
-// files, unquoted. It reads pip.conf, .npmrc and hosts.toml alike, since each
-// writes a path setting on one line.
-func settingValues(key string, files []string) []string {
-	var out []string
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			k, v, ok := strings.Cut(line, "=")
-			if !ok || strings.TrimSpace(k) != key {
-				continue
-			}
-			if v = strings.Trim(strings.TrimSpace(v), `"'`); v != "" {
-				out = append(out, v)
-			}
-		}
-	}
-	return out
-}
-
-// Apply returns findings with each OK row of a client configured for bodega
-// at base turned into a warning when that client cannot verify the
-// certificate base serves. A chain the system trust store verifies settles
-// every row, since each of these clients reads that store or accepts what it
-// accepts; a client's own setting is read only when it does not.
+// Apply returns findings with a warning on each row whose client is
+// configured for bodega at base and cannot verify the certificate base
+// serves, judged against the stores that client reads as this host
+// configures it. The system trust store settles a store only where the
+// client reads it there: a cafile, a cert bundle or a keystore that replaces
+// it is verified on its own. A row already warning keeps its finding and
+// gains this one, since a client can both bypass bodega for one scope and
+// refuse its certificate for the rest.
 //
 // The rows come back unchanged when base is not https, and when the server
 // does not answer: an unreachable bodega is not a certificate nobody trusts.
@@ -188,7 +433,11 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 	for i, f := range findings {
 		out[i] = f
 		row, ok := trustRows[f.Check]
-		if !ok || f.Status != StatusOK || (row.mentions != nil && !row.mentions(t, u.Host)) {
+		if !ok || (f.Status != StatusOK && f.Status != StatusWarn) {
+			continue
+		}
+		stores := row.stores(t, u)
+		if len(stores) == 0 {
 			continue
 		}
 		if !probed {
@@ -209,22 +458,62 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 			}
 			systemErr = system(chain, u.Hostname())
 		}
-		if systemErr == nil {
-			continue
-		}
-		verdict := "the system trust store does not verify"
-		if row.own != nil {
-			name, files := row.own(t, u.Host)
-			if verifyChain(chain, u.Hostname(), poolOf(files)) == nil {
+		var failed, unread []string
+		for _, s := range stores {
+			if s.system && systemErr == nil {
 				continue
 			}
-			verdict = "neither the system trust store nor " + name + " verifies"
+			pool := poolOf(s.files)
+			for _, p := range s.pem {
+				pool.AppendCertsFromPEM([]byte(p))
+			}
+			if s.load != nil {
+				name, certs, err := s.load()
+				s.name = name
+				if err != nil {
+					unread = append(unread, fmt.Sprintf("%s was not read (%v), so whether this client verifies bodega's certificate is unchecked", strings.TrimSuffix(s.name, ","), err))
+					continue
+				}
+				for _, c := range certs {
+					pool.AddCert(c)
+				}
+			}
+			verr := verifyChain(chain, u.Hostname(), pool)
+			if verr == nil {
+				continue
+			}
+			switch {
+			case !s.system:
+				failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", s.name, verr))
+			case s.name == systemStoreName || strings.HasPrefix(s.name, systemStoreName+","):
+				failed = append(failed, fmt.Sprintf("%s does not verify the certificate it serves (%v)", s.name, systemErr))
+			default:
+				failed = append(failed, fmt.Sprintf("neither %s nor %s verifies the certificate it serves (%v)", systemStoreName, s.name, systemErr))
+			}
 		}
-		out[i].Status = StatusWarn
-		out[i].Detail = fmt.Sprintf("configured for bodega at %s, and %s the certificate it serves (%v), so every fetch fails on the certificate",
-			u.Host, verdict, systemErr)
-		out[i].Remediation = fmt.Sprintf("install the CA that issued bodega's certificate: bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s",
-			row.system, strings.TrimRight(base, "/"))
+		var detail, remedy string
+		if len(failed) > 0 {
+			detail = fmt.Sprintf("configured for bodega at %s, and %s, so every fetch fails on the certificate", u.Host, strings.Join(failed, "; and "))
+			remedy = fmt.Sprintf("install the CA that issued bodega's certificate: bodega doctor --configure %s --ca-file <CA certificate PEM> --apply --url %s",
+				row.system, strings.TrimRight(base, "/"))
+			out[i].Status = StatusWarn
+		}
+		if len(unread) > 0 {
+			detail = strings.Join(append(unread, detail), "; ")
+			detail = strings.TrimSuffix(detail, "; ")
+		}
+		switch {
+		case detail == "":
+		case f.Status == StatusWarn:
+			out[i].Detail = f.Detail + "; also " + detail
+			if remedy != "" {
+				out[i].Remediation = strings.TrimPrefix(f.Remediation+"; "+remedy, "; ")
+			}
+		case len(failed) == 0:
+			out[i].Detail = strings.TrimPrefix(f.Detail+"; "+detail, "; ")
+		default:
+			out[i].Detail, out[i].Remediation = detail, remedy
+		}
 	}
 	return out
 }
