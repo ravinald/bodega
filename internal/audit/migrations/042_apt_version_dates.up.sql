@@ -9,16 +9,19 @@
 -- an older snapshot late moves a date earlier, to the Date: of a Release that
 -- listed the version, and nothing ever moves one later.
 
--- published_at is the earliest Date: among the recorded Releases whose
--- Packages bodega read and found listing the version. It predates bodega when
--- it is no later than the codename's baseline.
+-- Every source version a Packages file bodega read in full has listed.
+-- published_at is the earliest Date: among the recorded Releases publishing
+-- one of those files, and '' while no recorded Release publishes any of them:
+-- the version was read, and is dated when such a Release is. It predates
+-- bodega when it is no later than the codename's baseline.
 CREATE TABLE IF NOT EXISTS apt_version_dates (
+    id           INTEGER PRIMARY KEY,
     source       TEXT NOT NULL,
     version      TEXT NOT NULL,
     codename     TEXT NOT NULL,
-    published_at TEXT NOT NULL,
+    published_at TEXT NOT NULL DEFAULT '',
     recorded_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (source, version, codename)
+    UNIQUE (source, version, codename)
 );
 
 -- The earliest Release Date: recorded for each mirrored codename: the archive
@@ -33,20 +36,38 @@ CREATE TABLE IF NOT EXISTS apt_codename_baseline (
 -- so an index bodega serves or reads is tied to the Releases that published
 -- those exact bytes, by-hash and cached copies included. idx is the logical
 -- index (component/binary-arch) the compressions share. release_date is the
--- earliest Date: of a recorded Release listing the file. observed_date is the
--- release_date the file's versions were last recorded under, '' when never:
--- one later than release_date means an older Release listing the same bytes
--- was recorded afterwards, and the versions are recorded again at its date.
+-- earliest Date: of a recorded Release listing the file.
 CREATE TABLE IF NOT EXISTS apt_release_indexes (
-    codename      TEXT NOT NULL,
-    sha256        TEXT NOT NULL,
-    path          TEXT NOT NULL,
-    idx           TEXT NOT NULL,
-    release_date  TEXT NOT NULL,
-    observed_date TEXT NOT NULL DEFAULT '',
+    codename     TEXT NOT NULL,
+    sha256       TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    idx          TEXT NOT NULL,
+    release_date TEXT NOT NULL,
     PRIMARY KEY (codename, sha256, path)
 );
 CREATE INDEX IF NOT EXISTS apt_release_indexes_idx ON apt_release_indexes (codename, idx);
+
+-- Every Packages file bodega read in full and parsed, by the SHA256 of the
+-- bytes as the archive publishes them, whether or not a Release publishing
+-- them is recorded yet. A row here is what separates an index bodega read
+-- from one a Release only names.
+CREATE TABLE IF NOT EXISTS apt_observed_indexes (
+    id          INTEGER PRIMARY KEY,
+    codename    TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (codename, sha256)
+);
+
+-- The source versions each observed Packages file listed. A Release recorded
+-- after the read, older or newer, dates them from this relation, so the
+-- archive is never asked for bytes bodega already read. Without it a Release
+-- that arrives second can move the file's date and not its versions'.
+CREATE TABLE IF NOT EXISTS apt_index_members (
+    index_id   INTEGER NOT NULL,
+    version_id INTEGER NOT NULL,
+    PRIMARY KEY (index_id, version_id)
+) WITHOUT ROWID;
 
 -- The source package and version each pool Filename was listed under, so the
 -- age gate can find a version's date once the index stops listing it. A pool
