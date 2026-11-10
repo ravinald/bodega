@@ -4709,7 +4709,7 @@ Run `systemctl edit` only once the first line succeeds. Then set `"distfiles_por
 Manifests reload without a restart, and the journal carries everything the process writes:
 
 ```bash
-sudo systemctl reload bodega        # SIGHUP; rereads manifests in place
+sudo systemctl reload bodega        # SIGHUP; rereads manifests and the TLS certificate in place
 journalctl -u bodega -f
 ```
 
@@ -4792,7 +4792,7 @@ sudo service bodega status
 sudo tail -f /var/log/bodega.log
 ```
 
-`reload` does what `systemctl reload` does: manifests, the signing keys and the CIDR access lists are reread in place, and every other `config.json` key still needs a restart. `status` reports the `daemon(8)` supervisor's pid, from `/var/run/bodega.pid`; the server's own is in `/var/run/bodega_child.pid`.
+`reload` does what `systemctl reload` does: manifests, the signing keys, the CIDR access lists and the [TLS certificate](#certificate-renewal) are reread in place, and every other `config.json` key still needs a restart. `status` reports the `daemon(8)` supervisor's pid, from `/var/run/bodega.pid`; the server's own is in `/var/run/bodega_child.pid`.
 
 The log file belongs to root, mode 0600, because the supervisor that writes it runs as root. It is not rotated by default. `daemon(8)` reopens it on SIGHUP to the supervisor, so a `newsyslog` entry naming the supervisor's pidfile rotates it without restarting the server:
 
@@ -7101,6 +7101,29 @@ Or set in config:
 { "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem" }
 ```
 
+#### Certificate renewal
+
+A renewed certificate takes effect without a restart. bodega checks the modification times of `tls_cert` and `tls_key` once a minute and rereads both files when either changed, so `certbot` or any other renewer needs no deploy hook: write the new pair to the configured paths and the next handshake after the check receives it. `systemctl reload bodega` (`SIGHUP`) rereads the pair at once, for a renewer that would rather not wait out the minute. The check follows symlinks, so paths under `certbot`'s `live/` directory work as they are.
+
+The swap applies to new handshakes only. A connection already established keeps the certificate it negotiated and is not interrupted.
+
+Each swap logs the certificate now in service at `INFO`:
+
+```text
+level=INFO msg="TLS certificate loaded" subject="CN=bodega.example.com" issuer="CN=E7,O=Let's Encrypt,C=US" expires=2026-11-16T09:13:21Z
+```
+
+A reload never takes the certificate away. bodega keeps serving the loaded pair, and logs the file and the reason at `ERROR`, when the new pair:
+
+- cannot be read,
+- does not parse, in the leaf or in any later certificate of the chain,
+- has a key that does not match the certificate, or
+- carries a certificate that has already expired.
+
+The rest of a `SIGHUP` reload (manifests, signing keys, access lists) proceeds either way. A renewer that writes the two files a moment apart can be caught between them; bodega reports the mismatch once and loads the pair at the next check, when the second file's time has changed. A failed pair is not retried until one of the files changes again or a reload is sent.
+
+Two things still take a restart: changing the `tls_cert` or `tls_key` path, and changing `tls_min_version`. And a server started with an expired certificate serves it: the expiry check applies to a reload, where there is a working certificate to keep.
+
 Responses include `Strict-Transport-Security` (HSTS) whenever clients reach bodega over https, which is not the same question as whether this listener terminates TLS. The scheme comes from `public_url` when one is set, and from the request otherwise, honoring `X-Forwarded-Proto` only when the peer is inside `trusted_proxies`. So a loopback listener behind a terminating proxy sends HSTS, and a client on plain http that sets the header itself does not get one.
 
 #### Serving without TLS
@@ -7130,7 +7153,7 @@ Two refusals sit behind the same guard:
 - **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal: at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` writes only the keys whose value differs from what `Load` resolved, and clearing `tls_cert` in the TUI removes the key on the next save, so a cert path cleared there reaches the listener with nothing else in the way.
 - **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with an `ERROR` on every start — the shipped `log_level` prints only `ERROR`, and a line the default install cannot see is not a warning. Off `:443` an authorized plaintext listener is silent: it serves what the operator asked for.
 
-bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries either key logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
+bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries either key logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, which bodega [picks up on renewal](#certificate-renewal) without a restart, or terminate TLS at a proxy in front and set `public_url`.
 
 Behind a TLS-terminating proxy, set `allow_plaintext` together with `public_url` — see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
@@ -7459,7 +7482,7 @@ Both are approver routes, so they also need the engineer's address inside `admin
 
 ## REST API
 
-All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](../api/openapi.yaml).
+All API responses are JSON. The full API is documented in the [API reference](../api/openapi.yaml), an OpenAPI 3.0 document.
 
 ### Read endpoints
 

@@ -210,8 +210,13 @@ GO_TEST_TIMEOUT := 30m
 TEST_FLAGS ?=
 
 ## test: Run every package but internal/server, with the race detector
+#
+# site is a module of its own, so `go list ./...` never names it and its tests
+# need a run of their own. They build the whole site from this checkout, which
+# is what fails a pull request that breaks a link or a $ref in the API reference.
 test:
 	go list ./... | grep -v '/internal/server$$' | xargs go test -race -count=1 -timeout $(GO_TEST_TIMEOUT) $(TEST_FLAGS)
+	cd site && go test -race -count=1 ./...
 
 ## test-server: Run internal/server with the race detector
 test-server:
