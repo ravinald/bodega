@@ -222,11 +222,17 @@ func TestEnsurePublicAccessBlock(t *testing.T) {
 		wantOut string
 		wantPut bool
 		wantErr bool
+		// wantRead: the failure is the read's, and no write follows it.
+		wantRead bool
 	}{
 		{name: "already blocked", mutate: func(*fakeBucket) {}, wantOut: "  public acl: blocked\n"},
 		{name: "one flag off", mutate: func(f *fakeBucket) { f.pab = partial }, wantOut: "  public acl: CONFIGURED (all blocked)\n", wantPut: true},
 		{name: "no configuration", mutate: func(f *fakeBucket) { f.pab = nil }, wantOut: "  public acl: CONFIGURED (all blocked)\n", wantPut: true},
-		{name: "read fails", mutate: func(f *fakeBucket) { f.pabGetErr = errBoom }, wantOut: "  public acl: CONFIGURED (all blocked)\n", wantPut: true},
+		{name: "read says none is set", mutate: func(f *fakeBucket) {
+			f.pabGetErr = &smithy.GenericAPIError{Code: "NoSuchPublicAccessBlockConfiguration"}
+		}, wantOut: "  public acl: CONFIGURED (all blocked)\n", wantPut: true},
+		{name: "read is not implemented", mutate: func(f *fakeBucket) { f.pabGetErr = notImplemented("GetPublicAccessBlock") }, wantOut: "  public acl: CONFIGURED (all blocked)\n", wantPut: true},
+		{name: "read fails", mutate: func(f *fakeBucket) { f.pabGetErr = errBoom }, wantErr: true, wantRead: true},
 		{name: "write fails", mutate: func(f *fakeBucket) { f.pab = nil; f.pabPutErr = errBoom }, wantPut: true, wantErr: true},
 	}
 	for _, tc := range cases {
@@ -235,7 +241,11 @@ func TestEnsurePublicAccessBlock(t *testing.T) {
 			tc.mutate(f)
 			var out bytes.Buffer
 			err := ensurePublicAccessBlock(context.Background(), f, &out, "b")
-			checkStep(t, err, tc.wantErr, "put public access block on b", &out, tc.wantOut)
+			errPrefix := "put public access block on b"
+			if tc.wantRead {
+				errPrefix = "read public access block on b"
+			}
+			checkStep(t, err, tc.wantErr, errPrefix, &out, tc.wantOut)
 			if f.pabPut != tc.wantPut {
 				t.Errorf("PutPublicAccessBlock called = %v, want %v", f.pabPut, tc.wantPut)
 			}
@@ -250,11 +260,14 @@ func TestEnsureVersioning(t *testing.T) {
 		wantOut string
 		wantPut bool
 		wantErr bool
+		// wantRead: the failure is the read's, and no write follows it.
+		wantRead bool
 	}{
 		{name: "already enabled", mutate: func(*fakeBucket) {}, wantOut: "  versioning: enabled\n"},
 		{name: "suspended", mutate: func(f *fakeBucket) { f.versioning = types.BucketVersioningStatusSuspended }, wantOut: "  versioning: ENABLED\n", wantPut: true},
 		{name: "never set", mutate: func(f *fakeBucket) { f.versioning = "" }, wantOut: "  versioning: ENABLED\n", wantPut: true},
-		{name: "read fails", mutate: func(f *fakeBucket) { f.versionGetErr = errBoom }, wantOut: "  versioning: ENABLED\n", wantPut: true},
+		{name: "read is not implemented", mutate: func(f *fakeBucket) { f.versionGetErr = notImplemented("GetBucketVersioning") }, wantOut: "  versioning: ENABLED\n", wantPut: true},
+		{name: "read fails", mutate: func(f *fakeBucket) { f.versionGetErr = errBoom }, wantErr: true, wantRead: true},
 		{name: "write fails", mutate: func(f *fakeBucket) { f.versioning = ""; f.versionPutErr = errBoom }, wantPut: true, wantErr: true},
 	}
 	for _, tc := range cases {
@@ -263,7 +276,11 @@ func TestEnsureVersioning(t *testing.T) {
 			tc.mutate(f)
 			var out bytes.Buffer
 			err := ensureVersioning(context.Background(), f, &out, "b")
-			checkStep(t, err, tc.wantErr, "enable versioning on b", &out, tc.wantOut)
+			errPrefix := "enable versioning on b"
+			if tc.wantRead {
+				errPrefix = "read versioning on b"
+			}
+			checkStep(t, err, tc.wantErr, errPrefix, &out, tc.wantOut)
 			if f.versionPut != tc.wantPut {
 				t.Errorf("PutBucketVersioning called = %v, want %v", f.versionPut, tc.wantPut)
 			}
@@ -281,11 +298,17 @@ func TestEnsureEncryption(t *testing.T) {
 		wantOut string
 		wantPut bool
 		wantErr bool
+		// wantRead: the failure is the read's, and no write follows it.
+		wantRead bool
 	}{
 		{name: "already encrypted reports the algorithm in place", mutate: func(*fakeBucket) {}, wantOut: "  encryption: aws:kms\n"},
 		{name: "rule without a default", mutate: func(f *fakeBucket) { f.encryption = noDefault }, wantOut: "  encryption: CONFIGURED (AES-256)\n", wantPut: true},
 		{name: "no configuration", mutate: func(f *fakeBucket) { f.encryption = nil }, wantOut: "  encryption: CONFIGURED (AES-256)\n", wantPut: true},
-		{name: "read fails", mutate: func(f *fakeBucket) { f.encGetErr = errBoom }, wantOut: "  encryption: CONFIGURED (AES-256)\n", wantPut: true},
+		{name: "read says none is set", mutate: func(f *fakeBucket) {
+			f.encGetErr = &smithy.GenericAPIError{Code: "ServerSideEncryptionConfigurationNotFoundError"}
+		}, wantOut: "  encryption: CONFIGURED (AES-256)\n", wantPut: true},
+		{name: "read is not implemented", mutate: func(f *fakeBucket) { f.encGetErr = notImplemented("GetBucketEncryption") }, wantOut: "  encryption: CONFIGURED (AES-256)\n", wantPut: true},
+		{name: "read fails", mutate: func(f *fakeBucket) { f.encGetErr = errBoom }, wantErr: true, wantRead: true},
 		{name: "write fails", mutate: func(f *fakeBucket) { f.encryption = nil; f.encPutErr = errBoom }, wantPut: true, wantErr: true},
 	}
 	for _, tc := range cases {
@@ -294,7 +317,11 @@ func TestEnsureEncryption(t *testing.T) {
 			tc.mutate(f)
 			var out bytes.Buffer
 			err := ensureEncryption(context.Background(), f, &out, "b")
-			checkStep(t, err, tc.wantErr, "enable encryption on b", &out, tc.wantOut)
+			errPrefix := "enable encryption on b"
+			if tc.wantRead {
+				errPrefix = "read default encryption on b"
+			}
+			checkStep(t, err, tc.wantErr, errPrefix, &out, tc.wantOut)
 			if f.encPut != tc.wantPut {
 				t.Errorf("PutBucketEncryption called = %v, want %v", f.encPut, tc.wantPut)
 			}
@@ -559,7 +586,7 @@ func TestInitBucketAllowUnsupportedKeepsOtherFailuresFatal(t *testing.T) {
 	for name, encErr := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := compatibleStore()
-			f.encGetErr, f.encPutErr = encErr, encErr
+			f.encPutErr = encErr
 			var out bytes.Buffer
 			err := InitBucket(context.Background(), f, &out, "b", "us-ord", true)
 			if err == nil || !strings.Contains(err.Error(), "enable encryption on b") {
@@ -760,5 +787,32 @@ func TestUsageDocCoversCompatibleStores(t *testing.T) {
 		if !found {
 			t.Errorf("environment table has no %s row naming the %s key that overrides it", variable, key)
 		}
+	}
+}
+
+func TestReviewF113InitPreservesControlReadFailures(t *testing.T) {
+	controls := []struct {
+		name string
+		set  func(*fakeBucket, error, error)
+	}{
+		{"public access block", func(f *fakeBucket, get, put error) { f.pabGetErr, f.pabPutErr = get, put }},
+		{"versioning", func(f *fakeBucket, get, put error) { f.versionGetErr, f.versionPutErr = get, put }},
+		{"default encryption", func(f *fakeBucket, get, put error) { f.encGetErr, f.encPutErr = get, put }},
+	}
+	for _, control := range controls {
+		t.Run(control.name, func(t *testing.T) {
+			f := newFake()
+			denied := &smithy.GenericAPIError{Code: "AccessDenied", Message: "read is forbidden"}
+			control.set(f, denied, notImplemented("PutControl"))
+			f.missing["charts/"] = true
+			var out bytes.Buffer
+			err := InitBucket(context.Background(), f, &out, "b", "us-ord", true)
+			if !errors.Is(err, denied) {
+				t.Fatalf("InitBucket = %v, want the control read's AccessDenied to stay fatal; output:\n%s", err, out.String())
+			}
+			if len(f.markers) != 0 {
+				t.Fatalf("markers were written after a fatal read: %v", f.markers)
+			}
+		})
 	}
 }

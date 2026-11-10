@@ -133,6 +133,18 @@ func NewClientFromConfig(cfg aws.Config, bucket, region string, optFns ...func(*
 // access (e.g. InitBucket).
 func (c *Client) S3Client() *awss3.Client { return c.raw }
 
+// Endpoint returns the base URL the client dials when one is set, by the
+// endpoint key or by whatever the SDK read for it (AWS_ENDPOINT_URL_S3,
+// AWS_ENDPOINT_URL, the profile), and "" when the SDK derives AWS's own from
+// the region. It is the SDK's resolved value, so two clients report the same
+// string exactly when they were handed the same one, however it arrived.
+func (c *Client) Endpoint() string {
+	if c.raw == nil {
+		return ""
+	}
+	return aws.ToString(c.raw.Options().BaseEndpoint)
+}
+
 // Bucket returns the configured bucket name.
 func (c *Client) Bucket() string { return c.bucket }
 

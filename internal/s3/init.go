@@ -107,6 +107,25 @@ func isNotImplemented(err error) bool {
 	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotImplemented
 }
 
+// controlReadFailed decides what a failed read of a control's current setting
+// means before the write that follows it. It returns nil for the two answers
+// that leave the write to settle the control: one of absent, the codes this
+// control uses to say nothing is configured yet, and a store with no such
+// operation, which the write then reports for itself. Everything else is
+// returned and ends the run, because a denial, a timeout or a 500 is not
+// evidence the control is unset, and writing over it would let a later
+// NotImplemented from the PUT pass as the whole story.
+func controlReadFailed(err error, what, bucket string, absent ...string) error {
+	if isNotImplemented(err) {
+		return nil
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) && slices.Contains(absent, ae.ErrorCode()) {
+		return nil
+	}
+	return fmt.Errorf("read %s on %s: %w", what, bucket, err)
+}
+
 func ensureBucket(ctx context.Context, client BucketAPI, out io.Writer, bucket, region string) error {
 	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(bucket),
@@ -143,7 +162,11 @@ func ensurePublicAccessBlock(ctx context.Context, client BucketAPI, out io.Write
 	resp, err := client.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{
 		Bucket: aws.String(bucket),
 	})
-	if err == nil && resp.PublicAccessBlockConfiguration != nil {
+	if err != nil {
+		if err := controlReadFailed(err, "public access block", bucket, "NoSuchPublicAccessBlockConfiguration"); err != nil {
+			return err
+		}
+	} else if resp.PublicAccessBlockConfiguration != nil {
 		cfg := resp.PublicAccessBlockConfiguration
 		if aws.ToBool(cfg.BlockPublicAcls) &&
 			aws.ToBool(cfg.BlockPublicPolicy) &&
@@ -174,7 +197,12 @@ func ensureVersioning(ctx context.Context, client BucketAPI, out io.Writer, buck
 	resp, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(bucket),
 	})
-	if err == nil && resp.Status == types.BucketVersioningStatusEnabled {
+	if err != nil {
+		// An unversioned bucket answers with an empty status, never an error.
+		if err := controlReadFailed(err, "versioning", bucket); err != nil {
+			return err
+		}
+	} else if resp.Status == types.BucketVersioningStatusEnabled {
 		fmt.Fprintf(out, "  versioning: enabled\n")
 		return nil
 	}
@@ -196,7 +224,11 @@ func ensureEncryption(ctx context.Context, client BucketAPI, out io.Writer, buck
 	resp, err := client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
 		Bucket: aws.String(bucket),
 	})
-	if err == nil && resp.ServerSideEncryptionConfiguration != nil {
+	if err != nil {
+		if err := controlReadFailed(err, "default encryption", bucket, "ServerSideEncryptionConfigurationNotFoundError"); err != nil {
+			return err
+		}
+	} else if resp.ServerSideEncryptionConfiguration != nil {
 		for _, rule := range resp.ServerSideEncryptionConfiguration.Rules {
 			if rule.ApplyServerSideEncryptionByDefault != nil {
 				algo := rule.ApplyServerSideEncryptionByDefault.SSEAlgorithm

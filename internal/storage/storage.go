@@ -347,8 +347,12 @@ func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPref
 // "cold/x/k" are two distinct objects in one bucket, and a cleaned label over
 // an s3 inner would claim an identity the bucket does not have.
 func (p *prefixed) Label() string {
-	cleaned := strings.TrimPrefix(path.Clean("/"+p.prefix), "/")
-	base := strings.TrimSuffix(p.inner.Label(), "/")
+	return joinLabel(p.inner.Label(), p.prefix)
+}
+
+func joinLabel(base, prefix string) string {
+	cleaned := strings.TrimPrefix(path.Clean("/"+prefix), "/")
+	base = strings.TrimSuffix(base, "/")
 	if cleaned == "" {
 		return base
 	}

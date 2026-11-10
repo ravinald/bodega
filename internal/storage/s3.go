@@ -2,8 +2,11 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 
 	bos3 "github.com/ravinald/bodega/internal/s3"
 )
@@ -143,6 +146,71 @@ func (s *S3) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix str
 	return s.client.SyncDir(ctx, out, localDir, keyPrefix)
 }
 
+// Label is "s3://<bucket>" on AWS and "s3+<endpoint>/<bucket>" on a store
+// reached through an endpoint, because a bucket name is unique only within
+// one service: two MinIO instances can each hold "artifacts", and a label
+// that said only the bucket made them one location, so the fan-out dropped
+// one and 'pkg move' refused a real copy as a copy onto itself.
+//
+// The region stays out of it. An AWS bucket name is global, so two entries
+// naming one bucket under different regions are one location.
 func (s *S3) Label() string {
-	return fmt.Sprintf("s3://%s", s.client.Bucket())
+	ns := endpointNamespace(s.client.Endpoint())
+	if ns == "" {
+		return s3BucketScheme + s.client.Bucket()
+	}
+	return "s3+" + ns + "/" + s.client.Bucket()
+}
+
+const s3BucketScheme = "s3://"
+
+// endpointNamespace reduces an endpoint to the part that says which service
+// it is, so two spellings of one endpoint are one namespace: the scheme, the
+// host in lower case with no trailing dot, the port unless it is the scheme's
+// default, and the path with no trailing slash. Addressing style and
+// checksums are how a client talks to the store, not where it is.
+//
+// Userinfo, a query and a fragment are dropped, and an endpoint that does not
+// parse is named by a digest instead of its text. Config load refuses all of
+// those, but an endpoint the SDK read from the environment was never checked,
+// and a label is printed in logs and errors.
+func endpointNamespace(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return fmt.Sprintf("endpoint-%x", sha256.Sum256([]byte(endpoint)))[:21]
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return u.Scheme + "://" + host + strings.TrimRight(u.EscapedPath(), "/")
+}
+
+// S3BucketLabel returns an s3 store's location as "s3://<bucket>" or
+// "s3://<bucket>/<prefix>", with no endpoint, and false for a store on
+// another driver. It is the form an s3:// URI written outside bodega takes,
+// which has nowhere to name an endpoint, so it is what such a URI is matched
+// against; Label is the identity and is not interchangeable with it.
+func S3BucketLabel(store ObjectStore) (string, bool) {
+	switch s := store.(type) {
+	case *S3:
+		return s3BucketScheme + s.client.Bucket(), true
+	case *prefixed:
+		inner, ok := S3BucketLabel(s.inner)
+		if !ok {
+			return "", false
+		}
+		return joinLabel(inner, s.prefix), true
+	}
+	return "", false
 }

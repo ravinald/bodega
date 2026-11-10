@@ -412,3 +412,173 @@ func TestSpecForCarriesTheS3StoreKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewF113S3FanoutKeepsSeparateEndpoints(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://minio-a.example.net",
+		StorageBackends: map[string]config.StorageSpec{
+			"archive": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://minio-b.example.net"},
+			"alias":   {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://minio-a.example.net", PathStyle: true, Checksums: bos3.ChecksumsWhenRequired},
+		},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := r.ByName("archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Default().Label() == archive.Label() {
+		t.Errorf("different endpoints share location %q", archive.Label())
+	}
+	got := r.Fanout(context.Background(), "apt", []string{"archive", "alias"})
+	var names []string
+	for _, store := range got {
+		names = append(names, store.Name)
+	}
+	if len(got) != 2 {
+		t.Errorf("Fanout = %v; want two locations (default/alias plus archive)", names)
+	}
+}
+
+// isolateS3Env keeps the SDK from reading an endpoint, a checksum mode or a
+// profile off the machine running the test.
+func isolateS3Env(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+}
+
+func s3Label(t *testing.T, region string, opts bos3.Options) string {
+	t.Helper()
+	client, err := bos3.NewClient(context.Background(), "b", region, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewS3(client).Label()
+}
+
+// TestS3LabelIsOnePerLocation holds S3.Label to what dedupByLabel and
+// 'pkg move' read it as: equal exactly when two stores are one place. A
+// spelling of one endpoint that produced a second label would list a bucket
+// twice; two endpoints under one label is the collision that hid a store.
+func TestS3LabelIsOnePerLocation(t *testing.T) {
+	isolateS3Env(t)
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{"AWS", "", "s3://b"},
+		{"endpoint", "https://minio.example.net", "s3+https://minio.example.net/b"},
+		{"case, default port and trailing slash", "HTTPS://MinIO.Example.NET:443/", "s3+https://minio.example.net/b"},
+		{"trailing dot", "https://minio.example.net.", "s3+https://minio.example.net/b"},
+		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000/b"},
+		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net/b"},
+		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443/b"},
+		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a/b"},
+		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b/b"},
+		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000/b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := s3Label(t, "us-east-1", bos3.Options{Endpoint: tc.endpoint}); got != tc.want {
+				t.Errorf("Label = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("region is not part of an AWS location", func(t *testing.T) {
+		if a, b := s3Label(t, "us-east-1", bos3.Options{}), s3Label(t, "eu-west-1", bos3.Options{}); a != b {
+			t.Errorf("one AWS bucket under two regions = %q and %q, want one label", a, b)
+		}
+	})
+	t.Run("addressing and checksums are not part of a location", func(t *testing.T) {
+		plain := s3Label(t, "us-east-1", bos3.Options{Endpoint: "https://minio.example.net"})
+		tuned := s3Label(t, "us-east-1", bos3.Options{Endpoint: "https://minio.example.net", PathStyle: true, Checksums: bos3.ChecksumsWhenRequired})
+		if plain != tuned {
+			t.Errorf("one endpoint = %q and %q, want one label", plain, tuned)
+		}
+	})
+}
+
+// TestS3LabelFollowsTheEnvironmentEndpoint: an entry with no endpoint key
+// dials whatever the SDK read, so that is where it is. It must match an entry
+// that names the same endpoint by key and differ from AWS.
+func TestS3LabelFollowsTheEnvironmentEndpoint(t *testing.T) {
+	isolateS3Env(t)
+	byKey := s3Label(t, "us-east-1", bos3.Options{Endpoint: "https://minio.example.net"})
+	t.Setenv("AWS_ENDPOINT_URL_S3", "https://minio.example.net/")
+	if got := s3Label(t, "us-east-1", bos3.Options{}); got != byKey {
+		t.Errorf("Label under AWS_ENDPOINT_URL_S3 = %q, want %q", got, byKey)
+	}
+}
+
+// TestS3LabelNeverPrintsEndpointCredentials: config load refuses userinfo in
+// the endpoint key, but nothing checks an endpoint the SDK read from the
+// environment, and a label goes to logs and error text.
+func TestS3LabelNeverPrintsEndpointCredentials(t *testing.T) {
+	isolateS3Env(t)
+	for _, endpoint := range []string{
+		"https://access:sentinel-secret@minio.example.net",
+		"https://access:sentinel-secret@minio.example.net:bad",
+		"https://minio.example.net?token=sentinel-secret",
+		"access:sentinel-secret@minio.example.net",
+		"sentinel-secret",
+	} {
+		t.Setenv("AWS_ENDPOINT_URL_S3", endpoint)
+		got := s3Label(t, "us-east-1", bos3.Options{})
+		if strings.Contains(got, "sentinel-secret") {
+			t.Errorf("Label for %q = %q, which prints the credential", endpoint, got)
+		}
+		if got == "s3://b" {
+			t.Errorf("Label for %q is AWS's %q, and the client does not dial AWS", endpoint, got)
+		}
+	}
+}
+
+// TestS3BucketLabelDropsTheEndpoint: an s3:// URI written outside bodega
+// names a bucket and a key and nothing else, so the form it is matched
+// against carries the bucket and the backend's prefix and no endpoint.
+func TestS3BucketLabelDropsTheEndpoint(t *testing.T) {
+	isolateS3Env(t)
+	cfg := &config.Config{
+		StorageBackend: "local", StoragePath: t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"aws":    {Driver: "s3", Bucket: "artifacts", Region: "us-east-1"},
+			"linode": {Driver: "s3", Bucket: "artifacts", Region: "us-ord", Endpoint: "https://us-ord-1.linodeobjects.com"},
+			"cold":   {Driver: "s3", Bucket: "artifacts", Region: "us-ord", Endpoint: "https://us-ord-1.linodeobjects.com", Prefix: "cold/"},
+		},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][2]string{
+		"aws":    {"s3://artifacts", "s3://artifacts"},
+		"linode": {"s3+https://us-ord-1.linodeobjects.com/artifacts", "s3://artifacts"},
+		"cold":   {"s3+https://us-ord-1.linodeobjects.com/artifacts/cold", "s3://artifacts/cold"},
+	}
+	for name, w := range want {
+		store, err := r.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bucket, ok := S3BucketLabel(store)
+		if store.Label() != w[0] || !ok || bucket != w[1] {
+			t.Errorf("%s: Label = %q, S3BucketLabel = %q, %v; want %q and %q", name, store.Label(), bucket, ok, w[0], w[1])
+		}
+	}
+	if got, ok := S3BucketLabel(r.Default()); ok {
+		t.Errorf("S3BucketLabel(local store) = %q, true; want false", got)
+	}
+}

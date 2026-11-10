@@ -2359,18 +2359,25 @@ func (c *Config) validateStorage() error {
 // so plaintext needs the same allow_plaintext the listener does. Userinfo is
 // refused because a credential written there lands in every log line that
 // prints the endpoint; the AWS chain is where credentials belong.
+//
+// No refusal here may print what could be that credential. The "@" check runs
+// on the text and before the parse for that reason: a malformed URL never
+// yields a URL.User to test, and url.Parse's own error quotes its whole input.
+// The query and fragment refusal prints the scheme and host alone, since a
+// query is the other place a secret gets pasted.
 func validateS3Store(at, backend, endpoint, checksums string, allowPlaintext bool) error {
+	if strings.Contains(endpoint, "@") {
+		return fmt.Errorf("%sendpoint for %s carries credentials in the URL (it holds an \"@\", and the value is not printed here because of that): remove them, write it as https://host[:port], and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)", at, backend)
+	}
 	if endpoint != "" {
 		u, err := url.Parse(endpoint)
 		switch {
 		case err != nil:
 			return fmt.Errorf("%sendpoint %q for %s is not a URL: %w", at, endpoint, backend, err)
-		case u.Host == "":
+		case u.Hostname() == "":
 			return fmt.Errorf("%sendpoint %q for %s names no host: write it as https://host[:port]", at, endpoint, backend)
-		case u.User != nil:
-			return fmt.Errorf("%sendpoint for %s carries credentials in the URL: remove them and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)", at, backend)
-		case u.RawQuery != "" || u.Fragment != "":
-			return fmt.Errorf("%sendpoint %q for %s carries a query or fragment: write only https://host[:port][/path]", at, endpoint, backend)
+		case u.RawQuery != "" || u.ForceQuery || u.Fragment != "":
+			return fmt.Errorf("%sendpoint for %s (%s://%s) carries a query or fragment: write only https://host[:port][/path]", at, backend, u.Scheme, u.Host)
 		case u.Scheme == "http" && !allowPlaintext:
 			return fmt.Errorf("%sendpoint %q for %s is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that", at, endpoint, backend)
 		case u.Scheme != "https" && u.Scheme != "http":
@@ -3084,7 +3091,15 @@ func topLevelKeys(data []byte) ([]string, map[string]bool) {
 func parseConfigError(path string, err error) error {
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) && typeErr.Field != "" {
-		return fmt.Errorf("parse config %s: key %q: cannot use %s as %s", path, typeErr.Field, typeErr.Value, typeErr.Type)
+		// A storage_backends entry's key arrives with its backend in the
+		// field path. The same three keys at the top level are the default
+		// backend's and say so nowhere, in a file that may hold several.
+		whose := ""
+		switch typeErr.Field {
+		case "endpoint", "path_style", "checksums":
+			whose = " (the default storage backend's)"
+		}
+		return fmt.Errorf("parse config %s: key %q%s: cannot use %s as %s", path, typeErr.Field, whose, typeErr.Value, typeErr.Type)
 	}
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &syntaxErr) {

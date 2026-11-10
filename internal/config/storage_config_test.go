@@ -239,3 +239,52 @@ func TestLoadValidatesS3StoreKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewF113MalformedEndpointDoesNotLogCredentials(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	writeConfig(t, `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"https://access:sentinel-secret@store.example:bad"}}}`)
+	_, err := config.Load("", "", "", "", false, false)
+	if err == nil {
+		t.Fatal("Load accepted an endpoint with an invalid port")
+	}
+	if strings.Contains(err.Error(), "sentinel-secret") {
+		t.Fatalf("Load leaked the endpoint credential: %v", err)
+	}
+}
+
+func TestReviewF113S3TypeErrorsNameBackend(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for key, value := range map[string]string{"endpoint": "123", "path_style": `"true"`, "checksums": "false"} {
+		for _, backend := range []string{"default", "linode"} {
+			t.Run(backend+"/"+key, func(t *testing.T) {
+				body := `{"` + key + `":` + value + `}`
+				if backend != "default" {
+					body = `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","` + key + `":` + value + `}}}`
+				}
+				writeConfig(t, body)
+				_, err := config.Load("", "", "", "", false, false)
+				message := ""
+				if err != nil {
+					message = strings.ReplaceAll(err.Error(), os.Getenv(config.EnvConfigFile), "<config>")
+				}
+				if err == nil || !strings.Contains(message, key) || !strings.Contains(message, backend) {
+					t.Fatalf("Load = %s; want an error naming key %q and backend %q", message, key, backend)
+				}
+			})
+		}
+	}
+}
+
+func TestReviewF113EndpointRequiresHostname(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for _, body := range []string{
+		`{"endpoint":"https://:443"}`,
+		`{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"https://:443"}}}`,
+	} {
+		writeConfig(t, body)
+		_, err := config.Load("", "", "", "", false, false)
+		if err == nil {
+			t.Errorf("Load accepted an HTTPS endpoint with no hostname: %s", body)
+		}
+	}
+}
