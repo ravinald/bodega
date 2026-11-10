@@ -27,6 +27,7 @@ try {
   <nav>
     <a href="{{ .Site.Base }}docs/"{{ if or (eq .Kind "doc") (eq .Out "docs/index.html") }} class="here"{{ end }}>Docs</a>
     <a href="{{ .Site.Base }}docs/quickstart.html">Quick start</a>
+    <a href="{{ .Site.Base }}api/"{{ if hasPrefix .Out "api/" }} class="here"{{ end }}>API</a>
     <a href="{{ .Site.Base }}coverage.html"{{ if eq .Out "coverage.html" }} class="here"{{ end }}>Package support</a>
     <a href="https://github.com/ravinald/bodega">Source</a>
   </nav>

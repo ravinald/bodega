@@ -2,14 +2,14 @@ openapi: "3.0.3"
 info:
   title: bodega API
   description: REST API for the bodega package repository manager.
-  version: 0.1.0
+  version: 0.2.0
   license:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
 
 servers:
-  - url: http://localhost:8080
-    description: Local development
+  - url: https://bodega.example.com
+    description: A placeholder for your bodega server's base URL
 
 tags:
   - name: packages
