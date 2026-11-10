@@ -480,15 +480,15 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		want     string
 	}{
 		{"AWS", "", "s3://b"},
-		{"endpoint", "https://minio.example.net", "s3+https://minio.example.net#b"},
-		{"case, default port and trailing slash", "HTTPS://MinIO.Example.NET:443/", "s3+https://minio.example.net#b"},
-		{"trailing dot", "https://minio.example.net.", "s3+https://minio.example.net#b"},
-		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000#b"},
-		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net#b"},
-		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443#b"},
-		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a#b"},
-		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b#b"},
-		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000#b"},
+		{"endpoint", "https://minio.example.net", "s3+https://minio.example.net/b"},
+		{"case, default port and trailing slash", "HTTPS://MinIO.Example.NET:443/", "s3+https://minio.example.net/b"},
+		{"trailing dot", "https://minio.example.net.", "s3+https://minio.example.net/b"},
+		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000/b"},
+		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net/b"},
+		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443/b"},
+		{"path", "https://gw.example.net/tenant-a/", "s3+https://tenant-a.gw.example.net/b"},
+		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://tenant-b.gw.example.net/b"},
+		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000/b"},
 		{"AWS regional endpoint is AWS", "https://s3.us-west-2.amazonaws.com", "s3://b"},
 		{"AWS global endpoint", "https://s3.amazonaws.com/", "s3://b"},
 		{"AWS dash-region endpoint", "https://s3-us-west-2.amazonaws.com", "s3://b"},
@@ -498,11 +498,11 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		{"AWS China endpoint", "https://s3.cn-north-1.amazonaws.com.cn", "s3://b"},
 		{"AWS interface VPC endpoint", "https://bucket.vpce-0a1b2c-abcd.s3.us-east-1.vpce.amazonaws.com", "s3://b"},
 		{"AWS over plaintext is still AWS", "http://s3.us-west-2.amazonaws.com", "s3://b"},
-		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000#b"},
-		{"a path on an AWS name is not the bucket namespace", "https://s3.us-west-2.amazonaws.com/x", "s3+https://s3.us-west-2.amazonaws.com/x#b"},
-		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com#b"},
-		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net#b"},
-		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com#b"},
+		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000/b"},
+		{"the first path segment on an AWS host is the bucket", "https://s3.us-west-2.amazonaws.com/x", "s3://x/b"},
+		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com/b"},
+		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net/b"},
+		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com/b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -580,8 +580,8 @@ func TestS3BucketLabelDropsTheEndpoint(t *testing.T) {
 	}
 	want := map[string][2]string{
 		"aws":    {"s3://artifacts", "s3://artifacts"},
-		"linode": {"s3+https://us-ord-1.linodeobjects.com#artifacts", "s3://artifacts"},
-		"cold":   {"s3+https://us-ord-1.linodeobjects.com#artifacts/cold", "s3://artifacts/cold"},
+		"linode": {"s3+https://artifacts.us-ord-1.linodeobjects.com", "s3://artifacts"},
+		"cold":   {"s3+https://cold.artifacts.us-ord-1.linodeobjects.com", "s3://artifacts/cold"},
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -621,8 +621,8 @@ func TestS3RecordLabelNamesAWS(t *testing.T) {
 		"aws":      "s3+aws://artifacts",
 		"regional": "s3+aws://artifacts",
 		"nested":   "s3+aws://artifacts/cold",
-		"linode":   "s3+https://us-ord-1.linodeobjects.com#artifacts",
-		"cold":     "s3+https://us-ord-1.linodeobjects.com#artifacts/cold",
+		"linode":   "s3+https://artifacts.us-ord-1.linodeobjects.com",
+		"cold":     "s3+https://cold.artifacts.us-ord-1.linodeobjects.com",
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -689,20 +689,46 @@ func TestReviewF113EndpointPathKeepsBucketBoundary(t *testing.T) {
 	}
 }
 
-// TestS3LabelsKeepComponentBoundaries: no two (endpoint, bucket, prefix)
-// tuples share a location label or a record label, whichever component a
-// separator is moved into, and a record label is never a location label.
+// sdkNamespace is what a key is appended to on the wire for one (endpoint,
+// bucket, prefix), computed from the SDK's resolver the way the request
+// middleware applies it: the resolved scheme and host, the decoded path with
+// one "/" closing it, then the prefix.
+func sdkNamespace(t *testing.T, client *bos3.Client, bucket, prefix string) string {
+	t.Helper()
+	opts := client.S3Client().Options()
+	ep, err := awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(t.Context(), awss3.EndpointParameters{
+		Region: aws.String(opts.Region), Bucket: aws.String(bucket), Endpoint: opts.BaseEndpoint,
+		ForcePathStyle: aws.Bool(opts.UsePathStyle),
+	})
+	if err != nil {
+		return "unresolved " + aws.ToString(opts.BaseEndpoint) + " " + bucket + " " + prefix
+	}
+	return ep.URI.Scheme + "://" + ep.URI.Host + strings.TrimSuffix(ep.URI.Path, "/") + "/" + prefix
+}
+
+// TestS3LabelsKeepComponentBoundaries: two (endpoint, bucket, prefix) tuples
+// share a location label, and a record label, exactly when the SDK sends
+// their keys under one URL, whichever component a separator is moved into,
+// and a record label is never another location's label. The names here are
+// ones the SDK does not address as a host label, so the SDK's route is the
+// whole of the identity; TestS3LocationIsTheSDKRoute covers the ones it does.
 func TestS3LabelsKeepComponentBoundaries(t *testing.T) {
 	isolateS3Env(t)
 	tuples := [][3]string{
-		{"", "a", ""}, {"", "a", "b"}, {"", "a/b", ""}, {"", "a", "b#c"}, {"", "a#b", "c"},
-		{"https://gw.example.net", "a", ""}, {"https://gw.example.net", "a", "b"},
+		{"", "a", ""}, {"", "a", "b"}, {"", "a", "b/"}, {"", "a/b", ""}, {"", "a", "b#c"}, {"", "a#b", "c"},
+		{"https://gw.example.net", "a", ""}, {"https://gw.example.net", "a", "b"}, {"https://gw.example.net", "a", "b/"},
 		{"https://gw.example.net", "a/b", ""}, {"https://gw.example.net", "a#b", ""},
 		{"https://gw.example.net/a", "b", ""}, {"https://gw.example.net/a", "b", "c"},
 		{"https://gw.example.net/a/b", "c", ""}, {"https://gw.example.net/a%2Fb", "c", ""},
+		{"https://gw.example.net/a", "b", "c/"}, {"https://gw.example.net/a//", "b", "c/"},
 		{"aws://a", "b", ""}, {"aws://a/b", "c", ""},
 	}
-	labels, records := map[string][3]string{}, map[string][3]string{}
+	type seen struct {
+		tuple     [3]string
+		namespace string
+	}
+	labels, records := map[string]seen{}, map[string]seen{}
+	var shared int
 	for _, tuple := range tuples {
 		client, err := bos3.NewClient(t.Context(), tuple[1], "us-east-1", bos3.Options{Endpoint: tuple[0]})
 		if err != nil {
@@ -712,18 +738,98 @@ func TestS3LabelsKeepComponentBoundaries(t *testing.T) {
 		if tuple[2] != "" {
 			store = &prefixed{inner: store, prefix: tuple[2]}
 		}
-		if prev, dup := labels[store.Label()]; dup {
-			t.Errorf("%q and %q share the label %q", prev, tuple, store.Label())
+		this := seen{tuple, sdkNamespace(t, client, tuple[1], tuple[2])}
+		for label, into := range map[string]map[string]seen{store.Label(): labels, S3RecordLabel(store): records} {
+			for prevLabel, prev := range into {
+				if (prevLabel == label) != (prev.namespace == this.namespace) {
+					t.Errorf("%q is %q under %s and %q is %q under %s", prev.tuple, prevLabel, prev.namespace, tuple, label, this.namespace)
+				}
+			}
+			if _, dup := into[label]; dup {
+				shared++
+			}
+			into[label] = this
 		}
-		labels[store.Label()] = tuple
-		if prev, dup := records[S3RecordLabel(store)]; dup {
-			t.Errorf("%q and %q share the record label %q", prev, tuple, S3RecordLabel(store))
-		}
-		records[S3RecordLabel(store)] = tuple
 	}
-	for record, tuple := range records {
-		if prev, dup := labels[record]; dup && prev != tuple {
-			t.Errorf("the record label of %q is the label %q of %q", tuple, record, prev)
+	// Each of "/a/b", its encoded spelling and the same path split across
+	// bucket and prefix is one namespace, so the list has to hold aliases or
+	// it only shows that different strings differ.
+	if shared < 6 {
+		t.Errorf("the tuples hold %d aliases, want at least 6", shared)
+	}
+	for record, r := range records {
+		if l, dup := labels[record]; dup && l.namespace != r.namespace {
+			t.Errorf("the record label of %q is the label %q of %q", r.tuple, record, l.tuple)
+		}
+	}
+}
+
+// TestS3LocationIsTheSDKRoute: every consumer of an s3 identity reads one
+// location, and it follows where the SDK sends a request and not how the
+// configuration spelled it. Each group is one object namespace under several
+// spellings (the addressing style, an encoded endpoint path, a path segment
+// moved between endpoint, bucket and prefix) and no two groups are the same
+// place.
+func TestS3LocationIsTheSDKRoute(t *testing.T) {
+	isolateS3Env(t)
+	type spelling struct {
+		endpoint  string
+		pathStyle bool
+		bucket    string
+		prefix    string
+	}
+	const gw = "https://gw.example.net"
+	groups := []struct {
+		label, record string
+		spellings     []spelling
+	}{
+		{"s3+https://artifacts.gw.example.net", "", []spelling{
+			{gw, false, "artifacts", ""}, {gw, true, "artifacts", ""}, {"HTTPS://GW.Example.NET:443/", true, "artifacts", ""},
+		}},
+		{"s3+https://cold.artifacts.gw.example.net", "", []spelling{
+			{gw, false, "artifacts", "cold/"}, {gw, true, "artifacts", "cold"},
+			{"https://artifacts.gw.example.net", true, "cold", ""}, {"https://artifacts.gw.example.net", false, "cold", ""},
+			{gw + "/artifacts", true, "cold", ""}, {gw + "/%61rtifacts/", true, "cold", ""},
+		}},
+		{"s3+https://tenant.artifacts.gw.example.net", "", []spelling{
+			{gw + "/tenant", false, "artifacts", ""}, {gw, true, "artifacts", "tenant/"},
+		}},
+		{"s3+https://artifacts.tenant.gw.example.net", "", []spelling{
+			{gw + "/tenant", true, "artifacts", ""}, {gw, false, "tenant", "artifacts/"},
+		}},
+		{"s3+https://gw.example.net/a/b/artifacts", "", []spelling{
+			{gw + "/a/b", true, "artifacts", ""}, {gw + "/a%2Fb", true, "artifacts", ""}, {gw + "/a", true, "b", "artifacts/"},
+		}},
+		{"s3+https://gw.example.net/Cold", "", []spelling{{gw, true, "Cold", ""}, {gw, false, "Cold", ""}}},
+		{"s3+https://cold.artifacts.gw.example.net/", "", []spelling{{gw, true, "artifacts", "cold//"}, {gw, false, "artifacts", "cold//"}}},
+		{"s3+http://artifacts.gw.example.net", "", []spelling{{"http://gw.example.net", false, "artifacts", ""}}},
+		{"s3+https://10.0.0.1/artifacts", "", []spelling{{"https://10.0.0.1", false, "artifacts", ""}, {"https://10.0.0.1", true, "artifacts", ""}}},
+		{"s3://artifacts", "s3+aws://artifacts", []spelling{
+			{"", false, "artifacts", ""}, {"", true, "artifacts", ""}, {"https://s3.eu-west-1.amazonaws.com", true, "artifacts", ""},
+		}},
+		{"s3://artifacts/cold", "s3+aws://artifacts/cold", []spelling{
+			{"", false, "artifacts", "cold/"}, {"https://s3.us-west-2.amazonaws.com", false, "artifacts", "cold/"},
+			{"https://s3.us-west-2.amazonaws.com/artifacts", true, "cold", ""}, {"https://s3.us-west-2.amazonaws.com/cold", false, "artifacts", ""},
+		}},
+		{"s3://my.dotted.bucket/cold", "s3+aws://my.dotted.bucket/cold", []spelling{
+			{"", false, "my.dotted.bucket", "cold/"}, {"http://s3.us-west-2.amazonaws.com", false, "my.dotted.bucket", "cold/"},
+		}},
+	}
+	for _, g := range groups {
+		if g.record == "" {
+			g.record = g.label
+		}
+		for _, sp := range g.spellings {
+			store, err := NewFromSpec(t.Context(), Spec{Driver: "s3", Bucket: sp.bucket, Region: "us-east-1", Prefix: sp.prefix, Endpoint: sp.endpoint, PathStyle: sp.pathStyle})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := store.Label(); got != g.label {
+				t.Errorf("%+v: Label = %q, want %q", sp, got, g.label)
+			}
+			if got := S3RecordLabel(store); got != g.record {
+				t.Errorf("%+v: S3RecordLabel = %q, want %q", sp, got, g.record)
+			}
 		}
 	}
 }

@@ -7,13 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -611,5 +617,155 @@ func TestReviewF113MoveRefusesAWSRegionalEndpointAlias(t *testing.T) {
 	}
 	if got := r.Fanout(t.Context(), "apt", []string{"alias"}); len(got) != 1 {
 		t.Errorf("Fanout returned %d locations for one AWS bucket", len(got))
+	}
+}
+
+func TestReviewF113MoveRefusesSDKPathAliases(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	cases := []struct {
+		name, sourcePath, targetPath, targetBucket, targetPrefix string
+	}{
+		{"encoded letter", "/tenant", "/%74enant", "artifacts", ""},
+		{"encoded slash", "/tenant/a", "/tenant%2Fa", "artifacts", ""},
+		{"path-style component alias", "/tenant", "", "tenant", "artifacts"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{
+				StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+				Endpoint: "https://store.example.net" + tc.sourcePath, PathStyle: true,
+				StorageBackends: map[string]config.StorageSpec{
+					"alias": {Driver: "s3", Bucket: tc.targetBucket, Prefix: tc.targetPrefix, Region: "us-east-1", Endpoint: "https://store.example.net" + tc.targetPath, PathStyle: true},
+				},
+			}
+			var routes []string
+			for _, name := range []string{storage.DefaultName, "alias"} {
+				spec, _ := storage.SpecFor(cfg, name)
+				client, err := bos3.NewClient(t.Context(), spec.Bucket, spec.Region, spec.S3Options())
+				if err != nil {
+					t.Fatal(err)
+				}
+				opts := client.S3Client().Options()
+				ep, err := awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(t.Context(), awss3.EndpointParameters{
+					Region: aws.String(opts.Region), Bucket: aws.String(spec.Bucket), Endpoint: opts.BaseEndpoint,
+					ForcePathStyle: aws.Bool(opts.UsePathStyle),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				route := strings.TrimRight(ep.URI.String(), "/")
+				if spec.Prefix != "" {
+					route += "/" + spec.Prefix
+				}
+				routes = append(routes, route+"/"+exampleToolKey)
+			}
+			if routes[0] != routes[1] {
+				t.Fatalf("fixture does not address one object: %q and %q", routes[0], routes[1])
+			}
+			t.Logf("both SDK routes: %s", routes[0])
+			r, err := storage.NewResolver(t.Context(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := r.ByName("alias")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pm := &manifest.PackageManifest{
+				Type: manifest.TypeBinary, Name: "example-tool",
+				Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+			}
+			selected, err := selectForMove(r, dst, pm, "", "alias")
+			if err == nil || !strings.Contains(err.Error(), "same location") {
+				t.Errorf("selectForMove = %v, %v for %q -> %q; want same-location refusal before --delete-source can remove the only copy", selected, err, r.Default().Label(), dst.Label())
+			}
+			if got := r.Fanout(t.Context(), "apt", []string{"alias"}); len(got) != 1 {
+				t.Errorf("Fanout returned %d locations for one SDK object namespace", len(got))
+			}
+			if a, b := storage.S3RecordLabel(r.Default()), storage.S3RecordLabel(dst); a != b {
+				t.Errorf("one SDK object namespace has two cache-record identities: %q and %q", a, b)
+			}
+		})
+	}
+}
+
+func TestReviewF113SDKPathAliasCannotDeleteTheOnlyCopy(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION", "AWS_SESSION_TOKEN", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	for _, componentAlias := range []bool{false, true} {
+		t.Run(fmt.Sprintf("component_alias=%v", componentAlias), func(t *testing.T) {
+			const objectPath = "/tenant/artifacts/" + exampleToolKey
+			var mu sync.Mutex
+			objects := map[string][]byte{objectPath: []byte("payload")}
+			var mutations []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.URL.Query().Has("list-type") {
+					_, _ = io.WriteString(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>`)
+					return
+				}
+				switch r.Method {
+				case http.MethodPut:
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					objects[r.URL.Path] = body
+					mutations = append(mutations, r.Method+" "+r.RequestURI)
+					w.Header().Set("ETag", `"same"`)
+				case http.MethodDelete:
+					delete(objects, r.URL.Path)
+					mutations = append(mutations, r.Method+" "+r.RequestURI)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					body, ok := objects[r.URL.Path]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					w.Header().Set("ETag", `"same"`)
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					if r.Method != http.MethodHead {
+						_, _ = w.Write(body)
+					}
+				}
+			}))
+			t.Cleanup(srv.Close)
+			srcSpec := storage.Spec{Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: srv.URL + "/tenant", PathStyle: true, Checksums: bos3.ChecksumsWhenRequired}
+			dstSpec := srcSpec
+			dstSpec.Endpoint = srv.URL + "/%74enant"
+			if componentAlias {
+				dstSpec.Endpoint, dstSpec.Bucket, dstSpec.Prefix = srv.URL, "tenant", "artifacts"
+			}
+			src, err := storage.NewFromSpec(t.Context(), srcSpec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := storage.NewFromSpec(t.Context(), dstSpec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, _, pm, out := moveFixture(t, src, dst, true)
+			err = m.moveVersion(t.Context(), pm, 0)
+			if err == nil || !strings.Contains(err.Error(), "same location") {
+				t.Errorf("moveVersion = %v, want same-location refusal; output:\n%s", err, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(mutations) != 0 || string(objects[objectPath]) != "payload" {
+				t.Errorf("self-move mutated the store: %v; surviving payload = %q", mutations, objects[objectPath])
+			}
+		})
 	}
 }

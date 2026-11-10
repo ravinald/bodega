@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,16 +134,57 @@ func NewClientFromConfig(cfg aws.Config, bucket, region string, optFns ...func(*
 // access (e.g. InitBucket).
 func (c *Client) S3Client() *awss3.Client { return c.raw }
 
-// Endpoint returns the base URL the client dials when one is set, by the
-// endpoint key or by whatever the SDK read for it (AWS_ENDPOINT_URL_S3,
-// AWS_ENDPOINT_URL, the profile), and "" when the SDK derives AWS's own from
-// the region. It is the SDK's resolved value, so two clients report the same
-// string exactly when they were handed the same one, however it arrived.
-func (c *Client) Endpoint() string {
-	if c.raw == nil {
-		return ""
+// Route is where the pinned SDK sends a request for the client's bucket.
+type Route struct {
+	// URL carries the scheme, host and percent-decoded path the SDK resolved.
+	// A key is appended to that path.
+	URL url.URL
+	// Endpoint is the base URL handed to the client, by the endpoint key or by
+	// whatever the SDK read for it (AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, the
+	// profile), and "" when the SDK derives AWS's own host from the region.
+	Endpoint string
+}
+
+// Route resolves the client's bucket through the SDK's own endpoint rules,
+// with the endpoint and addressing style the client was built with, so it is
+// the route a request takes and not a reading of the configuration: the rules
+// decode the endpoint's path, choose between <bucket>.<host> and
+// <host>/<bucket>, and fall back to the second for a bucket or host they will
+// not address the first way. Endpoint is set even when it fails.
+//
+// A client with no region and no endpoint is resolved as if it had a region.
+// Its requests fail until the SDK's chain supplies one, but the rules resolve
+// nothing without it, and which region is no part of where an AWS bucket is:
+// the answer would otherwise change with AWS_REGION.
+func (c *Client) Route(ctx context.Context) (Route, error) {
+	region, endpoint, pathStyle := c.region, "", false
+	if c.raw != nil {
+		opts := c.raw.Options()
+		region, endpoint, pathStyle = opts.Region, aws.ToString(opts.BaseEndpoint), opts.UsePathStyle
 	}
-	return aws.ToString(c.raw.Options().BaseEndpoint)
+	if region == "" && endpoint == "" {
+		region = "us-east-1"
+	}
+	return ResolveRoute(ctx, region, endpoint, c.bucket, pathStyle)
+}
+
+// ResolveRoute is Route for a bucket no client was built for.
+func ResolveRoute(ctx context.Context, region, endpoint, bucket string, pathStyle bool) (Route, error) {
+	params := awss3.EndpointParameters{
+		Region:         aws.String(region),
+		Bucket:         aws.String(bucket),
+		ForcePathStyle: aws.Bool(pathStyle),
+	}
+	if endpoint != "" {
+		params.Endpoint = aws.String(endpoint)
+	}
+	route := Route{Endpoint: endpoint}
+	ep, err := awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, params)
+	if err != nil {
+		return route, err
+	}
+	route.URL = ep.URI
+	return route, nil
 }
 
 // Bucket returns the configured bucket name.

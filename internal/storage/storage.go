@@ -342,11 +342,13 @@ func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPref
 // names: selectForMove's same-location refusal could not fire and
 // --delete-source removed the only copy (#189).
 //
-// Cleaning here is safe only because config.validateStorage refuses those
-// spellings at admission. s3 does not clean keys, so "cold//x/k" and
-// "cold/x/k" are two distinct objects in one bucket, and a cleaned label over
-// an s3 inner would claim an identity the bucket does not have.
+// Cleaning is for the local backend. s3 does not clean keys, so "cold//x/k"
+// and "cold/x/k" are two distinct objects in one bucket, and a prefix over an
+// s3 store is part of that store's location instead (see s3Location).
 func (p *prefixed) Label() string {
+	if loc, ok := s3LocationOf(p); ok {
+		return loc.label()
+	}
 	return joinLabel(p.inner.Label(), p.prefix)
 }
 
