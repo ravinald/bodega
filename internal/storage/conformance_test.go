@@ -34,8 +34,9 @@ import (
 //
 // S3 runs against a live bucket, which a gate that needs an AWS account can
 // only do while the account is available. So it runs when credentials
-// resolve, and skips when none do unless s3ConformanceEnv promises them, in
-// which case their absence fails the run: a skip nothing forces is a gate that
+// resolve, and skips when none do unless s3ConformanceEnv or an endpoint in
+// s3ConformanceEndpointEnv promises them, in which case their absence fails
+// the run: a skip nothing forces is a gate that
 // stops blocking without anyone deciding it should.
 func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
@@ -73,6 +74,57 @@ func rootWithDecoySibling(t *testing.T) string {
 // "no AWS credentials resolved" from a skip into a failure, so a pipeline that
 // is meant to exercise S3 cannot pass by quietly not doing so.
 const s3ConformanceEnv = "BODEGA_S3_CONFORMANCE"
+
+// These point the s3 backend at an S3-compatible store, each standing in for
+// the config key of the same name: endpoint, path_style, checksums. Naming an
+// endpoint promises a store exactly as s3ConformanceEnv does, because nobody
+// names one and then wants the run to pass by skipping it.
+const (
+	s3ConformanceEndpointEnv  = "BODEGA_S3_CONFORMANCE_ENDPOINT"
+	s3ConformancePathStyleEnv = "BODEGA_S3_CONFORMANCE_PATH_STYLE"
+	s3ConformanceChecksumsEnv = "BODEGA_S3_CONFORMANCE_CHECKSUMS"
+)
+
+// s3Promised names the variable that promised this run a store, or "".
+func s3Promised() string {
+	for _, env := range []string{s3ConformanceEnv, s3ConformanceEndpointEnv} {
+		if os.Getenv(env) != "" {
+			return env
+		}
+	}
+	return ""
+}
+
+// conformanceS3Options reads the three variables into the bos3.Options the
+// driver builds from the three config keys.
+func conformanceS3Options() (bos3.Options, error) {
+	opts := bos3.Options{
+		Endpoint:  os.Getenv(s3ConformanceEndpointEnv),
+		Checksums: os.Getenv(s3ConformanceChecksumsEnv),
+	}
+	if v := os.Getenv(s3ConformancePathStyleEnv); v != "" {
+		pathStyle, err := strconv.ParseBool(v)
+		if err != nil {
+			return opts, fmt.Errorf("%s=%q is not a boolean: use true or false", s3ConformancePathStyleEnv, v)
+		}
+		opts.PathStyle = pathStyle
+	}
+	return opts, nil
+}
+
+// conformanceS3Client builds the client for one conformance bucket through
+// Options.ClientOptions, the call bos3.NewClient makes for the driver.
+func conformanceS3Client(cfg aws.Config, bucket string) (*bos3.Client, error) {
+	opts, err := conformanceS3Options()
+	if err != nil {
+		return nil, err
+	}
+	optFns, err := opts.ClientOptions()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", s3ConformanceChecksumsEnv, err)
+	}
+	return bos3.NewClientFromConfig(cfg, bucket, cfg.Region, optFns...), nil
+}
 
 // conformanceBucketPrefix is the name every bucket this file creates starts
 // with. The development account's test role may create and delete only
@@ -150,10 +202,10 @@ func requireReachable(t *testing.T, name string) {
 		return
 	}
 	if _, err := liveS3Config(); err != nil {
-		if os.Getenv(s3ConformanceEnv) != "" {
-			t.Fatalf("%s is set, so this run was promised an S3 endpoint, and no AWS credentials resolved: %v", s3ConformanceEnv, err)
+		if env := s3Promised(); env != "" {
+			t.Fatalf("%s is set, so this run was promised an S3 endpoint, and no AWS credentials resolved: %v", env, err)
 		}
-		t.Skipf("no AWS credentials resolved (%v); set %s to make that a failure", err, s3ConformanceEnv)
+		t.Skipf("no AWS credentials resolved (%v); set %s or %s to make that a failure", err, s3ConformanceEnv, s3ConformanceEndpointEnv)
 	}
 }
 
@@ -173,7 +225,10 @@ func liveS3Bucket(t *testing.T) (aws.Config, *bos3.Client) {
 		t.Fatal(err)
 	}
 	bucket := conformanceBucketPrefix + hex.EncodeToString(raw[:])
-	client := bos3.NewClientFromConfig(cfg, bucket, cfg.Region)
+	client, err := conformanceS3Client(cfg, bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { dropLiveBucket(t, client) })
 	return cfg, client
 }
@@ -249,18 +304,29 @@ func isNoSuchBucket(err error) bool {
 // cases do not: a versioned, encrypted, lifecycle-configured bucket, created
 // by the code an operator runs. The second pass is the idempotence claim, and
 // it must report every step as already correct.
+//
+// Against a compatible store it runs as `bodega init --allow-unsupported`
+// does: a control the store lacks is reported NOT APPLIED on both passes, and
+// the lifecycle read-back is skipped when lifecycle is one of them.
 func TestInitBucketAgainstALiveBucket(t *testing.T) {
 	requireReachable(t, "s3")
 	cfg, client := liveS3Bucket(t)
+	compatible := os.Getenv(s3ConformanceEndpointEnv) != ""
+	var last string
 	for pass, wantChange := range []bool{true, false} {
 		var out bytes.Buffer
-		if err := bos3.InitBucket(t.Context(), client.S3Client(), &out, client.Bucket(), cfg.Region); err != nil {
+		if err := bos3.InitBucket(t.Context(), client.S3Client(), &out, client.Bucket(), cfg.Region, compatible); err != nil {
 			t.Fatalf("pass %d: %v\n%s", pass+1, err, out.String())
 		}
+		last = out.String()
 		changed := strings.Contains(out.String(), "CREATED") || strings.Contains(out.String(), "CONFIGURED") || strings.Contains(out.String(), "ENABLED")
 		if changed != wantChange {
 			t.Errorf("pass %d reported a change = %v, want %v:\n%s", pass+1, changed, wantChange, out.String())
 		}
+	}
+	if strings.Contains(last, "lifecycle:  NOT APPLIED") {
+		t.Logf("the store does not implement lifecycle rules; nothing to read back:\n%s", last)
+		return
 	}
 	lc, err := client.S3Client().GetBucketLifecycleConfiguration(t.Context(), &awss3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(client.Bucket())})
 	if err != nil {
@@ -268,6 +334,74 @@ func TestInitBucketAgainstALiveBucket(t *testing.T) {
 	}
 	if got, want := len(lc.Rules), len(bos3.LifecycleRules()); got != want {
 		t.Errorf("bucket holds %d lifecycle rules, want %d", got, want)
+	}
+}
+
+// TestEndpointPromisesAStore is the gate's half of a compatible-store run:
+// naming an endpoint turns unresolved credentials into a failure rather than
+// a skip, as s3ConformanceEnv does.
+func TestEndpointPromisesAStore(t *testing.T) {
+	cases := []struct{ flag, endpoint, want string }{
+		{"", "", ""},
+		{"1", "", s3ConformanceEnv},
+		{"", "https://us-ord-1.linodeobjects.com", s3ConformanceEndpointEnv},
+		{"1", "https://us-ord-1.linodeobjects.com", s3ConformanceEnv},
+	}
+	for _, tc := range cases {
+		t.Setenv(s3ConformanceEnv, tc.flag)
+		t.Setenv(s3ConformanceEndpointEnv, tc.endpoint)
+		if got := s3Promised(); got != tc.want {
+			t.Errorf("flag=%q endpoint=%q: promised by %q, want %q", tc.flag, tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+// TestConformanceVariablesConfigureTheClient holds the three variables to
+// what the three config keys do: the same four SDK options, and nothing
+// written when a variable is unset.
+func TestConformanceVariablesConfigureTheClient(t *testing.T) {
+	for _, env := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"} {
+		t.Setenv(env, "")
+	}
+	cfg := aws.Config{Region: "us-ord"}
+
+	t.Setenv(s3ConformanceEndpointEnv, "https://us-ord-1.linodeobjects.com")
+	t.Setenv(s3ConformancePathStyleEnv, "true")
+	t.Setenv(s3ConformanceChecksumsEnv, bos3.ChecksumsWhenRequired)
+	client, err := conformanceS3Client(cfg, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := client.S3Client().Options()
+	if aws.ToString(got.BaseEndpoint) != "https://us-ord-1.linodeobjects.com" || !got.UsePathStyle ||
+		got.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired ||
+		got.ResponseChecksumValidation != aws.ResponseChecksumValidationWhenRequired {
+		t.Errorf("client options = endpoint %q, path style %v, request %v, response %v; want all three variables applied",
+			aws.ToString(got.BaseEndpoint), got.UsePathStyle, got.RequestChecksumCalculation, got.ResponseChecksumValidation)
+	}
+
+	t.Setenv(s3ConformanceEndpointEnv, "")
+	t.Setenv(s3ConformancePathStyleEnv, "")
+	t.Setenv(s3ConformanceChecksumsEnv, "")
+	client, err = conformanceS3Client(cfg, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := awss3.NewFromConfig(cfg).Options()
+	got = client.S3Client().Options()
+	if got.BaseEndpoint != nil || got.UsePathStyle ||
+		got.RequestChecksumCalculation != want.RequestChecksumCalculation ||
+		got.ResponseChecksumValidation != want.ResponseChecksumValidation {
+		t.Errorf("unset variables changed the client: endpoint %q, path style %v, request %v, response %v",
+			aws.ToString(got.BaseEndpoint), got.UsePathStyle, got.RequestChecksumCalculation, got.ResponseChecksumValidation)
+	}
+
+	for env, bad := range map[string]string{s3ConformancePathStyleEnv: "yes please", s3ConformanceChecksumsEnv: "never"} {
+		t.Setenv(env, bad)
+		if _, err := conformanceS3Client(cfg, "b"); err == nil || !strings.Contains(err.Error(), env) {
+			t.Errorf("%s=%q: err = %v, want a refusal naming the variable", env, bad, err)
+		}
+		t.Setenv(env, "")
 	}
 }
 

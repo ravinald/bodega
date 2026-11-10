@@ -16,7 +16,7 @@ func newS3FromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
 	if spec.Bucket == "" {
 		return nil, fmt.Errorf("s3 backend requires a bucket (set bucket in config or REPO_BUCKET env)")
 	}
-	client, err := bos3.NewClient(ctx, spec.Bucket, spec.Region)
+	client, err := bos3.NewClient(ctx, spec.Bucket, spec.Region, spec.S3Options())
 	if err != nil {
 		return nil, fmt.Errorf("create S3 client: %w", err)
 	}

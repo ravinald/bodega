@@ -251,7 +251,7 @@ func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, s
 
 // initBucketFunc is bos3.InitBucket's signature, so a test can stand in for
 // the calls that would otherwise reach AWS.
-type initBucketFunc func(ctx context.Context, api bos3.BucketAPI, out io.Writer, bucket, region string) error
+type initBucketFunc func(ctx context.Context, api bos3.BucketAPI, out io.Writer, bucket, region string, allowUnsupported bool) error
 
 // initTargetMsg carries the outcome of dialing init request seq back to the
 // event loop, which asks for confirmation before anything touches the bucket.
@@ -467,7 +467,10 @@ func runInit(buf *bytes.Buffer, target storage.S3Target, client *bos3.Client, in
 	if target.Prefix != "" {
 		fmt.Fprintf(buf, "  prefix:     %s is not applied; markers and lifecycle rules sit at the bucket root\n", target.Prefix)
 	}
-	return initBucket(context.Background(), client.S3Client(), buf, target.Bucket, region)
+	// Never allowUnsupported: finishing without a bucket control is a decision
+	// `bodega init --allow-unsupported` records on a command line, and the
+	// refusal printed here names that flag.
+	return initBucket(context.Background(), client.S3Client(), buf, target.Bucket, region, false)
 }
 
 func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {

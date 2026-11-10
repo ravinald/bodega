@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -472,7 +474,7 @@ func TestInitBucketStopsAtFirstFailure(t *testing.T) {
 	f.versionPutErr = errBoom
 	f.encryption = nil
 	var out bytes.Buffer
-	err := InitBucket(context.Background(), f, &out, "b", "us-west-2")
+	err := InitBucket(context.Background(), f, &out, "b", "us-west-2", false)
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("err = %v, want boom", err)
 	}
@@ -485,11 +487,120 @@ func TestInitBucketStopsAtFirstFailure(t *testing.T) {
 	}
 }
 
+// notImplemented is how a store answers an operation it does not have.
+func notImplemented(op string) error {
+	return sdkErr(op, http.StatusNotImplemented, &smithy.GenericAPIError{Code: "NotImplemented", Message: "A header you provided implies functionality that is not implemented"})
+}
+
+// compatibleStore is a bucket on a store with no public access block and no
+// default encryption, with versioning off and one prefix marker missing, so
+// a run has supported work on both sides of each unsupported control.
+func compatibleStore() *fakeBucket {
+	f := newFake()
+	f.pabGetErr, f.pabPutErr = notImplemented("GetPublicAccessBlock"), notImplemented("PutPublicAccessBlock")
+	f.encGetErr, f.encPutErr = notImplemented("GetBucketEncryption"), notImplemented("PutBucketEncryption")
+	f.versioning = ""
+	f.missing["charts/"] = true
+	return f
+}
+
+const compatibleStoreOutput = "  bucket:     exists\n" +
+	"  public acl: NOT APPLIED (the store does not implement public access block)\n" +
+	"  versioning: ENABLED\n" +
+	"  encryption: NOT APPLIED (the store does not implement default encryption)\n" +
+	"  lifecycle:  configured\n"
+
+func TestInitBucketNamesEveryUnsupportedControl(t *testing.T) {
+	f := compatibleStore()
+	var out bytes.Buffer
+	err := InitBucket(context.Background(), f, &out, "b", "us-ord", false)
+	if err == nil {
+		t.Fatalf("InitBucket succeeded on a store missing two controls:\n%s", out.String())
+	}
+	for _, want := range []string{"public access block, default encryption", "--allow-unsupported", "s3://b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to contain %q", err, want)
+		}
+	}
+	if !f.pabPut || !f.encPut || !f.versionPut {
+		t.Errorf("a control went unattempted: pab=%v versioning=%v encryption=%v", f.pabPut, f.versionPut, f.encPut)
+	}
+	if len(f.markers) != 0 {
+		t.Errorf("prefix markers written on a refused run: %v", f.markers)
+	}
+	if out.String() != compatibleStoreOutput {
+		t.Errorf("output = %q, want %q", out.String(), compatibleStoreOutput)
+	}
+}
+
+func TestInitBucketAllowUnsupportedContinues(t *testing.T) {
+	f := compatibleStore()
+	var out bytes.Buffer
+	if err := InitBucket(context.Background(), f, &out, "b", "us-ord", true); err != nil {
+		t.Fatalf("err = %v, want the run to finish without the two controls", err)
+	}
+	if !f.versionPut || !slices.Equal(f.markers, []string{"charts/"}) {
+		t.Errorf("the rest did not run: versioning=%v markers=%v", f.versionPut, f.markers)
+	}
+	if !strings.HasPrefix(out.String(), compatibleStoreOutput) || !strings.Contains(out.String(), "CREATED") {
+		t.Errorf("output = %q, want both controls reported NOT APPLIED and the marker created", out.String())
+	}
+}
+
+// TestInitBucketAllowUnsupportedKeepsOtherFailuresFatal is the flag's limit:
+// it excuses a store that lacks an operation, never one that refused or
+// failed it.
+func TestInitBucketAllowUnsupportedKeepsOtherFailuresFatal(t *testing.T) {
+	cases := map[string]error{
+		"access denied":      sdkErr("PutBucketEncryption", http.StatusForbidden, &smithy.GenericAPIError{Code: "AccessDenied"}),
+		"method not allowed": sdkErr("PutBucketEncryption", http.StatusMethodNotAllowed, &smithy.GenericAPIError{Code: "MethodNotAllowed"}),
+		"transport":          errBoom,
+	}
+	for name, encErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := compatibleStore()
+			f.encGetErr, f.encPutErr = encErr, encErr
+			var out bytes.Buffer
+			err := InitBucket(context.Background(), f, &out, "b", "us-ord", true)
+			if err == nil || !strings.Contains(err.Error(), "enable encryption on b") {
+				t.Fatalf("err = %v, want the encryption failure", err)
+			}
+			if f.lifecycleIn != nil || len(f.markers) != 0 {
+				t.Errorf("the run continued past a failure: lifecycle=%v markers=%v", f.lifecycleIn != nil, f.markers)
+			}
+		})
+	}
+}
+
+func TestIsNotImplemented(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"NotImplemented code", notImplemented("PutPublicAccessBlock"), true},
+		{"XNotImplemented code", &smithy.GenericAPIError{Code: "XNotImplemented"}, true},
+		{"bare 501", sdkErr("PutBucketEncryption", http.StatusNotImplemented, errors.New("unparsed body")), true},
+		{"wrapped", fmt.Errorf("read lifecycle configuration on b: %w", notImplemented("GetBucketLifecycleConfiguration")), true},
+		{"403", sdkErr("PutBucketEncryption", http.StatusForbidden, &smithy.GenericAPIError{Code: "AccessDenied"}), false},
+		{"405", sdkErr("PutBucketEncryption", http.StatusMethodNotAllowed, &smithy.GenericAPIError{Code: "MethodNotAllowed"}), false},
+		{"text that mentions it", errors.New("NotImplemented"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNotImplemented(tc.err); got != tc.want {
+				t.Errorf("isNotImplemented(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestInitBucketNilWriter(t *testing.T) {
 	f := newFake()
 	f.headErr = &types.NotFound{}
 	f.missing["charts/"] = true
-	if err := InitBucket(context.Background(), f, nil, "b", "us-west-2"); err != nil {
+	if err := InitBucket(context.Background(), f, nil, "b", "us-west-2", false); err != nil {
 		t.Fatal(err)
 	}
 	if f.created == nil || !slices.Equal(f.markers, []string{"charts/"}) {
@@ -579,5 +690,75 @@ func checkStep(t *testing.T, err error, wantErr bool, errPrefix string, out *byt
 	}
 	if out.String() != wantOut {
 		t.Errorf("output = %q, want %q", out.String(), wantOut)
+	}
+}
+
+// TestUsageDocCoversCompatibleStores holds docs/usage.md to what an operator
+// pointing bodega at a compatible store has to find there: the three keys,
+// the flag, a status for each store, and which environment variable each key
+// overrides. The control names are checked against bucketControls so the
+// documented refusal cannot drift from the one InitBucket prints.
+func TestUsageDocCoversCompatibleStores(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(raw)
+	if strings.Contains(doc, "untested, not unsupported") {
+		t.Error("docs/usage.md still carries the paragraph the section replaces")
+	}
+	setup := strings.Index(doc, "\n#### S3 setup\n")
+	start := strings.Index(doc, "\n##### S3-compatible stores\n")
+	if setup < 0 || start < setup {
+		t.Fatalf("no S3-compatible stores section under S3 setup (setup at %d, section at %d)", setup, start)
+	}
+	if next := strings.Index(doc[setup+1:start], "\n#### "); next >= 0 {
+		t.Fatal("the S3-compatible stores section sits under a heading other than S3 setup")
+	}
+	section := doc[start:]
+	section = section[:strings.Index(section, "\n### ")]
+
+	for _, want := range []string{"`endpoint`", "`path_style`", "`checksums`", "`when_supported`", "`when_required`", "`allow_plaintext`", "--allow-unsupported", "NOT APPLIED"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("section does not mention %s", want)
+		}
+	}
+	for _, c := range bucketControls {
+		if !strings.Contains(section, c.name) {
+			t.Errorf("section does not name the %q control InitBucket reports", c.name)
+		}
+	}
+	status := map[string]string{}
+	for _, line := range strings.Split(section, "\n") {
+		cells := strings.Split(line, "|")
+		if len(cells) >= 3 {
+			status[strings.TrimSpace(cells[1])] = strings.TrimSpace(cells[2])
+		}
+	}
+	for store, want := range map[string]string{
+		"AWS S3": "tested", "Linode Object Storage": "tested",
+		"MinIO": "untested", "Ceph RGW": "untested", "Wasabi": "untested",
+	} {
+		if status[store] != want {
+			t.Errorf("store table marks %s %q, want %q", store, status[store], want)
+		}
+	}
+
+	env := doc[strings.Index(doc, "\n### Environment variables\n"):]
+	for variable, key := range map[string]string{
+		"AWS_ENDPOINT_URL_S3":              "`endpoint`",
+		"AWS_REQUEST_CHECKSUM_CALCULATION": "`checksums`",
+		"AWS_RESPONSE_CHECKSUM_VALIDATION": "`checksums`",
+	} {
+		found := false
+		for _, line := range strings.Split(env, "\n") {
+			if strings.HasPrefix(line, "|") && strings.Contains(line, "`"+variable+"`") {
+				found = strings.Contains(line, key) && strings.Contains(line, "`path_style`") == (key == "`checksums`")
+				break
+			}
+		}
+		if !found {
+			t.Errorf("environment table has no %s row naming the %s key that overrides it", variable, key)
+		}
 	}
 }

@@ -619,7 +619,7 @@ func newObjStore(cfg *config.Config) (storage.ObjectStore, error) {
 // the TUI, which has not yet been migrated to the storage abstraction).
 func newS3Client(cfg *config.Config) (*bos3.Client, error) {
 	ctx := backgroundCtx()
-	client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+	client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region, storage.SpecFromConfig(cfg).S3Options())
 	if err != nil {
 		return nil, fmt.Errorf("connect to AWS: %w", err)
 	}

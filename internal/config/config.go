@@ -118,8 +118,14 @@ var (
 // added here is read, resolved and written back with no other edit, and the
 // two runtime-only fields opt out with `json:"-"`.
 type Config struct {
-	Bucket          string `json:"bucket"`
-	Region          string `json:"region"`
+	Bucket string `json:"bucket"`
+	Region string `json:"region"`
+	// Endpoint, PathStyle and Checksums point the default backend's s3 driver
+	// at a store that is not AWS. A storage_backends entry carries its own,
+	// and inherits none of these.
+	Endpoint        string `json:"endpoint,omitempty"`
+	PathStyle       bool   `json:"path_style,omitempty"`
+	Checksums       string `json:"checksums,omitempty"`
 	BuildRoot       string `json:"build_root"`
 	ManifestDir     string `json:"manifest_dir,omitempty"` // unset means {storage_path}/manifests, so clearing it drops the key rather than pinning "" as a setting
 	LogDir          string `json:"log_dir"`
@@ -1430,6 +1436,12 @@ type StorageSpec struct {
 	Bucket string `json:"bucket,omitempty"` // s3
 	Region string `json:"region,omitempty"` // s3
 	Prefix string `json:"prefix,omitempty"` // key prefix within the backend
+
+	// s3, for a store that is not AWS. Unset leaves the AWS SDK's own
+	// resolution (AWS_ENDPOINT_URL_S3, AWS_REQUEST_CHECKSUM_CALCULATION) alone.
+	Endpoint  string `json:"endpoint,omitempty"`   // base URL: https, or http under allow_plaintext
+	PathStyle bool   `json:"path_style,omitempty"` // <endpoint>/<bucket> rather than <bucket>.<endpoint>
+	Checksums string `json:"checksums,omitempty"`  // when_supported | when_required
 }
 
 // StorageDrivers reports the storage driver names the binary has registered.
@@ -2284,6 +2296,9 @@ func (c *Config) validateStorage() error {
 	}
 	driverList := strings.Join(drivers, ", ")
 
+	if err := validateS3Store("", "the default storage backend", c.Endpoint, c.Checksums, c.AllowPlaintext); err != nil {
+		return err
+	}
 	for name, spec := range c.StorageBackends {
 		switch {
 		case name == "":
@@ -2300,6 +2315,10 @@ func (c *Config) validateStorage() error {
 			return fmt.Errorf("storage_backends[%q]: unknown driver %q (drivers: %s)", name, spec.Driver, driverList)
 		}
 		if err := validatePrefix(name, spec.Prefix); err != nil {
+			return err
+		}
+		at := fmt.Sprintf("storage_backends[%q].", name)
+		if err := validateS3Store(at, fmt.Sprintf("storage backend %q", name), spec.Endpoint, spec.Checksums, c.AllowPlaintext); err != nil {
 			return err
 		}
 	}
@@ -2328,6 +2347,40 @@ func (c *Config) validateStorage() error {
 		if _, ok := c.StorageBackends[name]; !ok {
 			return fmt.Errorf("storage_by_group[%q] names undefined storage backend %q (defined: %s)", group, name, c.definedStorageNames())
 		}
+	}
+	return nil
+}
+
+// validateS3Store checks one backend's endpoint and checksums keys. at is the
+// path to the keys in the file, empty for the default backend's top-level
+// ones, and backend is how the error names whose they are.
+//
+// An endpoint is where every artifact and the AWS-signed requests for it go,
+// so plaintext needs the same allow_plaintext the listener does. Userinfo is
+// refused because a credential written there lands in every log line that
+// prints the endpoint; the AWS chain is where credentials belong.
+func validateS3Store(at, backend, endpoint, checksums string, allowPlaintext bool) error {
+	if endpoint != "" {
+		u, err := url.Parse(endpoint)
+		switch {
+		case err != nil:
+			return fmt.Errorf("%sendpoint %q for %s is not a URL: %w", at, endpoint, backend, err)
+		case u.Host == "":
+			return fmt.Errorf("%sendpoint %q for %s names no host: write it as https://host[:port]", at, endpoint, backend)
+		case u.User != nil:
+			return fmt.Errorf("%sendpoint for %s carries credentials in the URL: remove them and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)", at, backend)
+		case u.RawQuery != "" || u.Fragment != "":
+			return fmt.Errorf("%sendpoint %q for %s carries a query or fragment: write only https://host[:port][/path]", at, endpoint, backend)
+		case u.Scheme == "http" && !allowPlaintext:
+			return fmt.Errorf("%sendpoint %q for %s is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that", at, endpoint, backend)
+		case u.Scheme != "https" && u.Scheme != "http":
+			return fmt.Errorf("%sendpoint %q for %s has scheme %q: use https (http only with allow_plaintext)", at, endpoint, backend, u.Scheme)
+		}
+	}
+	switch checksums {
+	case "", "when_supported", "when_required":
+	default:
+		return fmt.Errorf("%schecksums %q for %s is not a known value: use \"when_supported\" (the default) or \"when_required\"", at, checksums, backend)
 	}
 	return nil
 }
@@ -2741,6 +2794,7 @@ func defaultConfigContent() []byte {
 
   "bucket": "",
   "region": "us-west-2",
+  "_comment_s3_compatible": "endpoint, path_style, checksums: for an S3-compatible store (Linode Object Storage, MinIO, Ceph RGW, Wasabi) rather than AWS. endpoint is its https URL (http only with allow_plaintext); path_style addresses the bucket as endpoint/bucket for a store with no wildcard DNS; checksums is \"when_supported\" (default) or \"when_required\", the latter for a store that rejects the SDK's CRC32 request checksums. A storage_backends entry takes the same three keys and inherits none of these. Left out, the AWS SDK's own environment settings apply.",
   "build_root": "/opt/bodega",
 
   "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests, so a backup of storage_path is a backup of the whole repository. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /. Nothing else is probed: a manifests/ directory beside the binary, or one level above it, is read only when this key, $BODEGA_MANIFEST_DIR or --manifest-dir names it. Upgrading an install whose manifests were written relative to the directory bodega was started from, or found beside the binary: move that manifests/ directory into {storage_path}/manifests, or point this key at where it already is.",

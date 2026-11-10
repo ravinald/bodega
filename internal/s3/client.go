@@ -48,21 +48,79 @@ type Client struct {
 	region string
 }
 
+// The two values the checksums key takes, which are the SDK's own names for
+// them in AWS_REQUEST_CHECKSUM_CALCULATION.
+const (
+	ChecksumsWhenSupported = "when_supported"
+	ChecksumsWhenRequired  = "when_required"
+)
+
+// Options are the s3 driver's settings past bucket and region: what a store
+// that is not AWS needs. A zero field is not written to the client, so
+// whatever the SDK resolved for it from the environment or the shared config
+// (AWS_ENDPOINT_URL_S3, AWS_REQUEST_CHECKSUM_CALCULATION and the rest) stands.
+type Options struct {
+	// Endpoint is the store's base URL.
+	Endpoint string
+	// PathStyle addresses the bucket as <endpoint>/<bucket> rather than
+	// <bucket>.<endpoint>, for a store with no wildcard DNS.
+	PathStyle bool
+	// Checksums is ChecksumsWhenSupported, ChecksumsWhenRequired or empty. It
+	// governs both directions: the CRC32 the SDK adds to a request, which
+	// several compatible stores reject, and the validation of one on a
+	// response.
+	Checksums string
+}
+
+// ClientOptions renders o as SDK client options. It is the one place the
+// three settings meet the SDK, so the driver and the conformance suite
+// configure a client identically.
+func (o Options) ClientOptions() ([]func(*awss3.Options), error) {
+	var fns []func(*awss3.Options)
+	if o.Endpoint != "" {
+		fns = append(fns, func(so *awss3.Options) { so.BaseEndpoint = aws.String(o.Endpoint) })
+	}
+	if o.PathStyle {
+		fns = append(fns, func(so *awss3.Options) { so.UsePathStyle = true })
+	}
+	switch o.Checksums {
+	case "":
+	case ChecksumsWhenSupported:
+		fns = append(fns, func(so *awss3.Options) {
+			so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenSupported
+			so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenSupported
+		})
+	case ChecksumsWhenRequired:
+		fns = append(fns, func(so *awss3.Options) {
+			so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		})
+	default:
+		return nil, fmt.Errorf("checksums %q is not a known value: use %q or %q",
+			o.Checksums, ChecksumsWhenSupported, ChecksumsWhenRequired)
+	}
+	return fns, nil
+}
+
 // NewClient creates an S3 Client using the default credential chain. An
 // empty region is left to that chain (AWS_REGION, AWS_DEFAULT_REGION, the
 // profile's region), and Region reports what it resolved to, which may still
 // be empty.
-func NewClient(ctx context.Context, bucket, region string) (*Client, error) {
+func NewClient(ctx context.Context, bucket, region string, opts Options) (*Client, error) {
+	optFns, err := opts.ClientOptions()
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return NewClientFromConfig(cfg, bucket, cfg.Region), nil
+	return NewClientFromConfig(cfg, bucket, cfg.Region, optFns...), nil
 }
 
 // NewClientFromConfig returns an S3 Client from a pre-built aws.Config.
-func NewClientFromConfig(cfg aws.Config, bucket, region string) *Client {
-	raw := awss3.NewFromConfig(cfg)
+func NewClientFromConfig(cfg aws.Config, bucket, region string, optFns ...func(*awss3.Options)) *Client {
+	raw := awss3.NewFromConfig(cfg, optFns...)
 	return &Client{
 		s3:     raw,
 		raw:    raw,

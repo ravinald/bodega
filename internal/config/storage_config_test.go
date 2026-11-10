@@ -190,3 +190,52 @@ func TestLoadAcceptsPrefixSpellingsWithPrefixStrips(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadValidatesS3StoreKeys covers endpoint and checksums on the default
+// backend and on a named one. Each refusal names the key and whose it is,
+// because a file with three s3 backends has three endpoints to suspect.
+func TestLoadValidatesS3StoreKeys(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	named := func(keys string) string {
+		return `{"storage_backends":{"linode":{"driver":"s3","bucket":"b",` + keys + `}}}`
+	}
+	cases := []struct {
+		name string
+		body string
+		want []string // empty: Load accepts it
+	}{
+		{name: "default https", body: `{"endpoint":"https://us-ord-1.linodeobjects.com","path_style":true,"checksums":"when_required"}`},
+		{name: "named https", body: named(`"endpoint":"https://minio.example.net:9000","path_style":true,"checksums":"when_supported"`)},
+		{name: "http under allow_plaintext", body: `{"allow_plaintext":true,"endpoint":"http://127.0.0.1:9000"}`},
+		{name: "default http", body: `{"endpoint":"http://127.0.0.1:9000"}`, want: []string{`endpoint "http://127.0.0.1:9000"`, "the default storage backend", "allow_plaintext"}},
+		{name: "named http", body: named(`"endpoint":"http://minio:9000"`), want: []string{`storage_backends["linode"].endpoint`, `storage backend "linode"`, "allow_plaintext"}},
+		{name: "no scheme", body: named(`"endpoint":"us-ord-1.linodeobjects.com"`), want: []string{`storage_backends["linode"].endpoint`, "names no host"}},
+		{name: "other scheme", body: `{"endpoint":"s3://bucket"}`, want: []string{"endpoint", "the default storage backend", `scheme "s3"`}},
+		{name: "credentials in the URL", body: named(`"endpoint":"https://key:secret@minio.example.net"`), want: []string{`storage_backends["linode"].endpoint`, "carries credentials"}},
+		{name: "default checksums", body: `{"checksums":"never"}`, want: []string{`checksums "never"`, "the default storage backend", "when_required"}},
+		{name: "named checksums", body: named(`"checksums":"WHEN_REQUIRED"`), want: []string{`storage_backends["linode"].checksums "WHEN_REQUIRED"`, `storage backend "linode"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, tc.body)
+			_, err := config.Load("", "", "", "", false, false)
+			if len(tc.want) == 0 {
+				if err != nil {
+					t.Fatalf("Load refused %s: %v", tc.body, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted %s", tc.body)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Errorf("error repeats the credential: %q", err)
+			}
+		})
+	}
+}

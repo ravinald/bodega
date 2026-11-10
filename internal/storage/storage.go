@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // ObjectStore is the unified interface for all object storage operations.
@@ -180,6 +181,16 @@ type Spec struct {
 	Bucket string // s3
 	Region string // s3
 	Prefix string // key prefix within the backend
+
+	// s3, for a store that is not AWS; see bos3.Options.
+	Endpoint  string
+	PathStyle bool
+	Checksums string
+}
+
+// S3Options is the part of s the s3 driver hands to bos3.NewClient.
+func (s Spec) S3Options() bos3.Options {
+	return bos3.Options{Endpoint: s.Endpoint, PathStyle: s.PathStyle, Checksums: s.Checksums}
 }
 
 // Constructor creates an ObjectStore from one backend's Spec.
@@ -353,6 +364,10 @@ func SpecFromConfig(cfg *config.Config) Spec {
 		Path:   cfg.StoragePath,
 		Bucket: cfg.Bucket,
 		Region: cfg.Region,
+
+		Endpoint:  cfg.Endpoint,
+		PathStyle: cfg.PathStyle,
+		Checksums: cfg.Checksums,
 	}
 }
 
@@ -376,6 +391,10 @@ func SpecFor(cfg *config.Config, name string) (Spec, bool) {
 		Bucket: spec.Bucket,
 		Region: spec.Region,
 		Prefix: spec.Prefix,
+
+		Endpoint:  spec.Endpoint,
+		PathStyle: spec.PathStyle,
+		Checksums: spec.Checksums,
 	}, true
 }
 

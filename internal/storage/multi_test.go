@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+
 	"github.com/ravinald/bodega/internal/config"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 )
@@ -347,12 +349,66 @@ func TestResolverDialsTheRegionSpecForDescribes(t *testing.T) {
 			t.Errorf("%s: service dials %q, want %q", name, got, want)
 		}
 		spec, _ := SpecFor(cfg, name)
-		viaSpec, err := bos3.NewClient(context.Background(), spec.Bucket, spec.Region)
+		viaSpec, err := bos3.NewClient(context.Background(), spec.Bucket, spec.Region, spec.S3Options())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if viaSpec.Region() != want {
 			t.Errorf("%s: SpecFor resolves %q, want %q", name, viaSpec.Region(), want)
+		}
+	}
+}
+
+// TestSpecForCarriesTheS3StoreKeys holds endpoint, path_style and checksums to
+// the path region takes: from the config, through SpecFor, into the client
+// the resolver builds and the target `bodega init` dials. A named entry
+// inherits none of the default backend's.
+func TestSpecForCarriesTheS3StoreKeys(t *testing.T) {
+	for _, env := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"} {
+		t.Setenv(env, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "main-bucket", Region: "us-ord",
+		Endpoint: "https://us-ord-1.linodeobjects.com", Checksums: bos3.ChecksumsWhenRequired,
+		StorageBackends: map[string]config.StorageSpec{
+			"minio": {Driver: "s3", Bucket: "minio-bucket", Region: "us-east-1", Endpoint: "https://minio.example.net:9000", PathStyle: true},
+			"aws":   {Driver: "s3", Bucket: "aws-bucket", Region: "us-west-2"},
+		},
+	}
+	want := map[string]bos3.Options{
+		DefaultName: {Endpoint: "https://us-ord-1.linodeobjects.com", Checksums: bos3.ChecksumsWhenRequired},
+		"minio":     {Endpoint: "https://minio.example.net:9000", PathStyle: true},
+		"aws":       {},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, opts := range want {
+		target, err := ResolveS3Target(cfg, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target.Options != opts {
+			t.Errorf("%s: init target carries %+v, want %+v", name, target.Options, opts)
+		}
+		store, err := r.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := store.(*S3).client.S3Client().Options()
+		if aws.ToString(got.BaseEndpoint) != opts.Endpoint || got.UsePathStyle != opts.PathStyle {
+			t.Errorf("%s: service client has endpoint %q, path style %v; want %q, %v",
+				name, aws.ToString(got.BaseEndpoint), got.UsePathStyle, opts.Endpoint, opts.PathStyle)
+		}
+		wantSum := aws.RequestChecksumCalculationWhenSupported
+		if opts.Checksums == bos3.ChecksumsWhenRequired {
+			wantSum = aws.RequestChecksumCalculationWhenRequired
+		}
+		if got.RequestChecksumCalculation != wantSum {
+			t.Errorf("%s: service client request checksums = %v, want %v", name, got.RequestChecksumCalculation, wantSum)
 		}
 	}
 }

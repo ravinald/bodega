@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -38,6 +40,20 @@ type BucketAPI interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
+// bucketControls are the bucket settings InitBucket applies after the bucket
+// exists, in order. An S3-compatible store may implement none of them, so
+// each is judged on its own: label is the column a result prints under, name
+// is what a refusal calls it.
+var bucketControls = []struct {
+	label, name string
+	ensure      func(ctx context.Context, client BucketAPI, out io.Writer, bucket string) error
+}{
+	{"public acl:", "public access block", ensurePublicAccessBlock},
+	{"versioning:", "versioning", ensureVersioning},
+	{"encryption:", "default encryption", ensureEncryption},
+	{"lifecycle:", "lifecycle rules", ensureLifecycle},
+}
+
 // InitBucket creates the S3 bucket (if needed) and ensures all required
 // configuration and directory structure is in place. It is idempotent:
 // each step checks the current state before making changes.
@@ -45,29 +61,50 @@ type BucketAPI interface {
 // This is the recovery path when the infrastructure tooling partially applied or was
 // never run. It creates anything that is missing and logs what already
 // exists. Each step's result goes to out, which may be nil.
-func InitBucket(ctx context.Context, client BucketAPI, out io.Writer, bucket, region string) error {
+//
+// A control the store answers as not implemented is reported on its own line
+// and never passed over. Every control is still attempted, so one run names
+// all of them; then InitBucket fails before writing the prefix markers unless
+// allowUnsupported is set, in which case it finishes without those controls.
+// Any other failure of a control ends the run where it happened.
+func InitBucket(ctx context.Context, client BucketAPI, out io.Writer, bucket, region string, allowUnsupported bool) error {
 	if out == nil {
 		out = io.Discard
 	}
 	if err := ensureBucket(ctx, client, out, bucket, region); err != nil {
 		return err
 	}
-	if err := ensurePublicAccessBlock(ctx, client, out, bucket); err != nil {
-		return err
+	var unsupported []string
+	for _, c := range bucketControls {
+		err := c.ensure(ctx, client, out, bucket)
+		if err == nil {
+			continue
+		}
+		if !isNotImplemented(err) {
+			return err
+		}
+		unsupported = append(unsupported, c.name)
+		fmt.Fprintf(out, "  %-11s NOT APPLIED (the store does not implement %s)\n", c.label, c.name)
 	}
-	if err := ensureVersioning(ctx, client, out, bucket); err != nil {
-		return err
+	if len(unsupported) > 0 && !allowUnsupported {
+		return fmt.Errorf("the store holding s3://%s does not implement: %s. Nothing else failed, and the prefix markers were not written. "+
+			"If the store offers an equivalent, set it there; then re-run with --allow-unsupported to finish without what it lacks",
+			bucket, strings.Join(unsupported, ", "))
 	}
-	if err := ensureEncryption(ctx, client, out, bucket); err != nil {
-		return err
+	return ensurePrefixes(ctx, client, out, bucket)
+}
+
+// isNotImplemented reports whether err is a store saying it has no such
+// operation: the NotImplemented code AWS documents, the XNotImplemented
+// spelling older MinIO releases used, or a bare 501. A 403, a 405 or a
+// timeout says nothing of the kind and stays a failure.
+func isNotImplemented(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && (ae.ErrorCode() == "NotImplemented" || ae.ErrorCode() == "XNotImplemented") {
+		return true
 	}
-	if err := ensureLifecycle(ctx, client, out, bucket); err != nil {
-		return err
-	}
-	if err := ensurePrefixes(ctx, client, out, bucket); err != nil {
-		return err
-	}
-	return nil
+	var re *awshttp.ResponseError
+	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotImplemented
 }
 
 func ensureBucket(ctx context.Context, client BucketAPI, out io.Writer, bucket, region string) error {
