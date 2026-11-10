@@ -1165,3 +1165,42 @@ func TestCacheOriginOnAWSTellsARecordFromALegacyRow(t *testing.T) {
 		t.Errorf("a record written for AWS was read for %s: %q, %v", compatible.Label(), got, err)
 	}
 }
+
+func TestReviewF113EndpointPathCannotBorrowCacheOrigin(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	stores, err := storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+		Endpoint: "https://store.example.net/tenant",
+		StorageBackends: map[string]config.StorageSpec{
+			"other": {Driver: "s3", Bucket: "tenant", Region: "us-east-1", Endpoint: "https://store.example.net", Prefix: "artifacts"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := StreamIdentity(stores.Default(), &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	const origin = "https://upstream.example.net/tool.tgz"
+	if err := adb.StoreCacheOrigin(t.Context(), binaryKey, origin, id); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := CacheOrigin(t.Context(), adb, stores, stores.Default(), binaryKey, id); got != origin || err != nil {
+		t.Fatalf("writer lost its own origin: %q, %v", got, err)
+	}
+	other, err := stores.ByName("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID := StreamIdentity(other, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	if got, err := CacheOrigin(t.Context(), adb, stores, other, binaryKey, otherID); got != "" {
+		t.Errorf("different endpoint/bucket inherited origin %q (error %v); writer identity %q, reader identity %q", got, err, id.Backend, otherID.Backend)
+	}
+}

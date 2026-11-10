@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/ravinald/bodega/internal/config"
 	bos3 "github.com/ravinald/bodega/internal/s3"
@@ -479,15 +480,15 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		want     string
 	}{
 		{"AWS", "", "s3://b"},
-		{"endpoint", "https://minio.example.net", "s3+https://minio.example.net/b"},
-		{"case, default port and trailing slash", "HTTPS://MinIO.Example.NET:443/", "s3+https://minio.example.net/b"},
-		{"trailing dot", "https://minio.example.net.", "s3+https://minio.example.net/b"},
-		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000/b"},
-		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net/b"},
-		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443/b"},
-		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a/b"},
-		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b/b"},
-		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000/b"},
+		{"endpoint", "https://minio.example.net", "s3+https://minio.example.net#b"},
+		{"case, default port and trailing slash", "HTTPS://MinIO.Example.NET:443/", "s3+https://minio.example.net#b"},
+		{"trailing dot", "https://minio.example.net.", "s3+https://minio.example.net#b"},
+		{"another port is another service", "https://minio.example.net:9000", "s3+https://minio.example.net:9000#b"},
+		{"http default port", "http://minio.example.net:80", "s3+http://minio.example.net#b"},
+		{"https port over http is not the default", "http://minio.example.net:443", "s3+http://minio.example.net:443#b"},
+		{"path", "https://gw.example.net/tenant-a/", "s3+https://gw.example.net/tenant-a#b"},
+		{"another path is another service", "https://gw.example.net/tenant-b", "s3+https://gw.example.net/tenant-b#b"},
+		{"IPv6", "https://[::1]:9000", "s3+https://[::1]:9000#b"},
 		{"AWS regional endpoint is AWS", "https://s3.us-west-2.amazonaws.com", "s3://b"},
 		{"AWS global endpoint", "https://s3.amazonaws.com/", "s3://b"},
 		{"AWS dash-region endpoint", "https://s3-us-west-2.amazonaws.com", "s3://b"},
@@ -497,11 +498,11 @@ func TestS3LabelIsOnePerLocation(t *testing.T) {
 		{"AWS China endpoint", "https://s3.cn-north-1.amazonaws.com.cn", "s3://b"},
 		{"AWS interface VPC endpoint", "https://bucket.vpce-0a1b2c-abcd.s3.us-east-1.vpce.amazonaws.com", "s3://b"},
 		{"AWS over plaintext is still AWS", "http://s3.us-west-2.amazonaws.com", "s3://b"},
-		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000/b"},
-		{"a path on an AWS name is not the bucket namespace", "https://s3.us-west-2.amazonaws.com/x", "s3+https://s3.us-west-2.amazonaws.com/x/b"},
-		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com/b"},
-		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net/b"},
-		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com/b"},
+		{"a port on an AWS name is not AWS's service", "https://s3.us-west-2.amazonaws.com:9000", "s3+https://s3.us-west-2.amazonaws.com:9000#b"},
+		{"a path on an AWS name is not the bucket namespace", "https://s3.us-west-2.amazonaws.com/x", "s3+https://s3.us-west-2.amazonaws.com/x#b"},
+		{"Outposts is another namespace", "https://s3-outposts.us-west-2.amazonaws.com", "s3+https://s3-outposts.us-west-2.amazonaws.com#b"},
+		{"an AWS suffix inside another domain", "https://s3.us-west-2.amazonaws.com.example.net", "s3+https://s3.us-west-2.amazonaws.com.example.net#b"},
+		{"an AWS lookalike", "https://xs3.amazonaws.com", "s3+https://xs3.amazonaws.com#b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -579,8 +580,8 @@ func TestS3BucketLabelDropsTheEndpoint(t *testing.T) {
 	}
 	want := map[string][2]string{
 		"aws":    {"s3://artifacts", "s3://artifacts"},
-		"linode": {"s3+https://us-ord-1.linodeobjects.com/artifacts", "s3://artifacts"},
-		"cold":   {"s3+https://us-ord-1.linodeobjects.com/artifacts/cold", "s3://artifacts/cold"},
+		"linode": {"s3+https://us-ord-1.linodeobjects.com#artifacts", "s3://artifacts"},
+		"cold":   {"s3+https://us-ord-1.linodeobjects.com#artifacts/cold", "s3://artifacts/cold"},
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -620,8 +621,8 @@ func TestS3RecordLabelNamesAWS(t *testing.T) {
 		"aws":      "s3+aws://artifacts",
 		"regional": "s3+aws://artifacts",
 		"nested":   "s3+aws://artifacts/cold",
-		"linode":   "s3+https://us-ord-1.linodeobjects.com/artifacts",
-		"cold":     "s3+https://us-ord-1.linodeobjects.com/artifacts/cold",
+		"linode":   "s3+https://us-ord-1.linodeobjects.com#artifacts",
+		"cold":     "s3+https://us-ord-1.linodeobjects.com#artifacts/cold",
 	}
 	for name, w := range want {
 		store, err := r.ByName(name)
@@ -635,5 +636,94 @@ func TestS3RecordLabelNamesAWS(t *testing.T) {
 	}
 	if got := S3RecordLabel(r.Default()); got != r.Default().Label() {
 		t.Errorf("S3RecordLabel(local store) = %q, want its Label %q", got, r.Default().Label())
+	}
+}
+
+func TestReviewF113EndpointPathKeepsBucketBoundary(t *testing.T) {
+	isolateS3Env(t)
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+		Endpoint: "https://store.example.net/tenant",
+		StorageBackends: map[string]config.StorageSpec{
+			"other": {Driver: "s3", Bucket: "tenant", Region: "us-east-1", Endpoint: "https://store.example.net", Prefix: "artifacts"},
+		},
+	}
+	stores, err := NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var routes []string
+	for _, name := range []string{DefaultName, "other"} {
+		spec, _ := SpecFor(cfg, name)
+		client, err := bos3.NewClient(t.Context(), spec.Bucket, spec.Region, spec.S3Options())
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts := client.S3Client().Options()
+		ep, err := awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(t.Context(), awss3.EndpointParameters{
+			Region: aws.String(opts.Region), Bucket: aws.String(spec.Bucket), Endpoint: opts.BaseEndpoint,
+			ForcePathStyle: aws.Bool(opts.UsePathStyle),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		route := strings.TrimRight(ep.URI.String(), "/")
+		if spec.Prefix != "" {
+			route += "/" + spec.Prefix
+		}
+		routes = append(routes, route+"/object")
+	}
+	if routes[0] == routes[1] {
+		t.Fatalf("fixture resolved both objects to %s", routes[0])
+	}
+	t.Logf("SDK routes: %s and %s", routes[0], routes[1])
+	other, err := stores.ByName("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := stores.Default().Label(), other.Label(); a == b {
+		t.Errorf("distinct SDK locations share label %q", a)
+	}
+	if got := stores.Fanout(t.Context(), "apt", []string{"other"}); len(got) != 2 {
+		t.Errorf("Fanout returned %d locations, want 2", len(got))
+	}
+}
+
+// TestS3LabelsKeepComponentBoundaries: no two (endpoint, bucket, prefix)
+// tuples share a location label or a record label, whichever component a
+// separator is moved into, and a record label is never a location label.
+func TestS3LabelsKeepComponentBoundaries(t *testing.T) {
+	isolateS3Env(t)
+	tuples := [][3]string{
+		{"", "a", ""}, {"", "a", "b"}, {"", "a/b", ""}, {"", "a", "b#c"}, {"", "a#b", "c"},
+		{"https://gw.example.net", "a", ""}, {"https://gw.example.net", "a", "b"},
+		{"https://gw.example.net", "a/b", ""}, {"https://gw.example.net", "a#b", ""},
+		{"https://gw.example.net/a", "b", ""}, {"https://gw.example.net/a", "b", "c"},
+		{"https://gw.example.net/a/b", "c", ""}, {"https://gw.example.net/a%2Fb", "c", ""},
+		{"aws://a", "b", ""}, {"aws://a/b", "c", ""},
+	}
+	labels, records := map[string][3]string{}, map[string][3]string{}
+	for _, tuple := range tuples {
+		client, err := bos3.NewClient(t.Context(), tuple[1], "us-east-1", bos3.Options{Endpoint: tuple[0]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var store ObjectStore = &S3{client: client}
+		if tuple[2] != "" {
+			store = &prefixed{inner: store, prefix: tuple[2]}
+		}
+		if prev, dup := labels[store.Label()]; dup {
+			t.Errorf("%q and %q share the label %q", prev, tuple, store.Label())
+		}
+		labels[store.Label()] = tuple
+		if prev, dup := records[S3RecordLabel(store)]; dup {
+			t.Errorf("%q and %q share the record label %q", prev, tuple, S3RecordLabel(store))
+		}
+		records[S3RecordLabel(store)] = tuple
+	}
+	for record, tuple := range records {
+		if prev, dup := labels[record]; dup && prev != tuple {
+			t.Errorf("the record label of %q is the label %q of %q", tuple, record, prev)
+		}
 	}
 }

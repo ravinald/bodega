@@ -147,7 +147,7 @@ func (s *S3) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix str
 	return s.client.SyncDir(ctx, out, localDir, keyPrefix)
 }
 
-// Label is "s3://<bucket>" on AWS and "s3+<endpoint>/<bucket>" on any other
+// Label is "s3://<bucket>" on AWS and "s3+<endpoint>#<bucket>" on any other
 // store reached through an endpoint, because a bucket name is unique only
 // within one service: two MinIO instances can each hold "artifacts", and a
 // label that said only the bucket made them one location, so the fan-out
@@ -165,12 +165,26 @@ func (s *S3) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix str
 // What this cannot equate is two hostnames for one compatible service (a DNS
 // name and its address, a CNAME): nothing short of a request tells them
 // apart from two services, and they are kept apart.
+//
+// The label, and a prefixed store's label over it, decodes to one (endpoint,
+// bucket, prefix): a namespace holds no "#" (see endpointNamespace), so the
+// first one ends it; the bucket is escaped (see bucketSegment), so the first
+// "/" after it starts the prefix. A "/" between endpoint and bucket instead
+// gave the endpoint "https://gw/tenant" with bucket "artifacts" the label of
+// the endpoint "https://gw" with bucket "tenant" and prefix "artifacts".
 func (s *S3) Label() string {
 	ns := endpointNamespace(s.client.Endpoint())
 	if ns == "" {
-		return s3BucketScheme + s.client.Bucket()
+		return s3BucketScheme + bucketSegment(s.client.Bucket())
 	}
-	return "s3+" + ns + "/" + s.client.Bucket()
+	return "s3+" + ns + "#" + bucketSegment(s.client.Bucket())
+}
+
+// bucketSegment is a bucket name as one label segment. A name any S3 service
+// accepts comes back unchanged. Config load does not check bucket names, and
+// one holding "/" would otherwise read as a bucket and a prefix.
+func bucketSegment(bucket string) string {
+	return url.PathEscape(bucket)
 }
 
 const s3BucketScheme = "s3://"
@@ -195,15 +209,17 @@ var awsS3Endpoint = regexp.MustCompile(`^(?:bucket\.vpce-[a-z0-9-]+\.)?s3(?:-fip
 // checksums are how a client talks to the store, not where it is.
 //
 // Userinfo, a query and a fragment are dropped, and an endpoint that does not
-// parse is named by a digest instead of its text. Config load refuses all of
-// those, but an endpoint the SDK read from the environment was never checked,
+// parse, or whose scheme is not http or https, is named by a digest instead
+// of its text. So a namespace is "http://...", "https://..." or
+// "endpoint-<hex>", holds no "#", and is never awsRecordNamespace. Config
+// load refuses all of those, but an endpoint the SDK read from the environment was never checked,
 // and a label is printed in logs and errors.
 func endpointNamespace(endpoint string) string {
 	if endpoint == "" {
 		return ""
 	}
 	u, err := url.Parse(endpoint)
-	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return fmt.Sprintf("endpoint-%x", sha256.Sum256([]byte(endpoint)))[:21]
 	}
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
@@ -243,8 +259,8 @@ func S3BucketLabel(store ObjectStore) (string, bool) {
 }
 
 // awsRecordNamespace stands where an endpoint would in the label an AWS
-// bucket is recorded under. No URL parses to it, so it collides with no
-// compatible store's namespace.
+// bucket is recorded under. endpointNamespace never returns a namespace
+// opening with it, so it collides with no compatible store's.
 const awsRecordNamespace = "aws:/"
 
 // S3RecordLabel is the location a record about an object is written under.
@@ -262,7 +278,7 @@ func S3RecordLabel(store ObjectStore) string {
 	switch s := store.(type) {
 	case *S3:
 		if endpointNamespace(s.client.Endpoint()) == "" {
-			return "s3+" + awsRecordNamespace + "/" + s.client.Bucket()
+			return "s3+" + awsRecordNamespace + "/" + bucketSegment(s.client.Bucket())
 		}
 	case *prefixed:
 		return joinLabel(S3RecordLabel(s.inner), s.prefix)
