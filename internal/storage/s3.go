@@ -241,3 +241,31 @@ func S3BucketLabel(store ObjectStore) (string, bool) {
 	}
 	return "", false
 }
+
+// awsRecordNamespace stands where an endpoint would in the label an AWS
+// bucket is recorded under. No URL parses to it, so it collides with no
+// compatible store's namespace.
+const awsRecordNamespace = "aws:/"
+
+// S3RecordLabel is the location a record about an object is written under.
+// It is Label for every store but an s3 one on AWS, whose Label is
+// "s3://<bucket>": that is also what every s3 store's label was before a
+// label carried an endpoint, so a row saying only that cannot tell an AWS
+// bucket recorded today from a compatible store's bucket recorded then.
+// Naming AWS here ("s3+aws://<bucket>") leaves the bare spelling to mean one
+// thing, a row from before, which a reader has to resolve against every
+// configured store instead of matching by text.
+//
+// Label stays the identity that location comparisons use and is not
+// interchangeable with this.
+func S3RecordLabel(store ObjectStore) string {
+	switch s := store.(type) {
+	case *S3:
+		if endpointNamespace(s.client.Endpoint()) == "" {
+			return "s3+" + awsRecordNamespace + "/" + s.client.Bucket()
+		}
+	case *prefixed:
+		return joinLabel(S3RecordLabel(s.inner), s.prefix)
+	}
+	return store.Label()
+}

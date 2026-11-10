@@ -1064,3 +1064,104 @@ func TestCacheOriginReadsAPreEndpointRowOnlyForItsOneStore(t *testing.T) {
 		t.Errorf("a row under the current identity: origin = %q, %v; want %q", got, err, origin)
 	}
 }
+
+func TestReviewF113LegacyOriginAmbiguityIncludesAWS(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	stores, err := storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+		Endpoint: "https://compatible.example.net",
+		StorageBackends: map[string]config.StorageSpec{
+			"aws": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := audit.ObjectIdentity{Backend: "s3://artifacts", Size: 10, ETag: `"same"`}
+	if err := adb.StoreCacheOrigin(t.Context(), binaryKey, "https://upstream.example.net/tool.tgz", legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, ns := range stores.All() {
+		id := StreamIdentity(ns.Store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+		got, err := CacheOrigin(t.Context(), adb, stores, ns.Store, binaryKey, id)
+		if got != "" || err == nil {
+			t.Errorf("%s (%s): origin = %q, %v; want no origin and an ambiguity error for a legacy row with two candidate stores", ns.Name, ns.Store.Label(), got, err)
+		}
+	}
+}
+
+// TestCacheOriginOnAWSTellsARecordFromALegacyRow: an AWS bucket's label is
+// still the spelling every s3 row carried before endpoints, so only the
+// identity a record is written under separates the two. A row from before is
+// read for AWS while AWS is the one store it can mean; a record written now
+// stays AWS's when a compatible store of the same bucket name is configured
+// beside it, and is not read for that store.
+func TestCacheOriginOnAWSTellsARecordFromALegacyRow(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	ctx := t.Context()
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	resolver := func(backends map[string]config.StorageSpec) storage.Resolver {
+		t.Helper()
+		r, err := storage.NewResolver(ctx, &config.Config{
+			StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1", StorageBackends: backends,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const origin = "https://upstream.example.net/tool.tgz"
+	identity := func(store storage.ObjectStore) audit.ObjectIdentity {
+		return StreamIdentity(store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	}
+
+	legacy := audit.ObjectIdentity{Backend: "s3://artifacts", Size: 10, ETag: `"same"`}
+	if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, legacy); err != nil {
+		t.Fatal(err)
+	}
+	alone := resolver(map[string]config.StorageSpec{
+		"regional": {Driver: "s3", Bucket: "artifacts", Region: "us-west-2", Endpoint: "https://s3.us-west-2.amazonaws.com"},
+	})
+	aws := alone.Default()
+	if id := identity(aws); id.Backend == aws.Label() || id.Backend == legacy.Backend {
+		t.Fatalf("an AWS record is written under %q, the spelling of a legacy row", id.Backend)
+	}
+	if got, err := CacheOrigin(ctx, adb, alone, aws, binaryKey, identity(aws)); err != nil || got != origin {
+		t.Errorf("legacy row with AWS its one candidate: origin = %q, %v; want %q", got, err, origin)
+	}
+	// An identity from somewhere else is not widened to this store's legacy row.
+	if got, err := CacheOrigin(ctx, adb, alone, aws, binaryKey, audit.ObjectIdentity{Backend: "/srv/cache", Size: 10, ETag: `"same"`}); err != nil || got != "" {
+		t.Errorf("a foreign identity read the legacy row: %q, %v", got, err)
+	}
+
+	if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, identity(aws)); err != nil {
+		t.Fatal(err)
+	}
+	two := resolver(map[string]config.StorageSpec{
+		"compatible": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://compatible.example.net"},
+	})
+	if got, err := CacheOrigin(ctx, adb, two, two.Default(), binaryKey, identity(two.Default())); err != nil || got != origin {
+		t.Errorf("a record written for AWS, read for AWS beside a compatible store: origin = %q, %v; want %q", got, err, origin)
+	}
+	compatible, _ := two.ByName("compatible")
+	if got, err := CacheOrigin(ctx, adb, two, compatible, binaryKey, identity(compatible)); err != nil || got != "" {
+		t.Errorf("a record written for AWS was read for %s: %q, %v", compatible.Label(), got, err)
+	}
+}

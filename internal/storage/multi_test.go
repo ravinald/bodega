@@ -596,3 +596,44 @@ func TestS3BucketLabelDropsTheEndpoint(t *testing.T) {
 		t.Errorf("S3BucketLabel(local store) = %q, true; want false", got)
 	}
 }
+
+// TestS3RecordLabelNamesAWS: the label a record is written under is never
+// the bare "s3://<bucket>" a row from before endpoints carries, on AWS or
+// off it, with or without a prefix, and is Label for everything else.
+func TestS3RecordLabelNamesAWS(t *testing.T) {
+	isolateS3Env(t)
+	cfg := &config.Config{
+		StorageBackend: "local", StoragePath: t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"aws":      {Driver: "s3", Bucket: "artifacts", Region: "us-east-1"},
+			"regional": {Driver: "s3", Bucket: "artifacts", Region: "us-west-2", Endpoint: "https://s3.us-west-2.amazonaws.com"},
+			"nested":   {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Prefix: "cold/"},
+			"linode":   {Driver: "s3", Bucket: "artifacts", Region: "us-ord", Endpoint: "https://us-ord-1.linodeobjects.com"},
+			"cold":     {Driver: "s3", Bucket: "artifacts", Region: "us-ord", Endpoint: "https://us-ord-1.linodeobjects.com", Prefix: "cold/"},
+		},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"aws":      "s3+aws://artifacts",
+		"regional": "s3+aws://artifacts",
+		"nested":   "s3+aws://artifacts/cold",
+		"linode":   "s3+https://us-ord-1.linodeobjects.com/artifacts",
+		"cold":     "s3+https://us-ord-1.linodeobjects.com/artifacts/cold",
+	}
+	for name, w := range want {
+		store, err := r.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bucket, _ := S3BucketLabel(store)
+		if got := S3RecordLabel(store); got != w || got == bucket {
+			t.Errorf("%s: S3RecordLabel = %q, want %q and never the bare spelling %q", name, got, w, bucket)
+		}
+	}
+	if got := S3RecordLabel(r.Default()); got != r.Default().Label() {
+		t.Errorf("S3RecordLabel(local store) = %q, want its Label %q", got, r.Default().Label())
+	}
+}
