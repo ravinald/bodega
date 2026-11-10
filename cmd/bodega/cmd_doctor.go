@@ -727,6 +727,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osRelease, _ := os.ReadFile(doctorOSRelease)
 		h := clientconf.CAHost{
 			Base: planBase(records, client.BaseURL), Home: home, Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease,
+			Getenv: os.Getenv,
 		}
 		if slices.ContainsFunc(records, func(r clientconf.PlanRecord) bool { return r.System == manifest.TypeMaven }) {
 			// Read before anything is written: which certificates the JVM
@@ -802,7 +803,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		if ca != nil && req.apply {
-			warnUnreadCA(caSystems, client.BaseURL)
+			return unreadCA(caSystems, client.BaseURL)
 		}
 		return nil
 	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
@@ -863,8 +864,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		fmt.Printf("ran        %s\n", shown)
 	}
+	// Judged here, while the trust store is fresh, and returned once the
+	// remaining steps have run: they do not depend on it.
+	var unread error
 	if ca != nil {
-		warnUnreadCA(caSystems, client.BaseURL)
+		unread = unreadCA(caSystems, client.BaseURL)
 	}
 	for _, q := range []struct {
 		ledger stepRecord
@@ -910,7 +914,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 	}
 	printRuntimeRestarts(changes)
-	return nil
+	return unread
 }
 
 // disableDistroAptSources runs the apt source edits once apt-get update
@@ -971,12 +975,14 @@ var (
 	doctorRunJVM = clientconf.RunJVMCommand
 )
 
-// warnUnreadCA names each of systems whose client, after this run installed
-// the CA, still reads a store that does not hold it: a setting or an
-// environment variable outranking the one the plan wrote. The system trust
-// store counts as holding it, since the plan put it there and checked; the
+// unreadCA is the error for each of systems whose client, after this run
+// installed the CA, still reads a store that does not hold it: an
+// environment variable or a setting in a file the plan does not edit,
+// outranking what the plan wrote. A run that leaves one exits non-zero,
+// because for that client nothing was installed. The system trust store
+// counts as holding the CA, since the plan put it there and checked; the
 // process's own copy of that store predates the rebuild.
-func warnUnreadCA(systems []string, base string) {
+func unreadCA(systems []string, base string) error {
 	checks := host.TrustSystems()
 	var rows []host.Finding
 	for _, check := range slices.Sorted(maps.Keys(checks)) {
@@ -986,11 +992,18 @@ func warnUnreadCA(systems []string, base string) {
 	}
 	probe := doctorTrustProbe()
 	probe.System = func([]*x509.Certificate, string) error { return nil }
+	var left []string
 	for _, f := range probe.Apply(rows, base) {
 		if f.Status == host.StatusWarn {
-			fmt.Printf("warning    %-10s the CA is installed, and this client still reads a store without it: %s\n", checks[f.Check], f.Detail)
+			left = append(left, fmt.Sprintf("  %s: %s", checks[f.Check], f.Detail))
 		}
 	}
+	if len(left) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the CA is written, and %d client(s) still read a store without it, so they still refuse bodega's certificate:\n%s\n"+
+		"  Unset the variable or correct the setting that names that store, then re-run: this command edits the configuration files a client reads, not its environment",
+		len(left), strings.Join(left, "\n"))
 }
 
 // doctorJVM resolves the trust store of the JVM Maven and Gradle run on and

@@ -1556,8 +1556,11 @@ func TestAuditPipInstallUsesTheInstalledCA(t *testing.T) {
 }
 
 // F116 R1: a CA written where a client no longer looks is not an install.
-// The run says which client still reads another store, and why.
-func TestDoctorConfigureWarnsWhenAnotherStoreOutranksTheCA(t *testing.T) {
+// A store the run cannot edit, one the environment names, fails the run and
+// names the client and the variable. A configuration file the environment
+// selects is edited instead, in the preview and the apply, keeping its own
+// settings.
+func TestDoctorConfigureFailsWhenAnotherStoreOutranksTheCA(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	stubRuntimes(t)
@@ -1571,17 +1574,73 @@ func TestDoctorConfigureWarnsWhenAnotherStoreOutranksTheCA(t *testing.T) {
 	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply"}
-	out, err := runDoctor(t, args...)
-	if err != nil || strings.Contains(out, "warning ") {
+	args := []string{"--configure", "pip,npm", "--ca-file", caFile, "--url", srv.URL}
+	out, err := runDoctor(t, append(args, "--apply")...)
+	if err != nil {
 		t.Fatalf("--apply on a host with nothing outranking the plan = %v:\n%s", err, out)
 	}
 	t.Setenv("PIP_CERT", "/missing/site-ca.pem")
-	out, err = runDoctor(t, args...)
-	if err != nil || !strings.Contains(out, "Nothing to change") {
-		t.Fatalf("second --apply = %v:\n%s", err, out)
+	out, err = runDoctor(t, append(args, "--apply")...)
+	if err == nil || !strings.Contains(err.Error(), "pypi: ") || !strings.Contains(err.Error(), "the environment's PIP_CERT") {
+		t.Fatalf("PIP_CERT outranks the cert setting the plan wrote; want the run to fail naming pypi and the variable, got %v:\n%s", err, out)
 	}
-	if !strings.Contains(out, "warning    pypi") || !strings.Contains(out, "the environment's PIP_CERT") {
-		t.Errorf("PIP_CERT outranks the cert setting the plan wrote; want a warning for pypi naming it:\n%s", out)
+	t.Setenv("PIP_CERT", "")
+
+	selected := filepath.Join(home, "work.npmrc")
+	if err := os.WriteFile(selected, []byte("; work\nregistry=https://registry.corp.example/\ncafile=/missing/corp.pem\nfund=false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NPM_CONFIG_USERCONFIG", selected)
+	out, err = runDoctor(t, args...)
+	if err != nil || !strings.Contains(out, selected) || !strings.Contains(out, "-cafile=/missing/corp.pem") {
+		t.Fatalf("the preview leaves out the npmrc the environment selects (%v):\n%s", err, out)
+	}
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil {
+		t.Fatalf("--apply with a selected npmrc = %v:\n%s", err, out)
+	}
+	got, err := os.ReadFile(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"; work\n", "fund=false\n", "registry=" + srv.URL + "/npm/\n", "cafile=" + filepath.Join(home, ".config/bodega/ca.pem") + "\n"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("the selected npmrc lacks %q:\n%s", want, got)
+		}
+	}
+	if out, err = runDoctor(t, append(args, "--apply")...); err != nil || !strings.Contains(out, "Nothing to change") {
+		t.Fatalf("a second --apply with a selected npmrc = %v:\n%s", err, out)
+	}
+}
+
+func TestIndependentPipInstallSelectedConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubRuntimes(t)
+	srv, pem, _ := caPlanServer(t)
+	cafile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(cafile, pem, 0600); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(home, "selected-pip.conf")
+	if err := os.WriteFile(selected, []byte("[global]\nindex-url="+srv.URL+"/pypi/simple/\ncert=/missing/old-ca.pem\n[install]\nno-compile=true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIP_CONFIG_FILE", selected)
+	out, err := runDoctor(t, "--configure", "pip", "--ca-file", cafile, "--url", srv.URL, "--apply")
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	probe := host.TrustProbe{Root: home, GOOS: "linux", Getenv: func(k string) string {
+		if k == "PIP_CONFIG_FILE" {
+			return selected
+		}
+		return ""
+	},
+		Chain:  func(string) ([]*x509.Certificate, error) { return []*x509.Certificate{srv.Certificate()}, nil },
+		System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} },
+	}
+	f := probe.Apply([]host.Finding{{Check: "pip-config", Status: host.StatusOK}}, srv.URL)[0]
+	if f.Status != host.StatusOK {
+		t.Fatalf("successful install left selected pip store untrusted: %+v", f)
 	}
 }

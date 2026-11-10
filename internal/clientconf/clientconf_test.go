@@ -13,6 +13,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -1260,5 +1261,113 @@ func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
 	}
 	if !strings.Contains(string(ran), "-list") || !strings.Contains(string(ran), "-importcert") {
 		t.Errorf("keytool ran %q, want a listing and an import", ran)
+	}
+}
+
+func TestIndependentCANamedEntryPreservation(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		file         File
+		before, keep string
+	}{
+		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n", "Architectures: amd64"},
+		{"podman", RegistriesConf(testBase, []string{"docker.io"}), "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nmirror-by-digest-only = true\n", "mirror-by-digest-only = true"},
+		{"helm", Helm(testBase), HelmDocument(HelmRepository(testBase, "certFile: /etc/helm/client.crt", "keyFile: /etc/helm/client.key")), "certFile: /etc/helm/client.crt"},
+		{"pkg", File{System: manifest.TypeFreeBSD, Paths: map[string]string{OSLinux: "/usr/local/etc/pkg/repos/bodega.conf"}, Content: "bodega: { url: \"" + testBase + "/freebsd\", enabled: yes }\n"}, "bodega: { url: \"" + testBase + "/freebsd\", enabled: yes, priority: 10 }\n", "priority: 10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(tc.before), 0644); err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply(in.Changes, ".independent-backup"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), tc.keep) {
+				t.Fatalf("CA install discarded %q; wrote:\n%s", tc.keep, got)
+			}
+		})
+	}
+}
+
+// TestEntryMergeIsFieldLevel pins what a named entry keeps when a plan joins
+// it: every field the plan does not set, in the layout the host wrote, less
+// the fields named as unable to stand beside the plan's. A second merge
+// changes nothing, and an entry the merge cannot follow is refused.
+func TestEntryMergeIsFieldLevel(t *testing.T) {
+	ucl := fileKind{blocks: mergeUCL, holds: uclHolds}
+	registries := fileKind{blocks: mergeRegistries, holds: registriesHold}
+	helm := fileKind{blocks: func(o, p []string) []string { return mergeYAML(o, p, "repositories") }, holds: yamlHolds("repositories")}
+	pkgPlan := "bodega: {\n  url: \"https://b/freebsd/${ABI}\",\n  signature_type: \"none\",\n  enabled: yes\n}\n"
+	registryPlan := "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\n"
+	for _, tc := range []struct {
+		name         string
+		kind         fileKind
+		old, planned string
+		want         string
+	}{
+		{"pkg object over several lines", ucl, "# mine\nbodega: {\n  url: \"https://old/x\", # was\n  priority: 10\n}\n", pkgPlan,
+			"# mine\nbodega: {\n  url: \"https://b/freebsd/${ABI}\", # was\n  priority: 10,\n  signature_type: \"none\",\n  enabled: yes\n}\n"},
+		{"pkg object holding a nested object", ucl, "bodega: {\n  url: \"https://old/x\",\n  env: {\n    A: b\n  },\n  enabled: no,\n}\n", pkgPlan,
+			"bodega: {\n  url: \"https://b/freebsd/${ABI}\",\n  env: {\n    A: b\n  },\n  enabled: yes,\n  signature_type: \"none\"\n}\n"},
+		{"empty pkg object beside a bare variable", ucl, "bodega: {}\nother { url = pkg+http://x/${ABI}; }\n", pkgPlan,
+			"bodega: { url: \"https://b/freebsd/${ABI}\", signature_type: \"none\", enabled: yes }\nother { url = pkg+http://x/${ABI}; }\n"},
+		{"registry keeps its mirrors and their order", registries,
+			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nblocked = false\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\ninsecure = true\npull-from-mirror = \"all\"\n", registryPlan,
+			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nblocked = false\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\npull-from-mirror = \"all\"\n"},
+		{"a new mirror leads the registry's own", registries, "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n", registryPlan,
+			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n"},
+		{"helm entry keeps client auth, loses caFile and its duplicate", helm,
+			"repositories:\n  - caFile: /old/ca.pem\n    name: bodega\n    url: https://old/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n  - name: bodega\n    url: https://dup\n", "repositories:\n" + HelmRepository("https://b"),
+			"repositories:\n  - name: bodega\n    url: https://b/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n"},
+		{"helm empty flow sequence", helm, "repositories: []\n", "repositories:\n" + HelmRepository("https://b"), "repositories:\n- name: bodega\n  url: https://b/helm\n"},
+		{"apt stanza", fileKind{blocks: mergeDeb822}, "# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: jammy\nEnabled: no\nArchitectures: amd64\n arm64\nTrusted: yes\n",
+			"Types: deb\nURIs: https://b/apt/\nSuites: noble\nSigned-By: /k.asc\n",
+			"# ours\nTypes: deb\nURIs: https://b/apt/\nSuites: noble\nArchitectures: amd64\n arm64\nSigned-By: /k.asc\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.kind.merge([]byte(tc.old), []byte(tc.planned))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("merged:\n%s\nwant:\n%s", got, tc.want)
+			}
+			again, err := tc.kind.merge(got, []byte(tc.planned))
+			if err != nil || string(again) != tc.want {
+				t.Fatalf("a second merge changed the file (%v):\n%s", err, again)
+			}
+		})
+	}
+	if _, err := ucl.merge([]byte("bodega: {\n  url: \"https://old/x\n"), []byte(pkgPlan)); err == nil {
+		t.Error("an object with no closing brace was merged, not refused")
+	}
+}
+
+// TestPipOptionsReadsPipsGrammar pins the reader the trust probe shares with
+// the merge: a colon delimits, a deeper line continues the option above it,
+// and the last assignment wins.
+func TestPipOptionsReadsPipsGrammar(t *testing.T) {
+	got := PipOptions([]byte("[global]\nIndex_URL: https://b/simple\ncert = /a.pem\nfind-links =\n  cert=/not.pem\n  # note\n  /srv/wheels\ncert=/b.pem\n[install]\n  no-compile = true\n"))
+	want := map[string]string{"global.index-url": "https://b/simple", "global.cert": "/b.pem", "global.find-links": "cert=/not.pem\n/srv/wheels", "install.no-compile": "true"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("PipOptions = %q, want %q", got, want)
 	}
 }

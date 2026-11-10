@@ -162,9 +162,7 @@ func envCA(t TrustProbe, keys ...string) *trustStore {
 }
 
 var (
-	aptCAInfo  = regexp.MustCompile(`(?i)\bCaInfo\s+"([^"]+)"`)
-	gemCACert  = regexp.MustCompile(`(?m)^:?ssl_ca_cert:\s*["']?([^"'\s#]+)`)
-	tomlCAInfo = regexp.MustCompile(`(?m)^\s*cainfo\s*=\s*["']([^"']+)["']`)
+	gemCACert = regexp.MustCompile(`(?m)^:?ssl_ca_cert:\s*["']?([^"'\s#]+)`)
 )
 
 // firstMatch is the first capture of re in the files, and the file it is in.
@@ -181,15 +179,7 @@ func firstMatch(re *regexp.Regexp, files ...string) (value, file string) {
 
 // trustRows maps a row's check name to its client.
 var trustRows = map[string]trustRow{
-	"apt-sources": systemOnly(manifest.TypeApt, func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*")
-	}, func(t TrustProbe) *trustStore {
-		conf, _ := filepath.Glob(filepath.Join(t.Root, "/etc/apt/apt.conf.d/*"))
-		if v, f := firstMatch(aptCAInfo, append([]string{filepath.Join(t.Root, "/etc/apt/apt.conf")}, conf...)...); v != "" {
-			return named(v, "Acquire::https::CAInfo in "+f, true)
-		}
-		return nil
-	}),
+	"apt-sources": {system: manifest.TypeApt, stores: aptStores},
 	"dnf-repos": {system: manifest.TypeRpm, stores: func(t TrustProbe, u *url.URL) []trustStore {
 		// The repositories dnf loads, reposdir included, not a directory
 		// scan: a .repo file dnf never reads configures nothing. One
@@ -223,8 +213,20 @@ var trustRows = map[string]trustRow{
 		if s := envCA(t, "CARGO_HTTP_CAINFO"); s != nil {
 			return s
 		}
-		if v, f := firstMatch(tomlCAInfo, filepath.Join(t.Home, ".cargo", "config.toml"), filepath.Join(t.Home, ".cargo", "config")); v != "" {
-			return named(v, "http.cainfo in "+f, true)
+		// Cargo reads the file without the extension when both exist.
+		for _, f := range []string{filepath.Join(t.Home, ".cargo", "config"), filepath.Join(t.Home, ".cargo", "config.toml")} {
+			var doc struct {
+				HTTP struct {
+					CAInfo string `toml:"cainfo"`
+				} `toml:"http"`
+			}
+			if _, err := toml.DecodeFile(f, &doc); err != nil {
+				continue
+			}
+			if doc.HTTP.CAInfo != "" {
+				return named(doc.HTTP.CAInfo, "http.cainfo in "+f, true)
+			}
+			break
 		}
 		return nil
 	}),
@@ -290,6 +292,166 @@ var trustRows = map[string]trustRow{
 	}},
 }
 
+// aptStores is the store apt verifies bodega at u against: the file the
+// effective Acquire::https::CAInfo names, which apt reads in place of the
+// system trust store, and the system store with none set. The option scoped
+// to bodega's own host outranks the unscoped one, and one scoped to another
+// host says nothing here.
+func aptStores(t TrustProbe, u *url.URL) []trustStore {
+	if !t.filesMention(u.Host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*") {
+		return nil
+	}
+	conf := t.aptConfig()
+	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
+		if v := conf[key]; v.value != "" {
+			return []trustStore{*named(v.value, "Acquire::https::CAInfo in "+v.file, true)}
+		}
+	}
+	return []trustStore{{name: systemStoreName, system: true}}
+}
+
+// aptOption is the value apt's configuration ends up giving one option, and
+// the file that gave it.
+type aptOption struct{ value, file string }
+
+var aptPartName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// aptConfig reads apt's configuration in the order apt loads it, a later
+// assignment replacing an earlier one: the file APT_CONFIG names, then the
+// apt.conf.d fragments in name order (those apt accepts: no extension, or
+// .conf), then apt.conf. Keys are lowercased, since apt matches them without
+// regard to case. #include is not followed.
+func (t TrustProbe) aptConfig() map[string]aptOption {
+	var files []string
+	if v := t.env("APT_CONFIG"); v != "" {
+		files = append(files, v)
+	}
+	parts, _ := filepath.Glob(filepath.Join(t.Root, "/etc/apt/apt.conf.d/*"))
+	sort.Strings(parts)
+	for _, f := range parts {
+		name := filepath.Base(f)
+		if ext := filepath.Ext(name); aptPartName.MatchString(name) && (ext == "" || ext == ".conf") {
+			files = append(files, f)
+		}
+	}
+	files = append(files, filepath.Join(t.Root, "/etc/apt/apt.conf"))
+	out := map[string]aptOption{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		readAptConf(string(data), func(key, value string, clearTree bool) {
+			if !clearTree {
+				out[key] = aptOption{value, f}
+				return
+			}
+			for k := range out {
+				if k == key || strings.HasPrefix(k, key+"::") {
+					delete(out, k)
+				}
+			}
+		})
+	}
+	return out
+}
+
+// readAptConf walks one apt configuration file and calls set for each
+// assignment, with the scopes around it joined into the key, and for each
+// #clear. Comments (//, /* */ and a line opening with #) are dropped outside
+// quotes, so a commented-out option assigns nothing.
+func readAptConf(text string, set func(key, value string, clearTree bool)) {
+	var scopes []string
+	var stmt strings.Builder
+	quoted, lineStart := false, true
+	flush := func() (tag, word string) {
+		fields := aptWords(stmt.String())
+		stmt.Reset()
+		if len(fields) > 0 {
+			tag = fields[0]
+		}
+		if len(fields) > 1 {
+			word = fields[1]
+		}
+		return tag, word
+	}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if quoted {
+			quoted = c != '"'
+			stmt.WriteByte(c)
+			continue
+		}
+		atStart := lineStart
+		lineStart = c == '\n' || lineStart && (c == ' ' || c == '\t')
+		switch {
+		case c == '"':
+			quoted = true
+			stmt.WriteByte(c)
+		case c == '/' && strings.HasPrefix(text[i:], "//"), c == '#' && atStart && !strings.HasPrefix(text[i:], "#clear"):
+			end := strings.IndexByte(text[i:], '\n')
+			if end < 0 {
+				return
+			}
+			i += end - 1
+		case c == '/' && strings.HasPrefix(text[i:], "/*"):
+			end := strings.Index(text[i+2:], "*/")
+			if end < 0 {
+				return
+			}
+			i += end + 3
+		case c == '{':
+			tag, _ := flush()
+			scopes = append(scopes, strings.ToLower(tag))
+		case c == '}':
+			stmt.Reset()
+			if len(scopes) > 0 {
+				scopes = scopes[:len(scopes)-1]
+			}
+		case c == ';':
+			tag, word := flush()
+			if tag == "" {
+				continue
+			}
+			clearTree := tag == "#clear"
+			if clearTree {
+				tag, word = word, ""
+			}
+			key := strings.ToLower(strings.Join(append(slices.Clone(scopes), tag), "::"))
+			set(strings.Trim(key, ":"), word, clearTree)
+		default:
+			stmt.WriteByte(c)
+		}
+	}
+}
+
+// aptWords splits a statement into its words, a quoted run being one word
+// with the quotes removed.
+func aptWords(stmt string) []string {
+	var out []string
+	var word strings.Builder
+	quoted, open := false, false
+	for _, r := range stmt {
+		switch {
+		case r == '"':
+			quoted, open = !quoted, true
+		case !quoted && (r == ' ' || r == '\t' || r == '\n' || r == '\r'):
+			if open {
+				out = append(out, word.String())
+				word.Reset()
+				open = false
+			}
+		default:
+			word.WriteRune(r)
+			open = true
+		}
+	}
+	if open {
+		out = append(out, word.String())
+	}
+	return out
+}
+
 // certsDir is a certs.d directory for one registry host, whose *.crt files
 // Docker and podman add to the system store.
 func certsDir(dir string) trustStore {
@@ -320,40 +482,6 @@ func (t TrustProbe) env(key string) string {
 	return t.Getenv(key)
 }
 
-// iniValues reads the settings of an INI file as "section.key", both
-// lowercased, each to every value the file gives it in order: npm reads a
-// repeated ca[] as a list, where pip reads the last. A file with no sections
-// keys them ".key", and a file that will not read sets nothing.
-func iniValues(path string) map[string][]string {
-	out := map[string][]string{}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return out
-	}
-	section := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case line == "" || line[0] == '#' || line[0] == ';':
-		case line[0] == '[' && strings.HasSuffix(line, "]"):
-			section = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
-		default:
-			if k, v, ok := strings.Cut(line, "="); ok {
-				key := section + "." + strings.ToLower(strings.TrimSpace(k))
-				out[key] = append(out[key], strings.TrimSpace(v))
-			}
-		}
-	}
-	return out
-}
-
-func last(vals []string) string {
-	if len(vals) == 0 {
-		return ""
-	}
-	return vals[len(vals)-1]
-}
-
 // pipFiles lists the configuration files pip loads, in the order it loads
 // them. PIP_CONFIG_FILE names one more, loaded last; when that file exists
 // pip skips the per-user files, and when it is the null device pip loads no
@@ -374,26 +502,36 @@ func pipFiles(t TrustProbe) []string {
 	return files
 }
 
-// pipStores resolves the bundle pip verifies an install against. cert, from
-// the last file pip loads that sets it or from PIP_CERT, replaces pip's
-// default; a per-command section outranks [global] whichever file holds it.
-// With none set, requests falls back to REQUESTS_CA_BUNDLE and then
-// CURL_CA_BUNDLE, and only then does pip read its default: the system store
-// through truststore, or on an older pip certifi's bundle, which holds no
-// private CA whatever the system store holds. Which of the two is pip's own
-// to say, so Pip asks it.
+// pipStores resolves the bundle pip verifies an install against. requests
+// reads REQUESTS_CA_BUNDLE and then CURL_CA_BUNDLE ahead of the verify pip
+// sets on its session, so either outranks every cert setting. Behind them
+// comes cert: PIP_CERT, then the last file pip loads that sets it, a
+// per-command section outranking [global] whichever file holds it. Any of
+// these replaces pip's default, which is read only with none set: the system
+// store through truststore, or on an older pip certifi's bundle, which holds
+// no private CA whatever the system store holds. Which of the two is pip's
+// own to say, so Pip asks it.
 func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	files := pipFiles(t)
 	if !mention(u.Host, files...) && !strings.Contains(t.env("PIP_INDEX_URL"), u.Host) {
 		return nil
 	}
+	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
+		if v := t.env(key); v != "" {
+			return []trustStore{{name: fmt.Sprintf("%s, which the environment's %s names and requests reads ahead of pip's cert setting and in place of the system trust store,", v, key), files: []string{v}}}
+		}
+	}
 	var global, install [2]string
 	for _, f := range files {
-		vals := iniValues(f)
-		if v := last(vals["global.cert"]); v != "" {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		vals := clientconf.PipOptions(data)
+		if v := vals["global.cert"]; v != "" {
 			global = [2]string{v, f}
 		}
-		if v := last(vals["install.cert"]); v != "" {
+		if v := vals["install.cert"]; v != "" {
 			install = [2]string{v, f}
 		}
 	}
@@ -401,11 +539,8 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	if install[0] != "" {
 		cert = install
 	}
-	for _, key := range []string{"PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
-		if v := t.env(key); v != "" && (key == "PIP_CERT" || cert[0] == "") {
-			cert = [2]string{v, "the environment's " + key}
-			break
-		}
+	if v := t.env("PIP_CERT"); v != "" {
+		cert = [2]string{v, "the environment's PIP_CERT"}
 	}
 	if cert[0] != "" {
 		return []trustStore{{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}}
@@ -450,53 +585,151 @@ func nodeCAFlags(t TrustProbe) (bundled, openssl, system bool) {
 	return bundled, openssl, system
 }
 
-// npmStores resolves the CAs npm verifies its registry against. cafile or ca,
-// from the last npmrc npm loads that sets one or from npm_config_cafile,
-// replaces Node's defaults, and NODE_EXTRA_CA_CERTS no longer adds to them. A
-// file's ca[] lines are one list, every entry trusted.
+// npmLayer is what one source of npm's configuration, a file or the
+// environment, says about CAs.
+type npmLayer struct {
+	from string
+	// ca is the inline list and caSet whether the source assigns one at all,
+	// since an empty assignment clears the list a lower source gave.
+	ca     []string
+	caSet  bool
+	cafile string
+	// caLast says ca was first assigned after cafile, which is the order
+	// npm applies the two in.
+	caLast bool
+}
+
+// npmFiles lists the npmrc files npm loads, lowest priority first. An
+// environment variable naming the global or the per-user file replaces the
+// default path: npm then never opens the file it would have.
+func npmFiles(t TrustProbe) []string {
+	env := func(key string) string {
+		if v := t.env("npm_config_" + key); v != "" {
+			return v
+		}
+		return t.env("NPM_CONFIG_" + strings.ToUpper(key))
+	}
+	files := rooted(t.Root, npmPaths(t.GOOS, ""))
+	if v := env("globalconfig"); v != "" {
+		files = []string{v}
+	}
+	switch v := env("userconfig"); {
+	case v != "":
+		files = append(files, v)
+	case t.Home != "":
+		files = append(files, filepath.Join(t.Root, t.Home, ".npmrc"))
+	}
+	return files
+}
+
+// npmFileLayer reads the top-level ca, ca[] and cafile of an npmrc as npm's
+// ini reader does: ca[] appends to a list, a plain ca replaces it, and a
+// quoted value is unescaped.
+func npmFileLayer(path string) npmLayer {
+	l := npmLayer{from: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return l
+	}
+	value := func(v string) string {
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = strings.ReplaceAll(v[1:len(v)-1], `\n`, "\n")
+		}
+		return v
+	}
+	fileSeen := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		if line[0] == '[' && strings.HasSuffix(line, "]") {
+			break
+		}
+		k, v, _ := strings.Cut(line, "=")
+		switch k = strings.TrimSpace(k); k {
+		case "cafile":
+			l.cafile, fileSeen = value(v), true
+		case "ca", "ca[]":
+			if !l.caSet {
+				l.caSet, l.caLast = true, fileSeen
+			}
+			if k == "ca" {
+				l.ca = nil
+			}
+			if v = value(v); v != "" {
+				l.ca = append(l.ca, v)
+			}
+		}
+	}
+	return l
+}
+
+// npmStores resolves the CAs npm verifies its registry against. npm keeps
+// one CA list: each source that sets ca replaces it, and each source whose
+// cafile names a file npm can read replaces it with that file's certificates,
+// applied from the lowest source to the highest and inside one source in the
+// order the two were first set. So a cafile after a ca[] in one npmrc drops
+// the inline certificates, a ca after a cafile drops the file, and a cafile
+// naming no readable file changes nothing. The sources are the global npmrc,
+// the per-user one and then the environment. A list from any of them replaces
+// Node's defaults, and NODE_EXTRA_CA_CERTS no longer adds to them.
 //
-// With neither set npm verifies against Node's defaults: the Mozilla roots
-// Node bundles, or OpenSSL's store under --use-openssl-ca and in a Node built
-// that way, with the system store added under --use-system-ca, and
+// With none set npm verifies against Node's defaults: the Mozilla roots Node
+// bundles, or OpenSSL's store under --use-openssl-ca and in a Node built that
+// way, with the system store added under --use-system-ca, and
 // NODE_EXTRA_CA_CERTS beside any of them. A private CA in the system store
 // is in none of the bundled roots, so the system store's answer settles this
 // row only where Node reads that store, and Node lists what it trusts.
 func npmStores(t TrustProbe, u *url.URL) []trustStore {
-	files := rooted(t.Root, npmPaths(t.GOOS, t.Home))
+	files := npmFiles(t)
 	if !mention(u.Host, files...) {
 		return nil
 	}
-	unquote := func(v string) string { return strings.Trim(v, `"'`) }
-	var cafile, from string
-	var inline []string
+	var layers []npmLayer
 	for _, f := range files {
-		vals := iniValues(f)
-		if v := unquote(last(vals[".cafile"])); v != "" {
-			cafile, from = v, f
+		layers = append(layers, npmFileLayer(f))
+	}
+	env := npmLayer{from: "the environment"}
+	for _, key := range []string{"NPM_CONFIG_CAFILE", "npm_config_cafile"} {
+		if v := t.env(key); v != "" {
+			env.cafile, env.from = v, "the environment's "+key
 		}
-		var list []string
-		for _, v := range append(slices.Clone(vals[".ca[]"]), last(vals[".ca"])) {
-			if v = unquote(v); v != "" {
-				list = append(list, strings.ReplaceAll(v, `\n`, "\n"))
+	}
+	for _, key := range []string{"NPM_CONFIG_CA", "npm_config_ca"} {
+		if v := t.env(key); v != "" {
+			env.ca, env.caSet = []string{strings.ReplaceAll(v, `\n`, "\n")}, true
+		}
+	}
+	var store *trustStore
+	for _, l := range append(layers, env) {
+		inline := func() {
+			switch {
+			case !l.caSet:
+			case len(l.ca) == 0:
+				store = nil
+			default:
+				store = &trustStore{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", l.from), pem: l.ca}
 			}
 		}
-		if len(list) > 0 {
-			inline, from = list, f
+		if !l.caLast {
+			inline()
+		}
+		if file := l.cafile; file != "" {
+			if rest, ok := strings.CutPrefix(file, "~/"); ok {
+				file = filepath.Join(t.Root, t.Home, rest)
+			}
+			if data, err := os.ReadFile(file); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+				store = &trustStore{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", file, l.from), files: []string{file}}
+			}
+		}
+		if l.caLast {
+			inline()
 		}
 	}
-	for _, key := range []string{"npm_config_cafile", "NPM_CONFIG_CAFILE"} {
-		if v := t.env(key); v != "" {
-			cafile, from = v, "the environment's "+key
-		}
-	}
-	if rest, ok := strings.CutPrefix(cafile, "~/"); ok {
-		cafile = filepath.Join(t.Root, t.Home, rest)
-	}
-	switch {
-	case cafile != "":
-		return []trustStore{{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", cafile, from), files: []string{cafile}, pem: inline}}
-	case len(inline) > 0:
-		return []trustStore{{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", from), pem: inline}}
+	if store != nil {
+		return []trustStore{*store}
 	}
 	var extra []string
 	if v := t.env("NODE_EXTRA_CA_CERTS"); v != "" {

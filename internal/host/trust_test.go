@@ -561,3 +561,174 @@ func TestPipDefaultFrom(t *testing.T) {
 		t.Error("a line naming no version was read as one")
 	}
 }
+
+func TestIndependentPipConfigSyntax(t *testing.T) {
+	for _, tc := range []struct {
+		name, setting string
+		want          Status
+	}{
+		{"colon", "cert: /missing/private-ca.pem\n", StatusWarn},
+		{"continued-non-cert", "cert=CA_PATH\nfind-links =\n  cert=/missing/not-a-setting.pem\n", StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			setting := strings.ReplaceAll(tc.setting, "CA_PATH", ca)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\n"+setting)
+			if tc.want == StatusWarn {
+				p.System = func([]*x509.Certificate, string) error { return nil }
+			}
+			f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+			if f.Status != tc.want {
+				t.Fatalf("pip reads %q: got %+v; want %s", setting, f, tc.want)
+			}
+		})
+	}
+}
+
+func TestIndependentAptEffectiveCA(t *testing.T) {
+	for _, mode := range []string{"later-file", "other-host", "comment"} {
+		t.Run(mode, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+			dir := filepath.Join(p.Root, "etc/apt/apt.conf.d")
+			switch mode {
+			case "later-file":
+				writeTrustFile(t, filepath.Join(dir, "10ca"), "Acquire::https::CAInfo \""+ca+"\";\n")
+				writeTrustFile(t, filepath.Join(dir, "90ca"), "Acquire::https::CAInfo \"/missing/effective-ca.pem\";\n")
+			case "other-host":
+				writeTrustFile(t, filepath.Join(dir, "10ca"), "Acquire::https::unrelated.example::CAInfo \""+ca+"\";\n")
+			case "comment":
+				writeTrustFile(t, filepath.Join(dir, "10ca"), "// Acquire::https::CAInfo \""+ca+"\";\n")
+			}
+			f := p.Apply([]Finding{{Check: "apt-sources", Status: StatusOK}}, base)[0]
+			if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") {
+				t.Fatalf("apt %s: got %+v; want WARN", mode, f)
+			}
+		})
+	}
+}
+
+func TestIndependentNpmSelectedUserConfig(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
+	selected := filepath.Join(p.Root, "selected.npmrc")
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "effective-ca.pem")
+	writeTrustFile(t, wrong, string(other))
+	writeTrustFile(t, selected, "registry="+base+"/npm/\ncafile="+wrong+"\n")
+	p.Getenv = func(k string) string {
+		if k == "NPM_CONFIG_USERCONFIG" {
+			return selected
+		}
+		return ""
+	}
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, wrong) {
+		t.Fatalf("npm selected userconfig: got %+v; want WARN naming effective-ca.pem", f)
+	}
+}
+
+func TestIndependentNpmCAFileIsNotAUnion(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	trusted, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "other.pem")
+	writeTrustFile(t, wrong, string(other))
+	inline := "\"" + strings.ReplaceAll(strings.TrimSpace(string(trusted)), "\n", `\n`) + "\""
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\nca[]="+inline+"\ncafile="+wrong+"\n")
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn {
+		t.Fatalf("npm cafile replaces inline ca: got %+v; want WARN", f)
+	}
+}
+
+func TestIndependentPipRequestsBundlePrecedence(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url="+base+"/pypi/simple/\ncert="+ca+"\n")
+	p.Getenv = func(k string) string {
+		if k == "REQUESTS_CA_BUNDLE" {
+			return "/missing/requests-ca.pem"
+		}
+		return ""
+	}
+	f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/requests-ca.pem") {
+		t.Fatalf("requests overrides pip session.verify: got %+v; want WARN naming requests-ca.pem", f)
+	}
+}
+
+// TestTrustFollowsEachClientsOwnPrecedence pins the cases beside the ones a
+// review reported: the same grammar and precedence rules, read the other way.
+func TestTrustFollowsEachClientsOwnPrecedence(t *testing.T) {
+	inline := func(t *testing.T, ca string) string {
+		data, err := os.ReadFile(ca)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return `"` + strings.ReplaceAll(strings.TrimSpace(string(data)), "\n", `\n`) + `"`
+	}
+	apt := func(t *testing.T, p TrustProbe, base string, files map[string]string) {
+		writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+		for name, body := range files {
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt", name), body)
+		}
+	}
+	for _, tc := range []struct {
+		name, check string
+		setup       func(t *testing.T, p *TrustProbe, ca, base string)
+		want        Status
+	}{
+		{"apt scoped to bodega's host, in nested braces, over a wrong global", "apt-sources", func(t *testing.T, p *TrustProbe, ca, base string) {
+			apt(t, *p, base, map[string]string{
+				"apt.conf.d/10global": "Acquire::https::CAInfo \"/missing/global.pem\";\n",
+				"apt.conf.d/20host":   "/* ours */ Acquire { HTTPS { bodega.internal { cainfo \"" + ca + "\"; }; }; };\n",
+			})
+		}, StatusOK},
+		{"apt.conf is read after apt.conf.d", "apt-sources", func(t *testing.T, p *TrustProbe, ca, base string) {
+			apt(t, *p, base, map[string]string{"apt.conf.d/99ca": "Acquire::https::CAInfo \"" + ca + "\";\n", "apt.conf": "Acquire::https::CAInfo \"/missing/main.pem\";\n"})
+		}, StatusWarn},
+		{"apt skips a fragment whose name it does not load, and honors #clear", "apt-sources", func(t *testing.T, p *TrustProbe, ca, base string) {
+			apt(t, *p, base, map[string]string{
+				"apt.conf.d/10ca":           "Acquire::https::CAInfo \"" + ca + "\";\n",
+				"apt.conf.d/50clear":        "#clear Acquire::https;\n",
+				"apt.conf.d/90ca.dpkg-dist": "Acquire::https::CAInfo \"" + ca + "\";\n",
+			})
+		}, StatusWarn},
+		{"npm ca[] after cafile replaces the file", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			other, _ := trustFixture(t)
+			wrong := filepath.Join(p.Root, "other.pem")
+			writeTrustFile(t, wrong, string(other))
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+wrong+"\nca[]="+inline(t, ca)+"\n")
+		}, StatusOK},
+		{"npm cafile naming no file leaves the inline ca", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\nca="+inline(t, ca)+"\ncafile=/missing/gone.pem\n")
+		}, StatusOK},
+		{"npm environment cafile outranks the selected userconfig", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			selected := filepath.Join(p.Root, "selected.npmrc")
+			writeTrustFile(t, selected, "registry="+base+"/npm/\ncafile="+ca+"\n")
+			other, _ := trustFixture(t)
+			wrong := filepath.Join(p.Root, "other.pem")
+			writeTrustFile(t, wrong, string(other))
+			p.Getenv = func(k string) string {
+				return map[string]string{"npm_config_userconfig": selected, "npm_config_cafile": wrong}[k]
+			}
+		}, StatusWarn},
+		{"cargo reads config ahead of config.toml, and cainfo only under [http]", "cargo-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			p.Home = filepath.Join(p.Root, "home")
+			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[http]\ncainfo = \"/missing/unread.pem\"\n")
+			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[net]\ncainfo = \"/missing/not-http.pem\"\n[http]\ncainfo = \""+ca+"\"\n")
+		}, StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			tc.setup(t, &p, ca, base)
+			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
+			if f.Status != tc.want || tc.want == StatusOK && f.Detail != "" {
+				t.Fatalf("got %+v; want %s", f, tc.want)
+			}
+		})
+	}
+}

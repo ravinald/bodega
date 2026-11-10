@@ -91,6 +91,72 @@ type CAHost struct {
 	// of the keytool on PATH, and a nil JVMTrusted an empty store.
 	JVM        JVMStore
 	JVMTrusted []*x509.Certificate
+	// Getenv reads the environment the host's clients start in, which can
+	// name a configuration file a client reads in place of, or after, the
+	// one the plan writes. Nil is an environment naming none.
+	Getenv func(string) string
+}
+
+// selectedConfig is the existing configuration file the environment has the
+// client of rec read that outranks the plan's file at target, "" for none. npm
+// and git read the file the variable names in place of the per-user one, so
+// the plan's file is then never opened; pip reads PIP_CONFIG_FILE after every
+// other file, so it outranks the plan's only for the options it sets itself.
+func (h CAHost) selectedConfig(rec PlanRecord, target string, planned []byte) string {
+	if h.Getenv == nil {
+		return ""
+	}
+	env := func(keys ...string) string {
+		for _, k := range keys {
+			if v := h.Getenv(k); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	user := strings.HasPrefix(rec.Path, "~/")
+	var sel string
+	switch {
+	case rec.System == manifest.TypePypi:
+		sel = env("PIP_CONFIG_FILE")
+	case rec.System == manifest.TypeNpm && user:
+		sel = env("npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
+	case rec.System == manifest.TypeNpm:
+		sel = env("npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG")
+	case rec.System == manifest.TypeGit && user:
+		sel = env("GIT_CONFIG_GLOBAL")
+	case rec.System == manifest.TypeGit:
+		sel = env("GIT_CONFIG_SYSTEM")
+	}
+	if sel == "" || sel == os.DevNull {
+		return ""
+	}
+	sel, err := filepath.Abs(sel)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(sel)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	if own, err := os.Stat(target); sel == target || err == nil && os.SameFile(info, own) {
+		return ""
+	}
+	if rec.System != manifest.TypePypi {
+		return sel
+	}
+	data, err := os.ReadFile(sel)
+	if err != nil {
+		return ""
+	}
+	want := PipOptions(append(slices.Clone(planned), "\ncert = x\n"...))
+	for key := range PipOptions(data) {
+		_, option, _ := strings.Cut(key, ".")
+		if _, shadows := want["global."+option]; shadows {
+			return sel
+		}
+	}
+	return ""
 }
 
 // CAInstall is a plan with a CA added to it.
@@ -370,6 +436,11 @@ var ownStoreSystems = []string{manifest.TypeNpm, manifest.TypePypi, manifest.Typ
 // per registry host, an import into the JVM trust store for Maven and Gradle,
 // and for every other system an anchor in the operating system's trust store.
 //
+// A client whose environment names an existing configuration file that
+// outranks the plan's (PIP_CONFIG_FILE, npm's userconfig, GIT_CONFIG_GLOBAL)
+// gets the same edit in that file, as a change of its own: the plan's file
+// alone would leave the client reading its old settings.
+//
 // Every file the plan edits that already exists keeps what the plan does not
 // set, whether its client reads a CA setting or the system store: kindOf
 // names how each format takes the plan's settings, where a plan without a CA
@@ -425,6 +496,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	}
 
 	var system []string
+	var selected []Change
 	jvm := false
 	for i, c := range in.Changes {
 		rec := c.Record
@@ -487,15 +559,15 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		}
-		refuse := func(err error) error {
+		refuse := func(target string, err error) error {
 			return fmt.Errorf("%s: %s with bodega's settings merged in would not read as the plan sets it (%w). "+
-				"It holds a form this merge does not edit, such as a value spanning several lines or a table spelled another way; move the file aside and re-run to have it written whole", rec.System, c.Target, err)
+				"It holds a form this merge does not edit, such as a value spanning several lines or a table spelled another way; move the file aside and re-run to have it written whole", rec.System, target, err)
 		}
 		if line == nil {
 			if c.Existed && !c.Unchanged() {
 				merged, err := kind.merge(c.Old, c.New)
 				if err != nil {
-					return CAInstall{}, refuse(err)
+					return CAInstall{}, refuse(c.Target, err)
 				}
 				in.Changes[i].New = merged
 			}
@@ -505,32 +577,67 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
 		}
-		body := splitBody(c.New)
-		if c.Existed {
-			// New holds the plan's file and nothing of the host's but a
-			// credential; the host's file is what the settings join.
-			body = mergeSettings(splitBody(c.Old), body, *kind.rules)
-		}
-		// A setting in a section leads it, so it reads beside the header
-		// that scopes it; npm's file has no sections, and it ends the file.
-		set := []string{line(caPath)}
-		body = setSection(body, header, set, *kind.rules, header != "")
-		if rec.System == manifest.TypePypi {
-			// A command's own section outranks [global], so a cert left in
-			// one would keep pip on the bundle it named.
-			for _, other := range sectionsSetting(body, "cert", *kind.rules) {
-				if other != header {
-					body = setSection(body, other, set, *kind.rules, false)
+		// edit is the plan's file with the CA setting in it, merged into old
+		// when the host holds a file there.
+		edit := func(target string, old, planned []byte, existed bool) ([]byte, error) {
+			body := splitBody(planned)
+			if existed {
+				// planned holds the plan's file and nothing of the host's but
+				// a credential; the host's file is what the settings join.
+				body = mergeSettings(splitBody(old), body, *kind.rules)
+			}
+			// A setting in a section leads it, so it reads beside the header
+			// that scopes it; npm's file has no sections, and it ends the
+			// file.
+			set := []string{line(caPath)}
+			body = setSection(body, header, set, *kind.rules, header != "")
+			if rec.System == manifest.TypePypi {
+				// A command's own section outranks [global], so a cert left
+				// in one would keep pip on the bundle it named.
+				for _, other := range sectionsSetting(body, "cert", *kind.rules) {
+					if other != header {
+						body = setSection(body, other, set, *kind.rules, false)
+					}
 				}
 			}
-		}
-		merged := joinBody(body)
-		if kind.holds != nil {
-			if err := kind.holds(merged, c.New); err != nil {
-				return CAInstall{}, refuse(err)
+			merged := joinBody(body)
+			if kind.holds != nil {
+				if err := kind.holds(merged, planned); err != nil {
+					return nil, refuse(target, err)
+				}
 			}
+			return merged, nil
 		}
-		in.Changes[i].New = merged
+		if in.Changes[i].New, err = edit(c.Target, c.Old, c.New, c.Existed); err != nil {
+			return CAInstall{}, err
+		}
+		// The file the environment has this client read ahead of the plan's
+		// takes the same edit, or the client never reads what was installed.
+		// It keeps its own credential: the one the plan carried over belongs
+		// to the file it came from.
+		if sel := h.selectedConfig(rec, c.Target, c.New); sel != "" && !slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sel }) {
+			old, err := os.ReadFile(sel)
+			if err != nil {
+				return CAInstall{}, fmt.Errorf("%s: read %s, which the environment has this client read ahead of %s: %w", rec.System, sel, c.Target, err)
+			}
+			planned := c.New
+			if kept := npmCredential(splitLines(string(planned))); rec.System == manifest.TypeNpm && len(kept) > 0 {
+				var lines []string
+				for _, l := range splitLines(string(planned)) {
+					if !slices.Contains(kept, l) {
+						lines = append(lines, l)
+					}
+				}
+				planned = joinBody(lines)
+			}
+			merged, err := edit(sel, old, planned, true)
+			if err != nil {
+				return CAInstall{}, err
+			}
+			also := rec
+			also.Path = sel
+			selected = append(selected, Change{Record: also, Target: sel, Old: old, Existed: true, New: merged})
+		}
 	}
 
 	if len(system) > 0 {
@@ -559,7 +666,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			in.Step = store.step
 		}
 	}
-	in.Changes = append(in.Changes, files...)
+	in.Changes = append(append(in.Changes, selected...), files...)
 	return in, nil
 }
 
