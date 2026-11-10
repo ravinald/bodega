@@ -288,11 +288,11 @@ func TestUsageDocDescribesHelmProvenance(t *testing.T) {
 // publisher statement, and says what the helm check does and does not stop;
 // docs/design.md names the .prov among the admission checks.
 func TestThreatModelDocDescribesHelmProvenance(t *testing.T) {
-	everywhere := docSpan(t, "threat-model.md", "- **A compromised maintainer account publishing outside CI, everywhere", "\n- **")
+	everywhere := docSpan(t, "threat-model.md", "### A compromised maintainer account publishing outside CI, everywhere", "\n### ")
 	if strings.Contains(everywhere, "helm") {
 		t.Errorf("the threat model still lists helm among the types with no verified publisher statement:\n%s", everywhere)
 	}
-	requireAll(t, "the threat model's helm item", docSpan(t, "threat-model.md", "- **Helm charts, past the keyring.**", "\n- **"),
+	requireAll(t, "the threat model's helm item", docSpan(t, "threat-model.md", "### Helm charts, past the keyring", "\n### "),
 		"did not configure records `invalid`", "drops its `.prov` records `unavailable`", "only `block`",
 		"only as good as how the operator", "served over OCI is not checked")
 	requireAll(t, "docs/design.md's admission checks", docParagraph(t, "design.md", "Every path runs the same admission checks"),

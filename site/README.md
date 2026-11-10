@@ -13,6 +13,21 @@
 
 The generator is its own Go module (`site/go.mod`), so its Markdown dependency stays out of bodega's `go.mod` and out of `go list ./...`.
 
+## Contents column
+
+Every doc page lists the whole contents in the left column, numbered serially. An entry for a page with headings opens to that page's `h2`s and, under each, its `h3`s, read from the rendered page, so a split usage section lists its own `###` headings as its first level. The current page's entry starts open; the others start closed and open on a click on the number or the chevron, with no script. The narrow-screen contents lists pages only.
+
+## Platform icons
+
+`static/icons.svg` is a sprite of [Simple Icons](https://simpleicons.org) 16.36.0 marks (CC0). The generator draws one before a word naming an operating system or package ecosystem under these rules:
+
+- Only the first plain-text mention of each mark in each section gets one, where a section is everything under one rendered `h2`, plus the intro above the first.
+- Code spans, code blocks, headings and link text never get one: code is a literal a reader pastes.
+- A table cell holding nothing but a term, plain or code, is a row label and always gets one. So do the coverage page's Type column and evidence entries.
+- A match must be a whole word: `apt-get`, `npm/lodash`, `go.mod` and `GitHub` do not match.
+
+The words and the mark each one draws are `iconTerms` in `main.go`. Words with an everyday meaning (`go`, `binary`, `ports`) are left out. Marks draw in brand colors, or in the text color under a color-vision palette or when the reader picks it under Icons. Black and low-contrast brands are mapped to the text color in `site.css`.
+
 ## Configuration
 
 Deployment settings live in `docs-internal/site-deploy.json`, which is not committed. It holds exactly these four keys:

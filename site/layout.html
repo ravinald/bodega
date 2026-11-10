@@ -9,9 +9,10 @@
 /* Applies the saved theme before the first paint, so a reader who chose dark
    or a color-vision palette never sees a flash of the default. */
 try {
-  var d = document.documentElement, m = localStorage.getItem("bodega-mode"), v = localStorage.getItem("bodega-vision");
+  var d = document.documentElement, m = localStorage.getItem("bodega-mode"), v = localStorage.getItem("bodega-vision"), i = localStorage.getItem("bodega-icons");
   if (m === "light" || m === "dark") d.dataset.mode = m;
   if (v === "protan" || v === "tritan") d.dataset.vision = v;
+  if (i === "brand" || i === "mono") d.dataset.icons = i;
 } catch (e) {}
 </script>
 <link rel="stylesheet" href="{{ .Site.Base }}site.css?v={{ .Site.CSSVersion }}">
@@ -32,6 +33,7 @@ try {
   <form class="prefs" hidden aria-label="Display preferences">
     <label>Theme <select name="mode"><option value="">Auto</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     <label>Color vision <select name="vision"><option value="">Standard</option><option value="protan">Protanopia &amp; deuteranopia</option><option value="tritan">Tritanopia</option></select></label>
+    <label>Icons <select name="icons"><option value="">Auto</option><option value="brand">Brand colors</option><option value="mono">Text color</option></select></label>
   </form>
 </header>
 <div class="frame">
@@ -41,7 +43,19 @@ try {
     <h2>{{ .Name }}</h2>
     <ol>
     {{- range .Entries }}
+    {{- if .Children }}
+      <li class="tree{{ if .Here }} here{{ end }}"><details{{ if .Here }} open{{ end }}><summary><span>{{ .Num }}</span><a href="{{ .Href }}"{{ if .Here }} aria-current="page"{{ end }}>{{ .Title }}</a></summary>
+        <ol class="sub">
+        {{- $href := .Href }}
+        {{- range .Children }}
+          <li><a href="{{ $href }}#{{ .ID }}">{{ .Title }}</a>
+          {{- if .Children }}<ol>{{ range .Children }}<li><a href="{{ $href }}#{{ .ID }}">{{ .Title }}</a></li>{{ end }}</ol>{{ end }}</li>
+        {{- end }}
+        </ol>
+      </details></li>
+    {{- else }}
       <li{{ if .Here }} class="here"{{ end }}><span>{{ .Num }}</span><a href="{{ .Href }}"{{ if .Here }} aria-current="page"{{ end }}>{{ .Title }}</a></li>
+    {{- end }}
     {{- end }}
     </ol>
   {{- end }}
@@ -78,7 +92,7 @@ try {
 (function () {
   var form = document.querySelector(".prefs"), d = document.documentElement;
   if (!form) return;
-  var keys = { mode: "bodega-mode", vision: "bodega-vision" };
+  var keys = { mode: "bodega-mode", vision: "bodega-vision", icons: "bodega-icons" };
   Object.keys(keys).forEach(function (name) {
     var select = form.elements[name];
     select.value = d.dataset[name] || "";
