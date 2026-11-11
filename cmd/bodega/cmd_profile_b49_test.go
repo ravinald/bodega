@@ -143,7 +143,7 @@ func TestPolicyListMarksARowItsGateCannotEvaluate(t *testing.T) {
 	ctx := context.Background()
 	// Written directly, the way a build predating the refusal would have.
 	if err := adb.SetAgePolicy(ctx, audit.AgePolicy{
-		Ecosystem: manifest.TypeApt, MinAgeSeconds: 604800, Action: "block",
+		Ecosystem: manifest.TypeHelm, MinAgeSeconds: 604800, Action: "block",
 	}); err != nil {
 		t.Fatalf("seed age policy: %v", err)
 	}

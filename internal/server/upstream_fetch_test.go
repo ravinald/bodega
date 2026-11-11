@@ -1,14 +1,17 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -338,5 +341,63 @@ func TestEncodedRateLimitIsStillARateLimit(t *testing.T) {
 		if limited.status != status || limited.retryAfter != "120" {
 			t.Errorf("status %d: got status %d Retry-After %q", status, limited.status, limited.retryAfter)
 		}
+	}
+}
+
+// An object is observed by the Read that hands over its last byte, whichever
+// way its reader reports the end, and never from a prefix or an overrun.
+func TestObservedInputObservesAtTheReadThatCompletesTheObject(t *testing.T) {
+	const body = "Packages body"
+	cut := errors.New("connection reset")
+	for _, tc := range []struct {
+		name    string
+		r       io.Reader
+		want    int64
+		observe bool
+	}{
+		{"last bytes and EOF together", iotest.DataErrReader(strings.NewReader(body)), int64(len(body)), true},
+		{"EOF on the read after the last bytes", strings.NewReader(body), int64(len(body)), true},
+		{"one byte at a time", iotest.OneByteReader(strings.NewReader(body)), int64(len(body)), true},
+		{"no declared length", strings.NewReader(body), -1, true},
+		{"shorter than declared", strings.NewReader(body), int64(len(body)) + 1, false},
+		{"longer than declared", strings.NewReader(body), int64(len(body)) - 1, false},
+		{"read error", io.MultiReader(strings.NewReader(body), iotest.ErrReader(cut)), -1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var observed []byte
+			calls := 0
+			obs := &inputObserver{observe: func(_ context.Context, raw []byte) {
+				calls++
+				observed = append([]byte(nil), raw...)
+			}}
+			in := obs.wrap(t.Context(), tc.r, tc.want)
+			var got []byte
+			p := make([]byte, 64)
+			for {
+				n, err := in.Read(p)
+				got = append(got, p[:n]...)
+				// A consumer writes these bytes before it reads again, and
+				// that write can block: a declared-length object has to be on
+				// record by the time its last byte is handed over.
+				if tc.observe && tc.want >= 0 && len(got) == len(body) && calls != 1 {
+					t.Fatalf("last byte returned with %d observer calls; want the object already observed", calls)
+				}
+				if err != nil {
+					break
+				}
+			}
+			if string(got) != body {
+				t.Errorf("consumer read %q; want the stream unchanged, %q", got, body)
+			}
+			if tc.observe && (calls != 1 || string(observed) != body) {
+				t.Errorf("observer calls = %d with %q; want one call with the whole object", calls, observed)
+			}
+			if !tc.observe && calls != 0 {
+				t.Errorf("observer called %d times with %q; want none for an incomplete or overrun object", calls, observed)
+			}
+			if err := in.drain(); (err == nil) != tc.observe {
+				t.Errorf("drain error = %v; want an error exactly when nothing was observed", err)
+			}
+		})
 	}
 }
