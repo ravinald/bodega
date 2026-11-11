@@ -297,12 +297,16 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 					"Nothing was written. Move the certificates %s holds into a file of your own named by cafile, or remove the key, then re-run", rec.System, f, key, key, key)
 			}
 		}
-		// The other files npm loads keep their own CA settings, which the
-		// check after the write reads beside the one written here.
-		for _, f := range loaded {
-			if slices.Contains(files, f) {
+		// The probe's own classifier over every file npm loads and every file
+		// this edit writes. A file the edit writes is not exempt: replacing a
+		// cafile line npm would not have read as written is still an edit to
+		// a construct this command detects and does not interpret.
+		seen := map[string]bool{}
+		for _, f := range append(slices.Clone(files), loaded...) {
+			if seen[f] {
 				continue
 			}
+			seen[f] = true
 			if unread := NpmUnread(f); unread != "" {
 				return fmt.Errorf("%s: npm reads %s, which this command detects and does not interpret, so whether npm would verify bodega's certificate with the CA written to %s cannot be told. "+
 					"Nothing was written. Leave that file one plain cafile naming a certificate file, or none, then re-run", rec.System, unread, target)
@@ -395,11 +399,10 @@ func systemStoreFor(h CAHost) (systemStore, error) {
 	return systemStore{}, fmt.Errorf("doctor installs into the system trust store on Debian and Ubuntu, the RHEL family and FreeBSD, and this host is none of them")
 }
 
-// holds reports whether the store the rebuild command last wrote under root
-// carries every certificate. An anchor file in place proves nothing on its
-// own: the command may have failed after the file was written.
-func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
-	have := map[[sha256.Size]byte]bool{}
+// roots reads every certificate in the files the rebuild command last wrote
+// under root, which are what the host's clients verify against.
+func (s systemStore) roots(root string) []*x509.Certificate {
+	var out []*x509.Certificate
 	for _, pattern := range s.live {
 		files, _ := filepath.Glob(filepath.Join(root, pattern))
 		for _, f := range files {
@@ -408,9 +411,22 @@ func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
 				continue
 			}
 			for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
-				have[sha256.Sum256(block.Bytes)] = true
+				if c, err := x509.ParseCertificate(block.Bytes); err == nil {
+					out = append(out, c)
+				}
 			}
 		}
+	}
+	return out
+}
+
+// holds reports whether the store the rebuild command last wrote under root
+// carries every certificate. An anchor file in place proves nothing on its
+// own: the command may have failed after the file was written.
+func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
+	have := map[[sha256.Size]byte]bool{}
+	for _, c := range s.roots(root) {
+		have[sha256.Sum256(c.Raw)] = true
 	}
 	for _, c := range certs {
 		if !have[sha256.Sum256(c.Raw)] {
@@ -418,6 +434,19 @@ func (s systemStore) holds(root string, certs []*x509.Certificate) bool {
 		}
 	}
 	return true
+}
+
+// SystemRoots reads the operating system's trust store from the files its
+// rebuild command writes, as they stand now. A process that loaded the store
+// before a rebuild keeps the roots it loaded, so a verdict owed after one is
+// reached against these. It errs on a host whose store doctor does not
+// install into.
+func SystemRoots(h CAHost) ([]*x509.Certificate, error) {
+	store, err := systemStoreFor(h)
+	if err != nil {
+		return nil, err
+	}
+	return store.roots(h.Root), nil
 }
 
 // JVMStore is the keystore a JVM reads its trust anchors from, and the
@@ -1090,14 +1119,18 @@ type lineScan struct {
 	// keyIndent is the indentation of the setting a deeper line continues,
 	// -1 under a header before its first setting.
 	keyIndent int
-	slash     bool
+	open      lineOpen
 }
 
-// continues reports whether l continues the line above it.
+// continues reports whether l continues the line above it. Whether l in turn
+// runs on is the format's own lexer's call, made on the line's tokens: the
+// last character of a physical line says nothing where it sits in a comment.
 func (s *lineScan) continues(l string) bool {
 	t := strings.TrimSpace(l)
-	cont := s.slash || s.rules.indent && s.keyIndent >= 0 && t != "" && indentOf(l) > s.keyIndent
-	s.slash = s.rules.backslash && strings.HasSuffix(t, `\`)
+	cont := s.open.on || s.rules.indent && s.keyIndent >= 0 && t != "" && indentOf(l) > s.keyIndent
+	if s.rules.runsOn != nil {
+		s.open = s.rules.runsOn(l, s.open)
+	}
 	return cont
 }
 

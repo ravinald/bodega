@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 )
@@ -390,12 +391,14 @@ func checkNpmConfig(root, goos, home string) Finding {
 }
 
 // rubyTools is what the rubygems check reads from the host, so a test can
-// stand in for gem and for the environment Bundler resolves its config from.
+// stand in for which tools are on PATH, the root the system gemrc sits
+// under, and the environment gem and Bundler resolve their config from.
 type rubyTools struct {
-	lookPath   func(string) (string, error)
-	gemSources func(gem string) (string, error)
-	getenv     func(string) string
-	home       string
+	lookPath func(string) (string, error)
+	getenv   func(string) string
+	home     string
+	root     string
+	goos     string
 }
 
 // CheckRubygems reports whether gem or Bundler still fetch from
@@ -403,24 +406,110 @@ type rubyTools struct {
 // would describe a client nobody runs.
 func CheckRubygems() (f Finding, ok bool) {
 	home, _ := os.UserHomeDir()
-	return checkRubygems(rubyTools{lookPath: exec.LookPath, gemSources: runGemSources, getenv: os.Getenv, home: home})
+	return checkRubygems(rubyTools{lookPath: exec.LookPath, getenv: os.Getenv, home: home, goos: runtime.GOOS})
 }
 
-// runGemSources asks gem itself, because the list it uses merges the system
-// gemrc, ~/.gemrc (or its XDG location) and every file $GEMRC names, and
-// falls back to rubygems.org when none of them sets :sources:.
-func runGemSources(gem string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, gem, "sources", "--list").Output()
-	if err != nil {
-		return "", fmt.Errorf("%s sources --list: %w", gem, err)
+// gemrcLayer is one configuration file gem merges, and whether it is the
+// system-wide one.
+type gemrcLayer struct {
+	path   string
+	system bool
+}
+
+// gemrcLayers lists the files gem merges its configuration from, in the
+// order it merges them. The report's source list and the trust probe's
+// endpoint discovery both read this one list.
+func gemrcLayers(root, goos, home string, getenv func(string) string) []gemrcLayer {
+	layers := []gemrcLayer{{filepath.Join(root, "/etc/gemrc"), true}}
+	if goos == clientconf.OSFreeBSD {
+		layers = append(layers, gemrcLayer{filepath.Join(root, "/usr/local/etc/gemrc"), true})
 	}
-	return string(out), nil
+	if home != "" {
+		user := filepath.Join(home, ".gemrc")
+		if _, err := os.Stat(user); errors.Is(err, fs.ErrNotExist) {
+			xdg := getenv("XDG_CONFIG_HOME")
+			if xdg == "" {
+				xdg = filepath.Join(home, ".config")
+			}
+			user = filepath.Join(xdg, "gem", "gemrc")
+		}
+		layers = append(layers, gemrcLayer{user, false})
+	}
+	for _, f := range filepath.SplitList(getenv("GEMRC")) {
+		layers = append(layers, gemrcLayer{f, false})
+	}
+	return layers
+}
+
+// gemSourceList is the source list gem's configuration files give it.
+type gemSourceList struct {
+	// sources is the list and from the file setting it, "" when no file
+	// does and gem falls back to its default, https://rubygems.org/.
+	sources []string
+	from    string
+	// unread says why the list cannot be told from the files, "" when it can.
+	unread string
+}
+
+// gemSources resolves gem's source list from its configuration files, never
+// from gem: a binary found on PATH is not a witness to where it connects.
+// It ports Gem::ConfigFile (RubyGems 3.6): the system gemrc, then the user's
+// (~/.gemrc, or gem/gemrc under the XDG config home when that file is
+// absent), then each file $GEMRC lists, are merged key by key, so the last
+// file holding :sources: replaces the list outright.
+//
+// Which system gemrc a Ruby reads is compiled into it (Etc.sysconfdir), so a
+// list only a system file sets is reported unread unless it names
+// rubygems.org, where the warning stands either way. The defaults a
+// distribution patches into rubygems/defaults/operating_system.rb are Ruby
+// code and are not read.
+func gemSources(t rubyTools) gemSourceList {
+	layers := gemrcLayers(t.root, t.goos, t.home, t.getenv)
+	var out gemSourceList
+	system := false
+	for _, l := range layers {
+		data, err := os.ReadFile(l.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return gemSourceList{unread: fmt.Sprintf("%s could not be read (%v)", l.path, err)}
+		}
+		var doc yaml.Node
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			return gemSourceList{unread: fmt.Sprintf("%s does not parse as YAML (%v)", l.path, err)}
+		}
+		if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+			continue
+		}
+		pairs := doc.Content[0].Content
+		for i := 0; i+1 < len(pairs); i += 2 {
+			key, val := pairs[i], pairs[i+1]
+			if key.Value != ":sources" {
+				continue
+			}
+			// Only the plain scalar is the symbol gem looks up.
+			if key.Style&(yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle) != 0 || val.Kind != yaml.SequenceNode {
+				return gemSourceList{unread: fmt.Sprintf("%s sets :sources: in a form other than a plain key over a list", l.path)}
+			}
+			var list []string
+			for _, item := range val.Content {
+				if item.Kind != yaml.ScalarNode {
+					return gemSourceList{unread: fmt.Sprintf("%s lists a source under :sources: that is not a URL", l.path)}
+				}
+				list = append(list, item.Value)
+			}
+			out, system = gemSourceList{sources: list, from: l.path}, l.system
+		}
+	}
+	if system && !slices.ContainsFunc(out.sources, isRubygemsOrg) {
+		return gemSourceList{unread: fmt.Sprintf("only %s sets :sources:, and which system gemrc a Ruby reads is compiled into it; set the list in ~/.gemrc, which every gem reads", out.from)}
+	}
+	return out
 }
 
 func checkRubygems(t rubyTools) (Finding, bool) {
-	gem, gemErr := t.lookPath("gem")
+	_, gemErr := t.lookPath("gem")
 	_, bundleErr := t.lookPath("bundle")
 	if gemErr != nil && bundleErr != nil {
 		return Finding{}, false
@@ -428,11 +517,15 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 	f := Finding{Check: "rubygems"}
 	var found, unread, clean []string
 	if gemErr == nil {
-		switch out, err := t.gemSources(gem); {
-		case err != nil:
-			unread = append(unread, "gem's sources could not be listed: "+err.Error())
-		case rubygemsOrgSource(out) != "":
-			found = append(found, "gem sources lists "+rubygemsOrgSource(out))
+		list := gemSources(t)
+		at := slices.IndexFunc(list.sources, isRubygemsOrg)
+		switch {
+		case list.unread != "":
+			unread = append(unread, "gem's sources could not be told from its configuration files: "+list.unread)
+		case list.from == "":
+			found = append(found, "no gemrc sets :sources:, so gem uses its default, https://rubygems.org/")
+		case at >= 0:
+			found = append(found, "gem sources lists "+list.sources[at]+" (in "+list.from+")")
 		default:
 			clean = append(clean, "gem sources")
 		}
@@ -463,17 +556,6 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 		f.Detail = strings.Join(clean, " and ") + " name no rubygems.org"
 	}
 	return f, true
-}
-
-// rubygemsOrgSource is the first source `gem sources --list` prints on
-// rubygems.org, or "". The list is one URL per line under a banner.
-func rubygemsOrgSource(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		if src := strings.TrimSpace(line); isRubygemsOrg(src) {
-			return src
-		}
-	}
-	return ""
 }
 
 func isRubygemsOrg(raw string) bool {

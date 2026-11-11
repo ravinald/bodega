@@ -27,8 +27,125 @@ type lineRules struct {
 	// that key's value, as Python's ConfigParser and dnf read one. A line at
 	// the key's own indentation is the next key.
 	indent bool
-	// backslash says a line ending in a backslash runs on into the next.
-	backslash bool
+	// runsOn lexes one physical line the way the format's own reader does
+	// and reports whether its value runs on into the next line. open is the
+	// state the line above left: a line reached with it set is the tail of
+	// that line's value, never a setting or a comment of its own. Nil is a
+	// format with no such continuation.
+	runsOn func(line string, open lineOpen) lineOpen
+}
+
+// lineOpen is what a line left open for the one under it: a value running on,
+// and the quote it was inside, 0 for none.
+type lineOpen struct {
+	on    bool
+	quote byte
+}
+
+// oddSlashRunsOn is continuation as make and systemd's environment.d read
+// it: a line ending in an odd number of backslashes joins the next, and a
+// comment is no exception, since both readers join lines before they look
+// for one.
+func oddSlashRunsOn(line string, _ lineOpen) lineOpen {
+	line = strings.TrimSuffix(line, "\r")
+	n := len(line) - len(strings.TrimRight(line, `\`))
+	return lineOpen{on: n%2 == 1}
+}
+
+// shRunsOn is continuation as sh reads a profile script: a backslash before
+// the newline joins the next line outside single quotes, an open quote
+// carries the newline into its string, and a comment, which a # opening a
+// word starts, runs to the end of its line and joins nothing.
+func shRunsOn(line string, open lineOpen) lineOpen {
+	line = strings.TrimSuffix(line, "\r")
+	quote, word := open.quote, open.on && open.quote == 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote == '\'':
+			if c == '\'' {
+				quote = 0
+			}
+		case c == '\\':
+			if i++; i >= len(line) {
+				return lineOpen{on: true, quote: quote}
+			}
+		case quote == '"':
+			if c == '"' {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '#' && !word:
+			return lineOpen{}
+		}
+		word = quote != 0 || c != ' ' && c != '\t' && c != ';' && c != '&' && c != '|' && c != '(' && c != ')'
+	}
+	return lineOpen{on: quote != 0, quote: quote}
+}
+
+// gitRunsOn is continuation as git's config reader takes it (parse_value in
+// config.c, git 2.47): only a value continues, on a backslash before the
+// newline, inside quotes or out. A comment, which a # or ; outside quotes
+// opens anywhere on a line, runs to the end of that line and continues
+// nothing, and neither does a section header or a name with no value.
+func gitRunsOn(line string, open lineOpen) lineOpen {
+	line = strings.TrimSuffix(line, "\r")
+	rest, quoted := line, open.quote != 0
+	if !open.on {
+		rest = strings.TrimLeft(rest, " \t")
+		for strings.HasPrefix(rest, "[") {
+			end := gitHeaderEnd(rest)
+			if end < 0 {
+				return lineOpen{}
+			}
+			rest = strings.TrimLeft(rest[end:], " \t")
+		}
+		i := 0
+		for i < len(rest) && (rest[i] == '-' || rest[i] >= '0' && rest[i] <= '9' || rest[i] >= 'a' && rest[i] <= 'z' || rest[i] >= 'A' && rest[i] <= 'Z') {
+			i++
+		}
+		rest = strings.TrimLeft(rest[i:], " \t")
+		if i == 0 || !strings.HasPrefix(rest, "=") {
+			return lineOpen{}
+		}
+		rest = rest[1:]
+	}
+	for i := 0; i < len(rest); i++ {
+		switch c := rest[i]; {
+		case c == '\\':
+			if i++; i >= len(rest) {
+				q := byte(0)
+				if quoted {
+					q = '"'
+				}
+				return lineOpen{on: true, quote: q}
+			}
+		case c == '"':
+			quoted = !quoted
+		case !quoted && (c == '#' || c == ';'):
+			return lineOpen{}
+		}
+	}
+	return lineOpen{}
+}
+
+// gitHeaderEnd is the offset past the ] closing the section header s opens
+// with, -1 when the line does not close it. A ] inside the quoted subsection
+// closes nothing.
+func gitHeaderEnd(s string) int {
+	quoted := false
+	for i := 1; i < len(s); i++ {
+		switch c := s[i]; {
+		case quoted && c == '\\':
+			i++
+		case c == '"':
+			quoted = !quoted
+		case !quoted && c == ']':
+			return i + 1
+		}
+	}
+	return -1
 }
 
 var (
@@ -49,9 +166,11 @@ var (
 		}
 		return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(t[:i])), "_", "-")
 	}}
-	dnfRules   = lineRules{key: settingKey, indent: true}
-	slashRules = lineRules{key: settingKey, backslash: true}
-	makeRules  = lineRules{backslash: true, key: func(line string) string {
+	dnfRules  = lineRules{key: settingKey, indent: true}
+	gitRules  = lineRules{key: settingKey, runsOn: gitRunsOn}
+	shRules   = lineRules{key: settingKey, runsOn: shRunsOn}
+	envdRules = lineRules{key: settingKey, runsOn: oddSlashRunsOn}
+	makeRules = lineRules{runsOn: oddSlashRunsOn, key: func(line string) string {
 		if m := makeAssignment.FindStringSubmatch(line); m != nil {
 			return m[1]
 		}
@@ -187,16 +306,19 @@ func kindOf(rec PlanRecord) fileKind {
 		return fileKind{rules: &plainRules, unread: strayHeader(plainRules)}
 	case manifest.TypeNpm:
 		// An npmrc takes no continuation, under whatever name the
-		// environment gives it; the environment files NodeMirror writes take
-		// a backslash.
-		if rec.Path == NodeMirrorSystemPath || rec.Path == NodeMirrorUserPath {
-			return fileKind{rules: &slashRules}
+		// environment gives it; the two files NodeMirror writes each continue
+		// a line as their own reader does, sh and systemd.
+		switch rec.Path {
+		case NodeMirrorSystemPath:
+			return fileKind{rules: &shRules}
+		case NodeMirrorUserPath:
+			return fileKind{rules: &envdRules}
 		}
 		return fileKind{rules: &npmRules, unread: strayHeader(npmRules)}
 	case manifest.TypePypi:
 		return fileKind{rules: &pipRules, unread: strayHeader(pipRules)}
 	case manifest.TypeGit:
-		return fileKind{rules: &slashRules, unread: gitUnread}
+		return fileKind{rules: &gitRules, unread: gitUnread}
 	case manifest.TypeRpm:
 		if strings.HasSuffix(name, ".repo") {
 			return fileKind{rules: &dnfRules, unread: strayHeader(dnfRules)}

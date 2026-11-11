@@ -1518,12 +1518,22 @@ func TestReviewDoctorRetriesFailedTrustRebuild(t *testing.T) {
 	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
 	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
 	attempts := 0
+	// A rebuild that succeeds leaves the anchor in the bundle clients open,
+	// which is what the verdict after it is reached against.
 	doctorRun = func(string, ...string) error {
 		attempts++
 		if attempts == 1 {
 			return errors.New("temporary trust rebuild failure")
 		}
-		return nil
+		data, err := os.ReadFile(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt"))
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0o644)
 	}
 	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
 	args := []string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL, "--apply"}
@@ -2139,6 +2149,41 @@ func TestNpmCALayersVerifyAsNpmDoes(t *testing.T) {
 			}
 			if !tc.trusted && (strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Remediation, "--ca-file")) {
 				t.Errorf("an empty CA list is a refusal with the --ca-file remedy, not an unchecked row: %+v", f)
+			}
+		})
+	}
+}
+
+func TestAudit10SystemInstallStillVerifiesServedChain(t *testing.T) {
+	srv, _, _ := caPlanServer(t)
+	prev := doctorTrustProbe
+	t.Cleanup(func() { doctorTrustProbe = prev })
+	for _, name := range []string{"wrong-host"} {
+		t.Run(name, func(t *testing.T) {
+			base := "https://wrong.example:443"
+			doctorTrustProbe = func() host.TrustProbe {
+				return host.TrustProbe{GOOS: clientconf.OSLinux,
+					Getenv: func(k string) string {
+						if k == "GOPROXY" {
+							return base + "/go/"
+						}
+						return ""
+					},
+					Chain: func(string) ([]*x509.Certificate, error) { return []*x509.Certificate{srv.Certificate()}, nil },
+					System: func(chain []*x509.Certificate, host string) error {
+						pool := x509.NewCertPool()
+						pool.AddCert(srv.Certificate())
+						_, err := chain[0].Verify(x509.VerifyOptions{Roots: pool, DNSName: host})
+						return err
+					},
+				}
+			}
+			control, err := doctorTrustProbe().Judge([]string{"goproxy-env"}, base)
+			if err != nil || len(control) != 1 || control[0].State != host.TrustFailed {
+				t.Fatalf("control = %+v, %v", control, err)
+			}
+			if err := unreadCA([]string{"goproxy-env"}, []string{manifest.TypeGomod}, base); err == nil {
+				t.Fatalf("post-apply accepted %s after the same probe rejected it: %+v", name, control)
 			}
 		})
 	}

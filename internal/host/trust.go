@@ -240,7 +240,11 @@ var trustRows = map[string]trustRow{
 	}),
 	// gem adds ssl_ca_cert to OpenSSL's default paths; it replaces nothing.
 	"rubygems": systemOnly(manifest.TypeRubygems, func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(t.Home, ".gemrc"), filepath.Join(t.Home, ".bundle", "config"))
+		files := []string{filepath.Join(t.Home, ".bundle", "config")}
+		for _, l := range gemrcLayers(t.Root, t.GOOS, t.Home, t.env) {
+			files = append(files, l.path)
+		}
+		return mention(host, files...) || slices.ContainsFunc(bundlerMirrorKeys, func(k string) bool { return strings.Contains(t.env(k), host) })
 	}, func(t TrustProbe) *trustStore {
 		if v, f := firstMatch(gemCACert, filepath.Join(t.Home, ".gemrc")); v != "" {
 			return named(v, "ssl_ca_cert in "+f, false)
@@ -1162,7 +1166,7 @@ func (s *served) get() error {
 		dial = dialChain
 	}
 	if system == nil {
-		system = func(chain []*x509.Certificate, name string) error { return verifyChain(chain, name, nil) }
+		system = VerifySystem
 	}
 	if s.chain, s.err = dial(hostport); s.err == nil && len(s.chain) == 0 {
 		s.err = errors.New("the server presented no certificate")
@@ -1346,6 +1350,23 @@ func verifyChain(chain []*x509.Certificate, dnsName string, roots *x509.CertPool
 	}
 	_, err := chain[0].Verify(x509.VerifyOptions{DNSName: dnsName, Roots: roots, Intermediates: inter})
 	return err
+}
+
+// VerifyServed verifies chain for dnsName against roots alone: the name, the
+// lifetime, the constraints and each signature, as a client holding those
+// roots would.
+func VerifyServed(chain []*x509.Certificate, dnsName string, roots []*x509.Certificate) error {
+	pool := x509.NewCertPool()
+	for _, c := range roots {
+		pool.AddCert(c)
+	}
+	return verifyChain(chain, dnsName, pool)
+}
+
+// VerifySystem verifies chain for dnsName against the operating system's
+// trust store as this process loaded it.
+func VerifySystem(chain []*x509.Certificate, dnsName string) error {
+	return verifyChain(chain, dnsName, nil)
 }
 
 // dialChain completes a TLS handshake with hostport and returns what it

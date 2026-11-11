@@ -1175,3 +1175,63 @@ func nativeNpm(t *testing.T) {
 		t.Skip("native npm is not installed")
 	}
 }
+
+func TestAudit10GitCommentCannotHideProbeOverride(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native git is required in CI")
+		}
+		t.Skip("native git is not installed")
+	}
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	target := filepath.Join(p.Home, ".gitconfig")
+	body := "[url \"" + base + "/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http \"" + base + "/\"]\n\tsslCAInfo = " + ca + "\n[http \"" + base + "/git/gh/\"]\n# corporate policy \\\n\tsslCAInfo = /missing/corporate.pem\n"
+	writeTrustFile(t, target, body)
+	out, err := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", base+"/git/gh/repo").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "/missing/corporate.pem" {
+		t.Fatalf("native git control: %q, %v", out, err)
+	}
+	f := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn {
+		t.Fatalf("native git selects a missing CA but doctor reports %+v", f)
+	}
+}
+
+func TestAudit10RubygemsReportNeverExecutesHostClient(t *testing.T) {
+	home, bin := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", bin)
+	marker := filepath.Join(home, "client-ran")
+	t.Setenv("F116_AUDIT_MARKER", marker)
+	script := "#!/bin/sh\nprintf ran > \"$F116_AUDIT_MARKER\"\nprintf '%s\\n' 'https://bodega.internal:8443/rubygems/'\n"
+	if err := os.WriteFile(filepath.Join(bin, "gem"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, ok := CheckRubygems()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("normal doctor's Rubygems discovery executed the host gem binary: row=%+v present=%v", f, ok)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+// A gem sent to bodega only by a file $GEMRC names still owes a trust
+// verdict: the probe finds the endpoint through the files the report's
+// source list is read from, not ~/.gemrc alone.
+func TestRubygemsTrustFollowsEveryGemrcLayer(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	p.Home = t.TempDir()
+	extra := filepath.Join(t.TempDir(), "gemrc")
+	writeTrustFile(t, extra, "---\n:sources:\n- "+base+"/rubygems/\n")
+	p.Getenv = func(k string) string {
+		if k == "GEMRC" {
+			return extra
+		}
+		return ""
+	}
+	f := p.Apply([]Finding{{Check: "rubygems", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") {
+		t.Fatalf("gem configured for bodega through GEMRC, system store refusing its chain: %+v; want WARN and --ca-file", f)
+	}
+}

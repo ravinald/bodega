@@ -226,11 +226,12 @@ func TestAllChecksRunCleanly(t *testing.T) {
 	}
 }
 
-// rubyFixture stands in for a host's gem and bundle: which are on PATH, what
-// `gem sources --list` prints, and the home Bundler's user config sits in.
-func rubyFixture(t *testing.T, tools []string, sources string, env map[string]string) rubyTools {
+// rubyFixture stands in for a host's gem and bundle: which are on PATH, the
+// ~/.gemrc gem reads its sources from ("" for none), and the home Bundler's
+// user config sits in.
+func rubyFixture(t *testing.T, tools []string, gemrc string, env map[string]string) rubyTools {
 	t.Helper()
-	return rubyTools{
+	r := rubyTools{
 		lookPath: func(name string) (string, error) {
 			for _, tool := range tools {
 				if tool == name {
@@ -239,13 +240,20 @@ func rubyFixture(t *testing.T, tools []string, sources string, env map[string]st
 			}
 			return "", exec.ErrNotFound
 		},
-		gemSources: func(string) (string, error) { return sources, nil },
-		getenv:     func(k string) string { return env[k] },
-		home:       t.TempDir(),
+		getenv: func(k string) string { return env[k] },
+		home:   t.TempDir(),
+		root:   t.TempDir(),
+		goos:   clientconf.OSLinux,
 	}
+	if gemrc != "" {
+		if err := os.WriteFile(filepath.Join(r.home, ".gemrc"), []byte(gemrc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return r
 }
 
-const bodegaGemSources = "*** CURRENT SOURCES ***\n\nhttps://bodega.internal/rubygems/\n"
+const bodegaGemSources = "---\n:sources:\n- https://bodega.internal/rubygems/\n"
 
 func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
 	if f, ok := checkRubygems(rubyFixture(t, nil, "", nil)); ok {
@@ -257,7 +265,6 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	both := []string{"gem", "bundle"}
 	configured := func(t *testing.T) rubyTools {
 		r := rubyFixture(t, both, bodegaGemSources, nil)
-		r.home = t.TempDir()
 		for _, c := range clientconf.Rubygems("https://bodega.internal") {
 			if c.Label != "Bundler mirror" {
 				continue
@@ -279,7 +286,9 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	}
 
 	r := configured(t)
-	r.gemSources = func(string) (string, error) { return "*** CURRENT SOURCES ***\n\nhttps://rubygems.org/\n", nil }
+	if err := os.WriteFile(filepath.Join(r.home, ".gemrc"), []byte("---\n:sources:\n- https://rubygems.org/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	f, _ = checkRubygems(r)
 	if f.Status != StatusWarn || !strings.Contains(f.Detail, "gem sources lists https://rubygems.org/") || !strings.Contains(f.Remediation, "--configure rubygems") {
 		t.Errorf("gem sources on rubygems.org = %+v, want a warning naming the source and --configure rubygems", f)
@@ -300,12 +309,71 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 		t.Errorf("BUNDLE_MIRROR__ALL on bodega = %+v, want OK", f)
 	}
 
-	r = rubyFixture(t, []string{"gem"}, "", nil)
-	r.gemSources = func(string) (string, error) { return "", errors.New("exit status 1") }
-	f, _ = checkRubygems(r)
-	if f.Status != StatusSkip || !strings.Contains(f.Detail, "exit status 1") {
-		t.Errorf("gem sources failing = %+v, want SKIPPED with the error", f)
+	f, _ = checkRubygems(rubyFixture(t, []string{"gem"}, ":sources: [unclosed\n", nil))
+	if f.Status != StatusSkip || !strings.Contains(f.Detail, "does not parse as YAML") {
+		t.Errorf("an unparseable gemrc = %+v, want SKIPPED naming the file", f)
 	}
+}
+
+// TestGemSourcesFollowsGemsConfigMerge holds the reader to the order gem
+// merges its files in: the last one setting :sources: replaces the list, a
+// file gem never reaches sets nothing, and a list only the system gemrc
+// holds is not taken as read.
+func TestGemSourcesFollowsGemsConfigMerge(t *testing.T) {
+	const bodega, public = "https://bodega.internal/rubygems/", "https://rubygems.org/"
+	rc := func(url string) string { return "---\n:sources:\n- " + url + "\n" }
+	write := func(t *testing.T, path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("no file leaves the default", func(t *testing.T) {
+		f, _ := checkRubygems(rubyFixture(t, []string{"gem"}, "", nil))
+		if f.Status != StatusWarn || !strings.Contains(f.Detail, "default, https://rubygems.org/") {
+			t.Errorf("no gemrc = %+v, want a warning naming gem's default", f)
+		}
+	})
+	t.Run("GEMRC outranks the user file", func(t *testing.T) {
+		extra := filepath.Join(t.TempDir(), "extra")
+		write(t, extra, rc(public))
+		r := rubyFixture(t, []string{"gem"}, rc(bodega), map[string]string{"GEMRC": extra})
+		if f, _ := checkRubygems(r); f.Status != StatusWarn || !strings.Contains(f.Detail, extra) {
+			t.Errorf("GEMRC naming rubygems.org = %+v, want a warning naming %s", f, extra)
+		}
+	})
+	t.Run("the XDG gemrc is read only without ~/.gemrc", func(t *testing.T) {
+		r := rubyFixture(t, []string{"gem"}, rc(bodega), nil)
+		write(t, filepath.Join(r.home, ".config", "gem", "gemrc"), rc(public))
+		if f, _ := checkRubygems(r); f.Status != StatusOK {
+			t.Errorf("~/.gemrc on bodega beside an XDG gemrc = %+v, want OK", f)
+		}
+		r = rubyFixture(t, []string{"gem"}, "", nil)
+		write(t, filepath.Join(r.home, ".config", "gem", "gemrc"), rc(bodega))
+		if f, _ := checkRubygems(r); f.Status != StatusOK {
+			t.Errorf("the XDG gemrc alone on bodega = %+v, want OK", f)
+		}
+	})
+	t.Run("a system gemrc alone is not taken as read", func(t *testing.T) {
+		r := rubyFixture(t, []string{"gem"}, "", nil)
+		write(t, filepath.Join(r.root, "etc", "gemrc"), rc(bodega))
+		if f, _ := checkRubygems(r); f.Status != StatusSkip || !strings.Contains(f.Detail, "compiled into it") {
+			t.Errorf("a system gemrc alone on bodega = %+v, want SKIPPED", f)
+		}
+		write(t, filepath.Join(r.root, "etc", "gemrc"), rc(public))
+		if f, _ := checkRubygems(r); f.Status != StatusWarn {
+			t.Errorf("a system gemrc on rubygems.org = %+v, want a warning", f)
+		}
+	})
+	t.Run("a quoted key is not the symbol", func(t *testing.T) {
+		f, _ := checkRubygems(rubyFixture(t, []string{"gem"}, "\":sources\":\n- "+bodega+"\n", nil))
+		if f.Status != StatusSkip {
+			t.Errorf("a quoted :sources key = %+v, want SKIPPED", f)
+		}
+	})
 }
 
 // mavenFixture stands in for a host's mvn and gradle: which are on PATH, and

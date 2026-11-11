@@ -1031,11 +1031,14 @@ func owedTrustChecks(records []clientconf.PlanRecord) []string {
 // nothing here.
 //
 // osStore names the systems whose anchors the plan put in the operating
-// system's trust store. For those the store counts as holding the CA, since
-// the plan checked the rebuilt store and the process's own copy predates the
-// rebuild. For every other system the plan left that store alone, so the
-// client is judged against what it reads today: the store as it stands and
-// the files the plan wrote for it.
+// system's trust store. This process loaded that store before the rebuild,
+// so where its own copy refuses the chain those systems are verified again
+// against the store's files as the rebuild left them. Either way the served
+// chain is verified in full for the plan's hostname: an install says which
+// roots exist, never that the certificate bodega serves is valid under them.
+// For every other system the plan left that store alone, so the client is
+// judged against what it reads today: the store as it stands and the files
+// the plan wrote for it.
 func unreadCA(owed, osStore []string, base string) error {
 	checks := host.TrustSystems()
 	var rebuilt, own []string
@@ -1051,7 +1054,21 @@ func unreadCA(owed, osStore []string, base string) error {
 	if err != nil {
 		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
 	}
-	probe.System = func([]*x509.Certificate, string) error { return nil }
+	loaded := probe.System
+	if loaded == nil {
+		loaded = host.VerifySystem
+	}
+	probe.System = func(chain []*x509.Certificate, name string) error {
+		err := loaded(chain, name)
+		if err == nil {
+			return nil
+		}
+		roots := doctorRebuiltRoots()
+		if len(roots) == 0 {
+			return err
+		}
+		return host.VerifyServed(chain, name, roots)
+	}
 	more, err := probe.Judge(rebuilt, base)
 	if err != nil {
 		return fmt.Errorf("the CA is written, and whether the clients it was installed for verify bodega's certificate could not be checked: %w. Re-run once bodega answers", err)
@@ -1094,6 +1111,14 @@ func unreadCA(owed, osStore []string, base string) error {
 		return nil
 	}
 	return fmt.Errorf("the CA is written, and %s", strings.Join(parts, "\nAlso, "))
+}
+
+// doctorRebuiltRoots reads the system trust store from the files its rebuild
+// command writes, nil on a host whose store doctor does not install into.
+var doctorRebuiltRoots = func() []*x509.Certificate {
+	osRelease, _ := os.ReadFile(doctorOSRelease)
+	roots, _ := clientconf.SystemRoots(clientconf.CAHost{Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease})
+	return roots
 }
 
 // doctorJVM resolves the trust store of the JVM Maven and Gradle run on and

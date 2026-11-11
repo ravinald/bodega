@@ -187,7 +187,7 @@ var gitSection = regexp.MustCompile(`^\[\s*([A-Za-z0-9-]+)(?:\s+"((?:[^"\\]|\\.)
 // reader does not follow: what it scopes is unknown, so neither an edit nor a
 // verdict can be built on the settings under it.
 func gitCAInfos(lines []string, file, home string) (out []GitCA, unread []string) {
-	scan := lineScan{rules: slashRules, keyIndent: -1}
+	scan := lineScan{rules: gitRules, keyIndent: -1}
 	var header, pattern string
 	inHTTP := false
 	for _, l := range lines {
@@ -206,7 +206,7 @@ func gitCAInfos(lines []string, file, home string) (out []GitCA, unread []string
 			}
 			continue
 		}
-		if !inHTTP || slashRules.key(l) != "sslcainfo" {
+		if !inHTTP || gitRules.key(l) != "sslcainfo" {
 			continue
 		}
 		_, raw, _ := strings.Cut(t, "=")
@@ -316,7 +316,7 @@ func GitIncludes(files []string) []string {
 		if err != nil {
 			continue
 		}
-		scan := lineScan{rules: slashRules, keyIndent: -1}
+		scan := lineScan{rules: gitRules, keyIndent: -1}
 		for _, l := range splitBody(data) {
 			if scan.continues(l) {
 				continue

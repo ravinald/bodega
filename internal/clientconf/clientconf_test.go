@@ -2618,3 +2618,153 @@ func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit10GitCommentCannotHideTrustOverride(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native git is required in CI")
+		}
+		t.Skip("native git is not installed")
+	}
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	old := "[http \"https://bodega.example.com/git/\"]\n# company policy \\\nsslCAInfo = /missing/company-ca.pem\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	remote := "https://bodega.example.com/git/gh/repo"
+	native := func() string {
+		cmd := exec.Command("git", "config", "--file", target, "--get-urlmatch", "http.sslCAInfo", remote)
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1"}
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := native(); got != "/missing/company-ca.pem" {
+		t.Fatalf("native control = %q", got)
+	}
+	file := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	in, err := AddCA(caPlan(t, home, file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err != nil {
+		if !strings.Contains(err.Error(), target) {
+			t.Fatalf("refusal omits target: %v", err)
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit10"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config/bodega/ca.pem")
+	if got := native(); got != want {
+		t.Fatalf("CA apply succeeded but native git still selects %q; want %q", got, want)
+	}
+}
+
+func TestAudit10NpmUncheckedInputRefusesInPrimaryFile(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range []string{"cafile=", "cafile[]=/missing/company.pem", "cafile=${CORP_CA}"} {
+		t.Run(option, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".npmrc")
+			old := "registry=" + testBase + "/npm/\n" + option + "\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if why := NpmUnread(target); why == "" {
+				t.Fatal("control: probe classifier did not mark the input unchecked")
+			}
+			_, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+			if err == nil || !strings.Contains(err.Error(), target) {
+				t.Fatalf("primary file has a documented unchecked construct %q, but AddCA = %v; want refusal naming %s", option, err, target)
+			}
+			if got, _ := os.ReadFile(target); string(got) != old {
+				t.Fatal("refusal changed the primary file")
+			}
+		})
+	}
+}
+
+// TestGitContinuationFollowsGitsLexer holds the one continuation decision the
+// editor, the classifier and the probe share to native git's, on the lines
+// that tell a value running on from a backslash that continues nothing.
+func TestGitContinuationFollowsGitsLexer(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native git is required in CI")
+		}
+		t.Skip("native git is not installed")
+	}
+	const base = "https://bodega.example.com/"
+	for name, body := range map[string]string{
+		"a # comment ending in a backslash":          "[http]\n# note \\\nsslCAInfo = /ca.pem\n",
+		"a ; comment ending in a backslash":          "[http]\n; note \\\nsslCAInfo = /ca.pem\n",
+		"a header comment ending in a backslash":     "[http] # note \\\nsslCAInfo = /ca.pem\n",
+		"a value comment ending in a backslash":      "[http]\nproxy = x # note \\\nsslCAInfo = /ca.pem\n",
+		"an escaped backslash ending a value":        "[http]\nproxy = \"x\\\\\"\nsslCAInfo = /ca.pem\n",
+		"a value running on":                         "[http]\nproxy = x \\\nsslCAInfo = /ca.pem\n",
+		"a quoted ; before the backslash":            "[http]\nproxy = \"x ; y\" \\\nsslCAInfo = /ca.pem\n",
+		"a quoted value running on past a ;":         "[http]\nproxy = \"x ; \\\nsslCAInfo = /ca.pem\"\n",
+		"a ] inside the subsection before a comment": "[http \"https://bodega.example.com/a]b/\"] # note \\\nsslCAInfo = /deep.pem\n[http]\nsslCAInfo = /ca.pem\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config")
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("git", "config", "--file", file, "--get-urlmatch", "http.sslCAInfo", base)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1"}
+			out, _ := cmd.Output()
+			want := strings.TrimSpace(string(out))
+			got := ""
+			if own, _ := GitCAInfo([]string{file}, base, ""); own != nil {
+				got = own.Value
+			}
+			if got != want {
+				t.Errorf("git reads http.sslCAInfo = %q, this package %q, from:\n%s", want, got, body)
+			}
+		})
+	}
+}
+
+// TestContinuationIsEachFormatsOwn holds each line format to its own reader:
+// sh ends a comment at the newline, where make and systemd's environment.d
+// join lines before they look for one.
+func TestContinuationIsEachFormatsOwn(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		rules lineRules
+		lines []string
+		want  []bool
+	}{
+		{"sh comment", shRules, []string{`# note \`, `export A=b`}, []bool{false, false}},
+		{"sh trailing comment", shRules, []string{`export A=b # note \`, `export C=d`}, []bool{false, false}},
+		{"sh value", shRules, []string{`export A=b\`, `c`, `export C=d`}, []bool{false, true, false}},
+		{"sh # inside a word", shRules, []string{`export A=b#c\`, `d`}, []bool{false, true}},
+		{"sh single quotes keep a backslash", shRules, []string{`export A='b\'`, `export C=d`}, []bool{false, false}},
+		{"sh open quote", shRules, []string{`export A="b`, `# c"`, `export C=d`}, []bool{false, true, false}},
+		{"make comment", makeRules, []string{`# note \`, `A=b`, `C=d`}, []bool{false, true, false}},
+		{"make escaped backslash", makeRules, []string{`A=b\\`, `C=d`}, []bool{false, false}},
+		{"environment.d comment", envdRules, []string{`# note \`, `A=b`, `C=d`}, []bool{false, true, false}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			scan := lineScan{rules: c.rules, keyIndent: -1}
+			for i, l := range c.lines {
+				if got := scan.continues(l); got != c.want[i] {
+					t.Errorf("line %d %q: continues = %v, want %v", i+1, l, got, c.want[i])
+				}
+			}
+		})
+	}
+}
