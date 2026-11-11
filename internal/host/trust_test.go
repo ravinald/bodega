@@ -705,15 +705,26 @@ func TestTrustFollowsEachClientsOwnPrecedence(t *testing.T) {
 				"apt.conf.d/90ca.dpkg-dist": "Acquire::https::CAInfo \"" + ca + "\";\n",
 			})
 		}, StatusWarn},
-		{"npm ca[] after cafile replaces the file", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+		{"npm ca[] after cafile in one file is unchecked, not resolved", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
 			other, _ := trustFixture(t)
 			wrong := filepath.Join(p.Root, "other.pem")
 			writeTrustFile(t, wrong, string(other))
 			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+wrong+"\nca[]="+inline(t, ca)+"\n")
-		}, StatusOK},
-		{"npm cafile naming no file leaves the inline ca", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+		}, StatusWarn},
+		{"npm ca beside a cafile naming no file is unchecked", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
 			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\nca="+inline(t, ca)+"\ncafile=/missing/gone.pem\n")
+		}, StatusWarn},
+		{"npm inline ca in the global file under a per-user cafile", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			other, _ := trustFixture(t)
+			wrong := filepath.Join(p.Root, "other.pem")
+			writeTrustFile(t, wrong, string(other))
+			writeTrustFile(t, filepath.Join(p.Root, "etc/npmrc"), "ca="+inline(t, wrong)+"\n")
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile=\""+ca+"\"\n")
 		}, StatusOK},
+		{"npm cafile through a ${NAME} reference is unchecked", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile=${CA_DIR}/ca.pem\n")
+			p.System = func([]*x509.Certificate, string) error { return nil }
+		}, StatusWarn},
 		{"npm environment cafile outranks the selected userconfig", "npm-config", func(t *testing.T, p *TrustProbe, ca, base string) {
 			selected := filepath.Join(p.Root, "selected.npmrc")
 			writeTrustFile(t, selected, "registry="+base+"/npm/\ncafile="+ca+"\n")
@@ -979,5 +990,60 @@ func TestAudit6GitIncludeProbe(t *testing.T) {
 	f := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
 	if f.Status != StatusWarn || (!strings.Contains(f.Detail, "/missing/corporate.pem") && !strings.Contains(strings.ToLower(f.Detail), "include")) || !strings.Contains(f.Remediation, "--ca-file") {
 		t.Fatalf("native git selects the included missing CA; probe returned %+v", f)
+	}
+}
+
+func TestAudit7NpmInlinePolicyMustBeUnchecked(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	raw, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(p.Root, p.Home, ".npmrc")
+	writeTrustFile(t, config, "registry="+base+"/npm/\ncafile="+ca+"\nca[]=\""+strings.ReplaceAll(strings.TrimSpace(string(raw)), "\n", `\n`)+"\"\n")
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, config) || !strings.Contains(f.Detail, "ca[]") || !strings.Contains(f.Remediation, "--ca-file") {
+		t.Fatalf("operator requires an unchecked warning naming ca[] and its file; got %+v", f)
+	}
+}
+
+func TestAudit7NpmCAFileCommentCannotRestoreDefaultRoots(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	p, ca, base := reviewTrust(t)
+	good, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "corporate.pem")
+	writeTrustFile(t, wrong, string(other))
+	p.Getenv = func(key string) string {
+		if key == "NODE_EXTRA_CA_CERTS" {
+			return ca
+		}
+		return ""
+	}
+	p.Node = func() (NodeRoots, error) { return NodeRoots{PEM: []string{string(good)}, Effective: true}, nil }
+	home := filepath.Join(p.Root, p.Home)
+	config := filepath.Join(home, ".npmrc")
+	writeTrustFile(t, config, "registry="+base+"/npm/\ncafile="+wrong+" # corporate bundle\n")
+	cmd := exec.Command("npm", "config", "get", "cafile", "--userconfig", config, "--globalconfig", filepath.Join(p.Root, "global.npmrc"))
+	cmd.Dir = home
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if !strings.HasPrefix(strings.ToLower(key), "npm_config_") && key != "HOME" && key != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != wrong {
+		t.Fatalf("native npm cafile = %q, %v; want %s", out, err, wrong)
+	}
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") || (!strings.Contains(f.Detail, wrong) && !strings.Contains(f.Detail, "unchecked")) {
+		t.Fatalf("native npm replaces default roots with %s; probe returned %+v", wrong, f)
 	}
 }

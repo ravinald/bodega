@@ -284,17 +284,27 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 					"Nothing was written. Move the certificates %s holds into a file of your own named by cafile, or remove the key, then re-run", rec.System, f, key, key, key)
 			}
 		}
+		// The other files npm loads keep their own CA settings, which the
+		// check after the write reads beside the one written here.
+		for _, f := range NpmConfigFiles(h.Getenv, h.GOOS, h.Home, h.Root) {
+			if slices.Contains(files, f) {
+				continue
+			}
+			if unread := NpmUnread(f); unread != "" {
+				return fmt.Errorf("%s: npm reads %s, which this command detects and does not interpret, so whether npm would verify bodega's certificate with the CA written to %s cannot be told. "+
+					"Nothing was written. Leave that file one plain cafile naming a certificate file, or none, then re-run", rec.System, unread, target)
+			}
+		}
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
 		}
 	case rec.System == manifest.TypeGit:
-		if unread := GitUnread(h.Getenv, nil); len(unread) > 0 {
-			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so whether git would apply the CA written to %s cannot be told. "+
-				"Unset the variable, then re-run", rec.System, unread[0], target)
-		}
-		if includes := GitIncludes(append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)); len(includes) > 0 {
-			return fmt.Errorf("%s: git takes configuration from %s, and this command does not open the files it names, so a setting there could outrank the CA written to %s unseen. "+
-				"Nothing was written. Move the included settings into the file itself or remove the include, then re-run", rec.System, includes[0], target)
+		// The probe's own classifier over the probe's own file set, with the
+		// file the plan edits beside it: a construct that leaves the verdict
+		// unchecked after the write is refused before it.
+		if unread := GitUnread(h.Getenv, append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)); len(unread) > 0 {
+			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so a setting there could outrank the CA written to %s unseen. "+
+				"Nothing was written. Unset the variable, move included settings into the file itself, or write the header as [name] or [name \"subsection\"] alone on its line and the value on one line, then re-run", rec.System, unread[0], target)
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")

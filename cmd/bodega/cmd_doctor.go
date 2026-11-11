@@ -810,7 +810,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	case changed == 0 && len(proPlan) == 0 && len(osPlan) == 0 && len(aptPlan) == 0 && dnfStep == nil && caStep == nil && len(caImports) == 0:
 		fmt.Println("\nNothing to change: every file already matches the plan.")
 		if ca != nil && req.apply {
-			return unreadCA(caOwed, caOSStore, client.BaseURL)
+			return unreadCA(caOwed, caOSStore, planBase(records, client.BaseURL))
 		}
 		return nil
 	case !req.apply && len(proPlan)+len(osPlan)+len(aptPlan)+len(caImports) > 0 || !req.apply && dnfStep != nil || !req.apply && caStep != nil:
@@ -875,7 +875,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	// remaining steps have run: they do not depend on it.
 	var unread error
 	if ca != nil {
-		unread = unreadCA(caOwed, caOSStore, client.BaseURL)
+		unread = unreadCA(caOwed, caOSStore, planBase(records, client.BaseURL))
 	}
 	for _, q := range []struct {
 		ledger stepRecord

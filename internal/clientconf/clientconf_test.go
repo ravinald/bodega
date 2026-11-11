@@ -1897,6 +1897,10 @@ func TestCARefusesWhatItDoesNotInterpret(t *testing.T) {
 		{"npm inline ca ahead of cafile", Npm(testBase, nil), map[string]string{"~/.npmrc": "ca=\ncafile=/old.pem\n"}, nil, []string{"sets ca,", ".npmrc"}},
 		{"npm ca[] in the file the environment selects", Npm(testBase, nil), map[string]string{"~/corp.npmrc": "ca[]=\"x\"\n"}, map[string]string{"NPM_CONFIG_USERCONFIG": "~/corp.npmrc"}, []string{"ca[]", "corp.npmrc"}},
 		{"npm inline ca from the environment", Npm(testBase, nil), nil, map[string]string{"npm_config_ca": "x"}, []string{"npm_config_ca"}},
+		{"git header carrying a setting in a file the plan does not edit", git, map[string]string{"~/.config/git/config": "[http] sslCAInfo = /corp.pem\n"}, nil, []string{"[http] sslCAInfo", ".config/git/config"}},
+		{"npm ca[] beside cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\nca[]=\"x\"\n"}, nil, []string{"ca[] beside cafile", "etc/npmrc"}},
+		{"npm cafile with a comment in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem # corporate\n"}, nil, []string{"cafile value", "etc/npmrc"}},
+		{"npm plain cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\n"}, nil, nil},
 		{"npm cafile from the environment", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "/etc/ssl/corp.pem"}, []string{"NPM_CONFIG_CAFILE", "/etc/ssl/corp.pem"}},
 		{"npm cafile from the environment naming the installed copy", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "~/.config/bodega/ca.pem"}, nil},
 	} {
@@ -1945,5 +1949,40 @@ func TestCARefusesWhatItDoesNotInterpret(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
 			t.Errorf("%s: the refusal left a CA copy behind: %v", tc.name, err)
 		}
+	}
+}
+
+func TestAudit7GitInlineIncludeInSelectedFileRefusesBeforeWrite(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	xdg := filepath.Join(home, ".config/git/config")
+	included := filepath.Join(home, "corporate.gitconfig")
+	if err := os.MkdirAll(filepath.Dir(xdg), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(included, []byte("[http \""+testBase+"/git/gh/\"]\nsslCAInfo = /missing/corporate.pem\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := "[include] path = " + included + "\n"
+	if err := os.WriteFile(xdg, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("git", "config", "--includes", "--file", xdg, "--get-urlmatch", "http.sslCAInfo", testBase+"/git/gh/repo").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "/missing/corporate.pem" {
+		t.Fatalf("native git fixture: %q, %v", out, err)
+	}
+	_, err = AddCA(caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "include") || !strings.Contains(err.Error(), xdg) {
+		t.Fatalf("selected %s imports native Git CA policy through %q; want a pre-write refusal naming it, got %v", xdg, strings.TrimSpace(old), err)
+	}
+	if got, _ := os.ReadFile(xdg); string(got) != old {
+		t.Fatal("refusal changed the selected file")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Fatalf("refusal wrote a CA: %v", err)
 	}
 }

@@ -699,37 +699,22 @@ type npmLayer struct {
 	ca     []string
 	caSet  bool
 	cafile string
-	// caLast says ca was first assigned after cafile, which is the order
-	// npm applies the two in.
-	caLast bool
 }
 
-// npmFiles lists the npmrc files npm loads, lowest priority first. An
-// environment variable naming the global or the per-user file replaces the
-// default path: npm then never opens the file it would have.
+// npmFiles lists the npmrc files npm loads, lowest priority first.
 func npmFiles(t TrustProbe) []string {
-	env := func(key string) string {
-		if v := t.env("npm_config_" + key); v != "" {
-			return v
-		}
-		return t.env("NPM_CONFIG_" + strings.ToUpper(key))
+	home := ""
+	if t.Home != "" {
+		home = t.home()
 	}
-	files := rooted(t.Root, npmPaths(t.GOOS, ""))
-	if v := env("globalconfig"); v != "" {
-		files = []string{v}
-	}
-	switch v := env("userconfig"); {
-	case v != "":
-		files = append(files, v)
-	case t.Home != "":
-		files = append(files, filepath.Join(t.home(), ".npmrc"))
-	}
-	return files
+	return clientconf.NpmConfigFiles(t.Getenv, t.GOOS, home, t.Root)
 }
 
 // npmFileLayer reads the top-level ca, ca[] and cafile of an npmrc as npm's
 // ini reader does: ca[] appends to a list, a plain ca replaces it, and a
-// quoted value is unescaped.
+// quoted value is unescaped. A file setting both ca and cafile, or a cafile
+// clientconf.NpmPlainValue does not take whole, never gets here: npmStores
+// leaves npm unchecked first.
 func npmFileLayer(path string) npmLayer {
 	l := npmLayer{from: path}
 	data, err := os.ReadFile(path)
@@ -743,7 +728,6 @@ func npmFileLayer(path string) npmLayer {
 		}
 		return v
 	}
-	fileSeen := false
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line[0] == '#' || line[0] == ';' {
@@ -755,11 +739,9 @@ func npmFileLayer(path string) npmLayer {
 		k, v, _ := strings.Cut(line, "=")
 		switch k = strings.TrimSpace(k); k {
 		case "cafile":
-			l.cafile, fileSeen = value(v), true
+			l.cafile, _ = clientconf.NpmPlainValue(v)
 		case "ca", "ca[]":
-			if !l.caSet {
-				l.caSet, l.caLast = true, fileSeen
-			}
+			l.caSet = true
 			if k == "ca" {
 				l.ca = nil
 			}
@@ -833,12 +815,15 @@ func npmRegistries(t TrustProbe, files []string) []string {
 // npmStores resolves the CAs npm verifies its registry against. npm keeps
 // one CA list: each source that sets ca replaces it, and each source whose
 // cafile names a file npm can read replaces it with that file's certificates,
-// applied from the lowest source to the highest and inside one source in the
-// order the two were first set. So a cafile after a ca[] in one npmrc drops
-// the inline certificates, a ca after a cafile drops the file, and a cafile
-// naming no readable file changes nothing. The sources are the global npmrc,
-// the per-user one and then the environment. A list from any of them replaces
-// Node's defaults, and NODE_EXTRA_CA_CERTS no longer adds to them.
+// applied from the lowest source to the highest; a cafile naming no readable
+// file changes nothing. The sources are the global npmrc, the per-user one
+// and then the environment. A list from any of them replaces Node's defaults,
+// and NODE_EXTRA_CA_CERTS no longer adds to them.
+//
+// One source setting both is not resolved here, since the order npm applies
+// the two in is the order that source set them, and neither is a cafile
+// value npm's reader would rewrite: either leaves npm unchecked, naming what
+// clientconf.NpmUnread found, which the install refuses for the same files.
 //
 // With none set npm verifies against Node's defaults: the Mozilla roots Node
 // bundles, or OpenSSL's store under --use-openssl-ca and in a Node built that
@@ -851,8 +836,14 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(npmRegistries(t, files), func(r string) bool { return sameHost(r, u) }) {
 		return nil
 	}
+	blind := func(what string) []trustStore {
+		return []trustStore{{name: "npm's configuration", blind: fmt.Sprintf("npm reads %s, which doctor detects and does not interpret, so which CA list npm verifies bodega against and whether it verifies bodega's certificate is unchecked", what)}}
+	}
 	var layers []npmLayer
 	for _, f := range files {
+		if unread := clientconf.NpmUnread(f); unread != "" {
+			return blind(unread)
+		}
 		layers = append(layers, npmFileLayer(f))
 	}
 	env := npmLayer{from: "the environment"}
@@ -866,19 +857,17 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 			env.ca, env.caSet = []string{strings.ReplaceAll(v, `\n`, "\n")}, true
 		}
 	}
+	if env.caSet && env.cafile != "" {
+		return blind("npm_config_ca beside npm_config_cafile in the environment, which replace npm's one CA list in an order the environment does not record")
+	}
 	var store *trustStore
 	for _, l := range append(layers, env) {
-		inline := func() {
-			switch {
-			case !l.caSet:
-			case len(l.ca) == 0:
-				store = nil
-			default:
-				store = &trustStore{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", l.from), pem: l.ca}
-			}
-		}
-		if !l.caLast {
-			inline()
+		switch {
+		case !l.caSet:
+		case len(l.ca) == 0:
+			store = nil
+		default:
+			store = &trustStore{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", l.from), pem: l.ca}
 		}
 		if file := l.cafile; file != "" {
 			if rest, ok := strings.CutPrefix(file, "~/"); ok {
@@ -887,9 +876,6 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 			if data, err := os.ReadFile(file); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 				store = &trustStore{name: fmt.Sprintf("%s, which npm's cafile setting names in %s in place of the roots Node bundles,", file, l.from), files: []string{file}}
 			}
-		}
-		if l.caLast {
-			inline()
 		}
 	}
 	if store != nil {

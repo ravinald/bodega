@@ -1840,3 +1840,66 @@ func TestDoctorFailsASelectedClientLeftUnverified(t *testing.T) {
 		t.Errorf("apply once npm reads the registry written = %v:\n%s", err, out)
 	}
 }
+
+func TestAudit7DoctorVerifiesTheAdvertisedEndpoint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_ca", "NPM_CONFIG_CA", "npm_config_cafile", "NPM_CONFIG_CAFILE"} {
+		t.Setenv(key, "")
+	}
+	stubRuntimes(t)
+	var content string
+	public := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, content) }))
+	t.Cleanup(public.Close)
+	content = clientconf.Npm(public.URL, nil).Content
+	sum := sha256.Sum256([]byte(content))
+	plan := clientconf.Plan{Records: []clientconf.PlanRecord{{System: manifest.TypeNpm, Action: clientconf.PlanInstall, Path: "~/.npmrc", URL: public.URL + "/client/npm", SHA256: hex.EncodeToString(sum[:])}}}
+	management := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(plan) }))
+	t.Cleanup(management.Close)
+	caFile := filepath.Join(home, "issuer.pem")
+	bundle := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: public.Certificate().Raw}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: management.Certificate().Raw})...)
+	if err := os.WriteFile(caFile, bundle, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prev := doctorTrustProbe
+	t.Cleanup(func() { doctorTrustProbe = prev })
+	doctorTrustProbe = func() host.TrustProbe {
+		return host.TrustProbe{Root: home, Home: home, GOOS: clientconf.OSLinux, Getenv: os.Getenv}
+	}
+	for i := 0; i < 2; i++ {
+		out, err := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", management.URL, "--apply")
+		if err != nil {
+			t.Errorf("apply %d: a client configured for public_url %s was judged against management URL %s: %v", i+1, public.URL, management.URL, err)
+		}
+		if i == 1 && !strings.Contains(out, "Nothing to change") {
+			t.Errorf("second apply rewrote files: %s", out)
+		}
+	}
+	verdicts, err := doctorTrustProbe().Judge([]string{"npm-config"}, public.URL)
+	if err != nil || len(verdicts) != 1 || verdicts[0].State != host.TrustVerified {
+		t.Fatalf("the installed configuration does not verify the advertised endpoint: %+v, %v", verdicts, err)
+	}
+}
+
+func TestAudit7CAInputTableNamesMavenDiscovery(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, table, ok := strings.Cut(string(data), "Doctor installs and verifies through the inputs below")
+	if !ok {
+		t.Fatal("no CA input boundary")
+	}
+	table, _, _ = strings.Cut(table, "An input outside this table")
+	var row string
+	for _, line := range strings.Split(table, "\n") {
+		if strings.HasPrefix(line, "| `maven`") {
+			row = line
+		}
+	}
+	for _, input := range []string{".m2/settings.xml", ".gradle/init.d/bodega.gradle", "GRADLE_USER_HOME"} {
+		if !strings.Contains(row, input) {
+			t.Errorf("CA input table omits Maven discovery input %s, which mavenStores reads", input)
+		}
+	}
+}

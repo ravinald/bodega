@@ -295,7 +295,7 @@ func GitUnread(getenv func(string) string, files []string) []string {
 			continue
 		}
 		if _, unread := gitCAInfos(splitBody(data), f, ""); len(unread) > 0 {
-			out = append(out, fmt.Sprintf("the section header %s in %s, written in a form other than [name] or [name \"subsection\"]", unread[0], f))
+			out = append(out, fmt.Sprintf("the line %s in %s, which opens a section in a form other than [name] or [name \"subsection\"] or carries a value on past the line", unread[0], f))
 		}
 	}
 	return append(out, GitIncludes(files)...)
@@ -349,6 +349,92 @@ func NpmInlineCA(path string) string {
 		if key = strings.TrimSpace(key); key == "ca" || key == "ca[]" {
 			return key
 		}
+	}
+	return ""
+}
+
+// NpmConfigFiles lists the npmrc files npm loads on this host, lowest
+// priority first: the global one under root and the per-user one in home,
+// each replaced by the file the environment names in its place, which npm
+// then reads instead. A project's own .npmrc is not listed.
+func NpmConfigFiles(getenv func(string) string, goos, home, root string) []string {
+	env := func(key string) string {
+		if getenv == nil {
+			return ""
+		}
+		if v := getenv("npm_config_" + key); v != "" {
+			return v
+		}
+		return getenv("NPM_CONFIG_" + strings.ToUpper(key))
+	}
+	files := []string{filepath.Join(root, "/etc/npmrc")}
+	if goos == OSFreeBSD {
+		files = append(files, filepath.Join(root, "/usr/local/etc/npmrc"))
+	}
+	if v := env("globalconfig"); v != "" {
+		files = []string{v}
+	}
+	switch v := env("userconfig"); {
+	case v != "":
+		files = append(files, v)
+	case home != "":
+		files = append(files, filepath.Join(home, ".npmrc"))
+	}
+	return files
+}
+
+// NpmPlainValue reads an npmrc value this package takes whole: bare, or
+// inside one pair of quotes. ok is false for a value npm's ini reader would
+// change on the way in, which this package does not reproduce: outside quotes
+// a # or ; opens a comment, a backslash escapes, and anywhere a ${NAME}
+// reference is replaced from the environment. A caller that read such a
+// value as written would name a file npm never opens.
+func NpmPlainValue(raw string) (value string, ok bool) {
+	v := strings.TrimSpace(raw)
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
+		return v, !strings.ContainsAny(v, "\\\"'") && !strings.Contains(v, "${")
+	}
+	return v, !strings.ContainsAny(v, "#;\\\"'") && !strings.Contains(v, "${")
+}
+
+// NpmUnread names what the npmrc at path holds that this package detects and
+// does not interpret, as a phrase a diagnostic can carry, "" when it holds
+// nothing of the kind or cannot be read: a ca or ca[] beside cafile, which
+// replace one CA list in the order the file sets them, and a cafile whose
+// value NpmPlainValue does not take whole. The install refuses a host with
+// one in any npmrc npm loads, and the probe leaves npm unchecked.
+func NpmUnread(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var inline string
+	cafile, plain := false, true
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		if line[0] == '[' && strings.HasSuffix(line, "]") {
+			break
+		}
+		key, raw, _ := strings.Cut(line, "=")
+		switch key = strings.TrimSpace(key); key {
+		case "ca", "ca[]":
+			if inline == "" {
+				inline = key
+			}
+		case "cafile":
+			cafile = true
+			_, plain = NpmPlainValue(raw)
+		}
+	}
+	switch {
+	case cafile && inline != "":
+		return fmt.Sprintf("%s beside cafile in %s, which replace npm's one CA list in the order the file sets them", inline, path)
+	case cafile && !plain:
+		return fmt.Sprintf("the cafile value in %s, written with a comment, a quote inside it, a backslash or a ${NAME} reference, which npm resolves before it opens the file", path)
 	}
 	return ""
 }
