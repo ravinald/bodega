@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -125,6 +126,13 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(rendered, [revision])
         self.assertTrue(uploads[0].endswith('.json'))
         self.assertTrue(uploads[1].endswith('.html'))
+
+    def test_coverage_archive_carries_every_path_the_generator_reads(self):
+        source = (deploy.SITE / 'main.go').read_text()
+        read = set(re.findall(r'read\(repo, "([^"]+)"\)', source))
+        self.assertIn('api/openapi.yaml', read)
+        missing = sorted(p for p in read if p.split('/')[0] not in deploy.RENDERED)
+        self.assertEqual(missing, [])
 
     def test_deployed_revision_refuses_a_manifest_without_a_full_commit(self):
         reply = subprocess.CompletedProcess([], 0, stdout=json.dumps({'sourceRevision': 'abc123'}))
