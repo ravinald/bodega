@@ -247,6 +247,10 @@ type Server struct {
 	// adding twenty entries would refetch the base's Packages twenty times
 	// from an archive that republishes it daily.
 	aptUpstreamIdx sync.Map
+	// aptReleaseRecorded holds, per codename, the identity of the last
+	// Release whose digests reached the audit database, so the readers
+	// sharing one Release do not rewrite its rows on every read.
+	aptReleaseRecorded sync.Map
 
 	// aptRoutes remembers which configured archive answered for each pool
 	// path, because a pool request carries no codename to resolve it by.
@@ -2416,8 +2420,23 @@ func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, s3Key strin
 	}
 
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, result.Body); err != nil {
+	obs := inputObserverFor(r.Context())
+	if obs == nil || result.ContentLength > maxUpstreamBody {
+		if _, err := io.Copy(w, result.Body); err != nil {
+			_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
+		}
+		return
+	}
+	want := result.ContentLength
+	if want <= 0 {
+		want = -1
+	}
+	in := obs.wrap(r.Context(), result.Body, want)
+	if _, err := io.Copy(w, in); err != nil {
 		_ = failBodyTransfer(r.Context(), fmt.Errorf("stream %s from storage: %w", s3Key, err))
+	}
+	if err := in.drain(); err != nil {
+		s.logFor(r.Context()).Warn("could not read a stored object to its end for its observer, so what bodega read goes unrecorded", "key", s3Key, "error", err)
 	}
 }
 
