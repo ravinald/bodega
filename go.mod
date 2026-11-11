@@ -23,6 +23,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/klauspost/compress v1.20.3
 	github.com/osquery/osquery-go v0.0.0-20260630173615-eb39ad3443df
+	github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0
 	github.com/ravinald/jsondiff v0.2.1
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1
 	github.com/sigstore/protobuf-specs v0.5.2
@@ -38,6 +39,7 @@ require (
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.61.1
+	software.sslmate.com/src/go-pkcs12 v0.5.0
 )
 
 require (

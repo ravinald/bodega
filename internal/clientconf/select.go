@@ -48,8 +48,9 @@ func (h PipHost) env(key string) string {
 // the null device pip loads no file at all.
 //
 // The prefix is VIRTUAL_ENV, else Prefix, else where the platform's packaged
-// Python lives; an interpreter installed anywhere else has a pip.conf beside
-// it that only asking pip finds.
+// Python lives. An interpreter installed anywhere else has a pip.conf beside
+// it that only running pip finds, which doctor does not do: that file is
+// outside the inputs it reads.
 func PipConfigFiles(h PipHost) (files []string, global int) {
 	explicit := h.env("PIP_CONFIG_FILE")
 	if explicit == os.DevNull {
@@ -480,6 +481,62 @@ func npmKey(line string) string {
 	return o.Key
 }
 
+// NpmCA is what the ca lines of one npmrc leave the option holding, which
+// npm tells three ways. A file that never assigns it leaves a lower file's
+// value standing. null, quoted or not, resets the option, so Node's default
+// roots are read again. Anything else is an explicit list that replaces
+// those roots, an empty string included: npm 11 types "ca=" as [""], a list
+// holding no certificate, and verifies against nothing.
+type NpmCA struct {
+	// Set says the file assigns ca. Set with a nil List is npm's null.
+	Set  bool
+	List []string
+	// Line and Why name the first line whose value this reader does not
+	// take, 0 and "" when it takes them all: a boolean, or a null inside a
+	// list, neither of which npm documents a meaning for.
+	Line int
+	Why  string
+}
+
+// NpmCAOf folds the ca and ca[] lines of opts the way npm/ini 6.0.0 builds
+// the value: a plain ca replaces what the file held, ca[] turns it into a
+// list and appends, and once it is a list a plain ca appends too. ini reads
+// the words true, false and null as JSON after unquoting, so "null" in
+// quotes is null as well.
+func NpmCAOf(opts []NpmOption) NpmCA {
+	var ca NpmCA
+	list := false
+	for _, o := range opts {
+		if o.Key != "ca" {
+			continue
+		}
+		null := !o.Bare && o.Value == "null"
+		why := ""
+		switch {
+		case o.Bare || o.Value == "true" || o.Value == "false":
+			why = "gives it a boolean, where npm takes certificates or null"
+		case null && (list || o.Array):
+			why = "puts null inside the list of certificates"
+		case o.Array && !list && ca.Set && ca.List == nil:
+			why = "makes a list of certificates out of an earlier null"
+		}
+		if why != "" && ca.Why == "" {
+			ca.Line, ca.Why = o.Line, why
+		}
+		list = list || o.Array
+		switch {
+		case list:
+			ca.List = append(ca.List, o.Value)
+		case null:
+			ca.List = nil
+		default:
+			ca.List = []string{o.Value}
+		}
+		ca.Set = true
+	}
+	return ca
+}
+
 func npmFileOptions(path string) []NpmOption {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -587,6 +644,8 @@ func NpmUnread(path string) string {
 			why = "gives it no value"
 		case o.Key == "cafile" && o.Array:
 			why = "writes it as a list, cafile[]"
+		case o.Key == "cafile" && o.Value == "":
+			why = "gives it an empty value, which npm refuses to start on"
 		case strings.Contains(o.Value, "${"):
 			why = "takes its value from a ${NAME} reference, which npm resolves from the environment"
 		}
@@ -603,6 +662,9 @@ func NpmUnread(path string) string {
 	}
 	if cafile && inline != "" {
 		return fmt.Sprintf("%s beside cafile in %s, which replace npm's one CA list in the order the file sets them", inline, path)
+	}
+	if ca := NpmCAOf(npmFileOptions(path)); ca.Why != "" {
+		return fmt.Sprintf("line %d of %s, which sets ca and %s", ca.Line, path, ca.Why)
 	}
 	return ""
 }

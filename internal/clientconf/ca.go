@@ -17,6 +17,9 @@ import (
 	"strings"
 	"time"
 
+	keystore "github.com/pavlo-v-chernykh/keystore-go/v4"
+	"software.sslmate.com/src/go-pkcs12"
+
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -428,6 +431,9 @@ type JVMStore struct {
 	Keystore string
 	// Password is javax.net.ssl.trustStorePassword, "" for the JDK's default.
 	Password string
+	// Cacerts is the cacerts file of that JDK, which doctor reads where
+	// keytool is handed -cacerts, "" when the JDK holds none.
+	Cacerts string
 }
 
 const jvmDefaultPassword = "changeit"
@@ -472,6 +478,15 @@ func ResolveJVMStore(getenv func(string) string, lookPath func(string) (string, 
 			}
 		}
 	}
+	if s.Keystore == "" {
+		for _, dir := range []string{"lib/security", "jre/lib/security"} {
+			cacerts := filepath.Join(home, dir, "cacerts")
+			if info, err := os.Stat(cacerts); err == nil && info.Mode().IsRegular() {
+				s.Cacerts = cacerts
+				break
+			}
+		}
+	}
 	return s, nil
 }
 
@@ -509,17 +524,81 @@ func (s JVMStore) ImportCommand(alias, file string) []string {
 	return append(s.command("-importcert", "-noprompt", "-trustcacerts"), "-alias", alias, "-file", file)
 }
 
-// Trusted lists the certificates the store holds, by running keytool.
+// Trusted lists the certificates the store holds, read from the keystore
+// file itself. keytool is never run to learn what the JVM trusts: it is a
+// program found on the host, started with whatever JAVA_TOOL_OPTIONS loads,
+// and a verdict on trust cannot rest on its answer.
 func (s JVMStore) Trusted() ([]*x509.Certificate, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := s.command("-list", "-rfc")
-	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w (%s). keytool lists a JDK's own cacerts from JDK 9 on, with the password %q unless -Djavax.net.ssl.trustStorePassword in MAVEN_OPTS names another",
-			RedactJVMCommand(cmd), err, jvmDiagnostic(out, cmd), jvmDefaultPassword)
+	path := s.Keystore
+	if path == "" {
+		path = s.Cacerts
 	}
-	return ParseKeytoolList(out), nil
+	if path == "" {
+		return nil, fmt.Errorf("the cacerts keystore of the JDK %s belongs to was not found under its lib/security; set JAVA_HOME to the JDK Maven and Gradle run on", s.keytool())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w. Run doctor as an account that can read the keystore", err)
+	}
+	pass := s.Password
+	if pass == "" {
+		pass = jvmDefaultPassword
+	}
+	certs, err := decodeKeystore(data, pass)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w. doctor reads a JKS or PKCS#12 trust store holding certificates only, with the password %q unless -Djavax.net.ssl.trustStorePassword in MAVEN_OPTS names another",
+			path, err, jvmDefaultPassword)
+	}
+	return certs, nil
+}
+
+// jksMagic opens a JKS keystore. Anything else is read as PKCS#12, the
+// JDK's default type since 9 and the form of its own cacerts since 18.
+var jksMagic = []byte{0xFE, 0xED, 0xFE, 0xED}
+
+// decodeKeystore lists the trust anchors a JVM takes from a keystore: each
+// trusted-certificate entry, and the leaf of each key entry's chain, which
+// JSSE trusts as well. A PKCS#12 store holding anything but trusted
+// certificates is an error, so nothing in a store is passed over unread.
+func decodeKeystore(data []byte, password string) ([]*x509.Certificate, error) {
+	if !bytes.HasPrefix(data, jksMagic) {
+		certs, err := pkcs12.DecodeTrustStore(data, password)
+		if err != nil {
+			// The JDK's own cacerts carries no MAC and no encryption, and
+			// the JVM opens it under any password.
+			if bare, bareErr := pkcs12.DecodeTrustStore(data, ""); bareErr == nil {
+				return bare, nil
+			}
+		}
+		return certs, err
+	}
+	ks := keystore.New()
+	if err := ks.Load(bytes.NewReader(data), []byte(password)); err != nil {
+		return nil, err
+	}
+	var certs []*x509.Certificate
+	for _, alias := range ks.Aliases() {
+		var der []byte
+		if ks.IsTrustedCertificateEntry(alias) {
+			entry, err := ks.GetTrustedCertificateEntry(alias)
+			if err != nil {
+				return nil, err
+			}
+			der = entry.Certificate.Content
+		} else {
+			chain, err := ks.GetPrivateKeyEntryCertificateChain(alias)
+			if err != nil || len(chain) == 0 {
+				continue
+			}
+			der = chain[0].Content
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, fmt.Errorf("entry %q holds a certificate that does not parse: %w", alias, err)
+		}
+		certs = append(certs, cert)
+	}
+	return certs, nil
 }
 
 // RunJVMCommand runs a keytool command and returns what it said when it
@@ -787,7 +866,18 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				"It holds a form this merge does not edit, such as a value spanning several lines or a table spelled another way; move the file aside and re-run to have it written whole", rec.System, target, err)
 		}
 		if line == nil {
-			if c.Existed && !c.Unchanged() {
+			switch {
+			case !c.Existed || c.Unchanged():
+			case kind.whole() && bytes.Equal(c.New, c.planned):
+				// No merger has kept this file's other lines: the plan's
+				// rendering is all c.New holds.
+				kept, err := keepWhole(c.Old, c.New)
+				if err != nil {
+					return CAInstall{}, fmt.Errorf("%s: %s is written whole and already exists: %w, so replacing it could delete what you added. "+
+						"Move the file aside and re-run to have it written whole, then add your own lines back", rec.System, c.Target, err)
+				}
+				in.Changes[i].New = kept
+			default:
 				merged, err := kind.merge(c.Old, c.New)
 				if err != nil {
 					return CAInstall{}, refuse(c.Target, err)

@@ -1,6 +1,8 @@
 package clientconf
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -230,6 +232,43 @@ func kindOf(rec PlanRecord) fileKind {
 		}
 	}
 	return fileKind{}
+}
+
+// whole reports a file no editor here reads: bodega renders it and writes it
+// whole.
+func (k fileKind) whole() bool { return k.rules == nil && k.block == nil && k.blocks == nil }
+
+// keepWhole is the merge for such a file when the host already holds one
+// that differs from planned. With no editor for the format, the only lines
+// known to be bodega's are planned's own, so the host's file is kept as it
+// stands when it holds planned intact, with whatever its owner wrote around
+// it, and is replaced when it is blank. Any other difference is an error for
+// the caller to refuse: it may be an older rendering or an edit, and writing
+// planned over it would delete lines nothing here can show bodega wrote.
+func keepWhole(old, planned []byte) ([]byte, error) {
+	switch {
+	case len(bytes.TrimSpace(old)) == 0:
+		return planned, nil
+	case holdsLines(old, bytes.TrimRight(planned, "\n")):
+		return old, nil
+	}
+	return nil, errors.New("it differs from the file bodega renders in lines this command cannot show are bodega's own")
+}
+
+// holdsLines reports whether block sits in data as a run of whole lines.
+func holdsLines(data, block []byte) bool {
+	for from := 0; ; {
+		at := bytes.Index(data[from:], block)
+		if at < 0 {
+			return false
+		}
+		at += from
+		end := at + len(block)
+		if (at == 0 || data[at-1] == '\n') && (end == len(data) || data[end] == '\n') {
+			return true
+		}
+		from = at + 1
+	}
 }
 
 // merge returns old with planned's settings in it, and an error when the

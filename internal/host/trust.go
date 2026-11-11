@@ -1,7 +1,6 @@
 package host
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -15,7 +14,6 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,13 +51,13 @@ type TrustProbe struct {
 	// trust store. Nil uses the store this process reads.
 	System func(chain []*x509.Certificate, dnsName string) error
 	// JVM names the trust store of the JVM Maven and Gradle run on and lists
-	// its certificates. Nil asks that JVM's keytool.
+	// its certificates. Nil reads that JVM's keystore file.
 	JVM func() (name string, certs []*x509.Certificate, err error)
 	// Node lists the CA certificates the host's Node trusts by default, and
 	// Pip names the bundle the host's pip reads when no setting names one:
-	// neither is a file doctor can find without asking. Nil is a host where
-	// the client cannot be asked, and the row then says what it left
-	// unchecked.
+	// neither is a file doctor can find, and doctor runs neither client to
+	// ask. Nil, or an error, is a default nothing answers for, and the row
+	// then says what it left unchecked.
 	Node func() (NodeRoots, error)
 	Pip  func() (PipDefault, error)
 }
@@ -106,14 +104,14 @@ type trustStore struct {
 	// setting carries inline.
 	files []string
 	pem   []string
-	// load names and lists a store only a command can read. It runs after
-	// bodega has answered, so a host with nothing to verify starts no command.
+	// load names and lists a keystore. It runs after bodega has answered, so
+	// a host with nothing to verify opens no keystore.
 	load func() (name string, certs []*x509.Certificate, err error)
 	// unsure is why the system store verifying does not settle this store:
 	// the client could not be asked whether it reads that store at all. The
 	// row then keeps its status and says so.
 	unsure string
-	// resolve replaces the store with the one a command names. Like load it
+	// resolve replaces the store with the client's default one. Like load it
 	// runs only once bodega has answered.
 	resolve func() trustStore
 	// blind is why nothing can be said about this store at all: the client
@@ -608,7 +606,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 				return system
 			}
 		}
-		system.unsure = fmt.Sprintf("pip could not say which bundle it reads (%s), and a pip before 24.2 reads certifi's, which the system trust store's answer says nothing about, so whether pip verifies bodega's certificate is unchecked", reason)
+		system.unsure = fmt.Sprintf("which bundle pip reads by default is not known (%s), and a pip before 24.2 reads certifi's, which the system trust store's answer says nothing about, so whether pip verifies bodega's certificate is unchecked while no cert setting names a bundle", reason)
 		return system
 	}}}
 }
@@ -694,8 +692,10 @@ func nodeCAFlags(t TrustProbe) (bundled, openssl, system bool) {
 // environment, says about CAs.
 type npmLayer struct {
 	from string
-	// ca is the inline list and caSet whether the source assigns one at all,
-	// since an empty assignment clears the list a lower source gave.
+	// ca is the inline list and caSet whether the source assigns one at all.
+	// Set with a nil list is npm's null, which clears the list a lower source
+	// gave; a list holding only an empty string is still a list, and replaces
+	// Node's defaults with no certificate.
 	ca     []string
 	caSet  bool
 	cafile string
@@ -711,30 +711,22 @@ func npmFiles(t TrustProbe) []string {
 }
 
 // npmFileLayer reads the top-level ca, ca[] and cafile of an npmrc through
-// clientconf.NpmOptions, the decoder the install reads the same file with.
-// A list keeps what it holds: ca[] appends, and so does a plain ca once the
-// file has written the list form, where a plain ca alone replaces. A file
-// clientconf.NpmUnread names never gets here: npmStores leaves npm unchecked
-// first.
+// clientconf.NpmOptions, the decoder the install reads the same file with,
+// and clientconf.NpmCAOf, which keeps an absent ca, a null one and an empty
+// one apart. A file clientconf.NpmUnread names never gets here: npmStores
+// leaves npm unchecked first.
 func npmFileLayer(path string) npmLayer {
 	l := npmLayer{from: path}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return l
 	}
-	list := false
-	for _, o := range clientconf.NpmOptions(data) {
-		switch o.Key {
-		case "cafile":
+	opts := clientconf.NpmOptions(data)
+	ca := clientconf.NpmCAOf(opts)
+	l.caSet, l.ca = ca.Set, ca.List
+	for _, o := range opts {
+		if o.Key == "cafile" {
 			l.cafile = o.Value
-		case "ca":
-			l.caSet = true
-			if list = list || o.Array; !list {
-				l.ca = nil
-			}
-			if o.Value != "" {
-				l.ca = append(l.ca, o.Value)
-			}
 		}
 	}
 	return l
@@ -788,7 +780,9 @@ func npmRegistries(t TrustProbe, files []string) []string {
 // one CA list: each source that sets ca replaces it, and each source whose
 // cafile names a file npm can read replaces it with that file's certificates,
 // applied from the lowest source to the highest; a cafile naming no readable
-// file changes nothing. The sources are the global npmrc, the per-user one
+// file changes nothing. A ca of null is the one assignment that restores the
+// defaults. An empty ca does not: npm hands Node a list holding no
+// certificate, which verifies nothing, so the row warns. The sources are the global npmrc, the per-user one
 // and then the environment. A list from any of them replaces Node's defaults,
 // and NODE_EXTRA_CA_CERTS no longer adds to them.
 //
@@ -847,7 +841,7 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	for _, l := range append(layers, env) {
 		switch {
 		case !l.caSet:
-		case len(l.ca) == 0:
+		case l.ca == nil:
 			store = nil
 		default:
 			store = &trustStore{name: fmt.Sprintf("npm's ca setting in %s, read in place of the roots Node bundles,", l.from), pem: l.ca}
@@ -894,7 +888,7 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 			return trustStore{name: systemStoreName + ", which Node reads beside the roots it bundles under --use-system-ca,", system: true, files: extra}
 		}
 		return trustStore{name: standIn, system: true, files: extra,
-			unsure: fmt.Sprintf("node could not list the CA certificates it trusts (%s), and a Node reads the roots it bundles unless it was built or told to read the system trust store, so whether npm verifies bodega's certificate is unchecked", reason)}
+			unsure: fmt.Sprintf("the CA certificates Node trusts by default are not known (%s), and a Node reads the roots it bundles unless it was built or told to read the system trust store, so whether npm verifies bodega's certificate is unchecked while no cafile setting, NODE_EXTRA_CA_CERTS or --use-system-ca in NODE_OPTIONS names what it reads", reason)}
 	}}}
 }
 
@@ -1378,102 +1372,17 @@ func TrustSystems() map[string]string {
 	return out
 }
 
-// nodeRootsScript prints what this Node trusts by default. getCACertificates
-// answers for the options and environment the process started with; a Node
-// that predates it can only list the roots it bundles.
-const nodeRootsScript = `const tls=require("tls");` +
-	`const o={openssl:!!process.config.variables.openssl_use_def_ca_store,effective:!!tls.getCACertificates};` +
-	`o.pem=o.effective?tls.getCACertificates("default"):tls.rootCertificates;` +
-	`process.stdout.write(JSON.stringify(o))`
-
-// AskNode asks the node on PATH, started in this process's environment as
-// npm would start it, which CA certificates it trusts by default.
+// AskNode and AskPip are the answers doctor has for a host's Node and pip
+// without running either: none. The roots a Node bundles and whether it was
+// built onto OpenSSL's store are compiled into its binary, and which bundle a
+// pip reads follows from its version and its interpreter. Starting node or
+// pip to ask would run a program found on PATH, with whatever NODE_OPTIONS or
+// a .pth file loads into it, under doctor's privileges, so a trust verdict
+// never rests on one. The row says what it left unchecked instead.
 func AskNode() (NodeRoots, error) {
-	path, err := exec.LookPath("node")
-	if err != nil {
-		return NodeRoots{}, errors.New("no node on PATH")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "-e", nodeRootsScript).Output()
-	if err != nil {
-		return NodeRoots{}, fmt.Errorf("%s did not list them: %w", path, err)
-	}
-	var doc struct {
-		PEM       []string `json:"pem"`
-		Effective bool     `json:"effective"`
-		OpenSSL   bool     `json:"openssl"`
-	}
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return NodeRoots{}, fmt.Errorf("%s printed no list: %w", path, err)
-	}
-	return NodeRoots{PEM: doc.PEM, Effective: doc.Effective, OpenSSLDefault: doc.OpenSSL}, nil
+	return NodeRoots{}, errors.New("doctor does not run node to list them")
 }
 
-var pipVersionLine = regexp.MustCompile(`^pip (\d+)\.(\d+)\S* from (.+) \(python (\d+)\.(\d+)\)`)
-
-// AskPip asks the pip on PATH for its version and where it is installed,
-// which between them say what it verifies against with no cert setting.
 func AskPip() (PipDefault, error) {
-	for _, name := range []string{"pip3", "pip"} {
-		path, err := exec.LookPath(name)
-		if err != nil {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, path, "--version").Output()
-		if err != nil {
-			return PipDefault{}, fmt.Errorf("%s --version: %w", path, err)
-		}
-		d, err := pipDefaultFrom(string(out))
-		if err != nil {
-			return d, err
-		}
-		// config debug lists each file pip would load; the one under "site"
-		// sits in the interpreter's prefix. A pip too old for the command
-		// leaves the prefix unknown.
-		if out, err := exec.CommandContext(ctx, path, "config", "debug").Output(); err == nil {
-			d.Prefix = pipSitePrefix(string(out))
-		}
-		return d, nil
-	}
-	return PipDefault{}, errors.New("no pip on PATH")
-}
-
-// pipSitePrefix reads the directory of the site configuration file out of
-// `pip config debug`, "" when the output names none.
-func pipSitePrefix(debug string) string {
-	lines := strings.Split(debug, "\n")
-	for i, l := range lines[:max(len(lines)-1, 0)] {
-		if strings.TrimSpace(l) != "site:" {
-			continue
-		}
-		if file, _, ok := strings.Cut(strings.TrimSpace(lines[i+1]), ", exists:"); ok && filepath.IsAbs(file) {
-			return filepath.Dir(file)
-		}
-	}
-	return ""
-}
-
-// pipDefaultFrom reads a `pip --version` line. pip verifies through the
-// system store by default from 24.2 on, where Python is 3.10 or later, and
-// against the certifi bundle vendored beside it before that.
-func pipDefaultFrom(version string) (PipDefault, error) {
-	line, _, _ := strings.Cut(strings.TrimSpace(version), "\n")
-	m := pipVersionLine.FindStringSubmatch(line)
-	if m == nil {
-		return PipDefault{}, fmt.Errorf("pip --version printed %q, which names no version and location", line)
-	}
-	n := func(s string) int { v, _ := strconv.Atoi(s); return v }
-	major, minor, pyMajor, pyMinor := n(m[1]), n(m[2]), n(m[4]), n(m[5])
-	d := PipDefault{
-		Version:    m[1] + "." + m[2],
-		Truststore: (major > 24 || major == 24 && minor >= 2) && (pyMajor > 3 || pyMajor == 3 && pyMinor >= 10),
-	}
-	bundle := filepath.Join(m[3], "_vendor", "certifi", "cacert.pem")
-	if info, err := os.Stat(bundle); err == nil && info.Mode().IsRegular() {
-		d.Certifi = bundle
-	}
-	return d, nil
+	return PipDefault{}, errors.New("doctor does not run pip to ask")
 }

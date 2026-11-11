@@ -551,22 +551,34 @@ func TestTrustProbeReadsTheStoreAClientIsPointedAt(t *testing.T) {
 	}
 }
 
-func TestPipDefaultFrom(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "site-packages", "pip")
-	bundle := filepath.Join(dir, "_vendor/certifi/cacert.pem")
-	writeTrustFile(t, bundle, "")
-	for line, want := range map[string]PipDefault{
-		"pip 23.3.2 from " + dir + " (python 3.12)\n":                    {Version: "23.3", Certifi: bundle},
-		"pip 24.2 from " + dir + " (python 3.9)":                         {Version: "24.2", Certifi: bundle},
-		"pip 26.2.1 from " + dir + " (python 3.15)":                      {Version: "26.2", Truststore: true, Certifi: bundle},
-		"pip 24.0 from /usr/lib/python3/dist-packages/pip (python 3.12)": {Version: "24.0"},
+// F116 R2: doctor runs neither node nor pip to learn its default store, so
+// a client left on that default is unchecked whatever the system store
+// says, and verified only through an input doctor reads.
+func TestDefaultStoresNobodyAnswersForAreUnchecked(t *testing.T) {
+	for check, tc := range map[string]struct {
+		config, body, key string
+	}{
+		"npm-config": {".npmrc", "registry=BASE/npm/\n", "NODE_EXTRA_CA_CERTS"},
+		"pip-config": {".config/pip/pip.conf", "[global]\nindex-url = BASE/pypi/simple/\n", "PIP_CERT"},
 	} {
-		if got, err := pipDefaultFrom(line); err != nil || got != want {
-			t.Errorf("pipDefaultFrom(%q) = %+v, %v; want %+v", line, got, err, want)
+		p, ca, base := reviewTrust(t)
+		p.Node, p.Pip = AskNode, AskPip
+		p.System = func([]*x509.Certificate, string) error { return nil }
+		writeTrustFile(t, filepath.Join(p.Root, p.Home, tc.config), strings.ReplaceAll(tc.body, "BASE", base))
+		f := p.Apply([]Finding{{Check: check, Status: StatusOK}}, base)[0]
+		if f.Status != StatusWarn || !strings.Contains(f.Detail, "unchecked") {
+			t.Errorf("%s on its default store, the system store verifying: %s %q; want WARN unchecked", check, f.Status, f.Detail)
 		}
-	}
-	if _, err := pipDefaultFrom("Usage: pip <command>"); err == nil {
-		t.Error("a line naming no version was read as one")
+		p.Getenv = func(k string) string {
+			if k == tc.key {
+				return ca
+			}
+			return ""
+		}
+		p.System = func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }
+		if f := p.Apply([]Finding{{Check: check, Status: StatusOK}}, base)[0]; f.Status != StatusOK {
+			t.Errorf("%s with %s naming the CA: %s %q; want OK", check, tc.key, f.Status, f.Detail)
+		}
 	}
 }
 
@@ -1008,9 +1020,7 @@ func TestAudit7NpmInlinePolicyMustBeUnchecked(t *testing.T) {
 }
 
 func TestAudit7NpmCAFileCommentCannotRestoreDefaultRoots(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	p, ca, base := reviewTrust(t)
 	good, err := os.ReadFile(ca)
 	if err != nil {
@@ -1049,9 +1059,7 @@ func TestAudit7NpmCAFileCommentCannotRestoreDefaultRoots(t *testing.T) {
 }
 
 func TestAudit8NpmQuotedCAFileCannotRestoreDefaultRoots(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	p, ca, base := reviewTrust(t)
 	good, err := os.ReadFile(ca)
 	if err != nil {
@@ -1084,9 +1092,7 @@ func TestAudit8NpmQuotedCAFileCannotRestoreDefaultRoots(t *testing.T) {
 }
 
 func TestAudit8NpmRegistryCommentStillOwesTrust(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	p, _, base := reviewTrust(t)
 	other, _ := trustFixture(t)
 	wrong := filepath.Join(p.Root, "corporate.pem")
@@ -1153,5 +1159,19 @@ func TestNpmProbeReadsLinesAsNpmDecodesThem(t *testing.T) {
 				t.Fatalf("want a warning naming %q and no value; probe returned %+v", tc.want, f)
 			}
 		})
+	}
+}
+
+// nativeNpm gates a test that holds doctor's reading of an npmrc against
+// npm's own. A developer's machine without npm skips it. CI does not: its
+// test job installs a pinned Node, so a missing npm there is a broken job
+// that would otherwise pass every oracle test unrun.
+func nativeNpm(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("npm"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
+		}
+		t.Skip("native npm is not installed")
 	}
 }

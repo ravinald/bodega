@@ -1,6 +1,7 @@
 package clientconf
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -26,10 +27,13 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	keystore "github.com/pavlo-v-chernykh/keystore-go/v4"
 	"gopkg.in/yaml.v3"
+	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
@@ -1214,16 +1218,24 @@ func TestAddCARefusesAMergeThatWouldNotHold(t *testing.T) {
 	}
 }
 
-// F116 R1, R2: the store ResolveJVMStore names is the one keytool lists and
-// imports into, and a failed keytool reports its own error with nothing that
+// F116 R1, R2: the store ResolveJVMStore names is the one doctor reads and
+// keytool imports into, and a failed keytool reports its own error with nothing that
 // reads as a password in it.
 func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
 	const secret = "hunter2-keystore"
 	jdk := t.TempDir()
 	jsse, args := filepath.Join(jdk, "lib/security/jssecacerts"), filepath.Join(jdk, "args")
 	caPEM, _, _ := testCA(t, "bodega.example.com")
-	script := "#!/bin/sh\necho \"$@\" >> " + args + "\ncase \"$*\" in *-importcert*) echo 'Picked up JAVA_TOOL_OPTIONS: -Dx.password=" + secret + "'; echo 'keytool error: storepass=" + secret + " refused for " + secret + "'; exit 1;; esac\ncat " + filepath.Join(jdk, "listing") + "\n"
-	for path, content := range map[string]string{jsse: "store", filepath.Join(jdk, "bin/keytool"): script, filepath.Join(jdk, "listing"): "Alias name: a\n" + string(caPEM)} {
+	script := "#!/bin/sh\necho \"$@\" >> " + args + "\ncase \"$*\" in *-importcert*) echo 'Picked up JAVA_TOOL_OPTIONS: -Dx.password=" + secret + "'; echo 'keytool error: storepass=" + secret + " refused for " + secret + "'; exit 1;; esac\nexit 1\n"
+	held, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p12, err := pkcs12.Modern.EncodeTrustStore(held.Certs, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{jsse: string(p12), filepath.Join(jdk, "bin/keytool"): script} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1239,6 +1251,9 @@ func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
 	certs, err := store.Trusted()
 	if err != nil || len(certs) != 1 {
 		t.Fatalf("Trusted = %d certificates, %v", len(certs), err)
+	}
+	if ran, _ := os.ReadFile(args); len(ran) != 0 {
+		t.Fatalf("listing the store ran keytool: %s", ran)
 	}
 	other, _, _ := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(other)
@@ -1260,8 +1275,8 @@ func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
 			t.Errorf("keytool ran %q, want the JSSE store %s", line, jsse)
 		}
 	}
-	if !strings.Contains(string(ran), "-list") || !strings.Contains(string(ran), "-importcert") {
-		t.Errorf("keytool ran %q, want a listing and an import", ran)
+	if strings.Contains(string(ran), "-list") || !strings.Contains(string(ran), "-importcert") {
+		t.Errorf("keytool ran %q, want the import alone: the store is listed from its file", ran)
 	}
 }
 
@@ -1826,9 +1841,7 @@ func TestAudit6CAHandlesGitIncludes(t *testing.T) {
 }
 
 func TestAudit6NpmInlineCAAfterCAFile(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	raw, leaf, _ := testCA(t, "bodega.example.com")
 	other, _, _ := testCA(t, "other.example.com")
 	ca, err := ParseCA(raw)
@@ -1990,9 +2003,7 @@ func TestAudit7GitInlineIncludeInSelectedFileRefusesBeforeWrite(t *testing.T) {
 }
 
 func TestAudit8NpmQuotedCARefusesBeforeWrite(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	raw, _, _ := testCA(t, "bodega.example.com")
 	other, _, _ := testCA(t, "other.example.com")
 	ca, err := ParseCA(raw)
@@ -2073,9 +2084,7 @@ func TestAudit8CAGradlePreservesUnrelatedPolicy(t *testing.T) {
 // reading of the same file: every name and value NpmOptions is sure of is
 // the one `npm config list --json` reports.
 func TestNpmOptionsDecodeAsNpmDoes(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	rc := strings.Join([]string{
 		`"tag"=a1`,
 		`'otp'="q # x"`,
@@ -2216,5 +2225,396 @@ func TestGradleInitMergeKeepsLinesAroundBodegasBlock(t *testing.T) {
 	edited := strings.Replace(was, "name = 'bodega'", "name = 'mine'", 1)
 	if _, err := mergeGradleInit([]byte(edited), []byte(now)); err == nil {
 		t.Fatal("a script edited inside bodega's lines was replaced")
+	}
+}
+
+// F116 R1, R2: what a JVM trusts is read from the keystore file in each form
+// a JDK ships or keytool writes, and a store that cannot be read is an error,
+// never an empty store.
+func TestJVMStoreReadsTheKeystoreFile(t *testing.T) {
+	const pass = "hunter2-keystore"
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jks := keystore.New()
+	if err := jks.SetTrustedCertificateEntry("bodega", keystore.TrustedCertificateEntry{
+		CreationTime: time.Now(), Certificate: keystore.Certificate{Type: "X.509", Content: ca.Certs[0].Raw},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var jksFile bytes.Buffer
+	if err := jks.Store(&jksFile, []byte(pass)); err != nil {
+		t.Fatal(err)
+	}
+	p12, err := pkcs12.Modern.EncodeTrustStore(ca.Certs, pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare, err := pkcs12.Passwordless.EncodeTrustStore(ca.Certs, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for name, tc := range map[string]struct {
+		data     []byte
+		password string
+		want     int
+	}{
+		"jks":                   {jksFile.Bytes(), pass, 1},
+		"pkcs12":                {p12, pass, 1},
+		"pkcs12 without a MAC":  {bare, "", 1},
+		"jks, wrong password":   {jksFile.Bytes(), "wr0ng-pass", -1},
+		"pkcs12 wrong password": {p12, "wr0ng-pass", -1},
+		"not a keystore":        {[]byte("store"), pass, -1},
+		"truncated jks":         {jksFile.Bytes()[:40], pass, -1},
+	} {
+		file := filepath.Join(dir, strings.ReplaceAll(name, " ", "-"))
+		if err := os.WriteFile(file, tc.data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		certs, err := (JVMStore{Keystore: file, Password: tc.password}).Trusted()
+		switch {
+		case tc.want < 0 && err == nil:
+			t.Errorf("%s: Trusted = %d certificates, want an error", name, len(certs))
+		case tc.want < 0 && (strings.Contains(err.Error(), "wr0ng-pass") || !strings.Contains(err.Error(), file)):
+			t.Errorf("%s: error %q must name the file and not the password", name, err)
+		case tc.want >= 0 && (err != nil || len(certs) != tc.want || !bytes.Equal(certs[0].Raw, ca.Certs[0].Raw)):
+			t.Errorf("%s: Trusted = %d certificates, %v", name, len(certs), err)
+		}
+	}
+	if _, err := (JVMStore{Keytool: filepath.Join(dir, "bin/keytool")}).Trusted(); err == nil || !strings.Contains(err.Error(), "JAVA_HOME") {
+		t.Errorf("a JDK with no cacerts: Trusted = %v, want an error naming JAVA_HOME", err)
+	}
+	// The cacerts is found where keytool -cacerts writes: under the JDK.
+	cacerts := filepath.Join(dir, "jdk/lib/security/cacerts")
+	if err := os.MkdirAll(filepath.Dir(cacerts), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cacerts, bare, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ResolveJVMStore(func(k string) string {
+		if k == "JAVA_HOME" {
+			return filepath.Join(dir, "jdk")
+		}
+		return ""
+	}, func(string) (string, error) { return "", os.ErrNotExist })
+	if err != nil || store.Cacerts != cacerts {
+		t.Fatalf("ResolveJVMStore = %+v, %v; want cacerts %s", store, err, cacerts)
+	}
+	if certs, err := store.Trusted(); err != nil || len(certs) != 1 {
+		t.Errorf("the JDK's cacerts: Trusted = %d certificates, %v", len(certs), err)
+	}
+}
+
+// F116 R1, R2: the keystore reader agrees with keytool, the oracle, on the
+// JDK's own cacerts and on a store keytool wrote in each type.
+func TestJVMStoreAgreesWithKeytool(t *testing.T) {
+	keytool, err := exec.LookPath("keytool")
+	if err != nil {
+		t.Skip("native keytool is not installed")
+	}
+	list := func(args ...string) []*x509.Certificate {
+		t.Helper()
+		out, err := exec.Command(keytool, append([]string{"-list", "-rfc", "-storepass", "changeit"}, args...)...).Output()
+		if err != nil {
+			t.Skipf("keytool does not list %v: %v", args, err)
+		}
+		return ParseKeytoolList(out)
+	}
+	same := func(what string, got, want []*x509.Certificate) {
+		t.Helper()
+		sums := func(certs []*x509.Certificate) []string {
+			var out []string
+			for _, c := range certs {
+				sum := sha256.Sum256(c.Raw)
+				out = append(out, hex.EncodeToString(sum[:]))
+			}
+			slices.Sort(out)
+			return out
+		}
+		if len(want) == 0 || !slices.Equal(sums(got), sums(want)) {
+			t.Errorf("%s: read %d certificates, keytool lists %d", what, len(got), len(want))
+		}
+	}
+	store, err := ResolveJVMStore(os.Getenv, exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Keystore == "" && store.Cacerts != "" {
+		got, err := store.Trusted()
+		if err != nil {
+			t.Fatalf("%s: %v", store.Cacerts, err)
+		}
+		same(store.Cacerts, got, list("-cacerts"))
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"JKS", "PKCS12"} {
+		file := filepath.Join(dir, kind)
+		if out, err := exec.Command(keytool, "-importcert", "-noprompt", "-trustcacerts", "-alias", "bodega", "-file", caFile,
+			"-keystore", file, "-storetype", kind, "-storepass", "changeit").CombinedOutput(); err != nil {
+			t.Fatalf("keytool -importcert into %s: %v\n%s", kind, err, out)
+		}
+		got, err := (JVMStore{Keystore: file}).Trusted()
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		same(kind, got, list("-keystore", file))
+	}
+}
+
+// nativeNpm gates a test that holds doctor's reading of an npmrc against
+// npm's own. A developer's machine without npm skips it. CI does not: its
+// test job installs a pinned Node, so a missing npm there is a broken job
+// that would otherwise pass every oracle test unrun.
+func nativeNpm(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("npm"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
+		}
+		t.Skip("native npm is not installed")
+	}
+}
+
+func TestAudit9NativeOraclesCannotSkipInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.v", "-test.run=^(TestAudit8NpmQuotedCARefusesBeforeWrite|TestNpmOptionsDecodeAsNpmDoes)$")
+	for _, e := range os.Environ() {
+		k, _, _ := strings.Cut(e, "=")
+		if k != "CI" && k != "PATH" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("CI=true with no npm passed its oracle tests:\n%s", out)
+	}
+}
+
+func TestAudit9CIInstallsPinnedNativeOracle(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	pinned := false
+	for _, step := range workflow.Jobs["test"].Steps {
+		if strings.HasPrefix(step.Uses, "actions/setup-node@") {
+			pinned = regexp.MustCompile(`^actions/setup-node@[0-9a-f]{40}$`).MatchString(step.Uses) && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(step.With["node-version"])
+		}
+		if strings.Contains(step.Run, "make test") && !pinned {
+			t.Fatal("CI's Go test job runs before any full-SHA setup-node with an exact node-version; native npm oracle is not pinned and required")
+		}
+	}
+	if !pinned {
+		t.Fatal("CI's test job installs no pinned Node/npm release")
+	}
+}
+
+func TestAudit9CADistfilesCompanionPreservesUnrelatedPolicy(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := (distinfo.EnvironmentSpec{}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	main := MakeConf(testBase)
+	main.Paths = map[string]string{OSLinux: main.Path(OSFreeBSD)}
+	companion := File{System: main.System, Paths: map[string]string{OSLinux: DistfilesCheckPath}, Content: string(env.ClientCheck())}
+	target := filepath.Join(home, DistfilesCheckPath)
+	keep := "CFLAGS+= -fstack-protector-strong\n"
+	old := companion.Content + "\n" + keep
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: root, GOOS: OSFreeBSD})
+	if err != nil {
+		if !strings.Contains(err.Error(), target) {
+			t.Fatalf("refusal does not name the companion script: %v", err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != old {
+			t.Fatal("refusal changed the companion script")
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), keep) {
+		t.Fatalf("CA apply silently removed unrelated compiler policy from %s", target)
+	}
+}
+
+// F116 R2: an absent ca, a null one and an empty one are three states to
+// npm, and NpmCAOf folds a file's lines to the one native npm reports. The
+// global file gives ca a value, so a per-user file that does not set it
+// shows as that value and a null shows as null.
+func TestNpmCAStatesAsNpmDoes(t *testing.T) {
+	nativeNpm(t)
+	dir := t.TempDir()
+	global, user := filepath.Join(dir, "global"), filepath.Join(dir, "rc")
+	if err := os.WriteFile(global, []byte("ca=GLOBAL\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		"", "ca=", `ca=""`, "ca= ; comment", "ca=null", `ca="null"`, "ca=true", "ca=false", "ca",
+		"ca[]=", "ca[]=null", "ca=x\nca=", "ca=x\nca=null", "ca[]=x\nca=", "ca[]=x\nca=null",
+		"ca=null\nca[]=x", "ca=x\nca[]=y", "ca=null\nca=x", "cafile=/corp.pem",
+	} {
+		if err := os.WriteFile(user, []byte(body+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("npm", "config", "list", "--json", "--userconfig", user, "--globalconfig", global)
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%q: npm config list: %v", body, err)
+		}
+		var native struct {
+			CA any `json:"ca"`
+		}
+		if err := json.Unmarshal(out, &native); err != nil {
+			t.Fatalf("%q: npm config list printed %q: %v", body, out, err)
+		}
+		// want is the state native npm reports: absent, null, unread for a
+		// value holding anything but strings, or the list itself.
+		want := "unread"
+		switch v := native.CA.(type) {
+		case nil:
+			want = "null"
+		case string:
+			want = "list " + strconv.Quote(v)
+		case []any:
+			var list []string
+			for _, e := range v {
+				if s, ok := e.(string); ok {
+					list = append(list, strconv.Quote(s))
+				}
+			}
+			if len(list) == len(v) {
+				want = "list " + strings.Join(list, ",")
+			}
+		}
+		if want == `list "GLOBAL"` {
+			want = "absent"
+		}
+		ca := NpmCAOf(NpmOptions([]byte(body + "\n")))
+		got := "absent"
+		switch {
+		case ca.Why != "":
+			got = "unread"
+		case ca.Set && ca.List == nil:
+			got = "null"
+		case ca.Set:
+			var list []string
+			for _, s := range ca.List {
+				list = append(list, strconv.Quote(s))
+			}
+			got = "list " + strings.Join(list, ",")
+		}
+		if got != want {
+			t.Errorf("%q: NpmCAOf = %s, native npm reports %s (%v)", body, got, want, native.CA)
+		}
+		if unread := NpmUnread(user); (unread != "") != (want == "unread") {
+			t.Errorf("%q: NpmUnread = %q, and native npm reports %s", body, unread, want)
+		}
+	}
+}
+
+// F116 R1: a record no editor reads is written whole only over nothing. Over
+// an existing file it keeps the file when the rendering is intact inside it,
+// and is refused, naming the file, when the two differ any other way.
+func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rendered = "# bodega distfiles client check\nBODEGA_DISTFILES_DRIFT=\n"
+	for name, tc := range map[string]struct {
+		old     string
+		want    string
+		refused bool
+	}{
+		"blank":                {" \n", rendered, false},
+		"same":                 {rendered, rendered, false},
+		"lines around":         {"# mine\n" + rendered + "CFLAGS+= -O2\n", "# mine\n" + rendered + "CFLAGS+= -O2\n", false},
+		"an older rendering":   {"# bodega distfiles client check\nBODEGA_DISTFILES_DRIFT= old\n", "", true},
+		"edited inside":        {"# bodega distfiles client check\nCFLAGS+= -O2\nBODEGA_DISTFILES_DRIFT=\n", "", true},
+		"another file's lines": {"CFLAGS+= -O2\n", "", true},
+	} {
+		home := t.TempDir()
+		main := MakeConf(testBase)
+		main.Paths = map[string]string{OSLinux: main.Path(OSFreeBSD)}
+		companion := File{System: main.System, Paths: map[string]string{OSLinux: DistfilesCheckPath}, Content: rendered}
+		target := filepath.Join(home, DistfilesCheckPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(tc.old), 0600); err != nil {
+			t.Fatal(err)
+		}
+		in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSFreeBSD})
+		if tc.refused {
+			if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "Move the file aside") {
+				t.Errorf("%s: AddCA = %v, want a refusal naming %s and the next step", name, err, target)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: AddCA = %v", name, err)
+			continue
+		}
+		if _, err := Apply(in.Changes, ".f116"); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != tc.want {
+			t.Errorf("%s: wrote %q, want %q", name, got, tc.want)
+		}
+		again, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSFreeBSD})
+		if err != nil {
+			t.Errorf("%s: second AddCA = %v", name, err)
+			continue
+		}
+		for _, c := range again.Changes {
+			if c.Target == target && !c.Unchanged() {
+				t.Errorf("%s: a second apply would rewrite %s", name, target)
+			}
+		}
 	}
 }

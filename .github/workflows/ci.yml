@@ -96,6 +96,13 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
+      # The npm these tests hold doctor's npmrc reading against. An exact
+      # version, so the oracle is a release the action verifies and not
+      # whatever the runner image carries; with CI=true a test that finds no
+      # npm fails where it would skip on a developer's machine.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
       - run: make test TEST_FLAGS=-coverprofile=coverage.out
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1

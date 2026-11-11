@@ -728,20 +728,10 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		}
 		if slices.ContainsFunc(records, func(r clientconf.PlanRecord) bool { return r.System == manifest.TypeMaven }) {
 			// Read before anything is written: which certificates the JVM
-			// lacks decides the imports, and a store keytool cannot list is
-			// one it cannot import into either.
+			// lacks decides the imports, and a store doctor cannot read is
+			// one it cannot show the import reached either.
 			if h.JVM, h.JVMTrusted, err = doctorJVM(); err != nil {
 				return fmt.Errorf("--ca-file: maven: the JVM trust store Maven and Gradle read could not be listed: %w. Nothing was written", err)
-			}
-		}
-		if os.Getenv("VIRTUAL_ENV") == "" && slices.ContainsFunc(records, func(r clientconf.PlanRecord) bool { return r.System == manifest.TypePypi }) {
-			// Which pip.conf the interpreter's prefix adds is pip's to say; a
-			// host whose pip cannot be asked falls back to the packaged one's.
-			// A nil doctorPip is a probe told not to ask.
-			if doctorPip != nil {
-				if d, err := doctorPip(); err == nil {
-					h.PipPrefix = d.Prefix
-				}
 			}
 		}
 		in, err := clientconf.AddCA(changes, *ca, h)
@@ -995,9 +985,9 @@ func doctorConfigDir() (string, error) {
 	return filepath.Join(home, ".config"), nil
 }
 
-// doctorNode and doctorPip ask the host's Node and pip what each verifies
-// against by default, and doctorRunJVM runs a keytool import, so a test can
-// stand in for each.
+// doctorNode and doctorPip answer for what the host's Node and pip verify
+// against by default, which doctor does not run either to learn, and
+// doctorRunJVM runs a keytool import, so a test can stand in for each.
 var (
 	doctorNode   = host.AskNode
 	doctorPip    = host.AskPip
@@ -1107,7 +1097,8 @@ func unreadCA(owed, osStore []string, base string) error {
 }
 
 // doctorJVM resolves the trust store of the JVM Maven and Gradle run on and
-// lists the certificates it holds, so a test can stand in for keytool.
+// lists the certificates its keystore file holds, so a test can stand in
+// for a JDK.
 var doctorJVM = func() (clientconf.JVMStore, []*x509.Certificate, error) {
 	store, err := clientconf.ResolveJVMStore(os.Getenv, exec.LookPath)
 	if err != nil {

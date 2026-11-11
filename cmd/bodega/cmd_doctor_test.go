@@ -1906,9 +1906,7 @@ func TestAudit7CAInputTableNamesMavenDiscovery(t *testing.T) {
 }
 
 func TestAudit8DoctorCannotCertifyQuotedNpmCA(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		t.Skip("native npm is not installed")
-	}
+	nativeNpm(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_ca", "NPM_CONFIG_CA", "npm_config_cafile", "NPM_CONFIG_CAFILE"} {
@@ -1962,5 +1960,186 @@ func TestAudit8DoctorCannotCertifyQuotedNpmCA(t *testing.T) {
 	}
 	if _, err := srv.Certificate().Verify(x509.VerifyOptions{Roots: pool, DNSName: "127.0.0.1"}); err != nil {
 		t.Fatalf("doctor returned success after writing cafile, but native npm's quoted ca replaces it and rejects bodega: %v", err)
+	}
+}
+
+// nativeNpm gates a test that holds doctor's reading of an npmrc against
+// npm's own. A developer's machine without npm skips it. CI does not: its
+// test job installs a pinned Node, so a missing npm there is a broken job
+// that would otherwise pass every oracle test unrun.
+func nativeNpm(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("npm"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
+		}
+		t.Skip("native npm is not installed")
+	}
+}
+
+func TestAudit9TrustDiscoveryNeverExecutesHostClients(t *testing.T) {
+	for _, mode := range []string{"node-report", "pip-preview", "keytool-preview"} {
+		t.Run(mode, func(t *testing.T) {
+			home, bin := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("VIRTUAL_ENV", "")
+			t.Setenv("JAVA_HOME", "")
+			t.Setenv("JAVA_TOOL_OPTIONS", "")
+			t.Setenv("MAVEN_OPTS", "")
+			for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_ca", "NPM_CONFIG_CA", "npm_config_cafile", "NPM_CONFIG_CAFILE", "PIP_CONFIG_FILE"} {
+				t.Setenv(key, "")
+			}
+			marker := filepath.Join(home, "host-client-ran")
+			t.Setenv("F116_AUDIT_MARKER", marker)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			for _, name := range []string{"node", "pip3", "pip", "keytool"} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$F116_AUDIT_MARKER\"\nexit 1\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldNode, oldPip := doctorNode, doctorPip
+			doctorNode, doctorPip = host.AskNode, host.AskPip
+			t.Cleanup(func() { doctorNode, doctorPip = oldNode, oldPip })
+			stubRuntimes(t)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(home, "issuer.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "node-report" {
+				if err := os.WriteFile(filepath.Join(home, ".npmrc"), []byte("registry="+srv.URL+"/npm/\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				doctorTrustProbe().Apply([]host.Finding{{Check: "npm-config", Status: host.StatusOK}}, srv.URL)
+			} else {
+				system := "pip"
+				if mode == "keytool-preview" {
+					system = "maven"
+				}
+				_, _ = runDoctor(t, "--configure", system, "--ca-file", caFile, "--url", srv.URL)
+			}
+			if ran, err := os.ReadFile(marker); err == nil {
+				t.Fatalf("trust discovery executed host code before any apply:\n%s", ran)
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAudit9NpmEmptyCADoesNotRestoreDefaultRoots(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native npm is required in CI")
+		}
+		t.Skip("native npm is not installed")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(home, "issuer.pem")
+	configFile := filepath.Join(home, ".npmrc")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configFile, []byte("registry="+srv.URL+"/\nca=\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "list", "--json", "--userconfig", configFile, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NODE_EXTRA_CA_CERTS=" + caFile}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var native struct {
+		CA []string `json:"ca"`
+	}
+	if err := json.Unmarshal(out, &native); err != nil {
+		t.Fatal(err)
+	}
+	if len(native.CA) != 1 || native.CA[0] != "" {
+		t.Fatalf("native npm ca = %#v; want the explicitly empty CA string", native.CA)
+	}
+	ping := exec.Command("npm", "ping", "--userconfig", configFile, "--globalconfig", filepath.Join(home, "global.npmrc"), "--fetch-retries=0", "--fetch-timeout=3000")
+	ping.Dir, ping.Env = cmd.Dir, cmd.Env
+	controlFile := filepath.Join(home, "control.npmrc")
+	if err := os.WriteFile(controlFile, []byte("registry="+srv.URL+"/\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	control := exec.Command("npm", "ping", "--userconfig", controlFile, "--globalconfig", filepath.Join(home, "global.npmrc"), "--fetch-retries=0", "--fetch-timeout=3000")
+	control.Dir, control.Env = cmd.Dir, cmd.Env
+	controlOut, controlErr := control.CombinedOutput()
+	if controlErr == nil || !strings.Contains(string(controlOut), "E404") {
+		t.Fatalf("without ca= npm did not complete TLS and reach the fixture's missing ping route: %v\n%s", controlErr, controlOut)
+	}
+	actual, err := ping.CombinedOutput()
+	if err == nil || !strings.Contains(string(actual), "DEPTH_ZERO_SELF_SIGNED_CERT") {
+		t.Fatalf("native npm did not reject the fixture certificate: %v\n%s", err, actual)
+	}
+	p := host.TrustProbe{Root: home, Home: home, GOOS: clientconf.OSLinux, Getenv: func(string) string { return "" }, Node: func() (host.NodeRoots, error) {
+		return host.NodeRoots{PEM: []string{string(caPEM)}, Effective: true}, nil
+	}}
+	f := p.Apply([]host.Finding{{Check: "npm-config", Status: host.StatusOK}}, srv.URL)[0]
+	if f.Status != host.StatusWarn || !strings.Contains(f.Remediation, "--ca-file") {
+		t.Fatalf("native npm rejects the chain despite NODE_EXTRA_CA_CERTS, but doctor returned %+v", f)
+	}
+}
+
+// F116 R2: a null ca resets npm's CA list to Node's defaults and an empty one
+// replaces them, through each layer npm reads, and doctor's verdict follows
+// what native npm does on the wire: with NODE_EXTRA_CA_CERTS naming the CA,
+// npm completes TLS exactly where the effective ca is absent or null.
+func TestNpmCALayersVerifyAsNpmDoes(t *testing.T) {
+	nativeNpm(t)
+	for name, tc := range map[string]struct {
+		global, user string
+		trusted      bool
+	}{
+		"no ca":                 {"", "", true},
+		"null":                  {"", "ca=null\n", true},
+		"null over empty":       {"ca=\n", "ca=null\n", true},
+		"empty over null":       {"ca=null\n", "ca=\n", false},
+		"empty list entry":      {"", "ca[]=\n", false},
+		"empty in the global":   {"ca=\n", "", false},
+		"null over a stray PEM": {"ca=not-a-certificate\n", `ca="null"` + "\n", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(root, "issuer.pem")
+			global, user := filepath.Join(root, "etc/npmrc"), filepath.Join(home, ".npmrc")
+			for path, content := range map[string]string{caFile: string(caPEM), global: tc.global, user: "registry=" + srv.URL + "/\n" + tc.user} {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ping := exec.Command("npm", "ping", "--userconfig", user, "--globalconfig", global, "--fetch-retries=0", "--fetch-timeout=3000")
+			ping.Dir = t.TempDir()
+			ping.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NODE_EXTRA_CA_CERTS=" + caFile}
+			out, _ := ping.CombinedOutput()
+			// The fixture has no ping route, so a 404 is npm past the handshake.
+			if reached := strings.Contains(string(out), "E404"); reached != tc.trusted {
+				t.Fatalf("native npm completed TLS = %v, want %v:\n%s", reached, tc.trusted, out)
+			}
+			p := host.TrustProbe{Root: root, Home: home, GOOS: clientconf.OSLinux, Node: host.AskNode, Getenv: func(key string) string {
+				if key == "NODE_EXTRA_CA_CERTS" {
+					return caFile
+				}
+				return ""
+			}}
+			f := p.Apply([]host.Finding{{Check: "npm-config", Status: host.StatusOK}}, srv.URL)[0]
+			if want := map[bool]host.Status{true: host.StatusOK, false: host.StatusWarn}[tc.trusted]; f.Status != want {
+				t.Errorf("doctor = %s %q; native npm completed TLS = %v", f.Status, f.Detail, tc.trusted)
+			}
+			if !tc.trusted && (strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Remediation, "--ca-file")) {
+				t.Errorf("an empty CA list is a refusal with the --ca-file remedy, not an unchecked row: %+v", f)
+			}
+		})
 	}
 }
