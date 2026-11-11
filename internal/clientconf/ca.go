@@ -178,6 +178,8 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		if dir := env("XDG_CONFIG_HOME"); sel == "" && dir != "" && h.GOOS != OSDarwin {
 			sel = filepath.Join(dir, "go", "env")
 		}
+	case rec.System == manifest.TypeCargo && user:
+		sel = CargoConfigFile(h.Home)
 	case rec.System == manifest.TypeRubygems && strings.HasSuffix(rec.Path, "/.bundle/config"):
 		sel = env("BUNDLE_USER_CONFIG")
 		if dir := env("BUNDLE_USER_HOME"); sel == "" && dir != "" {
@@ -235,6 +237,36 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		}
 	}
 	return out
+}
+
+// pipCommandIndex refuses a pip configuration whose command section sets an
+// index the plan does not. pip reads a command's own section ahead of
+// [global] from every file it loads, so an [install] index-url anywhere keeps
+// pip install on that index after the plan writes bodega's under [global],
+// and the CA installed for bodega would certify an endpoint pip never asks.
+func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) error {
+	want := PipOptions(planned)
+	files, _ := PipConfigFiles(PipHost{GOOS: h.GOOS, Root: h.Root, Home: h.Home, Getenv: h.Getenv, Prefix: h.PipPrefix})
+	if !slices.Contains(files, target) {
+		files = append(files, target)
+	}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for key, v := range PipOptions(data) {
+			section, option, _ := strings.Cut(key, ".")
+			if section == "global" || (option != "index-url" && option != "extra-index-url") {
+				continue
+			}
+			if planned, ok := want["global."+option]; ok && strings.TrimSpace(v) != strings.TrimSpace(planned) {
+				return fmt.Errorf("%s: %s sets %s = %s under [%s], and pip reads a command's own section ahead of the [global] index this command writes to %s, so pip %s would keep fetching from %s and the CA installed for bodega would verify an index pip does not use. "+
+					"Nothing was written. Remove %s from [%s] or set it to %s, then re-run", rec.System, f, option, v, section, target, section, v, option, section, planned)
+			}
+		}
+	}
+	return nil
 }
 
 // ignored is the error for a plan file the environment tells its client not
@@ -815,6 +847,11 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		rec := c.Record
 		if err := h.ignored(rec, c.Target); err != nil {
 			return CAInstall{}, err
+		}
+		if rec.System == manifest.TypePypi {
+			if err := h.pipCommandIndex(rec, c.Target, c.New); err != nil {
+				return CAInstall{}, err
+			}
 		}
 		if c.Existed && c.planned != nil {
 			switch {

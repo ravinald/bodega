@@ -2883,3 +2883,31 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit12CargoCAPlansTheWinningFile(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	target := filepath.Join(home, ".cargo", "config")
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	old := "[source.crates-io]\nregistry = \"sparse+https://index.crates.io/\"\n[build]\njobs = 3\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+	in, err := AddCA(caPlan(t, home, Cargo(testBase)), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := changeAt(t, in.Changes, target)
+	for _, want := range []string{testBase, "jobs = 3"} {
+		if !strings.Contains(string(c.New), want) {
+			t.Fatalf("winning Cargo file does not contain %s:\n%s", want, c.New)
+		}
+	}
+}

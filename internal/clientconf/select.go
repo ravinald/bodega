@@ -790,3 +790,14 @@ func gitShadowHeaders(lines []string, base string) []string {
 	}
 	return out
 }
+
+// CargoConfigFile is the per-user file Cargo reads under home: config
+// without the extension when it exists, which Cargo then reads in place of
+// config.toml, and config.toml otherwise.
+func CargoConfigFile(home string) string {
+	legacy := filepath.Join(home, ".cargo", "config")
+	if info, err := os.Stat(legacy); err == nil && info.Mode().IsRegular() {
+		return legacy
+	}
+	return filepath.Join(home, ".cargo", "config.toml")
+}

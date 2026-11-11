@@ -2224,3 +2224,39 @@ func TestAudit11GomodApplyCannotPassOnShadowedEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit12PipApplyCannotPassOnShadowedIndex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	for _, k := range []string{"PIP_CONFIG_FILE", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "VIRTUAL_ENV"} {
+		t.Setenv(k, "")
+	}
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(home, "etc", "pip.conf")
+	if err := os.MkdirAll(filepath.Dir(conf), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conf, []byte("[install]\nindex-url = https://pypi.org/simple\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"first apply", "idle second apply"} {
+		out, err := runDoctor(t, "--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		data, readErr := os.ReadFile(conf)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		vals := clientconf.PipOptions(data)
+		effective, ok := vals["install.index-url"]
+		if !ok {
+			effective = vals["global.index-url"]
+		}
+		if err == nil && effective != srv.URL+"/pypi/simple/" {
+			t.Errorf("%s certified pip although its install index is %s:\n%s", name, effective, out)
+		}
+	}
+}

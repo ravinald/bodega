@@ -272,25 +272,19 @@ var trustRows = map[string]trustRow{
 		return t.filesMention(host, "/etc/make.conf")
 	}, func(t TrustProbe) *trustStore { return envCA(t, "SSL_CA_CERT_FILE") }),
 	"cargo-config": systemOnly(manifest.TypeCargo, func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(t.Home, ".cargo", "config.toml"), filepath.Join(t.Home, ".cargo", "config"))
+		return mention(host, clientconf.CargoConfigFile(t.Home))
 	}, func(t TrustProbe) *trustStore {
 		if s := envCA(t, "CARGO_HTTP_CAINFO"); s != nil {
 			return s
 		}
-		// Cargo reads the file without the extension when both exist.
-		for _, f := range []string{filepath.Join(t.Home, ".cargo", "config"), filepath.Join(t.Home, ".cargo", "config.toml")} {
-			var doc struct {
-				HTTP struct {
-					CAInfo string `toml:"cainfo"`
-				} `toml:"http"`
-			}
-			if _, err := toml.DecodeFile(f, &doc); err != nil {
-				continue
-			}
-			if doc.HTTP.CAInfo != "" {
-				return named(doc.HTTP.CAInfo, "http.cainfo in "+f, true)
-			}
-			break
+		var doc struct {
+			HTTP struct {
+				CAInfo string `toml:"cainfo"`
+			} `toml:"http"`
+		}
+		f := clientconf.CargoConfigFile(t.Home)
+		if _, err := toml.DecodeFile(f, &doc); err == nil && doc.HTTP.CAInfo != "" {
+			return named(doc.HTTP.CAInfo, "http.cainfo in "+f, true)
 		}
 		return nil
 	}),
@@ -669,37 +663,33 @@ func sameHost(raw string, u *url.URL) bool {
 	return strings.EqualFold(p.Hostname(), u.Hostname()) && port(p) == port(u)
 }
 
-// pipReaches reports whether pip, as its effective configuration stands,
-// fetches from bodega at u: an index-url or extra-index-url there, from the
-// last of files to set it in any section, or from the environment, which
-// outranks every file. A file that names bodega only in a comment, or in an
-// option a later file replaces, configures nothing.
+// pipReaches reports whether pip install, as its effective configuration
+// stands, fetches from bodega at u. pip merges its files in load order, a
+// later file replacing an earlier one's option, then reads [global], the
+// command's own section over it, and the environment over both. The cert
+// pipStores selects follows the same order, so the endpoint and the CA judged
+// together are the pair one pip install uses. A file that names bodega only
+// in a comment, in an option a later file replaces, or under [global] while
+// [install] sets its own index, configures nothing.
 func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
-	effective := map[string]string{}
+	merged := map[string]string{}
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			continue
 		}
 		for key, v := range clientconf.PipOptions(data) {
-			if _, option, _ := strings.Cut(key, "."); option == "index-url" || option == "extra-index-url" {
-				effective[key] = v
-			}
+			merged[key] = v
 		}
 	}
 	for option, env := range map[string]string{"index-url": "PIP_INDEX_URL", "extra-index-url": "PIP_EXTRA_INDEX_URL"} {
 		v := t.env(env)
 		if v == "" {
-			continue
+			v = merged["install."+option]
 		}
-		for key := range effective {
-			if strings.HasSuffix(key, "."+option) {
-				delete(effective, key)
-			}
+		if v == "" {
+			v = merged["global."+option]
 		}
-		effective["env."+option] = v
-	}
-	for _, v := range effective {
 		if slices.ContainsFunc(strings.Fields(v), func(one string) bool { return sameHost(one, u) }) {
 			return true
 		}

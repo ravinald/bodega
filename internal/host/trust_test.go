@@ -1334,3 +1334,34 @@ func TestTrustFollowsTheEffectiveEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit12CargoIgnoresTheHiddenConfig(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = t.TempDir()
+	writeTrustFile(t, filepath.Join(p.Home, ".cargo", "config"), "[source.crates-io]\nregistry = \"sparse+https://index.crates.io/\"\n")
+	writeTrustFile(t, filepath.Join(p.Home, ".cargo", "config.toml"), "[source.crates-io]\nreplace-with = \"bodega\"\n[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n")
+	p.System = func(chain []*x509.Certificate, name string) error {
+		return verifyChain(chain, name, poolOf([]string{ca}))
+	}
+	got, err := p.Judge([]string{"cargo-config"}, base)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Judge = %+v, %v", got, err)
+	}
+	if got[0].State == TrustVerified {
+		t.Fatalf("Cargo reads .cargo/config, which names crates.io, but the hidden config.toml certified the selected install: %+v", got[0])
+	}
+}
+
+func TestAudit12PipEndpointAndCAUseTheSameCommand(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = t.TempDir()
+	file := filepath.Join(p.Root, "etc", "pip.conf")
+	writeTrustFile(t, file, "[global]\nindex-url = "+base+"/pypi/simple/\ncert = /missing/default-ca.pem\n[install]\nindex-url = https://packages.corp.example/simple/\ncert = "+ca+"\n")
+	got, err := p.Judge([]string{"pip-config"}, base)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Judge = %+v, %v", got, err)
+	}
+	if got[0].State == TrustVerified {
+		t.Fatalf("the global endpoint reaches bodega with a missing CA; the trusted install CA belongs to another endpoint, but the verdict is %+v", got[0])
+	}
+}

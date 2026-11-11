@@ -333,16 +333,13 @@ func checkPipConfig(root, goos, home string) Finding {
 	return f
 }
 
-// CheckCargoConfig scans Cargo's config files for crates.io references.
+// CheckCargoConfig scans the config file Cargo reads for crates.io references.
 func CheckCargoConfig() Finding {
 	f := Finding{Check: "cargo-config"}
 	home, _ := os.UserHomeDir()
 	var paths []string
 	if home != "" {
-		paths = []string{
-			filepath.Join(home, ".cargo", "config.toml"),
-			filepath.Join(home, ".cargo", "config"),
-		}
+		paths = []string{clientconf.CargoConfigFile(home)}
 	}
 
 	hit := firstHit(paths, publicUpstreams["cargo"])
