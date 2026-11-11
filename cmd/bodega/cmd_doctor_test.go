@@ -2188,3 +2188,39 @@ func TestAudit10SystemInstallStillVerifiesServedChain(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit11GomodApplyCannotPassOnShadowedEndpoint(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GOENV", "")
+	t.Setenv("GOPROXY", "https://proxy.golang.org,direct")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	doctorRun = func(string, ...string) error {
+		data, err := os.ReadFile(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt"))
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0644)
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	for _, run := range []string{"first apply", "idle second apply"} {
+		out, err := runDoctor(t, "--configure", "gomod", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("%s succeeded although GOPROXY overrides the installed endpoint:\n%s", run, out)
+		}
+	}
+}

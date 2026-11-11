@@ -876,27 +876,18 @@ func CheckGoproxyEnv() Finding {
 func checkGoproxy(getenv func(string) string, configDir func() (string, error)) Finding {
 	f := Finding{Check: "goproxy-env"}
 
-	val, source := getenv("GOPROXY"), "the environment"
-	if val == "" {
-		file, err := goEnvFile(getenv, configDir)
-		if err != nil {
-			f.Status = StatusSkip
-			f.Detail = "GOPROXY unset in the environment and the go env file could not be located: " + err.Error()
-			f.Remediation = "set GOENV to the go env file's path, or HOME, and run doctor again"
-			return f
-		}
-		if file != "" {
-			fileVal, found, err := readGoEnvFile(file, "GOPROXY")
-			if err != nil {
-				f.Status = StatusSkip
-				f.Detail = "GOPROXY unset in the environment and " + file + " could not be read: " + err.Error()
-				f.Remediation = "run doctor as the user whose go env file that is, or check its permissions"
-				return f
-			}
-			if found {
-				val, source = fileVal, file
-			}
-		}
+	val, source, file, err := effectiveGoproxy(getenv, configDir)
+	switch {
+	case err != nil && file == "":
+		f.Status = StatusSkip
+		f.Detail = "GOPROXY unset in the environment and the go env file could not be located: " + err.Error()
+		f.Remediation = "set GOENV to the go env file's path, or HOME, and run doctor again"
+		return f
+	case err != nil:
+		f.Status = StatusSkip
+		f.Detail = "GOPROXY unset in the environment and " + file + " could not be read: " + err.Error()
+		f.Remediation = "run doctor as the user whose go env file that is, or check its permissions"
+		return f
 	}
 
 	reached := reachableProxies(val)
@@ -932,6 +923,31 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 		f.Detail = "GOPROXY=" + val + " (from " + source + "; no fall-through to public upstreams)"
 	}
 	return f
+}
+
+// effectiveGoproxy resolves GOPROXY the way the go command does: a non-empty
+// value in the environment wins, then the go env file. source names where
+// val came from. On an error file is the go env file that would not read,
+// or "" when it could not be located.
+func effectiveGoproxy(getenv func(string) string, configDir func() (string, error)) (val, source, file string, err error) {
+	if val = getenv("GOPROXY"); val != "" {
+		return val, "the environment", "", nil
+	}
+	file, err = goEnvFile(getenv, configDir)
+	if err != nil {
+		return "", "", "", err
+	}
+	if file == "" {
+		return "", "the environment", "", nil
+	}
+	fileVal, found, err := readGoEnvFile(file, "GOPROXY")
+	if err != nil {
+		return "", "", file, err
+	}
+	if found {
+		return fileVal, file, file, nil
+	}
+	return "", "the environment", file, nil
 }
 
 // reachableProxies returns the GOPROXY entries the go command can reach, in

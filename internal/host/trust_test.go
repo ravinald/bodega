@@ -1235,3 +1235,102 @@ func TestRubygemsTrustFollowsEveryGemrcLayer(t *testing.T) {
 		t.Fatalf("gem configured for bodega through GEMRC, system store refusing its chain: %+v; want WARN and --ca-file", f)
 	}
 }
+
+func TestAudit11BundlerSelectedConfigStillOwesTrust(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	for _, key := range []string{"BUNDLE_USER_CONFIG", "BUNDLE_USER_HOME"} {
+		t.Run(key, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "config")
+			selected := file
+			if key == "BUNDLE_USER_HOME" {
+				selected = dir
+			}
+			writeTrustFile(t, file, "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \""+base+"/rubygems/\"\n")
+			r := rubyFixture(t, []string{"bundle"}, "", map[string]string{key: selected})
+			f, ok := checkRubygems(r)
+			if !ok || f.Status != StatusOK {
+				t.Fatalf("configured Bundler control = %+v, %v", f, ok)
+			}
+			p.Home, p.Getenv = r.home, r.getenv
+			got := p.Apply([]Finding{f}, base)[0]
+			if got.Status != StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
+				t.Fatalf("Bundler reads %s selected by %s, but the untrusted chain left %+v; want WARN and --ca-file", file, key, got)
+			}
+		})
+	}
+}
+
+func TestAudit11FreeBSDReportNeverExecutesHostClients(t *testing.T) {
+	for _, name := range []string{"pkg", "make"} {
+		t.Run(name, func(t *testing.T) {
+			home, bin := t.TempDir(), t.TempDir()
+			marker := filepath.Join(home, "client-ran")
+			t.Setenv("PATH", bin)
+			t.Setenv("F116_AUDIT_MARKER", marker)
+			script := "#!/bin/sh\nprintf ran > \"$F116_AUDIT_MARKER\"\nprintf '%s\\n' /missing/ports\n"
+			if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			var f Finding
+			if name == "pkg" {
+				f = checkPkgRepos("freebsd", runTool)
+			} else {
+				f = checkMakeConf("freebsd", runTool, func(string) bool { return false })
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatalf("normal FreeBSD doctor discovery executed host %s: %+v", name, f)
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// A client's endpoint is the one its effective configuration gives it: a
+// value the environment sets hides the file below it, for the trust verdict
+// as for the row, so a hidden file naming bodega owes and proves nothing.
+func TestTrustFollowsTheEffectiveEndpoint(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	p.Home = t.TempDir()
+	conf := filepath.Join(p.Home, ".config")
+	p.ConfigDir = func() (string, error) { return conf, nil }
+	writeTrustFile(t, filepath.Join(conf, "go", "env"), "GOPROXY="+base+"/go,off\n")
+	writeTrustFile(t, filepath.Join(p.Home, ".bundle", "config"), "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \""+base+"/rubygems/\"\n")
+	elsewhere := t.TempDir()
+	writeTrustFile(t, filepath.Join(elsewhere, "config"), "---\nBUNDLE_MIRROR__ALL: \"https://mirror.example/\"\n")
+	writeTrustFile(t, filepath.Join(elsewhere, "goenv"), "GOPROXY=https://proxy.golang.org,direct\n")
+
+	state := func(check string, env map[string]string) TrustState {
+		t.Helper()
+		p.Getenv = func(k string) string { return env[k] }
+		got, err := p.Judge([]string{check}, base)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("Judge(%s) = %+v, %v", check, got, err)
+		}
+		return got[0].State
+	}
+	for _, c := range []struct {
+		name, check string
+		env         map[string]string
+		want        TrustState
+	}{
+		{"go env file alone", "goproxy-env", nil, TrustFailed},
+		{"GOPROXY names another proxy", "goproxy-env", map[string]string{"GOPROXY": "https://proxy.golang.org,direct"}, TrustAbsent},
+		{"GOPROXY reaches bodega after off", "goproxy-env", map[string]string{"GOPROXY": "off," + base + "/go"}, TrustAbsent},
+		{"GOPROXY names bodega", "goproxy-env", map[string]string{"GOPROXY": base + "/go,off"}, TrustFailed},
+		{"GOENV selects another file", "goproxy-env", map[string]string{"GOENV": filepath.Join(elsewhere, "goenv")}, TrustAbsent},
+		{"GOENV=off", "goproxy-env", map[string]string{"GOENV": "off"}, TrustAbsent},
+		{"GOENV names a directory", "goproxy-env", map[string]string{"GOENV": elsewhere}, TrustUnchecked},
+		{"~/.bundle/config alone", "rubygems", nil, TrustFailed},
+		{"BUNDLE_USER_CONFIG selects another file", "rubygems", map[string]string{"BUNDLE_USER_CONFIG": filepath.Join(elsewhere, "config")}, TrustAbsent},
+		{"BUNDLE_USER_HOME selects another file", "rubygems", map[string]string{"BUNDLE_USER_HOME": elsewhere}, TrustAbsent},
+		{"a mirror in the environment hides the file", "rubygems", map[string]string{"BUNDLE_MIRROR__ALL": "https://mirror.example/"}, TrustAbsent},
+		{"a mirror in the environment names bodega", "rubygems", map[string]string{"BUNDLE_USER_HOME": elsewhere, "BUNDLE_MIRROR__ALL": base + "/rubygems/"}, TrustFailed},
+		{"BUNDLE_USER_CONFIG names a directory", "rubygems", map[string]string{"BUNDLE_USER_CONFIG": elsewhere}, TrustUnchecked},
+	} {
+		if got := state(c.check, c.env); got != c.want {
+			t.Errorf("%s: state = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

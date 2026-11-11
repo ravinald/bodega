@@ -1456,14 +1456,11 @@ instance, the recommended posture is:
 - **Configure each package manager to talk to bodega exclusively.**
   `bodega doctor` enumerates the files it checks and the bodega endpoint each
   should point at. Re-run `bodega doctor` after rewriting to confirm exit 0.
-  On FreeBSD the `pkg-repos` check reads `/etc/pkg/`,
-  `/usr/local/etc/pkg/repos/` and `/var/db/pkg/repos_state/` for an enabled
-  upstream repository, and `make-conf` reads `/etc/make.conf`, the files it
-  includes and the stock system makefiles make reads around it for
-  distfiles sites that are not bodega's and for the client check included
-  last. Neither reports OK for a file it cannot evaluate the
-  way pkg or make would, nor when `pkg.conf` or the environment moves what
-  pkg or make reads away from those files.
+  On FreeBSD the `pkg-repos` and `make-conf` rows never report OK: which
+  repositories pkg enables and which sites a port fetches from are what pkg
+  and make compute, and doctor runs neither to ask. Each row warns
+  `unchecked` and names the command to run by hand (`pkg -vv`, `make -V`),
+  so exit 0 is not reachable on a FreeBSD host with pkg installed.
 - **Set `GOPROXY` to `http://<bodega>/go`**, with no `direct` entry after
   it. A cache miss then fails loudly; a `direct` entry silently falls
   through to public VCS, defeating the chokepoint.

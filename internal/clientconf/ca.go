@@ -159,6 +159,30 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		sel = env("GIT_CONFIG_GLOBAL")
 	case rec.System == manifest.TypeGit:
 		sel = env("GIT_CONFIG_SYSTEM")
+	case rec.System == manifest.TypeHelm:
+		// helm reads one repositories.yaml: the file named outright, or the
+		// one in the configuration directory the environment moves.
+		sel = env("HELM_REPOSITORY_CONFIG")
+		if dir := env("HELM_CONFIG_HOME"); sel == "" && dir != "" {
+			sel = filepath.Join(dir, "repositories.yaml")
+		}
+		if dir := env("XDG_CONFIG_HOME"); sel == "" && dir != "" && h.GOOS != OSDarwin {
+			sel = filepath.Join(dir, "helm", "repositories.yaml")
+		}
+	case rec.System == manifest.TypeGomod:
+		// GOENV=off reads no file, which the verdict reports; there is no
+		// file to edit in its place.
+		if sel = env("GOENV"); sel == "off" {
+			sel = ""
+		}
+		if dir := env("XDG_CONFIG_HOME"); sel == "" && dir != "" && h.GOOS != OSDarwin {
+			sel = filepath.Join(dir, "go", "env")
+		}
+	case rec.System == manifest.TypeRubygems && strings.HasSuffix(rec.Path, "/.bundle/config"):
+		sel = env("BUNDLE_USER_CONFIG")
+		if dir := env("BUNDLE_USER_HOME"); sel == "" && dir != "" {
+			sel = filepath.Join(dir, "config")
+		}
 	}
 	if sel != "" && sel != os.DevNull {
 		if abs, err := filepath.Abs(sel); err == nil {
@@ -912,6 +936,30 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 					return CAInstall{}, refuse(c.Target, err)
 				}
 				in.Changes[i].New = merged
+			}
+			// A file the environment has this client read in place of the
+			// plan's takes the same merge, whichever store the client
+			// verifies through: its entry may name a CA that replaces the
+			// system store, and the plan's file is never opened.
+			for _, sh := range h.shadows(rec, c.Target, c.New) {
+				if !sh.whole || kind.whole() || slices.ContainsFunc(selected, func(o Change) bool { return o.Target == sh.path }) {
+					continue
+				}
+				old, err := os.ReadFile(sh.path)
+				if err != nil {
+					return CAInstall{}, fmt.Errorf("%s: read %s, which this client reads in place of %s: %w", rec.System, sh.path, c.Target, err)
+				}
+				planned := c.planned
+				if planned == nil {
+					planned = c.New
+				}
+				merged, err := kind.merge(old, planned)
+				if err != nil {
+					return CAInstall{}, refuse(sh.path, err)
+				}
+				also := rec
+				also.Path = sh.path
+				selected = append(selected, Change{Record: also, Target: sh.path, Old: old, Existed: true, New: merged})
 			}
 			continue
 		}

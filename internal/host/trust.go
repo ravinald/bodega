@@ -169,6 +169,62 @@ func envCA(t TrustProbe, keys ...string) *trustStore {
 	return nil
 }
 
+// namesHost reports whether raw is a URL at host, port included.
+func namesHost(raw, host string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(u.Host, host)
+}
+
+// goStores is the system trust store when a proxy the go command can reach
+// is at bodega's host. The list is the effective GOPROXY, resolved as the
+// goproxy-env row resolves it: a non-empty value in the environment hides
+// the go env file, so a file naming bodega under an environment that names
+// another proxy configures nothing.
+func goStores(t TrustProbe, u *url.URL) []trustStore {
+	configDir := t.ConfigDir
+	if configDir == nil {
+		configDir = func() (string, error) { return "", errors.New("no user config directory") }
+	}
+	val, _, _, err := effectiveGoproxy(t.env, configDir)
+	if err != nil {
+		if t.ConfigDir == nil {
+			return nil
+		}
+		return []trustStore{{blind: fmt.Sprintf("GOPROXY is unset in the environment and the go env file was not read (%v), so whether go fetches from bodega, and verifies its certificate, is unchecked", err)}}
+	}
+	if !slices.ContainsFunc(reachableProxies(val), func(entry string) bool { return namesHost(entry, u.Host) }) {
+		return nil
+	}
+	return []trustStore{{name: systemStoreName, system: true}}
+}
+
+// rubyStores is the store gem and Bundler verify bodega against when either
+// is configured for it. gem adds ssl_ca_cert to OpenSSL's default paths; it
+// replaces nothing. Bundler's mirror is the one the rubygems row resolves:
+// the environment, then the user config $BUNDLE_USER_CONFIG or
+// $BUNDLE_USER_HOME selects, which hides ~/.bundle/config.
+func rubyStores(t TrustProbe, u *url.URL) []trustStore {
+	var files []string
+	for _, l := range gemrcLayers(t.Root, t.GOOS, t.Home, t.env) {
+		files = append(files, l.path)
+	}
+	configured := mention(u.Host, files...)
+	if !configured {
+		mirror, _, err := bundlerMirror(t.env, t.Home)
+		if err != nil {
+			return []trustStore{{blind: fmt.Sprintf("Bundler's config was not read (%v), so whether Bundler fetches from bodega, and verifies its certificate, is unchecked", err)}}
+		}
+		configured = namesHost(mirror, u.Host)
+	}
+	if !configured {
+		return nil
+	}
+	if v, f := firstMatch(gemCACert, filepath.Join(t.Home, ".gemrc")); v != "" {
+		return []trustStore{*named(v, "ssl_ca_cert in "+f, false)}
+	}
+	return []trustStore{{name: systemStoreName, system: true}}
+}
+
 var (
 	gemCACert = regexp.MustCompile(`(?m)^:?ssl_ca_cert:\s*["']?([^"'\s#]+)`)
 )
@@ -238,19 +294,7 @@ var trustRows = map[string]trustRow{
 		}
 		return nil
 	}),
-	// gem adds ssl_ca_cert to OpenSSL's default paths; it replaces nothing.
-	"rubygems": systemOnly(manifest.TypeRubygems, func(t TrustProbe, host string) bool {
-		files := []string{filepath.Join(t.Home, ".bundle", "config")}
-		for _, l := range gemrcLayers(t.Root, t.GOOS, t.Home, t.env) {
-			files = append(files, l.path)
-		}
-		return mention(host, files...) || slices.ContainsFunc(bundlerMirrorKeys, func(k string) bool { return strings.Contains(t.env(k), host) })
-	}, func(t TrustProbe) *trustStore {
-		if v, f := firstMatch(gemCACert, filepath.Join(t.Home, ".gemrc")); v != "" {
-			return named(v, "ssl_ca_cert in "+f, false)
-		}
-		return nil
-	}),
+	"rubygems": {system: manifest.TypeRubygems, stores: rubyStores},
 	"composer": systemOnly(manifest.TypeComposer, func(t TrustProbe, host string) bool {
 		return mention(host, filepath.Join(clientconf.HostComposerHome(t.Home), "config.json"))
 	}, func(t TrustProbe) *trustStore {
@@ -265,16 +309,7 @@ var trustRows = map[string]trustRow{
 		}
 		return nil
 	}),
-	"goproxy-env": systemOnly(manifest.TypeGomod, func(t TrustProbe, host string) bool {
-		if strings.Contains(t.env("GOPROXY"), host) {
-			return true
-		}
-		if t.ConfigDir == nil {
-			return false
-		}
-		file, err := goEnvFile(t.env, t.ConfigDir)
-		return err == nil && file != "" && mention(host, file)
-	}, nil),
+	"goproxy-env": {system: manifest.TypeGomod, stores: goStores},
 	// git and helm have no row in the report; these judge them after a CA
 	// install, which answers for every client it configured.
 	"git-config":                          {system: manifest.TypeGit, stores: gitStores},

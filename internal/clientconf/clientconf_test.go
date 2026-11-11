@@ -2768,3 +2768,118 @@ func TestContinuationIsEachFormatsOwn(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit11CAPlanEditsSelectedHelmConfig(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, root := t.TempDir(), t.TempDir()
+	target := filepath.Join(t.TempDir(), "repositories.yaml")
+	old := HelmDocument(HelmRepository(testBase, "caFile: /missing/company-ca.pem", "username: company-user", "password: company-password"))
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string {
+		if k == "HELM_REPOSITORY_CONFIG" {
+			return target
+		}
+		return ""
+	}}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := changeAt(t, in.Changes, target)
+	if strings.Contains(string(change.New), "/missing/company-ca.pem") {
+		t.Fatal("selected Helm file still replaces system roots with the missing CA")
+	}
+	for _, keep := range []string{"company-user", "company-password"} {
+		if !strings.Contains(string(change.New), keep) {
+			t.Fatalf("selected Helm file lost %s", keep)
+		}
+	}
+	if _, err := Apply(in.Changes, ".audit11"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, change.New) {
+		t.Fatalf("selected Helm file was not applied: %s, %v", got, err)
+	}
+	again, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changeAt(t, again.Changes, target).Unchanged() {
+		t.Fatal("selected Helm file changes again")
+	}
+}
+
+// A system-store client whose configuration the environment relocates gets
+// the plan's merge in the file it reads, with that file's other settings
+// kept, and a second plan leaves it alone.
+func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundler := Rubygems(testBase)[1]
+	for _, c := range []struct {
+		name string
+		file File
+		env  func(target string) map[string]string
+		path string
+		old  string
+		want string
+	}{
+		{"GOENV", Gomod(testBase), func(f string) map[string]string { return map[string]string{"GOENV": f} }, "goenv",
+			"GOFLAGS=-mod=mod\nGOPROXY=https://proxy.golang.org,direct\n", "GOPROXY=" + GoProxy(testBase)},
+		{"XDG_CONFIG_HOME for go", Gomod(testBase), func(f string) map[string]string {
+			return map[string]string{"XDG_CONFIG_HOME": filepath.Dir(filepath.Dir(f))}
+		}, "go/env", "GOFLAGS=-mod=mod\n", "GOPROXY=" + GoProxy(testBase)},
+		{"HELM_CONFIG_HOME", Helm(testBase), func(f string) map[string]string { return map[string]string{"HELM_CONFIG_HOME": filepath.Dir(f)} }, "repositories.yaml",
+			HelmDocument("- name: company\n  url: https://charts.example/\n"), testBase + "/helm"},
+		{"BUNDLE_USER_CONFIG", bundler, func(f string) map[string]string { return map[string]string{"BUNDLE_USER_CONFIG": f} }, "config",
+			"---\nBUNDLE_JOBS: \"4\"\n", testBase},
+		{"BUNDLE_USER_HOME", bundler, func(f string) map[string]string { return map[string]string{"BUNDLE_USER_HOME": filepath.Dir(f)} }, "config",
+			"---\nBUNDLE_JOBS: \"4\"\n", testBase},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			target := filepath.Join(t.TempDir(), c.path)
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(c.old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			env := c.env(target)
+			h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string { return env[k] }}
+			in, err := AddCA(caPlan(t, home, c.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			change := changeAt(t, in.Changes, target)
+			if !strings.Contains(string(change.New), c.want) {
+				t.Fatalf("%s does not hold %s:\n%s", target, c.want, change.New)
+			}
+			for _, line := range strings.Split(strings.TrimSpace(c.old), "\n") {
+				if !strings.HasPrefix(line, "GOPROXY=") && !strings.Contains(string(change.New), line) {
+					t.Errorf("%s lost the line %q:\n%s", target, line, change.New)
+				}
+			}
+			if _, err := Apply(in.Changes, ".selected"); err != nil {
+				t.Fatal(err)
+			}
+			again, err := AddCA(caPlan(t, home, c.file), ca, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !changeAt(t, again.Changes, target).Unchanged() {
+				t.Fatal("the selected file changes again on a second plan")
+			}
+		})
+	}
+}
