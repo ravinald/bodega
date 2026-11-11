@@ -136,7 +136,7 @@ func TestPolicySimulateRefusesWhatSetRefuses(t *testing.T) {
 		{"--osv", "helm=block"},
 		{"--osv", "npm=deny"},
 		{"--age", "npm=block"},
-		{"--age", "apt=7d:block"},
+		{"--age", "helm=7d:block"},
 	} {
 		cmd := newPolicySimulateCmd(&globalFlags{})
 		cmd.SetArgs(args)

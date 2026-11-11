@@ -306,7 +306,7 @@ func (s *Server) aptPoolHidden(w http.ResponseWriter, r *http.Request, poolPath 
 // skipped, because "not found" would then be a claim about an archive nobody
 // read.
 func LocateMirroredAptVersion(ctx context.Context, cfg *config.Config, db *audit.DB, name, version string) ([]string, error) {
-	s := &Server{cfg: cfg, logger: slog.New(slog.DiscardHandler)}
+	s := &Server{cfg: cfg, logger: slog.New(slog.DiscardHandler), auditDB: db}
 	if db != nil {
 		s.policy = policy.NewChecker(db)
 	}

@@ -113,11 +113,11 @@ func TestAgePolicy_WarnDoesNotBlock(t *testing.T) {
 // when a policy row exists for them.
 func TestAgePolicy_UnsupportedEcosystem(t *testing.T) {
 	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
-		manifest.TypeApt: {Ecosystem: manifest.TypeApt, MinAgeSeconds: 86400, Action: ActionBlock},
+		manifest.TypeHelm: {Ecosystem: manifest.TypeHelm, MinAgeSeconds: 86400, Action: ActionBlock},
 	}}
 	ck := NewAgeChecker(store)
 	r := ck.Check(context.Background(),
-		&manifest.PackageManifest{Name: "bash", Type: manifest.TypeApt},
+		&manifest.PackageManifest{Name: "bash", Type: manifest.TypeHelm},
 		&manifest.VersionEntry{Version: "5.2.21"})
 	// Unsupported ecosystem => publishedAt errors => warn (not block).
 	// The operator sees "upstream timestamp unavailable" in the audit.
@@ -516,7 +516,7 @@ func TestAgePolicy_RpmDatedFromPrimary(t *testing.T) {
 }
 
 func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
+	want := []string{manifest.TypeApt, manifest.TypeCargo, manifest.TypeComposer, manifest.TypeGomod, manifest.TypeMaven, manifest.TypeNpm, manifest.TypeOCI, manifest.TypePypi, manifest.TypeRpm, manifest.TypeRubygems}
 	got := AgeEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
@@ -528,9 +528,9 @@ func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
 	}
 	// An ecosystem `policy age set` refuses must also be one publishedAt
 	// cannot date, or the refusal and the gate disagree.
-	_, err := (&AgeChecker{}).PublishedAt(context.Background(), manifest.TypeApt, "bash", "5.2")
+	_, err := (&AgeChecker{}).PublishedAt(context.Background(), manifest.TypeHelm, "nginx", "1.0.0")
 	if err == nil || !strings.Contains(err.Error(), "no upstream timestamp source") {
-		t.Errorf("apt has no timestamp source; got err=%v", err)
+		t.Errorf("helm has no timestamp source; got err=%v", err)
 	}
 }
 
@@ -569,5 +569,40 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 	}
 	if reached {
 		t.Error("the gate queried an upstream for a version that pins nothing")
+	}
+}
+
+// An apt version is dated off its entry by the record bodega made when a
+// mirrored index first listed it; no record is a check that did not run.
+func TestAgeChecker_AptDatedByTheFirstIndexThatListedIt(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeApt: {Ecosystem: manifest.TypeApt, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	dated := func(by, at string) *manifest.VersionEntry {
+		return &manifest.VersionEntry{Version: "8.5.4-0ubuntu2", PublishedAt: at,
+			Metadata: map[string]string{AptDatedByKey: by, AptCodenameKey: "resolute-security"}}
+	}
+	for _, tc := range []struct {
+		label  string
+		ve     *manifest.VersionEntry
+		action string
+		suffix string
+	}{
+		{"too new", dated(AptDatedByRelease, "2026-11-09T06:00:00Z"), ActionBlock, "dated by the Release of resolute-security generated 2026-11-09T06:00:00Z"},
+		{"old enough", dated(AptDatedByRelease, "2026-10-01T06:00:00Z"), ActionPass, "dated by the Release of resolute-security generated 2026-10-01T06:00:00Z"},
+		{"predates", dated(AptDatedByPredates, ""), ActionPass, "listed before bodega first read resolute-security"},
+		{"no record", &manifest.VersionEntry{Version: "8.5.4-0ubuntu2", Metadata: map[string]string{AptDateErrorKey: "the index failed"}}, ActionNotEvaluated, "the index failed"},
+		{"not mirrored", &manifest.VersionEntry{Version: "8.5.4-0ubuntu2"}, ActionNotEvaluated, "not fetched through a mirrored codename's pool"},
+	} {
+		ck := NewAgeChecker(store)
+		ck.Now = func() time.Time { return now }
+		r := ck.Check(t.Context(), &manifest.PackageManifest{Name: "php8.5-fpm", Type: manifest.TypeApt}, tc.ve)
+		if r.Action != tc.action || !strings.HasSuffix(r.Reason, tc.suffix) {
+			t.Errorf("%s: got %s %q, want %s ending %q", tc.label, r.Action, r.Reason, tc.action, tc.suffix)
+		}
+	}
+	if slices.Contains(LookupDatedEcosystems(), manifest.TypeApt) {
+		t.Error("apt is dated as bodega reads a mirrored index, and no lookup by name and version can record a time for it")
 	}
 }

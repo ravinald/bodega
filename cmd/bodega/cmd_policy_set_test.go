@@ -37,11 +37,11 @@ func TestPolicyOSVSet_RefusesUnmappedEcosystem(t *testing.T) {
 func TestPolicyAgeSet_RefusesUnmappedEcosystem(t *testing.T) {
 	loadFrom(t, "{}")
 	cmd := newPolicyAgeSetCmd(&globalFlags{})
-	err := cmd.RunE(cmd, []string{"apt", "7d", "warn"})
+	err := cmd.RunE(cmd, []string{"helm", "7d", "warn"})
 	if err == nil {
-		t.Fatal("apt has no upstream timestamp source; set must refuse it")
+		t.Fatal("helm has no upstream timestamp source; set must refuse it")
 	}
-	for _, want := range []string{"apt", "age gate", "every version would warn", "cargo", "gomod"} {
+	for _, want := range []string{"helm", "age gate", "every version would warn", "cargo", "gomod"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should name %q, got: %v", want, err)
 		}
@@ -59,6 +59,10 @@ func TestRequireEcosystem_AcceptsCovered(t *testing.T) {
 			t.Errorf("%s is dated but was refused: %v", eco, err)
 		}
 	}
+	// apt is dated by the earliest mirrored index that lists a version (F112).
+	if err := requireEcosystem("apt", policy.AgeEcosystems(), "age gate", "x"); err != nil {
+		t.Errorf("apt is dated by its mirrored Release but was refused: %v", err)
+	}
 	if err := requireEcosystem("NPM", policy.OSVEcosystems(), "OSV gate", "x"); err == nil {
 		t.Error("registry types are lowercase; NPM must be refused, not silently accepted")
 	}
@@ -68,9 +72,9 @@ func TestRequireEcosystem_AcceptsCovered(t *testing.T) {
 // `list` prints them beside the enforced rows with nothing to tell them apart.
 func TestReportUncoveredNamesTheStoredRowsNoGateReads(t *testing.T) {
 	out := captureStdout(t, func() {
-		reportUncovered("age gate", []string{"npm", "helm", "apt"}, policy.AgeEcosystems(), "bodega policy age remove")
+		reportUncovered("age gate", []string{"npm", "helm", "git"}, policy.AgeEcosystems(), "bodega policy age remove")
 	})
-	for _, want := range []string{"helm", "apt", "never read", "bodega policy age remove"} {
+	for _, want := range []string{"helm", "git", "never read", "bodega policy age remove"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("note does not mention %q:\n%s", want, out)
 		}
