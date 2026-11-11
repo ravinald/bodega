@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -948,5 +950,65 @@ func TestReviewF113ResolvedRoutesStayDistinct(t *testing.T) {
 				t.Errorf("fan-out retained %d of two distinct locations", len(got))
 			}
 		})
+	}
+}
+
+type reviewF113HTTPClient func(*http.Request) (*http.Response, error)
+
+func (f reviewF113HTTPClient) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestReviewF113MoveRouteMatchesSDKRequest(t *testing.T) {
+	isolateS3Env(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv(config.EnvBucket, "")
+	t.Setenv(config.EnvRegion, "")
+	body := `{"storage_backend":"local","storage_backends":{
+		"source":{"driver":"s3","region":"fips-us-west-2","bucket":"artifacts","prefix":"cold"},
+		"target":{"driver":"s3","region":"us-west-2","endpoint":"https://artifacts.s3-fips.us-west-2.amazonaws.com","bucket":"cold","path_style":true}
+	}}`
+	file := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigFile, file)
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("configuration did not load: %v", err)
+	}
+	cfg.StoragePath = t.TempDir()
+	resolver, err := NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stores []ObjectStore
+	var routes []string
+	for _, name := range []string{"source", "target"} {
+		store, err := resolver.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores = append(stores, store)
+		s, prefix, _ := s3Under(store)
+		out, err := s.client.S3Client().GetObject(t.Context(), &awss3.GetObjectInput{
+			Bucket: aws.String(s.client.Bucket()), Key: aws.String(prefix + "object"),
+		}, func(o *awss3.Options) {
+			o.HTTPClient = reviewF113HTTPClient(func(r *http.Request) (*http.Response, error) {
+				routes = append(routes, r.URL.Scheme+"://"+r.URL.Host+r.URL.Path)
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("payload")), ContentLength: 7, Request: r}, nil
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = out.Body.Close()
+		route, resolved := s3ObjectRoute(store)
+		t.Logf("label=%s wire URL=%s move route=%s resolved=%v", store.Label(), routes[len(routes)-1], route, resolved)
+	}
+	if len(routes) != 2 || routes[0] != routes[1] {
+		t.Fatalf("fixture routes differ: %q", routes)
+	}
+	if !SameLocation(stores[0], stores[1]) {
+		t.Errorf("SameLocation=false for the same SDK object URL %s; both move guards permit self-copy", routes[0])
 	}
 }

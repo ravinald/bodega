@@ -683,6 +683,18 @@ func TestReviewF113MoveRefusesSDKPathAliases(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "same location") {
 				t.Errorf("selectForMove = %v, %v for %q -> %q; want same-location refusal before --delete-source can remove the only copy", selected, err, r.Default().Label(), dst.Label())
 			}
+			if tc.name == "path-style component alias" {
+				// Operator decision, 2026-11-10: two configured roots are two
+				// identities, and only the move refuses, on the route.
+				if got := r.Fanout(t.Context(), "apt", []string{"alias"}); len(got) != 2 {
+					t.Errorf("Fanout returned %d locations for two configured roots; want 2", len(got))
+				}
+				const wantDefault, wantAlias = "s3+https://store.example.net/tenant|artifacts", "s3+https://store.example.net/tenant/artifacts"
+				if a, b := storage.S3RecordLabel(r.Default()), storage.S3RecordLabel(dst); a != wantDefault || b != wantAlias {
+					t.Errorf("record labels = %q and %q; want %q and %q", a, b, wantDefault, wantAlias)
+				}
+				return
+			}
 			if got := r.Fanout(t.Context(), "apt", []string{"alias"}); len(got) != 1 {
 				t.Errorf("Fanout returned %d locations for one SDK object namespace", len(got))
 			}
@@ -767,5 +779,35 @@ func TestReviewF113SDKPathAliasCannotDeleteTheOnlyCopy(t *testing.T) {
 				t.Errorf("self-move mutated the store: %v; surviving payload = %q", mutations, objects[objectPath])
 			}
 		})
+	}
+}
+
+func TestReviewF113MoveSelectionRefusesFIPSRouteAlias(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE", "AWS_USE_FIPS_ENDPOINT", "AWS_USE_DUALSTACK_ENDPOINT"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	stores, err := storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "local", StoragePath: t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"source": {Driver: "s3", Region: "fips-us-west-2", Bucket: "artifacts", Prefix: "cold"},
+			"target": {Driver: "s3", Region: "us-west-2", Endpoint: "https://artifacts.s3-fips.us-west-2.amazonaws.com", Bucket: "cold", PathStyle: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := stores.ByName("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0", Storage: "source"}},
+	}
+	selected, err := selectForMove(stores, dst, pm, "", "target")
+	if err == nil || !strings.Contains(err.Error(), "same location") {
+		t.Errorf("selectForMove = %v, %v; want refusal before a FIPS route alias can delete the only copy", selected, err)
 	}
 }

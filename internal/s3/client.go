@@ -19,6 +19,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 )
 
 // ObjectAPI is every SDK call a running bodega makes against its bucket, and
@@ -145,46 +146,86 @@ type Route struct {
 	Endpoint string
 }
 
-// Route resolves the client's bucket through the SDK's own endpoint rules,
-// with the endpoint and addressing style the client was built with, so it is
-// the route a request takes and not a reading of the configuration: the rules
-// decode the endpoint's path, choose between <bucket>.<host> and
-// <host>/<bucket>, and fall back to the second for a bucket or host they will
-// not address the first way. Endpoint is set even when it fails.
+// Route asks the client's own request pipeline where a key in its bucket
+// goes. It starts a GetObject through the SDK client the driver uses and
+// stops it at endpoint resolution, so the answer comes from the parameters
+// the SDK binds for a real request: a "fips-us-west-2" region is already
+// "us-west-2" with FIPS selected, a dual-stack or FIPS setting read from the
+// environment is applied, and the rules have decoded the endpoint's path and
+// chosen between <bucket>.<host> and <host>/<bucket>. Resolving a copy of
+// some client settings by hand disagrees with the request wherever the SDK
+// infers one of the others. Endpoint is set even when it fails.
 //
-// A client with no region and no endpoint is resolved as if it had a region.
-// Its requests fail until the SDK's chain supplies one, but the rules resolve
-// nothing without it, and which region is no part of where an AWS bucket is:
-// the answer would otherwise change with AWS_REGION.
+// Nothing is sent and no credential is read: the resolver is the first thing
+// the SDK consults, before it picks an auth scheme, and the stand-in
+// credentials and transport hold that if a later SDK reorders the stack.
+//
+// A client with no region is resolved as if it had one. Its requests fail
+// until the SDK's chain supplies a region, and which region is no part of
+// where an AWS bucket is: the answer would otherwise change with AWS_REGION.
 func (c *Client) Route(ctx context.Context) (Route, error) {
-	region, endpoint, pathStyle := c.region, c.Endpoint(), false
-	if c.raw != nil {
-		opts := c.raw.Options()
-		region, pathStyle = opts.Region, opts.UsePathStyle
+	route := Route{Endpoint: c.Endpoint()}
+	raw := c.raw
+	if raw == nil {
+		raw = awss3.New(awss3.Options{Region: c.region})
 	}
-	if region == "" && endpoint == "" {
-		region = "us-east-1"
+	capture := &routeCapture{}
+	_, err := raw.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String("key"),
+	}, func(o *awss3.Options) {
+		if o.Region == "" {
+			o.Region = "us-east-1"
+		}
+		capture.inner = o.EndpointResolverV2
+		o.EndpointResolverV2 = capture
+		o.Retryer = aws.NopRetryer{}
+		o.Credentials = aws.AnonymousCredentials{}
+		o.HTTPClient = noTransport{}
+	})
+	switch {
+	case capture.uri != nil:
+		route.URL = *capture.uri
+		return route, nil
+	case capture.err != nil:
+		return route, capture.err
+	case err != nil:
+		return route, fmt.Errorf("resolve route for bucket %q: %w", c.bucket, err)
 	}
-	return ResolveRoute(ctx, region, endpoint, c.bucket, pathStyle)
+	return route, fmt.Errorf("resolve route for bucket %q: the SDK resolved no endpoint", c.bucket)
 }
 
-// ResolveRoute is Route for a bucket no client was built for.
-func ResolveRoute(ctx context.Context, region, endpoint, bucket string, pathStyle bool) (Route, error) {
-	params := awss3.EndpointParameters{
-		Region:         aws.String(region),
-		Bucket:         aws.String(bucket),
-		ForcePathStyle: aws.Bool(pathStyle),
+var errRouteCaptured = errors.New("route captured")
+
+// routeCapture records the first endpoint the SDK resolves for an operation
+// and fails the operation there.
+type routeCapture struct {
+	inner awss3.EndpointResolverV2
+	uri   *url.URL
+	err   error
+}
+
+func (r *routeCapture) ResolveEndpoint(ctx context.Context, params awss3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	if r.inner == nil {
+		r.err = errors.New("the client has no endpoint resolver")
+		return smithyendpoints.Endpoint{}, r.err
 	}
-	if endpoint != "" {
-		params.Endpoint = aws.String(endpoint)
-	}
-	route := Route{Endpoint: endpoint}
-	ep, err := awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, params)
+	ep, err := r.inner.ResolveEndpoint(ctx, params)
 	if err != nil {
-		return route, err
+		r.err = err
+		return ep, err
 	}
-	route.URL = ep.URI
-	return route, nil
+	if r.uri == nil {
+		uri := ep.URI
+		r.uri = &uri
+	}
+	return ep, errRouteCaptured
+}
+
+type noTransport struct{}
+
+func (noTransport) Do(*http.Request) (*http.Response, error) {
+	return nil, errors.New("route resolution sends no request")
 }
 
 // Endpoint is the base URL the client dials, from the endpoint key or from
