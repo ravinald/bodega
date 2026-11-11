@@ -64,7 +64,7 @@ try {
 {{- else if eq .Kind "home" }}
   <aside class="mark"><img src="{{ .Site.Base }}assets/emblem/emblem-256.png" width="256" height="256" alt="A pixel-art depot with a blue lowercase b above one open bay and a parcel on its threshold"></aside>
 {{- end }}
-  <main class="prose{{ if eq .Kind "colophon" }} colophon{{ end }}">
+  <main{{ if ne .Kind "api" }} class="prose{{ if eq .Kind "colophon" }} colophon{{ end }}"{{ end }}>
 {{- if eq .Kind "doc" }}
   <details class="contents-compact">
     <summary>Contents{{ if .Here.Title }} <span>{{ .Here.Num }} · {{ .Here.Title }}</span>{{ end }}</summary>

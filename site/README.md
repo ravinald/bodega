@@ -1,16 +1,16 @@
 # Bodega website
 
-`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, [`api/openapi.yaml`](../api/openapi.yaml) becomes the API reference under `/api/`, and the coverage feed becomes `/coverage.html`. nginx serves the static output. There is no JavaScript framework and no npm step.
+`sitegen` (`main.go`) renders the project website from the repository: `README.md` becomes the front page, each document under [docs](../docs) becomes a page under `/docs/`, `docs/usage.md` splits into one page per `##` section, [Scalar](https://github.com/scalar/scalar) renders [`api/openapi.yaml`](../api/openapi.yaml) as the API reference at `/api/` from a vendored, checksummed bundle, and the coverage feed becomes `/coverage.html`. nginx serves the static output. No build step runs npm, and every script, stylesheet and font a page loads comes from the site's own origin.
 
-| Path            | What it holds                                                                               |
-| --------------- | ------------------------------------------------------------------------------------------- |
-| `main.go`       | The generator: Markdown rendering, link rewriting, the contents column, the coverage tables |
-| `api.go`        | The API reference: reads the OpenAPI document and writes the pages under `/api/`            |
-| `layout.html`   | The page template every page shares                                                         |
-| `site.css`      | The stylesheet, including the light, dark and color-vision palettes                         |
-| `pages/`        | Pages with no Markdown source: the colophon and the 404 page                                |
-| `static/fonts/` | Self-hosted Archivo and Source Serif 4 woff2 files and their SIL Open Font License texts    |
-| `scripts/`      | Coverage export, deployment and their tests                                                 |
+| Path             | What it holds                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `main.go`        | The generator: Markdown rendering, link rewriting, the contents column, the coverage tables |
+| `layout.html`    | The page template every page shares                                                         |
+| `site.css`       | The stylesheet, including the light, dark and color-vision palettes                         |
+| `pages/`         | Pages with no Markdown source: the colophon and the 404 page                                |
+| `static/fonts/`  | Self-hosted Archivo and Source Serif 4 woff2 files and their SIL Open Font License texts    |
+| `static/scalar/` | The vendored Scalar bundle and `scalar.json`, the record of its version and SHA-256         |
+| `scripts/`       | Coverage export, deployment and their tests, and `update-scalar.sh`                         |
 
 The generator is its own Go module (`site/go.mod`), so its Markdown dependency stays out of bodega's `go.mod` and out of `go list ./...`.
 
@@ -20,13 +20,34 @@ Every doc page lists the whole contents in the left column, numbered serially. A
 
 ## API reference
 
-`api.go` renders `api/openapi.yaml` with no viewer script: `/api/` lists every tag with its operations, `/api/<tag>.html` holds one tag's operations (method, path, description, parameters, request body and responses), and `/api/schemas.html` holds every schema under `components.schemas`. The pages sit in the contents column under their own group, placed by the `api` row of the `contents` table in `main.go`.
+`/api/` is one page. It keeps the site's header and navigation, and under them [Scalar](https://github.com/scalar/scalar)'s standalone bundle renders `api/openapi.yaml` in the reader's browser, embedded the way Scalar's own HTML integration does it: a mount point, the bundle, and one `Scalar.createApiReference` call. The generator copies the document to `/api/openapi.yaml`, which is both what the page fetches and the download. The page sits in the contents column under its own group, placed by the `api` row of the `contents` table in `main.go`.
 
 A doc that links `api/openapi.yaml` by its repository path lands on `/api/` here, and on the raw YAML when read on GitHub.
 
-A `$ref` to a schema renders as a link into `/api/schemas.html`, so one that names a missing schema is a broken link and stops the build like any other. A `$ref` to a parameter or a response is resolved in place, and one that names nothing stops the build with the operation and the `$ref` in the message.
+This is the one page where the site runs a third-party script. The pages around it carry a few lines of their own for the display preferences and the coverage table's sorting, and nothing else. The configuration in `apiBody` (`main.go`) keeps Scalar on this origin:
 
-The renderer reads the OpenAPI keywords the document uses today. A schema's `description`, `enum`, `default`, `pattern`, `minimum` and `maximum` appear wherever the document puts them: on a request or response body, a named schema, a property, a parameter, or the element of an array or a map. It does not render response headers, `example` values, links, callbacks or a `discriminator`; a document that starts using one builds, and the page omits it.
+| Option                                                 | Why                                                                                                  |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `telemetry: false`                                     | Scalar reports usage to scalar.com otherwise                                                         |
+| `withDefaultFonts: false`                              | Its default theme fetches Inter and a monospace face from fonts.scalar.com                           |
+| `hideClientButton`, `hideTestRequestButton`            | A request from this site to a reader's own bodega server is cross-origin and would carry their token |
+| `showDeveloperTools: "never"`                          | The toolbar links to Scalar's hosted products                                                        |
+| `mcp: { disabled: true }`, `agent: { disabled: true }` | Both reach scalar.com, and the agent is on by default for a localhost URL                            |
+| `layout: "modern"`                                     | Scalar's layout with its own sidebar and search                                                      |
+
+The mount point's id is `reference`, not `api-reference`: the bundle mounts a second reference with its defaults on any element carrying that id, and the defaults fetch the hosted fonts.
+
+### Updating Scalar
+
+The bundle is one exact `@scalar/api-reference` release, committed under `static/scalar/`. To move to another:
+
+```sh
+sh site/scripts/update-scalar.sh 1.76.0
+```
+
+Give it a release published at least two weeks ago, so a bad publish has had time to be noticed and pulled. The script downloads the package tarball from `registry.npmjs.org`, refuses it unless its sha512 matches the `dist.integrity` the registry's metadata reports for that version, extracts `dist/browser/standalone.js`, and writes `scalar.json` with the version and the bundle's SHA-256. It needs `curl`, `openssl`, `tar` and `python3`, and runs no npm or other package client. The registry check catches a truncated or substituted download; the metadata and the tarball come from the same origin, so it is the committed SHA-256 that holds from then on. Commit the bundle and `scalar.json` together.
+
+The generator refuses to build when the bundle's SHA-256 is not the one `scalar.json` records, and a test fails on the same mismatch, so an edit to the bundle that nobody recorded does not ship. After an update, load `/api/` from a local build with the browser's network panel open and confirm every request stays on the site's origin: a new release can add a default that reaches out, and the page test reads only the HTML the generator writes.
 
 ## Platform icons
 
@@ -109,4 +130,4 @@ make test
 python3 -m unittest discover -s site/scripts -p 'test_*.py'
 ```
 
-`make test` runs the generator's Go tests after bodega's own: they render a fixture OpenAPI document, and build the whole site from this checkout and fail on a broken link. The Python tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
+`make test` runs the generator's Go tests after bodega's own: they build the whole site from this checkout and fail on a broken link, on a Scalar bundle whose SHA-256 is not the recorded one, on an `/api/` page that loads a script, stylesheet, font or image from another origin, and on a site URL in `api/openapi.yaml` or `docs/usage.md` that names no page. The Python tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
