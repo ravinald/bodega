@@ -2911,3 +2911,45 @@ func TestAudit12CargoCAPlansTheWinningFile(t *testing.T) {
 		}
 	}
 }
+
+// TestPipOptionsMatchesNativePip compares PipOptions with pip config list
+// across the spellings pip's loader folds together: a -- prefix, _ for -,
+// case, a colon delimiter, and [DEFAULT] inheritance in either direction.
+func TestPipOptionsMatchesNativePip(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("native pip oracle needs python3")
+	}
+	cases := []string{
+		"[global]\n--cert = /a.pem\nindex-url = https://x/simple/\n",
+		"[global]\ncert = /a.pem\n--cert = /b.pem\n",
+		"[global]\n--Index_URL: https://x/simple/\n",
+		"[DEFAULT]\ncert = /d.pem\n[global]\nindex-url = https://x/simple/\n[install]\n",
+		"[DEFAULT]\n--cert = /d.pem\n[global]\ncert = /g.pem\n",
+		"[DEFAULT]\ncert = /d.pem\n[global]\n--cert = /g.pem\n",
+		"[DEFAULT]\nindex-url = https://d/simple/\n[install]\nextra_index_url = https://e/simple/\n  https://f/simple/\n",
+	}
+	line := regexp.MustCompile(`^([^=]+)='(.*)'$`)
+	for _, body := range cases {
+		file := filepath.Join(t.TempDir(), "pip.conf")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(python, "-m", "pip", "config", "list")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PIP_CONFIG_FILE=" + file}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("native pip on %q: %v: %s", body, err, out)
+		}
+		native := map[string]string{}
+		for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if m := line.FindStringSubmatch(l); m != nil && !strings.HasPrefix(m[1], ":env:.") {
+				native[m[1]] = strings.ReplaceAll(m[2], `\n`, "\n")
+			}
+		}
+		if got := PipOptions([]byte(body)); !maps.Equal(got, native) {
+			t.Errorf("PipOptions(%q)\n got %v\nnative pip %v", body, got, native)
+		}
+	}
+}

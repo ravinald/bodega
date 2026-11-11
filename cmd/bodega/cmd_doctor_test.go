@@ -2260,3 +2260,47 @@ func TestAudit12PipApplyCannotPassOnShadowedIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit13PipOptionIdentityRefusesBeforeWritingOrInstalls(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	for _, key := range []string{"PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "VIRTUAL_ENV"} {
+		t.Setenv(key, "")
+	}
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "etc", "pip.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	old := "[global]\n--cert = /missing/company-ca.pem\nindex-url = https://pypi.org/simple/\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIP_CONFIG_FILE", target)
+	out, err := runDoctor(t, "--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if err != nil {
+		if string(got) != old {
+			t.Fatalf("apply changed pip.conf but left pip on its old --cert and failed: %v\n%s\nwritten file:\n%s", err, out, got)
+		}
+		if !strings.Contains(err.Error(), target) {
+			t.Fatalf("refusal does not name %s: %v", target, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(home, ".config", "bodega", "ca.pem")); !os.IsNotExist(statErr) {
+			t.Fatalf("refusal wrote the CA: %v", statErr)
+		}
+		return
+	}
+	want := filepath.Join(home, ".config", "bodega", "ca.pem")
+	if effective := clientconf.PipOptions(got)["global.cert"]; effective != want {
+		t.Fatalf("apply succeeded with effective cert %s, want %s:\n%s", effective, want, got)
+	}
+}

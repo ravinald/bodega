@@ -153,18 +153,14 @@ var (
 	// An npmrc names an option the way npm's own reader decodes the line, so
 	// a quoted name is the option it spells and a name is matched exactly.
 	npmRules = lineRules{key: npmKey}
-	// pip lowercases a key and reads _ as -, and ConfigParser takes a colon
-	// for the equals sign.
+	// ConfigParser takes a colon for the equals sign, and pip names the
+	// option it reads through pipName, so the merge replaces --cert when the
+	// plan sets cert.
 	pipRules = lineRules{indent: true, key: func(line string) string {
-		t := strings.TrimSpace(line)
-		if t == "" || strings.ContainsRune("#;[", rune(t[0])) {
-			return ""
+		if raw := pipRawKey(line); raw != "" {
+			return pipName(raw)
 		}
-		i := strings.IndexAny(t, "=:")
-		if i < 0 {
-			return ""
-		}
-		return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(t[:i])), "_", "-")
+		return ""
 	}}
 	dnfRules  = lineRules{key: settingKey, indent: true}
 	gitRules  = lineRules{key: settingKey, runsOn: gitRunsOn}
@@ -1603,38 +1599,95 @@ func mergeMakeConf(old, planned []string) []string {
 	return out
 }
 
+// pipRawKey is the option name a pip configuration line assigns as
+// ConfigParser stores it, lowercased and otherwise as written, or "" for a
+// line assigning none.
+func pipRawKey(line string) string {
+	t := strings.TrimSpace(line)
+	if t == "" || strings.ContainsRune("#;[", rune(t[0])) {
+		return ""
+	}
+	i := strings.IndexAny(t, "=:")
+	if i < 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(t[:i]))
+}
+
+// pipName is pip's _normalize_name (pip 26.2.1, configuration.py): _ reads as
+// - and a leading -- is dropped, so "--cert" and "cert" are one option.
+func pipName(raw string) string {
+	return strings.TrimPrefix(strings.ReplaceAll(strings.ToLower(raw), "_", "-"), "--")
+}
+
 // PipOptions reads a pip configuration file into "section.option", the
-// option lowercased with _ read as -, each to the value pip takes for it. It
+// option named as pipName names it, each to the value pip takes for it. It
 // walks the file with the scan the merge edits one with, so a line the merge
 // treats as the tail of another setting is never read here as a setting of
-// its own: a deeper-indented line continues the option above it, a colon
-// delimits as an equals sign does, and the last assignment of an option wins.
+// its own: a deeper-indented line continues the option above it, and a colon
+// delimits as an equals sign does.
+//
+// The rest ports pip's _load_file over RawConfigParser: [DEFAULT] is no
+// section of its own but is inherited by every section the file declares,
+// a section's own option replacing the default of the same raw name in the
+// default's place; pip then walks each section's items in that order,
+// normalizing names, and the last item of one normalized name wins.
 func PipOptions(data []byte) map[string]string {
-	out := map[string]string{}
+	type item struct{ raw, value string }
+	sections := map[string][]item{}
+	var order []string
 	scan := lineScan{rules: pipRules, keyIndent: -1}
-	section, current := "", ""
+	section, current := "", -1
 	for _, l := range splitBody(data) {
 		t := strings.TrimSpace(l)
 		if scan.continues(l) {
-			if current != "" && !strings.ContainsRune("#;", rune(t[0])) {
-				out[current] = strings.TrimSpace(out[current] + "\n" + t)
+			if current >= 0 && !strings.ContainsRune("#;", rune(t[0])) {
+				it := &sections[section][current]
+				it.value = strings.TrimSpace(it.value + "\n" + t)
 			}
 			continue
 		}
 		if strings.HasPrefix(t, "[") {
-			section, current, scan.keyIndent = "", "", -1
+			section, current, scan.keyIndent = "", -1, -1
 			if end := strings.LastIndex(t, "]"); end > 0 {
 				section = t[1:end]
 			}
+			if _, ok := sections[section]; !ok && section != "DEFAULT" {
+				order = append(order, section)
+			}
+			if _, ok := sections[section]; !ok {
+				sections[section] = nil
+			}
 			continue
 		}
-		key := pipRules.key(l)
-		if key == "" {
+		raw := pipRawKey(l)
+		if raw == "" {
 			continue
 		}
 		scan.keyIndent = indentOf(l)
-		current = section + "." + strings.TrimPrefix(key, "--")
-		out[current] = strings.TrimSpace(t[strings.IndexAny(t, "=:")+1:])
+		value := strings.TrimSpace(t[strings.IndexAny(t, "=:")+1:])
+		items := sections[section]
+		current = slices.IndexFunc(items, func(it item) bool { return it.raw == raw })
+		if current < 0 {
+			current = len(items)
+			items = append(items, item{raw: raw})
+		}
+		items[current].value = value
+		sections[section] = items
+	}
+	out := map[string]string{}
+	for _, name := range order {
+		merged := slices.Clone(sections["DEFAULT"])
+		for _, it := range sections[name] {
+			if k := slices.IndexFunc(merged, func(d item) bool { return d.raw == it.raw }); k >= 0 {
+				merged[k].value = it.value
+			} else {
+				merged = append(merged, it)
+			}
+		}
+		for _, it := range merged {
+			out[name+"."+pipName(it.raw)] = it.value
+		}
 	}
 	return out
 }

@@ -1365,3 +1365,55 @@ func TestAudit12PipEndpointAndCAUseTheSameCommand(t *testing.T) {
 		t.Fatalf("the global endpoint reaches bodega with a missing CA; the trusted install CA belongs to another endpoint, but the verdict is %+v", got[0])
 	}
 }
+
+func TestAudit13PipDefaultsUseTheInstallCA(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	file := filepath.Join(p.Root, "etc", "pip.conf")
+	missing := filepath.Join(p.Root, "missing.pem")
+	writeTrustFile(t, file, "[DEFAULT]\ncert = "+missing+"\n[global]\nindex-url = "+base+"/pypi/simple/\ncert = "+ca+"\n[install]\n")
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("native pip oracle needs python3")
+	}
+	cmd := exec.Command(python, "-m", "pip", "config", "list")
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
+	native, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native pip: %v: %s", err, native)
+	}
+	if !strings.Contains(string(native), "install.cert='"+missing+"'") {
+		t.Fatalf("native pip install.cert = %q, want %q", native, missing)
+	}
+	got := p.Apply([]Finding{checkPipConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+	if got.Status != StatusWarn || !(strings.Contains(got.Detail, missing) || strings.Contains(got.Detail, "unchecked") && strings.Contains(got.Detail, "DEFAULT")) || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Fatalf("native pip install.cert = %s, but doctor returned %+v", strings.TrimSpace(string(native)), got)
+	}
+}
+
+func TestAudit13PipDefaultsStillDiscoverBodega(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	file := filepath.Join(p.Root, "etc", "pip.conf")
+	missing := filepath.Join(p.Root, "missing.pem")
+	writeTrustFile(t, file, "[DEFAULT]\nindex-url = "+base+"/pypi/simple/\ncert = "+missing+"\n[install]\n")
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("native pip oracle needs python3")
+	}
+	cmd := exec.Command(python, "-m", "pip", "config", "list")
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
+	native, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native pip: %v: %s", err, native)
+	}
+	if !strings.Contains(string(native), "install.index-url='"+base+"/pypi/simple/'") {
+		t.Fatalf("native pip install.index-url = %q", native)
+	}
+	got := p.Apply([]Finding{checkPipConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+	if got.Status != StatusWarn || !(strings.Contains(got.Detail, missing) || strings.Contains(got.Detail, "unchecked") && strings.Contains(got.Detail, "DEFAULT")) || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Fatalf("native pip install.index-url = %s and cert = %s, but doctor returned %+v", strings.TrimSpace(string(native)), missing, got)
+	}
+}
