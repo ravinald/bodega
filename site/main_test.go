@@ -197,7 +197,13 @@ func browserLoads(t *testing.T, out, page, ready string) []string {
 	site := httptest.NewServer(http.FileServer(http.Dir(out)))
 	defer site.Close()
 
+	// Chrome's sandbox guards against hostile pages, and this one loads only
+	// the site's own pages from a local server with every other host name
+	// unresolvable. Ubuntu 23.10 and later refuse the unprivileged user
+	// namespace the sandbox needs, so with it Chrome exits before the page
+	// loads on those hosts and on GitHub's runners.
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.NoSandbox,
 		chromedp.Flag("host-resolver-rules", "MAP * ~NOTFOUND, EXCLUDE 127.0.0.1"))
 	alloc, stop := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer stop()
