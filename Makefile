@@ -213,7 +213,8 @@ TEST_FLAGS ?=
 #
 # site is a module of its own, so `go list ./...` never names it and its tests
 # need a run of their own. They build the whole site from this checkout, which
-# is what fails a pull request that breaks a link or a $ref in the API reference.
+# is what fails a pull request that breaks a link or edits the vendored API
+# viewer without recording it.
 test:
 	go list ./... | grep -v '/internal/server$$' | xargs go test -race -count=1 -timeout $(GO_TEST_TIMEOUT) $(TEST_FLAGS)
 	cd site && go test -race -count=1 ./...

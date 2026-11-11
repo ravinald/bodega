@@ -7431,7 +7431,7 @@ Both are approver routes, so they also need the engineer's address inside `admin
 
 ## REST API
 
-All API responses are JSON. The full API is documented in the [API reference](../api/openapi.yaml), an OpenAPI 3.0 document.
+API responses are JSON, apart from the plain-text refusals the reference's introduction describes. The [API reference](../api/), published at `/api/` on the project site, renders every route with its parameters, bodies and examples, and its introduction is where a new operator starts: when to use the API, how to authenticate, what an error looks like, and a first set of requests to run. The document behind it is [`api/openapi.yaml`](../api/openapi.yaml "Download the OpenAPI document"), an OpenAPI 3.0 file you can download and hand to a client generator.
 
 ### Read endpoints
 

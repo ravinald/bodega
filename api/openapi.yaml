@@ -1,7 +1,161 @@
 openapi: "3.0.3"
 info:
   title: bodega API
-  description: REST API for the bodega package repository manager.
+  description: |
+    The REST API is how anything that is not on the bodega host works with the server: a CI job cataloging what it built, a script hiding a bad release, a dashboard reading status, an approver working the refusal queue from their own machine.
+
+    ## When to use it
+
+    bodega has three operator interfaces, and they overlap less than it looks.
+
+    - **The `bodega` CLI**, run on the bodega host, reads and writes the manifest store and the audit database directly. It needs no token there. Some decisions exist only on the host and have no route here on purpose: binding a token to an identity, editing `oidc_providers`, and changing the access lists with `bodega acl`.
+    - **The TUI**, `bodega shell`, is the same local access as a full-screen interface, for browsing and editing by hand.
+    - **This API** is for everything remote or automated. A few CLI commands are clients of it when given `--server`, `bodega pkg import --server` and `bodega login` among them, so what they can do from another machine is what these routes allow.
+
+    Package clients do not use this API. apt, pip, npm and the rest speak their own protocols at `/apt/`, `/pypi/`, `/npm/` and the other registry routes, which this document leaves out.
+
+    ## Base URL
+
+    Every path below is relative to the server's `public_url`, the address its clients reach it at. The examples use the placeholder `https://bodega.example.com`; substitute your own. Routes under `/api/v1/` are the API proper, and `/healthz` and `/client/` sit beside it.
+
+    ## Authentication
+
+    A bodega token is a bearer credential with scopes. Send it on every request that needs one:
+
+    ```
+    Authorization: Bearer bodega_ak_...
+    ```
+
+    ### When a request needs a token
+
+    Two settings decide it: the route, and `admin_permit_cidr`, the list of addresses the server takes admin requests from. That list defaults to localhost only.
+
+    | Request | From an address outside `admin_permit_cidr` | From inside it, list is localhost only | From inside it, list reaches past localhost |
+    | --- | --- | --- | --- |
+    | Reads of packages, status and metrics | No token needed | No token needed | No token needed |
+    | The admin reads: audit, config, policies, inventory, profile pins, the override and queue lists | `403` | No token needed, except the override list | No token needed, except the override list |
+    | `POST`, `PATCH` and `DELETE` | `403` | No token needed | A token holding the route's scope |
+    | Requesting or voting on an override, approving or dismissing a queue row | `403` | A token that names an identity | A token that names an identity |
+    | `/api/v1/tokens` | `403` | A token holding `superadmin` | A token holding `superadmin` |
+
+    The `/client/` routes take no token either: they admit a host by its identity binding. Widening `admin_permit_cidr` past localhost is what turns the token requirement on for mutations. A token that is presented is held to its scopes on every route in every column, reads included: a `read:npm` token is refused on a pypi read it could have made with no token at all.
+
+    Three routes authenticate by something other than a bodega token and sit outside `admin_permit_cidr`: `POST /api/v1/auth/exchange` takes an OIDC ID token, `POST /api/v1/policy/revet` takes an HMAC signature over its body, and the inventory push routes take a token scoped `inventory` or the source's own credential.
+
+    ### Making a token
+
+    On the bodega host:
+
+    ```sh
+    bodega token generate {label} --scope {scopes}
+    ```
+
+    The raw token is printed once and cannot be read back. `--scope` is required, so no token is minted for everything because a flag was left off. The scopes:
+
+    | Scope | Reaches |
+    | --- | --- |
+    | `read` | Every read that is not an admin read. Narrow it to package types with a colon: `read:npm,pypi` |
+    | `write` | Creating, importing and deleting packages, the hide and freeze toggles, and requesting an override. Narrows the same way: `write:npm` |
+    | `admin` | The allow-list rules under `/api/v1/policies`, and the admin reads |
+    | `approve` | Voting on overrides, approving and dismissing queue rows, and the two lists those work from |
+    | `superadmin` | `/api/v1/tokens`: minting, listing and revoking tokens |
+    | `inventory` | Reads, plus the inventory push routes. Combines with no other scope |
+
+    Each scope is granted only by naming it. `admin` implies neither `approve` nor `superadmin`, so the operator who sets policy does not also approve exceptions to it, and nobody approving exceptions can mint a second voter.
+
+    The override and queue routes record who acted, so they need a token that names a person: one bound on the host with `bodega identity bind token {id} {identity}`, or one minted by the exchange below.
+
+    ### Trading an OIDC ID token for one
+
+    A CI job or a person who already has an identity with your identity provider does not need a stored bodega secret. `POST /api/v1/auth/exchange` takes `{"id_token": "..."}`, verifies the ID token against the server's `oidc_providers`, and answers with a bodega token carrying the scopes of the first provider rule whose claims all match. That token lasts `oidc_token_ttl`, 15 minutes by default, and acts as the ID token's issuer and subject. `bodega login` does the same exchange for a person through the device flow. The exchange is reachable from any address; the token it returns is still held to `admin_permit_cidr` on every write and admin route.
+
+    ## Errors
+
+    A handler that refuses a request answers JSON with one member:
+
+    ```json
+    { "error": "package already exists" }
+    ```
+
+    That is the `Error` schema. The message says what failed and is written for a person; branch on the status code, not on the text. A few `409` answers add members a client acts on, such as `near_popular` on a refused allow-list rule, and those are documented on the operation.
+
+    Two kinds of answer are `text/plain` instead, with the reason on one line:
+
+    - The access gate in front of every route. A `401` or `403` for an address outside `admin_permit_cidr`, a missing, unknown or expired token, or a token without the route's scope comes from there. The scope refusal names the scope the token lacks and the ones it holds.
+    - Every refusal under `/client/`. Those routes are read by shell scripts on client hosts, and the text names the `bodega identity` or `bodega acl` command that would admit the host.
+
+    The status codes you will meet most:
+
+    | Status | Meaning here |
+    | --- | --- |
+    | `400` | The body or a parameter is malformed, or a required field is missing. The message names it |
+    | `401` | No token where one is required, or one that matches nothing or has expired. On the override and queue routes, also a token bound to no identity |
+    | `403` | The address is outside `admin_permit_cidr`, the token lacks the scope, the entry is frozen, or policy refused the package |
+    | `404` | No such type, package, version, rule, override or queue row |
+    | `409` | The change conflicts with what is stored: the package exists, the vote was already cast, the queue row is not open |
+    | `413` | The body is over the route's limit: 1 MiB on the single-package create, 64 MiB on the bulk import |
+    | `503` | The audit database is not configured, so a route that needs it cannot answer |
+
+    ## First requests
+
+    These run against the placeholder base URL in order, from a machine whose address is inside `admin_permit_cidr`. The first four are reads and need no token.
+
+    Is the server up? `/healthz` answers `ok` and nothing else, which makes it the probe for a load balancer:
+
+    ```sh
+    curl https://bodega.example.com/healthz
+    ```
+
+    What is it serving? Status reports entry counts per type, one probe row per storage backend, and the apt and FreeBSD client state:
+
+    ```sh
+    curl https://bodega.example.com/api/v1/status
+    ```
+
+    List the packages of one type:
+
+    ```sh
+    curl https://bodega.example.com/api/v1/packages/npm
+    ```
+
+    Read one version, with the checksum, the digest of the stored bytes and its vetting stamps:
+
+    ```sh
+    curl https://bodega.example.com/api/v1/packages/npm/lodash/4.17.21
+    ```
+
+    The rest change something or read who asked for what, so they take a token. Mint one on the bodega host and bind it to yourself, then export the raw token on the machine you are working from:
+
+    ```sh
+    bodega token generate walkthrough expiry 1d --scope read,approve,write:npm
+    bodega identity bind token {id} {identity}
+    export BODEGA_TOKEN=bodega_ak_...
+    ```
+
+    The approval queue holds one row per package version a client was refused. List the open rows for npm; this takes `admin` or `approve`:
+
+    ```sh
+    curl -H "Authorization: Bearer $BODEGA_TOKEN" \
+      "https://bodega.example.com/api/v1/queue?state=open&type=npm"
+    ```
+
+    Approve one row by its `id`. What the approval does depends on the check that refused it: an allow-list rule, a profile pin, or a two-person override request. The answer says which. This takes `approve`:
+
+    ```sh
+    curl -X POST -H "Authorization: Bearer $BODEGA_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data '{"reason": "INC-4411: vendor needs 1.3.0 today"}' \
+      https://bodega.example.com/api/v1/queue/12/approve
+    ```
+
+    Hide one version, so clients stop being offered it while its bytes and its record stay. This takes `write` for the package's type. The route is a toggle: the same request again shows the version:
+
+    ```sh
+    curl -X PATCH -H "Authorization: Bearer $BODEGA_TOKEN" \
+      https://bodega.example.com/api/v1/packages/npm/lodash/hide/4.17.21
+    ```
+
+    From here, each group below describes its routes with a request and a response example.
   version: 0.2.0
   license:
     name: Apache 2.0
@@ -13,25 +167,35 @@ servers:
 
 tags:
   - name: packages
-    description: Package manifest operations
+    description: |
+      The catalog: which packages and versions bodega serves, and the two switches on each. Use these to list what is cataloged, read one version's checksum and vetting stamps, add or bulk-import entries from a build or a host, and hide or freeze a version when a release goes bad. [Manifest Structure](../docs/usage/manifest-structure.html) explains the fields a manifest carries.
   - name: status
-    description: Server health and status
+    description: |
+      Running the server day to day: the health probe and status report, the audit trail, API tokens, the upstream allow-list, two-person overrides, and the queue of refusals waiting for a decision. [REST API](../docs/usage/rest-api.html) covers who may call each, and [Supply Chain Management](../docs/usage/supply-chain-management.html) explains the allow-list those rules belong to.
   - name: config
-    description: Server configuration
+    description: |
+      The settings a client or dashboard may see: bucket, region and manifest directory, never a secret. Use it to confirm which store a server points at. [Configuration](../docs/usage/configuration.html) lists every key.
   - name: metrics
-    description: Package metrics
+    description: |
+      Package, version, frozen, hidden and dependency counts, overall and per type, for a dashboard or a capacity check. The [read endpoints](../docs/usage/rest-api.html#read-endpoints) table says where the numbers come from.
   - name: profiles
-    description: What one class of host may fetch
+    description: |
+      What one class of host may fetch. Use the pins report to review every version a profile deliberately holds back, with the reason recorded, the review date and the advisories open against it. [Profiles](../docs/usage/http-server.html#profiles) explains how a host gets one.
   - name: client
-    description: Configuration a client host reads to point its package systems at bodega
+    description: |
+      What a client host reads to point its package managers at bodega: the plan of files for that host, each file, and the setup script that installs them. Call these from the host being configured, since the answer depends on its identity and profile. [Client configuration](../docs/usage/http-server.html#client-configuration) walks through it.
   - name: attestation
-    description: Keys bodega signs attestations with
+    description: |
+      The public keys bodega signs attestations with. Fetch them to verify an envelope from the packages group, and pin the key ID from somewhere other than this server. [Attestations](../docs/usage/attestations.html) explains what an envelope claims.
   - name: inventory
-    description: Installed-package reports from inventory sources
+    description: |
+      What is installed on your hosts, compared with what bodega served them. Inventory sources push reports here, and the read answers with one host's installed set, classified. [Inventory](../docs/usage/inventory.html) explains the sources and the classes.
   - name: policy
-    description: Re-running admission over admitted versions
+    description: |
+      Re-running admission over versions already admitted. A threat feed calls the webhook when an advisory lands, and bodega re-vets the package at once. [Re-vet webhook](../docs/usage/commands.html#re-vet-webhook) explains the signature it requires.
   - name: auth
-    description: Exchanging an OIDC ID token for a scoped bodega token
+    description: |
+      Signing in without a stored secret: a CI job or a person trades an OIDC ID token for a short-lived bodega token. [CI token exchange](../docs/usage/authentication.html#ci-token-exchange) explains the provider rules that decide its scopes.
 
 paths:
   /healthz:
@@ -45,6 +209,7 @@ paths:
           description: Server is healthy
           content:
             text/plain:
+              example: "ok\n"
               schema:
                 type: string
                 example: "ok"
@@ -104,11 +269,31 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              - name: curl
+                type: apt
+                versions:
+                - version: 8.5.0-2ubuntu10.6
+                  suites:
+                  - noble
+              - name: lodash
+                description: Lodash modular utilities.
+                versions:
+                - version: 4.17.21
+                  mode: proxy
+                type: npm
             schema:
               type: array
               items:
                 $ref: "#/components/schemas/PackageManifest"
           application/x-ndjson:
+            example:
+              name: curl
+              type: apt
+              versions:
+              - version: 8.5.0-2ubuntu10.6
+                suites:
+                - noble
             schema:
               $ref: "#/components/schemas/PackageManifest"
       responses:
@@ -118,6 +303,18 @@ paths:
             per-package results say what happened.
           content:
             application/json:
+              example:
+                imported: 1
+                merged: 0
+                skipped: 1
+                results:
+                - type: apt
+                  name: curl
+                  outcome: imported
+                - type: npm
+                  name: lodash
+                  outcome: conflict
+                  reason: package already exists (retry with merge=true to add versions)
               schema:
                 $ref: "#/components/schemas/ImportResponse"
         "400":
@@ -141,6 +338,20 @@ paths:
           description: Packages of the specified type
           content:
             application/json:
+              example:
+                - config_version: 1
+                  name: lodash
+                  type: npm
+                  description: Lodash modular utilities.
+                  versions:
+                  - version: 4.17.21
+                    url: https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+                    mode: proxy
+                    published_at: '2021-02-20T15:42:16Z'
+                    artifact_size: 318961
+                    artifact_digest: 3f1c0e8a9b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e
+                    metadata:
+                      vetting.osv.checked_at: '2026-11-03T08:15:02Z'
               schema:
                 type: array
                 items:
@@ -163,6 +374,13 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              name: lodash
+              type: npm
+              description: Lodash modular utilities.
+              versions:
+              - version: 4.17.21
+                mode: proxy
             schema:
               $ref: "#/components/schemas/PackageManifest"
       responses:
@@ -170,6 +388,9 @@ paths:
           description: Package created
           content:
             application/json:
+              examples:
+                created:
+                  $ref: "#/components/examples/LodashManifest"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "400":
@@ -232,6 +453,10 @@ paths:
           description: Package deleted
           content:
             application/json:
+              example:
+                status: deleted
+                type: npm
+                name: lodash
               schema:
                 type: object
                 properties:
@@ -272,6 +497,9 @@ paths:
           description: Package manifest scoped to one version
           content:
             application/json:
+              examples:
+                oneVersion:
+                  $ref: "#/components/examples/LodashManifest"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "404":
@@ -405,6 +633,9 @@ paths:
           description: Updated package manifest
           content:
             application/json:
+              examples:
+                hidden:
+                  $ref: "#/components/examples/LodashHidden"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "401":
@@ -434,6 +665,11 @@ paths:
           description: Updated package manifest
           content:
             application/json:
+              examples:
+                hidden:
+                  $ref: "#/components/examples/LodashHidden"
+                shownAgain:
+                  $ref: "#/components/examples/LodashManifest"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "401":
@@ -457,6 +693,9 @@ paths:
           description: Updated package manifest
           content:
             application/json:
+              examples:
+                frozen:
+                  $ref: "#/components/examples/LodashFrozen"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "401":
@@ -484,6 +723,11 @@ paths:
           description: Updated package manifest
           content:
             application/json:
+              examples:
+                frozen:
+                  $ref: "#/components/examples/LodashFrozen"
+                thawed:
+                  $ref: "#/components/examples/LodashManifest"
               schema:
                 $ref: "#/components/schemas/PackageManifest"
         "401":
@@ -573,6 +817,20 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              bomFormat: CycloneDX
+              specVersion: '1.6'
+              version: 1
+              metadata:
+                timestamp: '2026-11-03T08:00:00Z'
+                component:
+                  type: device
+                  name: web-01
+              components:
+              - type: library
+                name: curl
+                version: 8.5.0-2ubuntu10.6
+                purl: pkg:deb/ubuntu/curl@8.5.0-2ubuntu10.6?arch=amd64&distro=ubuntu-24.04
             schema:
               type: object
               description: The source's own document format
@@ -581,6 +839,11 @@ paths:
           description: Report stored
           content:
             application/json:
+              example:
+                instance: cyclonedx
+                reports: 1
+                attempts: 0
+                unbound: 0
               schema:
                 type: object
                 properties:
@@ -880,6 +1143,11 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              label: ci-pipeline
+              scope: read,write:npm
+              expiry: 90d
+              comment: Jenkins deploy key
             schema:
               type: object
               required: [label, scope]
@@ -905,6 +1173,12 @@ paths:
           description: Token created
           content:
             application/json:
+              example:
+                token: bodega_ak_5d41402abc4b2a76b9719d911017c5925d41402abc4b2a76b9719d911017c592
+                id: 4f3c9a1e7b2d8c6054a1f0e9d3b7c285
+                label: ci-pipeline
+                scope: read,write:npm
+                expires_at: '2027-02-01T09:30:00Z'
               schema:
                 type: object
                 properties:
@@ -949,6 +1223,12 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              type: npm
+              name: minimist
+              version: 1.2.5
+              reason: GHSA-late-0001
+              timestamp: 1791900000
             schema:
               type: object
               required: [type, name, timestamp]
@@ -971,6 +1251,19 @@ paths:
           description: The versions were re-vetted
           content:
             application/json:
+              example:
+                results:
+                - type: npm
+                  name: minimist
+                  version: 1.2.5
+                  previous_decision: admitted
+                  decision: policy_blocked
+                  action: hidden
+                  failing:
+                  - check: osv
+                    action: block
+                    status: block
+                    detail: GHSA-late-0001
               schema:
                 type: object
                 properties:
@@ -1040,6 +1333,8 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              id_token: eyJhbGciOiJSUzI1NiIsImtpZCI6ImV4YW1wbGUifQ.eyJzdWIiOiJyZXBvOmFjbWUvd2ViOnJlZjpyZWZzL2hlYWRzL21haW4ifQ.c2lnbmF0dXJl
             schema:
               type: object
               required: [id_token]
@@ -1052,6 +1347,13 @@ paths:
           description: Token minted
           content:
             application/json:
+              example:
+                token: bodega_ak_9d1e7c3a5b0f2468ace013579bdf24689d1e7c3a5b0f2468ace013579bdf2468
+                id: 5b0c2e9f7a1d4c6830b5e2f1a9d7c483
+                scopes: read,write:npm
+                expires_at: '2026-11-03T09:45:00Z'
+                subject: repo:acme/web:ref:refs/heads/main
+                issuer: https://token.actions.githubusercontent.com
               schema:
                 type: object
                 properties:
@@ -1172,6 +1474,10 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              registry_type: npm
+              pattern: "@example-cloud/*"
+              comment: our own scope
             schema:
               type: object
               required: [registry_type, pattern]
@@ -1193,6 +1499,14 @@ paths:
           description: Rule created
           content:
             application/json:
+              example:
+                ID: 8c2e71b04d9f5a36
+                RegistryType: npm
+                RuleKind: package
+                Pattern: "@example-cloud/*"
+                Comment: our own scope
+                CreatedAt: '2026-11-03T09:30:00Z'
+                CreatedBy: ops
               schema:
                 $ref: "#/components/schemas/PolicyRule"
         "400":
@@ -1310,6 +1624,13 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              type: npm
+              name: left-pad
+              version: 1.3.0
+              check: age
+              reason: 'INC-4411: vendor needs 1.3.0 today'
+              expires: 7d
             schema:
               type: object
               required: [type, name, version, check, reason, expires]
@@ -1337,6 +1658,9 @@ paths:
           description: Override requested
           content:
             application/json:
+              examples:
+                pending:
+                  $ref: "#/components/examples/OverridePending"
               schema:
                 $ref: "#/components/schemas/Override"
         "400":
@@ -1364,6 +1688,8 @@ paths:
         required: false
         content:
           application/json:
+            example:
+              comment: checked the diff against 1.2.9
             schema:
               $ref: "#/components/schemas/OverrideVoteRequest"
       responses:
@@ -1371,6 +1697,9 @@ paths:
           description: Vote recorded; the override as it now stands
           content:
             application/json:
+              examples:
+                oneApproval:
+                  $ref: "#/components/examples/OverrideOneApproval"
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
@@ -1401,6 +1730,8 @@ paths:
         required: false
         content:
           application/json:
+            example:
+              comment: 1.2.9 already carries the fix
             schema:
               $ref: "#/components/schemas/OverrideVoteRequest"
       responses:
@@ -1408,6 +1739,9 @@ paths:
           description: Vote recorded; the override as it now stands
           content:
             application/json:
+              examples:
+                rejected:
+                  $ref: "#/components/examples/OverrideRejected"
               schema:
                 $ref: "#/components/schemas/Override"
         "401":
@@ -1459,6 +1793,23 @@ paths:
           description: Queue rows
           content:
             application/json:
+              example:
+                - id: 12
+                  pkg_type: npm
+                  pkg_name: left-pad
+                  pkg_version: 1.3.0
+                  check: age
+                  detail: left-pad@1.3.0 was published 2 days ago; min_package_age is 7 days
+                  incident: 01JBQ7M3K9X2V4T6R8W0Y5Z1AB
+                  first_seen: '2026-11-02T22:40:11Z'
+                  last_seen: '2026-11-03T08:59:30Z'
+                  request_count: 4
+                  requesters:
+                  - identity: build-07
+                    client_ip: 10.20.4.17
+                    request_count: 4
+                    last_seen: '2026-11-03T08:59:30Z'
+                  state: open
               schema:
                 type: array
                 items:
@@ -1494,6 +1845,9 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              reason: 'INC-4411: vendor needs 1.3.0 today'
+              expires: 7d
             schema:
               type: object
               required: [reason]
@@ -1511,6 +1865,44 @@ paths:
           description: Row approved; what the approval did
           content:
             application/json:
+              example:
+                row:
+                  id: 12
+                  pkg_type: npm
+                  pkg_name: left-pad
+                  pkg_version: 1.3.0
+                  check: age
+                  detail: left-pad@1.3.0 was published 2 days ago; min_package_age is 7 days
+                  incident: 01JBQ7M3K9X2V4T6R8W0Y5Z1AB
+                  first_seen: '2026-11-02T22:40:11Z'
+                  last_seen: '2026-11-03T08:59:30Z'
+                  request_count: 4
+                  requesters:
+                  - identity: build-07
+                    client_ip: 10.20.4.17
+                    request_count: 4
+                    last_seen: '2026-11-03T08:59:30Z'
+                  state: approved
+                  resolved_at: '2026-11-03T09:12:44Z'
+                  resolved_by: dana@example.com
+                  resolution: override
+                  resolution_reason: 'INC-4411: vendor needs 1.3.0 today'
+                override:
+                  id: 3f9a1c0e5b7d2a64
+                  pkg_type: npm
+                  pkg_name: left-pad
+                  pkg_version: 1.3.0
+                  check: age
+                  reason: 'INC-4411: vendor needs 1.3.0 today'
+                  requested_by: dana@example.com
+                  requested_at: '2026-11-03T09:12:44Z'
+                  expires_at: '2026-11-10T09:12:44Z'
+                  quorum: 2
+                  requester_counts: false
+                  approvals_needed: 2
+                  state: pending
+                  votes: []
+                  status: pending
               schema:
                 $ref: "#/components/schemas/QueueResolution"
         "400":
@@ -1542,6 +1934,8 @@ paths:
         required: true
         content:
           application/json:
+            example:
+              reason: typo of leftpad; nothing to admit
             schema:
               type: object
               required: [reason]
@@ -1553,6 +1947,9 @@ paths:
           description: Row dismissed
           content:
             application/json:
+              examples:
+                dismissed:
+                  $ref: "#/components/examples/QueueRowDismissed"
               schema:
                 $ref: "#/components/schemas/QueueRow"
         "400":
@@ -1587,6 +1984,9 @@ paths:
           description: Token revoked
           content:
             application/json:
+              example:
+                status: revoked
+                id: 4f3c9a1e7b2d8c6054a1f0e9d3b7c285
               schema:
                 type: object
                 properties:
@@ -1611,6 +2011,29 @@ paths:
           description: Server status
           content:
             application/json:
+              example:
+                healthy: true
+                entry_count:
+                  apt: 633
+                  npm: 41
+                  pypi: 18
+                spool:
+                  in_flight: 0
+                  used_bytes: 0
+                  peak_bytes: 268435456
+                  budget_bytes: 4294967296
+                  max_artifact_bytes: 1073741824
+                  refused_too_large: 0
+                  refused_budget: 0
+                backend_entries:
+                - type: apt
+                  name: apt-pool
+                  key: apt/pool/
+                  present: true
+                  backend: default
+                  healthy: true
+                  error: ''
+                client_setup_sha256: c9f45017ad9456d3cfea3dbbedcc4786f49425c99e7160894512d08d0f2365e9
               schema:
                 $ref: "#/components/schemas/StatusResponse"
 
@@ -1648,8 +2071,11 @@ components:
       type: http
       scheme: bearer
       description: |
-        API token generated with `bodega token generate`. Required for
-        POST and DELETE when the server accepts connections from non-localhost IPs.
+        API token generated with `bodega token generate`, or minted by
+        `POST /api/v1/auth/exchange`. Required for POST, PATCH and DELETE when
+        `admin_permit_cidr` reaches past localhost, and on the token, override
+        and queue routes in every posture. The introduction's Authentication
+        section has the full rule.
 
   parameters:
     OverrideID:
@@ -1757,6 +2183,148 @@ components:
         text/plain:
           schema:
             type: string
+
+  examples:
+    LodashManifest:
+      summary: An npm package with one proxied version
+      value:
+        config_version: 1
+        name: lodash
+        type: npm
+        description: Lodash modular utilities.
+        versions:
+        - version: 4.17.21
+          url: https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+          mode: proxy
+          published_at: '2021-02-20T15:42:16Z'
+          artifact_size: 318961
+          artifact_digest: 3f1c0e8a9b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e
+          metadata:
+            vetting.osv.checked_at: '2026-11-03T08:15:02Z'
+    LodashHidden:
+      summary: The same package after hiding 4.17.21
+      value:
+        config_version: 1
+        name: lodash
+        type: npm
+        description: Lodash modular utilities.
+        versions:
+        - version: 4.17.21
+          url: https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+          mode: proxy
+          published_at: '2021-02-20T15:42:16Z'
+          artifact_size: 318961
+          artifact_digest: 3f1c0e8a9b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e
+          metadata:
+            vetting.osv.checked_at: '2026-11-03T08:15:02Z'
+          hidden: true
+    LodashFrozen:
+      summary: The same package after freezing 4.17.21
+      value:
+        config_version: 1
+        name: lodash
+        type: npm
+        description: Lodash modular utilities.
+        versions:
+        - version: 4.17.21
+          url: https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+          mode: proxy
+          published_at: '2021-02-20T15:42:16Z'
+          artifact_size: 318961
+          artifact_digest: 3f1c0e8a9b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e
+          metadata:
+            vetting.osv.checked_at: '2026-11-03T08:15:02Z'
+          frozen: true
+    OverridePending:
+      summary: A request waiting on two approvals
+      value:
+        id: 3f9a1c0e5b7d2a64
+        pkg_type: npm
+        pkg_name: left-pad
+        pkg_version: 1.3.0
+        check: age
+        reason: 'INC-4411: vendor needs 1.3.0 today'
+        requested_by: dana@example.com
+        requested_at: '2026-11-03T09:12:44Z'
+        expires_at: '2026-11-10T09:12:44Z'
+        quorum: 2
+        requester_counts: false
+        approvals_needed: 2
+        state: pending
+        votes: []
+        status: pending
+    OverrideOneApproval:
+      summary: After the first of two approvals
+      value:
+        id: 3f9a1c0e5b7d2a64
+        pkg_type: npm
+        pkg_name: left-pad
+        pkg_version: 1.3.0
+        check: age
+        reason: 'INC-4411: vendor needs 1.3.0 today'
+        requested_by: dana@example.com
+        requested_at: '2026-11-03T09:12:44Z'
+        expires_at: '2026-11-10T09:12:44Z'
+        quorum: 2
+        requester_counts: false
+        approvals_needed: 1
+        state: pending
+        votes:
+        - identity: sam@example.com
+          vote: approve
+          comment: checked the diff against 1.2.9
+          voted_at: '2026-11-03T10:02:19Z'
+          scope: read,approve
+          counted: true
+        status: pending
+    OverrideRejected:
+      summary: After a rejection, which is final
+      value:
+        id: 3f9a1c0e5b7d2a64
+        pkg_type: npm
+        pkg_name: left-pad
+        pkg_version: 1.3.0
+        check: age
+        reason: 'INC-4411: vendor needs 1.3.0 today'
+        requested_by: dana@example.com
+        requested_at: '2026-11-03T09:12:44Z'
+        expires_at: '2026-11-10T09:12:44Z'
+        quorum: 2
+        requester_counts: false
+        approvals_needed: 0
+        state: rejected
+        votes:
+        - identity: sam@example.com
+          vote: reject
+          comment: 1.2.9 already carries the fix
+          voted_at: '2026-11-03T10:02:19Z'
+          scope: read,approve
+          counted: true
+        status: rejected
+        decided_at: '2026-11-03T10:02:19Z'
+    QueueRowDismissed:
+      summary: The row after a dismissal
+      value:
+        id: 12
+        pkg_type: npm
+        pkg_name: left-pad
+        pkg_version: 1.3.0
+        check: age
+        detail: left-pad@1.3.0 was published 2 days ago; min_package_age is 7 days
+        incident: 01JBQ7M3K9X2V4T6R8W0Y5Z1AB
+        first_seen: '2026-11-02T22:40:11Z'
+        last_seen: '2026-11-03T08:59:30Z'
+        request_count: 4
+        requesters:
+        - identity: build-07
+          client_ip: 10.20.4.17
+          request_count: 4
+          last_seen: '2026-11-03T08:59:30Z'
+        state: dismissed
+        resolved_at: '2026-11-03T09:20:05Z'
+        resolved_by: dana@example.com
+        resolution: dismissed
+        resolution_reason: typo of leftpad; nothing to admit
 
   schemas:
     Error:
