@@ -710,43 +710,30 @@ func npmFiles(t TrustProbe) []string {
 	return clientconf.NpmConfigFiles(t.Getenv, t.GOOS, home, t.Root)
 }
 
-// npmFileLayer reads the top-level ca, ca[] and cafile of an npmrc as npm's
-// ini reader does: ca[] appends to a list, a plain ca replaces it, and a
-// quoted value is unescaped. A file setting both ca and cafile, or a cafile
-// clientconf.NpmPlainValue does not take whole, never gets here: npmStores
-// leaves npm unchecked first.
+// npmFileLayer reads the top-level ca, ca[] and cafile of an npmrc through
+// clientconf.NpmOptions, the decoder the install reads the same file with.
+// A list keeps what it holds: ca[] appends, and so does a plain ca once the
+// file has written the list form, where a plain ca alone replaces. A file
+// clientconf.NpmUnread names never gets here: npmStores leaves npm unchecked
+// first.
 func npmFileLayer(path string) npmLayer {
 	l := npmLayer{from: path}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return l
 	}
-	value := func(v string) string {
-		v = strings.TrimSpace(v)
-		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-			v = strings.ReplaceAll(v[1:len(v)-1], `\n`, "\n")
-		}
-		return v
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line[0] == '#' || line[0] == ';' {
-			continue
-		}
-		if line[0] == '[' && strings.HasSuffix(line, "]") {
-			break
-		}
-		k, v, _ := strings.Cut(line, "=")
-		switch k = strings.TrimSpace(k); k {
+	list := false
+	for _, o := range clientconf.NpmOptions(data) {
+		switch o.Key {
 		case "cafile":
-			l.cafile, _ = clientconf.NpmPlainValue(v)
-		case "ca", "ca[]":
+			l.cafile = o.Value
+		case "ca":
 			l.caSet = true
-			if k == "ca" {
+			if list = list || o.Array; !list {
 				l.ca = nil
 			}
-			if v = value(v); v != "" {
-				l.ca = append(l.ca, v)
+			if o.Value != "" {
+				l.ca = append(l.ca, o.Value)
 			}
 		}
 	}
@@ -770,28 +757,13 @@ func npmRegistries(t TrustProbe, files []string) []string {
 		if err != nil {
 			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || line[0] == '#' || line[0] == ';' {
-				continue
-			}
-			if line[0] == '[' {
-				break
-			}
-			k, v, ok := strings.Cut(line, "=")
-			if !ok {
-				continue
-			}
-			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
-			if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-				v = v[1 : len(v)-1]
-			}
-			v = npmEnvRef.ReplaceAllStringFunc(v, func(ref string) string { return t.env(ref[2 : len(ref)-1]) })
+		for _, o := range clientconf.NpmOptions(data) {
+			v := npmEnvRef.ReplaceAllStringFunc(o.Value, func(ref string) string { return t.env(ref[2 : len(ref)-1]) })
 			switch {
-			case k == "registry":
+			case o.Key == "registry":
 				def = v
-			case strings.HasSuffix(k, ":registry"):
-				scoped[k] = v
+			case strings.HasSuffix(o.Key, ":registry"):
+				scoped[o.Key] = v
 			}
 		}
 	}
@@ -821,9 +793,12 @@ func npmRegistries(t TrustProbe, files []string) []string {
 // and NODE_EXTRA_CA_CERTS no longer adds to them.
 //
 // One source setting both is not resolved here, since the order npm applies
-// the two in is the order that source set them, and neither is a cafile
-// value npm's reader would rewrite: either leaves npm unchecked, naming what
-// clientconf.NpmUnread found, which the install refuses for the same files.
+// the two in is the order that source set them, and neither is a line whose
+// option cannot be told or a ca or cafile written in a form this reader does
+// not take: each leaves npm unchecked, naming what clientconf.NpmUnread
+// found, which the install refuses for the same files. A line that could set
+// a registry is checked before the registries are, so it leaves npm unchecked
+// whether or not another line names bodega.
 //
 // With none set npm verifies against Node's defaults: the Mozilla roots Node
 // bundles, or OpenSSL's store under --use-openssl-ca and in a Node built that
@@ -833,11 +808,19 @@ func npmRegistries(t TrustProbe, files []string) []string {
 // row only where Node reads that store, and Node lists what it trusts.
 func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	files := npmFiles(t)
-	if !slices.ContainsFunc(npmRegistries(t, files), func(r string) bool { return sameHost(r, u) }) {
-		return nil
-	}
 	blind := func(what string) []trustStore {
 		return []trustStore{{name: "npm's configuration", blind: fmt.Sprintf("npm reads %s, which doctor detects and does not interpret, so which CA list npm verifies bodega against and whether it verifies bodega's certificate is unchecked", what)}}
+	}
+	// A line that may set a registry leaves the registries npm asks unknown,
+	// and a registry list that cannot be read is no evidence that bodega is
+	// absent from it.
+	for _, f := range files {
+		if line := clientconf.NpmUnclassified(f); line != "" {
+			return blind(line)
+		}
+	}
+	if !slices.ContainsFunc(npmRegistries(t, files), func(r string) bool { return sameHost(r, u) }) {
+		return nil
 	}
 	var layers []npmLayer
 	for _, f := range files {

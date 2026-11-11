@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -186,6 +187,29 @@ allprojects { project ->
     bodegaOnly(project.repositories, projectRepositories)
 }
 `
+}
+
+var gradleInitURL = regexp.MustCompile(`(?m)^def bodegaUrl = '((?:[^'\\\n]|\\.)*)'$`)
+
+// mergeGradleInit returns old with the init script bodega rendered into it
+// replaced by planned, keeping every line around that script. Which lines are
+// bodega's is settled by rendering the script again for the URL old names and
+// finding it there byte for byte, which needs no Groovy parser. A script that
+// does not hold that rendering was edited inside bodega's own lines, or was
+// written by a release whose template differed, and replacing it whole would
+// delete what its owner wrote, so it is an error for the caller to refuse.
+func mergeGradleInit(old, planned []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(old)) == 0 {
+		return planned, nil
+	}
+	for _, m := range gradleInitURL.FindAllSubmatch(old, -1) {
+		root := strings.NewReplacer(`\\`, `\`, `\'`, `'`).Replace(string(m[1]))
+		was := []byte(gradleInit(root))
+		if at := bytes.Index(old, was); at >= 0 {
+			return slices.Concat(old[:at], planned, old[at+len(was):]), nil
+		}
+	}
+	return nil, errors.New("the script is not the one bodega doctor writes with lines of your own before or after it: it differs inside bodega's own lines, which this merge replaces as one block and does not edit")
 }
 
 // groovyQuote single-quotes s as a Groovy string literal.

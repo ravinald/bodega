@@ -1,6 +1,7 @@
 package clientconf
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 )
 
 // The functions here answer one question for a client that can take its
@@ -328,26 +330,175 @@ func GitIncludes(files []string) []string {
 	return out
 }
 
-// NpmInlineCA returns the first top-level ca or ca[] key the npmrc at path
+// NpmOption is one top-level line of an npmrc as npm's ini reader decodes
+// it. The decoding is npm/ini 6.0.0's, the reader npm 11 bundles: the name
+// and the value are each trimmed, unquoted when quoted and cut at a ; or #
+// outside quotes, and name[] is the array form of name. The install's
+// preflight, the editor and the trust probe all read an npmrc through this
+// one decoder, so no two of them can disagree about what a line says.
+type NpmOption struct {
+	// Line is the line's number in the file, from 1.
+	Line int
+	// Key is the option's decoded name, without the [] of an array form.
+	Key string
+	// Value is the decoded value, "" when Bare.
+	Value string
+	// Array says the line was written key[], which appends to a list.
+	Array bool
+	// Bare says the line holds no =, which npm reads as true.
+	Bare bool
+	// Unsure says why the line's name is not decoded with certainty, "" when
+	// it is. Such a line could name any option, a CA or registry included.
+	Unsure string
+	// ValueUnsure says the same of the value alone.
+	ValueUnsure string
+
+	section bool
+}
+
+// isJSSpace is the whitespace JavaScript's String.prototype.trim and \s
+// strip, which differs from unicode.IsSpace at U+FEFF and U+0085.
+func isJSSpace(r rune) bool {
+	return strings.ContainsRune("\t\n\v\f\r \u00a0\ufeff\u2028\u2029", r) || unicode.Is(unicode.Zs, r)
+}
+
+// npmUnsafe is npm/ini's unsafe(): the text a name or value decodes to. sure
+// is false where JSON.parse would give something this port does not
+// reproduce: a quoted number, list or object, or a lone surrogate escape.
+func npmUnsafe(val string) (out string, sure bool) {
+	val = strings.TrimFunc(val, isJSSpace)
+	quoted := func(q string) bool { return strings.HasPrefix(val, q) && strings.HasSuffix(val, q) }
+	if !quoted(`"`) && !quoted("'") {
+		var b strings.Builder
+		esc := false
+	walk:
+		for _, c := range val {
+			switch {
+			case esc:
+				if !strings.ContainsRune(`\;#`, c) {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(c)
+				esc = false
+			case c == ';' || c == '#':
+				break walk
+			case c == '\\':
+				esc = true
+			default:
+				b.WriteRune(c)
+			}
+		}
+		if esc {
+			b.WriteByte('\\')
+		}
+		return strings.TrimFunc(b.String(), isJSSpace), true
+	}
+	if val[0] == '\'' {
+		// A lone quote is its own opening and closing quote.
+		val = val[min(1, len(val)-1) : len(val)-1]
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(val), &parsed); err != nil {
+		return val, true
+	}
+	text, isString := parsed.(string)
+	if !isString || strings.ContainsRune(text, unicode.ReplacementChar) {
+		return val, false
+	}
+	return text, true
+}
+
+var npmSection = regexp.MustCompile(`^\[[^\]]*\]\s*$`)
+
+// npmDecodeLine decodes one line of an npmrc, without its line ending. ok is
+// false for a line npm's reader skips: a blank, a comment, one with nothing
+// before its =.
+func npmDecodeLine(line string) (o NpmOption, ok bool) {
+	t := strings.TrimFunc(line, isJSSpace)
+	if t == "" || t[0] == ';' || t[0] == '#' {
+		return o, false
+	}
+	switch {
+	case npmSection.MatchString(line):
+		return NpmOption{section: true}, true
+	case t[0] == '[':
+		return NpmOption{Unsure: "opens with [ and is not a section header alone at the start of its line, so npm reads it as an option where a section reader sees a header"}, true
+	case strings.ContainsAny(line, "\r\u2028\u2029"):
+		return NpmOption{Unsure: "holds a line separator inside it, where npm's reader splits or drops the line"}, true
+	}
+	rawKey, rawValue, assigned := strings.Cut(line, "=")
+	if rawKey == "" {
+		return o, false
+	}
+	key, sure := npmUnsafe(rawKey)
+	if o.Array = len(key) > 2 && strings.HasSuffix(key, "[]"); o.Array {
+		key = strings.TrimSuffix(key, "[]")
+	}
+	switch {
+	case !sure:
+		return NpmOption{Unsure: "quotes its option name around something other than a plain string"}, true
+	case strings.Contains(key, "${"):
+		return NpmOption{Unsure: "takes part of its option name from a ${NAME} reference, which npm resolves from the environment"}, true
+	case key == "__proto__":
+		return o, false
+	}
+	o.Key, o.Bare = key, !assigned
+	if assigned {
+		if o.Value, sure = npmUnsafe(rawValue); !sure {
+			o.ValueUnsure = "quotes its value around something other than a plain string"
+		}
+	}
+	return o, true
+}
+
+// NpmOptions decodes the top-level options of the npmrc in data, in order,
+// stopping at the first section header: npm reads the lines under one as a
+// nested object and takes no option from them.
+func NpmOptions(data []byte) []NpmOption {
+	var out []NpmOption
+	for i, line := range strings.Split(string(data), "\n") {
+		o, ok := npmDecodeLine(strings.TrimRight(line, "\r"))
+		if !ok {
+			continue
+		}
+		if o.section {
+			break
+		}
+		o.Line = i + 1
+		out = append(out, o)
+	}
+	return out
+}
+
+// npmKey is the option a line of an npmrc sets, "" for a line that sets none
+// or whose name is not decoded with certainty.
+func npmKey(line string) string {
+	o, ok := npmDecodeLine(strings.TrimRight(line, "\r"))
+	if !ok || o.section {
+		return ""
+	}
+	return o.Key
+}
+
+func npmFileOptions(path string) []NpmOption {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return NpmOptions(data)
+}
+
+// NpmInlineCA returns the first top-level ca or ca[] the npmrc at path
 // assigns, "" when it assigns neither or cannot be read. npm keeps one CA
 // list that ca and cafile both replace, in the order a file sets them, so a
 // file holding either key beside cafile does not read the cafile alone.
 func NpmInlineCA(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line[0] == '#' || line[0] == ';' {
-			continue
-		}
-		if line[0] == '[' && strings.HasSuffix(line, "]") {
-			break
-		}
-		key, _, _ := strings.Cut(line, "=")
-		if key = strings.TrimSpace(key); key == "ca" || key == "ca[]" {
-			return key
+	for _, o := range npmFileOptions(path) {
+		switch {
+		case o.Key == "ca" && o.Array:
+			return "ca[]"
+		case o.Key == "ca":
+			return "ca"
 		}
 	}
 	return ""
@@ -383,58 +534,75 @@ func NpmConfigFiles(getenv func(string) string, goos, home, root string) []strin
 	return files
 }
 
-// NpmPlainValue reads an npmrc value this package takes whole: bare, or
-// inside one pair of quotes. ok is false for a value npm's ini reader would
-// change on the way in, which this package does not reproduce: outside quotes
-// a # or ; opens a comment, a backslash escapes, and anywhere a ${NAME}
-// reference is replaced from the environment. A caller that read such a
-// value as written would name a file npm never opens.
-func NpmPlainValue(raw string) (value string, ok bool) {
-	v := strings.TrimSpace(raw)
-	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-		v = v[1 : len(v)-1]
-		return v, !strings.ContainsAny(v, "\\\"'") && !strings.Contains(v, "${")
+// NpmUnclassified names the first line of the npmrc at path that cannot be
+// told apart from a registry or CA option, or that sets a registry in a form
+// this package does not read, as a phrase a diagnostic can carry; "" when
+// there is none or the file cannot be read. The phrase names the file, the
+// line number and the option name where one decoded, never the value, which
+// may be a credential. Which registry npm asks is unknown with such a line
+// present, so the install refuses the host and the probe leaves npm
+// unchecked before either decides npm does not reach bodega.
+func NpmUnclassified(path string) string {
+	for _, o := range npmFileOptions(path) {
+		why := o.Unsure
+		registry := o.Key == "registry" || strings.HasSuffix(o.Key, ":registry")
+		switch {
+		case why != "":
+		case !registry:
+			continue
+		case o.Array:
+			why = "sets " + o.Key + " in its list form, " + o.Key + "[]"
+		case o.Bare:
+			why = "names " + o.Key + " with no value"
+		case o.ValueUnsure != "":
+			why = "sets " + o.Key + " and " + o.ValueUnsure
+		default:
+			continue
+		}
+		return fmt.Sprintf("line %d of %s, which %s", o.Line, path, why)
 	}
-	return v, !strings.ContainsAny(v, "#;\\\"'") && !strings.Contains(v, "${")
+	return ""
 }
 
 // NpmUnread names what the npmrc at path holds that this package detects and
 // does not interpret, as a phrase a diagnostic can carry, "" when it holds
-// nothing of the kind or cannot be read: a ca or ca[] beside cafile, which
-// replace one CA list in the order the file sets them, and a cafile whose
-// value NpmPlainValue does not take whole. The install refuses a host with
-// one in any npmrc npm loads, and the probe leaves npm unchecked.
+// nothing of the kind or cannot be read: a line NpmUnclassified names, a ca
+// or ca[] beside cafile, which replace one CA list in the order the file sets
+// them, and a ca or cafile written with no value, as a list, with a ${NAME}
+// reference or quoted around something other than a string. The install
+// refuses a host with one in any npmrc npm loads, and the probe leaves npm
+// unchecked.
 func NpmUnread(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	if unclassified := NpmUnclassified(path); unclassified != "" {
+		return unclassified
 	}
-	var inline string
-	cafile, plain := false, true
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line[0] == '#' || line[0] == ';' {
+	inline, cafile := "", false
+	for _, o := range npmFileOptions(path) {
+		if o.Key != "ca" && o.Key != "cafile" {
 			continue
 		}
-		if line[0] == '[' && strings.HasSuffix(line, "]") {
-			break
+		why := o.ValueUnsure
+		switch {
+		case o.Bare:
+			why = "gives it no value"
+		case o.Key == "cafile" && o.Array:
+			why = "writes it as a list, cafile[]"
+		case strings.Contains(o.Value, "${"):
+			why = "takes its value from a ${NAME} reference, which npm resolves from the environment"
 		}
-		key, raw, _ := strings.Cut(line, "=")
-		switch key = strings.TrimSpace(key); key {
-		case "ca", "ca[]":
-			if inline == "" {
-				inline = key
-			}
-		case "cafile":
+		if why != "" {
+			return fmt.Sprintf("line %d of %s, which sets %s and %s", o.Line, path, o.Key, why)
+		}
+		if o.Key == "cafile" {
 			cafile = true
-			_, plain = NpmPlainValue(raw)
+		} else if inline == "" {
+			if inline = "ca"; o.Array {
+				inline = "ca[]"
+			}
 		}
 	}
-	switch {
-	case cafile && inline != "":
+	if cafile && inline != "" {
 		return fmt.Sprintf("%s beside cafile in %s, which replace npm's one CA list in the order the file sets them", inline, path)
-	case cafile && !plain:
-		return fmt.Sprintf("the cafile value in %s, written with a comment, a quote inside it, a backslash or a ${NAME} reference, which npm resolves before it opens the file", path)
 	}
 	return ""
 }

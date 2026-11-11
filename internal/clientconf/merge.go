@@ -31,6 +31,9 @@ type lineRules struct {
 
 var (
 	plainRules = lineRules{key: settingKey}
+	// An npmrc names an option the way npm's own reader decodes the line, so
+	// a quoted name is the option it spells and a name is matched exactly.
+	npmRules = lineRules{key: npmKey}
 	// pip lowercases a key and reads _ as -, and ConfigParser takes a colon
 	// for the equals sign.
 	pipRules = lineRules{indent: true, key: func(line string) string {
@@ -70,9 +73,12 @@ var makeAssignment = regexp.MustCompile(`^([A-Za-z0-9_.{}()$-]+)[ \t]*[:+?!]?=`)
 
 // fileKind is how an existing file of one client takes a plan's settings and
 // keeps its own. The zero kind is a file written whole: one NewChange merged
-// already, or a document that holds nothing but what the plan renders (a key,
-// a script).
+// already, or a document that holds nothing but the one value the plan
+// renders (a key).
 type fileKind struct {
+	// block merges a file bodega renders as one block, which a person may
+	// have written lines of their own around.
+	block func(old, planned []byte) ([]byte, error)
 	// rules merges a file of sectioned key and value lines.
 	rules *lineRules
 	// blocks merges a file of named entries, each taking the plan's fields
@@ -184,7 +190,7 @@ func kindOf(rec PlanRecord) fileKind {
 		if rec.Path == NodeMirrorSystemPath || rec.Path == NodeMirrorUserPath {
 			return fileKind{rules: &slashRules}
 		}
-		return fileKind{rules: &plainRules, unread: strayHeader(plainRules)}
+		return fileKind{rules: &npmRules, unread: strayHeader(npmRules)}
 	case manifest.TypePypi:
 		return fileKind{rules: &pipRules, unread: strayHeader(pipRules)}
 	case manifest.TypeGit:
@@ -201,6 +207,10 @@ func kindOf(rec PlanRecord) fileKind {
 			return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
 		case OCIRuntimeOf(rec.Path) == RuntimePodman:
 			return fileKind{blocks: mergeRegistries, holds: registriesHold, keeps: registriesKeep}
+		}
+	case manifest.TypeMaven:
+		if rec.Path == GradleInitPath {
+			return fileKind{block: mergeGradleInit}
 		}
 	case manifest.TypeRubygems:
 		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "") }, holds: yamlHolds(""), keeps: yamlKeeps("")}
@@ -232,6 +242,8 @@ func (k fileKind) merge(old, planned []byte) ([]byte, error) {
 		}
 	}
 	switch {
+	case k.block != nil:
+		return k.block(old, planned)
 	case k.rules != nil:
 		lines = mergeSettings(splitBody(old), splitBody(planned), *k.rules)
 		if err := linesKeep(splitBody(old), lines, splitBody(planned), *k.rules); err != nil {

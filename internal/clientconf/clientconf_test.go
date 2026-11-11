@@ -1899,7 +1899,9 @@ func TestCARefusesWhatItDoesNotInterpret(t *testing.T) {
 		{"npm inline ca from the environment", Npm(testBase, nil), nil, map[string]string{"npm_config_ca": "x"}, []string{"npm_config_ca"}},
 		{"git header carrying a setting in a file the plan does not edit", git, map[string]string{"~/.config/git/config": "[http] sslCAInfo = /corp.pem\n"}, nil, []string{"[http] sslCAInfo", ".config/git/config"}},
 		{"npm ca[] beside cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\nca[]=\"x\"\n"}, nil, []string{"ca[] beside cafile", "etc/npmrc"}},
-		{"npm cafile with a comment in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem # corporate\n"}, nil, []string{"cafile value", "etc/npmrc"}},
+		{"npm cafile with a comment in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem # corporate\n"}, nil, nil},
+		{"npm cafile from a reference in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "save=true\ncafile=${CORP_CA}\n"}, nil, []string{"sets cafile", "line 2 of", "etc/npmrc"}},
+		{"npm quoted ca[] beside quoted cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "'cafile'=/corp.pem\n\"ca[]\"=x\n"}, nil, []string{"ca[] beside cafile", "etc/npmrc"}},
 		{"npm plain cafile in the global file", Npm(testBase, nil), map[string]string{"/etc/npmrc": "cafile=/corp.pem\n"}, nil, nil},
 		{"npm cafile from the environment", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "/etc/ssl/corp.pem"}, []string{"NPM_CONFIG_CAFILE", "/etc/ssl/corp.pem"}},
 		{"npm cafile from the environment naming the installed copy", Npm(testBase, nil), nil, map[string]string{"NPM_CONFIG_CAFILE": "~/.config/bodega/ca.pem"}, nil},
@@ -1984,5 +1986,235 @@ func TestAudit7GitInlineIncludeInSelectedFileRefusesBeforeWrite(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
 		t.Fatalf("refusal wrote a CA: %v", err)
+	}
+}
+
+func TestAudit8NpmQuotedCARefusesBeforeWrite(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	raw, _, _ := testCA(t, "bodega.example.com")
+	other, _, _ := testCA(t, "other.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	old := "registry=" + testBase + "/npm/\ncafile=/missing/previous.pem\n\"ca\"=\"" + strings.ReplaceAll(strings.TrimSpace(string(other)), "\n", `\n`) + "\"\nsave-exact=true\n"
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "get", "ca", "--userconfig", target, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = home
+	for _, entry := range os.Environ() {
+		k, _, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(strings.ToLower(k), "npm_config_") && k != "HOME" && k != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != strings.TrimSpace(string(other)) {
+		t.Fatalf("native npm did not select the quoted ca: %q, %v", out, err)
+	}
+	_, err = AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "ca") {
+		t.Fatalf("native npm selects the quoted ca beside cafile; want pre-write refusal naming %s and ca, got %v", target, err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != old {
+		t.Fatal("refusal changed .npmrc")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Fatalf("refusal wrote a CA: %v", err)
+	}
+}
+
+func TestAudit8CAGradlePreservesUnrelatedPolicy(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	files := Maven(testBase, nil)
+	target := filepath.Join(home, ".gradle/init.d/bodega.gradle")
+	keep := "allprojects { project -> project.tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' } }\n"
+	old := files[1].Content + "\n" + keep
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, files...), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, JVMTrusted: ca.Certs})
+	if err != nil {
+		if !strings.Contains(err.Error(), target) {
+			t.Fatalf("refusal does not name the script: %v", err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != old {
+			t.Fatal("refusal changed the script")
+		}
+		return
+	}
+	if _, err := Apply(in.Changes, ".audit"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), keep) {
+		t.Fatalf("CA apply silently removed Gradle's unrelated compiler policy from %s", target)
+	}
+}
+
+// TestNpmOptionsDecodeAsNpmDoes holds the npmrc decoder to native npm's own
+// reading of the same file: every name and value NpmOptions is sure of is
+// the one `npm config list --json` reports.
+func TestNpmOptionsDecodeAsNpmDoes(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	rc := strings.Join([]string{
+		`"tag"=a1`,
+		`'otp'="q # x"`,
+		`scope = @x ; trailing`,
+		`heading=a\#b\;c\qd`,
+		` "init-author-url" = y `,
+		`omit[]=dev`,
+		`"omit[]"="peer"`,
+		`ca # named before the comment = dropped`,
+		`init-author-name="unterminated`,
+		`init-author-email='single'`,
+		`init-license = "a\nb"`,
+		`"init-version"[]=z`,
+		`=skipped`,
+		`; cafile=/comment`,
+		`[section]`,
+		`registry=https://under.section.example/`,
+	}, "\n") + "\n"
+	dir := t.TempDir()
+	file := filepath.Join(dir, "rc")
+	if err := os.WriteFile(file, []byte(rc), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("npm", "config", "list", "--json", "--userconfig", file, "--globalconfig", filepath.Join(dir, "global"))
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("npm config list: %v", err)
+	}
+	var native map[string]any
+	if err := json.Unmarshal(out, &native); err != nil {
+		t.Fatalf("npm config list printed %q: %v", out, err)
+	}
+	opts := NpmOptions([]byte(rc))
+	if len(opts) != 12 {
+		t.Fatalf("decoded %d options, want the 12 above the section: %+v", len(opts), opts)
+	}
+	for _, o := range opts {
+		if o.Unsure != "" || o.ValueUnsure != "" {
+			t.Errorf("line %d: unsure of a line npm reads plainly: %+v", o.Line, o)
+			continue
+		}
+		switch got := native[o.Key].(type) {
+		case string:
+			if o.Array || got != o.Value {
+				t.Errorf("line %d: decoded %q = %q, npm reads %q", o.Line, o.Key, o.Value, got)
+			}
+		case []any:
+			if !slices.Contains(got, any(o.Value)) {
+				t.Errorf("line %d: decoded %q[] = %q, npm reads %v", o.Line, o.Key, o.Value, got)
+			}
+		case bool:
+			if !o.Bare || !got {
+				t.Errorf("line %d: decoded %q = %q, npm reads %v", o.Line, o.Key, o.Value, got)
+			}
+		default:
+			t.Errorf("line %d: npm reports no option named %q (%v)", o.Line, o.Key, got)
+		}
+	}
+	if native["registry"] != "https://registry.npmjs.org/" {
+		t.Errorf("npm read the registry under a section: %v", native["registry"])
+	}
+}
+
+// TestNpmUnclassifiedLinesRefuseAndStayUnchecked walks the forms the decoder
+// is not sure of, and the registry forms the readers do not take: each names
+// its file and line, and none echoes a value.
+func TestNpmUnclassifiedLinesRefuseAndStayUnchecked(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string]string{
+		"quoted number name":  `'8443'=hunter2`,
+		"env in name":         `//${HOST}/:_authToken=hunter2`,
+		"indented bracket":    ` [scope]`,
+		"header with comment": `[scope] ; hunter2`,
+		"carriage return":     "save=hunter2\rregistry=https://elsewhere.example/",
+		"registry list":       `registry[]=https://elsewhere.example/hunter2`,
+		"bare registry":       `@corp:registry`,
+		"quoted list value":   `registry='["hunter2"]'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".npmrc")
+			old := "save-exact=true\n" + line + "\n"
+			if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got := NpmUnclassified(target)
+			if !strings.Contains(got, "line 2 of "+target) || strings.Contains(got, "hunter2") {
+				t.Fatalf("NpmUnclassified = %q, want line 2 of %s named and no value", got, target)
+			}
+			_, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+			if err == nil || !strings.Contains(err.Error(), "line 2 of "+target) || strings.Contains(err.Error(), "hunter2") {
+				t.Fatalf("AddCA = %v, want a refusal naming line 2 of %s and no value", err, target)
+			}
+			if now, _ := os.ReadFile(target); string(now) != old {
+				t.Fatal("refusal changed .npmrc")
+			}
+		})
+	}
+	// A token whose value npm fills from the environment is the common
+	// credential line, and names nothing this install reads.
+	home := t.TempDir()
+	target := filepath.Join(home, ".npmrc")
+	if err := os.WriteFile(target, []byte("//registry.example/:_authToken=${NPM_TOKEN}\n\"registry\"=https://old.example/\n'cafile' = /old.example.pem ; before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, GOOS: OSLinux, Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := string(in.Changes[0].New)
+	if !strings.Contains(merged, "//registry.example/:_authToken=${NPM_TOKEN}\n") || strings.Contains(merged, "old.example") || !strings.Contains(merged, "registry="+testBase+"/npm/\n") || strings.Count(merged, "cafile") != 1 {
+		t.Fatalf("merge did not replace the quoted registry and cafile and keep the token line:\n%s", merged)
+	}
+}
+
+// TestGradleInitMergeKeepsLinesAroundBodegasBlock covers the script on both
+// sides of bodega's rendering, a move to another URL, and the edit inside the
+// rendering that the merge refuses.
+func TestGradleInitMergeKeepsLinesAroundBodegasBlock(t *testing.T) {
+	was, now := gradleInit("https://old.example/maven/"), gradleInit(testBase+"/maven/")
+	before, after := "// site policy\n", "\nallprojects { }\n"
+	got, err := mergeGradleInit([]byte(before+was+after), []byte(now))
+	if err != nil || string(got) != before+now+after {
+		t.Fatalf("merge = %v\n%s", err, got)
+	}
+	if again, err := mergeGradleInit(got, []byte(now)); err != nil || string(again) != string(got) {
+		t.Fatalf("second merge changed the script: %v", err)
+	}
+	if got, err := mergeGradleInit([]byte(" \n"), []byte(now)); err != nil || string(got) != now {
+		t.Fatalf("an empty script is not written whole: %v", err)
+	}
+	edited := strings.Replace(was, "name = 'bodega'", "name = 'mine'", 1)
+	if _, err := mergeGradleInit([]byte(edited), []byte(now)); err == nil {
+		t.Fatal("a script edited inside bodega's lines was replaced")
 	}
 }

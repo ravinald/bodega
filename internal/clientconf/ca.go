@@ -278,6 +278,16 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				}
 			}
 		}
+		loaded := NpmConfigFiles(h.Getenv, h.GOOS, h.Home, h.Root)
+		// A line that cannot be told apart from a registry or CA option is
+		// refused in every file npm loads and every file this edit writes,
+		// ahead of the checks below, which read only lines they can name.
+		for _, f := range append(slices.Clone(files), loaded...) {
+			if line := NpmUnclassified(f); line != "" {
+				return fmt.Errorf("%s: npm reads %s, so which option that line sets, and with it which registry npm asks and which CA list it verifies one against, cannot be told. "+
+					"Nothing was written. Write that line as a plain name=value with no ${NAME} in the name, or remove it, then re-run", rec.System, line)
+			}
+		}
 		for _, f := range files {
 			if key := NpmInlineCA(f); key != "" {
 				return fmt.Errorf("%s: %s sets %s, and npm keeps one CA list that %s and cafile each replace in the order the file sets them, so the cafile this command writes there would not be read alone. "+
@@ -286,7 +296,7 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		}
 		// The other files npm loads keep their own CA settings, which the
 		// check after the write reads beside the one written here.
-		for _, f := range NpmConfigFiles(h.Getenv, h.GOOS, h.Home, h.Root) {
+		for _, f := range loaded {
 			if slices.Contains(files, f) {
 				continue
 			}
@@ -699,11 +709,14 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		var line func(caPath string) string
 		switch {
 		case rec.System == manifest.TypeMaven:
+			// The JVM import is planned once for the system; each of its
+			// records still goes on to the merge that keeps its own file.
+			certs := ca.Certs
 			if jvm {
-				continue
+				certs = nil
 			}
 			jvm = true
-			for _, cert := range ca.Certs {
+			for _, cert := range certs {
 				if slices.ContainsFunc(h.JVMTrusted, func(have *x509.Certificate) bool { return bytes.Equal(have.Raw, cert.Raw) }) {
 					continue
 				}

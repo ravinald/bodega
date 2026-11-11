@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"slices"
@@ -1901,5 +1902,65 @@ func TestAudit7CAInputTableNamesMavenDiscovery(t *testing.T) {
 		if !strings.Contains(row, input) {
 			t.Errorf("CA input table omits Maven discovery input %s, which mavenStores reads", input)
 		}
+	}
+}
+
+func TestAudit8DoctorCannotCertifyQuotedNpmCA(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_ca", "NPM_CONFIG_CA", "npm_config_cafile", "NPM_CONFIG_CAFILE"} {
+		t.Setenv(key, "")
+	}
+	stubRuntimes(t)
+	srv, caPEM, _ := caPlanServer(t)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: "unrelated CA"}, IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	caFile, target := filepath.Join(home, "issuer.pem"), filepath.Join(home, ".npmrc")
+	old := "registry=" + srv.URL + "/npm/\ncafile=/missing/previous.pem\n\"ca\"=\"" + strings.ReplaceAll(strings.TrimSpace(string(wrong)), "\n", `\n`) + "\"\n"
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err != nil {
+		if got, _ := os.ReadFile(target); string(got) != old {
+			t.Fatal("refused quoted inline CA only after writing .npmrc")
+		}
+		if _, statErr := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(statErr) {
+			t.Fatalf("refused only after writing the CA: %v", statErr)
+		}
+		return
+	}
+	cmd := exec.Command("npm", "config", "get", "ca", "--userconfig", target, "--globalconfig", filepath.Join(home, "global.npmrc"))
+	cmd.Dir = home
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if !strings.HasPrefix(strings.ToLower(key), "npm_config_") && key != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != strings.TrimSpace(string(wrong)) {
+		t.Fatalf("native npm fixture: %q, %v", out, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(out) {
+		t.Fatal("native npm returned no CA")
+	}
+	if _, err := srv.Certificate().Verify(x509.VerifyOptions{Roots: pool, DNSName: "127.0.0.1"}); err != nil {
+		t.Fatalf("doctor returned success after writing cafile, but native npm's quoted ca replaces it and rejects bodega: %v", err)
 	}
 }

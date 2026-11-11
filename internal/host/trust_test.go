@@ -1047,3 +1047,111 @@ func TestAudit7NpmCAFileCommentCannotRestoreDefaultRoots(t *testing.T) {
 		t.Fatalf("native npm replaces default roots with %s; probe returned %+v", wrong, f)
 	}
 }
+
+func TestAudit8NpmQuotedCAFileCannotRestoreDefaultRoots(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	p, ca, base := reviewTrust(t)
+	good, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "corporate.pem")
+	writeTrustFile(t, wrong, string(other))
+	p.Node = func() (NodeRoots, error) { return NodeRoots{PEM: []string{string(good)}, Effective: true}, nil }
+	home := filepath.Join(p.Root, p.Home)
+	config := filepath.Join(home, ".npmrc")
+	writeTrustFile(t, config, "registry="+base+"/npm/\n\"cafile\"="+wrong+"\n")
+	cmd := exec.Command("npm", "config", "get", "cafile", "--userconfig", config, "--globalconfig", filepath.Join(p.Root, "global.npmrc"))
+	cmd.Dir = home
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if !strings.HasPrefix(strings.ToLower(key), "npm_config_") && key != "HOME" && key != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != wrong {
+		t.Fatalf("native npm cafile = %q, %v; want %s", out, err, wrong)
+	}
+	f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") || (!strings.Contains(f.Detail, wrong) && !strings.Contains(f.Detail, "unchecked")) {
+		t.Fatalf("native npm replaces default roots with quoted cafile %s; probe returned %+v", wrong, f)
+	}
+}
+
+func TestAudit8NpmRegistryCommentStillOwesTrust(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("native npm is not installed")
+	}
+	p, _, base := reviewTrust(t)
+	other, _ := trustFixture(t)
+	wrong := filepath.Join(p.Root, "corporate.pem")
+	writeTrustFile(t, wrong, string(other))
+	home := filepath.Join(p.Root, p.Home)
+	config := filepath.Join(home, ".npmrc")
+	writeTrustFile(t, config, "registry="+base+" # internal registry\ncafile="+wrong+"\n")
+	cmd := exec.Command("npm", "config", "get", "registry", "--userconfig", config, "--globalconfig", filepath.Join(p.Root, "global.npmrc"))
+	cmd.Dir = home
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if !strings.HasPrefix(strings.ToLower(key), "npm_config_") && key != "HOME" && key != "NODE_OPTIONS" {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimRight(strings.TrimSpace(string(out)), "/") != base {
+		t.Fatalf("native npm registry = %q, %v; want %s", out, err, base)
+	}
+	before := checkNpmConfig(p.Root, p.GOOS, p.Home)
+	f := p.Apply([]Finding{before}, base)[0]
+	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") || (!strings.Contains(f.Detail, wrong) && !strings.Contains(f.Detail, "unchecked")) {
+		t.Fatalf("native npm reaches %s and its cafile lacks the issuer, but doctor left the row %+v", base, f)
+	}
+}
+
+// TestNpmProbeReadsLinesAsNpmDecodesThem walks the npmrc forms the probe
+// shares a decoder with the install for: a quoted or commented line names the
+// option npm reads, and a line whose option cannot be told leaves the row
+// unchecked whether or not another line names bodega.
+func TestNpmProbeReadsLinesAsNpmDecodesThem(t *testing.T) {
+	for _, tc := range []struct {
+		name, rc string
+		good     bool
+		want     string
+	}{
+		{"quoted registry and cafile with the issuer", "\"registry\" = {base}/npm/ ; internal\n'cafile'={ca} # issuer\n", true, ""},
+		{"ca list form holding the issuer after a plain ca", "registry={base}\nca=\"unrelated\"\n\"ca[]\"={inline}\n", true, ""},
+		{"cafile under a section sets nothing", "registry={base}\n[corp]\ncafile={ca}\n", false, "Node"},
+		{"registry in its list form", "registry[]={base}\n", false, "unchecked"},
+		{"reference in a name on a host with no bodega registry", "//${HOST}/:_authToken=hunter2\n", false, "unchecked"},
+		{"bracket line npm reads as an option", "registry={base}\n [corp]\ncafile={ca}\n", false, "unchecked"},
+		{"cafile from a reference", "registry={base}\ncafile=${CORP_CA}\n", false, "unchecked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			issuer, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Node = func() (NodeRoots, error) { return NodeRoots{Effective: true}, nil }
+			inline := `"` + strings.ReplaceAll(strings.TrimSpace(string(issuer)), "\n", `\n`) + `"`
+			rc := strings.NewReplacer("{base}", base, "{ca}", ca, "{inline}", inline).Replace(tc.rc)
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), rc)
+			f := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+			if tc.good {
+				if f.Status != StatusOK {
+					t.Fatalf("npm verifies bodega through this file; probe returned %+v", f)
+				}
+				return
+			}
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, tc.want) || !strings.Contains(f.Remediation, "--ca-file") || strings.Contains(f.Detail, "hunter2") {
+				t.Fatalf("want a warning naming %q and no value; probe returned %+v", tc.want, f)
+			}
+		})
+	}
+}
