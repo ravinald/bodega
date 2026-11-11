@@ -319,14 +319,16 @@ var trustRows = map[string]trustRow{
 		return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
 	}},
 	"oci-" + clientconf.RuntimePodman: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
-		user := filepath.Join(t.Home, ".config", "containers")
-		configured := t.filesMention(u.Host, "/etc/containers/registries.conf", "/etc/containers/registries.conf.d/*.conf")
-		if !configured && t.Home != "" {
-			drop, _ := filepath.Glob(filepath.Join(user, "registries.conf.d", "*.conf"))
-			configured = mention(u.Host, append(drop, filepath.Join(user, "registries.conf"))...)
-		}
-		if !configured {
+		// The files and table precedence the oci-podman row resolves, so a
+		// system drop-in a user registries.conf replaces counts for nothing,
+		// and CONTAINERS_REGISTRIES_CONF's file counts as the main one.
+		reg := OCIHost{Root: t.Root, Home: t.Home, RegistriesConf: t.env("CONTAINERS_REGISTRIES_CONF")}
+		files := reg.registriesConfFiles()
+		if !mention(u.Host, files...) {
 			return nil
+		}
+		if f := reg.checkRegistriesConf(u.Host); f.Status != StatusOK {
+			return []trustStore{{name: "podman's registries.conf", blind: "a registries.conf podman reads names bodega, but " + f.Detail + ", so whether podman pulls through bodega or verifies its certificate is unchecked"}}
 		}
 		// The one directory containers/image picks, not every candidate: an
 		// existing per-user directory hides the system one even when it holds
@@ -577,6 +579,15 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		ask = sync.OnceValues(t.Pip)
 	}
 	files := pipFiles(t, ask)
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if err := clientconf.PipLoadError(data); err != nil {
+			return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip refuses to load %s (%v) and aborts every command while it does, so whether pip reaches bodega or verifies its certificate is unchecked", f, err)}}
+		}
+	}
 	if !pipReaches(t, files, u) {
 		if t.env("PIP_CONFIG_FILE") != os.DevNull {
 			return nil

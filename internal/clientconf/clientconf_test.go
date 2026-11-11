@@ -2953,3 +2953,37 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 		}
 	}
 }
+
+// TestPipLoadErrorMatchesNativePip compares PipLoadError with whether pip
+// config list loads the file at all.
+func TestPipLoadErrorMatchesNativePip(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("native pip oracle needs python3")
+	}
+	cases := []string{
+		"[global]\ntimeout = 1\ntimeout = 2\n",
+		"[global]\ntimeout = 1\n[global]\nretries = 2\n",
+		"[global]\nTimeout = 1\ntimeout = 2\n",
+		"[global]\ncert = /a.pem\n--cert = /b.pem\n",
+		"[global]\nindex_url = https://a/\nindex-url = https://b/\n",
+		"[DEFAULT]\ntimeout = 1\n[DEFAULT]\nretries = 2\n",
+		"[DEFAULT]\ntimeout = 1\n[DEFAULT]\ntimeout = 2\n",
+		"timeout = 1\n[global]\n",
+		"[global]\nindex-url = https://a/\n  https://b/\n[install]\nindex-url = https://c/\n",
+		"# comment\n\n[global]\ntimeout: 1\n",
+	}
+	for _, body := range cases {
+		file := filepath.Join(t.TempDir(), "pip.conf")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(python, "-m", "pip", "config", "list")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PIP_CONFIG_FILE=" + file}
+		out, nativeErr := cmd.CombinedOutput()
+		if got := PipLoadError([]byte(body)); (got == nil) != (nativeErr == nil) {
+			t.Errorf("PipLoadError(%q) = %v, native pip: %v: %s", body, got, nativeErr, out)
+		}
+	}
+}

@@ -1417,3 +1417,60 @@ func TestAudit13PipDefaultsStillDiscoverBodega(t *testing.T) {
 		t.Fatalf("native pip install.index-url = %s and cert = %s, but doctor returned %+v", strings.TrimSpace(string(native)), missing, got)
 	}
 }
+
+func TestAudit14PipRejectsDuplicatePolicy(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tail := range []string{"timeout = 1\ntimeout = 2\n", "[global]\ntimeout = 1\n"} {
+		t.Run(strings.ReplaceAll(tail, "\n", "_"), func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			p.Home = filepath.Join(p.Root, "home")
+			file := filepath.Join(p.Root, "etc", "pip.conf")
+			writeTrustFile(t, file, "[global]\nindex-url = "+base+"/pypi/simple/\ncert = "+ca+"\n"+tail)
+			cmd := exec.Command(python, "-m", "pip", "config", "list")
+			cmd.Dir = t.TempDir()
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
+			native, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(native), "already exists") {
+				t.Fatalf("oracle did not reject duplicate: %v: %s", err, native)
+			}
+			got := p.Apply([]Finding{checkPipConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+			verdict, err := p.Judge([]string{"pip-config"}, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != StatusWarn || !strings.Contains(got.Detail, "unchecked") || !strings.Contains(got.Detail, file) || !strings.Contains(got.Remediation, "--ca-file") || len(verdict) != 1 || verdict[0].State != TrustUnchecked {
+				t.Fatalf("native pip rejects this file:\n%s\ndoctor row: %+v; selected verdict: %+v", native, got, verdict)
+			}
+		})
+	}
+}
+
+func TestAudit14PodmanSelectedEndpointStillOwesTrust(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	selected := filepath.Join(p.Root, "selected-registries.conf")
+	writeTrustFile(t, selected, "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n[[registry.mirror]]\nlocation = \""+strings.TrimPrefix(base, "https://")+"\"\n")
+	p.Getenv = func(k string) string {
+		if k == "CONTAINERS_REGISTRIES_CONF" {
+			return selected
+		}
+		return ""
+	}
+	h := OCIHost{Root: p.Root, Home: p.Home, RegistriesConf: selected, LookPath: func(name string) (string, error) {
+		if name == "podman" {
+			return "/not-executed/podman", nil
+		}
+		return "", os.ErrNotExist
+	}}
+	rows := h.Check(base)
+	if len(rows) != 1 || rows[0].Status != StatusOK {
+		t.Fatalf("setup: %+v", rows)
+	}
+	got := p.Apply(rows, base)[0]
+	if got.Status != StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
+		t.Fatalf("normal row resolves bodega from %s, but its untrusted chain is never checked: %+v", selected, got)
+	}
+}

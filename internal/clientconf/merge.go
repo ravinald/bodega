@@ -1620,6 +1620,54 @@ func pipName(raw string) string {
 	return strings.TrimPrefix(strings.ReplaceAll(strings.ToLower(raw), "_", "-"), "--")
 }
 
+// PipLoadError is why pip cannot load a configuration file, or nil when it
+// can. pip reads each file with a strict RawConfigParser, which refuses a
+// section declared twice and an option assigned twice in one section, named
+// as ConfigParser stores it (lowercased, before pip's own normalization, so
+// cert and --cert are two options), and refuses an option above every
+// section header. pip then aborts on the file, so no option in it is policy.
+// A repeated [DEFAULT] header is not an error: ConfigParser keeps no DEFAULT
+// in its section list and reopens the defaults.
+func PipLoadError(data []byte) error {
+	declared := map[string]bool{}
+	assigned := map[string]bool{}
+	scan := lineScan{rules: pipRules, keyIndent: -1}
+	section, inSection := "", false
+	for n, l := range splitBody(data) {
+		t := strings.TrimSpace(l)
+		if scan.continues(l) {
+			continue
+		}
+		if strings.HasPrefix(t, "[") {
+			scan.keyIndent = -1
+			end := strings.LastIndex(t, "]")
+			if end <= 0 {
+				continue
+			}
+			section, inSection = t[1:end], true
+			if section != "DEFAULT" && declared[section] {
+				return fmt.Errorf("line %d: section %q already exists", n+1, section)
+			}
+			declared[section] = true
+			continue
+		}
+		raw := pipRawKey(l)
+		if raw == "" {
+			continue
+		}
+		scan.keyIndent = indentOf(l)
+		if !inSection {
+			return fmt.Errorf("line %d: %q sits above every section header", n+1, t)
+		}
+		key := section + "\x00" + raw
+		if assigned[key] {
+			return fmt.Errorf("line %d: option %q in section %q already exists", n+1, raw, section)
+		}
+		assigned[key] = true
+	}
+	return nil
+}
+
 // PipOptions reads a pip configuration file into "section.option", the
 // option named as pipName names it, each to the value pip takes for it. It
 // walks the file with the scan the merge edits one with, so a line the merge

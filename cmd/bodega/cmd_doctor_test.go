@@ -2304,3 +2304,99 @@ func TestAudit13PipOptionIdentityRefusesBeforeWritingOrInstalls(t *testing.T) {
 		t.Fatalf("apply succeeded with effective cert %s, want %s:\n%s", effective, want, got)
 	}
 }
+
+func TestAudit14PipDuplicatesRefusedBeforeWrites(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, location := range []string{"plan target", "selected extra file"} {
+		t.Run(location, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			for _, key := range []string{"PIP_CONFIG_FILE", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CERT", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "VIRTUAL_ENV"} {
+				t.Setenv(key, "")
+			}
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(home, "etc", "pip.conf")
+			invalid := target
+			if location == "selected extra file" {
+				invalid = filepath.Join(home, "extra.conf")
+			}
+			if err := os.MkdirAll(filepath.Dir(invalid), 0700); err != nil {
+				t.Fatal(err)
+			}
+			old := "[global]\ntimeout = 1\ntimeout = 2\n"
+			if err := os.WriteFile(invalid, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PIP_CONFIG_FILE", invalid)
+			cmd := exec.Command(python, "-m", "pip", "config", "list")
+			cmd.Dir = t.TempDir()
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + invalid}
+			native, nativeErr := cmd.CombinedOutput()
+			if nativeErr == nil || !strings.Contains(string(native), "already exists") {
+				t.Fatalf("oracle did not reject: %v: %s", nativeErr, native)
+			}
+			out, applyErr := runDoctor(t, "--configure", "pip", "--ca-file", caFile, "--url", srv.URL, "--apply")
+			data, err := os.ReadFile(invalid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, caErr := os.Stat(filepath.Join(home, ".config", "bodega", "ca.pem"))
+			if applyErr == nil || !strings.Contains(applyErr.Error(), invalid) || string(data) != old || !os.IsNotExist(caErr) {
+				t.Fatalf("native pip refuses:\n%s\napply error=%v, invalid file unchanged=%t, CA stat=%v\n%s", native, applyErr, string(data) == old, caErr, out)
+			}
+		})
+	}
+}
+
+func TestAudit14PodmanApplyCannotPassOnHiddenSystemConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CONTAINERS_REGISTRIES_CONF", "")
+	stubRuntimes(t, "podman")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(home, ".config", "containers", "registries.conf")
+	if err := os.MkdirAll(filepath.Dir(selected), 0700); err != nil {
+		t.Fatal(err)
+	}
+	old := "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n[[registry.mirror]]\nlocation = \"other.internal:5443\"\n"
+	if err := os.WriteFile(selected, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []string{"first apply", "idle second apply"} {
+		out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		rows := (host.OCIHost{Root: home, Home: home, LookPath: doctorLookPath}).Check(srv.URL)
+		if len(rows) != 1 {
+			t.Fatalf("setup: %+v", rows)
+		}
+		if err == nil && rows[0].Status != host.StatusOK {
+			t.Errorf("%s certified the install but podman's effective endpoint is still elsewhere: %+v\n%s", run, rows[0], out)
+		}
+	}
+}
+
+func TestAudit14CAInputTableNamesPodmanDiscovery(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, table, ok := strings.Cut(string(data), "Doctor installs and verifies through the inputs below")
+	if !ok {
+		t.Fatal("missing input boundary")
+	}
+	table, _, _ = strings.Cut(table, "An input outside this table")
+	if !strings.Contains(table, "CONTAINERS_REGISTRIES_CONF") {
+		t.Fatal("CA input boundary omits CONTAINERS_REGISTRIES_CONF, which the normal oci-podman row reads to discover its endpoint")
+	}
+}

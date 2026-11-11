@@ -239,8 +239,8 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 	return out
 }
 
-// pipCommandIndex refuses a pip configuration whose command section sets an
-// index the plan does not. pip reads a command's own section ahead of
+// pipCommandIndex refuses a pip configuration pip cannot load, and one whose
+// command section sets an index the plan does not. pip reads a command's own section ahead of
 // [global] from every file it loads, so an [install] index-url anywhere keeps
 // pip install on that index after the plan writes bodega's under [global],
 // and the CA installed for bodega would certify an endpoint pip never asks.
@@ -254,6 +254,9 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 		data, err := os.ReadFile(f)
 		if err != nil {
 			continue
+		}
+		if err := PipLoadError(data); err != nil {
+			return fmt.Errorf("%s: pip refuses to load %s (%v), so it aborts before reading any index or cert this command would write, and the install could not be verified. Nothing was written. Fix %s so pip loads it, then re-run", rec.System, f, err, f)
 		}
 		for key, v := range PipOptions(data) {
 			section, option, _ := strings.Cut(key, ".")
@@ -370,6 +373,14 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		}
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
+		}
+	case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimePodman && !user && h.Home != "" && env("CONTAINERS_REGISTRIES_CONF") == "":
+		// containers-registries.conf.d(5): a user's own registries.conf
+		// replaces the system file and every system drop-in with it.
+		own := filepath.Join(h.Home, ".config", "containers", "registries.conf")
+		if _, ok := regularFile(own); ok {
+			return fmt.Errorf("%s: %s exists, and podman, buildah and CRI-O read it in place of the system registries.conf and every system drop-in, %s included, so the mirror and CA written there would not reach podman. "+
+				"Nothing was written. Move that file's tables into a drop-in under %s, or remove it, then re-run", rec.System, own, target, filepath.Join(filepath.Dir(own), "registries.conf.d"))
 		}
 	case rec.System == manifest.TypeGit:
 		// The probe's own classifier over the probe's own file set, with the
