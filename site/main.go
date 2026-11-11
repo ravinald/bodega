@@ -250,6 +250,9 @@ func (g *generator) render(src []byte, srcPath string) (string, string) {
 			}
 		case *ast.Link:
 			n.Destination = []byte(g.rewrite(string(n.Destination), srcPath))
+			if string(n.Title) == downloadTitle && string(n.Destination) == g.base+apiDir {
+				n.Destination = []byte(g.base + apiSpec)
+			}
 		case *ast.Image:
 			n.Destination = []byte(g.rewrite(string(n.Destination), srcPath))
 		}
@@ -477,6 +480,10 @@ func build(repo, out, tmplDir, version, commit, base, coverage string) int {
 const (
 	apiDir  = "api/"
 	apiSpec = apiDir + "openapi.yaml"
+	// downloadTitle is the Markdown link title that keeps a link to
+	// api/openapi.yaml on the document itself. Without it the link goes to the
+	// rendered reference, which is what a doc naming the file in passing means.
+	downloadTitle = "Download the OpenAPI document"
 )
 
 // scalarBundle is the record site/scripts/update-scalar.sh writes beside the

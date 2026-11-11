@@ -12,7 +12,7 @@
 | `static/scalar/` | The vendored Scalar bundle and `scalar.json`, the record of its version and SHA-256         |
 | `scripts/`       | Coverage export, deployment and their tests, and `update-scalar.sh`                         |
 
-The generator is its own Go module (`site/go.mod`), so its Markdown dependency stays out of bodega's `go.mod` and out of `go list ./...`.
+The generator is its own Go module (`site/go.mod`), so its dependencies stay out of bodega's `go.mod` and out of `go list ./...`: goldmark for the Markdown, and for the tests alone [`chromedp`](https://github.com/chromedp/chromedp) and a YAML parser.
 
 ## Contents column
 
@@ -22,7 +22,11 @@ Every doc page lists the whole contents in the left column, numbered serially. A
 
 `/api/` is one page. It keeps the site's header and navigation, and under them [Scalar](https://github.com/scalar/scalar)'s standalone bundle renders `api/openapi.yaml` in the reader's browser, embedded the way Scalar's own HTML integration does it: a mount point, the bundle, and one `Scalar.createApiReference` call. The generator copies the document to `/api/openapi.yaml`, which is both what the page fetches and the download. The page sits in the contents column under its own group, placed by the `api` row of the `contents` table in `main.go`.
 
-A doc that links `api/openapi.yaml` by its repository path lands on `/api/` here, and on the raw YAML when read on GitHub.
+A doc that links `api/openapi.yaml` by its repository path lands on `/api/` here, and on the raw YAML when read on GitHub. A link that offers the file as a download carries the Markdown title `"Download the OpenAPI document"`, which keeps it on `/api/openapi.yaml`:
+
+```md
+[`api/openapi.yaml`](../api/openapi.yaml "Download the OpenAPI document")
+```
 
 This is the one page where the site runs a third-party script. The pages around it carry a few lines of their own for the display preferences and the coverage table's sorting, and nothing else. The configuration in `apiBody` (`main.go`) keeps Scalar on this origin:
 
@@ -47,7 +51,7 @@ sh site/scripts/update-scalar.sh 1.76.0
 
 Give it a release published at least two weeks ago, so a bad publish has had time to be noticed and pulled. The script downloads the package tarball from `registry.npmjs.org`, refuses it unless its sha512 matches the `dist.integrity` the registry's metadata reports for that version, extracts `dist/browser/standalone.js`, and writes `scalar.json` with the version and the bundle's SHA-256. It needs `curl`, `openssl`, `tar` and `python3`, and runs no npm or other package client. The registry check catches a truncated or substituted download; the metadata and the tarball come from the same origin, so it is the committed SHA-256 that holds from then on. Commit the bundle and `scalar.json` together.
 
-The generator refuses to build when the bundle's SHA-256 is not the one `scalar.json` records, and a test fails on the same mismatch, so an edit to the bundle that nobody recorded does not ship. After an update, load `/api/` from a local build with the browser's network panel open and confirm every request stays on the site's origin: a new release can add a default that reaches out, and the page test reads only the HTML the generator writes.
+The generator refuses to build when the bundle's SHA-256 is not the one `scalar.json` records, and a test fails on the same mismatch, so an edit to the bundle that nobody recorded does not ship. A new release can add a default that reaches out, so after an update run `make test`: it loads `/api/` in headless Chrome with the new bundle and fails on any request that leaves the site's origin.
 
 ## Platform icons
 
@@ -130,4 +134,15 @@ make test
 python3 -m unittest discover -s site/scripts -p 'test_*.py'
 ```
 
-`make test` runs the generator's Go tests after bodega's own: they build the whole site from this checkout and fail on a broken link, on a Scalar bundle whose SHA-256 is not the recorded one, on an `/api/` page that loads a script, stylesheet, font or image from another origin, and on a site URL in `api/openapi.yaml` or `docs/usage.md` that names no page. The Python tests check the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
+`make test` runs the generator's Go tests after bodega's own: they build the whole site from this checkout and fail on a broken link, on a Scalar bundle whose SHA-256 is not the recorded one, on an `/api/` page that loads anything from another origin, and on a site URL in `api/openapi.yaml` or `docs/usage.md` that names no page. The `/api/` check reads the page four ways, because one reader cannot see every load:
+
+| Reader                 | What it sees                                                                                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| The generated HTML     | A script, stylesheet, font, image or frame the page names                                                                              |
+| The linked stylesheets | Every `url()` and `@import` in the site's CSS, including rules a browser would not apply on the day                                    |
+| The OpenAPI document   | A Markdown image or an HTML tag in any string of `api/openapi.yaml`, including the tags, operations and schemas Scalar keeps collapsed |
+| Headless Chrome        | Every request the page makes once Scalar has run and rendered the introduction                                                         |
+
+The last one needs Chrome or Chromium on the host, under a name `chromedp` looks for, and the test fails with that instruction when it finds none. Chrome resolves no host name during the run, so a request the test reports was attempted and never sent. Nothing clicks through the reference: what Scalar fetches only after a reader opens a section is covered by the document reader for the document's own content, and by the pinned bundle and its configuration for the rest.
+
+`test_reference_privacy.py` plants an image on another origin in a copy of the document's introduction and passes only when the Go check refuses that copy. `test_deploy.py` checks the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.

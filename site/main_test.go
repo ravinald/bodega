@@ -2,12 +2,24 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	stdhtml "html"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
+	"gopkg.in/yaml.v3"
 )
 
 func buildSite(t *testing.T) string {
@@ -87,6 +99,170 @@ func remoteLoads(page string) []string {
 	return found
 }
 
+var stylesheetLink = regexp.MustCompile(`(?is)<link\b[^>]*>`)
+
+// stylesheetLoads follows every stylesheet of this site that a page links,
+// and each one those import, and lists what they fetch from another origin.
+// It reads the rules rather than watching a browser apply them, because a
+// browser fetches only what the rules it happens to match name: a dark-mode
+// background or an unused face would pass on the day of the test.
+func stylesheetLoads(t *testing.T, out, page string) []string {
+	t.Helper()
+	var found []string
+	seen := map[string]bool{}
+	var read func(href, from string)
+	read = func(href, from string) {
+		u, err := url.Parse(strings.TrimSpace(stdhtml.UnescapeString(href)))
+		if err != nil || u.Scheme != "" || u.Host != "" || u.Path == "" {
+			return // a remote sheet is remoteLoads' finding, or this function's own below
+		}
+		name := u.Path
+		if !strings.HasPrefix(name, "/") {
+			name = path.Join(path.Dir(from), name)
+		}
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		css, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(name)))
+		if err != nil {
+			t.Errorf("%s links the stylesheet %s, which the build did not write: %v", from, href, err)
+			return
+		}
+		for _, m := range cssLoad.FindAllStringSubmatch(string(css), -1) {
+			switch {
+			case remote.MatchString(m[1]):
+				found = append(found, name+": "+m[1])
+			case strings.HasSuffix(strings.SplitN(m[1], "?", 2)[0], ".css"):
+				read(m[1], name)
+			}
+		}
+	}
+	for _, link := range stylesheetLink.FindAllString(page, -1) {
+		rel := relAttr.FindStringSubmatch(link)
+		if rel == nil || !strings.Contains(strings.ToLower(rel[1]), "stylesheet") {
+			continue
+		}
+		for _, a := range loadAttr.FindAllStringSubmatch(link, -1) {
+			read(a[1]+a[2]+a[3], "/api/index.html")
+		}
+	}
+	return found
+}
+
+// documentLoads lists what the OpenAPI document would make its viewer fetch
+// from another origin. Scalar renders descriptions as Markdown, and renders a
+// collapsed tag, operation or schema only once a reader opens it, so a
+// browser that loads the page sees the introduction and little else. This
+// reads every string in the document as Markdown instead, wherever it sits:
+// stricter than Scalar, which renders only some fields, and that is the side
+// to err on.
+func documentLoads(spec []byte) ([]string, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(spec, &doc); err != nil {
+		return nil, fmt.Errorf("the OpenAPI document is not YAML: %w", err)
+	}
+	var found []string
+	var walk func(n *yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		// No URL on another origin is written without "//".
+		if n.Kind == yaml.ScalarNode && strings.Contains(n.Value, "//") {
+			var rendered bytes.Buffer
+			if err := md.Convert([]byte(n.Value), &rendered); err != nil {
+				return fmt.Errorf("line %d: %w", n.Line, err)
+			}
+			for _, u := range remoteLoads(rendered.String()) {
+				found = append(found, fmt.Sprintf("line %d: %s", n.Line, u))
+			}
+		}
+		for _, c := range n.Content {
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return found, walk(&doc)
+}
+
+// browserLoads serves the built site on loopback, opens one of its pages in
+// headless Chrome, waits until the page shows the text ready, and lists every
+// request the page made to anywhere but the site. It is the one check that
+// runs the vendored bundle, so it is the one that sees what Scalar itself
+// fetches: a font, a telemetry call, an asset a new release adds by default.
+// Chrome resolves no name while it runs, so a request this reports was
+// attempted and never sent.
+func browserLoads(t *testing.T, out, page, ready string) []string {
+	t.Helper()
+	site := httptest.NewServer(http.FileServer(http.Dir(out)))
+	defer site.Close()
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("host-resolver-rules", "MAP * ~NOTFOUND, EXCLUDE 127.0.0.1"))
+	alloc, stop := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer stop()
+	ctx, closeTab := chromedp.NewContext(alloc)
+	defer closeTab()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var mu sync.Mutex
+	var requests, elsewhere []string
+	record := func(u string) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests = append(requests, u)
+		switch strings.ToLower(strings.SplitN(u, ":", 2)[0]) {
+		case "data", "blob", "about":
+			return // made of bytes the page already holds
+		}
+		if !strings.HasPrefix(u, site.URL+"/") {
+			elsewhere = append(elsewhere, u)
+		}
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(requests)
+	}
+	err := chromedp.Listen(ctx, func(ev any) {
+		switch e := ev.(type) {
+		case *network.EventRequestWillBeSent:
+			record(e.Request.URL)
+		case *network.EventWebSocketCreated:
+			record(e.URL)
+		}
+	})
+	if err == nil {
+		_, err = chromedp.Call(ctx, network.Enable, network.EnableParams{})
+	}
+	if err != nil {
+		t.Fatalf("no headless browser to load %s in: %v. This check runs the page in Chrome or Chromium, which chromedp looks for under its usual names on PATH and in /Applications; install one and run the test again", page, err)
+	}
+
+	shows := fmt.Sprintf(`(document.querySelector("#reference")?.innerText ?? "").includes(%q)`, ready)
+	err = chromedp.Do(ctx, chromedp.Navigate(site.URL+page))
+	if err == nil {
+		_, err = chromedp.Run(ctx, chromedp.Poll[bool](shows, chromedp.WithPollingTimeout(time.Minute)))
+	}
+	if err != nil {
+		t.Fatalf("%s never showed %q in headless Chrome, so nothing says the reference rendered: %v (requests so far: %v)", page, ready, err, requests)
+	}
+	// The introduction is on screen; give what it embeds a second with no
+	// new request before calling the page loaded.
+	for seen, quiet := count(), 0; quiet < 4 && ctx.Err() == nil; {
+		time.Sleep(250 * time.Millisecond)
+		if n := count(); n != seen {
+			seen, quiet = n, 0
+		} else {
+			quiet++
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), elsewhere...)
+}
+
 func TestRemoteLoadsFindsEveryForm(t *testing.T) {
 	for form, page := range map[string]string{
 		"a script from a CDN":           `<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>`,
@@ -143,12 +319,23 @@ func TestBuildPublishesAPIReference(t *testing.T) {
 	out := buildSite(t)
 	api := readPage(t, out, "api/index.html")
 
-	if loads := remoteLoads(api); len(loads) != 0 {
-		t.Errorf("/api/ loads from another origin, which hands every reader's visit to a third party: %v", loads)
-	}
 	s, err := vendoredScalar(".")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Four readers, because no one of them sees every load: the HTML the
+	// generator wrote, the stylesheets that HTML links, the document Scalar
+	// renders as a reader opens each part of it, and Scalar's own script.
+	loads := remoteLoads(api)
+	loads = append(loads, stylesheetLoads(t, out, api)...)
+	inDocument, err := documentLoads([]byte(readPage(t, out, "api/openapi.yaml")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads = append(loads, inDocument...)
+	loads = append(loads, browserLoads(t, out, "/api/", referenceReady)...)
+	if len(loads) != 0 {
+		t.Errorf("/api/ loads from another origin, which hands every reader's visit to a third party: %v", loads)
 	}
 	wantAll(t, "api/index.html", api, map[string]string{
 		"the site header":                          `<header class="head">`,
@@ -199,10 +386,76 @@ func TestBuildPublishesAPIReference(t *testing.T) {
 		"the API reference row": `<a href="/api/">API reference</a>`,
 	})
 	wantAll(t, "the REST API usage page", readPage(t, out, "docs/usage/rest-api.html"), map[string]string{
-		"the rendered reference":                   `<a href="/api/">API reference</a>, published at <code>/api/</code>`,
-		"where a new operator starts":              `its introduction is where a new operator starts`,
-		"the document's repository path, rendered": `<a href="/api/"><code>api/openapi.yaml</code></a>`,
+		"the rendered reference":               `<a href="/api/">API reference</a>, published at <code>/api/</code>`,
+		"where a new operator starts":          `its introduction is where a new operator starts`,
+		"the document itself, as the download": `<a href="/api/openapi.yaml" title="Download the OpenAPI document"><code>api/openapi.yaml</code></a>`,
 	})
+}
+
+// referenceReady is a heading of the introduction in info.description. Scalar
+// showing it means the bundle ran, fetched the document and rendered its
+// Markdown.
+const referenceReady = "First requests"
+
+// Each reader of the page's loads has to see the load only it can see, or a
+// clean result from it says nothing.
+func TestReferenceLoadChecksSeeEachSource(t *testing.T) {
+	out := buildSite(t)
+	const probe = "https://probe.invalid/pixel.png"
+
+	sheet := `<link rel="stylesheet" href="/probe.css?v=1">`
+	write(filepath.Join(out, "probe.css"), []byte(`@import "nested/more.css"; @media (prefers-color-scheme: dark) { body { background: url(`+probe+`) } }`))
+	write(filepath.Join(out, "nested", "more.css"), []byte(`@font-face { font-family: x; src: url("//probe.invalid/x.woff2") }`))
+	if got := stylesheetLoads(t, out, sheet); len(got) != 2 {
+		t.Errorf("stylesheetLoads found %v, want the image a media query holds and the font an imported sheet names", got)
+	}
+	if got := stylesheetLoads(t, out, readPage(t, out, "api/index.html")); len(got) != 0 {
+		t.Errorf("stylesheetLoads reports %v in the site's own stylesheet", got)
+	}
+
+	inDocument, err := documentLoads([]byte(`openapi: 3.0.3
+info:
+  description: |
+    Read [the docs](https://bodega.example.com/docs/) at https://bodega.example.com.
+tags:
+  - name: last
+    description: "A tag a reader has to open. ![probe](` + probe + `)"
+paths:
+  /a:
+    get:
+      description: |
+        An operation below the fold.
+
+        ![probe][pixel]
+
+        [pixel]: ` + probe + `
+      responses:
+        "200":
+          description: <img src="` + probe + `" alt="">
+components:
+  schemas:
+    S:
+      properties:
+        p:
+          description: Raw <picture><source srcset="//probe.invalid/a.png 2x"></picture>.
+          example: https://bodega.example.com/api/v1/status
+`))
+	if err != nil || len(inDocument) != 4 {
+		t.Errorf("documentLoads found %v (err %v), want the probe in a tag, an operation, a response and a schema, and no link or example URL", inDocument, err)
+	}
+
+	// Scalar renders the introduction on load, so an image there is a request
+	// only a browser running the bundle makes.
+	spec := filepath.Join(out, "api", "openapi.yaml")
+	document := readPage(t, out, "api/openapi.yaml")
+	const opens = "  description: |\n"
+	if !strings.Contains(document, opens) {
+		t.Fatal("api/openapi.yaml no longer opens info.description as a block scalar, so this test has nowhere to put its probe")
+	}
+	write(spec, []byte(strings.Replace(document, opens, opens+"    ![probe]("+probe+")\n\n", 1)))
+	if got := browserLoads(t, out, "/api/", referenceReady); len(got) != 1 || got[0] != probe {
+		t.Errorf("browserLoads saw %v, want the one image Scalar loads from info.description", got)
+	}
 }
 
 var docsLink = regexp.MustCompile(`\]\((\.\./docs/[^)\s]+)\)`)
@@ -232,5 +485,14 @@ func TestOpenAPIDocsLinksResolve(t *testing.T) {
 		if frag != "" && !bytes.Contains(page, []byte(`id="`+frag+`"`)) {
 			t.Errorf("api/openapi.yaml links %s, and that page has no element with that id", m[1])
 		}
+	}
+}
+
+func TestRESTAPIOffersRawDownload(t *testing.T) {
+	out := buildSite(t)
+	page := readPage(t, out, "docs/usage/rest-api.html")
+	rawDownload := regexp.MustCompile(`<a\b[^>]*\bhref="/api/openapi\.yaml"[^>]*>`)
+	if !rawDownload.MatchString(page) {
+		t.Fatal("REST API offers no link to /api/openapi.yaml; the advertised document link leads to the viewer")
 	}
 }
