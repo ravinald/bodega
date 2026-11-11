@@ -2129,8 +2129,15 @@ func TestAptVersionDatesBackfillTheFirstReleasesUnreadIndex(t *testing.T) {
 
 // An InRelease a client fetches records its Release like a plain one.
 func TestAptClearsignedBodyReadsInRelease(t *testing.T) {
-	in := "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nDate: Sun, 08 Nov 2026 06:00:00 UTC\nCodename: fixture\nSHA256:\n abc 1 universe/binary-amd64/Packages.gz\n-----BEGIN PGP SIGNATURE-----\n\nsig\n-----END PGP SIGNATURE-----\n"
-	release, err := deb822.ParseSingle(aptClearsignedBody([]byte(in)))
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := kr.ClearSign([]byte("Date: Sun, 08 Nov 2026 06:00:00 UTC\nCodename: fixture\nSHA256:\n abc 1 universe/binary-amd64/Packages.gz\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := deb822.ParseSingle(aptClearsignedBody(in))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -2795,5 +2802,65 @@ func TestReviewF112HideLookupRecordsCompletedInputs(t *testing.T) {
 	}
 	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
 		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+func TestReviewF112SignedCRLFReleaseRetainsInitialSnapshot(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		t.Run(fmt.Sprintf("newline-%x", newline), func(t *testing.T) {
+			s, archive := ageMirrorServer(t)
+			setAptAge(t, s, policy.ActionBlock)
+			now := time.Now().UTC().Truncate(time.Second)
+			firstDate := now.Add(-24 * time.Hour)
+			objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+			release := "Date: " + firstDate.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+			kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed, err := kr.ClearSign([]byte(release))
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed = []byte(strings.ReplaceAll(strings.ReplaceAll(string(signed), "\r\n", "\n"), "\n", newline))
+			block, _ := clearsign.Decode(signed)
+			if block == nil {
+				t.Fatal("the pinned OpenPGP decoder refused the fixture")
+			}
+			pub, err := kr.PublicKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openpgp.CheckDetachedSignature(ring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+				t.Fatalf("fixture signature does not verify: %v", err)
+			}
+			archive.setObject("dists/fixture/InRelease", string(signed))
+			const packages = "dists/fixture/universe/binary-amd64/Packages.gz"
+			archive.setObject(packages, objects[packages])
+			for _, rel := range []string{"dists/fixture/InRelease", packages} {
+				if code, _ := mirrorGet(t, s, "/apt/"+rel); code != http.StatusOK {
+					t.Fatalf("%s = %d", rel, code)
+				}
+			}
+			sum := sha256.Sum256([]byte(objects[packages]))
+			if snap, ok, err := s.auditDB.LookupAptIndex(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !ok || !snap.Initial || !snap.ReleaseDate.Equal(firstDate) {
+				t.Errorf("verified complete InRelease: snapshot=%+v ok=%v err=%v; want initial Release %s", snap, ok, err, firstDate)
+			}
+			fresh := now.Add(-time.Hour)
+			publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+				t.Errorf("version added after the initial InRelease = %+v; want Release date %s", d, fresh)
+			}
+			if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+				t.Errorf("young version after the initial InRelease = %d %q; want 403", code, body)
+			}
+			if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+				t.Errorf("admission = %+v; want block", c)
+			}
+		})
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/deb822"
@@ -672,22 +674,15 @@ func aptIndexEntries(body []byte) ([]audit.AptIndexEntry, error) {
 
 // aptClearsignedBody is the signed text of an InRelease, or raw unchanged when
 // it is not clearsigned. bodega checks no signature here: the Release is read
-// only for the digests and Date: it publishes.
+// only for the digests and Date: it publishes. The OpenPGP decoder reads the
+// armor, because an archive may sign with CRLF line endings and a split on a
+// blank LF line returns the armored document instead of the Release.
 func aptClearsignedBody(raw []byte) []byte {
-	const begin, sig = "-----BEGIN PGP SIGNED MESSAGE-----", "\n-----BEGIN PGP SIGNATURE-----"
-	if !bytes.HasPrefix(bytes.TrimLeft(raw, "\r\n"), []byte(begin)) {
+	block, _ := clearsign.Decode(raw)
+	if block == nil {
 		return raw
 	}
-	_, text, ok := bytes.Cut(raw, []byte("\n\n"))
-	if !ok {
-		return raw
-	}
-	text, _, _ = bytes.Cut(text, []byte(sig))
-	lines := bytes.Split(text, []byte("\n"))
-	for i, l := range lines {
-		lines[i] = bytes.TrimPrefix(l, []byte("- "))
-	}
-	return bytes.Join(lines, []byte("\n"))
+	return block.Plaintext
 }
 
 // aptDistsObserved reports whether the age gate records what a client read of
