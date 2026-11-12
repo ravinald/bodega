@@ -1101,7 +1101,7 @@ func TestTrustFollowsTheEffectiveEndpoint(t *testing.T) {
 		{"GOPROXY names bodega", "goproxy-env", map[string]string{"GOPROXY": base + "/go,off"}, TrustFailed},
 		{"GOENV selects another file", "goproxy-env", map[string]string{"GOENV": filepath.Join(elsewhere, "goenv")}, TrustAbsent},
 		{"GOENV=off", "goproxy-env", map[string]string{"GOENV": "off"}, TrustAbsent},
-		{"GOENV names a directory", "goproxy-env", map[string]string{"GOENV": elsewhere}, TrustUnchecked},
+		{"GOENV names a directory, which go reads nothing from", "goproxy-env", map[string]string{"GOENV": elsewhere}, TrustAbsent},
 	} {
 		if got := state(c.check, c.env); got != c.want {
 			t.Errorf("%s: state = %v, want %v", c.name, got, c.want)
@@ -1323,5 +1323,35 @@ func TestHelmLoadErrorIsUnchecked(t *testing.T) {
 				t.Fatalf("helm refuses this file; doctor row=%+v, verdict=%+v", got, verdict)
 			}
 		})
+	}
+}
+
+func TestAudit21AptLoadErrorsRemainUnchecked(t *testing.T) {
+	for _, location := range []string{"APT_CONFIG", "etc/apt/apt.conf", "etc/apt/apt.conf.d/99local"} {
+		for _, tail := range []string{"Acquire::https::CAInfo \"/unused.pem\"\n", "Acquire::Retries \"3\" extra;\n"} {
+			t.Run(location+"/"+strings.TrimSpace(tail), func(t *testing.T) {
+				p, ca, base := reviewTrust(t)
+				file := filepath.Join(p.Root, location)
+				writeTrustFile(t, file, "Acquire::https::CAInfo \""+ca+"\";\n"+tail)
+				writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt\nSuites: stable\nComponents: main\n")
+				p.Getenv = func(key string) string {
+					if location == "APT_CONFIG" && key == "APT_CONFIG" {
+						return file
+					}
+					return ""
+				}
+				vs, err := p.Judge([]string{"apt-sources"}, base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(vs) != 1 || vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, file) {
+					t.Errorf("selected verdict = %+v; want unchecked naming %s", vs, file)
+				}
+				row := p.Apply([]Finding{checkAptSources(p.Root, "linux")}, base)[0]
+				if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, file) {
+					t.Errorf("ordinary apt row = %+v; want unchecked naming %s", row, file)
+				}
+			})
+		}
 	}
 }

@@ -3021,3 +3021,80 @@ func TestAudit20OrdinaryDoctorNeverExecutesDockerd(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAudit21AptApplyRefusesUnloadablePolicy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t)
+	var srv *httptest.Server
+	var content string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		sum := sha256.Sum256([]byte(content))
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			System: manifest.TypeApt, Action: clientconf.PlanInstall, Path: "~" + clientconf.AptSourcesPath,
+			URL: srv.URL + "/client/apt", SHA256: hex.EncodeToString(sum[:]),
+		}}})
+	})
+	mux.HandleFunc("GET /client/apt", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, content) })
+	srv = httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	content = "Types: deb\nURIs: " + srv.URL + "/apt\nSuites: stable\nComponents: main\n"
+	caFile := filepath.Join(home, "issuer.pem")
+	bad := filepath.Join(home, "etc/apt/apt.conf")
+	release := filepath.Join(home, "os-release")
+	for file, body := range map[string][]byte{
+		caFile:  pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}),
+		bad:     []byte("Acquire::Retries \"3\" extra;\n"),
+		release: []byte("ID=ubuntu\n"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldGOOS, oldRoot, oldRelease, oldRun, oldProbe, oldApt := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, doctorTrustProbe, aptSources
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
+	aptSources = &aptSourcesHost{goos: "linux", root: home, record: filepath.Join(home, "apt-ledger.json")}
+	doctorTrustProbe = func() host.TrustProbe {
+		return host.TrustProbe{Root: home, Home: home, GOOS: clientconf.OSLinux, Getenv: os.Getenv}
+	}
+	anchor := filepath.Join(home, "usr/local/share/ca-certificates/bodega-ca.crt")
+	ran := 0
+	doctorRun = func(name string, args ...string) error {
+		ran++
+		if name != "update-ca-certificates" {
+			t.Fatalf("unexpected command: %s %v", name, args)
+		}
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(home, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, doctorTrustProbe, aptSources = oldGOOS, oldRoot, oldRelease, oldRun, oldProbe, oldApt
+	})
+	for phase, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		args := append([]string{"--configure", "apt", "--ca-file", caFile, "--url", srv.URL}, apply...)
+		out, err := runDoctor(t, args...)
+		if err == nil || !strings.Contains(err.Error(), bad) {
+			t.Errorf("phase %d: err=%v; want refusal naming %s\n%s", phase, err, bad, out)
+		}
+		for _, path := range []string{anchor, filepath.Join(home, clientconf.AptSourcesPath)} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("phase %d wrote %s: %v", phase, path, err)
+			}
+		}
+		if ran != 0 {
+			t.Errorf("phase %d ran %d rebuild(s) before rejecting apt's configuration", phase, ran)
+		}
+	}
+}

@@ -152,13 +152,7 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if configDir == nil {
 		configDir = func() (string, error) { return "", errors.New("no user config directory") }
 	}
-	val, _, _, err := effectiveGoproxy(t.env, configDir)
-	if err != nil {
-		if t.ConfigDir == nil {
-			return nil
-		}
-		return []trustStore{{blind: fmt.Sprintf("GOPROXY is unset in the environment and the go env file was not read (%v), so whether go fetches from bodega, and verifies its certificate, is unchecked", err)}}
-	}
+	val := effectiveGoproxy(t.env, configDir).val
 	if !slices.ContainsFunc(reachableProxies(val), func(entry string) bool { return namesHost(entry, u.Host) }) {
 		return nil
 	}
@@ -198,160 +192,23 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 // effective Acquire::https::CAInfo names, which apt reads in place of the
 // system trust store, and the system store with none set. The option scoped
 // to bodega's own host outranks the unscoped one, and one scoped to another
-// host says nothing here.
+// host says nothing here. The configuration is loaded whole, as apt loads it:
+// a file apt refuses, over any statement, stops every apt command, so the
+// options it holds are settings nothing runs with and apt is left unchecked.
 func aptStores(t TrustProbe, u *url.URL) []trustStore {
 	if !t.filesMention(u.Host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*") {
 		return nil
 	}
-	conf := t.aptConfig()
+	conf, err := clientconf.LoadAptConfig(t.Root, t.Getenv)
+	if err != nil {
+		return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt does not load its configuration (%v) and fails every command, so whether apt reaches bodega or verifies its certificate is unchecked", err)}}
+	}
 	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
-		if v := conf[key]; v.value != "" {
-			return []trustStore{*named(v.value, "Acquire::https::CAInfo in "+v.file, true)}
+		if v := conf[key]; v.Value != "" {
+			return []trustStore{*named(v.Value, "Acquire::https::CAInfo in "+v.File, true)}
 		}
 	}
 	return []trustStore{{name: systemStoreName, system: true}}
-}
-
-// aptOption is the value apt's configuration ends up giving one option, and
-// the file that gave it.
-type aptOption struct{ value, file string }
-
-var aptPartName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
-
-// aptConfig reads apt's configuration in the order apt loads it, a later
-// assignment replacing an earlier one: the file APT_CONFIG names, then the
-// apt.conf.d fragments in name order (those apt accepts: no extension, or
-// .conf), then apt.conf. Keys are lowercased, since apt matches them without
-// regard to case. #include is not followed.
-func (t TrustProbe) aptConfig() map[string]aptOption {
-	var files []string
-	if v := t.env("APT_CONFIG"); v != "" {
-		files = append(files, v)
-	}
-	parts, _ := filepath.Glob(filepath.Join(t.Root, "/etc/apt/apt.conf.d/*"))
-	sort.Strings(parts)
-	for _, f := range parts {
-		name := filepath.Base(f)
-		if ext := filepath.Ext(name); aptPartName.MatchString(name) && (ext == "" || ext == ".conf") {
-			files = append(files, f)
-		}
-	}
-	files = append(files, filepath.Join(t.Root, "/etc/apt/apt.conf"))
-	out := map[string]aptOption{}
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		readAptConf(string(data), func(key, value string, clearTree bool) {
-			if !clearTree {
-				out[key] = aptOption{value, f}
-				return
-			}
-			for k := range out {
-				if k == key || strings.HasPrefix(k, key+"::") {
-					delete(out, k)
-				}
-			}
-		})
-	}
-	return out
-}
-
-// readAptConf walks one apt configuration file and calls set for each
-// assignment, with the scopes around it joined into the key, and for each
-// #clear. Comments (//, /* */ and a line opening with #) are dropped outside
-// quotes, so a commented-out option assigns nothing.
-func readAptConf(text string, set func(key, value string, clearTree bool)) {
-	var scopes []string
-	var stmt strings.Builder
-	quoted, lineStart := false, true
-	flush := func() (tag, word string) {
-		fields := aptWords(stmt.String())
-		stmt.Reset()
-		if len(fields) > 0 {
-			tag = fields[0]
-		}
-		if len(fields) > 1 {
-			word = fields[1]
-		}
-		return tag, word
-	}
-	for i := 0; i < len(text); i++ {
-		c := text[i]
-		if quoted {
-			quoted = c != '"'
-			stmt.WriteByte(c)
-			continue
-		}
-		atStart := lineStart
-		lineStart = c == '\n' || lineStart && (c == ' ' || c == '\t')
-		switch {
-		case c == '"':
-			quoted = true
-			stmt.WriteByte(c)
-		case c == '/' && strings.HasPrefix(text[i:], "//"), c == '#' && atStart && !strings.HasPrefix(text[i:], "#clear"):
-			end := strings.IndexByte(text[i:], '\n')
-			if end < 0 {
-				return
-			}
-			i += end - 1
-		case c == '/' && strings.HasPrefix(text[i:], "/*"):
-			end := strings.Index(text[i+2:], "*/")
-			if end < 0 {
-				return
-			}
-			i += end + 3
-		case c == '{':
-			tag, _ := flush()
-			scopes = append(scopes, strings.ToLower(tag))
-		case c == '}':
-			stmt.Reset()
-			if len(scopes) > 0 {
-				scopes = scopes[:len(scopes)-1]
-			}
-		case c == ';':
-			tag, word := flush()
-			if tag == "" {
-				continue
-			}
-			clearTree := tag == "#clear"
-			if clearTree {
-				tag, word = word, ""
-			}
-			key := strings.ToLower(strings.Join(append(slices.Clone(scopes), tag), "::"))
-			set(strings.Trim(key, ":"), word, clearTree)
-		default:
-			stmt.WriteByte(c)
-		}
-	}
-}
-
-// aptWords splits a statement into its words, a quoted run being one word
-// with the quotes removed.
-func aptWords(stmt string) []string {
-	var out []string
-	var word strings.Builder
-	quoted, open := false, false
-	for _, r := range stmt {
-		switch {
-		case r == '"':
-			quoted, open = !quoted, true
-		case !quoted && (r == ' ' || r == '\t' || r == '\n' || r == '\r'):
-			if open {
-				out = append(out, word.String())
-				word.Reset()
-				open = false
-			}
-		default:
-			word.WriteRune(r)
-			open = true
-		}
-	}
-	if open {
-		out = append(out, word.String())
-	}
-	return out
 }
 
 // certsDir is a certs.d directory for one registry host, whose *.crt files

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -134,8 +135,8 @@ func TestCheckGoproxyEnv(t *testing.T) {
 		{name: "indented line is not an assignment", env: map[string]string{"GOENV": indented}, want: StatusWarn},
 		{name: "file empties the value", env: map[string]string{"GOENV": emptied}, want: StatusWarn},
 		{name: "GOENV=off reads no file", env: map[string]string{"GOENV": "off"}, configDir: cfgDir, want: StatusWarn},
-		{name: "unreadable file is not a measurement", env: map[string]string{"GOENV": dir}, want: StatusSkip},
-		{name: "no config dir is not a measurement", dirErr: errors.New("$HOME is not defined"), want: StatusSkip},
+		{name: "a file that does not read sets nothing, as for go", env: map[string]string{"GOENV": dir}, want: StatusWarn},
+		{name: "no config dir is no user file, as for go", dirErr: errors.New("$HOME is not defined"), want: StatusWarn},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -183,6 +184,130 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 		if got := CheckGoproxyEnv(); got.Status != StatusWarn {
 			t.Errorf("unsafe environment override %q: got %v, want WARN (detail=%q)", override, got.Status, got.Detail)
 		}
+	}
+}
+
+// TestGoEnvResolvesAsGo asks the go command running these tests, which is the
+// toolchain go.mod pins, what GOPROXY it resolves under each arrangement of
+// the environment, the user's go env file and GOROOT/go.env, and holds
+// effectiveGoproxy to the same answer. GOROOT points at a scratch tree so the
+// distribution's go.env is the test's to write.
+func TestGoEnvResolvesAsGo(t *testing.T) {
+	// go test puts the toolchain's own bin directory first on PATH.
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("no go command to compare against")
+		}
+		t.Skip("no go command to compare against")
+	}
+	const dist = "GOPROXY=https://dist.example/go,direct\n"
+	for _, tc := range []struct {
+		name string
+		// user is the user's go env file, "" for none written.
+		user string
+		// goenv is GOENV: "file" for the user file, "dir" for a directory,
+		// "absent" for a path nothing is at, "" for unset, or "off".
+		goenv string
+		// goroot is GOROOT/go.env, and other a second GOROOT's, which the
+		// user file names when it holds %s.
+		goroot, other string
+		proxy         string
+		noHome        bool
+		// onPath leaves GOROOT unset and reaches go through a symlink.
+		onPath bool
+	}{
+		{name: "user file sets it", user: "GOPROXY=https://bodega.example/go,off\n", goenv: "file", goroot: dist},
+		{name: "user file is silent, the distribution sets it", user: "GOSUMDB=off\n", goenv: "file", goroot: dist},
+		{name: "an empty assignment hides the distribution", user: "GOPROXY=\n", goenv: "file", goroot: dist},
+		{name: "GOENV=off still reads the distribution", user: "GOPROXY=https://bodega.example/go\n", goenv: "off", goroot: dist},
+		{name: "a directory for GOENV sets nothing", goenv: "dir", goroot: dist},
+		{name: "an absent GOENV sets nothing", goenv: "absent", goroot: dist},
+		{name: "the environment outranks both", user: "GOPROXY=https://bodega.example/go\n", goenv: "file", goroot: dist, proxy: "https://env.example/go"},
+		{name: "GOROOT in the user file picks the distribution", user: "GOROOT=%s\n", goenv: "file", goroot: dist, other: "GOPROXY=https://other.example/go\n"},
+		{name: "a distribution without the key leaves it unset", goenv: "absent", goroot: "# no proxy\nGOSUMDB=sum.golang.org\n"},
+		{name: "lines go skips, and the last assignment", user: " GOPROXY=https://indented.example\ngoproxy=https://lower.example\n#GOPROXY=https://comment.example\nGOPROXY=https://first.example\nGOPROXY= https://last.example , direct\n", goenv: "file", goroot: dist},
+		{name: "no home directory still reads the distribution", goroot: dist, noHome: true},
+		{name: "the default user file", user: "GOPROXY=https://bodega.example/go,off\n", goroot: dist},
+		{name: "GOROOT found from the go on PATH", goenv: "absent", onPath: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write := func(path, body string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			home := filepath.Join(dir, "home")
+			configDir := filepath.Join(home, ".config")
+			if runtime.GOOS == "darwin" {
+				configDir = filepath.Join(home, "Library", "Application Support")
+			}
+			env := map[string]string{"PATH": filepath.Dir(goBin), "GOTOOLCHAIN": "local", "HOME": home}
+			if tc.noHome {
+				delete(env, "HOME")
+			}
+			if tc.onPath {
+				bin := filepath.Join(dir, "bin")
+				if err := os.MkdirAll(bin, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(goBin, filepath.Join(bin, "go")); err != nil {
+					t.Fatal(err)
+				}
+				env["PATH"] = bin
+			} else {
+				env["GOROOT"] = filepath.Join(dir, "goroot")
+				write(filepath.Join(env["GOROOT"], "pkg", "tool", "keep"), "")
+				write(filepath.Join(env["GOROOT"], "go.env"), tc.goroot)
+			}
+			other := filepath.Join(dir, "other")
+			if tc.other != "" {
+				write(filepath.Join(other, "go.env"), tc.other)
+			}
+			userFile := filepath.Join(configDir, "go", "env")
+			switch tc.goenv {
+			case "file":
+				userFile = filepath.Join(dir, "user-env")
+				env["GOENV"] = userFile
+			case "dir":
+				env["GOENV"] = dir
+			case "absent":
+				env["GOENV"] = filepath.Join(dir, "absent")
+			case "off":
+				env["GOENV"] = "off"
+			}
+			if tc.user != "" {
+				write(userFile, strings.ReplaceAll(tc.user, "%s", other))
+			}
+			if tc.proxy != "" {
+				env["GOPROXY"] = tc.proxy
+			}
+
+			cmd := exec.Command(filepath.Join(env["PATH"], "go"), "env", "GOPROXY")
+			for k, v := range env {
+				cmd.Env = append(cmd.Env, k+"="+v)
+			}
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("go env GOPROXY: %v", err)
+			}
+			want := strings.TrimSuffix(string(out), "\n")
+
+			got := effectiveGoproxy(func(k string) string { return env[k] }, func() (string, error) {
+				if tc.noHome {
+					return "", errors.New("$HOME is not defined")
+				}
+				return configDir, nil
+			})
+			if got.val != want {
+				t.Errorf("GOPROXY = %q (from %s); go resolves %q", got.val, got.source, want)
+			}
+		})
 	}
 }
 

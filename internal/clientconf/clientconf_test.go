@@ -2707,3 +2707,36 @@ func TestCAPlanRefusesUnloadableHelmFile(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit21AptLoadErrorsRefuseCAPlan(t *testing.T) {
+	for _, location := range []string{"APT_CONFIG", "etc/apt/apt.conf", "etc/apt/apt.conf.d/99local"} {
+		for _, body := range []string{"Acquire::https::CAInfo \"/unused.pem\"\n", "Acquire::Retries \"3\" extra;\n"} {
+			t.Run(location+"/"+strings.TrimSpace(body), func(t *testing.T) {
+				home := t.TempDir()
+				file := filepath.Join(home, location)
+				if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				caPEM, _, _ := testCA(t, "bodega.example.com")
+				ca, err := ParseCA(caPEM)
+				if err != nil {
+					t.Fatal(err)
+				}
+				getenv := func(key string) string {
+					if location == "APT_CONFIG" && key == "APT_CONFIG" {
+						return file
+					}
+					return ""
+				}
+				f := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+				in, err := AddCA(caPlan(t, home, f), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: getenv})
+				if err == nil || !strings.Contains(err.Error(), file) || len(in.Changes) != 0 {
+					t.Errorf("CA plan accepted apt's unloadable file %s: err=%v changes=%d step=%v", file, err, len(in.Changes), in.Step)
+				}
+			})
+		}
+	}
+}

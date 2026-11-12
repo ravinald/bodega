@@ -252,8 +252,8 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 // naming an existing file is not one of these; shadows gives that file the
 // edit. It also refuses what this package detects and does not interpret: a
 // git file with an include, and anything beside cafile that assigns npm's CA
-// list. And it refuses a file its client cannot load: git's, and helm's
-// repositories.yaml.
+// list. And it refuses a file its client cannot load: git's, helm's
+// repositories.yaml, and apt's configuration.
 func (h CAHost) ignored(rec PlanRecord, target string) error {
 	env := func(key string) string {
 		if h.Getenv == nil {
@@ -368,6 +368,14 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")
+		}
+	case rec.System == manifest.TypeApt:
+		// apt's whole configuration, loaded as apt loads it: a statement apt
+		// refuses in any file stops every apt command, whichever option it
+		// names, and a rebuilt system store does not change that.
+		if _, err := LoadAptConfig(h.Root, h.Getenv); err != nil {
+			return fmt.Errorf("%s: apt does not load its configuration (%w) and fails every command, so it would read neither the source written to %s nor the CA this command installs, and the install could not be verified. "+
+				"Nothing was written. Repair what the error names (apt-config dump repeats a syntax error), then re-run", rec.System, err, target)
 		}
 	case rec.System == manifest.TypeHelm:
 		// The file helm reads and the file the plan edits, each loaded whole
