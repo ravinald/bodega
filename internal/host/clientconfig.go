@@ -1168,38 +1168,31 @@ func checkContainerdHosts(root, host string) Finding {
 	return f
 }
 
-// judgeContainerdHosts reads the hosts.toml containerd uses for docker.io.
-// containerd tries its hosts in file order and the upstream server last, so
-// bodega must be the first host that may pull.
+// judgeContainerdHosts reads the hosts.toml containerd uses for docker.io,
+// loaded whole as containerd loads it. containerd tries its hosts in file
+// order and the upstream server last, so bodega must be the first host that
+// may pull. A file containerd discards routes nothing: containerd falls back
+// to Docker Hub, whatever host the text names.
 func judgeContainerdHosts(path, host string) Finding {
-	data, err := os.ReadFile(path)
+	doc, err := clientconf.LoadContainerdHostsFile(path)
+	var unread *fs.PathError
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
-	case err != nil:
+	case errors.As(err, &unread):
 		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, or repair what the error names"}
+	case err != nil:
+		return Finding{Status: StatusWarn, Detail: "containerd discards its registry configuration (" + err.Error() + ") and pulls Docker Hub images from Docker Hub; bypasses bodega's registry",
+			Remediation: "fix the field the error names in " + path + " so containerd loads the file; its log repeats the error at each pull"}
+	case doc == nil:
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 	}
-	var doc struct {
-		Host map[string]struct {
-			Capabilities []string `toml:"capabilities"`
-		} `toml:"host"`
-	}
-	md, err := toml.Decode(string(data), &doc)
-	if err != nil {
-		return Finding{Status: StatusSkip, Detail: path + " is not TOML containerd can load: " + err.Error(), Remediation: "repair " + path + "; containerd fails every Docker Hub pull while it stands"}
-	}
-	for _, k := range md.Keys() {
-		if len(k) != 2 || k[0] != "host" {
+	for _, h := range doc.Hosts {
+		if h.Server || !h.Pull {
 			continue
 		}
-		caps := doc.Host[k[1]].Capabilities
-		if caps != nil && !slices.Contains(caps, "pull") {
-			continue
+		if !mirrorIsBodega(h.Key, host) {
+			return Finding{Status: StatusWarn, Detail: path + " sends containerd's Docker Hub pulls to " + h.Key + " before bodega" + inHost(host) + "; bypasses bodega's registry"}
 		}
-		if !mirrorIsBodega(k[1], host) {
-			return Finding{Status: StatusWarn, Detail: path + " sends containerd's Docker Hub pulls to " + k[1] + " before bodega" + inHost(host) + "; bypasses bodega's registry"}
-		}
-		return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + k[1]}
+		return Finding{Status: StatusOK, Detail: path + " sends containerd's Docker Hub pulls to " + h.Key}
 	}
 	return Finding{Status: StatusWarn, Detail: path + " names no host at bodega" + inHost(host) + ", so containerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 }

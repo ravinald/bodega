@@ -2700,3 +2700,78 @@ func TestAudit17HelmNativeLoadErrorRefusesBeforeWriting(t *testing.T) {
 		t.Errorf("idle apply also certified the unloadable Helm policy:\n%s", idle)
 	}
 }
+
+func TestAudit18ContainerdNativeTypeErrorRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t, "containerd")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml")
+	old := "server = \"https://registry-1.docker.io\"\n\n[host.\"" + srv.URL + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = [\"wrong-type\"]\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "second"} {
+		out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		got, readErr := os.ReadFile(file)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		_, caErr := os.Stat(filepath.Join(home, ".config/bodega/ca.pem"))
+		_, configErr := os.Stat(filepath.Join(home, "etc/containerd/config.toml"))
+		if err == nil || !strings.Contains(err.Error(), file) || string(got) != old || !os.IsNotExist(caErr) || !os.IsNotExist(configErr) {
+			t.Errorf("%s apply: err=%v; hosts unchanged=%t; CA stat=%v; config stat=%v\n%s", phase, err, string(got) == old, caErr, configErr, out)
+		}
+	}
+}
+
+func TestAudit18ContainerdNativeTypeErrorRemainsUnchecked(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t, "containerd")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml")
+	caFile := filepath.Join(home, "issuer.pem")
+	configFile := filepath.Join(home, "etc/containerd/config.toml")
+	for path, body := range map[string]string{
+		caFile:     string(caPEM),
+		configFile: "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n",
+		file:       "server = \"https://registry-1.docker.io\"\n[host.\"" + srv.URL + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n  ca = \"" + caFile + "\"\n  skip_verify = [\"wrong-type\"]\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevRoot, prevExit := doctorOCIRoot, doctorExit
+	doctorOCIRoot, doctorExit = home, func(int) {}
+	t.Cleanup(func() { doctorOCIRoot, doctorExit = prevRoot, prevExit })
+	out, err := runDoctor(t, "--url", srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "oci-containerd") {
+			row = line
+		}
+	}
+	if !strings.Contains(row, "WARN") || !strings.Contains(row, "unchecked") || !strings.Contains(row, file) {
+		t.Errorf("want unchecked containerd row naming invalid policy; got %q", row)
+	}
+	verdicts, err := doctorTrustProbe().Judge([]string{"oci-containerd"}, srv.URL)
+	if err != nil || len(verdicts) != 1 || verdicts[0].State != host.TrustUnchecked {
+		t.Errorf("selected verdict = %+v, %v; want unchecked", verdicts, err)
+	}
+}

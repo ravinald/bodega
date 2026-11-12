@@ -302,7 +302,7 @@ func kindOf(rec PlanRecord) fileKind {
 		return fileKind{rules: &gitRules, unread: gitUnread, holds: gitHolds, keeps: gitKeeps}
 	case manifest.TypeOCI:
 		if name == "hosts.toml" {
-			return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
+			return fileKind{rules: &plainRules, holds: containerdHostsHolds, keeps: containerdHostsKeeps}
 		}
 	case manifest.TypeHelm:
 		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "repositories") }, holds: yamlHolds("repositories"), keeps: yamlKeeps("repositories")}
@@ -421,6 +421,27 @@ func tomlKeeps(old, merged, planned []byte) error {
 		return err
 	}
 	return treeKeeps(o, m, p, "")
+}
+
+// containerdHostsHolds is holds for a hosts.toml: the merged file is one
+// containerd loads, and it reads as the plan sets it. A merge containerd
+// would discard installs nothing, whatever a generic TOML reader finds in it.
+func containerdHostsHolds(merged, planned []byte) error {
+	if _, err := ParseContainerdHostsFile("", merged); err != nil {
+		return fmt.Errorf("containerd would discard the merged file: %w", err)
+	}
+	return tomlHolds(merged, planned)
+}
+
+// containerdHostsKeeps is keeps for a hosts.toml. A file containerd discards
+// as it stands is refused rather than merged: the merge keeps every setting
+// the plan does not own, the one containerd rejects among them, so the
+// result would be discarded too.
+func containerdHostsKeeps(old, merged, planned []byte) error {
+	if _, err := ParseContainerdHostsFile("", old); err != nil {
+		return fmt.Errorf("containerd discards the file as it stands and pulls from the registry's own server: %w", err)
+	}
+	return tomlKeeps(old, merged, planned)
 }
 
 // yamlKeeps is keeps for a YAML mapping merged key by key: every top-level

@@ -388,10 +388,11 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 
 // containerdReads refuses a plan that writes containerd's hosts.toml on a
 // host whose containerd would not read it: a config.toml, as the plan leaves
-// it, that does not resolve, or one that disables the CRI plugin, which is
-// what reads the registry configuration. Neither is repaired here. Enabling
-// a plugin its owner disabled is not this command's call, and a ca in a file
-// nothing loads would report an install no pull uses.
+// it, that does not resolve, one that disables the CRI plugin, which is what
+// reads the registry configuration, or a hosts.toml containerd discards. None
+// is repaired here. Enabling a plugin its owner disabled is not this
+// command's call, and a ca in a file nothing loads would report an install no
+// pull uses.
 func (h CAHost) containerdReads(changes []Change) error {
 	if !slices.ContainsFunc(changes, func(c Change) bool {
 		return c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd
@@ -405,20 +406,39 @@ func (h CAHost) containerdReads(changes []Change) error {
 			path, data, err = c.Target, c.New, nil
 		}
 	}
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%s: read %s, which says where containerd reads its registry configuration: %w. Run this command as an account that can read it", manifest.TypeOCI, path, err)
-	}
-	eff, err := ResolveContainerdConfig("", path, data)
+	var roots []string
 	switch {
+	case os.IsNotExist(err):
 	case err != nil:
-		return fmt.Errorf("%s: containerd's configuration at %s does not resolve (%w), so which hosts.toml files containerd reads cannot be told and a CA written for it could not be verified. "+
-			"Repair it, then re-run", manifest.TypeOCI, path, err)
-	case eff.CRIDisabled:
-		return fmt.Errorf("%s: %s disables containerd's CRI plugin (disabled_plugins), and that plugin is what reads hosts.toml and the ca this command writes there, so containerd would use neither and the install could not be verified. "+
-			"Where this host pulls through containerd's CRI, remove the plugin from disabled_plugins, restart containerd and re-run; where only Docker Engine pulls here, add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path)
+		return fmt.Errorf("%s: read %s, which says where containerd reads its registry configuration: %w. Run this command as an account that can read it", manifest.TypeOCI, path, err)
+	default:
+		eff, err := ResolveContainerdConfig("", path, data)
+		switch {
+		case err != nil:
+			return fmt.Errorf("%s: containerd's configuration at %s does not resolve (%w), so which hosts.toml files containerd reads cannot be told and a CA written for it could not be verified. "+
+				"Repair it, then re-run", manifest.TypeOCI, path, err)
+		case eff.CRIDisabled:
+			return fmt.Errorf("%s: %s disables containerd's CRI plugin (disabled_plugins), and that plugin is what reads hosts.toml and the ca this command writes there, so containerd would use neither and the install could not be verified. "+
+				"Where this host pulls through containerd's CRI, remove the plugin from disabled_plugins, restart containerd and re-run; where only Docker Engine pulls here, add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path)
+		case eff.ConfigPath != "":
+			roots = strings.Split(eff.ConfigPath, ":")
+		}
+	}
+	// Every hosts.toml containerd loads, and every one the plan edits, read
+	// whole as containerd reads it, whether or not this plan changes it: a
+	// wrong type in a field no edit touches makes containerd discard the
+	// file, and the merge would carry that field into the rewrite.
+	files := ContainerdHostsFiles(h.Root, roots)
+	for _, c := range changes {
+		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd && filepath.Base(c.Target) == "hosts.toml" && !slices.Contains(files, c.Target) {
+			files = append(files, c.Target)
+		}
+	}
+	for _, f := range files {
+		if _, err := LoadContainerdHostsFile(f); err != nil {
+			return fmt.Errorf("%s: containerd discards its registry configuration (%w) and pulls from the registry's own server instead, so it would use neither the bodega host nor the ca this command writes, and the install could not be verified. "+
+				"Nothing was written. Fix that field so containerd loads the file (its log names the same error at each pull), then re-run", manifest.TypeOCI, err)
+		}
 	}
 	return nil
 }

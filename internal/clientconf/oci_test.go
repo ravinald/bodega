@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -331,5 +332,92 @@ func TestNewChangeRefusesAContainerdEditAnImportSupersedes(t *testing.T) {
 	}
 	if _, err := NewChange(rec, []byte(f.Content), home); err == nil || !strings.Contains(err.Error(), "missing.toml, which could not be read") {
 		t.Errorf("missing import: %v, want a refusal naming it", err)
+	}
+}
+
+// TestContainerdHostsFileLoadsAsContainerd holds ParseContainerdHostsFile to
+// what containerd v2.2.0's ConfigureHosts answered for each of these files:
+// the endpoints it resolved in order, or that it discarded the file. A host
+// written as an inline table or a dotted key is one containerd never lists,
+// because it orders hosts by their table headers.
+func TestContainerdHostsFileLoadsAsContainerd(t *testing.T) {
+	const host = "[host.\"https://bodega.internal:8443\"]\n"
+	const bodega = "https://bodega.internal:8443/v2"
+	for _, tc := range []struct {
+		name, body string
+		// want is the endpoints in order, the top-level server last and ""
+		// where the file names none; nil is a file containerd discards.
+		want []string
+	}{
+		{"control", "server = \"https://registry-1.docker.io\"\n" + host + " capabilities = [\"pull\", \"resolve\"]\n skip_verify = false\n", []string{bodega, "https://registry-1.docker.io/v2"}},
+		{"skip_verify array", host + " skip_verify = [\"x\"]\n", nil},
+		{"skip_verify string at the top level", "skip_verify = \"no\"\n" + host, nil},
+		{"ca integer", host + " ca = 3\n", nil},
+		{"ca date", host + " ca = 1979-05-27\n", nil},
+		{"ca mixed list", host + " ca = [\"a\", 3]\n", nil},
+		{"ca list", host + " ca = [\"a\", \"/b\"]\n", []string{bodega, ""}},
+		{"ca twice", host + " ca = \"a\"\n ca = \"b\"\n", nil},
+		{"client pair", host + " client = [[\"a\", \"b\"]]\n", []string{bodega, ""}},
+		{"client short pair", host + " client = [[\"a\"]]\n", nil},
+		{"client integer", host + " client = 5\n", nil},
+		{"client integer list", host + " client = [5]\n", nil},
+		{"capability case", host + " capabilities = [\"Pull\"]\n", []string{bodega, ""}},
+		{"capability unknown", host + " capabilities = [\"bogus\"]\n", nil},
+		{"capabilities string", host + " capabilities = \"pull\"\n", nil},
+		{"capabilities empty", host + " capabilities = []\n", []string{bodega, ""}},
+		{"header integer", host + " [host.\"https://bodega.internal:8443\".header]\n x = 5\n", nil},
+		{"header mixed list", host + " [host.\"https://bodega.internal:8443\".header]\n x = [\"a\", 1]\n", nil},
+		{"header list", host + " [host.\"https://bodega.internal:8443\".header]\n x = [\"a\", \"b\"]\n", []string{bodega, ""}},
+		{"header string", host + " header = \"x\"\n", nil},
+		{"override_path string", host + " override_path = \"yes\"\n", nil},
+		{"dial_timeout unparsable", host + " dial_timeout = \"abc\"\n", nil},
+		{"dial_timeout integer", host + " dial_timeout = 5\n", nil},
+		{"dial_timeout", host + " dial_timeout = \"5s\"\n", []string{bodega, ""}},
+		{"server integer", "server = 5\n" + host, nil},
+		{"server unparsable", "server = \"http://%zz\"\n" + host, nil},
+		{"host unparsable", "[host.\"http://%zz\"]\n", nil},
+		{"host a string", "host = \"x\"\n", nil},
+		{"syntax", host + " ca = \n", nil},
+		{"unknown keys", "foo = 1\n" + host + " bar = [1]\n", []string{bodega, ""}},
+		{"host without a scheme", "[host.\"bodega.internal:8443\"]\n", []string{bodega, ""}},
+		{"host with a path", "[host.\"https://bodega.internal:8443/a/b/\"]\n", []string{"https://bodega.internal:8443/a/b/v2", ""}},
+		{"host with an overridden path", "[host.\"https://bodega.internal:8443/a/b/\"]\n override_path = true\n", []string{"https://bodega.internal:8443/a/b", ""}},
+		{"host reopened", "[host.\"https://a\"]\n[host.\"https://b\"]\n[host.\"https://a\".header]\n x = \"1\"\n", []string{"https://a/v2", "https://b/v2", "https://a/v2", ""}},
+		{"host as an inline table", "host = { \"https://bodega.internal:8443\" = { capabilities = [\"pull\"] } }\n", []string{""}},
+		{"host as a dotted key", "host.\"https://bodega.internal:8443\".capabilities = [\"pull\"]\n", []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := ParseContainerdHostsFile("/etc/containerd/certs.d/docker.io", []byte(tc.body))
+			if tc.want == nil {
+				if err == nil {
+					t.Fatalf("loaded %+v; containerd discards this file", f.Hosts)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("refused (%v); containerd loads this file", err)
+			}
+			var got []string
+			for _, h := range f.Hosts {
+				endpoint := ""
+				if h.Host != "" {
+					endpoint = h.Scheme + "://" + h.Host + h.Path
+				}
+				got = append(got, endpoint)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("endpoints = %q, want %q", got, tc.want)
+			}
+			if last := f.Hosts[len(f.Hosts)-1]; !last.Server {
+				t.Errorf("the last entry is %+v, not the top-level server", last)
+			}
+		})
+	}
+	f, err := ParseContainerdHostsFile("/etc/containerd/certs.d/docker.io", []byte(host+" ca = [\"a\", \"/b\"]\n capabilities = [\"resolve\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := f.Hosts[0]; !slices.Equal(h.CA, []string{"/etc/containerd/certs.d/docker.io/a", "/b"}) || h.Pull {
+		t.Errorf("host = %+v; want ca resolved against the file's directory and no pull", h)
 	}
 }

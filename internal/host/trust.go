@@ -17,8 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/BurntSushi/toml"
-
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -870,6 +868,12 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 // evidence about a containerd whose configuration says otherwise or cannot
 // be told. Only a host with no config.toml, or one naming no config_path, is
 // read at that default directory.
+//
+// Each hosts.toml is loaded whole through clientconf.LoadContainerdHostsFile.
+// One containerd discards, for any field of any host, leaves containerd
+// unchecked: it then pulls from the registry's own server, so no host or ca
+// the file holds is one containerd runs with, and the roots of that fallback
+// say nothing about bodega.
 func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 	path := filepath.Join(t.Root, clientconf.ContainerdConfigPath)
 	blind := func(why string) []trustStore {
@@ -892,51 +896,21 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		}
 	}
 	var out []trustStore
-	seen := map[string]bool{}
-	for _, r := range roots {
-		if r == "" {
+	for _, path := range clientconf.ContainerdHostsFiles(t.Root, roots) {
+		doc, err := clientconf.LoadContainerdHostsFile(path)
+		if err != nil {
+			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd discards its registry configuration (%v) and pulls from the registry's own server instead, so whether containerd reaches bodega or verifies its certificate is unchecked", err)}}
+		}
+		if doc == nil {
 			continue
 		}
-		dirs, _ := filepath.Glob(filepath.Join(t.Root, r, "*"))
-		for _, dir := range dirs {
-			if info, err := os.Stat(dir); err != nil || !info.IsDir() || seen[filepath.Base(dir)] {
-				continue
-			}
-			seen[filepath.Base(dir)] = true
-			path := filepath.Join(dir, "hosts.toml")
-			var doc struct {
-				Host map[string]struct {
-					CA any `toml:"ca"`
-				} `toml:"host"`
-			}
-			if _, err := toml.DecodeFile(path, &doc); err != nil {
-				continue
-			}
-			for name, table := range doc.Host {
-				if !mirrorIsBodega(name, u.Host) {
-					continue
-				}
-				var cas []string
-				switch v := table.CA.(type) {
-				case string:
-					cas = []string{v}
-				case []any:
-					for _, e := range v {
-						if s, ok := e.(string); ok {
-							cas = append(cas, s)
-						}
-					}
-				}
-				for i, ca := range cas {
-					if !filepath.IsAbs(ca) {
-						cas[i] = filepath.Join(dir, ca)
-					}
-				}
-				out = append(out, trustStore{name: "the ca of " + path, system: true, files: cas})
+		for _, h := range doc.Hosts {
+			if mirrorIsBodega(h.Key, u.Host) {
+				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA})
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	sort.SliceStable(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
 }
 
