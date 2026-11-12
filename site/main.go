@@ -71,7 +71,7 @@ type siteInfo struct {
 
 // A doc source and the contents group it is listed under. Usage sections are
 // named by their ## heading and become pages of their own. The "api" source
-// stands for every page renderAPI returns, each named by its output path.
+// is the page Scalar renders the OpenAPI document on.
 type source struct{ group, src, section string }
 
 var contents = []source{
@@ -250,6 +250,9 @@ func (g *generator) render(src []byte, srcPath string) (string, string) {
 			}
 		case *ast.Link:
 			n.Destination = []byte(g.rewrite(string(n.Destination), srcPath))
+			if string(n.Title) == downloadTitle && string(n.Destination) == g.base+apiDir {
+				n.Destination = []byte(g.base + apiSpec)
+			}
 		case *ast.Image:
 			n.Destination = []byte(g.rewrite(string(n.Destination), srcPath))
 		}
@@ -315,23 +318,10 @@ func build(repo, out, tmplDir, version, commit, base, coverage string) int {
 	cssSum := sha256.Sum256(css)
 	info := siteInfo{Base: base, Version: version, Commit: commit, CSSVersion: hex.EncodeToString(cssSum[:6])}
 
-	apiPages, err := renderAPI(read(repo, "api/openapi.yaml"), base)
+	scalar, err := vendoredScalar(tmplDir)
 	if err != nil {
-		log.Fatalf("api/openapi.yaml: %v; fix the document, then rebuild", err)
+		log.Fatalf("%v; run site/scripts/update-scalar.sh with the version to vendor, then rebuild", err)
 	}
-	apiByOut := map[string]*page{}
-	var expanded []source
-	for _, c := range contents {
-		if c.src != "api" {
-			expanded = append(expanded, c)
-			continue
-		}
-		for _, p := range apiPages {
-			apiByOut[p.Out] = p
-			expanded = append(expanded, source{c.group, c.src, p.Out})
-		}
-	}
-	contents := expanded
 
 	g := &generator{repo: repo, base: base, commit: info.Commit, outOf: map[string]string{}, usageSection: map[string]string{}}
 	for _, c := range contents {
@@ -343,6 +333,7 @@ func build(repo, out, tmplDir, version, commit, base, coverage string) int {
 	// A doc links the OpenAPI document by its repository path, which is the
 	// raw YAML on GitHub and the rendered reference here.
 	g.outOf["api/openapi.yaml"] = apiDir
+	g.outOf["api"] = apiDir
 
 	usageSrc := read(repo, "docs/usage.md")
 	section := ""
@@ -386,8 +377,8 @@ func build(repo, out, tmplDir, version, commit, base, coverage string) int {
 		p := &page{Src: c.src, Group: c.group, Kind: "doc"}
 		switch {
 		case c.src == "api":
-			*p = *apiByOut[c.section]
-			p.Group = c.group
+			p.Out, p.Title, p.Src, p.Kind = apiDir+"index.html", "API reference", apiSpec, "api"
+			p.Body = apiBody(base, scalar)
 		case c.src == "coverage":
 			p.Out, p.Title, p.Src = "coverage.html", "Package support", ""
 			p.Body = template.HTML("<h1>Package support</h1>\n" + renderCoverage(coverage, base))
@@ -477,12 +468,90 @@ func build(repo, out, tmplDir, version, commit, base, coverage string) int {
 	copyFile(filepath.Join(tmplDir, "site.css"), filepath.Join(out, "site.css"))
 	copyFile(filepath.Join(repo, "assets", "favicon.ico"), filepath.Join(out, "favicon.ico"))
 	copyFile(filepath.Join(repo, "assets", "app", "icon-180.png"), filepath.Join(out, "icon-180.png"))
+	write(filepath.Join(out, apiSpec), read(repo, "api/openapi.yaml"))
 	// The snapshot the coverage page was rendered from. nginx answers /data/coverage.json
 	// from the live feed instead, so this copy only serves a local build and the link check.
 	copyFile(coverage, filepath.Join(out, "data", "coverage.json"))
 
 	fmt.Printf("%d pages, bodega %s (%s)\n", len(pages)+1, info.Version, info.Commit)
 	return checkLinks(out, base)
+}
+
+const (
+	apiDir  = "api/"
+	apiSpec = apiDir + "openapi.yaml"
+	// downloadTitle is the Markdown link title that keeps a link to
+	// api/openapi.yaml on the document itself. Without it the link goes to the
+	// rendered reference, which is what a doc naming the file in passing means.
+	downloadTitle = "Download the OpenAPI document"
+)
+
+// scalarBundle is the record site/scripts/update-scalar.sh writes beside the
+// bundle it vendors.
+type scalarBundle struct {
+	Package string `json:"package"`
+	Version string `json:"version"`
+	File    string `json:"file"`
+	SHA256  string `json:"sha256"`
+}
+
+// vendoredScalar reads that record and refuses a bundle whose digest is not
+// the recorded one: the page runs this file in the reader's browser, so an
+// edit nobody recorded must stop the build rather than ship.
+func vendoredScalar(tmplDir string) (scalarBundle, error) {
+	dir := filepath.Join(tmplDir, "static", "scalar")
+	var s scalarBundle
+	record, err := os.ReadFile(filepath.Join(dir, "scalar.json"))
+	if err != nil {
+		return s, fmt.Errorf("the vendored Scalar bundle has no record: %w", err)
+	}
+	if err := json.Unmarshal(record, &s); err != nil {
+		return s, fmt.Errorf("%s: %w", filepath.Join(dir, "scalar.json"), err)
+	}
+	if s.File != filepath.Base(s.File) || s.File == "" || s.Version == "" {
+		return s, fmt.Errorf("%s names file %q at version %q, and needs a bare file name and a version", filepath.Join(dir, "scalar.json"), s.File, s.Version)
+	}
+	bundle, err := os.ReadFile(filepath.Join(dir, s.File))
+	if err != nil {
+		return s, fmt.Errorf("the vendored Scalar bundle is missing: %w", err)
+	}
+	sum := sha256.Sum256(bundle)
+	if got := hex.EncodeToString(sum[:]); got != s.SHA256 {
+		return s, fmt.Errorf("%s has sha256 %s, and scalar.json records %s for %s %s", filepath.Join(dir, s.File), got, s.SHA256, s.Package, s.Version)
+	}
+	return s, nil
+}
+
+// apiBody is Scalar's documented HTML integration: a mount point, the
+// standalone bundle, and one createApiReference call. The mount point is not
+// named "api-reference": the bundle mounts itself on an element with that id,
+// with its defaults, which fetch fonts from scalar.com and show its agent
+// beside the reference configured here. Everything the page loads is
+// on this origin. The request client stays hidden because a request from this
+// site to a reader's own bodega server would be cross-origin and carry their
+// token; the other switches keep Scalar from reaching scalar.com for
+// telemetry, fonts, its MCP hook and its agent.
+func apiBody(base string, s scalarBundle) template.HTML {
+	spec := template.HTMLEscapeString(base + apiSpec)
+	config, err := json.Marshal(map[string]any{
+		"url":                   base + apiSpec,
+		"telemetry":             false,
+		"withDefaultFonts":      false,
+		"hideClientButton":      true,
+		"hideTestRequestButton": true,
+		"showDeveloperTools":    "never",
+		"mcp":                   map[string]bool{"disabled": true},
+		"agent":                 map[string]bool{"disabled": true},
+		"layout":                "modern",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return template.HTML(fmt.Sprintf(`<noscript><h1>API reference</h1><p>This page renders bodega's OpenAPI document with a script. Without one, read the document itself: <a href="%s">openapi.yaml</a>.</p></noscript>
+<div id="reference"></div>
+<script src="%sscalar/%s?v=%.12s"></script>
+<script>Scalar.createApiReference("#reference", %s);</script>
+`, spec, template.HTMLEscapeString(base), template.HTMLEscapeString(s.File), s.SHA256, config))
 }
 
 func indexed(out string) string {

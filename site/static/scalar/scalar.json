@@ -1,0 +1,8 @@
+{
+  "package": "@scalar/api-reference",
+  "version": "1.76.0",
+  "license": "MIT",
+  "integrity": "sha512-pjqwnzmA9YK3ZX+IZSICMsywm4qI6HLSngR2py9H6TvFApHHuJjkTAd+gFJfnqJDzJuro8k7ji6JCtJ2U+Byng==",
+  "file": "standalone.js",
+  "sha256": "dcb027152bf20bf2f6dcd66e8f9fb073c1a9e274cf0b94b939a7d99ab8947060"
+}
