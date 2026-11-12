@@ -51,7 +51,7 @@ Press ? for keybinding help, q to quit.`,
 			// else: a bucket key left on a local-driver install dials nothing,
 			// and the I action dials the backend it resolves.
 			var s3client *bos3.Client
-			if !cfg.UsesLocalManifests() {
+			if !cfg.UsesLocalManifests() && storageBackendName(cfg) == "s3" {
 				if s3client, err = newS3Client(cfg); err != nil {
 					return fmt.Errorf("connect to AWS: %w", err)
 				}

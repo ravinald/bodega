@@ -206,19 +206,24 @@ type s3Location struct {
 	tail string
 }
 
+// unwrapPrefixes returns the store under any prefixes and the prefix they
+// compose to.
+func unwrapPrefixes(store ObjectStore) (inner ObjectStore, prefix string) {
+	for {
+		p, ok := store.(*prefixed)
+		if !ok {
+			return store, prefix
+		}
+		prefix, store = p.prefix+prefix, p.inner
+	}
+}
+
 // s3Under unwraps prefixes down to the s3 store they are over, and reports
 // false for any other store.
 func s3Under(store ObjectStore) (s3 *S3, prefix string, ok bool) {
-	for {
-		switch s := store.(type) {
-		case *prefixed:
-			prefix, store = s.prefix+prefix, s.inner
-		case *S3:
-			return s, prefix, true
-		default:
-			return nil, "", false
-		}
-	}
+	inner, prefix := unwrapPrefixes(store)
+	s3, ok = inner.(*S3)
+	return s3, prefix, ok
 }
 
 // s3LocationOf is the location of an s3 store or of prefixes over one, and
@@ -341,27 +346,40 @@ func (l s3Location) path() string {
 // SameLocation reports whether writing a key to one store overwrites that key
 // in the other. It is what a move asks before it copies or deletes anything,
 // and it is wider than the identity: two stores are the same location when
-// their labels are equal, and also when the pinned SDK sends a key for each
-// to one URL. The second holds for configurations whose components differ (an
-// endpoint path segment spelled as a bucket under path-style addressing, a
-// dotted bucket spelled as a bucket and a prefix), which stay two identities
-// everywhere else. The route only ever refuses here; it never names a store.
+// their labels are equal, and also when the pinned SDKs send a key for each
+// to one object. The second holds for s3 configurations whose components
+// differ (an endpoint path segment spelled as a bucket under path-style
+// addressing, a dotted bucket spelled as a bucket and a prefix), and for a
+// gcs backend beside an s3 backend on Cloud Storage's S3-compatible endpoint
+// for the same bucket. All of them stay separate identities everywhere else.
+// The route only ever refuses here; it never names a store.
 func SameLocation(a, b ObjectStore) bool {
 	if a.Label() == b.Label() {
 		return true
 	}
-	ra, ok := s3ObjectRoute(a)
+	ra, ok := objectRoute(a)
 	if !ok {
 		return false
 	}
-	rb, ok := s3ObjectRoute(b)
+	rb, ok := objectRoute(b)
 	return ok && ra == rb
+}
+
+// objectRoute is where a key of an s3 or gcs store lands, prefix included,
+// in a form two stores share exactly when they share objects. False for
+// another driver and for a store its SDK resolves no route for.
+func objectRoute(store ObjectStore) (string, bool) {
+	if g, prefix, ok := gcsUnder(store); ok {
+		return g.root + g.name + "/" + prefix, true
+	}
+	return s3ObjectRoute(store)
 }
 
 // s3ObjectRoute is the URL the SDK puts a key under for an s3 store: the
 // resolved scheme and host, the decoded path closed by a "/" as the request
-// middleware joins it, then the prefix. False for another driver and for a
-// store the SDK resolves no route for.
+// middleware joins it, then the prefix. A URL on Cloud Storage is rewritten
+// to the form a gcs store's route has. False for a store the SDK resolves no
+// route for, and for another driver.
 func s3ObjectRoute(store ObjectStore) (string, bool) {
 	s, prefix, ok := s3Under(store)
 	if !ok {
@@ -372,6 +390,7 @@ func s3ObjectRoute(store ObjectStore) (string, bool) {
 		return "", false
 	}
 	u := route.URL
+	hostname := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	port := u.Port()
 	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
 		port = ""
@@ -383,7 +402,37 @@ func s3ObjectRoute(store ObjectStore) (string, bool) {
 	if !strings.HasSuffix(path, "/") {
 		path += "/"
 	}
-	return u.Scheme + "://" + hostPort(strings.TrimSuffix(strings.ToLower(u.Hostname()), "."), port) + path + prefix, true
+	if port == "" {
+		if gcs, ok := cloudStorageRoute(hostname, path+prefix); ok {
+			return gcs, true
+		}
+	}
+	return u.Scheme + "://" + hostPort(hostname, port) + path + prefix, true
+}
+
+// cloudStorageRoot opens the route of every object in Cloud Storage's one
+// global bucket namespace, whichever host and scheme a request reaches it by.
+const cloudStorageRoot = "gs://"
+
+// cloudStorageHost matches the hosts Cloud Storage serves its XML API on with
+// the bucket as the first path segment: the global host, the mTLS host the
+// pinned Go SDK names beside it (WithDefaultMTLSEndpoint in storage.NewClient)
+// and a regional endpoint. The XML API is the one an s3 client speaks to it.
+var cloudStorageHost = regexp.MustCompile(`^storage(?:\.mtls|\.[a-z0-9-]+\.rep)?\.googleapis\.com$`)
+
+// cloudStorageRoute rewrites an XML API URL as cloudStorageRoot, the bucket
+// and the key prefix. objectPath is the URL's path with the prefix appended.
+// A bucket name holds no "/", so on a path-style host the first segment is
+// the bucket however the s3 configuration divided endpoint path, bucket and
+// prefix; on the virtual-hosted form the bucket is the host's own label.
+func cloudStorageRoute(hostname, objectPath string) (string, bool) {
+	if bucket, ok := strings.CutSuffix(hostname, ".storage.googleapis.com"); ok && bucket != "" {
+		return cloudStorageRoot + bucket + objectPath, true
+	}
+	if rest := strings.TrimPrefix(objectPath, "/"); cloudStorageHost.MatchString(hostname) && rest != "" && rest[0] != '/' {
+		return cloudStorageRoot + rest, true
+	}
+	return "", false
 }
 
 // S3BucketLabel returns an s3 store's location as "s3://<bucket>" or

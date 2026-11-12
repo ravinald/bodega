@@ -11,10 +11,15 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	gstorage "cloud.google.com/go/storage"
+	"github.com/ravinald/bodega/internal/config"
+	bogcs "github.com/ravinald/bodega/internal/gcs"
+	"github.com/ravinald/bodega/internal/gcs/gcstest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -363,4 +368,478 @@ func TestInitAgainstACompatibleStore(t *testing.T) {
 			t.Errorf("marker PUT carried no CRC32 with checksums unset; the when_required case above proves nothing: %v", store.markerCRCs)
 		}
 	})
+}
+
+// gcsInit runs `bodega init` with the SDK pointed at an in-process Cloud
+// Storage fake through STORAGE_EMULATOR_HOST, the SDK's own switch, so the
+// command builds its client exactly as it does against the service.
+func gcsInit(t *testing.T, srv *gcstest.Server, config string, args ...string) (string, error) {
+	t.Helper()
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.Host())
+	t.Setenv(bogcs.ProjectEnv, "example-project")
+	return runInit(t, config, args...)
+}
+
+// TestInitGCS covers `bodega init` on the gcs driver end to end: the driver
+// name as the argument, a create with all four controls in the project and
+// location given, an idempotent second run, a named backend, and the flags
+// that belong to the other driver.
+func TestInitGCS(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts",
+	  "storage_backends": {"bulk": {"driver": "local", "path": "/srv/bulk"}}}`
+
+	t.Run("init gcs creates and configures the bucket", func(t *testing.T) {
+		srv := gcstest.New(t)
+		out, err := gcsInit(t, srv, cfg, "gcs", "--location", "us-central1")
+		if err != nil {
+			t.Fatalf("err = %v\n%s", err, out)
+		}
+		for _, want := range []string{
+			`Initializing bucket gs://example-bodega-artifacts (backend "default")`,
+			"CREATED gs://example-bodega-artifacts in project example-project, US-CENTRAL1",
+			"Bucket gs://example-bodega-artifacts is ready.",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%s", want, out)
+			}
+		}
+		b := srv.Bucket("example-bodega-artifacts")
+		if b == nil {
+			t.Fatal("no bucket was created")
+		}
+		raw, _ := json.Marshal(b)
+		for _, want := range []string{
+			`"uniformBucketLevelAccess":{"enabled":true`, `"publicAccessPrevention":"enforced"`, `"versioning":{"enabled":true}`,
+			`"daysSinceNoncurrentTime":30`, `"isLive":false`, `"location":"US-CENTRAL1"`,
+		} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("created bucket lacks %s:\n%s", want, raw)
+			}
+		}
+		if strings.Contains(string(raw), `"manifests/"`) || strings.Contains(string(raw), `"attestations/"`) {
+			t.Errorf("the lifecycle rule names a prefix whose history is kept:\n%s", raw)
+		}
+
+		out, err = gcsInit(t, srv, cfg)
+		if err != nil || strings.Contains(out, "CREATED") || strings.Contains(out, "CONFIGURED") || strings.Contains(out, "ENABLED") {
+			t.Errorf("second run, no argument: err %v, want every line lowercase:\n%s", err, out)
+		}
+	})
+
+	t.Run("named backend", func(t *testing.T) {
+		srv := gcstest.New(t)
+		named := `{"storage_backends": {"archive": {"driver": "gcs", "bucket": "example-archive", "prefix": "cold"}}}`
+		out, err := gcsInit(t, srv, named, "archive")
+		if err != nil || srv.Bucket("example-archive") == nil || !strings.Contains(out, `(backend "archive")`) || !strings.Contains(out, "prefix:     cold/ (the lifecycle rule is scoped under it)") {
+			t.Errorf("err %v, bucket %v:\n%s", err, srv.Bucket("example-archive"), out)
+		}
+		// The driver name finds the one backend on it.
+		if out, err := gcsInit(t, srv, named, "gcs"); err != nil || !strings.Contains(out, `(backend "archive")`) {
+			t.Errorf("init gcs with one gcs backend: err %v:\n%s", err, out)
+		}
+	})
+
+	t.Run("refusals", func(t *testing.T) {
+		srv := gcstest.New(t)
+		two := `{"storage_backend": "gcs", "bucket": "one-bucket", "storage_backends": {"archive": {"driver": "gcs", "bucket": "two-bucket"}}}`
+		for _, tc := range []struct {
+			name, config string
+			args         []string
+			want         string
+		}{
+			{"driver name with two backends", two, []string{"gcs"}, "2 storage backends use the gcs driver (default, archive)"},
+			{"driver name with none", `{"storage_backend": "s3", "bucket": "b-b"}`, []string{"gcs"}, "no storage backend uses the gcs driver"},
+			{"allow-unsupported is s3's", cfg, []string{"--allow-unsupported"}, "--allow-unsupported is for an S3-compatible store"},
+			{"location is gcs's", `{"storage_backend": "s3", "bucket": "b-b"}`, []string{"--location", "us-central1"}, "--location places a new gcs bucket"},
+			{"no bucket", `{"storage_backend": "gcs"}`, nil, "a bucket is required"},
+			{"named, no bucket", `{"storage_backends": {"archive": {"driver": "gcs"}}}`, []string{"archive"}, `storage_backends["archive"] uses the gcs driver and names no bucket`},
+			{"invalid bucket name", `{"storage_backend": "gcs", "bucket": "Not_A*Bucket"}`, nil, "not a valid Cloud Storage bucket name"},
+			{"local stays refused", cfg, []string{"bulk"}, `"bulk" uses the local driver`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := gcsInit(t, srv, tc.config, tc.args...)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("err = %v, want %q", err, tc.want)
+				}
+			})
+		}
+		if n := len(srv.Requests()); n != 0 {
+			t.Errorf("a refused run reached the API %d times: %v", n, srv.Requests())
+		}
+	})
+
+	t.Run("credentials are Application Default Credentials", func(t *testing.T) {
+		t.Setenv("STORAGE_EMULATOR_HOST", "")
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "absent.json"))
+		_, err := runInit(t, cfg)
+		if err == nil || !strings.Contains(err.Error(), "Application Default Credentials") {
+			t.Errorf("err = %v, want the missing credentials named as ADC", err)
+		}
+	})
+}
+
+// TestInitGCSPrintPolicy: one role prints as the bare definition gcloud
+// reads, both print with who each is for, and neither needs credentials or
+// reaches the API.
+func TestInitGCSPrintPolicy(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts"}`
+	srv := gcstest.New(t)
+	for which, role := range map[string]bogcs.Role{"setup": bogcs.SetupRole(), "runtime": bogcs.RuntimeRole()} {
+		out, err := gcsInit(t, srv, cfg, "--print-policy="+which)
+		if err != nil || out != role.YAML() {
+			t.Errorf("--print-policy=%s: err %v, output is not the bare role definition:\n%s", which, err, out)
+		}
+	}
+	out, err := gcsInit(t, srv, cfg, "--print-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"setup: for whoever runs `bodega init`; creates and configures gs://example-bodega-artifacts and cannot delete it",
+		"bind on:    the project", "predefined: roles/storage.admin",
+		"runtime: for the service", "bind on:    the bucket", "predefined: roles/storage.objectUser",
+		bogcs.SetupRole().YAML(), bogcs.RuntimeRole().YAML(),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--print-policy lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := gcsInit(t, srv, cfg, "--print-policy=both"); err == nil || !strings.Contains(err.Error(), "want setup, runtime") {
+		t.Errorf("unknown value: err = %v", err)
+	}
+	if n := len(srv.Requests()); n != 0 {
+		t.Errorf("printing roles reached the API %d times: %v", n, srv.Requests())
+	}
+}
+
+// TestInitCheckGCS: the check names each runtime permission, exits non-zero
+// naming the ones missing, and writes nothing.
+func TestInitCheckGCS(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts"}`
+	srv := gcstest.New(t)
+	srv.AddBucket("example-bodega-artifacts")
+
+	out, err := gcsInit(t, srv, cfg, "check")
+	if err != nil {
+		t.Fatalf("err = %v\n%s", err, out)
+	}
+	for _, want := range append([]string{
+		`Checking gs://example-bodega-artifacts (backend "default") with Application Default Credentials...`,
+		"these credentials hold everything the runtime role grants",
+	}, bogcs.RuntimeRole().Permissions...) {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+
+	srv.Deny("storage.objects.create")
+	out, err = gcsInit(t, srv, cfg, "check", "gcs")
+	if err == nil || !strings.Contains(err.Error(), "these credentials lack storage.objects.create") ||
+		!strings.Contains(err.Error(), "`bodega init --print-policy=runtime`") {
+		t.Errorf("err = %v, want the missing permission and the command that prints the role\n%s", err, out)
+	}
+	if !strings.Contains(out, "storage.objects.create   missing; grant it on gs://example-bodega-artifacts") {
+		t.Errorf("output does not say where to grant it:\n%s", out)
+	}
+	for _, r := range srv.Requests() {
+		if !strings.HasPrefix(r, "GET ") {
+			t.Errorf("check wrote to the bucket: %s", r)
+		}
+	}
+}
+
+func TestReviewGCSPrefixedLifecycle(t *testing.T) {
+	for _, prefix := range []string{"cold", "binaries"} {
+		t.Run(prefix, func(t *testing.T) {
+			srv := gcstest.New(t)
+			cfg := fmt.Sprintf(`{"storage_backends":{"archive":{"driver":"gcs","bucket":"review-bucket","prefix":%q}}}`, prefix)
+			out, err := gcsInit(t, srv, cfg, "archive")
+			if err != nil {
+				t.Fatalf("init: %v\n%s", err, out)
+			}
+			attrs, err := srv.Client(t).Bucket("review-bucket").Attrs(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range []struct {
+				key  string
+				want bool
+			}{
+				{prefix + "/binaries/tool/v1/tool.zip", true},
+				{prefix + "/manifests/index.json", false},
+				{prefix + "/attestations/record.json", false},
+			} {
+				selected, expiresAfter30Days := false, false
+				for _, rule := range attrs.Lifecycle.Rules {
+					if rule.Action.Type != gstorage.DeleteAction {
+						continue
+					}
+					matches := len(rule.Condition.MatchesPrefix) == 0
+					for _, p := range rule.Condition.MatchesPrefix {
+						matches = matches || strings.HasPrefix(tc.key, p)
+					}
+					selected = selected || matches
+					if matches && rule.Condition.Liveness == gstorage.Archived && rule.Condition.DaysSinceNoncurrentTime == 30 {
+						expiresAfter30Days = true
+					}
+				}
+				if tc.want && !expiresAfter30Days {
+					t.Errorf("artifact %q has no 30-day noncurrent expiry rule", tc.key)
+				}
+				if !tc.want && selected {
+					t.Errorf("history %q is selected by a delete rule", tc.key)
+				}
+			}
+		})
+	}
+}
+
+// gcsExpiry reports, for one object name, whether any delete rule on the
+// bucket selects it and whether one expires its noncurrent generations after
+// 30 days. Cloud Storage matches a prefix against the start of the name.
+func gcsExpiry(rules []gstorage.LifecycleRule, key string) (selected, expires bool) {
+	for _, rule := range rules {
+		if rule.Action.Type != gstorage.DeleteAction {
+			continue
+		}
+		matches := len(rule.Condition.MatchesPrefix) == 0
+		for _, p := range rule.Condition.MatchesPrefix {
+			matches = matches || strings.HasPrefix(key, p)
+		}
+		selected = selected || matches
+		expires = expires || (matches && rule.Condition.Liveness == gstorage.Archived && rule.Condition.DaysSinceNoncurrentTime == 30)
+	}
+	return selected, expires
+}
+
+func gcsRules(t *testing.T, srv *gcstest.Server, bucket string) []gstorage.LifecycleRule {
+	t.Helper()
+	attrs, err := srv.Client(t).Bucket(bucket).Attrs(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attrs.Lifecycle.Rules
+}
+
+// TestInitGCSLifecycleFollowsThePrefix is the lifecycle rule against where
+// each backend's objects really are: a root and a prefixed backend sharing a
+// bucket each get their artifacts expired and their history kept, running
+// init again for either changes nothing, the rule names what the driver
+// writes, a rule an earlier init left that reaches a backend's history is
+// removed from an existing bucket while the operator's own rule stays, and
+// two backends no rules can serve are refused before the API is reached.
+func TestInitGCSLifecycleFollowsThePrefix(t *testing.T) {
+	const bucket = "shared-bucket"
+	shared := `{"storage_backend": "gcs", "bucket": "shared-bucket",
+	  "storage_backends": {"archive": {"driver": "gcs", "bucket": "shared-bucket", "prefix": "/cold"},
+	                       "elsewhere": {"driver": "gcs", "bucket": "other-bucket", "prefix": "binaries"}}}`
+
+	t.Run("backends sharing a bucket", func(t *testing.T) {
+		srv := gcstest.New(t)
+		for _, args := range [][]string{nil, {"archive"}} {
+			if out, err := gcsInit(t, srv, shared, args...); err != nil || !strings.Contains(out, "lifecycle:  CONFIGURED") {
+				t.Fatalf("init %v: %v\n%s", args, err, out)
+			}
+		}
+		rules := gcsRules(t, srv, bucket)
+		if len(rules) != 2 {
+			t.Fatalf("rules = %+v, want one per backend", rules)
+		}
+		for key, want := range map[string]bool{
+			"binaries/tool/v1/tool.zip":      true,
+			"oci/manifests/sha256/abc":       true,
+			"cold/binaries/tool/v1/tool.zip": true,
+			"cold/npm/left-pad/1.0.0.tgz":    true,
+			"manifests/index.json":           false,
+			"attestations/record.json":       false,
+			"cold/manifests/index.json":      false,
+			"cold/attestations/record.json":  false,
+			"coldbinaries/tool.zip":          false,
+		} {
+			if selected, expires := gcsExpiry(rules, key); expires != want || selected != want {
+				t.Errorf("%s: selected %v, expires after 30 days %v; want both %v", key, selected, expires, want)
+			}
+		}
+
+		// What the rule names is what the driver writes.
+		t.Setenv("STORAGE_EMULATOR_HOST", srv.Host())
+		store, err := storage.NewFromSpec(t.Context(), storage.Spec{Driver: "gcs", Bucket: bucket, Prefix: "/cold"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(t.Context(), "binaries/tool/v1/tool.zip", []byte("artifact")); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := srv.Object(bucket, "cold/binaries/tool/v1/tool.zip"); !ok {
+			t.Error("the archive backend did not write under cold/, where its rule is scoped")
+		}
+
+		before := len(srv.Requests())
+		for _, args := range [][]string{nil, {"archive"}, {"archive"}} {
+			out, err := gcsInit(t, srv, shared, args...)
+			if err != nil || strings.Contains(out, "CONFIGURED") || strings.Contains(out, "REMOVED") {
+				t.Errorf("repeat init %v: err %v, want every line lowercase:\n%s", args, err, out)
+			}
+		}
+		for _, r := range srv.Requests()[before:] {
+			if !strings.HasPrefix(r, "GET ") {
+				t.Errorf("a repeat init wrote to the bucket: %s", r)
+			}
+		}
+		if got := gcsRules(t, srv, bucket); !reflect.DeepEqual(got, rules) {
+			t.Errorf("rules changed across repeat runs:\n%+v\n%+v", rules, got)
+		}
+	})
+
+	t.Run("existing bucket with a root rule", func(t *testing.T) {
+		for prefix, removed := range map[string]bool{"binaries": true, "cold": false} {
+			t.Run(prefix, func(t *testing.T) {
+				srv := gcstest.New(t)
+				srv.AddBucket(bucket)
+				theirs := gstorage.LifecycleRule{
+					Action:    gstorage.LifecycleAction{Type: gstorage.SetStorageClassAction, StorageClass: "NEARLINE"},
+					Condition: gstorage.LifecycleCondition{AgeInDays: 90},
+				}
+				if _, err := srv.Client(t).Bucket(bucket).Update(t.Context(), gstorage.BucketAttrsToUpdate{
+					Lifecycle: &gstorage.Lifecycle{Rules: []gstorage.LifecycleRule{bogcs.LifecycleRule(""), theirs}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				cfg := fmt.Sprintf(`{"storage_backends":{"archive":{"driver":"gcs","bucket":%q,"prefix":%q}}}`, bucket, prefix)
+				out, err := gcsInit(t, srv, cfg, "archive")
+				if err != nil || strings.Contains(out, "REMOVED the rule matching") != removed {
+					t.Fatalf("init: %v, want a removal reported = %v\n%s", err, removed, out)
+				}
+				rules := gcsRules(t, srv, bucket)
+				want := 3
+				if removed {
+					want = 2
+				}
+				if len(rules) != want || !slices.ContainsFunc(rules, func(r gstorage.LifecycleRule) bool { return reflect.DeepEqual(r.Action, theirs.Action) }) {
+					t.Errorf("rules = %+v, want %d with the operator's kept", rules, want)
+				}
+				for key, expire := range map[string]bool{prefix + "/binaries/tool.zip": true, prefix + "/manifests/index.json": false, prefix + "/attestations/a.json": false} {
+					if selected, expires := gcsExpiry(rules, key); expires != expire || selected != expire {
+						t.Errorf("%s: selected %v, expires %v; want both %v", key, selected, expires, expire)
+					}
+				}
+				if out, err := gcsInit(t, srv, cfg, "archive"); err != nil || strings.Contains(out, "CONFIGURED") {
+					t.Errorf("repeat init: %v\n%s", err, out)
+				}
+			})
+		}
+	})
+
+	t.Run("a prefix inside another backend's artifacts is refused", func(t *testing.T) {
+		srv := gcstest.New(t)
+		clash := `{"storage_backend": "gcs", "bucket": "shared-bucket",
+		  "storage_backends": {"archive": {"driver": "gcs", "bucket": "shared-bucket", "prefix": "binaries"}}}`
+		for _, args := range [][]string{nil, {"archive"}} {
+			_, err := gcsInit(t, srv, clash, args...)
+			if err == nil || !strings.Contains(err.Error(), "the bucket root") || !strings.Contains(err.Error(), "binaries/") ||
+				!strings.Contains(err.Error(), "cannot exclude a prefix") {
+				t.Errorf("init %v: err = %v, want both backends named and the reason", args, err)
+			}
+		}
+		if n := len(srv.Requests()); n != 0 {
+			t.Errorf("a refused run reached the API %d times: %v", n, srv.Requests())
+		}
+	})
+}
+
+func TestReviewGCSLifecycleProtectsS3History(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	for _, endpoint := range []string{"https://storage.googleapis.com", "https://storage.mtls.googleapis.com"} {
+		t.Run(endpoint, func(t *testing.T) {
+			srv := gcstest.New(t)
+			cfg := &config.Config{
+				StorageBackend: "gcs", Bucket: "review-shared-bucket",
+				StorageBackends: map[string]config.StorageSpec{
+					"legacy": {Driver: "s3", Bucket: "review-shared-bucket", Region: "us-east-1", Endpoint: endpoint, PathStyle: true, Prefix: "binaries"},
+				},
+			}
+			spec, _ := storage.SpecFor(cfg, storage.DefaultName)
+			ns := gcsNamespaces(cfg, storage.DefaultName, spec)
+			var out strings.Builder
+			err := bogcs.InitBucket(t.Context(), srv.Client(t), &out, spec.Bucket, "",
+				func(context.Context) (string, error) { return "review-project", nil }, ns)
+			if err == nil || !strings.Contains(err.Error(), "cannot exclude a prefix") {
+				t.Errorf("init = %v; want overlapping configured history refused; output:\n%s", err, out.String())
+			}
+			if srv.Bucket(spec.Bucket) != nil {
+				for _, key := range []string{"binaries/manifests/index.json", "binaries/attestations/record.json"} {
+					if selected, _ := gcsExpiry(gcsRules(t, srv, spec.Bucket), key); selected {
+						t.Errorf("init installed a delete rule selecting the S3 backend's history %q", key)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestGCSNamespacesCountS3Aliases: the namespaces init checks a lifecycle
+// rule against are every backend writing to the target's bucket, whichever
+// driver and address form it is configured with and whether it is the default
+// or a named one, and no backend that writes anywhere else.
+func TestGCSNamespacesCountS3Aliases(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "")
+	const gcsHost = "https://storage.googleapis.com"
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: gcsHost, PathStyle: true,
+		StorageBackends: map[string]config.StorageSpec{
+			"native":    {Driver: "gcs", Bucket: "example-shared", Prefix: "warm"},
+			"sibling":   {Driver: "gcs", Bucket: "example-shared", Prefix: "cold"},
+			"split":     {Driver: "s3", Bucket: "archive", Region: "us-east-1", Endpoint: gcsHost + "/example-shared", PathStyle: true, Prefix: "x"},
+			"vhost":     {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: gcsHost, Prefix: "warm"},
+			"aws":       {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Prefix: "binaries"},
+			"elsewhere": {Driver: "s3", Bucket: "example-other", Region: "us-east-1", Endpoint: gcsHost, PathStyle: true},
+			"minio":     {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: "https://minio.example.com", PathStyle: true},
+			"disk":      {Driver: "local", Path: t.TempDir()},
+		},
+	}
+	spec, _ := storage.SpecFor(cfg, "native")
+	ns := gcsNamespaces(cfg, "native", spec)
+	want := bogcs.Namespaces{Target: "warm/", Others: []string{"", "cold/", "archive/x/", "warm/"}}
+	if !reflect.DeepEqual(ns, want) {
+		t.Fatalf("namespaces = %+v, want %+v", ns, want)
+	}
+
+	// The root alias holds warm/ only as a namespace of its own artifacts'
+	// sibling, not under an artifact prefix, so this layout is compatible and
+	// init writes the target's rule under exactly its prefix.
+	srv := gcstest.New(t)
+	var out strings.Builder
+	if err := bogcs.InitBucket(t.Context(), srv.Client(t), &out, spec.Bucket, "",
+		func(context.Context) (string, error) { return "example-project", nil }, ns); err != nil {
+		t.Fatalf("compatible layout refused: %v", err)
+	}
+	rules := gcsRules(t, srv, spec.Bucket)
+	for key, wantSelected := range map[string]bool{
+		"warm/binaries/tool/v1/tool.zip": true,
+		"warm/manifests/index.json":      false,
+		"warm/attestations/record.json":  false,
+		"manifests/index.json":           false,
+		"binaries/tool/v1/tool.zip":      false,
+		"cold/binaries/tool/v1/tool.zip": false,
+		"archive/x/manifests/index.json": false,
+	} {
+		if selected, _ := gcsExpiry(rules, key); selected != wantSelected {
+			t.Errorf("rule selects %q = %v, want %v", key, selected, wantSelected)
+		}
+	}
+
+	// A backend whose route does not resolve stops init before the bucket.
+	cfg.StorageBackends["broken"] = config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: gcsHost}
+	ns = gcsNamespaces(cfg, "native", spec)
+	if len(ns.Unresolved) != 1 || !strings.Contains(ns.Unresolved[0], `"broken"`) {
+		t.Fatalf("unresolved = %q, want the broken backend named", ns.Unresolved)
+	}
+	srv = gcstest.New(t)
+	err := bogcs.InitBucket(t.Context(), srv.Client(t), nil, spec.Bucket, "",
+		func(context.Context) (string, error) { return "example-project", nil }, ns)
+	if err == nil || srv.Bucket(spec.Bucket) != nil {
+		t.Errorf("init = %v with an unresolved backend; want a refusal and no bucket", err)
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,12 +20,17 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
+	gstorage "cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"google.golang.org/api/iterator"
 
+	bogcs "github.com/ravinald/bodega/internal/gcs"
+	"github.com/ravinald/bodega/internal/gcs/gcstest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
@@ -38,11 +44,16 @@ import (
 // s3ConformanceEndpointEnv promises them, in which case their absence fails
 // the run: a skip nothing forces is a gate that
 // stops blocking without anyone deciding it should.
+//
+// GCS is gated the same way: it runs when Application Default Credentials
+// resolve and name a project to create buckets in, and gcsConformanceEnv turns
+// their absence into a failure.
 func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
 		"local":  func(t *testing.T) ObjectStore { return NewLocal(rootWithDecoySibling(t)) },
 		"memory": func(t *testing.T) ObjectStore { return NewMemory() },
 		"s3":     newConformanceS3,
+		"gcs":    newConformanceGCS,
 		// prefixed is a wrapper rather than a driver, and it was absent long
 		// enough for Label() to grow a second spelling of one directory that
 		// TestLabelIsOnePerLocation would have caught (#189).
@@ -137,7 +148,7 @@ var (
 	s3ConfErr  error
 )
 
-// leaked records every bucket dropLiveBucket could not remove, so TestMain can
+// leaked records, as a URI, every bucket a teardown could not remove, so TestMain can
 // fail the binary once at the end. Teardown stays best-effort per bucket
 // because one abandoned bucket is a sweep and not a contract violation, but a
 // permission the role never held leaks one per store while every case passes:
@@ -165,11 +176,12 @@ func TestMain(m *testing.M) {
 		leaked.Unlock()
 		fmt.Fprintf(os.Stderr, "\n%d live bucket(s) survived teardown and are still billing:\n", n)
 		for _, b := range names {
-			fmt.Fprintf(os.Stderr, "  s3://%s\n", b)
+			fmt.Fprintf(os.Stderr, "  %s\n", b)
 		}
 		fmt.Fprintf(os.Stderr, "Every case passed, so the cause is the role rather than the contract. "+
-			"Sweep with: aws s3api list-buckets --query 'Buckets[?starts_with(Name, `%s`)].Name'\n",
-			conformanceBucketPrefix)
+			"Sweep with: aws s3api list-buckets --query 'Buckets[?starts_with(Name, `%s`)].Name'\n"+
+			"       or: gcloud storage ls | grep '^gs://%s'\n",
+			conformanceBucketPrefix, conformanceBucketPrefix)
 		code = 1
 	}
 	os.Exit(code)
@@ -198,6 +210,17 @@ func liveS3Config() (aws.Config, error) {
 // so the decision is made once per backend on the goroutine that owns it.
 func requireReachable(t *testing.T, name string) {
 	t.Helper()
+	if name == "gcs" {
+		_, _, err := liveGCS()
+		skip, fail := gcsVerdict(err)
+		if fail != "" {
+			t.Fatal(fail)
+		}
+		if skip != "" {
+			t.Skip(skip)
+		}
+		return
+	}
 	if name != "s3" {
 		return
 	}
@@ -269,7 +292,7 @@ func dropLiveBucket(t *testing.T, client *bos3.Client) {
 				return
 			}
 			t.Logf("teardown: list s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
-			recordLeak(*bucket)
+			recordLeak(s3BucketScheme + *bucket)
 			return
 		}
 		for _, v := range page.Versions {
@@ -285,13 +308,183 @@ func dropLiveBucket(t *testing.T, client *bos3.Client) {
 			Bucket: bucket, Delete: &s3types.Delete{Objects: objects[:n], Quiet: aws.Bool(true)},
 		}); err != nil {
 			t.Logf("teardown: empty s3://%s: %v", *bucket, err)
-			recordLeak(*bucket)
+			recordLeak(s3BucketScheme + *bucket)
 		}
 		objects = objects[n:]
 	}
 	if _, err := api.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: bucket}); err != nil && !isNoSuchBucket(err) {
 		t.Logf("teardown: delete s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
-		recordLeak(*bucket)
+		recordLeak(s3BucketScheme + *bucket)
+	}
+}
+
+// gcsConformanceEnv promises this run a Cloud Storage project. Set to
+// anything, it turns "Application Default Credentials did not resolve" from a
+// skip into a failure, as s3ConformanceEnv does for AWS.
+const gcsConformanceEnv = "BODEGA_GCS_CONFORMANCE"
+
+var (
+	gcsOnce    sync.Once
+	gcsClient  *gstorage.Client
+	gcsProject string
+	gcsErr     error
+)
+
+// liveGCS resolves credentials and a project once per test binary.
+func liveGCS() (*gstorage.Client, string, error) {
+	gcsOnce.Do(func() { gcsClient, gcsProject, gcsErr = resolveLiveGCS() })
+	return gcsClient, gcsProject, gcsErr
+}
+
+// resolveLiveGCS proves credentials and a project exist before any case
+// runs. Detecting credentials succeeds on a file that no longer yields a
+// token, so a token is fetched; and a bucket is created in a project, which
+// gcloud's user credentials do not name, so bogcs.ProjectEnv or the
+// credentials have to.
+func resolveLiveGCS() (*gstorage.Client, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	creds, err := credentials.DetectDefault(&credentials.DetectOptions{Scopes: []string{gstorage.ScopeFullControl}})
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := creds.Token(ctx); err != nil {
+		return nil, "", fmt.Errorf("Application Default Credentials yield no token: %w", err)
+	}
+	project, err := bogcs.Project(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	client, err := bogcs.Dial(context.Background())
+	return client, project, err
+}
+
+// gcsVerdict turns what resolveLiveGCS returned into the gate's decision: at
+// most one of skip and fail is set, and neither means run.
+func gcsVerdict(err error) (skip, fail string) {
+	if err == nil {
+		return "", ""
+	}
+	if os.Getenv(gcsConformanceEnv) != "" {
+		return "", fmt.Sprintf("%s is set, so this run was promised a Cloud Storage project, and Application Default Credentials did not yield credentials and a project: %v", gcsConformanceEnv, err)
+	}
+	return fmt.Sprintf("Application Default Credentials did not yield credentials and a project (%v); set %s to make that a failure", err, gcsConformanceEnv), ""
+}
+
+// newConformanceGCS creates a fresh bucket per store, for the reason
+// liveS3Bucket does. It is created bare rather than through InitBucket:
+// versioning would leave every replaced generation for teardown to walk, and
+// soft delete would keep billing for objects the teardown removed.
+func newConformanceGCS(t *testing.T) ObjectStore {
+	t.Helper()
+	client, project, err := liveGCS()
+	if err != nil {
+		t.Fatalf("requireReachable did not run before the gcs factory: %v", err)
+	}
+	var raw [12]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		t.Fatal(err)
+	}
+	bucket := conformanceBucketPrefix + hex.EncodeToString(raw[:])
+	err = client.Bucket(bucket).Create(t.Context(), project, &gstorage.BucketAttrs{
+		UniformBucketLevelAccess: gstorage.UniformBucketLevelAccess{Enabled: true},
+		PublicAccessPrevention:   gstorage.PublicAccessPreventionEnforced,
+		SoftDeletePolicy:         &gstorage.SoftDeletePolicy{RetentionDuration: 0},
+	})
+	if err != nil {
+		t.Fatalf("create gs://%s in project %s: %v", bucket, project, err)
+	}
+	t.Cleanup(func() { dropLiveGCSBucket(t, client, bucket) })
+	return NewGCS(client, bucket)
+}
+
+// dropLiveGCSBucket empties and deletes a bucket newConformanceGCS created,
+// every generation included. Best-effort per bucket, and a bucket it leaves
+// behind fails the binary through recordLeak, as dropLiveBucket's do.
+func dropLiveGCSBucket(t *testing.T, client *gstorage.Client, bucket string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	b := client.Bucket(bucket)
+	it := b.Objects(ctx, &gstorage.Query{Versions: true})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if errors.Is(err, gstorage.ErrBucketNotExist) {
+			return
+		}
+		if err == nil {
+			err = b.Object(attrs.Name).Generation(attrs.Generation).Delete(ctx)
+		}
+		if err != nil && !errors.Is(err, gstorage.ErrObjectNotExist) {
+			t.Logf("teardown: empty gs://%s: %v; sweep %s* by hand", bucket, err, conformanceBucketPrefix)
+			recordLeak("gs://" + bucket)
+			return
+		}
+	}
+	if err := b.Delete(ctx); err != nil && !errors.Is(err, gstorage.ErrBucketNotExist) {
+		t.Logf("teardown: delete gs://%s: %v; sweep %s* by hand", bucket, err, conformanceBucketPrefix)
+		recordLeak("gs://" + bucket)
+	}
+}
+
+// TestGCSConformanceGate holds the gcs gate to what the s3 one does: with
+// gcsConformanceEnv set, credentials that do not resolve fail the run, and
+// without it they skip it. The resolver is driven with a credentials file
+// that does not exist and, separately, with credentials naming no project.
+func TestGCSConformanceGate(t *testing.T) {
+	if _, ok := conformanceBackends()["gcs"]; !ok {
+		t.Fatal("gcs is not in conformanceBackends")
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "absent.json"))
+	t.Setenv(bogcs.ProjectEnv, "example-project")
+	_, _, err := resolveLiveGCS()
+	if err == nil {
+		t.Fatal("a credentials file that does not exist resolved")
+	}
+
+	t.Setenv(gcsConformanceEnv, "")
+	if skip, fail := gcsVerdict(err); skip == "" || fail != "" {
+		t.Errorf("unset gate, no credentials: skip=%q fail=%q, want a skip", skip, fail)
+	}
+	t.Setenv(gcsConformanceEnv, "1")
+	if skip, fail := gcsVerdict(err); fail == "" || skip != "" || !strings.Contains(fail, gcsConformanceEnv) {
+		t.Errorf("set gate, no credentials: skip=%q fail=%q, want a failure naming the variable", skip, fail)
+	}
+	if skip, fail := gcsVerdict(nil); skip != "" || fail != "" {
+		t.Errorf("resolved credentials: skip=%q fail=%q, want neither", skip, fail)
+	}
+}
+
+// TestGCSTeardownFailureFailsTheBinary: a bucket teardown cannot remove is
+// recorded where TestMain turns it into a non-zero exit, under the URI an
+// operator sweeps by.
+func TestGCSTeardownFailureFailsTheBinary(t *testing.T) {
+	srv := gcstest.New(t)
+	srv.AddBucket("bodega-conf-stuck")
+	srv.FailNext("DELETE /storage/v1/b/bodega-conf-stuck", 100)
+	before := leakedCount.Load()
+	dropLiveGCSBucket(t, srv.Client(t), "bodega-conf-stuck")
+	leaked.Lock()
+	recorded := slices.Contains(leaked.names, "gs://bodega-conf-stuck")
+	// The leak is this test's own, staged against a fake: take it back out so
+	// TestMain does not fail a run that leaked nothing.
+	leaked.names = slices.DeleteFunc(leaked.names, func(n string) bool { return n == "gs://bodega-conf-stuck" })
+	leaked.Unlock()
+	leakedCount.Store(before)
+	if !recorded {
+		t.Error("a bucket teardown could not delete was not recorded as leaked")
+	}
+
+	srv.AddBucket("bodega-conf-clean")
+	store := NewGCS(srv.Client(t), "bodega-conf-clean")
+	if err := store.Put(t.Context(), "a/b", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	dropLiveGCSBucket(t, srv.Client(t), "bodega-conf-clean")
+	if srv.Bucket("bodega-conf-clean") != nil || leakedCount.Load() != before {
+		t.Error("teardown left a bucket it could have removed, or recorded a leak for one it removed")
 	}
 }
 
@@ -1110,6 +1303,12 @@ func sameLocationSpellings(t *testing.T) map[string][]ObjectStore {
 		// spellings that would need cleaning are refused at load, and s3
 		// takes no prefix of its own: s3://<bucket> is one string per bucket.
 		// Label reads no network, so this entry needs no credentials.
+		// A bucket name is global and the driver takes no endpoint, so two
+		// clients naming one bucket are one location. Label reads no network.
+		"gcs": {
+			NewGCS(gcstest.New(t).Client(t), "bodega-conf-label"),
+			NewGCS(gcstest.New(t).Client(t), "bodega-conf-label"),
+		},
 		"s3": {
 			NewS3(bos3.NewClientFromConfig(aws.Config{Region: "us-west-2"}, "bodega-conf-label", "us-west-2")),
 			NewS3(bos3.NewClientFromConfig(aws.Config{Region: "us-east-1"}, "bodega-conf-label", "us-east-1")),
