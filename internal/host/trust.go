@@ -320,6 +320,11 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	if err := clientconf.PipInstallError(layers, t.Getenv); err != nil {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip install exits while it converts its configured options, before any request: %v. Whether pip reaches bodega or verifies its certificate is unchecked", err)}}
 	}
+	// Ahead of asking whether an index names bodega: the alias is one, read
+	// by pip and not here.
+	if from := clientconf.PipIndexAlias(layers, t.Getenv); from != "" {
+		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's configuration sets pypi-url (%s), a second name for index-url that doctor does not interpret, so which index pip install asks, and whether it reaches bodega or verifies its certificate, is unchecked", from)}}
+	}
 	if !pipReaches(t, files, u) {
 		if t.env("PIP_CONFIG_FILE") != os.DevNull {
 			return nil
@@ -337,6 +342,11 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 			return nil
 		}
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("the environment's PIP_CONFIG_FILE is %s, which tells pip to load no configuration file, so the pip.conf pointing at bodega is not read and whether pip reaches bodega or verifies its certificate is unchecked", os.DevNull)}}
+	}
+	// An index naming bodega that pip install drops is no endpoint: no store
+	// is verified against a host pip never contacts.
+	if from := clientconf.PipNoIndex(layers, t.Getenv); from != "" {
+		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip is told to use no index (%s), and with no-index set pip install drops the index naming bodega before its first request, so pip does not reach bodega and whether it would verify bodega's certificate is unchecked", from)}}
 	}
 	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
 		if v := t.env(key); v != "" {
@@ -662,7 +672,7 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	files := clientconf.GitConfigFiles(t.Getenv, t.Home, t.Root)
 	if bad := clientconf.GitLoadError(files); bad != "" {
-		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git refuses to load %s and aborts every command that reads it, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
+		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git fetch and git clone do not run with %s: git stops on a variable it cannot convert, whichever section holds it, and doctor does not vouch for one it does not interpret, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
 	}
 	// A rewrite to a base git does not normalize is no evidence that git is
 	// not sent to bodega, and no URL-scoped setting applies to it.

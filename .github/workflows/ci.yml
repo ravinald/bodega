@@ -103,6 +103,37 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26.13.0
+      # The pip, git and helm the same tests hold doctor's pip, git and helm
+      # ports against: pip 26.2.1, Git 2.54.0 and Helm v4.3.0, the versions
+      # the ports name. Each comes from its project's own release and is
+      # checked against the SHA-256 that project publishes for it, since the
+      # runner image carries whichever versions it was built with and a test
+      # that finds another version fails here.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.15.2
+      - name: Native oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          printf '%s\n' 'pip==26.2.1 --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e' > pip-oracle.txt
+          python3 -m pip install --disable-pip-version-check --no-deps --require-hashes -r pip-oracle.txt
+          mkdir -p oracles/bin
+          curl -fsSLO https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz
+          echo '86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb  helm-v4.3.0-linux-amd64.tar.gz' | sha256sum -c -
+          tar -xzf helm-v4.3.0-linux-amd64.tar.gz
+          install -m 0755 linux-amd64/helm oracles/bin/helm
+          curl -fsSLO https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz
+          echo 'f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3  git-2.54.0.tar.xz' | sha256sum -c -
+          tar -xf git-2.54.0.tar.xz
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
+          make -C git-2.54.0 -j"$(nproc)" prefix="$RUNNER_TEMP/oracles" NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 install
+          echo "$RUNNER_TEMP/oracles/bin" >> "$GITHUB_PATH"
+          oracles/bin/git version
+          oracles/bin/helm version --short
+          python3 -m pip --version
       - run: make test TEST_FLAGS=-coverprofile=coverage.out
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1

@@ -2,6 +2,7 @@ package clientconf
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -1075,10 +1076,19 @@ func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
 }
 
 func TestIndependentCANamedEntryPreservation(t *testing.T) {
-	raw, _, _ := testCA(t, "bodega.example.com")
+	raw, leaf, key := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(raw)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// A client pair helm can load: it reads both files beside the caFile the
+	// install adds, and an entry naming a pair it cannot read is refused.
+	pair := t.TempDir()
+	certFile, keyFile := filepath.Join(pair, "client.crt"), filepath.Join(pair, "client.key")
+	for path, data := range map[string][]byte{certFile: leaf, keyFile: key} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, tc := range []struct {
 		name         string
@@ -1086,7 +1096,7 @@ func TestIndependentCANamedEntryPreservation(t *testing.T) {
 		before, keep string
 	}{
 		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n", "Architectures: amd64"},
-		{"helm", Helm(testBase), HelmDocument(HelmRepository(testBase, "certFile: /etc/helm/client.crt", "keyFile: /etc/helm/client.key")), "certFile: /etc/helm/client.crt"},
+		{"helm", Helm(testBase), HelmDocument(HelmRepository(testBase, "certFile: "+certFile, "keyFile: "+keyFile)), "certFile: " + certFile},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -2359,7 +2369,7 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 func TestPipOptionsMatchesNativePip(t *testing.T) {
 	python, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("native pip oracle needs python3")
+		oracleAbsent(t, "native pip oracle needs python3")
 	}
 	cases := []string{
 		"[global]\n--cert = /a.pem\nindex-url = https://x/simple/\n",
@@ -2405,7 +2415,7 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 func TestPipLoadErrorMatchesNativePip(t *testing.T) {
 	python, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("native pip oracle needs python3")
+		oracleAbsent(t, "native pip oracle needs python3")
 	}
 	cases := []string{
 		"[global]\ntimeout = 1\ntimeout = 2\n",
@@ -2974,19 +2984,47 @@ func TestAudit24GomodEmptyProxyListRefusesCAPlan(t *testing.T) {
 	}
 }
 
+// oracleAbsent ends a test whose native client is missing, will not say its
+// version, or is at a version the port under test is not of. On a developer's
+// machine that is a skip. In CI it is a failure: the test job installs each
+// client at the version its port names, so an oracle that cannot run there is
+// a broken job, and a skip would pass the port unchecked.
+func oracleAbsent(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("CI") == "true" {
+		t.Fatalf("in CI, where the test job installs this oracle: "+format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // nativePip261 finds a python3 whose pip is the 26.2.1 PipInstallError
-// ports, or skips: another pip declares other options.
+// ports: another pip declares other options.
 func nativePip261(t *testing.T) string {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("native pip oracle needs python3")
+		oracleAbsent(t, "native pip oracle needs python3")
 	}
 	out, err := exec.Command(python, "-m", "pip", "--version").Output()
 	if err != nil || !strings.HasPrefix(string(out), "pip 26.2.1 ") {
-		t.Skipf("native pip oracle needs pip 26.2.1, found %q (%v)", strings.TrimSpace(string(out)), err)
+		oracleAbsent(t, "native pip oracle needs pip 26.2.1, found %q (%v)", strings.TrimSpace(string(out)), err)
 	}
 	return python
+}
+
+// nativeGit254 finds the git whose 2.54 the configuration port is of: another
+// release converts other variables.
+func nativeGit254(t *testing.T) string {
+	t.Helper()
+	git, err := exec.LookPath("git")
+	if err != nil {
+		oracleAbsent(t, "native git is not installed")
+	}
+	out, err := exec.Command(git, "version").Output()
+	if err != nil || !strings.HasPrefix(string(out), "git version 2.54.") {
+		oracleAbsent(t, "the port is of Git 2.54.0, and %q converts other variables (%v)", strings.TrimSpace(string(out)), err)
+	}
+	return git
 }
 
 // TestPipInstallOptionsMatchNativePip compares the option table
@@ -3260,20 +3298,13 @@ func TestPipInstallErrorRefusesWhatItDoesNotInterpret(t *testing.T) {
 // git-remote-https, the process that reads http.sslCAInfo and connects, gets
 // past its configuration: started on a URL nothing listens at with no
 // command on stdin, it exits 128 with "fatal:" when a variable does not
-// convert and 1 when all of them do. Every variable the port names is given
-// every value below, alone and under an [http "<url>"] section matching the
-// remote, beside names the port leaves alone.
+// convert and 1 when all of them do. Every variable of http_options and
+// git_default_config is given every value below, alone and under an
+// [http "<url>"] section matching the remote, beside names the port leaves
+// alone. TestGitOperationVarsMatchNativeGit holds the variables git fetch and
+// git clone convert themselves against those commands.
 func TestGitConvertErrorMatchesNativeGit(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native git is required in CI")
-		}
-		t.Skip("native git is not installed")
-	}
-	if out, _ := exec.Command(git, "version").Output(); !strings.HasPrefix(string(out), "git version 2.54.") {
-		t.Skipf("the port is of Git 2.54.0, and %q converts other variables", strings.TrimSpace(string(out)))
-	}
+	git := nativeGit254(t)
 	const remote = "https://127.0.0.1:1/"
 	const novalue = "\x00"
 	common := []string{"maybe", "true", "ON", "1", "abc", "auto", "", novalue}
@@ -3302,8 +3333,7 @@ func TestGitConvertErrorMatchesNativeGit(t *testing.T) {
 	entries = append(entries, []entry{
 		{section: "[advice]", name: "detachedHead"}, {section: "[advice]", name: "statushints"}, {section: "[advice]", name: "noSuchAdvice"},
 		{section: `[advice "x"]`, name: "detachedhead"}, {section: "[http]", name: "nosuchkey"}, {section: `[http "` + remote + `"]`, name: "nosuchkey"},
-		{section: `[core "x"]`, name: "filemode"}, {section: "[core]", name: "eol"}, {section: "[core]", name: "nosuchkey"},
-		{section: "[color]", name: "ui"}, {section: "[pack]", name: "threads"}, {section: `[user "x"]`, name: "name"}, {section: "[CORE]", name: "FileMode"},
+		{section: "[core]", name: "eol"}, {section: "[color]", name: "ui"}, {section: "[alias]", name: "co"}, {section: "[CORE]", name: "FileMode"},
 	}...)
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, 8)
@@ -3360,11 +3390,27 @@ func TestGitConvertErrorMatchesNativeGit(t *testing.T) {
 // under a URL the remote may not match, a color and another account's home.
 // It also pins the line and message GitLoadError carries.
 func TestGitConvertErrorRefusals(t *testing.T) {
-	for body, want := range map[string]string{
+	for body, want := range map[string]string{ //nolint:gosec // G101: names of git's credential section, no credential
 		"[http \"https://other.example/\"]\n\tsslVerify = maybe\n": "bad boolean config value 'maybe' for 'http.sslverify'",
 		"[color \"advice\"]\n\thint = red\n":                       "color.advice.hint",
 		"[http]\n\tsslCAInfo = ~bob/ca.pem\n":                      "the account bob",
 		"[user]\n\tname = x\n[http]\n\tpostBuffer = 1x\n":          "bad numeric config value '1x' for 'http.postbuffer': invalid unit",
+		// A name in a section git fetch and git clone read that the port
+		// holds no conversion for, which git itself ignores.
+		"[core]\n\tnosuchkey = 1\n":                  "'core.nosuchkey' is in a section git fetch and git clone read",
+		"[core \"x\"]\n\tfilemode = true\n":          "'core.x.filemode' is in a section",
+		"[user \"x\"]\n\tname = y\n":                 "'user.x.name' is in a section",
+		"[fetch]\n\tprunee = true\n":                 "'fetch.prunee' is in a section",
+		"[remote \"origin\"]\n\turl = https://x/y\n": "git clone then fetches from what this file names",
+		"[remote \"up\"]\n\tfetch = main\n":          "is a refspec git dies on when it is malformed",
+		"[hook \"x\"]\n\tevent = post-checkout\n":    "has git run a configured command",
+		"[clone]\n\tdefaultRemoteName = a/b\n":       "is a remote name git clone checks",
+		"[core]\n\tsharedRepository = 0640\n":        "is the file mode 0640",
+		"[credential]\n\tuseHttpPath = maybe\n":      "bad boolean config value 'maybe' for 'credential.usehttppath'",
+		"[credential]\n\thelper\n":                   "missing value for 'credential.helper'",
+		"[submodule \"a\"]\n\tactive = maybe\n":      "bad boolean config value 'maybe' for 'submodule.a.active'",
+		"[filter \"lfs\"]\n\trequired = maybe\n":     "bad boolean config value 'maybe' for 'filter.lfs.required'",
+		"[protocol \"https\"]\n\tallow = never\n":    "transport 'https' not allowed",
 	} {
 		if _, msg := GitConvertError(ParseGitConfig([]byte(body))); !strings.Contains(msg, want) {
 			t.Errorf("GitConvertError(%q) = %q; want %q", body, msg, want)
@@ -3377,26 +3423,185 @@ func TestGitConvertErrorRefusals(t *testing.T) {
 	if got := GitLoadError([]string{file}); !strings.Contains(got, file+" (line 4: bad numeric config value 'fast' for 'core.compression': invalid unit") {
 		t.Errorf("GitLoadError = %q", got)
 	}
-	ok := "[user]\n\tname = x\n\temail = x@example.com\n[core]\n\tautocrlf = input\n\tcompression = 9\n[http]\n\tsslVerify = true\n\tpostBuffer = 512m\n\tsslCAInfo = ~/ca.pem\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /etc/ca.pem\n[fetch]\n\tprune = true\n"
+	ok := "[user]\n\tname = x\n\temail = x@example.com\n\tsigningkey = ABCD\n[core]\n\tautocrlf = input\n\tcompression = 9\n\tpager = less\n\tfsmonitor = true\n[http]\n\tsslVerify = true\n\tpostBuffer = 512m\n\tsslCAInfo = ~/ca.pem\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /etc/ca.pem\n[fetch]\n\tprune = true\n" +
+		"[alias]\n\tco = checkout\n[pull]\n\trebase = maybe\n[lfs]\n\tanything = 1\n[credential]\n\thelper = osxkeychain\n\tcredentialStore = cache\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n" +
+		"[init]\n\tdefaultBranch = main\n[push]\n\tautoSetupRemote = true\n[branch]\n\tsort = -committerdate\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\trebase = true\n" +
+		"[remote \"up\"]\n\turl = https://example.com/x.git\n\tfetch = +refs/heads/*:refs/remotes/up/*\n\tfetch = +refs/pull/*/head:refs/remotes/up/pr/*\n[url \"https://bodega.example.com/git/gh/\"]\n\tinsteadOf = https://github.com/\n" +
+		"[maintenance]\n\trepo = /src/x\n\tstrategy = incremental\n[gc]\n\tauto = 0\n[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n" +
+		"[fetch \"fsck\"]\n\tzeroPaddedFilemode = ignore\n\tnoSuchId = whatever\n[protocol]\n\tversion = 2\n[submodule]\n\trecurse = true\n\tfetchJobs = 4\n[advice]\n\tdetachedHead = false\n\tnoSuchAdvice = maybe\n"
 	if line, msg := GitConvertError(ParseGitConfig([]byte(ok))); msg != "" {
 		t.Errorf("valid configuration refused at line %d: %s", line, msg)
 	}
 }
 
-// nativeNpm1120 finds the npm 11.20.0 the type port is of, or skips; in CI,
-// where the workflow installs it, a missing npm fails.
+// TestGitOperationVarsMatchNativeGit compares the conversions gitOpVars holds
+// with git fetch and git clone themselves: each variable the table converts
+// is given each value below in the global configuration, and both commands
+// are run over https against a port nothing listens at, where a command that
+// got past its configuration ends "unable to access", and over file:// from a
+// repository holding one commit, where it exits 0. The port must refuse the
+// value exactly when one of the four runs stops. The serving side of the
+// file:// runs reads no configuration, so only the client's conversions are
+// held to it.
+//
+// Not held to it: a refusal that is doctor's own (a value it does not
+// interpret), and a conversion git runs only in a state these runs do not
+// reach (gitVar.later, and the one value named below).
+func TestGitOperationVarsMatchNativeGit(t *testing.T) {
+	git := nativeGit254(t)
+	home := t.TempDir()
+	env := func(global string) []string {
+		return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + global, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0"}
+	}
+	// A run that outlives its limit is a value that has git start something
+	// which keeps the output open, and is reported in place of hanging the
+	// package's tests.
+	run := func(global string, args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, git, args...)
+		cmd.Dir = home
+		cmd.Env = env(global)
+		cmd.WaitDelay = time.Second
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			t.Errorf("git %v under %s did not exit within a minute", args, global)
+		}
+		return string(out), err
+	}
+	must := func(args ...string) {
+		t.Helper()
+		if out, err := run(os.DevNull, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	seed, empty := filepath.Join(home, "seed"), filepath.Join(home, "empty")
+	must("init", "--quiet", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "f.txt"), []byte("x\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	must("-C", seed, "add", ".")
+	must("-C", seed, "-c", "user.name=a", "-c", "user.email=a@example.com", "commit", "--quiet", "-m", "c")
+	must("init", "--quiet", empty)
+	const remote = "https://127.0.0.1:1/x.git"
+	serve := "--upload-pack=GIT_CONFIG_GLOBAL=" + os.DevNull + " '" + git + "' upload-pack"
+	// stops reports whether git fetch or git clone stops under the global
+	// configuration file, and what the run that stopped printed.
+	stops := func(global, scratch string) (bool, string) {
+		if out, _ := run(global, "-C", empty, "fetch", remote); !strings.Contains(out, "unable to access") {
+			return true, out
+		}
+		if out, _ := run(global, "clone", remote, filepath.Join(scratch, "c1")); !strings.Contains(out, "unable to access") {
+			return true, out
+		}
+		if out, err := run(global, "clone", serve, "file://"+seed, filepath.Join(scratch, "c2")); err != nil {
+			return true, out
+		}
+		fresh := filepath.Join(scratch, "f")
+		if out, err := run(os.DevNull, "init", "--quiet", fresh); err != nil {
+			return true, "init: " + out
+		}
+		if out, err := run(global, "-C", fresh, "fetch", serve, "file://"+seed); err != nil {
+			return true, out
+		}
+		return false, ""
+	}
+	const novalue = "\x00"
+	values := func(v gitVar) []string {
+		switch v.conv {
+		case gitBool:
+			return []string{"maybe", "true", "no", "1k", "99999999999", "", novalue}
+		case gitInt, gitUlong:
+			return []string{"maybe", "true", "1", "2", "3", "-1", "0", "1k", "99999999999", "", novalue}
+		case gitString, gitAny:
+			return []string{"maybe", "", novalue}
+		case gitPath:
+			return []string{"~nosuchuser-bodega/x", "/nonexistent/x", novalue}
+		}
+		return append([]string{"maybe", "true", "1", "always", "ALWAYS", "never", "user", "auto", "error", "warn", "ignore", "", novalue}, v.words...)
+	}
+	// later holds the one value-dependent refusal git reaches only in a state
+	// these runs do not: fsck_set_msg_type refuses to demote a fatal message
+	// once fsckObjects has index-pack check the pack, and not before.
+	later := func(key, value string) bool {
+		return key == "fetch.fsck.nulinheader" && (value == "warn" || value == "ignore")
+	}
+	keys := []string{"fetch.fsck.baddate", "fetch.fsck.nulinheader", "fetch.fsck.nosuchid", "fetch.fsck.skiplist", "protocol.https.allow", "core.pager", "init.defaultbranch", "gc.auto"}
+	for key, v := range gitOpVars {
+		if v.conv != gitAny && !v.later {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for i, key := range keys {
+		parts := strings.Split(key, ".")
+		header, name := "["+parts[0]+"]", parts[len(parts)-1]
+		if len(parts) == 3 {
+			sub := parts[1]
+			if sub == "*" {
+				sub = "other"
+			}
+			header = "[" + parts[0] + " \"" + sub + "\"]"
+		}
+		probe := ParseGitConfig([]byte(header + "\n\t" + name + " = x\n"))
+		_, v, ok, known := probe.Entries[0].lookup()
+		if !ok || !known {
+			t.Errorf("%s: the table has no conversion for its own key", key)
+			continue
+		}
+		for j, value := range values(v) {
+			if later(key, value) {
+				continue
+			}
+			body := header + "\n\t" + name + " = \"" + value + "\"\n"
+			if value == novalue {
+				body = header + "\n\t" + name + "\n"
+			}
+			cfg := ParseGitConfig([]byte(body))
+			if cfg.BadLine != 0 {
+				t.Errorf("%q does not parse", body)
+				continue
+			}
+			e := cfg.Entries[0]
+			full, _, _, _ := e.lookup()
+			msg, own := v.refuses(full, e.Value, e.HasValue)
+			if own {
+				continue
+			}
+			scratch := filepath.Join(home, strconv.Itoa(i)+"-"+strconv.Itoa(j))
+			if err := os.MkdirAll(scratch, 0700); err != nil {
+				t.Fatal(err)
+			}
+			global := filepath.Join(scratch, "gitconfig")
+			if err := os.WriteFile(global, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				if native, out := stops(global, scratch); native != (msg != "") {
+					t.Errorf("%q\n the port: %q\n native git stops = %v: %s", body, msg, native, strings.TrimSpace(out))
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// nativeNpm1120 finds the npm 11.20.0 the type port is of.
 func nativeNpm1120(t *testing.T) string {
 	t.Helper()
 	npm, err := exec.LookPath("npm")
 	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native npm is required in CI")
-		}
-		t.Skip("native npm is not installed")
+		oracleAbsent(t, "native npm is not installed")
 	}
 	out, err := exec.Command(npm, "--version").Output()
 	if v := strings.TrimSpace(string(out)); err != nil || v != "11.20.0" {
-		t.Skipf("the port is of npm 11.20.0, and npm %s declares other options (%v)", v, err)
+		oracleAbsent(t, "the port is of npm 11.20.0, and npm %q declares other options (%v)", v, err)
 	}
 	return npm
 }
@@ -3644,5 +3849,278 @@ func TestOptionConversionFailureRefusesCAPlan(t *testing.T) {
 				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
 			}
 		})
+	}
+}
+
+func TestAudit25GitFetchConversionRefusesCAPlan(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".gitconfig")
+	bad := "[fetch]\n\tprune = maybe\n"
+	if err := os.WriteFile(target, []byte(bad), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(home, "repo")
+	init := exec.Command(git, "init", "--quiet", repo)
+	init.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + target}
+	if out, err := init.CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+	fetch := exec.Command(git, "-C", repo, "fetch", "https://127.0.0.1:1/audit.git")
+	fetch.Env = init.Env
+	out, err := fetch.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "bad boolean config value 'maybe' for 'fetch.prune'") {
+		t.Fatalf("native fetch: %v: %s", err, out)
+	}
+	t.Logf("native fetch: %s", out)
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := caPlan(t, home, Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}))
+	in, err := AddCA(plan, ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "fetch.prune") || len(in.Changes) != 0 {
+		t.Errorf("native-invalid fetch accepted: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+func TestAudit25HelmMissingPairRefusesCAPlan(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".config/helm/repositories.yaml")
+	cert, key := filepath.Join(home, "missing.crt"), filepath.Join(home, "missing.key")
+	body := "repositories:\n- name: bodega\n  url: " + testBase + "/helm\n  certFile: " + cert + "\n  keyFile: " + key + "\n"
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err == nil || !strings.Contains(err.Error(), "cert") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("unloadable Helm pair accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit25MissingPipOracleFailsInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.v", "-test.run=^TestPipInstallOptionsMatchNativePip$")
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "CI=") {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("missing native pip oracle passed CI:\n%s", out)
+	}
+}
+
+func TestAudit25ContainerdV2ConversionRefusesCAPlan(t *testing.T) {
+	home := t.TempDir()
+	file := filepath.Join(home, "etc/containerd/config.toml")
+	body := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\nmax_concurrent_downloads = \"three\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || len(in.Changes) != 0 {
+		t.Errorf("unloadable version 2 CRI policy accepted: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+// TestContainerdCRITablesDecodeAsContainerdDoes pins what makes containerd
+// v2.2.0 serve no CRI pull for each config.toml format: a wrong type or a
+// refused value in the image, runtime or CRI plugin's table, read from the
+// one table versions 1 and 2 keep them in as its migration moves the keys.
+func TestContainerdCRITablesDecodeAsContainerdDoes(t *testing.T) {
+	const v2 = "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\n"
+	const v3 = "version = 3\n"
+	for name, tc := range map[string]struct{ body, invalid, err string }{
+		"v2 as kubeadm writes it": {body: v2 + "sandbox_image = \"registry.k8s.io/pause:3.10\"\nmax_concurrent_downloads = 3\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" +
+			"[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"overlayfs\"\ndefault_runtime_name = \"runc\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\nsandbox_mode = \"podsandbox\"\n" +
+			"[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]\nSystemdCgroup = true\n[plugins.\"io.containerd.grpc.v1.cri\".cni]\nbin_dir = \"/opt/cni/bin\"\n"},
+		"v1 as containerd 1.x wrote it": {body: "[plugins.cri]\nstream_server_port = \"0\"\n[plugins.cri.registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"},
+		"v1 image key":                  {body: "[plugins.cri]\nmax_concurrent_downloads = \"three\"\n", invalid: "what it migrates its version 1 CRI table into"},
+		"v2 image duration":             {body: v2 + "image_pull_progress_timeout = \"soon\"\n", invalid: "invalid image pull progress timeout"},
+		"v2 runtime key":                {body: v2 + "enable_selinux = \"yes\"\n", invalid: "CRI runtime plugin"},
+		"v2 server duration":            {body: v2 + "stream_idle_timeout = \"soon\"\n", invalid: "invalid stream idle timeout"},
+		"v2 moved key":                  {body: v2 + "sandbox_image = 5\n", invalid: "what it migrates its version 2 CRI table into"},
+		"v2 containerd not a table":     {body: v2 + "containerd = \"runc\"\n", invalid: "what it migrates"},
+		"v2 default runtime undefined":  {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n", invalid: "no corresponding runtime configured"},
+		"v2 default runtime defined":    {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.kata]\nruntime_type = \"io.containerd.kata.v2\"\n"},
+		"v2 default runtime, imports":   {body: "imports = [\"/etc/containerd/conf.d/*.toml\"]\n" + v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n"},
+		"v2 beside a v3 table":          {body: v2 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/x\"\n", err: "does not follow that merge"},
+		"v1 beside the long name":       {body: "[plugins.cri]\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/x\"\n", err: "does not follow that merge"},
+		"v3 runtime key":                {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\"]\nmax_container_log_line_size = \"big\"\n", invalid: "CRI runtime plugin"},
+		"v3 runtime io_type":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\nio_type = \"pipe\"\n", invalid: "`io_type` can only be"},
+		"v3 cgroup_writable":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\ncgroup_writable = true\n", invalid: "doctor does not interpret"},
+		"v3 server key":                 {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\ndisable_tcp_service = \"no\"\n", invalid: "CRI plugin"},
+		"v3 stream key without TLS":     {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\".x509_key_pair_streaming]\ntls_cert_file = \"/c.pem\"\n", invalid: "EnableTLSStreaming is not set"},
+		"v3 legacy keys are unknown":    {body: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nsandbox_image = 5\nmax_concurrent_downloads = \"three\"\n"},
+		"v3 as containerd 2.x writes":   {body: v3 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc.options]\nSystemdCgroup = true\n"},
+	} {
+		r, err := ReadContainerdConfig([]byte(tc.body))
+		switch {
+		case tc.err != "":
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("%s: err = %v; want one naming %q", name, err, tc.err)
+			}
+		case err != nil:
+			t.Errorf("%s: %v", name, err)
+		case tc.invalid == "" && r.Invalid != "":
+			t.Errorf("%s: refused a configuration containerd starts its CRI plugins on: %s", name, r.Invalid)
+		case !strings.Contains(r.Invalid, tc.invalid):
+			t.Errorf("%s: Invalid = %q; want %q", name, r.Invalid, tc.invalid)
+		}
+	}
+}
+
+// TestPipIndexPolicyFollowsPipOrder pins which no-index pip install runs
+// with, by pip's own order of [global], [install] and the environment, and
+// that the pypi-url alias is reported wherever it is set.
+func TestPipIndexPolicyFollowsPipOrder(t *testing.T) {
+	layer := func(body string) []PipLayer { return []PipLayer{{File: "pip.conf", Data: []byte(body)}} }
+	env := func(kv ...string) func(string) string {
+		return func(key string) string {
+			for i := 0; i < len(kv); i += 2 {
+				if kv[i] == key {
+					return kv[i+1]
+				}
+			}
+			return ""
+		}
+	}
+	for name, tc := range map[string]struct {
+		body   string
+		getenv func(string) string
+		want   string
+	}{
+		"unset":                        {body: "[global]\nindex-url = https://x/simple/\n"},
+		"global":                       {body: "[global]\nno-index = true\n", want: "[global]"},
+		"global spelled as pip folds":  {body: "[global]\n--No_Index = YES\n", want: "[global]"},
+		"install replaces global":      {body: "[global]\nno-index = true\n[install]\nno-index = false\n"},
+		"install sets it":              {body: "[global]\nno-index = 0\n[install]\nno-index = on\n", want: "[install]"},
+		"another command's section":    {body: "[download]\nno-index = true\n"},
+		"environment replaces a file":  {body: "[install]\nno-index = true\n", getenv: env("PIP_NO_INDEX", "0")},
+		"environment sets it":          {body: "[global]\nno-index = false\n", getenv: env("PIP_NO_INDEX", "1"), want: "PIP_NO_INDEX"},
+		"an empty variable is not set": {body: "[global]\nno-index = true\n", getenv: env("PIP_NO_INDEX", ""), want: "[global]"},
+	} {
+		if got := PipNoIndex(layer(tc.body), tc.getenv); (got == "") != (tc.want == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: PipNoIndex = %q; want one naming %q", name, got, tc.want)
+		}
+	}
+	later := []PipLayer{{File: "a.conf", Data: []byte("[global]\nno-index = true\n")}, {File: "b.conf", Data: []byte("[global]\nno-index = false\n")}}
+	if got := PipNoIndex(later, nil); got != "" {
+		t.Errorf("a later file's value did not replace an earlier one's: %q", got)
+	}
+	for name, tc := range map[string]struct {
+		body   string
+		getenv func(string) string
+		want   string
+	}{
+		"unset":       {body: "[global]\nindex-url = https://x/simple/\n"},
+		"global":      {body: "[global]\npypi-url = https://x/simple/\n", want: "[global]"},
+		"install":     {body: "[install]\nPyPI_URL = https://x/simple/\n", want: "[install]"},
+		"environment": {body: "", getenv: env("PIP_PYPI_URL", "https://x/simple/"), want: "PIP_PYPI_URL"},
+	} {
+		if got := PipIndexAlias(layer(tc.body), tc.getenv); (got == "") != (tc.want == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: PipIndexAlias = %q; want one naming %q", name, got, tc.want)
+		}
+	}
+}
+
+// TestPipIndexPolicyMatchesNativePip holds PipNoIndex and PipIndexAlias
+// against pip install's own choice of indexes: pip download prints "Looking
+// in indexes" with each index it is about to ask and nothing of the kind
+// under no-index, and an index set through pypi-url is one it names there.
+func TestPipIndexPolicyMatchesNativePip(t *testing.T) {
+	python := nativePip261(t)
+	const index, alias = "http://127.0.0.1:9/index/", "http://127.0.0.1:9/alias/"
+	for name, tc := range map[string]struct {
+		body string
+		env  []string
+	}{
+		"plain":               {body: "[global]\nindex-url = " + index + "\n"},
+		"global no-index":     {body: "[global]\nindex-url = " + index + "\nno-index = true\n"},
+		"install overrides":   {body: "[global]\nindex-url = " + index + "\nno-index = true\n[install]\nno-index = false\n"},
+		"environment sets":    {body: "[global]\nindex-url = " + index + "\n", env: []string{"PIP_NO_INDEX=1"}},
+		"environment unsets":  {body: "[global]\nindex-url = " + index + "\nno-index = true\n", env: []string{"PIP_NO_INDEX=0"}},
+		"alias":               {body: "[global]\npypi-url = " + alias + "\n"},
+		"alias after index":   {body: "[global]\nindex-url = " + index + "\npypi-url = " + alias + "\n"},
+		"alias from the env":  {body: "[global]\nindex-url = " + index + "\n", env: []string{"PIP_PYPI_URL=" + alias}},
+		"download's own bool": {body: "[global]\nindex-url = " + index + "\n[download]\nno-index = true\n"},
+	} {
+		home := t.TempDir()
+		file := filepath.Join(home, "pip.conf")
+		if err := os.WriteFile(file, []byte(tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// pip install and pip download share the index options; install is
+		// what the configuration is judged for, so its section is read.
+		cmd := exec.Command(python, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--no-deps", "--no-cache-dir", "--disable-pip-version-check", "--retries", "0", "--timeout", "1", "--target", filepath.Join(home, "t"), "bodega-ca-audit-does-not-exist==1.0.0")
+		cmd.Dir = home
+		cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "PIP_CONFIG_FILE=" + file}, tc.env...)
+		out, _ := cmd.CombinedOutput()
+		getenv := func(key string) string {
+			for _, kv := range tc.env {
+				if k, v, _ := strings.Cut(kv, "="); k == key {
+					return v
+				}
+			}
+			return ""
+		}
+		layers := []PipLayer{{File: file, Data: []byte(tc.body)}}
+		if native, got := !strings.Contains(string(out), "Looking in indexes"), PipNoIndex(layers, getenv) != ""; native != got {
+			t.Errorf("%s: PipNoIndex says pip asks no index = %v, native pip = %v: %s", name, got, native, strings.TrimSpace(string(out)))
+		}
+		if native, got := strings.Contains(string(out), alias), PipIndexAlias(layers, getenv) != ""; native && !got {
+			t.Errorf("%s: native pip asks the index pypi-url names and PipIndexAlias reports none: %s", name, strings.TrimSpace(string(out)))
+		}
+	}
+}
+
+// TestHelmEntryMovedToBodegaKeepsItsPairObligation covers the entry a plan
+// moves to bodega from another URL: it keeps the certFile and keyFile it had,
+// helm loads them with the caFile the install adds, and a pair that does not
+// load is refused before anything is written.
+func TestHelmEntryMovedToBodegaKeepsItsPairObligation(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, ".config/helm/repositories.yaml")
+	body := "repositories:\n- name: bodega\n  url: https://old.example/helm\n  certFile: " + filepath.Join(home, "missing.crt") + "\n  keyFile: " + filepath.Join(home, "missing.key") + "\n"
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
+	if err == nil || !strings.Contains(err.Error(), "unable to read cert file") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("a moved entry's unloadable pair was accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
 	}
 }

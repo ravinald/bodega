@@ -1857,3 +1857,67 @@ func TestOptionConversionFailureIsUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit25GitFetchConversionIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".gitconfig")
+	body := "[url \"" + base + "/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http]\n\tsslCAInfo = " + ca + "\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "git-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, body+"[fetch]\n\tprune = maybe\n")
+	if v := auditState(t, p, "git-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "fetch.prune") {
+		t.Errorf("native-invalid fetch certified: %+v", v)
+	}
+	rows := p.Apply(p.Rows(base), base)
+	for _, r := range rows {
+		if r.Check == "git-config" && (r.Status != StatusWarn || !strings.Contains(r.Detail, "unchecked")) {
+			t.Errorf("ordinary row: %+v", r)
+		}
+	}
+}
+
+func TestAudit25PipNoIndexDoesNotReachBodega(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".config/pip/pip.conf")
+	body := "[global]\nindex-url = " + base + "/pypi/simple/\ncert = " + ca + "\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "pip-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, body+"no-index = true\n")
+	if v := auditState(t, p, "pip-config", base); v.State == TrustVerified {
+		t.Errorf("disabled index certified: %+v", v)
+	}
+}
+
+func TestAudit25ContainerdV2ConversionIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Root, "etc/containerd/config.toml")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\n")
+	body := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\nmax_concurrent_downloads = 3\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "oci-containerd", base); v.State != TrustVerified && v.State != TrustUnchecked {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, strings.ReplaceAll(body, "downloads = 3", "downloads = \"three\""))
+	if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+		t.Errorf("native-invalid version 2 plugin certified: %+v", v)
+	}
+	rows := p.Apply([]Finding{{Check: "oci-containerd", Status: StatusOK}}, base)
+	if rows[0].Status != StatusWarn || !strings.Contains(rows[0].Detail, "unchecked") {
+		t.Errorf("ordinary row: %+v", rows[0])
+	}
+}
+
+// TestPipIndexAliasIsUnchecked covers pypi-url, the second name pip install
+// takes for index-url: doctor does not interpret it, so a configuration that
+// sets it is unchecked, never read as naming no bodega index.
+func TestPipIndexAliasIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	writeTrustFile(t, filepath.Join(p.Home, ".config/pip/pip.conf"), "[global]\npypi-url = "+base+"/pypi/simple/\ncert = "+ca+"\n")
+	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "pypi-url") {
+		t.Errorf("a pip configured through pypi-url: %+v", v)
+	}
+}

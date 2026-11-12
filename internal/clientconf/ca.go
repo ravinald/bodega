@@ -250,6 +250,17 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 	if err := PipInstallError(layers, h.Getenv); err != nil {
 		return fmt.Errorf("%s: pip install exits while it converts its configured options, before it reads any index or cert this command would write: %v. The install could not be verified. Nothing was written. Correct or remove that setting so pip starts, then re-run", rec.System, err)
 	}
+	// The same holds for what decides which index pip asks at all: the plan
+	// writes index-url and leaves no-index and the pypi-url alias as the
+	// account set them.
+	if from := PipNoIndex(layers, h.Getenv); from != "" {
+		return fmt.Errorf("%s: pip is told to use no index (%s), and with no-index set pip install drops index-url and every extra-index-url before its first request, so it would never ask the bodega index this command writes to %s and the CA installed for it would verify nothing. "+
+			"Nothing was written, and no-index is left as it is. Remove no-index where pip should install from bodega, then re-run", rec.System, from, target)
+	}
+	if from := PipIndexAlias(layers, h.Getenv); from != "" {
+		return fmt.Errorf("%s: pip's configuration sets pypi-url (%s), a second name for index-url that this command does not interpret, so which index pip install asks once index-url is written to %s cannot be told. "+
+			"Nothing was written. Write that index as index-url, or remove pypi-url, then re-run", rec.System, from, target)
+	}
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -434,8 +445,8 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		// unchecked after the write is refused before it.
 		files := append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)
 		if bad := GitLoadError(files); bad != "" {
-			return fmt.Errorf("%s: git refuses to load %s and aborts every command that reads it, so it would read neither the rewrite nor the CA written to %s, and the install could not be verified. "+
-				"Nothing was written. Fix that line so git loads the file (git config --file <file> --list names it), then re-run", rec.System, bad, target)
+			return fmt.Errorf("%s: git fetch and git clone do not run with %s. git stops on a variable it cannot convert, whichever section holds it, and doctor refuses one it does not interpret, so whether git would read the rewrite and the CA written to %s could not be verified. "+
+				"Nothing was written. Correct or remove that line (git config --file <file> --list names a line git cannot parse), then re-run", rec.System, bad, target)
 		}
 		if unread := GitRewriteUnread(files); unread != "" {
 			return fmt.Errorf("%s: git rewrites URLs to %s, so whether git reaches bodega through it, and with it whether the CA written to %s is the one git verifies bodega against, cannot be told. "+
@@ -498,15 +509,44 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				if u, perr := url.Parse(r.URL); perr != nil || u.Host != base.Host {
 					continue
 				}
-				// A pair that is named whole and not on disk yet is left
-				// to the verdict after the write, which reads it again: the
-				// plan keeps another party's certFile and keyFile as
-				// written, present or not.
-				if err := r.ClientTLSError(true); err != nil && !(r.CertFile != "" && r.KeyFile != "" && errors.Is(err, os.ErrNotExist)) {
-					return fmt.Errorf("%s: helm builds no client for a repository at bodega in %s (%w), so it would never verify bodega with the CA this command installs, and the install could not be verified. "+
-						"Nothing was written. Correct or remove that repository's certFile and keyFile, then re-run", rec.System, f, err)
+				if err := r.ClientTLSError(true); err != nil {
+					return helmNoClient(rec, f, err)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+func helmNoClient(rec PlanRecord, file string, err error) error {
+	return fmt.Errorf("%s: helm builds no client for a repository at bodega in %s (%w), so it would never verify bodega with the CA this command installs, and the install could not be verified. "+
+		"Nothing was written. Restore the files that repository's certFile and keyFile name, or remove both settings, then re-run", rec.System, file, err)
+}
+
+// helmClientTLS refuses a plan that leaves helm unable to build a client for
+// a repository at bodega: planned is the file as the plan writes it, merged
+// with the host's, where an entry the plan moves to bodega from another URL
+// keeps the certFile and keyFile it had.
+// helm loads that pair with the caFile this command adds, and an entry whose
+// pair does not load reaches no repository, whichever CA it names.
+func (h CAHost) helmClientTLS(rec PlanRecord, target string, planned []byte) error {
+	doc, err := ParseHelmFile(planned)
+	if err != nil {
+		return fmt.Errorf("%s: the repository file this command would write to %s is one helm refuses to load (%w). Nothing was written", rec.System, target, err)
+	}
+	base, _ := url.Parse(h.Base)
+	if doc == nil || base == nil {
+		return nil
+	}
+	for _, r := range doc.Repositories {
+		if r == nil {
+			continue
+		}
+		if u, perr := url.Parse(r.URL); perr != nil || u.Host != base.Host {
+			continue
+		}
+		if err := r.ClientTLSError(true); err != nil {
+			return helmNoClient(rec, target, err)
 		}
 	}
 	return nil
@@ -946,6 +986,11 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				}
 				in.Changes[i].New = merged
 			}
+			if rec.System == manifest.TypeHelm {
+				if err := h.helmClientTLS(rec, c.Target, in.Changes[i].New); err != nil {
+					return CAInstall{}, err
+				}
+			}
 			// A file the environment has this client read in place of the
 			// plan's takes the same merge, whichever store the client
 			// verifies through: its entry may name a CA that replaces the
@@ -965,6 +1010,11 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				merged, err := kind.merge(old, planned)
 				if err != nil {
 					return CAInstall{}, refuse(sh.path, err)
+				}
+				if rec.System == manifest.TypeHelm {
+					if err := h.helmClientTLS(rec, sh.path, merged); err != nil {
+						return CAInstall{}, err
+					}
 				}
 				also := rec
 				also.Path = sh.path

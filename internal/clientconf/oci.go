@@ -415,12 +415,26 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 			r.Invalid = err.Error()
 		}
 	}
-	// Only a version 3 file holds the image plugin's table as that plugin
-	// decodes it. An older one is migrated first, which doctor does not
+	// containerd 2.x migrates a version 1 or 2 file to version 3 before any
+	// plugin decodes its table: v1Migrate renames [plugins.cri], and the CRI
+	// plugins move that table's keys into their own. A file of an older
+	// version that also holds a table under a name the migration writes to is
+	// one whose result depends on which table wins, which doctor does not
 	// follow.
-	if r.Version == 3 && r.Invalid == "" {
-		if err := containerdImagePluginError(data); err != nil {
-			r.Invalid = "the CRI image plugin, which reads the registry configuration, does not start on its table: " + err.Error()
+	if r.Version < 3 {
+		later := []string{containerdImagesPlugin, containerdRuntimePlugin}
+		if r.Version == 1 {
+			later = append(later, containerdCRIPlugin)
+		}
+		for _, name := range later {
+			if _, ok := tomlTable(doc, []string{"plugins"})[name]; ok {
+				return r, fmt.Errorf("it declares version = %d and holds [plugins.%s], a table of a later format that containerd 2.x merges with the one it migrates [plugins.%s] into; doctor does not follow that merge. Move its settings into [plugins.%s], or migrate the file with containerd config migrate", r.Version, jsonString(name), strings.Trim(jsonString(path[1]), `"`), strings.Trim(jsonString(path[1]), `"`))
+			}
+		}
+	}
+	if r.Invalid == "" {
+		if err := containerdCRIError(data, r.Version, path[1], version == 0 && len(cfg.Imports) == 0); err != nil {
+			r.Invalid = err.Error()
 		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to

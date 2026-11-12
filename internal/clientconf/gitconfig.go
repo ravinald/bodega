@@ -286,13 +286,13 @@ func (e GitEntry) Key() string {
 	return strings.TrimPrefix(strings.Join(append(parts, e.Name), "."), ".")
 }
 
-// GitLoadError names the first of files git refuses to run with, as a phrase
-// a diagnostic can carry: a file it cannot parse, with the line it stops at,
-// or one holding a variable git dies on while converting it
-// (GitConvertError), with that line and git's message. "" when git loads and
-// converts every one that can be read. git aborts on such a file whichever
-// section the line sits in, so nothing else it holds is configuration git
-// runs with.
+// GitLoadError names the first of files git fetch and git clone do not run
+// with, or doctor cannot tell so of, as a phrase a diagnostic can carry: a
+// file git cannot parse, with the line it stops at, or one holding a variable
+// GitConvertError names, with that line and its message. "" when git loads
+// every one that can be read and converts each variable those commands read.
+// git aborts on such a file whichever section the line sits in, so nothing
+// else it holds is configuration git runs with.
 func GitLoadError(files []string) string {
 	for _, f := range files {
 		data, err := os.ReadFile(f)
@@ -301,10 +301,10 @@ func GitLoadError(files []string) string {
 		}
 		cfg := ParseGitConfig(data)
 		if cfg.BadLine > 0 {
-			return fmt.Sprintf("%s (bad config line %d)", f, cfg.BadLine)
+			return fmt.Sprintf("%s (bad config line %d, which git aborts every command on)", f, cfg.BadLine)
 		}
 		if line, msg := GitConvertError(cfg); msg != "" {
-			return fmt.Sprintf("%s (line %d: %s, which git dies on as its HTTPS transport starts)", f, line, msg)
+			return fmt.Sprintf("%s (line %d: %s)", f, line, msg)
 		}
 	}
 	return ""

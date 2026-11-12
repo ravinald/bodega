@@ -3239,3 +3239,156 @@ func TestAudit24GomodEmptyProxyListRefusesBeforeWrites(t *testing.T) {
 		t.Errorf("invalid GOPROXY ran %d trust rebuild(s)", ran)
 	}
 }
+
+func TestAudit25GitFetchConversionRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home, ".gitconfig")
+	old := "[fetch]\n\tprune = maybe\n"
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "git", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(err.Error(), "fetch.prune") {
+			t.Errorf("%s apply certified unusable fetch: err=%v\n%s", phase, err, out)
+		}
+	}
+	if got, _ := os.ReadFile(file); string(got) != old {
+		t.Errorf("unusable Git policy was written:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Errorf("CA written before refusal: %v", err)
+	}
+	prev := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = prev })
+	out, _ := runDoctor(t, "--url", srv.URL)
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "git-config") {
+			found = true
+			if !strings.Contains(line, "unchecked") || !strings.Contains(line, "fetch.prune") {
+				t.Errorf("ordinary doctor: %s", line)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("ordinary doctor omitted Git: %s", out)
+	}
+}
+
+func TestAudit25HelmMissingPairRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	old := "repositories:\n- name: bodega\n  url: " + srv.URL + "/helm\n  certFile: " + filepath.Join(home, "missing.crt") + "\n  keyFile: " + filepath.Join(home, "missing.key") + "\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
+	ran := 0
+	doctorRun = func(string, ...string) error { ran++; return nil }
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	out, err := runDoctor(t, "--configure", "helm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err == nil {
+		t.Errorf("unloadable Helm pair accepted:\n%s", out)
+	}
+	if got, _ := os.ReadFile(file); string(got) != old {
+		t.Errorf("repository changed before refusal:\n%s", got)
+	}
+	anchor := filepath.Join(home, "usr/local/share/ca-certificates/bodega-ca.crt")
+	if _, err := os.Stat(anchor); !os.IsNotExist(err) {
+		t.Errorf("anchor written before refusal: %v", err)
+	}
+	if ran != 0 {
+		t.Errorf("unloadable Helm pair ran %d trust rebuild(s); returned %v", ran, err)
+	}
+}
+
+func TestAudit25PipNoIndexRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/pip.conf")
+	old := "[global]\nno-index = true\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIP_CONFIG_FILE", file)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "pypi", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("%s apply certified a disabled index:\n%s", phase, out)
+		}
+	}
+	if got, _ := os.ReadFile(file); string(got) != old {
+		t.Errorf("disabled index config changed:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Errorf("CA written before refusal: %v", err)
+	}
+}
+
+func TestAudit25ContainerdV2ConversionRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t, "containerd")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/containerd/config.toml")
+	old := "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\"]\nmax_concurrent_downloads = \"three\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prevRoot := doctorOCIRoot
+	doctorOCIRoot = home
+	t.Cleanup(func() { doctorOCIRoot = prevRoot })
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("%s apply certified an unloadable version 2 plugin:\n%s", phase, out)
+		}
+	}
+	for _, name := range []string{".config/bodega/ca.pem", "etc/containerd/certs.d/docker.io/hosts.toml"} {
+		if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
+			t.Errorf("wrote %s before refusal: %v", name, err)
+		}
+	}
+}

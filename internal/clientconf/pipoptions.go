@@ -162,6 +162,14 @@ type pipSet struct {
 // configuration and bundle, and an uploaded-prior-to outside the forms every
 // Python pip supports parses alike.
 func PipInstallError(layers []PipLayer, getenv func(string) string) error {
+	return pipInstallRefusal(pipGroups(layers, getenv))
+}
+
+// pipGroups is the configuration pip install converts, as the three groups
+// _get_ordered_configuration_items orders it by: "global" and "install" from
+// the files, a later file replacing an earlier one's value for one section and
+// option, and ":env:" for the PIP_ name of each option the parser declares.
+func pipGroups(layers []PipLayer, getenv func(string) string) map[string][]pipSet {
 	groups := map[string][]pipSet{}
 	put := func(group string, s pipSet) {
 		if i := slices.IndexFunc(groups[group], func(o pipSet) bool { return o.key == s.key }); i >= 0 {
@@ -191,6 +199,52 @@ func PipInstallError(layers []PipLayer, getenv func(string) string) error {
 			put(":env:", pipSet{key: o.name, value: getenv(name), from: "the environment's " + name})
 		}
 	}
+	return groups
+}
+
+// pipInstallValue is the value pip install runs with for one option name, and
+// where it came from: the last of [global], [install] and the environment to
+// set it to anything but the empty string, which is the order _update_defaults
+// assigns them in. "" when nothing sets it.
+func pipInstallValue(groups map[string][]pipSet, name string) (value, from string) {
+	for _, group := range []string{"global", "install", ":env:"} {
+		for _, s := range groups[group] {
+			if s.key == name && s.value != "" {
+				value, from = s.value, s.from
+			}
+		}
+	}
+	return value, from
+}
+
+// PipNoIndex is where pip install is told to ask no index, or "" when it asks
+// the ones configured. With no-index true, LinkCollector.create in pip 26.2.1
+// (pip/_internal/index/collector.py:391-396) drops index-url and every
+// extra-index-url before the first request, so an index naming bodega is one
+// pip never contacts and no certificate is verified for it. The value is the
+// one pip install runs with, [global] then [install] then PIP_NO_INDEX, read
+// by pip's strtobool; PipInstallError has already refused one that is no
+// truth value.
+func PipNoIndex(layers []PipLayer, getenv func(string) string) string {
+	value, from := pipInstallValue(pipGroups(layers, getenv), "no-index")
+	switch strings.ToLower(value) {
+	case "y", "yes", "t", "true", "on", "1":
+		return from
+	}
+	return ""
+}
+
+// PipIndexAlias is where pip's configuration sets pypi-url, the second name
+// pip install declares for index-url, or "" when nothing does. Both names
+// assign one index, and which wins inside a file is the order pip walks that
+// file's options in, so a configuration setting the alias is refused as not
+// interpreted rather than read as naming no index.
+func PipIndexAlias(layers []PipLayer, getenv func(string) string) string {
+	_, from := pipInstallValue(pipGroups(layers, getenv), "pypi-url")
+	return from
+}
+
+func pipInstallRefusal(groups map[string][]pipSet) error {
 	pass := func(order []string, generalOnly bool) error {
 		for _, group := range order {
 			for _, s := range groups[group] {
