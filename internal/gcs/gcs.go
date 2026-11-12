@@ -154,18 +154,84 @@ const NoncurrentVersionDays = 30
 // that aged either out would finish a compromised service's deletion for it.
 var historyPrefixes = []string{manifest.ManifestsPrefix, manifest.AttestationPrefix}
 
-// LifecycleRule is the one rule InitBucket keeps on the bucket: noncurrent
-// generations under every artifact prefix are deleted after
-// NoncurrentVersionDays, and nothing under historyPrefixes is named.
+// Namespaces are the key prefixes bodega's backends hold in one bucket. Each
+// is "" for the bucket root or ends in "/", as the driver roots keys.
+type Namespaces struct {
+	// Target is the backend InitBucket prepares the bucket for.
+	Target string
+	// Others are the other backends configured on the same bucket. Their
+	// rules are left alone and their history is kept out of every rule.
+	Others []string
+}
+
+func (n Namespaces) all() []string {
+	all := append([]string{n.Target}, n.Others...)
+	slices.Sort(all)
+	return slices.Compact(all)
+}
+
+func describe(namespace string) string {
+	if namespace == "" {
+		return "the bucket root"
+	}
+	return namespace
+}
+
+func historyUnder(namespace string) []string {
+	out := make([]string, len(historyPrefixes))
+	for i, p := range historyPrefixes {
+		out[i] = namespace + p
+	}
+	return out
+}
+
+// selects reports whether a rule matching one of prefixes reaches an object
+// under one of kept. Cloud Storage matches the start of the whole object
+// name, so two prefixes share objects exactly when one starts the other.
+func selects(prefixes, kept []string) bool {
+	for _, p := range prefixes {
+		for _, k := range kept {
+			if strings.HasPrefix(p, k) || strings.HasPrefix(k, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// check refuses a set of namespaces no rules can serve: one backend's
+// artifact prefix that holds another's history. A lifecycle condition cannot
+// exclude a prefix, so the rule that expires the first would expire the
+// second, and dropping either half silently is worse than saying so.
+func (n Namespaces) check(bucket string) error {
+	all := n.all()
+	for _, a := range all {
+		for _, b := range all {
+			if a != b && selects(LifecycleRule(a).Condition.MatchesPrefix, historyUnder(b)) {
+				return fmt.Errorf("gs://%s holds a backend at %s and one at %s, and the rule that expires the first one's artifacts "+
+					"would also match the second one's manifests/ or attestations/, which keep every generation. "+
+					"A Cloud Storage lifecycle rule cannot exclude a prefix, so nothing was written: "+
+					"give one of the two a prefix outside the other's artifact prefixes, or its own bucket",
+					bucket, describe(a), describe(b))
+			}
+		}
+	}
+	return nil
+}
+
+// LifecycleRule is the rule InitBucket keeps on the bucket for the backend
+// rooted at namespace: noncurrent generations under each of its artifact
+// prefixes are deleted after NoncurrentVersionDays, and nothing under its
+// historyPrefixes is named.
 //
 // Cloud Storage needs no second rule for abandoned uploads. A resumable
 // session that never finishes is not an object, appears in no listing and
 // expires on its own after a week.
-func LifecycleRule() gstorage.LifecycleRule {
+func LifecycleRule(namespace string) gstorage.LifecycleRule {
 	var prefixes []string
 	for _, p := range manifest.StoragePrefixes() {
 		if !slices.Contains(historyPrefixes, p) {
-			prefixes = append(prefixes, p)
+			prefixes = append(prefixes, namespace+p)
 		}
 	}
 	slices.Sort(prefixes)
@@ -179,49 +245,87 @@ func LifecycleRule() gstorage.LifecycleRule {
 	}
 }
 
-// ownedRule reports whether a rule on the bucket is one InitBucket wrote. A
-// Cloud Storage rule has no id to mark it with, so ownership is by form: a
-// delete of noncurrent generations scoped to nothing but bodega's own
-// prefixes. That includes one naming manifests/, which is then drift and is
-// rewritten without it. Every other rule is the operator's.
-func ownedRule(r gstorage.LifecycleRule) bool {
-	if r.Action.Type != gstorage.DeleteAction || r.Condition.Liveness != gstorage.Archived || len(r.Condition.MatchesPrefix) == 0 {
-		return false
+// ruleNamespaces returns the namespaces a rule on the bucket could have been
+// written for by InitBucket, and nil for a rule in any other form. A Cloud
+// Storage rule has no id to mark it with, so ownership is by form: a delete
+// of noncurrent generations scoped to nothing but bodega's own prefixes under
+// one namespace. That includes one naming manifests/, which is drift. A
+// prefix can end in more than one storage prefix ("x/oci/manifests/" is
+// manifests/ under "x/oci/" and oci/manifests/ under "x/"), so the answer is
+// every namespace all of the rule's prefixes agree on.
+func ruleNamespaces(r gstorage.LifecycleRule) []string {
+	if r.Action.Type != gstorage.DeleteAction || r.Condition.Liveness != gstorage.Archived {
+		return nil
 	}
-	ours := manifest.StoragePrefixes()
-	for _, p := range r.Condition.MatchesPrefix {
-		if !slices.Contains(ours, p) {
-			return false
+	var agreed []string
+	for i, p := range r.Condition.MatchesPrefix {
+		var candidates []string
+		for _, sp := range manifest.StoragePrefixes() {
+			ns, ok := strings.CutSuffix(p, sp)
+			if ok && (ns == "" || strings.HasSuffix(ns, "/")) {
+				candidates = append(candidates, ns)
+			}
+		}
+		if i > 0 {
+			candidates = slices.DeleteFunc(candidates, func(ns string) bool { return !slices.Contains(agreed, ns) })
+		}
+		if agreed = candidates; len(agreed) == 0 {
+			return nil
 		}
 	}
-	return true
+	return agreed
 }
 
-// reconcileLifecycle returns the rules the bucket should hold, the operator's
-// first and unchanged, and whether current already holds exactly those.
-func reconcileLifecycle(current []gstorage.LifecycleRule) (rules []gstorage.LifecycleRule, satisfied bool) {
-	want := LifecycleRule()
-	var owned []gstorage.LifecycleRule
+// reconcileLifecycle returns the rules the bucket should hold, whether
+// current already holds them, and the rules it removed besides the target's
+// own. Rules in no bodega form are the operator's and come first, unchanged.
+// A bodega-form rule is kept when it is for another namespace, configured
+// here or not (a second install may share the bucket), with one exception: a
+// rule that reaches the history of a namespace configured here is removed,
+// because keeping it deletes what init exists to keep and removing it only
+// costs storage until its owner runs init again.
+func reconcileLifecycle(current []gstorage.LifecycleRule, n Namespaces) (rules []gstorage.LifecycleRule, satisfied bool, removed []gstorage.LifecycleRule) {
+	want := LifecycleRule(n.Target)
+	var kept []string
+	for _, ns := range n.all() {
+		kept = append(kept, historyUnder(ns)...)
+	}
+	changed := false
 	for _, r := range current {
-		if ownedRule(r) {
-			owned = append(owned, r)
-		} else {
+		namespaces := ruleNamespaces(r)
+		sorted := r
+		sorted.Condition.MatchesPrefix = slices.Sorted(slices.Values(r.Condition.MatchesPrefix))
+		switch {
+		case namespaces == nil:
+			rules = append(rules, r)
+		case !satisfied && reflect.DeepEqual(sorted, want):
+			satisfied = true
+		case slices.Contains(namespaces, n.Target):
+			changed = true
+		case selects(r.Condition.MatchesPrefix, kept):
+			changed = true
+			removed = append(removed, r)
+		default:
 			rules = append(rules, r)
 		}
 	}
-	if len(owned) == 1 {
-		have := owned[0]
-		have.Condition.MatchesPrefix = slices.Sorted(slices.Values(have.Condition.MatchesPrefix))
-		satisfied = reflect.DeepEqual(have, want)
+	return append(rules, want), satisfied && !changed, removed
+}
+
+// lifecycleNote says what the target's rule does, in the words init prints.
+func lifecycleNote(namespace string) string {
+	under := ""
+	if namespace != "" {
+		under = " under " + namespace
 	}
-	return append(rules, want), satisfied
+	return fmt.Sprintf("noncurrent versions%s after %dd, %s kept", under, NoncurrentVersionDays, strings.Join(historyUnder(namespace), " and "))
 }
 
 // InitBucket creates the bucket if it is missing and holds it to four
 // controls: uniform bucket-level access, public access prevention enforced,
-// object versioning, and LifecycleRule. It is idempotent, and writes one line
-// per control to out: lowercase when the bucket was already correct,
-// UPPERCASE when this call changed it.
+// object versioning, and LifecycleRule for namespaces.Target. It is
+// idempotent, and writes one line per control to out: lowercase when the
+// bucket was already correct, UPPERCASE when this call changed it.
 //
 // location is used only when the bucket is created, and empty leaves the
 // choice to Cloud Storage. project is asked only then too, so preparing a
@@ -231,17 +335,20 @@ func reconcileLifecycle(current []gstorage.LifecycleRule) (rules []gstorage.Life
 // metageneration this call read. The patch replaces the whole lifecycle
 // configuration, so a rule someone added between the read and the write would
 // otherwise be deleted by it.
-func InitBucket(ctx context.Context, client *gstorage.Client, out io.Writer, bucket, location string, project func(context.Context) (string, error)) error {
+func InitBucket(ctx context.Context, client *gstorage.Client, out io.Writer, bucket, location string, project func(context.Context) (string, error), namespaces Namespaces) error {
 	if out == nil {
 		out = io.Discard
 	}
 	if err := ValidateBucket(bucket); err != nil {
 		return err
 	}
+	if err := namespaces.check(bucket); err != nil {
+		return err
+	}
 	b := client.Bucket(bucket)
 	attrs, err := b.Attrs(ctx)
 	if errors.Is(err, gstorage.ErrBucketNotExist) {
-		return createBucket(ctx, b, out, bucket, location, project)
+		return createBucket(ctx, b, out, bucket, location, project, namespaces.Target)
 	}
 	if err != nil {
 		if statusOf(err) == http.StatusForbidden {
@@ -282,8 +389,12 @@ func InitBucket(ctx context.Context, client *gstorage.Client, out io.Writer, buc
 		changed = true
 	}
 	lifecycle := "  lifecycle:  configured\n"
-	if rules, ok := reconcileLifecycle(attrs.Lifecycle.Rules); !ok {
-		lifecycle = fmt.Sprintf("  lifecycle:  CONFIGURED (noncurrent versions after %dd, manifests/ and attestations/ kept)\n", NoncurrentVersionDays)
+	if rules, ok, removed := reconcileLifecycle(attrs.Lifecycle.Rules, namespaces); !ok {
+		lifecycle = fmt.Sprintf("  lifecycle:  CONFIGURED (%s)\n", lifecycleNote(namespaces.Target))
+		for _, r := range removed {
+			lifecycle += fmt.Sprintf("  lifecycle:  REMOVED the rule matching %s: it reaches manifests/ or attestations/ of a backend configured here\n",
+				strings.Join(r.Condition.MatchesPrefix, ", "))
+		}
 		update.Lifecycle = &gstorage.Lifecycle{Rules: rules}
 		changed = true
 	}
@@ -300,7 +411,7 @@ func InitBucket(ctx context.Context, client *gstorage.Client, out io.Writer, buc
 	return err
 }
 
-func createBucket(ctx context.Context, b *gstorage.BucketHandle, out io.Writer, bucket, location string, project func(context.Context) (string, error)) error {
+func createBucket(ctx context.Context, b *gstorage.BucketHandle, out io.Writer, bucket, location string, project func(context.Context) (string, error), namespace string) error {
 	p, err := project(ctx)
 	if err != nil {
 		return fmt.Errorf("bucket gs://%s does not exist: %w", bucket, err)
@@ -310,7 +421,7 @@ func createBucket(ctx context.Context, b *gstorage.BucketHandle, out io.Writer, 
 		UniformBucketLevelAccess: gstorage.UniformBucketLevelAccess{Enabled: true},
 		PublicAccessPrevention:   gstorage.PublicAccessPreventionEnforced,
 		VersioningEnabled:        true,
-		Lifecycle:                gstorage.Lifecycle{Rules: []gstorage.LifecycleRule{LifecycleRule()}},
+		Lifecycle:                gstorage.Lifecycle{Rules: []gstorage.LifecycleRule{LifecycleRule(namespace)}},
 	})
 	if err != nil {
 		return fmt.Errorf("create bucket gs://%s in project %s: %w", bucket, p, err)
@@ -323,7 +434,7 @@ func createBucket(ctx context.Context, b *gstorage.BucketHandle, out io.Writer, 
 	fmt.Fprintf(out, "  access:     CONFIGURED (uniform bucket-level)\n")
 	fmt.Fprintf(out, "  public:     CONFIGURED (public access prevention enforced)\n")
 	fmt.Fprintf(out, "  versioning: ENABLED\n")
-	fmt.Fprintf(out, "  lifecycle:  CONFIGURED (noncurrent versions after %dd, manifests/ and attestations/ kept)\n", NoncurrentVersionDays)
+	fmt.Fprintf(out, "  lifecycle:  CONFIGURED (%s)\n", lifecycleNote(namespace))
 	return nil
 }
 

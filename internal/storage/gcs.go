@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	gstorage "cloud.google.com/go/storage"
@@ -72,6 +74,8 @@ const publishAttempts = 5
 type GCS struct {
 	bucket *gstorage.BucketHandle
 	name   string
+	// root opens the store's object route (see objectRoute).
+	root string
 	// chunkSize overrides the SDK's 16 MiB upload chunk when positive, so a
 	// test reaches the resumable path with a small body.
 	chunkSize int
@@ -79,7 +83,36 @@ type GCS struct {
 
 // NewGCS wraps one bucket of an existing client as an ObjectStore.
 func NewGCS(client *gstorage.Client, bucket string) *GCS {
-	return &GCS{bucket: client.Bucket(bucket), name: bucket}
+	return &GCS{bucket: client.Bucket(bucket), name: bucket, root: gcsRouteRoot()}
+}
+
+// gcsRouteRoot is where the SDK sends object requests for a client built with
+// no endpoint option, which is how bogcs.Dial builds every one: Cloud Storage
+// itself, or the host STORAGE_EMULATOR_HOST names. storage.NewClient (v1.70.0)
+// reads the variable the same way, taking a bare host as http and replacing
+// any path, and addresses an object there as <scheme>://<host>/<bucket>/<key>,
+// which is also the URL a path-style s3 client on that host sends.
+//
+// The client does not publish the host it chose, so this reads the variable
+// again. A value that does not parse fails NewClient before any store exists.
+func gcsRouteRoot() string {
+	host := os.Getenv("STORAGE_EMULATOR_HOST")
+	if host == "" {
+		return cloudStorageRoot
+	}
+	u := &url.URL{Scheme: "http", Host: host}
+	if strings.Contains(host, "://") {
+		parsed, err := url.Parse(host)
+		if err != nil {
+			return cloudStorageRoot
+		}
+		u = parsed
+	}
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	return u.Scheme + "://" + hostPort(strings.TrimSuffix(strings.ToLower(u.Hostname()), "."), port) + "/"
 }
 
 // identity is the string a GCS object is known by across Head and GetStream.
@@ -287,7 +320,9 @@ func (g *GCS) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix st
 }
 
 // Label is "gs://<bucket>". A bucket name is global and the driver takes no
-// endpoint, so the name is the whole location.
+// endpoint, so the name is the whole identity. An s3 backend on Cloud
+// Storage's S3-compatible endpoint reaches the same bucket under another
+// label, which is what SameLocation is for.
 func (g *GCS) Label() string {
 	return "gs://" + g.name
 }

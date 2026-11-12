@@ -15,12 +15,15 @@ import (
 	"sync"
 	"testing"
 
+	gstorage "cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/gcs/gcstest"
 	"github.com/ravinald/bodega/internal/manifest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/storage"
+	"google.golang.org/api/option"
 )
 
 const exampleToolKey = "binaries/example-tool/2.1.0/example-tool.zip"
@@ -809,5 +812,129 @@ func TestReviewF113MoveSelectionRefusesFIPSRouteAlias(t *testing.T) {
 	selected, err := selectForMove(stores, dst, pm, "", "target")
 	if err == nil || !strings.Contains(err.Error(), "same location") {
 		t.Errorf("selectForMove = %v, %v; want refusal before a FIPS route alias can delete the only copy", selected, err)
+	}
+}
+
+func TestReviewGCSMoveRefusesS3Alias(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	client, err := gstorage.NewClient(t.Context(), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	const bucket = "review-gcs-artifacts"
+	legacyClient := bos3.NewClientFromConfig(aws.Config{
+		Region: "us-east-1", Credentials: aws.AnonymousCredentials{},
+	}, bucket, "us-east-1", func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String("https://storage.googleapis.com")
+		o.UsePathStyle = true
+	})
+	route, err := legacyClient.Route(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("S3 route: %s", route.URL.String())
+	legacy := storage.NewS3(legacyClient)
+	native := storage.NewGCS(client, bucket)
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprint(reverse), func(t *testing.T) {
+			var src, dst storage.ObjectStore = legacy, native
+			if reverse {
+				src, dst = dst, src
+			}
+			stores := &testResolver{def: src, bulk: dst}
+			pm := &manifest.PackageManifest{
+				Type: manifest.TypeBinary, Name: "example-tool",
+				Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+			}
+			selected, err := selectForMove(stores, dst, pm, "", "bulk")
+			if err == nil || !strings.Contains(err.Error(), "same location") {
+				t.Errorf("selectForMove(%q -> %q) = %v, %v; want same-location refusal", src.Label(), dst.Label(), selected, err)
+			}
+		})
+	}
+}
+
+// TestMoveOnGCSEndToEnd runs `pkg move` through the gcs driver against the
+// in-process fake on loopback. A move onto the bucket and a move between two
+// prefixes of it copy, verify, record and delete the source. A move to an s3
+// backend that reaches the same bucket through the same host is refused in
+// both directions' terms (the version is on the gcs name, the target is the
+// s3 one) before a request is sent to it, and the artifact is still there.
+func TestMoveOnGCSEndToEnd(t *testing.T) {
+	srv := gcstest.New(t)
+	srv.AddBucket("move-bucket")
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.Host())
+	isolateAWS(t, "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	for _, env := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"} {
+		t.Setenv(env, "")
+	}
+
+	source, manifestDir := t.TempDir(), t.TempDir()
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "example-tool", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/example-tool.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	artifact := filepath.Join(source, filepath.FromSlash(exampleToolKey))
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("the only copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSpoolConfig(t, map[string]any{
+		"storage_backend": "local",
+		"storage_path":    source,
+		"manifest_dir":    manifestDir,
+		"build_root":      t.TempDir(),
+		"log_dir":         t.TempDir(),
+		"allow_plaintext": true,
+		"storage_backends": map[string]config.StorageSpec{
+			"native": {Driver: "gcs", Bucket: "move-bucket"},
+			"cold":   {Driver: "gcs", Bucket: "move-bucket", Prefix: "cold"},
+			"legacy": {Driver: "s3", Bucket: "move-bucket", Region: "us-east-1", Endpoint: srv.URL, PathStyle: true},
+		},
+	})
+	move := func(to string) error {
+		root := newRootCmd()
+		root.SetArgs([]string{"pkg", "move", "binary", "example-tool", "--to", to, "--delete-source"})
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		return root.Execute()
+	}
+	held := func(key string) bool {
+		data, ok := srv.Object("move-bucket", key)
+		return ok && string(data) == "the only copy"
+	}
+
+	if err := move("native"); err != nil {
+		t.Fatalf("move onto the gcs backend: %v", err)
+	}
+	if _, err := os.Stat(artifact); !held(exampleToolKey) || err == nil {
+		t.Fatalf("after the move: on the bucket %v, source stat %v; want it on the bucket and gone from the source", held(exampleToolKey), err)
+	}
+
+	before := len(srv.Requests())
+	err := move("legacy")
+	if err == nil || !strings.Contains(err.Error(), "same location") || !strings.Contains(err.Error(), `"native"`) || !strings.Contains(err.Error(), `"legacy"`) {
+		t.Errorf("move to the s3 name for the same bucket: err = %v, want a same-location refusal naming both", err)
+	}
+	if !held(exampleToolKey) {
+		t.Fatal("the artifact is gone after the refused move")
+	}
+	if after := srv.Requests()[before:]; len(after) != 0 {
+		t.Errorf("the refused move reached the store: %v", after)
+	}
+
+	if err := move("cold"); err != nil {
+		t.Fatalf("move between two prefixes of one bucket: %v", err)
+	}
+	if !held("cold/"+exampleToolKey) || held(exampleToolKey) {
+		t.Errorf("after the move to cold: under cold/ %v, at the root %v; want it moved", held("cold/"+exampleToolKey), held(exampleToolKey))
 	}
 }

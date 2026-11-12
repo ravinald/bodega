@@ -46,7 +46,7 @@ func TestInitBucketCreatesAndIsIdempotent(t *testing.T) {
 	srv := gcstest.New(t)
 	client := srv.Client(t)
 	var out bytes.Buffer
-	if err := InitBucket(t.Context(), client, &out, "example-bodega-artifacts", "us-central1", project("example-project")); err != nil {
+	if err := InitBucket(t.Context(), client, &out, "example-bodega-artifacts", "us-central1", project("example-project"), Namespaces{}); err != nil {
 		t.Fatalf("first init: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "CREATED gs://example-bodega-artifacts in project example-project, US-CENTRAL1") {
@@ -65,7 +65,7 @@ func TestInitBucketCreatesAndIsIdempotent(t *testing.T) {
 
 	before := len(srv.Requests())
 	out.Reset()
-	if err := InitBucket(t.Context(), client, &out, "example-bodega-artifacts", "", noProject); err != nil {
+	if err := InitBucket(t.Context(), client, &out, "example-bodega-artifacts", "", noProject, Namespaces{}); err != nil {
 		t.Fatalf("second init: %v\n%s", err, out.String())
 	}
 	if changed(out.String()) {
@@ -90,7 +90,7 @@ func TestInitBucketConfiguresAnExistingBucket(t *testing.T) {
 		Condition: gstorage.LifecycleCondition{AgeInDays: 90},
 	}
 	// Drift: a rule in bodega's form that ages out manifests/.
-	drift := LifecycleRule()
+	drift := LifecycleRule("")
 	drift.Condition.MatchesPrefix = []string{manifest.ManifestsPrefix}
 	if _, err := client.Bucket("existing").Update(t.Context(), gstorage.BucketAttrsToUpdate{
 		Lifecycle: &gstorage.Lifecycle{Rules: []gstorage.LifecycleRule{theirs, drift}},
@@ -99,7 +99,7 @@ func TestInitBucketConfiguresAnExistingBucket(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := InitBucket(t.Context(), client, &out, "existing", "", noProject); err != nil {
+	if err := InitBucket(t.Context(), client, &out, "existing", "", noProject, Namespaces{}); err != nil {
 		t.Fatalf("init: %v\n%s", err, out.String())
 	}
 	for _, want := range []string{"bucket:     exists in US", "access:     CONFIGURED", "public:     CONFIGURED", "versioning: ENABLED", "lifecycle:  CONFIGURED"} {
@@ -125,7 +125,7 @@ func TestInitBucketConfiguresAnExistingBucket(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := InitBucket(t.Context(), client, &out, "existing", "", noProject); err != nil || changed(out.String()) {
+	if err := InitBucket(t.Context(), client, &out, "existing", "", noProject, Namespaces{}); err != nil || changed(out.String()) {
 		t.Errorf("second run: err %v, output reports a change:\n%s", err, out.String())
 	}
 }
@@ -134,7 +134,7 @@ func TestInitBucketConfiguresAnExistingBucket(t *testing.T) {
 // generations only, after NoncurrentVersionDays, under every storage prefix
 // except the two whose history is the point.
 func TestLifecycleRuleNeverNamesHistory(t *testing.T) {
-	r := LifecycleRule()
+	r := LifecycleRule("")
 	if r.Action.Type != gstorage.DeleteAction || r.Condition.Liveness != gstorage.Archived ||
 		r.Condition.DaysSinceNoncurrentTime != 30 || NoncurrentVersionDays != 30 {
 		t.Errorf("rule = %+v, want a delete of noncurrent generations after 30 days", r)
@@ -167,7 +167,7 @@ func TestInitBucketRefusals(t *testing.T) {
 	client := srv.Client(t)
 	srv.AddBucket("elsewhere")
 
-	err := InitBucket(t.Context(), client, nil, "elsewhere", "europe-west1", noProject)
+	err := InitBucket(t.Context(), client, nil, "elsewhere", "europe-west1", noProject, Namespaces{})
 	if err == nil || !strings.Contains(err.Error(), "location cannot change") {
 		t.Errorf("location mismatch: err = %v, want a refusal", err)
 	}
@@ -175,7 +175,7 @@ func TestInitBucketRefusals(t *testing.T) {
 		t.Errorf("a refused run changed the bucket: %v", got)
 	}
 
-	err = InitBucket(t.Context(), client, nil, "missing-bucket", "", noProject)
+	err = InitBucket(t.Context(), client, nil, "missing-bucket", "", noProject, Namespaces{})
 	if err == nil || !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "no project") {
 		t.Errorf("missing bucket, no project: err = %v, want both named", err)
 	}
@@ -184,13 +184,13 @@ func TestInitBucketRefusals(t *testing.T) {
 	}
 
 	for _, bad := range []string{"", "ab", "Upper-Case", "has space", "star*", "-leading"} {
-		if err := InitBucket(t.Context(), client, nil, bad, "", project("p")); err == nil || !strings.Contains(err.Error(), "not a valid") {
+		if err := InitBucket(t.Context(), client, nil, bad, "", project("p"), Namespaces{}); err == nil || !strings.Contains(err.Error(), "not a valid") {
 			t.Errorf("bucket %q: err = %v, want the name refused", bad, err)
 		}
 	}
 
 	srv.FailNext("GET /storage/v1/b/elsewhere", 1)
-	err = InitBucket(t.Context(), client, nil, "elsewhere", "", noProject)
+	err = InitBucket(t.Context(), client, nil, "elsewhere", "", noProject, Namespaces{})
 	if err == nil || !strings.Contains(err.Error(), "storage.buckets.get") {
 		t.Errorf("403 on the read: err = %v, want the permission and the global-name cause named", err)
 	}
@@ -332,5 +332,64 @@ func TestUsageDocCoversGCS(t *testing.T) {
 	}
 	if !strings.Contains(section, "30 days") {
 		t.Error("the section does not state the noncurrent-version retention")
+	}
+}
+
+// TestRuleNamespaces: a rule is bodega's by form, for the namespace all of
+// its prefixes agree on, and a prefix that reads two ways counts for both.
+func TestRuleNamespaces(t *testing.T) {
+	rule := func(prefixes ...string) gstorage.LifecycleRule {
+		r := LifecycleRule("")
+		r.Condition.MatchesPrefix = prefixes
+		return r
+	}
+	live := rule("binaries/")
+	live.Condition.Liveness = gstorage.Live
+	for _, tc := range []struct {
+		name string
+		rule gstorage.LifecycleRule
+		want []string
+	}{
+		{"root", LifecycleRule(""), []string{""}},
+		{"prefixed", LifecycleRule("cold/"), []string{"cold/"}},
+		{"nested", LifecycleRule("a/b/"), []string{"a/b/"}},
+		{"drift naming history", rule("cold/manifests/"), []string{"cold/"}},
+		{"reads two ways", rule("x/oci/manifests/"), []string{"x/", "x/oci/"}},
+		{"second prefix settles it", rule("x/oci/manifests/", "x/npm/"), []string{"x/"}},
+		{"two namespaces in one rule", rule("a/npm/", "b/npm/"), nil},
+		{"not a segment boundary", rule("coldnpm/"), nil},
+		{"someone else's prefix", rule("logs/"), nil},
+		{"no prefix", rule(), nil},
+		{"live objects", live, nil},
+	} {
+		got := ruleNamespaces(tc.rule)
+		slices.Sort(got)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s: ruleNamespaces = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNamespacesCheck: namespaces are refused exactly when one's expiry rule
+// would reach another's history, whichever of the two init was run for.
+func TestNamespacesCheck(t *testing.T) {
+	for _, tc := range []struct {
+		a, b    string
+		refused bool
+	}{
+		{"", "cold/", false},
+		{"cold/", "cold/deep/", false},
+		{"", "cargo/", false},
+		{"", "binaries/", true},
+		{"", "oci/", true},
+		{"cold/", "cold/npm/", true},
+		{"", "manifests/x/", true},
+		{"cold/", "cold/", false},
+	} {
+		for _, n := range []Namespaces{{Target: tc.a, Others: []string{tc.b}}, {Target: tc.b, Others: []string{tc.a}}} {
+			if err := n.check("example"); (err != nil) != tc.refused {
+				t.Errorf("check(%+v) = %v, want refused = %v", n, err, tc.refused)
+			}
+		}
 	}
 }

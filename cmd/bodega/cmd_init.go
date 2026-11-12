@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -102,6 +103,23 @@ func gcsBucket(cfg *config.Config, name string) (storage.Spec, error) {
 	return spec, bogcs.ValidateBucket(spec.Bucket)
 }
 
+// gcsNamespaces is where the backend called name keeps its keys in its
+// bucket, and where every other gcs backend of this config on the same bucket
+// keeps its own.
+func gcsNamespaces(cfg *config.Config, name string, spec storage.Spec) bogcs.Namespaces {
+	ns := bogcs.Namespaces{Target: spec.KeyPrefix()}
+	for _, other := range append([]string{config.DefaultStorageName}, slices.Sorted(maps.Keys(cfg.StorageBackends))...) {
+		if other == name {
+			continue
+		}
+		o, ok := storage.SpecFor(cfg, other)
+		if ok && o.Driver == "gcs" && o.Bucket == spec.Bucket {
+			ns.Others = append(ns.Others, o.KeyPrefix())
+		}
+	}
+	return ns
+}
+
 // runInitGCS is `bodega init` for a backend on the gcs driver.
 func runInitGCS(ctx context.Context, out io.Writer, cfg *config.Config, name, printPolicy, location string) error {
 	spec, err := gcsBucket(cfg, name)
@@ -118,10 +136,11 @@ func runInitGCS(ctx context.Context, out io.Writer, cfg *config.Config, name, pr
 	defer func() { _ = client.Close() }()
 
 	fmt.Fprintf(out, "Initializing bucket gs://%s (backend %q)...\n", spec.Bucket, name)
-	if spec.Prefix != "" {
-		fmt.Fprintf(out, "  prefix:     %s is not applied; the lifecycle rule names prefixes at the bucket root\n", spec.Prefix)
+	namespaces := gcsNamespaces(cfg, name, spec)
+	if namespaces.Target != "" {
+		fmt.Fprintf(out, "  prefix:     %s (the lifecycle rule is scoped under it)\n", namespaces.Target)
 	}
-	if err := bogcs.InitBucket(ctx, client, out, spec.Bucket, location, bogcs.Project); err != nil {
+	if err := bogcs.InitBucket(ctx, client, out, spec.Bucket, location, bogcs.Project, namespaces); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "\nBucket gs://%s is ready.\n", spec.Bucket)
@@ -214,7 +233,9 @@ and holds it to:
   - Public access prevention, enforced
   - Object versioning, so a rewritten manifest keeps its previous generation
   - Lifecycle: noncurrent generations are deleted after %d days under every
-    artifact prefix, and never under manifests/ or attestations/
+    artifact prefix, and never under manifests/ or attestations/. A backend
+    with a prefix gets its rule under that prefix, beside the rules of other
+    backends on the bucket
 Lifecycle rules in any other form are yours and are kept. --print-policy
 prints the IAM roles instead, as custom role definitions with the predefined
 role that covers each, and "init check" asks the bucket through

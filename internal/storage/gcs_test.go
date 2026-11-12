@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,8 +16,14 @@ import (
 	"strings"
 	"testing"
 
+	gstorage "cloud.google.com/go/storage"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"google.golang.org/api/option"
+
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/gcs/gcstest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // fakeGCS is a gcs store on a fresh bucket of an in-process fake, driven
@@ -220,5 +228,112 @@ func TestGCSLabelCarriesThePrefix(t *testing.T) {
 	}
 	if got, want := withPrefix(s, "cold/x").Label(), "gs://"+bucket+"/cold/x"; got != want {
 		t.Errorf("prefixed Label() = %q, want %q", got, want)
+	}
+}
+
+// TestSameLocationGCSAndItsS3Aliases: a gcs backend and an s3 backend on
+// Cloud Storage's S3-compatible endpoint are one location when they name one
+// bucket and prefix, by every host and addressing form that reaches it and in
+// both directions, and two locations otherwise. No request is sent.
+func TestSameLocationGCSAndItsS3Aliases(t *testing.T) {
+	const bucket = "example-artifacts"
+	native := func(t *testing.T, emulator, bucket, prefix string) ObjectStore {
+		t.Helper()
+		t.Setenv("STORAGE_EMULATOR_HOST", emulator)
+		client, err := gstorage.NewClient(t.Context(), option.WithoutAuthentication())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		return withPrefix(NewGCS(client, bucket), prefix)
+	}
+	s3 := func(endpoint, bucket, prefix string, pathStyle bool) ObjectStore {
+		client := bos3.NewClientFromConfig(aws.Config{Region: "us-east-1", Credentials: aws.AnonymousCredentials{}},
+			bucket, "us-east-1", func(o *awss3.Options) {
+				if endpoint != "" {
+					o.BaseEndpoint = aws.String(endpoint)
+				}
+				o.UsePathStyle = pathStyle
+			})
+		return withPrefix(NewS3(client), prefix)
+	}
+	for _, tc := range []struct {
+		name     string
+		emulator string
+		gcs      [2]string // bucket, prefix
+		s3       ObjectStore
+		want     bool
+	}{
+		{"path-style", "", [2]string{bucket, ""}, s3("https://storage.googleapis.com", bucket, "", true), true},
+		{"virtual-hosted", "", [2]string{bucket, ""}, s3("https://storage.googleapis.com", bucket, "", false), true},
+		{"plain http", "", [2]string{bucket, ""}, s3("http://storage.googleapis.com:80/", bucket, "", true), true},
+		{"mTLS host", "", [2]string{bucket, ""}, s3("https://storage.mtls.googleapis.com", bucket, "", true), true},
+		{"regional endpoint", "", [2]string{bucket, ""}, s3("https://storage.us-central1.rep.googleapis.com", bucket, "", true), true},
+		{"same prefix", "", [2]string{bucket, "cold"}, s3("https://storage.googleapis.com", bucket, "cold/", false), true},
+		{"bucket in the endpoint path", "", [2]string{bucket, "cold"}, s3("https://storage.googleapis.com/"+bucket, "cold", "", true), true},
+		{"prefix on one side only", "", [2]string{bucket, "cold"}, s3("https://storage.googleapis.com", bucket, "", true), false},
+		{"different prefixes", "", [2]string{bucket, "cold"}, s3("https://storage.googleapis.com", bucket, "warm", true), false},
+		{"different buckets", "", [2]string{bucket, ""}, s3("https://storage.googleapis.com", "example-other", "", true), false},
+		{"bucket that only starts alike", "", [2]string{bucket, ""}, s3("https://storage.googleapis.com", bucket+"-2", "", false), false},
+		{"the same name on AWS", "", [2]string{bucket, ""}, s3("", bucket, "", false), false},
+		{"another host", "", [2]string{bucket, ""}, s3("https://storage.example.com", bucket, "", true), false},
+		{"emulator and a path-style s3 client on it", "127.0.0.1:4443", [2]string{bucket, "cold"}, s3("http://127.0.0.1:4443", bucket, "cold", true), true},
+		{"emulator named with a scheme and a path", "http://LOCALHOST:4443/ignored", [2]string{bucket, ""}, s3("http://localhost:4443", bucket, "", true), true},
+		{"emulator is not Cloud Storage", "127.0.0.1:4443", [2]string{bucket, ""}, s3("https://storage.googleapis.com", bucket, "", true), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := native(t, tc.emulator, tc.gcs[0], tc.gcs[1])
+			if got := SameLocation(g, tc.s3); got != tc.want {
+				gr, _ := objectRoute(g)
+				sr, _ := objectRoute(tc.s3)
+				t.Errorf("SameLocation(gcs, s3) = %v, want %v (routes %q and %q)", got, tc.want, gr, sr)
+			}
+			if got := SameLocation(tc.s3, g); got != tc.want {
+				t.Errorf("SameLocation(s3, gcs) = %v, want %v", got, tc.want)
+			}
+			if g.Label() == tc.s3.Label() {
+				t.Errorf("the two share the label %q; they are separate identities to the fan-out", g.Label())
+			}
+		})
+	}
+
+	// Two s3 spellings of one Cloud Storage bucket are one location too, and
+	// two gcs stores are told apart by prefix as any two stores are.
+	if !SameLocation(s3("https://storage.googleapis.com", bucket, "", true), s3("https://storage.mtls.googleapis.com", bucket, "", true)) {
+		t.Error("two Cloud Storage hosts for one bucket are two locations to a move")
+	}
+	if SameLocation(native(t, "", bucket, ""), native(t, "", bucket, "cold")) {
+		t.Error("a bucket and a prefix of it are one location to a move")
+	}
+}
+
+// TestGCSRouteIsWhereTheSDKSendsARead holds gcsRouteRoot to the client it
+// stands in for: the SDK is asked for an object through each spelling of
+// STORAGE_EMULATOR_HOST, and the request has to arrive at the URL the store's
+// route names.
+func TestGCSRouteIsWhereTheSDKSendsARead(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, "http://"+r.Host+r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	for _, emulator := range []string{host, srv.URL, srv.URL + "/ignored"} {
+		got = nil
+		t.Setenv("STORAGE_EMULATOR_HOST", emulator)
+		client, err := gstorage.NewClient(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := withPrefix(NewGCS(client, "example-artifacts"), "cold")
+		if _, err := store.Get(t.Context(), "key"); err != nil {
+			t.Fatalf("%s: %v", emulator, err)
+		}
+		_ = client.Close()
+		route, _ := objectRoute(store)
+		if len(got) != 1 || got[0] != route+"key" {
+			t.Errorf("STORAGE_EMULATOR_HOST=%s: the SDK asked %q, and the route says %q", emulator, got, route+"key")
+		}
 	}
 }

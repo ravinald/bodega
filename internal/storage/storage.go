@@ -227,14 +227,23 @@ func NewFromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
 // backends — the listing fan-out does exactly that — sees one namespace rather
 // than one per backend.
 func withPrefix(store ObjectStore, prefix string) ObjectStore {
-	prefix = strings.TrimPrefix(prefix, "/")
+	prefix = Spec{Prefix: prefix}.KeyPrefix()
 	if prefix == "" {
 		return store
 	}
-	if !strings.HasSuffix(prefix, "/") {
+	return &prefixed{inner: store, prefix: prefix}
+}
+
+// KeyPrefix is what the backend's store puts in front of every key: "" for
+// no prefix, and otherwise the configured one closed by a "/". Anything that
+// names the backend's objects to the service itself, a lifecycle rule for
+// one, takes it from here so that it names what the driver writes.
+func (s Spec) KeyPrefix() string {
+	prefix := strings.TrimPrefix(s.Prefix, "/")
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	return &prefixed{inner: store, prefix: prefix}
+	return prefix
 }
 
 // prefixed roots one backend under a key prefix.
