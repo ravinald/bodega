@@ -4325,7 +4325,7 @@ The `s3` driver reaches a store that is not AWS through three keys. They sit at 
   "storage_backend": "s3",
   "bucket": "example-bodega-artifacts",
   "region": "us-ord",
-  "endpoint": "https://us-ord-1.linodeobjects.com",
+  "endpoint": "https://us-ord-10.linodeobjects.com",
   "checksums": "when_required",
   "storage_backends": {
     "onprem": {
@@ -4363,13 +4363,15 @@ Error: the store holding s3://bodega-onprem does not implement: public access bl
 
 **Stores.** "Tested" means the [S3 conformance suite](#the-s3-conformance-suite) passed against the store with the settings shown. For an untested store the settings are what its documentation suggests, not a result, and the conformance suite is how to find out:
 
-| Store                 | Status   | `endpoint`                           | `path_style`                                              | `checksums`                                            |
-| --------------------- | -------- | ------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------ |
-| AWS S3                | tested   | unset                                | unset                                                     | unset                                                  |
-| Linode Object Storage | tested   | `https://us-ord-1.linodeobjects.com` | unset                                                     | `when_required`                                        |
-| MinIO                 | untested | the server's URL                     | `true`, unless the server is configured with a domain     | unset on a current release                             |
-| Ceph RGW              | untested | the gateway's URL                    | `true`, unless the gateway has a DNS name with a wildcard | `when_required` on a release that rejects CRC32        |
-| Wasabi                | untested | `https://s3.REGION.wasabisys.com`    | unset                                                     | `when_required` if a write is rejected over a checksum |
+| Store                 | Status   | `endpoint`                            | `path_style`                                              | `checksums`                                            |
+| --------------------- | -------- | ------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| AWS S3                | tested   | unset                                 | unset                                                     | unset                                                  |
+| Linode Object Storage | tested   | the account's endpoint for the region | unset                                                     | `when_required`                                        |
+| MinIO                 | untested | the server's URL                      | `true`, unless the server is configured with a domain     | unset on a current release                             |
+| Ceph RGW              | untested | the gateway's URL                     | `true`, unless the gateway has a DNS name with a wildcard | `when_required` on a release that rejects CRC32        |
+| Wasabi                | untested | `https://s3.REGION.wasabisys.com`     | unset                                                     | `when_required` if a write is rejected over a checksum |
+
+Linode assigns each account its endpoint per region, and a key works only there: `linode-cli object-storage keys-view {id}` names it in the key's `regions[].s3_endpoint`. The tested account's `us-ord` endpoint is `https://us-ord-10.linodeobjects.com`; the same key sent to the older `https://us-ord-1.linodeobjects.com` is refused with `InvalidAccessKeyId`.
 
 SeaweedFS, Garage and other stores are untested as well, and the same three keys are what they would be configured with.
 
@@ -9249,7 +9251,7 @@ Credentials come from the AWS default chain, the same one the service reads. `AW
 
 ```bash
 AWS_REGION=us-ord \
-BODEGA_S3_CONFORMANCE_ENDPOINT=https://us-ord-1.linodeobjects.com \
+BODEGA_S3_CONFORMANCE_ENDPOINT=https://us-ord-10.linodeobjects.com \
 BODEGA_S3_CONFORMANCE_CHECKSUMS=when_required \
   go test ./internal/storage/ -run 'TestObjectStoreConformance|TestInitBucketAgainstALiveBucket|TestLabel'
 ```
