@@ -35,6 +35,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/oracletest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
@@ -1224,10 +1225,7 @@ func TestStaffCAKeepsRepositoryPolicy(t *testing.T) {
 }
 
 func TestStaffGitCAReachesEffectiveURL(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	git := oracletest.Git(t)
 	raw, _, _ := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(raw)
 	if err != nil {
@@ -1905,12 +1903,7 @@ func TestNpmUnclassifiedLinesRefuseAndStayUnchecked(t *testing.T) {
 // that would otherwise pass every oracle test unrun.
 func nativeNpm(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("npm"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
-		}
-		t.Skip("native npm is not installed")
-	}
+	oracletest.Npm(t)
 }
 
 func TestAudit9NativeOraclesCannotSkipInCI(t *testing.T) {
@@ -2106,12 +2099,7 @@ func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
 }
 
 func TestAudit10GitCommentCannotHideTrustOverride(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native git is required in CI")
-		}
-		t.Skip("native git is not installed")
-	}
+	oracletest.Git(t)
 	raw, _, _ := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(raw)
 	if err != nil {
@@ -2186,12 +2174,7 @@ func TestAudit10NpmUncheckedInputRefusesInPrimaryFile(t *testing.T) {
 // editor, the classifier and the probe share to native git's, on the lines
 // that tell a value running on from a backslash that continues nothing.
 func TestGitContinuationFollowsGitsLexer(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native git is required in CI")
-		}
-		t.Skip("native git is not installed")
-	}
+	oracletest.Git(t)
 	const base = "https://bodega.example.com/"
 	for name, body := range map[string]string{
 		"a # comment ending in a backslash":          "[http]\n# note \\\nsslCAInfo = /ca.pem\n",
@@ -2367,10 +2350,7 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 // across the spellings pip's loader folds together: a -- prefix, _ for -,
 // case, a colon delimiter, and [DEFAULT] inheritance in either direction.
 func TestPipOptionsMatchesNativePip(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		oracleAbsent(t, "native pip oracle needs python3")
-	}
+	python := oracletest.Pip(t)
 	cases := []string{
 		"[global]\n--cert = /a.pem\nindex-url = https://x/simple/\n",
 		"[global]\ncert = /a.pem\n--cert = /b.pem\n",
@@ -2413,10 +2393,7 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 // TestPipLoadErrorMatchesNativePip compares PipLoadError with whether pip
 // config list loads the file at all.
 func TestPipLoadErrorMatchesNativePip(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		oracleAbsent(t, "native pip oracle needs python3")
-	}
+	python := oracletest.Pip(t)
 	cases := []string{
 		"[global]\ntimeout = 1\ntimeout = 2\n",
 		"[global]\ntimeout = 1\n[global]\nretries = 2\n",
@@ -2482,13 +2459,7 @@ func TestPipLoadErrorMatchesNativePip(t *testing.T) {
 // the oracle: for each body the variables it lists, or the line it refuses
 // the file at, are the ones the port gives, for a line in any section.
 func TestGitConfigMatchesNativeGit(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal(err)
-		}
-		t.Skip("native git is not installed")
-	}
+	git := oracletest.Git(t)
 	dir := t.TempDir()
 	for i, body := range []string{
 		"",
@@ -2594,7 +2565,6 @@ func TestNpmEnvResolvesOneOption(t *testing.T) {
 // type in any field of File or Entry is a load error, whichever field it is,
 // and where helm is installed it gives the same verdict on the same bytes.
 func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
-	helm, _ := exec.LookPath("helm")
 	entry := "repositories:\n  - name: bodega\n    url: https://b/helm\n"
 	for name, tc := range map[string]struct {
 		body string
@@ -2629,9 +2599,7 @@ func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
 			case tc.bad != "" && (err == nil || !strings.Contains(err.Error(), tc.bad) || !strings.Contains(err.Error(), file)):
 				t.Fatalf("LoadHelmFile error = %v; want one naming %s and %q", err, file, tc.bad)
 			}
-			if helm == "" {
-				return
-			}
+			helm := oracletest.Helm(t)
 			cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
 			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}
 			out, _ := cmd.CombinedOutput()
@@ -2648,8 +2616,7 @@ func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
 // F116 R1, R2: one resolver names the repositories.yaml helm reads, in
 // helm's own order on every platform, and native helm names the same file.
 func TestHelmRepositoryFileFollowsHelmpath(t *testing.T) {
-	helm, _ := exec.LookPath("helm")
-	for _, tc := range []struct {
+	cases := []struct {
 		goos string
 		env  map[string]string
 		want string
@@ -2660,12 +2627,19 @@ func TestHelmRepositoryFileFollowsHelmpath(t *testing.T) {
 		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x"}, "/x/helm/repositories.yaml"},
 		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c"}, "/c/repositories.yaml"},
 		{OSLinux, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c", "HELM_REPOSITORY_CONFIG": "/r.yaml"}, "/r.yaml"},
-	} {
+	}
+	for _, tc := range cases {
 		got := HelmRepositoryFile(func(k string) string { return tc.env[k] }, tc.goos, "/h")
 		if got != tc.want {
 			t.Errorf("%s %v = %s; want %s", tc.goos, tc.env, got, tc.want)
 		}
-		if helm == "" || tc.goos != runtime.GOOS {
+	}
+	if got := HelmRepositoryFile(nil, OSLinux, ""); got != "" {
+		t.Errorf("no home and no environment = %q; want none", got)
+	}
+	helm := oracletest.Helm(t)
+	for _, tc := range cases {
+		if tc.goos != runtime.GOOS {
 			continue
 		}
 		cmd := exec.Command(helm, "env", "HELM_REPOSITORY_CONFIG")
@@ -2677,9 +2651,6 @@ func TestHelmRepositoryFileFollowsHelmpath(t *testing.T) {
 		if err != nil || strings.TrimSpace(string(out)) != tc.want {
 			t.Errorf("%s %v: native helm reads %s (%v); want %s", tc.goos, tc.env, out, err, tc.want)
 		}
-	}
-	if got := HelmRepositoryFile(nil, OSLinux, ""); got != "" {
-		t.Errorf("no home and no environment = %q; want none", got)
 	}
 }
 
@@ -2984,47 +2955,18 @@ func TestAudit24GomodEmptyProxyListRefusesCAPlan(t *testing.T) {
 	}
 }
 
-// oracleAbsent ends a test whose native client is missing, will not say its
-// version, or is at a version the port under test is not of. On a developer's
-// machine that is a skip. In CI it is a failure: the test job installs each
-// client at the version its port names, so an oracle that cannot run there is
-// a broken job, and a skip would pass the port unchecked.
-func oracleAbsent(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv("CI") == "true" {
-		t.Fatalf("in CI, where the test job installs this oracle: "+format, args...)
-	}
-	t.Skipf(format, args...)
-}
-
 // nativePip261 finds a python3 whose pip is the 26.2.1 PipInstallError
 // ports: another pip declares other options.
 func nativePip261(t *testing.T) string {
 	t.Helper()
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		oracleAbsent(t, "native pip oracle needs python3")
-	}
-	out, err := exec.Command(python, "-m", "pip", "--version").Output()
-	if err != nil || !strings.HasPrefix(string(out), "pip 26.2.1 ") {
-		oracleAbsent(t, "native pip oracle needs pip 26.2.1, found %q (%v)", strings.TrimSpace(string(out)), err)
-	}
-	return python
+	return oracletest.Pip(t)
 }
 
 // nativeGit254 finds the git whose 2.54 the configuration port is of: another
 // release converts other variables.
 func nativeGit254(t *testing.T) string {
 	t.Helper()
-	git, err := exec.LookPath("git")
-	if err != nil {
-		oracleAbsent(t, "native git is not installed")
-	}
-	out, err := exec.Command(git, "version").Output()
-	if err != nil || !strings.HasPrefix(string(out), "git version 2.54.") {
-		oracleAbsent(t, "the port is of Git 2.54.0, and %q converts other variables (%v)", strings.TrimSpace(string(out)), err)
-	}
-	return git
+	return oracletest.Git(t)
 }
 
 // TestPipInstallOptionsMatchNativePip compares the option table
@@ -3595,15 +3537,7 @@ func TestGitOperationVarsMatchNativeGit(t *testing.T) {
 // nativeNpm1120 finds the npm 11.20.0 the type port is of.
 func nativeNpm1120(t *testing.T) string {
 	t.Helper()
-	npm, err := exec.LookPath("npm")
-	if err != nil {
-		oracleAbsent(t, "native npm is not installed")
-	}
-	out, err := exec.Command(npm, "--version").Output()
-	if v := strings.TrimSpace(string(out)); err != nil || v != "11.20.0" {
-		oracleAbsent(t, "the port is of npm 11.20.0, and npm %q declares other options (%v)", v, err)
-	}
-	return npm
+	return oracletest.Npm(t)
 }
 
 // runNpmView runs npm view against a registry nothing listens at, with file
@@ -3853,10 +3787,7 @@ func TestOptionConversionFailureRefusesCAPlan(t *testing.T) {
 }
 
 func TestAudit25GitFetchConversionRefusesCAPlan(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	git := oracletest.Git(t)
 	home := t.TempDir()
 	target := filepath.Join(home, ".gitconfig")
 	bad := "[fetch]\n\tprune = maybe\n"
@@ -4122,5 +4053,124 @@ func TestHelmEntryMovedToBodegaKeepsItsPairObligation(t *testing.T) {
 	in, err := AddCA(caPlan(t, home, Helm(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
 	if err == nil || !strings.Contains(err.Error(), "unable to read cert file") || len(in.Changes) != 0 || len(in.Step) != 0 {
 		t.Errorf("a moved entry's unloadable pair was accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit26NpmSectionValueMatchesNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	file := filepath.Join(home, ".npmrc")
+	body := "registry=" + testBase + "/npm/\n[ca]\nx=1\n"
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(npm, "view", "left-pad", "--registry=https://127.0.0.1:1/", "--fetch-retries=0", "--fetch-timeout=1000", "--loglevel=error")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + file, "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "empty-global")}
+	out, nativeErr := cmd.CombinedOutput()
+	if nativeErr == nil || !strings.Contains(string(out), "Cannot convert object to primitive value") {
+		t.Fatalf("native npm control: %v: %s", nativeErr, out)
+	}
+	t.Logf("npm 11.20.0: %v: %s", nativeErr, out)
+	in, err := AddCA(caPlan(t, home, Npm(testBase, nil)), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux})
+	if err == nil || len(in.Changes) != 0 {
+		t.Errorf("AddCA accepted npm's fatal nested ca: err=%v changes=%d", err, len(in.Changes))
+	}
+}
+
+func TestAudit26MissingHelmOracleFailsInCI(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestHelmFileLoadsAsHelmLoadsIt$", "-test.v")
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "CI=") {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CI=true", "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("missing native Helm passed CI:\n%s", out)
+	}
+}
+
+// F116 R1, R2: npmDefined is the option list of the npm the port is of.
+func TestNpmDefinedOptionsMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	home := t.TempDir()
+	cmd := exec.Command(npm, "config", "ls", "-l", "--json")
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + filepath.Join(home, "no-user"), "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "no-global")}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("npm config ls -l --json: %v", err)
+	}
+	var native map[string]any
+	if err := json.Unmarshal(out, &native); err != nil {
+		t.Fatal(err)
+	}
+	for name := range native {
+		if !npmDefined[name] {
+			t.Errorf("npm defines %s, which npmDefined lacks", name)
+		}
+	}
+	for name := range npmDefined {
+		if _, ok := native[name]; !ok {
+			t.Errorf("npmDefined holds %s, which npm does not define", name)
+		}
+	}
+}
+
+// F116 R1, R2: the one npm decoder reads what a section header or a dotted
+// null builds the way npm/ini does. Native npm is the oracle: on each file
+// it either reaches the request, which nothing answers, or stops before it,
+// and the decoder names a line exactly where npm stops. Where the decoder
+// refuses more than npm stops on, the case says so.
+func TestNpmObjectLinesMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for _, tc := range []struct {
+		body string
+		// stricter is a file the decoder refuses and this npm command runs
+		// on: an object npm reads only for another package or command.
+		stricter bool
+	}{
+		{body: "[ca]\nx=1\n"},
+		{body: "[\"ca\"]\nx=1\n"},
+		{body: "[cafile]\n"},
+		{body: "[registry.x]\n"},
+		{body: "ca.x=null\n"},
+		{body: "[corp]\nx=1\n[ca]\ny=1\n"},
+		{body: "[corp]\nx=1\n"},
+		{body: "[corp]\ncafile=/x\nca.x=null\n"},
+		{body: "[corp.ca]\nx=1\n"},
+		{body: "[__proto__]\nca=1\n"},
+		{body: "corp=1\n[corp]\nx=1\n"},
+		{body: "corp.ca=null\n"},
+		{body: "[//h.example/]\nx=1\n"},
+		{body: "[@corp:registry]\nx=1\n", stricter: true},
+		{body: "[${F116_SECTION}]\nx=1\n", stricter: true},
+	} {
+		file := filepath.Join(t.TempDir(), "npmrc")
+		if err := os.WriteFile(file, []byte("fetch-timeout=1000\n"+tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		out := runNpmView(t, npm, file, nil)
+		reached := strings.Contains(out, "ECONNREFUSED")
+		refused := NpmUnclassified(file)
+		switch {
+		case !reached && refused == "":
+			t.Errorf("%q: npm stops before the request and the decoder names no line:\n%s", tc.body, out)
+		case reached && refused != "" && !tc.stricter:
+			t.Errorf("%q: npm reaches the request and the decoder refuses it: %s", tc.body, refused)
+		case tc.stricter && (!reached || refused == ""):
+			t.Errorf("%q: want npm running and the decoder refusing; reached=%v refused=%q", tc.body, reached, refused)
+		}
 	}
 }

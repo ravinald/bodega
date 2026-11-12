@@ -358,7 +358,40 @@ func npmUnsafe(val string) (out string, sure bool) {
 	return text, true
 }
 
-var npmSection = regexp.MustCompile(`^\[[^\]]*\]\s*$`)
+var npmSection = regexp.MustCompile(`^\[([^\]]*)\]\s*$`)
+
+// npmObjectAt is the top-level name npm/ini 6.0.0's decode leaves an object
+// on for a section named name, or for a top-level name set to null, which
+// its last pass reads as one (lib/ini.js, lines 149-180): the text before
+// the first dot no backslash precedes, the outer of the objects a dotted
+// name nests, and otherwise the name itself with each \. read as a dot.
+// dotted says the name held such a dot.
+func npmObjectAt(name string) (top string, dotted bool) {
+	for i := 0; i < len(name); i++ {
+		if name[i] == '.' && (i == 0 || name[i-1] != '\\') {
+			return name[:i], true
+		}
+	}
+	return strings.ReplaceAll(name, `\.`, "."), false
+}
+
+// npmObjectUnsure is why a line that builds an object at the top-level name
+// top leaves npm's configuration unknown, "" when it does not. npm carries an
+// object on a name it does not define and reads nothing from it. On one it
+// defines, npm 11.20.0 stops before any request with "Cannot convert object
+// to primitive value", or with ERR_INVALID_AUTH for a credential, and a
+// scoped registry it hands to the request as written.
+func npmObjectUnsure(how, top string) string {
+	switch {
+	case strings.Contains(top, "${"):
+		return how + " whose name takes a ${NAME} reference, which npm resolves from the environment, so which option receives the object npm builds from it is not known"
+	case top == "__proto__":
+		return how + " that nests under __proto__, which npm's reader steps over in a way doctor does not follow"
+	case npmDefined[top] || slices.Contains(npmUnscopedAuth, top) || strings.HasSuffix(top, ":registry"):
+		return how + " that builds an object on " + top + ", an option npm reads, and npm stops before any request on an object there"
+	}
+	return ""
+}
 
 // npmDecodeLine decodes one line of an npmrc, without its line ending. ok is
 // false for a line npm's reader skips: a blank, a comment, one with nothing
@@ -370,7 +403,17 @@ func npmDecodeLine(line string) (o NpmOption, ok bool) {
 	}
 	switch {
 	case npmSection.MatchString(line):
-		return NpmOption{section: true}, true
+		o = NpmOption{section: true}
+		name, sure := npmUnsafe(npmSection.FindStringSubmatch(line)[1])
+		switch top, _ := npmObjectAt(name); {
+		case !sure:
+			o.Unsure = "opens a section and quotes its name around something other than a plain string"
+		// decode keeps reading a section named __proto__ and attaches
+		// nothing.
+		case name != "__proto__":
+			o.Unsure = npmObjectUnsure("opens a section", top)
+		}
+		return o, true
 	case t[0] == '[':
 		return NpmOption{Unsure: "opens with [ and is not a section header alone at the start of its line, so npm reads it as an option where a section reader sees a header"}, true
 	case strings.ContainsAny(line, "\r\u2028\u2029"):
@@ -398,21 +441,33 @@ func npmDecodeLine(line string) (o NpmOption, ok bool) {
 			o.ValueUnsure = "quotes its value around something other than a plain string"
 		}
 	}
+	// decode's last pass takes a top-level name holding a dot and the value
+	// null for a section written a.b, and nests it under a.
+	if top, dotted := npmObjectAt(key); dotted && assigned && !o.Array && o.Value == "null" {
+		if why := npmObjectUnsure("sets a dotted name to null, which npm reads as a section", top); why != "" {
+			return NpmOption{Unsure: why}, true
+		}
+	}
 	return o, true
 }
 
-// NpmOptions decodes the top-level options of the npmrc in data, in order,
-// stopping at the first section header: npm reads the lines under one as a
-// nested object and takes no option from them.
+// NpmOptions decodes the top-level options of the npmrc in data, in order.
+// The first section header ends them: npm reads the lines under one as the
+// fields of an object and takes no option from them. What the headers
+// themselves build is still read to the end of the file, and one that leaves
+// an object on an option npm reads is an entry with no Key and Unsure saying
+// so, which every reader of the file then meets where it would otherwise
+// have stopped reading without a word.
 func NpmOptions(data []byte) []NpmOption {
 	var out []NpmOption
+	inSection := false
 	for i, line := range strings.Split(string(data), "\n") {
 		o, ok := npmDecodeLine(strings.TrimRight(line, "\r"))
-		if !ok {
+		if !ok || inSection && !o.section {
 			continue
 		}
-		if o.section {
-			break
+		if inSection = inSection || o.section; o.section && o.Unsure == "" {
+			continue
 		}
 		o.Line = i + 1
 		out = append(out, o)

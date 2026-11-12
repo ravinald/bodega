@@ -349,8 +349,13 @@ type ContainerdRegistry struct {
 	// with beside config_path (mirrors, configs.<host>.tls), "" for none.
 	Legacy string
 	// CRIDisabled is a disabled_plugins entry naming the CRI plugin, as
-	// Docker's packaged config.toml carries: nothing then reads the table.
+	// Docker's packaged config.toml carries, or its image plugin: nothing
+	// then reads the table.
 	CRIDisabled bool
+	// Disabled and Required are disabled_plugins and required_plugins by
+	// plugin URI, a version 1 file's short names migrated as containerd 2.x
+	// migrates them.
+	Disabled, Required []string
 	// Imports is the file's imports list as written.
 	Imports []string
 	// HasPlugin is whether the file holds the CRI plugin's table at all, and
@@ -358,13 +363,18 @@ type ContainerdRegistry struct {
 	HasPlugin      bool
 	SetsConfigPath bool
 	// Invalid is what containerd's ValidateVersion refuses once every file
-	// has loaded, on which containerd exits, or what the CRI image plugin
-	// refuses in its own table, on which containerd runs without it; "" for
-	// nothing. Either way no hosts.toml is read. It is a field
+	// has loaded, on which containerd exits, what a CRI plugin refuses in its
+	// own table, on which containerd runs without it, or a disabled plugin
+	// whose effect on the CRI service doctor does not follow; "" for
+	// nothing. In each case no hosts.toml is known to be read. It is a field
 	// rather than an error so a caller can still say the CRI plugin is
 	// disabled, which is the more useful thing to tell whoever wrote
 	// disabled_plugins = ["cri"] under version = 2.
 	Invalid string
+
+	// cri holds the CRI tables as this file decodes them, for
+	// ResolveContainerdConfig to load each import over.
+	cri *containerdCRI
 }
 
 // ReadContainerdConfig decodes a config.toml and reports its CRI registry
@@ -432,10 +442,17 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 			}
 		}
 	}
-	if r.Invalid == "" {
-		if err := containerdCRIError(data, r.Version, path[1], version == 0 && len(cfg.Imports) == 0); err != nil {
-			r.Invalid = err.Error()
-		}
+	// A file that imports another, or is imported, is one part of what
+	// containerd validates: its tables are decoded here for their types, and
+	// ResolveContainerdConfig validates what the parts add up to.
+	whole := version == 0 && len(cfg.Imports) == 0
+	r.cri = newContainerdCRI(r.Version, path[1])
+	err = r.cri.load(data)
+	if err == nil && whole {
+		err = r.cri.validate()
+	}
+	if err != nil && r.Invalid == "" {
+		r.Invalid = err.Error()
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to
 	// the main file's before merging it, so [plugins.cri] there becomes the
@@ -469,10 +486,17 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 		return r, fmt.Errorf("imports = %v is not a list", v)
 	}
 	r.HasPlugin = tomlTable(doc, path[:2]) != nil
-	if list, ok := doc["disabled_plugins"].([]any); ok {
-		for _, p := range list {
-			r.CRIDisabled = r.CRIDisabled || p == "cri" || p == "io.containerd.grpc.v1.cri" || p == path[1]
+	r.Disabled, r.Required = slices.Clone(cfg.DisabledPlugins), slices.Clone(cfg.RequiredPlugins)
+	if r.Version == 1 {
+		for _, list := range [][]string{r.Disabled, r.Required} {
+			for i, name := range list {
+				list[i] = containerdV1PluginName(name)
+			}
 		}
+	}
+	var unmodeled string
+	if r.CRIDisabled, unmodeled = containerdPluginState(r.Disabled, r.Required); whole && r.Invalid == "" {
+		r.Invalid = unmodeled
 	}
 	table := tomlTable(doc, path)
 	_, r.SetsConfigPath = table["config_path"]
@@ -549,9 +573,14 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 		if err != nil {
 			return eff, fmt.Errorf("its import %s cannot be judged: %w", p, err)
 		}
-		eff.CRIDisabled = eff.CRIDisabled || r.CRIDisabled
+		eff.Disabled, eff.Required = append(eff.Disabled, r.Disabled...), append(eff.Required, r.Required...)
 		if eff.Invalid == "" {
 			eff.Invalid = r.Invalid
+		}
+		if eff.Invalid == "" {
+			if err := eff.cri.load(b); err != nil {
+				eff.Invalid = fmt.Sprintf("with its import %s: %v", p, err)
+			}
 		}
 		if eff.Legacy == "" {
 			eff.Legacy = r.Legacy
@@ -567,6 +596,21 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			return eff, err
 		}
 		pending = append(pending, next...)
+	}
+	// What containerd validates is what the files add up to, and it does so
+	// whether or not an import pattern matched a file: the checks a file with
+	// imports deferred run here, on the composed tables and plugin lists.
+	if len(main.Imports) > 0 {
+		var unmodeled string
+		eff.CRIDisabled, unmodeled = containerdPluginState(eff.Disabled, eff.Required)
+		if eff.Invalid == "" {
+			if err := eff.cri.validate(); err != nil {
+				eff.Invalid = err.Error()
+			}
+		}
+		if eff.Invalid == "" {
+			eff.Invalid = unmodeled
+		}
 	}
 	if replaced != eff.ConfigPath {
 		return eff, fmt.Errorf("its import %s carries the CRI plugin table without config_path, so containerd 1.x reads none and 2.x keeps %q from %s; doctor cannot tell which runs here. Set config_path in %s", replacedFrom, eff.ConfigPath, eff.Source, replacedFrom)

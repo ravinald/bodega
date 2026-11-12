@@ -41,6 +41,44 @@ const (
 	npmAddress
 )
 
+// npmDefined holds every option npm 11.20.0 defines, as npm config ls -l
+// lists them (@npmcli/config 10.13.0, lib/definitions/definitions.js). npm
+// reads a value for each of these names and for no other, the credentials of
+// npmUnscopedAuth and the scoped registries aside, so an object npm/ini
+// builds on one of them is an object where npm expects a value.
+var npmDefined = func() map[string]bool {
+	out := map[string]bool{}
+	for _, name := range strings.Fields(`
+		access all allow-directory allow-file allow-git allow-remote allow-same-version allow-scripts
+		allow-scripts-pending allow-scripts-pin also audit audit-level auth-type before bin-links
+		browser bypass-2fa ca cache cache-max cache-min cafile call cert cidr color commit-hooks cpu
+		dangerously-allow-all-scripts depth description dev diff diff-dst-prefix diff-ignore-all-space
+		diff-name-only diff-no-prefix diff-src-prefix diff-text diff-unified dry-run editor
+		engine-strict expect-result-count expect-results expires fetch-retries fetch-retry-factor
+		fetch-retry-maxtimeout fetch-retry-mintimeout fetch-timeout force foreground-scripts
+		format-package-lock fund git git-tag-version global global-style globalconfig heading
+		https-proxy if-present ignore-scripts include include-attestations include-staged
+		include-workspace-root init-author-email init-author-name init-author-url init-license
+		init-module init-private init-type init-version init.author.email init.author.name
+		init.author.url init.license init.module init.version install-links install-strategy json key
+		legacy-bundling legacy-peer-deps libc link local-address location lockfile-version loglevel
+		logs-dir logs-max long maxsockets message min-release-age min-release-age-exclude name node-gyp
+		node-options noproxy npm-version offline omit omit-lockfile-registry-resolved only optional orgs
+		orgs-permission os otp pack-destination package package-lock package-lock-only packages
+		packages-all packages-and-scopes-permission parseable prefer-dedupe prefer-offline prefer-online
+		prefix preid production progress provenance provenance-file proxy read-only rebuild-bundle
+		registry replace-registry-host save save-bundle save-dev save-exact save-optional save-peer
+		save-prefix save-prod sbom-format sbom-type scope scopes script-shell searchexclude searchlimit
+		searchopts searchstaleness shell shrinkwrap sign-git-commit sign-git-tag strict-allow-scripts
+		strict-peer-deps strict-ssl tag tag-version-prefix timing token-description umask unicode
+		update-notifier usage user-agent userconfig version versions viewer which workspace workspaces
+		workspaces-update yes
+	`) {
+		out[name] = true
+	}
+	return out
+}()
+
 // npmTypes is generated from that file's definitions. registry is left to
 // NpmRegistryURL, which reads it as the request does, and cafile to NpmUnread,
 // which also knows the empty one npm stops on.

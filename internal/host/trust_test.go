@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/oracletest"
 )
 
 // trustFixture is a CA, and the chain a bodega at bodega.internal:8443
@@ -1044,21 +1045,11 @@ func TestNpmProbeReadsLinesAsNpmDecodesThem(t *testing.T) {
 // that would otherwise pass every oracle test unrun.
 func nativeNpm(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("npm"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
-		}
-		t.Skip("native npm is not installed")
-	}
+	oracletest.Npm(t)
 }
 
 func TestAudit10GitCommentCannotHideProbeOverride(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native git is required in CI")
-		}
-		t.Skip("native git is not installed")
-	}
+	oracletest.Git(t)
 	p, ca, base := reviewTrust(t)
 	p.Home = filepath.Join(p.Root, "home")
 	target := filepath.Join(p.Home, ".gitconfig")
@@ -1134,10 +1125,7 @@ func TestAudit13PipDefaultsUseTheInstallCA(t *testing.T) {
 	file := filepath.Join(p.Root, "etc", "pip.conf")
 	missing := filepath.Join(p.Root, "missing.pem")
 	writeTrustFile(t, file, "[DEFAULT]\ncert = "+missing+"\n[global]\nindex-url = "+base+"/pypi/simple/\ncert = "+ca+"\n[install]\n")
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("native pip oracle needs python3")
-	}
+	python := oracletest.Pip(t)
 	cmd := exec.Command(python, "-m", "pip", "config", "list")
 	cmd.Dir = t.TempDir()
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
@@ -1160,10 +1148,7 @@ func TestAudit13PipDefaultsStillDiscoverBodega(t *testing.T) {
 	file := filepath.Join(p.Root, "etc", "pip.conf")
 	missing := filepath.Join(p.Root, "missing.pem")
 	writeTrustFile(t, file, "[DEFAULT]\nindex-url = "+base+"/pypi/simple/\ncert = "+missing+"\n[install]\n")
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("native pip oracle needs python3")
-	}
+	python := oracletest.Pip(t)
 	cmd := exec.Command(python, "-m", "pip", "config", "list")
 	cmd.Dir = t.TempDir()
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
@@ -1181,10 +1166,7 @@ func TestAudit13PipDefaultsStillDiscoverBodega(t *testing.T) {
 }
 
 func TestAudit14PipRejectsDuplicatePolicy(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
+	python := oracletest.Pip(t)
 	for _, tail := range []string{"timeout = 1\ntimeout = 2\n", "[global]\ntimeout = 1\n"} {
 		t.Run(strings.ReplaceAll(tail, "\n", "_"), func(t *testing.T) {
 			p, ca, base := reviewTrust(t)
@@ -1246,10 +1228,7 @@ func TestTrustProbeLeavesOtherRowsAsWritten(t *testing.T) {
 }
 
 func TestAudit15PipSyntaxErrorIsUnchecked(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
+	python := oracletest.Pip(t)
 	for _, tail := range []string{"not-an-assignment\n", "= nameless\n"} {
 		t.Run(strings.ReplaceAll(tail, "\n", "_"), func(t *testing.T) {
 			p, ca, base := reviewTrust(t)
@@ -1276,10 +1255,7 @@ func TestAudit15PipSyntaxErrorIsUnchecked(t *testing.T) {
 }
 
 func TestAudit16GitLoadErrorIsUnchecked(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	git := oracletest.Git(t)
 	p, ca, base := reviewTrust(t)
 	p.Home = filepath.Join(p.Root, "home")
 	file := filepath.Join(p.Home, ".gitconfig")
@@ -1362,13 +1338,7 @@ func TestAudit21AptLoadErrorsRemainUnchecked(t *testing.T) {
 }
 
 func TestAudit22GomodProxyValidityMatchesGo(t *testing.T) {
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native Go oracle missing in CI")
-		}
-		t.Skip("native Go oracle unavailable")
-	}
+	goBin := oracletest.Go(t)
 	const base = "https://bodega.internal:8443"
 	caPEM, chain := trustFixture(t)
 	block, _ := pem.Decode(caPEM)
@@ -1587,13 +1557,7 @@ func TestAudit23NpmRegistryAsNpmRequestsIt(t *testing.T) {
 // setting from a section whose URL does not normalize. Native git answers
 // for each pattern through --get-urlmatch.
 func TestAudit23GitURLNormalizesAsGit(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native git is required in CI")
-		}
-		t.Skip("native git is not installed")
-	}
+	git := oracletest.Git(t)
 	const fetched = "https://bodega.internal:8443/git/gh/"
 	for _, pattern := range []string{
 		"https://bodega.internal:8443/",
@@ -1752,13 +1716,7 @@ func TestAudit24PipOptionTypeIsUnchecked(t *testing.T) {
 }
 
 func TestAudit24GomodEmptyProxyListMatchesGo(t *testing.T) {
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal(err)
-		}
-		t.Skip("native Go unavailable")
-	}
+	goBin := oracletest.Go(t)
 	p, _, base := auditTrust(t)
 	p.Getenv = func(key string) string {
 		if key == "GOPROXY" {
@@ -1919,5 +1877,51 @@ func TestPipIndexAliasIsUnchecked(t *testing.T) {
 	writeTrustFile(t, filepath.Join(p.Home, ".config/pip/pip.conf"), "[global]\npypi-url = "+base+"/pypi/simple/\ncert = "+ca+"\n")
 	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "pypi-url") {
 		t.Errorf("a pip configured through pypi-url: %+v", v)
+	}
+}
+
+func TestAudit26ContainerdDependencyGraphIsUnchecked(t *testing.T) {
+	for name, conf := range map[string]string{
+		"disabled runtime":                 "version = 3\ndisabled_plugins = [\"io.containerd.cri.v1.runtime\"]\n",
+		"imports evade runtime validation": "version = 3\nimports = [\"empty/*.toml\"]\n[plugins.\"io.containerd.cri.v1.runtime\".containerd]\ndefault_runtime_name = \"missing\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			file := filepath.Join(p.Root, "etc/containerd/config.toml")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\ncapabilities = [\"pull\", \"resolve\"]\n")
+			conf += "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			writeTrustFile(t, file, conf)
+			if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+				t.Errorf("CRI cannot serve pulls, but selected verdict = %+v", v)
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "containerd" {
+					return "/fixture/containerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("ordinary report certifies unavailable CRI: %+v", rows)
+			}
+		})
+	}
+}
+
+func TestAudit26NpmSectionValueIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".npmrc")
+	body := "registry=" + base + "/npm/\ncafile=" + ca + "\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "npm-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, body+"[ca]\nx=1\n")
+	if v := auditState(t, p, "npm-config", base); v.State != TrustUnchecked {
+		t.Errorf("npm cannot load section-valued ca: %+v", v)
+	}
+	rows := p.Apply([]Finding{checkNpmConfig(p.Root, p.GOOS, p.Home)}, base)
+	if rows[0].Status != StatusWarn || !strings.Contains(rows[0].Detail, "unchecked") {
+		t.Errorf("ordinary report certifies unloadable npm configuration: %+v", rows)
 	}
 }

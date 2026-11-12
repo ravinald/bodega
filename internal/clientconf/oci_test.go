@@ -577,3 +577,108 @@ func TestMergeDockerDaemonRefusesWhatDockerdRefuses(t *testing.T) {
 		t.Errorf("merge into a file dockerd loads = %q, %v", out, err)
 	}
 }
+
+// F116 R1, R2: the CRI plugins' checks run on what config.toml and its
+// imports add up to, as containerd v2.2.0 validates the merged configuration,
+// whether or not an import matched a file and whichever file holds each key.
+func TestContainerdValidatesWhatItsImportsAddUpTo(t *testing.T) {
+	const registry = "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	const runtime = "[plugins.\"io.containerd.cri.v1.runtime\".containerd"
+	for name, tc := range map[string]struct {
+		main    string
+		imports map[string]string
+		invalid string
+	}{
+		"no import, default runtime": {main: "version = 3\n" + registry},
+		"pattern matching nothing still validates": {
+			main:    "version = 3\nimports = [\"conf.d/*.toml\"]\n" + runtime + "]\ndefault_runtime_name = \"missing\"\n" + registry,
+			invalid: "no corresponding runtime configured",
+		},
+		"the runtime the main file names is in an import": {
+			main:    "version = 3\nimports = [\"conf.d/*.toml\"]\n" + runtime + "]\ndefault_runtime_name = \"nvidia\"\n" + registry,
+			imports: map[string]string{"conf.d/nvidia.toml": "version = 3\n" + runtime + ".runtimes.nvidia]\nruntime_type = \"io.containerd.runc.v2\"\n"},
+		},
+		"an import names a runtime no file configures": {
+			main:    "version = 3\nimports = [\"conf.d/*.toml\"]\n" + registry,
+			imports: map[string]string{"conf.d/default.toml": "version = 3\n" + runtime + "]\ndefault_runtime_name = \"kata\"\n"},
+			invalid: "no corresponding runtime configured",
+		},
+		"an import empties the name": {
+			main:    "version = 3\nimports = [\"conf.d/*.toml\"]\n" + registry,
+			imports: map[string]string{"conf.d/default.toml": "version = 3\n" + runtime + "]\ndefault_runtime_name = \"\"\n"},
+			invalid: "`default_runtime_name` is empty",
+		},
+		"a nested import completes a runtime's fields": {
+			main: "version = 3\nimports = [\"a.toml\"]\n" + runtime + ".runtimes.runc]\nprivileged_without_host_devices_all_devices_allowed = true\n" + registry,
+			imports: map[string]string{
+				"a.toml": "version = 3\nimports = [\"b.toml\"]\n",
+				"b.toml": "version = 3\n" + runtime + ".runtimes.runc]\nprivileged_without_host_devices = true\n",
+			},
+		},
+		"the fields stay incomplete across imports": {
+			main:    "version = 3\nimports = [\"a.toml\"]\n" + runtime + ".runtimes.runc]\nprivileged_without_host_devices_all_devices_allowed = true\n" + registry,
+			imports: map[string]string{"a.toml": "version = 3\n"},
+			invalid: "requires `privileged_without_host_devices`",
+		},
+		"a version 2 table split over two files": {
+			main:    "version = 2\nimports = [\"a.toml\"]\n[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"nvidia\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n",
+			imports: map[string]string{"a.toml": "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.nvidia]\nruntime_type = \"io.containerd.runc.v2\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"},
+		},
+		"an import disables what the main file requires": {
+			main:    "version = 3\nimports = [\"a.toml\"]\nrequired_plugins = [\"io.containerd.internal.v1.opt\"]\n" + registry,
+			imports: map[string]string{"a.toml": "version = 3\ndisabled_plugins = [\"io.containerd.internal.v1.opt\"]\n"},
+			invalid: "required plugin io.containerd.internal.v1.opt not included",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			for rel, body := range tc.imports {
+				file := filepath.Join(root, "etc/containerd", rel)
+				if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			eff, err := ResolveContainerdConfig(root, ContainerdConfigPath, []byte(tc.main))
+			if err != nil {
+				t.Fatalf("ResolveContainerdConfig: %v", err)
+			}
+			if tc.invalid == "" && eff.Invalid != "" || tc.invalid != "" && !strings.Contains(eff.Invalid, tc.invalid) {
+				t.Errorf("Invalid = %q; want one holding %q", eff.Invalid, tc.invalid)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: a disabled plugin is read for what it does to the CRI
+// service at containerd v2.2.0, and one doctor does not follow is never
+// read as harmless.
+func TestContainerdDisabledPluginsAreNeverAssumedHarmless(t *testing.T) {
+	for _, tc := range []struct {
+		conf        string
+		criDisabled bool
+		invalid     string
+	}{
+		{conf: "disabled_plugins = [\"cri\"]\n", criDisabled: true},
+		{conf: "version = 2\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n", criDisabled: true},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.cri.v1.images\"]\n", criDisabled: true},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.cri.v1.runtime\"]\n", invalid: "unable to load CRI runtime service plugin dependency"},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.snapshotter.v1.overlayfs\"]\n", invalid: "a type containerd's CRI service requires"},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.metadata.v1.bolt\"]\n", invalid: "a type containerd's CRI service requires"},
+		{conf: "version = 3\ndisabled_plugins = [\"com.example.unknown.v1.thing\"]\n", invalid: "a type containerd's CRI service requires"},
+		{conf: "disabled_plugins = [\"bolt\"]\n", invalid: "io.containerd.metadata.v1.bolt"},
+		{conf: "disabled_plugins = [\"restart\", \"opt\", \"otlp\", \"introspection\"]\n"},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.internal.v1.opt\", \"io.containerd.tracing.processor.v1.otlp\", \"io.containerd.grpc.v1.healthcheck\"]\n"},
+		{conf: "version = 3\ndisabled_plugins = [\"io.containerd.internal.v1.opt\"]\nrequired_plugins = [\"io.containerd.internal.v1.opt\"]\n", invalid: "required plugin io.containerd.internal.v1.opt not included"},
+	} {
+		r, err := ReadContainerdConfig([]byte(tc.conf))
+		if err != nil {
+			t.Fatalf("%q: %v", tc.conf, err)
+		}
+		if r.CRIDisabled != tc.criDisabled || tc.invalid == "" && r.Invalid != "" || tc.invalid != "" && !strings.Contains(r.Invalid, tc.invalid) {
+			t.Errorf("%q: CRIDisabled = %v, Invalid = %q; want %v and one holding %q", tc.conf, r.CRIDisabled, r.Invalid, tc.criDisabled, tc.invalid)
+		}
+	}
+}

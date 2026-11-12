@@ -262,18 +262,15 @@ type containerdRuntime struct {
 // version behind enable_unprivileged_ports is not checked: it is on by
 // default and 4.11 is older than any kernel containerd 2.x is packaged for.
 //
-// whole is whether the table is all of the runtime configuration, which it is
-// not in a file that imports another or is imported: default_runtime_name and
-// the runtime it names can then sit in different files, so that check runs
-// only on a config.toml standing alone.
-func (c *containerdRuntimeConfig) validate(whole bool) error {
-	if name := c.Containerd.DefaultRuntimeName; whole {
-		if name == "" {
-			return errors.New("`default_runtime_name` is empty")
-		}
-		if _, ok := c.Containerd.Runtimes[name]; !ok {
-			return fmt.Errorf("no corresponding runtime configured in `containerd.runtimes` for `containerd` `default_runtime_name = \"%s\"", name)
-		}
+// It reads the table every loaded file added up to: default_runtime_name and
+// the runtime it names can sit in different files.
+func (c *containerdRuntimeConfig) validate() error {
+	name := c.Containerd.DefaultRuntimeName
+	if name == "" {
+		return errors.New("`default_runtime_name` is empty")
+	}
+	if _, ok := c.Containerd.Runtimes[name]; !ok {
+		return fmt.Errorf("no corresponding runtime configured in `containerd.runtimes` for `containerd` `default_runtime_name = \"%s\"", name)
 	}
 	names := make([]string, 0, len(c.Containerd.Runtimes))
 	for name := range c.Containerd.Runtimes {
@@ -401,58 +398,186 @@ func decodeContainerdPlugin(data []byte, id string, into any) error {
 	return nil
 }
 
-// containerdCRIError is why containerd v2.2.0 serves no CRI pull under the
-// config.toml in data, of format version, or nil when its three CRI plugins
-// start on their tables: images, which reads the registry configuration,
-// runtime, and the CRI plugin that needs both. containerd logs a plugin's
-// failure and goes on without it, so no hosts.toml under config_path is read.
+// containerdCRI is the configuration containerd v2.2.0's three CRI plugins
+// start on: images, which reads the registry configuration, runtime, and the
+// CRI plugin that needs both. containerd logs a plugin's failure and goes on
+// without it, so no hosts.toml under config_path is read.
+//
+// It is filled one file at a time, main file first and then each import in
+// the order containerd loads them, because containerd validates what the
+// files add up to and not each file: mergeConfig
+// (cmd/containerd/server/config/config.go, lines 429-449) merges an import's
+// plugin tables into the main file's key by key, the import's value winning,
+// and each plugin decodes and validates its table after that. Decoding every
+// file over the same structs gives the same result for every key they hold.
 //
 // A version 3 file names each plugin's table. An older one is migrated first:
 // version 1 names the CRI table "cri", which v1Migrate renames, and the
 // plugins' own migrations then move its keys into the three tables. Those
 // keys are decoded where the file has them, with the types their destinations
 // have. legacy is the name the file's version gives the table.
-func containerdCRIError(data []byte, version int, legacy string, whole bool) error {
-	failed := func(plugin string, err error) error {
-		return fmt.Errorf("the CRI %s, without which containerd serves no CRI pull, does not start on its table: %w", plugin, err)
-	}
-	images := containerdImageConfig{}
+type containerdCRI struct {
+	version int
+	legacy  string
+	moved   containerdLegacyCRI
+	images  containerdImageConfig
+	runtime containerdRuntimeConfig
+	server  containerdCRIServerConfig
+}
+
+func newContainerdCRI(version int, legacy string) *containerdCRI {
+	c := &containerdCRI{version: version, legacy: legacy}
 	// DefaultRuntimeConfig: the runtime every install starts with.
-	runtime := containerdRuntimeConfig{}
-	runtime.Containerd.DefaultRuntimeName = "runc"
-	runtime.Containerd.Runtimes = map[string]containerdRuntime{"runc": {Type: "io.containerd.runc.v2"}}
-	server := containerdCRIServerConfig{}
+	c.runtime.Containerd.DefaultRuntimeName = "runc"
+	c.runtime.Containerd.Runtimes = map[string]containerdRuntime{"runc": {Type: "io.containerd.runc.v2"}}
+	return c
+}
+
+func containerdPluginFailed(plugin string, err error) error {
+	return fmt.Errorf("the CRI %s, without which containerd serves no CRI pull, does not start on its table: %w", plugin, err)
+}
+
+// load decodes the CRI tables of one config.toml over what earlier files
+// left. The error is a value of the wrong type, which no later file repairs.
+func (c *containerdCRI) load(data []byte) error {
 	imagesTable, runtimeTable, serverTable := containerdImagesPlugin, containerdRuntimePlugin, containerdCRIPlugin
-	if version < 3 {
-		imagesTable, runtimeTable, serverTable = "", legacy, legacy
-		var moved containerdLegacyCRI
-		if err := decodeContainerdPlugin(data, legacy, &moved); err != nil {
-			return fmt.Errorf("containerd's CRI plugins do not start on what it migrates its version %d CRI table into: %w", version, err)
+	if c.version < 3 {
+		imagesTable, runtimeTable, serverTable = "", c.legacy, c.legacy
+		if err := decodeContainerdPlugin(data, c.legacy, &c.moved); err != nil {
+			return fmt.Errorf("containerd's CRI plugins do not start on what it migrates its version %d CRI table into: %w", c.version, err)
 		}
-		// The image plugin's migration takes six keys by name and leaves the
-		// rest of the table to the runtime plugin.
-		images = containerdImageConfig{Registry: moved.Registry, ImageDecryption: moved.ImageDecryption, MaxConcurrentDownloads: moved.MaxConcurrentDownloads,
-			ImagePullProgressTimeout: moved.ImagePullProgressTimeout, ImagePullWithSyncFs: moved.ImagePullWithSyncFs, StatsCollectPeriod: moved.StatsCollectPeriod}
 	}
 	if imagesTable != "" {
-		if err := decodeContainerdPlugin(data, imagesTable, &images); err != nil {
-			return failed("image plugin", err)
+		if err := decodeContainerdPlugin(data, imagesTable, &c.images); err != nil {
+			return containerdPluginFailed("image plugin", err)
 		}
 	}
-	if err := images.validate(); err != nil {
-		return failed("image plugin", fmt.Errorf("invalid cri image config: %w", err))
+	if err := decodeContainerdPlugin(data, runtimeTable, &c.runtime); err != nil {
+		return containerdPluginFailed("runtime plugin", err)
 	}
-	if err := decodeContainerdPlugin(data, runtimeTable, &runtime); err != nil {
-		return failed("runtime plugin", err)
-	}
-	if err := runtime.validate(whole); err != nil {
-		return failed("runtime plugin", fmt.Errorf("invalid plugin config: %w", err))
-	}
-	if err := decodeContainerdPlugin(data, serverTable, &server); err != nil {
-		return failed("plugin", err)
-	}
-	if err := server.validate(); err != nil {
-		return failed("plugin", err)
+	if err := decodeContainerdPlugin(data, serverTable, &c.server); err != nil {
+		return containerdPluginFailed("plugin", err)
 	}
 	return nil
+}
+
+// validate is what the three plugins refuse in the tables every loaded file
+// added up to: ValidateImageConfig, ValidateRuntimeConfig and
+// ValidateServerConfig. It runs once, after the last file.
+func (c *containerdCRI) validate() error {
+	images := c.images
+	if c.version < 3 {
+		// The image plugin's migration takes six keys by name and leaves the
+		// rest of the table to the runtime plugin.
+		m := c.moved
+		images = containerdImageConfig{Registry: m.Registry, ImageDecryption: m.ImageDecryption, MaxConcurrentDownloads: m.MaxConcurrentDownloads,
+			ImagePullProgressTimeout: m.ImagePullProgressTimeout, ImagePullWithSyncFs: m.ImagePullWithSyncFs, StatsCollectPeriod: m.StatsCollectPeriod}
+	}
+	if err := images.validate(); err != nil {
+		return containerdPluginFailed("image plugin", fmt.Errorf("invalid cri image config: %w", err))
+	}
+	if err := c.runtime.validate(); err != nil {
+		return containerdPluginFailed("runtime plugin", fmt.Errorf("invalid plugin config: %w", err))
+	}
+	if err := c.server.validate(); err != nil {
+		return containerdPluginFailed("plugin", err)
+	}
+	return nil
+}
+
+// containerdV1Plugins is corePlugins in v1MigratePluginName
+// (cmd/containerd/server/config/config.go, lines 148-187): the short names a
+// version 1 file gives plugins, and the URIs containerd 2.x reads them as.
+var containerdV1Plugins = map[string]string{
+	"cri":       "io.containerd.grpc.v1.cri",
+	"cgroups":   "io.containerd.monitor.v1.cgroups",
+	"linux":     "io.containerd.runtime.v1.linux",
+	"scheduler": "io.containerd.gc.v1.scheduler",
+	"bolt":      "io.containerd.metadata.v1.bolt",
+	"task":      "io.containerd.runtime.v2.task",
+	"opt":       "io.containerd.internal.v1.opt",
+	"restart":   "io.containerd.internal.v1.restart",
+	"tracing":   "io.containerd.internal.v1.tracing",
+	"otlp":      "io.containerd.tracing.processor.v1.otlp",
+	"aufs":      "io.containerd.snapshotter.v1.aufs",
+	"btrfs":     "io.containerd.snapshotter.v1.btrfs",
+	"devmapper": "io.containerd.snapshotter.v1.devmapper",
+	"native":    "io.containerd.snapshotter.v1.native",
+	"overlayfs": "io.containerd.snapshotter.v1.overlayfs",
+	"zfs":       "io.containerd.snapshotter.v1.zfs",
+}
+
+// containerdV1PluginName is v1MigratePluginName: the URI of a plugin a
+// version 1 file names without one.
+func containerdV1PluginName(name string) string {
+	if strings.Contains(name, ".") {
+		return name
+	}
+	if full, ok := containerdV1Plugins[name]; ok {
+		return full
+	}
+	switch {
+	case strings.HasSuffix(name, "-service"):
+		return "io.containerd.service.v1." + name
+	case name == "windows" || name == "windows-lcow":
+		return "io.containerd.snapshotter.v1." + name
+	}
+	return "io.containerd.grpc.v1." + name
+}
+
+// containerdOutsideCRI are the plugin types no plugin the CRI service starts
+// through requires, at containerd v2.2.0: following Requires from the CRI
+// plugin's registration (plugins/cri/cri.go, lines 46-60) through the image
+// and runtime plugins, the transfer, metadata, snapshot and service plugins
+// and the task service (plugins/services/tasks/local.go, lines 67-72)
+// reaches none of them. A disabled plugin of one of these types leaves the
+// CRI service as it was. The CRI plugin is itself a gRPC plugin and is told
+// apart by its URI.
+var containerdOutsideCRI = []string{
+	"io.containerd.grpc.v1.",
+	"io.containerd.ttrpc.v1.",
+	"io.containerd.http.v1.",
+	"io.containerd.internal.v1.",
+	"io.containerd.streaming.v1.",
+	"io.containerd.runtime.v1.",
+	"io.containerd.monitor.container.v1.",
+	"io.containerd.tracing.processor.v1.",
+}
+
+// containerdPluginState reads disabled_plugins and required_plugins, as every
+// loaded file adds them up and by URI, for what they do to the CRI service.
+//
+// criDisabled is a disabled plugin that reads the registry configuration:
+// the CRI plugin, or its image plugin. invalid is why containerd does not
+// start, the CRI plugin does not, or doctor cannot say it does: the runtime
+// plugin, which initCRIService fetches before it serves anything and stops
+// without (plugins/cri/cri.go, lines 71-75); a plugin both required and
+// disabled, on which New exits with "required plugin not included"
+// (cmd/containerd/server/server.go, lines 260-356); or a disabled plugin of a
+// type the CRI service's requirements reach, where whether the service
+// starts without it depends on which plugin of that type each requirement
+// takes, which doctor does not follow.
+func containerdPluginState(disabled, required []string) (criDisabled bool, invalid string) {
+	for _, p := range disabled {
+		switch {
+		// "cri" is the CRI plugin as a version 1 file names it. A later
+		// format refuses the bare name, and the plugin is what its author
+		// meant to disable.
+		case p == "cri" || p == containerdCRIPlugin || p == containerdImagesPlugin:
+			criDisabled = true
+		case p == containerdRuntimePlugin:
+			if invalid == "" {
+				invalid = fmt.Sprintf("disabled_plugins names %s, and the CRI plugin, which reads the registry configuration, does not start without it: unable to load CRI runtime service plugin dependency", p)
+			}
+		case slices.Contains(required, p):
+			if invalid == "" {
+				invalid = fmt.Sprintf("required plugin %s not included: disabled_plugins names it too", p)
+			}
+		case !slices.ContainsFunc(containerdOutsideCRI, func(prefix string) bool { return strings.HasPrefix(p, prefix) }):
+			if invalid == "" {
+				invalid = fmt.Sprintf("disabled_plugins names %s, a plugin of a type containerd's CRI service requires, and doctor does not follow whether the service starts without it", p)
+			}
+		}
+	}
+	return criDisabled, invalid
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/oracletest"
 
 	_ "modernc.org/sqlite" // the audit store's driver, for the raw handles below
 )
@@ -2002,12 +2003,7 @@ func TestAudit8DoctorCannotCertifyQuotedNpmCA(t *testing.T) {
 // that would otherwise pass every oracle test unrun.
 func nativeNpm(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("npm"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native npm is required in CI: the test job installs it with actions/setup-node")
-		}
-		t.Skip("native npm is not installed")
-	}
+	oracletest.Npm(t)
 }
 
 func TestAudit9TrustDiscoveryNeverExecutesHostClients(t *testing.T) {
@@ -2054,12 +2050,7 @@ func TestAudit9TrustDiscoveryNeverExecutesHostClients(t *testing.T) {
 }
 
 func TestAudit9NpmEmptyCADoesNotRestoreDefaultRoots(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("native npm is required in CI")
-		}
-		t.Skip("native npm is not installed")
-	}
+	oracletest.Npm(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	srv, caPEM, _ := caPlanServer(t)
@@ -2322,10 +2313,7 @@ func TestAudit13PipOptionIdentityRefusesBeforeWritingOrInstalls(t *testing.T) {
 }
 
 func TestAudit14PipDuplicatesRefusedBeforeWrites(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
+	python := oracletest.Pip(t)
 	for _, location := range []string{"plan target", "selected extra file"} {
 		t.Run(location, func(t *testing.T) {
 			home := t.TempDir()
@@ -2373,10 +2361,7 @@ func TestAudit14PipDuplicatesRefusedBeforeWrites(t *testing.T) {
 }
 
 func TestAudit15PipSyntaxErrorRefusedBeforeWrites(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
+	python := oracletest.Pip(t)
 	for _, location := range []string{"plan target", "selected extra file"} {
 		t.Run(location, func(t *testing.T) {
 			home := t.TempDir()
@@ -2424,10 +2409,7 @@ func TestAudit15PipSyntaxErrorRefusedBeforeWrites(t *testing.T) {
 }
 
 func TestAudit16GitLoadErrorRefusedBeforeWrites(t *testing.T) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	git := oracletest.Git(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	clearClientEnv(t)
@@ -2459,13 +2441,7 @@ func TestAudit16GitLoadErrorRefusedBeforeWrites(t *testing.T) {
 }
 
 func TestAudit16NpmEnvCaseDoesNotCertifyShadowedEndpoint(t *testing.T) {
-	npm, err := exec.LookPath("npm")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal(err)
-		}
-		t.Skip("native npm is not installed")
-	}
+	npm := oracletest.Npm(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	clearClientEnv(t)
@@ -2583,10 +2559,7 @@ func TestAudit16DisabledContainerdCannotPass(t *testing.T) {
 }
 
 func TestAudit17HelmLoadErrorsRemainReportObligations(t *testing.T) {
-	helm, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("native Helm oracle is not installed")
-	}
+	helm := oracletest.Helm(t)
 	for name, broken := range map[string]string{
 		"syntax":      "broken: [\n",
 		"typed field": "    pass_credentials_all: [wrong-type]\n",
@@ -2638,10 +2611,7 @@ func TestAudit17HelmLoadErrorsRemainReportObligations(t *testing.T) {
 }
 
 func TestAudit17HelmNativeLoadErrorRefusesBeforeWriting(t *testing.T) {
-	helm, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("native Helm oracle is not installed")
-	}
+	helm := oracletest.Helm(t)
 	home, root := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 	clearClientEnv(t)
@@ -3390,5 +3360,77 @@ func TestAudit25ContainerdV2ConversionRefusesBeforeWrites(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
 			t.Errorf("wrote %s before refusal: %v", name, err)
 		}
+	}
+}
+
+func TestAudit26ContainerdDependencyGraphRefusesBeforeWrites(t *testing.T) {
+	for name, conf := range map[string]string{
+		"disabled runtime":                 "version = 3\ndisabled_plugins = [\"io.containerd.cri.v1.runtime\"]\n",
+		"imports evade runtime validation": "version = 3\nimports = [\"empty/*.toml\"]\n[plugins.\"io.containerd.cri.v1.runtime\".containerd]\ndefault_runtime_name = \"missing\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, "containerd")
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, "etc/containerd/config.toml")
+			conf += "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(conf), 0600); err != nil {
+				t.Fatal(err)
+			}
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			prevRoot := doctorOCIRoot
+			doctorOCIRoot = home
+			t.Cleanup(func() { doctorOCIRoot = prevRoot })
+			for _, phase := range []string{"first", "idle"} {
+				out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+				if err == nil {
+					t.Errorf("%s apply certified unavailable CRI:\n%s", phase, out)
+				}
+			}
+			if got, _ := os.ReadFile(file); string(got) != conf {
+				t.Errorf("changed parent configuration before refusal:\n%s", got)
+			}
+			for _, path := range []string{".config/bodega/ca.pem", "etc/containerd/certs.d/docker.io/hosts.toml"} {
+				if _, err := os.Stat(filepath.Join(home, path)); !os.IsNotExist(err) {
+					t.Errorf("wrote %s before refusal: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAudit26NpmSectionValueRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".npmrc")
+	old := "registry=" + srv.URL + "/npm/\n[ca]\nx=1\n"
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("%s apply certified an npm startup failure:\n%s", phase, out)
+		}
+	}
+	if got, _ := os.ReadFile(file); string(got) != old {
+		t.Errorf("changed invalid configuration:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Errorf("CA written before refusal: %v", err)
 	}
 }

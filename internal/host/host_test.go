@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/oracletest"
 )
 
 // TestFirstHit covers the substring-scan logic that underlies every
@@ -169,14 +170,13 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 	if got := CheckGoproxyEnv(); got.Status != StatusOK {
 		t.Errorf("rendered env file: got %v, want OK (detail=%q)", got.Status, got.Detail)
 	}
-	if goBin, err := exec.LookPath("go"); err == nil {
-		out, err := exec.Command(goBin, "env", "GOPROXY").Output()
-		if err != nil {
-			t.Fatalf("go env GOPROXY: %v", err)
-		}
-		if got := strings.TrimSpace(string(out)); got != clientconf.GoProxy(base) {
-			t.Errorf("go env GOPROXY = %q, want %q: the toolchain does not read the rendered file as doctor does", got, clientconf.GoProxy(base))
-		}
+	goBin := oracletest.Go(t)
+	out, err := exec.Command(goBin, "env", "GOPROXY").Output()
+	if err != nil {
+		t.Fatalf("go env GOPROXY: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != clientconf.GoProxy(base) {
+		t.Errorf("go env GOPROXY = %q, want %q: the toolchain does not read the rendered file as doctor does", got, clientconf.GoProxy(base))
 	}
 
 	for _, override := range []string{clientconf.GoProxy(base) + ",direct", clientconf.GoProxy(base) + "|direct", "direct"} {
@@ -194,13 +194,7 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 // distribution's go.env is the test's to write.
 func TestGoEnvResolvesAsGo(t *testing.T) {
 	// go test puts the toolchain's own bin directory first on PATH.
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		if os.Getenv("CI") == "true" {
-			t.Fatal("no go command to compare against")
-		}
-		t.Skip("no go command to compare against")
-	}
+	goBin := oracletest.Go(t)
 	const dist = "GOPROXY=https://dist.example/go,direct\n"
 	for _, tc := range []struct {
 		name string
