@@ -3,7 +3,6 @@ package host
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -959,9 +957,6 @@ type OCIHost struct {
 	// the main registries.conf in place of the system one.
 	Home           string
 	RegistriesConf string
-	// DockerdVersion runs the dockerd LookPath found with --version. Nil
-	// reads no version, which adds no note to the oci-docker row.
-	DockerdVersion func(dockerd string) (string, error)
 }
 
 const ociRemedy = "bodega doctor --configure oci --apply --url <bodega base URL>"
@@ -979,10 +974,10 @@ func (t OCIHost) Check(base string) []Finding {
 	}
 	var out []Finding
 	for _, rt := range []string{clientconf.RuntimeDocker, clientconf.RuntimeContainerd, clientconf.RuntimePodman} {
-		present, binPath := false, ""
+		present := false
 		for _, bin := range clientconf.RuntimeBinaries[rt] {
-			if p, err := t.LookPath(bin); err == nil {
-				present, binPath = true, p
+			if _, err := t.LookPath(bin); err == nil {
+				present = true
 			}
 		}
 		if !present {
@@ -991,11 +986,7 @@ func (t OCIHost) Check(base string) []Finding {
 		var f Finding
 		switch rt {
 		case clientconf.RuntimeDocker:
-			version := func() (string, error) { return "", errors.New("no version reader") }
-			if t.DockerdVersion != nil {
-				version = func() (string, error) { return t.DockerdVersion(binPath) }
-			}
-			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host, version)
+			f = checkDockerMirror(filepath.Join(t.Root, clientconf.DockerDaemonPath), host)
 		case clientconf.RuntimeContainerd:
 			f = checkContainerdHosts(t.Root, host)
 		case clientconf.RuntimePodman:
@@ -1010,17 +1001,9 @@ func (t OCIHost) Check(base string) []Finding {
 	return out
 }
 
-// mirrorIsBodega reports whether a mirror URL or location names host, or,
-// with no host to compare, whether there is a mirror at all.
-func mirrorIsBodega(mirror, host string) bool {
-	if host == "" {
-		return mirror != ""
-	}
-	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
-	return m == host || strings.HasPrefix(m, host+"/")
-}
-
-// RunDockerdVersion asks dockerd for its version string.
+// RunDockerdVersion runs dockerd --version. No doctor check calls it: a
+// binary found on PATH is not an admissible reader of where a client
+// connects. It is exported for the test that proves the report runs nothing.
 func RunDockerdVersion(dockerd string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1031,65 +1014,40 @@ func RunDockerdVersion(dockerd string) (string, error) {
 	return string(out), nil
 }
 
-// dockerdNoLookup is the earliest Docker Engine measured not to resolve
-// docker.io while every pull is served by registry-mirrors; 26.1.5 (Debian
-// 13) asks systemd-resolved for it once per pull and connects nowhere.
-var dockerdNoLookup = [3]int{29, 1, 3}
+// dockerdLookupNote is on every mirrored dockerd's row. Whether it applies
+// turns on dockerd's version, which only running dockerd reports, and doctor
+// runs no client to learn where it connects: 26.1.5 (Debian 13) was measured
+// asking the resolver for docker.io once per pull and connecting nowhere,
+// and 29.1.3 is the earliest measured not to ask.
+const dockerdLookupNote = "; note: dockerd before 29.1.3 resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (doctor does not run dockerd to read its version; dockerd --version reports it)"
 
-// dockerdVersionRe matches the whole version token, up to the comma before
-// "build", so a fourth component or trailing junk is unparseable rather than
-// truncated to a version dockerd never reported. Debian's +dfsg1 is build
-// metadata and a -rc1 a prerelease, as semver spells them.
-var dockerdVersionRe = regexp.MustCompile(`^Docker version (\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:,|$)`)
-
-// dockerdLookupNote is the note a mirrored dockerd's row carries when its
-// version is one that still resolves docker.io, or "" when the version is
-// later, or cannot be read: doctor never guesses one. The note names the
-// version with its prerelease, which is what ranks a 29.1.3-rc below the
-// measured release; build metadata ranks nothing and is left out.
-func dockerdLookupNote(version func() (string, error)) string {
-	out, err := version()
-	if err != nil {
-		return ""
+// mirrorIsBodega reports whether a mirror URL or location names host, or,
+// with no host to compare, whether there is a mirror at all.
+func mirrorIsBodega(mirror, host string) bool {
+	if host == "" {
+		return mirror != ""
 	}
-	m := dockerdVersionRe.FindStringSubmatch(strings.TrimSpace(out))
-	if m == nil {
-		return ""
-	}
-	var v [3]int
-	for i := range v {
-		n, err := strconv.Atoi(m[i+1])
-		if err != nil {
-			return ""
-		}
-		v[i] = n
-	}
-	switch c := slices.Compare(v[:], dockerdNoLookup[:]); {
-	case c > 0, c == 0 && m[4] == "":
-		return ""
-	}
-	read := m[1] + "." + m[2] + "." + m[3] + m[4]
-	floor := fmt.Sprintf("%d.%d.%d", dockerdNoLookup[0], dockerdNoLookup[1], dockerdNoLookup[2])
-	return "; note: dockerd " + read + " resolves docker.io on every pull, and no connection follows while the mirror answers, so on a host allowed to reach only bodega the name may be left unresolvable without breaking pulls (" + floor + " is the earliest version measured not to make the lookup)"
+	m := strings.TrimPrefix(strings.TrimPrefix(mirror, "https://"), "http://")
+	return m == host || strings.HasPrefix(m, host+"/")
 }
 
-func checkDockerMirror(path, host string, version func() (string, error)) Finding {
-	data, err := os.ReadFile(path)
+// checkDockerMirror judges the daemon.json at path as dockerd loads it,
+// whole: a file dockerd refuses over any key is one it does not start with,
+// so a mirror it names routes nothing.
+func checkDockerMirror(path, host string) Finding {
+	doc, err := clientconf.LoadDockerDaemonFile(path)
+	var unread *fs.PathError
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
-	case err != nil:
+	case errors.As(err, &unread):
 		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + path}
-	}
-	var doc struct {
-		Mirrors []string `json:"registry-mirrors"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return Finding{Status: StatusSkip, Detail: path + " is not JSON dockerd can read: " + err.Error(), Remediation: "repair " + path + "; dockerd refuses to start with it"}
+	case err != nil:
+		return Finding{Status: StatusSkip, Detail: "dockerd refuses to load its configuration (" + err.Error() + ") and does not start, so where it pulls from is unchecked", Remediation: "repair what the error names in " + path + "; dockerd --validate repeats it"}
+	case doc == nil:
+		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 	}
 	for _, m := range doc.Mirrors {
 		if mirrorIsBodega(m, host) {
-			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)" + dockerdLookupNote(version)}
+			return Finding{Status: StatusOK, Detail: path + " mirrors Docker Hub through " + m + " (Docker Hub only; other registries are containerd's or podman's)" + dockerdLookupNote}
 		}
 	}
 	if len(doc.Mirrors) == 0 {
@@ -1108,7 +1066,7 @@ func checkContainerdHosts(root, host string) Finding {
 		return Finding{Status: StatusSkip, Detail: cfgPath + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + cfgPath}
 	}
 	if _, err := clientconf.ReadContainerdConfig(data); err != nil {
-		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a config.toml containerd can load: " + err.Error(), Remediation: "repair " + cfgPath + "; containerd refuses to start with it"}
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a config.toml containerd can load, so where containerd pulls from is unchecked: " + err.Error(), Remediation: "repair " + cfgPath + "; containerd refuses to start with it"}
 	}
 	cfg, err := clientconf.ResolveContainerdConfig(root, clientconf.ContainerdConfigPath, data)
 	if err != nil {
@@ -1118,6 +1076,8 @@ func checkContainerdHosts(root, host string) Finding {
 	switch {
 	case cfg.CRIDisabled:
 		return Finding{Status: StatusSkip, Detail: cfgPath + " disables the CRI plugin, so nothing here pulls through containerd's registry configuration; the oci-docker row covers dockerd"}
+	case cfg.Invalid != "":
+		return Finding{Status: StatusSkip, Detail: cfgPath + " is not a configuration containerd can load, so where containerd pulls from is unchecked: " + cfg.Invalid, Remediation: "repair " + cfgPath + " or the import the error names; containerd refuses to start with it"}
 	case cfg.ConfigPath == "" && cfg.Legacy != "":
 		return Finding{Status: StatusSkip, Detail: cfgPath + " routes CRI pulls through the deprecated " + cfg.Legacy + " rather than config_path, which doctor does not judge",
 			Remediation: "move " + cfg.Legacy + " into hosts.toml files under " + clientconf.ContainerdCertsDir + " and remove it, then run " + ociRemedy}

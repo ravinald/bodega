@@ -319,7 +319,7 @@ See docs/threat-model.md for the rationale behind each check.`,
 				findings = append(findings, *lockFinding)
 			}
 			base := doctorBaseURL(gf, baseURL)
-			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, DockerdVersion: doctorDockerdVersion, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
+			findings = append(findings, host.OCIHost{LookPath: doctorLookPath, Root: doctorOCIRoot, Home: os.Getenv("HOME"), RegistriesConf: os.Getenv("CONTAINERS_REGISTRIES_CONF")}.Check(base)...)
 			if f, ok := (host.RpmHost{LookPath: doctorLookPath, MainConf: doctorDnfConf, Dirs: doctorYumReposDirs}).Check(base); ok {
 				findings = append(findings, f)
 			}
@@ -916,10 +916,13 @@ func disableDistroAptSources(bodegaSources string, steps []string) error {
 	return nil
 }
 
-// doctorLookPath is how doctor asks whether a container runtime is installed,
-// doctorOCIRoot the directory its /etc files are read under, and
-// doctorDockerdVersion how it reads dockerd's version, so a test can stand in
-// for each.
+// doctorLookPath is how doctor asks whether a container runtime is installed
+// and doctorOCIRoot the directory its /etc files are read under, so a test
+// can stand in for each.
+//
+// doctorDockerdVersion is on no report path: doctor runs no client to learn
+// where it connects. It names the one function here that would run dockerd,
+// so a test can install it and show the report still runs nothing.
 var (
 	doctorLookPath       = exec.LookPath
 	doctorOCIRoot        = ""

@@ -386,6 +386,36 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 	return nil
 }
 
+// dockerReads refuses a plan for Docker Engine on a host whose dockerd would
+// not load its daemon.json, as the plan leaves it: dockerd does not start
+// with that file, so a ca.crt under certs.d would report an install no pull
+// uses.
+func (h CAHost) dockerReads(changes []Change) error {
+	if !slices.ContainsFunc(changes, func(c Change) bool {
+		return c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeDocker
+	}) {
+		return nil
+	}
+	path := filepath.Join(h.Root, DockerDaemonPath)
+	data, err := os.ReadFile(path)
+	for _, c := range changes {
+		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Record.Path, "/docker/daemon.json") {
+			path, data, err = c.Target, c.New, nil
+		}
+	}
+	switch {
+	case os.IsNotExist(err):
+		return nil
+	case err == nil:
+		_, err = ParseDockerDaemonFile(data)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: dockerd refuses to load %s (%w) and does not start, so it would use neither the mirror nor the CA this command installs, and the install could not be verified. "+
+			"Nothing was written. Repair what the error names (dockerd --validate repeats it), then re-run", manifest.TypeOCI, path, err)
+	}
+	return nil
+}
+
 // containerdReads refuses a plan that writes containerd's hosts.toml on a
 // host whose containerd would not read it: a config.toml, as the plan leaves
 // it, that does not resolve, one that disables the CRI plugin, which is what
@@ -420,6 +450,9 @@ func (h CAHost) containerdReads(changes []Change) error {
 		case eff.CRIDisabled:
 			return fmt.Errorf("%s: %s disables containerd's CRI plugin (disabled_plugins), and that plugin is what reads hosts.toml and the ca this command writes there, so containerd would use neither and the install could not be verified. "+
 				"Where this host pulls through containerd's CRI, remove the plugin from disabled_plugins, restart containerd and re-run; where only Docker Engine pulls here, add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path)
+		case eff.Invalid != "":
+			return fmt.Errorf("%s: containerd refuses to load its configuration at %s (%s) and does not start, so it would read neither hosts.toml nor the ca this command writes there, and the install could not be verified. "+
+				"Nothing was written. Repair what the error names, then re-run", manifest.TypeOCI, path, eff.Invalid)
 		case eff.ConfigPath != "":
 			roots = strings.Split(eff.ConfigPath, ":")
 		}
@@ -640,6 +673,9 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		}
 	}
 	if err := h.containerdReads(changes); err != nil {
+		return CAInstall{}, err
+	}
+	if err := h.dockerReads(changes); err != nil {
 		return CAInstall{}, err
 	}
 	in := CAInstall{Changes: slices.Clone(changes)}

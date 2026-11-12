@@ -175,12 +175,23 @@ var trustRows = map[string]trustRow{
 	"pip-config":                          {system: manifest.TypePypi, stores: pipStores},
 	"npm-config":                          {system: manifest.TypeNpm, stores: npmStores},
 	"oci-" + clientconf.RuntimeContainerd: {system: manifest.TypeOCI, stores: containerdStores},
-	"oci-" + clientconf.RuntimeDocker: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
-		if !t.filesMention(u.Host, clientconf.DockerDaemonPath) {
-			return nil
-		}
-		return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
-	}},
+	"oci-" + clientconf.RuntimeDocker:     {system: manifest.TypeOCI, stores: dockerStores},
+}
+
+// dockerStores is the certs.d directory dockerd reads for bodega at u when a
+// registry-mirrors entry of the daemon.json it loads names that host. The
+// file is loaded whole, as dockerd loads it: one dockerd refuses, over any
+// key, is one it does not start with, so the mirror and the directory are
+// settings nothing runs with and Docker Engine is left unchecked.
+func dockerStores(t TrustProbe, u *url.URL) []trustStore {
+	doc, err := clientconf.LoadDockerDaemonFile(filepath.Join(t.Root, clientconf.DockerDaemonPath))
+	switch {
+	case err != nil:
+		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd refuses to load its configuration (%v) and does not start, so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
+	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return mirrorIsBodega(m, u.Host) }):
+		return nil
+	}
+	return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
 }
 
 // aptStores is the store apt verifies bodega at u against: the file the
@@ -891,6 +902,8 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 			return blind(fmt.Sprintf("does not resolve (%v)", err))
 		case cfg.CRIDisabled:
 			return blind("disables the CRI plugin, which is what reads containerd's registry configuration")
+		case cfg.Invalid != "":
+			return blind(fmt.Sprintf("is one containerd refuses to load (%s)", cfg.Invalid))
 		case cfg.ConfigPath != "":
 			roots = strings.Split(cfg.ConfigPath, ":")
 		}

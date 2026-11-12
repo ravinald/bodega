@@ -2876,3 +2876,148 @@ func TestAudit19OrdinaryDoctorNeverExecutesGem(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAudit20RuntimeLoadErrorsRefuseBeforeWrites(t *testing.T) {
+	for _, tc := range []struct{ name, bin, path, body string }{
+		{"containerd root type", "containerd", "etc/containerd/config.toml", "version = 2\nroot = 17\n"},
+		{"containerd disabled_plugins type", "containerd", "etc/containerd/config.toml", "version = 2\ndisabled_plugins = 17\n"},
+		{"docker log-driver type", "dockerd", "etc/docker/daemon.json", "{\"log-driver\":17}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, tc.bin)
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, tc.path)
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, phase := range []string{"first", "second"} {
+				out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+				got, readErr := os.ReadFile(file)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				cert := filepath.Join(home, ".config/bodega/ca.pem")
+				if tc.bin == "dockerd" {
+					cert = filepath.Join(home, "etc/docker/certs.d", strings.TrimPrefix(srv.URL, "https://"), "ca.crt")
+				}
+				_, caErr := os.Stat(cert)
+				if err == nil || !strings.Contains(err.Error(), file) || string(got) != tc.body || !os.IsNotExist(caErr) {
+					t.Errorf("%s apply: err=%v; config unchanged=%t; CA stat=%v\n%s", phase, err, string(got) == tc.body, caErr, out)
+				}
+			}
+		})
+	}
+}
+
+func TestAudit20RuntimeLoadErrorsRemainUnchecked(t *testing.T) {
+	for _, rt := range []string{"containerd", "docker"} {
+		t.Run(rt, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			bin := rt
+			if rt == "docker" {
+				bin = "dockerd"
+			}
+			stubRuntimes(t, bin)
+			srv, caPEM, _ := caPlanServer(t)
+			hostpart := strings.TrimPrefix(srv.URL, "https://")
+			caFile := filepath.Join(home, "issuer.pem")
+			file := filepath.Join(home, "etc/containerd/config.toml")
+			files := map[string]string{
+				caFile: string(caPEM),
+				file:   "version = 2\nroot = 17\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n",
+				filepath.Join(home, "etc/containerd/certs.d/docker.io/hosts.toml"): "server = \"https://registry-1.docker.io\"\n[host.\"" + srv.URL + "\"]\n  capabilities = [\"pull\", \"resolve\"]\n  ca = \"" + caFile + "\"\n",
+			}
+			if rt == "docker" {
+				file = filepath.Join(home, "etc/docker/daemon.json")
+				files = map[string]string{
+					file: "{\"log-driver\":17,\"registry-mirrors\":[\"" + srv.URL + "\"]}\n",
+					filepath.Join(home, "etc/docker/certs.d", hostpart, "ca.crt"): string(caPEM),
+				}
+			}
+			for p, body := range files {
+				if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prevRoot, prevExit, prevVersion := doctorOCIRoot, doctorExit, doctorDockerdVersion
+			doctorOCIRoot, doctorExit = home, func(int) {}
+			doctorDockerdVersion = func(string) (string, error) { return "Docker version 29.1.3", nil }
+			t.Cleanup(func() { doctorOCIRoot, doctorExit, doctorDockerdVersion = prevRoot, prevExit, prevVersion })
+			out, err := runDoctor(t, "--url", srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := ""
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "oci-"+rt) {
+					row = line
+				}
+			}
+			if !strings.Contains(row, "unchecked") || !strings.Contains(row, file) || strings.Contains(row, " OK ") {
+				t.Errorf("want unchecked %s row naming unusable policy; got %q", rt, row)
+			}
+			vs, err := doctorTrustProbe().Judge([]string{"oci-" + rt}, srv.URL)
+			if err != nil || len(vs) != 1 || vs[0].State != host.TrustUnchecked {
+				t.Errorf("selected verdict = %+v, %v; want unchecked", vs, err)
+			}
+		})
+	}
+}
+
+func TestAudit20OrdinaryDoctorNeverExecutesDockerd(t *testing.T) {
+	home, bin := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t)
+	marker := filepath.Join(home, "dockerd-ran")
+	t.Setenv("F116_AUDIT_MARKER", marker)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	executable := filepath.Join(bin, "dockerd")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$F116_AUDIT_MARKER\"\nprintf '%s\\n' 'Docker version 26.1.5, build audit'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	srv, _, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/docker/daemon.json")
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("{\"registry-mirrors\":[\""+srv.URL+"\"]}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prevRoot, prevExit, prevLook, prevVersion := doctorOCIRoot, doctorExit, doctorLookPath, doctorDockerdVersion
+	doctorOCIRoot, doctorExit = home, func(int) {}
+	doctorLookPath = func(name string) (string, error) {
+		if name == "dockerd" {
+			return exec.LookPath(name)
+		}
+		return "", os.ErrNotExist
+	}
+	doctorDockerdVersion = host.RunDockerdVersion
+	t.Cleanup(func() {
+		doctorOCIRoot, doctorExit, doctorLookPath, doctorDockerdVersion = prevRoot, prevExit, prevLook, prevVersion
+	})
+	out, err := runDoctor(t, "--url", srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("ordinary doctor executed a PATH runtime while reporting where it connects: %s\n%s", ran, out)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}

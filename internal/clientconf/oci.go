@@ -17,7 +17,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	gotoml224 "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -248,11 +247,15 @@ func RegistriesConf(base string, registries []string) File {
 // already holds. Every other key keeps its value and its place. An empty
 // existing file gets planned.
 //
-// A file that is not a JSON object is refused: dockerd will not start with
-// it either, so it is the operator's to repair.
+// A file dockerd would not load is refused, whatever key the fault is in:
+// dockerd will not start with it either, so it is the operator's to repair,
+// and a mirror merged into it would be one no pull uses.
 func MergeDockerDaemon(existing, planned []byte) ([]byte, error) {
 	if len(bytes.TrimSpace(existing)) == 0 {
 		return planned, nil
+	}
+	if _, err := ParseDockerDaemonFile(existing); err != nil {
+		return nil, fmt.Errorf("dockerd refuses to load it (%w) and does not start; repair what the error names, or move the file aside, then re-run. Nothing was written", err)
 	}
 	plan, err := objectMembers(planned)
 	if err != nil {
@@ -272,7 +275,14 @@ func MergeDockerDaemon(existing, planned []byte) ([]byte, error) {
 		}
 		doc = setMember(doc, p, false)
 	}
-	return indentJSON(doc)
+	out, err := indentJSON(doc)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ParseDockerDaemonFile(out); err != nil {
+		return nil, fmt.Errorf("with bodega's settings merged in, dockerd would refuse to load it (%w). Nothing was written", err)
+	}
+	return out, nil
 }
 
 // unionStrings is the JSON list have with every entry of add it lacks
@@ -347,6 +357,12 @@ type ContainerdRegistry struct {
 	// SetsConfigPath whether its registry table names config_path, even "".
 	HasPlugin      bool
 	SetsConfigPath bool
+	// Invalid is what containerd's ValidateVersion refuses once every file
+	// has loaded, "" for nothing: containerd exits on it. It is a field
+	// rather than an error so a caller can still say the CRI plugin is
+	// disabled, which is the more useful thing to tell whoever wrote
+	// disabled_plugins = ["cri"] under version = 2.
+	Invalid string
 }
 
 // ReadContainerdConfig decodes a config.toml and reports its CRI registry
@@ -362,10 +378,12 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 // format's CRI plugin, is refused, since containerd 2.x migrates each file
 // on its own and doctor does not follow that.
 func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) {
-	// containerd v2.2.0 loads this file with go-toml v2.2.4, which rejects
-	// TOML 1.1 syntax the decoder below accepts, and a config.toml it
-	// rejects is one it does not start with.
-	if err := gotoml224.Unmarshal(data, new(map[string]any)); err != nil {
+	// The typed load comes first: containerd v2.2.0 decodes the whole file
+	// into its Config with go-toml v2.2.4, which rejects TOML 1.1 syntax the
+	// decoder below accepts and any field of the wrong type, read here or
+	// not. A config.toml that fails it is one containerd does not start with.
+	cfg, err := decodeContainerdConfig(data)
+	if err != nil {
 		return ContainerdRegistry{}, err
 	}
 	var doc map[string]any
@@ -389,6 +407,11 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	path, ok := containerdRegistryTable[r.Version]
 	if !ok {
 		return r, fmt.Errorf("it declares version = %d, a config.toml format this release does not know", r.Version)
+	}
+	if _, declared := doc["version"]; declared && r.Version > 1 {
+		if err := cfg.validatePluginURIs(); err != nil {
+			r.Invalid = err.Error()
+		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to
 	// the main file's before merging it, so [plugins.cri] there becomes the
@@ -503,6 +526,9 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			return eff, fmt.Errorf("its import %s cannot be judged: %w", p, err)
 		}
 		eff.CRIDisabled = eff.CRIDisabled || r.CRIDisabled
+		if eff.Invalid == "" {
+			eff.Invalid = r.Invalid
+		}
 		if eff.Legacy == "" {
 			eff.Legacy = r.Legacy
 		}
@@ -559,6 +585,9 @@ func ContainerdEditEffective(root, path string, merged []byte) error {
 	eff, err := ResolveContainerdConfig(root, path, merged)
 	if err != nil {
 		return err
+	}
+	if eff.Invalid != "" {
+		return fmt.Errorf("containerd refuses to load it (%s) and does not start; repair what the error names, then re-run. Nothing was written", eff.Invalid)
 	}
 	if eff.Source != path && !slices.Contains(strings.Split(eff.ConfigPath, ":"), ContainerdCertsDir) {
 		return fmt.Errorf("its import %s sets config_path = %q, which containerd reads in place of this file's and which leaves out %s; add %s to config_path there, then re-run. Nothing was written", eff.Source, eff.ConfigPath, ContainerdCertsDir, ContainerdCertsDir)

@@ -458,3 +458,122 @@ func TestContainerdHostsFileLoadsAsContainerd(t *testing.T) {
 		t.Errorf("host = %+v; want ca resolved against the file's directory and no pull", h)
 	}
 }
+
+// TestContainerdConfigLoadsAsContainerdDoes holds the config.toml reader to
+// what containerd v2.2.0's config.LoadConfig answered for each of these
+// files, run from a scratch module against that release: it decodes the
+// whole server configuration with its field types, a key it does not know is
+// a warning, and a plugin named without its URI past version 1 is refused
+// once the files have merged.
+func TestContainerdConfigLoadsAsContainerdDoes(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		loads      bool
+	}{
+		{"valid", "version = 2\nroot = \"/var/lib/containerd\"\n[grpc]\n  uid = 0\n[timeouts]\n  \"io.containerd.timeout.shim.cleanup\" = \"5s\"\n", true},
+		{"unknown key", "version = 2\nnot_a_key = 17\n[grpc]\n  nope = true\n", true},
+		{"root", "version = 2\nroot = 17\n", false},
+		{"disabled_plugins", "version = 2\ndisabled_plugins = 17\n", false},
+		{"grpc uid", "version = 2\n[grpc]\n  uid = \"0\"\n", false},
+		{"timeouts", "version = 2\n[timeouts]\n  a = 5\n", false},
+		{"proxy_plugins", "version = 2\n[proxy_plugins.x]\n  capabilities = \"pull\"\n", false},
+		{"stream_processors", "version = 2\n[stream_processors.x]\n  args = [1]\n", false},
+		{"metrics", "version = 2\n[metrics]\n  grpc_histogram = \"yes\"\n", false},
+		{"imports", "version = 2\nimports = \"a.toml\"\n", false},
+		{"plugins", "version = 2\nplugins = 17\n", false},
+		{"oom_score", "version = 2\noom_score = 1.5\n", false},
+		{"version string", "version = \"2\"\n", false},
+		{"version 4", "version = 4\n", false},
+		{"v2 short disabled", "version = 2\ndisabled_plugins = [\"cri\"]\n", false},
+		{"v2 short required", "version = 2\nrequired_plugins = [\"cri\"]\n", false},
+		{"v1 short disabled", "disabled_plugins = [\"cri\"]\n", true},
+		{"v3 full disabled", "version = 3\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n", true},
+	} {
+		eff, err := ResolveContainerdConfig(t.TempDir(), ContainerdConfigPath, []byte(c.body))
+		if loads := err == nil && eff.Invalid == ""; loads != c.loads {
+			t.Errorf("%s: loads = %v (err %v, invalid %q), containerd says %v", c.name, loads, err, eff.Invalid, c.loads)
+		}
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "etc/containerd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "etc/containerd/extra.toml"), []byte("version = 2\nstate = 17\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveContainerdConfig(dir, ContainerdConfigPath, []byte("version = 2\nimports = [\"extra.toml\"]\n")); err == nil || !strings.Contains(err.Error(), "extra.toml") {
+		t.Errorf("an import with a wrong field type = %v, want an error naming it", err)
+	}
+}
+
+// TestDockerDaemonLoadsAsDockerdDoes holds the daemon.json loader to moby
+// v28.5.2's MergeDaemonConfigurations and Validate, read from that release's
+// source: dockerd does not build on the hosts these tests run on, so the
+// answers are the source's rather than a run's.
+func TestDockerDaemonLoadsAsDockerdDoes(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		loads      bool
+	}{
+		{"empty", "", true},
+		{"whitespace", " \n", true},
+		{"empty object", "{}", true},
+		{"utf-8 bom", "\xef\xbb\xbf{\"debug\":true}", true},
+		{"utf-16le bom", "\xff\xfe{\x00}\x00", true},
+		{"usual keys", `{"registry-mirrors":["https://bodega.internal"],"insecure-registries":["bodega.internal:8080"],"log-driver":"json-file","log-opts":{"max-size":"10m"},"live-restore":true,"default-ulimits":{"nofile":{"Name":"nofile","Hard":64000,"Soft":64000}},"runtimes":{"x":{"path":"/usr/bin/x"}},"default-address-pools":[{"base":"172.30.0.0/16","size":24}],"default-shm-size":"64M","dns":["192.0.2.1"],"features":{"containerd-snapshotter":true},"builder":{"gc":{"enabled":true,"policy":[{"keepStorage":"10GB","filter":["unused-for=2200h"]}]}},"proxies":{"http-proxy":"http://proxy.internal:3128"},"exec-opts":["native.cgroupdriver=systemd"],"hosts":["unix:///var/run/docker.sock","tcp://127.0.0.1:2376","fd://"]}`, true},
+		{"deprecated key dockerd skips", `{"deprecated-key-path":"/x"}`, true},
+		{"flag spelling of a tag dockerd never reads", `{"containerd-plugins-namespace":"x"}`, true},
+
+		{"not json", "{", false},
+		{"not an object", "[]", false},
+		{"invalid utf-8", "{\"labels\":[\"a=\xff\"]}", false},
+		{"log-driver type", `{"log-driver":17}`, false},
+		{"registry-mirrors type", `{"registry-mirrors":"https://bodega.internal"}`, false},
+		{"debug type", `{"debug":"yes"}`, false},
+		{"dns address", `{"dns":["not-an-ip"]}`, false},
+		{"shm size bare number", `{"default-shm-size":67108864}`, false},
+		{"address pool base", `{"default-address-pools":[{"base":"172.30.0.0","size":24}]}`, false},
+		{"builder gc policy type", `{"builder":{"gc":{"policy":"all"}}}`, false},
+		{"proxies member type", `{"proxies":{"http-proxy":17}}`, false},
+		{"unknown key", `{"registry-mirror":["https://bodega.internal"],"regsitry-mirrors":[]}`, false},
+		{"unknown key in a group", `{"proxies":{"socks-proxy":"x"}}`, false},
+		{"tag with no flag", `{"swarm-raft-heartbeat-tick":1}`, false},
+		{"tag spelling dockerd has no flag for", `{"containerd-plugin-namespace":"x"}`, false},
+		{"both host gateway keys", `{"host-gateway-ip":"192.0.2.1","host-gateway-ips":["192.0.2.1"]}`, false},
+		{"log level", `{"log-level":"loud"}`, false},
+		{"log format", `{"log-format":"xml"}`, false},
+		{"mirror without scheme", `{"registry-mirrors":["bodega.internal"]}`, false},
+		{"mirror with credentials", `{"registry-mirrors":["https://u:p@bodega.internal"]}`, false},
+		{"label without =", `{"labels":["a"]}`, false},
+		{"conflicting labels", `{"labels":["a=1","a=2"]}`, false},
+		{"host proto", `{"hosts":["ssh://x"]}`, false},
+		{"exec-opt", `{"exec-opts":["isolation=hyperv"]}`, false},
+		{"ipc mode", `{"default-ipc-mode":"host"}`, false},
+		{"cgroupns mode", `{"default-cgroupns-mode":"shared"}`, false},
+		{"fixed-cidr-v6", `{"fixed-cidr-v6":"10.0.0.0/8"}`, false},
+		{"negative mtu", `{"mtu":-1}`, false},
+		{"api-cors-header", `{"api-cors-header":"*"}`, false},
+		{"generic resource", `{"node-generic-resources":["gpu"]}`, false},
+	} {
+		d, err := ParseDockerDaemonFile([]byte(c.body))
+		if (err == nil) != c.loads {
+			t.Errorf("%s: err = %v, dockerd loads it = %v", c.name, err, c.loads)
+		}
+		if c.name == "usual keys" && (d == nil || len(d.Mirrors) != 1 || d.Mirrors[0] != "https://bodega.internal" || len(d.InsecureRegistries) != 1) {
+			t.Errorf("%s: read %+v", c.name, d)
+		}
+	}
+}
+
+// A daemon.json dockerd refuses over a key the plan never sets is not merged
+// into, and one it loads keeps that key.
+func TestMergeDockerDaemonRefusesWhatDockerdRefuses(t *testing.T) {
+	planned := DockerDaemon("https://bodega.internal", nil).Content
+	if out, err := MergeDockerDaemon([]byte(`{"log-driver":17}`), []byte(planned)); err == nil || !strings.Contains(err.Error(), "log-driver") && !strings.Contains(err.Error(), "Type") {
+		t.Errorf("merge into a file dockerd refuses = %q, %v; want a refusal naming the field", out, err)
+	}
+	out, err := MergeDockerDaemon([]byte(`{"log-driver":"journald"}`), []byte(planned))
+	if err != nil || !strings.Contains(string(out), `"log-driver": "journald"`) || !strings.Contains(string(out), "bodega.internal") {
+		t.Errorf("merge into a file dockerd loads = %q, %v", out, err)
+	}
+}
