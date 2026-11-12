@@ -627,6 +627,12 @@ func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch strin
 				rest, base, arch)
 		}
 	}
+	return aptDecompressIndex(base, rest, body)
+}
+
+// aptDecompressIndex decompresses one Packages file of base by the
+// compression its Release-relative path rest names.
+func aptDecompressIndex(base, rest string, body []byte) ([]byte, error) {
 	var r io.Reader = bytes.NewReader(body)
 	switch {
 	case strings.HasSuffix(rest, ".gz"):
@@ -666,9 +672,16 @@ func (s *Server) aptUpstreamPackages(ctx context.Context, base, rest, arch strin
 // answer later has already made the request the rule forbids. Nothing is
 // recorded as discovery here — this is bodega reading its own index on a
 // timer, not a host reaching for a package.
+//
+// Every complete body is handed to observeAptMirrorDists before it is
+// returned, from the cache or the archive. The pool index, the profile
+// rebuild and the hide filter have no other way to these bytes, so the age
+// gate holds the evidence before any of them can fail a digest check or a
+// parse.
 func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byte, error) {
 	key := base + "/" + rest
 	if body, ok := s.aptUpstreamCached(key); ok {
+		s.observeAptMirrorDists(ctx, base, rest, body)
 		return body, nil
 	}
 	ups := s.cfg.AptUpstreams[base]
@@ -692,6 +705,7 @@ func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byt
 		return nil, err
 	}
 	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: time.Now()})
+	s.observeAptMirrorDists(ctx, base, rest, body)
 	return body, nil
 }
 

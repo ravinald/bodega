@@ -24,6 +24,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -1678,5 +1679,1188 @@ func TestGeneratedPoolRefusalKeepsTheBinaryName(t *testing.T) {
 	}
 	if want := "bodega profile add web apt libexpat1"; rows[0].PatternHint != want {
 		t.Errorf("hint = %q, want %q", rows[0].PatternHint, want)
+	}
+}
+
+// The age gate on mirrored apt dates a source version by the Release of the
+// first index bodega read that lists it. These fixtures publish php8.5-fpm
+// builds under the fixture codename, one index at a time.
+const (
+	ageDebOld    = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu1_amd64.deb"
+	ageDebNew    = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu2_amd64.deb"
+	ageDebSeed   = "pool/universe/p/php8.5/php8.5-fpm_8.5.3-0ubuntu1_amd64.deb"
+	ageDebLatest = "pool/universe/p/php8.5/php8.5-fpm_8.5.4-0ubuntu3_amd64.deb"
+)
+
+func ageDeb(pool, version string) mirrorOSVDeb {
+	return mirrorOSVDeb{pool, "php8.5-fpm", "php8.5", version, "deb " + version}
+}
+
+// publishAptIndex has the archive serve one index for the fixture codename,
+// its Release dated generated, and has bodega read it as its next rebuild
+// would: the cached Release and Packages and the pool index are dropped first.
+func publishAptIndex(t *testing.T, s *Server, archive *fixtureArchive, generated time.Time, debs ...mirrorOSVDeb) {
+	t.Helper()
+	for rel, body := range mirrorOSVDists(mirroredCodename, debs...) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = strings.Replace(body, "Codename: ", "Date: "+generated.UTC().Format(time.RFC1123)+"\nCodename: ", 1)
+		}
+		archive.setObject(rel, body)
+	}
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	if idx := s.buildAptPoolIndex(t.Context(), s.cfg.MirroredAptCodenames()); len(idx.failed) > 0 {
+		t.Fatalf("read the fixture index: %v", idx.failed)
+	}
+}
+
+func ageMirrorServer(t *testing.T) (*Server, *fixtureArchive) {
+	t.Helper()
+	archive := newFixtureArchive(t, map[string]string{})
+	return mirrorServer(t, archive), archive
+}
+
+func aptDateOf(t *testing.T, s *Server, version string) audit.AptVersionDate {
+	t.Helper()
+	d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", version)
+	if err != nil || !ok {
+		t.Fatalf("no date recorded for php8.5 %s (ok=%v, err=%v)", version, ok, err)
+	}
+	return d
+}
+
+func setAptAge(t *testing.T, s *Server, action string) {
+	t.Helper()
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeApt,
+		MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: action}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+}
+
+// ageChecksFor is the age entry of every admission row for php8.5-fpm@version.
+func ageChecksFor(t *testing.T, s *Server, version string) []audit.AdmissionCheck {
+	t.Helper()
+	rows, err := s.auditDB.Admissions(t.Context(), audit.AdmissionFilter{PkgType: manifest.TypeApt, PkgName: "php8.5-fpm", PkgVersion: version})
+	if err != nil {
+		t.Fatalf("Admissions: %v", err)
+	}
+	var out []audit.AdmissionCheck
+	for _, r := range rows {
+		for _, c := range r.Checks {
+			if c.Check == audit.CheckAge {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+func lastAgeCheck(t *testing.T, s *Server, version string) audit.AdmissionCheck {
+	t.Helper()
+	checks := ageChecksFor(t, s, version)
+	if len(checks) == 0 {
+		t.Fatalf("no admission row for php8.5-fpm@%s carries an age check", version)
+	}
+	return checks[len(checks)-1]
+}
+
+// TestAptVersionDatesKeepTheFirstIndexThatListedThem is F112 requirement 1.
+func TestAptVersionDatesKeepTheFirstIndexThatListedThem(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	first := time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)
+
+	publishAptIndex(t, s, archive, first, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebOld, "8.5.4-0ubuntu1"))
+	publishAptIndex(t, s, archive, second, ageDeb(ageDebOld, "8.5.4-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates || d.Codename != mirroredCodename {
+		t.Errorf("a version only the first index listed = %+v, want predating %s", d, mirroredCodename)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates || !d.PublishedAt.IsZero() {
+		t.Errorf("a version both indexes listed = %+v, want the first index's record kept: predating, not dated by the second Release", d)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(second) {
+		t.Errorf("a version new in the second index = %+v, want dated by the second Release's Date: %s", d, second)
+	}
+
+	// The records are the audit database's, not the pool index's: a third
+	// index dropping a version and a restarted server both leave them alone.
+	publishAptIndex(t, s, archive, second.Add(24*time.Hour), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatalf("reopen the audit db: %v", err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || !d.PublishedAt.Equal(second) {
+		t.Errorf("after a third index and a reopen = %+v ok=%v err=%v, want the second Release's date", d, ok, err)
+	}
+	if _, ok, _ := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); !ok {
+		t.Error("a version the latest index no longer lists lost its record")
+	}
+}
+
+// TestAptMirrorAgeBlockRefusesTheNewVersionAndServesTheOld is F112
+// requirement 2, through the pool route.
+func TestAptMirrorAgeBlockRefusesTheNewVersionAndServesTheOld(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	old, fresh := now.Add(-30*24*time.Hour), now.Add(-time.Hour)
+
+	publishAptIndex(t, s, archive, old.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	publishAptIndex(t, s, archive, old, ageDeb(ageDebOld, "8.5.4-0ubuntu1"))
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebOld, "8.5.4-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	archive.setObject(ageDebLatest, "unlisted deb")
+
+	code, body := mirrorOSVGet(t, s, ageDebNew)
+	if code != http.StatusForbidden || !strings.Contains(body, "age") {
+		t.Fatalf("a version an hour old under 7d block = %d %q, want a 403 age refusal", code, body)
+	}
+	if archive.count(ageDebNew) != 0 {
+		t.Error("the refused .deb was fetched from the archive")
+	}
+	wantNew := "dated by the Release of " + mirroredCodename + " generated " + fresh.Format(time.RFC3339)
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock || !strings.HasSuffix(c.Detail, wantNew) {
+		t.Errorf("age check = %+v, want a block ending %q", c, wantNew)
+	}
+
+	if code, body := mirrorOSVGet(t, s, ageDebOld); code != http.StatusOK || body != "deb 8.5.4-0ubuntu1" {
+		t.Fatalf("a version 30 days old = %d %q, want 200 and the archive's bytes", code, body)
+	}
+	wantOld := "dated by the Release of " + mirroredCodename + " generated " + old.Format(time.RFC3339)
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, wantOld) {
+		t.Errorf("age check = %+v, want a pass ending %q", c, wantOld)
+	}
+
+	if code, _ := mirrorOSVGet(t, s, ageDebSeed); code != http.StatusOK {
+		t.Fatalf("a version the first index listed = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.3-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, "listed before bodega first read "+mirroredCodename) {
+		t.Errorf("age check = %+v, want a pass naming the first read", c)
+	}
+
+	// No paragraph lists it, so no record dates it: served, never warn or block.
+	if code, _ := mirrorOSVGet(t, s, ageDebLatest); code != http.StatusOK {
+		t.Fatalf("an undated version = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu3"); c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "no Packages paragraph") {
+		t.Errorf("age check = %+v, want not evaluated with the reason", c)
+	}
+}
+
+// TestAptMirrorAgeCachedDebTakesItsFillsVerdict is F112 requirement 3: the
+// hit neither re-judges the version nor reads the index to do it.
+func TestAptMirrorAgeCachedDebTakesItsFillsVerdict(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionWarn)
+	now := time.Now().UTC().Truncate(time.Second)
+	publishAptIndex(t, s, archive, now.Add(-48*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	publishAptIndex(t, s, archive, now.Add(-time.Hour), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+
+	if code, _ := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Fatalf("a new version under warn = %d, want 200", code)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckWarn {
+		t.Fatalf("the fill's age check = %+v, want warn", c)
+	}
+
+	setAptAge(t, s, policy.ActionBlock)
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	release := "dists/" + mirroredCodename + "/Release"
+	reads, checks := archive.count(release), len(ageChecksFor(t, s, "8.5.4-0ubuntu2"))
+
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK || body != "deb 8.5.4-0ubuntu2" {
+		t.Fatalf("the cached .deb = %d %q, want 200: its fill admitted it", code, body)
+	}
+	if got := archive.count(release); got != reads {
+		t.Errorf("Release reads = %d after the hit, want %d: a hit read the index", got, reads)
+	}
+	if got := len(ageChecksFor(t, s, "8.5.4-0ubuntu2")); got != checks {
+		t.Errorf("age checks = %d after the hit, want %d: the hit re-judged the version", got, checks)
+	}
+	if archive.count(ageDebNew) != 1 {
+		t.Errorf("the .deb was fetched %d times, want once", archive.count(ageDebNew))
+	}
+}
+
+func TestReviewF112ProfileIndexReadsRecordVersionDates(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, debs ...mirrorOSVDeb) {
+		for rel, body := range mirrorOSVDists(mirroredCodename, debs...) {
+			if strings.HasSuffix(rel, "/Release") {
+				body = "Date: " + date.Format(time.RFC1123) + "\n" + body
+			}
+			archive.setObject(rel, body)
+		}
+		s.aptUpstreamIdx.Clear()
+	}
+	publish(now.Add(-30*24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "php8.5")
+	if archive.count("dists/fixture/universe/binary-amd64/Packages.gz") == 0 {
+		t.Fatal("profile rebuild did not read the mirrored Packages")
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("first profile read: record=%+v ok=%v err=%v; want a predating record", d, ok, err)
+	}
+	fresh := now.Add(-time.Hour)
+	publish(fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	s.rebuildAptSnapshot(t.Context())
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("second profile read: record=%+v ok=%v err=%v; want Release date %s", d, ok, err, fresh)
+	}
+	if code, body := f.get(t, "/apt/"+ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version after two profile index reads = %d %q; want 403 under 7d block", code, body)
+	}
+}
+
+func TestReviewF112MirroredDistsReadsRecordVersionDates(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	s.cache.MetadataTTL = time.Nanosecond
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	for i, version := range []string{"8.5.3-0ubuntu1", "8.5.4-0ubuntu2"} {
+		pool := ageDebSeed
+		if i == 1 {
+			pool = ageDebNew
+		}
+		date := now.Add(-time.Duration(24-i*23) * time.Hour)
+		for rel, body := range mirrorOSVDists(mirroredCodename, ageDeb(pool, version)) {
+			if strings.HasSuffix(rel, "/Release") {
+				body = "Date: " + date.Format(time.RFC1123) + "\n" + body
+			}
+			archive.setObject(rel, body)
+		}
+		for _, rest := range []string{"Release", "universe/binary-amd64/Packages.gz"} {
+			if code, _ := mirrorGet(t, s, "/apt/dists/fixture/"+rest); code != http.StatusOK {
+				t.Fatalf("read %s = %d; want 200", rest, code)
+			}
+		}
+		d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", version)
+		if err != nil || !ok {
+			t.Errorf("mirrored dists read %d: date record ok=%v err=%v; want a record for %s", i+1, ok, err, version)
+		} else if i == 0 && d.DatedBy != audit.AptDatedByPredates {
+			t.Errorf("first read = %+v; want predating", d)
+		} else if i == 1 && (d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(date)) {
+			t.Errorf("second read = %+v; want Release date %s", d, date)
+		}
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version after two mirrored dists reads = %d %q; want 403 under 7d block", code, body)
+	}
+}
+
+func TestReviewF112PartialReadDoesNotGrandfatherLaterVersion(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	broken := "not a gzip file"
+	sum := sha256.Sum256([]byte(broken))
+	for rel, body := range mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1")) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+			body = strings.Replace(body, "Components: universe", "Components: universe main", 1)
+			body += fmt.Sprintf(" %x %d main/binary-amd64/Packages.gz\n", sum, len(broken))
+		}
+		archive.setObject(rel, body)
+	}
+	archive.setObject("dists/fixture/main/binary-amd64/Packages.gz", broken)
+	idx := s.buildAptPoolIndex(t.Context(), s.cfg.MirroredAptCodenames())
+	if len(idx.failed) == 0 {
+		t.Fatal("fixture must fail after reading universe")
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Fatalf("first read's version = %+v; want predating", d)
+	}
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("version added after the first read = %+v; want Release date %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version after partial first read = %d %q; want 403 under 7d block", code, body)
+	}
+}
+
+func TestReviewF112RemovedVersionUsesPersistedDate(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Fatalf("fixture lost its known date: %+v", d)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("known young version removed from the latest index = %d %q; want 403 under 7d block", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("persisted version's age check = %+v; want block", c)
+	}
+}
+
+func TestReviewF112ByHashDatesTheIndexActuallyServed(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	oldBody := objects["dists/fixture/universe/binary-amd64/Packages.gz"]
+	sum := sha256.Sum256([]byte(oldBody))
+	byHash := fmt.Sprintf("dists/fixture/universe/binary-amd64/by-hash/SHA256/%x", sum)
+	for rel, body := range objects {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		archive.setObject(rel, body)
+	}
+	archive.setObject(byHash, oldBody)
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK {
+		t.Fatalf("first Release = %d", code)
+	}
+	// The archive rotates after apt fetched Release; by-hash still serves its index.
+	for rel, body := range mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2")) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		archive.setObject(rel, body)
+	}
+	if code, body := mirrorGet(t, s, "/apt/"+byHash); code != http.StatusOK || string(body) != oldBody {
+		t.Fatalf("by-hash = %d; want the old index's exact bytes", code)
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("served first index's version = %+v ok=%v err=%v; want predating", d, ok, err)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version only in the later index = %d %q; want 403 under 7d block", code, body)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease {
+		t.Errorf("later index's version = %+v; want Release dated", d)
+	}
+}
+
+func TestReviewF112LaterArchitectureCannotGrandfatherNewSource(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, version string) {
+		release := "Date: " + date.Format(time.RFC1123) + "\nCodename: fixture\nComponents: universe\nArchitectures: amd64 arm64\nSHA256:\n"
+		for _, arch := range []string{"amd64", "arm64"} {
+			pool := "pool/universe/p/php8.5/php8.5-fpm_" + version + "_" + arch + ".deb"
+			body := fmt.Sprintf("Package: php8.5-fpm\nSource: php8.5\nVersion: %s\nArchitecture: %s\nFilename: %s\n\n", version, arch, pool)
+			gz := gzipFixture(body)
+			sum := sha256.Sum256(gz)
+			rest := "universe/binary-" + arch + "/Packages.gz"
+			release += fmt.Sprintf(" %x %d %s\n", sum, len(gz), rest)
+			archive.setObject("dists/fixture/"+rest, string(gz))
+			archive.setObject(pool, "deb "+version)
+		}
+		archive.setObject("dists/fixture/Release", release)
+	}
+	publish(now.Add(-24*time.Hour), "8.5.3-0ubuntu1")
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-amd64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("first amd64 index = %d", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Fatalf("first version = %+v; want predating", d)
+	}
+	fresh := now.Add(-time.Hour)
+	publish(fresh, "8.5.4-0ubuntu2")
+	for _, arch := range []string{"arm64", "amd64"} {
+		if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-"+arch+"/Packages.gz"); code != http.StatusOK {
+			t.Fatalf("second %s index = %d", arch, code)
+		}
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("source added after the codename's first read = %+v; want Release date %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new amd64 build after arm64's first read = %d %q; want 403 under 7d block", code, body)
+	}
+}
+
+// A version only an architecture nobody read listed when bodega found the
+// codename still predates bodega: the first Release's copy of that index is
+// read by hash before a later copy dates anything in it.
+func TestAptVersionDatesBackfillTheFirstReleasesUnreadIndex(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, versions map[string]string) {
+		release := "Date: " + date.Format(time.RFC1123) + "\nCodename: fixture\nComponents: universe\nArchitectures: amd64 arm64\nSHA256:\n"
+		for _, arch := range []string{"amd64", "arm64"} {
+			body := ""
+			if v := versions[arch]; v != "" {
+				body = fmt.Sprintf("Package: php8.5-fpm\nSource: php8.5\nVersion: %s\nArchitecture: %s\nFilename: pool/universe/p/php8.5/php8.5-fpm_%s_%s.deb\n\n", v, arch, v, arch)
+			}
+			gz := gzipFixture(body)
+			sum := sha256.Sum256(gz)
+			rest := "universe/binary-" + arch + "/Packages.gz"
+			release += fmt.Sprintf(" %x %d %s\n", sum, len(gz), rest)
+			archive.setObject("dists/fixture/"+rest, string(gz))
+			archive.setObject(fmt.Sprintf("dists/fixture/universe/binary-%s/by-hash/SHA256/%x", arch, sum), string(gz))
+		}
+		archive.setObject("dists/fixture/Release", release)
+	}
+	publish(now.Add(-24*time.Hour), map[string]string{"arm64": "8.5.3-0ubuntu1"})
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-amd64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("first amd64 index = %d", code)
+	}
+	fresh := now.Add(-time.Hour)
+	publish(fresh, map[string]string{"arm64": "8.5.4-0ubuntu2"})
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/universe/binary-arm64/Packages.gz"); code != http.StatusOK {
+		t.Fatalf("second arm64 index = %d", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("a version the first Release's unread arm64 index listed = %+v, want predating", d)
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("a version the later arm64 index added = %+v, want Release date %s", d, fresh)
+	}
+}
+
+// An InRelease a client fetches records its Release like a plain one.
+func TestAptClearsignedBodyReadsInRelease(t *testing.T) {
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := kr.ClearSign([]byte("Date: Sun, 08 Nov 2026 06:00:00 UTC\nCodename: fixture\nSHA256:\n abc 1 universe/binary-amd64/Packages.gz\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := deb822.ParseSingle(aptClearsignedBody(in))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, err := aptReleaseDate(release); err != nil || !got.Equal(time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)) {
+		t.Errorf("Date = %v %v", got, err)
+	}
+	if got := aptReleaseDigests(release)["universe/binary-amd64/Packages.gz"]; got != "abc" {
+		t.Errorf("digest = %q, want abc", got)
+	}
+	if plain := []byte("Codename: x\n"); string(aptClearsignedBody(plain)) != string(plain) {
+		t.Error("a plain Release was rewritten")
+	}
+}
+
+func TestReviewF112BackgroundRefreshRecordsTheIndexItReads(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	s.cache.MetadataTTL = time.Nanosecond
+	now := time.Now().UTC().Truncate(time.Second)
+	publish := func(date time.Time, deb mirrorOSVDeb) map[string]string {
+		objects := mirrorOSVDists(mirroredCodename, deb)
+		for rel, body := range objects {
+			if strings.HasSuffix(rel, "/Release") {
+				body = "Date: " + date.Format(time.RFC1123) + "\n" + body
+				objects[rel] = body
+			}
+			archive.setObject(rel, body)
+		}
+		return objects
+	}
+	get := func(rest string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/apt/dists/fixture/"+rest, nil)
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", rest, w.Code, w.Body.String())
+		}
+		return w
+	}
+	const rest = "universe/binary-amd64/Packages.gz"
+	first := publish(now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	get("Release")
+	get(rest)
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Fatalf("first version = %+v; want predating", d)
+	}
+	fresh := now.Add(-time.Hour)
+	second := publish(fresh, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	get("Release")
+	s.cache.StaleGrace = time.Millisecond
+	release := archive.hold(t)
+	w := get(rest)
+	release()
+	if w.Body.String() != first["dists/fixture/"+rest] {
+		t.Fatal("the request did not take the stale response path")
+	}
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	key := manifest.AptKey("dists/fixture/" + rest)
+	waitFor(t, func() bool { return cachedBody(t, store, key) == second["dists/fixture/"+rest] })
+	waitFor(t, refreshIdle(s, key))
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("completed background index read: record=%+v ok=%v err=%v; want Release date %s", d, ok, err, fresh)
+	}
+	// Rotation must not erase a version the completed refresh already read.
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("young version read by the refresh, then rotated out = %d %q; want 403 under 7d block", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("age admission = %+v; want block", c)
+	}
+}
+
+type reviewF112ShortWriter struct {
+	*httptest.ResponseRecorder
+	remaining int
+}
+
+func (w *reviewF112ShortWriter) Write(p []byte) (int, error) {
+	n := min(len(p), w.remaining)
+	w.remaining -= n
+	_, _ = w.ResponseRecorder.Write(p[:n])
+	return n, io.ErrClosedPipe
+}
+
+func TestReviewF112IncompleteDeliveryCannotSetInitialRelease(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	dateLine := "Date: " + now.Add(-time.Hour).Format(time.RFC1123) + "\n"
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	for rel, body := range objects {
+		if strings.HasSuffix(rel, "/Release") {
+			body = dateLine + body
+			objects[rel] = body
+		}
+		archive.setObject(rel, body)
+	}
+	w := &reviewF112ShortWriter{ResponseRecorder: httptest.NewRecorder(), remaining: len(dateLine)}
+	r := httptest.NewRequest(http.MethodGet, "/apt/dists/fixture/Release", nil)
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK || w.Body.String() != dateLine {
+		t.Fatalf("partial response = %d %q; want only the Date line", w.Code, w.Body.String())
+	}
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	if got := cachedBody(t, store, manifest.AptKey("dists/fixture/Release")); got != objects["dists/fixture/Release"] {
+		t.Fatal("the proxy did not finish reading and caching the full Release")
+	}
+	const rest = "universe/binary-amd64/Packages.gz"
+	sum := sha256.Sum256([]byte(objects["dists/fixture/"+rest]))
+	if snap, ok, err := s.auditDB.LookupAptIndex(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !ok || !snap.Initial {
+		t.Errorf("completed first Release: snapshot=%+v ok=%v err=%v; want initial=true", snap, ok, err)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture/"+rest); code != http.StatusOK {
+		t.Fatalf("first Packages = %d; want 200", code)
+	}
+	if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("first index version = %+v; want predating", d)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebSeed); code != http.StatusOK {
+		t.Errorf("first index's version under 7d block = %d %q; want 200", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.3-0ubuntu1"); c.Status != audit.CheckPass || !strings.HasSuffix(c.Detail, "listed before bodega first read "+mirroredCodename) {
+		t.Errorf("age admission = %+v; want pass naming the initial read", c)
+	}
+}
+
+type reviewF112ObservedShortWriter struct {
+	*httptest.ResponseRecorder
+	offered bytes.Buffer
+}
+
+func (w *reviewF112ObservedShortWriter) Write(p []byte) (int, error) {
+	_, _ = w.offered.Write(p)
+	return 0, io.ErrClosedPipe
+}
+
+func TestReviewF112CompletedReadsSurviveResponseChoice(t *testing.T) {
+	for _, mode := range []string{"head-fetch", "cached-disconnect"} {
+		t.Run(mode, func(t *testing.T) {
+			s, archive := ageMirrorServer(t)
+			setAptAge(t, s, policy.ActionBlock)
+			now := time.Now().UTC().Truncate(time.Second)
+			first := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+			store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+			for rel, body := range first {
+				if strings.HasSuffix(rel, "/Release") {
+					body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+					first[rel] = body
+				}
+				archive.setObject(rel, body)
+				if mode == "cached-disconnect" {
+					store.Seed(manifest.AptKey(rel), body)
+				}
+			}
+			for _, rest := range []string{"Release", "universe/binary-amd64/Packages.gz"} {
+				rel := "dists/fixture/" + rest
+				if mode == "head-fetch" {
+					w := httptest.NewRecorder()
+					s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/apt/"+rel, nil))
+					if w.Code != http.StatusOK || archive.count(rel) != 1 || cachedBody(t, store, manifest.AptKey(rel)) != first[rel] {
+						t.Fatalf("HEAD %s did not fetch and cache the complete body: status=%d upstream_reads=%d", rest, w.Code, archive.count(rel))
+					}
+				} else {
+					w := &reviewF112ObservedShortWriter{ResponseRecorder: httptest.NewRecorder()}
+					s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apt/"+rel, nil))
+					if w.Code != http.StatusOK || w.offered.String() != first[rel] || archive.count(rel) != 0 {
+						t.Fatalf("GET %s did not read the complete cached body before delivery failed: status=%d offered=%d want=%d upstream_reads=%d", rest, w.Code, w.offered.Len(), len(first[rel]), archive.count(rel))
+					}
+				}
+			}
+			if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+				t.Errorf("completed first Packages read: record=%+v ok=%v err=%v; want predating", d, ok, err)
+			}
+			fresh := now.Add(-time.Hour)
+			publishAptIndex(t, s, archive, fresh, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+				t.Errorf("new version after completed first read = %+v; want Release date %s", d, fresh)
+			}
+			if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+				t.Errorf("new version under 7d block = %d %q; want 403", code, body)
+			}
+			if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+				t.Errorf("new version's admission = %+v; want block", c)
+			}
+		})
+	}
+}
+
+// TestAptVersionDatesDoNotDependOnRecordingOrder is F112 requirement 1: two
+// successive snapshots of one codename, recorded in either order, give the
+// same dates. A version both list predates bodega, one new in the second takes
+// the second Release's Date:, and an index both Releases list unchanged is
+// dated by the older Release even when the newer one was recorded first.
+func TestAptVersionDatesDoNotDependOnRecordingOrder(t *testing.T) {
+	first := time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)
+	const packages = "universe/binary-amd64/Packages.gz"
+	snapshot := func(date time.Time, debs ...mirrorOSVDeb) map[string]string {
+		objects := mirrorOSVDists(mirroredCodename, debs...)
+		for rel, body := range objects {
+			if strings.HasSuffix(rel, "/Release") {
+				objects[rel] = "Date: " + date.Format(time.RFC1123) + "\n" + body
+			}
+		}
+		return objects
+	}
+	record := func(s *Server, objects map[string]string, rests ...string) {
+		for _, rest := range rests {
+			s.observeAptMirrorDists(t.Context(), mirroredCodename, rest, []byte(objects["dists/"+mirroredCodename+"/"+rest]))
+		}
+	}
+	older := snapshot(first, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebOld, "8.5.4-0ubuntu1"))
+	newer := snapshot(second, ageDeb(ageDebOld, "8.5.4-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	for _, order := range []string{"older-first", "newer-first"} {
+		t.Run(order, func(t *testing.T) {
+			s, _ := ageMirrorServer(t)
+			snaps := []map[string]string{older, newer}
+			if order == "newer-first" {
+				snaps[0], snaps[1] = newer, older
+			}
+			for _, objects := range snaps {
+				record(s, objects, "Release", packages)
+			}
+			if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+				t.Errorf("a version only the older index listed = %+v, want predating", d)
+			}
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+				t.Errorf("a version both indexes listed = %+v, want predating", d)
+			}
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(second) {
+				t.Errorf("a version new in the newer index = %+v, want dated %s", d, second)
+			}
+		})
+	}
+	t.Run("unchanged-index-newer-first", func(t *testing.T) {
+		s, archive := ageMirrorServer(t)
+		same := []mirrorOSVDeb{ageDeb(ageDebSeed, "8.5.3-0ubuntu1")}
+		a, b := snapshot(first, same...), snapshot(second, same...)
+		gz := b["dists/"+mirroredCodename+"/"+packages]
+		sum := sha256.Sum256([]byte(gz))
+		archive.setObject(fmt.Sprintf("dists/%s/universe/binary-amd64/by-hash/SHA256/%x", mirroredCodename, sum), gz)
+		record(s, b, "Release", packages)
+		record(s, a, "Release")
+		if d := aptDateOf(t, s, "8.5.3-0ubuntu1"); d.DatedBy != audit.AptDatedByPredates {
+			t.Errorf("a version the older Release listed in the same bytes = %+v, want predating", d)
+		}
+	})
+}
+
+type reviewF112WaitingWriter struct {
+	*httptest.ResponseRecorder
+	entered chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (w *reviewF112WaitingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.resume
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestReviewF112CompletedFetchCannotWaitForDelivery(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	first := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	for rel, body := range first {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+			first[rel] = body
+		}
+		archive.setObject(rel, body)
+	}
+	var releases []func()
+	for _, rest := range []string{"Release", "universe/binary-amd64/Packages.gz"} {
+		rel := "dists/fixture/" + rest
+		w := &reviewF112WaitingWriter{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), resume: make(chan struct{})}
+		done := make(chan struct{})
+		var once sync.Once
+		release := func() { once.Do(func() { close(w.resume); <-done }) }
+		releases = append(releases, release)
+		t.Cleanup(release)
+		go func() {
+			defer close(done)
+			s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apt/"+rel, nil))
+		}()
+		select {
+		case <-w.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("request never reached delivery")
+		}
+		if archive.count(rel) != 1 || cachedBody(t, store, manifest.AptKey(rel)) != first[rel] {
+			t.Fatalf("%s was not fully fetched and cached before delivery", rest)
+		}
+	}
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	for _, release := range releases {
+		release()
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("new version after earlier completed fetches = %+v; want Release date %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version under 7d block = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+func TestReviewF112EarlierReleaseUsesRecordedMembership(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	earlier, later := now.Add(-8*24*time.Hour), now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-30*24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	olderRelease := "Date: " + earlier.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, later, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	store.Seed(manifest.AptKey("dists/fixture/Release"), olderRelease)
+	if code, body := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK || string(body) != olderRelease {
+		t.Fatalf("cached older Release = %d %q; want its complete bytes", code, body)
+	}
+	sum := sha256.Sum256([]byte(objects["dists/fixture/universe/binary-amd64/Packages.gz"]))
+	if snap, ok, err := s.auditDB.LookupAptIndex(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !ok || !snap.ReleaseDate.Equal(earlier) {
+		t.Fatalf("earlier Release was not recorded: %+v ok=%v err=%v", snap, ok, err)
+	}
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(earlier) {
+		t.Errorf("version whose exact index bytes were already recorded = %+v ok=%v err=%v; want Release date %s after reopen", d, ok, err, earlier)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Errorf("version listed eight days ago under 7d block = %d %q; want 200", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckPass {
+		t.Errorf("admission = %+v; want pass", c)
+	}
+}
+
+func TestReviewF112PackagesBeforeReleaseRetainsMembership(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	objects["dists/fixture/Release"] = "Date: " + fresh.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	archive.setObject(ageDebNew, "deb 8.5.4-0ubuntu2")
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	for _, rest := range []string{"universe/binary-amd64/Packages.gz", "Release"} {
+		rel := "dists/fixture/" + rest
+		store.Seed(manifest.AptKey(rel), objects[rel])
+		if code, body := mirrorGet(t, s, "/apt/"+rel); code != http.StatusOK || string(body) != objects[rel] {
+			t.Fatalf("GET %s = %d; want the complete cached snapshot", rest, code)
+		}
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("complete Packages and its Release recorded in reverse order = %+v ok=%v err=%v; want Release date %s", d, ok, err, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version listed one hour ago under 7d block = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+// A Packages file read in full while no recorded Release publishes it leaves
+// its versions listed and undated: the .deb is not evaluated, and the row says
+// the index was read rather than that it never was.
+func TestAptMirrorAgeNamesAnIndexReadWithNoRelease(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	archive.setObject(ageDebNew, "deb 8.5.4-0ubuntu2")
+	rel := "dists/fixture/universe/binary-amd64/Packages.gz"
+	s.typeStore(manifest.TypeApt).(*storage.Memory).Seed(manifest.AptKey(rel), objects[rel])
+	if code, _ := mirrorGet(t, s, "/apt/"+rel); code != http.StatusOK {
+		t.Fatalf("GET cached Packages.gz = %d; want 200", code)
+	}
+	sum := sha256.Sum256([]byte(objects[rel]))
+	if seen, err := s.auditDB.AptIndexObserved(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !seen {
+		t.Fatalf("a complete Packages read with no matching Release: observed=%v err=%v; want it recorded", seen, err)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Errorf("version with no dated Release under 7d block = %d %q; want 200", code, body)
+	}
+	c := lastAgeCheck(t, s, "8.5.4-0ubuntu2")
+	if c.Status != audit.CheckNotEvaluated || !strings.Contains(c.Detail, "has recorded no Release publishing that index") {
+		t.Errorf("admission = %+v; want not evaluated, naming the index read with no Release", c)
+	}
+}
+
+func TestReviewF112PoolReleaseReconcilesWithoutPackagesRefetch(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	earlier, later := now.Add(-8*24*time.Hour), now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-30*24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	olderRelease := "Date: " + earlier.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, later, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	archive.setObject("dists/fixture/Release", olderRelease)
+	s.aptUpstreamIdx.Clear()
+	s.aptPoolIdx.mu.Lock()
+	s.aptPoolIdx.idx = nil
+	s.aptPoolIdx.mu.Unlock()
+	before := archive.count("dists/fixture/Release")
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusOK {
+		t.Errorf("version listed eight days ago under 7d block = %d %q; want 200", code, body)
+	}
+	if archive.count("dists/fixture/Release") != before+1 {
+		t.Fatal("pool check did not read the older Release")
+	}
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(earlier) {
+		t.Errorf("completed pool Release with membership already recorded = %+v ok=%v err=%v; want %s after reopen", d, ok, err, earlier)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckPass {
+		t.Errorf("admission = %+v; want pass", c)
+	}
+}
+
+func TestReviewF112PoolMismatchedPackagesRetainsMembership(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	objects["dists/fixture/Release"] = "Date: " + fresh.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	const rel = "dists/fixture/universe/binary-amd64/Packages.gz"
+	archive.setObject(rel, objects[rel])
+	archive.setObject(ageDebNew, "deb 8.5.4-0ubuntu2")
+	s.aptUpstreamIdx.Clear()
+	idx := s.buildAptPoolIndex(t.Context(), s.cfg.MirroredAptCodenames())
+	if len(idx.failed) == 0 {
+		t.Fatal("fixture must fail its Release digest check")
+	}
+	raw, ok := s.aptUpstreamCached("fixture/universe/binary-amd64/Packages.gz")
+	if !ok || string(raw) != objects[rel] {
+		t.Fatal("pool rebuild did not complete the Packages read")
+	}
+	sum := sha256.Sum256(raw)
+	if seen, err := s.auditDB.AptIndexObserved(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !seen {
+		t.Errorf("complete Packages with no matching Release: observed=%v err=%v; want persisted membership", seen, err)
+	}
+	s.typeStore(manifest.TypeApt).(*storage.Memory).Seed(manifest.AptKey("dists/fixture/Release"), objects["dists/fixture/Release"])
+	if code, body := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK || string(body) != objects["dists/fixture/Release"] {
+		t.Fatal("matching cached Release was not read completely")
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("completed pool Packages then its Release = %+v ok=%v err=%v; want %s", d, ok, err, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version listed one hour ago under 7d block = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+func TestReviewF112RejectedByHashStillRecordsCompletedInput(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	publishAptIndex(t, s, archive, now.Add(-24*time.Hour), ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	const packages = "dists/fixture/universe/binary-amd64/Packages.gz"
+	oldBody, ok := archive.object(packages)
+	if !ok {
+		t.Fatal("fixture has no initial Packages")
+	}
+	oldSum := sha256.Sum256([]byte(oldBody))
+	byHash := fmt.Sprintf("dists/fixture/universe/binary-amd64/by-hash/SHA256/%x", oldSum)
+	archive.setObject(byHash, oldBody)
+	if code, body := mirrorGet(t, s, "/apt/"+byHash); code != http.StatusOK || string(body) != oldBody {
+		t.Fatal("initial by-hash read did not cache and pin the index")
+	}
+	store := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	if err := store.Delete(t.Context(), manifest.AptKey(byHash)); err != nil {
+		t.Fatal(err)
+	}
+	fresh := now.Add(-time.Hour)
+	objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	raw := objects[packages]
+	sum := sha256.Sum256([]byte(raw))
+	archive.setObject(byHash, raw)
+	before := archive.count(byHash)
+	if code, body := mirrorGet(t, s, "/apt/"+byHash); code != http.StatusBadGateway || !strings.Contains(string(body), "checksum") {
+		t.Fatalf("changed by-hash input = %d %q; want checksum refusal", code, body)
+	}
+	if archive.count(byHash) != before+1 {
+		t.Fatal("fixture did not refetch the by-hash body")
+	}
+	if seen, err := s.auditDB.AptIndexObserved(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !seen {
+		t.Errorf("complete parseable input refused for another path's checksum: observed=%v err=%v; want membership under its actual SHA256", seen, err)
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByNothing {
+		t.Errorf("input with no matching Release = %+v ok=%v err=%v; want undated membership", d, ok, err)
+	}
+	publishAptIndex(t, s, archive, now, ageDeb(ageDebLatest, "8.5.4-0ubuntu3"))
+	matchingRelease := "Date: " + fresh.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+	store.Seed(manifest.AptKey("dists/fixture/Release"), matchingRelease)
+	if code, body := mirrorGet(t, s, "/apt/dists/fixture/Release"); code != http.StatusOK || string(body) != matchingRelease {
+		t.Fatal("matching Release was not read")
+	}
+	reopened, err := audit.Open(s.cfg.AuditDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if d, ok, err := reopened.GetAptVersionDate(t.Context(), "php8.5", "8.5.4-0ubuntu2"); err != nil || !ok || d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("completed input then matching Release, after reopen = %+v ok=%v err=%v; want %s", d, ok, err, fresh)
+	}
+	archive.setObject(ageDebNew, "deb 8.5.4-0ubuntu2")
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("version listed one hour ago under 7d block = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+type reviewF112EOFStore struct {
+	storage.ObjectStore
+	completed sync.Map
+}
+
+func (s *reviewF112EOFStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	result, err := s.ObjectStore.GetStream(ctx, key)
+	if err == nil && result != nil {
+		result.Body = &reviewF112EOFBody{ReadCloser: result.Body, left: result.ContentLength,
+			complete: func() { s.completed.Store(key, true) }}
+	}
+	return result, err
+}
+
+type reviewF112EOFBody struct {
+	io.ReadCloser
+	left     int64
+	complete func()
+}
+
+func (b *reviewF112EOFBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.left -= int64(n)
+	if b.left == 0 && (err == nil || err == io.EOF) {
+		b.complete()
+		return n, io.EOF
+	}
+	return n, err
+}
+
+func TestReviewF112CompletedCacheReadCannotWaitForDelivery(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	first := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+	memory := s.typeStore(manifest.TypeApt).(*storage.Memory)
+	store := &reviewF112EOFStore{ObjectStore: memory}
+	s.stores = storage.NewSingle(store)
+	for rel, body := range first {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		memory.Seed(manifest.AptKey(rel), body)
+	}
+	var releases []func()
+	for _, rest := range []string{"Release", "universe/binary-amd64/Packages.gz"} {
+		rel := "dists/fixture/" + rest
+		w := &reviewF112WaitingWriter{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), resume: make(chan struct{})}
+		done := make(chan struct{})
+		var once sync.Once
+		release := func() { once.Do(func() { close(w.resume); <-done }) }
+		releases = append(releases, release)
+		t.Cleanup(release)
+		go func() {
+			defer close(done)
+			s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apt/"+rel, nil))
+		}()
+		select {
+		case <-w.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("cached request never reached delivery")
+		}
+		if _, complete := store.completed.Load(manifest.AptKey(rel)); !complete || archive.count(rel) != 0 {
+			t.Fatalf("%s was not fully read to EOF from cache before delivery", rest)
+		}
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("completed cached inputs waiting on delivery = %+v ok=%v err=%v; want predating record already durable", d, ok, err)
+	}
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version while earlier complete inputs wait on delivery = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission while cached delivery waits = %+v; want block", c)
+	}
+	for _, release := range releases {
+		release()
+	}
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("new version after delivery resumes = %+v; want %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version after earlier inputs finish delivery = %d %q; want 403", code, body)
+	}
+}
+
+func TestReviewF112HideLookupRecordsCompletedInputs(t *testing.T) {
+	s, archive := ageMirrorServer(t)
+	setAptAge(t, s, policy.ActionBlock)
+	now := time.Now().UTC().Truncate(time.Second)
+	for rel, body := range mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1")) {
+		if strings.HasSuffix(rel, "/Release") {
+			body = "Date: " + now.Add(-24*time.Hour).Format(time.RFC1123) + "\n" + body
+		}
+		archive.setObject(rel, body)
+	}
+	found, err := LocateMirroredAptVersion(t.Context(), s.cfg, s.auditDB, "php8.5-fpm", "8.5.3-0ubuntu1")
+	if err != nil || len(found) != 1 || found[0] != mirroredCodename {
+		t.Fatalf("hide lookup = %v err=%v; want fixture", found, err)
+	}
+	for _, rel := range []string{"dists/fixture/Release", "dists/fixture/universe/binary-amd64/Packages.gz"} {
+		if archive.count(rel) != 1 {
+			t.Fatalf("hide lookup read %s %d times; want one completed read", rel, archive.count(rel))
+		}
+	}
+	if d, ok, err := s.auditDB.GetAptVersionDate(t.Context(), "php8.5", "8.5.3-0ubuntu1"); err != nil || !ok || d.DatedBy != audit.AptDatedByPredates {
+		t.Errorf("completed hide lookup with an open audit DB = %+v ok=%v err=%v; want predating record", d, ok, err)
+	}
+	fresh := now.Add(-time.Hour)
+	publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+	if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+		t.Errorf("version added after completed hide lookup = %+v; want %s", d, fresh)
+	}
+	if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+		t.Errorf("new version after completed hide lookup = %d %q; want 403", code, body)
+	}
+	if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+		t.Errorf("admission = %+v; want block", c)
+	}
+}
+
+func TestReviewF112SignedCRLFReleaseRetainsInitialSnapshot(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		t.Run(fmt.Sprintf("newline-%x", newline), func(t *testing.T) {
+			s, archive := ageMirrorServer(t)
+			setAptAge(t, s, policy.ActionBlock)
+			now := time.Now().UTC().Truncate(time.Second)
+			firstDate := now.Add(-24 * time.Hour)
+			objects := mirrorOSVDists(mirroredCodename, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"))
+			release := "Date: " + firstDate.Format(time.RFC1123) + "\n" + objects["dists/fixture/Release"]
+			kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed, err := kr.ClearSign([]byte(release))
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed = []byte(strings.ReplaceAll(strings.ReplaceAll(string(signed), "\r\n", "\n"), "\n", newline))
+			block, _ := clearsign.Decode(signed)
+			if block == nil {
+				t.Fatal("the pinned OpenPGP decoder refused the fixture")
+			}
+			pub, err := kr.PublicKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openpgp.CheckDetachedSignature(ring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+				t.Fatalf("fixture signature does not verify: %v", err)
+			}
+			archive.setObject("dists/fixture/InRelease", string(signed))
+			const packages = "dists/fixture/universe/binary-amd64/Packages.gz"
+			archive.setObject(packages, objects[packages])
+			for _, rel := range []string{"dists/fixture/InRelease", packages} {
+				if code, _ := mirrorGet(t, s, "/apt/"+rel); code != http.StatusOK {
+					t.Fatalf("%s = %d", rel, code)
+				}
+			}
+			sum := sha256.Sum256([]byte(objects[packages]))
+			if snap, ok, err := s.auditDB.LookupAptIndex(t.Context(), mirroredCodename, fmt.Sprintf("%x", sum)); err != nil || !ok || !snap.Initial || !snap.ReleaseDate.Equal(firstDate) {
+				t.Errorf("verified complete InRelease: snapshot=%+v ok=%v err=%v; want initial Release %s", snap, ok, err, firstDate)
+			}
+			fresh := now.Add(-time.Hour)
+			publishAptIndex(t, s, archive, fresh, ageDeb(ageDebSeed, "8.5.3-0ubuntu1"), ageDeb(ageDebNew, "8.5.4-0ubuntu2"))
+			if d := aptDateOf(t, s, "8.5.4-0ubuntu2"); d.DatedBy != audit.AptDatedByRelease || !d.PublishedAt.Equal(fresh) {
+				t.Errorf("version added after the initial InRelease = %+v; want Release date %s", d, fresh)
+			}
+			if code, body := mirrorOSVGet(t, s, ageDebNew); code != http.StatusForbidden {
+				t.Errorf("young version after the initial InRelease = %d %q; want 403", code, body)
+			}
+			if c := lastAgeCheck(t, s, "8.5.4-0ubuntu2"); c.Status != audit.CheckBlock {
+				t.Errorf("admission = %+v; want block", c)
+			}
+		})
 	}
 }

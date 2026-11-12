@@ -156,3 +156,33 @@ func TestUsageDoc_FreeBSDAdvisoriesComeFromVuXML(t *testing.T) {
 		}
 	}
 }
+
+// usage.md has to list apt in the age gate's source table with the Release
+// Date: rule, drop it from the types with no source, and state the two limits
+// dating by the index brings.
+func TestUsageDoc_AptAgeUsesMirroredReleaseDates(t *testing.T) {
+	section := docSection(t, readDoc(t, "usage.md"), "### `bodega policy age <set|list|remove>`")
+	if row := tableRow(section, "apt"); !strings.Contains(row, "`Date:` of the `Release`") {
+		t.Errorf("the age source table's apt row must name the Release Date: rule: %q", row)
+	}
+	for _, stale := range []string{
+		"`apt`, `binary`, `git`, `helm`, `freebsd` and `distfiles` have no such source",
+		"bodega policy age set apt 7d warn\nError:",
+		`does not cover ecosystem "apt"`,
+	} {
+		if strings.Contains(section, stale) {
+			t.Errorf("the age section still says apt has no publish timestamp: %q", stale)
+		}
+	}
+	for _, want := range []string{
+		"The date is an upper bound, set by the first index bodega read after the version appeared",
+		"`metadata_ttl`",
+		"A `block` rule holds security updates too",
+		"`-security`",
+		"Use `warn` for apt",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the age section lacks %q", want)
+		}
+	}
+}

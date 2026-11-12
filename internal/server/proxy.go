@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -573,6 +574,12 @@ func (s *Server) fetchUpstream(ctx context.Context, upstreamURL, regType string)
 		return upstreamFetch{err: err, answered: upstreamAnsweredIn(err)}
 	}
 	defer up.body.Close()
+	if obs := inputObserverFor(ctx); obs != nil && up.contentLength <= maxUpstreamBody {
+		up.body = struct {
+			io.Reader
+			io.Closer
+		}{obs.wrap(ctx, up.body, up.contentLength), up.body}
+	}
 	spool, err := s.spoolUpstream(up)
 	if err != nil {
 		return upstreamFetch{err: err, answered: true}
@@ -715,6 +722,135 @@ func (s *Server) finishStaleRefresh(ctx context.Context, results <-chan upstream
 	defer res.spool.close()
 	s.fillCache(ctx, store, s3Key, res.spool.path(), res.up.url, res.spool.sha256, res.spool.size)
 	s.logFor(ctx).Info("background refresh replaced the stale cached copy", "key", s3Key, "upstream", res.up.url)
+}
+
+// inputObserverCtxKey carries the func a handler wants called with every
+// object bodega reads in full for its request: each upstream body
+// fetchUpstream spools, including a stale refresh that finishes after the
+// response went out, and each cached object serveStored reads.
+//
+// The call is made inside the read that completes the object, by
+// observedInput, so nothing downstream of the bytes can delay or prevent it:
+// not a client that reads slowly or hangs up, not a checksum that refuses to
+// deliver them, not a cache write that fails. A handler recording what bodega
+// read cannot learn it from the response.
+type inputObserverCtxKey struct{}
+
+type inputObserver struct {
+	observe func(ctx context.Context, raw []byte)
+}
+
+func withInputObserver(r *http.Request, obs *inputObserver) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), inputObserverCtxKey{}, obs))
+}
+
+func inputObserverFor(ctx context.Context) *inputObserver {
+	obs, _ := ctx.Value(inputObserverCtxKey{}).(*inputObserver)
+	if obs == nil || obs.observe == nil {
+		return nil
+	}
+	return obs
+}
+
+// wrap returns body as a reader that reports the whole object to the observer
+// when it is read to its end. want is the declared length, negative when
+// nobody declared one.
+func (o *inputObserver) wrap(ctx context.Context, body io.Reader, want int64) *observedInput {
+	ctx = context.WithoutCancel(ctx)
+	return &observedInput{r: body, want: want, observe: func(raw []byte) { o.observe(ctx, raw) }}
+}
+
+// observedInput hands an object to its observer inside the Read that
+// completes the object, before that Read returns. A storage or upstream
+// reader may return its last bytes and io.EOF together, and whoever is
+// copying then writes those bytes somewhere that can block or fail; observing
+// after the copy would make the record of a completed read wait on that
+// write.
+//
+// A reader that returns the last declared byte with a nil error would leave
+// the same gap one Read later, so on reaching the declared length the end is
+// probed for at once. A byte the probe finds is past the declared length: the
+// object is not observed and the byte is returned by the next Read, so the
+// consumer sees the stream unchanged.
+//
+// Only a whole object is observed: a read error, a length other than the
+// declared one, or a body past maxUpstreamBody observes nothing, and err says
+// which once the read has ended.
+type observedInput struct {
+	r       io.Reader
+	want    int64
+	observe func(raw []byte)
+	buf     bytes.Buffer
+	n       int64
+	ended   bool
+	err     error
+	// held is a probed byte, and the error read with it, owed to the consumer.
+	held    []byte
+	heldErr error
+}
+
+func (i *observedInput) Read(p []byte) (int, error) {
+	if len(i.held) > 0 {
+		if len(p) == 0 {
+			return 0, nil
+		}
+		p[0] = i.held[0]
+		err := i.heldErr
+		i.held, i.heldErr = nil, nil
+		return 1, err
+	}
+	n, err := i.r.Read(p)
+	if i.ended {
+		return n, err
+	}
+	i.n += int64(n)
+	if i.n > maxUpstreamBody {
+		i.end(fmt.Errorf("the object runs past bodega's %d-byte buffer", maxUpstreamBody))
+		return n, err
+	}
+	i.buf.Write(p[:n])
+	if err == nil && n > 0 && i.n == i.want {
+		var probe [1]byte
+		m, perr := i.r.Read(probe[:])
+		switch {
+		case m > 0:
+			i.held, i.heldErr = probe[:m], perr
+			i.end(fmt.Errorf("read past a declared %d bytes", i.want))
+			return n, nil
+		case perr == nil:
+			return n, nil
+		}
+		err = perr
+	}
+	switch {
+	case err == nil:
+	case err != io.EOF:
+		i.end(err)
+	case i.want >= 0 && i.n != i.want:
+		i.end(fmt.Errorf("read %d of a declared %d bytes", i.n, i.want))
+	default:
+		raw := i.buf.Bytes()
+		i.end(nil)
+		i.observe(raw)
+	}
+	return n, err
+}
+
+func (i *observedInput) end(err error) {
+	i.ended, i.err = true, err
+	i.buf = bytes.Buffer{}
+}
+
+// drain reads whatever a refused write left unread, so an object whose
+// delivery failed is still read to its end and observed.
+func (i *observedInput) drain() error {
+	scratch := make([]byte, 32*1024)
+	for !i.ended {
+		if n, err := i.Read(scratch); n == 0 && err == nil {
+			return io.ErrNoProgress
+		}
+	}
+	return i.err
 }
 
 // notFoundPrefix holds one record per path every upstream answered 404 for.
@@ -1923,8 +2059,12 @@ func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regTy
 	case fill.typ == manifest.TypeApt && fill.version != "":
 		// Only a mirrored .deb reaches here with a version: bodega's own pool
 		// is served from storage, and a dists/ key names none.
-		if res, on := s.aptMirrorOSV(r.Context(), strings.TrimPrefix(s3Key, manifest.AptPrefix)); on {
-			checkers = []policy.VersionChecker{verdict{res}}
+		poolPath := strings.TrimPrefix(s3Key, manifest.AptPrefix)
+		if res, on := s.aptMirrorAge(r.Context(), poolPath); on {
+			checkers = append(checkers, verdict{res})
+		}
+		if res, on := s.aptMirrorOSV(r.Context(), poolPath); on {
+			checkers = append(checkers, verdict{res})
 		}
 	}
 	switch {
