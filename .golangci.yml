@@ -73,6 +73,13 @@ linters:
         # os.TempFile().Name() which is controlled by the OS temp directory.
         - G703
 
+  exclusions:
+    paths:
+      # go-toml v2.2.4 copied unchanged so its grammar stays the one
+      # containerd v2.2.0 parses with. Fixing a finding there would make the
+      # copy diverge from the release it stands in for.
+      - internal/clientconf/internal/gotoml224
+
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

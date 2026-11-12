@@ -335,9 +335,42 @@ func TestNewChangeRefusesAContainerdEditAnImportSupersedes(t *testing.T) {
 	}
 }
 
+// TestContainerdConfigLoadsWithContainerdsTOML holds ReadContainerdConfig to
+// the grammar of go-toml v2.2.4, which containerd v2.2.0 loads config.toml
+// with: TOML 1.1 syntax a later parser accepts is a file containerd does not
+// start with, in the main file and in one it imports.
+func TestContainerdConfigLoadsWithContainerdsTOML(t *testing.T) {
+	const registry = "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\n config_path = \"/etc/containerd/certs.d\"\n"
+	if r, err := ReadContainerdConfig([]byte(registry + " audit = { a = \"b\" }\n")); err != nil || r.ConfigPath != ContainerdCertsDir {
+		t.Fatalf("control = %+v, %v; want config_path read", r, err)
+	}
+	for name, tail := range map[string]string{
+		"trailing comma in an inline table":     " audit = { a = \"b\", }\n",
+		"newline in an inline table":            " audit = { a = \"b\",\n c = \"d\" }\n",
+		"newline before an inline table closes": " audit = { a = \"b\"\n }\n",
+	} {
+		if r, err := ReadContainerdConfig([]byte(registry + tail)); err == nil {
+			t.Errorf("%s: read %+v; containerd refuses to load this file", name, r)
+		}
+		home := t.TempDir()
+		dir := filepath.Join(home, "etc/containerd")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "extra.toml"), []byte(registry+tail), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := ResolveContainerdConfig(home, "/etc/containerd/config.toml", []byte("version = 2\nimports = [\"extra.toml\"]\n")); err == nil {
+			t.Errorf("%s in an imported file: read %+v; containerd refuses to load it", name, r)
+		}
+	}
+}
+
 // TestContainerdHostsFileLoadsAsContainerd holds ParseContainerdHostsFile to
 // what containerd v2.2.0's ConfigureHosts answered for each of these files:
-// the endpoints it resolved in order, or that it discarded the file. A host
+// the endpoints it resolved in order, or that it discarded the file. The
+// TOML 1.1 cases are ones the go-toml release the module graph resolves
+// accepts and the v2.2.4 containerd parses with rejects. A host
 // written as an inline table or a dotted key is one containerd never lists,
 // because it orders hosts by their table headers.
 func TestContainerdHostsFileLoadsAsContainerd(t *testing.T) {
@@ -384,6 +417,10 @@ func TestContainerdHostsFileLoadsAsContainerd(t *testing.T) {
 		{"host with an overridden path", "[host.\"https://bodega.internal:8443/a/b/\"]\n override_path = true\n", []string{"https://bodega.internal:8443/a/b", ""}},
 		{"host reopened", "[host.\"https://a\"]\n[host.\"https://b\"]\n[host.\"https://a\".header]\n x = \"1\"\n", []string{"https://a/v2", "https://b/v2", "https://a/v2", ""}},
 		{"host as an inline table", "host = { \"https://bodega.internal:8443\" = { capabilities = [\"pull\"] } }\n", []string{""}},
+		{"TOML 1.1 trailing comma in an inline table", host + " header = { X-Audit = \"value\", }\n", nil},
+		{"TOML 1.1 newline in an inline table", host + " header = { X-Audit = \"value\",\n X-Other = \"value\" }\n", nil},
+		{"TOML 1.1 newline before an inline table closes", host + " header = { X-Audit = \"value\"\n }\n", nil},
+		{"inline table header", host + " header = { X-Audit = \"value\" }\n", []string{bodega, ""}},
 		{"host as a dotted key", "host.\"https://bodega.internal:8443\".capabilities = [\"pull\"]\n", []string{""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

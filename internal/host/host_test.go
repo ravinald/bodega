@@ -226,10 +226,17 @@ func TestAllChecksRunCleanly(t *testing.T) {
 	}
 }
 
-// rubyFixture stands in for a host's gem and bundle: which are on PATH, what
-// `gem sources --list` prints, and the home Bundler's user config sits in.
-func rubyFixture(t *testing.T, tools []string, sources string, env map[string]string) rubyTools {
+// rubyFixture stands in for a host's gem and bundle: which are on PATH, the
+// ~/.gemrc gem reads (none when gemrc is empty), and the home Bundler's user
+// config sits in. The system gemrc is a path that does not exist.
+func rubyFixture(t *testing.T, tools []string, gemrc string, env map[string]string) rubyTools {
 	t.Helper()
+	home := t.TempDir()
+	if gemrc != "" {
+		if err := os.WriteFile(filepath.Join(home, ".gemrc"), []byte(gemrc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return rubyTools{
 		lookPath: func(name string) (string, error) {
 			for _, tool := range tools {
@@ -239,13 +246,12 @@ func rubyFixture(t *testing.T, tools []string, sources string, env map[string]st
 			}
 			return "", exec.ErrNotFound
 		},
-		gemSources: func(string) (string, error) { return sources, nil },
-		getenv:     func(k string) string { return env[k] },
-		home:       t.TempDir(),
+		getenv:      func(k string) string { return env[k] },
+		lookupEnv:   func(k string) (string, bool) { v, ok := env[k]; return v, ok },
+		home:        home,
+		systemGemrc: filepath.Join(home, "etc/gemrc"),
 	}
 }
-
-const bodegaGemSources = "*** CURRENT SOURCES ***\n\nhttps://bodega.internal/rubygems/\n"
 
 func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
 	if f, ok := checkRubygems(rubyFixture(t, nil, "", nil)); ok {
@@ -256,12 +262,8 @@ func TestCheckRubygemsGivesNoRowWithoutGemOrBundle(t *testing.T) {
 func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	both := []string{"gem", "bundle"}
 	configured := func(t *testing.T) rubyTools {
-		r := rubyFixture(t, both, bodegaGemSources, nil)
-		r.home = t.TempDir()
+		r := rubyFixture(t, both, "", nil)
 		for _, c := range clientconf.Rubygems("https://bodega.internal") {
-			if c.Label != "Bundler mirror" {
-				continue
-			}
 			path := filepath.Join(r.home, strings.TrimPrefix(c.Path(clientconf.OSLinux), "~/"))
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
@@ -279,10 +281,12 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 	}
 
 	r := configured(t)
-	r.gemSources = func(string) (string, error) { return "*** CURRENT SOURCES ***\n\nhttps://rubygems.org/\n", nil }
+	if err := os.Remove(filepath.Join(r.home, ".gemrc")); err != nil {
+		t.Fatal(err)
+	}
 	f, _ = checkRubygems(r)
 	if f.Status != StatusWarn || !strings.Contains(f.Detail, "gem sources lists https://rubygems.org/") || !strings.Contains(f.Remediation, "--configure rubygems") {
-		t.Errorf("gem sources on rubygems.org = %+v, want a warning naming the source and --configure rubygems", f)
+		t.Errorf("gem with no gemrc = %+v, want a warning naming its default source and --configure rubygems", f)
 	}
 
 	f, _ = checkRubygems(rubyFixture(t, []string{"bundle"}, "", nil))
@@ -300,11 +304,122 @@ func TestCheckRubygemsWarnsOnRubygemsOrg(t *testing.T) {
 		t.Errorf("BUNDLE_MIRROR__ALL on bodega = %+v, want OK", f)
 	}
 
-	r = rubyFixture(t, []string{"gem"}, "", nil)
-	r.gemSources = func(string) (string, error) { return "", errors.New("exit status 1") }
+	r = rubyFixture(t, []string{"gem"}, ":sources: [https://bodega.internal/rubygems/]\n", nil)
 	f, _ = checkRubygems(r)
-	if f.Status != StatusSkip || !strings.Contains(f.Detail, "exit status 1") {
-		t.Errorf("gem sources failing = %+v, want SKIPPED with the error", f)
+	if f.Status != StatusSkip || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, filepath.Join(r.home, ".gemrc")) {
+		t.Errorf("a gemrc gem cannot build a source list from = %+v, want SKIPPED, unchecked and naming the file", f)
+	}
+}
+
+// TestGemSourcesLoadAsRubyGems holds gemSources to what RubyGems 3.5.22's
+// Gem::ConfigFile answered for each ~/.gemrc: the sources gem runs with. An
+// empty want is a file gem raises on, discards, or builds no list of URLs
+// from, and both-spellings is one doctor declines to decide.
+func TestGemSourcesLoadAsRubyGems(t *testing.T) {
+	const def = "https://rubygems.org/"
+	const a, b = "https://a.example/", "https://b.example/"
+	for _, tc := range []struct {
+		name, gemrc string
+		want        []string
+	}{
+		{"rendered by clientconf", "---\n:sources:\n- https://bodega.internal/rubygems/\n", []string{"https://bodega.internal/rubygems/"}},
+		{"no sources key", ":verbose: true\n", []string{def}},
+		{"quoted items", ":sources:\n- \"" + a + "\"\n- '" + b + "'\n", []string{a, b}},
+		{"string key", "sources:\n- " + a + "\n", []string{a}},
+		{"string key with a trailing slash", "sources/:\n- " + a + "\n", []string{a}},
+		{"both spellings", ":sources:\n- " + a + "\nsources:\n- " + b + "\n", nil},
+		{"empty list", ":sources: []\n", []string{def}},
+		{"key with nothing under it", ":sources:\n:verbose: true\n", []string{def}},
+		{"items after another key", ":sources:\n:verbose: true\n- " + a + "\n", []string{a}},
+		{"scalar", ":sources: " + a + "\n", nil},
+		{"item with a comment", ":sources:\n- " + a + " # mirror\n", []string{a}},
+		{"commented-out sources", "# :sources:\n# - https://x.example/\n:sources:\n- " + a + "\n", []string{a}},
+		{"indented items", ":sources:\n  - " + a + "\n", []string{a}},
+		{"flow list", ":sources: [" + a + "]\n", nil},
+		{"item under no key", "- " + a + "\n", nil},
+		{"key indented under nothing", "    :sources:\n- " + a + "\n", nil},
+		{"sources nested under another key", "gem:\n  :sources:\n  - " + a + "\n", []string{def}},
+		{"key holding a colon and a space", ":sources: " + a + ": x\n", nil},
+		{"CRLF", ":sources:\r\n- " + a + "\r\n", []string{a}},
+		{"quoted empty string", ":sources: \"\"\n", []string{def}},
+		{"set twice", ":sources:\n- " + a + "\n:sources:\n- " + b + "\n", []string{b}},
+		{"tab after the colon", ":sources:\t\n- " + a + "\n", nil},
+		{"item with a port", ":sources:\n- https://a.example:8443/rubygems/\n", []string{"https://a.example:8443/rubygems/"}},
+		{"item that reads as a key", ":sources:\n- " + a + " extra: thing\n", []string{def}},
+		{"document end marker", ":sources:\n- " + a + "\n...\n", []string{a}},
+		{"anchor", ":sources: &a\n- " + a + "\n", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := rubyFixture(t, nil, tc.gemrc, nil)
+			got, err := gemSources(gemrcEnv{lookupEnv: r.lookupEnv, home: r.home, system: r.systemGemrc})
+			if tc.want == nil {
+				if err == nil {
+					t.Fatalf("sources = %q; want the file left undecided", got)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tc.want) {
+				t.Errorf("sources = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestGemSourcesMergeTheFilesRubyGemsLoads holds the files gemSources reads
+// to the ones RubyGems 3.5.22 merges: the system gemrc, then ~/.gemrc or its
+// XDG location, then each file $GEMRC names, where a set $GEMRC, even an
+// empty one, means the user's file is not read at all.
+func TestGemSourcesMergeTheFilesRubyGemsLoads(t *testing.T) {
+	const def = "https://rubygems.org/"
+	list := func(u string) string { return ":sources:\n- " + u + "\n" }
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		env   map[string]string
+		want  []string
+	}{
+		{"the system gemrc alone", map[string]string{"etc/gemrc": list("https://system.example/")}, nil, []string{"https://system.example/"}},
+		{"~/.gemrc over the system gemrc", map[string]string{"etc/gemrc": list("https://system.example/"), ".gemrc": list("https://home.example/")}, nil, []string{"https://home.example/"}},
+		{"~/.gemrc over the XDG file", map[string]string{".gemrc": list("https://home.example/"), "xdg/gem/gemrc": list("https://xdg.example/")}, map[string]string{"XDG_CONFIG_HOME": "{home}/xdg"}, []string{"https://home.example/"}},
+		{"the XDG file", map[string]string{"xdg/gem/gemrc": list("https://xdg.example/")}, map[string]string{"XDG_CONFIG_HOME": "{home}/xdg"}, []string{"https://xdg.example/"}},
+		{"~/.config without XDG_CONFIG_HOME", map[string]string{".config/gem/gemrc": list("https://dotconfig.example/")}, nil, []string{"https://dotconfig.example/"}},
+		{"an empty XDG_CONFIG_HOME", map[string]string{".config/gem/gemrc": list("https://dotconfig.example/")}, map[string]string{"XDG_CONFIG_HOME": ""}, []string{def}},
+		{"GEMRC over ~/.gemrc", map[string]string{".gemrc": list("https://home.example/"), "env1": list("https://env.example/")}, map[string]string{"GEMRC": "{home}/env1"}, []string{"https://env.example/"}},
+		{"GEMRC without sources hides ~/.gemrc", map[string]string{".gemrc": list("https://home.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env2"}, []string{def}},
+		{"an empty GEMRC hides ~/.gemrc", map[string]string{".gemrc": list("https://home.example/")}, map[string]string{"GEMRC": ""}, []string{def}},
+		{"GEMRC over the system gemrc", map[string]string{"etc/gemrc": list("https://system.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env2"}, []string{"https://system.example/"}},
+		{"two GEMRC files", map[string]string{"env1": list("https://env.example/"), "env2": ":verbose: true\n"}, map[string]string{"GEMRC": "{home}/env1:{home}/env2"}, []string{"https://env.example/"}},
+		{"a later GEMRC file resets sources", map[string]string{"env1": list("https://env.example/"), "reset": ":sources:\n"}, map[string]string{"GEMRC": "{home}/env1:{home}/reset"}, []string{def}},
+		{"a missing GEMRC file", nil, map[string]string{"GEMRC": "{home}/missing"}, []string{def}},
+		{"a GEMRC that is a directory", map[string]string{"dir/x": ""}, map[string]string{"GEMRC": "{home}/dir"}, nil},
+		{"a relative GEMRC", nil, map[string]string{"GEMRC": "gemrc"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := rubyFixture(t, nil, "", nil)
+			for name, body := range tc.files {
+				path := filepath.Join(r.home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lookup := func(k string) (string, bool) {
+				v, ok := tc.env[k]
+				return strings.ReplaceAll(v, "{home}", r.home), ok
+			}
+			got, err := gemSources(gemrcEnv{lookupEnv: lookup, home: r.home, system: r.systemGemrc})
+			if tc.want == nil {
+				if err == nil {
+					t.Fatalf("sources = %q; want the list left undecided", got)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tc.want) {
+				t.Errorf("sources = %q, %v; want %q", got, err, tc.want)
+			}
+		})
 	}
 }
 

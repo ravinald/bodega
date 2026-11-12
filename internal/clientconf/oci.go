@@ -17,6 +17,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	gotoml224 "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -361,6 +362,12 @@ func ReadContainerdConfig(data []byte) (ContainerdRegistry, error) {
 // format's CRI plugin, is refused, since containerd 2.x migrates each file
 // on its own and doctor does not follow that.
 func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) {
+	// containerd v2.2.0 loads this file with go-toml v2.2.4, which rejects
+	// TOML 1.1 syntax the decoder below accepts, and a config.toml it
+	// rejects is one it does not start with.
+	if err := gotoml224.Unmarshal(data, new(map[string]any)); err != nil {
+		return ContainerdRegistry{}, err
+	}
 	var doc map[string]any
 	if _, err := toml.Decode(string(data), &doc); err != nil {
 		return ContainerdRegistry{}, err

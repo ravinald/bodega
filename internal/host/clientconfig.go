@@ -390,12 +390,14 @@ func checkNpmConfig(root, goos, home string) Finding {
 }
 
 // rubyTools is what the rubygems check reads from the host, so a test can
-// stand in for gem and for the environment Bundler resolves its config from.
+// stand in for which tools are on PATH and for the environment and files gem
+// and Bundler resolve their config from.
 type rubyTools struct {
-	lookPath   func(string) (string, error)
-	gemSources func(gem string) (string, error)
-	getenv     func(string) string
-	home       string
+	lookPath    func(string) (string, error)
+	getenv      func(string) string
+	lookupEnv   func(string) (string, bool)
+	home        string
+	systemGemrc string
 }
 
 // CheckRubygems reports whether gem or Bundler still fetch from
@@ -403,24 +405,11 @@ type rubyTools struct {
 // would describe a client nobody runs.
 func CheckRubygems() (f Finding, ok bool) {
 	home, _ := os.UserHomeDir()
-	return checkRubygems(rubyTools{lookPath: exec.LookPath, gemSources: runGemSources, getenv: os.Getenv, home: home})
-}
-
-// runGemSources asks gem itself, because the list it uses merges the system
-// gemrc, ~/.gemrc (or its XDG location) and every file $GEMRC names, and
-// falls back to rubygems.org when none of them sets :sources:.
-func runGemSources(gem string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, gem, "sources", "--list").Output()
-	if err != nil {
-		return "", fmt.Errorf("%s sources --list: %w", gem, err)
-	}
-	return string(out), nil
+	return checkRubygems(rubyTools{lookPath: exec.LookPath, getenv: os.Getenv, lookupEnv: os.LookupEnv, home: home, systemGemrc: systemGemrc(runtime.GOOS)})
 }
 
 func checkRubygems(t rubyTools) (Finding, bool) {
-	gem, gemErr := t.lookPath("gem")
+	_, gemErr := t.lookPath("gem")
 	_, bundleErr := t.lookPath("bundle")
 	if gemErr != nil && bundleErr != nil {
 		return Finding{}, false
@@ -428,11 +417,11 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 	f := Finding{Check: "rubygems"}
 	var found, unread, clean []string
 	if gemErr == nil {
-		switch out, err := t.gemSources(gem); {
+		switch sources, err := gemSources(gemrcEnv{lookupEnv: t.lookupEnv, home: t.home, system: t.systemGemrc}); {
 		case err != nil:
-			unread = append(unread, "gem's sources could not be listed: "+err.Error())
-		case rubygemsOrgSource(out) != "":
-			found = append(found, "gem sources lists "+rubygemsOrgSource(out))
+			unread = append(unread, "unchecked: gem's sources cannot be decided from its gemrc files, and doctor does not run gem: "+err.Error())
+		case rubygemsOrgSource(sources) != "":
+			found = append(found, "gem sources lists "+rubygemsOrgSource(sources))
 		default:
 			clean = append(clean, "gem sources")
 		}
@@ -465,11 +454,10 @@ func checkRubygems(t rubyTools) (Finding, bool) {
 	return f, true
 }
 
-// rubygemsOrgSource is the first source `gem sources --list` prints on
-// rubygems.org, or "". The list is one URL per line under a banner.
-func rubygemsOrgSource(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		if src := strings.TrimSpace(line); isRubygemsOrg(src) {
+// rubygemsOrgSource is the first of gem's sources on rubygems.org, or "".
+func rubygemsOrgSource(sources []string) string {
+	for _, src := range sources {
+		if isRubygemsOrg(src) {
 			return src
 		}
 	}

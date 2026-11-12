@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
-	tomlu "github.com/pelletier/go-toml/v2/unstable"
+	toml "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224"
+	tomlu "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224/unstable"
 )
 
 // containerdHostFile is one host of a hosts.toml as containerd decodes it:
@@ -59,7 +59,7 @@ type ContainerdRegistryHost struct {
 }
 
 // ParseContainerdHostsFile decodes data as containerd's parseHostsFile does
-// for a hosts.toml in dir: go-toml/v2 fills the structs, then each host goes
+// for a hosts.toml in dir: go-toml v2.2.4 fills the structs, then each host goes
 // through the conversions of parseHostConfig. Any error is one containerd
 // logs before discarding the file whole, so nothing in a file that fails here
 // is a setting containerd runs with.

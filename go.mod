@@ -24,7 +24,6 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/klauspost/compress v1.20.3
 	github.com/osquery/osquery-go v0.0.0-20260630173615-eb39ad3443df
-	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/ravinald/jsondiff v0.2.1
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1
 	github.com/sigstore/protobuf-specs v0.5.2
