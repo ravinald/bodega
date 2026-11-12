@@ -2360,28 +2360,34 @@ func (c *Config) validateStorage() error {
 // refused because a credential written there lands in every log line that
 // prints the endpoint; the AWS chain is where credentials belong.
 //
-// No refusal here may print what could be that credential. The "@" check runs
-// on the text and before the parse for that reason: a malformed URL never
-// yields a URL.User to test, and url.Parse's own error quotes its whole input.
-// The query and fragment refusal prints the scheme and host alone, since a
-// query is the other place a secret gets pasted.
+// No endpoint refusal prints the endpoint, any part of it, or an error derived
+// from it: refuse takes a fixed reason and nothing else. A URL is where a
+// credential gets pasted (userinfo, a query token, a path segment), a
+// malformed one has no parsed components to pick the safe part out of, and
+// url.Parse's own error quotes its whole input. The key and the backend
+// already say which line of the file to open.
 func validateS3Store(at, backend, endpoint, checksums string, allowPlaintext bool) error {
-	if strings.Contains(endpoint, "@") {
-		return fmt.Errorf("%sendpoint for %s carries credentials in the URL (it holds an \"@\", and the value is not printed here because of that): remove them, write it as https://host[:port], and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)", at, backend)
+	refuse := func(reason string) error {
+		return fmt.Errorf("%sendpoint for %s %s (the value is not printed, because a URL can carry credentials)", at, backend, reason)
 	}
 	if endpoint != "" {
+		// On the text and before the parse: a malformed URL never yields a
+		// URL.User to test.
+		if strings.Contains(endpoint, "@") {
+			return refuse("carries credentials in the URL (it holds an \"@\"): remove them, write it as https://host[:port], and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)")
+		}
 		u, err := url.Parse(endpoint)
 		switch {
 		case err != nil:
-			return fmt.Errorf("%sendpoint %q for %s is not a URL: %w", at, endpoint, backend, err)
-		case u.Hostname() == "":
-			return fmt.Errorf("%sendpoint %q for %s names no host: write it as https://host[:port]", at, endpoint, backend)
+			return refuse("is not a URL the parser accepts: check it for a stray space, control character or malformed %XX escape, and write it as https://host[:port][/path]")
 		case u.RawQuery != "" || u.ForceQuery || u.Fragment != "":
-			return fmt.Errorf("%sendpoint for %s (%s://%s) carries a query or fragment: write only https://host[:port][/path]", at, backend, u.Scheme, u.Host)
+			return refuse("carries a query or fragment: write only https://host[:port][/path]")
+		case u.Hostname() == "":
+			return refuse("names no host: write it as https://host[:port]")
 		case u.Scheme == "http" && !allowPlaintext:
-			return fmt.Errorf("%sendpoint %q for %s is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that", at, endpoint, backend)
+			return refuse("is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that")
 		case u.Scheme != "https" && u.Scheme != "http":
-			return fmt.Errorf("%sendpoint %q for %s has scheme %q: use https (http only with allow_plaintext)", at, endpoint, backend, u.Scheme)
+			return refuse("has a scheme other than https: use https (http only with allow_plaintext)")
 		}
 	}
 	switch checksums {

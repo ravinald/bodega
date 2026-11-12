@@ -4356,7 +4356,7 @@ The `s3` driver reaches a store that is not AWS through three keys. They sit at 
 A key that is set wins over the AWS SDK's own setting for the same thing, and a key left out leaves the SDK's setting in force: `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` in the environment and `endpoint_url` in the shared config profile for the endpoint, `AWS_REQUEST_CHECKSUM_CALCULATION` and `AWS_RESPONSE_CHECKSUM_VALIDATION` for checksums. The SDK has no environment setting for path-style addressing, so `path_style` is the only way to select it. An invalid value fails at config load and names the key and the backend:
 
 ```text
-storage_backends["onprem"].endpoint "http://minio.example.net:9000" for storage backend "onprem" is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that
+storage_backends["onprem"].endpoint for storage backend "onprem" is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that (the value is not printed, because a URL can carry credentials)
 ```
 
 `region` is still required. The SDK signs every request with it, and most stores accept any value or name their own (`us-ord` on Linode Object Storage). Credentials come from the same AWS chain: put the store's access key in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or in a profile.
