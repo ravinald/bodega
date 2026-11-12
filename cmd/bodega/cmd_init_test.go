@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	bos3 "github.com/ravinald/bodega/internal/s3"
@@ -179,7 +183,7 @@ func TestInitDialsTheRegionTheServiceDials(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec, _ := storage.SpecFor(cfg, name)
-		service, err := bos3.NewClient(ctx, spec.Bucket, spec.Region)
+		service, err := bos3.NewClient(ctx, spec.Bucket, spec.Region, spec.S3Options())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -240,4 +244,123 @@ func TestCheckVerdictNamesWhatItDidNotProve(t *testing.T) {
 			}
 		})
 	}
+}
+
+// compatibleStore is an S3-compatible store with no public access block and
+// no default encryption. It records each request as "METHOD
+// path?subresource" and whether each object PUT carried a CRC32 checksum.
+//
+// It does not prove path_style: httptest listens on an IP address, and the
+// SDK addresses a bucket path-style at an IP whatever the option says.
+// TestNewClientPassesEachKeyToTheSDK in internal/s3 holds that key.
+type compatibleStore struct {
+	sync.Mutex
+	requests   []string
+	markerCRCs []bool
+}
+
+func (c *compatibleStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	sub := ""
+	for _, name := range []string{"publicAccessBlock", "versioning", "encryption", "lifecycle", "list-type"} {
+		if r.URL.Query().Has(name) {
+			sub = name
+		}
+	}
+	c.Lock()
+	c.requests = append(c.requests, r.Method+" "+r.URL.Path+"?"+sub)
+	if r.Method == http.MethodPut && sub == "" {
+		c.markerCRCs = append(c.markerCRCs, r.Header.Get("X-Amz-Checksum-Crc32") != "" || r.Header.Get("X-Amz-Trailer") != "")
+	}
+	c.Unlock()
+
+	fail := func(status int, code string) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(status)
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>%s</Message></Error>`, code, code)
+	}
+	switch {
+	case !strings.HasPrefix(r.URL.Path, "/bodega-onprem"):
+		fail(http.StatusNotFound, "NoSuchBucket")
+	case sub == "publicAccessBlock" || sub == "encryption":
+		fail(http.StatusNotImplemented, "NotImplemented")
+	case sub == "versioning" && r.Method == http.MethodGet:
+		_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`))
+	case sub == "lifecycle" && r.Method == http.MethodGet:
+		fail(http.StatusNotFound, "NoSuchLifecycleConfiguration")
+	case sub == "list-type":
+		_, _ = w.Write([]byte(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><KeyCount>0</KeyCount></ListBucketResult>`))
+	}
+}
+
+func (c *compatibleStore) count(prefix string) int {
+	c.Lock()
+	defer c.Unlock()
+	n := 0
+	for _, r := range c.requests {
+		if strings.HasPrefix(r, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestInitAgainstACompatibleStore runs `bodega init` through the real SDK to
+// a store over HTTP, which is where the three keys and the not-implemented
+// classification meet: the config key has to become a request line, and a 501
+// with an XML body has to come back out of the SDK as a control to name.
+func TestInitAgainstACompatibleStore(t *testing.T) {
+	run := func(t *testing.T, checksums string, args ...string) (*compatibleStore, error) {
+		store := &compatibleStore{}
+		srv := httptest.NewServer(store)
+		t.Cleanup(srv.Close)
+		t.Setenv("AWS_ACCESS_KEY_ID", "test")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+		for _, env := range []string{"AWS_SESSION_TOKEN", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"} {
+			t.Setenv(env, "")
+		}
+		body := fmt.Sprintf(`{"allow_plaintext": true, "storage_backends": {"onprem": {
+		  "driver": "s3", "bucket": "bodega-onprem", "region": "us-east-1",
+		  "endpoint": %q, "path_style": true%s}}}`, srv.URL, checksums)
+		_, err := runInit(t, body, append([]string{"onprem"}, args...)...)
+		return store, err
+	}
+
+	t.Run("refused naming both controls", func(t *testing.T) {
+		store, err := run(t, `, "checksums": "when_required"`)
+		if err == nil || !strings.Contains(err.Error(), "does not implement: public access block, default encryption") ||
+			!strings.Contains(err.Error(), "--allow-unsupported") {
+			t.Fatalf("err = %v, want both controls named and the flag offered", err)
+		}
+		if store.count("PUT /bodega-onprem?lifecycle") != 1 {
+			t.Errorf("lifecycle was not applied after the unsupported controls: %v", store.requests)
+		}
+		if len(store.markerCRCs) != 0 {
+			t.Errorf("prefix markers written on a refused run: %v", store.requests)
+		}
+	})
+
+	t.Run("allowed, and when_required sends no CRC32", func(t *testing.T) {
+		store, err := run(t, `, "checksums": "when_required"`, "--allow-unsupported")
+		if err != nil {
+			t.Fatalf("err = %v, want the run to finish: %v", err, store.requests)
+		}
+		if len(store.markerCRCs) == 0 {
+			t.Fatalf("no prefix marker written: %v", store.requests)
+		}
+		for _, crc := range store.markerCRCs {
+			if crc {
+				t.Fatal("a marker PUT carried a CRC32 checksum under checksums: when_required")
+			}
+		}
+	})
+
+	t.Run("checksums unset keeps the SDK default on the wire", func(t *testing.T) {
+		store, err := run(t, "", "--allow-unsupported")
+		if err != nil {
+			t.Fatalf("err = %v: %v", err, store.requests)
+		}
+		if len(store.markerCRCs) == 0 || !store.markerCRCs[0] {
+			t.Errorf("marker PUT carried no CRC32 with checksums unset; the when_required case above proves nothing: %v", store.markerCRCs)
+		}
+	})
 }

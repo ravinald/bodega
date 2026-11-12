@@ -49,6 +49,7 @@ Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default
 
 It sets SSE-S3 (AES-256) encryption, versioning and a full public access block, and writes the lifecycle rules: one bucket-wide rule that aborts incomplete multipart uploads, and one noncurrent-version expiry rule per artifact prefix, skipping `manifests/` and `attestations/`. It then writes a zero-byte marker under each prefix in [Storage Layout](#storage-layout). Versioning is on because it is the only protection a manifest has against whoever can already write it: a rewrite leaves the previous version in place, and the runtime policy withholds the one action that removes it. See [S3 setup](#s3-setup) for the policies, the lifecycle rules and their retention.
 
+- `bodega init --allow-unsupported` finishes without the bucket controls an S3-compatible store reports as not implemented, printing `NOT APPLIED` beside each. Without it, `bodega init` names every such control and exits non-zero. See [S3-compatible stores](#s3-compatible-stores).
 - `bodega init --print-policy` prints the two IAM policies, setup and runtime, and changes nothing. `--print-policy=setup` or `--print-policy=runtime` prints one as bare JSON, ready to redirect into a file.
 - `bodega init check [BACKEND]` asks the bucket whether the current credentials hold the runtime policy, and names each action the API refused. It changes nothing.
 
@@ -3449,7 +3450,7 @@ It re-runs every per-version check: the upstream allow-list, [OSV](#bodega-polic
 
 An integration instance is asked on re-vet only when its [`revet`](#integrations) field is on, which by default it is for a `free` type and not for a `free-tier` or `paid` one; an instance with it off records `not_evaluated` with `not re-run: revet is off for this instance`. Re-vet asks through the instance admission uses in the same process, so it shares that instance's answer cache and its type's quota gate. A hit is decided as at admission: under `block` it refuses the version, and a `malware` type's hit is never overridden. An error is not: the version was admitted on evidence, and an outage or a rate limit adds none, so the entry records `not_evaluated` with `not re-run: <error>`, the decision follows the other checks, the outcome carries the note `integration:<instance> could not be asked: <error>`, and the error is stored as the instance's last error.
 
-The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary, apt or distfiles version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`. A `hosted` catalog entry was uploaded rather than fetched, so like its admission it records the allow-list as `not_evaluated` with `the entry names no upstream the allow-list can rule on`, and no note.
+The allow-list rules on what it ruled on at admission: the package name for pypi, npm, gomod and cargo, the upstream URL for every other type. A helm, binary, apt or distfiles version the proxy cached has no catalog entry to name that URL, so the allow-list is re-run against the upstream recorded when the object was cached, provided the object now in the store is the one that upstream supplied. A version with no recorded upstream, or whose cached object was written over since, records the allow-list as `not_evaluated`, its decision follows the other checks, and the outcome carries the note `allow-list not re-run: the upstream of the cached object is unknown`. An upstream recorded as `s3://<bucket>`, before an `s3` backend's `endpoint` was part of its location, is read back only while one configured backend can be the store that spelling meant. When two can (an AWS bucket and a compatible store's bucket of the same name, or two compatible stores), the record is credited to neither: the re-vet of that version ends with an error naming both backends, records no decision and takes no action, so the earlier decision stands until the object is cached again and its upstream is recorded under the backend that holds it. A `hosted` catalog entry was uploaded rather than fetched, so like its admission it records the allow-list as `not_evaluated` with `the entry names no upstream the allow-list can rule on`, and no note.
 
 **Objects whose key names no version** (a distfile, a binary at `binaries/<name>/<file>`, an open-mode namespaced binary whose path is not `<name>/<version>/<file>`) are re-vetted per cached object, not per version: several files can share one name and an empty version, so each object key is its own target, and the VERSION column and the `object_key` field of `--json` show the key. The fill admitted such an object on the allow-list alone, so that is all the re-vet rules on: the allow-list against the upstream recorded for that object, with every per-version check `not_evaluated` and the detail `not re-run: the object's key names no version the per-version checks can evaluate`. A refusal is reported and revoked like any proxy-cached version's. `--version` never selects one; `--type` and `--name` do.
 
@@ -4435,7 +4436,70 @@ A multipart upload that dies partway leaves parts that are billed, appear in no 
 
 Rules whose ID does not start with `bodega-` are yours, and `bodega init` writes them back unchanged. A `bodega-` rule edited on the bucket is drift, and the next `bodega init` rewrites it; the retention periods are `AbortIncompleteMultipartDays` and `NoncurrentVersionDays` in `internal/s3/init.go`. A named backend with a `prefix` gets its rules and markers at the bucket root, not under the prefix, so its noncurrent versions do not expire.
 
-**S3-compatible stores** (SeaweedFS, Garage and the like) are untested, not unsupported. bodega speaks S3 through the AWS SDK, so the endpoint comes from the SDK's own settings: `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` in the environment, or `endpoint_url` in the shared config profile. bodega has no endpoint key of its own, and it sets no path-style addressing option, which some of those stores need.
+##### S3-compatible stores
+
+The `s3` driver reaches a store that is not AWS through three keys. They sit at the top level of the config for the default backend, beside `bucket` and `region`, and inside a `storage_backends` entry for a named one. A named entry inherits none of the default backend's.
+
+| Key          | Value                                              | What it does                                                                                                                                                                                                                                      |
+| ------------ | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`   | an `https` URL; `http` only with `allow_plaintext` | The store's base URL. Artifacts and signed requests go there, so a plaintext endpoint needs the same `allow_plaintext` a plaintext listener does. A URL carrying credentials is refused                                                           |
+| `path_style` | `true` or `false` (default)                        | Addresses the bucket as `endpoint/bucket` rather than `bucket.endpoint`. A store with no wildcard DNS record answers only the first                                                                                                               |
+| `checksums`  | `when_supported` (default) or `when_required`      | When the AWS SDK adds a CRC32 checksum to a request and validates one on a response. `when_supported` does both on every call that allows it, and several stores reject the request; `when_required` does neither unless the operation demands it |
+
+```json
+{
+  "storage_backend": "s3",
+  "bucket": "example-bodega-artifacts",
+  "region": "us-ord",
+  "endpoint": "https://us-ord-10.linodeobjects.com",
+  "checksums": "when_required",
+  "storage_backends": {
+    "onprem": {
+      "driver": "s3",
+      "bucket": "bodega-onprem",
+      "region": "us-east-1",
+      "endpoint": "https://minio.example.net:9000",
+      "path_style": true
+    }
+  }
+}
+```
+
+A key that is set wins over the AWS SDK's own setting for the same thing, and a key left out leaves the SDK's setting in force: `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` in the environment and `endpoint_url` in the shared config profile for the endpoint, `AWS_REQUEST_CHECKSUM_CALCULATION` and `AWS_RESPONSE_CHECKSUM_VALIDATION` for checksums. The SDK has no environment setting for path-style addressing, so `path_style` is the only way to select it. An invalid value fails at config load and names the key and the backend:
+
+```text
+storage_backends["onprem"].endpoint for storage backend "onprem" is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that (the value is not printed, because a URL can carry credentials)
+```
+
+`region` is still required. The SDK signs every request with it, and most stores accept any value or name their own (`us-ord` on Linode Object Storage). Credentials come from the same AWS chain: put the store's access key in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or in a profile.
+
+**Bucket controls the store lacks.** `bodega init` applies four controls after creating the bucket: the public access block, versioning, default encryption and the lifecycle rules. A compatible store may implement none of them. `bodega init` attempts all four, prints `NOT APPLIED` beside each one the store reports as not implemented, and exits non-zero naming every one, before writing the prefix markers:
+
+```text
+Initializing bucket s3://bodega-onprem in us-east-1 (backend "onprem")...
+  bucket:     exists
+  public acl: NOT APPLIED (the store does not implement public access block)
+  versioning: ENABLED
+  encryption: NOT APPLIED (the store does not implement default encryption)
+  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ and attestations/ kept)
+Error: the store holding s3://bodega-onprem does not implement: public access block, default encryption. Nothing else failed, and the prefix markers were not written. If the store offers an equivalent, set it there; then re-run with --allow-unsupported to finish without what it lacks
+```
+
+`bodega init --allow-unsupported` prints the same `NOT APPLIED` lines and finishes the run without those controls. It never passes over one without a line, and it excuses only a store that answers `NotImplemented` (or HTTP 501): a refusal, a `405`, a timeout or any other failure of a control stops the run with or without the flag. That covers the read `bodega init` makes of each control's current setting before it writes one: only an answer that nothing is configured yet, or `NotImplemented`, lets the write go ahead, so a read the credentials are denied fails as `read default encryption on <bucket>` rather than being reported as a control the store lacks. Read the list before reaching for the flag. A bucket with no public access block is private only if the store's own ACLs and policies make it so; one without versioning keeps no previous version of a rewritten manifest, which is the protection [the runtime policy](#s3-setup) is built around; one without lifecycle rules keeps abandoned multipart parts until something else clears them. The TUI's init action never allows it and prints the same refusal.
+
+**Stores.** "Tested" means the [S3 conformance suite](#the-s3-conformance-suite) passed against the store with the settings shown. For an untested store the settings are what its documentation suggests, not a result, and the conformance suite is how to find out:
+
+| Store                 | Status   | `endpoint`                            | `path_style`                                              | `checksums`                                            |
+| --------------------- | -------- | ------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| AWS S3                | tested   | unset                                 | unset                                                     | unset                                                  |
+| Linode Object Storage | tested   | the account's endpoint for the region | unset                                                     | `when_required`                                        |
+| MinIO                 | untested | the server's URL                      | `true`, unless the server is configured with a domain     | unset on a current release                             |
+| Ceph RGW              | untested | the gateway's URL                     | `true`, unless the gateway has a DNS name with a wildcard | `when_required` on a release that rejects CRC32        |
+| Wasabi                | untested | `https://s3.REGION.wasabisys.com`     | unset                                                     | `when_required` if a write is rejected over a checksum |
+
+Linode assigns each account its endpoint per region, and a key works only there: `linode-cli object-storage keys-view {id}` names it in the key's `regions[].s3_endpoint`. The tested account's `us-ord` endpoint is `https://us-ord-10.linodeobjects.com`; the same key sent to the older `https://us-ord-1.linodeobjects.com` is refused with `InvalidAccessKeyId`.
+
+SeaweedFS, Garage and other stores are untested as well, and the same three keys are what they would be configured with.
 
 ### Publication and access
 
@@ -4480,7 +4544,7 @@ What differs per backend is access, and it differs in the direction that matters
 }
 ```
 
-Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
+Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket`, `region`, `endpoint`, `path_style` and `checksums` by `s3` (the last three are for [S3-compatible stores](#s3-compatible-stores)); `prefix` roots every key under it, on either driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
 
 A `prefix` must be spelled canonically. A leading and a trailing `/` are stripped, so `cold/x`, `/cold/x` and `cold/x/` are one prefix and all three load. An empty segment or a `.` segment is refused, because they are a second spelling of a directory rather than a second directory:
 
@@ -4496,11 +4560,13 @@ The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **d
 storage_by_type["apt"] names undefined storage backend "archive" (defined: default, bulk)
 ```
 
-Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label: comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses by label before the first copy.
+Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label: comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses before the first copy: by label, and for two `s3` backends also by the URL their requests reach.
 
-The resolved label is resolved because the `local` driver is made to resolve it, not because a driver was ever guaranteed to. Until [#136](https://github.com/ravinald/bodega/issues/136), `storage_path` reached the label verbatim: a second backend pointing at a symlink of the first root produced two labels for one directory, the refusal did not fire, and `--delete-source` removed the only copy. `local` now resolves its root once at construction with `filepath.Abs` then `filepath.EvalSymlinks`, falling back to the absolute cleaned path for a root it is about to create. `s3://<bucket>` needs nothing: it is already one string per bucket.
+The resolved label is resolved because the `local` driver is made to resolve it, not because a driver was ever guaranteed to. Until [#136](https://github.com/ravinald/bodega/issues/136), `storage_path` reached the label verbatim: a second backend pointing at a symlink of the first root produced two labels for one directory, the refusal did not fire, and `--delete-source` removed the only copy. `local` now resolves its root once at construction with `filepath.Abs` then `filepath.EvalSymlinks`, falling back to the absolute cleaned path for a root it is about to create. An `s3` backend's label is built from the three things the entry configures, each kept whole: the `endpoint`, the `bucket` and the `prefix`. On AWS it is `s3://<bucket>`, followed by the `prefix`. Through any other `endpoint` it is `s3+<scheme>://<host>/<bucket>`, then the `prefix` (`s3+https://minio.example.net:9000/artifacts/cold`), because a bucket name is unique only within one service and two stores can each hold a bucket of the same name. An endpoint that carries a path closes it with a `|` ahead of the bucket: `https://gw.example.net/tenant` with bucket `artifacts` is `s3+https://gw.example.net/tenant|artifacts`. Nothing moves between the three. A bucket named `cold.artifacts` is not the bucket `artifacts` under the prefix `cold`, an endpoint path is not a subdomain, and an access-point ARN stays the ARN (its `/` written `%2F`) whatever prefix follows it. `path_style`, `checksums` and `region` are not part of a location: one endpoint and bucket in either addressing style is one backend. The endpoint is normalized before it is compared: host in lower case, the scheme's default port and one trailing slash dropped, and its path percent-decoded, so `https://MinIO.example.net:443/` and `https://minio.example.net` are one location, as are `https://gw.example.net/tenant` and `https://gw.example.net/%74enant`. An `endpoint` naming AWS's own S3 service with no path (`https://s3.us-west-2.amazonaws.com`, and its dual-stack, FIPS, accelerate, China and interface VPC endpoint forms) is the bucket AWS serves with no `endpoint` set, so it is `s3://<bucket>` too. Two entries whose keys differ can still reach one object: under `path_style`, `https://gw.example.net/tenant` with bucket `artifacts` and `https://gw.example.net` with bucket `tenant` under the prefix `artifacts` both send `https://gw.example.net/tenant/artifacts/<key>`. They are two locations with two labels, so a fan-out lists both, and `bodega pkg move` refuses to move between them all the same: besides the labels it compares the URL the AWS SDK resolves for each backend, and refuses when either matches. Two hostnames for one compatible service, a DNS name and its address for example, are not recognized as one location by either comparison: give every backend on that service the same `endpoint`.
 
-The prefix is the other half of that label, and it was still concatenated verbatim after #136 fixed the root. Until [#189](https://github.com/ravinald/bodega/issues/189), two backends over one `storage_path` with prefixes `cold/x` and `cold//x` carried two labels for one directory, and `bodega pkg move --to b --delete-source` between them exited 0 reporting a move and left nothing on disk. The label now cleans the prefix, which is truthful only because the spellings that would need cleaning are refused at load: `s3` stores the key it is handed, so `cold//x/k` and `cold/x/k` are two distinct objects in one bucket and a cleaned label over an s3 backend would claim an identity the bucket does not have.
+A cache origin recorded before a release that put the endpoint in the label names its store as `s3://<bucket>`. It is still read for a store reached through an endpoint while that store is the only configured location with that bucket name. Once two configured services hold a bucket of that name the record cannot say which it described: the cache-hit row then reports its upstream as unrecorded with a warning in the log, and [`bodega policy revet`](#bodega-policy-revet---type-type---name-name---version-version---older-than-duration) notes that the allow-list was not re-run and why. Refilling the object records it under the current label.
+
+The prefix is the other half of that label, and it was still concatenated verbatim after #136 fixed the root. Until [#189](https://github.com/ravinald/bodega/issues/189), two backends over one `storage_path` with prefixes `cold/x` and `cold//x` carried two labels for one directory, and `bodega pkg move --to b --delete-source` between them exited 0 reporting a move and left nothing on disk. The label of a `local` backend now cleans the prefix. An `s3` label does not: `s3` stores the key it is handed, so `cold//x/k` and `cold/x/k` are two distinct objects in one bucket, and those spellings are refused at load for every driver.
 
 #### The placement hierarchy
 
@@ -4608,7 +4674,7 @@ This is about an envelope somebody other than bodega wrote and named in `attesta
 
 An `attestation_uri` envelope is written outside bodega, so `storage` on the version entry says where the artifact went and nothing about where the envelope stayed. `pkg move` does not carry it either, so after a move the two are on different backends by construction.
 
-An `s3://<bucket>/<key>` `attestation_uri` is therefore resolved by its own bucket. `handleAttestation` matches `<bucket>` against every configured backend's label — `s3://<bucket>`, or `s3://<bucket>/<prefix>` for a backend rooted at a key prefix, in which case the URI's key must sit under that prefix — and reads from the one that answers. The URI is already in the manifest, so this needs no new field and nothing has to be migrated. An `http(s)` `attestation_uri` is redirected to rather than read, so it may not carry a credential; see [Credentials in a manifest](#credentials-in-a-manifest).
+An `s3://<bucket>/<key>` `attestation_uri` is therefore resolved by its own bucket. `handleAttestation` matches `<bucket>` against every configured `s3` backend's bucket (and, for a backend rooted at a key prefix, its prefix, in which case the URI's key must sit under that prefix) and reads from the one that answers. The URI has nowhere to name an endpoint, so the match ignores it: where two backends on different endpoints hold a bucket of the same name, the default backend answers first, then the others in name order. The URI is already in the manifest, so this needs no new field and nothing has to be migrated. An `http(s)` `attestation_uri` is redirected to rather than read, so it may not carry a credential; see [Credentials in a manifest](#credentials-in-a-manifest).
 
 A bucket no configured backend answers to falls back to the type rule and logs a WARN naming the URI. That is the answer every install gave before backends were named, so an envelope in a bucket bodega does not configure keeps whatever chance of resolving it had, and the WARN is where an operator learns which of the two happened. An `http(s)://` URI is still a 302 to the client, and any other scheme is a 502.
 
@@ -4683,7 +4749,8 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 | `AWS_REGION`                                                             | AWS region of the default backend, over `region` in the config (default: `us-west-2`). A named entry in `storage_backends` with no `region` of its own takes neither the config's `region` nor that default: the AWS SDK's chain resolves one, reading this variable itself |
 | `AWS_PROFILE`, `AWS_ACCESS_KEY_ID` and the rest of the AWS default chain | Credentials for an S3 backend. bodega has no credential key of its own; see [S3 setup](#s3-setup)                                                                                                                                                                           |
 | `AWS_DEFAULT_REGION`                                                     | Read by the AWS SDK's chain, after `AWS_REGION`, for a named backend that sets no `region`. bodega's default backend does not read it                                                                                                                                       |
-| `AWS_ENDPOINT_URL_S3`                                                    | Read by the AWS SDK: points S3 calls at an S3-compatible store instead of AWS                                                                                                                                                                                               |
+| `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`                                | Read by the AWS SDK: points S3 calls at an S3-compatible store instead of AWS. Overridden per backend by the `endpoint` key; see [S3-compatible stores](#s3-compatible-stores)                                                                                              |
+| `AWS_REQUEST_CHECKSUM_CALCULATION`, `AWS_RESPONSE_CHECKSUM_VALIDATION`   | Read by the AWS SDK: `when_supported` or `when_required`. Both are overridden per backend by the `checksums` key. No variable selects path-style addressing; `path_style` is the only setting for it                                                                        |
 | `BOOTSTRAP_BUILD_ROOT`                                                   | Local build directory (default `/opt/bodega`). Overridden by `--build-root`                                                                                                                                                                                                 |
 | `BODEGA_MANIFEST_DIR`                                                    | Manifest directory (default: `{storage_path}/manifests`). Overridden by `--manifest-dir`.                                                                                                                                                                                   |
 | `BODEGA_LOG_LEVEL`                                                       | Logging verbosity 0-4                                                                                                                                                                                                                                                       |
@@ -9130,7 +9197,7 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 ### Details pane
 
-Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
+Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one on AWS and `s3+<scheme>://<host>/<bucket>` for one reached through an `endpoint` that is not AWS's own (see [how a label is derived](#storage-backends)). Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
 The last fields of an entry are its client configuration: the file a client of that type installs, as [Client configuration](#client-configuration) shows it, with a **Path** row under it naming where the file goes on each operating system. The label names the file rather than assuming a URL: **pip.conf**, **.npmrc**, **Cargo config**, **Go env**, **repositories.yaml** for helm, **Git config**, **make.conf**, **Sources** for apt, **Repository conf** for freebsd. A binary, and a git entry's stored bundle, get a **Package URL** instead, which has no path. The pane renders through the same package as `client_config` on `GET /api/v1/packages/{type}/{name}` and the web dashboard, and every value carries the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches. A type with several variants shows one: the suite described below for apt, the first ABI that renders for freebsd, the first version for a binary or a git bundle.
 
@@ -9301,6 +9368,23 @@ BODEGA_S3_CONFORMANCE=1 go test ./internal/storage/ -run 'TestObjectStoreConform
 **Unset, the s3 backend skips. Set to anything, "no AWS credentials resolved" becomes a failure.** Those are two different promises and the second is the one that matters: a gate needing an AWS account is a gate that stops blocking the day the account goes away, and a suite that quietly skips the only driver it was run for reports the same green as one that passed. Set the variable in any pipeline meant to exercise S3.
 
 Credentials come from the AWS default chain, the same one the service reads. `AWS_REGION` decides where the buckets land.
+
+**Against an S3-compatible store**, three variables configure the suite's client the way the three config keys configure the driver:
+
+| Variable                           | Config key   |
+| ---------------------------------- | ------------ |
+| `BODEGA_S3_CONFORMANCE_ENDPOINT`   | `endpoint`   |
+| `BODEGA_S3_CONFORMANCE_PATH_STYLE` | `path_style` |
+| `BODEGA_S3_CONFORMANCE_CHECKSUMS`  | `checksums`  |
+
+```bash
+AWS_REGION=us-ord \
+BODEGA_S3_CONFORMANCE_ENDPOINT=https://us-ord-10.linodeobjects.com \
+BODEGA_S3_CONFORMANCE_CHECKSUMS=when_required \
+  go test ./internal/storage/ -run 'TestObjectStoreConformance|TestInitBucketAgainstALiveBucket|TestLabel'
+```
+
+Naming an endpoint is the same promise `BODEGA_S3_CONFORMANCE` makes: with it set, unresolved credentials fail the run. `TestInitBucketAgainstALiveBucket` runs as `bodega init --allow-unsupported` does when an endpoint is set, so a control the store lacks is logged rather than failed. The suite does not check the endpoint's scheme; that is `config.Load`'s refusal, and the suite never reads a config file.
 
 **Each store gets its own bucket**, named `bodega-conf-` plus 24 hex characters. `S3.Label()` is `s3://<bucket>`, so `TestLabelDistinguishesTwoStores` compares two labels and two stores sharing one bucket would collide; a prefix wrapper would satisfy the test by testing the wrapper. The credentials therefore need `s3:CreateBucket` and `s3:DeleteBucket`, which no condition can scope to a name, so the containment is the prefix: grant them on `arn:aws:s3:::bodega-conf-*` and nothing wider. Teardown also enumerates versions, which needs `s3:ListBucketVersions` on the bucket and `s3:DeleteObjectVersion` on its objects. Note that `ListObjectVersions` is authorized by `s3:ListBucketVersions`, one of three SDK calls in this codebase whose IAM action is spelled differently; the others are `HeadBucket` (`s3:ListBucket`) and `HeadObject` (`s3:GetObject`).
 

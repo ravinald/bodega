@@ -190,3 +190,175 @@ func TestLoadAcceptsPrefixSpellingsWithPrefixStrips(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadValidatesS3StoreKeys covers endpoint and checksums on the default
+// backend and on a named one. Each refusal names the key and whose it is,
+// because a file with three s3 backends has three endpoints to suspect.
+func TestLoadValidatesS3StoreKeys(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	named := func(keys string) string {
+		return `{"storage_backends":{"linode":{"driver":"s3","bucket":"b",` + keys + `}}}`
+	}
+	cases := []struct {
+		name string
+		body string
+		want []string // empty: Load accepts it
+	}{
+		{name: "default https", body: `{"endpoint":"https://us-ord-1.linodeobjects.com","path_style":true,"checksums":"when_required"}`},
+		{name: "named https", body: named(`"endpoint":"https://minio.example.net:9000","path_style":true,"checksums":"when_supported"`)},
+		{name: "http under allow_plaintext", body: `{"allow_plaintext":true,"endpoint":"http://127.0.0.1:9000"}`},
+		{name: "default http", body: `{"endpoint":"http://127.0.0.1:9000"}`, want: []string{"endpoint", "the default storage backend", "allow_plaintext"}},
+		{name: "named http", body: named(`"endpoint":"http://minio:9000"`), want: []string{`storage_backends["linode"].endpoint`, `storage backend "linode"`, "allow_plaintext"}},
+		{name: "no scheme", body: named(`"endpoint":"us-ord-1.linodeobjects.com"`), want: []string{`storage_backends["linode"].endpoint`, "names no host"}},
+		{name: "other scheme", body: `{"endpoint":"s3://bucket"}`, want: []string{"endpoint", "the default storage backend", "scheme other than https"}},
+		{name: "credentials in the URL", body: named(`"endpoint":"https://key:secret@minio.example.net"`), want: []string{`storage_backends["linode"].endpoint`, "carries credentials"}},
+		{name: "default checksums", body: `{"checksums":"never"}`, want: []string{`checksums "never"`, "the default storage backend", "when_required"}},
+		{name: "named checksums", body: named(`"checksums":"WHEN_REQUIRED"`), want: []string{`storage_backends["linode"].checksums "WHEN_REQUIRED"`, `storage backend "linode"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, tc.body)
+			_, err := config.Load("", "", "", "", false, false)
+			if len(tc.want) == 0 {
+				if err != nil {
+					t.Fatalf("Load refused %s: %v", tc.body, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted %s", tc.body)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Errorf("error repeats the credential: %q", err)
+			}
+		})
+	}
+}
+
+func TestReviewF113MalformedEndpointDoesNotLogCredentials(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	writeConfig(t, `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"https://access:sentinel-secret@store.example:bad"}}}`)
+	_, err := config.Load("", "", "", "", false, false)
+	if err == nil {
+		t.Fatal("Load accepted an endpoint with an invalid port")
+	}
+	if strings.Contains(err.Error(), "sentinel-secret") {
+		t.Fatalf("Load leaked the endpoint credential: %v", err)
+	}
+}
+
+func TestReviewF113S3TypeErrorsNameBackend(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for key, value := range map[string]string{"endpoint": "123", "path_style": `"true"`, "checksums": "false"} {
+		for _, backend := range []string{"default", "linode"} {
+			t.Run(backend+"/"+key, func(t *testing.T) {
+				body := `{"` + key + `":` + value + `}`
+				if backend != "default" {
+					body = `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","` + key + `":` + value + `}}}`
+				}
+				writeConfig(t, body)
+				_, err := config.Load("", "", "", "", false, false)
+				message := ""
+				if err != nil {
+					message = strings.ReplaceAll(err.Error(), os.Getenv(config.EnvConfigFile), "<config>")
+				}
+				if err == nil || !strings.Contains(message, key) || !strings.Contains(message, backend) {
+					t.Fatalf("Load = %s; want an error naming key %q and backend %q", message, key, backend)
+				}
+			})
+		}
+	}
+}
+
+func TestReviewF113EndpointRequiresHostname(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for _, body := range []string{
+		`{"endpoint":"https://:443"}`,
+		`{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"https://:443"}}}`,
+	} {
+		writeConfig(t, body)
+		_, err := config.Load("", "", "", "", false, false)
+		if err == nil {
+			t.Errorf("Load accepted an HTTPS endpoint with no hostname: %s", body)
+		}
+	}
+}
+
+func TestReviewF113MalformedEndpointQueryDoesNotLogCredentials(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for _, tc := range []struct{ name, endpoint string }{
+		{"bad path escape", "https://store.example.net/%ZZ?token=sentinel-secret"},
+		{"bad fragment escape", "https://store.example.net?token=sentinel-secret#%ZZ"},
+		{"missing host", "https:///artifacts?token=sentinel-secret"},
+	} {
+		for _, backend := range []string{"default", "linode"} {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				body := `{"endpoint":"` + tc.endpoint + `"}`
+				if backend != "default" {
+					body = `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"` + tc.endpoint + `"}}}`
+				}
+				writeConfig(t, body)
+				_, err := config.Load("", "", "", "", false, false)
+				if err == nil {
+					t.Fatal("Load accepted an invalid endpoint carrying a query")
+				}
+				if !strings.Contains(err.Error(), "endpoint") || !strings.Contains(err.Error(), backend) {
+					t.Errorf("Load error does not name endpoint and backend %q: %v", backend, err)
+				}
+				if strings.Contains(err.Error(), "sentinel-secret") {
+					t.Errorf("Load leaked the endpoint query credential: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// Every class of endpoint refusal, with a marker in each URL component that
+// reaches it: the error names the key and the backend and repeats no part of
+// the value, whichever check refuses first.
+func TestEndpointRefusalsNeverRepeatTheEndpoint(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	const marker = "zq9marker"
+	for _, tc := range []struct{ name, endpoint, want string }{
+		{"userinfo", "https://" + marker + ":" + marker + "@store.example.net", "carries credentials"},
+		{"userinfo on a malformed URL", "https://" + marker + "@store.example.net/%ZZ", "carries credentials"},
+		{"unparseable", "https://" + marker + ".example.net/" + marker + "/%ZZ", "not a URL"},
+		{"control character", "https://" + marker + ".example.net/\u007f" + marker, "not a URL"},
+		{"query", "https://" + marker + ".example.net/" + marker + "?k=" + marker, "query or fragment"},
+		{"fragment", "https://" + marker + ".example.net#" + marker, "query or fragment"},
+		{"query without a host", "https:///" + marker + "?k=" + marker, "query or fragment"},
+		{"no host", "https:///" + marker, "names no host"},
+		{"no scheme", marker + ".example.net/" + marker, "names no host"},
+		{"plaintext", "http://" + marker + ".example.net:9000/" + marker, "allow_plaintext"},
+		{"other scheme", marker + "://" + marker + ".example.net/" + marker, "scheme other than https"},
+	} {
+		for _, backend := range []string{"default", "linode"} {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				body := `{"endpoint":"` + tc.endpoint + `"}`
+				key := "endpoint for the default storage backend"
+				if backend != "default" {
+					body = `{"storage_backends":{"linode":{"driver":"s3","bucket":"b","endpoint":"` + tc.endpoint + `"}}}`
+					key = `storage_backends["linode"].endpoint for storage backend "linode"`
+				}
+				writeConfig(t, body)
+				_, err := config.Load("", "", "", "", false, false)
+				if err == nil {
+					t.Fatal("Load accepted the endpoint")
+				}
+				for _, want := range []string{key, tc.want} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %q, want it to contain %q", err, want)
+					}
+				}
+				if strings.Contains(err.Error(), marker) {
+					t.Errorf("error repeats part of the endpoint: %q", err)
+				}
+			})
+		}
+	}
+}

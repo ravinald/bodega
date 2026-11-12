@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -984,5 +985,311 @@ func TestRevetAllowListRefusalSkipsIntegrations(t *testing.T) {
 	c := checkOf(t, newestRevetRow(t, f), "integration:revet-meter-allow")
 	if c.Status != audit.CheckNotEvaluated || c.Detail != "not run: the allow-list refused this version" {
 		t.Errorf("entry = %+v", c)
+	}
+}
+
+// TestCacheOriginReadsAPreEndpointRowOnlyForItsOneStore: a row written when
+// an s3 label was "s3://<bucket>" belongs to the store that spelling can
+// still mean. With one such store it is read back; with two services holding
+// a bucket of that name it is refused by name for both, never credited to
+// either; and a row recorded under one endpoint is not read for another.
+func TestCacheOriginReadsAPreEndpointRowOnlyForItsOneStore(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	ctx := t.Context()
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+
+	spec := func(endpoint, prefix string) config.StorageSpec {
+		return config.StorageSpec{Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: endpoint, Prefix: prefix}
+	}
+	resolver := func(backends map[string]config.StorageSpec) storage.Resolver {
+		t.Helper()
+		r, err := storage.NewResolver(ctx, &config.Config{
+			StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+			Endpoint: "https://one.example.net", StorageBackends: backends,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const origin = "https://upstream.example.net/tool.tgz"
+	identity := func(store storage.ObjectStore) audit.ObjectIdentity {
+		return StreamIdentity(store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	}
+	record := func(backend string) {
+		t.Helper()
+		id := audit.ObjectIdentity{Backend: backend, Size: 10, ETag: `"same"`}
+		if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	record("s3://artifacts")
+	// A second name for the same location, and a prefix inside it, are not a
+	// second claimant to the bucket-wide spelling.
+	alone := resolver(map[string]config.StorageSpec{
+		"alias": spec("https://ONE.example.net/", ""),
+		"sub":   spec("https://one.example.net", "nested"),
+	})
+	if got, err := CacheOrigin(ctx, adb, alone, alone.Default(), binaryKey, identity(alone.Default())); err != nil || got != origin {
+		t.Errorf("one store spelled s3://artifacts: origin = %q, %v; want %q", got, err, origin)
+	}
+	sub, _ := alone.ByName("sub")
+	if got, err := CacheOrigin(ctx, adb, alone, sub, binaryKey, identity(sub)); err != nil || got != "" {
+		t.Errorf("a prefix of the bucket read the bucket's row: %q, %v", got, err)
+	}
+
+	two := resolver(map[string]config.StorageSpec{"other": spec("https://two.example.net", "")})
+	for _, ns := range two.All() {
+		got, err := CacheOrigin(ctx, adb, two, ns.Store, binaryKey, identity(ns.Store))
+		if got != "" || err == nil || !strings.Contains(err.Error(), "s3://artifacts") ||
+			!strings.Contains(err.Error(), "one.example.net") || !strings.Contains(err.Error(), "two.example.net") {
+			t.Errorf("%s with two services holding the bucket: origin = %q, %v; want no origin and an error naming both", ns.Name, got, err)
+		}
+	}
+
+	record(two.Default().Label())
+	other, _ := two.ByName("other")
+	if got, err := CacheOrigin(ctx, adb, two, other, binaryKey, identity(other)); err != nil || got != "" {
+		t.Errorf("a row recorded under %s was read for %s: %q, %v", two.Default().Label(), other.Label(), got, err)
+	}
+	if got, err := CacheOrigin(ctx, adb, two, two.Default(), binaryKey, identity(two.Default())); err != nil || got != origin {
+		t.Errorf("a row under the current identity: origin = %q, %v; want %q", got, err, origin)
+	}
+}
+
+func TestReviewF113LegacyOriginAmbiguityIncludesAWS(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	stores, err := storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+		Endpoint: "https://compatible.example.net",
+		StorageBackends: map[string]config.StorageSpec{
+			"aws": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := audit.ObjectIdentity{Backend: "s3://artifacts", Size: 10, ETag: `"same"`}
+	if err := adb.StoreCacheOrigin(t.Context(), binaryKey, "https://upstream.example.net/tool.tgz", legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, ns := range stores.All() {
+		id := StreamIdentity(ns.Store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+		got, err := CacheOrigin(t.Context(), adb, stores, ns.Store, binaryKey, id)
+		if got != "" || err == nil {
+			t.Errorf("%s (%s): origin = %q, %v; want no origin and an ambiguity error for a legacy row with two candidate stores", ns.Name, ns.Store.Label(), got, err)
+		}
+	}
+}
+
+// TestCacheOriginOnAWSTellsARecordFromALegacyRow: an AWS bucket's label is
+// still the spelling every s3 row carried before endpoints, so only the
+// identity a record is written under separates the two. A row from before is
+// read for AWS while AWS is the one store it can mean; a record written now
+// stays AWS's when a compatible store of the same bucket name is configured
+// beside it, and is not read for that store.
+func TestCacheOriginOnAWSTellsARecordFromALegacyRow(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	ctx := t.Context()
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	resolver := func(backends map[string]config.StorageSpec) storage.Resolver {
+		t.Helper()
+		r, err := storage.NewResolver(ctx, &config.Config{
+			StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1", StorageBackends: backends,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const origin = "https://upstream.example.net/tool.tgz"
+	identity := func(store storage.ObjectStore) audit.ObjectIdentity {
+		return StreamIdentity(store, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	}
+
+	legacy := audit.ObjectIdentity{Backend: "s3://artifacts", Size: 10, ETag: `"same"`}
+	if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, legacy); err != nil {
+		t.Fatal(err)
+	}
+	alone := resolver(map[string]config.StorageSpec{
+		"regional": {Driver: "s3", Bucket: "artifacts", Region: "us-west-2", Endpoint: "https://s3.us-west-2.amazonaws.com"},
+	})
+	aws := alone.Default()
+	if id := identity(aws); id.Backend == aws.Label() || id.Backend == legacy.Backend {
+		t.Fatalf("an AWS record is written under %q, the spelling of a legacy row", id.Backend)
+	}
+	if got, err := CacheOrigin(ctx, adb, alone, aws, binaryKey, identity(aws)); err != nil || got != origin {
+		t.Errorf("legacy row with AWS its one candidate: origin = %q, %v; want %q", got, err, origin)
+	}
+	// An identity from somewhere else is not widened to this store's legacy row.
+	if got, err := CacheOrigin(ctx, adb, alone, aws, binaryKey, audit.ObjectIdentity{Backend: "/srv/cache", Size: 10, ETag: `"same"`}); err != nil || got != "" {
+		t.Errorf("a foreign identity read the legacy row: %q, %v", got, err)
+	}
+
+	if err := adb.StoreCacheOrigin(ctx, binaryKey, origin, identity(aws)); err != nil {
+		t.Fatal(err)
+	}
+	two := resolver(map[string]config.StorageSpec{
+		"compatible": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://compatible.example.net"},
+	})
+	if got, err := CacheOrigin(ctx, adb, two, two.Default(), binaryKey, identity(two.Default())); err != nil || got != origin {
+		t.Errorf("a record written for AWS, read for AWS beside a compatible store: origin = %q, %v; want %q", got, err, origin)
+	}
+	compatible, _ := two.ByName("compatible")
+	if got, err := CacheOrigin(ctx, adb, two, compatible, binaryKey, identity(compatible)); err != nil || got != "" {
+		t.Errorf("a record written for AWS was read for %s: %q, %v", compatible.Label(), got, err)
+	}
+}
+
+func TestReviewF113EndpointPathCannotBorrowCacheOrigin(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adb.Close() })
+	stores, err := storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1",
+		Endpoint: "https://store.example.net/tenant",
+		StorageBackends: map[string]config.StorageSpec{
+			"other": {Driver: "s3", Bucket: "tenant", Region: "us-east-1", Endpoint: "https://store.example.net", Prefix: "artifacts"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := StreamIdentity(stores.Default(), &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	const origin = "https://upstream.example.net/tool.tgz"
+	if err := adb.StoreCacheOrigin(t.Context(), binaryKey, origin, id); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := CacheOrigin(t.Context(), adb, stores, stores.Default(), binaryKey, id); got != origin || err != nil {
+		t.Fatalf("writer lost its own origin: %q, %v", got, err)
+	}
+	other, err := stores.ByName("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID := StreamIdentity(other, &storage.StreamResult{ContentLength: 10, ETag: `"same"`})
+	if got, err := CacheOrigin(t.Context(), adb, stores, other, binaryKey, otherID); got != "" {
+		t.Errorf("different endpoint/bucket inherited origin %q (error %v); writer identity %q, reader identity %q", got, err, id.Backend, otherID.Backend)
+	}
+}
+
+func TestReviewF113DistinctRoutesCannotBorrowCurrentOrigin(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	cases := []struct {
+		name           string
+		writer, reader config.StorageSpec
+	}{
+		{"dotted bucket and key prefix on one service",
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: "http://gw.example.net", Bucket: "cold.artifacts"},
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: "http://gw.example.net", Bucket: "artifacts", Prefix: "cold"}},
+		{"gateway path and separate subdomain",
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: "https://gw.example.net/tenant", Bucket: "artifacts", PathStyle: true},
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: "https://tenant.gw.example.net", Bucket: "artifacts", PathStyle: true}},
+		{"different access points under a prefix",
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Bucket: "arn:aws:s3:us-east-1:111111111111:accesspoint/first", Prefix: "cold"},
+			config.StorageSpec{Driver: "s3", Region: "us-east-1", Bucket: "arn:aws:s3:us-east-1:222222222222:accesspoint/second", Prefix: "cold"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = adb.Close() })
+			cfg := &config.Config{
+				StorageBackend: "local", StoragePath: t.TempDir(), AllowPlaintext: true,
+				StorageBackends: map[string]config.StorageSpec{"writer": tc.writer, "reader": tc.reader},
+			}
+			data, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(file, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvConfigFile, file)
+			loaded, err := config.Load("", "", "", "", false, false)
+			if err != nil {
+				t.Fatalf("configuration did not load: %v", err)
+			}
+			stores, err := storage.NewResolver(t.Context(), loaded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer, err := stores.ByName("writer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader, err := stores.ByName("reader")
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := &storage.StreamResult{ContentLength: 10, ETag: `"same"`}
+			id := StreamIdentity(writer, meta)
+			const upstream = "https://trusted.example.net/tool.tgz"
+			if err := adb.StoreCacheOrigin(t.Context(), binaryKey, upstream, id); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := CacheOrigin(t.Context(), adb, stores, writer, binaryKey, id); err != nil || got != upstream {
+				t.Fatalf("writer lost its origin: %q, %v", got, err)
+			}
+			otherID := StreamIdentity(reader, meta)
+			if got, err := CacheOrigin(t.Context(), adb, stores, reader, binaryKey, otherID); got != "" {
+				t.Errorf("different store borrowed origin %q, error %v; identities %q and %q", got, err, id.Backend, otherID.Backend)
+			}
+			legacy, _ := storage.S3BucketLabel(writer)
+			otherLegacy, _ := storage.S3BucketLabel(reader)
+			if legacy == otherLegacy {
+				old := id
+				old.Backend = legacy
+				if err := adb.StoreCacheOrigin(t.Context(), binaryKey, upstream, old); err != nil {
+					t.Fatal(err)
+				}
+				for _, store := range []storage.ObjectStore{writer, reader} {
+					got, err := CacheOrigin(t.Context(), adb, stores, store, binaryKey, StreamIdentity(store, meta))
+					if got != "" || !errors.Is(err, ErrOriginAmbiguous) {
+						t.Errorf("legacy origin with two candidate services = %q, %v; want no origin and ErrOriginAmbiguous", got, err)
+					}
+				}
+			}
+		})
 	}
 }

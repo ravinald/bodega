@@ -118,8 +118,14 @@ var (
 // added here is read, resolved and written back with no other edit, and the
 // two runtime-only fields opt out with `json:"-"`.
 type Config struct {
-	Bucket          string `json:"bucket"`
-	Region          string `json:"region"`
+	Bucket string `json:"bucket"`
+	Region string `json:"region"`
+	// Endpoint, PathStyle and Checksums point the default backend's s3 driver
+	// at a store that is not AWS. A storage_backends entry carries its own,
+	// and inherits none of these.
+	Endpoint        string `json:"endpoint,omitempty"`
+	PathStyle       bool   `json:"path_style,omitempty"`
+	Checksums       string `json:"checksums,omitempty"`
 	BuildRoot       string `json:"build_root"`
 	ManifestDir     string `json:"manifest_dir,omitempty"` // unset means {storage_path}/manifests, so clearing it drops the key rather than pinning "" as a setting
 	LogDir          string `json:"log_dir"`
@@ -1430,6 +1436,12 @@ type StorageSpec struct {
 	Bucket string `json:"bucket,omitempty"` // s3
 	Region string `json:"region,omitempty"` // s3
 	Prefix string `json:"prefix,omitempty"` // key prefix within the backend
+
+	// s3, for a store that is not AWS. Unset leaves the AWS SDK's own
+	// resolution (AWS_ENDPOINT_URL_S3, AWS_REQUEST_CHECKSUM_CALCULATION) alone.
+	Endpoint  string `json:"endpoint,omitempty"`   // base URL: https, or http under allow_plaintext
+	PathStyle bool   `json:"path_style,omitempty"` // <endpoint>/<bucket> rather than <bucket>.<endpoint>
+	Checksums string `json:"checksums,omitempty"`  // when_supported | when_required
 }
 
 // StorageDrivers reports the storage driver names the binary has registered.
@@ -2284,6 +2296,9 @@ func (c *Config) validateStorage() error {
 	}
 	driverList := strings.Join(drivers, ", ")
 
+	if err := validateS3Store("", "the default storage backend", c.Endpoint, c.Checksums, c.AllowPlaintext); err != nil {
+		return err
+	}
 	for name, spec := range c.StorageBackends {
 		switch {
 		case name == "":
@@ -2300,6 +2315,10 @@ func (c *Config) validateStorage() error {
 			return fmt.Errorf("storage_backends[%q]: unknown driver %q (drivers: %s)", name, spec.Driver, driverList)
 		}
 		if err := validatePrefix(name, spec.Prefix); err != nil {
+			return err
+		}
+		at := fmt.Sprintf("storage_backends[%q].", name)
+		if err := validateS3Store(at, fmt.Sprintf("storage backend %q", name), spec.Endpoint, spec.Checksums, c.AllowPlaintext); err != nil {
 			return err
 		}
 	}
@@ -2328,6 +2347,53 @@ func (c *Config) validateStorage() error {
 		if _, ok := c.StorageBackends[name]; !ok {
 			return fmt.Errorf("storage_by_group[%q] names undefined storage backend %q (defined: %s)", group, name, c.definedStorageNames())
 		}
+	}
+	return nil
+}
+
+// validateS3Store checks one backend's endpoint and checksums keys. at is the
+// path to the keys in the file, empty for the default backend's top-level
+// ones, and backend is how the error names whose they are.
+//
+// An endpoint is where every artifact and the AWS-signed requests for it go,
+// so plaintext needs the same allow_plaintext the listener does. Userinfo is
+// refused because a credential written there lands in every log line that
+// prints the endpoint; the AWS chain is where credentials belong.
+//
+// No endpoint refusal prints the endpoint, any part of it, or an error derived
+// from it: refuse takes a fixed reason and nothing else. A URL is where a
+// credential gets pasted (userinfo, a query token, a path segment), a
+// malformed one has no parsed components to pick the safe part out of, and
+// url.Parse's own error quotes its whole input. The key and the backend
+// already say which line of the file to open.
+func validateS3Store(at, backend, endpoint, checksums string, allowPlaintext bool) error {
+	refuse := func(reason string) error {
+		return fmt.Errorf("%sendpoint for %s %s (the value is not printed, because a URL can carry credentials)", at, backend, reason)
+	}
+	if endpoint != "" {
+		// On the text and before the parse: a malformed URL never yields a
+		// URL.User to test.
+		if strings.Contains(endpoint, "@") {
+			return refuse("carries credentials in the URL (it holds an \"@\"): remove them, write it as https://host[:port], and supply the key through the AWS credential chain (AWS_ACCESS_KEY_ID, AWS_PROFILE)")
+		}
+		u, err := url.Parse(endpoint)
+		switch {
+		case err != nil:
+			return refuse("is not a URL the parser accepts: check it for a stray space, control character or malformed %XX escape, and write it as https://host[:port][/path]")
+		case u.RawQuery != "" || u.ForceQuery || u.Fragment != "":
+			return refuse("carries a query or fragment: write only https://host[:port][/path]")
+		case u.Hostname() == "":
+			return refuse("names no host: write it as https://host[:port]")
+		case u.Scheme == "http" && !allowPlaintext:
+			return refuse("is plaintext http, which sends artifacts and signed requests in the clear: use https, or set allow_plaintext to accept that")
+		case u.Scheme != "https" && u.Scheme != "http":
+			return refuse("has a scheme other than https: use https (http only with allow_plaintext)")
+		}
+	}
+	switch checksums {
+	case "", "when_supported", "when_required":
+	default:
+		return fmt.Errorf("%schecksums %q for %s is not a known value: use \"when_supported\" (the default) or \"when_required\"", at, checksums, backend)
 	}
 	return nil
 }
@@ -2741,6 +2807,7 @@ func defaultConfigContent() []byte {
 
   "bucket": "",
   "region": "us-west-2",
+  "_comment_s3_compatible": "endpoint, path_style, checksums: for an S3-compatible store (Linode Object Storage, MinIO, Ceph RGW, Wasabi) rather than AWS. endpoint is its https URL (http only with allow_plaintext); path_style addresses the bucket as endpoint/bucket for a store with no wildcard DNS; checksums is \"when_supported\" (default) or \"when_required\", the latter for a store that rejects the SDK's CRC32 request checksums. A storage_backends entry takes the same three keys and inherits none of these. Left out, the AWS SDK's own environment settings apply.",
   "build_root": "/opt/bodega",
 
   "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests, so a backup of storage_path is a backup of the whole repository. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /. Nothing else is probed: a manifests/ directory beside the binary, or one level above it, is read only when this key, $BODEGA_MANIFEST_DIR or --manifest-dir names it. Upgrading an install whose manifests were written relative to the directory bodega was started from, or found beside the binary: move that manifests/ directory into {storage_path}/manifests, or point this key at where it already is.",
@@ -3030,7 +3097,15 @@ func topLevelKeys(data []byte) ([]string, map[string]bool) {
 func parseConfigError(path string, err error) error {
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) && typeErr.Field != "" {
-		return fmt.Errorf("parse config %s: key %q: cannot use %s as %s", path, typeErr.Field, typeErr.Value, typeErr.Type)
+		// A storage_backends entry's key arrives with its backend in the
+		// field path. The same three keys at the top level are the default
+		// backend's and say so nowhere, in a file that may hold several.
+		whose := ""
+		switch typeErr.Field {
+		case "endpoint", "path_style", "checksums":
+			whose = " (the default storage backend's)"
+		}
+		return fmt.Errorf("parse config %s: key %q%s: cannot use %s as %s", path, typeErr.Field, whose, typeErr.Value, typeErr.Type)
 	}
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &syntaxErr) {

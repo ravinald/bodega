@@ -1206,3 +1206,153 @@ func TestProxyFillRefusesKnownMalware(t *testing.T) {
 		t.Errorf("approving a malware row: %v, want ErrQueueUnwaivable", err)
 	}
 }
+
+func TestReviewF113EndpointLabelKeepsPersistedCacheOrigin(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION", "AWS_SESSION_TOKEN", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	compatible := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/artifacts/binaries/tool/1.0.0/tool.tgz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"unchanged-object"`)
+		_, _ = io.WriteString(w, "the same bytes")
+	}))
+	t.Cleanup(compatible.Close)
+	t.Setenv("AWS_ENDPOINT_URL_S3", compatible.URL)
+	objects, err := storage.NewFromSpec(t.Context(), storage.Spec{Driver: "s3", Bucket: "artifacts", Region: "us-east-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "binaries/tool/1.0.0/tool.tgz"
+	const origin = "https://upstream.example.net/tool.tgz"
+	res, err := objects.GetStream(t.Context(), key)
+	if err != nil || res == nil {
+		t.Fatalf("read unchanged cached object: %v", err)
+	}
+	defer res.Body.Close()
+	id := admit.StreamIdentity(objects, res)
+	legacy := id
+	legacy.Backend = "s3://artifacts"
+	s := proxyingServer(t)
+	s.stores = storage.NewSingle(objects)
+	if err := s.auditDB.StoreCacheOrigin(t.Context(), key, origin, legacy); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	got := s.cachedOrigin(request, key, cachedObject{store: objects, id: id})
+	if got != origin {
+		t.Errorf("cachedOrigin after endpoint-label upgrade = %q, want persisted %q; stored backend %q, current backend %q", got, origin, legacy.Backend, id.Backend)
+	}
+
+	if err := s.auditDB.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0", ObjectKey: key,
+		Decision: audit.AdmissionAdmitted,
+		Checks:   []audit.AdmissionCheck{admit.AllowListCheck(true, origin, nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+		ID: "only-other-upstream", RegistryType: manifest.TypeBinary,
+		RuleKind: policy.RuleKindForType(manifest.TypeBinary), Pattern: "https://other.example.net/",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checker := policy.NewChecker(s.auditDB)
+	if err := checker.Check(t.Context(), manifest.TypeBinary, origin); err == nil {
+		t.Fatal("fixture must reject the recorded upstream")
+	}
+	rv := &admit.Revetter{
+		Cfg: s.cfg, DB: s.auditDB, Store: s.store, Stores: s.stores, Allow: checker,
+		OnBlock: config.RevetReport, Checkers: func() []policy.VersionChecker { return nil },
+	}
+	outcome := rv.One(t.Context(), admit.RevetTarget{
+		Type: manifest.TypeBinary, Name: "tool", Version: "1.0.0",
+	}, "test")
+	if outcome.Error != "" || outcome.Decision != audit.AdmissionPolicyBlocked {
+		t.Errorf("re-vet after label upgrade = %+v; want policy_blocked for the recorded upstream", outcome)
+	}
+}
+
+func TestReviewF113AmbiguousLegacyOriginCannotAdmit(t *testing.T) {
+	for _, key := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION", "AWS_SESSION_TOKEN", "AWS_PROFILE"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	compatible := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/artifacts/binaries/tool/1.0.0/tool.tgz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"unchanged-object"`)
+		_, _ = io.WriteString(w, "the same bytes")
+	}))
+	t.Cleanup(compatible.Close)
+	t.Setenv("AWS_ENDPOINT_URL_S3", compatible.URL)
+	objects, err := storage.NewFromSpec(t.Context(), storage.Spec{Driver: "s3", Bucket: "artifacts", Region: "us-east-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "binaries/tool/1.0.0/tool.tgz"
+	const origin = "https://upstream.example.net/tool.tgz"
+	res, err := objects.GetStream(t.Context(), key)
+	if err != nil || res == nil {
+		t.Fatalf("read unchanged cached object: %v", err)
+	}
+	defer res.Body.Close()
+	id := admit.StreamIdentity(objects, res)
+	legacy := id
+	legacy.Backend = "s3://artifacts"
+	s := proxyingServer(t)
+	s.stores, err = storage.NewResolver(t.Context(), &config.Config{
+		StorageBackend: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: compatible.URL,
+		StorageBackends: map[string]config.StorageSpec{
+			"other": {Driver: "s3", Bucket: "artifacts", Region: "us-east-1", Endpoint: "https://other.example.net"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.StoreCacheOrigin(t.Context(), key, origin, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := admit.CacheOrigin(t.Context(), s.auditDB, s.stores, objects, key, id); got != "" || err == nil {
+		t.Fatalf("ambiguous origin = %q, %v; fixture must refuse attribution", got, err)
+	}
+
+	if err := s.auditDB.RecordAdmission(t.Context(), audit.Admission{
+		PkgType: manifest.TypeBinary, PkgName: "tool", PkgVersion: "1.0.0", ObjectKey: key,
+		Decision: audit.AdmissionAdmitted,
+		Checks:   []audit.AdmissionCheck{admit.AllowListCheck(true, origin, nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+		ID: "only-other-upstream", RegistryType: manifest.TypeBinary,
+		RuleKind: policy.RuleKindForType(manifest.TypeBinary), Pattern: "https://other.example.net/",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checker := policy.NewChecker(s.auditDB)
+	if err := checker.Check(t.Context(), manifest.TypeBinary, origin); err == nil {
+		t.Fatal("fixture must reject the recorded upstream")
+	}
+	rv := &admit.Revetter{
+		Cfg: s.cfg, DB: s.auditDB, Store: s.store, Stores: s.stores, Allow: checker,
+		OnBlock: config.RevetReport, Checkers: func() []policy.VersionChecker { return nil },
+	}
+	outcome := rv.One(t.Context(), admit.RevetTarget{
+		Type: manifest.TypeBinary, Name: "tool", Version: "1.0.0",
+	}, "test")
+	if outcome.Error == "" && outcome.Decision == audit.AdmissionAdmitted {
+		t.Errorf("re-vet with ambiguous origin = %+v; want an unresolved error or a non-admitted decision", outcome)
+	}
+}

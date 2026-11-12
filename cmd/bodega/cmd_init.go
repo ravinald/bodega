@@ -24,6 +24,7 @@ type s3Target struct {
 	bucket string
 	region string
 	prefix string
+	opts   bos3.Options
 }
 
 // resolveS3Target resolves the backend named by args, or the default, through
@@ -34,15 +35,18 @@ func resolveS3Target(cfg *config.Config, args []string) (s3Target, error) {
 		name = args[0]
 	}
 	t, err := storage.ResolveS3Target(cfg, name)
-	return s3Target{name: t.Name, bucket: t.Bucket, region: t.Region, prefix: t.Prefix}, err
+	return s3Target{name: t.Name, bucket: t.Bucket, region: t.Region, prefix: t.Prefix, opts: t.Options}, err
 }
 
 func dialS3Target(ctx context.Context, t s3Target) (*bos3.Client, error) {
-	return storage.DialS3Target(ctx, storage.S3Target{Name: t.name, Bucket: t.bucket, Region: t.region, Prefix: t.prefix})
+	return storage.DialS3Target(ctx, storage.S3Target{Name: t.name, Bucket: t.bucket, Region: t.region, Prefix: t.prefix, Options: t.opts})
 }
 
 func newInitCmd(gf *globalFlags) *cobra.Command {
-	var printPolicy string
+	var (
+		printPolicy      string
+		allowUnsupported bool
+	)
 	cmd := &cobra.Command{
 		Use:   "init [backend]",
 		Short: "Create and configure the bucket an s3 storage backend needs",
@@ -67,6 +71,13 @@ internal/s3/init.go.
 The command is idempotent. Each line reads lowercase when the bucket was
 already correct and UPPERCASE when this run changed it.
 
+An S3-compatible store may not implement the public access block, default
+encryption, versioning or lifecycle rules. init tries all four, prints
+NOT APPLIED beside each one the store answers as not implemented, and exits
+non-zero naming them. --allow-unsupported finishes the run without them; set
+the store's own equivalent first where it has one. Any other failure of a
+control stops the run with or without the flag.
+
 --print-policy prints the IAM policies instead, and changes nothing: "setup"
 for whoever runs init, "runtime" for the service. Both are derived from the
 calls bodega makes. "init check" asks the bucket whether the current
@@ -76,6 +87,7 @@ Credentials come from the AWS default chain: environment variables,
 AWS_PROFILE and the shared config, SSO, or an instance role.`, bos3.AbortIncompleteMultipartDays, bos3.NoncurrentVersionDays),
 		Example: `  bodega init
   bodega init archive
+  bodega init --allow-unsupported
   bodega init --print-policy
   bodega init archive --print-policy=runtime
   bodega init check`,
@@ -102,7 +114,7 @@ AWS_PROFILE and the shared config, SSO, or an instance role.`, bos3.AbortIncompl
 			if target.prefix != "" {
 				fmt.Printf("  prefix:     %s is not applied; markers and lifecycle rules sit at the bucket root\n", target.prefix)
 			}
-			if err := bos3.InitBucket(ctx, client.S3Client(), os.Stdout, target.bucket, client.Region()); err != nil {
+			if err := bos3.InitBucket(ctx, client.S3Client(), os.Stdout, target.bucket, client.Region(), allowUnsupported); err != nil {
 				return err
 			}
 			fmt.Printf("\nBucket s3://%s is ready.\n", target.bucket)
@@ -112,6 +124,8 @@ AWS_PROFILE and the shared config, SSO, or an instance role.`, bos3.AbortIncompl
 	cmd.Flags().StringVar(&printPolicy, "print-policy", "",
 		`print IAM policies and change nothing: "setup", "runtime", or both when given no value`)
 	cmd.Flags().Lookup("print-policy").NoOptDefVal = "all"
+	cmd.Flags().BoolVar(&allowUnsupported, "allow-unsupported", false,
+		"finish without the bucket controls the store reports as not implemented, naming each one")
 	cmd.AddCommand(noReloadSignal(newInitCheckCmd(gf)))
 	return cmd
 }
