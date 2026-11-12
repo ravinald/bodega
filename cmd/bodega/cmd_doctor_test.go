@@ -2581,3 +2581,122 @@ func TestAudit16DisabledContainerdCannotPass(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit17HelmLoadErrorsRemainReportObligations(t *testing.T) {
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("native Helm oracle is not installed")
+	}
+	for name, broken := range map[string]string{
+		"syntax":      "broken: [\n",
+		"typed field": "    pass_credentials_all: [wrong-type]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t)
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, ".config/helm/repositories.yaml")
+			caFile := filepath.Join(home, "issuer.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			body := "repositories:\n  - name: bodega\n    url: " + srv.URL + "/helm\n    caFile: " + caFile + "\n" + broken
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			native := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+			native.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+			out, nativeErr := native.CombinedOutput()
+			if nativeErr == nil || !strings.Contains(string(out), "cannot unmarshal") && !strings.Contains(string(out), "did not find expected") {
+				t.Fatalf("Helm did not reject the fixture: %v: %s", nativeErr, out)
+			}
+			t.Logf("native Helm: %s", out)
+			prev := doctorExit
+			doctorExit = func(int) {}
+			t.Cleanup(func() { doctorExit = prev })
+			report, err := runDoctor(t, "--url", srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := ""
+			for _, line := range strings.Split(report, "\n") {
+				if strings.HasPrefix(line, "helm-repos") {
+					row = line
+					break
+				}
+			}
+			if !strings.Contains(row, "WARN") || !strings.Contains(row, "unchecked") || !strings.Contains(row, file) {
+				t.Fatalf("Helm refuses the documented policy; want unchecked naming %s, got row=%q", file, row)
+			}
+		})
+	}
+}
+
+func TestAudit17HelmNativeLoadErrorRefusesBeforeWriting(t *testing.T) {
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("native Helm oracle is not installed")
+	}
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	old := "repositories:\n  - name: bodega\n    url: " + srv.URL + "/helm\n    pass_credentials_all: [wrong-type]\n"
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	for path, body := range map[string]string{file: old, caFile: string(caPEM), release: "ID=ubuntu\n"} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	native := func() (string, error) {
+		cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := native(); err == nil || !strings.Contains(out, "cannot unmarshal") {
+		t.Fatalf("native fixture: %v: %s", err, out)
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	out, applyErr := runDoctor(t, "--configure", "helm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, anchorErr := os.Stat(anchor)
+	nativeOut, nativeErr := native()
+	if applyErr == nil || !strings.Contains(applyErr.Error(), file) || string(got) != old || !os.IsNotExist(anchorErr) || ran != 0 {
+		t.Errorf("apply error=%v; config unchanged=%t; anchor stat=%v; rebuilds=%d; native after apply=%v: %s\n%s", applyErr, string(got) == old, anchorErr, ran, nativeErr, nativeOut, out)
+	}
+	idle, idleErr := runDoctor(t, "--configure", "helm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if idleErr == nil {
+		t.Errorf("idle apply also certified the unloadable Helm policy:\n%s", idle)
+	}
+}

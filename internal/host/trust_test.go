@@ -704,7 +704,7 @@ func TestTrustProbeJudgesGitAndHelm(t *testing.T) {
 		env             map[string]string
 		warn            map[string]string
 	}{
-		{name: "not configured", git: scoped, helm: "repositories:\n  - name: corp\n    url: https://charts.example\n      caFile: /x\n"},
+		{name: "not configured", git: scoped, helm: "repositories:\n  - name: corp\n    url: https://charts.example\n    caFile: /x\n"},
 		{name: "own settings hold the CA", git: rewrite + scoped, helm: "repositories:\n  - name: bodega\n    url: " + base + "/helm\n    caFile: " + ca + "\n"},
 		{name: "a longer section and a caFile name another store", git: rewrite + scoped + "[http \"" + base + "/git/gh/corp/\"]\n\tsslCAInfo = /missing/corp.pem\n",
 			helm: "repositories:\n  - name: bodega\n    url: " + base + "/helm\n    caFile: /missing/helm.pem\n",
@@ -1294,5 +1294,34 @@ func TestAudit16GitLoadErrorIsUnchecked(t *testing.T) {
 	got := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
 	if len(verdict) != 1 || verdict[0].State != TrustUnchecked || got.Status != StatusWarn || !strings.Contains(got.Detail, file) || !strings.Contains(got.Detail, "unchecked") {
 		t.Fatalf("native git refuses this file: %s; doctor row=%+v, verdict=%+v", native, got, verdict)
+	}
+}
+
+// F116 R2: a repositories.yaml helm refuses to load keeps helm's row and
+// leaves it unchecked, for a syntax error and for a wrong type in a field
+// doctor never reads, even where the entry's own url and caFile are sound.
+func TestHelmLoadErrorIsUnchecked(t *testing.T) {
+	for name, broken := range map[string]string{
+		"syntax":      "broken: [\n",
+		"typed field": "    pass_credentials_all: [wrong-type]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			p.Home = filepath.Join(p.Root, "home")
+			file := filepath.Join(p.Home, ".config/helm/repositories.yaml")
+			writeTrustFile(t, file, "repositories:\n  - name: bodega\n    url: "+base+"/helm\n    caFile: "+ca+"\n"+broken)
+			rows := p.Rows(base)
+			if len(rows) != 1 || rows[0].Check != "helm-repos" {
+				t.Fatalf("Rows = %+v; want helm's row kept", rows)
+			}
+			verdict, err := p.Judge([]string{"helm-repos"}, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := p.Apply(rows, base)[0]
+			if len(verdict) != 1 || verdict[0].State != TrustUnchecked || got.Status != StatusWarn || !strings.Contains(got.Detail, file) || !strings.Contains(got.Detail, "unchecked") {
+				t.Fatalf("helm refuses this file; doctor row=%+v, verdict=%+v", got, verdict)
+			}
+		})
 	}
 }

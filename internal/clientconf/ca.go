@@ -148,15 +148,8 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 	case rec.System == manifest.TypeGit:
 		sel = env("GIT_CONFIG_SYSTEM")
 	case rec.System == manifest.TypeHelm:
-		// helm reads one repositories.yaml: the file named outright, or the
-		// one in the configuration directory the environment moves.
-		sel = env("HELM_REPOSITORY_CONFIG")
-		if dir := env("HELM_CONFIG_HOME"); sel == "" && dir != "" {
-			sel = filepath.Join(dir, "repositories.yaml")
-		}
-		if dir := env("XDG_CONFIG_HOME"); sel == "" && dir != "" && h.GOOS != OSDarwin {
-			sel = filepath.Join(dir, "helm", "repositories.yaml")
-		}
+		// helm reads one repositories.yaml, which the environment can move.
+		sel = HelmRepositoryFile(h.Getenv, h.GOOS, h.Home)
 	case rec.System == manifest.TypeGomod:
 		// GOENV=off reads no file, which the verdict reports; there is no
 		// file to edit in its place.
@@ -259,7 +252,8 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 // naming an existing file is not one of these; shadows gives that file the
 // edit. It also refuses what this package detects and does not interpret: a
 // git file with an include, and anything beside cafile that assigns npm's CA
-// list.
+// list. And it refuses a file its client cannot load: git's, and helm's
+// repositories.yaml.
 func (h CAHost) ignored(rec PlanRecord, target string) error {
 	env := func(key string) string {
 		if h.Getenv == nil {
@@ -374,6 +368,19 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")
+		}
+	case rec.System == manifest.TypeHelm:
+		// The file helm reads and the file the plan edits, each loaded whole
+		// as helm loads it: a wrong type in a field no edit touches still
+		// stops helm, and the merge would carry it into the rewrite.
+		for _, f := range []string{HelmRepositoryFile(h.Getenv, h.GOOS, h.Home), target} {
+			if f == "" {
+				continue
+			}
+			if _, err := LoadHelmFile(f); err != nil {
+				return fmt.Errorf("%s: helm refuses to load its repository file (%w) and fails every command that reads it, so it would read neither the repository nor the CA this command installs, and the install could not be verified. "+
+					"Nothing was written. Fix that field so helm loads the file (helm repo update names it), then re-run", rec.System, err)
+			}
 		}
 	}
 	return nil

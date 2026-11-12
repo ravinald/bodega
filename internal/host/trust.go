@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -824,39 +823,27 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 // helmStores resolves what helm verifies bodega at u against: the caFile of
 // each repository entry at that host, which helm reads in place of the system
 // trust store, and that store for an entry naming none.
+//
+// The file is loaded whole through clientconf.LoadHelmFile first. A file
+// helm refuses to load, for any field of any entry, leaves helm unchecked:
+// helm stops on it, so no url or caFile it holds is one helm runs with.
 func helmStores(t TrustProbe, u *url.URL) []trustStore {
-	path := t.env("HELM_REPOSITORY_CONFIG")
+	path := clientconf.HelmRepositoryFile(t.Getenv, t.GOOS, t.Home)
 	if path == "" {
-		dir := t.env("HELM_CONFIG_HOME")
-		switch {
-		case dir != "":
-		case t.Home == "":
-			return nil
-		case t.GOOS == "darwin":
-			dir = filepath.Join(t.Home, "Library", "Preferences", "helm")
-		case t.env("XDG_CONFIG_HOME") != "":
-			dir = filepath.Join(t.env("XDG_CONFIG_HOME"), "helm")
-		default:
-			dir = filepath.Join(t.Home, ".config", "helm")
-		}
-		path = filepath.Join(dir, "repositories.yaml")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
 		return nil
 	}
-	var doc struct {
-		Repositories []struct {
-			Name   string `yaml:"name"`
-			URL    string `yaml:"url"`
-			CAFile string `yaml:"caFile"`
-		} `yaml:"repositories"`
+	doc, err := clientconf.LoadHelmFile(path)
+	if err != nil {
+		return []trustStore{{name: "helm's configuration", blind: fmt.Sprintf("helm refuses to load its repository file (%v) and fails every command that reads it, so whether helm reaches bodega or verifies its certificate is unchecked", err)}}
 	}
-	if yaml.Unmarshal(data, &doc) != nil {
+	if doc == nil {
 		return nil
 	}
 	var out []trustStore
 	for _, r := range doc.Repositories {
+		if r == nil {
+			continue
+		}
 		if p, err := url.Parse(r.URL); err != nil || p.Host != u.Host {
 			continue
 		}

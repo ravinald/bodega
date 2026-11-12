@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -2575,5 +2576,134 @@ func TestNpmEnvResolvesOneOption(t *testing.T) {
 	}
 	if c := NpmEnvConflict(env(map[string]string{"npm_config_userconfig": "/a", "NPM_CONFIG_USERCONFIG": "/b"})); !strings.Contains(c, "npm_config_userconfig") {
 		t.Errorf("NpmEnvConflict over userconfig = %q; want the pair named", c)
+	}
+}
+
+// F116 R1, R2: repositories.yaml loads the way helm v4.3.0 loads it. A wrong
+// type in any field of File or Entry is a load error, whichever field it is,
+// and where helm is installed it gives the same verdict on the same bytes.
+func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
+	helm, _ := exec.LookPath("helm")
+	entry := "repositories:\n  - name: bodega\n    url: https://b/helm\n"
+	for name, tc := range map[string]struct {
+		body string
+		bad  string
+	}{
+		"plan's own document":   {body: HelmDocument(HelmRepository("https://b"))},
+		"empty file":            {body: ""},
+		"emptied list":          {body: "repositories: []\n"},
+		"null entry":            {body: "repositories:\n  -\n"},
+		"unknown keys":          {body: entry + "    extra: [1]\nother: {a: 1}\n"},
+		"bool spelled as YAML":  {body: entry + "    insecure_skip_tls_verify: yes\n"},
+		"syntax":                {body: entry + "broken: [\n", bad: "did not find expected"},
+		"pass_credentials_all":  {body: entry + "    pass_credentials_all: [wrong-type]\n", bad: "cannot unmarshal"},
+		"insecure as a string":  {body: entry + "    insecure_skip_tls_verify: \"maybe\"\n", bad: "cannot unmarshal"},
+		"name as a list":        {body: "repositories:\n  - name: [a]\n    url: https://b/helm\n", bad: "cannot unmarshal"},
+		"caFile as a mapping":   {body: entry + "    caFile: {a: b}\n", bad: "cannot unmarshal"},
+		"password as a list":    {body: entry + "    password: [x]\n", bad: "cannot unmarshal"},
+		"generated not a time":  {body: "generated: yesterday\n" + entry, bad: "parsing time"},
+		"apiVersion as a list":  {body: "apiVersion: [v1]\n" + entry, bad: "cannot unmarshal"},
+		"repositories a string": {body: "repositories: none\n", bad: "cannot unmarshal"},
+		"entry a string":        {body: "repositories:\n  - bodega\n", bad: "cannot unmarshal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "repositories.yaml")
+			if err := os.WriteFile(file, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			doc, err := LoadHelmFile(file)
+			switch {
+			case tc.bad == "" && (err != nil || doc == nil):
+				t.Fatalf("LoadHelmFile = %v, %v; helm loads this file", doc, err)
+			case tc.bad != "" && (err == nil || !strings.Contains(err.Error(), tc.bad) || !strings.Contains(err.Error(), file)):
+				t.Fatalf("LoadHelmFile error = %v; want one naming %s and %q", err, file, tc.bad)
+			}
+			if helm == "" {
+				return
+			}
+			cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}
+			out, _ := cmd.CombinedOutput()
+			if refused := strings.Contains(string(out), "failed loading file"); refused != (tc.bad != "") {
+				t.Errorf("native helm refused the file: %v (%s); LoadHelmFile error = %v", refused, out, err)
+			}
+		})
+	}
+	if doc, err := LoadHelmFile(filepath.Join(t.TempDir(), "absent.yaml")); doc != nil || err != nil {
+		t.Errorf("a path holding no file = %v, %v; want a helm with no repositories", doc, err)
+	}
+}
+
+// F116 R1, R2: one resolver names the repositories.yaml helm reads, in
+// helm's own order on every platform, and native helm names the same file.
+func TestHelmRepositoryFileFollowsHelmpath(t *testing.T) {
+	helm, _ := exec.LookPath("helm")
+	for _, tc := range []struct {
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{OSLinux, nil, "/h/.config/helm/repositories.yaml"},
+		{OSDarwin, nil, "/h/Library/Preferences/helm/repositories.yaml"},
+		{OSLinux, map[string]string{"XDG_CONFIG_HOME": "/x"}, "/x/helm/repositories.yaml"},
+		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x"}, "/x/helm/repositories.yaml"},
+		{OSDarwin, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c"}, "/c/repositories.yaml"},
+		{OSLinux, map[string]string{"XDG_CONFIG_HOME": "/x", "HELM_CONFIG_HOME": "/c", "HELM_REPOSITORY_CONFIG": "/r.yaml"}, "/r.yaml"},
+	} {
+		got := HelmRepositoryFile(func(k string) string { return tc.env[k] }, tc.goos, "/h")
+		if got != tc.want {
+			t.Errorf("%s %v = %s; want %s", tc.goos, tc.env, got, tc.want)
+		}
+		if helm == "" || tc.goos != runtime.GOOS {
+			continue
+		}
+		cmd := exec.Command(helm, "env", "HELM_REPOSITORY_CONFIG")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=/h"}
+		for k, v := range tc.env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.Output()
+		if err != nil || strings.TrimSpace(string(out)) != tc.want {
+			t.Errorf("%s %v: native helm reads %s (%v); want %s", tc.goos, tc.env, out, err, tc.want)
+		}
+	}
+	if got := HelmRepositoryFile(nil, OSLinux, ""); got != "" {
+		t.Errorf("no home and no environment = %q; want none", got)
+	}
+}
+
+// F116 R1: a repositories.yaml helm cannot load is refused before any edit
+// is built, on the file the plan writes and on the one the environment
+// selects, and on a second run as on the first.
+func TestCAPlanRefusesUnloadableHelmFile(t *testing.T) {
+	raw, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := HelmDocument(HelmRepository(testBase, "pass_credentials_all: [wrong-type]"))
+	for name, selected := range map[string]bool{"plan's own file": false, "file the environment selects": true} {
+		t.Run(name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			target := filepath.Join(home, ".config/helm/repositories.yaml")
+			env := map[string]string{}
+			if selected {
+				target = filepath.Join(t.TempDir(), "repositories.yaml")
+				env["HELM_REPOSITORY_CONFIG"] = target
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(broken), 0600); err != nil {
+				t.Fatal(err)
+			}
+			h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string { return env[k] }}
+			for range 2 {
+				_, err := AddCA(caPlan(t, home, Helm(testBase)), ca, h)
+				if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "pass_credentials_all") {
+					t.Fatalf("AddCA error = %v; want a refusal naming %s and the field", err, target)
+				}
+			}
+		})
 	}
 }
