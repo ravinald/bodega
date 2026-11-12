@@ -2740,3 +2740,194 @@ func TestAudit21AptLoadErrorsRefuseCAPlan(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit22GomodInvalidProxyRefusesCAPlan(t *testing.T) {
+	for _, tail := range []string{"broken", "ftp://mirror.invalid", "file://mirror.invalid/cache"} {
+		t.Run(tail, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			caPEM, _, _ := testCA(t, "bodega.example.com")
+			ca, err := ParseCA(caPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, CAHost{
+				Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string {
+					if key == "GOPROXY" {
+						return testBase + "/go," + tail
+					}
+					return ""
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "GOPROXY") || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("invalid GOPROXY accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+			}
+		})
+	}
+}
+
+// F116 R1: a value the client refuses when it comes to use it, or sends
+// somewhere this package does not work out, refuses the CA plan before any
+// change is built, in whichever documented input holds it. Each client's
+// plan is accepted on the same host without that value.
+func TestAudit23EndpointValuesRefuseCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "apt, an entry with no suite in another list", plan: apt,
+			files: map[string]string{"etc/apt/sources.list.d/extra.list": "deb https://mirror.example/ubuntu\n"}, names: "(Suite)"},
+		{name: "apt, an unknown type in sources.list", plan: apt,
+			files: map[string]string{"etc/apt/sources.list": "rpm https://mirror.example/ubuntu stable main\n"}, names: "Type 'rpm' is not known"},
+		{name: "npm, a registry with no scheme in the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"npm_config_registry": "//bodega.example.com/npm/"}, names: "npm_config_registry"},
+		{name: "npm, a scoped registry in another scheme", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "@corp:registry=ftp://corp.example/npm/\n"}, names: "@corp:registry=ftp://corp.example/npm/"},
+		{name: "npm, a registry Node's URL parser reads and net/url does not", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "@corp:registry=https:bodega.example.com/npm/\n"}, names: "@corp:registry"},
+		{name: "git, a rewrite to a URL git does not normalize", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[url \"https://bodega.example.com/git/%zz/\"]\n\tinsteadOf = https://example.org/\n"}, names: "invalid %XX escape sequence"},
+		{name: "helm, a repository in a scheme with no getter", plan: Helm(testBase),
+			files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: other\n  url: ftp://charts.example/\n"}, names: "could not find protocol handler for: ftp"},
+		{name: "docker, a client certificate with no key", plan: DockerDaemon(testBase, nil),
+			files: map[string]string{"etc/docker/certs.d/bodega.example.com/client.cert": string(caPEM)}, names: "missing key client.key"},
+		{name: "containerd, a ca another host of the file names and nothing holds", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n\n[host.\"https://mirror.example\"]\n  ca = \"/missing/mirror-ca.pem\"\n"}, names: "unable to read CA cert"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: the one-line sources format as APT 3.0.3's ParseFileOldStyle
+// and Type::ParseLine read it, each refusal in apt's words.
+func TestAudit23AptSourcesListReadsAsApt(t *testing.T) {
+	for _, tc := range []struct {
+		line, refused string
+		uri           string
+	}{
+		{line: "deb https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb-src https://a.example/ubuntu stable main contrib # trailing", uri: "https://a.example/ubuntu"},
+		{line: "deb [arch=amd64 signed-by=/k.gpg] https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb [ arch=amd64 ] https://a.example/ubuntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "deb [arch=amd64] \"https://a.example/ubuntu\" stable/", uri: "https://a.example/ubuntu"},
+		{line: "deb https://a.example/%75buntu stable main", uri: "https://a.example/ubuntu"},
+		{line: "  # deb https://a.example/ubuntu stable main"},
+		{line: "deb", refused: "Malformed line 1 in source list"},
+		{line: "rpm https://a.example/ubuntu stable main", refused: "Type 'rpm' is not known on line 1"},
+		{line: "deb [arch=amd64", refused: "([option] unparsable)"},
+		{line: "deb [arch=\"amd64 https://a.example/ubuntu stable main", refused: "([option] unparsable)"},
+		{line: "deb [arch=amd64 https://a.example/ubuntu stable main", refused: "([option] not assignment)"},
+		{line: "deb [a] https://a.example/ubuntu stable main", refused: "([option] too short)"},
+		{line: "deb [abc] https://a.example/ubuntu stable main", refused: "([option] not assignment)"},
+		{line: "deb [=amd64] https://a.example/ubuntu stable main", refused: "([option] no key)"},
+		{line: "deb [arch=] https://a.example/ubuntu stable main", refused: "([option] no value)"},
+		{line: "deb [arch=amd64]", refused: "(URI)"},
+		{line: "deb https://a.example/ubuntu", refused: "(Suite)"},
+		{line: "deb a.example/ubuntu stable main", refused: "(URI parse)"},
+		{line: "deb https://a.example/ubuntu stable", refused: "(Component)"},
+		{line: "deb https://a.example/ubuntu stable/ main", refused: "(absolute Suite Component)"},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, AptSourcesList)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := LoadAptSources(root)
+			switch {
+			case tc.refused != "":
+				if err == nil || !strings.Contains(err.Error(), tc.refused) {
+					t.Errorf("LoadAptSources = %+v, %v; apt refuses this line with %q", entries, err, tc.refused)
+				}
+			case err != nil:
+				t.Errorf("LoadAptSources refuses a line apt loads: %v", err)
+			case tc.uri == "" && len(entries) != 0, tc.uri != "" && (len(entries) != 1 || entries[0].URIs[0] != tc.uri):
+				t.Errorf("LoadAptSources = %+v; want the URI %q", entries, tc.uri)
+			}
+		})
+	}
+	for uri, want := range map[string][3]string{
+		"https://bodega.example.com:8443/apt":        {"https", "bodega.example.com", "8443"},
+		"https://user:pw@bodega.example.com/apt":     {"https", "bodega.example.com", "0"},
+		"mirror+https://bodega.example.com/list.txt": {"https", "bodega.example.com", "0"},
+		"http://[fd00::1]:8080/apt":                  {"http", "fd00::1", "8080"},
+		"file:/srv/mirror":                           {"file", "", "0"},
+		"cdrom:[Ubuntu 26.04]/":                      {"cdrom", "", "0"},
+	} {
+		access, host, port := AptURIHost(uri)
+		if got := [3]string{access, host, strconv.Itoa(port)}; got != want {
+			t.Errorf("AptURIHost(%q) = %v, want %v", uri, got, want)
+		}
+	}
+}
+
+// F116: the trust-store diagnostics for a refused endpoint never carry a URL
+// password, whether the client's own parser accepted the URL or not.
+func TestAudit23EndpointRefusalsRedactPasswords(t *testing.T) {
+	const secret = "hunter2"
+	for _, list := range []string{
+		"https://bodega.example.com/go,ftp://ci:" + secret + "@mirror.example/go",
+		"https://bodega.example.com/go,file://ci:" + secret + "@mirror.example/cache",
+		"https://bodega.example.com/go,https://ci:" + secret + "@mirror.example:port/go",
+	} {
+		if _, err := GoProxyList(list); err == nil || strings.Contains(err.Error(), secret) {
+			t.Errorf("GoProxyList(%q) = %v; want a refusal without the password", list, err)
+		}
+	}
+	if list, err := GoProxyList("https://bodega.example.com/go,off,ftp://never.example"); err != nil || len(list) != 2 {
+		t.Errorf("an entry past off is never checked: %v, %v", list, err)
+	}
+	regs := []NpmRegistry{{Option: "registry", Value: "ftp://ci:" + secret + "@mirror.example/npm/", From: "the test"}}
+	if unread := NpmRegistryUnread(regs); unread == "" || strings.Contains(unread, secret) {
+		t.Errorf("NpmRegistryUnread = %q; want the registry named without the password", unread)
+	}
+	for value, read := range map[string]bool{
+		"https://bodega.example.com/npm/":            true,
+		" HTTPS://ci:pw@Bodega.Example.com:8443/n ":  true,
+		"https://127.0.0.1:8443/npm/":                true,
+		"https://[fd00::1]:8443/npm/":                true,
+		"https://0x7f.1/npm/":                        false,
+		"https://bodega.example.com:99999/npm/":      false,
+		"https://bodega.example.com\\@evil.example/": false,
+		"https://bodega.example.com:08443/npm/":      false,
+		"https:///bodega.example.com/npm/":           false,
+	} {
+		if _, err := NpmRegistryURL(value); (err == nil) != read {
+			t.Errorf("NpmRegistryURL(%q) = %v; read should be %v", value, err, read)
+		}
+	}
+}

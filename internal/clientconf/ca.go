@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -246,6 +247,45 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 	return nil
 }
 
+// goProxyRefused refuses a plan that leaves the go command with a GOPROXY
+// list it rejects: the list resolved as the host has it once the plan's go
+// env file, and each file the environment has go read in its place, holds
+// planned. The go command checks every entry before it asks the first proxy,
+// so a valid bodega entry ahead of a bad one downloads nothing, and a system
+// store rebuilt for it would report an install no fetch uses.
+func (h CAHost) goProxyRefused(rec PlanRecord, target string, planned []byte) error {
+	env := GoEnv{Getenv: h.Getenv, ConfigDir: h.goConfigDir, Planned: map[string][]byte{target: planned}}
+	for _, s := range h.shadows(rec, target, planned) {
+		env.Planned[s.path] = planned
+	}
+	p := env.Proxy()
+	if p.Err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: the go command refuses the GOPROXY list it would run with, from %s (%w). It checks every entry before it asks the first proxy, so it would fetch nothing through bodega and the install could not be verified. "+
+		"Nothing was written. Correct or remove the entry the error names (GOPROXY in the environment outranks the go env file), then re-run", rec.System, p.Source, p.Err)
+}
+
+// goConfigDir is os.UserConfigDir for the account and platform the plan is
+// for, which is where the go command keeps its env file.
+func (h CAHost) goConfigDir() (string, error) {
+	if h.GOOS != OSDarwin && h.Getenv != nil {
+		if dir := h.Getenv("XDG_CONFIG_HOME"); dir != "" {
+			if !filepath.IsAbs(dir) {
+				return "", errors.New("path in $XDG_CONFIG_HOME is relative")
+			}
+			return dir, nil
+		}
+	}
+	if h.Home == "" {
+		return "", errors.New("no home directory")
+	}
+	if h.GOOS == OSDarwin {
+		return filepath.Join(h.Home, "Library", "Application Support"), nil
+	}
+	return filepath.Join(h.Home, ".config"), nil
+}
+
 // ignored is the error for a plan file the environment tells its client not
 // to load, or to load settings beside that no file holds: writing the file
 // would report an install the client never reads. An environment variable
@@ -329,6 +369,13 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 					"Nothing was written. Write that line as a plain name=value with no ${NAME} in the name, or remove it, then re-run", rec.System, line)
 			}
 		}
+		// The registries npm asks, each read as npm reads it at the request:
+		// one it refuses there, or sends somewhere this command does not
+		// work out, leaves the verdict unchecked after the write.
+		if unread := NpmRegistryUnread(NpmRegistries(h.Getenv, loaded)); unread != "" {
+			return fmt.Errorf("%s: npm reads %s, so whether npm reaches bodega through it, and with it whether the CA written to %s is the one npm verifies bodega against, cannot be told. "+
+				"Nothing was written. Write the registry as http://host[:port]/path or https://host[:port]/path, or remove it, then re-run", rec.System, unread, target)
+		}
 		for _, f := range files {
 			if key := NpmInlineCA(f); key != "" {
 				return fmt.Errorf("%s: %s sets %s, and npm keeps one CA list that %s and cafile each replace in the order the file sets them, so the cafile this command writes there would not be read alone. "+
@@ -362,6 +409,10 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			return fmt.Errorf("%s: git refuses to load %s and aborts every command that reads it, so it would read neither the rewrite nor the CA written to %s, and the install could not be verified. "+
 				"Nothing was written. Fix that line so git loads the file (git config --file <file> --list names it), then re-run", rec.System, bad, target)
 		}
+		if unread := GitRewriteUnread(files); unread != "" {
+			return fmt.Errorf("%s: git rewrites URLs to %s, so whether git reaches bodega through it, and with it whether the CA written to %s is the one git verifies bodega against, cannot be told. "+
+				"Nothing was written. Write that base as a URL git normalizes (git config --get-urlmatch http.sslCAInfo <base> names the error), or remove the rewrite, then re-run", rec.System, unread, target)
+		}
 		if unread := GitUnread(h.Getenv, files); len(unread) > 0 {
 			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so a setting there could outrank the CA written to %s unseen. "+
 				"Nothing was written. Unset the variable, move included settings into the file itself, or write the header as [name] or [name \"subsection\"] alone on its line and the value on one line, then re-run", rec.System, unread[0], target)
@@ -376,6 +427,12 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		if _, err := LoadAptConfig(h.Root, h.Getenv); err != nil {
 			return fmt.Errorf("%s: apt does not load its configuration (%w) and fails every command, so it would read neither the source written to %s nor the CA this command installs, and the install could not be verified. "+
 				"Nothing was written. Repair what the error names (apt-config dump repeats a syntax error), then re-run", rec.System, err, target)
+		}
+		// And its sources, the same way: an entry apt refuses in any file
+		// leaves it reading none of them, the one this plan writes included.
+		if _, err := LoadAptSources(h.Root); err != nil {
+			return fmt.Errorf("%s: apt does not read its sources (%w) and fails every command that needs them, so it would fetch nothing from the source written to %s, and the install could not be verified. "+
+				"Nothing was written. Repair or remove the entry the error names (apt update repeats it), then re-run", rec.System, err, target)
 		}
 	case rec.System == manifest.TypeHelm:
 		// The file helm reads and the file the plan edits, each loaded whole
@@ -420,6 +477,16 @@ func (h CAHost) dockerReads(changes []Change) error {
 	if err != nil {
 		return fmt.Errorf("%s: dockerd refuses to load %s (%w) and does not start, so it would use neither the mirror nor the CA this command installs, and the install could not be verified. "+
 			"Nothing was written. Repair what the error names (dockerd --validate repeats it), then re-run", manifest.TypeOCI, path, err)
+	}
+	// The certs.d directory the ca.crt goes into, loaded whole as dockerd
+	// loads it for the mirror: a client certificate there with no key stops
+	// dockerd configuring TLS for the host at all.
+	if base, err := url.Parse(h.Base); err == nil && base.Host != "" {
+		dir := filepath.Join(filepath.Dir(path), "certs.d", base.Host)
+		if err := DockerCertsDirError(dir, "ca.crt"); err != nil {
+			return fmt.Errorf("%s: dockerd does not load the certificates in %s (%w) and sends that host nothing while it cannot, so it would not use the CA this command installs there, and the install could not be verified. "+
+				"Nothing was written. Repair what the error names (a CA certificate takes the extension .crt, a client certificate a .cert with its .key beside it), then re-run", manifest.TypeOCI, dir, err)
+		}
 	}
 	return nil
 }
@@ -470,15 +537,33 @@ func (h CAHost) containerdReads(changes []Change) error {
 	// wrong type in a field no edit touches makes containerd discard the
 	// file, and the merge would carry that field into the rewrite.
 	files := ContainerdHostsFiles(h.Root, roots)
+	var planned []string
 	for _, c := range changes {
-		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd && filepath.Base(c.Target) == "hosts.toml" && !slices.Contains(files, c.Target) {
-			files = append(files, c.Target)
+		if c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd && filepath.Base(c.Target) == "hosts.toml" {
+			planned = append(planned, c.Target)
+			if !slices.Contains(files, c.Target) {
+				files = append(files, c.Target)
+			}
 		}
 	}
 	for _, f := range files {
-		if _, err := LoadContainerdHostsFile(f); err != nil {
+		doc, err := LoadContainerdHostsFile(f)
+		if err != nil {
 			return fmt.Errorf("%s: containerd discards its registry configuration (%w) and pulls from the registry's own server instead, so it would use neither the bodega host nor the ca this command writes, and the install could not be verified. "+
 				"Nothing was written. Fix that field so containerd loads the file (its log names the same error at each pull), then re-run", manifest.TypeOCI, err)
+		}
+		// The certificate files of each registry that reaches bodega, the
+		// ones this plan edits and any that already name it, which is the set
+		// the verdict reads. The ca of bodega's own host table is the plan's
+		// to replace; every other file such a hosts.toml names has to load
+		// as it stands.
+		reaches := slices.Contains(planned, f) || doc != nil && slices.ContainsFunc(doc.Hosts, func(host ContainerdRegistryHost) bool { return host.Key == trim(h.Base) })
+		if !reaches {
+			continue
+		}
+		if err := doc.TLSError(trim(h.Base)); err != nil {
+			return fmt.Errorf("%s: containerd cannot load a certificate %s names (%w) and resolves no host for that registry while it cannot, the bodega host included, so it would not use the ca this command writes, and the install could not be verified. "+
+				"Nothing was written. Restore the file the error names or remove the setting naming it, then re-run", manifest.TypeOCI, f, err)
 		}
 	}
 	return nil
@@ -729,6 +814,11 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		}
 		if rec.System == manifest.TypePypi {
 			if err := h.pipCommandIndex(rec, c.Target, c.New); err != nil {
+				return CAInstall{}, err
+			}
+		}
+		if rec.System == manifest.TypeGomod {
+			if err := h.goProxyRefused(rec, c.Target, c.New); err != nil {
 				return CAInstall{}, err
 			}
 		}

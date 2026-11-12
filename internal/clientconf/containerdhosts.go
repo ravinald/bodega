@@ -1,6 +1,8 @@
 package clientconf
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -56,6 +58,57 @@ type ContainerdRegistryHost struct {
 	CA []string
 	// SkipVerify is skip_verify, nil where the file does not set it.
 	SkipVerify *bool
+	// ClientPairs are the client certificates containerd presents to this
+	// host, each a certificate file and its key file, absolute. An empty key
+	// file is a key held in the certificate's own file.
+	ClientPairs [][2]string
+}
+
+// TLSError is the check containerd v2.2.0 runs on the files a hosts.toml
+// names when it builds the client for a registry: updateTLSConfigFromHost in
+// core/remotes/docker/config/hosts.go, lines 241-288, called for every host
+// of the file by ConfigureHosts (lines 171-181), which returns the first
+// error for the whole registry. Each ca file must read and hold at least one
+// PEM certificate, and each client pair must read and load as a key pair. One
+// host that fails is a registry containerd resolves no host for, the ones
+// that would have loaded included, so the error is for the file.
+//
+// planned names the host table whose ca a plan is about to replace, by its
+// key: that table's ca files are not read, since the file the plan names does
+// not exist until the plan is applied. "" reads every one.
+func (f *ContainerdHostsFile) TLSError(planned string) error {
+	if f == nil {
+		return nil
+	}
+	for _, h := range f.Hosts {
+		if h.Key != planned || planned == "" {
+			for _, ca := range h.CA {
+				data, err := os.ReadFile(ca)
+				if err != nil {
+					return fmt.Errorf("unable to read CA cert %q: %w", ca, err)
+				}
+				if !x509.NewCertPool().AppendCertsFromPEM(data) {
+					return fmt.Errorf("unable to load CA cert %q", ca)
+				}
+			}
+		}
+		for _, pair := range h.ClientPairs {
+			cert, err := os.ReadFile(pair[0])
+			if err != nil {
+				return fmt.Errorf("unable to read CERT file %q: %w", pair[0], err)
+			}
+			key := cert
+			if pair[1] != "" {
+				if key, err = os.ReadFile(pair[1]); err != nil {
+					return fmt.Errorf("unable to read CERT file %q: %w", pair[1], err)
+				}
+			}
+			if _, err := tls.X509KeyPair(cert, key); err != nil {
+				return fmt.Errorf("failed to load X509 key pair %q: %w", pair[0], err)
+			}
+		}
+	}
+	return nil
 }
 
 // ParseContainerdHostsFile decodes data as containerd's parseHostsFile does
@@ -181,11 +234,14 @@ func containerdHost(server, dir string, c containerdHostFile) (ContainerdRegistr
 		return h, fmt.Errorf("invalid type %v for \"ca\"", ca)
 	}
 	switch client := c.Client.(type) {
-	case nil, string:
+	case nil:
+	case string:
+		h.ClientPairs = [][2]string{{abs(client), ""}}
 	case []any:
 		for _, pair := range client {
 			switch p := pair.(type) {
 			case string:
+				h.ClientPairs = append(h.ClientPairs, [2]string{abs(p), ""})
 			case []any:
 				files, err := stringsOf(p)
 				if err != nil {
@@ -194,6 +250,7 @@ func containerdHost(server, dir string, c containerdHostFile) (ContainerdRegistr
 				if len(files) != 2 {
 					return h, fmt.Errorf("invalid pair %v for \"client\"", p)
 				}
+				h.ClientPairs = append(h.ClientPairs, [2]string{abs(files[0]), abs(files[1])})
 			default:
 				return h, fmt.Errorf("invalid type %T for \"client\"", p)
 			}

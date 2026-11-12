@@ -2,12 +2,13 @@ package clientconf
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -648,23 +649,241 @@ func NpmUnread(path string) string {
 	return ""
 }
 
-// gitURL is a URL as git's urlmatch compares one: scheme and host lowercased,
-// the scheme's default port dropped, and a path ending in a slash.
+// gitURL is a URL as git's urlmatch compares one: what url_normalize_1 makes
+// of it, with the scheme and host lowercased, the scheme's default port and
+// a port's leading zeros dropped, dot segments resolved, %-escapes
+// normalized, and the path ending in a slash so that a prefix test stops at
+// a segment boundary. user is the user name alone: urlmatch never compares a
+// password.
 type gitURL struct {
 	scheme, host, port, user, path string
 }
 
-func parseGitURL(s string) (gitURL, bool) {
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return gitURL{}, false
+const (
+	gitURLAlnum    = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	gitURLScheme   = gitURLAlnum + "+.-"
+	gitURLHost     = gitURLAlnum + ".-_[:]"
+	gitURLUnsafe   = " <>\"%{}|\\^`"
+	gitURLReserved = ":/?#[]@!$&'()*+,;="
+)
+
+// gitSpan is strspn and gitCSpan strcspn.
+func gitSpan(s, set string) int {
+	for i := 0; i < len(s); i++ {
+		if strings.IndexByte(set, s[i]) < 0 {
+			return i
+		}
 	}
-	g := gitURL{scheme: strings.ToLower(u.Scheme), host: strings.ToLower(u.Hostname()), port: u.Port(), user: u.User.String()}
-	if g.port == "443" && g.scheme == "https" || g.port == "80" && g.scheme == "http" {
-		g.port = ""
+	return len(s)
+}
+
+func gitCSpan(s, set string) int {
+	if i := strings.IndexAny(s, set); i >= 0 {
+		return i
 	}
-	g.path = strings.TrimRight(u.Path, "/") + "/"
-	return g, true
+	return len(s)
+}
+
+// gitEscapes is append_normalized_escapes with no esc_extra and the reserved
+// characters as esc_ok: an escaped character that need not be is unescaped,
+// one that must be is escaped in uppercase hex, and a reserved one stays as
+// it was written. false is a % not followed by two hex digits.
+func gitEscapes(buf []byte, from string) ([]byte, bool) {
+	for i := 0; i < len(from); i++ {
+		ch, wasEsc := from[i], false
+		if ch == '%' {
+			if len(from)-i < 3 {
+				return buf, false
+			}
+			v, err := strconv.ParseUint(from[i+1:i+3], 16, 8)
+			if err != nil {
+				return buf, false
+			}
+			ch, wasEsc = byte(v), true
+			i += 2
+		}
+		if ch <= 0x1F || ch >= 0x7F || strings.IndexByte(gitURLUnsafe, ch) >= 0 || wasEsc && strings.IndexByte(gitURLReserved, ch) >= 0 {
+			buf = fmt.Appendf(buf, "%%%02X", ch)
+		} else {
+			buf = append(buf, ch)
+		}
+	}
+	return buf, true
+}
+
+// gitNormalizeURL is url_normalize_1 of Git 2.54.0's urlmatch.c, lines
+// 110-452, the check git runs on the URL of every [http "<url>"] section
+// (urlmatch_config_entry, lines 573-580, with globs allowed) and on the URL
+// it is about to fetch (url_normalize from http.c, without). A section whose
+// URL does not normalize is one git matches against nothing and reads no
+// setting from; the error is the one git keeps for it. globs allows a * in
+// the host, which only a section's URL may hold.
+func gitNormalizeURL(raw string, globs bool) (gitURL, error) {
+	var g gitURL
+	s := raw
+	spanned := gitSpan(s, gitURLScheme)
+	if spanned == 0 || !gitAlpha(s[0]) || spanned+3 > len(s) || s[spanned:spanned+3] != "://" {
+		return g, errors.New("invalid URL scheme name or missing '://' suffix")
+	}
+	g.scheme = strings.ToLower(s[:spanned])
+	s = s[spanned+3:]
+
+	slash := gitCSpan(s, "/?#")
+	if at := strings.IndexByte(s, '@'); at >= 0 && at < slash {
+		if at > 0 {
+			info, ok := gitEscapes(nil, s[:at])
+			if !ok {
+				return g, errors.New("invalid %XX escape sequence")
+			}
+			g.user, _, _ = strings.Cut(string(info), ":")
+		}
+		s = s[at+1:]
+		slash -= at + 1
+	}
+
+	hasHost := true
+	if s == "" || strings.IndexByte(":/?#", s[0]) >= 0 {
+		if g.scheme != "file" {
+			return g, errors.New("missing host and scheme is not 'file:'")
+		}
+		hasHost = false
+	}
+	colon := slash - 1
+	for colon > 0 && s[colon] != ':' && s[colon] != ']' {
+		colon--
+	}
+	switch {
+	case colon < 0 || s[colon] != ':':
+		colon = slash
+	case !hasHost && colon < slash && colon+1 != slash:
+		return g, errors.New("a 'file:' URL may not have a port number")
+	}
+	hostChars := gitURLHost
+	if globs {
+		hostChars += "*"
+	}
+	if gitSpan(s, hostChars) < colon {
+		return g, errors.New("invalid characters in host name")
+	}
+	g.host = strings.ToLower(s[:colon])
+
+	if colon < slash {
+		port := s[colon+1 : slash]
+		trimmed := strings.TrimLeft(port, "0")
+		if trimmed == "" && port != "" {
+			trimmed = "0"
+		}
+		switch {
+		case trimmed == "":
+		case trimmed == "80" && g.scheme == "http":
+		case trimmed == "443" && g.scheme == "https":
+		default:
+			if gitSpan(trimmed, "0123456789") < len(trimmed) {
+				return g, errors.New("invalid port number")
+			}
+			pnum := 0
+			if len(trimmed) <= 5 {
+				pnum, _ = strconv.Atoi(trimmed)
+			}
+			if pnum == 0 || pnum > 65535 {
+				return g, errors.New("invalid port number")
+			}
+			g.port = trimmed
+		}
+	}
+	s = s[slash:]
+
+	path := []byte{'/'}
+	if s != "" && s[0] == '/' {
+		s = s[1:]
+	}
+	for {
+		segStart := len(path)
+		next := gitCSpan(s, "/?#")
+		var ok bool
+		if path, ok = gitEscapes(path, s[:next]); !ok {
+			return g, errors.New("invalid %XX escape sequence")
+		}
+		skipSlash := false
+		switch string(path[segStart:]) {
+		case ".":
+			if segStart == 1 {
+				path, skipSlash = path[:len(path)-1], true
+			} else {
+				path = path[:len(path)-2]
+			}
+		case "..":
+			prev := len(path) - 3
+			if prev == 0 {
+				return g, errors.New("invalid '..' path segment")
+			}
+			for prev--; path[prev] != '/'; prev-- {
+			}
+			if prev == 0 {
+				path, skipSlash = path[:1], true
+			} else {
+				path = path[:prev]
+			}
+		}
+		s = s[next:]
+		if s == "" || s[0] != '/' {
+			break
+		}
+		s = s[1:]
+		if !skipSlash {
+			path = append(path, '/')
+		}
+	}
+	if _, ok := gitEscapes(nil, s); !ok {
+		return g, errors.New("invalid %XX escape sequence")
+	}
+	g.path = strings.TrimRight(string(path), "/") + "/"
+	return g, nil
+}
+
+// parseGitURL normalizes s as git does: a section's URL when pattern is set,
+// and otherwise a URL git fetches.
+func parseGitURL(s string, pattern bool) (gitURL, bool) {
+	g, err := gitNormalizeURL(s, pattern)
+	return g, err == nil
+}
+
+// GitRewriteUnread names the first [url "<base>"] rewrite in files whose
+// http or https base git does not normalize, as a phrase a diagnostic can
+// carry with any URL password redacted, "" for none. git still rewrites to
+// such a base and hands it to curl, but matches no [http "<url>"] section
+// against it, so neither where git then connects nor which sslCAInfo it
+// reads is worked out here: the install refuses a host with one, and the
+// probe leaves git unchecked. A base in another scheme, or in scp form, is
+// not an endpoint a certificate is verified at and is passed over.
+func GitRewriteUnread(files []string) string {
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, e := range ParseGitConfig(data).Entries {
+			if e.Section != "url" || e.Name != "insteadof" && e.Name != "pushinsteadof" {
+				continue
+			}
+			lower := strings.ToLower(e.Subsection)
+			if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+				continue
+			}
+			if _, err := gitNormalizeURL(e.Subsection, false); err != nil {
+				return fmt.Sprintf("[url %q] in %s, a URL git does not normalize (%v) and so applies no [http \"<url>\"] section to", redactURLPassword(e.Subsection), f, err)
+			}
+		}
+	}
+	return ""
+}
+
+// GitURLHost is the host and port git connects to for the URL raw, the port
+// "" for the scheme's default, as url_normalize reads them. ok is false for
+// a URL git does not normalize, which no [http "<url>"] section applies to.
+func GitURLHost(raw string) (host, port string, ok bool) {
+	g, err := gitNormalizeURL(raw, false)
+	return g.host, g.port, err == nil
 }
 
 // hostMatch reports whether pattern names host, a * standing for one label,
@@ -689,7 +908,7 @@ func (g gitURL) hostMatch(pattern string) (match, exact bool) {
 // g's own host: the sections that outrank or tie with one scoped to g for
 // some URL below it.
 func (g gitURL) under(pattern string) bool {
-	p, ok := parseGitURL(pattern)
+	p, ok := parseGitURL(pattern, true)
 	return ok && p.scheme == g.scheme && p.host == g.host && p.port == g.port && strings.HasPrefix(p.path, g.path)
 }
 
@@ -702,7 +921,7 @@ func (g gitURL) under(pattern string) bool {
 // to a path below it or to one user, which git reads in own's place for the
 // URLs it covers.
 func GitCAInfo(files []string, base, home string) (own *GitCA, narrower []GitCA) {
-	b, ok := parseGitURL(base)
+	b, ok := parseGitURL(base, false)
 	if !ok {
 		return nil, nil
 	}
@@ -718,7 +937,7 @@ func GitCAInfo(files []string, base, home string) (own *GitCA, narrower []GitCA)
 		for _, ca := range cas {
 			rank := [3]int{}
 			if ca.Pattern != "" {
-				p, ok := parseGitURL(ca.Pattern)
+				p, ok := parseGitURL(ca.Pattern, true)
 				if !ok || p.scheme != b.scheme || p.port != b.port {
 					continue
 				}
@@ -756,7 +975,7 @@ func GitCAInfo(files []string, base, home string) (own *GitCA, narrower []GitCA)
 // config body that set sslCAInfo for URLs at or below base: each is read in
 // place of, or on equal terms with, the section a plan scopes to base.
 func gitShadowHeaders(lines []string, base string) []string {
-	b, ok := parseGitURL(base)
+	b, ok := parseGitURL(base, false)
 	if !ok {
 		return nil
 	}

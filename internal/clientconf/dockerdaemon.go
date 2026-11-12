@@ -2,6 +2,7 @@ package clientconf
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -751,6 +753,61 @@ func dockerValidateMirror(mirrorURL string) error {
 	case uri.User != nil:
 		uri.User = url.UserPassword(uri.User.Username(), "xxxxx")
 		return fmt.Errorf("invalid mirror: username/password not allowed in URI %q", uri)
+	}
+	return nil
+}
+
+// DockerCertsDirError is the check dockerd v28.5.2 runs on the certs.d
+// directory of a registry or mirror host before it sends that host a
+// request: loadTLSConfig in registry/registry.go, lines 66-118. Every .crt
+// must read, every .cert needs the .key beside it and must load with it as a
+// key pair, and every .key needs its .cert. dockerd builds no TLS
+// configuration for the host on any of those errors, so it sends the host
+// nothing, whatever a ca.crt in the same directory holds. A directory that
+// does not exist is a host with no certificates of its own: no error.
+//
+// planned names a .crt a plan is about to write there, which is not read
+// since the plan replaces it. "" reads every one.
+func DockerCertsDirError(dir, planned string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	has := func(name string) bool {
+		for _, e := range entries {
+			if e.Name() == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		switch filepath.Ext(name) {
+		case ".crt":
+			if name == planned {
+				continue
+			}
+			if _, err := os.ReadFile(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		case ".cert":
+			key := name[:len(name)-len(".cert")] + ".key"
+			if !has(key) {
+				return fmt.Errorf("missing key %s for client certificate %s in %s. CA certificates must use the extension .crt", key, name, dir)
+			}
+			if _, err := tls.LoadX509KeyPair(filepath.Join(dir, name), filepath.Join(dir, key)); err != nil {
+				return fmt.Errorf("client certificate %s in %s: %w", name, dir, err)
+			}
+		case ".key":
+			cert := name[:len(name)-len(".key")] + ".cert"
+			if !has(cert) {
+				return fmt.Errorf("missing client certificate %s for key %s in %s", cert, name, dir)
+			}
+		}
 	}
 	return nil
 }

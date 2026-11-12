@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"sigs.k8s.io/yaml"
@@ -91,5 +93,40 @@ func LoadHelmFile(path string) (*HelmFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	if err := f.RepositoryError(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	return f, nil
+}
+
+// helmSchemes are the URL schemes helm v4.3.0 has a getter for with no
+// plugin installed: getter.Getters in pkg/getter/getter.go, lines 203-222.
+var helmSchemes = []string{"http", "https", "oci"}
+
+// RepositoryError is the check helm v4.3.0 runs on every entry before it
+// fetches from any: NewChartRepository (pkg/repo/v1/chartrepo.go, lines
+// 59-68), which `helm repo update` calls for each entry in turn and returns
+// from on the first error (pkg/cmd/repo_update.go, lines 100-104). The url
+// must parse, with the net/url helm itself calls, and name a scheme helm has
+// a getter for. One entry that fails stops the update for every repository,
+// so the error is for the file. A getter plugin can add a scheme; doctor
+// reads no plugin, so a scheme outside the built-in ones is refused rather
+// than assumed served.
+func (f *HelmFile) RepositoryError() error {
+	if f == nil {
+		return nil
+	}
+	for _, r := range f.Repositories {
+		if r == nil {
+			continue
+		}
+		u, err := url.Parse(r.URL)
+		if err != nil {
+			return fmt.Errorf("repository %q: invalid chart URL format (helm repo update stops on it before it fetches any repository)", r.Name)
+		}
+		if !slices.Contains(helmSchemes, u.Scheme) {
+			return fmt.Errorf("repository %q: could not find protocol handler for: %s (helm repo update stops on it before it fetches any repository; helm reads http, https and oci without a getter plugin, and doctor reads no plugin)", r.Name, u.Scheme)
+		}
+	}
+	return nil
 }

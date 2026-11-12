@@ -9,13 +9,18 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ravinald/bodega/internal/clientconf"
 )
 
 // trustFixture is a CA, and the chain a bodega at bodega.internal:8443
@@ -80,7 +85,7 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 	writeTrustFile(t, filepath.Join(root, "etc/pip.conf"), "[global]\nindex-url = "+base+"/pypi/simple/\n")
 	writeTrustFile(t, filepath.Join(root, home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
 	writeTrustFile(t, filepath.Join(home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n")
-	writeTrustFile(t, filepath.Join(root, "etc/apt/sources.list.d/other.sources"), "URIs: https://mirror.example/ubuntu\n")
+	writeTrustFile(t, filepath.Join(root, "etc/apt/sources.list.d/other.sources"), "Types: deb\nURIs: https://mirror.example/ubuntu\nSuites: stable\nComponents: main\n")
 	writeTrustFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"registry-mirrors":["`+base+`"]}`)
 	writeTrustFile(t, filepath.Join(root, "etc/docker/certs.d", hostport, "ca.crt"), string(caPEM))
 	// cargo and podman are configured for bodega with no CA either reads;
@@ -419,7 +424,7 @@ func TestTrustProbeReadsTheStoreAClientIsPointedAt(t *testing.T) {
 		set func(t *testing.T, p *TrustProbe, base, file string)
 	}{
 		{"apt Acquire::https::CAInfo", "apt-sources", func(t *testing.T, p *TrustProbe, base, file string) {
-			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt/\nSuites: stable\nComponents: main\n")
 			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/apt.conf.d/99ca"), "Acquire::https::CAInfo \""+file+"\";\n")
 		}},
 	} {
@@ -503,7 +508,7 @@ func TestIndependentAptEffectiveCA(t *testing.T) {
 	for _, mode := range []string{"later-file", "other-host", "comment"} {
 		t.Run(mode, func(t *testing.T) {
 			p, ca, base := reviewTrust(t)
-			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt/\nSuites: stable\nComponents: main\n")
 			dir := filepath.Join(p.Root, "etc/apt/apt.conf.d")
 			switch mode {
 			case "later-file":
@@ -585,7 +590,7 @@ func TestTrustFollowsEachClientsOwnPrecedence(t *testing.T) {
 		return `"` + strings.ReplaceAll(strings.TrimSpace(string(data)), "\n", `\n`) + `"`
 	}
 	apt := func(t *testing.T, p TrustProbe, base string, files map[string]string) {
-		writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
+		writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt/\nSuites: stable\nComponents: main\n")
 		for name, body := range files {
 			writeTrustFile(t, filepath.Join(p.Root, "etc/apt", name), body)
 		}
@@ -1353,5 +1358,376 @@ func TestAudit21AptLoadErrorsRemainUnchecked(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAudit22GomodProxyValidityMatchesGo(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native Go oracle missing in CI")
+		}
+		t.Skip("native Go oracle unavailable")
+	}
+	const base = "https://bodega.internal:8443"
+	caPEM, chain := trustFixture(t)
+	block, _ := pem.Decode(caPEM)
+	ca, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tail := range []string{"broken", "ftp://mirror.invalid", "file://mirror.invalid/cache"} {
+		t.Run(tail, func(t *testing.T) {
+			dir := t.TempDir()
+			proxy := base + "/go," + tail
+			cmd := exec.Command(goBin, "mod", "download", "example.com/ca-audit@v1.0.0")
+			cmd.Dir = dir
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GOPATH=" + filepath.Join(dir, "gopath"), "GOCACHE=" + filepath.Join(dir, "cache"), "GOTOOLCHAIN=local", "GOENV=off", "GOSUMDB=off", "GOWORK=off", "GO111MODULE=on", "GOPROXY=" + proxy}
+			out, nativeErr := cmd.CombinedOutput()
+			if nativeErr == nil || !strings.Contains(string(out), "invalid") || !strings.Contains(string(out), "proxy URL") {
+				t.Fatalf("native go did not reject proxy list: %v: %s", nativeErr, out)
+			}
+			t.Logf("native go: %s", strings.TrimSpace(string(out)))
+			getenv := func(key string) string {
+				if key == "GOPROXY" {
+					return proxy
+				}
+				return ""
+			}
+			p := TrustProbe{GOOS: "linux", Home: dir, Root: dir, Getenv: getenv,
+				Chain:  func(string) ([]*x509.Certificate, error) { return chain, nil },
+				System: func(c []*x509.Certificate, name string) error { return VerifyServed(c, name, []*x509.Certificate{ca}) },
+			}
+			rows := p.Apply([]Finding{checkGoproxy(getenv, func() (string, error) { return dir, nil })}, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("normal row certified Go's invalid proxy list: %+v", rows)
+			}
+			v, err := p.Judge([]string{"goproxy-env"}, base)
+			if err != nil || len(v) != 1 || v[0].State != TrustUnchecked {
+				t.Errorf("selected verdict certified Go's invalid proxy list: %+v, %v", v, err)
+			}
+		})
+	}
+}
+
+// auditTrust is reviewTrust with a home directory inside the root and a
+// system store that holds the fixture's CA, so a row that reads OK reads it
+// through a real verification and only the client's own policy can stand in
+// the way.
+func auditTrust(t *testing.T) (TrustProbe, string, string) {
+	t.Helper()
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	data, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(data)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.System = func(c []*x509.Certificate, name string) error {
+		return VerifyServed(c, name, []*x509.Certificate{cert})
+	}
+	return p, ca, base
+}
+
+func auditState(t *testing.T, p TrustProbe, check, base string) TrustVerdict {
+	t.Helper()
+	vs, err := p.Judge([]string{check}, base)
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("Judge(%s) = %+v, %v", check, vs, err)
+	}
+	return vs[0]
+}
+
+// F116 R1, R2: apt validates its sources as it loads them, and one entry it
+// refuses in any file leaves it reading none. The cases are the errors of
+// APT 3.0.3's sourcelist.cc; no apt runs here.
+func TestAudit23AptSourcesLoadAsAptLoadsThem(t *testing.T) {
+	stanza := func(base, extra string) string {
+		return "Types: deb\nURIs: " + base + "/apt\nSuites: stable\nComponents: main\n" + extra
+	}
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  TrustState
+		names string
+	}{
+		{name: "a source apt loads", files: map[string]string{"etc/apt/sources.list.d/bodega.sources": stanza("BASE", "")}, want: TrustVerified},
+		{name: "an entry with no suite in another file", files: map[string]string{
+			"etc/apt/sources.list.d/bodega.sources": stanza("BASE", ""),
+			"etc/apt/sources.list.d/extra.list":     "deb https://mirror.example/ubuntu\n",
+		}, want: TrustUnchecked, names: "(Suite)"},
+		{name: "a URI with no colon", files: map[string]string{
+			"etc/apt/sources.list":                  "deb mirror.example/ubuntu stable main\n",
+			"etc/apt/sources.list.d/bodega.sources": stanza("BASE", ""),
+		}, want: TrustUnchecked, names: "(URI parse)"},
+		{name: "a stanza with no Types", files: map[string]string{
+			"etc/apt/sources.list.d/bodega.sources": stanza("BASE", ""),
+			"etc/apt/sources.list.d/other.sources":  "URIs: https://mirror.example/ubuntu\nSuites: stable\nComponents: main\n",
+		}, want: TrustUnchecked, names: "(type)"},
+		{name: "a stanza apt has disabled", files: map[string]string{"etc/apt/sources.list.d/bodega.sources": stanza("BASE", "Enabled: no\n")}, want: TrustAbsent},
+		{name: "a file apt passes over", files: map[string]string{"etc/apt/sources.list.d/bodega.sources.save": stanza("BASE", "")}, want: TrustAbsent},
+		{name: "a commented entry", files: map[string]string{"etc/apt/sources.list": "# deb BASE/apt stable main\n"}, want: TrustAbsent},
+		{name: "another host whose name ends in bodega's", files: map[string]string{"etc/apt/sources.list": "deb https://notbodega.internal:8443/apt stable main\n"}, want: TrustAbsent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, base := auditTrust(t)
+			for name, body := range tc.files {
+				writeTrustFile(t, filepath.Join(p.Root, name), strings.ReplaceAll(body, "BASE", base))
+			}
+			v := auditState(t, p, "apt-sources", base)
+			if v.State != tc.want || !strings.Contains(v.Detail, tc.names) {
+				t.Errorf("selected verdict = %+v; want state %d naming %q", v, tc.want, tc.names)
+			}
+			row := p.Apply([]Finding{{Check: "apt-sources", Status: StatusOK}}, base)[0]
+			if unchecked := strings.Contains(row.Detail, "unchecked"); unchecked != (tc.want == TrustUnchecked) {
+				t.Errorf("ordinary row = %+v; unchecked should be %v", row, tc.want == TrustUnchecked)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: pip accepts any string for an index and decides at the
+// request whether it is a location at all (build_source, is_url), and reads
+// cert through expanduser.
+func TestAudit23PipIndexAndCertAsPipReadsThem(t *testing.T) {
+	for _, tc := range []struct {
+		name, index, cert string
+		want              TrustState
+	}{
+		{name: "an https index and an absolute cert", index: "BASE/pypi/simple/", cert: "CA", want: TrustVerified},
+		{name: "a scheme requests has no adapter for", index: "ftp://bodega.internal:8443/pypi/simple/", cert: "CA", want: TrustAbsent},
+		{name: "a location with no scheme, which pip ignores", index: "//bodega.internal:8443/pypi/simple/", cert: "CA", want: TrustAbsent},
+		{name: "a cert under ~, which pip expands", index: "BASE/pypi/simple/", cert: "~/ca.pem", want: TrustVerified},
+		{name: "a relative cert, read from wherever pip starts", index: "BASE/pypi/simple/", cert: "ca.pem", want: TrustUnchecked},
+		{name: "another account's home", index: "BASE/pypi/simple/", cert: "~build/ca.pem", want: TrustUnchecked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			// The system store is no help: only the cert setting can verify.
+			p.System = func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }
+			data, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Home, "ca.pem"), string(data))
+			body := "[global]\nindex-url = " + tc.index + "\ncert = " + tc.cert + "\n"
+			body = strings.ReplaceAll(strings.ReplaceAll(body, "BASE", base), "CA", ca)
+			writeTrustFile(t, filepath.Join(p.Home, ".config/pip/pip.conf"), body)
+			if v := auditState(t, p, "pip-config", base); v.State != tc.want {
+				t.Errorf("selected verdict = %+v; want state %d", v, tc.want)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: npm hands a registry to Node's URL parser at the request and
+// refuses anything but http and https there. A local listener stands in for
+// the registry so native npm shows which spellings reach it; doctor must
+// never call a spelling npm fails on verified, nor one npm reaches absent.
+func TestAudit23NpmRegistryAsNpmRequestsIt(t *testing.T) {
+	nativeNpm(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, nil)
+	}))
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct {
+		name, form string
+		// reaches is whether npm 11.20.0 sends the request: the answer this
+		// case was written against, which a different npm must still give.
+		reaches bool
+		want    TrustState
+	}{
+		{name: "scheme, slashes, host", form: "SCHEME://HOST/npm/", reaches: true, want: TrustVerified},
+		{name: "no scheme", form: "//HOST/npm/", want: TrustUnchecked},
+		{name: "a bare host", form: "HOST/npm/", want: TrustUnchecked},
+		{name: "another scheme", form: "ftp://HOST/npm/", want: TrustUnchecked},
+		{name: "no slashes after the scheme", form: "SCHEME:HOST/npm/", reaches: true, want: TrustUnchecked},
+		{name: "three slashes", form: "SCHEME:///HOST/npm/", reaches: true, want: TrustUnchecked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			native := strings.NewReplacer("SCHEME", "http", "HOST", strings.TrimPrefix(srv.URL, "http://")).Replace(tc.form)
+			writeTrustFile(t, filepath.Join(dir, ".npmrc"), "registry="+native+"\nfetch-retries=0\n")
+			hits.Store(0)
+			cmd := exec.Command("npm", "view", "bodega-audit-absent", "version")
+			cmd.Dir = dir
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "npm_config_globalconfig=" + filepath.Join(dir, "none"), "npm_config_cache=" + filepath.Join(dir, "cache"), "npm_config_update_notifier=false"}
+			out, _ := cmd.CombinedOutput()
+			reached := hits.Load() > 0
+			t.Logf("native npm, registry=%s: reached=%v: %s", native, reached, strings.Join(strings.Fields(string(out)), " "))
+
+			p, ca, base := auditTrust(t)
+			value := strings.NewReplacer("SCHEME", "https", "HOST", strings.TrimPrefix(base, "https://")).Replace(tc.form)
+			writeTrustFile(t, filepath.Join(p.Home, ".npmrc"), "registry="+value+"\ncafile="+ca+"\n")
+			v := auditState(t, p, "npm-config", base)
+			if v.State != tc.want {
+				t.Errorf("registry=%s: verdict = %+v; want state %d", value, v, tc.want)
+			}
+			if !reached && v.State == TrustVerified {
+				t.Errorf("registry=%s: npm sends this spelling nowhere and doctor calls it verified", value)
+			}
+			if reached && v.State == TrustAbsent {
+				t.Errorf("registry=%s: npm reaches the registry through this spelling and doctor sees no registry", value)
+			}
+			if reached != tc.reaches {
+				t.Errorf("registry=%s: native npm reached=%v; this case was written for %v", native, reached, tc.reaches)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: git normalizes the URL of every [http "<url>"] section, and
+// the URL it fetches, before it matches one against the other, and reads no
+// setting from a section whose URL does not normalize. Native git answers
+// for each pattern through --get-urlmatch.
+func TestAudit23GitURLNormalizesAsGit(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native git is required in CI")
+		}
+		t.Skip("native git is not installed")
+	}
+	const fetched = "https://bodega.internal:8443/git/gh/"
+	for _, pattern := range []string{
+		"https://bodega.internal:8443/",
+		"HTTPS://Bodega.Internal:8443/git/",
+		"https://bodega.internal:08443/",
+		"https://bodega.internal:8443/git/x/../gh/",
+		"https://bodega.internal:8443/git/./gh",
+		"https://bodega.internal:8443/git/%67h/",
+		"https://bodega.internal:8443/../",
+		"https://bodega.internal:8443/git/%zz/",
+		"https://bodega.internal:99999/",
+		"https://bodega.internal:8443x/",
+		"https://*.internal:8443/git/",
+		"https://bodega.internal/",
+		"bodega.internal:8443/",
+		"https://bodega.internal:8443/gi",
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "config")
+			writeTrustFile(t, file, "[http]\n\tsslCAInfo = /plain.pem\n[http \""+pattern+"\"]\n\tsslCAInfo = /scoped.pem\n")
+			cmd := exec.Command(git, "config", "--file", file, "--get-urlmatch", "http.sslCAInfo", fetched)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_NOSYSTEM=1"}
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("git config --get-urlmatch: %v", err)
+			}
+			want := strings.TrimSpace(string(out))
+			own, _ := clientconf.GitCAInfo([]string{file}, fetched, dir)
+			if own == nil || own.Value != want {
+				t.Errorf("[http %q]: doctor reads %+v for %s; git reads %s", pattern, own, fetched, want)
+			}
+		})
+	}
+
+	// A rewrite to a base git does not normalize: git refuses to match
+	// anything against it, and doctor cannot say where it leads.
+	for _, rewrite := range []string{"https://bodega.internal:8443/git/%zz/", "https://bodega.internal:99999/git/"} {
+		t.Run("rewrite to "+rewrite, func(t *testing.T) {
+			p, _, base := auditTrust(t)
+			config := filepath.Join(p.Home, ".gitconfig")
+			writeTrustFile(t, config, "[url \""+rewrite+"\"]\n\tinsteadOf = https://github.com/\n")
+			// The file is one git loads, so the refusal is about the URL.
+			list := exec.Command(git, "config", "--file", config, "--list")
+			list.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Root, "GIT_CONFIG_NOSYSTEM=1"}
+			if out, err := list.CombinedOutput(); err != nil {
+				t.Fatalf("native git does not load the fixture: %v: %s", err, out)
+			}
+			cmd := exec.Command(git, "config", "--file", config, "--get-urlmatch", "http.sslCAInfo", rewrite)
+			cmd.Env = list.Env
+			if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "invalid") {
+				t.Fatalf("native git normalized %s: %v: %s", rewrite, err, out)
+			}
+			if v := auditState(t, p, "git-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "normalize") {
+				t.Errorf("verdict = %+v; want unchecked naming the rewrite git does not normalize", v)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: helm builds a client for every repository before it fetches
+// from any, and stops on a url with no getter (NewChartRepository).
+func TestAudit23HelmRepositoryURLAsHelmChecksIt(t *testing.T) {
+	for _, tc := range []struct {
+		name, other string
+		want        TrustState
+	}{
+		{name: "every entry has a getter", other: "https://charts.example/", want: TrustVerified},
+		{name: "an entry in a scheme helm has no getter for", other: "ftp://charts.example/", want: TrustUnchecked},
+		{name: "an entry with no scheme", other: "charts.example/stable", want: TrustUnchecked},
+		{name: "an entry net/url does not parse", other: "https://charts.example/%zz", want: TrustUnchecked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, base := auditTrust(t)
+			writeTrustFile(t, filepath.Join(p.Home, ".config/helm/repositories.yaml"),
+				"apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: "+base+"/helm\n- name: other\n  url: "+tc.other+"\n")
+			if v := auditState(t, p, "helm-repos", base); v.State != tc.want {
+				t.Errorf("selected verdict = %+v; want state %d", v, tc.want)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: dockerd and containerd load the certificate files a registry's
+// configuration names before they send it a request, and send nothing while
+// one does not load (loadTLSConfig, updateTLSConfigFromHost).
+func TestAudit23OCICertificateFilesLoadAsTheRuntimeLoadsThem(t *testing.T) {
+	for _, tc := range []struct {
+		name, check string
+		files       map[string]string
+		want        TrustState
+		names       string
+	}{
+		{name: "docker with a ca.crt alone", check: "oci-docker", files: map[string]string{
+			"etc/docker/daemon.json":         `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/certs.d/HOST/ca.crt": "PEM",
+		}, want: TrustVerified},
+		{name: "docker with a client certificate and no key", check: "oci-docker", files: map[string]string{
+			"etc/docker/daemon.json":              `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/certs.d/HOST/ca.crt":      "PEM",
+			"etc/docker/certs.d/HOST/client.cert": "PEM",
+		}, want: TrustUnchecked, names: "missing key client.key"},
+		{name: "docker with a key and no client certificate", check: "oci-docker", files: map[string]string{
+			"etc/docker/daemon.json":             `{"registry-mirrors":["BASE"]}`,
+			"etc/docker/certs.d/HOST/client.key": "x",
+		}, want: TrustUnchecked, names: "missing client certificate client.cert"},
+		{name: "containerd with a ca that loads", check: "oci-containerd", files: map[string]string{
+			"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n[host.\"BASE\"]\n  ca = \"CA\"\n",
+		}, want: TrustVerified},
+		{name: "containerd with a ca that is not there", check: "oci-containerd", files: map[string]string{
+			"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n[host.\"BASE\"]\n  ca = \"/missing/ca.pem\"\n",
+		}, want: TrustUnchecked, names: "unable to read CA cert"},
+		{name: "containerd with a ca holding no certificate, on another host of the file", check: "oci-containerd", files: map[string]string{
+			"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n[host.\"BASE\"]\n  ca = \"CA\"\n[host.\"https://mirror.example\"]\n  ca = \"EMPTY\"\n",
+		}, want: TrustUnchecked, names: "unable to load CA cert"},
+		{name: "containerd with a client pair that does not load", check: "oci-containerd", files: map[string]string{
+			"etc/containerd/certs.d/docker.io/hosts.toml": "server = \"https://registry-1.docker.io\"\n[host.\"BASE\"]\n  ca = \"CA\"\n  client = [[\"CA\", \"EMPTY\"]]\n",
+		}, want: TrustUnchecked, names: "failed to load X509 key pair"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			data, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			empty := filepath.Join(p.Root, "empty.pem")
+			writeTrustFile(t, empty, "not a certificate\n")
+			r := strings.NewReplacer("BASE", base, "HOST", strings.TrimPrefix(base, "https://"), "PEM", string(data), "CA", ca, "EMPTY", empty)
+			for name, body := range tc.files {
+				writeTrustFile(t, filepath.Join(p.Root, r.Replace(name)), r.Replace(body))
+			}
+			if v := auditState(t, p, tc.check, base); v.State != tc.want || !strings.Contains(v.Detail, tc.names) {
+				t.Errorf("selected verdict = %+v; want state %d naming %q", v, tc.want, tc.names)
+			}
+		})
 	}
 }

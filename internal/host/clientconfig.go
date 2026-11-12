@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -783,7 +782,7 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 
 	set := effectiveGoproxy(getenv, configDir)
 	val, source := set.val, set.source
-	reached := reachableProxies(val)
+	reached := set.reached
 	public, direct := "", false
 	for _, entry := range reached {
 		switch {
@@ -795,6 +794,12 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 	}
 
 	switch {
+	case set.err != nil:
+		// The value is left out of the row: it is the one thing here that
+		// can hold a password, and the error names the entry redacted.
+		f.Status = StatusWarn
+		f.Detail = fmt.Sprintf("the go command refuses the GOPROXY list from %s (%v); it checks every entry before it asks the first proxy, so no module downloads through any of them and what the list reaches is unchecked", source, set.err)
+		f.Remediation = "correct or remove the entry the error names, or go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
 	case !set.found:
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to proxy.golang.org,direct which bypasses bodega"
@@ -822,150 +827,21 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 	return f
 }
 
-// goSetting is the value the go command runs with for one configuration key.
-// found is false when nothing sets it. source names the environment or the
-// file that set it, and dist says that file is GOROOT/go.env, the defaults a
-// Go distribution ships, which `go env -w` overrides.
+// goSetting is clientconf.GoProxyPolicy under the names this package's rows
+// read it by.
 type goSetting struct {
 	val, source string
 	found, dist bool
+	// reached and err are clientconf.GoProxyList's answer for val.
+	reached []string
+	err     error
 }
 
-// effectiveGoproxy resolves GOPROXY as go1.27.4's cmd/go/internal/cfg does
-// (Getenv, EnvFile, initEnvCache, readEnvFile): a non-empty value in the
-// environment, else the user's go env file when it assigns the key, an empty
-// assignment included, else GOROOT/go.env. A file that is absent or does not
-// read sets nothing, GOENV=off and a missing user configuration directory
-// mean no user file, and none of those stops the go command reading
-// GOROOT/go.env.
+// effectiveGoproxy resolves GOPROXY, and what the go command makes of the
+// list, through clientconf.GoEnv: the one policy the CA install reads too.
 func effectiveGoproxy(getenv func(string) string, configDir func() (string, error)) goSetting {
-	const key = "GOPROXY"
-	if val := getenv(key); val != "" {
-		return goSetting{val: val, source: "the environment", found: true}
-	}
-	file := goEnvFile(getenv, configDir)
-	user := readGoEnvFile(file)
-	if val, ok := user[key]; ok {
-		return goSetting{val: val, source: file, found: true}
-	}
-	if goroot := findGoroot(user["GOROOT"], getenv); goroot != "" {
-		dist := filepath.Join(goroot, "go.env")
-		if val, ok := readGoEnvFile(dist)[key]; ok {
-			return goSetting{val: val, source: dist, found: true, dist: true}
-		}
-	}
-	return goSetting{source: "the environment"}
-}
-
-// reachableProxies returns the GOPROXY entries the go command can reach, in
-// order, walking the list as cmd/go/internal/modfetch does: entries separated
-// by ',' or '|', each trimmed, empties skipped, and the walk ending at "off" or
-// "direct" inclusive, since nothing after either is ever consulted, and an
-// entry with no scheme that is not a single word or a file path read as
-// https. The
-// separator only decides which errors fall through, and a fall-through to
-// direct or proxy.golang.org bypasses bodega either way.
-func reachableProxies(val string) []string {
-	var reached []string
-	for _, entry := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == '|' }) {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		if strings.ContainsAny(entry, ".:/") && !strings.Contains(entry, ":/") && !filepath.IsAbs(entry) && !path.IsAbs(entry) {
-			entry = "https://" + entry
-		}
-		reached = append(reached, entry)
-		if entry == "off" || entry == "direct" {
-			break
-		}
-	}
-	return reached
-}
-
-// goEnvFile is cfg.EnvFile: $GOENV, or go/env under the user configuration
-// directory. "" is no file: GOENV=off, or no such directory.
-func goEnvFile(getenv func(string) string, configDir func() (string, error)) string {
-	switch file := getenv("GOENV"); file {
-	case "off":
-		return ""
-	case "":
-	default:
-		return file
-	}
-	dir, err := configDir()
-	if err != nil || dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "go", "env")
-}
-
-// readGoEnvFile is cfg.readEnvFile: KEY=VALUE lines, untrimmed, the last
-// assignment winning, a line with no '=' or not opening with an uppercase
-// letter skipped. A file that does not read holds nothing, which is what the
-// go command makes of it.
-func readGoEnvFile(path string) map[string]string {
-	out := map[string]string{}
-	if path == "" {
-		return out
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return out
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		k, v, ok := strings.Cut(line, "=")
-		if !ok || line[0] < 'A' || line[0] > 'Z' {
-			continue
-		}
-		out[k] = v
-	}
-	return out
-}
-
-// findGoroot is cfg.findGOROOT for a caller that is not the go command: the
-// GOROOT the user's go env file sets, else the environment's, else the tree
-// around the go on PATH, tried as cmd/go tries its own executable: two and
-// three directories up, as PATH names it and then with its symlinks resolved.
-// The go command is located, never run. "" is no go, or one whose GOROOT its
-// path does not show.
-func findGoroot(fromUserFile string, getenv func(string) string) string {
-	env := fromUserFile
-	if env == "" {
-		env = getenv("GOROOT")
-	}
-	if env != "" {
-		return filepath.Clean(env)
-	}
-	// around is the GOROOT holding exe in its bin directory, which cmd/go
-	// knows by the pkg/tool beside it.
-	around := func(exe string) string {
-		for _, up := range []string{"../..", "../../.."} {
-			root := filepath.Join(exe, up)
-			if info, err := os.Stat(filepath.Join(root, "pkg", "tool")); err == nil && info.IsDir() {
-				return root
-			}
-		}
-		return ""
-	}
-	for _, dir := range filepath.SplitList(getenv("PATH")) {
-		exe := filepath.Join(dir, "go")
-		if info, err := os.Stat(exe); err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
-			continue
-		}
-		exe, err := filepath.Abs(exe)
-		if err != nil {
-			return ""
-		}
-		if root := around(exe); root != "" {
-			return root
-		}
-		if exe, err = filepath.EvalSymlinks(exe); err != nil {
-			return ""
-		}
-		return around(exe)
-	}
-	return ""
+	p := clientconf.GoEnv{Getenv: getenv, ConfigDir: configDir}.Proxy()
+	return goSetting{val: p.Value, source: p.Source, found: p.Found, dist: p.Dist, reached: p.Proxies, err: p.Err}
 }
 
 // scanHit records the first config file that contains a public-upstream

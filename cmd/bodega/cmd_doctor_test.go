@@ -3098,3 +3098,50 @@ func TestAudit21AptApplyRefusesUnloadablePolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit22GomodInvalidProxyRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	srv, caPEM, _ := caPlanServer(t)
+	t.Setenv("GOPROXY", srv.URL+"/go,broken")
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0644)
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	for _, phase := range []string{"first apply", "second apply"} {
+		out, err := runDoctor(t, "--configure", "gomod", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(err.Error(), "GOPROXY") {
+			t.Errorf("%s accepted unusable GOPROXY: err=%v\n%s", phase, err, out)
+		}
+		for _, file := range []string{anchor, filepath.Join(home, ".config/go/env")} {
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Errorf("%s wrote %s: %v", phase, file, err)
+			}
+		}
+		if ran != 0 {
+			t.Errorf("%s ran %d rebuild(s) before rejecting unusable GOPROXY", phase, ran)
+		}
+	}
+}

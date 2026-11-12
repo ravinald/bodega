@@ -10,9 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -146,14 +146,19 @@ func namesHost(raw, host string) bool {
 // is at bodega's host. The list is the effective GOPROXY, resolved as the
 // goproxy-env row resolves it: a non-empty value in the environment hides
 // the go env file, so a file naming bodega under an environment that names
-// another proxy configures nothing.
+// another proxy configures nothing. A list the go command refuses reaches
+// nothing, bodega included, whatever its first entry names: the row keeps its
+// obligation and is left unchecked.
 func goStores(t TrustProbe, u *url.URL) []trustStore {
 	configDir := t.ConfigDir
 	if configDir == nil {
 		configDir = func() (string, error) { return "", errors.New("no user config directory") }
 	}
-	val := effectiveGoproxy(t.env, configDir).val
-	if !slices.ContainsFunc(reachableProxies(val), func(entry string) bool { return namesHost(entry, u.Host) }) {
+	set := effectiveGoproxy(t.env, configDir)
+	if set.err != nil {
+		return []trustStore{{name: "the go command's GOPROXY", blind: fmt.Sprintf("the go command refuses the GOPROXY list from %s (%v) before it asks any proxy, so whether go reaches bodega or verifies its certificate is unchecked", set.source, set.err)}}
+	}
+	if !slices.ContainsFunc(set.reached, func(entry string) bool { return namesHost(entry, u.Host) }) {
 		return nil
 	}
 	return []trustStore{{name: systemStoreName, system: true}}
@@ -185,10 +190,15 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return mirrorIsBodega(m, u.Host) }):
 		return nil
 	}
-	return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
+	dir := filepath.Join(t.Root, "/etc/docker/certs.d", u.Host)
+	if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
+		return []trustStore{{name: dir, blind: fmt.Sprintf("dockerd does not load the certificates in %s (%v) and sends that host nothing while it cannot, so whether dockerd verifies bodega's certificate is unchecked", dir, err)}}
+	}
+	return []trustStore{certsDir(dir)}
 }
 
-// aptStores is the store apt verifies bodega at u against: the file the
+// aptStores is the store apt verifies bodega at u against, for a host one of
+// whose enabled sources names bodega's host and port: the file the
 // effective Acquire::https::CAInfo names, which apt reads in place of the
 // system trust store, and the system store with none set. The option scoped
 // to bodega's own host outranks the unscoped one, and one scoped to another
@@ -196,7 +206,26 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 // a file apt refuses, over any statement, stops every apt command, so the
 // options it holds are settings nothing runs with and apt is left unchecked.
 func aptStores(t TrustProbe, u *url.URL) []trustStore {
-	if !t.filesMention(u.Host, "/etc/apt/sources.list", "/etc/apt/sources.list.d/*") {
+	// The sources apt loads, read whole as apt reads them: an entry apt
+	// refuses in any file leaves it reading none, so no source is one apt
+	// fetches from and what the lists name says nothing about bodega.
+	entries, err := clientconf.LoadAptSources(t.Root)
+	if err != nil {
+		return []trustStore{{name: "apt's sources", blind: fmt.Sprintf("apt does not read its sources (%v) and fails every command that needs them, so whether apt reaches bodega or verifies its certificate is unchecked", err)}}
+	}
+	wantPort := 443
+	if p, err := strconv.Atoi(u.Port()); err == nil {
+		wantPort = p
+	}
+	if !slices.ContainsFunc(entries, func(e clientconf.AptSourceEntry) bool {
+		return slices.ContainsFunc(e.URIs, func(uri string) bool {
+			access, host, port := clientconf.AptURIHost(uri)
+			if port == 0 {
+				port = map[string]int{"https": 443, "http": 80}[access]
+			}
+			return strings.EqualFold(host, u.Hostname()) && port == wantPort
+		})
+	}) {
 		return nil
 	}
 	conf, err := clientconf.LoadAptConfig(t.Root, t.Getenv)
@@ -326,6 +355,15 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		cert = [2]string{v, "the environment's PIP_CERT"}
 	}
 	if cert[0] != "" {
+		home := ""
+		if t.Home != "" {
+			home = t.home()
+		}
+		path, sure := clientconf.PipCertPath(cert[0], home)
+		if !sure {
+			return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip's cert setting in %s names %s, which pip resolves against another account's home directory or the directory it is started in, neither of which doctor knows, so which bundle pip verifies bodega against is unchecked", cert[1], cert[0])}}
+		}
+		cert[0] = path
 		return []trustStore{{name: fmt.Sprintf("%s, which pip's cert setting names in %s in place of the system trust store,", cert[0], cert[1]), files: []string{cert[0]}}}
 	}
 	system := trustStore{name: systemStoreName + ", which pip reads while no cert setting names a bundle,", system: true}
@@ -374,7 +412,8 @@ func sameHost(raw string, u *url.URL) bool {
 // pipStores selects follows the same order, so the endpoint and the CA judged
 // together are the pair one pip install uses. A file that names bodega only
 // in a comment, in an option a later file replaces, or under [global] while
-// [install] sets its own index, configures nothing.
+// [install] sets its own index, configures nothing. Neither does a location
+// pip ignores or sends no TLS request to, which clientconf.PipIndexURL tells.
 func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 	merged := map[string]string{}
 	for _, f := range files {
@@ -394,7 +433,7 @@ func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 		if v == "" {
 			v = merged["global."+option]
 		}
-		if slices.ContainsFunc(strings.Fields(v), func(one string) bool { return sameHost(one, u) }) {
+		if slices.ContainsFunc(strings.Fields(v), func(one string) bool { return clientconf.PipIndexURL(one) != nil && sameHost(one, u) }) {
 			return true
 		}
 	}
@@ -465,46 +504,6 @@ func npmFileLayer(path string) npmLayer {
 	return l
 }
 
-var npmEnvRef = regexp.MustCompile(`\$\{([^}]+)\}`)
-
-// npmRegistries lists the registries npm fetches from as its effective
-// configuration names them: the default registry, which the environment's
-// npm_config_registry (NPM_CONFIG_REGISTRY is the same option) gives ahead of
-// every npmrc and the last npmrc to set it gives otherwise, and each scope's
-// own registry. A registry named only in an
-// npmrc the environment outranks is not one npm asks. Scoped registries set
-// through the environment are not read: a variable of unknown name cannot be
-// asked for.
-func npmRegistries(t TrustProbe, files []string) []string {
-	def := ""
-	scoped := map[string]string{}
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		for _, o := range clientconf.NpmOptions(data) {
-			v := npmEnvRef.ReplaceAllStringFunc(o.Value, func(ref string) string { return t.env(ref[2 : len(ref)-1]) })
-			switch {
-			case o.Key == "registry":
-				def = v
-			case strings.HasSuffix(o.Key, ":registry"):
-				scoped[o.Key] = v
-			}
-		}
-	}
-	out := []string{def}
-	// One option under either spelling. npmStores leaves npm unchecked ahead
-	// of this where the two disagree.
-	if v, _ := clientconf.NpmEnv(t.Getenv, "registry"); v != "" {
-		out = []string{v}
-	}
-	for _, v := range scoped {
-		out = append(out, v)
-	}
-	return out
-}
-
 // npmStores resolves the CAs npm verifies its registry against. npm keeps
 // one CA list: each source that sets ca replaces it, and each source whose
 // cafile names a file npm can read replaces it with that file's certificates,
@@ -545,7 +544,13 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 			return blind(line)
 		}
 	}
-	if !slices.ContainsFunc(npmRegistries(t, files), func(r string) bool { return sameHost(r, u) }) {
+	// A registry npm refuses at the request, or sends somewhere this probe
+	// does not work out, is no evidence that bodega is not the registry.
+	regs := clientconf.NpmRegistries(t.Getenv, files)
+	if unread := clientconf.NpmRegistryUnread(regs); unread != "" {
+		return blind(unread)
+	}
+	if !slices.ContainsFunc(regs, func(r clientconf.NpmRegistry) bool { return sameHost(r.Value, u) }) {
 		return nil
 	}
 	var layers []npmLayer
@@ -638,6 +643,15 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	if bad := clientconf.GitLoadError(files); bad != "" {
 		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git refuses to load %s and aborts every command that reads it, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
 	}
+	// A rewrite to a base git does not normalize is no evidence that git is
+	// not sent to bodega, and no URL-scoped setting applies to it.
+	if unread := clientconf.GitRewriteUnread(files); unread != "" {
+		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git rewrites URLs to %s, so whether git reaches bodega through it and which http.sslCAInfo it would verify bodega against is unchecked", unread)}}
+	}
+	wantPort := u.Port()
+	if wantPort == "443" {
+		wantPort = ""
+	}
 	var prefixes []string
 	for _, f := range files {
 		data, err := os.ReadFile(f)
@@ -648,7 +662,10 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 			if e.Section != "url" || e.Name != "insteadof" && e.Name != "pushinsteadof" {
 				continue
 			}
-			if p, err := url.Parse(e.Subsection); err == nil && p.Host == u.Host && !slices.Contains(prefixes, e.Subsection) {
+			// The base as git normalizes it, which is the URL it matches
+			// [http "<url>"] sections against and the host curl is handed.
+			host, port, ok := clientconf.GitURLHost(e.Subsection)
+			if ok && host == strings.ToLower(u.Hostname()) && port == wantPort && !slices.Contains(prefixes, e.Subsection) {
 				prefixes = append(prefixes, e.Subsection)
 			}
 		}
@@ -774,6 +791,12 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		if doc == nil {
 			continue
 		}
+		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return mirrorIsBodega(h.Key, u.Host) }) {
+			continue
+		}
+		if err := doc.TLSError(""); err != nil {
+			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether containerd reaches bodega or verifies its certificate is unchecked", path, err)}}
+		}
 		for _, h := range doc.Hosts {
 			if mirrorIsBodega(h.Key, u.Host) {
 				out = append(out, trustStore{name: "the ca of " + path, system: true, files: h.CA})
@@ -782,29 +805,6 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
-}
-
-// filesMention reports whether a file matching one of the patterns, each
-// under Root, names host.
-func (t TrustProbe) filesMention(host string, patterns ...string) bool {
-	for _, p := range patterns {
-		files, _ := filepath.Glob(filepath.Join(t.Root, p))
-		if mention(host, files...) {
-			return true
-		}
-	}
-	return false
-}
-
-// mention reports whether any of the files names host. A file that will not
-// read names nothing: the row above this probe already reported on it.
-func mention(host string, files ...string) bool {
-	for _, f := range files {
-		if data, err := os.ReadFile(f); err == nil && strings.Contains(string(data), host) {
-			return true
-		}
-	}
-	return false
 }
 
 // TrustState is what a probe could establish about one client.
