@@ -5,11 +5,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -160,6 +162,67 @@ func TestAttestation_S3URIResolvesByBucket(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "the-envelope" {
 		t.Errorf("served %q, want the copy in the bucket the URI names", string(body))
+	}
+}
+
+// TestAttestation_S3URIResolvesByBucketOnAnEndpointStore: a store reached
+// through an endpoint carries that endpoint in its label, and the URI has
+// nowhere to name one. The bucket still has to find it, or every envelope on
+// a compatible store is read from the type rule's backend instead.
+func TestAttestation_S3URIResolvesByBucketOnAnEndpointStore(t *testing.T) {
+	compatible := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/attest-bucket/cold/attest/sample.dsse.json" {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+			return
+		}
+		_, _ = io.WriteString(w, "the-envelope")
+	}))
+	t.Cleanup(compatible.Close)
+
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	archive, err := storage.NewFromSpec(context.Background(), storage.Spec{
+		Driver: "s3", Bucket: "attest-bucket", Region: "us-ord", Prefix: "cold",
+		Endpoint: compatible.URL, PathStyle: true, Checksums: bos3.ChecksumsWhenRequired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(archive.Label(), "s3://") {
+		t.Fatalf("Label = %q; the endpoint store no longer carries its endpoint, so this test proves nothing", archive.Label())
+	}
+	def := bucketStore{Memory: memStore(map[string]string{
+		"cold/attest/sample.dsse.json": "wrong-backend",
+	}), label: "s3://test-bucket"}
+
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(context.Background(), manifest.TypeNpm, "sample", manifest.VersionEntry{
+		Version: "1.0.0",
+		Metadata: map[string]string{
+			server.MetaAttestationURI: "s3://attest-bucket/cold/attest/sample.dsse.json",
+		},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	cfg := &config.Config{Bucket: "test-bucket", ManifestDir: "manifests", AptCodename: "noble"}
+	srv := server.New(cfg, store, attestationResolver{def: def, archive: archive}, ":0", nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/v1/packages/npm/sample/1.0.0/attestation")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "the-envelope" {
+		t.Errorf("status %d, served %q; want 200 and the copy on the store whose bucket the URI names", resp.StatusCode, string(body))
 	}
 }
 

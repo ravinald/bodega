@@ -274,7 +274,12 @@ func (s *Server) attestationStore(typ, bucket, key string) (storage.ObjectStore,
 	}
 	want := "s3://" + bucket
 	for _, ns := range s.stores.All() {
-		label := ns.Store.Label()
+		// An s3:// URI names a bucket and no endpoint, and Label carries the
+		// endpoint of a store that has one.
+		label, isS3 := storage.S3BucketLabel(ns.Store)
+		if !isS3 {
+			label = ns.Store.Label()
+		}
 		if label == want {
 			return ns.Store, key, ns.Name
 		}

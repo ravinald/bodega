@@ -176,8 +176,13 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"audit_sink_dsn": "/var/log/bodega/audit.jsonl",
 		"apt_suites":     []string{"value-apt_codename", "apt_suites-one"},
 		"storage_backends": map[string]config.StorageSpec{
-			"bulk": {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
+			"bulk":   {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
+			"linode": {Driver: "s3", Bucket: "b", Region: "us-ord", Endpoint: "https://us-ord-1.linodeobjects.com", PathStyle: true, Checksums: "when_required"},
 		},
+		// Load validates both: a URL, and one of two values. when_required
+		// is the one that is not the SDK's default.
+		"endpoint":         "https://s3.example.net",
+		"checksums":        "when_required",
 		"storage_by_type":  map[string]string{"apt": "bulk"},
 		"storage_by_group": map[string]string{"mirror-set": "bulk"},
 		// Load parses each value as a duration.

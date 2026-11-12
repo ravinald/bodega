@@ -13,10 +13,11 @@ import (
 // S3Target is the one s3 backend an init action acts on. Region is as
 // configured and may be empty; DialS3Target reports the one the SDK resolves.
 type S3Target struct {
-	Name   string
-	Bucket string
-	Region string
-	Prefix string
+	Name    string
+	Bucket  string
+	Region  string
+	Prefix  string
+	Options bos3.Options
 }
 
 // S3TargetNames lists the backends an init action can reach: the default when
@@ -52,7 +53,7 @@ func ResolveS3Target(cfg *config.Config, name string) (S3Target, error) {
 		sort.Strings(names[1:])
 		return S3Target{}, fmt.Errorf("unknown storage backend %q (configured: %s)", name, strings.Join(names, ", "))
 	}
-	t := S3Target{Name: name, Bucket: spec.Bucket, Region: spec.Region, Prefix: spec.Prefix}
+	t := S3Target{Name: name, Bucket: spec.Bucket, Region: spec.Region, Prefix: spec.Prefix, Options: spec.S3Options()}
 	driver := spec.Driver
 	if driver == "" {
 		driver = "local"
@@ -70,9 +71,10 @@ func ResolveS3Target(cfg *config.Config, name string) (S3Target, error) {
 	return t, nil
 }
 
-// S3Dialer builds a client for a bucket and a configured region, which may be
-// empty. bos3.NewClient is the one every caller outside a test passes.
-type S3Dialer func(ctx context.Context, bucket, region string) (*bos3.Client, error)
+// S3Dialer builds a client for a bucket, a configured region, which may be
+// empty, and the backend's endpoint settings. bos3.NewClient is the one every
+// caller outside a test passes.
+type S3Dialer func(ctx context.Context, bucket, region string, opts bos3.Options) (*bos3.Client, error)
 
 // DialS3Target builds the client the service would build for t, through the
 // same bos3.NewClient call, so an entry with no region resolves through the
@@ -84,7 +86,7 @@ func DialS3Target(ctx context.Context, t S3Target) (*bos3.Client, error) {
 // DialS3TargetWith is DialS3Target through dial. It refuses when the resolved
 // region is empty, because every call would fail, in the service as well.
 func DialS3TargetWith(ctx context.Context, t S3Target, dial S3Dialer) (*bos3.Client, error) {
-	client, err := dial(ctx, t.Bucket, t.Region)
+	client, err := dial(ctx, t.Bucket, t.Region, t.Options)
 	if err != nil {
 		return nil, fmt.Errorf("storage backend %q: %w", t.Name, err)
 	}

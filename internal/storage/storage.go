@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // ObjectStore is the unified interface for all object storage operations.
@@ -180,6 +181,16 @@ type Spec struct {
 	Bucket string // s3
 	Region string // s3
 	Prefix string // key prefix within the backend
+
+	// s3, for a store that is not AWS; see bos3.Options.
+	Endpoint  string
+	PathStyle bool
+	Checksums string
+}
+
+// S3Options is the part of s the s3 driver hands to bos3.NewClient.
+func (s Spec) S3Options() bos3.Options {
+	return bos3.Options{Endpoint: s.Endpoint, PathStyle: s.PathStyle, Checksums: s.Checksums}
 }
 
 // Constructor creates an ObjectStore from one backend's Spec.
@@ -331,13 +342,19 @@ func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPref
 // names: selectForMove's same-location refusal could not fire and
 // --delete-source removed the only copy (#189).
 //
-// Cleaning here is safe only because config.validateStorage refuses those
-// spellings at admission. s3 does not clean keys, so "cold//x/k" and
-// "cold/x/k" are two distinct objects in one bucket, and a cleaned label over
-// an s3 inner would claim an identity the bucket does not have.
+// Cleaning is for the local backend. s3 does not clean keys, so "cold//x/k"
+// and "cold/x/k" are two distinct objects in one bucket, and a prefix over an
+// s3 store is part of that store's location instead (see s3Location).
 func (p *prefixed) Label() string {
-	cleaned := strings.TrimPrefix(path.Clean("/"+p.prefix), "/")
-	base := strings.TrimSuffix(p.inner.Label(), "/")
+	if loc, ok := s3LocationOf(p); ok {
+		return loc.label()
+	}
+	return joinLabel(p.inner.Label(), p.prefix)
+}
+
+func joinLabel(base, prefix string) string {
+	cleaned := strings.TrimPrefix(path.Clean("/"+prefix), "/")
+	base = strings.TrimSuffix(base, "/")
 	if cleaned == "" {
 		return base
 	}
@@ -353,6 +370,10 @@ func SpecFromConfig(cfg *config.Config) Spec {
 		Path:   cfg.StoragePath,
 		Bucket: cfg.Bucket,
 		Region: cfg.Region,
+
+		Endpoint:  cfg.Endpoint,
+		PathStyle: cfg.PathStyle,
+		Checksums: cfg.Checksums,
 	}
 }
 
@@ -376,6 +397,10 @@ func SpecFor(cfg *config.Config, name string) (Spec, bool) {
 		Bucket: spec.Bucket,
 		Region: spec.Region,
 		Prefix: spec.Prefix,
+
+		Endpoint:  spec.Endpoint,
+		PathStyle: spec.PathStyle,
+		Checksums: spec.Checksums,
 	}, true
 }
 

@@ -336,7 +336,13 @@ func (r *Revetter) One(ctx context.Context, tg RevetTarget, trigger string) Reve
 	ev := newEvaluation(ctx, r.DB, &cp, r.now())
 	checkers := r.checkers()
 	ev.include(ctx, &cp, checkers)
-	allow := r.allowList(ctx, &out, &cp, cataloged, prev)
+	allow, err := r.allowList(ctx, &out, &cp, cataloged, prev)
+	if err != nil {
+		// Nothing is recorded and nothing is acted on: the last decision
+		// stands until the upstream can be ruled on.
+		out.Error = "allow-list not re-run: " + err.Error()
+		return out
+	}
 	if c, ok := ev.admitPast(&cp, 0, allow); ok {
 		allow = c
 	}
@@ -468,25 +474,30 @@ func (r *Revetter) previous(ctx context.Context, tg RevetTarget) ([]audit.Admiss
 // cached from, and refused if any of them is outside the list. Without that
 // the re-vet of such a version re-runs nothing, and a narrowed allow-list
 // never reaches what the cache already serves.
-func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifest.PackageManifest, cataloged bool, prev []audit.Admission) audit.AdmissionCheck {
+//
+// The error is an upstream that is on record and that no one store can be
+// credited with. Passing the version without it would admit bytes the list
+// was never asked about, so the re-vet stops undecided instead.
+func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifest.PackageManifest, cataloged bool, prev []audit.Admission) (audit.AdmissionCheck, error) {
 	if r.Allow == nil {
 		return audit.AdmissionCheck{Check: audit.CheckAllowList, Action: audit.ActionNone, Status: audit.CheckNotEvaluated,
-			Detail: "not run: no allow-list loaded"}
+			Detail: "not run: no allow-list loaded"}, nil
 	}
 	listed, _ := r.Allow.Listed(ctx, pm.Type)
 	ve := pm.Versions[0]
 	candidates := []string{policy.CandidateFor(pm.Type, pm.Name, ve.URL)}
+	var unresolved error
 	// A hosted entry was uploaded rather than fetched, so it has no upstream
 	// to rule on, as its admission recorded.
 	if candidates[0] == "" && !policy.KeysByName(pm.Type) && (!cataloged || ve.Mode != manifest.ModeHosted) {
 		var unknown []string
-		candidates, unknown = r.cacheOrigins(ctx, ve, cataloged, prev)
+		candidates, unknown, unresolved = r.cacheOrigins(ctx, ve, cataloged, prev)
 		for _, why := range unknown {
 			out.Notes = append(out.Notes, "allow-list not re-run: the upstream of the cached object is unknown: "+why)
 		}
 	}
 	if len(candidates) == 0 || candidates[0] == "" {
-		return AllowListCheck(listed, "", nil)
+		return AllowListCheck(listed, "", nil), unresolved
 	}
 	var check audit.AdmissionCheck
 	for i, c := range candidates {
@@ -495,10 +506,12 @@ func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifes
 			check = got
 		}
 		if got.Status == audit.CheckBlock {
-			break
+			// A refusal of an upstream that is known stands whatever the
+			// unattributed one turns out to be.
+			return check, nil
 		}
 	}
-	return check
+	return check, unresolved
 }
 
 // cacheOrigins returns the distinct upstreams recorded for the objects the
@@ -506,7 +519,11 @@ func (r *Revetter) allowList(ctx context.Context, out *RevetOutcome, pm *manifes
 // cannot be established, why not. An origin is read only against the
 // identity of the object at the key now, so bytes written over since by a
 // path that fetched nothing are not credited with the fill's upstream.
-func (r *Revetter) cacheOrigins(ctx context.Context, ve manifest.VersionEntry, cataloged bool, prev []audit.Admission) (origins, unknown []string) {
+//
+// A record that exists and cannot be attributed to one store is returned
+// apart from the unknowns. An unknown has no upstream on record to rule on;
+// this one has, and the allow-list was never asked about it.
+func (r *Revetter) cacheOrigins(ctx context.Context, ve manifest.VersionEntry, cataloged bool, prev []audit.Admission) (origins, unknown []string, ambiguous error) {
 	var keys []string
 	for _, p := range prev {
 		if p.ObjectKey != "" && !slices.Contains(keys, p.ObjectKey) {
@@ -514,14 +531,16 @@ func (r *Revetter) cacheOrigins(ctx context.Context, ve manifest.VersionEntry, c
 		}
 	}
 	if len(keys) == 0 {
-		return nil, []string{"no cached object of this version is on record"}
+		return nil, []string{"no cached object of this version is on record"}, nil
 	}
 	if r.Stores == nil {
-		return nil, []string{"no object store is open to identify the cached object"}
+		return nil, []string{"no object store is open to identify the cached object"}, nil
 	}
 	for _, k := range keys {
 		u, err := r.cacheOrigin(ctx, ve, cataloged, prev[0].PkgType, k)
 		switch {
+		case errors.Is(err, ErrOriginAmbiguous):
+			ambiguous = errors.Join(ambiguous, fmt.Errorf("%s: %w", k, err))
 		case err != nil:
 			unknown = append(unknown, k+": "+err.Error())
 		case u == "":
@@ -530,7 +549,7 @@ func (r *Revetter) cacheOrigins(ctx context.Context, ve manifest.VersionEntry, c
 			origins = append(origins, u)
 		}
 	}
-	return origins, unknown
+	return origins, unknown, ambiguous
 }
 
 func (r *Revetter) cacheOrigin(ctx context.Context, ve manifest.VersionEntry, cataloged bool, typ, key string) (string, error) {
@@ -546,7 +565,74 @@ func (r *Revetter) cacheOrigin(ctx context.Context, ve manifest.VersionEntry, ca
 		return "", errors.New("the object is no longer in the store")
 	}
 	_ = res.Body.Close()
-	return r.DB.CacheOrigin(ctx, key, StreamIdentity(store, res))
+	return CacheOrigin(ctx, r.DB, r.Stores, store, key, StreamIdentity(store, res))
+}
+
+// ErrOriginAmbiguous reports a recorded upstream that more than one
+// configured store could own. It is not the absence of a record: a caller
+// deciding on the upstream has no upstream to decide on and no grounds to
+// decide without one.
+var ErrOriginAmbiguous = errors.New("the recorded upstream cannot be attributed to one store")
+
+// CacheOrigin is the upstream recorded for the object id identifies at key in
+// store, or "" when none is. Every reader goes through it rather than through
+// the audit store, because it is what keeps a row written before an s3
+// store's identity carried its endpoint attached to its object.
+//
+// Such a row names the store as "s3://<bucket>", which is all a label said
+// then, whichever service the process reached. No current identity is
+// spelled that way (see StreamIdentity), so the spelling alone marks the
+// row, and it is never matched by text: not even for an AWS store, whose
+// label still reads the same, because the row may have been written while
+// AWS_ENDPOINT_URL_S3 pointed every s3 backend somewhere else. It is read as
+// this store's only when this is the one configured location that spelling
+// can mean: the process that wrote it had a single endpoint for every s3
+// backend, so one candidate today is that store. Two candidates are two
+// services holding a bucket of one name, and the row cannot say which it
+// described; a matching ETag says the bytes agree, not who fetched them.
+// That is ErrOriginAmbiguous rather than an empty answer, for every
+// candidate alike: crediting either store would hand one service's bytes the
+// other's origin.
+//
+// A row found this way is left as written. The next fill of the key replaces
+// it under the current identity.
+func CacheOrigin(ctx context.Context, db *audit.DB, stores storage.Resolver, store storage.ObjectStore, key string, id audit.ObjectIdentity) (string, error) {
+	origin, err := db.CacheOrigin(ctx, key, id)
+	if err != nil || origin != "" {
+		return origin, err
+	}
+	bucket, ok := storage.S3BucketLabel(store)
+	// An identity that is not this store's own is not widened to the old
+	// spelling of this store.
+	if !ok || id.Backend != storage.S3RecordLabel(store) {
+		return "", nil
+	}
+	old := id
+	old.Backend = bucket
+	origin, err = db.CacheOrigin(ctx, key, old)
+	if err != nil || origin == "" {
+		return "", err
+	}
+	if claimants := locationsSpelled(stores, bucket); len(claimants) > 1 {
+		return "", fmt.Errorf("%w: an upstream was recorded for %s before a store's endpoint was part of its identity, and %d configured stores now answer to that name (%s): refill the object to record which one holds it",
+			ErrOriginAmbiguous, bucket, len(claimants), strings.Join(claimants, ", "))
+	}
+	return origin, nil
+}
+
+// locationsSpelled returns the distinct locations among the configured
+// stores whose endpoint-less spelling is bucket.
+func locationsSpelled(stores storage.Resolver, bucket string) []string {
+	if stores == nil {
+		return nil
+	}
+	var labels []string
+	for _, ns := range stores.All() {
+		if got, ok := storage.S3BucketLabel(ns.Store); ok && got == bucket && !slices.Contains(labels, ns.Store.Label()) {
+			labels = append(labels, ns.Store.Label())
+		}
+	}
+	return labels
 }
 
 // objectStore is the backend an object of the version lives in: the one the
@@ -565,14 +651,16 @@ func (r *Revetter) objectStore(ve manifest.VersionEntry, cataloged bool, typ, ke
 // StreamIdentity is what the store said about the object an open handle is
 // on, in the form the audit store compares. A fill records its origin under
 // this identity and a re-vet reads it back under this identity, so the two
-// cannot drift apart. The zero value is what a caller with no metadata in
-// hand produces, and it matches no recorded origin.
+// cannot drift apart. The store is named by its record label, never by the
+// bare "s3://<bucket>" a row from before endpoints carries. The zero value is
+// what a caller with no metadata in hand produces, and it matches no
+// recorded origin.
 func StreamIdentity(store storage.ObjectStore, res *storage.StreamResult) audit.ObjectIdentity {
 	if store == nil || res == nil {
 		return audit.ObjectIdentity{}
 	}
 	obj := audit.ObjectIdentity{
-		Backend: store.Label(),
+		Backend: storage.S3RecordLabel(store),
 		Size:    res.ContentLength,
 		ETag:    res.ETag,
 	}

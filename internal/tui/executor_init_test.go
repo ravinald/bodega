@@ -21,7 +21,7 @@ import (
 const chainRegion = "eu-west-1"
 
 func fakeDial(dialed *[]string) storage.S3Dialer {
-	return func(_ context.Context, bucket, region string) (*bos3.Client, error) {
+	return func(_ context.Context, bucket, region string, _ bos3.Options) (*bos3.Client, error) {
 		*dialed = append(*dialed, bucket)
 		if region == "" {
 			region = chainRegion
@@ -33,7 +33,7 @@ func fakeDial(dialed *[]string) storage.S3Dialer {
 type initCall struct{ bucket, region string }
 
 func fakeInitBucket(calls *[]initCall) initBucketFunc {
-	return func(_ context.Context, _ bos3.BucketAPI, _ io.Writer, bucket, region string) error {
+	return func(_ context.Context, _ bos3.BucketAPI, _ io.Writer, bucket, region string, _ bool) error {
 		*calls = append(*calls, initCall{bucket, region})
 		return nil
 	}
@@ -51,11 +51,11 @@ func pressI(t *testing.T, m appModel) (appModel, tea.Cmd) {
 func TestInitRefusesLocalDefaultWithoutDialing(t *testing.T) {
 	cfg := &config.Config{Bucket: "stray", Region: "us-west-2"}
 	m := newAppModel(cfg, nil, nil, nil, nil)
-	m.dialS3 = func(context.Context, string, string) (*bos3.Client, error) {
+	m.dialS3 = func(context.Context, string, string, bos3.Options) (*bos3.Client, error) {
 		t.Fatal("I dialed AWS for a local-driver backend")
 		return nil, nil
 	}
-	m.initBucket = func(context.Context, bos3.BucketAPI, io.Writer, string, string) error {
+	m.initBucket = func(context.Context, bos3.BucketAPI, io.Writer, string, string, bool) error {
 		t.Fatal("I initialized a bucket for a local-driver backend")
 		return nil
 	}
@@ -192,7 +192,7 @@ func key(m appModel, k string) appModel {
 // blockingDial holds every dial until release is closed, so a test controls
 // when a resolution reaches the event loop relative to the keys around it.
 func blockingDial(started chan<- string, release <-chan struct{}) storage.S3Dialer {
-	return func(ctx context.Context, bucket, region string) (*bos3.Client, error) {
+	return func(ctx context.Context, bucket, region string, _ bos3.Options) (*bos3.Client, error) {
 		started <- bucket
 		select {
 		case <-release:
@@ -323,7 +323,7 @@ func TestStaleInitDoesNotRetarget(t *testing.T) {
 func TestInitDialFailureClosesThePendingPopup(t *testing.T) {
 	cfg := &config.Config{StorageBackend: "s3", Bucket: "main-bucket"}
 	m := newAppModel(cfg, nil, nil, nil, nil)
-	m.dialS3 = func(context.Context, string, string) (*bos3.Client, error) {
+	m.dialS3 = func(context.Context, string, string, bos3.Options) (*bos3.Client, error) {
 		return bos3.NewClientFromConfig(aws.Config{}, "main-bucket", ""), nil
 	}
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("I")})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 )
 
 // ObjectAPI is every SDK call a running bodega makes against its bucket, and
@@ -48,21 +50,79 @@ type Client struct {
 	region string
 }
 
+// The two values the checksums key takes, which are the SDK's own names for
+// them in AWS_REQUEST_CHECKSUM_CALCULATION.
+const (
+	ChecksumsWhenSupported = "when_supported"
+	ChecksumsWhenRequired  = "when_required"
+)
+
+// Options are the s3 driver's settings past bucket and region: what a store
+// that is not AWS needs. A zero field is not written to the client, so
+// whatever the SDK resolved for it from the environment or the shared config
+// (AWS_ENDPOINT_URL_S3, AWS_REQUEST_CHECKSUM_CALCULATION and the rest) stands.
+type Options struct {
+	// Endpoint is the store's base URL.
+	Endpoint string
+	// PathStyle addresses the bucket as <endpoint>/<bucket> rather than
+	// <bucket>.<endpoint>, for a store with no wildcard DNS.
+	PathStyle bool
+	// Checksums is ChecksumsWhenSupported, ChecksumsWhenRequired or empty. It
+	// governs both directions: the CRC32 the SDK adds to a request, which
+	// several compatible stores reject, and the validation of one on a
+	// response.
+	Checksums string
+}
+
+// ClientOptions renders o as SDK client options. It is the one place the
+// three settings meet the SDK, so the driver and the conformance suite
+// configure a client identically.
+func (o Options) ClientOptions() ([]func(*awss3.Options), error) {
+	var fns []func(*awss3.Options)
+	if o.Endpoint != "" {
+		fns = append(fns, func(so *awss3.Options) { so.BaseEndpoint = aws.String(o.Endpoint) })
+	}
+	if o.PathStyle {
+		fns = append(fns, func(so *awss3.Options) { so.UsePathStyle = true })
+	}
+	switch o.Checksums {
+	case "":
+	case ChecksumsWhenSupported:
+		fns = append(fns, func(so *awss3.Options) {
+			so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenSupported
+			so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenSupported
+		})
+	case ChecksumsWhenRequired:
+		fns = append(fns, func(so *awss3.Options) {
+			so.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			so.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		})
+	default:
+		return nil, fmt.Errorf("checksums %q is not a known value: use %q or %q",
+			o.Checksums, ChecksumsWhenSupported, ChecksumsWhenRequired)
+	}
+	return fns, nil
+}
+
 // NewClient creates an S3 Client using the default credential chain. An
 // empty region is left to that chain (AWS_REGION, AWS_DEFAULT_REGION, the
 // profile's region), and Region reports what it resolved to, which may still
 // be empty.
-func NewClient(ctx context.Context, bucket, region string) (*Client, error) {
+func NewClient(ctx context.Context, bucket, region string, opts Options) (*Client, error) {
+	optFns, err := opts.ClientOptions()
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return NewClientFromConfig(cfg, bucket, cfg.Region), nil
+	return NewClientFromConfig(cfg, bucket, cfg.Region, optFns...), nil
 }
 
 // NewClientFromConfig returns an S3 Client from a pre-built aws.Config.
-func NewClientFromConfig(cfg aws.Config, bucket, region string) *Client {
-	raw := awss3.NewFromConfig(cfg)
+func NewClientFromConfig(cfg aws.Config, bucket, region string, optFns ...func(*awss3.Options)) *Client {
+	raw := awss3.NewFromConfig(cfg, optFns...)
 	return &Client{
 		s3:     raw,
 		raw:    raw,
@@ -74,6 +134,109 @@ func NewClientFromConfig(cfg aws.Config, bucket, region string) *Client {
 // S3Client exposes the underlying SDK client for commands that need direct
 // access (e.g. InitBucket).
 func (c *Client) S3Client() *awss3.Client { return c.raw }
+
+// Route is where the pinned SDK sends a request for the client's bucket.
+type Route struct {
+	// URL carries the scheme, host and percent-decoded path the SDK resolved.
+	// A key is appended to that path.
+	URL url.URL
+	// Endpoint is the base URL handed to the client, by the endpoint key or by
+	// whatever the SDK read for it (AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, the
+	// profile), and "" when the SDK derives AWS's own host from the region.
+	Endpoint string
+}
+
+// Route asks the client's own request pipeline where a key in its bucket
+// goes. It starts a GetObject through the SDK client the driver uses and
+// stops it at endpoint resolution, so the answer comes from the parameters
+// the SDK binds for a real request: a "fips-us-west-2" region is already
+// "us-west-2" with FIPS selected, a dual-stack or FIPS setting read from the
+// environment is applied, and the rules have decoded the endpoint's path and
+// chosen between <bucket>.<host> and <host>/<bucket>. Resolving a copy of
+// some client settings by hand disagrees with the request wherever the SDK
+// infers one of the others. Endpoint is set even when it fails.
+//
+// Nothing is sent and no credential is read: the resolver is the first thing
+// the SDK consults, before it picks an auth scheme, and the stand-in
+// credentials and transport hold that if a later SDK reorders the stack.
+//
+// A client with no region is resolved as if it had one. Its requests fail
+// until the SDK's chain supplies a region, and which region is no part of
+// where an AWS bucket is: the answer would otherwise change with AWS_REGION.
+func (c *Client) Route(ctx context.Context) (Route, error) {
+	route := Route{Endpoint: c.Endpoint()}
+	raw := c.raw
+	if raw == nil {
+		raw = awss3.New(awss3.Options{Region: c.region})
+	}
+	capture := &routeCapture{}
+	_, err := raw.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String("key"),
+	}, func(o *awss3.Options) {
+		if o.Region == "" {
+			o.Region = "us-east-1"
+		}
+		capture.inner = o.EndpointResolverV2
+		o.EndpointResolverV2 = capture
+		o.Retryer = aws.NopRetryer{}
+		o.Credentials = aws.AnonymousCredentials{}
+		o.HTTPClient = noTransport{}
+	})
+	switch {
+	case capture.uri != nil:
+		route.URL = *capture.uri
+		return route, nil
+	case capture.err != nil:
+		return route, capture.err
+	case err != nil:
+		return route, fmt.Errorf("resolve route for bucket %q: %w", c.bucket, err)
+	}
+	return route, fmt.Errorf("resolve route for bucket %q: the SDK resolved no endpoint", c.bucket)
+}
+
+var errRouteCaptured = errors.New("route captured")
+
+// routeCapture records the first endpoint the SDK resolves for an operation
+// and fails the operation there.
+type routeCapture struct {
+	inner awss3.EndpointResolverV2
+	uri   *url.URL
+	err   error
+}
+
+func (r *routeCapture) ResolveEndpoint(ctx context.Context, params awss3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	if r.inner == nil {
+		r.err = errors.New("the client has no endpoint resolver")
+		return smithyendpoints.Endpoint{}, r.err
+	}
+	ep, err := r.inner.ResolveEndpoint(ctx, params)
+	if err != nil {
+		r.err = err
+		return ep, err
+	}
+	if r.uri == nil {
+		uri := ep.URI
+		r.uri = &uri
+	}
+	return ep, errRouteCaptured
+}
+
+type noTransport struct{}
+
+func (noTransport) Do(*http.Request) (*http.Response, error) {
+	return nil, errors.New("route resolution sends no request")
+}
+
+// Endpoint is the base URL the client dials, from the endpoint key or from
+// whatever the SDK read for it (AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, the
+// profile), and "" when the SDK derives AWS's own host from the region.
+func (c *Client) Endpoint() string {
+	if c.raw == nil {
+		return ""
+	}
+	return aws.ToString(c.raw.Options().BaseEndpoint)
+}
 
 // Bucket returns the configured bucket name.
 func (c *Client) Bucket() string { return c.bucket }
