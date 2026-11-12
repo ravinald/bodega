@@ -358,7 +358,9 @@ type ContainerdRegistry struct {
 	HasPlugin      bool
 	SetsConfigPath bool
 	// Invalid is what containerd's ValidateVersion refuses once every file
-	// has loaded, "" for nothing: containerd exits on it. It is a field
+	// has loaded, on which containerd exits, or what the CRI image plugin
+	// refuses in its own table, on which containerd runs without it; "" for
+	// nothing. Either way no hosts.toml is read. It is a field
 	// rather than an error so a caller can still say the CRI plugin is
 	// disabled, which is the more useful thing to tell whoever wrote
 	// disabled_plugins = ["cri"] under version = 2.
@@ -411,6 +413,14 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	if _, declared := doc["version"]; declared && r.Version > 1 {
 		if err := cfg.validatePluginURIs(); err != nil {
 			r.Invalid = err.Error()
+		}
+	}
+	// Only a version 3 file holds the image plugin's table as that plugin
+	// decodes it. An older one is migrated first, which doctor does not
+	// follow.
+	if r.Version == 3 && r.Invalid == "" {
+		if err := containerdImagePluginError(data); err != nil {
+			r.Invalid = "the CRI image plugin, which reads the registry configuration, does not start on its table: " + err.Error()
 		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to

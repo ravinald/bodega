@@ -808,10 +808,6 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to " + val + " (from " + source + "), which bypasses bodega"
 		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
-	case len(reached) == 0:
-		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + strconv.Quote(val) + " (from " + source + ") lists no proxy; the go command refuses every module download"
-		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
 	case public != "":
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY=" + val + " (from " + source + ") reaches " + public + " directly"

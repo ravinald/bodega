@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2929,5 +2930,719 @@ func TestAudit23EndpointRefusalsRedactPasswords(t *testing.T) {
 		if _, err := NpmRegistryURL(value); (err == nil) != read {
 			t.Errorf("NpmRegistryURL(%q) = %v; read should be %v", value, err, read)
 		}
+	}
+}
+
+func TestAudit24PipOptionTypeRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	target := filepath.Join(home, "etc/pip.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("[global]\nindex-url = https://pypi.org/simple/\ntimeout = abc\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, Pip(testBase)), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "timeout") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("CA plan accepted pip's invalid timeout: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+func TestAudit24GomodEmptyProxyListRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	in, err := AddCA(caPlan(t, home, Gomod(testBase)), ca, CAHost{
+		Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+		Getenv: func(key string) string {
+			if key == "GOPROXY" {
+				return ",|"
+			}
+			return ""
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "GOPROXY") || len(in.Changes) != 0 || len(in.Step) != 0 {
+		t.Errorf("empty proxy list accepted: err=%v changes=%d step=%v", err, len(in.Changes), in.Step)
+	}
+}
+
+// nativePip261 finds a python3 whose pip is the 26.2.1 PipInstallError
+// ports, or skips: another pip declares other options.
+func nativePip261(t *testing.T) string {
+	t.Helper()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("native pip oracle needs python3")
+	}
+	out, err := exec.Command(python, "-m", "pip", "--version").Output()
+	if err != nil || !strings.HasPrefix(string(out), "pip 26.2.1 ") {
+		t.Skipf("native pip oracle needs pip 26.2.1, found %q (%v)", strings.TrimSpace(string(out)), err)
+	}
+	return python
+}
+
+// TestPipInstallOptionsMatchNativePip compares the option table
+// PipInstallError converts by with the parser pip install builds.
+func TestPipInstallOptionsMatchNativePip(t *testing.T) {
+	python := nativePip261(t)
+	const dump = `
+from pip._internal.commands import create_command
+from pip._internal.cli.main_parser import create_main_parser
+general = {l for o in create_main_parser().option_list_all for l in o._long_opts}
+for o in create_command("install").parser.option_list_all:
+    for l in o._long_opts:
+        print(l[2:], o.action, o.type or "-", o.callback.__name__ if o.callback else "-", ",".join(o.choices or ()) or "-", int(l in general))
+`
+	cmd := exec.Command(python, "-I", "-c", dump)
+	cmd.Dir = t.TempDir()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("native pip: %v", err)
+	}
+	kind := func(action, typ, callback string) (pipKind, bool) {
+		switch {
+		case action == "store_true" || action == "store_false":
+			return pipBool, true
+		case action == "count":
+			return pipCount, true
+		case action == "callback":
+			k, ok := map[string]pipKind{
+				"_handle_no_cache_dir": pipNoCacheDir, "_handle_python_version": pipPythonVersion, "_handle_src": pipText,
+				"_handle_config_settings": pipConfigSettings, "_handle_dependency_group": pipGroup,
+				"_handle_all_releases": pipNoDash, "_handle_only_final": pipNoDash, "_handle_no_binary": pipNoDash,
+				"_handle_only_binary": pipNoDash, "_handle_refresh_package": pipNoDash, "_handle_uploaded_prior_to": pipUploadedPriorTo,
+			}[callback]
+			return k, ok && (typ == "string" || typ == "path" || typ == "-")
+		case action != "store" && action != "append" && action != "help":
+			return 0, false
+		}
+		k, ok := map[string]pipKind{"string": pipText, "path": pipText, "-": pipText, "int": pipInt, "float": pipFloat, "choice": pipChoice}[typ]
+		return k, ok
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != len(pipInstallOpts) {
+		t.Fatalf("native pip install declares %d long options, the table %d", len(lines), len(pipInstallOpts))
+	}
+	for i, l := range lines {
+		f := strings.Fields(l)
+		k, ok := kind(f[1], f[2], f[3])
+		if !ok {
+			t.Errorf("native option %q converts in a way the port does not model", l)
+			continue
+		}
+		want := pipOpt{name: f[0], kind: k, list: f[1] == "append", general: f[5] == "1"}
+		if f[4] != "-" {
+			want.choices = strings.Split(f[4], ",")
+		}
+		if got := pipInstallOpts[i]; got.name != want.name || got.kind != want.kind || got.list != want.list || got.general != want.general || !slices.Equal(got.choices, want.choices) {
+			t.Errorf("option %d: table has %+v, native pip %+v", i, got, want)
+		}
+	}
+}
+
+// TestPipInstallErrorMatchesNativePip compares PipInstallError with whether
+// pip install gets past its option conversion: an offline install of a
+// package that does not exist reaches "No matching distribution" only when
+// the configuration converts. The cases cover each conversion, the order of
+// the three groups, a later file replacing an earlier one's value, and the
+// empty value that is no setting.
+func TestPipInstallErrorMatchesNativePip(t *testing.T) {
+	python := nativePip261(t)
+	type tc struct {
+		legacy, user string
+		env          []string
+	}
+	global := func(lines ...string) tc { return tc{user: "[global]\n" + strings.Join(lines, "\n") + "\n"} }
+	cases := []tc{
+		global("timeout = abc"),
+		global("timeout = 5"),
+		global("timeout = 1_0.5e1_0"),
+		global("timeout = 1__0"),
+		global("timeout = 1_"),
+		global("timeout = 1e"),
+		global("timeout = .5"),
+		global("timeout = 5."),
+		global("timeout = ."),
+		global("timeout = +inf"),
+		global("timeout = -NaN"),
+		global("timeout = Infinity"),
+		global("timeout = 0x10"),
+		global("timeout = 1e999"),
+		global("timeout = ٣٫٥"),
+		global("timeout = ٣"),
+		global("default_timeout = abc"),
+		global("--Timeout: abc"),
+		global("retries = 5"),
+		global("retries = 08"),
+		global("retries = 017"),
+		global("retries = 0o17"),
+		global("retries = 0x1F"),
+		global("retries = 0x_1f"),
+		global("retries = 0x"),
+		global("retries = 0b"),
+		global("retries = 0b101"),
+		global("retries = 0b2"),
+		global("retries = 0B-1"),
+		global("retries = 1_000"),
+		global("retries = 1__0"),
+		global("retries = -3"),
+		global("retries = +3"),
+		global("retries = 3.0"),
+		global("retries = ٣"),
+		global("retries = 0٣"),
+		global("retries = 0٩"),
+		global("retries = " + strings.Repeat("9", 4300)),
+		global("retries = " + strings.Repeat("9", 4301)),
+		global("resume-retries = x"),
+		global("no-input = maybe"),
+		global("no-input = ON"),
+		global("no-input = t"),
+		global("version = abc"),
+		global("help = abc"),
+		global("verbose = 2"),
+		global("verbose = yes"),
+		global("verbose = -1"),
+		global("verbose = -0"),
+		global("verbose = 1.5"),
+		global("quiet = 0x1"),
+		global("keyring-provider = nope"),
+		global("keyring-provider = disabled"),
+		global("exists-action = s w"),
+		global("exists-action = s\n  w"),
+		global("exists-action = s q"),
+		global("use-feature = truststore fast-deps"),
+		global("use-feature = truststore nope"),
+		global("use-deprecated = legacy-certs"),
+		global("no-cache-dir = false"),
+		global("no-cache-dir = perhaps"),
+		global("progress-bar = loud"),
+		global("progress-bar = raw"),
+		global("upgrade-strategy = sometimes"),
+		global("root-user-action = shrug"),
+		global("python-version = 3.12"),
+		global("python-version = 312"),
+		global("python-version = 3.12.1.0"),
+		global("python-version = 3.x"),
+		global("python-version = 3."),
+		global("python-version = 3. 1_2"),
+		global("config-settings = novalue"),
+		global("config-settings = key=value"),
+		global("group = dev"),
+		global("group = other.toml:dev"),
+		global("group = sub/pyproject.toml/.:dev"),
+		global("no-binary = -x"),
+		global("no-binary = :all:"),
+		global("only-binary = -x"),
+		global("all-releases = -x"),
+		global("only-final = -x"),
+		global("refresh-package = -x"),
+		global("uploaded-prior-to = P3D"),
+		global("uploaded-prior-to = 2026-01-01"),
+		global("uploaded-prior-to = 2026-01-01T00:00:00Z"),
+		global("uploaded-prior-to = 2026-01-01T00:00:00+02:00"),
+		global("no-such-option = abc", "timeout_ = abc"),
+		global("upgrade = maybe"),
+		global("upgrade = yes", "pre = n", "compile = 0", "no-compile = F"),
+		global("cert = /nowhere.pem", "index-url = not a url", "proxy = ::", "trusted-host = a b", "find-links = /a\n  /b", "target = x", "src = y"),
+		{user: "[global]\ntimeout = abc\n[install]\ntimeout = 5\n"},
+		{user: "[global]\ntimeout = 5\n[install]\ntimeout = abc\n"},
+		{user: "[install]\nupgrade = maybe\n"},
+		{user: "[download]\ntimeout = abc\n[freeze]\nupgrade = maybe\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[global]\nretries = 1\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[global]\ntimeout = 1\n"},
+		{user: "[DEFAULT]\ntimeout = abc\n[download]\nretries = 1\n"},
+		{user: "[global]\ntimeout = abc\n--timeout = 1\n"},
+		{user: "[global]\n--timeout = 1\ntimeout = abc\n"},
+		{user: "[global.x]\ntimeout = abc\n"},
+		{user: "[global]\ntimeout =\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\ntimeout = 5\n"},
+		{legacy: "[global]\ntimeout = 5\n", user: "[global]\ntimeout = abc\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\ntimeout =\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[install]\ntimeout = 5\n"},
+		{legacy: "[global]\ntimeout = abc\n", user: "[global]\nretries = 2\n"},
+		{env: []string{"PIP_TIMEOUT=abc"}},
+		{env: []string{"PIP_TIMEOUT=5"}},
+		{env: []string{"PIP_TIMEOUT= 5 "}},
+		{env: []string{"PIP_DEFAULT_TIMEOUT=abc"}},
+		{env: []string{"PIP_RETRIES= 0x10"}},
+		{env: []string{"PIP_NO_CACHE_DIR=perhaps"}},
+		{env: []string{"PIP_NO_INPUT=maybe"}},
+		{env: []string{"PIP_VERSION=abc", "PIP_HELP=abc"}},
+		{env: []string{"PIP_UPGRADE_STRATEGY=sometimes"}},
+		{user: "[global]\ntimeout = abc\n", env: []string{"PIP_TIMEOUT=5"}},
+		{user: "[global]\ntimeout = 5\n", env: []string{"PIP_TIMEOUT=abc"}},
+	}
+	// pip is started once per case, several at a time.
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, c := range cases {
+		home, cwd := t.TempDir(), t.TempDir()
+		var layers []PipLayer
+		for _, f := range []struct{ rel, body string }{{".pip/pip.conf", c.legacy}, {".config/pip/pip.conf", c.user}} {
+			if f.body == "" {
+				continue
+			}
+			path := filepath.Join(home, f.rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(f.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := PipLoadError([]byte(f.body)); err != nil {
+				t.Fatalf("case %+v does not load: %v", c, err)
+			}
+			layers = append(layers, PipLayer{File: path, Data: []byte(f.body)})
+		}
+		if err := os.WriteFile(filepath.Join(cwd, "pyproject.toml"), []byte("[dependency-groups]\ndev = []\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			// --no-deps and --target satisfy the checks pip install runs on
+			// its merged options after converting them, which argv can
+			// always complete and the configuration alone does not fail.
+			cmd := exec.Command(python, "-m", "pip", "install", "--dry-run", "--no-index", "--no-deps", "--target", filepath.Join(home, "target"), "bodega-audit-does-not-exist")
+			cmd.Dir = cwd
+			cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "XDG_CONFIG_DIRS=" + filepath.Join(home, "none"), "PIP_DISABLE_PIP_VERSION_CHECK=1"}, c.env...)
+			out, _ := cmd.CombinedOutput()
+			// A group path that passes its conversion is opened afterwards.
+			native := strings.Contains(string(out), "No matching distribution found") || strings.Contains(string(out), "Cannot resolve '--group' option")
+			env := map[string]string{}
+			for _, kv := range c.env {
+				k, v, _ := strings.Cut(kv, "=")
+				env[k] = v
+			}
+			err := PipInstallError(layers, func(k string) string { return env[k] })
+			if (err == nil) != native {
+				t.Errorf("%+v\n PipInstallError = %v\n native pip starts = %v: %s", c, err, native, strings.TrimSpace(string(out)))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestPipInstallErrorRefusesWhatItDoesNotInterpret covers the two settings
+// PipInstallError refuses without judging, and that an error names its
+// source.
+func TestPipInstallErrorRefusesWhatItDoesNotInterpret(t *testing.T) {
+	for body, want := range map[string]string{
+		"[global]\npython = /opt/other/bin/python\n":                "python",
+		"[global]\nuploaded-prior-to = 2026-W01\n":                  "uploaded-prior-to",
+		"[global]\nuploaded-prior-to = P999999999D\n":               "uploaded-prior-to",
+		"[global]\nretries = 2\n\n[install]\nDefault_Timeout = x\n": "default_timeout under [install], pip.conf line 5",
+	} {
+		if err := PipInstallError([]PipLayer{{File: "pip.conf", Data: []byte(body)}}, nil); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("PipInstallError(%q) = %v; want a refusal naming %s", body, err, want)
+		}
+	}
+	env := func(k string) string { return map[string]string{"PIP_PYTHON": "/opt/other/bin/python"}[k] }
+	if err := PipInstallError(nil, env); err == nil || !strings.Contains(err.Error(), "PIP_PYTHON") {
+		t.Errorf("PIP_PYTHON = %v; want a refusal naming it", err)
+	}
+	if err := PipInstallError([]PipLayer{{File: "pip.conf", Data: []byte("[global]\nindex-url = https://x/simple/\ncert = /a.pem\ntimeout = 15\n")}}, nil); err != nil {
+		t.Errorf("valid configuration refused: %v", err)
+	}
+}
+
+// TestGitConvertErrorMatchesNativeGit compares GitConvertError with whether
+// git-remote-https, the process that reads http.sslCAInfo and connects, gets
+// past its configuration: started on a URL nothing listens at with no
+// command on stdin, it exits 128 with "fatal:" when a variable does not
+// convert and 1 when all of them do. Every variable the port names is given
+// every value below, alone and under an [http "<url>"] section matching the
+// remote, beside names the port leaves alone.
+func TestGitConvertErrorMatchesNativeGit(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native git is required in CI")
+		}
+		t.Skip("native git is not installed")
+	}
+	if out, _ := exec.Command(git, "version").Output(); !strings.HasPrefix(string(out), "git version 2.54.") {
+		t.Skipf("the port is of Git 2.54.0, and %q converts other variables", strings.TrimSpace(string(out)))
+	}
+	const remote = "https://127.0.0.1:1/"
+	const novalue = "\x00"
+	common := []string{"maybe", "true", "ON", "1", "abc", "auto", "", novalue}
+	numbers := []string{"-1", "-2", "3", "9", "10", "1k", "2G", "4g", "0x10", "08", " 7", "99999999999",
+		"9223372036854775807", "9223372036854775808", "18446744073709551615", "18446744073709551616", "8589934591g"}
+	words := []string{"AUTO", "input", "warn", "initial", "always", "never", "simple", "inherit", "none", "default", "Minimal",
+		"rename", "link", "nothing", "tracking", "local", "commit", "a\\nb", "~/x", ":(optional)~/x", "10"}
+	type entry struct {
+		section, name string
+		conv          gitConv
+	}
+	var entries []entry
+	for name, v := range gitHTTPVars {
+		// The backend is refused as not interpreted, which is no claim
+		// about git.
+		if v.conv != gitBackend {
+			entries = append(entries, entry{"[http]", name, v.conv}, entry{`[http "` + remote + `"]`, name, v.conv})
+		}
+	}
+	for key, v := range gitDefaultVars {
+		if v.conv != gitColor {
+			section, name, _ := strings.Cut(key, ".")
+			entries = append(entries, entry{"[" + section + "]", name, v.conv})
+		}
+	}
+	entries = append(entries, []entry{
+		{section: "[advice]", name: "detachedHead"}, {section: "[advice]", name: "statushints"}, {section: "[advice]", name: "noSuchAdvice"},
+		{section: `[advice "x"]`, name: "detachedhead"}, {section: "[http]", name: "nosuchkey"}, {section: `[http "` + remote + `"]`, name: "nosuchkey"},
+		{section: `[core "x"]`, name: "filemode"}, {section: "[core]", name: "eol"}, {section: "[core]", name: "nosuchkey"},
+		{section: "[color]", name: "ui"}, {section: "[pack]", name: "threads"}, {section: `[user "x"]`, name: "name"}, {section: "[CORE]", name: "FileMode"},
+	}...)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	home := t.TempDir()
+	for i, e := range entries {
+		values := slices.Clone(common)
+		switch e.conv {
+		case gitInt, gitSsize, gitUlong, gitLevel, gitAbbrev, gitBool:
+			values = append(values, numbers...)
+		default:
+			values = append(values, words...)
+		}
+		for j, v := range values {
+			// git converts these two and then acts on them: it parses a
+			// proxy as a URL once a request needs one, and asks for a
+			// username under proactive authentication.
+			if e.name == "proxy" && strings.ContainsAny(v, `/\`) || e.name == "proactiveauth" && v == "auto" {
+				continue
+			}
+			body := e.section + "\n\t" + e.name + " = \"" + v + "\"\n"
+			if v == novalue {
+				body = e.section + "\n\t" + e.name + "\n"
+			}
+			file := filepath.Join(home, strconv.Itoa(i)+"-"+strconv.Itoa(j))
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				cmd := exec.Command(git, "remote-https", "origin", remote+"x.git")
+				cmd.Dir = home
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + file, "LC_ALL=C"}
+				out, _ := cmd.CombinedOutput()
+				native := strings.Contains(string(out), "fatal:")
+				cfg := ParseGitConfig([]byte(body))
+				if cfg.BadLine != 0 {
+					t.Errorf("%q does not parse", body)
+					return
+				}
+				if _, msg := GitConvertError(cfg); (msg != "") != native {
+					t.Errorf("%q\n GitConvertError = %q\n native git: %s", body, msg, strings.TrimSpace(string(out)))
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// TestGitConvertErrorRefusals covers what GitConvertError refuses beyond
+// git's own verdict, each in the direction of refusing: an http variable
+// under a URL the remote may not match, a color and another account's home.
+// It also pins the line and message GitLoadError carries.
+func TestGitConvertErrorRefusals(t *testing.T) {
+	for body, want := range map[string]string{
+		"[http \"https://other.example/\"]\n\tsslVerify = maybe\n": "bad boolean config value 'maybe' for 'http.sslverify'",
+		"[color \"advice\"]\n\thint = red\n":                       "color.advice.hint",
+		"[http]\n\tsslCAInfo = ~bob/ca.pem\n":                      "the account bob",
+		"[user]\n\tname = x\n[http]\n\tpostBuffer = 1x\n":          "bad numeric config value '1x' for 'http.postbuffer': invalid unit",
+	} {
+		if _, msg := GitConvertError(ParseGitConfig([]byte(body))); !strings.Contains(msg, want) {
+			t.Errorf("GitConvertError(%q) = %q; want %q", body, msg, want)
+		}
+	}
+	file := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(file, []byte("[user]\n\tname = x\n[core]\n\tcompression = fast\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := GitLoadError([]string{file}); !strings.Contains(got, file+" (line 4: bad numeric config value 'fast' for 'core.compression': invalid unit") {
+		t.Errorf("GitLoadError = %q", got)
+	}
+	ok := "[user]\n\tname = x\n\temail = x@example.com\n[core]\n\tautocrlf = input\n\tcompression = 9\n[http]\n\tsslVerify = true\n\tpostBuffer = 512m\n\tsslCAInfo = ~/ca.pem\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = /etc/ca.pem\n[fetch]\n\tprune = true\n"
+	if line, msg := GitConvertError(ParseGitConfig([]byte(ok))); msg != "" {
+		t.Errorf("valid configuration refused at line %d: %s", line, msg)
+	}
+}
+
+// nativeNpm1120 finds the npm 11.20.0 the type port is of, or skips; in CI,
+// where the workflow installs it, a missing npm fails.
+func nativeNpm1120(t *testing.T) string {
+	t.Helper()
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("native npm is required in CI")
+		}
+		t.Skip("native npm is not installed")
+	}
+	out, err := exec.Command(npm, "--version").Output()
+	if v := strings.TrimSpace(string(out)); err != nil || v != "11.20.0" {
+		t.Skipf("the port is of npm 11.20.0, and npm %s declares other options (%v)", v, err)
+	}
+	return npm
+}
+
+// runNpmView runs npm view against a registry nothing listens at, with file
+// as the user's npmrc and env added to an otherwise empty environment, and
+// returns what it printed. The command line sets the log level and the
+// registry, which outrank the file and the environment without stopping npm
+// validating either.
+func runNpmView(t *testing.T, npm, file string, env []string) string {
+	t.Helper()
+	home := t.TempDir()
+	cmd := exec.Command(npm, "view", "left-pad", "version", "--registry=https://127.0.0.1:1/", "--loglevel=warn", "--fetch-retries=0", "--cache="+filepath.Join(home, "cache"), "--prefix="+filepath.Join(home, "prefix"))
+	cmd.Dir = home
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "NPM_CONFIG_USERCONFIG=" + file, "NPM_CONFIG_GLOBALCONFIG=" + filepath.Join(home, "none"), "NPM_CONFIG_UPDATE_NOTIFIER=false"}, env...)
+	out, _ := cmd.CombinedOutput()
+	return string(out)
+}
+
+// TestNpmTypesMatchNativeNpm compares the type port with the options npm
+// itself warns "invalid config" about, for every typed option holding each
+// value below, from an npmrc and from the environment. Where the port says
+// it cannot tell, npm's answer is not held against it.
+func TestNpmTypesMatchNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	warned := regexp.MustCompile(`(?m)^npm warn invalid config ([^=\s]+)=`)
+	var keys []string
+	for key := range npmTypes {
+		// These two move the files npm reads, which the runner pins.
+		if key != "userconfig" && key != "globalconfig" {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	const bare = "\x00"
+	values := []string{"abc", "true", "false", "null", "undefined", "", " ", "0", "5", "1e3", "0x10", "0o7", "0b1", "1_000", "Infinity", "-.5", "5.", "+5", "0x", "1e",
+		"dev", "none", "warn", "1", "4", "public", "all", "022", "0o22", "18", "999", "511", "512", "00", "0777", "01000", "http://h/", "socks5://h:1", "localhost:8080", "/abs", "rel", "1.2.3", "legacy", bare}
+	// A path or list option holding true, false or null stops npm with no
+	// output at all, which would hide every other option's warning, so each
+	// of those runs alone, on the values that tell its type apart, and
+	// counts as refused when npm never reaches the request.
+	var batch, solo []string
+	for _, key := range keys {
+		if npmTypes[key].kind == npmPath || npmTypes[key].list {
+			solo = append(solo, key)
+		} else {
+			batch = append(batch, key)
+		}
+	}
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	run := func(keys []string, v string, fromEnv bool) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			file := filepath.Join(t.TempDir(), "npmrc")
+			var body strings.Builder
+			var env []string
+			for _, key := range keys {
+				switch {
+				case fromEnv:
+					env = append(env, "npm_config_"+strings.ReplaceAll(key, "-", "_")+"="+v)
+				case v == bare:
+					body.WriteString(key + "\n")
+				default:
+					body.WriteString(key + "=" + v + "\n")
+				}
+			}
+			if err := os.WriteFile(file, []byte(body.String()), 0600); err != nil {
+				t.Error(err)
+				return
+			}
+			out := runNpmView(t, npm, file, env)
+			native := map[string]bool{}
+			for _, m := range warned.FindAllStringSubmatch(out, -1) {
+				native[m[1]] = true
+			}
+			for _, key := range keys {
+				val := jsValue{word: v, str: true}
+				if !fromEnv {
+					switch v {
+					case bare:
+						val = jsTrue
+					case "true", "false", "null":
+						val = jsValue{word: v}
+					}
+					// npm/ini trims a value before anything reads it.
+					val.word = jsTrim(val.word)
+				}
+				// npm/ini takes a dotted name set to null for a section.
+				if val == jsNull && strings.Contains(key, ".") {
+					continue
+				}
+				refused := native[key] || len(keys) == 1 && !strings.Contains(out, "ECONNREFUSED")
+				invalid, unread := npmTypes[key].check(val)
+				if !unread && invalid != refused {
+					t.Errorf("%s=%q (environment: %v): port says invalid=%v, native npm refused=%v: %s", key, v, fromEnv, invalid, refused, strings.TrimSpace(out))
+				}
+			}
+		}()
+	}
+	for _, fromEnv := range []bool{false, true} {
+		for _, v := range values {
+			if fromEnv && (v == bare || jsTrim(v) == "") {
+				continue
+			}
+			run(batch, v, fromEnv)
+		}
+		for _, key := range solo {
+			for _, v := range []string{"true", "false", "null", "undefined", "abc", "dev", "", bare} {
+				if fromEnv && (v == bare || v == "") {
+					continue
+				}
+				run([]string{key}, v, fromEnv)
+			}
+		}
+	}
+	wg.Wait()
+}
+
+// TestNpmStartErrorMatchesNativeNpm compares NpmStartError's reading of an
+// unscoped credential with whether npm exits on ERR_INVALID_AUTH, and pins
+// the phrases it carries for a type npm reports invalid.
+func TestNpmStartErrorMatchesNativeNpm(t *testing.T) {
+	npm := nativeNpm1120(t)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, key := range append(slices.Clone(npmUnscopedAuth), "//127.0.0.1:1/:_authToken", "email", "password", "_authTOKEN") {
+		for _, line := range []string{"=abc", "=", "=false", "=null", "=undefined", "=true", "", "[]=abc", "=0"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				file := filepath.Join(t.TempDir(), "npmrc")
+				if err := os.WriteFile(file, []byte("fetch-retries=1\n"+key+line+"\n"), 0600); err != nil {
+					t.Error(err)
+					return
+				}
+				native := strings.Contains(runNpmView(t, npm, file, nil), "ERR_INVALID_AUTH")
+				if got := NpmStartError(file); (got != "") != native {
+					t.Errorf("%s%s: NpmStartError = %q, native npm ERR_INVALID_AUTH = %v", key, line, got, native)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+func TestNpmStartErrorNamesTheLine(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "npmrc")
+	for body, want := range map[string]string{
+		"registry=https://r.example/\nfetch-timeout=abc\n":        "line 2 of " + file + ", which sets fetch-timeout to a value npm reports as invalid config",
+		"fetch-timeout=abc\nfetch-timeout=5\n_authToken=secret\n": "line 3 of " + file + ", which sets _authToken outside a registry's own //host/: scope",
+		"before=2026-01-01\n":     "sets before to a value npm validates in a way doctor does not interpret",
+		"fetch-retries[]=1\n":     "sets fetch-retries to a value npm validates in a way doctor does not interpret",
+		"maxsockets=${SOCKETS}\n": "sets maxsockets to a value npm validates in a way doctor does not interpret",
+		"loglevel=loud\n":         "sets loglevel to a value npm reports as invalid config",
+		"registry=https://r.example/\n//r.example/:_authToken=x\n":                                         "",
+		"fetch-timeout=abc\nfetch-timeout=5\nstrict-ssl=maybe\nomit=dev\n\n[section]\nfetch-retries=abc\n": "",
+	} {
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := NpmStartError(file); got != want && (want == "" || !strings.Contains(got, want)) {
+			t.Errorf("NpmStartError(%q) = %q; want %q", body, got, want)
+		}
+		if strings.Contains(NpmStartError(file), "secret") {
+			t.Errorf("NpmStartError(%q) echoes the credential", body)
+		}
+	}
+	env := func(k string) string { return map[string]string{"NPM_CONFIG_FETCH_TIMEOUT": "abc"}[k] }
+	if got := NpmEnvInvalid(env); !strings.Contains(got, "NPM_CONFIG_FETCH_TIMEOUT") {
+		t.Errorf("NpmEnvInvalid = %q", got)
+	}
+	if got := NpmEnvInvalid(func(k string) string {
+		return map[string]string{"npm_config_fetch_timeout": "5", "npm_config_proxy": "false"}[k]
+	}); got != "" {
+		t.Errorf("valid environment refused: %s", got)
+	}
+}
+
+// F116 R1: a CA plan is refused, before any change is planned, for a client
+// that stops on a configured value while it converts its options: the CA
+// would be installed for a client that never reaches the handshake.
+func TestOptionConversionFailureRefusesCAPlan(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "git, a boolean git dies on", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[http]\n\tsslVerify = maybe\n"}, names: "bad boolean config value 'maybe' for 'http.sslverify'"},
+		{name: "git, a compression level out of range", plan: Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
+			files: map[string]string{".gitconfig": "[core]\n\tcompression = 12\n"}, names: "bad zlib compression level 12"},
+		{name: "npm, a credential outside a registry's scope", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "_authToken=abc\n"}, names: "ERR_INVALID_AUTH"},
+		{name: "npm, a number npm reports invalid and keeps", plan: Npm(testBase, nil),
+			files: map[string]string{".npmrc": "fetch-timeout=abc\n"}, names: "fetch-timeout"},
+		{name: "npm, the same from the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"NPM_CONFIG_MAXSOCKETS": "abc"}, names: "NPM_CONFIG_MAXSOCKETS"},
+		{name: "pip, a choice from the environment", plan: Pip(testBase),
+			env: map[string]string{"PIP_KEYRING_PROVIDER": "nope"}, names: "PIP_KEYRING_PROVIDER"},
+		{name: "pip, a boolean under [install]", plan: Pip(testBase),
+			files: map[string]string{".config/pip/pip.conf": "[install]\nupgrade = maybe\n"}, names: "upgrade under [install]"},
+		{name: "apt, an option its https method no longer supports", plan: apt,
+			files: map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::SslForceVersion \"TLSv1.2\";\n"}, names: "the option 'SslForceVersion' is not supported anymore"},
+		{name: "apt, a client certificate that is not there", plan: apt,
+			files: map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslCert \"/missing/client.pem\";\n"}, names: "Could not load client certificate"},
+		{name: "helm, a client certificate with no key", plan: Helm(testBase),
+			files: map[string]string{".config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: mine\n  url: " + testBase + "/helm/mine\n  certFile: /missing/client.pem\n"}, names: "unable to read cert file"},
+		{name: "containerd, a wrong type in the image plugin's table", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: map[string]string{"etc/containerd/config.toml": "version = 3\n[plugins.\"io.containerd.cri.v1.images\"]\n  max_concurrent_downloads = \"three\"\n  [plugins.\"io.containerd.cri.v1.images\".registry]\n    config_path = \"/etc/containerd/certs.d\"\n"}, names: "row 3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+		})
 	}
 }

@@ -59,10 +59,15 @@ func (e GoEnv) env(key string) string {
 // nothing, GOENV=off and a missing user configuration directory mean no user
 // file, and none of those stops the go command reading GOROOT/go.env. The
 // value then goes through GoProxyList, the check the go command runs on it
-// before any download.
+// before any download, which refuses an empty assignment as it refuses any
+// other list holding no entry.
 func (e GoEnv) Proxy() GoProxyPolicy {
 	p := e.setting()
-	p.Proxies, p.Err = GoProxyList(p.Value)
+	// With nothing found, what the go command runs with is not known here,
+	// and an empty list would be a guess at it.
+	if p.Found {
+		p.Proxies, p.Err = GoProxyList(p.Value)
+	}
 	return p
 }
 
@@ -185,7 +190,10 @@ func findGoroot(fromUserFile string, getenv func(string) string) string {
 // terminator must then parse as a URL whose scheme is http, https or file,
 // a file URL holding a path and nothing else. The go command runs that check
 // over the whole list before it asks the first proxy, so the error is for
-// the list, not for the entry: a valid first proxy does not get used.
+// the list, not for the entry: a valid first proxy does not get used. A walk
+// that ends holding no entry, the empty string or separators and spaces alone,
+// is the list's last error (lines 116-123). GONOPROXY's implicit "noproxy"
+// entry does not count there, so it is not modeled.
 //
 // The separator only decides which errors fall through, so it is not
 // returned. An error names the entry with any URL password redacted.
@@ -213,6 +221,9 @@ func GoProxyList(val string) ([]string, error) {
 			return nil, err
 		}
 		reached = append(reached, entry)
+	}
+	if len(reached) == 0 {
+		return nil, errors.New("GOPROXY list is not the empty string, but contains no entries")
 	}
 	return reached, nil
 }

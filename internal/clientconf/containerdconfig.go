@@ -3,7 +3,9 @@ package clientconf
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+	"time"
 
 	toml "github.com/ravinald/bodega/internal/clientconf/internal/gotoml224"
 )
@@ -95,14 +97,20 @@ type containerdProxyPlugin struct {
 func decodeContainerdConfig(data []byte) (*containerdServerConfig, error) {
 	cfg := new(containerdServerConfig)
 	if err := toml.Unmarshal(data, cfg); err != nil {
-		var derr *toml.DecodeError
-		if errors.As(err, &derr) {
-			row, column := derr.Position()
-			return nil, fmt.Errorf("failed to unmarshal TOML at row %d column %d: %w", row, column, err)
-		}
-		return nil, fmt.Errorf("failed to unmarshal TOML: %w", err)
+		return nil, tomlPlaced(err)
 	}
 	return cfg, nil
+}
+
+// tomlPlaced adds the row and column of a go-toml decode error, as
+// containerd's loadConfigFile does.
+func tomlPlaced(err error) error {
+	var derr *toml.DecodeError
+	if errors.As(err, &derr) {
+		row, column := derr.Position()
+		return fmt.Errorf("failed to unmarshal TOML at row %d column %d: %w", row, column, err)
+	}
+	return fmt.Errorf("failed to unmarshal TOML: %w", err)
 }
 
 // validatePluginURIs is the plugin half of ValidateVersion: a file past
@@ -118,6 +126,83 @@ func (c *containerdServerConfig) validatePluginURIs() error {
 	for _, p := range c.RequiredPlugins {
 		if !strings.ContainsAny(p, ".") {
 			return fmt.Errorf("invalid required plugin URI %q expect io.containerd.x.vx", p)
+		}
+	}
+	return nil
+}
+
+// containerdImageConfig is ImageConfig in internal/cri/config/config.go at
+// containerd v2.2.0, with the structs it holds: the table the CRI image
+// plugin decodes for itself once config.toml has loaded.
+type containerdImageConfig struct {
+	Snapshotter                string            `toml:"snapshotter"`
+	DisableSnapshotAnnotations bool              `toml:"disable_snapshot_annotations"`
+	DiscardUnpackedLayers      bool              `toml:"discard_unpacked_layers"`
+	PinnedImages               map[string]string `toml:"pinned_images"`
+	RuntimePlatforms           map[string]struct {
+		Platform    string `toml:"platform"`
+		Snapshotter string `toml:"snapshotter"`
+	} `toml:"runtime_platforms"`
+	Registry struct {
+		ConfigPath string `toml:"config_path"`
+		Mirrors    map[string]struct {
+			Endpoints []string `toml:"endpoint"`
+		} `toml:"mirrors"`
+		Configs map[string]struct {
+			Auth *containerdAuthConfig `toml:"auth"`
+		} `toml:"configs"`
+		Auths   map[string]containerdAuthConfig `toml:"auths"`
+		Headers map[string][]string             `toml:"headers"`
+	} `toml:"registry"`
+	ImageDecryption struct {
+		KeyModel string `toml:"key_model"`
+	} `toml:"image_decryption"`
+	MaxConcurrentDownloads     int    `toml:"max_concurrent_downloads"`
+	ConcurrentLayerFetchBuffer int    `toml:"concurrent_layer_fetch_buffer"`
+	ImagePullProgressTimeout   string `toml:"image_pull_progress_timeout"`
+	ImagePullWithSyncFs        bool   `toml:"image_pull_with_sync_fs"`
+	StatsCollectPeriod         int    `toml:"stats_collect_period"`
+	UseLocalImagePull          bool   `toml:"use_local_image_pull"`
+}
+
+type containerdAuthConfig struct {
+	Username      string `toml:"username"`
+	Password      string `toml:"password"`
+	Auth          string `toml:"auth"`
+	IdentityToken string `toml:"identitytoken"`
+}
+
+// containerdImagePluginError is why the CRI image plugin of containerd v2.2.0
+// does not start on the version 3 config.toml in data, or nil when it does.
+// The plugin decodes its own table into ImageConfig (Config.Decode in
+// cmd/containerd/server/config/config.go, lines 262-290, where a key the
+// struct does not know is a warning and a value of the wrong type the error)
+// and then runs ValidateImageConfig (internal/cri/config/config.go) on it.
+// containerd logs the failure and goes on without the plugin, so the CRI
+// pulls nothing and no hosts.toml under config_path is read. mirrors beside
+// config_path, which ValidateImageConfig also refuses, is reported apart, as
+// ContainerdRegistry.Legacy.
+//
+// The table is decoded where it stands in the file, by the same go-toml
+// v2.2.4, in place of containerd's marshal and decode of the generic table.
+func containerdImagePluginError(data []byte) error {
+	var doc struct {
+		Plugins struct {
+			Images containerdImageConfig `toml:"io.containerd.cri.v1.images"`
+		} `toml:"plugins"`
+	}
+	if err := toml.Unmarshal(data, &doc); err != nil {
+		return tomlPlaced(err)
+	}
+	c := doc.Plugins.Images
+	for endpoint := range c.Registry.Auths {
+		if _, err := url.Parse(endpoint); err != nil {
+			return fmt.Errorf("failed to parse registry url %q from `registry.auths`: %w", endpoint, err)
+		}
+	}
+	if c.ImagePullProgressTimeout != "" {
+		if _, err := time.ParseDuration(c.ImagePullProgressTimeout); err != nil {
+			return fmt.Errorf("invalid image pull progress timeout: %w", err)
 		}
 	}
 	return nil

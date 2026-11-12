@@ -214,8 +214,16 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 	return out
 }
 
-// pipCommandIndex refuses a pip configuration pip cannot load, and one whose
-// command section sets an index the plan does not. pip reads a command's own section ahead of
+// npmWontStart refuses a host whose npm configuration holds what
+// NpmStartError or NpmEnvInvalid names.
+func npmWontStart(rec PlanRecord, bad string) error {
+	return fmt.Errorf("%s: npm reads %s, so npm may never reach bodega whichever CA it is given, and the install could not be verified. "+
+		"Nothing was written. Correct or remove that setting (npm config fix moves a credential under its registry), then re-run", rec.System, bad)
+}
+
+// pipCommandIndex refuses a pip configuration pip cannot load, one holding a
+// value pip install exits on while converting its options (PipInstallError),
+// and one whose command section sets an index the plan does not. pip reads a command's own section ahead of
 // [global] from every file it loads, so an [install] index-url anywhere keeps
 // pip install on that index after the plan writes bodega's under [global],
 // and the CA installed for bodega would certify an endpoint pip never asks.
@@ -225,6 +233,7 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 	if !slices.Contains(files, target) {
 		files = append(files, target)
 	}
+	var layers []PipLayer
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -232,6 +241,19 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 		}
 		if err := PipLoadError(data); err != nil {
 			return fmt.Errorf("%s: pip refuses to load %s (%v), so it aborts before reading any index or cert this command would write, and the install could not be verified. Nothing was written. Fix %s so pip loads it, then re-run", rec.System, f, err, f)
+		}
+		layers = append(layers, PipLayer{File: f, Data: data})
+	}
+	// The files are judged as they stand: the plan replaces only index and
+	// cert options, which hold text pip converts nothing in, and keeps every
+	// other option as written.
+	if err := PipInstallError(layers, h.Getenv); err != nil {
+		return fmt.Errorf("%s: pip install exits while it converts its configured options, before it reads any index or cert this command would write: %v. The install could not be verified. Nothing was written. Correct or remove that setting so pip starts, then re-run", rec.System, err)
+	}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
 		}
 		for key, v := range PipOptions(data) {
 			section, option, _ := strings.Cut(key, ".")
@@ -396,6 +418,12 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				return fmt.Errorf("%s: npm reads %s, which this command detects and does not interpret, so whether npm would verify bodega's certificate with the CA written to %s cannot be told. "+
 					"Nothing was written. Leave that file one plain cafile naming a certificate file, or none, then re-run", rec.System, unread, target)
 			}
+			if bad := NpmStartError(f); bad != "" {
+				return npmWontStart(rec, bad)
+			}
+		}
+		if bad := NpmEnvInvalid(h.Getenv); bad != "" {
+			return npmWontStart(rec, bad)
 		}
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
@@ -424,9 +452,19 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		// apt's whole configuration, loaded as apt loads it: a statement apt
 		// refuses in any file stops every apt command, whichever option it
 		// names, and a rebuilt system store does not change that.
-		if _, err := LoadAptConfig(h.Root, h.Getenv); err != nil {
+		conf, err := LoadAptConfig(h.Root, h.Getenv)
+		if err != nil {
 			return fmt.Errorf("%s: apt does not load its configuration (%w) and fails every command, so it would read neither the source written to %s nor the CA this command installs, and the install could not be verified. "+
 				"Nothing was written. Repair what the error names (apt-config dump repeats a syntax error), then re-run", rec.System, err, target)
+		}
+		// What the https method does with that configuration before the
+		// handshake, for bodega's host: an option it stops on leaves the CA
+		// this command installs unread.
+		if base, perr := url.Parse(h.Base); perr == nil && base.Scheme == "https" {
+			if err := conf.HTTPSError(base.Hostname(), h.Root); err != nil {
+				return fmt.Errorf("%s: apt's https method opens no TLS connection to bodega under apt's configuration (%w), so it would never verify bodega with the CA this command installs, and the install could not be verified. "+
+					"Nothing was written. Correct or remove the option the error names, then re-run", rec.System, err)
+			}
 		}
 		// And its sources, the same way: an entry apt refuses in any file
 		// leaves it reading none of them, the one this plan writes included.
@@ -442,9 +480,32 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			if f == "" {
 				continue
 			}
-			if _, err := LoadHelmFile(f); err != nil {
+			doc, err := LoadHelmFile(f)
+			if err != nil {
 				return fmt.Errorf("%s: helm refuses to load its repository file (%w) and fails every command that reads it, so it would read neither the repository nor the CA this command installs, and the install could not be verified. "+
 					"Nothing was written. Fix that field so helm loads the file (helm repo update names it), then re-run", rec.System, err)
+			}
+			if doc == nil {
+				continue
+			}
+			// The repositories at bodega, which this plan gives a caFile:
+			// helm then loads each one's client certificate with it.
+			base, _ := url.Parse(h.Base)
+			for _, r := range doc.Repositories {
+				if r == nil || base == nil {
+					continue
+				}
+				if u, perr := url.Parse(r.URL); perr != nil || u.Host != base.Host {
+					continue
+				}
+				// A pair that is named whole and not on disk yet is left
+				// to the verdict after the write, which reads it again: the
+				// plan keeps another party's certFile and keyFile as
+				// written, present or not.
+				if err := r.ClientTLSError(true); err != nil && !(r.CertFile != "" && r.KeyFile != "" && errors.Is(err, os.ErrNotExist)) {
+					return fmt.Errorf("%s: helm builds no client for a repository at bodega in %s (%w), so it would never verify bodega with the CA this command installs, and the install could not be verified. "+
+						"Nothing was written. Correct or remove that repository's certFile and keyFile, then re-run", rec.System, f, err)
+				}
 			}
 		}
 	}

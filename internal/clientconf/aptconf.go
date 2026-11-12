@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -514,6 +515,71 @@ func (l *aptLoader) include(file string, line int, target string, depth int) err
 	}
 	if err != nil {
 		return fmt.Errorf("%w (included from %s:%d)", err, file, line)
+	}
+	return nil
+}
+
+// aptBool is StringToBool in apt-pkg/contrib/strutl.cc at APT 3.0.3 (lines
+// 844-871): 0 or 1 written as a whole number, one of apt's truth words in any
+// case, and def for anything else. apt reads every boolean and integer
+// option through it or through strtol the same way (Configuration::FindB and
+// FindI, apt-pkg/contrib/configuration.cc, lines 471-496), so a value of the
+// wrong type is the default and never an error.
+func aptBool(text string, def bool) bool {
+	if m := aptZeroOrOne.FindStringSubmatch(text); m != nil && !(m[1] == "-" && m[2] == "1") {
+		return m[2] == "1"
+	}
+	switch strings.ToLower(text) {
+	case "no", "false", "without", "off", "disable":
+		return false
+	case "yes", "true", "with", "on", "enable":
+		return true
+	}
+	return def
+}
+
+// aptZeroOrOne is the whole of a string strtol reads in base 0 as 0 or 1.
+var aptZeroOrOne = regexp.MustCompile(`^[ \t\n\v\f\r]*([+-]?)(?:0[xX])?0*([01])$`)
+
+// HTTPSError is why apt's https method opens no TLS connection to host under
+// this configuration, or nil when it does: UnwrapTLS and GetContextForHost in
+// methods/connect.cc at APT 3.0.3 (lines 925-1004), up to the handshake.
+// Acquire::AllowTLS read as false turns TLS off; IssuerCert and
+// SslForceVersion are options apt no longer supports and stops on when
+// either is set; and a client certificate, its key and a revocation list
+// must each load. Each option is looked up for host first and then for every
+// host, as CAInfo is. root is the directory absolute paths sit under.
+//
+// Whether a file that reads also parses is OpenSSL's to say, at the
+// handshake. CAInfo is the trust store, and is read where trust is judged.
+func (c AptConfig) HTTPSError(host, root string) error {
+	if v := c["acquire::allowtls"]; v.Value != "" && !aptBool(v.Value, true) {
+		return fmt.Errorf("TLS support has been disabled: Acquire::AllowTLS is false (%s)", v.File)
+	}
+	find := func(option string) AptOption {
+		if v := c["acquire::https::"+strings.ToLower(host)+"::"+option]; v.Value != "" {
+			return v
+		}
+		return c["acquire::https::"+option]
+	}
+	for _, option := range []string{"IssuerCert", "SslForceVersion"} {
+		if v := find(strings.ToLower(option)); v.Value != "" {
+			return fmt.Errorf("the option '%s' is not supported anymore (%s)", option, v.File)
+		}
+	}
+	for _, f := range []struct{ option, what string }{
+		{"SslCert", "Could not load client certificate"}, {"SslKey", "Could not load client or key"}, {"CrlFile", "Could not load custom certificate revocation list"},
+	} {
+		v := find(strings.ToLower(f.option))
+		if v.Value == "" {
+			continue
+		}
+		if !filepath.IsAbs(v.Value) {
+			return fmt.Errorf("%s names the relative path %s (%s), which apt opens against the directory it is started in and doctor does not interpret", f.option, v.Value, v.File)
+		}
+		if _, err := os.ReadFile(filepath.Join(root, v.Value)); err != nil {
+			return fmt.Errorf("%s (%s, %s option in %s): %w", f.what, v.Value, f.option, v.File, err)
+		}
 	}
 	return nil
 }

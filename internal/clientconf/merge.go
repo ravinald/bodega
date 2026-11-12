@@ -1062,7 +1062,18 @@ func pipName(raw string) string {
 
 // pipItem is one option of a pip configuration file, under the name
 // ConfigParser stores it by.
-type pipItem struct{ raw, value string }
+type pipItem struct {
+	raw, value string
+	// line is where the file assigns it, counted from 1.
+	line int
+}
+
+// pipSetting is one option of one declared section as pip's _load_file hands
+// it on: option is pipName's reading of raw, the name the file wrote.
+type pipSetting struct {
+	section, option, raw, value string
+	line                        int
+}
 
 // pipFile is a pip configuration file as RawConfigParser reads one.
 type pipFile struct {
@@ -1146,7 +1157,7 @@ func readPipFile(data []byte) (pipFile, error) {
 		if slices.ContainsFunc(items, func(it pipItem) bool { return it.raw == raw }) {
 			return f, fmt.Errorf("line %d: option %q in section %q already exists", n, raw, section)
 		}
-		f.sections[section] = append(items, pipItem{raw: raw})
+		f.sections[section] = append(items, pipItem{raw: raw, line: n})
 		values[section] = append(values[section], []string{value})
 		// configparser continues an option only under a non-empty name.
 		if current = len(items); raw == "" {
@@ -1174,29 +1185,45 @@ func PipLoadError(data []byte) error {
 // lines are readPipFile's, so what PipLoadError judges and what is read here
 // are one reading of the file, and a file pip refuses to load gives no option
 // at all.
-//
-// The rest ports pip's _load_file over RawConfigParser: [DEFAULT] is no
-// section of its own but is inherited by every section the file declares,
-// a section's own option replacing the default of the same raw name in the
-// default's place; pip then walks each section's items in that order,
-// normalizing names, and the last item of one normalized name wins.
 func PipOptions(data []byte) map[string]string {
 	out := map[string]string{}
 	f, err := readPipFile(data)
 	if err != nil {
 		return out
 	}
+	for _, s := range f.settings() {
+		out[s.section+"."+s.option] = s.value
+	}
+	return out
+}
+
+// settings ports pip's _load_file over RawConfigParser: [DEFAULT] is no
+// section of its own but is inherited by every section the file declares, a
+// section's own option replacing the default of the same raw name in the
+// default's place; pip then walks each section's items in that order,
+// normalizing names, and the last item of one normalized name wins, in the
+// place the first one took.
+func (f pipFile) settings() []pipSetting {
+	var out []pipSetting
 	for _, name := range f.order {
 		merged := slices.Clone(f.sections["DEFAULT"])
 		for _, it := range f.sections[name] {
 			if k := slices.IndexFunc(merged, func(d pipItem) bool { return d.raw == it.raw }); k >= 0 {
-				merged[k].value = it.value
+				merged[k] = it
 			} else {
 				merged = append(merged, it)
 			}
 		}
+		// pip keys its dictionary by "section.option" and splits that at
+		// the first dot, so a dot in a section name moves the split.
 		for _, it := range merged {
-			out[name+"."+pipName(it.raw)] = it.value
+			section, option, _ := strings.Cut(name+"."+pipName(it.raw), ".")
+			s := pipSetting{section: section, option: option, raw: it.raw, value: it.value, line: it.line}
+			if k := slices.IndexFunc(out, func(o pipSetting) bool { return o.section == section && o.option == option }); k >= 0 {
+				out[k] = s
+			} else {
+				out = append(out, s)
+			}
 		}
 	}
 	return out

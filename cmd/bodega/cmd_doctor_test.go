@@ -3145,3 +3145,97 @@ func TestAudit22GomodInvalidProxyRefusesBeforeWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit24PipOptionTypeRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "etc/pip.conf")
+	old := "[global]\nindex-url = https://pypi.org/simple/\ntimeout = abc\n"
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIP_CONFIG_FILE", target)
+	for _, phase := range []string{"first apply", "second apply"} {
+		out, err := runDoctor(t, "--configure", "pypi", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(err.Error(), "timeout") {
+			t.Errorf("%s accepted unusable pip config: err=%v\n%s", phase, err, out)
+		}
+		if got, err := os.ReadFile(target); err != nil || string(got) != old {
+			t.Errorf("%s changed pip.conf before refusing it: %v\n%s", phase, err, got)
+		}
+		installed := filepath.Join(home, ".config/bodega/ca.pem")
+		if _, err := os.Stat(installed); !os.IsNotExist(err) {
+			t.Errorf("%s wrote %s: %v", phase, installed, err)
+		}
+	}
+	oldExit := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = oldExit })
+	out, _ := runDoctor(t, "--url", srv.URL)
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "pip-config") {
+			found = true
+			if !strings.Contains(line, "unchecked") || !strings.Contains(line, "timeout") {
+				t.Errorf("ordinary doctor certified unusable pip: %s", line)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("ordinary doctor omitted pip-config:\n%s", out)
+	}
+}
+
+func TestAudit24GomodEmptyProxyListRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GOPROXY", ",|")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile, release := filepath.Join(t.TempDir(), "ca.pem"), filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldOS, oldRoot, oldRelease, oldRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	anchor := filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0644)
+	}
+	t.Cleanup(func() { doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = oldOS, oldRoot, oldRelease, oldRun })
+	out, err := runDoctor(t, "--configure", "gomod", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	if err == nil || !strings.Contains(err.Error(), "GOPROXY") || !strings.Contains(err.Error(), "contains no entries") {
+		t.Errorf("wrong refusal: %v\n%s", err, out)
+	}
+	for _, file := range []string{anchor, filepath.Join(home, ".config/go/env")} {
+		if _, err := os.Stat(file); !os.IsNotExist(err) {
+			t.Errorf("invalid GOPROXY wrote %s: %v", file, err)
+		}
+	}
+	if ran != 0 {
+		t.Errorf("invalid GOPROXY ran %d trust rebuild(s)", ran)
+	}
+}

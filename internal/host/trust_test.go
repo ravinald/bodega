@@ -1731,3 +1731,129 @@ func TestAudit23OCICertificateFilesLoadAsTheRuntimeLoadsThem(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit24PipOptionTypeIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	p.System = func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }
+	file := filepath.Join(p.Home, ".config/pip/pip.conf")
+	body := "[global]\nindex-url = " + base + "/pypi/simple/\ncert = " + ca + "\n"
+	writeTrustFile(t, file, body)
+	if v := auditState(t, p, "pip-config", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, body+"timeout = abc\n")
+	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "timeout") {
+		t.Errorf("unusable pip config certified: %+v; want unchecked naming timeout", v)
+	}
+	row := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, "timeout") {
+		t.Errorf("ordinary row certified unusable pip config: %+v", row)
+	}
+}
+
+func TestAudit24GomodEmptyProxyListMatchesGo(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal(err)
+		}
+		t.Skip("native Go unavailable")
+	}
+	p, _, base := auditTrust(t)
+	p.Getenv = func(key string) string {
+		if key == "GOPROXY" {
+			return ",|"
+		}
+		return ""
+	}
+	dir := t.TempDir()
+	cmd := exec.Command(goBin, "mod", "download", "example.com/ca-audit@v1.0.0")
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GOPATH=" + dir, "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GO111MODULE=on", "GOSUMDB=off", "GOPROXY=,|"}
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "contains no entries") {
+		t.Fatalf("native Go: %v: %s", err, out)
+	}
+	t.Logf("native Go: %s", strings.TrimSpace(string(out)))
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "contains no entries") {
+		t.Errorf("selected verdict = %+v; want unchecked naming native list error", v)
+	}
+	row := p.Apply([]Finding{checkGoproxy(p.Getenv, func() (string, error) { return dir, nil })}, base)[0]
+	if !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("normal row dropped list validity: %+v", row)
+	}
+}
+
+// F116 R1, R2: a client that stops on a configured value while it converts
+// its options, before any request, is unchecked however good the CA its
+// configuration names. Each case is a configuration the probe verifies, and
+// then the same one holding the value its client stops on.
+func TestOptionConversionFailureIsUnchecked(t *testing.T) {
+	const hosts = "server = \"https://registry-1.docker.io\"\n[host.\"@BASE@\"]\n  ca = \"@CA@\"\n"
+	for _, tc := range []struct {
+		name, check string
+		files       map[string]string
+		// bad is appended to the file named, and env set, for the second run.
+		file, bad string
+		env       map[string]string
+		names     string
+	}{
+		{name: "git, a boolean git dies on", check: "git-config",
+			files: map[string]string{"home/.gitconfig": "[url \"@BASE@/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http]\n\tsslCAInfo = @CA@\n"},
+			file:  "home/.gitconfig", bad: "\tsslVerify = maybe\n", names: "bad boolean config value 'maybe' for 'http.sslverify'"},
+		{name: "git, a number git dies on outside the http section", check: "git-config",
+			files: map[string]string{"home/.gitconfig": "[url \"@BASE@/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http]\n\tsslCAInfo = @CA@\n"},
+			file:  "home/.gitconfig", bad: "[core]\n\tcompression = fast\n", names: "bad numeric config value 'fast' for 'core.compression'"},
+		{name: "npm, a credential outside a registry's scope", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=@BASE@/npm/\ncafile=@CA@\n"},
+			file:  "home/.npmrc", bad: "_authToken=abc\n", names: "ERR_INVALID_AUTH"},
+		{name: "npm, a number npm reports invalid and keeps", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=@BASE@/npm/\ncafile=@CA@\n"},
+			file:  "home/.npmrc", bad: "fetch-timeout=abc\n", names: "fetch-timeout"},
+		{name: "npm, the same from the environment", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=@BASE@/npm/\ncafile=@CA@\n"},
+			env:   map[string]string{"npm_config_fetch_timeout": "abc"}, names: "npm_config_fetch_timeout"},
+		{name: "pip, a number from the environment", check: "pip-config",
+			files: map[string]string{"home/.config/pip/pip.conf": "[global]\nindex-url = @BASE@/pypi/simple/\ncert = @CA@\n"},
+			env:   map[string]string{"PIP_RETRIES": "many"}, names: "PIP_RETRIES"},
+		{name: "apt, an option its https method no longer supports", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": "Types: deb\nURIs: @BASE@/apt\nSuites: stable\nComponents: main\n", "etc/apt/apt.conf.d/90ca": "Acquire::https::CAInfo \"@CA@\";\n"},
+			file:  "etc/apt/apt.conf.d/90ca", bad: "Acquire::https::IssuerCert \"@CA@\";\n", names: "the option 'IssuerCert' is not supported anymore"},
+		{name: "apt, TLS turned off", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": "Types: deb\nURIs: @BASE@/apt\nSuites: stable\nComponents: main\n", "etc/apt/apt.conf.d/90ca": "Acquire::https::CAInfo \"@CA@\";\n"},
+			file:  "etc/apt/apt.conf.d/90ca", bad: "Acquire::AllowTLS \"off\";\n", names: "Acquire::AllowTLS is false"},
+		{name: "helm, a client certificate with no key", check: "helm-repos",
+			files: map[string]string{"home/.config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: @BASE@/helm\n  caFile: @CA@\n"},
+			file:  "home/.config/helm/repositories.yaml", bad: "  certFile: @CA@\n", names: "unable to read key file"},
+		{name: "containerd, a wrong type in the image plugin's table", check: "oci-containerd",
+			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": hosts,
+				"etc/containerd/config.toml": "version = 3\n[plugins.\"io.containerd.cri.v1.images\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n"},
+			file: "etc/containerd/config.toml", bad: "[plugins.\"io.containerd.cri.v1.images\"]\n  max_concurrent_downloads = \"three\"\n", names: "row 5"},
+		{name: "containerd, a pull timeout that is no duration", check: "oci-containerd",
+			files: map[string]string{"etc/containerd/certs.d/docker.io/hosts.toml": hosts,
+				"etc/containerd/config.toml": "version = 3\n[plugins.\"io.containerd.cri.v1.images\".registry]\n  config_path = \"/etc/containerd/certs.d\"\n"},
+			file: "etc/containerd/config.toml", bad: "[plugins.\"io.containerd.cri.v1.images\"]\n  image_pull_progress_timeout = \"soon\"\n", names: "invalid image pull progress timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			r := strings.NewReplacer("@BASE@", base, "@CA@", ca)
+			for name, body := range tc.files {
+				writeTrustFile(t, filepath.Join(p.Root, name), r.Replace(body))
+			}
+			if v := auditState(t, p, tc.check, base); v.State != TrustVerified {
+				t.Fatalf("control: %+v", v)
+			}
+			if tc.file != "" {
+				writeTrustFile(t, filepath.Join(p.Root, tc.file), r.Replace(tc.files[tc.file]+tc.bad))
+			}
+			p.Getenv = func(key string) string { return tc.env[key] }
+			if v := auditState(t, p, tc.check, base); v.State != TrustUnchecked || !strings.Contains(v.Detail, tc.names) {
+				t.Errorf("verdict = %+v; want unchecked naming %q", v, tc.names)
+			}
+			row := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
+			if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+				t.Errorf("ordinary row = %+v; want a warning that says unchecked", row)
+			}
+		})
+	}
+}

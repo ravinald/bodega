@@ -1,6 +1,7 @@
 package clientconf
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -126,6 +127,46 @@ func (f *HelmFile) RepositoryError() error {
 		}
 		if !slices.Contains(helmSchemes, u.Scheme) {
 			return fmt.Errorf("repository %q: could not find protocol handler for: %s (helm repo update stops on it before it fetches any repository; helm reads http, https and oci without a getter plugin, and doctor reads no plugin)", r.Name, u.Scheme)
+		}
+	}
+	return nil
+}
+
+// ClientTLSError is why helm v4.3.0 builds no HTTP client for this
+// repository, or nil when it builds one: the client certificate half of
+// NewTLSConfig (internal/tlsutil/tls.go, lines 43-110) as httpGetter calls
+// it (pkg/getter/httpgetter.go, lines 127-144). With either of certFile and
+// keyFile set, both must read and hold a matching pair. helm skips that
+// whole step for an entry naming no caFile, no pair and no
+// insecure_skip_tls_verify; withCA says the entry holds, or is about to be
+// given, a caFile, which takes it out of that case. caFile itself is the
+// trust store, and is read where trust is judged.
+//
+// helm opens a relative path against the directory it is started in, which
+// doctor does not know, so one is refused as not interpreted.
+func (e *HelmEntry) ClientTLSError(withCA bool) error {
+	if e.CertFile == "" && e.KeyFile == "" {
+		return nil
+	}
+	if !withCA && !e.InsecureSkipTLSVerify && (e.CertFile == "" || e.KeyFile == "") {
+		return nil
+	}
+	for _, f := range []struct{ field, path string }{{"certFile", e.CertFile}, {"keyFile", e.KeyFile}} {
+		if f.path != "" && !filepath.IsAbs(f.path) {
+			return fmt.Errorf("repository %q: %s is the relative path %s, which helm opens against the directory it is started in and doctor does not interpret", e.Name, f.field, f.path)
+		}
+	}
+	cert, err := os.ReadFile(e.CertFile)
+	if err != nil {
+		return fmt.Errorf("repository %q: can't create TLS config for client: unable to read cert file: %q: %w", e.Name, e.CertFile, err)
+	}
+	key, err := os.ReadFile(e.KeyFile)
+	if err != nil {
+		return fmt.Errorf("repository %q: can't create TLS config for client: unable to read key file: %q: %w", e.Name, e.KeyFile, err)
+	}
+	if len(cert) > 0 && len(key) > 0 {
+		if _, err := tls.X509KeyPair(cert, key); err != nil {
+			return fmt.Errorf("repository %q: can't create TLS config for client: unable to load cert from key pair: %w", e.Name, err)
 		}
 	}
 	return nil

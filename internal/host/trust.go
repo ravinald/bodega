@@ -232,6 +232,11 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 	if err != nil {
 		return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt does not load its configuration (%v) and fails every command, so whether apt reaches bodega or verifies its certificate is unchecked", err)}}
 	}
+	if u.Scheme == "https" {
+		if err := conf.HTTPSError(u.Hostname(), t.Root); err != nil {
+			return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt's https method opens no TLS connection under this configuration (%v), so whether apt verifies bodega's certificate is unchecked", err)}}
+		}
+	}
 	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
 		if v := conf[key]; v.Value != "" {
 			return []trustStore{*named(v.Value, "Acquire::https::CAInfo in "+v.File, true)}
@@ -301,6 +306,7 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		ask = sync.OnceValues(t.Pip)
 	}
 	files := pipFiles(t, ask)
+	var layers []clientconf.PipLayer
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -309,6 +315,10 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 		if err := clientconf.PipLoadError(data); err != nil {
 			return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip refuses to load %s (%v) and aborts every command while it does, so whether pip reaches bodega or verifies its certificate is unchecked", f, err)}}
 		}
+		layers = append(layers, clientconf.PipLayer{File: f, Data: data})
+	}
+	if err := clientconf.PipInstallError(layers, t.Getenv); err != nil {
+		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip install exits while it converts its configured options, before any request: %v. Whether pip reaches bodega or verifies its certificate is unchecked", err)}}
 	}
 	if !pipReaches(t, files, u) {
 		if t.env("PIP_CONFIG_FILE") != os.DevNull {
@@ -533,6 +543,11 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	blind := func(what string) []trustStore {
 		return []trustStore{{name: "npm's configuration", blind: fmt.Sprintf("npm reads %s, which doctor detects and does not interpret, so which CA list npm verifies bodega against and whether it verifies bodega's certificate is unchecked", what)}}
 	}
+	// An unscoped credential ends npm before any request, and a value npm
+	// itself reports invalid goes on, as written, to whatever reads it.
+	wontStart := func(what string) []trustStore {
+		return []trustStore{{name: "npm's configuration", blind: fmt.Sprintf("npm reads %s, so whether npm reaches bodega or verifies its certificate is unchecked", what)}}
+	}
 	// Two spellings of one option holding different values, or a line that
 	// may set a registry, leave the registries npm asks unknown, and a registry
 	// list that cannot be read is no evidence that bodega is absent from it.
@@ -558,7 +573,13 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 		if unread := clientconf.NpmUnread(f); unread != "" {
 			return blind(unread)
 		}
+		if bad := clientconf.NpmStartError(f); bad != "" {
+			return wontStart(bad)
+		}
 		layers = append(layers, npmFileLayer(f))
+	}
+	if bad := clientconf.NpmEnvInvalid(t.Getenv); bad != "" {
+		return wontStart(bad)
 	}
 	env := npmLayer{from: "the environment"}
 	if v, _ := clientconf.NpmEnv(t.Getenv, "cafile"); v != "" {
@@ -729,6 +750,9 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		}
 		if p, err := url.Parse(r.URL); err != nil || p.Host != u.Host {
 			continue
+		}
+		if err := r.ClientTLSError(r.CAFile != ""); err != nil {
+			return []trustStore{{name: "helm's configuration", blind: fmt.Sprintf("helm builds no client for a repository at bodega in %s (%v), so whether helm verifies bodega's certificate is unchecked", path, err)}}
 		}
 		s := trustStore{name: systemStoreName, system: true}
 		if r.CAFile != "" {
