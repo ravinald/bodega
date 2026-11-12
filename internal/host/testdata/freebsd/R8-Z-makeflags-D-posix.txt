@@ -1,0 +1,16 @@
+@@ portsdir exit=0
+
+@@ portsdir stderr
+make: warning: /usr/obj/: Permission denied
+@@ values exit=0
+
+http://distcache.FreeBSD.org/ports-distfiles/
+
+
+@@ values stderr
+@@ recipe exit=0
+bodega-doctor:MASTER_SITE_OVERRIDE=
+bodega-doctor:MASTER_SITE_BACKUP=http://distcache.FreeBSD.org/ports-distfiles/
+bodega-doctor:BODEGA_DISTFILES_ENV=
+bodega-doctor:DIST_SUBDIR=
+@@ recipe stderr

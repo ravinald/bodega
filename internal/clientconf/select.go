@@ -108,27 +108,6 @@ func PipConfigFiles(h PipHost) (files []string, global int) {
 	return files, global
 }
 
-// PodmanCertDir is the directory podman, buildah and CRI-O read CA
-// certificates for the registry at hostPort from: the first that exists of
-// the per-user certs.d, /etc/containers/certs.d and /etc/docker/certs.d, as
-// containers/image picks it. The directories are not combined, so an existing
-// one hides every one after it even when it is empty. "" when none exists,
-// where those clients read no certificate of their own.
-func PodmanCertDir(home, root, hostPort string) string {
-	var dirs []string
-	if home != "" {
-		dirs = append(dirs, filepath.Join(home, ".config", "containers", "certs.d"))
-	}
-	dirs = append(dirs, filepath.Join(root, "/etc/containers/certs.d"), filepath.Join(root, "/etc/docker/certs.d"))
-	for _, d := range dirs {
-		full := filepath.Join(d, hostPort)
-		if _, err := os.Stat(full); err == nil {
-			return full
-		}
-	}
-	return ""
-}
-
 // GitConfigFiles lists the configuration files git reads outside a
 // repository, in the order it reads them: the system file, unless
 // GIT_CONFIG_NOSYSTEM turns it off, then the per-user files, the XDG one
@@ -789,15 +768,4 @@ func gitShadowHeaders(lines []string, base string) []string {
 		}
 	}
 	return out
-}
-
-// CargoConfigFile is the per-user file Cargo reads under home: config
-// without the extension when it exists, which Cargo then reads in place of
-// config.toml, and config.toml otherwise.
-func CargoConfigFile(home string) string {
-	legacy := filepath.Join(home, ".cargo", "config")
-	if info, err := os.Stat(legacy); err == nil && info.Mode().IsRegular() {
-		return legacy
-	}
-	return filepath.Join(home, ".cargo", "config.toml")
 }

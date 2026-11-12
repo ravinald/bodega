@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"maps"
 	"path"
 	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
@@ -24,7 +24,7 @@ type lineRules struct {
 	// key names the setting a line gives, "" for a line that gives none.
 	key func(line string) string
 	// indent says a line indented deeper than the key above it continues
-	// that key's value, as Python's ConfigParser and dnf read one. A line at
+	// that key's value, as Python's ConfigParser reads one. A line at
 	// the key's own indentation is the next key.
 	indent bool
 	// runsOn lexes one physical line the way the format's own reader does
@@ -42,10 +42,9 @@ type lineOpen struct {
 	quote byte
 }
 
-// oddSlashRunsOn is continuation as make and systemd's environment.d read
-// it: a line ending in an odd number of backslashes joins the next, and a
-// comment is no exception, since both readers join lines before they look
-// for one.
+// oddSlashRunsOn is continuation as systemd's environment.d reads it: a line
+// ending in an odd number of backslashes joins the next, and a comment is no
+// exception, since the reader joins lines before it looks for one.
 func oddSlashRunsOn(line string, _ lineOpen) lineOpen {
 	line = strings.TrimSuffix(line, "\r")
 	n := len(line) - len(strings.TrimRight(line, `\`))
@@ -162,16 +161,9 @@ var (
 		}
 		return ""
 	}}
-	dnfRules  = lineRules{key: settingKey, indent: true}
-	gitRules  = lineRules{key: settingKey, runsOn: gitRunsOn}
-	shRules   = lineRules{key: settingKey, runsOn: shRunsOn}
-	envdRules = lineRules{key: settingKey, runsOn: oddSlashRunsOn}
-	makeRules = lineRules{runsOn: oddSlashRunsOn, key: func(line string) string {
-		if m := makeAssignment.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-		return ""
-	}}
+	gitRules   = lineRules{key: settingKey, runsOn: gitRunsOn}
+	shRules    = lineRules{key: settingKey, runsOn: shRunsOn}
+	envdRules  = lineRules{key: settingKey, runsOn: oddSlashRunsOn}
 	fieldRules = lineRules{indent: true, key: func(line string) string {
 		if line == "" || strings.ContainsRune("# \t", rune(line[0])) {
 			return ""
@@ -184,18 +176,11 @@ var (
 	}}
 )
 
-// makeAssignment is a make variable assignment under any of its operators,
-// which all name the one variable: an = left beside the plan's ?= would win.
-var makeAssignment = regexp.MustCompile(`^([A-Za-z0-9_.{}()$-]+)[ \t]*[:+?!]?=`)
-
 // fileKind is how an existing file of one client takes a plan's settings and
 // keeps its own. The zero kind is a file written whole: one NewChange merged
 // already, or a document that holds nothing but the one value the plan
 // renders (a key).
 type fileKind struct {
-	// block merges a file bodega renders as one block, which a person may
-	// have written lines of their own around.
-	block func(old, planned []byte) ([]byte, error)
 	// rules merges a file of sectioned key and value lines.
 	rules *lineRules
 	// blocks merges a file of named entries, each taking the plan's fields
@@ -315,38 +300,15 @@ func kindOf(rec PlanRecord) fileKind {
 		return fileKind{rules: &pipRules, unread: strayHeader(pipRules)}
 	case manifest.TypeGit:
 		return fileKind{rules: &gitRules, unread: gitUnread}
-	case manifest.TypeRpm:
-		if strings.HasSuffix(name, ".repo") {
-			return fileKind{rules: &dnfRules, unread: strayHeader(dnfRules)}
-		}
-	case manifest.TypeCargo:
-		return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
 	case manifest.TypeOCI:
-		switch {
-		case name == "hosts.toml":
+		if name == "hosts.toml" {
 			return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}
-		case OCIRuntimeOf(rec.Path) == RuntimePodman:
-			return fileKind{blocks: mergeRegistries, holds: registriesHold, keeps: registriesKeep}
 		}
-	case manifest.TypeMaven:
-		if rec.Path == GradleInitPath {
-			return fileKind{block: mergeGradleInit}
-		}
-	case manifest.TypeRubygems:
-		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "") }, holds: yamlHolds(""), keeps: yamlKeeps("")}
 	case manifest.TypeHelm:
 		return fileKind{blocks: func(old, planned []string) []string { return mergeYAML(old, planned, "repositories") }, holds: yamlHolds("repositories"), keeps: yamlKeeps("repositories")}
 	case manifest.TypeApt:
 		if strings.HasSuffix(name, ".sources") {
 			return fileKind{blocks: mergeDeb822}
-		}
-	case manifest.TypeFreeBSD:
-		if strings.HasSuffix(name, ".conf") {
-			return fileKind{blocks: mergeUCL, holds: uclHolds, keeps: uclKeeps}
-		}
-	case manifest.TypeDistfiles:
-		if name == "make.conf" {
-			return fileKind{blocks: mergeMakeConf}
 		}
 	}
 	return fileKind{}
@@ -354,7 +316,7 @@ func kindOf(rec PlanRecord) fileKind {
 
 // whole reports a file no editor here reads: bodega renders it and writes it
 // whole.
-func (k fileKind) whole() bool { return k.rules == nil && k.block == nil && k.blocks == nil }
+func (k fileKind) whole() bool { return k.rules == nil && k.blocks == nil }
 
 // keepWhole is the merge for such a file when the host already holds one
 // that differs from planned. With no editor for the format, the only lines
@@ -399,8 +361,6 @@ func (k fileKind) merge(old, planned []byte) ([]byte, error) {
 		}
 	}
 	switch {
-	case k.block != nil:
-		return k.block(old, planned)
 	case k.rules != nil:
 		lines = mergeSettings(splitBody(old), splitBody(planned), *k.rules)
 		if err := linesKeep(splitBody(old), lines, splitBody(planned), *k.rules); err != nil {
@@ -461,104 +421,6 @@ func tomlKeeps(old, merged, planned []byte) error {
 		return err
 	}
 	return treeKeeps(o, m, p, "")
-}
-
-// registriesKeep is keeps for a containers-registries.conf drop-in: every
-// top-level key and every registry the plan does not name reads as it did,
-// and a registry the plan names keeps its own keys and its other mirrors in
-// their order. insecure in the plan's own mirror is the plan's to give.
-func registriesKeep(old, merged, planned []byte) error {
-	var o, m, p map[string]any
-	if _, err := toml.Decode(string(old), &o); err != nil {
-		return fmt.Errorf("the file as it stands does not read as TOML: %w", err)
-	}
-	if _, err := toml.Decode(string(merged), &m); err != nil {
-		return err
-	}
-	if _, err := toml.Decode(string(planned), &p); err != nil {
-		return err
-	}
-	tables := func(v any) []map[string]any {
-		list, _ := v.([]map[string]any)
-		return list
-	}
-	byID := func(list []map[string]any, id string) map[string]any {
-		for _, r := range list {
-			if registryID(r) == id {
-				return r
-			}
-		}
-		return nil
-	}
-	location := func(r map[string]any) string { s, _ := r["location"].(string); return s }
-	rest := func(doc map[string]any) map[string]any {
-		out := maps.Clone(doc)
-		delete(out, "registry")
-		return out
-	}
-	if err := treeKeeps(rest(o), rest(m), rest(p), ""); err != nil {
-		return err
-	}
-	seen := map[string]bool{}
-	for _, r := range tables(o["registry"]) {
-		id := registryID(r)
-		want := byID(tables(p["registry"]), id)
-		if want == nil {
-			if !slices.ContainsFunc(tables(m["registry"]), func(h map[string]any) bool { return reflect.DeepEqual(h, r) }) {
-				return fmt.Errorf("the merge would not keep the registry %q as the host wrote it", id)
-			}
-			continue
-		}
-		// A second entry of one prefix is a second definition of the one
-		// registry, which containers/image refuses; the merge keeps the first.
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		have := byID(tables(m["registry"]), id)
-		planned := func(loc string) map[string]any {
-			for _, w := range tables(want["mirror"]) {
-				if location(w) == loc {
-					return w
-				}
-			}
-			return nil
-		}
-		for key, v := range r {
-			if _, set := want[key]; set || key == "mirror" {
-				continue
-			}
-			if !reflect.DeepEqual(have[key], v) {
-				return fmt.Errorf("the merge would not keep %s of the registry %q", key, id)
-			}
-		}
-		var was, now []map[string]any
-		for _, om := range tables(r["mirror"]) {
-			w := planned(location(om))
-			if w == nil {
-				was = append(was, om)
-				continue
-			}
-			hm := byID(tables(have["mirror"]), location(om))
-			for key, v := range om {
-				if _, set := w[key]; set || key == "insecure" {
-					continue
-				}
-				if !reflect.DeepEqual(hm[key], v) {
-					return fmt.Errorf("the merge would not keep %s of the mirror %q of the registry %q", key, location(om), id)
-				}
-			}
-		}
-		for _, hm := range tables(have["mirror"]) {
-			if planned(location(hm)) == nil {
-				now = append(now, hm)
-			}
-		}
-		if !reflect.DeepEqual(was, now) {
-			return fmt.Errorf("the merge would not keep the other mirrors of the registry %q in the order the host tries them", id)
-		}
-	}
-	return nil
 }
 
 // yamlKeeps is keeps for a YAML mapping merged key by key: every top-level
@@ -785,179 +647,6 @@ func splitEntries(lines []string, starts func(i int) bool, ends func(i int) int,
 	}
 	filler(last, len(lines))
 	return out
-}
-
-func tomlHeader(line string) string {
-	t := strings.TrimSpace(line)
-	if !strings.HasPrefix(t, "[") {
-		return ""
-	}
-	if i := strings.Index(t, "#"); i > 0 {
-		t = strings.TrimSpace(t[:i])
-	}
-	return strings.Join(strings.Fields(t), "")
-}
-
-type registriesDoc struct {
-	Registry []map[string]any `toml:"registry"`
-}
-
-func registryID(r map[string]any) string {
-	for _, key := range []string{"prefix", "location"} {
-		if s, _ := r[key].(string); s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
-// mergeRegistries merges a containers-registries.conf drop-in: each
-// [[registry]] the plan renders joins the host's entry for that prefix field
-// by field, and the host's other registries, its other tables and its
-// top-level keys stay.
-func mergeRegistries(old, planned []string) []string {
-	split := func(lines []string) []block {
-		return splitEntries(lines,
-			func(i int) bool { return tomlHeader(lines[i]) == "[[registry]]" },
-			func(i int) int {
-				end := i + 1
-				for end < len(lines) {
-					if h := tomlHeader(lines[end]); h != "" && !strings.HasPrefix(h, "[[registry.") && !strings.HasPrefix(h, "[registry.") {
-						break
-					}
-					end++
-				}
-				return end
-			},
-			func(entry []string) string {
-				var doc registriesDoc
-				if _, err := toml.Decode(strings.Join(entry, "\n"), &doc); err != nil || len(doc.Registry) != 1 {
-					return ""
-				}
-				return registryID(doc.Registry[0])
-			})
-	}
-	return mergeBlocks(split(old), split(planned), true, mergeRegistry)
-}
-
-// tomlTables cuts one [[registry]] entry into the lines of the registry
-// itself and each table under it, a table opening at its header.
-func tomlTables(entry []string) [][]string {
-	out := [][]string{nil}
-	for i, l := range entry {
-		if h := tomlHeader(l); i > 0 && h != "" && h != "[[registry]]" {
-			out = append(out, nil)
-		}
-		out[len(out)-1] = append(out[len(out)-1], l)
-	}
-	return out
-}
-
-// tomlStringOf is the string the table's lines give key, "" for none.
-func tomlStringOf(table []string, key string) string {
-	for _, l := range table {
-		if plainRules.key(l) != key {
-			continue
-		}
-		var doc map[string]any
-		if _, err := toml.Decode(l, &doc); err == nil {
-			s, _ := doc[key].(string)
-			return s
-		}
-	}
-	return ""
-}
-
-// mergeRegistry sets the plan's keys in the host's registry entry and keeps
-// its others: the entry's own policy keys, and its other mirrors, which stay
-// in the order the host tries them. The plan's mirror joins the mirror table
-// of the same location, or leads the mirrors when there is none, since the
-// plan's is the one tried first. insecure in bodega's own mirror table is the
-// plan's to give, so one the plan does not render is removed: it is what a
-// plaintext plan wrote there, and it turns verification off.
-func mergeRegistry(old, planned []string) []string {
-	was, now := tomlTables(old), tomlTables(planned)
-	was[0] = setFields(was[0], now[0], plainRules, nil)
-	for _, table := range now[1:] {
-		header, location := tomlHeader(table[0]), tomlStringOf(table, "location")
-		_, sets := settings(table, plainRules)
-		at, first := -1, -1
-		for i, have := range was[1:] {
-			if tomlHeader(have[0]) != header {
-				continue
-			}
-			if first < 0 {
-				first = i + 1
-			}
-			if at < 0 && tomlStringOf(have, "location") == location {
-				at = i + 1
-			}
-		}
-		switch {
-		case at >= 0:
-			was[at] = setFields(was[at], table, plainRules, func(key, _ string) bool {
-				_, planned := sets["insecure"]
-				return key == "insecure" && !planned
-			})
-		case first >= 0:
-			was = slices.Insert(was, first, append(slices.Clone(table), ""))
-		default:
-			if last := was[len(was)-1]; strings.TrimSpace(last[len(last)-1]) != "" {
-				was[len(was)-1] = append(last, "")
-			}
-			was = append(was, table)
-		}
-	}
-	return slices.Concat(was...)
-}
-
-// registriesHold checks merged defines each registry the plan names once,
-// with every key the plan gives it and each of the plan's mirrors, and that
-// no mirror of the plan's carries an insecure the plan did not set.
-func registriesHold(merged, planned []byte) error {
-	var m, p registriesDoc
-	if _, err := toml.Decode(string(merged), &m); err != nil {
-		return err
-	}
-	if _, err := toml.Decode(string(planned), &p); err != nil {
-		return err
-	}
-	mirrors := func(r map[string]any) []map[string]any {
-		list, _ := r["mirror"].([]map[string]any)
-		return list
-	}
-	for _, want := range p.Registry {
-		id, n := registryID(want), 0
-		for _, have := range m.Registry {
-			if registryID(have) != id {
-				continue
-			}
-			n++
-			for key, w := range want {
-				if key != "mirror" && !reflect.DeepEqual(have[key], w) {
-					return fmt.Errorf("the registry %q would read %s as %v, not the plan's %v", id, key, have[key], w)
-				}
-			}
-			for _, wm := range mirrors(want) {
-				if !slices.ContainsFunc(mirrors(have), func(hm map[string]any) bool {
-					for key, w := range wm {
-						if !reflect.DeepEqual(hm[key], w) {
-							return false
-						}
-					}
-					_, planned := wm["insecure"]
-					_, kept := hm["insecure"]
-					return planned || !kept
-				}) {
-					return fmt.Errorf("the registry %q would not hold the plan's mirror %v", id, wm["location"])
-				}
-			}
-		}
-		if n != 1 {
-			return fmt.Errorf("the registry %q would be defined %d times", id, n)
-		}
-	}
-	return nil
 }
 
 // tomlHolds reports the first of planned's values merged does not read the
@@ -1305,313 +994,43 @@ func mergeStanza(old, planned []string) []string {
 	})
 }
 
-var uclObject = regexp.MustCompile(`^\s*("[^"]*"|[A-Za-z0-9_.-]+)\s*[:=]?\s*\{`)
-
-// uclField is one field of a UCL object: its key and where the key through
-// the end of its value stands in the object's text.
-type uclField struct {
-	key        string
-	start, end int
+// pipHeader is the section a stripped pip configuration line opens, as
+// configparser's SECTCRE matches one: a [ first, then at least one character,
+// then the last ] on the line, whatever follows it.
+func pipHeader(t string) (section string, ok bool) {
+	if !strings.HasPrefix(t, "[") {
+		return "", false
+	}
+	end := strings.LastIndex(t, "]")
+	if end < 2 {
+		return "", false
+	}
+	return t[1:end], true
 }
 
-// uclFields lists the fields of the first object text opens, with the index
-// of that object's closing brace, and false for text this reader does not
-// follow to that brace. Strings, comments and nested objects and arrays are
-// stepped over whole, so a brace or a separator inside one ends nothing.
-func uclFields(text string) (fields []uclField, closing int, ok bool) {
-	// skip steps over the string, comment or bracketed value opening at i and
-	// returns the index after it, or i itself when none opens there.
-	var skip func(i int) int
-	skip = func(i int) int {
-		switch c := text[i]; {
-		case c == '"' || c == '\'':
-			for j := i + 1; j < len(text); j++ {
-				switch text[j] {
-				case '\\':
-					j++
-				case c:
-					return j + 1
-				}
-			}
-			return len(text)
-		case c == '#':
-			if end := strings.IndexByte(text[i:], '\n'); end >= 0 {
-				return i + end
-			}
-			return len(text)
-		case strings.HasPrefix(text[i:], "/*"):
-			if end := strings.Index(text[i+2:], "*/"); end >= 0 {
-				return i + end + 4
-			}
-			return len(text)
-		case c == '{' || c == '[':
-			for j := i + 1; j < len(text); {
-				if text[j] == '}' || text[j] == ']' {
-					return j + 1
-				}
-				if next := skip(j); next > j {
-					j = next
-				} else {
-					j++
-				}
-			}
-			return len(text)
-		}
-		return i
-	}
-	i := 0
-	for i < len(text) && text[i] != '{' {
-		if next := skip(i); next > i {
-			i = next
-		} else {
-			i++
-		}
-	}
-	for i++; i < len(text); {
-		switch c := text[i]; {
-		case c == '}':
-			return fields, i, true
-		case strings.ContainsRune(" \t\r\n,;", rune(c)):
-			i++
-			continue
-		case c == '#' || strings.HasPrefix(text[i:], "/*"):
-			i = skip(i)
-			continue
-		}
-		f := uclField{start: i}
-		if next := skip(i); next > i {
-			f.key, i = strings.Trim(text[f.start:next], `"'`), next
-		} else {
-			for i < len(text) && !strings.ContainsRune(" \t\r\n:={[,;}", rune(text[i])) {
-				i++
-			}
-			f.key = text[f.start:i]
-		}
-		if f.key == "" {
-			return nil, 0, false
-		}
-		for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
-			i++
-		}
-		if i < len(text) && (text[i] == ':' || text[i] == '=') {
-			for i++; i < len(text) && (text[i] == ' ' || text[i] == '\t'); i++ {
-			}
-		}
-		if i >= len(text) {
-			return nil, 0, false
-		}
-		if next := skip(i); next > i && text[i] != '#' {
-			i = next
-		} else {
-			for i < len(text) && !strings.ContainsRune("\n,;}#", rune(text[i])) {
-				// ${ABI} in a bare value is a variable, not the object's end.
-				if end := strings.IndexByte(text[i:], '}'); strings.HasPrefix(text[i:], "${") && end > 0 {
-					i += end
-				}
-				i++
-			}
-		}
-		f.end = len(strings.TrimRight(text[:i], " \t\r"))
-		fields = append(fields, f)
-	}
-	return nil, 0, false
-}
-
-func uclEntries(lines []string) []block {
-	return splitEntries(lines,
-		func(i int) bool { return uclObject.MatchString(lines[i]) },
-		func(i int) int {
-			if _, closing, ok := uclFields(strings.Join(lines[i:], "\n")); ok {
-				return i + strings.Count(strings.Join(lines[i:], "\n")[:closing], "\n") + 1
-			}
-			return len(lines)
-		},
-		func(entry []string) string { return strings.Trim(uclObject.FindStringSubmatch(entry[0])[1], `"`) })
-}
-
-// mergeUCL merges a pkg repository file: each object the plan renders joins
-// the host's object of that tag field by field, and the host's other objects
-// stay. The comment block a plan opens the file with is replaced when the
-// host's file opens with the same line, since it describes the objects under
-// it.
-func mergeUCL(old, planned []string) []string {
-	was, now := uclEntries(old), uclEntries(planned)
-	if len(was) > 0 && len(now) > 0 && was[0].id == "" && now[0].id == "" && was[0].lines[0] == now[0].lines[0] {
-		was[0].lines = now[0].lines
-	}
-	return mergeBlocks(was, now, true, mergeUCLObject)
-}
-
-// mergeUCLObject sets the plan's fields in the host's object and keeps its
-// others, such as priority, editing the object's text in place so its layout
-// and comments stay. A field the object lacks goes before its closing brace:
-// on a line of its own where the object's fields have theirs, and after a
-// comma where the object is written on one line. An object this reader does
-// not follow is returned as it is, for uclHolds to refuse.
-func mergeUCLObject(old, planned []string) []string {
-	text, plan := strings.Join(old, "\n"), strings.Join(planned, "\n")
-	have, closing, ok := uclFields(text)
-	want, _, planOK := uclFields(plan)
-	if !ok || !planOK {
-		return old
-	}
-	var missing []string
-	edits := map[int]string{}
-	for _, w := range want {
-		at := slices.IndexFunc(have, func(f uclField) bool { return f.key == w.key })
-		if at < 0 {
-			missing = append(missing, plan[w.start:w.end])
-			continue
-		}
-		edits[at] = plan[w.start:w.end]
-	}
-	if len(missing) > 0 {
-		last := strings.Index(text, "{") + 1
-		if len(have) > 0 {
-			last = have[len(have)-1].end
-		}
-		tail := text[last:closing]
-		switch nl := strings.LastIndex(tail, "\n"); {
-		case nl >= 0 && len(have) > 0:
-			line := text[:have[0].start]
-			indent := line[strings.LastIndex(line, "\n")+1:]
-			if strings.TrimSpace(indent) != "" {
-				indent = "  "
-			}
-			sep := ""
-			if rest := strings.TrimLeft(tail, " \t"); !strings.HasPrefix(rest, ",") && !strings.HasPrefix(rest, ";") {
-				sep = ","
-			}
-			at := last + nl + 1
-			text = text[:last] + sep + text[last:at] + indent + strings.Join(missing, ",\n"+indent) + "\n" + text[at:]
-		case len(have) > 0:
-			text = text[:last] + ", " + strings.Join(missing, ", ") + text[last:]
-		default:
-			text = text[:last] + " " + strings.Join(missing, ", ") + " " + strings.TrimLeft(text[last:], " \t")
-		}
-	}
-	for at := len(have) - 1; at >= 0; at-- {
-		if edit, ok := edits[at]; ok {
-			text = text[:have[at].start] + edit + text[have[at].end:]
-		}
-	}
-	return strings.Split(text, "\n")
-}
-
-// uclHolds checks merged holds an object of each tag the plan renders, once,
-// giving every field the plan gives it the plan's value.
-func uclHolds(merged, planned []byte) error {
-	objects := func(body []byte) map[string][]string {
-		out := map[string][]string{}
-		for _, b := range uclEntries(splitBody(body)) {
-			if b.id != "" {
-				out[b.id] = append(out[b.id], strings.Join(b.lines, "\n"))
-			}
-		}
-		return out
-	}
-	have := objects(merged)
-	for tag, texts := range have {
-		for _, text := range texts {
-			if _, _, ok := uclFields(text); !ok {
-				return fmt.Errorf("the object %s is written in a form that cannot be followed to its closing brace", tag)
-			}
-		}
-	}
-	for tag, texts := range objects(planned) {
-		if len(have[tag]) != len(texts) {
-			return fmt.Errorf("the object %s would be defined %d times", tag, len(have[tag]))
-		}
-		for i, plan := range texts {
-			want, _, _ := uclFields(plan)
-			got, _, _ := uclFields(have[tag][i])
-			for _, w := range want {
-				if !slices.ContainsFunc(got, func(f uclField) bool {
-					return f.key == w.key && have[tag][i][f.start:f.end] == plan[w.start:w.end]
-				}) {
-					return fmt.Errorf("the object %s would not read %s as the plan sets it", tag, plan[w.start:w.end])
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// uclKeeps is keeps for a pkg repository file: an object the plan does not
-// render reads as it did, and one it renders keeps every field the plan does
-// not give it.
-func uclKeeps(old, merged, planned []byte) error {
-	objects := func(body []byte) map[string][]string {
-		out := map[string][]string{}
-		for _, b := range uclEntries(splitBody(body)) {
-			if b.id != "" {
-				out[b.id] = append(out[b.id], strings.Join(dropLead(b.lines), "\n"))
-			}
-		}
-		return out
-	}
-	have, plan := objects(merged), objects(planned)
-	for tag, texts := range objects(old) {
-		if len(plan[tag]) == 0 {
-			if !slices.Equal(have[tag], texts) {
-				return fmt.Errorf("the merge would not keep the object %s as the host wrote it", tag)
-			}
-			continue
-		}
-		if len(have[tag]) == 0 {
-			return fmt.Errorf("the merge would drop the object %s", tag)
-		}
-		was, _, _ := uclFields(texts[0])
-		now, _, _ := uclFields(have[tag][0])
-		want, _, _ := uclFields(plan[tag][0])
-		for _, f := range was {
-			if slices.ContainsFunc(want, func(w uclField) bool { return w.key == f.key }) {
-				continue
-			}
-			if !slices.ContainsFunc(now, func(n uclField) bool {
-				return n.key == f.key && have[tag][0][n.start:n.end] == texts[0][f.start:f.end]
-			}) {
-				return fmt.Errorf("the merge would not keep %s of the object %s", f.key, tag)
-			}
-		}
-	}
-	return nil
-}
-
-// mergeMakeConf merges make.conf: each variable the plan assigns replaces the
-// host's assignment of it under any operator, and every other line the plan
-// renders (the .include of the distfiles check) ends the file, where it sees
-// every assignment above it.
-func mergeMakeConf(old, planned []string) []string {
-	out := mergeSettings(old, planned, makeRules)
-	for _, l := range planned {
-		if makeRules.key(l) != "" || strings.TrimSpace(l) == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		kept := out[:0:0]
-		for _, o := range out {
-			if strings.TrimSpace(o) != strings.TrimSpace(l) {
-				kept = append(kept, o)
-			}
-		}
-		out = append(kept, l)
-	}
-	return out
-}
-
-// pipRawKey is the option name a pip configuration line assigns as
-// ConfigParser stores it, lowercased and otherwise as written, or "" for a
-// line assigning none.
-func pipRawKey(line string) string {
-	t := strings.TrimSpace(line)
-	if t == "" || strings.ContainsRune("#;[", rune(t[0])) {
-		return ""
-	}
+// pipOption splits a stripped pip configuration line at its first = or :, as
+// configparser's OPTCRE does with those two delimiters and no valueless
+// options. raw is the name as ConfigParser stores it, lowercased and
+// otherwise as written, which is empty for a line opening with a delimiter.
+func pipOption(t string) (raw, value string, ok bool) {
 	i := strings.IndexAny(t, "=:")
 	if i < 0 {
+		return "", "", false
+	}
+	return strings.ToLower(strings.TrimSpace(t[:i])), strings.TrimSpace(t[i+1:]), true
+}
+
+func pipComment(t string) bool { return t != "" && (t[0] == '#' || t[0] == ';') }
+
+// pipRawKey is the option name a pip configuration line assigns as
+// ConfigParser stores it, or "" for a line assigning none.
+func pipRawKey(line string) string {
+	t := strings.TrimSpace(line)
+	if _, header := pipHeader(t); header || t == "" || pipComment(t) {
 		return ""
 	}
-	return strings.ToLower(strings.TrimSpace(t[:i]))
+	raw, _, _ := pipOption(t)
+	return raw
 }
 
 // pipName is pip's _normalize_name (pip 26.2.1, configuration.py): _ reads as
@@ -1620,60 +1039,120 @@ func pipName(raw string) string {
 	return strings.TrimPrefix(strings.ReplaceAll(strings.ToLower(raw), "_", "-"), "--")
 }
 
-// PipLoadError is why pip cannot load a configuration file, or nil when it
-// can. pip reads each file with a strict RawConfigParser, which refuses a
-// section declared twice and an option assigned twice in one section, named
-// as ConfigParser stores it (lowercased, before pip's own normalization, so
-// cert and --cert are two options), and refuses an option above every
-// section header. pip then aborts on the file, so no option in it is policy.
-// A repeated [DEFAULT] header is not an error: ConfigParser keeps no DEFAULT
-// in its section list and reopens the defaults.
-func PipLoadError(data []byte) error {
+// pipItem is one option of a pip configuration file, under the name
+// ConfigParser stores it by.
+type pipItem struct{ raw, value string }
+
+// pipFile is a pip configuration file as RawConfigParser reads one.
+type pipFile struct {
+	// sections holds each section's options in the order the file first
+	// assigns them, DEFAULT among them, and order the sections other than
+	// DEFAULT in the order the file declares them.
+	sections map[string][]pipItem
+	order    []string
+}
+
+// readPipFile reads a pip configuration file the way pip does, and returns
+// the error pip refuses the whole file with. It ports RawConfigParser._read
+// (CPython 3.12, Lib/configparser.py) as pip constructs the parser: strict,
+// delimiters = and :, full-line comments # and ;, no inline comments, no
+// valueless options, and empty lines kept inside values.
+//
+// Every line is one of five things, decided in this order. A blank line or a
+// comment changes nothing, wherever it is indented. A line indented deeper
+// than the option above it continues that option's value; a section header
+// leaves no option to continue, so a line indented under one is read as any
+// other. A section header opens its section, and a second header of one name
+// is an error, DEFAULT excepted. Anything else above the first header is an
+// error. What remains must be an option: a non-empty name, a delimiter, a
+// value, with a name assigned twice in one section an error. A line that is
+// none of these is an error, never an unrelated setting.
+func readPipFile(data []byte) (pipFile, error) {
+	f := pipFile{sections: map[string][]pipItem{}}
 	declared := map[string]bool{}
-	assigned := map[string]bool{}
-	scan := lineScan{rules: pipRules, keyIndent: -1}
+	values := map[string][][]string{}
 	section, inSection := "", false
-	for n, l := range splitBody(data) {
-		t := strings.TrimSpace(l)
-		if scan.continues(l) {
-			continue
+	current, indent := -1, 0
+	var first error
+	fail := func(n int, format string, args ...any) {
+		if first == nil {
+			first = fmt.Errorf("line %d: %s", n, fmt.Sprintf(format, args...))
 		}
-		if strings.HasPrefix(t, "[") {
-			scan.keyIndent = -1
-			end := strings.LastIndex(t, "]")
-			if end <= 0 {
-				continue
-			}
-			section, inSection = t[1:end], true
-			if section != "DEFAULT" && declared[section] {
-				return fmt.Errorf("line %d: section %q already exists", n+1, section)
-			}
-			declared[section] = true
-			continue
-		}
-		raw := pipRawKey(l)
-		if raw == "" {
-			continue
-		}
-		scan.keyIndent = indentOf(l)
-		if !inSection {
-			return fmt.Errorf("line %d: %q sits above every section header", n+1, t)
-		}
-		key := section + "\x00" + raw
-		if assigned[key] {
-			return fmt.Errorf("line %d: option %q in section %q already exists", n+1, raw, section)
-		}
-		assigned[key] = true
 	}
-	return nil
+	// Python opens the file with universal newlines.
+	text := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(string(data))
+	for n, l := range strings.Split(text, "\n") {
+		n++
+		t := strings.TrimSpace(l)
+		if pipComment(t) {
+			continue
+		}
+		if t == "" {
+			if current >= 0 {
+				values[section][current] = append(values[section][current], "")
+			}
+			continue
+		}
+		at := len(l) - len(strings.TrimLeftFunc(l, unicode.IsSpace))
+		if current >= 0 && at > indent {
+			values[section][current] = append(values[section][current], t)
+			continue
+		}
+		indent = at
+		if name, ok := pipHeader(t); ok {
+			if name != "DEFAULT" && declared[name] {
+				return f, fmt.Errorf("line %d: section %q already exists", n, name)
+			}
+			if !declared[name] && name != "DEFAULT" {
+				f.order = append(f.order, name)
+			}
+			declared[name] = true
+			section, inSection, current = name, true, -1
+			continue
+		}
+		if !inSection {
+			return f, fmt.Errorf("line %d: %q sits above every section header", n, t)
+		}
+		raw, value, ok := pipOption(t)
+		if !ok {
+			fail(n, "%q is neither a section header nor an option with a = or : after its name", t)
+			continue
+		}
+		if raw == "" {
+			fail(n, "%q assigns a value to no option name", t)
+		}
+		items := f.sections[section]
+		if slices.ContainsFunc(items, func(it pipItem) bool { return it.raw == raw }) {
+			return f, fmt.Errorf("line %d: option %q in section %q already exists", n, raw, section)
+		}
+		f.sections[section] = append(items, pipItem{raw: raw})
+		values[section] = append(values[section], []string{value})
+		// configparser continues an option only under a non-empty name.
+		if current = len(items); raw == "" {
+			current = -1
+		}
+	}
+	for name, items := range f.sections {
+		for i := range items {
+			items[i].value = strings.TrimRightFunc(strings.Join(values[name][i], "\n"), unicode.IsSpace)
+		}
+	}
+	return f, first
+}
+
+// PipLoadError is why pip cannot load a configuration file, or nil when it
+// can: readPipFile's verdict. pip aborts on such a file, so no option in it
+// is policy, whichever line the error is on.
+func PipLoadError(data []byte) error {
+	_, err := readPipFile(data)
+	return err
 }
 
 // PipOptions reads a pip configuration file into "section.option", the
-// option named as pipName names it, each to the value pip takes for it. It
-// walks the file with the scan the merge edits one with, so a line the merge
-// treats as the tail of another setting is never read here as a setting of
-// its own: a deeper-indented line continues the option above it, and a colon
-// delimits as an equals sign does.
+// option named as pipName names it, each to the value pip takes for it. The
+// lines are readPipFile's, so what PipLoadError judges and what is read here
+// are one reading of the file, and a file pip refuses to load gives no option
+// at all.
 //
 // The rest ports pip's _load_file over RawConfigParser: [DEFAULT] is no
 // section of its own but is inherited by every section the file declares,
@@ -1681,53 +1160,15 @@ func PipLoadError(data []byte) error {
 // default's place; pip then walks each section's items in that order,
 // normalizing names, and the last item of one normalized name wins.
 func PipOptions(data []byte) map[string]string {
-	type item struct{ raw, value string }
-	sections := map[string][]item{}
-	var order []string
-	scan := lineScan{rules: pipRules, keyIndent: -1}
-	section, current := "", -1
-	for _, l := range splitBody(data) {
-		t := strings.TrimSpace(l)
-		if scan.continues(l) {
-			if current >= 0 && !strings.ContainsRune("#;", rune(t[0])) {
-				it := &sections[section][current]
-				it.value = strings.TrimSpace(it.value + "\n" + t)
-			}
-			continue
-		}
-		if strings.HasPrefix(t, "[") {
-			section, current, scan.keyIndent = "", -1, -1
-			if end := strings.LastIndex(t, "]"); end > 0 {
-				section = t[1:end]
-			}
-			if _, ok := sections[section]; !ok && section != "DEFAULT" {
-				order = append(order, section)
-			}
-			if _, ok := sections[section]; !ok {
-				sections[section] = nil
-			}
-			continue
-		}
-		raw := pipRawKey(l)
-		if raw == "" {
-			continue
-		}
-		scan.keyIndent = indentOf(l)
-		value := strings.TrimSpace(t[strings.IndexAny(t, "=:")+1:])
-		items := sections[section]
-		current = slices.IndexFunc(items, func(it item) bool { return it.raw == raw })
-		if current < 0 {
-			current = len(items)
-			items = append(items, item{raw: raw})
-		}
-		items[current].value = value
-		sections[section] = items
-	}
 	out := map[string]string{}
-	for _, name := range order {
-		merged := slices.Clone(sections["DEFAULT"])
-		for _, it := range sections[name] {
-			if k := slices.IndexFunc(merged, func(d item) bool { return d.raw == it.raw }); k >= 0 {
+	f, err := readPipFile(data)
+	if err != nil {
+		return out
+	}
+	for _, name := range f.order {
+		merged := slices.Clone(f.sections["DEFAULT"])
+		for _, it := range f.sections[name] {
+			if k := slices.IndexFunc(merged, func(d pipItem) bool { return d.raw == it.raw }); k >= 0 {
 				merged[k].value = it.value
 			} else {
 				merged = append(merged, it)

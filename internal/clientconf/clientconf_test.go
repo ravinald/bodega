@@ -27,13 +27,10 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	keystore "github.com/pavlo-v-chernykh/keystore-go/v4"
 	"gopkg.in/yaml.v3"
-	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
-	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
@@ -611,10 +608,14 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 		files := []File{
 			Npm(testBase, nil), Pip(testBase),
 			Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}),
-			Gomod(testBase), Cargo(testBase),
+			Gomod(testBase), Helm(testBase),
 		}
+		// podman's registries.conf is refused under a CA plan, as
+		// TestAddCARefusesEveryOtherClient holds it to.
 		for _, f := range oci {
-			files = append(files, f.File)
+			if OCIRuntimeOf(f.Path(OSLinux)) != RuntimePodman {
+				files = append(files, f.File)
+			}
 		}
 		return caPlan(t, home, files...)
 	}
@@ -629,9 +630,8 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 		filepath.Join(home, "etc/pip.conf"): "[global]\ncert = " + userCA + "\nindex-url = https://bodega.example.com/pypi/simple/\n",
 		filepath.Join(home, ".gitconfig"):   "[url \"https://bodega.example.com/git/gh/\"]\n\tinsteadOf = https://github.com/\n[http \"https://bodega.example.com/\"]\n\tsslCAInfo = " + userCA + "\n",
 		userCA:                              string(caPEM),
-		filepath.Join(home, "etc/docker/certs.d/bodega.example.com/ca.crt"):     string(caPEM),
-		filepath.Join(home, "etc/containers/certs.d/bodega.example.com/ca.crt"): string(caPEM),
-		filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt"):    string(caPEM),
+		filepath.Join(home, "etc/docker/certs.d/bodega.example.com/ca.crt"):  string(caPEM),
+		filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt"): string(caPEM),
 	} {
 		if got := string(changeAt(t, in.Changes, target).New); got != want {
 			t.Errorf("%s =\n%s\nwant\n%s", target, got, want)
@@ -652,7 +652,7 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 		t.Errorf("hosts.toml host table = %+v, server %q; want ca %s beside the capabilities\n%s", got, hosts.Server, userCA, hostsToml.New)
 	}
 	if !slices.Equal(in.Step, []string{"update-ca-certificates"}) {
-		t.Errorf("step = %v, want update-ca-certificates for the anchor go and cargo read through", in.Step)
+		t.Errorf("step = %v, want update-ca-certificates for the anchor go and helm read through", in.Step)
 	}
 	// daemon.json takes no CA setting: Docker reads certs.d beside it.
 	if got := changeAt(t, in.Changes, filepath.Join(home, "etc/docker/daemon.json")); strings.Contains(string(got.New), "ca") {
@@ -690,6 +690,57 @@ func TestAddCALandsWhereEachClientReadsIt(t *testing.T) {
 	}
 	if again.Step != nil {
 		t.Errorf("a second plan runs %v with the store holding the anchor", again.Step)
+	}
+}
+
+// F116 R1: a CA plan holding a record for any client other than apt, go,
+// helm, pip, npm, git, Docker Engine and containerd is refused whole, naming
+// the client, with no edit planned for the clients beside it.
+func TestAddCARefusesEveryOtherClient(t *testing.T) {
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := func(system string) File {
+		return File{System: system, Paths: map[string]string{OSLinux: "/etc/bodega-" + system + ".conf"}, Content: "x\n"}
+	}
+	for name, tc := range map[string]struct {
+		file File
+		want string
+	}{
+		"maven":     {Maven(testBase, nil)[0], "maven: private-CA installation for maven is not supported"},
+		"rpm":       {Rpm(testBase, []string{"baseos"}), "rpm: private-CA installation for rpm is not supported"},
+		"cargo":     {Cargo(testBase), "cargo: private-CA installation for cargo is not supported"},
+		"rubygems":  {Rubygems(testBase)[0], "rubygems: private-CA installation for rubygems is not supported"},
+		"composer":  {Composer(testBase), "composer: private-CA installation for composer is not supported"},
+		"freebsd":   {other(manifest.TypeFreeBSD), "freebsd: private-CA installation for freebsd is not supported"},
+		"distfiles": {other(manifest.TypeDistfiles), "distfiles: private-CA installation for distfiles is not supported"},
+		"binary":    {other(manifest.TypeBinary), "binary: private-CA installation for binary is not supported"},
+		"podman":    {RegistriesConf(testBase, []string{"docker.io"}), "oci: private-CA installation for podman, buildah and CRI-O is not supported"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
+			for _, files := range [][]File{{tc.file}, {Pip(testBase), tc.file}, {tc.file, Gomod(testBase)}} {
+				in, err := AddCA(caPlan(t, home, files...), ca, h)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("AddCA over %d file(s) = %v, want a refusal holding %q", len(files), err, tc.want)
+				}
+				if len(in.Changes) != 0 || in.Step != nil {
+					t.Errorf("a refused plan still carries %d change(s) and the step %v", len(in.Changes), in.Step)
+				}
+			}
+		})
+	}
+	if err := CAUnsupported(PlanRecord{System: manifest.TypeOCI}); err != nil {
+		t.Errorf("oci named alone = %v, want it left to the plan's records", err)
+	}
+	for _, f := range OCIClient(testBase, map[string]string{"docker.io": "https://registry-1.docker.io"}) {
+		rec := PlanRecord{System: f.System, Path: f.Path(OSLinux)}
+		if err := CAUnsupported(rec); (err != nil) != (OCIRuntimeOf(rec.Path) == RuntimePodman) {
+			t.Errorf("CAUnsupported(%s) = %v, want a refusal for podman's file alone", rec.Path, err)
+		}
 	}
 }
 
@@ -745,94 +796,6 @@ func TestAddCAFollowsTheHost(t *testing.T) {
 	}
 	if _, err := AddCA([]Change{apt}, ca, CAHost{Base: "http://bodega.example.com", GOOS: OSLinux}); err == nil {
 		t.Error("a plaintext base took a CA")
-	}
-}
-
-// F116 R1: Maven's CA goes into the JVM trust store, one keytool import per
-// certificate that store lacks, each reading a file the plan writes; a store
-// already holding the CA takes no import, and a keystore the JVM is pointed
-// at is the one edited.
-func TestAddCAImportsIntoTheJVMTrustStore(t *testing.T) {
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	otherPEM, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(append(slices.Clone(caPEM), otherPEM...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	home := t.TempDir()
-	// macOS, where no system store install exists: Maven needs none.
-	h := CAHost{Base: testBase, Home: home, GOOS: OSDarwin, JVM: JVMStore{Keytool: "/jdk/bin/keytool"}}
-	in, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(in.Imports) != 2 || in.Step != nil || !strings.Contains(in.Notes[manifest.TypeMaven], "gradle --stop") {
-		t.Fatalf("imports = %v, step %v, notes %v; want one import per certificate, no system step and the daemon note", in.Imports, in.Step, in.Notes)
-	}
-	for i, cmd := range in.Imports {
-		alias, file := cmd[len(cmd)-3], cmd[len(cmd)-1]
-		want := []string{"/jdk/bin/keytool", "-importcert", "-noprompt", "-trustcacerts", "-cacerts", "-storepass", "changeit", "-alias", alias, "-file", file}
-		if !slices.Equal(cmd, want) || !strings.HasPrefix(alias, "bodega-ca-") || filepath.Dir(file) != filepath.Join(home, ".config/bodega") {
-			t.Errorf("import %d = %v", i, cmd)
-		}
-		// What keytool reads is what the plan writes: one certificate.
-		if got := changeAt(t, in.Changes, file); string(got.New) != string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Certs[i].Raw})) {
-			t.Errorf("%s = %s, want certificate %d alone", file, got.New, i+1)
-		}
-	}
-	if in.Imports[0][8] == in.Imports[1][8] {
-		t.Errorf("two certificates share the alias %s", in.Imports[0][8])
-	}
-
-	// A failed import leaves the file written and the store without the CA:
-	// the import is planned again. Once the store holds both, nothing is.
-	if _, err := Apply(in.Changes, ".bak"); err != nil {
-		t.Fatal(err)
-	}
-	h.JVMTrusted = ca.Certs[:1]
-	retry, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
-	if err != nil || len(retry.Imports) != 1 || retry.Imports[0][8] != in.Imports[1][8] {
-		t.Errorf("retry with one certificate imported = %v, %v; want the other's import alone", retry.Imports, err)
-	}
-	h.JVMTrusted = ca.Certs
-	done, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, h)
-	if err != nil || len(done.Imports) != 0 || len(done.Notes) != 0 {
-		t.Errorf("a store holding the CA = imports %v, notes %v, %v; want none", done.Imports, done.Notes, err)
-	}
-	for _, c := range done.Changes {
-		if !c.Unchanged() {
-			t.Errorf("a store holding the CA still changes %s", c.Target)
-		}
-	}
-}
-
-// F116 R1: the JVM store is the JDK at JAVA_HOME's, or the keystore
-// MAVEN_OPTS points the JVM at, and a password an operator set is not printed.
-func TestResolveJVMStore(t *testing.T) {
-	env := map[string]string{"JAVA_HOME": "/opt/jdk"}
-	getenv := func(k string) string { return env[k] }
-	none := func(string) (string, error) { return "", os.ErrNotExist }
-	s, err := ResolveJVMStore(getenv, none)
-	if err != nil || s.Keytool != "/opt/jdk/bin/keytool" || !slices.Contains(s.ImportCommand("a", "f"), "-cacerts") {
-		t.Errorf("JAVA_HOME = %+v, %v", s, err)
-	}
-	env["JAVA_TOOL_OPTIONS"] = "-Djavax.net.ssl.trustStore=/etc/a.jks"
-	env["MAVEN_OPTS"] = "-Xmx1g -Djavax.net.ssl.trustStore=/etc/b.p12 -Djavax.net.ssl.trustStorePassword=hunter2"
-	s, _ = ResolveJVMStore(getenv, none)
-	cmd := s.ImportCommand("a", "f")
-	if s.Keystore != "/etc/b.p12" || slices.Contains(cmd, "-cacerts") || !slices.Contains(cmd, "hunter2") {
-		t.Errorf("MAVEN_OPTS keystore = %+v, %v", s, cmd)
-	}
-	if shown := RedactJVMCommand(cmd); strings.Contains(shown, "hunter2") || !strings.Contains(shown, "-keystore /etc/b.p12") {
-		t.Errorf("printed command = %q", shown)
-	}
-	delete(env, "JAVA_HOME")
-	if _, err := ResolveJVMStore(getenv, none); err == nil || !strings.Contains(err.Error(), "JAVA_HOME") {
-		t.Errorf("no keytool and no JAVA_HOME = %v, want a refusal naming JAVA_HOME", err)
-	}
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	if got := ParseKeytoolList(append([]byte("Alias name: x\nnot a cert\n"), caPEM...)); len(got) != 1 {
-		t.Errorf("ParseKeytoolList = %d certificates, want 1", len(got))
 	}
 }
 
@@ -957,27 +920,6 @@ func TestReviewCAKeepsExistingSettings(t *testing.T) {
 	}
 }
 
-func TestReviewMavenCAPlansTrustInstallation(t *testing.T) {
-	pem, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(pem)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home := t.TempDir()
-	plan := caPlan(t, home, Maven(testBase, nil)...)
-	in, err := AddCA(plan, ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	changed := len(in.Changes) != len(plan) || len(in.Step) > 0
-	for i := range plan {
-		changed = changed || string(plan[i].New) != string(in.Changes[i].New)
-	}
-	if !changed {
-		t.Fatalf("--ca-file added no trust write or step; only notes: %v", in.Notes)
-	}
-}
-
 func TestAuditCAPreservesExistingSettings(t *testing.T) {
 	pem, _, _ := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(pem)
@@ -991,8 +933,6 @@ func TestAuditCAPreservesExistingSettings(t *testing.T) {
 	}{
 		{"pip-indented", Pip(testBase), "[global]\n  index-url = https://pypi.org/simple/\n  timeout = 120\n", "timeout = 120"},
 		{"go", Gomod(testBase), "GOPROXY=https://proxy.golang.org\nGOPRIVATE=corp.example/*\n", "GOPRIVATE=corp.example/*"},
-		{"cargo", Cargo(testBase), "[build]\njobs = 7\n", "jobs = 7"},
-		{"podman", RegistriesConf(testBase, []string{"docker.io"}), "unqualified-search-registries = [\"registry.corp.example\"]\n", "unqualified-search-registries"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -1018,47 +958,6 @@ func TestAuditCAPreservesExistingSettings(t *testing.T) {
 				t.Fatalf("CA install discarded %q; wrote:\n%s", tc.keep, got)
 			}
 		})
-	}
-}
-
-func TestAuditJVMSelectsJSSEStore(t *testing.T) {
-	home := t.TempDir()
-	jsse := filepath.Join(home, "lib/security/jssecacerts")
-	if err := os.MkdirAll(filepath.Dir(jsse), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(jsse, []byte("store fixture"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	s, err := ResolveJVMStore(func(k string) string {
-		if k == "JAVA_HOME" {
-			return home
-		}
-		return ""
-	}, func(string) (string, error) { return "", os.ErrNotExist })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Keystore != jsse || slices.Contains(s.ImportCommand("bodega", "ca.pem"), "-cacerts") {
-		t.Fatalf("JSSE store exists, but resolved store=%q and import=%v; want %s", s.Keystore, s.ImportCommand("bodega", "ca.pem"), jsse)
-	}
-}
-
-//nolint:gosec // G101: the review's fixture password, set only in this test's environment
-func TestAuditJVMErrorsDoNotPrintTrustStorePassword(t *testing.T) {
-	const secret = "audit-only-keystore-password"
-	t.Setenv("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStorePassword="+secret)
-	keytool := filepath.Join(t.TempDir(), "keytool")
-	script := "#!/bin/sh\nprintf '%s\\n' \"Picked up JAVA_TOOL_OPTIONS: $JAVA_TOOL_OPTIONS\"\nexit 1\n"
-	if err := os.WriteFile(keytool, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	_, err := (JVMStore{Keytool: keytool, Password: secret}).Trusted()
-	if err == nil {
-		t.Fatal("fixture command must fail")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("keytool failure leaked trustStorePassword: %v", err)
 	}
 }
 
@@ -1110,9 +1009,7 @@ func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
 		f.Paths = map[string]string{OSLinux: path}
 		return f
 	}
-	gems := Rubygems(testBase)
 	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
-	pkgConf := "# bodega pkg repository. Install as x.\n# written for FreeBSD 15\n\nFreeBSD: { enabled: no }\n\nbodega: {\n  url: \"" + testBase + "/freebsd/${ABI}\",\n  enabled: yes\n}\n"
 	for _, tc := range []struct {
 		name   string
 		file   File
@@ -1120,22 +1017,10 @@ func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
 		// keep stays, want arrives and gone leaves.
 		keep, want, gone []string
 	}{
-		{"gemrc", gems[0], "---\n# house style\ngem: --no-document\n:sources:\n- https://rubygems.org/\n",
-			[]string{"# house style", "gem: --no-document"}, []string{"- " + testBase + "/rubygems/"}, []string{"rubygems.org"}},
-		{"bundler", gems[1], "---\nBUNDLE_JOBS: \"4\"\n", []string{"BUNDLE_JOBS"}, []string{"BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/"}, nil},
 		{"helm", Helm(testBase), "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n  - name: corp\n    url: https://charts.corp.example\n  - name: bodega\n    url: https://old.example/helm\n",
 			[]string{"name: corp", "url: https://charts.corp.example"}, []string{testBase + "/helm"}, []string{"old.example"}},
 		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: https://corp.example/apt\nSuites: stable\nComponents: main\n\n# ours\nTypes: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nTrusted: yes\n",
 			[]string{"URIs: https://corp.example/apt", "Suites: stable"}, []string{"Suites: noble", "Signed-By: "}, []string{"Components: main\nTrusted", "Trusted: yes"}},
-		{"pkg", at(File{System: manifest.TypeFreeBSD, Content: pkgConf}, pkgrepos.ClientConfPath),
-			"# bodega pkg repository. Install as x.\n# written for FreeBSD 14\n\ncorp: {\n  url: \"https://pkg.corp.example\", # {\n  enabled: yes\n}\nbodega: { url: \"https://old.example\" }\n",
-			[]string{"corp: {", "https://pkg.corp.example"}, []string{"written for FreeBSD 15", "FreeBSD: { enabled: no }", testBase + "/freebsd/${ABI}"}, []string{"old.example", "FreeBSD 14"}},
-		{"make.conf", at(MakeConf(testBase), "/etc/make.conf"), "WITH_PKGNG=yes\nMASTER_SITE_OVERRIDE= https://old.example/ \\\n\thttps://older.example/\n.include \"" + DistfilesCheckPath + "\"\nCFLAGS+= -O2\n",
-			[]string{"WITH_PKGNG=yes", "CFLAGS+= -O2"}, []string{"MASTER_SITE_OVERRIDE?= " + testBase, "MASTER_SITE_BACKUP?= ", "CFLAGS+= -O2\n.include \"" + DistfilesCheckPath + "\"\n"}, []string{"old.example", "older.example"}},
-		{"dnf", Rpm(testBase, []string{"baseos"}), "[bodega-baseos]\nname=old\nbaseurl=https://old.example/a\n    https://old.example/b\nproxy=http://proxy.corp.example\n\n[corp]\nbaseurl=https://rpm.corp.example\n",
-			[]string{"proxy=http://proxy.corp.example", "[corp]", "baseurl=https://rpm.corp.example"}, []string{"baseurl=" + testBase + "/rpm/baseos/"}, []string{"old.example"}},
-		{"cargo", Cargo(testBase), "[source.crates-io]\nreplace-with = \"corp\" # was\n\n[net]\nretry = 3\n",
-			[]string{"[net]", "retry = 3"}, []string{"replace-with = \"bodega\"", "sparse+" + testBase}, []string{"corp"}},
 		{"node mirror", at(File{System: manifest.TypeNpm, Content: "NODEJS_ORG_MIRROR=" + testBase + "/binaries/node/dist\n"}, NodeMirrorUserPath),
 			"EDITOR=vi\nNODEJS_ORG_MIRROR=https://nodejs.org/dist\n", []string{"EDITOR=vi"}, []string{testBase + "/binaries/node/dist"}, []string{"nodejs.org"}},
 		{"pip", Pip(testBase), "[global]\n  index_url: https://pypi.org/simple/\n  find-links =\n    cert = not-a-setting\n    /srv/wheels\n[install]\ncert = /old/ca.pem\nno-compile = true\n[download]\ncert:/old/ca.pem\n",
@@ -1187,99 +1072,6 @@ func TestAddCAMergesEveryFormatItEdits(t *testing.T) {
 	}
 }
 
-// F116 R1: a file whose form the merge cannot edit is refused with the next
-// step, never written saying something other than the plan.
-func TestAddCARefusesAMergeThatWouldNotHold(t *testing.T) {
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(caPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, tc := range map[string]struct {
-		file   File
-		before string
-	}{
-		"cargo inline table": {Cargo(testBase), "source = { crates-io = { replace-with = \"corp\" } }\n"},
-		"gemrc flow mapping": {Rubygems(testBase)[0], "{ \":sources\": [\"https://rubygems.org/\"] }\n"},
-		"podman dotted keys": {RegistriesConf(testBase, []string{"docker.io"}), "registry = [ { prefix = \"docker.io\", location = \"corp.example\" } ]\n"},
-	} {
-		home := t.TempDir()
-		target := filepath.Join(home, strings.TrimPrefix(tc.file.Path(OSLinux), "~"))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(target, []byte(tc.before), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		_, err := AddCA(caPlan(t, home, tc.file), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
-		if err == nil || !strings.Contains(err.Error(), "move the file aside") || !strings.Contains(err.Error(), target) {
-			t.Errorf("%s: AddCA = %v, want a refusal naming %s and the next step", name, err, target)
-		}
-	}
-}
-
-// F116 R1, R2: the store ResolveJVMStore names is the one doctor reads and
-// keytool imports into, and a failed keytool reports its own error with nothing that
-// reads as a password in it.
-func TestJVMStoreIsTheOneKeytoolIsHanded(t *testing.T) {
-	const secret = "hunter2-keystore"
-	jdk := t.TempDir()
-	jsse, args := filepath.Join(jdk, "lib/security/jssecacerts"), filepath.Join(jdk, "args")
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	script := "#!/bin/sh\necho \"$@\" >> " + args + "\ncase \"$*\" in *-importcert*) echo 'Picked up JAVA_TOOL_OPTIONS: -Dx.password=" + secret + "'; echo 'keytool error: storepass=" + secret + " refused for " + secret + "'; exit 1;; esac\nexit 1\n"
-	held, err := ParseCA(caPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p12, err := pkcs12.Modern.EncodeTrustStore(held.Certs, secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for path, content := range map[string]string{jsse: string(p12), filepath.Join(jdk, "bin/keytool"): script} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	env := map[string]string{"JAVA_HOME": jdk, "MAVEN_OPTS": "-Djavax.net.ssl.trustStorePassword=" + secret}
-	store, err := ResolveJVMStore(func(k string) string { return env[k] }, func(string) (string, error) { return "", os.ErrNotExist })
-	if err != nil {
-		t.Fatal(err)
-	}
-	certs, err := store.Trusted()
-	if err != nil || len(certs) != 1 {
-		t.Fatalf("Trusted = %d certificates, %v", len(certs), err)
-	}
-	if ran, _ := os.ReadFile(args); len(ran) != 0 {
-		t.Fatalf("listing the store ran keytool: %s", ran)
-	}
-	other, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(other)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home := t.TempDir()
-	in, err := AddCA(caPlan(t, home, Maven(testBase, nil)...), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, JVM: store, JVMTrusted: certs})
-	if err != nil || len(in.Imports) != 1 {
-		t.Fatalf("AddCA = %d imports, %v", len(in.Imports), err)
-	}
-	err = RunJVMCommand(in.Imports[0])
-	if err == nil || !strings.Contains(err.Error(), "keytool error") || strings.Contains(err.Error(), secret) {
-		t.Errorf("failed import = %v, want keytool's own error without the password", err)
-	}
-	ran, _ := os.ReadFile(args)
-	for _, line := range strings.Split(strings.TrimSpace(string(ran)), "\n") {
-		if !strings.Contains(line, "-keystore "+jsse) || strings.Contains(line, "-cacerts") {
-			t.Errorf("keytool ran %q, want the JSSE store %s", line, jsse)
-		}
-	}
-	if strings.Contains(string(ran), "-list") || !strings.Contains(string(ran), "-importcert") {
-		t.Errorf("keytool ran %q, want the import alone: the store is listed from its file", ran)
-	}
-}
-
 func TestIndependentCANamedEntryPreservation(t *testing.T) {
 	raw, _, _ := testCA(t, "bodega.example.com")
 	ca, err := ParseCA(raw)
@@ -1292,9 +1084,7 @@ func TestIndependentCANamedEntryPreservation(t *testing.T) {
 		before, keep string
 	}{
 		{"apt", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n", "Architectures: amd64"},
-		{"podman", RegistriesConf(testBase, []string{"docker.io"}), "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nmirror-by-digest-only = true\n", "mirror-by-digest-only = true"},
 		{"helm", Helm(testBase), HelmDocument(HelmRepository(testBase, "certFile: /etc/helm/client.crt", "keyFile: /etc/helm/client.key")), "certFile: /etc/helm/client.crt"},
-		{"pkg", File{System: manifest.TypeFreeBSD, Paths: map[string]string{OSLinux: "/usr/local/etc/pkg/repos/bodega.conf"}, Content: "bodega: { url: \"" + testBase + "/freebsd\", enabled: yes }\n"}, "bodega: { url: \"" + testBase + "/freebsd\", enabled: yes, priority: 10 }\n", "priority: 10"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -1328,28 +1118,13 @@ func TestIndependentCANamedEntryPreservation(t *testing.T) {
 // the fields named as unable to stand beside the plan's. A second merge
 // changes nothing, and an entry the merge cannot follow is refused.
 func TestEntryMergeIsFieldLevel(t *testing.T) {
-	ucl := fileKind{blocks: mergeUCL, holds: uclHolds}
-	registries := fileKind{blocks: mergeRegistries, holds: registriesHold}
 	helm := fileKind{blocks: func(o, p []string) []string { return mergeYAML(o, p, "repositories") }, holds: yamlHolds("repositories")}
-	pkgPlan := "bodega: {\n  url: \"https://b/freebsd/${ABI}\",\n  signature_type: \"none\",\n  enabled: yes\n}\n"
-	registryPlan := "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\n"
 	for _, tc := range []struct {
 		name         string
 		kind         fileKind
 		old, planned string
 		want         string
 	}{
-		{"pkg object over several lines", ucl, "# mine\nbodega: {\n  url: \"https://old/x\", # was\n  priority: 10\n}\n", pkgPlan,
-			"# mine\nbodega: {\n  url: \"https://b/freebsd/${ABI}\", # was\n  priority: 10,\n  signature_type: \"none\",\n  enabled: yes\n}\n"},
-		{"pkg object holding a nested object", ucl, "bodega: {\n  url: \"https://old/x\",\n  env: {\n    A: b\n  },\n  enabled: no,\n}\n", pkgPlan,
-			"bodega: {\n  url: \"https://b/freebsd/${ABI}\",\n  env: {\n    A: b\n  },\n  enabled: yes,\n  signature_type: \"none\"\n}\n"},
-		{"empty pkg object beside a bare variable", ucl, "bodega: {}\nother { url = pkg+http://x/${ABI}; }\n", pkgPlan,
-			"bodega: { url: \"https://b/freebsd/${ABI}\", signature_type: \"none\", enabled: yes }\nother { url = pkg+http://x/${ABI}; }\n"},
-		{"registry keeps its mirrors and their order", registries,
-			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nblocked = false\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\ninsecure = true\npull-from-mirror = \"all\"\n", registryPlan,
-			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\nblocked = false\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\npull-from-mirror = \"all\"\n"},
-		{"a new mirror leads the registry's own", registries, "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n", registryPlan,
-			"[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n\n[[registry.mirror]]\nlocation = \"b/docker.io\"\n\n[[registry.mirror]]\nlocation = \"corp/docker.io\"\n"},
 		{"helm entry keeps client auth, loses caFile and its duplicate", helm,
 			"repositories:\n  - caFile: /old/ca.pem\n    name: bodega\n    url: https://old/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n  - name: bodega\n    url: https://dup\n", "repositories:\n" + HelmRepository("https://b"),
 			"repositories:\n  - name: bodega\n    url: https://b/helm\n    certFile: /c.crt\n  # corp\n  - name: corp\n    url: https://corp\n"},
@@ -1372,19 +1147,27 @@ func TestEntryMergeIsFieldLevel(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ucl.merge([]byte("bodega: {\n  url: \"https://old/x\n"), []byte(pkgPlan)); err == nil {
-		t.Error("an object with no closing brace was merged, not refused")
-	}
 }
 
 // TestPipOptionsReadsPipsGrammar pins the reader the trust probe shares with
-// the merge: a colon delimits, a deeper line continues the option above it,
-// and the last assignment wins.
+// the merge: a colon delimits, a deeper line continues the option above it
+// across a comment and a blank line, a line indented under a header is an
+// option, and a file pip refuses to load gives no option.
 func TestPipOptionsReadsPipsGrammar(t *testing.T) {
-	got := PipOptions([]byte("[global]\nIndex_URL: https://b/simple\ncert = /a.pem\nfind-links =\n  cert=/not.pem\n  # note\n  /srv/wheels\ncert=/b.pem\n[install]\n  no-compile = true\n"))
-	want := map[string]string{"global.index-url": "https://b/simple", "global.cert": "/b.pem", "global.find-links": "cert=/not.pem\n/srv/wheels", "install.no-compile": "true"}
+	got := PipOptions([]byte("[global]\nIndex_URL: https://b/simple\nfind-links =\n  cert=/not.pem\n  # note\n\n  /srv/wheels\ncert=/b.pem\n[install]\n  no-compile = true\n"))
+	want := map[string]string{"global.index-url": "https://b/simple", "global.cert": "/b.pem", "global.find-links": "\ncert=/not.pem\n\n/srv/wheels", "install.no-compile": "true"}
 	if !maps.Equal(got, want) {
 		t.Fatalf("PipOptions = %q, want %q", got, want)
+	}
+	for _, refused := range []string{
+		"[global]\ncert = /a.pem\ncert = /b.pem\n",
+		"[global]\nindex-url = https://b/simple\nnot-an-assignment\n",
+		"[global]\nindex-url = https://b/simple\n= nameless\n",
+		"[global\nindex-url = https://b/simple\n",
+	} {
+		if got := PipOptions([]byte(refused)); len(got) != 0 {
+			t.Errorf("PipOptions(%q) = %q, want none from a file pip refuses to load", refused, got)
+		}
 	}
 }
 
@@ -1399,8 +1182,6 @@ func TestStaffCAKeepsRepositoryPolicy(t *testing.T) {
 		file         File
 		before, keep string
 	}{
-		{"composer", Composer(testBase), `{"repositories":{"bodega":{"type":"composer","url":"https://old.example/composer/","only":["corp/*"],"options":{"http":{"timeout":45}}}}}`, `"corp/*"`},
-		{"maven", Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://old.example/maven/</url><mirrorOf>*</mirrorOf><mirrorOfLayouts>default</mirrorOfLayouts></mirror></mirrors></settings>\n", "<mirrorOfLayouts>default</mirrorOfLayouts>"},
 		{"apt-distinct-stanza", AptArchive(testBase, "noble", nil), "Types: deb\nURIs: " + testBase + "/apt/\nSuites: noble\nComponents: main\nArchitectures: amd64\n\nTypes: deb-src\nURIs: " + testBase + "/apt/\nSuites: jammy\nComponents: main\nArchitectures: arm64\n", "Types: deb-src\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1495,8 +1276,6 @@ func TestCASelectionSecondPlanIsIdle(t *testing.T) {
 	early := filepath.Join(root, "etc/xdg/pip/pip.conf")
 	write(early, "[global]\ncert = /old/global.pem\n[install]\ncert = /old/install.pem\ntimeout = 9\n")
 	write(filepath.Join(venv, "pip.conf"), "[global]\ncert = /old/venv.pem\nretries = 2\n")
-	write(filepath.Join(home, ".config/composer/config.json"), `{"repositories":[{"type":"composer","url":"`+testBase+`/composer","only":["a/*"]},{"type":"composer","url":"`+testBase+`/composer","only":["b/*"]},{"packagist.org":false}]}`)
-	write(filepath.Join(home, ".m2/settings.xml"), "<settings>\n  <mirrors>\n    <mirror>\n      <id>corp</id>\n      <mirrorOf>central</mirrorOf>\n      <url>https://corp/</url>\n    </mirror>\n    <mirror>\n      <id>bodega</id>\n      <blocked>true</blocked>\n      <name>ours</name>\n    </mirror>\n  </mirrors>\n</settings>\n")
 	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"), Getenv: func(k string) string {
 		if k == "VIRTUAL_ENV" {
 			return venv
@@ -1508,7 +1287,7 @@ func TestCASelectionSecondPlanIsIdle(t *testing.T) {
 	plan := func() CAInstall {
 		t.Helper()
 		var changes []Change
-		for _, f := range []File{Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), pip, Composer(testBase), Maven(testBase, nil)[0]} {
+		for _, f := range []File{Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}}), pip} {
 			sum := sha256.Sum256([]byte(f.Content))
 			c, err := NewChange(PlanRecord{System: f.System, Action: PlanInstall, Path: f.Path(OSLinux), SHA256: hex.EncodeToString(sum[:])}, []byte(f.Content), home)
 			if err != nil {
@@ -1530,8 +1309,6 @@ func TestCASelectionSecondPlanIsIdle(t *testing.T) {
 		filepath.Join(home, ".gitconfig"): {"[http \"" + testBase + "\"]\n\tsslCAInfo = " + caPath, "name = x"},
 		early:                             {"[global]\ncert = /old/global.pem", "[install]\ncert = " + pipCA + "\ntimeout = 9"},
 		filepath.Join(venv, "pip.conf"):   {"cert = " + pipCA, "retries = 2", "index-url = " + testBase},
-		filepath.Join(home, ".config/composer/config.json"): {`"name": "bodega"`, `"a/*"`, `"b/*"`},
-		filepath.Join(home, ".m2/settings.xml"):             {"<id>corp</id>", "<name>ours</name>", "<url>" + testBase + "/maven/</url>", "<mirrorOf>*</mirrorOf>"},
 	} {
 		got, err := os.ReadFile(path)
 		if err != nil {
@@ -1541,9 +1318,6 @@ func TestCASelectionSecondPlanIsIdle(t *testing.T) {
 			if !strings.Contains(string(got), w) {
 				t.Errorf("%s does not hold %q:\n%s", path, w, got)
 			}
-		}
-		if strings.Contains(string(got), "<blocked>") {
-			t.Errorf("%s keeps bodega's mirror blocked:\n%s", path, got)
 		}
 	}
 	own, narrower := GitCAInfo(GitConfigFiles(h.Getenv, home, root), testBase+"/git/gh/", home)
@@ -1558,24 +1332,10 @@ func TestCASelectionSecondPlanIsIdle(t *testing.T) {
 	}
 }
 
-// F116 R1, R2: podman reads the first certs.d directory that exists for a
-// host, and pip loads its files in one order, with PIP_CONFIG_FILE displacing
-// the per-user ones.
+// F116 R1, R2: pip loads its files in one order, with PIP_CONFIG_FILE
+// displacing the per-user ones.
 func TestTrustSourceSelection(t *testing.T) {
 	root, home := t.TempDir(), t.TempDir()
-	const host = "bodega.internal:8443"
-	dirs := []string{filepath.Join(root, "etc/docker/certs.d", host), filepath.Join(root, "etc/containers/certs.d", host), filepath.Join(home, ".config/containers/certs.d", host)}
-	if got := PodmanCertDir(home, root, host); got != "" {
-		t.Errorf("no directory exists and podman is given %s", got)
-	}
-	for _, d := range dirs {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if got := PodmanCertDir(home, root, host); got != d {
-			t.Errorf("podman reads %s; want %s, the first that exists", got, d)
-		}
-	}
 	env := map[string]string{"VIRTUAL_ENV": "/venv"}
 	h := PipHost{GOOS: OSLinux, Root: root, Home: home, Getenv: func(k string) string { return env[k] }}
 	rel := func(files []string) string {
@@ -1617,7 +1377,6 @@ func TestFinalCAPreservesAlternateSyntax(t *testing.T) {
 		before, keep string
 	}{
 		{"helm-dash", Helm(testBase), "repositories:\n  -\n    name: bodega\n    url: https://old.example/helm\n    certFile: /corp/client.pem\n    keyFile: /corp/client.key\n", "certFile: /corp/client.pem"},
-		{"maven-cdata", Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url><![CDATA[https://old.example/maven/]]></url><mirrorOf>*</mirrorOf><mirrorOfLayouts>default</mirrorOfLayouts></mirror></mirrors></settings>\n", "<mirrorOfLayouts>default</mirrorOfLayouts>"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -1703,10 +1462,6 @@ func TestCARefusesWhatItCannotEditExactly(t *testing.T) {
 		env    map[string]string
 		want   string
 	}{
-		"maven mirror named twice":      {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://a/</url></mirror><mirror><id>bodega</id><url>https://b/</url><name>second</name></mirror></mirrors></settings>\n", nil, "2 times"},
-		"maven url holding markup":      {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id><url>https://a/<!-- was b --></url></mirror></mirrors></settings>\n", nil, "markup"},
-		"maven file that is not XML":    {Maven(testBase, nil)[0], "<settings><mirrors><mirror><id>bodega</id>\n", nil, "not XML"},
-		"maven second mirrors element":  {Maven(testBase, nil)[0], "<settings><mirrors/><mirrors><mirror><id>corp</id></mirror></mirrors></settings>\n", nil, "more than one <mirrors>"},
 		"pip header with a comment":     {Pip(testBase), "[global] ; site policy\nindex-url = https://corp.example/simple\n", nil, "[global] ; site policy"},
 		"git setting on a header line":  {git, "[http \"" + testBase + "/\"] sslCAInfo = /corp.pem\n", nil, "opens a section"},
 		"git value continued":           {git, "[http \"" + testBase + "/git/\"]\n\tsslCAInfo = /corp\\\n.pem\n", nil, "opens a section"},
@@ -1733,41 +1488,6 @@ func TestCARefusesWhatItCannotEditExactly(t *testing.T) {
 				t.Fatalf("AddCA = %v; want a refusal naming %s and %q", err, target, tc.want)
 			}
 		})
-	}
-}
-
-// F116 R1: bodega's Maven mirror is edited where the XML tokenizer finds
-// it. A CDATA value is replaced between its tags, a blocked flag goes on its
-// own, every other element and mirror stays byte for byte, a commented-out
-// mirror is not the live one, and a second merge changes nothing.
-func TestMavenMirrorEditsInPlace(t *testing.T) {
-	planned := []byte(Maven(testBase, nil)[0].Content)
-	decoy := "<!-- <mirrors><mirror><id>bodega</id><url>https://decoy/</url></mirror></mirrors> -->"
-	corp := "<mirror><id>corp</id><url>https://corp.example/</url><mirrorOf>central</mirrorOf></mirror>"
-	old := "<?xml version=\"1.0\"?>\n<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">\n  " + decoy + "\n  <servers><server><id>corp</id></server></servers>\n  <mirrors>\n    <mirror>\n      <id> bodega </id>\n      <url><![CDATA[https://old.example/maven/]]></url>\n      <blocked>true</blocked>\n      <mirrorOfLayouts>default</mirrorOfLayouts>\n    </mirror>\n    " + corp + "\n  </mirrors>\n</settings>\n"
-	got, err := mergeMavenMirror([]byte(old), planned)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{decoy, corp, "<servers><server><id>corp</id></server></servers>", "<id> bodega </id>",
-		"<url>" + testBase + "/maven/</url>", "<mirrorOfLayouts>default</mirrorOfLayouts>\n      <mirrorOf>*</mirrorOf>\n    </mirror>"} {
-		if !strings.Contains(string(got), want) {
-			t.Errorf("the merge lost or misplaced %q:\n%s", want, got)
-		}
-	}
-	for _, gone := range []string{"blocked", "old.example", "CDATA"} {
-		if strings.Contains(string(got), gone) {
-			t.Errorf("the merge kept %q:\n%s", gone, got)
-		}
-	}
-	again, err := mergeMavenMirror(got, planned)
-	if err != nil || string(again) != string(got) {
-		t.Errorf("a second merge changed the file (%v):\n%s", err, again)
-	}
-	// A CDATA value already the plan's is left as the host wrote it.
-	same := "<settings><mirrors><mirror><id>bodega</id><mirrorOf>*</mirrorOf><url><![CDATA[" + testBase + "/maven/]]></url></mirror></mirrors></settings>\n"
-	if got, err := mergeMavenMirror([]byte(same), planned); err != nil || string(got) != same {
-		t.Errorf("a mirror already reading as the plan sets it was rewritten (%v):\n%s", err, got)
 	}
 }
 
@@ -2041,45 +1761,6 @@ func TestAudit8NpmQuotedCARefusesBeforeWrite(t *testing.T) {
 	}
 }
 
-func TestAudit8CAGradlePreservesUnrelatedPolicy(t *testing.T) {
-	raw, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home := t.TempDir()
-	files := Maven(testBase, nil)
-	target := filepath.Join(home, ".gradle/init.d/bodega.gradle")
-	keep := "allprojects { project -> project.tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' } }\n"
-	old := files[1].Content + "\n" + keep
-	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-	in, err := AddCA(caPlan(t, home, files...), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, JVMTrusted: ca.Certs})
-	if err != nil {
-		if !strings.Contains(err.Error(), target) {
-			t.Fatalf("refusal does not name the script: %v", err)
-		}
-		if got, _ := os.ReadFile(target); string(got) != old {
-			t.Fatal("refusal changed the script")
-		}
-		return
-	}
-	if _, err := Apply(in.Changes, ".audit"); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(got), keep) {
-		t.Fatalf("CA apply silently removed Gradle's unrelated compiler policy from %s", target)
-	}
-}
-
 // TestNpmOptionsDecodeAsNpmDoes holds the npmrc decoder to native npm's own
 // reading of the same file: every name and value NpmOptions is sure of is
 // the one `npm config list --json` reports.
@@ -2206,170 +1887,6 @@ func TestNpmUnclassifiedLinesRefuseAndStayUnchecked(t *testing.T) {
 	}
 }
 
-// TestGradleInitMergeKeepsLinesAroundBodegasBlock covers the script on both
-// sides of bodega's rendering, a move to another URL, and the edit inside the
-// rendering that the merge refuses.
-func TestGradleInitMergeKeepsLinesAroundBodegasBlock(t *testing.T) {
-	was, now := gradleInit("https://old.example/maven/"), gradleInit(testBase+"/maven/")
-	before, after := "// site policy\n", "\nallprojects { }\n"
-	got, err := mergeGradleInit([]byte(before+was+after), []byte(now))
-	if err != nil || string(got) != before+now+after {
-		t.Fatalf("merge = %v\n%s", err, got)
-	}
-	if again, err := mergeGradleInit(got, []byte(now)); err != nil || string(again) != string(got) {
-		t.Fatalf("second merge changed the script: %v", err)
-	}
-	if got, err := mergeGradleInit([]byte(" \n"), []byte(now)); err != nil || string(got) != now {
-		t.Fatalf("an empty script is not written whole: %v", err)
-	}
-	edited := strings.Replace(was, "name = 'bodega'", "name = 'mine'", 1)
-	if _, err := mergeGradleInit([]byte(edited), []byte(now)); err == nil {
-		t.Fatal("a script edited inside bodega's lines was replaced")
-	}
-}
-
-// F116 R1, R2: what a JVM trusts is read from the keystore file in each form
-// a JDK ships or keytool writes, and a store that cannot be read is an error,
-// never an empty store.
-func TestJVMStoreReadsTheKeystoreFile(t *testing.T) {
-	const pass = "hunter2-keystore"
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(caPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jks := keystore.New()
-	if err := jks.SetTrustedCertificateEntry("bodega", keystore.TrustedCertificateEntry{
-		CreationTime: time.Now(), Certificate: keystore.Certificate{Type: "X.509", Content: ca.Certs[0].Raw},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var jksFile bytes.Buffer
-	if err := jks.Store(&jksFile, []byte(pass)); err != nil {
-		t.Fatal(err)
-	}
-	p12, err := pkcs12.Modern.EncodeTrustStore(ca.Certs, pass)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bare, err := pkcs12.Passwordless.EncodeTrustStore(ca.Certs, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	for name, tc := range map[string]struct {
-		data     []byte
-		password string
-		want     int
-	}{
-		"jks":                   {jksFile.Bytes(), pass, 1},
-		"pkcs12":                {p12, pass, 1},
-		"pkcs12 without a MAC":  {bare, "", 1},
-		"jks, wrong password":   {jksFile.Bytes(), "wr0ng-pass", -1},
-		"pkcs12 wrong password": {p12, "wr0ng-pass", -1},
-		"not a keystore":        {[]byte("store"), pass, -1},
-		"truncated jks":         {jksFile.Bytes()[:40], pass, -1},
-	} {
-		file := filepath.Join(dir, strings.ReplaceAll(name, " ", "-"))
-		if err := os.WriteFile(file, tc.data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		certs, err := (JVMStore{Keystore: file, Password: tc.password}).Trusted()
-		switch {
-		case tc.want < 0 && err == nil:
-			t.Errorf("%s: Trusted = %d certificates, want an error", name, len(certs))
-		case tc.want < 0 && (strings.Contains(err.Error(), "wr0ng-pass") || !strings.Contains(err.Error(), file)):
-			t.Errorf("%s: error %q must name the file and not the password", name, err)
-		case tc.want >= 0 && (err != nil || len(certs) != tc.want || !bytes.Equal(certs[0].Raw, ca.Certs[0].Raw)):
-			t.Errorf("%s: Trusted = %d certificates, %v", name, len(certs), err)
-		}
-	}
-	if _, err := (JVMStore{Keytool: filepath.Join(dir, "bin/keytool")}).Trusted(); err == nil || !strings.Contains(err.Error(), "JAVA_HOME") {
-		t.Errorf("a JDK with no cacerts: Trusted = %v, want an error naming JAVA_HOME", err)
-	}
-	// The cacerts is found where keytool -cacerts writes: under the JDK.
-	cacerts := filepath.Join(dir, "jdk/lib/security/cacerts")
-	if err := os.MkdirAll(filepath.Dir(cacerts), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cacerts, bare, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := ResolveJVMStore(func(k string) string {
-		if k == "JAVA_HOME" {
-			return filepath.Join(dir, "jdk")
-		}
-		return ""
-	}, func(string) (string, error) { return "", os.ErrNotExist })
-	if err != nil || store.Cacerts != cacerts {
-		t.Fatalf("ResolveJVMStore = %+v, %v; want cacerts %s", store, err, cacerts)
-	}
-	if certs, err := store.Trusted(); err != nil || len(certs) != 1 {
-		t.Errorf("the JDK's cacerts: Trusted = %d certificates, %v", len(certs), err)
-	}
-}
-
-// F116 R1, R2: the keystore reader agrees with keytool, the oracle, on the
-// JDK's own cacerts and on a store keytool wrote in each type.
-func TestJVMStoreAgreesWithKeytool(t *testing.T) {
-	keytool, err := exec.LookPath("keytool")
-	if err != nil {
-		t.Skip("native keytool is not installed")
-	}
-	list := func(args ...string) []*x509.Certificate {
-		t.Helper()
-		out, err := exec.Command(keytool, append([]string{"-list", "-rfc", "-storepass", "changeit"}, args...)...).Output()
-		if err != nil {
-			t.Skipf("keytool does not list %v: %v", args, err)
-		}
-		return ParseKeytoolList(out)
-	}
-	same := func(what string, got, want []*x509.Certificate) {
-		t.Helper()
-		sums := func(certs []*x509.Certificate) []string {
-			var out []string
-			for _, c := range certs {
-				sum := sha256.Sum256(c.Raw)
-				out = append(out, hex.EncodeToString(sum[:]))
-			}
-			slices.Sort(out)
-			return out
-		}
-		if len(want) == 0 || !slices.Equal(sums(got), sums(want)) {
-			t.Errorf("%s: read %d certificates, keytool lists %d", what, len(got), len(want))
-		}
-	}
-	store, err := ResolveJVMStore(os.Getenv, exec.LookPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if store.Keystore == "" && store.Cacerts != "" {
-		got, err := store.Trusted()
-		if err != nil {
-			t.Fatalf("%s: %v", store.Cacerts, err)
-		}
-		same(store.Cacerts, got, list("-cacerts"))
-	}
-	caPEM, _, _ := testCA(t, "bodega.example.com")
-	dir := t.TempDir()
-	caFile := filepath.Join(dir, "ca.pem")
-	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for _, kind := range []string{"JKS", "PKCS12"} {
-		file := filepath.Join(dir, kind)
-		if out, err := exec.Command(keytool, "-importcert", "-noprompt", "-trustcacerts", "-alias", "bodega", "-file", caFile,
-			"-keystore", file, "-storetype", kind, "-storepass", "changeit").CombinedOutput(); err != nil {
-			t.Fatalf("keytool -importcert into %s: %v\n%s", kind, err, out)
-		}
-		got, err := (JVMStore{Keystore: file}).Trusted()
-		if err != nil {
-			t.Fatalf("%s: %v", kind, err)
-		}
-		same(kind, got, list("-keystore", file))
-	}
-}
-
 // nativeNpm gates a test that holds doctor's reading of an npmrc against
 // npm's own. A developer's machine without npm skips it. CI does not: its
 // test job installs a pinned Node, so a missing npm there is a broken job
@@ -2431,51 +1948,6 @@ func TestAudit9CIInstallsPinnedNativeOracle(t *testing.T) {
 	}
 	if !pinned {
 		t.Fatal("CI's test job installs no pinned Node/npm release")
-	}
-}
-
-func TestAudit9CADistfilesCompanionPreservesUnrelatedPolicy(t *testing.T) {
-	raw, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	env, err := (distinfo.EnvironmentSpec{}).Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	home, root := t.TempDir(), t.TempDir()
-	main := MakeConf(testBase)
-	main.Paths = map[string]string{OSLinux: main.Path(OSFreeBSD)}
-	companion := File{System: main.System, Paths: map[string]string{OSLinux: DistfilesCheckPath}, Content: string(env.ClientCheck())}
-	target := filepath.Join(home, DistfilesCheckPath)
-	keep := "CFLAGS+= -fstack-protector-strong\n"
-	old := companion.Content + "\n" + keep
-	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-	in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: root, GOOS: OSFreeBSD})
-	if err != nil {
-		if !strings.Contains(err.Error(), target) {
-			t.Fatalf("refusal does not name the companion script: %v", err)
-		}
-		if got, _ := os.ReadFile(target); string(got) != old {
-			t.Fatal("refusal changed the companion script")
-		}
-		return
-	}
-	if _, err := Apply(in.Changes, ".audit"); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(got), keep) {
-		t.Fatalf("CA apply silently removed unrelated compiler policy from %s", target)
 	}
 }
 
@@ -2565,7 +2037,7 @@ func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const rendered = "# bodega distfiles client check\nBODEGA_DISTFILES_DRIFT=\n"
+	const rendered = "# bodega apt settings\nAcquire::Retries \"3\";\n"
 	for name, tc := range map[string]struct {
 		old     string
 		want    string
@@ -2573,23 +2045,25 @@ func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
 	}{
 		"blank":                {" \n", rendered, false},
 		"same":                 {rendered, rendered, false},
-		"lines around":         {"# mine\n" + rendered + "CFLAGS+= -O2\n", "# mine\n" + rendered + "CFLAGS+= -O2\n", false},
-		"an older rendering":   {"# bodega distfiles client check\nBODEGA_DISTFILES_DRIFT= old\n", "", true},
-		"edited inside":        {"# bodega distfiles client check\nCFLAGS+= -O2\nBODEGA_DISTFILES_DRIFT=\n", "", true},
-		"another file's lines": {"CFLAGS+= -O2\n", "", true},
+		"lines around":         {"# mine\n" + rendered + "APT::Color \"0\";\n", "# mine\n" + rendered + "APT::Color \"0\";\n", false},
+		"an older rendering":   {"# bodega apt settings\nAcquire::Retries \"1\";\n", "", true},
+		"edited inside":        {"# bodega apt settings\nAPT::Color \"0\";\nAcquire::Retries \"3\";\n", "", true},
+		"another file's lines": {"APT::Color \"0\";\n", "", true},
 	} {
 		home := t.TempDir()
-		main := MakeConf(testBase)
-		main.Paths = map[string]string{OSLinux: main.Path(OSFreeBSD)}
-		companion := File{System: main.System, Paths: map[string]string{OSLinux: DistfilesCheckPath}, Content: rendered}
-		target := filepath.Join(home, DistfilesCheckPath)
+		// A record beside the system's first one, in a format no editor here
+		// reads.
+		const companionPath = "/etc/apt/apt.conf.d/90bodega"
+		main := AptArchive(testBase, "noble", nil)
+		companion := File{System: main.System, Paths: map[string]string{OSLinux: companionPath}, Content: rendered}
+		target := filepath.Join(home, companionPath)
 		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(target, []byte(tc.old), 0600); err != nil {
 			t.Fatal(err)
 		}
-		in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSFreeBSD})
+		in, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
 		if tc.refused {
 			if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "Move the file aside") {
 				t.Errorf("%s: AddCA = %v, want a refusal naming %s and the next step", name, err, target)
@@ -2606,7 +2080,7 @@ func TestCAPlanNeverOverwritesAWholeFileItCannotAccountFor(t *testing.T) {
 		if got, _ := os.ReadFile(target); string(got) != tc.want {
 			t.Errorf("%s: wrote %q, want %q", name, got, tc.want)
 		}
-		again, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSFreeBSD})
+		again, err := AddCA(caPlan(t, home, main, companion), ca, CAHost{Base: testBase, Home: home, Root: t.TempDir(), GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")})
 		if err != nil {
 			t.Errorf("%s: second AddCA = %v", name, err)
 			continue
@@ -2739,8 +2213,8 @@ func TestGitContinuationFollowsGitsLexer(t *testing.T) {
 }
 
 // TestContinuationIsEachFormatsOwn holds each line format to its own reader:
-// sh ends a comment at the newline, where make and systemd's environment.d
-// join lines before they look for one.
+// sh ends a comment at the newline, where systemd's environment.d joins
+// lines before it looks for one.
 func TestContinuationIsEachFormatsOwn(t *testing.T) {
 	for _, c := range []struct {
 		name  string
@@ -2754,8 +2228,6 @@ func TestContinuationIsEachFormatsOwn(t *testing.T) {
 		{"sh # inside a word", shRules, []string{`export A=b#c\`, `d`}, []bool{false, true}},
 		{"sh single quotes keep a backslash", shRules, []string{`export A='b\'`, `export C=d`}, []bool{false, false}},
 		{"sh open quote", shRules, []string{`export A="b`, `# c"`, `export C=d`}, []bool{false, true, false}},
-		{"make comment", makeRules, []string{`# note \`, `A=b`, `C=d`}, []bool{false, true, false}},
-		{"make escaped backslash", makeRules, []string{`A=b\\`, `C=d`}, []bool{false, false}},
 		{"environment.d comment", envdRules, []string{`# note \`, `A=b`, `C=d`}, []bool{false, true, false}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -2825,7 +2297,6 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bundler := Rubygems(testBase)[1]
 	for _, c := range []struct {
 		name string
 		file File
@@ -2841,10 +2312,6 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 		}, "go/env", "GOFLAGS=-mod=mod\n", "GOPROXY=" + GoProxy(testBase)},
 		{"HELM_CONFIG_HOME", Helm(testBase), func(f string) map[string]string { return map[string]string{"HELM_CONFIG_HOME": filepath.Dir(f)} }, "repositories.yaml",
 			HelmDocument("- name: company\n  url: https://charts.example/\n"), testBase + "/helm"},
-		{"BUNDLE_USER_CONFIG", bundler, func(f string) map[string]string { return map[string]string{"BUNDLE_USER_CONFIG": f} }, "config",
-			"---\nBUNDLE_JOBS: \"4\"\n", testBase},
-		{"BUNDLE_USER_HOME", bundler, func(f string) map[string]string { return map[string]string{"BUNDLE_USER_HOME": filepath.Dir(f)} }, "config",
-			"---\nBUNDLE_JOBS: \"4\"\n", testBase},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			home, root := t.TempDir(), t.TempDir()
@@ -2884,34 +2351,6 @@ func TestCAPlanEditsEnvSelectedSystemStoreFiles(t *testing.T) {
 	}
 }
 
-func TestAudit12CargoCAPlansTheWinningFile(t *testing.T) {
-	raw, _, _ := testCA(t, "bodega.example.com")
-	ca, err := ParseCA(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home, root := t.TempDir(), t.TempDir()
-	target := filepath.Join(home, ".cargo", "config")
-	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		t.Fatal(err)
-	}
-	old := "[source.crates-io]\nregistry = \"sparse+https://index.crates.io/\"\n[build]\njobs = 3\n"
-	if err := os.WriteFile(target, []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-	h := CAHost{Base: testBase, Home: home, Root: root, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n")}
-	in, err := AddCA(caPlan(t, home, Cargo(testBase)), ca, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := changeAt(t, in.Changes, target)
-	for _, want := range []string{testBase, "jobs = 3"} {
-		if !strings.Contains(string(c.New), want) {
-			t.Fatalf("winning Cargo file does not contain %s:\n%s", want, c.New)
-		}
-	}
-}
-
 // TestPipOptionsMatchesNativePip compares PipOptions with pip config list
 // across the spellings pip's loader folds together: a -- prefix, _ for -,
 // case, a colon delimiter, and [DEFAULT] inheritance in either direction.
@@ -2928,6 +2367,11 @@ func TestPipOptionsMatchesNativePip(t *testing.T) {
 		"[DEFAULT]\n--cert = /d.pem\n[global]\ncert = /g.pem\n",
 		"[DEFAULT]\ncert = /d.pem\n[global]\n--cert = /g.pem\n",
 		"[DEFAULT]\nindex-url = https://d/simple/\n[install]\nextra_index_url = https://e/simple/\n  https://f/simple/\n",
+		"[global]\n  index-url = https://x/simple/\n  cert = /a.pem\n",
+		"[global]\nfind-links = /a\n  # note\n\n  /b\n  [install]\n  cert = /not.pem\ncert = /a.pem\n",
+		"[global] trailing\ncert = /a.pem # kept\n",
+		"[global]\nfind-links =\n  /a\n\n  /b\n",
+		"[global]\r\ncert = /a.pem\r\n[install]\r\ntimeout: 5\r\n",
 	}
 	line := regexp.MustCompile(`^([^=]+)='(.*)'$`)
 	for _, body := range cases {
@@ -2972,7 +2416,31 @@ func TestPipLoadErrorMatchesNativePip(t *testing.T) {
 		"timeout = 1\n[global]\n",
 		"[global]\nindex-url = https://a/\n  https://b/\n[install]\nindex-url = https://c/\n",
 		"# comment\n\n[global]\ntimeout: 1\n",
+		// The rest of configparser's line grammar: every line that is not
+		// blank or a comment is a header, an option or a continuation.
+		"[global]\ntimeout = 1\nnot-an-assignment\n",
+		"[global]\ntimeout = 1\n= nameless\n",
+		"[global]\ntimeout = 1\n: nameless\n",
+		"[global\ntimeout = 1\n",
+		"[global]\ntimeout = 1\n[install\nretries = 2\n",
+		"[global]\ntimeout = 1\n[]\n",
+		"[global]\n  not-an-assignment\n",
+		"[global]\n  timeout = 1\n",
+		"[global]\n  timeout = 1\nretries = 2\n",
+		"[global]\nfind-links = /a\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n# note\n  not-an-assignment\n",
+		"[global]\nfind-links = /a\n  [install]\n  retries = 2\n",
+		"[global]\nfind-links = /a\n  /b\nnot-an-assignment\n",
+		"[global]\n= nameless\n  not-an-assignment\n",
+		"[global] trailing\ntimeout = 1\n",
+		"[global]\n  # indented comment\n; another\ntimeout = 1\n",
+		"[global]\nfind-links = /a # not a comment\n",
+		"[global]\r\ntimeout = 1\r\nnot-an-assignment\r\n",
+		"not-an-assignment\n[global]\n",
+		"[global]\ntimeout\n",
 	}
+	accepted, refused := 0, 0
 	for _, body := range cases {
 		file := filepath.Join(t.TempDir(), "pip.conf")
 		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
@@ -2982,8 +2450,18 @@ func TestPipLoadErrorMatchesNativePip(t *testing.T) {
 		cmd.Dir = t.TempDir()
 		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PIP_CONFIG_FILE=" + file}
 		out, nativeErr := cmd.CombinedOutput()
+		if nativeErr == nil {
+			accepted++
+		} else {
+			refused++
+		}
 		if got := PipLoadError([]byte(body)); (got == nil) != (nativeErr == nil) {
 			t.Errorf("PipLoadError(%q) = %v, native pip: %v: %s", body, got, nativeErr, out)
 		}
+	}
+	// A pip that refuses or accepts everything would agree with nothing
+	// these cases are here to tell apart.
+	if accepted == 0 || refused == 0 {
+		t.Fatalf("native pip accepted %d and refused %d of the cases; the oracle is not telling them apart", accepted, refused)
 	}
 }

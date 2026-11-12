@@ -2,7 +2,6 @@ package clientconf
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -10,15 +9,9 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
-	"time"
-
-	keystore "github.com/pavlo-v-chernykh/keystore-go/v4"
-	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -89,11 +82,6 @@ type CAHost struct {
 	// OSRelease is the content of /etc/os-release, which names the Linux
 	// family whose trust store command applies.
 	OSRelease []byte
-	// JVM is the trust store of the JVM Maven and Gradle run on, and
-	// JVMTrusted the certificates it holds now. The zero JVM is the cacerts
-	// of the keytool on PATH, and a nil JVMTrusted an empty store.
-	JVM        JVMStore
-	JVMTrusted []*x509.Certificate
 	// Getenv reads the environment the host's clients start in, which can
 	// name a configuration file a client reads in place of, or after, the
 	// one the plan writes. Nil is an environment naming none.
@@ -177,13 +165,6 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		}
 		if dir := env("XDG_CONFIG_HOME"); sel == "" && dir != "" && h.GOOS != OSDarwin {
 			sel = filepath.Join(dir, "go", "env")
-		}
-	case rec.System == manifest.TypeCargo && user:
-		sel = CargoConfigFile(h.Home)
-	case rec.System == manifest.TypeRubygems && strings.HasSuffix(rec.Path, "/.bundle/config"):
-		sel = env("BUNDLE_USER_CONFIG")
-		if dir := env("BUNDLE_USER_HOME"); sel == "" && dir != "" {
-			sel = filepath.Join(dir, "config")
 		}
 	}
 	if sel != "" && sel != os.DevNull {
@@ -374,14 +355,6 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
 		}
-	case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimePodman && !user && h.Home != "" && env("CONTAINERS_REGISTRIES_CONF") == "":
-		// containers-registries.conf.d(5): a user's own registries.conf
-		// replaces the system file and every system drop-in with it.
-		own := filepath.Join(h.Home, ".config", "containers", "registries.conf")
-		if _, ok := regularFile(own); ok {
-			return fmt.Errorf("%s: %s exists, and podman, buildah and CRI-O read it in place of the system registries.conf and every system drop-in, %s included, so the mirror and CA written there would not reach podman. "+
-				"Nothing was written. Move that file's tables into a drop-in under %s, or remove it, then re-run", rec.System, own, target, filepath.Join(filepath.Dir(own), "registries.conf.d"))
-		}
 	case rec.System == manifest.TypeGit:
 		// The probe's own classifier over the probe's own file set, with the
 		// file the plan edits beside it: a construct that leaves the verdict
@@ -420,12 +393,6 @@ type CAInstall struct {
 	// anchors in Changes, or nil when the store the host's clients read
 	// already holds every one of them.
 	Step []string
-	// Imports are the keytool commands that add to the JVM trust store each
-	// certificate it lacks, run after Changes are written: each names a file
-	// among them.
-	Imports [][]string
-	// Notes name what the operator still does by hand, one per system.
-	Notes map[string]string
 	// System lists the systems whose anchors went into the operating
 	// system's trust store. For every other system the plan left that store
 	// as it was.
@@ -516,251 +483,6 @@ func SystemRoots(h CAHost) ([]*x509.Certificate, error) {
 	return store.roots(h.Root), nil
 }
 
-// JVMStore is the keystore a JVM reads its trust anchors from, and the
-// keytool that reads and edits it. The JVM reads nothing else: neither the
-// system trust store nor any setting in Maven's or Gradle's own files.
-type JVMStore struct {
-	// Keytool is the keytool of the JVM, "" for the one on PATH.
-	Keytool string
-	// Keystore is the file javax.net.ssl.trustStore names, or the JDK's
-	// jssecacerts, and "" for the cacerts of the JDK Keytool belongs to.
-	Keystore string
-	// Password is javax.net.ssl.trustStorePassword, "" for the JDK's default.
-	Password string
-	// Cacerts is the cacerts file of that JDK, which doctor reads where
-	// keytool is handed -cacerts, "" when the JDK holds none.
-	Cacerts string
-}
-
-const jvmDefaultPassword = "changeit"
-
-// ResolveJVMStore finds the trust store of the JVM Maven and Gradle start:
-// the JDK at JAVA_HOME, or else the one whose keytool is on PATH, and the
-// keystore a -Djavax.net.ssl.trustStore in JAVA_TOOL_OPTIONS or MAVEN_OPTS
-// names. MAVEN_OPTS is read last because the JVM takes it after
-// JAVA_TOOL_OPTIONS and the later definition wins. With no such property JSSE
-// loads lib/security/jssecacerts when the JDK holds one and cacerts only
-// otherwise, so a JDK with a jssecacerts never reads its cacerts.
-func ResolveJVMStore(getenv func(string) string, lookPath func(string) (string, error)) (JVMStore, error) {
-	var s JVMStore
-	for _, opt := range strings.Fields(getenv("JAVA_TOOL_OPTIONS") + " " + getenv("MAVEN_OPTS")) {
-		if v, ok := strings.CutPrefix(opt, "-Djavax.net.ssl.trustStore="); ok {
-			s.Keystore = v
-		}
-		if v, ok := strings.CutPrefix(opt, "-Djavax.net.ssl.trustStorePassword="); ok {
-			s.Password = v
-		}
-	}
-	home := getenv("JAVA_HOME")
-	if home != "" {
-		s.Keytool = filepath.Join(home, "bin", "keytool")
-	} else {
-		path, err := lookPath("keytool")
-		if err != nil {
-			return JVMStore{}, fmt.Errorf("no keytool on PATH and JAVA_HOME is unset, so the JVM Maven and Gradle run on is not known; set JAVA_HOME to its JDK")
-		}
-		s.Keytool = path
-		if real, err := filepath.EvalSymlinks(path); err == nil {
-			home = filepath.Dir(filepath.Dir(real))
-		}
-	}
-	if s.Keystore == "" {
-		// The second directory is a JDK 8, whose JRE sits a level down.
-		for _, dir := range []string{"lib/security", "jre/lib/security"} {
-			jsse := filepath.Join(home, dir, "jssecacerts")
-			if info, err := os.Stat(jsse); err == nil && info.Mode().IsRegular() {
-				s.Keystore = jsse
-				break
-			}
-		}
-	}
-	if s.Keystore == "" {
-		for _, dir := range []string{"lib/security", "jre/lib/security"} {
-			cacerts := filepath.Join(home, dir, "cacerts")
-			if info, err := os.Stat(cacerts); err == nil && info.Mode().IsRegular() {
-				s.Cacerts = cacerts
-				break
-			}
-		}
-	}
-	return s, nil
-}
-
-// Name is how a message names the store.
-func (s JVMStore) Name() string {
-	if s.Keystore != "" {
-		return "the JVM trust store " + s.Keystore
-	}
-	return "the cacerts keystore of the JDK " + s.keytool() + " belongs to"
-}
-
-func (s JVMStore) keytool() string {
-	if s.Keytool == "" {
-		return "keytool"
-	}
-	return s.Keytool
-}
-
-func (s JVMStore) command(verb ...string) []string {
-	cmd := append([]string{s.keytool()}, verb...)
-	if s.Keystore != "" {
-		cmd = append(cmd, "-keystore", s.Keystore)
-	} else {
-		cmd = append(cmd, "-cacerts")
-	}
-	pass := s.Password
-	if pass == "" {
-		pass = jvmDefaultPassword
-	}
-	return append(cmd, "-storepass", pass)
-}
-
-// ImportCommand adds the certificate in file to the store as alias.
-func (s JVMStore) ImportCommand(alias, file string) []string {
-	return append(s.command("-importcert", "-noprompt", "-trustcacerts"), "-alias", alias, "-file", file)
-}
-
-// Trusted lists the certificates the store holds, read from the keystore
-// file itself. keytool is never run to learn what the JVM trusts: it is a
-// program found on the host, started with whatever JAVA_TOOL_OPTIONS loads,
-// and a verdict on trust cannot rest on its answer.
-func (s JVMStore) Trusted() ([]*x509.Certificate, error) {
-	path := s.Keystore
-	if path == "" {
-		path = s.Cacerts
-	}
-	if path == "" {
-		return nil, fmt.Errorf("the cacerts keystore of the JDK %s belongs to was not found under its lib/security; set JAVA_HOME to the JDK Maven and Gradle run on", s.keytool())
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w. Run doctor as an account that can read the keystore", err)
-	}
-	pass := s.Password
-	if pass == "" {
-		pass = jvmDefaultPassword
-	}
-	certs, err := decodeKeystore(data, pass)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w. doctor reads a JKS or PKCS#12 trust store holding certificates only, with the password %q unless -Djavax.net.ssl.trustStorePassword in MAVEN_OPTS names another",
-			path, err, jvmDefaultPassword)
-	}
-	return certs, nil
-}
-
-// jksMagic opens a JKS keystore. Anything else is read as PKCS#12, the
-// JDK's default type since 9 and the form of its own cacerts since 18.
-var jksMagic = []byte{0xFE, 0xED, 0xFE, 0xED}
-
-// decodeKeystore lists the trust anchors a JVM takes from a keystore: each
-// trusted-certificate entry, and the leaf of each key entry's chain, which
-// JSSE trusts as well. A PKCS#12 store holding anything but trusted
-// certificates is an error, so nothing in a store is passed over unread.
-func decodeKeystore(data []byte, password string) ([]*x509.Certificate, error) {
-	if !bytes.HasPrefix(data, jksMagic) {
-		certs, err := pkcs12.DecodeTrustStore(data, password)
-		if err != nil {
-			// The JDK's own cacerts carries no MAC and no encryption, and
-			// the JVM opens it under any password.
-			if bare, bareErr := pkcs12.DecodeTrustStore(data, ""); bareErr == nil {
-				return bare, nil
-			}
-		}
-		return certs, err
-	}
-	ks := keystore.New()
-	if err := ks.Load(bytes.NewReader(data), []byte(password)); err != nil {
-		return nil, err
-	}
-	var certs []*x509.Certificate
-	for _, alias := range ks.Aliases() {
-		var der []byte
-		if ks.IsTrustedCertificateEntry(alias) {
-			entry, err := ks.GetTrustedCertificateEntry(alias)
-			if err != nil {
-				return nil, err
-			}
-			der = entry.Certificate.Content
-		} else {
-			chain, err := ks.GetPrivateKeyEntryCertificateChain(alias)
-			if err != nil || len(chain) == 0 {
-				continue
-			}
-			der = chain[0].Content
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			return nil, fmt.Errorf("entry %q holds a certificate that does not parse: %w", alias, err)
-		}
-		certs = append(certs, cert)
-	}
-	return certs, nil
-}
-
-// RunJVMCommand runs a keytool command and returns what it said when it
-// failed. Its output is captured, never passed through: a JVM opens with a
-// banner echoing JAVA_TOOL_OPTIONS, which is where a keystore password sits.
-func RunJVMCommand(cmd []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w (%s)", err, jvmDiagnostic(out, cmd))
-	}
-	return nil
-}
-
-var jvmSecret = regexp.MustCompile(`(?i)(pass(?:word|phrase)?[^\s=:]*[=:]\s*)\S+`)
-
-// jvmDiagnostic is the first line of a failed keytool's output that is its
-// own, with anything that reads as a password blanked. The JVM's "Picked up"
-// banners are skipped whole: they print the environment, not the failure.
-func jvmDiagnostic(out []byte, cmd []string) string {
-	var secret string
-	for i := 1; i < len(cmd); i++ {
-		if cmd[i-1] == "-storepass" && cmd[i] != jvmDefaultPassword {
-			secret = cmd[i]
-		}
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.Contains(line, "Picked up ") {
-			continue
-		}
-		if secret != "" {
-			line = strings.ReplaceAll(line, secret, "<trustStorePassword>")
-		}
-		return jvmSecret.ReplaceAllString(line, "${1}<redacted>")
-	}
-	return "it printed nothing of its own"
-}
-
-// ParseKeytoolList reads the certificates out of keytool -list -rfc output.
-// An entry keytool prints that does not parse is no trust anchor and is left
-// out.
-func ParseKeytoolList(out []byte) []*x509.Certificate {
-	var certs []*x509.Certificate
-	for block, rest := pem.Decode(out); block != nil; block, rest = pem.Decode(rest) {
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil && block.Type == "CERTIFICATE" {
-			certs = append(certs, cert)
-		}
-	}
-	return certs
-}
-
-// RedactJVMCommand renders a keytool command for a message, without a
-// keystore password an operator set: the JDK's default is public, any other
-// is theirs.
-func RedactJVMCommand(cmd []string) string {
-	out := slices.Clone(cmd)
-	for i := 1; i < len(out); i++ {
-		if out[i-1] == "-storepass" && out[i] != jvmDefaultPassword {
-			out[i] = "<trustStorePassword>"
-		}
-	}
-	return strings.Join(out, " ")
-}
-
 // osReleaseFamily is ID followed by each ID_LIKE entry, the order os-release
 // gives for "what this distribution is, then what it derives from".
 func osReleaseFamily(data []byte) []string {
@@ -783,24 +505,46 @@ func osReleaseFamily(data []byte) []string {
 }
 
 // ownStoreSystems are the systems whose client reads a CA from its own
-// setting. Every other system verifies through the system trust store, apart
-// from Maven, whose JVM reads a keystore of its own.
-var ownStoreSystems = []string{manifest.TypeNpm, manifest.TypePypi, manifest.TypeOCI, manifest.TypeGit}
+// setting, and systemStoreSystems the ones whose client verifies through the
+// operating system's trust store. Together they are every system a CA is
+// installed for.
+var (
+	ownStoreSystems    = []string{manifest.TypeNpm, manifest.TypePypi, manifest.TypeOCI, manifest.TypeGit}
+	systemStoreSystems = []string{manifest.TypeApt, manifest.TypeGomod, manifest.TypeHelm}
+)
+
+// CAUnsupported is the error for a plan record no CA is installed for, nil
+// for one that is: a system outside the two lists above, and under oci the
+// registries.conf podman, buildah and CRI-O read. Each of those clients
+// selects its trust by rules this package does not port, so a CA written for
+// one could report an install the client never reads. A record naming only a
+// system answers for the system alone.
+func CAUnsupported(rec PlanRecord) error {
+	supported := strings.Join(systemStoreSystems, ", ") + ", " + strings.Join(ownStoreSystems, ", ")
+	switch {
+	case !slices.Contains(systemStoreSystems, rec.System) && !slices.Contains(ownStoreSystems, rec.System):
+		return fmt.Errorf("%s: private-CA installation for %s is not supported; --ca-file installs a CA for %s. "+
+			"Configure %s in a run without --ca-file, and add the CA to the trust store its client reads by hand",
+			rec.System, rec.System, supported, rec.System)
+	case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimePodman:
+		return fmt.Errorf("%s: private-CA installation for podman, buildah and CRI-O is not supported, and this host's plan writes %s for them; under %s, --ca-file installs a CA for Docker Engine and containerd alone. "+
+			"Configure %s in a run without --ca-file, and add the CA to the certs.d directory those clients read by hand",
+			rec.System, rec.Path, rec.System, rec.System)
+	}
+	return nil
+}
 
 // AddCA plans the install of ca for every system changes configures: the
 // client's own setting merged into the file the plan already writes for npm,
-// pip, git and containerd, a ca.crt in the directory Docker and podman read
-// per registry host, an import into the JVM trust store for Maven and Gradle,
-// and for every other system an anchor in the operating system's trust store.
+// pip, git and containerd, a ca.crt in the directory Docker reads per
+// registry host, and for apt, go and helm an anchor in the operating system's
+// trust store. A change for any other client is refused before an edit is
+// built, as CAUnsupported words it.
 //
 // A client that reads an existing configuration file ahead of the plan's (a
 // pip.conf pip loads later, npm's userconfig, GIT_CONFIG_GLOBAL, a git section
 // scoped to a longer URL) gets the edit in that file too, as a change of its
 // own: the plan's file alone would leave the client reading its old settings.
-//
-// Maven's settings.xml and Composer's config.json, which NewChange merges for
-// any plan, are merged again here so bodega's own mirror and repository keep
-// the fields the plan does not set.
 //
 // Every file the plan edits that already exists keeps what the plan does not
 // set, whether its client reads a CA setting or the system store: kindOf
@@ -817,7 +561,12 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 	if base.Scheme != "https" {
 		return CAInstall{}, fmt.Errorf("%s is plain http, where no client verifies a certificate, so there is no CA to install", h.Base)
 	}
-	in := CAInstall{Changes: slices.Clone(changes), Notes: map[string]string{}}
+	for _, c := range changes {
+		if err := CAUnsupported(c.Record); err != nil {
+			return CAInstall{}, err
+		}
+	}
+	in := CAInstall{Changes: slices.Clone(changes)}
 	var files []Change
 	// resolve turns a path as a plan writes it into this host's: ~/ under the
 	// home directory, anything else under Root.
@@ -853,7 +602,6 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 
 	var system []string
 	var selected []Change
-	jvm := false
 	for i, c := range in.Changes {
 		rec := c.Record
 		if err := h.ignored(rec, c.Target); err != nil {
@@ -864,59 +612,12 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				return CAInstall{}, err
 			}
 		}
-		if c.Existed && c.planned != nil {
-			switch {
-			case rec.System == manifest.TypeMaven && rec.Path == MavenSettingsPath:
-				merged, err := mergeMavenMirror(c.Old, c.planned)
-				if err != nil {
-					return CAInstall{}, fmt.Errorf("%s: cannot merge bodega's mirror into %s: %w. "+
-						"Write that mirror with plain <id>, <mirrorOf> and <url> elements, once, or move the file aside, then re-run", rec.System, c.Target, err)
-				}
-				c.New = merged
-			case rec.System == manifest.TypeComposer:
-				merged, err := mergeComposer(c.Old, c.planned, true)
-				if err != nil {
-					return CAInstall{}, fmt.Errorf("%s: cannot merge bodega's repository into %s: %w", rec.System, c.Target, err)
-				}
-				c.New = merged
-			}
-			in.Changes[i].New = c.New
-		}
 		// header and line are the CA setting and the section it belongs
 		// under.
 		kind := kindOf(rec)
 		var header string
 		var line func(caPath string) string
 		switch {
-		case rec.System == manifest.TypeMaven:
-			// The JVM import is planned once for the system; each of its
-			// records still goes on to the merge that keeps its own file.
-			certs := ca.Certs
-			if jvm {
-				certs = nil
-			}
-			jvm = true
-			for _, cert := range certs {
-				if slices.ContainsFunc(h.JVMTrusted, func(have *x509.Certificate) bool { return bytes.Equal(have.Raw, cert.Raw) }) {
-					continue
-				}
-				// The fingerprint keeps a rotated CA from colliding with the
-				// alias of the one it replaces, which keytool refuses.
-				sum := sha256.Sum256(cert.Raw)
-				alias := "bodega-ca-" + hex.EncodeToString(sum[:6])
-				dir, err := sharedPath(rec.Path)
-				if err != nil {
-					return CAInstall{}, fmt.Errorf("%s: %w", rec.System, err)
-				}
-				target := filepath.Join(filepath.Dir(dir), alias+".pem")
-				if err := addFile(rec.System, target, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})); err != nil {
-					return CAInstall{}, err
-				}
-				in.Imports = append(in.Imports, h.JVM.ImportCommand(alias, target))
-			}
-			if len(in.Imports) > 0 {
-				in.Notes[rec.System] = "a JVM already running keeps the trust store it started with; stop Gradle's daemons (gradle --stop) and Maven's (mvnd --stop) once the import has run"
-			}
 		case !slices.Contains(ownStoreSystems, rec.System):
 			if !slices.Contains(system, rec.System) {
 				system = append(system, rec.System)
@@ -936,17 +637,6 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 			// Docker reads certs.d beside daemon.json, keyed by the host and
 			// port of the registry or mirror it is talking to.
 			if err := addFile(rec.System, filepath.Join(filepath.Dir(c.Target), "certs.d", base.Host, "ca.crt"), ca.PEM); err != nil {
-				return CAInstall{}, err
-			}
-		case rec.System == manifest.TypeOCI && OCIRuntimeOf(rec.Path) == RuntimePodman:
-			// The one directory podman reads for this host, which hides the
-			// others even when it is empty; with none yet, the certs.d two
-			// levels above the drop-in, which then becomes that directory.
-			dir := PodmanCertDir(h.Home, h.Root, base.Host)
-			if dir == "" {
-				dir = filepath.Join(filepath.Dir(filepath.Dir(c.Target)), "certs.d", base.Host)
-			}
-			if err := addFile(rec.System, filepath.Join(dir, "ca.crt"), ca.PEM); err != nil {
 				return CAInstall{}, err
 			}
 		}
@@ -1128,7 +818,7 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err != nil {
 			return CAInstall{}, fmt.Errorf("%s verify through the system trust store: %w.\n"+
 				"  Add the CA to this host's store by hand, then re-run without --ca-file, or name only the systems that read their own: %s",
-				strings.Join(system, ", "), err, strings.Join(append(slices.Clone(ownStoreSystems), manifest.TypeMaven), ", "))
+				strings.Join(system, ", "), err, strings.Join(ownStoreSystems, ", "))
 		}
 		before := len(files)
 		for i, cert := range ca.Certs {

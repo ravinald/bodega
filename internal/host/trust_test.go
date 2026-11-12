@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,12 +83,9 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 	writeTrustFile(t, filepath.Join(root, "etc/apt/sources.list.d/other.sources"), "URIs: https://mirror.example/ubuntu\n")
 	writeTrustFile(t, filepath.Join(root, "etc/docker/daemon.json"), `{"registry-mirrors":["`+base+`"]}`)
 	writeTrustFile(t, filepath.Join(root, "etc/docker/certs.d", hostport, "ca.crt"), string(caPEM))
+	// cargo and podman are configured for bodega with no CA either reads;
+	// their rows are not this probe's to judge.
 	writeTrustFile(t, filepath.Join(root, "etc/containers/registries.conf.d/bodega.conf"), "[[registry]]\nprefix = \"docker.io\"\n[[registry.mirror]]\nlocation = \""+hostport+"\"\n")
-	// podman reads the first certs.d directory that exists for the host and
-	// no other, so this empty one hides Docker's, which holds the CA.
-	if err := os.MkdirAll(filepath.Join(root, "etc/containers/certs.d", hostport), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	writeTrustFile(t, filepath.Join(root, "etc/containerd/certs.d/docker.io/hosts.toml"),
 		"server = \"https://registry-1.docker.io\"\n\n[host.\""+base+"\"]\n  ca = \""+ca+"\"\n  capabilities = [\"pull\", \"resolve\"]\n")
 
@@ -119,16 +117,14 @@ func TestTrustProbeWarnsNamingTheStore(t *testing.T) {
 		got[f.Check] = f
 	}
 	for check, want := range map[string]struct{ store, system string }{
-		"pip-config":   {"the system trust store, which pip reads while no cert setting names a bundle, does not verify", "--configure pypi --ca-file"},
-		"cargo-config": {"the system trust store does not verify", "--configure cargo --ca-file"},
-		"oci-podman":   {filepath.Join(root, "etc/containers/certs.d", hostport), "--configure oci --ca-file"},
+		"pip-config": {"the system trust store, which pip reads while no cert setting names a bundle, does not verify", "--configure pypi --ca-file"},
 	} {
 		f := got[check]
 		if f.Status != StatusWarn || !strings.Contains(f.Detail, want.store) || !strings.Contains(f.Detail, hostport) || !strings.Contains(f.Remediation, want.system) {
 			t.Errorf("%s = %s %q, remediation %q; want a warning naming %q and %q", check, f.Status, f.Detail, f.Remediation, want.store, want.system)
 		}
 	}
-	for _, check := range []string{"npm-config", "oci-docker", "oci-containerd", "apt-sources", "snapd"} {
+	for _, check := range []string{"npm-config", "oci-docker", "oci-containerd", "apt-sources", "snapd", "cargo-config", "oci-podman"} {
 		if f := got[check]; f.Status != StatusOK {
 			t.Errorf("%s = %s %q, want it left OK", check, f.Status, f.Detail)
 		}
@@ -251,28 +247,6 @@ func TestReviewTrustFindsDarwinPip(t *testing.T) {
 	}
 }
 
-func TestReviewTrustProbesConfiguredMaven(t *testing.T) {
-	p, _, base := reviewTrust(t)
-	home := t.TempDir()
-	p.Home = home
-	writeTrustFile(t, filepath.Join(home, ".m2/settings.xml"), "<settings><mirrors><mirror><id>bodega</id><mirrorOf>*</mirrorOf><url>"+base+"/maven/</url></mirror></mirrors></settings>")
-	before, ok := checkMaven(mavenTools{home: home, getenv: func(string) string { return "" }, lookPath: func(name string) (string, error) {
-		if name == "mvn" {
-			return "/stub/mvn", nil
-		}
-		return "", exec.ErrNotFound
-	}})
-	if !ok || before.Status != StatusOK {
-		t.Fatalf("fixture is not configured: %+v", before)
-	}
-	called := false
-	p.Chain = func(string) ([]*x509.Certificate, error) { called = true; return nil, os.ErrNotExist }
-	p.Apply([]Finding{before}, base)
-	if !called {
-		t.Fatal("configured Maven row never probes bodega's chain")
-	}
-}
-
 func TestReviewContainerdUsesEffectiveConfigPath(t *testing.T) {
 	p, ca, base := reviewTrust(t)
 	writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/config.toml"),
@@ -294,22 +268,6 @@ func TestReviewContainerdUsesEffectiveConfigPath(t *testing.T) {
 	}
 }
 
-func TestReviewTrustFindsDnfReposdir(t *testing.T) {
-	p, _, base := reviewTrust(t)
-	main := filepath.Join(p.Root, "etc/dnf/dnf.conf")
-	repos := filepath.Join(p.Root, "srv/repos")
-	writeTrustFile(t, main, "[main]\nreposdir="+repos+"\n")
-	writeTrustFile(t, filepath.Join(repos, "bodega.repo"), "[bodega]\nbaseurl="+base+"/rpm/repo/\nenabled=1\n")
-	before, ok := (RpmHost{MainConf: main, Dirs: []string{repos}, LookPath: func(string) (string, error) { return "/stub/dnf", nil }}).Check(base)
-	if !ok || before.Status != StatusOK {
-		t.Fatalf("fixture not configured: %+v", before)
-	}
-	f := p.Apply([]Finding{before}, base)[0]
-	if f.Status != StatusWarn {
-		t.Fatalf("configured dnf custom reposdir and untrusted CA: got %+v; want WARN", f)
-	}
-}
-
 func TestReviewTrustChecksConfiguredWarnRow(t *testing.T) {
 	p, _, base := reviewTrust(t)
 	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\n@legacy:registry=https://registry.npmjs.org/\n")
@@ -321,51 +279,6 @@ func TestReviewTrustChecksConfiguredWarnRow(t *testing.T) {
 	if !strings.Contains(f.Remediation, "--ca-file") {
 		t.Fatalf("configured npm has two problems but CA is unchecked: %+v", f)
 	}
-}
-
-// F116 R2: the Maven row is judged against the JVM trust store and nothing
-// else. The system store verifying does not settle it, a store holding the
-// CA does, and one keytool cannot list is reported as unchecked.
-func TestTrustProbeReadsTheJVMStoreForMaven(t *testing.T) {
-	const base = "https://bodega.internal:8443"
-	caPEM, chain := trustFixture(t)
-	block, _ := pem.Decode(caPEM)
-	ca, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home := t.TempDir()
-	writeTrustFile(t, filepath.Join(home, ".gradle/init.d/bodega.gradle"), "def bodegaUrl = '"+base+"/maven/'\n")
-	var stored []*x509.Certificate
-	var storeErr error
-	probe := TrustProbe{
-		Home: home, GOOS: "linux",
-		Chain:  func(string) ([]*x509.Certificate, error) { return chain, nil },
-		System: func([]*x509.Certificate, string) error { return nil },
-		JVM:    func() (string, []*x509.Certificate, error) { return "the cacerts keystore of /jdk", stored, storeErr },
-	}
-	row := []Finding{{Check: "maven", Status: StatusOK, Detail: "Gradle's init script points at bodega"}}
-
-	f := probe.Apply(row, base)[0]
-	if f.Status != StatusWarn || !strings.Contains(f.Detail, "the cacerts keystore of /jdk") || !strings.Contains(f.Remediation, "--configure maven --ca-file") {
-		t.Errorf("JVM store without the CA, system store verifying = %+v; want a warning naming the keystore", f)
-	}
-	stored = []*x509.Certificate{ca}
-	probe.System = func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }
-	if f := probe.Apply(row, base)[0]; f.Status != StatusOK || f.Detail != row[0].Detail {
-		t.Errorf("JVM store holding the CA = %+v; want the row as the check wrote it", f)
-	}
-	storeErr = errors.New("keytool: exit status 1")
-	if f := probe.Apply(row, base)[0]; f.Status != StatusWarn || !strings.Contains(f.Detail, "unchecked") || !strings.Contains(f.Detail, "exit status 1") {
-		t.Errorf("unreadable JVM store = %+v; want a warning saying the certificate is unchecked", f)
-	}
-	// Not pointed at bodega: nothing is listed and nothing is dialed.
-	probe.JVM = func() (string, []*x509.Certificate, error) {
-		t.Error("keytool ran for a host not configured")
-		return "", nil, nil
-	}
-	probe.Home = t.TempDir()
-	probe.Apply(row, base)
 }
 
 func TestAuditNpmBundledRootsAreNotSystemStore(t *testing.T) {
@@ -504,30 +417,11 @@ func TestTrustProbeReadsTheStoreAClientIsPointedAt(t *testing.T) {
 		// set configures the client for bodega with a CA setting naming
 		// file, and returns the probe to judge it with.
 		set func(t *testing.T, p *TrustProbe, base, file string)
-		// additive says the setting adds to the system store.
-		additive bool
 	}{
 		{"apt Acquire::https::CAInfo", "apt-sources", func(t *testing.T, p *TrustProbe, base, file string) {
 			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "URIs: "+base+"/apt/\n")
 			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/apt.conf.d/99ca"), "Acquire::https::CAInfo \""+file+"\";\n")
-		}, false},
-		{"dnf sslcacert", "dnf-repos", func(t *testing.T, p *TrustProbe, base, file string) {
-			p.DnfConf, p.DnfDirs = filepath.Join(p.Root, "etc/dnf/dnf.conf"), []string{filepath.Join(p.Root, "etc/yum.repos.d")}
-			writeTrustFile(t, p.DnfConf, "[main]\nsslcacert="+file+"\n")
-			writeTrustFile(t, filepath.Join(p.DnfDirs[0], "bodega.repo"), "[bodega-baseos]\nbaseurl="+base+"/rpm/baseos/\n")
-		}, false},
-		{"cargo http.cainfo", "cargo-config", func(t *testing.T, p *TrustProbe, base, file string) {
-			p.Home = filepath.Join(p.Root, "home")
-			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[http]\ncainfo = \""+file+"\"\n")
-		}, false},
-		{"pkg SSL_CA_CERT_FILE", "pkg-repos", func(t *testing.T, p *TrustProbe, base, file string) {
-			writeTrustFile(t, filepath.Join(p.Root, "usr/local/etc/pkg/repos/bodega.conf"), "bodega: { url: \""+base+"/freebsd\" }\n")
-			p.Getenv = func(k string) string { return map[string]string{"SSL_CA_CERT_FILE": file}[k] }
-		}, false},
-		{"gem ssl_ca_cert", "rubygems", func(t *testing.T, p *TrustProbe, base, file string) {
-			p.Home = filepath.Join(p.Root, "home")
-			writeTrustFile(t, filepath.Join(p.Home, ".gemrc"), "---\n:sources:\n- "+base+"/rubygems/\n:ssl_ca_cert: "+file+"\n")
-		}, true},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The named file holds the CA and the system store does not.
@@ -544,8 +438,8 @@ func TestTrustProbeReadsTheStoreAClientIsPointedAt(t *testing.T) {
 			tc.set(t, &p, base, wrong)
 			p.System = trusted
 			f := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
-			if want := map[bool]Status{true: StatusOK, false: StatusWarn}[tc.additive]; f.Status != want || (!tc.additive && !strings.Contains(f.Detail, wrong)) {
-				t.Errorf("the system store holds the CA and the named file does not: %s %q; want %s", f.Status, f.Detail, want)
+			if f.Status != StatusWarn || !strings.Contains(f.Detail, wrong) {
+				t.Errorf("the system store holds the CA and the named file does not: %s %q; want %s", f.Status, f.Detail, StatusWarn)
 			}
 		})
 	}
@@ -747,11 +641,6 @@ func TestTrustFollowsEachClientsOwnPrecedence(t *testing.T) {
 				return map[string]string{"npm_config_userconfig": selected, "npm_config_cafile": wrong}[k]
 			}
 		}, StatusWarn},
-		{"cargo reads config ahead of config.toml, and cainfo only under [http]", "cargo-config", func(t *testing.T, p *TrustProbe, ca, base string) {
-			p.Home = filepath.Join(p.Root, "home")
-			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[http]\ncainfo = \"/missing/unread.pem\"\n")
-			writeTrustFile(t, filepath.Join(p.Home, ".cargo/config"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n[net]\ncainfo = \"/missing/not-http.pem\"\n[http]\ncainfo = \""+ca+"\"\n")
-		}, StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, ca, base := reviewTrust(t)
@@ -778,24 +667,6 @@ func TestStaffPipVirtualenvOverridesGlobalCA(t *testing.T) {
 	f := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
 	if f.Status != StatusWarn || !strings.Contains(f.Detail, "/missing/venv-ca.pem") {
 		t.Fatalf("pip virtualenv overrides global cert: got %+v; want WARN naming venv-ca.pem", f)
-	}
-}
-
-func TestStaffPodmanUserStoreShadowsSystemDirectory(t *testing.T) {
-	p, ca, base := reviewTrust(t)
-	p.Home = filepath.Join(p.Root, "home")
-	good, err := os.ReadFile(ca)
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, _ := trustFixture(t)
-	writeTrustFile(t, filepath.Join(p.Root, "etc/containers/registries.conf"), "[[registry]]\nprefix=\"docker.io\"\nlocation=\"docker.io\"\n[[registry.mirror]]\nlocation=\"bodega.internal:8443/docker.io\"\n")
-	writeTrustFile(t, filepath.Join(p.Root, "etc/containers/certs.d/bodega.internal:8443/ca.crt"), string(good))
-	own := filepath.Join(p.Home, ".config/containers/certs.d/bodega.internal:8443/ca.crt")
-	writeTrustFile(t, own, string(other))
-	f := p.Apply([]Finding{{Check: "oci-podman", Status: StatusOK}}, base)[0]
-	if f.Status != StatusWarn {
-		t.Fatalf("podman user certs.d shadows system certs.d: got %+v; want WARN", f)
 	}
 }
 
@@ -961,11 +832,11 @@ func TestJudgeTellsVerifiedFromEverythingElse(t *testing.T) {
 	gitHome := filepath.Join(p.Root, "githome")
 	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
 	writeTrustFile(t, filepath.Join(p.Root, "etc/pip.conf"), "[global]\nindex-url = "+base+"/pypi/simple/\ncert = /missing/ca.pem\n")
-	got, err := p.Judge([]string{"npm-config", "pip-config", "cargo-config", "no-such-check"}, base)
+	got, err := p.Judge([]string{"npm-config", "pip-config", "helm-repos", "no-such-check"}, base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]TrustState{"npm-config": TrustVerified, "pip-config": TrustFailed, "cargo-config": TrustAbsent}
+	want := map[string]TrustState{"npm-config": TrustVerified, "pip-config": TrustFailed, "helm-repos": TrustAbsent}
 	if len(got) != len(want) {
 		t.Fatalf("Judge returned %d verdicts for %d known checks: %+v", len(got), len(want), got)
 	}
@@ -1198,95 +1069,6 @@ func TestAudit10GitCommentCannotHideProbeOverride(t *testing.T) {
 	}
 }
 
-func TestAudit10RubygemsReportNeverExecutesHostClient(t *testing.T) {
-	home, bin := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("PATH", bin)
-	marker := filepath.Join(home, "client-ran")
-	t.Setenv("F116_AUDIT_MARKER", marker)
-	script := "#!/bin/sh\nprintf ran > \"$F116_AUDIT_MARKER\"\nprintf '%s\\n' 'https://bodega.internal:8443/rubygems/'\n"
-	if err := os.WriteFile(filepath.Join(bin, "gem"), []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	f, ok := CheckRubygems()
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatalf("normal doctor's Rubygems discovery executed the host gem binary: row=%+v present=%v", f, ok)
-	} else if !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-}
-
-// A gem sent to bodega only by a file $GEMRC names still owes a trust
-// verdict: the probe finds the endpoint through the files the report's
-// source list is read from, not ~/.gemrc alone.
-func TestRubygemsTrustFollowsEveryGemrcLayer(t *testing.T) {
-	p, _, base := reviewTrust(t)
-	p.Home = t.TempDir()
-	extra := filepath.Join(t.TempDir(), "gemrc")
-	writeTrustFile(t, extra, "---\n:sources:\n- "+base+"/rubygems/\n")
-	p.Getenv = func(k string) string {
-		if k == "GEMRC" {
-			return extra
-		}
-		return ""
-	}
-	f := p.Apply([]Finding{{Check: "rubygems", Status: StatusOK}}, base)[0]
-	if f.Status != StatusWarn || !strings.Contains(f.Remediation, "--ca-file") {
-		t.Fatalf("gem configured for bodega through GEMRC, system store refusing its chain: %+v; want WARN and --ca-file", f)
-	}
-}
-
-func TestAudit11BundlerSelectedConfigStillOwesTrust(t *testing.T) {
-	p, _, base := reviewTrust(t)
-	for _, key := range []string{"BUNDLE_USER_CONFIG", "BUNDLE_USER_HOME"} {
-		t.Run(key, func(t *testing.T) {
-			dir := t.TempDir()
-			file := filepath.Join(dir, "config")
-			selected := file
-			if key == "BUNDLE_USER_HOME" {
-				selected = dir
-			}
-			writeTrustFile(t, file, "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \""+base+"/rubygems/\"\n")
-			r := rubyFixture(t, []string{"bundle"}, "", map[string]string{key: selected})
-			f, ok := checkRubygems(r)
-			if !ok || f.Status != StatusOK {
-				t.Fatalf("configured Bundler control = %+v, %v", f, ok)
-			}
-			p.Home, p.Getenv = r.home, r.getenv
-			got := p.Apply([]Finding{f}, base)[0]
-			if got.Status != StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
-				t.Fatalf("Bundler reads %s selected by %s, but the untrusted chain left %+v; want WARN and --ca-file", file, key, got)
-			}
-		})
-	}
-}
-
-func TestAudit11FreeBSDReportNeverExecutesHostClients(t *testing.T) {
-	for _, name := range []string{"pkg", "make"} {
-		t.Run(name, func(t *testing.T) {
-			home, bin := t.TempDir(), t.TempDir()
-			marker := filepath.Join(home, "client-ran")
-			t.Setenv("PATH", bin)
-			t.Setenv("F116_AUDIT_MARKER", marker)
-			script := "#!/bin/sh\nprintf ran > \"$F116_AUDIT_MARKER\"\nprintf '%s\\n' /missing/ports\n"
-			if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0700); err != nil {
-				t.Fatal(err)
-			}
-			var f Finding
-			if name == "pkg" {
-				f = checkPkgRepos("freebsd", runTool)
-			} else {
-				f = checkMakeConf("freebsd", runTool, func(string) bool { return false })
-			}
-			if _, err := os.Stat(marker); err == nil {
-				t.Fatalf("normal FreeBSD doctor discovery executed host %s: %+v", name, f)
-			} else if !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
 // A client's endpoint is the one its effective configuration gives it: a
 // value the environment sets hides the file below it, for the trust verdict
 // as for the row, so a hidden file naming bodega owes and proves nothing.
@@ -1296,9 +1078,7 @@ func TestTrustFollowsTheEffectiveEndpoint(t *testing.T) {
 	conf := filepath.Join(p.Home, ".config")
 	p.ConfigDir = func() (string, error) { return conf, nil }
 	writeTrustFile(t, filepath.Join(conf, "go", "env"), "GOPROXY="+base+"/go,off\n")
-	writeTrustFile(t, filepath.Join(p.Home, ".bundle", "config"), "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \""+base+"/rubygems/\"\n")
 	elsewhere := t.TempDir()
-	writeTrustFile(t, filepath.Join(elsewhere, "config"), "---\nBUNDLE_MIRROR__ALL: \"https://mirror.example/\"\n")
 	writeTrustFile(t, filepath.Join(elsewhere, "goenv"), "GOPROXY=https://proxy.golang.org,direct\n")
 
 	state := func(check string, env map[string]string) TrustState {
@@ -1322,33 +1102,10 @@ func TestTrustFollowsTheEffectiveEndpoint(t *testing.T) {
 		{"GOENV selects another file", "goproxy-env", map[string]string{"GOENV": filepath.Join(elsewhere, "goenv")}, TrustAbsent},
 		{"GOENV=off", "goproxy-env", map[string]string{"GOENV": "off"}, TrustAbsent},
 		{"GOENV names a directory", "goproxy-env", map[string]string{"GOENV": elsewhere}, TrustUnchecked},
-		{"~/.bundle/config alone", "rubygems", nil, TrustFailed},
-		{"BUNDLE_USER_CONFIG selects another file", "rubygems", map[string]string{"BUNDLE_USER_CONFIG": filepath.Join(elsewhere, "config")}, TrustAbsent},
-		{"BUNDLE_USER_HOME selects another file", "rubygems", map[string]string{"BUNDLE_USER_HOME": elsewhere}, TrustAbsent},
-		{"a mirror in the environment hides the file", "rubygems", map[string]string{"BUNDLE_MIRROR__ALL": "https://mirror.example/"}, TrustAbsent},
-		{"a mirror in the environment names bodega", "rubygems", map[string]string{"BUNDLE_USER_HOME": elsewhere, "BUNDLE_MIRROR__ALL": base + "/rubygems/"}, TrustFailed},
-		{"BUNDLE_USER_CONFIG names a directory", "rubygems", map[string]string{"BUNDLE_USER_CONFIG": elsewhere}, TrustUnchecked},
 	} {
 		if got := state(c.check, c.env); got != c.want {
 			t.Errorf("%s: state = %v, want %v", c.name, got, c.want)
 		}
-	}
-}
-
-func TestAudit12CargoIgnoresTheHiddenConfig(t *testing.T) {
-	p, ca, base := reviewTrust(t)
-	p.Home = t.TempDir()
-	writeTrustFile(t, filepath.Join(p.Home, ".cargo", "config"), "[source.crates-io]\nregistry = \"sparse+https://index.crates.io/\"\n")
-	writeTrustFile(t, filepath.Join(p.Home, ".cargo", "config.toml"), "[source.crates-io]\nreplace-with = \"bodega\"\n[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n")
-	p.System = func(chain []*x509.Certificate, name string) error {
-		return verifyChain(chain, name, poolOf([]string{ca}))
-	}
-	got, err := p.Judge([]string{"cargo-config"}, base)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("Judge = %+v, %v", got, err)
-	}
-	if got[0].State == TrustVerified {
-		t.Fatalf("Cargo reads .cargo/config, which names crates.io, but the hidden config.toml certified the selected install: %+v", got[0])
 	}
 }
 
@@ -1448,29 +1205,67 @@ func TestAudit14PipRejectsDuplicatePolicy(t *testing.T) {
 	}
 }
 
-func TestAudit14PodmanSelectedEndpointStillOwesTrust(t *testing.T) {
+// F116 R2: a row for any client other than apt, pip, npm, git, helm, go,
+// Docker Engine and containerd comes back as its check wrote it, whatever
+// the chain bodega serves, and owes no verdict after an install.
+func TestTrustProbeLeavesOtherRowsAsWritten(t *testing.T) {
 	p, _, base := reviewTrust(t)
 	p.Home = filepath.Join(p.Root, "home")
-	selected := filepath.Join(p.Root, "selected-registries.conf")
-	writeTrustFile(t, selected, "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.io\"\n[[registry.mirror]]\nlocation = \""+strings.TrimPrefix(base, "https://")+"\"\n")
-	p.Getenv = func(k string) string {
-		if k == "CONTAINERS_REGISTRIES_CONF" {
-			return selected
-		}
-		return ""
+	host := strings.TrimPrefix(base, "https://")
+	// Each is configured for bodega, whose chain no store on the host verifies.
+	writeTrustFile(t, filepath.Join(p.Home, ".cargo/config.toml"), "[source.bodega]\nregistry = \"sparse+"+base+"/cargo/\"\n")
+	writeTrustFile(t, filepath.Join(p.Home, ".gemrc"), "---\n:sources:\n- "+base+"/rubygems/\n")
+	writeTrustFile(t, filepath.Join(p.Home, ".m2/settings.xml"), "<settings><mirrors><mirror><id>bodega</id><mirrorOf>*</mirrorOf><url>"+base+"/maven/</url></mirror></mirrors></settings>")
+	writeTrustFile(t, filepath.Join(p.Home, ".config/composer/config.json"), `{"repositories":{"bodega":{"type":"composer","url":"`+base+`/composer/"}}}`)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/yum.repos.d/bodega.repo"), "[bodega-baseos]\nbaseurl="+base+"/rpm/baseos/\n")
+	writeTrustFile(t, filepath.Join(p.Root, "usr/local/etc/pkg/repos/bodega.conf"), "bodega: { url: \""+base+"/freebsd\" }\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/make.conf"), "MASTER_SITE_OVERRIDE?= "+base+"/distfiles/\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containers/registries.conf.d/bodega.conf"), "[[registry]]\nprefix = \"docker.io\"\n[[registry.mirror]]\nlocation = \""+host+"\"\n")
+	var rows []Finding
+	var checks []string
+	for _, check := range []string{"cargo-config", "rubygems", "maven", "composer", "dnf-repos", "pkg-repos", "make-conf", "oci-podman"} {
+		checks = append(checks, check)
+		rows = append(rows, Finding{Check: check, Status: StatusOK, Detail: "as written"}, Finding{Check: check, Status: StatusWarn, Detail: "as written", Remediation: "as written"})
 	}
-	h := OCIHost{Root: p.Root, Home: p.Home, RegistriesConf: selected, LookPath: func(name string) (string, error) {
-		if name == "podman" {
-			return "/not-executed/podman", nil
-		}
-		return "", os.ErrNotExist
-	}}
-	rows := h.Check(base)
-	if len(rows) != 1 || rows[0].Status != StatusOK {
-		t.Fatalf("setup: %+v", rows)
+	if got := p.Apply(rows, base); !slices.Equal(got, rows) {
+		t.Errorf("rows for clients outside --ca-file changed:\n got %+v\nwant %+v", got, rows)
 	}
-	got := p.Apply(rows, base)[0]
-	if got.Status != StatusWarn || !strings.Contains(got.Remediation, "--ca-file") {
-		t.Fatalf("normal row resolves bodega from %s, but its untrusted chain is never checked: %+v", selected, got)
+	if got, err := p.Judge(checks, base); err != nil || len(got) != 0 {
+		t.Errorf("Judge(%v) = %+v, %v; want no verdict owed", checks, got, err)
+	}
+	for check, system := range TrustSystems() {
+		if !slices.Contains([]string{"apt", "pypi", "npm", "git", "helm", "gomod", "oci"}, system) || check == "oci-podman" {
+			t.Errorf("the probe judges %s for %s, a client --ca-file refuses", check, system)
+		}
+	}
+}
+
+func TestAudit15PipSyntaxErrorIsUnchecked(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tail := range []string{"not-an-assignment\n", "= nameless\n"} {
+		t.Run(strings.ReplaceAll(tail, "\n", "_"), func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			p.Home = filepath.Join(p.Root, "home")
+			file := filepath.Join(p.Root, "etc", "pip.conf")
+			writeTrustFile(t, file, "[global]\nindex-url = "+base+"/pypi/simple/\ncert = "+ca+"\n"+tail)
+			cmd := exec.Command(python, "-m", "pip", "config", "list")
+			cmd.Dir = t.TempDir()
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
+			native, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(native), "parsing errors") {
+				t.Fatalf("oracle did not reject malformed line: %v: %s", err, native)
+			}
+			got := p.Apply([]Finding{checkPipConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+			verdict, err := p.Judge([]string{"pip-config"}, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != StatusWarn || !strings.Contains(got.Detail, "unchecked") || !strings.Contains(got.Detail, file) || !strings.Contains(got.Remediation, "--ca-file") || len(verdict) != 1 || verdict[0].State != TrustUnchecked {
+				t.Fatalf("native pip rejects this file:\n%s\ndoctor row: %+v; selected verdict: %+v", native, got, verdict)
+			}
+		})
 	}
 }

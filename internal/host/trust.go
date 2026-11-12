@@ -3,13 +3,11 @@ package host
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -39,20 +37,12 @@ type TrustProbe struct {
 	GOOS      string
 	Getenv    func(string) string
 	ConfigDir func() (string, error)
-	// DnfConf is dnf's main configuration file and DnfDirs the directories
-	// it reads .repo files from when that file sets no reposdir. Empty reads
-	// dnf's own, under Root.
-	DnfConf string
-	DnfDirs []string
 	// Chain returns the certificates the server at hostport presents, leaf
 	// first, without verifying them. Nil dials it.
 	Chain func(hostport string) ([]*x509.Certificate, error)
 	// System verifies a chain for dnsName against the operating system's
 	// trust store. Nil uses the store this process reads.
 	System func(chain []*x509.Certificate, dnsName string) error
-	// JVM names the trust store of the JVM Maven and Gradle run on and lists
-	// its certificates. Nil reads that JVM's keystore file.
-	JVM func() (name string, certs []*x509.Certificate, err error)
 	// Node lists the CA certificates the host's Node trusts by default, and
 	// Pip names the bundle the host's pip reads when no setting names one:
 	// neither is a file doctor can find, and doctor runs neither client to
@@ -98,21 +88,18 @@ type trustStore struct {
 	name string
 	// system says the client also accepts what the operating system's store
 	// accepts here. False is a store read in place of it: a setting that
-	// replaces the client's defaults, or a keystore.
+	// replaces the client's defaults.
 	system bool
 	// files are the PEM files the store reads, and pem certificates a
 	// setting carries inline.
 	files []string
 	pem   []string
-	// load names and lists a keystore. It runs after bodega has answered, so
-	// a host with nothing to verify opens no keystore.
-	load func() (name string, certs []*x509.Certificate, err error)
 	// unsure is why the system store verifying does not settle this store:
 	// the client could not be asked whether it reads that store at all. The
 	// row then keeps its status and says so.
 	unsure string
-	// resolve replaces the store with the client's default one. Like load it
-	// runs only once bodega has answered.
+	// resolve replaces the store with the client's default one. It runs only
+	// once bodega has answered.
 	resolve func() trustStore
 	// blind is why nothing can be said about this store at all: the client
 	// takes its configuration from an input this probe does not read, or is
@@ -131,24 +118,6 @@ type trustRow struct {
 }
 
 const systemStoreName = "the system trust store"
-
-// systemOnly is the row of a client that verifies through the system trust
-// store unless a setting of its own names another, configured when mentions
-// says its configuration names host. own returns that other store, and nil
-// for a client left on the system store.
-func systemOnly(system string, mentions func(t TrustProbe, host string) bool, own func(t TrustProbe) *trustStore) trustRow {
-	return trustRow{system: system, stores: func(t TrustProbe, u *url.URL) []trustStore {
-		if !mentions(t, u.Host) {
-			return nil
-		}
-		if own != nil {
-			if s := own(t); s != nil {
-				return []trustStore{*s}
-			}
-		}
-		return []trustStore{{name: systemStoreName, system: true}}
-	}}
-}
 
 // named is a CA file a client's setting names. replaces says the client
 // reads it in place of the system trust store rather than beside it.
@@ -198,111 +167,9 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	return []trustStore{{name: systemStoreName, system: true}}
 }
 
-// rubyStores is the store gem and Bundler verify bodega against when either
-// is configured for it. gem adds ssl_ca_cert to OpenSSL's default paths; it
-// replaces nothing. Bundler's mirror is the one the rubygems row resolves:
-// the environment, then the user config $BUNDLE_USER_CONFIG or
-// $BUNDLE_USER_HOME selects, which hides ~/.bundle/config.
-func rubyStores(t TrustProbe, u *url.URL) []trustStore {
-	var files []string
-	for _, l := range gemrcLayers(t.Root, t.GOOS, t.Home, t.env) {
-		files = append(files, l.path)
-	}
-	configured := mention(u.Host, files...)
-	if !configured {
-		mirror, _, err := bundlerMirror(t.env, t.Home)
-		if err != nil {
-			return []trustStore{{blind: fmt.Sprintf("Bundler's config was not read (%v), so whether Bundler fetches from bodega, and verifies its certificate, is unchecked", err)}}
-		}
-		configured = namesHost(mirror, u.Host)
-	}
-	if !configured {
-		return nil
-	}
-	if v, f := firstMatch(gemCACert, filepath.Join(t.Home, ".gemrc")); v != "" {
-		return []trustStore{*named(v, "ssl_ca_cert in "+f, false)}
-	}
-	return []trustStore{{name: systemStoreName, system: true}}
-}
-
-var (
-	gemCACert = regexp.MustCompile(`(?m)^:?ssl_ca_cert:\s*["']?([^"'\s#]+)`)
-)
-
-// firstMatch is the first capture of re in the files, and the file it is in.
-func firstMatch(re *regexp.Regexp, files ...string) (value, file string) {
-	for _, f := range files {
-		if data, err := os.ReadFile(f); err == nil {
-			if m := re.FindSubmatch(data); m != nil {
-				return string(m[1]), f
-			}
-		}
-	}
-	return "", ""
-}
-
 // trustRows maps a row's check name to its client.
 var trustRows = map[string]trustRow{
 	"apt-sources": {system: manifest.TypeApt, stores: aptStores},
-	"dnf-repos": {system: manifest.TypeRpm, stores: func(t TrustProbe, u *url.URL) []trustStore {
-		// The repositories dnf loads, reposdir included, not a directory
-		// scan: a .repo file dnf never reads configures nothing. One
-		// store per repository, since sslcacert is set per repository.
-		var out []trustStore
-		for _, r := range t.dnfRepos() {
-			if !r.Enabled || !slices.ContainsFunc(r.URLs, func(l string) bool { return strings.Contains(l, u.Host) }) {
-				continue
-			}
-			s := trustStore{name: systemStoreName, system: true}
-			if r.CACert != "" {
-				s = *named(r.CACert, "sslcacert of ["+r.ID+"] in "+r.File, true)
-			}
-			if !slices.ContainsFunc(out, func(o trustStore) bool { return o.name == s.name }) {
-				out = append(out, s)
-			}
-		}
-		return out
-	}},
-	// pkg and fetch(1) verify through libfetch, which reads
-	// SSL_CA_CERT_FILE in place of the system store when it is set.
-	"pkg-repos": systemOnly(manifest.TypeFreeBSD, func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/usr/local/etc/pkg/repos/*.conf")
-	}, func(t TrustProbe) *trustStore { return envCA(t, "SSL_CA_CERT_FILE") }),
-	"make-conf": systemOnly(manifest.TypeDistfiles, func(t TrustProbe, host string) bool {
-		return t.filesMention(host, "/etc/make.conf")
-	}, func(t TrustProbe) *trustStore { return envCA(t, "SSL_CA_CERT_FILE") }),
-	"cargo-config": systemOnly(manifest.TypeCargo, func(t TrustProbe, host string) bool {
-		return mention(host, clientconf.CargoConfigFile(t.Home))
-	}, func(t TrustProbe) *trustStore {
-		if s := envCA(t, "CARGO_HTTP_CAINFO"); s != nil {
-			return s
-		}
-		var doc struct {
-			HTTP struct {
-				CAInfo string `toml:"cainfo"`
-			} `toml:"http"`
-		}
-		f := clientconf.CargoConfigFile(t.Home)
-		if _, err := toml.DecodeFile(f, &doc); err == nil && doc.HTTP.CAInfo != "" {
-			return named(doc.HTTP.CAInfo, "http.cainfo in "+f, true)
-		}
-		return nil
-	}),
-	"rubygems": {system: manifest.TypeRubygems, stores: rubyStores},
-	"composer": systemOnly(manifest.TypeComposer, func(t TrustProbe, host string) bool {
-		return mention(host, filepath.Join(clientconf.HostComposerHome(t.Home), "config.json"))
-	}, func(t TrustProbe) *trustStore {
-		path := filepath.Join(clientconf.HostComposerHome(t.Home), "config.json")
-		var doc struct {
-			Config struct {
-				CAFile string `json:"cafile"`
-			} `json:"config"`
-		}
-		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &doc) == nil && doc.Config.CAFile != "" {
-			return named(doc.Config.CAFile, "cafile in "+path, true)
-		}
-		return nil
-	}),
 	"goproxy-env": {system: manifest.TypeGomod, stores: goStores},
 	// git and helm have no row in the report; these judge them after a CA
 	// install, which answers for every client it configured.
@@ -310,35 +177,12 @@ var trustRows = map[string]trustRow{
 	"helm-repos":                          {system: manifest.TypeHelm, stores: helmStores},
 	"pip-config":                          {system: manifest.TypePypi, stores: pipStores},
 	"npm-config":                          {system: manifest.TypeNpm, stores: npmStores},
-	"maven":                               {system: manifest.TypeMaven, stores: mavenStores},
 	"oci-" + clientconf.RuntimeContainerd: {system: manifest.TypeOCI, stores: containerdStores},
 	"oci-" + clientconf.RuntimeDocker: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
 		if !t.filesMention(u.Host, clientconf.DockerDaemonPath) {
 			return nil
 		}
 		return []trustStore{certsDir(filepath.Join(t.Root, "/etc/docker/certs.d", u.Host))}
-	}},
-	"oci-" + clientconf.RuntimePodman: {system: manifest.TypeOCI, stores: func(t TrustProbe, u *url.URL) []trustStore {
-		// The files and table precedence the oci-podman row resolves, so a
-		// system drop-in a user registries.conf replaces counts for nothing,
-		// and CONTAINERS_REGISTRIES_CONF's file counts as the main one.
-		reg := OCIHost{Root: t.Root, Home: t.Home, RegistriesConf: t.env("CONTAINERS_REGISTRIES_CONF")}
-		files := reg.registriesConfFiles()
-		if !mention(u.Host, files...) {
-			return nil
-		}
-		if f := reg.checkRegistriesConf(u.Host); f.Status != StatusOK {
-			return []trustStore{{name: "podman's registries.conf", blind: "a registries.conf podman reads names bodega, but " + f.Detail + ", so whether podman pulls through bodega or verifies its certificate is unchecked"}}
-		}
-		// The one directory containers/image picks, not every candidate: an
-		// existing per-user directory hides the system one even when it holds
-		// no certificate.
-		dir := clientconf.PodmanCertDir(t.Home, t.Root, u.Host)
-		if dir == "" {
-			return []trustStore{{name: systemStoreName + ", which podman reads alone while no certs.d directory exists for " + u.Host + ",", system: true}}
-		}
-		store := certsDir(dir)
-		return []trustStore{store}
 	}},
 }
 
@@ -503,26 +347,10 @@ func aptWords(stmt string) []string {
 }
 
 // certsDir is a certs.d directory for one registry host, whose *.crt files
-// Docker and podman add to the system store.
+// Docker adds to the system store.
 func certsDir(dir string) trustStore {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.crt"))
 	return trustStore{name: dir, system: true, files: files}
-}
-
-// dnfRepos is every repository dnf loads on the host.
-func (t TrustProbe) dnfRepos() []clientconf.YumRepo {
-	conf, dirs := t.DnfConf, t.DnfDirs
-	if conf == "" {
-		conf = filepath.Join(t.Root, clientconf.DnfMainConf)
-	}
-	if dirs == nil {
-		dirs = rooted(t.Root, clientconf.YumReposDirs)
-	}
-	loaded, err := clientconf.ReadDnfConfig(conf, dirs)
-	if err != nil {
-		return nil
-	}
-	return loaded.Repos
 }
 
 // home is the home directory on disk. Home names it as the host does, so it
@@ -932,38 +760,6 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	}}}
 }
 
-// mavenStores is the one store the JVM reads, for a host whose Maven mirror
-// or Gradle init script names bodega.
-func mavenStores(t TrustProbe, u *url.URL) []trustStore {
-	if t.Home == "" {
-		return nil
-	}
-	gradleHome := t.env("GRADLE_USER_HOME")
-	if gradleHome == "" {
-		gradleHome = filepath.Join(t.Home, ".gradle")
-	}
-	mirror, _, _ := mavenMirror(filepath.Join(t.Home, ".m2", "settings.xml"))
-	repo, _ := gradleInitURL(filepath.Join(gradleHome, "init.d", "bodega.gradle"))
-	if !strings.Contains(mirror, u.Host) && !strings.Contains(repo, u.Host) {
-		return nil
-	}
-	jvm := t.JVM
-	if jvm == nil {
-		jvm = func() (string, []*x509.Certificate, error) {
-			store, err := clientconf.ResolveJVMStore(t.env, exec.LookPath)
-			if err != nil {
-				return "the JVM trust store", nil, err
-			}
-			certs, err := store.Trusted()
-			return store.Name(), certs, err
-		}
-	}
-	return []trustStore{{name: "the JVM trust store", load: func() (string, []*x509.Certificate, error) {
-		name, certs, err := jvm()
-		return name + ", which Maven and Gradle read in place of the system trust store,", certs, err
-	}}}
-}
-
 var gitInsteadOf = regexp.MustCompile(`(?mi)^\s*\[url\s+"([^"]+)"\]`)
 
 // gitStores resolves what git verifies bodega at u against, for a host whose
@@ -1232,17 +1028,6 @@ func (s *served) weigh(stores []trustStore) (failed, unread []string) {
 		for _, p := range st.pem {
 			pool.AppendCertsFromPEM([]byte(p))
 		}
-		if st.load != nil {
-			name, certs, err := st.load()
-			st.name = name
-			if err != nil {
-				unread = append(unread, fmt.Sprintf("%s was not read (%v), so whether this client verifies bodega's certificate is unchecked", strings.TrimSuffix(st.name, ","), err))
-				continue
-			}
-			for _, c := range certs {
-				pool.AddCert(c)
-			}
-		}
 		verr := verifyChain(s.chain, s.u.Hostname(), pool)
 		if verr == nil {
 			continue
@@ -1267,8 +1052,8 @@ func (s *served) weigh(stores []trustStore) (failed, unread []string) {
 // configured for bodega at base and cannot verify the certificate base
 // serves, judged against the stores that client reads as this host
 // configures it. The system trust store settles a store only where the
-// client reads it there: a cafile, a cert bundle or a keystore that replaces
-// it is verified on its own. A row already warning keeps its finding and
+// client reads it there: a cafile or a cert bundle that replaces it is
+// verified on its own. A row already warning keeps its finding and
 // gains this one, since a client can both bypass bodega for one scope and
 // refuse its certificate for the rest.
 //

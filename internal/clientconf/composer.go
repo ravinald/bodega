@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -136,16 +135,6 @@ type member struct {
 // refused rather than replaced: Composer cannot read it either, so it is the
 // operator's to repair, and it may hold the only copy of a credential.
 func MergeComposerConfig(existing, planned []byte) ([]byte, error) {
-	return mergeComposer(existing, planned, false)
-}
-
-// mergeComposer is MergeComposerConfig, and under keep it edits bodega's
-// repository field by field instead of replacing it: the entry keeps every
-// member the plan does not give (only, exclude, canonical, options), and in
-// the list form the one entry that is bodega's takes the plan's members while
-// every other entry stays, a second one at the same URL included, since two
-// entries at one URL can carry different filters.
-func mergeComposer(existing, planned []byte, keep bool) ([]byte, error) {
 	if len(bytes.TrimSpace(existing)) == 0 {
 		return planned, nil
 	}
@@ -182,9 +171,6 @@ func mergeComposer(existing, planned []byte, keep bool) ([]byte, error) {
 			return nil, fmt.Errorf("its repositories: %w", err)
 		}
 		for _, p := range planRepos {
-			if keep && p.key == composerBodegaRepo {
-				p.value = keepMembers(lookup(repos, p.key), p.value)
-			}
 			repos = setMember(repos, p, p.key == composerBodegaRepo)
 		}
 		doc[reposAt].value = joinObject(repos)
@@ -198,25 +184,9 @@ func mergeComposer(existing, planned []byte, keep bool) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("the planned repository: %w", err)
 		}
-		named := joinObject(append([]member{{"name", json.RawMessage(jsonString(composerBodegaRepo))}}, fields...))
-		own := -1
-		if keep {
-			// The entry named bodega is bodega's; with none, the first at the
-			// plan's URL is, and takes the name with the plan's other members.
-			isNamed := func(r json.RawMessage) bool {
-				var e composerRepo
-				return json.Unmarshal(r, &e) == nil && e.Name == composerBodegaRepo
-			}
-			if own = slices.IndexFunc(list, isNamed); own < 0 {
-				own = slices.IndexFunc(list, func(r json.RawMessage) bool { return sameComposerRepo(r, bodega) })
-			}
-			if own >= 0 {
-				named = keepMembers(list[own], named)
-			}
-		}
-		out := []json.RawMessage{named}
-		for i, r := range list {
-			if i != own && (keep || !sameComposerRepo(r, bodega)) && !disablesPackagist(r) {
+		out := []json.RawMessage{joinObject(append([]member{{"name", json.RawMessage(jsonString(composerBodegaRepo))}}, fields...))}
+		for _, r := range list {
+			if !sameComposerRepo(r, bodega) && !disablesPackagist(r) {
 				out = append(out, r)
 			}
 		}
@@ -230,23 +200,6 @@ func mergeComposer(existing, planned []byte, keep bool) ([]byte, error) {
 		return nil, fmt.Errorf("its repositories is %s, and Composer reads an object or a list there; repair it or move it aside, then re-run. Nothing was written", trimmed)
 	}
 	return indentComposer(doc)
-}
-
-// keepMembers is the object old with each member of planned set in it, and
-// planned itself when old is not an object.
-func keepMembers(old, planned json.RawMessage) json.RawMessage {
-	have, err := objectMembers(old)
-	if err != nil {
-		return planned
-	}
-	want, err := objectMembers(planned)
-	if err != nil {
-		return planned
-	}
-	for _, w := range want {
-		have = setMember(have, w, false)
-	}
-	return joinObject(have)
 }
 
 // mergeComposerSettings sets each key of planned, the plan's config object,
