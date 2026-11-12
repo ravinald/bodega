@@ -58,9 +58,12 @@ func ResolveS3Target(cfg *config.Config, name string) (S3Target, error) {
 	if driver == "" {
 		driver = "local"
 	}
+	if driver == "gcs" {
+		return t, fmt.Errorf("storage backend %q uses the gcs driver, which this action does not prepare; run `bodega init` for it from the command line", name)
+	}
 	if driver != "s3" {
 		return t, fmt.Errorf("storage backend %q uses the %s driver, which keeps artifacts in a directory and needs no init; "+
-			"init prepares s3 backends only (set storage_backend to \"s3\", or name an s3 entry from storage_backends)", name, driver)
+			"init prepares s3 and gcs backends only (set storage_backend to one, or name such an entry from storage_backends)", name, driver)
 	}
 	if t.Bucket == "" {
 		if name == DefaultName {

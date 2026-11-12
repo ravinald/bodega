@@ -199,7 +199,7 @@ type Config struct {
 	AuditEvents            []string               `json:"audit_events,omitempty"`      // event types to record; empty = all
 	AuditSink              string                 `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
 	AuditSinkDSN           string                 `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
-	StorageBackend         string                 `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
+	StorageBackend         string                 `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3", "gcs"
 	StoragePath            string                 `json:"storage_path,omitempty"`      // root directory for local backend
 	AptCodename            string                 `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
 	AptSuites              []string               `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
@@ -1433,7 +1433,7 @@ const DefaultStorageName = "default"
 type StorageSpec struct {
 	Driver string `json:"driver"`
 	Path   string `json:"path,omitempty"`   // local: filesystem root
-	Bucket string `json:"bucket,omitempty"` // s3
+	Bucket string `json:"bucket,omitempty"` // s3, gcs
 	Region string `json:"region,omitempty"` // s3
 	Prefix string `json:"prefix,omitempty"` // key prefix within the backend
 

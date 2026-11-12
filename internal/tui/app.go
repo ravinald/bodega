@@ -143,11 +143,25 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 // The nil client is still a fallback rather than a branch of its own: an s3
 // install whose client failed to build has no store to read, and a local one
 // is a better answer than a panic.
-func loadManifestStore(ctx context.Context, cfg *config.Config, s3c *bos3.Client) (*manifest.Store, error) {
+//
+// def is the default backend, for a driver that is neither local nor s3: the
+// s3 client above is built from the bucket name alone, so on a gcs install it
+// would ask AWS for a Cloud Storage bucket's manifests.
+func loadManifestStore(ctx context.Context, cfg *config.Config, s3c *bos3.Client, def storage.ObjectStore) (*manifest.Store, error) {
 	var store *manifest.Store
-	if cfg.UsesLocalManifests() || s3c == nil {
+	switch {
+	case cfg.UsesLocalManifests() || (s3c == nil && def == nil):
 		store = manifest.NewLocalStore(cfg.ManifestDir)
-	} else {
+	case s3c == nil:
+		store = manifest.NewStore(&manifest.S3Backend{
+			Prefix:   "manifests/",
+			GetFn:    def.Get,
+			PutFn:    def.Put,
+			DeleteFn: def.Delete,
+			ListFn:   def.List,
+			Label_:   def.Label() + "/manifests/",
+		})
+	default:
 		store = manifest.NewStore(&manifest.S3Backend{
 			Prefix:   "manifests/",
 			GetFn:    s3c.GetObject,
@@ -161,6 +175,15 @@ func loadManifestStore(ctx context.Context, cfg *config.Config, s3c *bos3.Client
 		return nil, err
 	}
 	return store, nil
+}
+
+// defaultStore is the default backend when it is one manifests are read
+// through and no s3 client covers: nil on a local or s3 install.
+func (m appModel) defaultStore() storage.ObjectStore {
+	if m.stores == nil || m.s3client != nil || m.cfg.UsesLocalManifests() {
+		return nil
+	}
+	return m.stores.Default()
 }
 
 // Init fires the initial storage status check.
@@ -242,9 +265,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.refresh {
 			cfg := m.cfg
-			s3c := m.s3client
+			s3c, def := m.s3client, m.defaultStore()
 			return m, func() tea.Msg {
-				store, err := loadManifestStore(context.Background(), cfg, s3c)
+				store, err := loadManifestStore(context.Background(), cfg, s3c, def)
 				if err != nil {
 					return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
 				}
@@ -280,9 +303,9 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Reload manifests from whichever store the install reads.
 		m.log.appendLog(dimStyle.Render("Reloading manifests..."))
 		cfg := m.cfg
-		s3c := m.s3client
+		s3c, def := m.s3client, m.defaultStore()
 		return m, func() tea.Msg {
-			store, err := loadManifestStore(context.Background(), cfg, s3c)
+			store, err := loadManifestStore(context.Background(), cfg, s3c, def)
 			if err != nil {
 				return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
 			}

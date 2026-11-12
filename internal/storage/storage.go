@@ -1,6 +1,6 @@
 // Package storage defines the ObjectStore interface for pluggable object
-// storage backends. The default backend is the local filesystem; S3 is
-// available when configured. GCS and Azure can be added via build tags.
+// storage backends. The default backend is the local filesystem; S3 and GCS
+// are available when configured.
 //
 // This package must never import internal/manifest. Placement is recorded in
 // the manifest and resolved by internal/server, which owns both imports; see
@@ -176,9 +176,9 @@ type ObjectInfo struct {
 // could not be instantiated twice with different parameters, which is what
 // naming backends requires.
 type Spec struct {
-	Driver string // "local" | "s3"
+	Driver string // "local" | "s3" | "gcs"
 	Path   string // local: filesystem root
-	Bucket string // s3
+	Bucket string // s3, gcs
 	Region string // s3
 	Prefix string // key prefix within the backend
 
@@ -227,14 +227,23 @@ func NewFromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
 // backends — the listing fan-out does exactly that — sees one namespace rather
 // than one per backend.
 func withPrefix(store ObjectStore, prefix string) ObjectStore {
-	prefix = strings.TrimPrefix(prefix, "/")
+	prefix = Spec{Prefix: prefix}.KeyPrefix()
 	if prefix == "" {
 		return store
 	}
-	if !strings.HasSuffix(prefix, "/") {
+	return &prefixed{inner: store, prefix: prefix}
+}
+
+// KeyPrefix is what the backend's store puts in front of every key: "" for
+// no prefix, and otherwise the configured one closed by a "/". Anything that
+// names the backend's objects to the service itself, a lifecycle rule for
+// one, takes it from here so that it names what the driver writes.
+func (s Spec) KeyPrefix() string {
+	prefix := strings.TrimPrefix(s.Prefix, "/")
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	return &prefixed{inner: store, prefix: prefix}
+	return prefix
 }
 
 // prefixed roots one backend under a key prefix.
@@ -344,10 +353,16 @@ func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPref
 //
 // Cleaning is for the local backend. s3 does not clean keys, so "cold//x/k"
 // and "cold/x/k" are two distinct objects in one bucket, and a prefix over an
-// s3 store is part of that store's location instead (see s3Location).
+// s3 store is part of that store's location instead (see s3Location). gcs
+// does not clean them either, and its prefix is kept byte for byte: "/" and
+// "cold//" are prefixes whose objects no other prefix holds, so each has a
+// label no other has. Only the "/" closing the prefix is left off.
 func (p *prefixed) Label() string {
 	if loc, ok := s3LocationOf(p); ok {
 		return loc.label()
+	}
+	if g, prefix, ok := gcsUnder(p); ok {
+		return g.Label() + "/" + strings.TrimSuffix(prefix, "/")
 	}
 	return joinLabel(p.inner.Label(), p.prefix)
 }
