@@ -299,7 +299,7 @@ func kindOf(rec PlanRecord) fileKind {
 	case manifest.TypePypi:
 		return fileKind{rules: &pipRules, unread: strayHeader(pipRules)}
 	case manifest.TypeGit:
-		return fileKind{rules: &gitRules, unread: gitUnread}
+		return fileKind{rules: &gitRules, unread: gitUnread, holds: gitHolds, keeps: gitKeeps}
 	case manifest.TypeOCI:
 		if name == "hosts.toml" {
 			return fileKind{rules: &plainRules, holds: tomlHolds, keeps: tomlKeeps}

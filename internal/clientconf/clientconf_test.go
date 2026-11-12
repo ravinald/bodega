@@ -2465,3 +2465,115 @@ func TestPipLoadErrorMatchesNativePip(t *testing.T) {
 		t.Fatalf("native pip accepted %d and refused %d of the cases; the oracle is not telling them apart", accepted, refused)
 	}
 }
+
+// F116 R1, R2: ParseGitConfig loads a file as git itself does. Native git is
+// the oracle: for each body the variables it lists, or the line it refuses
+// the file at, are the ones the port gives, for a line in any section.
+func TestGitConfigMatchesNativeGit(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal(err)
+		}
+		t.Skip("native git is not installed")
+	}
+	dir := t.TempDir()
+	for i, body := range []string{
+		"",
+		"top = level\n",
+		"[user]\n\tname = \"bad\\q\"\n",
+		"[user]\n\tname = \"A \\\"B\\\" \\\\ C\\tD\\n\\b\"\n",
+		"[a]\n\tb\n\tc =\n\td = \n",
+		"[a] b = c\n[d.E]\nf=g\n[H \"I.j\"] k = l\n",
+		"[a \"b\\c\\\"d\"]\n e = f\n",
+		"[a]\n b = c \\\n d ; x\n e = \"f \\\n g\" h # i\n",
+		"\xef\xbb\xbf[a]\nb=c\n",
+		"\xef\xbb[a]\nb=c\n",
+		"[a]\n b = \"open\n c = d\n",
+		"[a]\n 1b = c\n",
+		"[a]\n b c\n",
+		"[a]\n b ; c\n",
+		"[a]\r\n b = c\r\n d = e\\\r\n f\r\n",
+		"[a]\n b = c\\",
+		"[a]\n b = c \\\n",
+		"[]\n",
+		"[a\n b = c\n",
+		"[a \"b\n\"]\n",
+		"[a \"b\" ]\n",
+		"[ a]\n",
+		"[a b]\n",
+		"[a_b]\n",
+		"# c\n; d\n[a] # e\n b = c#d\n f = \"g#h\" ; i\n",
+		"[a]\n b = c ; \\\n d = e\n",
+		"[http]\n sslCAInfo = /a\\\n/b\n[http \"https://h/\"]\n\tsslCAInfo = ~/x.pem  \n",
+		"[url \"https://h/git/\"]\n insteadOf = https://github.com/\n insteadOf = gh:\n",
+		"[a]\n b = x\ty  z \n",
+		"[a]\n\x0cb = c\n",
+		"[a]\n b = c\n=d\n",
+	} {
+		file := filepath.Join(dir, strconv.Itoa(i)+".cfg")
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(git, "config", "--file", file, "--list", "-z")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_NOSYSTEM=1"}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		native, nativeErr := cmd.Output()
+		got := ParseGitConfig([]byte(body))
+		if nativeErr != nil {
+			want := 0
+			if m := regexp.MustCompile(`^fatal: bad config line (\d+) `).FindStringSubmatch(stderr.String()); m != nil {
+				want, _ = strconv.Atoi(m[1])
+			} else {
+				t.Fatalf("%q: native git failed another way: %s", body, stderr.String())
+			}
+			if got.BadLine != want {
+				t.Errorf("%q: BadLine = %d; native git stops at line %d", body, got.BadLine, want)
+			}
+			continue
+		}
+		var ours []string
+		for _, e := range got.Entries {
+			one := e.Key()
+			if e.HasValue {
+				one += "\n" + e.Value
+			}
+			ours = append(ours, one)
+		}
+		var theirs []string
+		if len(native) > 0 {
+			theirs = strings.Split(strings.TrimSuffix(string(native), "\x00"), "\x00")
+		}
+		if got.BadLine != 0 || !slices.Equal(ours, theirs) {
+			t.Errorf("%q: BadLine = %d and variables %q; native git loads it as %q", body, got.BadLine, ours, theirs)
+		}
+	}
+}
+
+// F116 R1, R2: the two spellings of one npm option in the environment are
+// one option. Agreeing or alone they give its value; disagreeing they give
+// none and name the pair, since the order npm takes them in is not readable.
+func TestNpmEnvResolvesOneOption(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	for _, tc := range []struct {
+		env      map[string]string
+		value    string
+		conflict bool
+	}{
+		{env: nil},
+		{env: map[string]string{"npm_config_registry": "https://a/"}, value: "https://a/"},
+		{env: map[string]string{"NPM_CONFIG_REGISTRY": "https://b/"}, value: "https://b/"},
+		{env: map[string]string{"npm_config_registry": "https://a/", "NPM_CONFIG_REGISTRY": "https://a/"}, value: "https://a/"},
+		{env: map[string]string{"npm_config_registry": "https://a/", "NPM_CONFIG_REGISTRY": "https://b/"}, conflict: true},
+	} {
+		value, conflict := NpmEnv(env(tc.env), "registry")
+		if value != tc.value || (conflict != "") != tc.conflict || NpmEnvConflict(env(tc.env)) != conflict {
+			t.Errorf("NpmEnv(%v) = %q, %q; want %q, conflict %v", tc.env, value, conflict, tc.value, tc.conflict)
+		}
+	}
+	if c := NpmEnvConflict(env(map[string]string{"npm_config_userconfig": "/a", "NPM_CONFIG_USERCONFIG": "/b"})); !strings.Contains(c, "npm_config_userconfig") {
+		t.Errorf("NpmEnvConflict over userconfig = %q; want the pair named", c)
+	}
+}

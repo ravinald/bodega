@@ -288,6 +288,10 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		return nil
 	}
 	user := strings.HasPrefix(rec.Path, "~/")
+	if conflict := NpmEnvConflict(h.Getenv); rec.System == manifest.TypeNpm && conflict != "" {
+		return fmt.Errorf("%s: npm reads %s, so which registry npm asks, which npmrc it loads and which CA list it verifies with cannot be told. "+
+			"Nothing was written. Unset one of the two, or give both the same value, then re-run", rec.System, conflict)
+	}
 	switch {
 	case rec.System == manifest.TypePypi && env("PIP_CONFIG_FILE") == os.DevNull:
 		return fmt.Errorf("%s: PIP_CONFIG_FILE is set to %s, which tells pip to load no configuration file, so it would read neither the index nor the CA written to %s. "+
@@ -359,13 +363,55 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		// The probe's own classifier over the probe's own file set, with the
 		// file the plan edits beside it: a construct that leaves the verdict
 		// unchecked after the write is refused before it.
-		if unread := GitUnread(h.Getenv, append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)); len(unread) > 0 {
+		files := append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)
+		if bad := GitLoadError(files); bad != "" {
+			return fmt.Errorf("%s: git refuses to load %s and aborts every command that reads it, so it would read neither the rewrite nor the CA written to %s, and the install could not be verified. "+
+				"Nothing was written. Fix that line so git loads the file (git config --file <file> --list names it), then re-run", rec.System, bad, target)
+		}
+		if unread := GitUnread(h.Getenv, files); len(unread) > 0 {
 			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so a setting there could outrank the CA written to %s unseen. "+
 				"Nothing was written. Unset the variable, move included settings into the file itself, or write the header as [name] or [name \"subsection\"] alone on its line and the value on one line, then re-run", rec.System, unread[0], target)
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")
 		}
+	}
+	return nil
+}
+
+// containerdReads refuses a plan that writes containerd's hosts.toml on a
+// host whose containerd would not read it: a config.toml, as the plan leaves
+// it, that does not resolve, or one that disables the CRI plugin, which is
+// what reads the registry configuration. Neither is repaired here. Enabling
+// a plugin its owner disabled is not this command's call, and a ca in a file
+// nothing loads would report an install no pull uses.
+func (h CAHost) containerdReads(changes []Change) error {
+	if !slices.ContainsFunc(changes, func(c Change) bool {
+		return c.Record.System == manifest.TypeOCI && OCIRuntimeOf(c.Record.Path) == RuntimeContainerd
+	}) {
+		return nil
+	}
+	path := filepath.Join(h.Root, ContainerdConfigPath)
+	data, err := os.ReadFile(path)
+	for _, c := range changes {
+		if c.Record.System == manifest.TypeOCI && strings.HasSuffix(c.Record.Path, "/containerd/config.toml") {
+			path, data, err = c.Target, c.New, nil
+		}
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%s: read %s, which says where containerd reads its registry configuration: %w. Run this command as an account that can read it", manifest.TypeOCI, path, err)
+	}
+	eff, err := ResolveContainerdConfig("", path, data)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: containerd's configuration at %s does not resolve (%w), so which hosts.toml files containerd reads cannot be told and a CA written for it could not be verified. "+
+			"Repair it, then re-run", manifest.TypeOCI, path, err)
+	case eff.CRIDisabled:
+		return fmt.Errorf("%s: %s disables containerd's CRI plugin (disabled_plugins), and that plugin is what reads hosts.toml and the ca this command writes there, so containerd would use neither and the install could not be verified. "+
+			"Where this host pulls through containerd's CRI, remove the plugin from disabled_plugins, restart containerd and re-run; where only Docker Engine pulls here, add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path)
 	}
 	return nil
 }
@@ -565,6 +611,9 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 		if err := CAUnsupported(c.Record); err != nil {
 			return CAInstall{}, err
 		}
+	}
+	if err := h.containerdReads(changes); err != nil {
+		return CAInstall{}, err
 	}
 	in := CAInstall{Changes: slices.Clone(changes)}
 	var files []Change
@@ -802,10 +851,23 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				if err := unreadSection(sh.path, body); err != nil {
 					return CAInstall{}, err
 				}
+				var sets []string
 				for _, other := range outranking(body, true) {
 					body = setSection(body, other, set, *kind.rules, false)
+					sets = append(append(sets, other), set...)
 				}
 				merged = joinBody(body)
+				want := joinBody(sets)
+				if kind.holds != nil {
+					if err := kind.holds(merged, want); err != nil {
+						return CAInstall{}, refuse(sh.path, err)
+					}
+				}
+				if kind.keeps != nil {
+					if err := kind.keeps(old, merged, want); err != nil {
+						return CAInstall{}, refuse(sh.path, err)
+					}
+				}
 			}
 			also := rec
 			also.Path = sh.path

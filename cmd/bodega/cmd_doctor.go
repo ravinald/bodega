@@ -328,7 +328,9 @@ See docs/threat-model.md for the rationale behind each check.`,
 			}
 			findings = append(findings, osCallers.findings(internalTimeSources(gf, baseURL, ntpServers))...)
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
-			findings = doctorTrustProbe().Apply(findings, base)
+			probe := doctorTrustProbe()
+			findings = append(findings, probe.Rows(base)...)
+			findings = probe.Apply(findings, base)
 			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)

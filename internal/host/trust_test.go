@@ -1269,3 +1269,30 @@ func TestAudit15PipSyntaxErrorIsUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit16GitLoadErrorIsUnchecked(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	file := filepath.Join(p.Home, ".gitconfig")
+	body := "[user]\n name = \"bad\\q\"\n[url \"" + base + "/git/gh/\"]\n insteadOf = https://github.com/\n[http]\n sslCAInfo = " + ca + "\n"
+	writeTrustFile(t, file, body)
+	cmd := exec.Command(git, "config", "--file", file, "--get", "http.sslCAInfo")
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "GIT_CONFIG_NOSYSTEM=1"}
+	native, nativeErr := cmd.CombinedOutput()
+	if nativeErr == nil || !strings.Contains(string(native), "bad config line 2") {
+		t.Fatalf("oracle did not reject fixture: %v: %s", nativeErr, native)
+	}
+	verdict, err := p.Judge([]string{"git-config"}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.Apply([]Finding{{Check: "git-config", Status: StatusOK}}, base)[0]
+	if len(verdict) != 1 || verdict[0].State != TrustUnchecked || got.Status != StatusWarn || !strings.Contains(got.Detail, file) || !strings.Contains(got.Detail, "unchecked") {
+		t.Fatalf("native git refuses this file: %s; doctor row=%+v, verdict=%+v", native, got, verdict)
+	}
+}

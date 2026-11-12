@@ -2422,3 +2422,162 @@ func TestAudit15PipSyntaxErrorRefusedBeforeWrites(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit16GitLoadErrorRefusedBeforeWrites(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home, ".gitconfig")
+	old := "[user]\n name = \"bad\\q\"\n"
+	if err := os.WriteFile(file, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(git, "config", "--file", file, "--list")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_NOSYSTEM=1"}
+	native, nativeErr := cmd.CombinedOutput()
+	if nativeErr == nil || !strings.Contains(string(native), "bad config line 2") {
+		t.Fatalf("oracle did not reject fixture: %v: %s", nativeErr, native)
+	}
+	out, applyErr := runDoctor(t, "--configure", "git", "--ca-file", caFile, "--url", srv.URL, "--apply")
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, caErr := os.Stat(filepath.Join(home, ".config/bodega/ca.pem"))
+	if applyErr == nil || !strings.Contains(applyErr.Error(), file) || string(got) != old || !os.IsNotExist(caErr) {
+		t.Fatalf("native git refuses: %s; apply error=%v, config unchanged=%t, CA stat=%v\n%s", native, applyErr, string(got) == old, caErr, out)
+	}
+}
+
+func TestAudit16NpmEnvCaseDoesNotCertifyShadowedEndpoint(t *testing.T) {
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatal(err)
+		}
+		t.Skip("native npm is not installed")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	planned, other := srv.URL+"/npm/", "https://other.example/"
+	t.Setenv("npm_config_registry", planned)
+	t.Setenv("NPM_CONFIG_REGISTRY", other)
+	read := func() string {
+		t.Helper()
+		cmd := exec.Command(npm, "config", "get", "registry")
+		cmd.Dir = home
+		cmd.Env = os.Environ()
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	// Either environment order is valid. Make the winning alias name the
+	// other registry and leave the losing alias naming the plan's host.
+	if read() == planned {
+		t.Setenv("npm_config_registry", other)
+		t.Setenv("NPM_CONFIG_REGISTRY", planned)
+	}
+	if got := read(); got != other {
+		t.Fatalf("native registry=%s, want %s", got, other)
+	}
+	for _, name := range []string{"first apply", "idle second apply"} {
+		out, err := runDoctor(t, "--configure", "npm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if got := read(); got != other {
+			t.Fatalf("native registry changed to %s", got)
+		}
+		if err == nil {
+			t.Errorf("%s succeeded although native npm selects %s and the losing environment alias alone names bodega:\n%s", name, other, out)
+		}
+	}
+}
+
+func TestAudit16DoctorReportsGitAndHelmTrust(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t)
+	srv, _, _ := caPlanServer(t)
+	for path, body := range map[string]string{
+		filepath.Join(home, ".gitconfig"):                     "[url \"" + srv.URL + "/git/gh/\"]\n insteadOf = https://github.com/\n[http]\n sslCAInfo = /missing/private-ca.pem\n",
+		filepath.Join(home, ".config/helm/repositories.yaml"): "repositories:\n- name: bodega\n  url: " + srv.URL + "/helm\n  caFile: /missing/private-ca.pem\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevExit := doctorExit
+	doctorExit = func(int) {}
+	t.Cleanup(func() { doctorExit = prevExit })
+	out, err := runDoctor(t, "--url", srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for check, system := range map[string]string{"git-config": "git", "helm-repos": "helm"} {
+		row := ""
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, check) {
+				row = line
+				break
+			}
+		}
+		if !strings.Contains(row, "WARN") || !strings.Contains(row, "/missing/private-ca.pem") || !strings.Contains(out, "--configure "+system+" --ca-file") {
+			t.Errorf("%s has an untrusted bodega endpoint but no trust warning/remediation; row=%q", system, row)
+		}
+	}
+}
+
+func TestAudit16DisabledContainerdCannotPass(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t, "containerd")
+	srv, caPEM, _ := caPlanServer(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(conf), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conf, []byte("version = 2\ndisabled_plugins = [\"cri\"]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []string{"first apply", "idle second apply"} {
+		out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		data, readErr := os.ReadFile(conf)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		effective, readErr := clientconf.ResolveContainerdConfig("", conf, data)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !effective.CRIDisabled {
+			t.Fatal("the plan unexpectedly enabled CRI")
+		}
+		if err == nil {
+			t.Errorf("%s certified containerd with its CRI plugin disabled and its registry configuration unused:\n%s", run, out)
+		}
+	}
+}

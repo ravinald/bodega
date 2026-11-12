@@ -153,100 +153,69 @@ type GitCA struct {
 	Header, Pattern string
 }
 
-// gitSection is a section header as git reads one: the name, an optional
-// quoted subsection, and after the closing bracket nothing but a # or ;
-// comment. git also takes a setting on the header's own line and the dotted
-// [section.subsection] form; neither is matched, and a file holding one is
-// reported by gitCAInfos rather than read past.
-var gitSection = regexp.MustCompile(`^\[\s*([A-Za-z0-9-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*(?:[#;].*)?$`)
+// gitSection is a section header in the one form the line editor matches
+// sections by: the name, an optional quoted subsection, and after the closing
+// bracket nothing but a # or ; comment. git also takes a setting on the
+// header's own line and the dotted [section.subsection] form; a file holding
+// either is reported by gitCAInfos rather than read past.
+var gitSection = regexp.MustCompile(`^\[([A-Za-z0-9-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\]\s*(?:[#;].*)?$`)
 
 // gitCAInfos reads every http.sslCAInfo out of a git config body, in order,
-// telling settings from continuation lines by the rule the merge edits the
-// file with. unread lists each line that opens a section in a form this
-// reader does not follow: what it scopes is unknown, so neither an edit nor a
-// verdict can be built on the settings under it.
+// through ParseGitConfig. unread lists each line an edit or a verdict cannot
+// be built on: the line git refuses to load the file at, a section header in
+// a form the editor does not match sections by, a line the editor would not
+// take the way git's grammar does, and an sslCAInfo or insteadOf that names
+// no value or carries one on past its line.
 func gitCAInfos(lines []string, file, home string) (out []GitCA, unread []string) {
-	scan := lineScan{rules: gitRules, keyIndent: -1}
-	var header, pattern string
-	inHTTP := false
-	for _, l := range lines {
-		if scan.continues(l) {
+	cfg := ParseGitConfig([]byte(strings.Join(lines, "\n")))
+	text := func(line int) string {
+		if line < 1 || line > len(lines) {
+			return fmt.Sprintf("line %d", line)
+		}
+		return strings.TrimSpace(lines[line-1])
+	}
+	if cfg.BadLine > 0 {
+		return nil, []string{text(cfg.BadLine)}
+	}
+	for _, h := range cfg.Headers {
+		if !gitSection.MatchString(text(h.HeaderLine)) {
+			unread = append(unread, text(h.HeaderLine))
+		}
+	}
+	if line := gitEditorMisreads(lines, cfg); line != "" {
+		unread = append(unread, line)
+	}
+	for _, e := range cfg.Entries {
+		ca := e.Section == "http" && e.Name == "sslcainfo"
+		if !ca && !(e.Section == "url" && (e.Name == "insteadof" || e.Name == "pushinsteadof")) {
 			continue
 		}
-		t := strings.TrimSpace(l)
-		if strings.HasPrefix(t, "[") {
-			m := gitSection.FindStringSubmatch(t)
-			if m == nil {
-				unread = append(unread, t)
-			}
-			inHTTP = m != nil && strings.EqualFold(m[1], "http")
-			if inHTTP {
-				header, pattern = t, strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(m[2])
-			}
+		if !e.HasValue || e.EndLine != e.Line {
+			unread = append(unread, text(e.Line))
 			continue
 		}
-		if !inHTTP || gitRules.key(l) != "sslcainfo" {
+		if !ca {
 			continue
 		}
-		_, raw, _ := strings.Cut(t, "=")
-		v, whole := gitValue(raw)
-		if !whole {
-			// The value runs on into the next line, which this reader steps
-			// over: what git reads there is not what stands on this line.
-			unread = append(unread, t)
-			continue
-		}
+		v := e.Value
 		if rest, ok := strings.CutPrefix(v, "~/"); ok && home != "" {
 			v = filepath.Join(home, rest)
 		}
-		out = append(out, GitCA{Value: v, File: file, Header: header, Pattern: pattern})
+		out = append(out, GitCA{Value: v, File: file, Header: text(e.HeaderLine), Pattern: e.Subsection})
 	}
 	return out, unread
 }
 
 // gitValue reads the value of a setting from what follows its equals sign,
-// as git does: quotes group and are dropped, a backslash escapes the next
-// character, and outside quotes a # or ; opens a comment wherever it stands,
-// not only after a space. whole is false for a value the line does not end,
-// one a trailing backslash or an open quote carries on.
+// through ParseGitConfig. whole is false for a value the line does not end,
+// one a trailing backslash or an open quote carries on, and for one git
+// refuses.
 func gitValue(raw string) (value string, whole bool) {
-	var sb strings.Builder
-	quoted := false
-	// kept is the length the value keeps once trailing blanks outside quotes
-	// are dropped.
-	kept := 0
-	raw = strings.TrimLeft(raw, " \t")
-	for i := 0; i < len(raw); i++ {
-		c := raw[i]
-		switch {
-		case c == '\\':
-			if i++; i >= len(raw) {
-				return "", false
-			}
-			switch raw[i] {
-			case 'n':
-				sb.WriteByte('\n')
-			case 't':
-				sb.WriteByte('\t')
-			case 'b':
-				sb.WriteByte('\b')
-			default:
-				sb.WriteByte(raw[i])
-			}
-			kept = sb.Len()
-		case c == '"':
-			quoted = !quoted
-			kept = sb.Len()
-		case !quoted && (c == '#' || c == ';'):
-			return sb.String()[:kept], true
-		default:
-			sb.WriteByte(c)
-			if quoted || c != ' ' && c != '\t' {
-				kept = sb.Len()
-			}
-		}
+	cfg := ParseGitConfig([]byte("v =" + raw))
+	if cfg.BadLine > 0 || len(cfg.Entries) != 1 || cfg.Entries[0].EndLine != 1 {
+		return "", false
 	}
-	return sb.String()[:kept], !quoted
+	return cfg.Entries[0].Value, true
 }
 
 // gitQuote writes value as a git config file reads it back: bare where git
@@ -276,8 +245,12 @@ func GitUnread(getenv func(string) string, files []string) []string {
 		if err != nil {
 			continue
 		}
+		if ParseGitConfig(data).BadLine > 0 {
+			// GitLoadError names it, and its callers refuse it first.
+			continue
+		}
 		if _, unread := gitCAInfos(splitBody(data), f, ""); len(unread) > 0 {
-			out = append(out, fmt.Sprintf("the line %s in %s, which opens a section in a form other than [name] or [name \"subsection\"] or carries a value on past the line", unread[0], f))
+			out = append(out, fmt.Sprintf("the line %s in %s, which opens a section in a form other than [name] or [name \"subsection\"], carries a value on past the line or names a setting with no value", unread[0], f))
 		}
 	}
 	return append(out, GitIncludes(files)...)
@@ -295,14 +268,10 @@ func GitIncludes(files []string) []string {
 		if err != nil {
 			continue
 		}
-		scan := lineScan{rules: gitRules, keyIndent: -1}
-		for _, l := range splitBody(data) {
-			if scan.continues(l) {
-				continue
-			}
-			m := gitSection.FindStringSubmatch(strings.TrimSpace(l))
-			if m != nil && (strings.EqualFold(m[1], "include") || strings.EqualFold(m[1], "includeIf")) {
-				out = append(out, fmt.Sprintf("the include section %s in %s, which has git read another file there", strings.TrimSpace(l), f))
+		lines := strings.Split(string(data), "\n")
+		for _, h := range ParseGitConfig(data).Headers {
+			if h.Section == "include" || h.Section == "includeif" {
+				out = append(out, fmt.Sprintf("the include section %s in %s, which has git read another file there", strings.TrimSpace(lines[h.HeaderLine-1]), f))
 				break
 			}
 		}
@@ -540,19 +509,50 @@ func NpmInlineCA(path string) string {
 	return ""
 }
 
+// npmEnvOptions are the npm options doctor reads from the environment.
+var npmEnvOptions = []string{"registry", "cafile", "ca", "userconfig", "globalconfig"}
+
+// NpmEnv is the value the environment gives the npm option key. npm reads
+// every variable whose name opens with npm_config_ in any case as one option,
+// a later entry of the environment replacing an earlier one, and ignores an
+// empty one. doctor asks for the two spellings its documentation lists, all
+// lowercase and all uppercase, and an environment read one name at a time
+// carries no order: where both are set and differ, which one npm uses cannot
+// be told, and conflict names the pair for a caller to refuse.
+func NpmEnv(getenv func(string) string, key string) (value, conflict string) {
+	if getenv == nil {
+		return "", ""
+	}
+	lower, upper := "npm_config_"+key, "NPM_CONFIG_"+strings.ToUpper(key)
+	a, b := getenv(lower), getenv(upper)
+	switch {
+	case a != "" && b != "" && a != b:
+		return "", fmt.Sprintf("%s and %s in the environment, which npm reads as one option and which name different values, the later entry in the environment winning, an order this command cannot see", lower, upper)
+	case a != "":
+		return a, ""
+	}
+	return b, ""
+}
+
+// NpmEnvConflict names the first option the environment gives two values
+// under its two spellings, as NpmEnv words it, "" for none.
+func NpmEnvConflict(getenv func(string) string) string {
+	for _, key := range npmEnvOptions {
+		if _, conflict := NpmEnv(getenv, key); conflict != "" {
+			return conflict
+		}
+	}
+	return ""
+}
+
 // NpmConfigFiles lists the npmrc files npm loads on this host, lowest
 // priority first: the global one under root and the per-user one in home,
 // each replaced by the file the environment names in its place, which npm
 // then reads instead. A project's own .npmrc is not listed.
 func NpmConfigFiles(getenv func(string) string, goos, home, root string) []string {
 	env := func(key string) string {
-		if getenv == nil {
-			return ""
-		}
-		if v := getenv("npm_config_" + key); v != "" {
-			return v
-		}
-		return getenv("NPM_CONFIG_" + strings.ToUpper(key))
+		v, _ := NpmEnv(getenv, key)
+		return v
 	}
 	files := []string{filepath.Join(root, "/etc/npmrc")}
 	if goos == OSFreeBSD {

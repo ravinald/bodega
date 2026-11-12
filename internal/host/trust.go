@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -171,8 +172,7 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 var trustRows = map[string]trustRow{
 	"apt-sources": {system: manifest.TypeApt, stores: aptStores},
 	"goproxy-env": {system: manifest.TypeGomod, stores: goStores},
-	// git and helm have no row in the report; these judge them after a CA
-	// install, which answers for every client it configured.
+	// Rows gives git and helm their row; no inventory check writes one.
 	"git-config":                          {system: manifest.TypeGit, stores: gitStores},
 	"helm-repos":                          {system: manifest.TypeHelm, stores: helmStores},
 	"pip-config":                          {system: manifest.TypePypi, stores: pipStores},
@@ -604,8 +604,9 @@ var npmEnvRef = regexp.MustCompile(`\$\{([^}]+)\}`)
 
 // npmRegistries lists the registries npm fetches from as its effective
 // configuration names them: the default registry, which the environment's
-// npm_config_registry gives ahead of every npmrc and the last npmrc to set it
-// gives otherwise, and each scope's own registry. A registry named only in an
+// npm_config_registry (NPM_CONFIG_REGISTRY is the same option) gives ahead of
+// every npmrc and the last npmrc to set it gives otherwise, and each scope's
+// own registry. A registry named only in an
 // npmrc the environment outranks is not one npm asks. Scoped registries set
 // through the environment are not read: a variable of unknown name cannot be
 // asked for.
@@ -628,15 +629,10 @@ func npmRegistries(t TrustProbe, files []string) []string {
 		}
 	}
 	out := []string{def}
-	// npm reads the variable under either spelling, so both are candidates.
-	var env []string
-	for _, key := range []string{"npm_config_registry", "NPM_CONFIG_REGISTRY"} {
-		if v := t.env(key); v != "" {
-			env = append(env, v)
-		}
-	}
-	if len(env) > 0 {
-		out = env
+	// One option under either spelling. npmStores leaves npm unchecked ahead
+	// of this where the two disagree.
+	if v, _ := clientconf.NpmEnv(t.Getenv, "registry"); v != "" {
+		out = []string{v}
 	}
 	for _, v := range scoped {
 		out = append(out, v)
@@ -673,9 +669,12 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	blind := func(what string) []trustStore {
 		return []trustStore{{name: "npm's configuration", blind: fmt.Sprintf("npm reads %s, which doctor detects and does not interpret, so which CA list npm verifies bodega against and whether it verifies bodega's certificate is unchecked", what)}}
 	}
-	// A line that may set a registry leaves the registries npm asks unknown,
-	// and a registry list that cannot be read is no evidence that bodega is
-	// absent from it.
+	// Two spellings of one option holding different values, or a line that
+	// may set a registry, leave the registries npm asks unknown, and a registry
+	// list that cannot be read is no evidence that bodega is absent from it.
+	if conflict := clientconf.NpmEnvConflict(t.Getenv); conflict != "" {
+		return blind(conflict)
+	}
 	for _, f := range files {
 		if line := clientconf.NpmUnclassified(f); line != "" {
 			return blind(line)
@@ -692,15 +691,14 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 		layers = append(layers, npmFileLayer(f))
 	}
 	env := npmLayer{from: "the environment"}
-	for _, key := range []string{"NPM_CONFIG_CAFILE", "npm_config_cafile"} {
-		if v := t.env(key); v != "" {
-			env.cafile, env.from = v, "the environment's "+key
+	if v, _ := clientconf.NpmEnv(t.Getenv, "cafile"); v != "" {
+		env.cafile, env.from = v, "the environment's npm_config_cafile"
+		if t.env("npm_config_cafile") == "" {
+			env.from = "the environment's NPM_CONFIG_CAFILE"
 		}
 	}
-	for _, key := range []string{"NPM_CONFIG_CA", "npm_config_ca"} {
-		if v := t.env(key); v != "" {
-			env.ca, env.caSet = []string{strings.ReplaceAll(v, `\n`, "\n")}, true
-		}
+	if v, _ := clientconf.NpmEnv(t.Getenv, "ca"); v != "" {
+		env.ca, env.caSet = []string{strings.ReplaceAll(v, `\n`, "\n")}, true
 	}
 	if env.caSet && env.cafile != "" {
 		return blind("npm_config_ca beside npm_config_cafile in the environment, which replace npm's one CA list in an order the environment does not record")
@@ -760,25 +758,33 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	}}}
 }
 
-var gitInsteadOf = regexp.MustCompile(`(?mi)^\s*\[url\s+"([^"]+)"\]`)
-
 // gitStores resolves what git verifies bodega at u against, for a host whose
 // configuration rewrites a URL to it: the file the effective http.sslCAInfo
 // names, which git reads in place of the system trust store. One store per
 // setting git can pick for a URL under each rewritten prefix, since a section
 // scoped to a longer URL outranks one scoped to bodega's base for the
 // repositories below it. GIT_SSL_CAINFO outranks every file.
+//
+// Every file is read whole through clientconf.ParseGitConfig first. A file
+// git refuses to load, for a line in any section, leaves git unchecked: git
+// aborts on it, so nothing else it holds is configuration git runs with.
 func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	files := clientconf.GitConfigFiles(t.Getenv, t.Home, t.Root)
+	if bad := clientconf.GitLoadError(files); bad != "" {
+		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git refuses to load %s and aborts every command that reads it, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
+	}
 	var prefixes []string
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			continue
 		}
-		for _, m := range gitInsteadOf.FindAllSubmatch(data, -1) {
-			if p, err := url.Parse(string(m[1])); err == nil && p.Host == u.Host && !slices.Contains(prefixes, string(m[1])) {
-				prefixes = append(prefixes, string(m[1]))
+		for _, e := range clientconf.ParseGitConfig(data).Entries {
+			if e.Section != "url" || e.Name != "insteadof" && e.Name != "pushinsteadof" {
+				continue
+			}
+			if p, err := url.Parse(e.Subsection); err == nil && p.Host == u.Host && !slices.Contains(prefixes, e.Subsection) {
+				prefixes = append(prefixes, e.Subsection)
 			}
 		}
 	}
@@ -870,10 +876,31 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 // a ca set for docker.io verifies nothing for ghcr.io. The hosts.toml files
 // are the ones containerd loads: under each root of the effective
 // config_path, the first root holding a directory for the registry.
+//
+// A config.toml that cannot be read or does not resolve, and one that
+// disables the CRI plugin, which is what reads hosts.toml, leave containerd
+// unchecked: the certs.d directory a default install would read is no
+// evidence about a containerd whose configuration says otherwise or cannot
+// be told. Only a host with no config.toml, or one naming no config_path, is
+// read at that default directory.
 func containerdStores(t TrustProbe, u *url.URL) []trustStore {
+	path := filepath.Join(t.Root, clientconf.ContainerdConfigPath)
+	blind := func(why string) []trustStore {
+		return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("%s %s, so which hosts.toml files containerd reads, and whether it verifies bodega's certificate, is unchecked", path, why)}}
+	}
 	roots := []string{clientconf.ContainerdCertsDir}
-	if data, err := os.ReadFile(filepath.Join(t.Root, clientconf.ContainerdConfigPath)); err == nil {
-		if cfg, err := clientconf.ResolveContainerdConfig(t.Root, clientconf.ContainerdConfigPath, data); err == nil && cfg.ConfigPath != "" {
+	switch data, err := os.ReadFile(path); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return blind(fmt.Sprintf("could not be read (%v)", err))
+	default:
+		cfg, err := clientconf.ResolveContainerdConfig(t.Root, clientconf.ContainerdConfigPath, data)
+		switch {
+		case err != nil:
+			return blind(fmt.Sprintf("does not resolve (%v)", err))
+		case cfg.CRIDisabled:
+			return blind("disables the CRI plugin, which is what reads containerd's registry configuration")
+		case cfg.ConfigPath != "":
 			roots = strings.Split(cfg.ConfigPath, ":")
 		}
 	}
@@ -1107,6 +1134,30 @@ func (t TrustProbe) Apply(findings []Finding, base string) []Finding {
 		default:
 			out[i].Detail, out[i].Remediation = detail, remedy
 		}
+	}
+	return out
+}
+
+// Rows returns a row for each client no inventory check reports on, git and
+// helm, whose configuration sends it to bodega at base or could not be read
+// far enough to tell. Apply then judges each as it does any other row. A
+// client configured for somewhere else gets no row.
+func (t TrustProbe) Rows(base string) []Finding {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return nil
+	}
+	var out []Finding
+	for _, check := range []string{"git-config", "helm-repos"} {
+		stores := trustRows[check].stores(t, u)
+		if len(stores) == 0 {
+			continue
+		}
+		f := Finding{Check: check, Status: StatusOK}
+		if !slices.ContainsFunc(stores, func(s trustStore) bool { return s.blind != "" }) {
+			f.Detail = "configured for bodega at " + u.Host
+		}
+		out = append(out, f)
 	}
 	return out
 }
