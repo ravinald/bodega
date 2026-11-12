@@ -353,10 +353,16 @@ func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPref
 //
 // Cleaning is for the local backend. s3 does not clean keys, so "cold//x/k"
 // and "cold/x/k" are two distinct objects in one bucket, and a prefix over an
-// s3 store is part of that store's location instead (see s3Location).
+// s3 store is part of that store's location instead (see s3Location). gcs
+// does not clean them either, and its prefix is kept byte for byte: "/" and
+// "cold//" are prefixes whose objects no other prefix holds, so each has a
+// label no other has. Only the "/" closing the prefix is left off.
 func (p *prefixed) Label() string {
 	if loc, ok := s3LocationOf(p); ok {
 		return loc.label()
+	}
+	if g, prefix, ok := gcsUnder(p); ok {
+		return g.Label() + "/" + strings.TrimSuffix(prefix, "/")
 	}
 	return joinLabel(p.inner.Label(), p.prefix)
 }

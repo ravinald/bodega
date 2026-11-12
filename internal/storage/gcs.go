@@ -326,3 +326,47 @@ func (g *GCS) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix st
 func (g *GCS) Label() string {
 	return "gs://" + g.name
 }
+
+// gcsUnder unwraps prefixes down to the gcs store they are over, and reports
+// false for any other store.
+func gcsUnder(store ObjectStore) (g *GCS, prefix string, ok bool) {
+	inner, prefix := unwrapPrefixes(store)
+	g, ok = inner.(*GCS)
+	return g, prefix, ok
+}
+
+// GCSNamespace reports whether the backend spec describes keeps its objects
+// in bucket as the gcs driver reaches it, and the object-name prefix it keeps
+// them under: "" for the bucket root, otherwise closed by a "/". It answers
+// for a gcs backend and for an s3 backend whose requests the pinned SDK sends
+// to that bucket (Cloud Storage's S3-compatible hosts, or the emulator the
+// gcs driver is pointed at), however that backend's configuration divides
+// endpoint path, bucket and prefix. The comparison is the one SameLocation
+// makes. Nothing is sent and no credential is read.
+//
+// An s3 backend whose route the SDK cannot resolve is an error, not a "no":
+// the caller decides what a bucket's lifecycle rule may delete.
+func GCSNamespace(ctx context.Context, spec Spec, bucket string) (prefix string, ok bool, err error) {
+	root := gcsRouteRoot() + bucket + "/"
+	switch spec.Driver {
+	case "gcs":
+		if spec.Bucket != bucket {
+			return "", false, nil
+		}
+		return spec.KeyPrefix(), true, nil
+	case "s3":
+		store, err := NewFromSpec(ctx, spec)
+		if err != nil {
+			return "", false, err
+		}
+		route, ok := objectRoute(store)
+		if !ok {
+			return "", false, fmt.Errorf("the S3 SDK resolved no request URL for bucket %q at endpoint %q", spec.Bucket, spec.Endpoint)
+		}
+		if prefix, ok = strings.CutPrefix(route, root); !ok {
+			return "", false, nil
+		}
+		return prefix, true, nil
+	}
+	return "", false, nil
+}

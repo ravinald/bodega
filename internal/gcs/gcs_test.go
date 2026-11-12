@@ -393,3 +393,17 @@ func TestNamespacesCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestInitRefusesAnUnresolvedBackend: a configured backend whose bucket could
+// not be worked out may be on this one, so nothing is created or patched.
+func TestInitRefusesAnUnresolvedBackend(t *testing.T) {
+	srv := gcstest.New(t)
+	n := Namespaces{Unresolved: []string{`"legacy": no route`}}
+	err := InitBucket(t.Context(), srv.Client(t), nil, "example-unresolved", "", project("example-project"), n)
+	if err == nil || !strings.Contains(err.Error(), `"legacy": no route`) || !strings.Contains(err.Error(), "nothing was written") {
+		t.Errorf("init = %v; want a refusal naming the backend", err)
+	}
+	if srv.Bucket("example-unresolved") != nil {
+		t.Error("init created the bucket before refusing")
+	}
+}

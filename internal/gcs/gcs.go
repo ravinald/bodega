@@ -162,6 +162,10 @@ type Namespaces struct {
 	// Others are the other backends configured on the same bucket. Their
 	// rules are left alone and their history is kept out of every rule.
 	Others []string
+	// Unresolved names each configured backend whose bucket could not be
+	// worked out, with why. One of them may be on this bucket, so InitBucket
+	// writes nothing while any is listed.
+	Unresolved []string
 }
 
 func (n Namespaces) all() []string {
@@ -204,6 +208,12 @@ func selects(prefixes, kept []string) bool {
 // exclude a prefix, so the rule that expires the first would expire the
 // second, and dropping either half silently is worse than saying so.
 func (n Namespaces) check(bucket string) error {
+	if len(n.Unresolved) > 0 {
+		return fmt.Errorf("cannot tell whether every configured s3 backend stays out of gs://%s, so nothing was written: storage backend %s. "+
+			"An s3 backend on Cloud Storage's S3-compatible endpoint shares the bucket's lifecycle rules; "+
+			"fix that backend's endpoint, bucket or AWS profile so the service could start with it, then re-run",
+			bucket, strings.Join(n.Unresolved, "; storage backend "))
+	}
 	all := n.all()
 	for _, a := range all {
 		for _, b := range all {

@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	gstorage "cloud.google.com/go/storage"
+	"github.com/ravinald/bodega/internal/config"
 	bogcs "github.com/ravinald/bodega/internal/gcs"
 	"github.com/ravinald/bodega/internal/gcs/gcstest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
@@ -744,4 +745,101 @@ func TestInitGCSLifecycleFollowsThePrefix(t *testing.T) {
 			t.Errorf("a refused run reached the API %d times: %v", n, srv.Requests())
 		}
 	})
+}
+
+func TestReviewGCSLifecycleProtectsS3History(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	for _, endpoint := range []string{"https://storage.googleapis.com", "https://storage.mtls.googleapis.com"} {
+		t.Run(endpoint, func(t *testing.T) {
+			srv := gcstest.New(t)
+			cfg := &config.Config{
+				StorageBackend: "gcs", Bucket: "review-shared-bucket",
+				StorageBackends: map[string]config.StorageSpec{
+					"legacy": {Driver: "s3", Bucket: "review-shared-bucket", Region: "us-east-1", Endpoint: endpoint, PathStyle: true, Prefix: "binaries"},
+				},
+			}
+			spec, _ := storage.SpecFor(cfg, storage.DefaultName)
+			ns := gcsNamespaces(cfg, storage.DefaultName, spec)
+			var out strings.Builder
+			err := bogcs.InitBucket(t.Context(), srv.Client(t), &out, spec.Bucket, "",
+				func(context.Context) (string, error) { return "review-project", nil }, ns)
+			if err == nil || !strings.Contains(err.Error(), "cannot exclude a prefix") {
+				t.Errorf("init = %v; want overlapping configured history refused; output:\n%s", err, out.String())
+			}
+			if srv.Bucket(spec.Bucket) != nil {
+				for _, key := range []string{"binaries/manifests/index.json", "binaries/attestations/record.json"} {
+					if selected, _ := gcsExpiry(gcsRules(t, srv, spec.Bucket), key); selected {
+						t.Errorf("init installed a delete rule selecting the S3 backend's history %q", key)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestGCSNamespacesCountS3Aliases: the namespaces init checks a lifecycle
+// rule against are every backend writing to the target's bucket, whichever
+// driver and address form it is configured with and whether it is the default
+// or a named one, and no backend that writes anywhere else.
+func TestGCSNamespacesCountS3Aliases(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "")
+	const gcsHost = "https://storage.googleapis.com"
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: gcsHost, PathStyle: true,
+		StorageBackends: map[string]config.StorageSpec{
+			"native":    {Driver: "gcs", Bucket: "example-shared", Prefix: "warm"},
+			"sibling":   {Driver: "gcs", Bucket: "example-shared", Prefix: "cold"},
+			"split":     {Driver: "s3", Bucket: "archive", Region: "us-east-1", Endpoint: gcsHost + "/example-shared", PathStyle: true, Prefix: "x"},
+			"vhost":     {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: gcsHost, Prefix: "warm"},
+			"aws":       {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Prefix: "binaries"},
+			"elsewhere": {Driver: "s3", Bucket: "example-other", Region: "us-east-1", Endpoint: gcsHost, PathStyle: true},
+			"minio":     {Driver: "s3", Bucket: "example-shared", Region: "us-east-1", Endpoint: "https://minio.example.com", PathStyle: true},
+			"disk":      {Driver: "local", Path: t.TempDir()},
+		},
+	}
+	spec, _ := storage.SpecFor(cfg, "native")
+	ns := gcsNamespaces(cfg, "native", spec)
+	want := bogcs.Namespaces{Target: "warm/", Others: []string{"", "cold/", "archive/x/", "warm/"}}
+	if !reflect.DeepEqual(ns, want) {
+		t.Fatalf("namespaces = %+v, want %+v", ns, want)
+	}
+
+	// The root alias holds warm/ only as a namespace of its own artifacts'
+	// sibling, not under an artifact prefix, so this layout is compatible and
+	// init writes the target's rule under exactly its prefix.
+	srv := gcstest.New(t)
+	var out strings.Builder
+	if err := bogcs.InitBucket(t.Context(), srv.Client(t), &out, spec.Bucket, "",
+		func(context.Context) (string, error) { return "example-project", nil }, ns); err != nil {
+		t.Fatalf("compatible layout refused: %v", err)
+	}
+	rules := gcsRules(t, srv, spec.Bucket)
+	for key, wantSelected := range map[string]bool{
+		"warm/binaries/tool/v1/tool.zip": true,
+		"warm/manifests/index.json":      false,
+		"warm/attestations/record.json":  false,
+		"manifests/index.json":           false,
+		"binaries/tool/v1/tool.zip":      false,
+		"cold/binaries/tool/v1/tool.zip": false,
+		"archive/x/manifests/index.json": false,
+	} {
+		if selected, _ := gcsExpiry(rules, key); selected != wantSelected {
+			t.Errorf("rule selects %q = %v, want %v", key, selected, wantSelected)
+		}
+	}
+
+	// A backend whose route does not resolve stops init before the bucket.
+	cfg.StorageBackends["broken"] = config.StorageSpec{Driver: "s3", Region: "us-east-1", Endpoint: gcsHost}
+	ns = gcsNamespaces(cfg, "native", spec)
+	if len(ns.Unresolved) != 1 || !strings.Contains(ns.Unresolved[0], `"broken"`) {
+		t.Fatalf("unresolved = %q, want the broken backend named", ns.Unresolved)
+	}
+	srv = gcstest.New(t)
+	err := bogcs.InitBucket(t.Context(), srv.Client(t), nil, spec.Bucket, "",
+		func(context.Context) (string, error) { return "example-project", nil }, ns)
+	if err == nil || srv.Bucket(spec.Bucket) != nil {
+		t.Errorf("init = %v with an unresolved backend; want a refusal and no bucket", err)
+	}
 }

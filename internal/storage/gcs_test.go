@@ -337,3 +337,84 @@ func TestGCSRouteIsWhereTheSDKSendsARead(t *testing.T) {
 		}
 	}
 }
+
+// TestGCSNamespaceFollowsTheObjectName: what a lifecycle rule on a bucket may
+// delete is decided by object names, so an s3 backend counts as a namespace
+// of a Cloud Storage bucket by every address form that reaches it, with the
+// prefix the SDK really sends, and by none that reaches somewhere else.
+func TestGCSNamespaceFollowsTheObjectName(t *testing.T) {
+	const bucket = "example-artifacts"
+	s3 := func(endpoint, bucket, prefix string, pathStyle bool) Spec {
+		return Spec{Driver: "s3", Region: "us-east-1", Endpoint: endpoint, Bucket: bucket, Prefix: prefix, PathStyle: pathStyle}
+	}
+	for _, tc := range []struct {
+		name     string
+		emulator string
+		spec     Spec
+		prefix   string
+		ok       bool
+	}{
+		{"gcs root", "", Spec{Driver: "gcs", Bucket: bucket}, "", true},
+		{"gcs prefix", "", Spec{Driver: "gcs", Bucket: bucket, Prefix: "cold"}, "cold/", true},
+		{"gcs slash prefix", "", Spec{Driver: "gcs", Bucket: bucket, Prefix: "//"}, "/", true},
+		{"gcs other bucket", "", Spec{Driver: "gcs", Bucket: "example-other"}, "", false},
+		{"local", "", Spec{Driver: "local", Path: t.TempDir()}, "", false},
+		{"s3 path-style", "", s3("https://storage.googleapis.com", bucket, "binaries", true), "binaries/", true},
+		{"s3 virtual-hosted", "", s3("https://storage.googleapis.com", bucket, "binaries", false), "binaries/", true},
+		{"s3 root", "", s3("https://storage.googleapis.com", bucket, "", true), "", true},
+		{"s3 mTLS host", "", s3("https://storage.mtls.googleapis.com", bucket, "cold/", true), "cold/", true},
+		{"s3 regional endpoint", "", s3("https://storage.us-central1.rep.googleapis.com", bucket, "cold", true), "cold/", true},
+		{"s3 bucket in the endpoint path", "", s3("https://storage.googleapis.com/"+bucket, "binaries", "", true), "binaries/", true},
+		{"s3 bucket and prefix in the endpoint path", "", s3("https://storage.googleapis.com/"+bucket+"/cold", "binaries", "x", true), "cold/binaries/x/", true},
+		{"s3 doubled slash kept", "", s3("https://storage.googleapis.com", bucket, "cold//x", true), "cold//x/", true},
+		{"s3 other bucket", "", s3("https://storage.googleapis.com", "example-other", "", true), "", false},
+		{"s3 bucket that only starts alike", "", s3("https://storage.googleapis.com", bucket+"-2", "", false), "", false},
+		{"s3 same name on AWS", "", s3("", bucket, "binaries", false), "", false},
+		{"s3 another host", "", s3("https://storage.example.com", bucket, "", true), "", false},
+		{"s3 on the emulator the gcs driver uses", "127.0.0.1:4443", s3("http://127.0.0.1:4443", bucket, "cold", true), "cold/", true},
+		{"s3 on Cloud Storage while gcs uses an emulator", "127.0.0.1:4443", s3("https://storage.googleapis.com", bucket, "", true), "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("STORAGE_EMULATOR_HOST", tc.emulator)
+			t.Setenv("AWS_ENDPOINT_URL", "")
+			t.Setenv("AWS_ENDPOINT_URL_S3", "")
+			prefix, ok, err := GCSNamespace(t.Context(), tc.spec, bucket)
+			if err != nil || ok != tc.ok || prefix != tc.prefix {
+				t.Errorf("GCSNamespace = %q, %v, %v; want %q, %v", prefix, ok, err, tc.prefix, tc.ok)
+			}
+		})
+	}
+
+	// An endpoint only the environment names reaches the bucket all the same.
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "https://storage.googleapis.com")
+	if prefix, ok, err := GCSNamespace(t.Context(), s3("", bucket, "binaries", true), bucket); err != nil || !ok || prefix != "binaries/" {
+		t.Errorf("endpoint from AWS_ENDPOINT_URL_S3: GCSNamespace = %q, %v, %v; want binaries/, true", prefix, ok, err)
+	}
+	// A backend whose route cannot be resolved is an error, never a "no".
+	if _, _, err := GCSNamespace(t.Context(), Spec{Driver: "s3", Region: "us-east-1"}, bucket); err == nil {
+		t.Error("an s3 backend with no bucket resolved to no error")
+	}
+}
+
+// TestGCSPrefixLabelsAreInjective: two accepted gcs prefixes that hold
+// different objects never share the label the fan-out dedups on.
+func TestGCSPrefixLabelsAreInjective(t *testing.T) {
+	s, _, bucket := fakeGCS(t)
+	seen := map[string]string{}
+	for _, configured := range []string{"", "/", "//", "cold", "cold/", "/cold", "cold//", "//cold", "cold/x", "cold//x", "cold/./x", "cold/y/../x"} {
+		store := withPrefix(s, configured)
+		_, keyPrefix := unwrapPrefixes(store)
+		label := store.Label()
+		if prior, dup := seen[label]; dup && prior != keyPrefix {
+			t.Errorf("prefix %q (keys under %q) shares label %q with keys under %q", configured, keyPrefix, label, prior)
+		}
+		seen[label] = keyPrefix
+		if !strings.HasPrefix(label, "gs://"+bucket) {
+			t.Errorf("prefix %q: label %q does not open with the bucket", configured, label)
+		}
+	}
+	if len(seen) != 9 {
+		t.Errorf("%d labels for 9 distinct key prefixes: %v", len(seen), seen)
+	}
+}

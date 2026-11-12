@@ -938,3 +938,47 @@ func TestMoveOnGCSEndToEnd(t *testing.T) {
 		t.Errorf("after the move to cold: under cold/ %v, at the root %v; want it moved", held("cold/"+exampleToolKey), held(exampleToolKey))
 	}
 }
+
+func TestReviewGCSKeepsSlashNamespaceDistinct(t *testing.T) {
+	srv := gcstest.New(t)
+	srv.AddBucket("review-gcs-prefix")
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.Host())
+	t.Setenv("REPO_BUCKET", "")
+	cfg := loadFrom(t, `{"storage_backend":"gcs","bucket":"review-gcs-prefix","storage_backends":{"slash":{"driver":"gcs","bucket":"review-gcs-prefix","prefix":"//"}}}`)
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := stores.Default()
+	slash, err := stores.ByName("slash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "binaries/tool/v1/tool.zip"
+	for _, pair := range []struct {
+		store storage.ObjectStore
+		body  string
+	}{{root, "at root"}, {slash, "under slash"}} {
+		if err := pair.store.Put(t.Context(), key, []byte(pair.body)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := pair.store.Get(t.Context(), key)
+		if err != nil || string(got) != pair.body {
+			t.Fatalf("read %q: %q, %v", pair.body, got, err)
+		}
+	}
+	for raw, want := range map[string]string{key: "at root", "/" + key: "under slash"} {
+		if got, ok := srv.Object("review-gcs-prefix", raw); !ok || string(got) != want {
+			t.Fatalf("object %q = %q, %v; want %q", raw, got, ok, want)
+		}
+	}
+	if root.Label() == slash.Label() {
+		t.Errorf("distinct GCS object namespaces share label %q", root.Label())
+	}
+	if storage.SameLocation(root, slash) {
+		t.Error("SameLocation reports two distinct GCS object namespaces as one")
+	}
+	if got := stores.Fanout(t.Context(), "binary", []string{"slash"}); len(got) != 2 {
+		t.Errorf("Fanout returned %d store(s), want both distinct namespaces", len(got))
+	}
+}

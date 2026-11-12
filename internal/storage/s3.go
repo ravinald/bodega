@@ -369,8 +369,7 @@ func SameLocation(a, b ObjectStore) bool {
 // in a form two stores share exactly when they share objects. False for
 // another driver and for a store its SDK resolves no route for.
 func objectRoute(store ObjectStore) (string, bool) {
-	inner, prefix := unwrapPrefixes(store)
-	if g, ok := inner.(*GCS); ok {
+	if g, prefix, ok := gcsUnder(store); ok {
 		return g.root + g.name + "/" + prefix, true
 	}
 	return s3ObjectRoute(store)

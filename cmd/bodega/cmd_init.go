@@ -104,17 +104,23 @@ func gcsBucket(cfg *config.Config, name string) (storage.Spec, error) {
 }
 
 // gcsNamespaces is where the backend called name keeps its keys in its
-// bucket, and where every other gcs backend of this config on the same bucket
-// keeps its own.
+// bucket, and where every other backend of this config that writes to the
+// same bucket keeps its own: a gcs backend, or an s3 backend whose requests
+// reach it. A lifecycle rule matches object names, so the driver a backend
+// reaches the bucket through is no part of what the rule may delete.
 func gcsNamespaces(cfg *config.Config, name string, spec storage.Spec) bogcs.Namespaces {
 	ns := bogcs.Namespaces{Target: spec.KeyPrefix()}
 	for _, other := range append([]string{config.DefaultStorageName}, slices.Sorted(maps.Keys(cfg.StorageBackends))...) {
 		if other == name {
 			continue
 		}
-		o, ok := storage.SpecFor(cfg, other)
-		if ok && o.Driver == "gcs" && o.Bucket == spec.Bucket {
-			ns.Others = append(ns.Others, o.KeyPrefix())
+		o, _ := storage.SpecFor(cfg, other)
+		prefix, ok, err := storage.GCSNamespace(context.Background(), o, spec.Bucket)
+		switch {
+		case err != nil:
+			ns.Unresolved = append(ns.Unresolved, fmt.Sprintf("%q: %v", other, err))
+		case ok:
+			ns.Others = append(ns.Others, prefix)
 		}
 	}
 	return ns
