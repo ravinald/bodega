@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -680,5 +681,144 @@ func TestContainerdDisabledPluginsAreNeverAssumedHarmless(t *testing.T) {
 		if r.CRIDisabled != tc.criDisabled || tc.invalid == "" && r.Invalid != "" || tc.invalid != "" && !strings.Contains(r.Invalid, tc.invalid) {
 			t.Errorf("%q: CRIDisabled = %v, Invalid = %q; want %v and one holding %q", tc.conf, r.CRIDisabled, r.Invalid, tc.criDisabled, tc.invalid)
 		}
+	}
+}
+
+const containerdDefaultFixture = "testdata/containerd-v2.2.0-config-default.toml"
+
+// F116 R1, R2: refusing what containerd cannot start on must not refuse a
+// stock host. The fixture is what `containerd config default` prints from the
+// v2.2.0 linux/arm64 release, and every plugin table in it is one the port
+// decodes rather than passes over.
+func TestContainerdConfigDefaultIsAccepted(t *testing.T) {
+	data, err := os.ReadFile(containerdDefaultFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eff, err := ResolveContainerdConfig(t.TempDir(), ContainerdConfigPath, data)
+	if err != nil || eff.Invalid != "" || eff.CRIDisabled {
+		t.Fatalf("refused the default config.toml: err=%v invalid=%q criDisabled=%v", err, eff.Invalid, eff.CRIDisabled)
+	}
+	if want := "/etc/containerd/certs.d:/etc/docker/certs.d"; eff.ConfigPath != want {
+		t.Errorf("config_path = %q, want %q", eff.ConfigPath, want)
+	}
+	cfg, err := decodeContainerdConfig(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := 0
+	for name := range cfg.Plugins {
+		table, registered := containerdPlugins[name]
+		if !registered {
+			t.Errorf("the default config.toml holds [plugins.%q], which the port does not list as registered", name)
+		}
+		if table != nil {
+			tables++
+		}
+	}
+	// Every plugin that registers a Config prints its table in the default.
+	for name, table := range containerdPlugins {
+		if _, printed := cfg.Plugins[name]; table != nil && !printed {
+			t.Errorf("the port decodes a table for %s, which the default config.toml does not hold", name)
+		}
+	}
+	if tables != 23 {
+		t.Errorf("the default config.toml holds %d tables the port decodes outside the CRI plugins, want 23", tables)
+	}
+}
+
+// F116 R1, R2: containerd v2.2.0's New decodes the table of every plugin it
+// registers and exits on a wrong type in any of them, so the port holds every
+// one to its types: each field of each table, given a value of another type,
+// is refused, and the same table under a disabled plugin is not.
+func TestContainerdEveryPluginTableIsTyped(t *testing.T) {
+	const registry = "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	resolve := func(t *testing.T, conf string) ContainerdEffective {
+		t.Helper()
+		eff, err := ResolveContainerdConfig("", filepath.Join(t.TempDir(), "config.toml"), []byte(conf))
+		if err != nil {
+			t.Fatalf("%v\n%s", err, conf)
+		}
+		return eff
+	}
+	for name, table := range containerdPlugins {
+		if table == nil {
+			continue
+		}
+		typ := reflect.TypeOf(table()).Elem()
+		wrong := []string{"plugins.\"" + name + "\" = 42\n"}
+		for i := range typ.NumField() {
+			f := typ.Field(i)
+			value := "42"
+			if k := f.Type.Kind(); k == reflect.Int || k == reflect.Float64 || k == reflect.Bool {
+				value = "\"x\""
+			}
+			wrong = append(wrong, "[plugins.\""+name+"\"]\n"+f.Tag.Get("toml")+" = "+value+"\n")
+		}
+		for _, w := range wrong {
+			if eff := resolve(t, "version = 3\n"+w+registry); eff.Invalid == "" {
+				t.Errorf("accepted a table containerd does not start on:\n%s", w)
+			}
+			if eff := resolve(t, "version = 3\ndisabled_plugins = [\""+name+"\"]\n"+w+registry); strings.Contains(eff.Invalid, "does not decode its table") {
+				t.Errorf("refused the table of a disabled plugin, which containerd never decodes: %s\n%s", eff.Invalid, w)
+			}
+		}
+	}
+}
+
+// F116 R1, R2: the rest of what New reads before it serves anything, on the
+// composed configuration. No containerd runs here: the cases are the errors
+// and panics of cmd/containerd/server/server.go at v2.2.0.
+func TestContainerdStartupChecks(t *testing.T) {
+	const registry = "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	for _, tc := range []struct {
+		name, conf, imported string
+		invalid              string
+	}{
+		{name: "no required plugin", conf: "version = 3\nrequired_plugins = []\n"},
+		{name: "the CRI plugin required", conf: "version = 3\nrequired_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\"]\n"},
+		{name: "a required plugin nothing registers", conf: "version = 3\nrequired_plugins = [\"io.containerd.audit.v1.missing\"]\n", invalid: "not included"},
+		{name: "a required plugin an import names", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\nrequired_plugins = [\"io.containerd.audit.v1.missing\"]\n", invalid: "not included"},
+		{name: "a required plugin under its version 2 name", conf: "version = 2\nrequired_plugins = [\"io.containerd.monitor.v1.cgroups\"]\n", invalid: "not included"},
+		{name: "a required plugin whose start depends on the host", conf: "version = 3\nrequired_plugins = [\"io.containerd.snapshotter.v1.btrfs\"]\n", invalid: "doctor does not follow"},
+		{name: "a required proxy plugin", conf: "version = 3\nrequired_plugins = [\"io.containerd.snapshotter.v1.stargz\"]\n[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n", invalid: "doctor does not follow"},
+		{name: "a proxy plugin", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n"},
+		{name: "a proxy plugin of no type", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"snapshots\"\n", invalid: "no type for plugin"},
+		{name: "a proxy plugin under a registered name", conf: "version = 3\n[proxy_plugins.overlayfs]\ntype = \"snapshot\"\n", invalid: "already registered"},
+		{name: "a timeout", conf: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5s\"\n"},
+		{name: "a timeout with no unit", conf: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5\"\n", invalid: "unable to parse 5 into a time duration"},
+		{name: "a timeout an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5\"\n", imported: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5s\"\n"},
+		{name: "a TLS pair for the TCP listener", conf: "version = 3\n[grpc]\ntcp_tls_cert = \"/etc/containerd/tls.crt\"\ntcp_tls_key = \"/etc/containerd/tls.key\"\n", invalid: "doctor does not interpret"},
+		{name: "a table no plugin decodes", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.stargz\"]\nroot_path = 42\n"},
+		{name: "version 2 names", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = false\n[plugins.\"io.containerd.internal.v1.restart\"]\ninterval = \"10s\"\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\"]\nsched_core = false\n[plugins.\"io.containerd.runtime.v1.linux\"]\nshim = 42\n"},
+		{name: "a version 2 table the cgroups plugin takes", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = \"no\"\n", invalid: "io.containerd.monitor.task.v1.cgroups does not decode its table"},
+		{name: "a version 1 table the restart plugin takes", conf: "[plugins.restart]\ninterval = 10\n", invalid: "io.containerd.monitor.container.v1.restart does not decode its table"},
+		{name: "a duration with no unit", conf: "version = 3\n[plugins.\"io.containerd.gc.v1.scheduler\"]\nschedule_delay = \"100\"\n", invalid: "io.containerd.gc.v1.scheduler does not decode its table"},
+		{name: "a wrong type in an import", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = 42\n", invalid: "io.containerd.metadata.v1.bolt does not decode its table"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.imported != "" {
+				if err := os.WriteFile(filepath.Join(dir, "extra.toml"), []byte(tc.imported), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			table := registry
+			if !strings.Contains(tc.conf, "version = ") {
+				table = "[plugins.cri.registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			} else if strings.Contains(tc.conf, "version = 2") {
+				table = "[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			}
+			eff, err := ResolveContainerdConfig("", filepath.Join(dir, "config.toml"), []byte(tc.conf+table))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.invalid == "" && eff.Invalid != "" {
+				t.Errorf("refused a configuration containerd starts on: %s", eff.Invalid)
+			}
+			if tc.invalid != "" && !strings.Contains(eff.Invalid, tc.invalid) {
+				t.Errorf("Invalid = %q, want it to name %q", eff.Invalid, tc.invalid)
+			}
+		})
 	}
 }

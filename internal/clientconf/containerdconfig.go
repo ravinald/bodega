@@ -423,6 +423,8 @@ type containerdCRI struct {
 	images  containerdImageConfig
 	runtime containerdRuntimeConfig
 	server  containerdCRIServerConfig
+	// start is the rest of what containerd reads before it serves anything.
+	start containerdStart
 }
 
 func newContainerdCRI(version int, legacy string) *containerdCRI {
@@ -458,7 +460,18 @@ func (c *containerdCRI) load(data []byte) error {
 	if err := decodeContainerdPlugin(data, serverTable, &c.server); err != nil {
 		return containerdPluginFailed("plugin", err)
 	}
-	return nil
+	return c.start.load(data, c.version)
+}
+
+// pluginState is containerdPluginState for the composed disabled_plugins and
+// required_plugins, and after it what containerdStart refuses: New's own
+// checks run on every plugin, not only those disabled_plugins names.
+func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bool, invalid string) {
+	criDisabled, invalid = containerdPluginState(disabled, required)
+	if invalid == "" {
+		invalid = c.start.invalid(disabled, required)
+	}
+	return criDisabled, invalid
 }
 
 // validate is what the three plugins refuse in the tables every loaded file

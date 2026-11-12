@@ -113,13 +113,16 @@ var helmSchemes = []string{"http", "https", "oci"}
 // so the error is for the file. A getter plugin can add a scheme; doctor
 // reads no plugin, so a scheme outside the built-in ones is refused rather
 // than assumed served.
+//
+// A null member is neither skipped nor an error helm prints: helm reads its
+// name without a nil check wherever it walks the list, and panics.
 func (f *HelmFile) RepositoryError() error {
 	if f == nil {
 		return nil
 	}
-	for _, r := range f.Repositories {
+	for i, r := range f.Repositories {
 		if r == nil {
-			continue
+			return fmt.Errorf("repository %d of %d is null, and helm stops on a nil pointer dereference reading it, before any request: checkForExpiredRepos as every command starts (pkg/cmd/root.go, line 383) and the loop of helm repo update (pkg/cmd/repo_update.go, line 101). Remove the null entry", i+1, len(f.Repositories))
 		}
 		u, err := url.Parse(r.URL)
 		if err != nil {

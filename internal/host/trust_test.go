@@ -1925,3 +1925,81 @@ func TestAudit26NpmSectionValueIsUnchecked(t *testing.T) {
 		t.Errorf("ordinary report certifies unloadable npm configuration: %+v", rows)
 	}
 }
+
+func TestAudit27ContainerdStartupIsUnchecked(t *testing.T) {
+	for name, extra := range map[string]string{
+		"missing required plugin": "required_plugins = [\"io.containerd.audit.v1.missing\"]\n",
+		"metadata plugin type":    "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = 42\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/config.toml"), "version = 3\n"+extra+"[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\ncapabilities = [\"pull\", \"resolve\"]\n")
+			if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+				t.Errorf("selected verdict certifies a runtime that cannot start: %+v", v)
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "containerd" {
+					return "/fixture/containerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("ordinary report certifies a runtime that cannot start: %+v", rows)
+			}
+		})
+	}
+}
+
+func TestAudit27HelmNullEntryIsUnchecked(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".config/helm/repositories.yaml")
+	writeTrustFile(t, file, "repositories:\n- null\n- name: bodega\n  url: "+base+"/helm\n  caFile: "+ca+"\n")
+	if v := auditState(t, p, "helm-repos", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict certifies a Helm startup panic: %+v", v)
+	}
+	rows := p.Apply(p.Rows(base), base)
+	if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+		t.Errorf("ordinary report certifies a Helm startup panic: %+v", rows)
+	}
+}
+
+// F116 R1, R2: a stock containerd host is certified, not refused: the
+// config.toml is what `containerd config default` prints at v2.2.0.
+func TestContainerdConfigDefaultIsCertified(t *testing.T) {
+	conf, err := os.ReadFile("../clientconf/testdata/containerd-v2.2.0-config-default.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, ca, base := auditTrust(t)
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/config.toml"), string(conf))
+	writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\ncapabilities = [\"pull\", \"resolve\"]\n")
+	if v := auditState(t, p, "oci-containerd", base); v.State != TrustVerified {
+		t.Errorf("selected verdict on the default config.toml: %+v", v)
+	}
+	rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+		if name == "containerd" {
+			return "/fixture/containerd", nil
+		}
+		return "", os.ErrNotExist
+	}}).Check(base)
+	rows = p.Apply(rows, base)
+	if len(rows) != 1 || rows[0].Status != StatusOK {
+		t.Errorf("ordinary report on the default config.toml: %+v", rows)
+	}
+}
+
+// F116 R1, R2: the repositories.yaml `helm repo add` writes at v4.3.0, every
+// key present and most of them empty, is certified.
+func TestHelmRepoAddFileIsCertified(t *testing.T) {
+	p, ca, base := auditTrust(t)
+	writeTrustFile(t, filepath.Join(p.Home, ".config/helm/repositories.yaml"), "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- caFile: "+ca+"\n  certFile: \"\"\n  insecure_skip_tls_verify: false\n  keyFile: \"\"\n  name: bodega\n  pass_credentials_all: false\n  password: \"\"\n  url: "+base+"/helm\n  username: \"\"\n")
+	if v := auditState(t, p, "helm-repos", base); v.State != TrustVerified {
+		t.Errorf("selected verdict on the file helm repo add writes: %+v", v)
+	}
+	rows := p.Apply(p.Rows(base), base)
+	if len(rows) != 1 || rows[0].Status != StatusOK {
+		t.Errorf("ordinary report on the file helm repo add writes: %+v", rows)
+	}
+}

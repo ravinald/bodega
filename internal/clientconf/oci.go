@@ -495,7 +495,7 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 		}
 	}
 	var unmodeled string
-	if r.CRIDisabled, unmodeled = containerdPluginState(r.Disabled, r.Required); whole && r.Invalid == "" {
+	if r.CRIDisabled, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole && r.Invalid == "" {
 		r.Invalid = unmodeled
 	}
 	table := tomlTable(doc, path)
@@ -602,7 +602,7 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 	// imports deferred run here, on the composed tables and plugin lists.
 	if len(main.Imports) > 0 {
 		var unmodeled string
-		eff.CRIDisabled, unmodeled = containerdPluginState(eff.Disabled, eff.Required)
+		eff.CRIDisabled, unmodeled = eff.cri.pluginState(eff.Disabled, eff.Required)
 		if eff.Invalid == "" {
 			if err := eff.cri.validate(); err != nil {
 				eff.Invalid = err.Error()

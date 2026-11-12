@@ -3434,3 +3434,100 @@ func TestAudit26NpmSectionValueRefusesBeforeWrites(t *testing.T) {
 		t.Errorf("CA written before refusal: %v", err)
 	}
 }
+
+func TestAudit27ContainerdStartupRefusesBeforeWrites(t *testing.T) {
+	for name, extra := range map[string]string{
+		"missing required plugin": "required_plugins = [\"io.containerd.audit.v1.missing\"]\n",
+		"metadata plugin type":    "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = 42\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, "containerd")
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, "etc/containerd/config.toml")
+			conf := "version = 3\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(conf), 0600); err != nil {
+				t.Fatal(err)
+			}
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			oldRoot := doctorOCIRoot
+			doctorOCIRoot = home
+			t.Cleanup(func() { doctorOCIRoot = oldRoot })
+			for _, phase := range []string{"first", "idle"} {
+				out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+				if err == nil {
+					t.Errorf("%s apply certified containerd startup failure:\n%s", phase, out)
+				}
+			}
+			if got, _ := os.ReadFile(file); string(got) != conf {
+				t.Errorf("changed the parent before refusal: %s", got)
+			}
+			for _, path := range []string{".config/bodega/ca.pem", "etc/containerd/certs.d/docker.io/hosts.toml"} {
+				if _, err := os.Stat(filepath.Join(home, path)); !os.IsNotExist(err) {
+					t.Errorf("wrote %s before refusal: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAudit27HelmNullEntryRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/helm/repositories.yaml")
+	body := "repositories:\n- null\n- name: bodega\n  url: " + srv.URL + "/helm\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HELM_REPOSITORY_CONFIG", file)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	release := filepath.Join(t.TempDir(), "os-release")
+	if err := os.WriteFile(release, []byte("ID=ubuntu\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	calls := 0
+	doctorRun = func(_ string, _ ...string) error {
+		calls++
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0644)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "helm", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil {
+			t.Errorf("%s apply certified a Helm startup panic:\n%s", phase, out)
+		}
+	}
+	if got, _ := os.ReadFile(file); string(got) != body {
+		t.Errorf("rewrote a file Helm cannot use:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")); !os.IsNotExist(err) {
+		t.Errorf("wrote the anchor before refusal: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("ran %d system-store rebuild(s) before refusal", calls)
+	}
+}

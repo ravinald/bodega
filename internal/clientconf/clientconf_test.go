@@ -17,6 +17,8 @@ import (
 	"go/token"
 	"maps"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2573,7 +2575,7 @@ func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
 		"plan's own document":   {body: HelmDocument(HelmRepository("https://b"))},
 		"empty file":            {body: ""},
 		"emptied list":          {body: "repositories: []\n"},
-		"null entry":            {body: "repositories:\n  -\n"},
+		"null entry":            {body: "repositories:\n  -\n", bad: "is null"},
 		"unknown keys":          {body: entry + "    extra: [1]\nother: {a: 1}\n"},
 		"bool spelled as YAML":  {body: entry + "    insecure_skip_tls_verify: yes\n"},
 		"syntax":                {body: entry + "broken: [\n", bad: "did not find expected"},
@@ -2603,7 +2605,9 @@ func TestHelmFileLoadsAsHelmLoadsIt(t *testing.T) {
 			cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
 			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}
 			out, _ := cmd.CombinedOutput()
-			if refused := strings.Contains(string(out), "failed loading file"); refused != (tc.bad != "") {
+			// helm prints a load error and panics on a null entry; either way it
+			// has stopped before any request.
+			if refused := strings.Contains(string(out), "failed loading file") || strings.Contains(string(out), "nil pointer dereference"); refused != (tc.bad != "") {
 				t.Errorf("native helm refused the file: %v (%s); LoadHelmFile error = %v", refused, out, err)
 			}
 		})
@@ -4172,5 +4176,72 @@ func TestNpmObjectLinesMatchNativeNpm(t *testing.T) {
 		case tc.stricter && (!reached || refused == ""):
 			t.Errorf("%q: want npm running and the decoder refusing; reached=%v refused=%q", tc.body, reached, refused)
 		}
+	}
+}
+
+func TestAudit27ContainerdStartupObligations(t *testing.T) {
+	for name, extra := range map[string]string{
+		"missing required plugin": "required_plugins = [\"io.containerd.audit.v1.missing\"]\n",
+		"metadata plugin type":    "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = 42\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte("version = 3\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			eff, err := ResolveContainerdConfig("", filepath.Join(t.TempDir(), "config.toml"), raw)
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a parent policy containerd cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}
+
+func TestAudit27HelmNullEntryMatchesNative(t *testing.T) {
+	helm := oracletest.Helm(t)
+	home := t.TempDir()
+	file := filepath.Join(home, "repositories.yaml")
+	body := "repositories:\n- null\n- name: bodega\n  url: https://127.0.0.1:1/helm\n"
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helm, "repo", "update", "audit-nonexistent", "--repository-config", file)
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "HELM_REPOSITORY_CONFIG=" + file}
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "invalid memory address or nil pointer dereference") {
+		t.Fatalf("native control: %v: %s", err, out)
+	}
+	t.Logf("Helm v4.3.0: %v: %s", err, out)
+	if _, err := LoadHelmFile(file); err == nil {
+		t.Error("accepted a repository file that aborts Helm before any request")
+	}
+}
+
+// F116 R1, R2: refusing a file helm cannot start on must not refuse the file
+// helm itself writes. Helm v4.3.0 adds a repository against a local index, and
+// what it wrote loads.
+func TestHelmRepoAddFileIsAccepted(t *testing.T) {
+	helm := oracletest.Helm(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index.yaml" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("apiVersion: v1\nentries: {}\ngenerated: \"2026-01-01T00:00:00Z\"\n"))
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	file := filepath.Join(home, "repositories.yaml")
+	cmd := exec.Command(helm, "repo", "add", "bodega", srv.URL, "--repository-config", file, "--repository-cache", filepath.Join(home, "cache"))
+	cmd.Dir = home
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helm repo add: %v: %s", err, out)
+	}
+	doc, err := LoadHelmFile(file)
+	if err != nil {
+		t.Fatalf("refused the file helm repo add wrote: %v", err)
+	}
+	if len(doc.Repositories) != 1 || doc.Repositories[0].Name != "bodega" || doc.Repositories[0].URL != srv.URL {
+		written, _ := os.ReadFile(file)
+		t.Errorf("read %+v from:\n%s", doc.Repositories, written)
 	}
 }
