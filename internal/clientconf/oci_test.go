@@ -822,3 +822,114 @@ func TestContainerdStartupChecks(t *testing.T) {
 		})
 	}
 }
+
+// A table that decodes is not one its plugin starts on. These are the values
+// containerd v2.2.0's command and the plugins its CRI service starts through
+// refuse after the decode, each beside a value of the same key they accept.
+// No containerd runs here: the cases are the errors of
+// cmd/containerd/command/main.go and each plugin's InitFn at that version.
+func TestContainerdInitChecks(t *testing.T) {
+	const (
+		registry  = "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+		images    = "[plugins.\"io.containerd.cri.v1.images\"]\n"
+		bolt      = "[plugins.\"io.containerd.metadata.v1.bolt\"]\n"
+		transfer  = "[[plugins.\"io.containerd.transfer.v1.local\".unpack_config]]\n"
+		devmapper = "[plugins.\"io.containerd.snapshotter.v1.devmapper\"]\n"
+		stargz    = "[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n"
+	)
+	for _, tc := range []struct {
+		name, conf, imported string
+		invalid              string
+	}{
+		{name: "a log level in upper case", conf: "version = 3\n[debug]\nlevel = \"WARNING\"\nformat = \"json\"\n"},
+		{name: "an unknown log level", conf: "version = 3\n[debug]\nlevel = \"verbose\"\n", invalid: "not a valid logrus Level"},
+		{name: "an unknown log level in an import", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[debug]\nlevel = \"verbose\"\n", invalid: "not a valid logrus Level"},
+		{name: "an unknown log format", conf: "version = 3\n[debug]\nformat = \"logfmt\"\n", invalid: "unknown log format"},
+		{name: "root and state apart", conf: "version = 3\nroot = \"/srv/containerd\"\nstate = \"/run/containerd\"\n"},
+		{name: "root and state the same", conf: "version = 3\nroot = \"/srv/containerd\"\nstate = \"/srv/containerd\"\n", invalid: "root and state must be different paths"},
+		{name: "root at the default state", conf: "version = 3\nroot = \"/run/containerd\"\n", invalid: "root and state must be different paths"},
+
+		{name: "the isolated policy", conf: "version = 3\n" + bolt + "content_sharing_policy = \"isolated\"\n"},
+		{name: "an empty policy", conf: "version = 3\n" + bolt + "content_sharing_policy = \"\"\n"},
+		{name: "an unknown policy", conf: "version = 3\n" + bolt + "content_sharing_policy = \"private\"\n", invalid: "unknown policy: private"},
+		{name: "an unknown policy an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n" + bolt + "content_sharing_policy = \"private\"\n", imported: "version = 3\n" + bolt + "content_sharing_policy = \"shared\"\n"},
+		{name: "an unknown policy under its version 1 name", conf: "[plugins.bolt]\ncontent_sharing_policy = \"private\"\n", invalid: "unknown policy: private"},
+		{name: "an unknown policy of a disabled plugin", conf: "version = 3\ndisabled_plugins = [\"io.containerd.metadata.v1.bolt\"]\n" + bolt + "content_sharing_policy = \"private\"\n", invalid: "doctor does not follow"},
+
+		{name: "a built-in snapshotter", conf: "version = 3\n" + images + "snapshotter = \"native\"\n"},
+		{name: "a proxy snapshotter", conf: "version = 3\n" + stargz + images + "snapshotter = \"stargz\"\n"},
+		{name: "a snapshotter nothing provides", conf: "version = 3\n" + images + "snapshotter = \"stargz\"\n", invalid: "failed to find snapshotter \"stargz\""},
+		{name: "an empty snapshotter", conf: "version = 3\n" + images + "snapshotter = \"\"\n", invalid: "failed to find snapshotter \"\""},
+		{name: "a proxy of another type", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"diff\"\n" + images + "snapshotter = \"stargz\"\n", invalid: "failed to find snapshotter \"stargz\""},
+		{name: "a proxy snapshotter an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"stargz\"\n", imported: "version = 3\n" + stargz},
+		{name: "a version 2 snapshotter nothing provides", conf: "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"stargz\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\n", invalid: "failed to find snapshotter \"stargz\""},
+		{name: "a runtime platform", conf: "version = 3\n" + images + "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.kata]\nplatform = \"linux/arm64/v8\"\nsnapshotter = \"anything\"\n"},
+		{name: "a runtime platform with a wildcard", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.kata]\nplatform = \"linux/*\"\n", invalid: "wildcards not yet supported"},
+
+		{name: "a task platform", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"arm64\"]\n"},
+		{name: "a task platform nothing knows", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"beos\"]\n", invalid: "invalid platform beos"},
+		{name: "a differ order", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"erofs\", \"walking\"]\n"},
+		{name: "a differ order naming none", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"walking\", \"zstd\"]\n", invalid: "needed differ not loaded: zstd"},
+		{name: "an unpack configuration", conf: "version = 3\n" + stargz + transfer + "platform = \"linux/amd64\"\nsnapshotter = \"stargz\"\ndiffer = \"walking\"\n"},
+		{name: "an unpack platform that does not parse", conf: "version = 3\n" + transfer + "platform = \"\"\nsnapshotter = \"overlayfs\"\n", invalid: "platform configuration  invalid"},
+		{name: "an unpack snapshotter nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", invalid: "snapshotter \"stargz\" not found"},
+		{name: "an unpack differ nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"zstd\"\n", invalid: "failed to get instance for diff plugin \"zstd\""},
+		{name: "an unpack configuration an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", imported: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"native\"\n"},
+
+		{name: "devmapper with no pool", conf: "version = 3\n" + devmapper + "fs_type = \"zfs\"\n"},
+		{name: "devmapper configured", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"xfs\"\n"},
+		{name: "devmapper with no image size", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\n", invalid: "failed to parse base image size"},
+		{name: "devmapper with an unknown filesystem", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"zfs\"\n", invalid: "unsupported Filesystem Type"},
+		{name: "an erofs default size", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"64 MiB\"\n"},
+		{name: "an erofs default size with no number", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"large\"\n", invalid: "failed to parse default_size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.imported != "" {
+				if err := os.WriteFile(filepath.Join(dir, "extra.toml"), []byte(tc.imported), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			table := registry
+			if !strings.Contains(tc.conf, "version = ") {
+				table = "[plugins.cri.registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			} else if strings.Contains(tc.conf, "version = 2") {
+				table = "[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			}
+			eff, err := ResolveContainerdConfig("", filepath.Join(dir, "config.toml"), []byte(tc.conf+table))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.invalid == "" && eff.Invalid != "" {
+				t.Errorf("refused a configuration containerd starts on: %s", eff.Invalid)
+			}
+			if tc.invalid != "" && !strings.Contains(eff.Invalid, tc.invalid) {
+				t.Errorf("Invalid = %q, want it to name %q", eff.Invalid, tc.invalid)
+			}
+		})
+	}
+}
+
+// The two parsers the init checks port answer as their sources do: Parse in
+// github.com/containerd/platforms v1.0.0-rc.2 and RAMInBytes in
+// github.com/docker/go-units v0.5.0, for whether a value parses at all.
+func TestContainerdPlatformAndSizeParsers(t *testing.T) {
+	for spec, ok := range map[string]bool{
+		"linux": true, "macOS": true, "windows(10.0.17763)": true, "arm64": true, "x86_64": true, "armhf": true,
+		"linux/amd64": true, "anything/atall": true, "linux/arm/v7": true, "linux/arm64/v8": true,
+		"": false, "beos": false, "linux/": false, "/amd64": false, "linux/amd64/v1/extra": false,
+		"linux/*": false, "lin ux/amd64": false, "linux(10)(11)": false, "linux/amd64(1)": false,
+	} {
+		if err := containerdPlatformError(spec); (err == nil) != ok {
+			t.Errorf("platform %q: error %v, want it to parse: %v", spec, err, ok)
+		}
+	}
+	for size, ok := range map[string]bool{
+		"10": true, "10b": true, "10k": true, "10KB": true, "10KiB": true, "1.5g": true, "10 GB": true, "32": true, ".5m": true, "10 ": true,
+		"": false, "large": false, "10x": false, "10kk": false, "10kbb": false, "10bb": false, "-1g": false, "10kib2x": false, "1.2.3g": false, "g": false,
+	} {
+		if err := containerdRAMSizeError(size); (err == nil) != ok {
+			t.Errorf("size %q: error %v, want it to parse: %v", size, err, ok)
+		}
+	}
+}

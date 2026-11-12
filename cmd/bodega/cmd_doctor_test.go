@@ -3531,3 +3531,52 @@ func TestAudit27HelmNullEntryRefusesBeforeWrites(t *testing.T) {
 		t.Errorf("ran %d system-store rebuild(s) before refusal", calls)
 	}
 }
+
+func TestAudit28ContainerdOperationRefusesBeforeWrites(t *testing.T) {
+	for name, extra := range map[string]string{
+		"metadata policy":     "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = \"audit-unknown\"\n",
+		"missing snapshotter": "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"audit-missing\"\n",
+		"runtime platform":    "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.runc]\nplatform = \"linux/amd64/bad/extra\"\n",
+		"debug level":         "[debug]\nlevel = \"audit-unknown\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name != "missing snapshotter" {
+				extra = "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n" + extra
+			}
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, "containerd")
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, "etc/containerd/config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(conf), 0600); err != nil {
+				t.Fatal(err)
+			}
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			oldRoot := doctorOCIRoot
+			doctorOCIRoot = home
+			t.Cleanup(func() { doctorOCIRoot = oldRoot })
+			for _, phase := range []string{"first", "idle"} {
+				out, err := runDoctor(t, "--configure", "oci", "--ca-file", caFile, "--url", srv.URL, "--apply")
+				if err == nil {
+					t.Errorf("%s apply certified containerd startup failure:\n%s", phase, out)
+				}
+			}
+			if got, _ := os.ReadFile(file); string(got) != conf {
+				t.Errorf("changed the parent before refusal: %s", got)
+			}
+			for _, path := range []string{".config/bodega/ca.pem", "etc/containerd/certs.d/docker.io/hosts.toml"} {
+				if _, err := os.Stat(filepath.Join(home, path)); !os.IsNotExist(err) {
+					t.Errorf("wrote %s before refusal: %v", path, err)
+				}
+			}
+		})
+	}
+}

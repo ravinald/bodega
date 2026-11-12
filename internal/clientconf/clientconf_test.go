@@ -4245,3 +4245,23 @@ func TestHelmRepoAddFileIsAccepted(t *testing.T) {
 		t.Errorf("read %+v from:\n%s", doc.Repositories, written)
 	}
 }
+
+func TestAudit28ContainerdOperationValidity(t *testing.T) {
+	for name, extra := range map[string]string{
+		"metadata policy":     "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = \"audit-unknown\"\n",
+		"missing snapshotter": "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"audit-missing\"\n",
+		"runtime platform":    "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.runc]\nplatform = \"linux/amd64/bad/extra\"\n",
+		"debug level":         "[debug]\nlevel = \"audit-unknown\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name != "missing snapshotter" {
+				extra = "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n" + extra
+			}
+			raw := []byte("version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n" + extra + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			eff, err := ResolveContainerdConfig("", filepath.Join(t.TempDir(), "config.toml"), raw)
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a parent policy containerd cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}

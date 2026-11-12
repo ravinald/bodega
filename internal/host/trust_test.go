@@ -2003,3 +2003,34 @@ func TestHelmRepoAddFileIsCertified(t *testing.T) {
 		t.Errorf("ordinary report on the file helm repo add writes: %+v", rows)
 	}
 }
+
+func TestAudit28ContainerdOperationIsUnchecked(t *testing.T) {
+	for name, extra := range map[string]string{
+		"metadata policy":     "[plugins.\"io.containerd.metadata.v1.bolt\"]\ncontent_sharing_policy = \"audit-unknown\"\n",
+		"missing snapshotter": "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"audit-missing\"\n",
+		"runtime platform":    "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.runc]\nplatform = \"linux/amd64/bad/extra\"\n",
+		"debug level":         "[debug]\nlevel = \"audit-unknown\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name != "missing snapshotter" {
+				extra = "[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n" + extra
+			}
+			p, ca, base := auditTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/config.toml"), "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n"+extra+"[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n")
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\ncapabilities = [\"pull\", \"resolve\"]\n")
+			if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+				t.Errorf("selected verdict certifies a runtime that cannot start: %+v", v)
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "containerd" {
+					return "/fixture/containerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("ordinary report certifies a runtime that cannot start: %+v", rows)
+			}
+		})
+	}
+}

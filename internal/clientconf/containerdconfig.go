@@ -3,6 +3,7 @@ package clientconf
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"reflect"
 	"slices"
@@ -358,9 +359,11 @@ type containerdLegacyCRI struct {
 	ImagePullWithSyncFs      bool                      `toml:"image_pull_with_sync_fs"`
 	StatsCollectPeriod       int                       `toml:"stats_collect_period"`
 	Containerd               struct {
-		Snapshotter                string `toml:"snapshotter"`
-		DisableSnapshotAnnotations bool   `toml:"disable_snapshot_annotations"`
-		DiscardUnpackedLayers      bool   `toml:"discard_unpacked_layers"`
+		// Snapshotter is a pointer because the migration moves the key when
+		// the table holds it, "" included.
+		Snapshotter                *string `toml:"snapshotter"`
+		DisableSnapshotAnnotations bool    `toml:"disable_snapshot_annotations"`
+		DiscardUnpackedLayers      bool    `toml:"discard_unpacked_layers"`
 		Runtimes                   map[string]struct {
 			SandboxMode string `toml:"sandbox_mode"`
 		} `toml:"runtimes"`
@@ -432,8 +435,13 @@ func newContainerdCRI(version int, legacy string) *containerdCRI {
 	// DefaultRuntimeConfig: the runtime every install starts with.
 	c.runtime.Containerd.DefaultRuntimeName = "runc"
 	c.runtime.Containerd.Runtimes = map[string]containerdRuntime{"runc": {Type: "io.containerd.runc.v2"}}
+	// DefaultImageConfig (internal/cri/config/config_unix.go): the snapshotter
+	// the image plugin looks up when no file names one.
+	c.images.Snapshotter = containerdDefaultSnapshotter
 	return c
 }
+
+const containerdDefaultSnapshotter = "overlayfs"
 
 func containerdPluginFailed(plugin string, err error) error {
 	return fmt.Errorf("the CRI %s, without which containerd serves no CRI pull, does not start on its table: %w", plugin, err)
@@ -471,21 +479,60 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 	if invalid == "" {
 		invalid = c.start.invalid(disabled, required)
 	}
+	if invalid == "" && !slices.Contains(disabled, containerdImagesPlugin) {
+		if err := c.imagesInit(disabled); err != nil {
+			invalid = containerdPluginFailed("image plugin", err).Error()
+		}
+	}
 	return criDisabled, invalid
+}
+
+// imagesConfig is the table the image plugin decodes once every file has
+// loaded: its own in a version 3 file, and what its migration builds in an
+// older one.
+func (c *containerdCRI) imagesConfig() containerdImageConfig {
+	if c.version >= 3 {
+		return c.images
+	}
+	// The image plugin's migration takes six keys by name and leaves the
+	// rest of the table to the runtime plugin. It moves [containerd]'s
+	// snapshotter only past a return it takes when that table holds no
+	// runtimes (migrateConfig in plugins/cri/images/plugin.go, lines 225-262).
+	m := c.moved
+	images := containerdImageConfig{Snapshotter: containerdDefaultSnapshotter, Registry: m.Registry, ImageDecryption: m.ImageDecryption,
+		MaxConcurrentDownloads: m.MaxConcurrentDownloads, ImagePullProgressTimeout: m.ImagePullProgressTimeout,
+		ImagePullWithSyncFs: m.ImagePullWithSyncFs, StatsCollectPeriod: m.StatsCollectPeriod}
+	if m.Containerd.Snapshotter != nil && m.Containerd.Runtimes != nil {
+		images.Snapshotter = *m.Containerd.Snapshotter
+	}
+	return images
+}
+
+// imagesInit is what the image plugin's InitFn refuses in its table past
+// ValidateImageConfig (plugins/cri/images/plugin.go, lines 106-143): a
+// snapshotter containerd holds no plugin for, and a runtime platform that
+// does not parse. initCRIService stops without the image plugin, so no
+// hosts.toml is read.
+func (c *containerdCRI) imagesInit(disabled []string) error {
+	images := c.imagesConfig()
+	if !c.start.provides("io.containerd.snapshotter.v1", images.Snapshotter, disabled) {
+		return fmt.Errorf("failed to find snapshotter %q", images.Snapshotter)
+	}
+	for _, name := range slices.Sorted(maps.Keys(images.RuntimePlatforms)) {
+		if p := images.RuntimePlatforms[name].Platform; p != "" {
+			if err := containerdPlatformError(p); err != nil {
+				return fmt.Errorf("unable to parse platform %q: %w", p, err)
+			}
+		}
+	}
+	return nil
 }
 
 // validate is what the three plugins refuse in the tables every loaded file
 // added up to: ValidateImageConfig, ValidateRuntimeConfig and
 // ValidateServerConfig. It runs once, after the last file.
 func (c *containerdCRI) validate() error {
-	images := c.images
-	if c.version < 3 {
-		// The image plugin's migration takes six keys by name and leaves the
-		// rest of the table to the runtime plugin.
-		m := c.moved
-		images = containerdImageConfig{Registry: m.Registry, ImageDecryption: m.ImageDecryption, MaxConcurrentDownloads: m.MaxConcurrentDownloads,
-			ImagePullProgressTimeout: m.ImagePullProgressTimeout, ImagePullWithSyncFs: m.ImagePullWithSyncFs, StatsCollectPeriod: m.StatsCollectPeriod}
-	}
+	images := c.imagesConfig()
 	if err := images.validate(); err != nil {
 		return containerdPluginFailed("image plugin", fmt.Errorf("invalid cri image config: %w", err))
 	}
