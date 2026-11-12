@@ -1,5 +1,5 @@
 // Command bodega manages a centralized package repository. Artifact bytes live
-// in a storage backend named by the config ("local" or "s3"); the eight
+// in a storage backend named by the config ("local", "s3" or "gcs"); the eight
 // artifact types are listed by `bodega --help` and enumerated in
 // manifest.AllTypes.
 //
@@ -132,7 +132,7 @@ func buildRootCmd(gf *globalFlags) *cobra.Command {
   npm     npm packages from a registry
   pypi    Python wheels built from a requirements set
 
-Artifact bytes live in a storage backend: "local" (a directory) or "s3".
+Artifact bytes live in a storage backend: "local" (a directory), "s3" or "gcs".
 storage_backend picks the default and storage_by_type can send one type
 somewhere else, so the S3 flags below apply only where an s3 backend is
 configured.

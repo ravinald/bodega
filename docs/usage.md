@@ -34,7 +34,7 @@ Comprehensive documentation for the bodega package repository manager.
 
 ### `bodega init [BACKEND]`
 
-Creates and configures the bucket behind an `s3` backend: the default backend, or the `storage_backends` entry named as the argument. It refuses a backend on the `local` driver, which needs no initialization, even when the config carries a `bucket` key. Idempotent: each step prints lowercase when the bucket was already correct and UPPERCASE when this run changed it.
+Creates and configures the bucket behind an `s3` or `gcs` backend: the default backend, or the `storage_backends` entry named as the argument. A driver name stands for the one backend on that driver, so `bodega init gcs` prepares the `gcs` backend of an install that has one. On a `gcs` backend the controls, the roles and the output differ from what follows; see [GCS setup](#gcs-setup). It refuses a backend on the `local` driver, which needs no initialization, even when the config carries a `bucket` key. Idempotent: each step prints lowercase when the bucket was already correct and UPPERCASE when this run changed it.
 
 ```text
 Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default")...
@@ -4212,13 +4212,14 @@ Each names the path and the config file the path came from, so the next move is 
 
 ### Storage backends
 
-bodega supports two storage backends:
+bodega supports three storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
   It is the only backend that carries per-object access state, and the only one on which a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next refill. See [Publication and access](#publication-and-access).
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption, versioning and lifecycle rules. Versioning is what a rewritten manifest's previous version survives in, so do not switch it off as a cost; the lifecycle rules already bound what it costs. See [S3 setup](#s3-setup).
+- **`gcs`**: Stores artifacts in a Google Cloud Storage bucket, through Google's own client and Application Default Credentials. Set `bucket`, then run `bodega init` to create the bucket with uniform bucket-level access, public access prevention, versioning and a lifecycle rule. See [GCS setup](#gcs-setup).
 
-Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
+Manifests follow the backend. On `s3` and `gcs` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
 
 A backend that fails to construct is not fatal for `bodega serve`. The server starts, `/healthz` and the `/api/v1/` routes answer, and every package route returns 503 naming no driver — the driver in the config is rarely the thing that broke. The reason is logged once at `ERROR` on startup, so it prints at the default `log_level` of 0:
 
@@ -4389,6 +4390,117 @@ Linode assigns each account its endpoint per region, and a key works only there:
 
 SeaweedFS, Garage and other stores are untested as well, and the same three keys are what they would be configured with.
 
+#### GCS setup
+
+**Config.** The `gcs` driver reads two keys: `bucket`, and `prefix` on a `storage_backends` entry. Nothing else about the store is configured in bodega.
+
+```json
+{
+  "storage_backend": "gcs",
+  "bucket": "example-bodega-artifacts",
+  "storage_backends": {
+    "archive": { "driver": "gcs", "bucket": "example-bodega-archive", "prefix": "cold" }
+  }
+}
+```
+
+`endpoint`, `path_style` and `checksums` belong to the `s3` driver, and a `gcs` backend that sets one fails to construct and says which keys to remove, rather than ignoring a setting someone wrote on purpose. `region` is ignored: the default backend always carries one, and a bucket's location is fixed when it is created.
+
+**Credentials** are Application Default Credentials and nothing else. bodega has no key for a credential file, on purpose: a path in its config would be a second place a long-lived key lives.
+
+- **On GCE**, attach a service account to the instance. The client reads its token from the metadata server, and `GOOGLE_CLOUD_PROJECT` is not needed because the instance names its project. The instance's access scopes must allow writes to Cloud Storage (`cloud-platform`, or `devstorage.read_write`): the default scope set is read-only for storage, and a write then fails with `403` however the role reads.
+- **Elsewhere**, set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key or a workload identity federation config, or run `gcloud auth application-default login` on a workstation. Credentials from `gcloud` name no project, so set `GOOGLE_CLOUD_PROJECT` before a `bodega init` that has to create the bucket.
+
+Google's client also reads `STORAGE_EMULATOR_HOST`, and sends every request there with no credentials. It is for an emulator; leave it unset on a host that serves anything.
+
+**Two roles, because there are two people.** `bodega init --print-policy` prints both, each as a custom role definition with the predefined role that covers it; `--print-policy=setup` or `--print-policy=runtime` prints one definition bare, ready to redirect into the file `gcloud iam roles create --file` reads. Nothing is dialed and no credentials are needed to print them.
+
+The setup role is for whoever runs `bodega init`. It deletes nothing:
+
+```yaml
+title: bodega setup
+description: Creates and configures the bucket behind a bodega gcs storage backend. Cannot delete a bucket or an object.
+stage: GA
+includedPermissions:
+  - storage.buckets.create
+  - storage.buckets.get
+  - storage.buckets.setIamPolicy
+  - storage.buckets.update
+```
+
+Creating a bucket is a project permission, so this role is bound on the project. The predefined role that covers it is `roles/storage.admin`, which can also delete buckets and read, write and delete every object in the project. Cloud Storage requires `storage.buckets.setIamPolicy` to change public access prevention, and that permission also lets its holder rewrite the bucket's IAM policy, so remove the binding once the bucket is prepared. For a bucket that already exists, the last three permissions bound on the bucket alone are enough.
+
+The runtime role is for the service, bound on the bucket:
+
+```yaml
+title: bodega runtime
+description: Reads, lists, writes and deletes objects for a bodega gcs storage backend. Cannot change the bucket.
+stage: GA
+includedPermissions:
+  - storage.objects.create
+  - storage.objects.delete
+  - storage.objects.get
+  - storage.objects.list
+```
+
+```bash
+gcloud iam roles create bodegaRuntime --project=PROJECT --file=runtime.yaml
+gcloud storage buckets add-iam-policy-binding gs://example-bodega-artifacts \
+  --member=serviceAccount:SERVICE_ACCOUNT_EMAIL --role=projects/PROJECT/roles/bodegaRuntime
+```
+
+The predefined role that covers it is `roles/storage.objectUser`, which also grants object metadata updates, restore, move, folders and multipart uploads. Neither holds a bucket permission, so a compromised service cannot switch off public access prevention, uniform bucket-level access or versioning.
+
+`storage.objects.delete` is there twice over: Cloud Storage requires it to replace an object as well as to remove one. It is also where this backend is weaker than `s3`. AWS separates deleting an object from deleting an earlier version, and the S3 runtime policy withholds the second; Cloud Storage has one permission for both, so the identity that can overwrite a manifest can also delete the generations versioning kept. What stands behind those is the bucket's soft delete window, 7 days on a new bucket, during which a deleted generation can be restored and cannot be removed for good. `bodega init` does not change the soft delete policy; lengthen it on the bucket if 7 days is short for how often you would notice.
+
+**`bodega init`** creates the bucket when it is missing, in the project `GOOGLE_CLOUD_PROJECT` or the credentials name and the location `--location` gives, and holds it to four controls:
+
+| Control                     | Setting                                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------------------------- |
+| uniform bucket-level access | on, so no object carries an ACL and access is the bucket's IAM policy alone                             |
+| public access prevention    | enforced                                                                                                |
+| object versioning           | on, so a rewritten manifest keeps its previous generation                                               |
+| lifecycle                   | noncurrent generations deleted 30 days after they are replaced, under every artifact prefix in one rule |
+
+```text
+Initializing bucket gs://example-bodega-artifacts (backend "default")...
+  bucket:     CREATED gs://example-bodega-artifacts in project example-project, US-CENTRAL1
+  access:     CONFIGURED (uniform bucket-level)
+  public:     CONFIGURED (public access prevention enforced)
+  versioning: ENABLED
+  lifecycle:  CONFIGURED (noncurrent versions after 30d, manifests/ and attestations/ kept)
+
+Bucket gs://example-bodega-artifacts is ready.
+```
+
+It is idempotent: a line reads lowercase when the bucket was already correct and UPPERCASE when this run changed it, and a bucket that is already correct is only read. A bucket that exists is changed in one patch, conditional on the metageneration the run read, so an edit someone made in between fails the run instead of being overwritten. `--location` applies to a create only (`us-central1`, `EU`, and so on); unset leaves the choice to Cloud Storage, and naming one for a bucket that exists somewhere else is refused, because a bucket's location cannot change. Cloud Storage encrypts every object at rest without being asked, so there is no encryption step, and it writes no prefix markers.
+
+The lifecycle rule names every prefix in [Storage Layout](#storage-layout) except `manifests/` and `attestations/`, which keep every generation for the reason the S3 rules do: when a compromised service overwrites a manifest or a signed envelope, the honest generation stays behind as noncurrent, and an expiry rule would remove it. No rule is needed for abandoned uploads: a resumable upload that never finishes is not an object, appears in no listing and expires after a week. A Cloud Storage rule has no ID, so `bodega init` recognizes its own by form: a delete of noncurrent generations scoped only to bodega's prefixes. Any other rule is yours and is written back unchanged, ahead of bodega's; a rule in that form that names `manifests/`, or a different period, is drift and the next `bodega init` rewrites it. The period is `NoncurrentVersionDays` in `internal/gcs/gcs.go`. A named backend with a `prefix` gets its rule at the bucket root, not under the prefix, so its noncurrent generations do not expire.
+
+**`bodega init check`** answers "do these credentials hold the runtime role" by asking Cloud Storage's `testIamPermissions` about each permission. It writes nothing, and unlike the S3 check it leaves nothing unproven, delete included:
+
+```text
+Checking gs://example-bodega-artifacts (backend "default") with Application Default Credentials...
+  storage.objects.create   missing; grant it on gs://example-bodega-artifacts
+  storage.objects.delete   allowed
+  storage.objects.get      allowed
+  storage.objects.list     allowed
+Error: these credentials lack storage.objects.create; `bodega init --print-policy=runtime` prints the role that grants them. If it was granted in the last minute, re-run this check once before changing it
+```
+
+Two things it cannot see. `testIamPermissions` answers for IAM alone, so a GCE instance whose access scopes are read-only passes the check and still fails to write. And an error raised before the API answers (no credentials resolved, an expired login, a dead network) is not a missing permission: `check` reports it as no answer and draws no conclusion about the role.
+
+**The conformance suite.** The `gcs` driver is held to the same `ObjectStore` contract as every other, twice. `TestGCSDriverKeepsTheContractOffline` runs every case through Google's client against an in-process fake on every `go test`, which holds bodega's wrapper to the contract and proves nothing about the service. `TestObjectStoreConformance/gcs` runs the same cases against real buckets, behind a gate:
+
+```bash
+GOOGLE_CLOUD_PROJECT=example-project BODEGA_GCS_CONFORMANCE=1 \
+  go test ./internal/storage/ -run 'TestObjectStoreConformance/gcs|TestLabel' -v
+```
+
+Unset, the `gcs` backend skips when Application Default Credentials yield no token or no project. With `BODEGA_GCS_CONFORMANCE` set to anything, that is a failure, for the reason [the S3 gate](#the-s3-conformance-suite) gives: a suite that quietly skips the one driver it was run for reports the same green as one that passed. Each store gets its own bucket, named `bodega-conf-` plus 24 hex characters and created without versioning or soft delete so teardown leaves nothing billed. The credentials therefore need `storage.buckets.create` and `storage.buckets.delete` on the project as well as the four runtime permissions; an IAM condition on `resource.name.startsWith("projects/_/buckets/bodega-conf-")` contains the grant to those buckets. A bucket teardown cannot remove fails the test binary and prints its `gs://` URI.
+
+The driver's write path is conditional. Each write reads the key's generation and uploads on the precondition that it has not changed (or that the key is still absent), which is what lets Google's client retry an upload safely; when another writer wins that race the write reads again and retries, up to five times, and then fails with nothing published.
+
 ### Publication and access
 
 Every backend publishes rather than overwrites. A key names the object it named before a write or the object the write stores, never something in between, whichever backend placement sent it to:
@@ -4399,15 +4511,17 @@ Every backend publishes rather than overwrites. A key names the object it named 
 
 What differs per backend is access, and it differs in the direction that matters:
 
-|                                                  | `local`        | `s3`                    |
-| ------------------------------------------------ | -------------- | ----------------------- |
-| Refill preserves mode, owner, group, ACL, xattrs | yes            | nothing to preserve     |
-| A restriction survives the next refill           | yes            | no                      |
-| Bytes on disk when the write returns             | not guaranteed | the service's guarantee |
+|                                                  | `local`        | `s3`                    | `gcs`                   |
+| ------------------------------------------------ | -------------- | ----------------------- | ----------------------- |
+| Refill preserves mode, owner, group, ACL, xattrs | yes            | nothing to preserve     | nothing to preserve     |
+| A restriction survives the next refill           | yes            | no                      | no                      |
+| Bytes on disk when the write returns             | not guaranteed | the service's guarantee | the service's guarantee |
 
 **On `local`, a restriction is a decision and a refill is not.** Refilling an object restates everything it carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, applied to the staging file inside a directory nothing else can enter. The ACL goes on after the mode, because on ZFS a `chmod` rewrites an NFSv4 ACL and drops every entry the mode cannot express. So a reader the artifact denied stays denied. On FreeBSD both kinds of ACL are carried: POSIX.1e on UFS mounted `-o acls`, and NFSv4 on ZFS or UFS mounted `-o nfsv4acls`. Where the server cannot restate one of them, the refill fails, names which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not something a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group. An ACL the filesystem under the key does not keep is the other: an NFSv4 ACL on an object sitting on a UFS that keeps POSIX.1e, or none, refuses the refill with `the object's NFSv4 ACL cannot travel to a filesystem that keeps POSIX.1e ACLs` rather than landing the artifact without it. A new object has nothing to carry and lands at the mode the server's umask allows. On FreeBSD a UFS mounted without `acls` or `nfsv4acls` keeps no ACL for the staging file to be confirmed free of, so a refill there is refused with `the filesystem reports that it keeps neither NFSv4 nor POSIX.1e ACLs` and the previous object stays; a new object still lands. Keep the storage root on ZFS, or mount the UFS with one of those options.
 
 **On `s3`, it is not.** The backend reads and writes no per-object mode, owner or ACL, so there is nothing a refill can widen and equally nothing it preserves. An object ACL or a bucket policy applied outside bodega is not carried across a refill: the next write is a plain `PUT`. An artifact whose restriction has to survive refills belongs on a `local` backend, which per-package placement can arrange.
+
+**On `gcs`, there is nothing per object to keep.** `bodega init` turns on uniform bucket-level access, under which an object has no ACL and access is the bucket's IAM policy alone, so a refill can neither widen nor preserve anything.
 
 **Durability.** On `local`, a write returns after the rename with no `fsync`, so a host that loses power moments later can come up holding either object. The guarantees above survive that; the bytes may not. Every artifact the store holds is refetchable from an upstream or rebuildable from source, and the alternative is an `fsync` on every proxy cache fill. Mount the storage tree with your filesystem's own barrier settings if you need the other trade.
 
@@ -4432,7 +4546,7 @@ What differs per backend is access, and it differs in the direction that matters
 }
 ```
 
-Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket`, `region`, `endpoint`, `path_style` and `checksums` by `s3` (the last three are for [S3-compatible stores](#s3-compatible-stores)); `prefix` roots every key under it, on either driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
+Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket`, `region`, `endpoint`, `path_style` and `checksums` by `s3` (the last three are for [S3-compatible stores](#s3-compatible-stores)); `bucket` alone by `gcs`; `prefix` roots every key under it, on any driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
 
 A `prefix` must be spelled canonically. A leading and a trailing `/` are stripped, so `cold/x`, `/cold/x` and `cold/x/` are one prefix and all three load. An empty segment or a `.` segment is refused, because they are a second spelling of a directory rather than a second directory:
 
@@ -4633,11 +4747,13 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 
 | Environment variable                                                     | Purpose                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REPO_BUCKET`                                                            | S3 bucket name, when the backend is S3                                                                                                                                                                                                                                      |
+| `REPO_BUCKET`                                                            | Bucket name, when the backend is S3 or GCS                                                                                                                                                                                                                                  |
 | `AWS_REGION`                                                             | AWS region of the default backend, over `region` in the config (default: `us-west-2`). A named entry in `storage_backends` with no `region` of its own takes neither the config's `region` nor that default: the AWS SDK's chain resolves one, reading this variable itself |
 | `AWS_PROFILE`, `AWS_ACCESS_KEY_ID` and the rest of the AWS default chain | Credentials for an S3 backend. bodega has no credential key of its own; see [S3 setup](#s3-setup)                                                                                                                                                                           |
 | `AWS_DEFAULT_REGION`                                                     | Read by the AWS SDK's chain, after `AWS_REGION`, for a named backend that sets no `region`. bodega's default backend does not read it                                                                                                                                       |
 | `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`                                | Read by the AWS SDK: points S3 calls at an S3-compatible store instead of AWS. Overridden per backend by the `endpoint` key; see [S3-compatible stores](#s3-compatible-stores)                                                                                              |
+| `GOOGLE_APPLICATION_CREDENTIALS`                                         | Read by Application Default Credentials, which are the only credentials a GCS backend takes. bodega has no credential key of its own; see [GCS setup](#gcs-setup)                                                                                                           |
+| `GOOGLE_CLOUD_PROJECT`                                                   | The project `bodega init` creates a GCS bucket in, ahead of the one the credentials name                                                                                                                                                                                    |
 | `AWS_REQUEST_CHECKSUM_CALCULATION`, `AWS_RESPONSE_CHECKSUM_VALIDATION`   | Read by the AWS SDK: `when_supported` or `when_required`. Both are overridden per backend by the `checksums` key. No variable selects path-style addressing; `path_style` is the only setting for it                                                                        |
 | `BOOTSTRAP_BUILD_ROOT`                                                   | Local build directory (default `/opt/bodega`). Overridden by `--build-root`                                                                                                                                                                                                 |
 | `BODEGA_MANIFEST_DIR`                                                    | Manifest directory (default: `{storage_path}/manifests`). Overridden by `--manifest-dir`.                                                                                                                                                                                   |
@@ -9083,7 +9199,7 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 ### Details pane
 
-Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one on AWS and `s3+<scheme>://<host>/<bucket>` for one reached through an `endpoint` that is not AWS's own (see [how a label is derived](#storage-backends)). Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
+Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `gs://<bucket>` for a gcs one, `s3://<bucket>` for an s3 one on AWS and `s3+<scheme>://<host>/<bucket>` for one reached through an `endpoint` that is not AWS's own (see [how a label is derived](#storage-backends)). Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
 The last fields of an entry are its client configuration: the file a client of that type installs, as [Client configuration](#client-configuration) shows it, with a **Path** row under it naming where the file goes on each operating system. The label names the file rather than assuming a URL: **pip.conf**, **.npmrc**, **Cargo config**, **Go env**, **repositories.yaml** for helm, **Git config**, **make.conf**, **Sources** for apt, **Repository conf** for freebsd. A binary, and a git entry's stored bundle, get a **Package URL** instead, which has no path. The pane renders through the same package as `client_config` on `GET /api/v1/packages/{type}/{name}` and the web dashboard, and every value carries the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches. A type with several variants shows one: the suite described below for apt, the first ABI that renders for freebsd, the first version for a binary or a git bundle.
 
@@ -9245,7 +9361,7 @@ Release archives are GoReleaser's, at tag time: `.goreleaser.yaml` builds `linux
 
 ### The S3 conformance suite
 
-Every `ObjectStore` driver is held to one contract by `TestObjectStoreConformance` in `internal/storage/conformance_test.go`. `local`, `memory` and `prefixed` run on any laptop. The `s3` driver talks to real AWS, so it has a gate.
+Every `ObjectStore` driver is held to one contract by `TestObjectStoreConformance` in `internal/storage/conformance_test.go`. `local`, `memory` and `prefixed` run on any laptop. The `s3` driver talks to real AWS, so it has a gate. The `gcs` driver has its own, `BODEGA_GCS_CONFORMANCE`; see [GCS setup](#gcs-setup).
 
 ```bash
 BODEGA_S3_CONFORMANCE=1 go test ./internal/storage/ -run 'TestObjectStoreConformance|TestInitBucketAgainstALiveBucket|TestLabel'

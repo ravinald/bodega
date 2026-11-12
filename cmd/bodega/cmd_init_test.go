@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 
+	bogcs "github.com/ravinald/bodega/internal/gcs"
+	"github.com/ravinald/bodega/internal/gcs/gcstest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -363,4 +365,182 @@ func TestInitAgainstACompatibleStore(t *testing.T) {
 			t.Errorf("marker PUT carried no CRC32 with checksums unset; the when_required case above proves nothing: %v", store.markerCRCs)
 		}
 	})
+}
+
+// gcsInit runs `bodega init` with the SDK pointed at an in-process Cloud
+// Storage fake through STORAGE_EMULATOR_HOST, the SDK's own switch, so the
+// command builds its client exactly as it does against the service.
+func gcsInit(t *testing.T, srv *gcstest.Server, config string, args ...string) (string, error) {
+	t.Helper()
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.Host())
+	t.Setenv(bogcs.ProjectEnv, "example-project")
+	return runInit(t, config, args...)
+}
+
+// TestInitGCS covers `bodega init` on the gcs driver end to end: the driver
+// name as the argument, a create with all four controls in the project and
+// location given, an idempotent second run, a named backend, and the flags
+// that belong to the other driver.
+func TestInitGCS(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts",
+	  "storage_backends": {"bulk": {"driver": "local", "path": "/srv/bulk"}}}`
+
+	t.Run("init gcs creates and configures the bucket", func(t *testing.T) {
+		srv := gcstest.New(t)
+		out, err := gcsInit(t, srv, cfg, "gcs", "--location", "us-central1")
+		if err != nil {
+			t.Fatalf("err = %v\n%s", err, out)
+		}
+		for _, want := range []string{
+			`Initializing bucket gs://example-bodega-artifacts (backend "default")`,
+			"CREATED gs://example-bodega-artifacts in project example-project, US-CENTRAL1",
+			"Bucket gs://example-bodega-artifacts is ready.",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%s", want, out)
+			}
+		}
+		b := srv.Bucket("example-bodega-artifacts")
+		if b == nil {
+			t.Fatal("no bucket was created")
+		}
+		raw, _ := json.Marshal(b)
+		for _, want := range []string{
+			`"uniformBucketLevelAccess":{"enabled":true`, `"publicAccessPrevention":"enforced"`, `"versioning":{"enabled":true}`,
+			`"daysSinceNoncurrentTime":30`, `"isLive":false`, `"location":"US-CENTRAL1"`,
+		} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("created bucket lacks %s:\n%s", want, raw)
+			}
+		}
+		if strings.Contains(string(raw), `"manifests/"`) || strings.Contains(string(raw), `"attestations/"`) {
+			t.Errorf("the lifecycle rule names a prefix whose history is kept:\n%s", raw)
+		}
+
+		out, err = gcsInit(t, srv, cfg)
+		if err != nil || strings.Contains(out, "CREATED") || strings.Contains(out, "CONFIGURED") || strings.Contains(out, "ENABLED") {
+			t.Errorf("second run, no argument: err %v, want every line lowercase:\n%s", err, out)
+		}
+	})
+
+	t.Run("named backend", func(t *testing.T) {
+		srv := gcstest.New(t)
+		named := `{"storage_backends": {"archive": {"driver": "gcs", "bucket": "example-archive", "prefix": "cold"}}}`
+		out, err := gcsInit(t, srv, named, "archive")
+		if err != nil || srv.Bucket("example-archive") == nil || !strings.Contains(out, `(backend "archive")`) || !strings.Contains(out, "prefix:     cold is not applied") {
+			t.Errorf("err %v, bucket %v:\n%s", err, srv.Bucket("example-archive"), out)
+		}
+		// The driver name finds the one backend on it.
+		if out, err := gcsInit(t, srv, named, "gcs"); err != nil || !strings.Contains(out, `(backend "archive")`) {
+			t.Errorf("init gcs with one gcs backend: err %v:\n%s", err, out)
+		}
+	})
+
+	t.Run("refusals", func(t *testing.T) {
+		srv := gcstest.New(t)
+		two := `{"storage_backend": "gcs", "bucket": "one-bucket", "storage_backends": {"archive": {"driver": "gcs", "bucket": "two-bucket"}}}`
+		for _, tc := range []struct {
+			name, config string
+			args         []string
+			want         string
+		}{
+			{"driver name with two backends", two, []string{"gcs"}, "2 storage backends use the gcs driver (default, archive)"},
+			{"driver name with none", `{"storage_backend": "s3", "bucket": "b-b"}`, []string{"gcs"}, "no storage backend uses the gcs driver"},
+			{"allow-unsupported is s3's", cfg, []string{"--allow-unsupported"}, "--allow-unsupported is for an S3-compatible store"},
+			{"location is gcs's", `{"storage_backend": "s3", "bucket": "b-b"}`, []string{"--location", "us-central1"}, "--location places a new gcs bucket"},
+			{"no bucket", `{"storage_backend": "gcs"}`, nil, "a bucket is required"},
+			{"named, no bucket", `{"storage_backends": {"archive": {"driver": "gcs"}}}`, []string{"archive"}, `storage_backends["archive"] uses the gcs driver and names no bucket`},
+			{"invalid bucket name", `{"storage_backend": "gcs", "bucket": "Not_A*Bucket"}`, nil, "not a valid Cloud Storage bucket name"},
+			{"local stays refused", cfg, []string{"bulk"}, `"bulk" uses the local driver`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := gcsInit(t, srv, tc.config, tc.args...)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("err = %v, want %q", err, tc.want)
+				}
+			})
+		}
+		if n := len(srv.Requests()); n != 0 {
+			t.Errorf("a refused run reached the API %d times: %v", n, srv.Requests())
+		}
+	})
+
+	t.Run("credentials are Application Default Credentials", func(t *testing.T) {
+		t.Setenv("STORAGE_EMULATOR_HOST", "")
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "absent.json"))
+		_, err := runInit(t, cfg)
+		if err == nil || !strings.Contains(err.Error(), "Application Default Credentials") {
+			t.Errorf("err = %v, want the missing credentials named as ADC", err)
+		}
+	})
+}
+
+// TestInitGCSPrintPolicy: one role prints as the bare definition gcloud
+// reads, both print with who each is for, and neither needs credentials or
+// reaches the API.
+func TestInitGCSPrintPolicy(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts"}`
+	srv := gcstest.New(t)
+	for which, role := range map[string]bogcs.Role{"setup": bogcs.SetupRole(), "runtime": bogcs.RuntimeRole()} {
+		out, err := gcsInit(t, srv, cfg, "--print-policy="+which)
+		if err != nil || out != role.YAML() {
+			t.Errorf("--print-policy=%s: err %v, output is not the bare role definition:\n%s", which, err, out)
+		}
+	}
+	out, err := gcsInit(t, srv, cfg, "--print-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"setup: for whoever runs `bodega init`; creates and configures gs://example-bodega-artifacts and cannot delete it",
+		"bind on:    the project", "predefined: roles/storage.admin",
+		"runtime: for the service", "bind on:    the bucket", "predefined: roles/storage.objectUser",
+		bogcs.SetupRole().YAML(), bogcs.RuntimeRole().YAML(),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--print-policy lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := gcsInit(t, srv, cfg, "--print-policy=both"); err == nil || !strings.Contains(err.Error(), "want setup, runtime") {
+		t.Errorf("unknown value: err = %v", err)
+	}
+	if n := len(srv.Requests()); n != 0 {
+		t.Errorf("printing roles reached the API %d times: %v", n, srv.Requests())
+	}
+}
+
+// TestInitCheckGCS: the check names each runtime permission, exits non-zero
+// naming the ones missing, and writes nothing.
+func TestInitCheckGCS(t *testing.T) {
+	const cfg = `{"storage_backend": "gcs", "bucket": "example-bodega-artifacts"}`
+	srv := gcstest.New(t)
+	srv.AddBucket("example-bodega-artifacts")
+
+	out, err := gcsInit(t, srv, cfg, "check")
+	if err != nil {
+		t.Fatalf("err = %v\n%s", err, out)
+	}
+	for _, want := range append([]string{
+		`Checking gs://example-bodega-artifacts (backend "default") with Application Default Credentials...`,
+		"these credentials hold everything the runtime role grants",
+	}, bogcs.RuntimeRole().Permissions...) {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+
+	srv.Deny("storage.objects.create")
+	out, err = gcsInit(t, srv, cfg, "check", "gcs")
+	if err == nil || !strings.Contains(err.Error(), "these credentials lack storage.objects.create") ||
+		!strings.Contains(err.Error(), "`bodega init --print-policy=runtime`") {
+		t.Errorf("err = %v, want the missing permission and the command that prints the role\n%s", err, out)
+	}
+	if !strings.Contains(out, "storage.objects.create   missing; grant it on gs://example-bodega-artifacts") {
+		t.Errorf("output does not say where to grant it:\n%s", out)
+	}
+	for _, r := range srv.Requests() {
+		if !strings.HasPrefix(r, "GET ") {
+			t.Errorf("check wrote to the bucket: %s", r)
+		}
+	}
 }

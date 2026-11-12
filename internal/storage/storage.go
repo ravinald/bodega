@@ -1,6 +1,6 @@
 // Package storage defines the ObjectStore interface for pluggable object
-// storage backends. The default backend is the local filesystem; S3 is
-// available when configured. GCS and Azure can be added via build tags.
+// storage backends. The default backend is the local filesystem; S3 and GCS
+// are available when configured.
 //
 // This package must never import internal/manifest. Placement is recorded in
 // the manifest and resolved by internal/server, which owns both imports; see
@@ -176,9 +176,9 @@ type ObjectInfo struct {
 // could not be instantiated twice with different parameters, which is what
 // naming backends requires.
 type Spec struct {
-	Driver string // "local" | "s3"
+	Driver string // "local" | "s3" | "gcs"
 	Path   string // local: filesystem root
-	Bucket string // s3
+	Bucket string // s3, gcs
 	Region string // s3
 	Prefix string // key prefix within the backend
 
