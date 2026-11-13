@@ -179,7 +179,7 @@ type (
 	}
 )
 
-func containerdTable[T any]() any { return new(T) }
+func containerdZero[T any]() any { return new(T) }
 
 // containerdInit is the part of a plugin's InitFn at containerd v2.2.0 that
 // its decoded table decides alone, whatever the host: an enumeration, a
@@ -409,7 +409,7 @@ var containerdPlugins = map[string]func() any{
 	"io.containerd.content.v1.content": nil,
 	"io.containerd.cri.v1.images":      nil,
 	"io.containerd.cri.v1.runtime":     nil,
-	"io.containerd.differ.v1.erofs":    containerdTable[containerdErofsDiffConfig],
+	"io.containerd.differ.v1.erofs":    containerdZero[containerdErofsDiffConfig],
 	"io.containerd.differ.v1.walking":  nil,
 	"io.containerd.event.v1.exchange":  nil,
 	"io.containerd.gc.v1.scheduler": func() any {
@@ -436,13 +436,13 @@ var containerdPlugins = map[string]func() any{
 	"io.containerd.image-verifier.v1.bindir": func() any {
 		return &containerdVerifierConfig{BinDir: "/opt/containerd/image-verifier/bin", MaxVerifiers: 10, PerVerifierTimeout: containerdDuration(10 * time.Second)}
 	},
-	"io.containerd.internal.v1.opt":              containerdTable[containerdOptConfig],
-	"io.containerd.internal.v1.tracing":          containerdTable[containerdTraceConfig],
+	"io.containerd.internal.v1.opt":              func() any { return &containerdOptConfig{Path: "/opt/containerd"} },
+	"io.containerd.internal.v1.tracing":          containerdZero[containerdTraceConfig],
 	"io.containerd.lease.v1.manager":             nil,
 	"io.containerd.metadata.v1.bolt":             func() any { return &containerdBoltConfig{ContentSharingPolicy: "shared"} },
-	"io.containerd.monitor.container.v1.restart": containerdTable[containerdRestartConfig],
-	"io.containerd.monitor.task.v1.cgroups":      containerdTable[containerdCgroupsConfig],
-	"io.containerd.mount-handler.v1.erofs":       containerdTable[containerdErofsMountConfig],
+	"io.containerd.monitor.container.v1.restart": func() any { return &containerdRestartConfig{Interval: containerdDuration(10 * time.Second)} },
+	"io.containerd.monitor.task.v1.cgroups":      containerdZero[containerdCgroupsConfig],
+	"io.containerd.mount-handler.v1.erofs":       containerdZero[containerdErofsMountConfig],
 	"io.containerd.mount-manager.v1.bolt":        nil,
 	"io.containerd.nri.v1.nri": func() any {
 		return &containerdNRIConfig{
@@ -452,7 +452,7 @@ var containerdPlugins = map[string]func() any{
 		}
 	},
 	"io.containerd.podsandbox.controller.v1.podsandbox": nil,
-	"io.containerd.runtime.v2.task":                     containerdTable[containerdTaskConfig],
+	"io.containerd.runtime.v2.task":                     containerdZero[containerdTaskConfig],
 	"io.containerd.sandbox.controller.v1.shim":          nil,
 	"io.containerd.sandbox.store.v1.local":              nil,
 	"io.containerd.service.v1.containers-service":       nil,
@@ -462,17 +462,17 @@ var containerdPlugins = map[string]func() any{
 	"io.containerd.service.v1.introspection-service":    nil,
 	"io.containerd.service.v1.namespaces-service":       nil,
 	"io.containerd.service.v1.snapshots-service":        nil,
-	"io.containerd.service.v1.tasks-service":            containerdTable[containerdTasksServiceConfig],
-	"io.containerd.shim.v1.manager":                     containerdTable[containerdShimConfig],
-	"io.containerd.snapshotter.v1.blockfile":            containerdTable[containerdBlockfileConfig],
-	"io.containerd.snapshotter.v1.btrfs":                containerdTable[containerdRootPathConfig],
-	"io.containerd.snapshotter.v1.devmapper":            containerdTable[containerdDevmapperConfig],
-	"io.containerd.snapshotter.v1.erofs":                containerdTable[containerdErofsConfig],
-	"io.containerd.snapshotter.v1.native":               containerdTable[containerdRootPathConfig],
-	"io.containerd.snapshotter.v1.overlayfs":            containerdTable[containerdOverlayConfig],
-	"io.containerd.snapshotter.v1.zfs":                  containerdTable[containerdRootPathConfig],
+	"io.containerd.service.v1.tasks-service":            containerdZero[containerdTasksServiceConfig],
+	"io.containerd.shim.v1.manager":                     containerdZero[containerdShimConfig],
+	"io.containerd.snapshotter.v1.blockfile":            containerdZero[containerdBlockfileConfig],
+	"io.containerd.snapshotter.v1.btrfs":                containerdZero[containerdRootPathConfig],
+	"io.containerd.snapshotter.v1.devmapper":            containerdZero[containerdDevmapperConfig],
+	"io.containerd.snapshotter.v1.erofs":                containerdZero[containerdErofsConfig],
+	"io.containerd.snapshotter.v1.native":               containerdZero[containerdRootPathConfig],
+	"io.containerd.snapshotter.v1.overlayfs":            containerdZero[containerdOverlayConfig],
+	"io.containerd.snapshotter.v1.zfs":                  containerdZero[containerdRootPathConfig],
 	"io.containerd.streaming.v1.manager":                nil,
-	"io.containerd.tracing.processor.v1.otlp":           containerdTable[containerdOTLPConfig],
+	"io.containerd.tracing.processor.v1.otlp":           containerdZero[containerdOTLPConfig],
 	"io.containerd.transfer.v1.local": func() any {
 		return &containerdTransferConfig{MaxConcurrentDownloads: 3, MaxConcurrentUploadedLayers: 3, MaxConcurrentUnpacks: 1}
 	},
@@ -490,22 +490,22 @@ var containerdProxyTypes = map[string]string{
 	"io.containerd.differ.v1": "io.containerd.differ.v1", "diff": "io.containerd.differ.v1",
 }
 
-// containerdStart is what New in cmd/containerd/server/server.go at
-// containerd v2.2.0 reads of config.toml before it serves anything, outside
-// the CRI plugins' own tables: the timeouts it parses, the TLS pair of the
-// TCP listener, the proxy plugins it registers, the table every registered
-// plugin decodes, and required_plugins. New returns an error or panics on
-// each, and containerd exits; no hosts.toml is read then, whatever the CRI
-// tables say.
+// containerdStart is what the containerd v2.2.0 command and New in
+// cmd/containerd/server/server.go read of config.toml before containerd
+// serves anything, outside the CRI plugins' own tables: the daemon's own
+// keys, the proxy plugins New registers, the table every registered plugin
+// decodes, and required_plugins. containerd exits on a failure in any of
+// them; no hosts.toml is read then, whatever the CRI tables say.
 //
-// Like containerdCRI it is filled one file at a time, since New runs on what
-// config.toml and its imports add up to: mergeConfig lets an import's
-// timeouts and proxy_plugins replace the main file's by key.
+// Like containerdCRI it is filled one file at a time, since the command runs
+// on what config.toml and its imports add up to.
 type containerdStart struct {
-	timeouts map[string]string
-	proxies  map[string]containerdProxyPlugin
-	tlsCert  string
-	tlsCName string
+	// top is the daemon's own keys as the command holds them once every file
+	// has loaded: its defaults with each file merged over them. It is kept
+	// whole, because the command goes on reading it after New returns
+	// (cmd/containerd/command/main.go, lines 245-284), and a key dropped here
+	// is one nothing can refuse.
+	top *containerdServerConfig
 	// tables is the first decode error of each registered plugin's table, by
 	// plugin URI. It is judged once the files are all loaded, because New
 	// decodes no table of a plugin disabled_plugins names.
@@ -515,12 +515,6 @@ type containerdStart struct {
 	// table decoded over it. It is kept past the decode because a plugin's
 	// InitFn refuses values of the right type too.
 	values map[string]any
-	// What the containerd command reads before it calls New
-	// (cmd/containerd/command/main.go, lines 143-160): the log level and
-	// format, and the two directories. An import's value replaces the main
-	// file's unless it is empty.
-	logLevel, logFormat string
-	root, state         string
 }
 
 // containerdPluginURI is the plugin a table named name in a config.toml of
@@ -553,26 +547,7 @@ func (s *containerdStart) load(data []byte, version int) error {
 	if err != nil {
 		return err
 	}
-	if s.timeouts == nil {
-		s.timeouts, s.proxies, s.tables, s.values = map[string]string{}, map[string]containerdProxyPlugin{}, map[string]error{}, map[string]any{}
-		// defaultConfig in cmd/containerd/command/config.go.
-		s.root, s.state = "/var/lib/containerd", "/run/containerd"
-	}
-	for _, field := range []struct{ to, from *string }{
-		{&s.logLevel, &cfg.Debug.Level}, {&s.logFormat, &cfg.Debug.Format}, {&s.root, &cfg.Root}, {&s.state, &cfg.State},
-	} {
-		if *field.from != "" {
-			*field.to = *field.from
-		}
-	}
-	maps.Copy(s.timeouts, cfg.Timeouts)
-	maps.Copy(s.proxies, cfg.ProxyPlugins)
-	if cfg.GRPC.TCPTLSCert != "" {
-		s.tlsCert = cfg.GRPC.TCPTLSCert
-	}
-	if cfg.GRPC.TCPTLSCName != "" {
-		s.tlsCName = cfg.GRPC.TCPTLSCName
-	}
+	containerdMerge(reflect.ValueOf(s.top).Elem(), reflect.ValueOf(cfg).Elem())
 	for _, name := range slices.Sorted(maps.Keys(cfg.Plugins)) {
 		uri := containerdPluginURI(name, version)
 		table := containerdPlugins[uri]
@@ -693,7 +668,7 @@ func (s *containerdStart) providers(typ string, disabled []string) map[string]co
 			found[id] = containerdProvider{skipped, host}
 		}
 	}
-	for name, proxy := range s.proxies {
+	for name, proxy := range s.top.ProxyPlugins {
 		if containerdProxyTypes[proxy.Type] == typ && !slices.Contains(disabled, typ+"."+name) {
 			found[name] = containerdProvider{}
 		}
@@ -765,40 +740,6 @@ func (s *containerdStart) collect(typ string, disabled []string) error {
 // containerdDefaultDiffer is DefaultDiffer in defaults/defaults_linux.go.
 const containerdDefaultDiffer = "walking"
 
-// containerdReached is every plugin with a table that containerd v2.2.0
-// initializes on the way to serving a CRI pull: the transitive Requires of
-// io.containerd.grpc.v1.cri and io.containerd.cri.v1.images in the Linux
-// release, which name types and so take in every plugin of each type. A
-// plugin outside it (opt, tracing, the restart monitor) can fail without
-// taking the CRI service with it.
-//
-// The value lists the keys of that table whose every value the port follows
-// to the end of the plugin's InitFn. Any other key is followed at one value
-// only, the one the plugin registers: what a snapshotter does with another
-// root, or a verifier with another directory, is decided by code and host
-// state nothing here reads.
-var containerdReached = map[string][]string{
-	"io.containerd.differ.v1.erofs":          nil,
-	"io.containerd.gc.v1.scheduler":          nil,
-	"io.containerd.image-verifier.v1.bindir": nil,
-	"io.containerd.metadata.v1.bolt":         {"content_sharing_policy"},
-	"io.containerd.monitor.task.v1.cgroups":  nil,
-	"io.containerd.mount-handler.v1.erofs":   nil,
-	"io.containerd.nri.v1.nri":               nil,
-	"io.containerd.runtime.v2.task":          {"platforms"},
-	"io.containerd.service.v1.diff-service":  {"default"},
-	"io.containerd.service.v1.tasks-service": nil,
-	"io.containerd.shim.v1.manager":          nil,
-	"io.containerd.snapshotter.v1.blockfile": nil,
-	"io.containerd.snapshotter.v1.btrfs":     nil,
-	"io.containerd.snapshotter.v1.devmapper": nil,
-	"io.containerd.snapshotter.v1.erofs":     nil,
-	"io.containerd.snapshotter.v1.native":    nil,
-	"io.containerd.snapshotter.v1.overlayfs": nil,
-	"io.containerd.snapshotter.v1.zfs":       nil,
-	"io.containerd.transfer.v1.local":        {"unpack_config"},
-}
-
 // containerdSameValue reports whether two decoded values are the same
 // configuration: an empty list is one a file left out, and a table behind a
 // pointer is compared by what it holds.
@@ -830,44 +771,18 @@ func containerdSameValue(a, b reflect.Value) bool {
 	return a.Interface() == b.Interface()
 }
 
-// unmodeled is the first key of a table in containerdReached that holds a
-// value the port does not follow, as the reason doctor cannot say containerd
-// starts; "" when every such table holds what its plugin registers or a
-// value the port follows. It is the bound on what the checks above certify:
-// they follow named keys, and this refuses the rest instead of passing them.
-//
-// A disabled plugin decodes no table, and one its own table makes containerd
-// skip reads nothing past the key that skips it.
-func (s *containerdStart) unmodeled(disabled []string) string {
-	for _, uri := range slices.Sorted(maps.Keys(s.values)) {
-		followed, reached := containerdReached[uri]
-		if skipped, _ := s.skip(uri); !reached || skipped != "" || slices.Contains(disabled, uri) {
-			continue
-		}
-		got, registered := reflect.ValueOf(s.values[uri]).Elem(), reflect.ValueOf(containerdPlugins[uri]()).Elem()
-		for i := range got.NumField() {
-			key := got.Type().Field(i).Tag.Get("toml")
-			if slices.Contains(followed, key) || containerdSameValue(got.Field(i), registered.Field(i)) {
-				continue
-			}
-			return fmt.Sprintf("[plugins.%q] sets %s to a value other than the one containerd v2.2.0 registers, in a plugin the CRI service starts through: whether containerd starts on it depends on this host and that plugin, which doctor does not follow", uri, key)
-		}
-	}
-	return ""
-}
-
 // command is what the containerd command refuses in the loaded configuration
 // before it calls New: applyFlags sets the log level and format
 // (cmd/containerd/command/main.go, lines 320-378), and
 // CreateTopLevelDirectories compares the two directories
 // (cmd/containerd/server/server.go, lines 73-81). containerd exits on each.
 func (s *containerdStart) command() error {
-	switch {
-	case s.logLevel != "" && !slices.Contains(containerdLogLevels, strings.ToLower(s.logLevel)):
-		return fmt.Errorf("[debug] sets level = %q: not a valid logrus Level: %q", s.logLevel, s.logLevel)
-	case s.logFormat != "" && s.logFormat != "text" && s.logFormat != "json":
-		return fmt.Errorf("[debug] sets format = %q: unknown log format: %s", s.logFormat, s.logFormat)
-	case s.root == s.state:
+	switch level, format := s.top.Debug.Level, s.top.Debug.Format; {
+	case level != "" && !slices.Contains(containerdLogLevels, strings.ToLower(level)):
+		return fmt.Errorf("[debug] sets level = %q: not a valid logrus Level: %q", level, level)
+	case format != "" && format != "text" && format != "json":
+		return fmt.Errorf("[debug] sets format = %q: unknown log format: %s", format, format)
+	case s.top.Root == s.top.State:
 		return errors.New("root and state must be different paths")
 	}
 	return nil
@@ -880,23 +795,18 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 	if err := s.command(); err != nil {
 		return fmt.Sprintf("containerd does not start: %v", err)
 	}
-	for _, key := range slices.Sorted(maps.Keys(s.timeouts)) {
-		if _, err := time.ParseDuration(s.timeouts[key]); err != nil {
-			return fmt.Sprintf("timeouts sets %s = %q, and containerd does not start: unable to parse %s into a time duration", key, s.timeouts[key], s.timeouts[key])
+	for _, key := range slices.Sorted(maps.Keys(s.top.Timeouts)) {
+		value := s.top.Timeouts[key]
+		if _, err := time.ParseDuration(value); err != nil {
+			return fmt.Sprintf("timeouts sets %s = %q, and containerd does not start: unable to parse %s into a time duration", key, value, value)
 		}
 	}
-	switch {
-	case s.tlsCert != "":
-		return fmt.Sprintf("[grpc] sets tcp_tls_cert = %q, a certificate and key containerd loads before it starts and exits without, which doctor does not interpret", s.tlsCert)
-	case s.tlsCName != "":
-		return fmt.Sprintf("[grpc] sets tcp_tls_common_name = %q, which containerd reads a Windows certificate store for before it starts, and doctor does not interpret", s.tlsCName)
-	}
 	proxies := map[string]bool{}
-	for _, name := range slices.Sorted(maps.Keys(s.proxies)) {
-		typ, ok := containerdProxyTypes[s.proxies[name].Type]
+	for _, name := range slices.Sorted(maps.Keys(s.top.ProxyPlugins)) {
+		typ, ok := containerdProxyTypes[s.top.ProxyPlugins[name].Type]
 		switch {
 		case !ok:
-			return fmt.Sprintf("proxy_plugins.%s has type %q, which containerd has no proxy for, and it panics registering the plugin: no type for plugin", name, s.proxies[name].Type)
+			return fmt.Sprintf("proxy_plugins.%s has type %q, which containerd has no proxy for, and it panics registering the plugin: no type for plugin", name, s.top.ProxyPlugins[name].Type)
 		case name == "":
 			return "proxy_plugins holds an entry with an empty name, and containerd panics registering it: no plugin id"
 		}

@@ -117,6 +117,77 @@ func tomlPlaced(err error) error {
 	return fmt.Errorf("failed to unmarshal TOML: %w", err)
 }
 
+// containerdDefaultServerConfig is what the containerd v2.2.0 command starts
+// from before it loads any file: platformAgnosticDefaultConfig
+// (cmd/containerd/command/config.go, lines 128-143), which is what
+// `containerd config default` prints of these keys on Linux. Timeouts holds
+// what the plugins of the Linux release register with the timeout package,
+// which a [timeouts] entry replaces by key and that command prints too.
+func containerdDefaultServerConfig() *containerdServerConfig {
+	const keys = "--decryption-keys-path"
+	decoder := func(accepts, returns string) containerdStreamProcessor {
+		return containerdStreamProcessor{
+			Accepts: []string{accepts}, Returns: returns, Path: "ctd-decoder",
+			Args: []string{keys, "/etc/containerd/ocicrypt/keys"},
+			Env:  []string{"OCICRYPT_KEYPROVIDER_CONFIG=/etc/containerd/ocicrypt/ocicrypt_keyprovider.conf"},
+		}
+	}
+	const tar = "application/vnd.oci.image.layer.v1.tar"
+	return &containerdServerConfig{
+		Version: 3,
+		Root:    "/var/lib/containerd",
+		State:   "/run/containerd",
+		GRPC:    containerdGRPCConfig{Address: "/run/containerd/containerd.sock", MaxRecvMsgSize: 16 << 20, MaxSendMsgSize: 16 << 20},
+		Imports: []string{"/etc/containerd/conf.d/*.toml"},
+		StreamProcessors: map[string]containerdStreamProcessor{
+			"io.containerd.ocicrypt.decoder.v1.tar":      decoder(tar+"+encrypted", tar),
+			"io.containerd.ocicrypt.decoder.v1.tar.gzip": decoder(tar+"+gzip+encrypted", tar+"+gzip"),
+		},
+		ProxyPlugins: map[string]containerdProxyPlugin{},
+		Timeouts: map[string]string{
+			"io.containerd.timeout.bolt.open":         "0s",
+			"io.containerd.timeout.cri.defercleanup":  "1m0s",
+			"io.containerd.timeout.metrics.shimstats": "2s",
+			"io.containerd.timeout.shim.cleanup":      "5s",
+			"io.containerd.timeout.shim.load":         "5s",
+			"io.containerd.timeout.shim.shutdown":     "3s",
+			"io.containerd.timeout.task.state":        "2s",
+		},
+	}
+}
+
+// containerdMerge is mergeConfig (cmd/containerd/server/config/config.go,
+// lines 417-449) for the keys of the daemon itself: a value a file sets
+// replaces the one before it unless it is the zero value, and an entry of
+// stream_processors, proxy_plugins or timeouts replaces the entry of that
+// name whole. The command merges every file this way, the main one included,
+// over its defaults, so a key set to "" or 0 is a key left out.
+//
+// The lists and the plugin tables are not merged here: ResolveContainerdConfig
+// adds up disabled_plugins, required_plugins and imports, and each plugin
+// table is decoded over the one before it.
+func containerdMerge(to, from reflect.Value) {
+	for i := range to.NumField() {
+		t, f := to.Field(i), from.Field(i)
+		switch f.Kind() {
+		case reflect.Struct:
+			containerdMerge(t, f)
+		case reflect.Map:
+			if f.Type().Elem().Kind() == reflect.Interface {
+				continue
+			}
+			for _, key := range f.MapKeys() {
+				t.SetMapIndex(key, f.MapIndex(key))
+			}
+		case reflect.Slice:
+		default:
+			if !f.IsZero() {
+				t.Set(f)
+			}
+		}
+	}
+}
+
 // validatePluginURIs is the plugin half of ValidateVersion: a file past
 // format version 1 names each plugin by its full URI. A version 1 name is
 // migrated to one before this runs there, so only a file declaring version 2
@@ -435,6 +506,7 @@ type containerdCRI struct {
 func newContainerdCRI(version int, legacy string) *containerdCRI {
 	c := &containerdCRI{version: version, legacy: legacy}
 	c.images, c.runtime, c.server = containerdCRIDefaults()
+	c.start = containerdStart{top: containerdDefaultServerConfig(), tables: map[string]error{}, values: map[string]any{}}
 	// A version 1 or 2 table holds these two under their version 3 names, and
 	// the image plugin's migration moves them only when the table has them.
 	c.moved.MaxConcurrentDownloads, c.moved.StatsCollectPeriod = c.images.MaxConcurrentDownloads, c.images.StatsCollectPeriod
@@ -445,7 +517,7 @@ func newContainerdCRI(version int, legacy string) *containerdCRI {
 // Linux at containerd v2.2.0, for every key unmodeled compares:
 // DefaultImageConfig and DefaultRuntimeConfig
 // (internal/cri/config/config_unix.go) and DefaultServerConfig
-// (internal/cri/config/config.go, lines 779-791). A key containerdCRIFollowed
+// (internal/cri/config/config.go, lines 779-791). A key containerdModeled
 // names is left at its zero value where no reader here needs the default.
 func containerdCRIDefaults() (images containerdImageConfig, runtime containerdRuntimeConfig, server containerdCRIServerConfig) {
 	images.Snapshotter = containerdDefaultSnapshotter
@@ -511,38 +583,57 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 		}
 	}
 	if invalid == "" {
-		invalid = c.start.unmodeled(disabled)
-	}
-	if invalid == "" && !criDisabled {
-		invalid = c.unmodeled()
+		invalid = c.unmodeled(disabled, criDisabled)
 	}
 	return criDisabled, invalid
 }
 
-// containerdCRIFollowed lists, for each CRI plugin, the keys of its table
-// whose every value the port follows to the point containerd serves its first
-// CRI request. A key is here on one of three grounds, each read from
-// containerd v2.2.0:
+// containerdModeled is the one list of keys in a composed containerd
+// configuration whose every value the port follows from the command's start
+// to the point containerd serves its first CRI request, by table: "" is the
+// daemon's own keys, with a section's keys under its name, and every other
+// name is a plugin's URI. A "*" stands for any name of a table.
 //
-//   - a validator ported above refuses the values containerd exits on
-//     (stream_idle_timeout, default_runtime_name, io_type, the snapshotter
-//     and platforms imagesInit looks up, the registry table);
+// Every key the composed configuration holds that is not here is followed at
+// one value only, the one containerd v2.2.0 starts with when no file sets it,
+// and unmodeled refuses any other. That covers the keys startup acts on with
+// this host's state or with code nothing here ports: the listeners the
+// command opens (cmd/containerd/command/main.go, lines 245-284), the
+// directories, OOM score and cgroup it sets up, the stream server's listener,
+// the CNI and CDI directories, a snapshotter's root.
+//
+// A key is here on one of four grounds, each read from containerd v2.2.0:
+//
+//   - the port composes or validates it as containerd does: version,
+//     imports and the two plugin lists, which ResolveContainerdConfig and
+//     containerdPluginState follow; debug.level and debug.format, which
+//     command refuses as applyFlags does; a proxy plugin's type, which
+//     invalid refuses as LoadPlugins panics on it, and its address, which
+//     getClient hands to a client that dials nothing until a request; the
+//     keys the validators and initError methods above read;
 //   - startup reads it and no value fails: initPlatform
 //     (internal/cri/server/service_linux.go) warns on the selinux and oom
 //     keys, skips CDI when enable_cdi is off, and introspectRuntimeHandler
 //     (internal/cri/server/service.go) logs and drops any error a runtime's
 //     type, path or options produce;
 //   - nothing reads it before a request arrives: its only readers are the
-//     sandbox, container, exec, status and pull handlers.
+//     sandbox, container, exec, status and pull handlers;
+//   - its plugin is one nothing the CRI service starts through requires, and
+//     no value of it stops containerd: the opt plugin's InitFn
+//     (plugins/services/opt/service.go, lines 42-61) returns every failure
+//     as an error, which New logs and passes over for a plugin
+//     required_plugins does not name (cmd/containerd/server/server.go, lines
+//     320-336), and the restart monitor sleeps for whatever interval it is
+//     given (plugins/restart/monitor.go, lines 90-100). invalid refuses
+//     either plugin under required_plugins.
 //
-// Every other key holds what containerdCRIDefaults registers or the table is
-// unmodeled. Those are the keys startup acts on with this host's state or
-// with code nothing here ports: the stream server's listener, the CNI
-// directories cni.New and the conf syncer open, the CDI spec directories,
-// the snapshot syncer's ticker period (zero panics in time.NewTicker), and
-// the keys that switch the image plugin between local pull and the transfer
-// service. A "*" stands for any name of a table.
-var containerdCRIFollowed = map[string][]string{
+// "plugins" is the table of tables, each walked under its own name.
+var containerdModeled = map[string][]string{
+	"": {
+		"version", "imports", "disabled_plugins", "required_plugins", "plugins",
+		"debug.level", "debug.format",
+		"proxy_plugins.*.type", "proxy_plugins.*.address",
+	},
 	containerdCRIPlugin: {"disable_tcp_service", "stream_idle_timeout"},
 	containerdImagesPlugin: {
 		"snapshotter", "registry", "runtime_platforms", "pinned_images", "image_decryption",
@@ -563,6 +654,12 @@ var containerdCRIFollowed = map[string][]string{
 		"enable_unprivileged_ports", "enable_unprivileged_icmp", "enable_cdi",
 		"drain_exec_sync_io_timeout", "ignore_deprecation_warnings",
 	},
+	"io.containerd.internal.v1.opt":              {"path"},
+	"io.containerd.metadata.v1.bolt":             {"content_sharing_policy"},
+	"io.containerd.monitor.container.v1.restart": {"interval"},
+	"io.containerd.runtime.v2.task":              {"platforms"},
+	"io.containerd.service.v1.diff-service":      {"default"},
+	"io.containerd.transfer.v1.local":            {"unpack_config"},
 }
 
 // containerdFollowedKey reports whether followed names the key at path.
@@ -581,10 +678,19 @@ func containerdFollowedKey(path, followed []string) bool {
 	})
 }
 
+// containerdFollowsUnder reports whether followed names a key below path.
+func containerdFollowsUnder(path, followed []string) bool {
+	return slices.ContainsFunc(followed, func(pattern string) bool {
+		names := strings.Split(pattern, ".")
+		return len(names) > len(path) && containerdFollowedKey(path, []string{strings.Join(names[:len(path)], ".")})
+	})
+}
+
 // containerdOffDefault is the path of the first key under got that followed
 // does not name and that holds something other than want holds, or nil. A
-// table of named entries is compared entry by entry, an entry want lacks
-// against the empty one a file starts it from.
+// table of named entries is compared entry by entry. An entry want lacks is
+// off by being there, unless followed names keys of such an entry: then it is
+// compared against the empty one a file starts it from.
 func containerdOffDefault(got, want reflect.Value, path, followed []string) []string {
 	if containerdFollowedKey(path, followed) {
 		return nil
@@ -613,6 +719,9 @@ func containerdOffDefault(got, want reflect.Value, path, followed []string) []st
 				return under(name)
 			}
 			if !registered.IsValid() {
+				if !containerdFollowsUnder(under(name), followed) {
+					return under(name)
+				}
 				registered = reflect.Zero(got.Type().Elem())
 			}
 			if off := containerdOffDefault(entry, registered, under(name), followed); off != nil {
@@ -632,41 +741,89 @@ func containerdOffDefault(got, want reflect.Value, path, followed []string) []st
 	return nil
 }
 
-// unmodeled is the first key of a CRI plugin's own table that holds a value
-// the port does not follow, as the reason doctor cannot say containerd serves
-// a CRI pull; "" when each of the three tables holds what its plugin
-// registers or a value containerdCRIFollowed names. It is containerdStart's
-// unmodeled for the tables the CRI plugins decode themselves, and it reads
-// them as they stand once every file has loaded and a version 1 or 2 table
-// has been migrated.
-func (c *containerdCRI) unmodeled() string {
-	runtime := c.runtime
-	if dir := c.moved.Cni.BinDir; c.version < 3 && dir != nil {
-		// migrateConfig in plugins/cri/runtime/plugin.go, lines 248-262:
-		// bin_dir becomes bin_dirs and is not carried over under its own name.
-		runtime.Cni.BinDir, runtime.Cni.BinDirs = "", []string{*dir}
+// containerdTable is one table of the composed configuration: what the
+// loaded files add up to in it, and what containerd v2.2.0 starts with when
+// no file names it. name is its key in containerdModeled.
+type containerdTable struct {
+	name      string
+	got, want any
+}
+
+// document is every table of the composed configuration containerd acts on
+// before it serves a CRI pull, read once every file has loaded and a version
+// 1 or 2 CRI table has been migrated: the daemon's own keys, the three CRI
+// plugins' tables, and the table of every registered plugin a file holds one
+// for.
+//
+// A disabled plugin decodes no table, one its own table makes containerd
+// skip reads nothing past the key that skips it, and a table under a name no
+// plugin registers is decoded by nothing. The CRI plugins' tables are read by
+// nothing either once disabled_plugins takes the CRI service out.
+func (c *containerdCRI) document(disabled []string, criDisabled bool) []containerdTable {
+	// New turns each timeout into a duration before anything reads it, so two
+	// spellings of one duration are one value. invalid has refused any that
+	// does not parse.
+	canonical := func(timeouts map[string]string) map[string]string {
+		out := make(map[string]string, len(timeouts))
+		for key, value := range timeouts {
+			if d, err := time.ParseDuration(value); err == nil {
+				value = d.String()
+			}
+			out[key] = value
+		}
+		return out
 	}
-	images, server := c.imagesConfig(), c.server
-	wantImages, wantRuntime, wantServer := containerdCRIDefaults()
-	for _, table := range []struct {
-		plugin    string
-		got, want any
-	}{
-		{containerdCRIPlugin, &server, &wantServer},
-		{containerdRuntimePlugin, &runtime, &wantRuntime},
-		{containerdImagesPlugin, &images, &wantImages},
-	} {
-		off := containerdOffDefault(reflect.ValueOf(table.got).Elem(), reflect.ValueOf(table.want).Elem(), nil, containerdCRIFollowed[table.plugin])
+	top, wantTop := *c.start.top, containerdDefaultServerConfig()
+	top.Timeouts, wantTop.Timeouts = canonical(top.Timeouts), canonical(wantTop.Timeouts)
+	tables := []containerdTable{{"", &top, wantTop}}
+	if !criDisabled {
+		runtime := c.runtime
+		if dir := c.moved.Cni.BinDir; c.version < 3 && dir != nil {
+			// migrateConfig in plugins/cri/runtime/plugin.go, lines 248-262:
+			// bin_dir becomes bin_dirs and is not carried over under its own name.
+			runtime.Cni.BinDir, runtime.Cni.BinDirs = "", []string{*dir}
+		}
+		images, server := c.imagesConfig(), c.server
+		wantImages, wantRuntime, wantServer := containerdCRIDefaults()
+		tables = append(tables,
+			containerdTable{containerdCRIPlugin, &server, &wantServer},
+			containerdTable{containerdRuntimePlugin, &runtime, &wantRuntime},
+			containerdTable{containerdImagesPlugin, &images, &wantImages})
+	}
+	for _, uri := range slices.Sorted(maps.Keys(c.start.values)) {
+		if skipped, _ := c.start.skip(uri); skipped != "" || slices.Contains(disabled, uri) {
+			continue
+		}
+		tables = append(tables, containerdTable{uri, c.start.values[uri], containerdPlugins[uri]()})
+	}
+	return tables
+}
+
+// unmodeled is the first key of the composed configuration that holds a
+// value the port does not follow, as the reason doctor cannot say containerd
+// serves a CRI pull; "" when every key of every table in document holds what
+// containerd v2.2.0 starts with or is one containerdModeled names. It is the
+// bound on what every check here certifies: they follow named keys, and this
+// one walk refuses the rest instead of passing them, the daemon's own keys
+// and each plugin's alike.
+func (c *containerdCRI) unmodeled(disabled []string, criDisabled bool) string {
+	for _, table := range c.document(disabled, criDisabled) {
+		off := containerdOffDefault(reflect.ValueOf(table.got).Elem(), reflect.ValueOf(table.want).Elem(), nil, containerdModeled[table.name])
 		if off == nil {
 			continue
 		}
-		where := fmt.Sprintf("[plugins.%q]", table.plugin)
-		if c.version < 3 {
+		where, key := fmt.Sprintf("[plugins.%q]", table.name), strings.Join(off, ".")
+		switch cri := table.name == containerdCRIPlugin || table.name == containerdRuntimePlugin || table.name == containerdImagesPlugin; {
+		case table.name == "" && len(off) > 1:
+			where, key = "["+off[0]+"]", strings.Join(off[1:], ".")
+		case table.name == "":
+			where = "config.toml"
+		case cri && c.version < 3:
 			// The file holds one table for all three plugins, under its own
 			// names for some of these keys.
-			where = fmt.Sprintf("[plugins.%q], in the table containerd migrates to %s,", c.legacy, table.plugin)
+			where = fmt.Sprintf("[plugins.%q], in the table containerd migrates to %s,", c.legacy, table.name)
 		}
-		return fmt.Sprintf("%s sets %s to a value other than the one containerd v2.2.0 registers: the CRI plugins act on that key as they start, with this host's state and code doctor does not follow, so whether containerd serves a CRI pull on it is unknown", where, strings.Join(off, "."))
+		return fmt.Sprintf("%s sets %s to a value other than the one containerd v2.2.0 starts with by default: containerd acts on that key before it serves, with this host's state and code doctor does not follow, so whether it serves a CRI pull on that value is unknown", where, key)
 	}
 	return ""
 }

@@ -727,6 +727,79 @@ func TestContainerdConfigDefaultIsAccepted(t *testing.T) {
 	}
 }
 
+// F116 R1, R2: the bound on what the port certifies is the whole composed
+// document, not the tables some check happens to read. The stock config.toml
+// with one key moved off its default, in each top-level section in turn, is
+// refused by name unless containerdModeled lists that key: a listener
+// address on a port that would bind is refused exactly as one that would not.
+func TestContainerdDefaultWithOneUnlistedKeyIsRefused(t *testing.T) {
+	stock, err := os.ReadFile(containerdDefaultFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const overlayfs = "[plugins.'io.containerd.snapshotter.v1.overlayfs']\n    root_path = "
+	for _, tc := range []struct {
+		name, old, new, imported string
+		invalid                  string
+	}{
+		{name: "root", old: "root = '/var/lib/containerd'", new: "root = '/srv/containerd'", invalid: "config.toml sets root "},
+		{name: "state", old: "state = '/run/containerd'", new: "state = '/srv/run'", invalid: "config.toml sets state "},
+		{name: "temp", old: "temp = ''", new: "temp = '/srv/tmp'", invalid: "config.toml sets temp "},
+		{name: "oom_score", old: "oom_score = 0", new: "oom_score = -999", invalid: "config.toml sets oom_score "},
+		{name: "grpc", old: "[grpc]\n  address = '/run/containerd/containerd.sock'", new: "[grpc]\n  address = '/srv/run/containerd.sock'", invalid: "[grpc] sets address "},
+		{name: "grpc tcp listener", old: "tcp_address = ''", new: "tcp_address = '127.0.0.1:5000'", invalid: "[grpc] sets tcp_address "},
+		{name: "grpc message size", old: "max_recv_message_size = 16777216", new: "max_recv_message_size = 1024", invalid: "[grpc] sets max_recv_message_size "},
+		{name: "ttrpc", old: "[ttrpc]\n  address = ''", new: "[ttrpc]\n  address = '/run/containerd/other.ttrpc'", invalid: "[ttrpc] sets address "},
+		{name: "debug", old: "[debug]\n  address = ''", new: "[debug]\n  address = '/run/containerd/debug.sock'", invalid: "[debug] sets address "},
+		{name: "metrics", old: "[metrics]\n  address = ''", new: "[metrics]\n  address = '127.0.0.1:1338'", invalid: "[metrics] sets address "},
+		{name: "metrics histogram", old: "grpc_histogram = false", new: "grpc_histogram = true", invalid: "[metrics] sets grpc_histogram "},
+		{name: "cgroup", old: "[cgroup]\n  path = ''", new: "[cgroup]\n  path = '/containerd'", invalid: "[cgroup] sets path "},
+		{name: "timeouts", old: "'io.containerd.timeout.shim.load' = '5s'", new: "'io.containerd.timeout.shim.load' = '30s'", invalid: "[timeouts] sets io.containerd.timeout.shim.load "},
+		{name: "timeouts key nothing registers", old: "[timeouts]\n", new: "[timeouts]\n  'io.containerd.timeout.other' = '5s'\n", invalid: "[timeouts] sets io.containerd.timeout.other "},
+		{name: "stream_processors", old: "returns = 'application/vnd.oci.image.layer.v1.tar'\n    path = 'ctd-decoder'", new: "returns = 'application/vnd.oci.image.layer.v1.tar'\n    path = '/srv/decoder'", invalid: "[stream_processors] sets io.containerd.ocicrypt.decoder.v1.tar.path "},
+		{name: "stream_processors entry", old: "[stream_processors]\n", new: "[stream_processors]\n  [stream_processors.other]\n", invalid: "[stream_processors] sets other "},
+		{name: "proxy_plugins", old: "[cgroup]\n", new: "[proxy_plugins.stargz]\n  type = 'snapshot'\n  address = '/run/stargz.sock'\n  platform = 'linux/amd64'\n\n[cgroup]\n", invalid: "[proxy_plugins] sets stargz.platform "},
+		{name: "plugins", old: overlayfs + "''", new: overlayfs + "'/srv/overlay'", invalid: "[plugins.\"io.containerd.snapshotter.v1.overlayfs\"] sets root_path "},
+		{name: "plugins, a CRI table", old: "stream_server_port = '0'", new: "stream_server_port = '10010'", invalid: "[plugins.\"io.containerd.grpc.v1.cri\"] sets stream_server_port "},
+		{name: "an import", imported: "version = 3\n[debug]\naddress = '/run/containerd/debug.sock'\n", invalid: "[debug] sets address "},
+
+		{name: "a default spelled another way", old: "'io.containerd.timeout.cri.defercleanup' = '1m0s'", new: "'io.containerd.timeout.cri.defercleanup' = '60s'"},
+		{name: "a listed key", old: "level = ''", new: "level = 'debug'"},
+		{name: "a default an import spells out", imported: "version = 3\nroot = '/var/lib/containerd'\n[grpc]\ntcp_address = ''\nuid = 0\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if strings.Count(string(stock), tc.old) != 1 && tc.old != "" {
+				t.Fatalf("the default config.toml holds %q %d times, want once", tc.old, strings.Count(string(stock), tc.old))
+			}
+			conf := string(stock)
+			if tc.old != "" {
+				conf = strings.Replace(conf, tc.old, tc.new, 1)
+			}
+			root := t.TempDir()
+			if tc.imported != "" {
+				// The stock imports list is /etc/containerd/conf.d/*.toml.
+				file := filepath.Join(root, "etc/containerd/conf.d/10-site.toml")
+				if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file, []byte(tc.imported), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			eff, err := ResolveContainerdConfig(root, ContainerdConfigPath, []byte(conf))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.invalid == "" && eff.Invalid != "" {
+				t.Errorf("refused a configuration that holds containerd's defaults or a key the port follows: %s", eff.Invalid)
+			}
+			if tc.invalid != "" && !strings.Contains(eff.Invalid, tc.invalid) {
+				t.Errorf("Invalid = %q, want it to name %q", eff.Invalid, tc.invalid)
+			}
+		})
+	}
+}
+
 // F116 R1, R2: containerd v2.2.0's New decodes the table of every plugin it
 // registers and exits on a wrong type in any of them, so the port holds every
 // one to its types: each field of each table, given a value of another type,
@@ -788,7 +861,7 @@ func TestContainerdStartupChecks(t *testing.T) {
 		{name: "a timeout", conf: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5s\"\n"},
 		{name: "a timeout with no unit", conf: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5\"\n", invalid: "unable to parse 5 into a time duration"},
 		{name: "a timeout an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5\"\n", imported: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5s\"\n"},
-		{name: "a TLS pair for the TCP listener", conf: "version = 3\n[grpc]\ntcp_tls_cert = \"/etc/containerd/tls.crt\"\ntcp_tls_key = \"/etc/containerd/tls.key\"\n", invalid: "doctor does not interpret"},
+		{name: "a TLS pair for the TCP listener", conf: "version = 3\n[grpc]\ntcp_tls_cert = \"/etc/containerd/tls.crt\"\ntcp_tls_key = \"/etc/containerd/tls.key\"\n", invalid: "[grpc] sets tcp_tls_cert"},
 		{name: "a table no plugin decodes", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.stargz\"]\nroot_path = 42\n"},
 		{name: "version 2 names", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = false\n[plugins.\"io.containerd.internal.v1.restart\"]\ninterval = \"10s\"\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\"]\nsched_core = false\n[plugins.\"io.containerd.runtime.v1.linux\"]\nshim = 42\n"},
 		{name: "a version 2 table the cgroups plugin takes", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = \"no\"\n", invalid: "io.containerd.monitor.task.v1.cgroups does not decode its table"},
@@ -845,7 +918,7 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "an unknown log level", conf: "version = 3\n[debug]\nlevel = \"verbose\"\n", invalid: "not a valid logrus Level"},
 		{name: "an unknown log level in an import", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[debug]\nlevel = \"verbose\"\n", invalid: "not a valid logrus Level"},
 		{name: "an unknown log format", conf: "version = 3\n[debug]\nformat = \"logfmt\"\n", invalid: "unknown log format"},
-		{name: "root and state apart", conf: "version = 3\nroot = \"/srv/containerd\"\nstate = \"/run/containerd\"\n"},
+		{name: "root and state apart", conf: "version = 3\nroot = \"/srv/containerd\"\nstate = \"/run/containerd\"\n", invalid: "config.toml sets root"},
 		{name: "root and state the same", conf: "version = 3\nroot = \"/srv/containerd\"\nstate = \"/srv/containerd\"\n", invalid: "root and state must be different paths"},
 		{name: "root at the default state", conf: "version = 3\nroot = \"/run/containerd\"\n", invalid: "root and state must be different paths"},
 
