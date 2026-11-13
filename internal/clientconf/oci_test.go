@@ -980,3 +980,74 @@ func TestContainerdPlatformAndSizeParsers(t *testing.T) {
 		}
 	}
 }
+
+// The CRI plugins' own tables answer to the same bound as the tables of the
+// plugins they start through: a key startup acts on holds what containerd
+// v2.2.0 registers, in whichever file and format version sets it, and a key
+// the port follows may hold anything its validator passes.
+func TestContainerdCRITablesHoldDefaultsOrFollowedValues(t *testing.T) {
+	const (
+		v3 = "version = 3\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+		v2 = "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	)
+	for name, tc := range map[string]struct {
+		main, imported string
+		// refused is the key the reason names, "" when the file is accepted.
+		refused string
+	}{
+		"registry only":            {main: v3},
+		"registry only, version 2": {main: v2},
+		"systemd cgroup and a second runtime": {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc.options]\nSystemdCgroup = true\n" +
+			"[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.kata]\nruntime_type = \"io.containerd.kata.v2\"\nsandboxer = \"shim\"\n"},
+		"followed scalars": {main: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\ndisable_tcp_service = false\nstream_idle_timeout = \"1h\"\n" +
+			"[plugins.\"io.containerd.cri.v1.runtime\"]\nenable_cdi = false\nenable_selinux = true\nmax_container_log_line_size = -1\n"},
+		"version 2 names the stock directories": {main: v2 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nsandbox_image = \"registry.k8s.io/pause:3.8\"\nstream_server_port = \"0\"\n" +
+			"[plugins.\"io.containerd.grpc.v1.cri\".cni]\nbin_dir = \"/opt/cni/bin\"\nconf_dir = \"/etc/cni/net.d\"\nmax_conf_num = 1\n"},
+
+		"stream address":       {main: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_server_address = \"\"\n", refused: "stream_server_address"},
+		"stream port":          {main: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_server_port = \"10010\"\n", refused: "stream_server_port"},
+		"self-signed streams":  {main: v3 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nenable_tls_streaming = true\n", refused: "enable_tls_streaming"},
+		"cni conf dir":         {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".cni]\nconf_dir = \"/nonexistent\"\n", refused: "cni.conf_dir"},
+		"cni bin dirs emptied": {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".cni]\nbin_dirs = []\n", refused: "cni.bin_dirs"},
+		"cdi spec dirs":        {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\"]\ncdi_spec_dirs = [\"/x\"]\n", refused: "cdi_spec_dirs"},
+		"a runtime's cni conf dir": {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.kata]\nruntime_type = \"io.containerd.kata.v2\"\ncni_conf_dir = \"/x\"\n",
+			refused: "containerd.runtimes.kata.cni_conf_dir"},
+		"a runtime's snapshotter": {main: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\nsnapshotter = \"native\"\n",
+			refused: "containerd.runtimes.runc.snapshotter"},
+		// time.NewTicker panics on it in the snapshot syncer.
+		"stats period of zero": {main: v3 + "[plugins.\"io.containerd.cri.v1.images\"]\nstats_collect_period = 0\n", refused: "stats_collect_period"},
+		"local pull":           {main: v3 + "[plugins.\"io.containerd.cri.v1.images\"]\nuse_local_image_pull = true\n", refused: "use_local_image_pull"},
+
+		"version 2 stream port":  {main: v2 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_server_port = \"65536\"\n", refused: "stream_server_port"},
+		"version 2 bin_dir":      {main: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".cni]\nbin_dir = \"/usr/lib/cni\"\n", refused: "cni.bin_dirs"},
+		"version 2 stats period": {main: v2 + "[plugins.\"io.containerd.grpc.v1.cri\"]\nstats_collect_period = 0\n", refused: "stats_collect_period"},
+		"version 2 snapshot annotations": {main: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndisable_snapshot_annotations = false\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\n",
+			refused: "disable_snapshot_annotations"},
+
+		"an import sets the port": {main: "imports = [\"conf.d/*.toml\"]\n" + v3,
+			imported: "version = 3\n[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_server_port = \"65536\"\n", refused: "stream_server_port"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "config.toml")
+			if tc.imported != "" {
+				if err := os.MkdirAll(filepath.Join(dir, "conf.d"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "conf.d", "10-cri.toml"), []byte(tc.imported), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			eff, err := ResolveContainerdConfig("", file, []byte(tc.main))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.refused == "" && (eff.Invalid != "" || eff.ConfigPath != "/etc/containerd/certs.d"):
+				t.Errorf("refused a configuration containerd v2.2.0 starts on: config_path=%q invalid=%q", eff.ConfigPath, eff.Invalid)
+			case tc.refused != "" && !strings.Contains(eff.Invalid, "sets "+tc.refused+" to a value other than"):
+				t.Errorf("want a refusal naming %s, got invalid=%q", tc.refused, eff.Invalid)
+			}
+		})
+	}
+}

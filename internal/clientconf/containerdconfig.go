@@ -362,14 +362,16 @@ type containerdLegacyCRI struct {
 		// Snapshotter is a pointer because the migration moves the key when
 		// the table holds it, "" included.
 		Snapshotter                *string `toml:"snapshotter"`
-		DisableSnapshotAnnotations bool    `toml:"disable_snapshot_annotations"`
-		DiscardUnpackedLayers      bool    `toml:"discard_unpacked_layers"`
+		DisableSnapshotAnnotations *bool   `toml:"disable_snapshot_annotations"`
+		DiscardUnpackedLayers      *bool   `toml:"discard_unpacked_layers"`
 		Runtimes                   map[string]struct {
 			SandboxMode string `toml:"sandbox_mode"`
 		} `toml:"runtimes"`
 	} `toml:"containerd"`
 	Cni struct {
-		BinDir string `toml:"bin_dir"`
+		// BinDir is a pointer for the same reason: the migration turns the
+		// key into bin_dirs when the table holds it.
+		BinDir *string `toml:"bin_dir"`
 	} `toml:"cni"`
 }
 
@@ -432,13 +434,37 @@ type containerdCRI struct {
 
 func newContainerdCRI(version int, legacy string) *containerdCRI {
 	c := &containerdCRI{version: version, legacy: legacy}
-	// DefaultRuntimeConfig: the runtime every install starts with.
-	c.runtime.Containerd.DefaultRuntimeName = "runc"
-	c.runtime.Containerd.Runtimes = map[string]containerdRuntime{"runc": {Type: "io.containerd.runc.v2"}}
-	// DefaultImageConfig (internal/cri/config/config_unix.go): the snapshotter
-	// the image plugin looks up when no file names one.
-	c.images.Snapshotter = containerdDefaultSnapshotter
+	c.images, c.runtime, c.server = containerdCRIDefaults()
+	// A version 1 or 2 table holds these two under their version 3 names, and
+	// the image plugin's migration moves them only when the table has them.
+	c.moved.MaxConcurrentDownloads, c.moved.StatsCollectPeriod = c.images.MaxConcurrentDownloads, c.images.StatsCollectPeriod
 	return c
+}
+
+// containerdCRIDefaults is what the three CRI plugins register as Config on
+// Linux at containerd v2.2.0, for every key unmodeled compares:
+// DefaultImageConfig and DefaultRuntimeConfig
+// (internal/cri/config/config_unix.go) and DefaultServerConfig
+// (internal/cri/config/config.go, lines 779-791). A key containerdCRIFollowed
+// names is left at its zero value where no reader here needs the default.
+func containerdCRIDefaults() (images containerdImageConfig, runtime containerdRuntimeConfig, server containerdCRIServerConfig) {
+	images.Snapshotter = containerdDefaultSnapshotter
+	images.DisableSnapshotAnnotations = true
+	images.MaxConcurrentDownloads = 3
+	images.StatsCollectPeriod = 10
+
+	runtime.Containerd.DefaultRuntimeName = "runc"
+	runtime.Containerd.Runtimes = map[string]containerdRuntime{"runc": {Type: "io.containerd.runc.v2"}}
+	runtime.Cni.BinDirs = []string{"/opt/cni/bin"}
+	runtime.Cni.ConfDir = "/etc/cni/net.d"
+	runtime.Cni.MaxConfNum = 1
+	runtime.CDISpecDirs = []string{"/etc/cdi", "/var/run/cdi"}
+
+	server.DisableTCPService = true
+	server.StreamServerAddress = "127.0.0.1"
+	server.StreamServerPort = "0"
+	server.StreamIdleTimeout = "4h0m0s"
+	return images, runtime, server
 }
 
 const containerdDefaultSnapshotter = "overlayfs"
@@ -487,7 +513,162 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 	if invalid == "" {
 		invalid = c.start.unmodeled(disabled)
 	}
+	if invalid == "" && !criDisabled {
+		invalid = c.unmodeled()
+	}
 	return criDisabled, invalid
+}
+
+// containerdCRIFollowed lists, for each CRI plugin, the keys of its table
+// whose every value the port follows to the point containerd serves its first
+// CRI request. A key is here on one of three grounds, each read from
+// containerd v2.2.0:
+//
+//   - a validator ported above refuses the values containerd exits on
+//     (stream_idle_timeout, default_runtime_name, io_type, the snapshotter
+//     and platforms imagesInit looks up, the registry table);
+//   - startup reads it and no value fails: initPlatform
+//     (internal/cri/server/service_linux.go) warns on the selinux and oom
+//     keys, skips CDI when enable_cdi is off, and introspectRuntimeHandler
+//     (internal/cri/server/service.go) logs and drops any error a runtime's
+//     type, path or options produce;
+//   - nothing reads it before a request arrives: its only readers are the
+//     sandbox, container, exec, status and pull handlers.
+//
+// Every other key holds what containerdCRIDefaults registers or the table is
+// unmodeled. Those are the keys startup acts on with this host's state or
+// with code nothing here ports: the stream server's listener, the CNI
+// directories cni.New and the conf syncer open, the CDI spec directories,
+// the snapshot syncer's ticker period (zero panics in time.NewTicker), and
+// the keys that switch the image plugin between local pull and the transfer
+// service. A "*" stands for any name of a table.
+var containerdCRIFollowed = map[string][]string{
+	containerdCRIPlugin: {"disable_tcp_service", "stream_idle_timeout"},
+	containerdImagesPlugin: {
+		"snapshotter", "registry", "runtime_platforms", "pinned_images", "image_decryption",
+		"image_pull_progress_timeout", "concurrent_layer_fetch_buffer",
+	},
+	containerdRuntimePlugin: {
+		"containerd.default_runtime_name", "containerd.ignore_blockio_not_enabled_errors", "containerd.ignore_rdt_not_enabled_errors",
+		"containerd.runtimes.*.runtime_type", "containerd.runtimes.*.runtime_path",
+		"containerd.runtimes.*.pod_annotations", "containerd.runtimes.*.container_annotations",
+		"containerd.runtimes.*.options", "containerd.runtimes.*.sandboxer", "containerd.runtimes.*.io_type",
+		"containerd.runtimes.*.privileged_without_host_devices",
+		"containerd.runtimes.*.privileged_without_host_devices_all_devices_allowed",
+		"cni.setup_serially", "cni.conf_template", "cni.ip_pref",
+		"enable_selinux", "selinux_category_range", "max_container_log_line_size", "disable_apparmor",
+		"restrict_oom_score_adj", "disable_proc_mount", "unset_seccomp_profile",
+		"tolerate_missing_hugetlb_controller", "disable_hugetlb_controller",
+		"device_ownership_from_security_context", "ignore_image_defined_volumes", "netns_mounts_under_state_dir",
+		"enable_unprivileged_ports", "enable_unprivileged_icmp", "enable_cdi",
+		"drain_exec_sync_io_timeout", "ignore_deprecation_warnings",
+	},
+}
+
+// containerdFollowedKey reports whether followed names the key at path.
+func containerdFollowedKey(path, followed []string) bool {
+	return slices.ContainsFunc(followed, func(pattern string) bool {
+		names := strings.Split(pattern, ".")
+		if len(names) != len(path) {
+			return false
+		}
+		for i, name := range names {
+			if name != "*" && name != path[i] {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// containerdOffDefault is the path of the first key under got that followed
+// does not name and that holds something other than want holds, or nil. A
+// table of named entries is compared entry by entry, an entry want lacks
+// against the empty one a file starts it from.
+func containerdOffDefault(got, want reflect.Value, path, followed []string) []string {
+	if containerdFollowedKey(path, followed) {
+		return nil
+	}
+	under := func(name string) []string { return append(slices.Clone(path), name) }
+	switch {
+	case got.Kind() == reflect.Struct:
+		for i := range got.NumField() {
+			if off := containerdOffDefault(got.Field(i), want.Field(i), under(got.Type().Field(i).Tag.Get("toml")), followed); off != nil {
+				return off
+			}
+		}
+		return nil
+	case got.Kind() == reflect.Map && got.Type().Elem().Kind() != reflect.Interface:
+		names := map[string]bool{}
+		for _, key := range got.MapKeys() {
+			names[key.String()] = true
+		}
+		for _, key := range want.MapKeys() {
+			names[key.String()] = true
+		}
+		for _, name := range slices.Sorted(maps.Keys(names)) {
+			key := reflect.ValueOf(name)
+			entry, registered := got.MapIndex(key), want.MapIndex(key)
+			if !entry.IsValid() {
+				return under(name)
+			}
+			if !registered.IsValid() {
+				registered = reflect.Zero(got.Type().Elem())
+			}
+			if off := containerdOffDefault(entry, registered, under(name), followed); off != nil {
+				return off
+			}
+		}
+		return nil
+	case got.Kind() == reflect.Map:
+		if !reflect.DeepEqual(got.Interface(), want.Interface()) {
+			return path
+		}
+		return nil
+	}
+	if !containerdSameValue(got, want) {
+		return path
+	}
+	return nil
+}
+
+// unmodeled is the first key of a CRI plugin's own table that holds a value
+// the port does not follow, as the reason doctor cannot say containerd serves
+// a CRI pull; "" when each of the three tables holds what its plugin
+// registers or a value containerdCRIFollowed names. It is containerdStart's
+// unmodeled for the tables the CRI plugins decode themselves, and it reads
+// them as they stand once every file has loaded and a version 1 or 2 table
+// has been migrated.
+func (c *containerdCRI) unmodeled() string {
+	runtime := c.runtime
+	if dir := c.moved.Cni.BinDir; c.version < 3 && dir != nil {
+		// migrateConfig in plugins/cri/runtime/plugin.go, lines 248-262:
+		// bin_dir becomes bin_dirs and is not carried over under its own name.
+		runtime.Cni.BinDir, runtime.Cni.BinDirs = "", []string{*dir}
+	}
+	images, server := c.imagesConfig(), c.server
+	wantImages, wantRuntime, wantServer := containerdCRIDefaults()
+	for _, table := range []struct {
+		plugin    string
+		got, want any
+	}{
+		{containerdCRIPlugin, &server, &wantServer},
+		{containerdRuntimePlugin, &runtime, &wantRuntime},
+		{containerdImagesPlugin, &images, &wantImages},
+	} {
+		off := containerdOffDefault(reflect.ValueOf(table.got).Elem(), reflect.ValueOf(table.want).Elem(), nil, containerdCRIFollowed[table.plugin])
+		if off == nil {
+			continue
+		}
+		where := fmt.Sprintf("[plugins.%q]", table.plugin)
+		if c.version < 3 {
+			// The file holds one table for all three plugins, under its own
+			// names for some of these keys.
+			where = fmt.Sprintf("[plugins.%q], in the table containerd migrates to %s,", c.legacy, table.plugin)
+		}
+		return fmt.Sprintf("%s sets %s to a value other than the one containerd v2.2.0 registers: the CRI plugins act on that key as they start, with this host's state and code doctor does not follow, so whether containerd serves a CRI pull on it is unknown", where, strings.Join(off, "."))
+	}
+	return ""
 }
 
 // imagesConfig is the table the image plugin decodes once every file has
@@ -502,11 +683,21 @@ func (c *containerdCRI) imagesConfig() containerdImageConfig {
 	// snapshotter only past a return it takes when that table holds no
 	// runtimes (migrateConfig in plugins/cri/images/plugin.go, lines 225-262).
 	m := c.moved
-	images := containerdImageConfig{Snapshotter: containerdDefaultSnapshotter, Registry: m.Registry, ImageDecryption: m.ImageDecryption,
-		MaxConcurrentDownloads: m.MaxConcurrentDownloads, ImagePullProgressTimeout: m.ImagePullProgressTimeout,
-		ImagePullWithSyncFs: m.ImagePullWithSyncFs, StatsCollectPeriod: m.StatsCollectPeriod}
-	if m.Containerd.Snapshotter != nil && m.Containerd.Runtimes != nil {
+	images, _, _ := containerdCRIDefaults()
+	images.Registry, images.ImageDecryption = m.Registry, m.ImageDecryption
+	images.MaxConcurrentDownloads, images.StatsCollectPeriod = m.MaxConcurrentDownloads, m.StatsCollectPeriod
+	images.ImagePullProgressTimeout, images.ImagePullWithSyncFs = m.ImagePullProgressTimeout, m.ImagePullWithSyncFs
+	if m.Containerd.Runtimes == nil {
+		return images
+	}
+	if m.Containerd.Snapshotter != nil {
 		images.Snapshotter = *m.Containerd.Snapshotter
+	}
+	if m.Containerd.DisableSnapshotAnnotations != nil {
+		images.DisableSnapshotAnnotations = *m.Containerd.DisableSnapshotAnnotations
+	}
+	if m.Containerd.DiscardUnpackedLayers != nil {
+		images.DiscardUnpackedLayers = *m.Containerd.DiscardUnpackedLayers
 	}
 	return images
 }
