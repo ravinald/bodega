@@ -106,11 +106,22 @@ The dry run validates the config and prints the destination without building, co
 
 The workstation needs Go, Python 3.9 or newer, SSH and rsync. The server needs SSH, rsync, a POSIX shell and GNU `mv`. Provision nginx, HTTPS and the writable site directory separately; deployment does not use sudo or reload nginx.
 
-## Coverage feed and page
+## Automatic deployment
 
 ```sh
 sh site/scripts/sync-coverage.sh --config docs-internal/site-deploy.json
 ```
+
+This runs `deploy.py sync`, which a scheduler calls every few minutes. It fetches `origin/main` and reads the commit the live release was built from (`sourceRevision` in `<remote_root>/current/deployment.json`). When the live commit is a strict ancestor of `main`, it deploys `main`. It builds from `git archive` of that commit rather than from the checkout, so the checkout's branch and working tree do not matter. It then republishes the coverage feed and page, described next. It leaves the live release in place in two cases, and says which in its output:
+
+| Case                                    | Why                                                   |
+| --------------------------------------- | ----------------------------------------------------- |
+| The live commit is not on `main`        | Someone deployed a branch on purpose                  |
+| `<remote_root>/auto-deploy-hold` exists | A rollback is in place and must outlive the next pass |
+
+A failed build or upload changes nothing on the server, and the next pass tries again.
+
+## Coverage feed and page
 
 `scripts/coverage.py` extracts feature evidence and test results from the report into `coverage.json`. It does not import the report's layout, publish private backlog rows or recalculate readiness. Publication uploads the feed under a temporary name and renames it into `<remote_root>/data/coverage.json`.
 
@@ -125,7 +136,7 @@ location = /coverage.html      { alias <remote_root>/data/coverage.html; expires
 
 ## Roll back
 
-Read `<remote_root>/previous-release` on the server, point a temporary symlink at that release, and replace `current` with `mv -Tf`, holding the same deployment lock. nginx needs no reload. Run the coverage publication afterwards so `/coverage.html` matches the restored release.
+Create `<remote_root>/auto-deploy-hold` first, or the next automatic pass deploys `main` over the rollback. Then read `<remote_root>/previous-release` on the server, point a temporary symlink at that release, and replace `current` with `mv -Tf`, holding the same deployment lock. nginx needs no reload. Run the coverage publication afterwards so `/coverage.html` matches the restored release. Remove the hold once `main` carries the fix.
 
 ## Tests
 
@@ -145,4 +156,4 @@ python3 -m unittest discover -s site/scripts -p 'test_*.py'
 
 The last one needs Chrome or Chromium on the host, under a name `chromedp` looks for, and the test fails with that instruction when it finds none. Chrome resolves no host name during the run, so a request the test reports was attempted and never sent. Nothing clicks through the reference: what Scalar fetches only after a reader opens a section is covered by the document reader for the document's own content, and by the pinned bundle and its configuration for the rest.
 
-`test_reference_privacy.py` plants an image on another origin in a copy of the document's introduction and passes only when the Go check refuses that copy. `test_deploy.py` checks the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, and that the coverage page renders from the deployed commit.
+`test_reference_privacy.py` plants an image on another origin in a copy of the document's introduction and passes only when the Go check refuses that copy. `test_deploy.py` checks the deployment safeguards without contacting a server: config validation, the clean-tree and changed-revision refusals, lock release on a failed upload, atomic activation, that the coverage page renders from the deployed commit, and that `sync` deploys only a trunk ahead of the live release with no hold in place.
