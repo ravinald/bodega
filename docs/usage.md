@@ -8291,36 +8291,42 @@ A destination that goes away **after** startup does not stop the server. The wri
 
 ### Choosing a sink
 
-Measured on an Apple M1 Ultra (Mac13,2), macOS 26.7, internal NVMe over Apple Fabric, APFS; `postgres:17-alpine` in Docker Desktop on the same host over loopback. 64 concurrent writers, 10 s per run, at a fixed offered request rate. Each request takes the post-B16 path: one event row on the hot path plus one discovery observation through the recorder's queue.
+Measured on AWS in us-west-2 on 2026-11-13: Ubuntu 26.04 (kernel 7.0.0-1016-aws), bodega `4ea1030` built the way releases are (`CGO_ENABLED=0`, pure-Go SQLite). Each instance wrote to a 30 GiB gp3 root volume at gp3's default 3,000 IOPS and 125 MiB/s, except `m7gd.large`, which wrote to its local NVMe instance store. The same-host `postgres` is `postgres:17-alpine` over loopback; RDS is PostgreSQL 17.11 on gp3, single-AZ, in the client's availability zone. The `t` instances ran with AWS's default unlimited CPU credits, so none of them throttled. Every run uses 64 concurrent writers for 10 s, and each request takes the post-B16 path: one event row on the hot path plus one discovery observation through the recorder's queue. The harness is `TestSinkLoad` in `internal/server/sink_load_test.go`: `BODEGA_SINK_LOAD=1` runs it, and `BODEGA_SINK_LOAD_RPS` offers a fixed rate instead of saturating.
 
-| Offered | Sink       | Events/s landed | Discovery dropped | Hot-path write p99 |
-| ------- | ---------- | --------------- | ----------------- | ------------------ |
-| 500/s   | `sqlite`   | 803             | 0%                | 1.27 s             |
-|         | `postgres` | 989             | 0%                | 24 ms              |
-|         | `syslog`   | 1,000           | 0%                | 3.1 ms             |
-|         | `jsonl`    | 1,000           | 0%                | 2.2 ms             |
-| 1,000/s | `sqlite`   | 1,772           | 0%                | 951 ms             |
-|         | `postgres` | 1,997           | 0%                | 17 ms              |
-|         | `syslog`   | 1,998           | 0%                | 3.4 ms             |
-|         | `jsonl`    | 1,999           | 0%                | 2.0 ms             |
-| 2,000/s | `sqlite`   | 3,608           | 0%                | 638 ms             |
-|         | `postgres` | 3,993           | 0%                | 15 ms              |
-|         | `syslog`   | 3,998           | 0%                | 3.2 ms             |
-|         | `jsonl`    | 3,997           | 0%                | 2.6 ms             |
-| 8,000/s | `sqlite`   | 8,941           | 64.4%             | 180 ms             |
-|         | `postgres` | 15,979          | 0%                | 15 ms              |
-|         | `syslog`   | 15,990          | 0%                | 3.0 ms             |
-|         | `jsonl`    | 15,992          | 0%                | 2.6 ms             |
+**Requests per second each sink sustains**, unthrottled, with the hot-path write p99 at 500 requests/s offered:
 
-Unthrottled, the same harness sustains 8,639 hot-path writes/s on `sqlite` (7 of 92,267 lost to the 5 s busy timeout, p99 57 ms), 11,720/s on `postgres` (none lost, p99 21 ms), 132,055/s on `syslog` and 199,655/s on `jsonl`.
+| Instance             | vCPU | Disk          | `sqlite` | p99 at 500/s | `postgres`, same host | p99 at 500/s | `syslog` | `jsonl` |
+| -------------------- | ---- | ------------- | -------- | ------------ | --------------------- | ------------ | -------- | ------- |
+| `t3a.small`          | 2    | gp3           | 239      | 1.10 s       | 2,803                 | 113 ms       | 42,684   | 89,014  |
+| `t4g.medium`         | 2    | gp3           | 275      | 1.05 s       | 3,734                 | 83 ms        | 55,040   | 135,874 |
+| `m7i.large`          | 2    | gp3           | 284      | 991 ms       | 6,367                 | 41 ms        | 275,880  | 263,727 |
+| `m7g.large`          | 2    | gp3           | 307      | 871 ms       | 5,219                 | 49 ms        | 114,086  | 220,389 |
+| `c7i.2xlarge`        | 8    | gp3           | 241      | 1.07 s       | 6,815                 | 18 ms        | 140,742  | 307,871 |
+| `m7gd.large`         | 2    | local NVMe    | 1,540    | 14 ms        | 6,356                 | 42 ms        | 114,404  | 223,152 |
+| Apple M1 Ultra (ref) | 20   | internal NVMe | 8,639    | 1.27 s       | 11,720                | 24 ms        | 132,055  | 199,655 |
+
+**`postgres` on RDS**, from a client in the same availability zone:
+
+| RDS class       | Client      | Requests/s sustained | p99 at 500/s | p99 at 8,000/s |
+| --------------- | ----------- | -------------------- | ------------ | -------------- |
+| `db.t4g.medium` | `m7g.large` | 5,680                | 268 ms       | 47 ms          |
+| `db.t4g.medium` | `m7i.large` | 5,554                | 252 ms       | 43 ms          |
+| `db.m7g.large`  | `m7g.large` | 7,192                | 180 ms       | 36 ms          |
+| `db.m7g.large`  | `m7i.large` | 7,146                | 161 ms       | 34 ms          |
+
+RDS lost no hot-path write and dropped no discovery observation at any rate, from 500 requests/s to unthrottled. Its p99 is highest at the lightest load measured and falls as load rises. The same-host container dropped observations only past its ceiling: 6.6% at 8,000 requests/s on `t3a.small` and 9.3% on `m7gd.large`.
+
+**gp3 caps `sqlite` near 300 requests/s, whatever the CPU.** The audit database runs SQLite in WAL mode at the default `synchronous` level, so every commit waits on `fsync`, and on gp3 that is a round trip to EBS. SQLite takes one writer at a time, so the commit latency sets the ceiling: `c7i.2xlarge`'s 8 vCPU sustained fewer requests than `m7g.large`'s 2. Local NVMe brings the same commit down far enough for `m7gd.large` to sustain 1,540. Above the ceiling, `sqlite` does not drop rows; requests wait instead. At 500 requests/s offered, every gp3 instance completed 240 to 300 of them each second and the rest queued behind the write lock, which is the second-long p99. The `serve_fetch` row is written after the handler has sent the body, so a client usually has its bytes, but the request's goroutine and its connection stay held until the commit lands, and a keep-alive client's next request waits with it. Through the full handler chain (`BenchmarkCachedPoolRequest`), a cached `.deb` costs 6.7 to 8.9 ms per request on gp3 against 1.55 ms on `m7gd.large`'s NVMe.
+
+**The M1 row is a ceiling for the code, not a sizing figure.** macOS `fsync` returns once the data reaches the drive, without flushing the drive's own cache, and SQLite asks for that flush (`F_FULLFSYNC`) only under `PRAGMA fullfsync`, which is off by default. The M1's commits never waited for the media; a Linux host on EBS waits for every one.
 
 Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-update / 3600`. A thousand hosts running `apt update` twice an hour over a dozen index paths is about 7 requests/s; a CI fleet installing packages per build is one to two orders of magnitude above that.
 
-- **Up to ~2,000 requests/s: `sqlite`.** Nothing drops, and the store you already have needs no daemon. Its hot-path p99 is the worst of the four even at 500 requests/s (over a second, because the request goroutine waits on the write lock the discovery batch holds), but that latency is off the response path.
-- **Above ~2,000 requests/s, or more than one bodega: `postgres`.** It dropped no observations at any rate measured here and lost no hot-path write to a timeout, and its p99 stays under 25 ms across the whole range. It is also the only way to report across instances: each host keeps its own `audit_db` for ACLs and tokens, and their events land in one place.
-- **When the SIEM already exists, at any rate: `syslog` or `jsonl`.** Neither dropped a row at any rate measured, and both have the cheapest hot-path latency of the four. You are trading `bodega discover promote` and `GET /api/v1/audit` for that; if you need them back, run one instance on `postgres`.
+- **Up to ~200 requests/s on EBS, or ~1,000 on local NVMe: `sqlite`.** That covers the thousand-host `apt` fleet above many times over, needs no daemon, and loses nothing past it: requests slow down rather than rows dropping. The lowest rate measured, 500 requests/s, is already past the gp3 ceiling, so the ~200 figure keeps headroom below the 239 the smallest instance sustained rather than being a measured knee.
+- **Above that, or more than one bodega: `postgres`.** Every instance, `t3a.small` included, took 2,000 requests/s on a same-host container with nothing lost, and RDS `db.t4g.medium` sustains about 5,500 with nothing lost at any rate. It is also the only way to report across instances: each host keeps its own `audit_db` for ACLs and tokens, and their events land in one place. Expect a p99 near 250 ms against a small RDS instance at light load.
+- **When the SIEM already exists, at any rate: `syslog` or `jsonl`.** Neither dropped a row at any rate measured; the smallest instance sustained 42,684 requests/s on `syslog` and 89,014 on `jsonl`, two orders of magnitude above `sqlite` on the same disk. You are trading `bodega discover promote` and `GET /api/v1/audit` for that; if you need them back, run one instance on `postgres`.
 
-**What `sqlite` drops at 8,000 requests/s is the write lock, not the drain.** `DiscoveryRecorder` accumulates up to 128 observations or 50 ms, whichever comes first, and writes the batch as one statement. Serially it was one write latency per row, which held the drain to about 2,700 rows/s on `sqlite` and about 900/s on `postgres` (each upsert there costs a network round trip) however wide the pool underneath was, and made `postgres` drop more observations than `sqlite` at 2,000 requests/s while absorbing 40% more hot-path writes. Batched, `postgres` drains 11,700 rows/s and takes everything offered at 8,000 requests/s. `sqlite` takes everything up to 2,000 and drops 64% at 8,000, because its batch contends with 64 request goroutines for the one write lock, which is a property of the store rather than of how the queue is drained.
+**The drain is batched, so the store's write path is the limit.** `DiscoveryRecorder` accumulates up to 128 observations or 50 ms, whichever comes first, and writes the batch as one statement. Serially it was one write latency per row, which held the drain to about 2,700 rows/s on `sqlite` and about 900/s on `postgres` (each upsert there costs a network round trip) however wide the pool underneath was. Batched, the drain stops being what limits either store: on `postgres`, observations dropped only past the instance's own ceiling, and on `sqlite` the batch waits for the same write lock as the 64 request goroutines, each holder paying one commit.
 
 **Event types:**
 
