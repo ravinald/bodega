@@ -186,13 +186,23 @@ func containerdTable[T any]() any { return new(T) }
 // GetByType (github.com/containerd/plugin v1.0.0, context.go) hand a
 // dependent the error of any plugin of the type it asks for, so one failing
 // snapshotter fails the metadata plugin, and with it the image plugin.
+//
+// An error that is a containerdHostError says the host decides, and anything
+// else that containerd fails on the configuration alone.
 type containerdInit interface {
 	initError(s *containerdStart, disabled []string) error
 }
 
-// BoltConfig.Validate (plugins/metadata/plugin.go, lines 84-91), which the
-// InitFn skips for "" (lines 143-146).
-func (c *containerdBoltConfig) initError(*containerdStart, []string) error {
+// The metadata plugin's InitFn (plugins/metadata/plugin.go, lines 112-146):
+// the one content store, the snapshotters that loaded, and then
+// BoltConfig.Validate (lines 84-91), which it skips for "".
+func (c *containerdBoltConfig) initError(s *containerdStart, disabled []string) error {
+	if err := s.single("io.containerd.content.v1", disabled); err != nil {
+		return err
+	}
+	if err := s.collect("io.containerd.snapshotter.v1", disabled); err != nil {
+		return err
+	}
 	switch c.ContentSharingPolicy {
 	case "", "shared", "isolated":
 		return nil
@@ -214,27 +224,35 @@ func (c *containerdTaskConfig) initError(*containerdStart, []string) error {
 // The diff service's InitFn (plugins/services/diff/local.go, lines 66-86)
 // takes each differ `default` names from those that loaded.
 func (c *containerdDiffServiceConfig) initError(s *containerdStart, disabled []string) error {
+	if err := s.collect("io.containerd.differ.v1", disabled); err != nil {
+		return err
+	}
 	for _, name := range c.Order {
-		if !s.provides("io.containerd.differ.v1", name, disabled) {
-			return fmt.Errorf("needed differ not loaded: %s", name)
+		if err := s.named("io.containerd.differ.v1", name, disabled); err != nil {
+			return fmt.Errorf("needed differ not loaded: %s: %w", name, err)
 		}
 	}
 	return nil
 }
 
 // The transfer plugin's InitFn (plugins/transfer/plugin.go, lines 94-170)
-// for each unpack_config entry: the platform it parses, and the snapshotter
-// and differ it looks up by name. Whether a differ matches the platform when
-// none is named is the host's.
+// for each unpack_config entry: the platform it parses, the snapshotter it
+// takes from those the metadata plugin collected, and the differ it looks up
+// by name, where GetByID hands it a skipped differ's error. Whether a differ
+// matches the platform when none is named is the host's.
 func (c *containerdTransferConfig) initError(s *containerdStart, disabled []string) error {
 	for _, uc := range c.UnpackConfiguration {
-		switch {
-		case containerdPlatformError(uc.Platform) != nil:
+		if containerdPlatformError(uc.Platform) != nil {
 			return fmt.Errorf("io.containerd.transfer.v1: platform configuration %v invalid", uc.Platform)
-		case !s.provides("io.containerd.snapshotter.v1", uc.Snapshotter, disabled):
-			return fmt.Errorf("snapshotter %q not found: not found", uc.Snapshotter)
-		case uc.Differ != "" && !s.provides("io.containerd.differ.v1", uc.Differ, disabled):
-			return fmt.Errorf("failed to get instance for diff plugin %q: no plugins registered for io.containerd.differ.v1.%s", uc.Differ, uc.Differ)
+		}
+		if err := s.named("io.containerd.snapshotter.v1", uc.Snapshotter, disabled); err != nil {
+			return fmt.Errorf("snapshotter %q not found: %w", uc.Snapshotter, err)
+		}
+		if uc.Differ == "" {
+			continue
+		}
+		if err := s.named("io.containerd.differ.v1", uc.Differ, disabled); err != nil {
+			return fmt.Errorf("failed to get instance for diff plugin %q: %w", uc.Differ, err)
 		}
 	}
 	return nil
@@ -242,7 +260,8 @@ func (c *containerdTransferConfig) initError(s *containerdStart, disabled []stri
 
 // Config.parse and Config.Validate (plugins/snapshots/devmapper/config.go),
 // which NewSnapshotter runs first. With no pool_name the plugin is skipped
-// and reads nothing; root_path is filled before either runs.
+// and reads nothing, which skip reports and is no failure of its own;
+// root_path is filled before either runs.
 func (c *containerdDevmapperConfig) initError(*containerdStart, []string) error {
 	if c.PoolName == "" {
 		return nil
@@ -554,20 +573,162 @@ func (s *containerdStart) load(data []byte, version int) error {
 	return nil
 }
 
-// provides is whether containerd holds a plugin of type typ named name once
-// it has loaded them: one the release builds in or a proxy_plugins entry
-// declares, and disabled_plugins does not name. Whether a plugin it holds
-// also initializes is the host's.
-func (s *containerdStart) provides(typ, name string, disabled []string) bool {
-	uri := typ + "." + name
-	if name == "" || slices.Contains(disabled, uri) {
-		return false
+// containerdHostError is a dependency lookup whose answer the host decides:
+// what has to hold for the plugins it asks for to load.
+type containerdHostError struct{ needs string }
+
+func (e *containerdHostError) Error() string { return e.needs }
+
+// containerdStartFailure says why a plugin the CRI service starts through
+// does not initialize, or that the host decides whether it does.
+func containerdStartFailure(plugin string, err error) string {
+	var host *containerdHostError
+	if errors.As(err, &host) {
+		return fmt.Sprintf("%s, without which containerd serves no CRI pull, initializes only when %s, which depends on this host and doctor does not follow", plugin, host.needs)
 	}
-	if _, builtin := containerdPlugins[uri]; builtin {
-		return true
+	return fmt.Sprintf("%s, without which containerd serves no CRI pull, does not initialize on its configuration: %v", plugin, err)
+}
+
+// config is the Config a registered plugin's InitFn is handed: what it
+// registers, with every loaded file's table decoded over it. nil for a
+// plugin that registers none.
+func (s *containerdStart) config(uri string) any {
+	if value := s.values[uri]; value != nil {
+		return value
 	}
-	proxy, ok := s.proxies[name]
-	return ok && containerdProxyTypes[proxy.Type] == typ
+	if table := containerdPlugins[uri]; table != nil {
+		return table()
+	}
+	return nil
+}
+
+// skip is why a registered plugin's InitFn returns ErrSkipPlugin at
+// containerd v2.2.0, for every plugin of the Linux release that can: skipped
+// when its Config alone decides so, host when something doctor does not read
+// does. Both are "" for a plugin that never skips. A skipped plugin is
+// registered and loads no instance, so a dependent that asks for it finds
+// none.
+func (s *containerdStart) skip(uri string) (skipped, host string) {
+	switch uri {
+	case "io.containerd.snapshotter.v1.devmapper":
+		// plugins/snapshots/devmapper/plugin/plugin.go, lines 45-47.
+		if s.config(uri).(*containerdDevmapperConfig).PoolName == "" {
+			return "its table sets no pool_name", ""
+		}
+	case "io.containerd.snapshotter.v1.blockfile":
+		// NewSnapshotter in plugins/snapshots/blockfile/blockfile.go, lines
+		// 138-153: with no scratch_file there is nothing to make the scratch
+		// file from, so the plugin loads only on one already under its root.
+		switch c := s.config(uri).(*containerdBlockfileConfig); {
+		case c.ScratchFile != "":
+		case c.RecreateScratch:
+			return "its table sets recreate_scratch and no scratch_file", ""
+		default:
+			return "", "a scratch file exists under the blockfile snapshotter's root"
+		}
+	case "io.containerd.snapshotter.v1.btrfs":
+		// plugins/snapshots/btrfs/btrfs.go, lines 60-69.
+		return "", "the btrfs snapshotter's root is on a btrfs filesystem"
+	case "io.containerd.snapshotter.v1.erofs":
+		// plugins/snapshots/erofs/erofs_linux.go, lines 50-56.
+		return "", "the kernel has EROFS loaded"
+	case "io.containerd.snapshotter.v1.zfs":
+		// github.com/containerd/zfs/v2 v2.0.0-rc.0, plugin/plugin.go, lines 52-60.
+		return "", "the zfs snapshotter's root is on a ZFS dataset"
+	case "io.containerd.differ.v1.erofs":
+		// plugins/diff/erofs/plugin/plugin.go, lines 50-57.
+		return "", "mkfs.erofs is installed and has a tar mode"
+	case "io.containerd.tracing.processor.v1.otlp":
+		// checkDisabled in pkg/tracing/plugin/otlp.go, lines 131-146.
+		return "", "containerd's environment names an OTLP endpoint"
+	}
+	return "", ""
+}
+
+// containerdProvider is one plugin of a type containerd holds once it has
+// loaded them, with why it is skipped; the fields are skip's.
+type containerdProvider struct{ skipped, host string }
+
+// providers is every plugin of type typ in the set an InitFn looks through,
+// by id: those the release builds in and those proxy_plugins declares, less
+// what disabled_plugins names. A proxy's InitFn dials nothing and loads
+// whatever its socket holds (LoadPlugins and getClient in
+// cmd/containerd/server/server.go, lines 548-609).
+func (s *containerdStart) providers(typ string, disabled []string) map[string]containerdProvider {
+	found := map[string]containerdProvider{}
+	for uri := range containerdPlugins {
+		if id, ok := strings.CutPrefix(uri, typ+"."); ok && !slices.Contains(disabled, uri) {
+			skipped, host := s.skip(uri)
+			found[id] = containerdProvider{skipped, host}
+		}
+	}
+	for name, proxy := range s.proxies {
+		if containerdProxyTypes[proxy.Type] == typ && !slices.Contains(disabled, typ+"."+name) {
+			found[name] = containerdProvider{}
+		}
+	}
+	return found
+}
+
+// loaded sorts the plugins of type typ into those that load on the
+// configuration and those the host decides; one the configuration skips is
+// in neither.
+func (s *containerdStart) loaded(typ string, disabled []string) (usable, host []string) {
+	found := s.providers(typ, disabled)
+	for _, id := range slices.Sorted(maps.Keys(found)) {
+		switch p := found[id]; {
+		case p.skipped != "":
+		case p.host != "":
+			host = append(host, fmt.Sprintf("%s.%s (when %s)", typ, id, p.host))
+		default:
+			usable = append(usable, id)
+		}
+	}
+	return usable, host
+}
+
+// named is a lookup of one plugin by id among those that loaded: GetByID,
+// and a map a GetByType filled. It needs that plugin, not skipped.
+func (s *containerdStart) named(typ, name string, disabled []string) error {
+	p, ok := s.providers(typ, disabled)[name]
+	switch {
+	case name == "" || !ok:
+		return fmt.Errorf("containerd holds no plugin %s.%s", typ, name)
+	case p.skipped != "":
+		return fmt.Errorf("containerd skips plugin %s.%s while %s", typ, name, p.skipped)
+	case p.host != "":
+		return &containerdHostError{fmt.Sprintf("plugin %s.%s loads, which it does only when %s", typ, name, p.host)}
+	}
+	return nil
+}
+
+// single is GetSingle (github.com/containerd/plugin v1.0.0, context.go,
+// lines 131-158): exactly one plugin of the type loaded. A skipped one does
+// not count, and a second one that loads fails the lookup.
+func (s *containerdStart) single(typ string, disabled []string) error {
+	usable, host := s.loaded(typ, disabled)
+	switch {
+	case len(usable) > 1:
+		return fmt.Errorf("multiple plugins registered for %s (%s): plugin: multiple instances", typ, strings.Join(usable, ", "))
+	case len(host) > 0:
+		return &containerdHostError{fmt.Sprintf("exactly one plugin of type %s loads, and whether these do is the host's: %s", typ, strings.Join(host, ", "))}
+	case len(usable) == 0:
+		return fmt.Errorf("no plugins registered for %s: plugin: not found", typ)
+	}
+	return nil
+}
+
+// collect is GetByType (context.go, lines 182-199): every plugin of the type
+// that loaded, and at least one.
+func (s *containerdStart) collect(typ string, disabled []string) error {
+	usable, host := s.loaded(typ, disabled)
+	switch {
+	case len(usable) > 0:
+		return nil
+	case len(host) > 0:
+		return &containerdHostError{fmt.Sprintf("a plugin of type %s loads, and whether these do is the host's: %s", typ, strings.Join(host, ", "))}
+	}
+	return fmt.Errorf("no plugins registered for %s: plugin: not found", typ)
 }
 
 // command is what the containerd command refuses in the loaded configuration
@@ -625,13 +786,15 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 			return fmt.Sprintf("plugin %s does not decode its table, and containerd does not start: %v", uri, s.tables[uri])
 		}
 	}
-	for _, uri := range slices.Sorted(maps.Keys(s.values)) {
-		check, ok := s.values[uri].(containerdInit)
+	// A plugin no file holds a table for starts on the Config it registers,
+	// and looks its dependencies up all the same.
+	for _, uri := range slices.Sorted(maps.Keys(containerdPlugins)) {
+		check, ok := s.config(uri).(containerdInit)
 		if !ok || slices.Contains(disabled, uri) {
 			continue
 		}
 		if err := check.initError(s, disabled); err != nil {
-			return fmt.Sprintf("plugin %s, which containerd's CRI service starts through, does not initialize on its table, and containerd serves no CRI pull: %v", uri, err)
+			return containerdStartFailure("plugin "+uri, err)
 		}
 	}
 	for _, uri := range required {

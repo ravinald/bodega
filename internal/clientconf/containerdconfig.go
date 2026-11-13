@@ -481,7 +481,7 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 	}
 	if invalid == "" && !slices.Contains(disabled, containerdImagesPlugin) {
 		if err := c.imagesInit(disabled); err != nil {
-			invalid = containerdPluginFailed("image plugin", err).Error()
+			invalid = containerdStartFailure("the CRI image plugin", err)
 		}
 	}
 	return criDisabled, invalid
@@ -510,13 +510,13 @@ func (c *containerdCRI) imagesConfig() containerdImageConfig {
 
 // imagesInit is what the image plugin's InitFn refuses in its table past
 // ValidateImageConfig (plugins/cri/images/plugin.go, lines 106-143): a
-// snapshotter containerd holds no plugin for, and a runtime platform that
-// does not parse. initCRIService stops without the image plugin, so no
-// hosts.toml is read.
+// snapshotter that is not among those the metadata plugin collected, and a
+// runtime platform that does not parse. initCRIService stops without the
+// image plugin, so no hosts.toml is read.
 func (c *containerdCRI) imagesInit(disabled []string) error {
 	images := c.imagesConfig()
-	if !c.start.provides("io.containerd.snapshotter.v1", images.Snapshotter, disabled) {
-		return fmt.Errorf("failed to find snapshotter %q", images.Snapshotter)
+	if err := c.start.named("io.containerd.snapshotter.v1", images.Snapshotter, disabled); err != nil {
+		return fmt.Errorf("failed to find snapshotter %q: %w", images.Snapshotter, err)
 	}
 	for _, name := range slices.Sorted(maps.Keys(images.RuntimePlatforms)) {
 		if p := images.RuntimePlatforms[name].Platform; p != "" {

@@ -2034,3 +2034,36 @@ func TestAudit28ContainerdOperationIsUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit29ContainerdComposedStartupIsUnchecked(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"unconfigured snapshotter": {"devmapper", ""},
+		"two content providers": {
+			"native", "[proxy_plugins.audit-content]\ntype = \"content\"\naddress = \"/tmp/audit-content.sock\"\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			file := filepath.Join(p.Root, "etc/containerd/config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			writeTrustFile(t, file, conf)
+
+			writeTrustFile(t, filepath.Join(p.Root, "etc/containerd/certs.d/docker.io/hosts.toml"), "server = \"https://registry-1.docker.io\"\n[host.\""+base+"\"]\nca = \""+ca+"\"\ncapabilities = [\"pull\", \"resolve\"]\n")
+			if v := auditState(t, p, "oci-containerd", base); v.State != TrustUnchecked {
+				t.Errorf("selected verdict certifies a containerd composition failure: %+v", v)
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "containerd" {
+					return "/fixture/containerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("ordinary report certifies a containerd composition failure: %+v", rows)
+			}
+		})
+	}
+}

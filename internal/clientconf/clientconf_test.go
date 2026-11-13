@@ -4265,3 +4265,23 @@ func TestAudit28ContainerdOperationValidity(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit29ContainerdComposedStartupValidity(t *testing.T) {
+	for name, tc := range map[string]struct{ snapshotter, extra string }{
+		"unconfigured snapshotter": {"devmapper", ""},
+		"two content providers": {
+			"native", "[proxy_plugins.audit-content]\ntype = \"content\"\naddress = \"/tmp/audit-content.sock\"\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			conf := "version = 3\nrequired_plugins = [\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\"]\nsnapshotter = \"native\"\n[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n" + tc.extra
+			conf = strings.ReplaceAll(conf, "snapshotter = \"native\"", "snapshotter = \""+tc.snapshotter+"\"")
+
+			eff, err := ResolveContainerdConfig("", file, []byte(conf))
+			if err == nil && eff.Invalid == "" && !eff.CRIDisabled {
+				t.Errorf("accepted a composed configuration containerd v2.2.0 cannot start: config_path=%q", eff.ConfigPath)
+			}
+		})
+	}
+}

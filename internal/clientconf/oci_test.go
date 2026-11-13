@@ -868,13 +868,38 @@ func TestContainerdInitChecks(t *testing.T) {
 
 		{name: "a task platform", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"arm64\"]\n"},
 		{name: "a task platform nothing knows", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"beos\"]\n", invalid: "invalid platform beos"},
-		{name: "a differ order", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"erofs\", \"walking\"]\n"},
+		{name: "a differ order", conf: "version = 3\n[proxy_plugins.zstd]\ntype = \"diff\"\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"zstd\", \"walking\"]\n"},
+		{name: "a differ order naming one the host may skip", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"erofs\", \"walking\"]\n", invalid: "mkfs.erofs is installed and has a tar mode, which depends on this host"},
 		{name: "a differ order naming none", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"walking\", \"zstd\"]\n", invalid: "needed differ not loaded: zstd"},
 		{name: "an unpack configuration", conf: "version = 3\n" + stargz + transfer + "platform = \"linux/amd64\"\nsnapshotter = \"stargz\"\ndiffer = \"walking\"\n"},
 		{name: "an unpack platform that does not parse", conf: "version = 3\n" + transfer + "platform = \"\"\nsnapshotter = \"overlayfs\"\n", invalid: "platform configuration  invalid"},
 		{name: "an unpack snapshotter nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", invalid: "snapshotter \"stargz\" not found"},
 		{name: "an unpack differ nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"zstd\"\n", invalid: "failed to get instance for diff plugin \"zstd\""},
 		{name: "an unpack configuration an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", imported: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"native\"\n"},
+
+		{name: "an unpack differ the host may skip", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"erofs\"\n", invalid: "depends on this host"},
+		{name: "an unpack snapshotter containerd skips", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"devmapper\"\n", invalid: "snapshotter \"devmapper\" not found: containerd skips plugin"},
+
+		// A registered plugin is not one that loaded: containerd skips
+		// devmapper with no pool_name, and blockfile with nothing to make its
+		// scratch file from, and a consumer naming either finds none. Where
+		// the host decides the skip, doctor does not.
+		{name: "devmapper selected with no pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n", invalid: "failed to find snapshotter \"devmapper\": containerd skips plugin io.containerd.snapshotter.v1.devmapper while its table sets no pool_name"},
+		{name: "devmapper selected with an empty pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n" + devmapper + "pool_name = \"\"\nbase_image_size = \"10GB\"\n", invalid: "failed to find snapshotter \"devmapper\""},
+		{name: "devmapper selected with a pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n"},
+		{name: "devmapper selected with a pool an import sets", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"devmapper\"\n", imported: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n"},
+		{name: "a version 2 devmapper with no pool", conf: "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"devmapper\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\n", invalid: "failed to find snapshotter \"devmapper\""},
+		{name: "blockfile selected with a scratch file", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n[plugins.\"io.containerd.snapshotter.v1.blockfile\"]\nscratch_file = \"/opt/containerd/blockfile\"\n"},
+		{name: "blockfile selected with nothing to recreate from", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n[plugins.\"io.containerd.snapshotter.v1.blockfile\"]\nrecreate_scratch = true\n", invalid: "containerd skips plugin io.containerd.snapshotter.v1.blockfile"},
+		{name: "blockfile selected as registered", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n", invalid: "a scratch file exists under the blockfile snapshotter's root, which depends on this host"},
+		{name: "zfs selected", conf: "version = 3\n" + images + "snapshotter = \"zfs\"\n", invalid: "depends on this host"},
+		{name: "btrfs selected", conf: "version = 3\n" + images + "snapshotter = \"btrfs\"\n", invalid: "depends on this host"},
+		{name: "zfs configured and not selected", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.zfs\"]\nroot_path = \"/tank/containerd\"\n"},
+
+		// GetSingle needs exactly one plugin of the type; GetByType takes all.
+		{name: "a second content store", conf: "version = 3\n[proxy_plugins.remote]\ntype = \"content\"\naddress = \"/run/content.sock\"\n", invalid: "multiple plugins registered for io.containerd.content.v1 (content, remote)"},
+		{name: "a second content store an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[proxy_plugins.remote]\ntype = \"io.containerd.content.v1\"\n", invalid: "multiple plugins registered for io.containerd.content.v1"},
+		{name: "proxies of the collected types", conf: "version = 3\n" + stargz + "[proxy_plugins.zstd]\ntype = \"diff\"\n[proxy_plugins.kata]\ntype = \"sandbox\"\n"},
 
 		{name: "devmapper with no pool", conf: "version = 3\n" + devmapper + "fs_type = \"zfs\"\n"},
 		{name: "devmapper configured", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"xfs\"\n"},
