@@ -18,6 +18,61 @@ import (
 //
 // Nothing here is consulted by a configure that installs no CA.
 
+// Environ reads one variable of the environment a client starts in, and says
+// whether the variable is set at all. Clients disagree about a variable set
+// to the empty string: git reads no per-user file under an empty
+// GIT_CONFIG_GLOBAL, helm takes an empty HELM_REPOSITORY_CONFIG for its
+// repository file, OpenSSL loads an empty SSL_CERT_FILE in place of its
+// default, while npm, pip and the go command read an empty variable as unset.
+// Each reader applies its own client's rule, so the two states stay apart
+// until the function that ports that rule.
+type Environ func(key string) (value string, set bool)
+
+// NewEnviron pairs getenv, which answers for a variable's value, with lookup,
+// which says whether one getenv reads as empty is set. A nil getenv is an
+// environment holding nothing, and a nil lookup one in which no variable is
+// set to the empty string.
+func NewEnviron(getenv func(string) string, lookup func(string) (string, bool)) Environ {
+	return func(key string) (string, bool) {
+		if getenv == nil {
+			return "", false
+		}
+		if v := getenv(key); v != "" {
+			return v, true
+		}
+		if lookup != nil {
+			if v, ok := lookup(key); ok && v == "" {
+				return "", true
+			}
+		}
+		return "", false
+	}
+}
+
+// GitEnvNoFile is the variable that has git read no file where it would read
+// target, as a phrase a diagnostic can carry, "" when none does.
+// git_global_config_paths (config.c at Git 2.54.0) takes GIT_CONFIG_GLOBAL
+// whenever it is set and then looks at neither ~/.gitconfig nor the XDG file,
+// so an empty value names a file git cannot open and git runs with no
+// per-user configuration at all.
+func GitEnvNoFile(env Environ) string {
+	if v, set := env("GIT_CONFIG_GLOBAL"); set && v == "" {
+		return "GIT_CONFIG_GLOBAL, which is set and empty: git reads the variable whenever it is set, in place of ~/.gitconfig and the XDG file, and an empty value names no file, so git runs with no per-user configuration"
+	}
+	return ""
+}
+
+// HelmEnvNoFile is GitEnvNoFile for helm: envOr (pkg/cli/environment.go at
+// Helm v4.3.0, lines 174-179) reads HELM_REPOSITORY_CONFIG through
+// os.LookupEnv, so a variable set and empty is the repository file's path,
+// and helm loads no repository from it.
+func HelmEnvNoFile(env Environ) string {
+	if v, set := env("HELM_REPOSITORY_CONFIG"); set && v == "" {
+		return "HELM_REPOSITORY_CONFIG, which is set and empty: helm reads the variable whenever it is set, in place of the repositories.yaml in its configuration directory, and an empty value names no file, so helm runs with no repository"
+	}
+	return ""
+}
+
 // GitEnvError is why git stops before it loads any configuration on the
 // environment it is started in, as a phrase a diagnostic can carry, "" when
 // it does not. git_config_system (config.c at Git 2.54.0, lines 1510-1513)
@@ -48,8 +103,8 @@ func gitNoSystem(getenv func(string) string) bool {
 // gitTLSEnv is every variable Git 2.54.0 reads from the environment into the
 // settings gitHTTPUnmodeled lists, with what each changes: http_init (http.c,
 // lines 1403-1440) and get_curl_handle (lines 1089-1090 and 1105-1106). git
-// tests most of them for presence alone, so any value counts; an empty one
-// cannot be told from an unset one through the environment doctor is handed.
+// tests them for presence (getenv, and set_from_env, which copies whatever
+// value it finds), so one set and empty counts as one set to anything.
 // GIT_SSL_CAINFO is not here: it names the roots, which the probe reads.
 var gitTLSEnv = []struct{ name, effect string }{
 	{"GIT_SSL_NO_VERIFY", "turns certificate verification off, so no CA decides what git accepts"},
@@ -70,15 +125,24 @@ var gitTLSEnv = []struct{ name, effect string }{
 // GitEnvUnmodeled is the first variable of the environment that constrains
 // git's TLS handshake past the root pool, as a phrase naming it, "" for none:
 // the environment's spelling of what GitTLSUnmodeled refuses in a file. The
-// value is never repeated.
+// value is never repeated. getenv cannot tell a variable set and empty from
+// one unset; GitEnvUnmodeledIn can, and is what a plan and a verdict call.
 func GitEnvUnmodeled(getenv func(string) string) string {
-	if getenv == nil {
-		return ""
-	}
+	return GitEnvUnmodeledIn(NewEnviron(getenv, nil))
+}
+
+// GitEnvUnmodeledIn is GitEnvUnmodeled over an environment that keeps
+// presence. A GIT_SSL_CAINFO set and empty is named too: set_from_env has it
+// replace http.sslCAInfo with an empty file name, which is neither the roots
+// a file names nor git's default store.
+func GitEnvUnmodeledIn(env Environ) string {
 	for _, e := range gitTLSEnv {
-		if getenv(e.name) != "" {
+		if _, set := env(e.name); set {
 			return fmt.Sprintf("the environment's %s, which %s: the CA roots doctor verifies bodega against do not show it and doctor does not interpret it", e.name, e.effect)
 		}
+	}
+	if v, set := env("GIT_SSL_CAINFO"); set && v == "" {
+		return "the environment's GIT_SSL_CAINFO, which is set and empty and replaces http.sslCAInfo with an empty file name: which roots git's TLS library then reads is not something doctor interprets"
 	}
 	return ""
 }
@@ -120,13 +184,25 @@ func (c AptConfig) TLSUnmodeled(host string) string {
 // but macOS, which the go command and helm verify through, both read
 // SSL_CERT_FILE and SSL_CERT_DIR ahead of the store update-ca-certificates
 // rebuilds. An anchor installed there is then one the client never loads.
+// getenv cannot tell a variable set and empty from one unset;
+// SystemStoreEnvIn can, and is what a plan and a verdict call.
 func SystemStoreEnv(getenv func(string) string) string {
-	if getenv == nil {
-		return ""
-	}
+	return SystemStoreEnvIn(NewEnviron(getenv, nil), false)
+}
+
+// SystemStoreEnvIn is SystemStoreEnv over an environment that keeps presence.
+// openssl says the client verifies through OpenSSL, as apt does: its by_file
+// and by_dir lookups take the variable whenever getenv returns one, so an
+// empty value is loaded in place of the default file or directory. Go's
+// crypto/x509 (root_unix.go) reads an empty one as unset.
+func SystemStoreEnvIn(env Environ, openssl bool) string {
 	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
-		if getenv(name) != "" {
+		v, set := env(name)
+		switch {
+		case v != "":
 			return fmt.Sprintf("the environment's %s, which names what the client's TLS library reads in place of the system trust store: doctor installs into and verifies against that store, and does not interpret the variable", name)
+		case set && openssl:
+			return fmt.Sprintf("the environment's %s, which is set and empty: OpenSSL reads the variable whenever it is set, in place of the system trust store's own path, and doctor does not interpret what it then loads", name)
 		}
 	}
 	return ""
@@ -183,20 +259,47 @@ func NpmClientTLS(getenv func(string) string, files []string) string {
 var nodeCAOptions = []string{"--use-bundled-ca", "--use-openssl-ca", "--use-system-ca"}
 
 // NodeOptionsUnread is why NODE_OPTIONS leaves the Node npm runs under
-// unknown, "" when it holds nothing but the options that choose a root
-// store. Node exits before npm starts on an option it does not allow there
-// ("is not allowed in NODE_OPTIONS"), and one it does allow can load code or
-// change what TLS accepts (--require, --tls-min-v1.3, --openssl-config).
-// Telling those apart is Node's option table, which nothing here ports, so
-// anything else is refused. The value is never repeated.
+// unknown or unable to start, "" when it holds nothing but options that
+// choose a root store, in a combination Node starts on. Node exits before
+// npm starts on an option it does not allow there ("is not allowed in
+// NODE_OPTIONS"), and one it does allow can load code or change what TLS
+// accepts (--require, --tls-min-v1.3, --openssl-config). Telling those apart
+// is Node's option table, which nothing here ports, so anything else is
+// refused.
+//
+// The three that remain are each valid alone, and Node checks them together
+// before any script loads (PerProcessOptions::CheckOptions, src/node_options.cc
+// at Node v26.13.0): --use-openssl-ca reads OpenSSL's store in place of the
+// bundled roots, so Node exits on it beside --use-bundled-ca ("either
+// --use-openssl-ca or --use-bundled-ca can be used, not both") and beside
+// --use-system-ca, which NODE_USE_SYSTEM_CA=1 also turns on, in any order.
+// --use-bundled-ca with --use-system-ca is the one pair it starts on. The
+// value is never repeated.
 func NodeOptionsUnread(getenv func(string) string) string {
 	if getenv == nil {
 		return ""
 	}
-	for _, opt := range strings.Fields(getenv("NODE_OPTIONS")) {
+	opts := strings.Fields(getenv("NODE_OPTIONS"))
+	for _, opt := range opts {
 		if !slices.Contains(nodeCAOptions, opt) {
 			return "the environment's NODE_OPTIONS, which holds an option other than " + strings.Join(nodeCAOptions, ", ") + ": Node exits on one it does not allow there and changes what it loads or verifies on others, and doctor interprets those three alone"
 		}
 	}
-	return ""
+	if !slices.Contains(opts, "--use-openssl-ca") {
+		return ""
+	}
+	// flag is the option Node's own message names, and beside how the
+	// environment turned it on.
+	flag, beside := "", ""
+	switch {
+	case slices.Contains(opts, "--use-bundled-ca"):
+		flag, beside = "--use-bundled-ca", "--use-bundled-ca"
+	case slices.Contains(opts, "--use-system-ca"):
+		flag, beside = "--use-system-ca", "--use-system-ca"
+	case getenv("NODE_USE_SYSTEM_CA") == "1":
+		flag, beside = "--use-system-ca", "NODE_USE_SYSTEM_CA=1, which turns --use-system-ca on"
+	default:
+		return ""
+	}
+	return "the environment's NODE_OPTIONS, which holds --use-openssl-ca beside " + beside + ": Node takes one root store of the two and exits on the pair before npm starts (either --use-openssl-ca or " + flag + " can be used, not both)"
 }

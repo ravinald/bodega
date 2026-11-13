@@ -53,22 +53,30 @@ func ParseHelmFile(data []byte) (*HelmFile, error) {
 // helm's helmpath does on every platform: the file HELM_REPOSITORY_CONFIG
 // names, else the one under HELM_CONFIG_HOME, else under
 // $XDG_CONFIG_HOME/helm, else the platform default under home. It is "" when
-// nothing names a file and home is unknown.
+// nothing names a file and home is unknown. getenv cannot tell a variable set
+// and empty from one unset; HelmRepositoryFileIn can, and is what a plan and
+// a verdict call.
 func HelmRepositoryFile(getenv func(string) string, goos, home string) string {
-	env := func(key string) string {
-		if getenv == nil {
-			return ""
-		}
-		return getenv(key)
+	return HelmRepositoryFileIn(NewEnviron(getenv, nil), goos, home)
+}
+
+// HelmRepositoryFileIn is HelmRepositoryFile over an environment that keeps
+// presence. It is "" as well under a HELM_REPOSITORY_CONFIG set and empty,
+// which helm takes for the path (HelmEnvNoFile); helmpath's lazypath reads an
+// empty HELM_CONFIG_HOME or XDG_CONFIG_HOME as unset.
+func HelmRepositoryFileIn(env Environ, goos, home string) string {
+	value := func(key string) string {
+		v, _ := env(key)
+		return v
 	}
-	if p := env("HELM_REPOSITORY_CONFIG"); p != "" {
+	if p, set := env("HELM_REPOSITORY_CONFIG"); set {
 		return p
 	}
-	dir := env("HELM_CONFIG_HOME")
+	dir := value("HELM_CONFIG_HOME")
 	switch {
 	case dir != "":
-	case env("XDG_CONFIG_HOME") != "":
-		dir = filepath.Join(env("XDG_CONFIG_HOME"), "helm")
+	case value("XDG_CONFIG_HOME") != "":
+		dir = filepath.Join(value("XDG_CONFIG_HOME"), "helm")
 	case home == "":
 		return ""
 	case goos == OSDarwin:

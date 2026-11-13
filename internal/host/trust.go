@@ -30,10 +30,14 @@ import (
 type TrustProbe struct {
 	// Root is the directory the /etc and /usr/local paths sit under, "" for
 	// the host's own.
-	Root      string
-	Home      string
-	GOOS      string
-	Getenv    func(string) string
+	Root   string
+	Home   string
+	GOOS   string
+	Getenv func(string) string
+	// LookupEnv says whether a variable Getenv reads as empty is set at all,
+	// as os.LookupEnv does: git, helm and OpenSSL each act on one set and
+	// empty. Nil is an environment in which no variable is.
+	LookupEnv func(string) (string, bool)
 	ConfigDir func() (string, error)
 	// Chain returns the certificates the server at hostport presents, leaf
 	// first, without verifying them. Nil dials it.
@@ -161,7 +165,7 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(set.reached, func(entry string) bool { return namesHost(entry, u.Host) }) {
 		return nil
 	}
-	return []trustStore{t.systemStore()}
+	return []trustStore{t.systemStore(false)}
 }
 
 // trustRows maps a row's check name to its client.
@@ -250,15 +254,17 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 			return []trustStore{*named(v.Value, "Acquire::https::CAInfo in "+v.File, true)}
 		}
 	}
-	return []trustStore{t.systemStore()}
+	return []trustStore{t.systemStore(true)}
 }
 
 // systemStore is the operating system's trust store as apt, the go command
 // and helm read it: the store itself, or nothing doctor can speak for when
 // the environment has the client's TLS library read another file in its
-// place. Go's crypto/x509 takes no such variable on macOS.
-func (t TrustProbe) systemStore() trustStore {
-	if env := clientconf.SystemStoreEnv(t.Getenv); env != "" && t.GOOS != clientconf.OSDarwin {
+// place. openssl says that library is OpenSSL, apt's, which takes such a
+// variable set and empty where Go's crypto/x509 reads it as unset, and takes
+// none at all on macOS.
+func (t TrustProbe) systemStore(openssl bool) trustStore {
+	if env := clientconf.SystemStoreEnvIn(t.environ(), openssl); env != "" && t.GOOS != clientconf.OSDarwin {
 		return trustStore{name: systemStoreName, blind: fmt.Sprintf("the client reads %s, so whether it verifies bodega's certificate is unchecked", env)}
 	}
 	return trustStore{name: systemStoreName, system: true}
@@ -282,6 +288,12 @@ func (t TrustProbe) home() string {
 		return t.Home
 	}
 	return filepath.Join(t.Root, t.Home)
+}
+
+// environ is the probe's environment with presence kept, for the readers
+// whose client tells a variable set and empty from one unset.
+func (t TrustProbe) environ() clientconf.Environ {
+	return clientconf.NewEnviron(t.Getenv, t.LookupEnv)
 }
 
 func (t TrustProbe) env(key string) string {
@@ -482,16 +494,18 @@ func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 	return false
 }
 
-// nodeCAFlags reads the options that choose Node's root store. The last of
-// --use-bundled-ca and --use-openssl-ca wins; --use-system-ca adds the
-// system store to whichever it is.
+// nodeCAFlags reads the options that choose Node's root store. Node exits
+// on --use-openssl-ca beside either of the other two, which
+// clientconf.NodeOptionsUnread reports before this is asked, so openssl is
+// true here only alone; --use-system-ca adds the system store to the bundled
+// roots.
 func nodeCAFlags(t TrustProbe) (bundled, openssl, system bool) {
 	for _, opt := range strings.Fields(t.env("NODE_OPTIONS")) {
 		switch opt {
 		case "--use-bundled-ca":
-			bundled, openssl = true, false
+			bundled = true
 		case "--use-openssl-ca":
-			bundled, openssl = false, true
+			openssl = true
 		case "--use-system-ca":
 			system = true
 		}
@@ -613,6 +627,9 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	if bad := clientconf.NpmEnvInvalid(t.Getenv); bad != "" {
 		return wontStart(bad)
 	}
+	if bad := clientconf.NpmExclusive(t.Getenv, files); bad != "" {
+		return wontStart(bad)
+	}
 	if unmodeled := clientconf.NpmClientTLS(t.Getenv, files); unmodeled != "" {
 		return blind(unmodeled)
 	}
@@ -703,7 +720,7 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	if bad := clientconf.GitEnvError(t.Getenv); bad != "" {
 		return []trustStore{{name: "git's environment", blind: fmt.Sprintf("git does not start with %s, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
 	}
-	files := clientconf.GitConfigFiles(t.Getenv, t.Home, t.Root)
+	files := clientconf.GitConfigFilesIn(t.environ(), t.Home, t.Root)
 	if bad := clientconf.GitLoadError(files); bad != "" {
 		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git fetch and git clone do not run with %s: git stops on a variable it cannot convert, whichever section holds it, and doctor does not vouch for one it does not interpret, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
 	}
@@ -742,7 +759,7 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	if len(prefixes) == 0 {
 		return nil
 	}
-	if unmodeled := clientconf.GitEnvUnmodeled(t.Getenv); unmodeled != "" {
+	if unmodeled := clientconf.GitEnvUnmodeledIn(t.environ()); unmodeled != "" {
 		return []trustStore{{name: "git's environment", blind: fmt.Sprintf("git reads %s, so whether git accepts bodega's certificate is unchecked", unmodeled)}}
 	}
 	if s := envCA(t, "GIT_SSL_CAINFO"); s != nil {
@@ -778,7 +795,7 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 // helm refuses to load, for any field of any entry, leaves helm unchecked:
 // helm stops on it, so no url or caFile it holds is one helm runs with.
 func helmStores(t TrustProbe, u *url.URL) []trustStore {
-	path := clientconf.HelmRepositoryFile(t.Getenv, t.GOOS, t.Home)
+	path := clientconf.HelmRepositoryFileIn(t.environ(), t.GOOS, t.Home)
 	if path == "" {
 		return nil
 	}
@@ -800,7 +817,7 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		if err := r.ClientTLSError(r.CAFile != ""); err != nil {
 			return []trustStore{{name: "helm's configuration", blind: fmt.Sprintf("helm builds no client for a repository at bodega in %s (%v), so whether helm verifies bodega's certificate is unchecked", path, err)}}
 		}
-		s := t.systemStore()
+		s := t.systemStore(false)
 		if r.CAFile != "" {
 			s = *named(r.CAFile, "caFile of the repository "+r.Name+" in "+path, true)
 		}

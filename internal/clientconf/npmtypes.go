@@ -346,3 +346,55 @@ func NpmEnvInvalid(getenv func(string) string) string {
 	}
 	return ""
 }
+
+// npmExclusive are the options npm 11.20.0 declares exclusive of one another
+// (the exclusive lists in @npmcli/config's lib/definitions/definitions.js),
+// each group holding every option of one such set.
+var npmExclusive = [][]string{
+	{"expect-result-count", "expect-results"},
+	{"provenance", "provenance-file"},
+	{"save-dev", "save-optional", "save-peer", "save-prod"},
+}
+
+// NpmExclusive names the first two options of one exclusive set that npm's
+// configuration assigns together, as a phrase a diagnostic can carry, "" for
+// none. Each is valid alone. Config's loader (@npmcli/config 10.13.0,
+// lib/index.js, lines 587-603) throws as it meets the second, in whichever
+// file or variable and whatever either is set to, false included, since it
+// asks only whether the other was assigned ("--save-prod cannot be provided
+// when using --save-dev"), and every npm command exits on that before it
+// reads a registry. The environment's options are npm_config_<name> in
+// either case, an empty one being no assignment.
+func NpmExclusive(getenv func(string) string, files []string) string {
+	from := map[string]string{}
+	seen := map[string]bool{}
+	for _, f := range files {
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		for _, o := range npmFileOptions(f) {
+			if _, set := from[o.Key]; o.Key != "" && o.Unsure == "" && !set {
+				from[o.Key] = fmt.Sprintf("line %d of %s", o.Line, f)
+			}
+		}
+	}
+	for _, set := range npmExclusive {
+		var held []string
+		for _, key := range set {
+			name := "npm_config_" + strings.ReplaceAll(key, "-", "_")
+			for _, name := range []string{name, strings.ToUpper(name)} {
+				if _, inFile := from[key]; !inFile && getenv != nil && getenv(name) != "" {
+					from[key] = "the environment's " + name
+				}
+			}
+			if _, ok := from[key]; ok {
+				held = append(held, key)
+			}
+		}
+		if len(held) > 1 {
+			return fmt.Sprintf("%s, which sets %s, beside %s, which sets %s: npm takes one of the two and exits on the pair before any request (--%s cannot be provided when using --%s)", from[held[0]], held[0], from[held[1]], held[1], held[1], held[0])
+		}
+	}
+	return ""
+}

@@ -733,7 +733,7 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 		osRelease, _ := os.ReadFile(doctorOSRelease)
 		h := clientconf.CAHost{
 			Base: planBase(records, client.BaseURL), Home: home, Root: doctorOCIRoot, GOOS: doctorCAGOOS, OSRelease: osRelease,
-			Getenv: os.Getenv,
+			Getenv: os.Getenv, LookupEnv: os.LookupEnv,
 		}
 		in, err := clientconf.AddCA(changes, *ca, h)
 		if err != nil {
@@ -940,7 +940,7 @@ var doctorCAGOOS = runtime.GOOS
 var doctorTrustProbe = func() host.TrustProbe {
 	home, _ := os.UserHomeDir()
 	return host.TrustProbe{
-		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, ConfigDir: doctorConfigDir,
+		Root: doctorOCIRoot, Home: home, GOOS: doctorCAGOOS, Getenv: os.Getenv, LookupEnv: os.LookupEnv, ConfigDir: doctorConfigDir,
 		Node: doctorNode, Pip: doctorPip,
 	}
 }

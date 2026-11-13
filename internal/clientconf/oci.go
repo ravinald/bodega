@@ -450,31 +450,40 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	// plugin decodes its table: v1Migrate renames [plugins.cri], and the CRI
 	// plugins move that table's keys into their own. A file of an older
 	// version that also holds a table under a name the migration writes to is
-	// one whose result depends on which table wins, which doctor does not
-	// follow.
+	// one containerd loads (configMigration in plugins/cri/images/plugin.go at
+	// v2.2.0 merges into a destination table it finds) and whose result
+	// depends on which table wins, which doctor does not follow. That bounds
+	// what is certified and is no load failure, so it is recorded and the
+	// registry table is still read: a plain configure edits such a file.
+	unfollowed := ""
 	if r.Version < 3 {
 		later := []string{containerdImagesPlugin, containerdRuntimePlugin}
 		if r.Version == 1 {
 			later = append(later, containerdCRIPlugin)
 		}
 		for _, name := range later {
-			if _, ok := tomlTable(doc, []string{"plugins"})[name]; ok {
-				return r, fmt.Errorf("it declares version = %d and holds [plugins.%s], a table of a later format that containerd 2.x merges with the one it migrates [plugins.%s] into; doctor does not follow that merge. Move its settings into [plugins.%s], or migrate the file with containerd config migrate", r.Version, jsonString(name), strings.Trim(jsonString(path[1]), `"`), strings.Trim(jsonString(path[1]), `"`))
+			if _, ok := tomlTable(doc, []string{"plugins"})[name]; ok && unfollowed == "" {
+				unfollowed = fmt.Sprintf("it declares version = %d and holds [plugins.%s], a table of a later format that containerd 2.x merges with the one it migrates [plugins.%s] into; doctor does not follow that merge. Move its settings into [plugins.%s], or migrate the file with containerd config migrate", r.Version, jsonString(name), strings.Trim(jsonString(path[1]), `"`), strings.Trim(jsonString(path[1]), `"`))
 			}
 		}
 	}
+	r.refuse("", unfollowed)
 	// A file that imports another, or is imported, is one part of what
 	// containerd validates: its tables are decoded here for their types, and
-	// ResolveContainerdConfig validates what the parts add up to.
+	// ResolveContainerdConfig validates what the parts add up to. Tables
+	// whose migration is not followed are not decoded as if it were: what
+	// containerd makes of them is already recorded as unknown.
 	whole := version == 0 && len(cfg.Imports) == 0
 	r.cri = newContainerdCRI(r.Version, path[1])
-	err = r.cri.load(data)
-	switch {
-	case err != nil:
-		r.refuse(err.Error(), "")
-	case whole:
-		if err := r.cri.validate(); err != nil {
-			r.refuse(containerdSplit(err.Error(), err))
+	if unfollowed == "" {
+		err = r.cri.load(data)
+		switch {
+		case err != nil:
+			r.refuse(err.Error(), "")
+		case whole:
+			if err := r.cri.validate(); err != nil {
+				r.refuse(containerdSplit(err.Error(), err))
+			}
 		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to
@@ -518,7 +527,7 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 		}
 	}
 	var invalid, unmodeled string
-	if r.CRIDisabled, invalid, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole {
+	if r.CRIDisabled, invalid, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole && unfollowed == "" {
 		r.refuse(invalid, unmodeled)
 	}
 	table := tomlTable(doc, path)

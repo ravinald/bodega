@@ -117,27 +117,40 @@ func PipConfigFiles(h PipHost) (files []string, global int) {
 // use of this list. GIT_CONFIG_SYSTEM and GIT_CONFIG_GLOBAL each name a
 // file read in place of those. A repository's own config, the entries
 // GIT_CONFIG_COUNT carries and files an [include] names are not listed;
-// GitUnread reports the last two.
+// GitUnread reports the last two. getenv cannot tell a variable set and
+// empty from one unset; GitConfigFilesIn can, and is what a plan and a
+// verdict call.
 func GitConfigFiles(getenv func(string) string, home, root string) []string {
-	env := func(key string) string {
-		if getenv == nil {
-			return ""
-		}
-		return getenv(key)
+	return GitConfigFilesIn(NewEnviron(getenv, nil), home, root)
+}
+
+// GitConfigFilesIn is GitConfigFiles over an environment that keeps presence.
+// git_system_config and git_global_config_paths (config.c at Git 2.54.0) take
+// GIT_CONFIG_SYSTEM and GIT_CONFIG_GLOBAL whenever getenv returns one: set
+// and empty, each names a file git cannot open, and git falls back to neither
+// /etc/gitconfig nor the per-user files. xdg_config_home reads an empty
+// XDG_CONFIG_HOME as unset.
+func GitConfigFilesIn(env Environ, home, root string) []string {
+	value := func(key string) string {
+		v, _ := env(key)
+		return v
 	}
 	var files []string
+	system, systemSet := env("GIT_CONFIG_SYSTEM")
 	switch {
-	case gitNoSystem(getenv):
-	case env("GIT_CONFIG_SYSTEM") != "":
-		files = append(files, env("GIT_CONFIG_SYSTEM"))
-	default:
+	case gitNoSystem(value):
+	case system != "":
+		files = append(files, system)
+	case !systemSet:
 		files = append(files, filepath.Join(root, "/etc/gitconfig"))
 	}
+	global, globalSet := env("GIT_CONFIG_GLOBAL")
 	switch {
-	case env("GIT_CONFIG_GLOBAL") != "":
-		files = append(files, env("GIT_CONFIG_GLOBAL"))
+	case global != "":
+		files = append(files, global)
+	case globalSet:
 	case home != "":
-		xdg := env("XDG_CONFIG_HOME")
+		xdg := value("XDG_CONFIG_HOME")
 		if xdg == "" {
 			xdg = filepath.Join(home, ".config")
 		}

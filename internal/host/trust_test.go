@@ -178,7 +178,9 @@ func reviewTrust(t *testing.T) (TrustProbe, string, string) {
 	root := t.TempDir()
 	ca := filepath.Join(root, "ca.pem")
 	writeTrustFile(t, ca, string(pem))
-	return TrustProbe{Root: root, Home: "/home/test", GOOS: "linux", Getenv: func(string) string { return "" },
+	// LookupEnv is the process's, as doctor wires it: a test that hands the
+	// probe os.Getenv then sees a variable t.Setenv set empty as set.
+	return TrustProbe{Root: root, Home: "/home/test", GOOS: "linux", Getenv: func(string) string { return "" }, LookupEnv: os.LookupEnv,
 		Chain:  func(string) ([]*x509.Certificate, error) { return chain, nil },
 		System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} },
 	}, ca, "https://bodega.internal:8443"
@@ -2394,6 +2396,156 @@ func TestUnmodeledTLSInputsAreUnchecked(t *testing.T) {
 			names := r.Replace(tc.names)
 			if v := auditState(t, p, tc.check, base); v.State != TrustUnchecked || !strings.Contains(v.Detail, names) {
 				t.Errorf("selected verdict = %+v; want unchecked naming %q", v, names)
+			}
+		})
+	}
+}
+
+func TestAudit36NodeConflictingCAFlagsAreUnchecked(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for _, flags := range []string{"--use-bundled-ca --use-openssl-ca", "--use-openssl-ca --use-bundled-ca"} {
+		t.Run(flags, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
+			cmd := exec.Command(npm, "--version")
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "NODE_OPTIONS=" + flags}
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "not both") {
+				t.Fatalf("native control: err=%v out=%s", err, out)
+			}
+			t.Logf("native npm: %s", strings.TrimSpace(string(out)))
+			p.Getenv = func(key string) string {
+				if key == "NODE_OPTIONS" {
+					return flags
+				}
+				return ""
+			}
+			vs, err := p.Judge([]string{"npm-config"}, base)
+			if err != nil || len(vs) != 1 {
+				t.Fatalf("Judge: %v %v", vs, err)
+			}
+			if vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, "NODE_OPTIONS") {
+				t.Errorf("selected verdict: %+v", vs[0])
+			}
+			row := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+			if row.Status != StatusWarn || !strings.Contains(row.Detail, "NODE_OPTIONS") {
+				t.Errorf("ordinary row: %+v", row)
+			}
+		})
+	}
+}
+
+func TestAudit36GitEmptyGlobalDoesNotCertifyIgnoredFile(t *testing.T) {
+	git := oracletest.Git(t)
+	p, ca, base := reviewTrust(t)
+	p.Home = filepath.Join(p.Root, "home")
+	file := filepath.Join(p.Home, ".gitconfig")
+	writeTrustFile(t, file, "[url \""+base+"/git/\"]\n\tinsteadOf = https://upstream.invalid/\n[http]\n\tsslCAInfo = "+ca+"\n")
+	for _, value := range []string{file, ""} {
+		cmd := exec.Command(git, "config", "--get", "http.sslCAInfo")
+		cmd.Dir = p.Home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + value}
+		out, err := cmd.CombinedOutput()
+		if value != "" && (err != nil || strings.TrimSpace(string(out)) != ca) {
+			t.Fatalf("native control: err=%v out=%s", err, out)
+		}
+		if value == "" && (err == nil || len(out) != 0) {
+			t.Fatalf("native empty selector did not disable global policy: err=%v out=%s", err, out)
+		}
+		t.Logf("native GIT_CONFIG_GLOBAL=%q: err=%v out=%q", value, err, out)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", "")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	p.Getenv = os.Getenv
+	vs, err := p.Judge([]string{"git-config"}, base)
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("Judge: %v %v", vs, err)
+	}
+	if vs[0].State != TrustAbsent && vs[0].State != TrustUnchecked {
+		t.Errorf("selected verdict certifies the ignored global file: %+v", vs[0])
+	}
+	for _, row := range p.Apply(p.Rows(base), base) {
+		if row.Status == StatusOK {
+			t.Errorf("ordinary row certifies the ignored global file: %+v", row)
+		}
+	}
+}
+
+// F116 R2: the probe reads a variable set and empty by its client's rule.
+// helm under an empty HELM_REPOSITORY_CONFIG has no repository file, so the
+// default one naming bodega is no evidence and helm gets no row; apt under
+// an empty SSL_CERT_FILE is unchecked, since OpenSSL loads that in place of
+// the store, while the go command reads the same variable as unset.
+func TestTrustProbeReadsSetAndEmptyAsTheClientDoes(t *testing.T) {
+	p, _, base := reviewTrust(t)
+	p.System = func([]*x509.Certificate, string) error { return nil }
+	writeTrustFile(t, filepath.Join(p.Root, p.Home, ".config/helm/repositories.yaml"), "apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: "+base+"/helm\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt\nSuites: stable\nComponents: main\n")
+	p.Home = filepath.Join(p.Root, p.Home)
+	state := func(set map[string]string, check string) TrustVerdict {
+		t.Helper()
+		p.Getenv = func(k string) string { return set[k] }
+		p.LookupEnv = func(k string) (string, bool) { v, ok := set[k]; return v, ok }
+		if check == "goproxy-env" {
+			set["GOPROXY"] = base + "/go"
+		}
+		vs, err := p.Judge([]string{check}, base)
+		if err != nil || len(vs) != 1 {
+			t.Fatalf("Judge %s: %v %v", check, vs, err)
+		}
+		return vs[0]
+	}
+	if v := state(map[string]string{}, "helm-repos"); v.State != TrustVerified {
+		t.Fatalf("control: helm with its default repository file: %+v", v)
+	}
+	if v := state(map[string]string{"HELM_REPOSITORY_CONFIG": ""}, "helm-repos"); v.State != TrustAbsent {
+		t.Errorf("helm reads no repository file under an empty HELM_REPOSITORY_CONFIG, and the default one counted: %+v", v)
+	}
+	if rows := p.Rows(base); slices.ContainsFunc(rows, func(f Finding) bool { return f.Check == "helm-repos" }) {
+		t.Errorf("a helm row from a repository file helm does not read: %+v", rows)
+	}
+	if v := state(map[string]string{"HELM_CONFIG_HOME": "", "XDG_CONFIG_HOME": ""}, "helm-repos"); v.State != TrustVerified {
+		t.Errorf("helm reads an empty HELM_CONFIG_HOME as unset: %+v", v)
+	}
+	if v := state(map[string]string{}, "apt-sources"); v.State != TrustVerified {
+		t.Fatalf("control: apt through the system store: %+v", v)
+	}
+	if v := state(map[string]string{"SSL_CERT_FILE": ""}, "apt-sources"); v.State != TrustUnchecked || !strings.Contains(v.Detail, "SSL_CERT_FILE") {
+		t.Errorf("OpenSSL loads an empty SSL_CERT_FILE in place of the store apt was verified against: %+v", v)
+	}
+	if v := state(map[string]string{"SSL_CERT_FILE": ""}, "goproxy-env"); v.State != TrustVerified {
+		t.Errorf("the go command reads an empty SSL_CERT_FILE as unset: %+v", v)
+	}
+}
+
+// F116 R2: a combination npm or Node exits on leaves npm unchecked in the
+// selected verdict and the ordinary row, naming what it holds: two options
+// npm declares exclusive, and --use-openssl-ca beside NODE_USE_SYSTEM_CA=1.
+func TestTrustProbeNpmCombinationsAreUnchecked(t *testing.T) {
+	for name, tc := range map[string]struct {
+		npmrc string
+		env   map[string]string
+		names string
+	}{
+		"exclusive options":         {"save-dev=true\nsave-prod=false\n", nil, "save-prod"},
+		"exclusive in environment":  {"provenance=true\n", map[string]string{"NPM_CONFIG_PROVENANCE_FILE": "x"}, "NPM_CONFIG_PROVENANCE_FILE"},
+		"openssl beside system env": {"", map[string]string{"NODE_OPTIONS": "--use-openssl-ca", "NODE_USE_SYSTEM_CA": "1"}, "NODE_OPTIONS"},
+		"openssl beside system":     {"", map[string]string{"NODE_OPTIONS": "--use-system-ca --use-openssl-ca"}, "NODE_OPTIONS"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n"+tc.npmrc)
+			p.Getenv = func(k string) string { return tc.env[k] }
+			vs, err := p.Judge([]string{"npm-config"}, base)
+			if err != nil || len(vs) != 1 {
+				t.Fatalf("Judge: %v %v", vs, err)
+			}
+			if vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, tc.names) {
+				t.Errorf("selected verdict: %+v; want unchecked naming %s", vs[0], tc.names)
+			}
+			row := p.Apply([]Finding{{Check: "npm-config", Status: StatusOK}}, base)[0]
+			if row.Status != StatusWarn || !strings.Contains(row.Detail, tc.names) {
+				t.Errorf("ordinary row: %+v; want a warning naming %s", row, tc.names)
 			}
 		})
 	}

@@ -3905,8 +3905,8 @@ func TestContainerdCRITablesDecodeAsContainerdDoes(t *testing.T) {
 		"v2 default runtime undefined":  {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n", invalid: "no corresponding runtime configured"},
 		"v2 default runtime defined":    {body: v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.kata]\nruntime_type = \"io.containerd.kata.v2\"\n"},
 		"v2 default runtime, imports":   {body: "imports = [\"/etc/containerd/conf.d/*.toml\"]\n" + v2 + "[plugins.\"io.containerd.grpc.v1.cri\".containerd]\ndefault_runtime_name = \"kata\"\n"},
-		"v2 beside a v3 table":          {body: v2 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/x\"\n", err: "does not follow that merge"},
-		"v1 beside the long name":       {body: "[plugins.cri]\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/x\"\n", err: "does not follow that merge"},
+		"v2 beside a v3 table":          {body: v2 + "[plugins.\"io.containerd.cri.v1.images\".registry]\nconfig_path = \"/x\"\n", invalid: "does not follow that merge"},
+		"v1 beside the long name":       {body: "[plugins.cri]\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/x\"\n", invalid: "does not follow that merge"},
 		"v3 runtime key":                {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\"]\nmax_container_log_line_size = \"big\"\n", invalid: "CRI runtime plugin"},
 		"v3 runtime io_type":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\nio_type = \"pipe\"\n", invalid: "`io_type` can only be"},
 		"v3 cgroup_writable":            {body: v3 + "[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\ncgroup_writable = true\n", invalid: "doctor does not interpret"},
@@ -4583,5 +4583,256 @@ func TestGitNoSystemMatchesNativeGit(t *testing.T) {
 		if got := slices.Contains(GitConfigFiles(getenv, dir, ""), system); got != reads {
 			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: GitConfigFiles lists the system file = %v, git reads it = %v", value, got, reads)
 		}
+	}
+}
+
+func TestAudit36ContainerdConfigureWithoutCAKeepsOtherVersionTable(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	original := "version = 2\nroot = \"/srv/containerd\"\n[plugins.\"io.containerd.cri.v1.images\"]\n  snapshotter = \"native\"\n"
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := ContainerdConfig("https://bodega.internal")
+	sum := sha256.Sum256([]byte(f.Content))
+	rec := PlanRecord{System: f.System, Action: PlanInstall, Path: "~/etc/containerd/config.toml", SHA256: hex.EncodeToString(sum[:])}
+	change, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil {
+		t.Fatalf("plain configure applied on main but rejects this preserved table: %v", err)
+	}
+	for _, kept := range []string{"root = \"/srv/containerd\"", "snapshotter = \"native\"", "config_path = \"/etc/containerd/certs.d\""} {
+		if !strings.Contains(string(change.New), kept) {
+			t.Fatalf("plain configure lost %q:\n%s", kept, change.New)
+		}
+	}
+	if _, err := Apply([]Change{change}, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil || !again.Unchanged() {
+		t.Fatalf("plain configure is not idle: %v", err)
+	}
+}
+
+// presenceEnv is an environment holding exactly set, a variable set to ""
+// included, as the doctor command hands the process's to a plan.
+func presenceEnv(set map[string]string) Environ {
+	return NewEnviron(func(k string) string { return set[k] }, func(k string) (string, bool) { v, ok := set[k]; return v, ok })
+}
+
+// F116 R1, R2: a variable set and empty is read by its own client's rule, not
+// as unset: git and helm take an empty file selector for the file, OpenSSL an
+// empty SSL_CERT_FILE for the store, git an empty TLS variable for a set one.
+func TestEnvironKeepsSetAndEmptyApart(t *testing.T) {
+	home := filepath.FromSlash("/h")
+	user := []string{filepath.Join(home, ".config/git/config"), filepath.Join(home, ".gitconfig")}
+	system := filepath.FromSlash("/etc/gitconfig")
+	for name, tc := range map[string]struct {
+		set  map[string]string
+		want []string
+	}{
+		"nothing set":                {nil, append([]string{system}, user...)},
+		"empty GIT_CONFIG_GLOBAL":    {map[string]string{"GIT_CONFIG_GLOBAL": ""}, []string{system}},
+		"empty GIT_CONFIG_SYSTEM":    {map[string]string{"GIT_CONFIG_SYSTEM": ""}, user},
+		"both empty":                 {map[string]string{"GIT_CONFIG_GLOBAL": "", "GIT_CONFIG_SYSTEM": ""}, nil},
+		"empty GIT_CONFIG_NOSYSTEM":  {map[string]string{"GIT_CONFIG_NOSYSTEM": ""}, append([]string{system}, user...)},
+		"empty XDG_CONFIG_HOME":      {map[string]string{"XDG_CONFIG_HOME": ""}, append([]string{system}, user...)},
+		"GIT_CONFIG_GLOBAL names it": {map[string]string{"GIT_CONFIG_GLOBAL": "/g"}, []string{system, "/g"}},
+	} {
+		if got := GitConfigFilesIn(presenceEnv(tc.set), home, ""); !slices.Equal(got, tc.want) {
+			t.Errorf("git, %s: reads %v; want %v", name, got, tc.want)
+		}
+	}
+	if got := GitEnvNoFile(presenceEnv(map[string]string{"GIT_CONFIG_GLOBAL": ""})); !strings.Contains(got, "GIT_CONFIG_GLOBAL") {
+		t.Errorf("an empty GIT_CONFIG_GLOBAL is not named as leaving git no per-user file: %q", got)
+	}
+	if got := GitEnvNoFile(presenceEnv(nil)); got != "" {
+		t.Errorf("an unset GIT_CONFIG_GLOBAL is named: %q", got)
+	}
+
+	helmDefault := filepath.Join(home, ".config/helm/repositories.yaml")
+	for name, tc := range map[string]struct {
+		set        map[string]string
+		want, none string
+	}{
+		"nothing set":                  {nil, helmDefault, ""},
+		"empty HELM_REPOSITORY_CONFIG": {map[string]string{"HELM_REPOSITORY_CONFIG": ""}, "", "HELM_REPOSITORY_CONFIG"},
+		"empty HELM_CONFIG_HOME":       {map[string]string{"HELM_CONFIG_HOME": ""}, helmDefault, ""},
+		"empty XDG_CONFIG_HOME":        {map[string]string{"XDG_CONFIG_HOME": ""}, helmDefault, ""},
+	} {
+		env := presenceEnv(tc.set)
+		if got := HelmRepositoryFileIn(env, OSLinux, home); got != tc.want {
+			t.Errorf("helm, %s: reads %q; want %q", name, got, tc.want)
+		}
+		if got := HelmEnvNoFile(env); (got != "") != (tc.none != "") || !strings.Contains(got, tc.none) {
+			t.Errorf("helm, %s: HelmEnvNoFile = %q; want one naming %q", name, got, tc.none)
+		}
+	}
+
+	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+		empty := presenceEnv(map[string]string{name: ""})
+		if got := SystemStoreEnvIn(empty, true); !strings.Contains(got, name) {
+			t.Errorf("OpenSSL takes an empty %s for the store; got %q", name, got)
+		}
+		if got := SystemStoreEnvIn(empty, false); got != "" {
+			t.Errorf("Go's crypto/x509 reads an empty %s as unset; got %q", name, got)
+		}
+		if got := SystemStoreEnvIn(presenceEnv(map[string]string{name: "/x"}), false); !strings.Contains(got, name) {
+			t.Errorf("a set %s is not named: %q", name, got)
+		}
+	}
+
+	for _, e := range gitTLSEnv {
+		if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{e.name: ""})); !strings.Contains(got, e.name) {
+			t.Errorf("git tests %s for presence, and an empty one is not named: %q", e.name, got)
+		}
+	}
+	if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{"GIT_SSL_CAINFO": ""})); !strings.Contains(got, "GIT_SSL_CAINFO") {
+		t.Errorf("an empty GIT_SSL_CAINFO replaces http.sslCAInfo and is not named: %q", got)
+	}
+	if got := GitEnvUnmodeledIn(presenceEnv(map[string]string{"GIT_SSL_CAINFO": "/ca.pem"})); got != "" {
+		t.Errorf("a GIT_SSL_CAINFO naming a file is the probe's to read; got %q", got)
+	}
+	if _, set := NewEnviron(nil, func(string) (string, bool) { return "", true })("X"); set {
+		t.Error("a nil getenv is an environment holding nothing, whatever lookup says")
+	}
+}
+
+// F116 R1, R2: git reads GIT_CONFIG_SYSTEM as GitConfigFilesIn does, the
+// native client as the oracle: named, it is the system file; set and empty,
+// git reads no system file and does not fall back to its built-in path.
+func TestGitEmptySystemSelectorMatchesNativeGit(t *testing.T) {
+	git := oracletest.Git(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "system")
+	if err := os.WriteFile(file, []byte("[audit]\n\tkey = kept\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{file, ""} {
+		cmd := exec.Command(git, "config", "--system", "--list", "--show-origin")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_SYSTEM=" + value}
+		out, err := cmd.CombinedOutput()
+		ours := GitConfigFilesIn(presenceEnv(map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_SYSTEM": value}), dir, "")
+		if value != "" && (err != nil || !strings.Contains(string(out), "file:"+file) || !slices.Contains(ours, file)) {
+			t.Errorf("GIT_CONFIG_SYSTEM=%q: git err=%v out=%s; doctor reads %v", value, err, out, ours)
+		}
+		if value == "" && (err == nil || !strings.Contains(string(out), "unable to read config file ''") || !slices.Equal(ours, []string{os.DevNull})) {
+			t.Errorf("GIT_CONFIG_SYSTEM set and empty: git err=%v out=%s; doctor reads %v, want no system file", err, out, ours)
+		}
+	}
+}
+
+// F116 R1, R2: the three NODE_OPTIONS doctor reads are each valid alone, and
+// Node exits on --use-openssl-ca beside --use-bundled-ca or --use-system-ca,
+// in either order and with NODE_USE_SYSTEM_CA=1 standing for the last. The
+// native client is the oracle.
+func TestNodeOptionsCombinationMatchesNativeNode(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for _, tc := range []struct{ flags, systemCA string }{
+		{"", ""}, {"--use-bundled-ca", ""}, {"--use-openssl-ca", ""}, {"--use-system-ca", ""},
+		{"--use-bundled-ca --use-system-ca", ""}, {"--use-bundled-ca --use-bundled-ca", ""},
+		{"--use-bundled-ca", "1"}, {"--use-system-ca", "1"}, {"", "1"},
+		{"--use-openssl-ca", "0"}, {"--use-openssl-ca", "true"},
+		{"--use-bundled-ca --use-openssl-ca", ""}, {"--use-openssl-ca --use-bundled-ca", ""},
+		{"--use-system-ca --use-openssl-ca", ""}, {"--use-openssl-ca --use-system-ca", ""},
+		{"--use-openssl-ca", "1"}, {"--use-openssl-ca --use-system-ca --use-bundled-ca", ""},
+	} {
+		env := map[string]string{"NODE_OPTIONS": tc.flags}
+		cmd := exec.Command(npm, "--version")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "NODE_OPTIONS=" + tc.flags}
+		if tc.systemCA != "" {
+			env["NODE_USE_SYSTEM_CA"] = tc.systemCA
+			cmd.Env = append(cmd.Env, "NODE_USE_SYSTEM_CA="+tc.systemCA)
+		}
+		out, err := cmd.CombinedOutput()
+		refused := NodeOptionsUnread(func(key string) string { return env[key] })
+		if (err != nil) != (refused != "") {
+			t.Errorf("%v: node err=%v (%s); doctor says %q", env, err, strings.TrimSpace(string(out)), refused)
+		}
+		if refused != "" && !strings.Contains(refused, "NODE_OPTIONS") {
+			t.Errorf("%v: the refusal does not name the variable: %q", env, refused)
+		}
+	}
+}
+
+// F116 R1, R2: two options npm declares exclusive of one another stop npm as
+// it loads its configuration, across files and the environment and whatever
+// either is set to; each alone does not. The native client is the oracle.
+func TestNpmExclusiveOptionsMatchNativeNpm(t *testing.T) {
+	npm := oracletest.Npm(t)
+	for name, tc := range map[string]struct {
+		user, global string
+		env          []string
+	}{
+		"one of a set":             {user: "save-dev=true\n"},
+		"one twice":                {user: "save-dev=true\nsave-dev=false\n"},
+		"two in one file":          {user: "save-dev=false\nsave-prod=true\n"},
+		"two across files":         {user: "save-peer=true\n", global: "save-optional=true\n"},
+		"file and environment":     {user: "expect-results=true\n", env: []string{"npm_config_expect_result_count=1"}},
+		"uppercase environment":    {user: "provenance=false\n", env: []string{"NPM_CONFIG_PROVENANCE_FILE=x"}},
+		"empty environment":        {user: "save-dev=true\n", env: []string{"npm_config_save_prod="}},
+		"options of separate sets": {user: "save-dev=true\nprovenance=true\nexpect-results=true\n"},
+	} {
+		home := t.TempDir()
+		user, global := filepath.Join(home, ".npmrc"), filepath.Join(home, "global-npmrc")
+		for file, body := range map[string]string{user: tc.user, global: tc.global} {
+			if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		env := map[string]string{"npm_config_globalconfig": global}
+		for _, kv := range tc.env {
+			k, v, _ := strings.Cut(kv, "=")
+			env[k] = v
+		}
+		cmd := exec.Command(npm, "config", "get", "registry")
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.CombinedOutput()
+		native := err != nil && strings.Contains(string(out), "cannot be provided when using")
+		getenv := func(k string) string { return env[k] }
+		ours := NpmExclusive(getenv, NpmConfigFiles(getenv, OSLinux, home, home))
+		if native != (ours != "") {
+			t.Errorf("%s: npm err=%v (%s); doctor says %q", name, err, strings.TrimSpace(string(out)), ours)
+		}
+	}
+}
+
+// F116 R1: a version 2 config.toml holding a version 3 CRI table is one
+// containerd loads and doctor does not follow, so it bounds what a CA install
+// certifies and is no load failure: the reader records it without refusing
+// the file, and the CA plan still refuses it before any write.
+func TestContainerdUnfollowedMigrationIsUncertaintyNotLoadFailure(t *testing.T) {
+	body := "version = 2\nroot = \"/srv/containerd\"\n[plugins.\"io.containerd.cri.v1.images\"]\n  snapshotter = \"native\"\n[plugins.\"io.containerd.grpc.v1.cri\".registry]\nconfig_path = \"/etc/containerd/certs.d\"\n"
+	r, err := ReadContainerdConfig([]byte(body))
+	if err != nil || r.Refused != "" || !strings.Contains(r.Invalid, "does not follow that merge") || r.ConfigPath != ContainerdCertsDir {
+		t.Fatalf("reader: err=%v Refused=%q Invalid=%q ConfigPath=%q; want the merge recorded as unmodeled and the registry table read", err, r.Refused, r.Invalid, r.ConfigPath)
+	}
+	home := t.TempDir()
+	file := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ContainerdEditEffective("", file, []byte(body)); err != nil {
+		t.Errorf("a plain configure refuses a file containerd loads: %v", err)
+	}
+	caPEM, _, _ := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := AddCA(caPlan(t, home, ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io")), ca, CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux})
+	if err == nil || !strings.Contains(err.Error(), "does not follow that merge") || len(in.Changes) != 0 {
+		t.Errorf("the CA plan certifies a migration doctor does not follow: err=%v changes=%d", err, len(in.Changes))
 	}
 }

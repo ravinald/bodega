@@ -1077,7 +1077,7 @@ func caPlanServer(t *testing.T) (srv *httptest.Server, caPEM []byte, requests *i
 	return srv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), requests
 }
 
-// clearClientEnv empties every variable a client under --ca-file takes
+// clearClientEnv unsets every variable a client under --ca-file takes
 // configuration or trust from, so a test reads the files it wrote and not
 // the machine it runs on.
 func clearClientEnv(t *testing.T) {
@@ -1094,7 +1094,18 @@ func clearClientEnv(t *testing.T) {
 		"GIT_SSL_NO_VERIFY", "GIT_SSL_CERT", "GIT_SSL_KEY", "GIT_SSL_CERT_TYPE", "GIT_SSL_KEY_TYPE", "GIT_SSL_CERT_PASSWORD_PROTECTED", "GIT_SSL_CAPATH",
 		"GIT_SSL_VERSION", "GIT_SSL_CIPHER_LIST", "GIT_PROXY_SSL_CERT", "GIT_PROXY_SSL_KEY", "GIT_PROXY_SSL_CAINFO", "GIT_PROXY_SSL_CERT_PASSWORD_PROTECTED",
 	} {
-		t.Setenv(key, "")
+		unsetEnv(t, key)
+	}
+}
+
+// unsetEnv removes key from the environment for the test. Setting it to ""
+// is not that: git, helm and OpenSSL each act on a variable set and empty.
+// Setenv records the value to restore when the test ends.
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1692,7 +1703,7 @@ func TestDoctorConfigureFailsWhenAnotherStoreOutranksTheCA(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "pypi: ") || !strings.Contains(err.Error(), "the environment's PIP_CERT") {
 		t.Fatalf("PIP_CERT outranks the cert setting the plan wrote; want the run to fail naming pypi and the variable, got %v:\n%s", err, out)
 	}
-	t.Setenv("PIP_CERT", "")
+	unsetEnv(t, "PIP_CERT")
 
 	selected := filepath.Join(home, "work.npmrc")
 	if err := os.WriteFile(selected, []byte("; work\nregistry=https://registry.corp.example/\ncafile=/missing/corp.pem\nfund=false\n"), 0o600); err != nil {
@@ -1757,7 +1768,7 @@ func TestFinalDoctorRejectsPipIgnoringEveryConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("PIP_CONFIG_FILE", os.DevNull)
-	t.Setenv("PIP_INDEX_URL", "")
+	unsetEnv(t, "PIP_INDEX_URL")
 	stubRuntimes(t)
 	prevRoot, prevOS := doctorOCIRoot, doctorCAGOOS
 	doctorOCIRoot, doctorCAGOOS = home, clientconf.OSLinux
@@ -1870,7 +1881,7 @@ func TestDoctorFailsASelectedClientLeftUnverified(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, key := range []string{"npm_config_userconfig", "NPM_CONFIG_USERCONFIG", "npm_config_globalconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_registry", "NPM_CONFIG_CA", "npm_config_ca", "npm_config_cafile", "NPM_CONFIG_CAFILE"} {
-		t.Setenv(key, "")
+		unsetEnv(t, key)
 	}
 	t.Setenv("NPM_CONFIG_REGISTRY", "https://registry.corp.example/")
 	stubRuntimes(t)
@@ -1889,14 +1900,14 @@ func TestDoctorFailsASelectedClientLeftUnverified(t *testing.T) {
 		t.Errorf("the refusal wrote .npmrc: %v", err)
 	}
 
-	t.Setenv("NPM_CONFIG_CAFILE", "")
+	unsetEnv(t, "NPM_CONFIG_CAFILE")
 	for i := 0; i < 2; i++ {
 		_, err := runDoctor(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "unverified") || !strings.Contains(err.Error(), "npm: ") {
 			t.Errorf("apply %d with npm's registry set elsewhere = %v; want a failure naming npm as unverified", i+1, err)
 		}
 	}
-	t.Setenv("NPM_CONFIG_REGISTRY", "")
+	unsetEnv(t, "NPM_CONFIG_REGISTRY")
 	if out, err := runDoctor(t, args...); err != nil {
 		t.Errorf("apply once npm reads the registry written = %v:\n%s", err, out)
 	}
@@ -3952,5 +3963,104 @@ func TestAudit35AptCRLRefusesBeforeWrites(t *testing.T) {
 		if ran != 0 {
 			t.Errorf("phase %d ran %d rebuild(s) before rejecting apt's configuration", phase, ran)
 		}
+	}
+}
+
+func TestAudit36EnvironmentPolicyRefusesBeforeWrites(t *testing.T) {
+	for _, tc := range []struct{ name, system, key, value, config string }{
+		{"node conflicting root flags", "npm", "NODE_OPTIONS", "--use-bundled-ca --use-openssl-ca", ".npmrc"},
+		{"node conflicting root flags reversed", "npm", "NODE_OPTIONS", "--use-openssl-ca --use-bundled-ca", ".npmrc"},
+		{"git disabled global file", "git", "GIT_CONFIG_GLOBAL", "", ".gitconfig"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			t.Setenv(tc.key, tc.value)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+				args := append([]string{"--configure", tc.system, "--ca-file", caFile, "--url", srv.URL}, apply...)
+				out, err := runDoctor(t, args...)
+				if err == nil || !strings.Contains(err.Error(), tc.key) {
+					t.Errorf("%v accepted a policy its client cannot use: err=%v\n%s", apply, err, out)
+				}
+				for _, name := range []string{tc.config, ".config/bodega/ca.pem"} {
+					if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
+						t.Errorf("%v wrote %s before refusing %s: %v", apply, name, tc.key, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// F116 R1: a variable set to the empty string is refused by its client's own
+// rule before anything is written, in the preview, the apply and a second
+// apply: helm takes an empty HELM_REPOSITORY_CONFIG for its repository file,
+// OpenSSL an empty SSL_CERT_FILE for apt's store, git an empty TLS variable
+// for a set one, and Node exits on --use-openssl-ca beside the system store
+// NODE_USE_SYSTEM_CA=1 turns on. The same variables unset, or empty where the
+// client reads empty as unset, do not refuse.
+func TestDoctorCARefusesEnvironmentPresenceAndCombination(t *testing.T) {
+	for _, tc := range []struct {
+		name, system string
+		env          map[string]string
+		names        string
+		config       string
+	}{
+		{"helm empty repository selector", "helm", map[string]string{"HELM_REPOSITORY_CONFIG": ""}, "HELM_REPOSITORY_CONFIG", ".config/helm/repositories.yaml"},
+		{"git empty TLS switch", "git", map[string]string{"GIT_SSL_NO_VERIFY": ""}, "GIT_SSL_NO_VERIFY", ".gitconfig"},
+		{"git empty CA override", "git", map[string]string{"GIT_SSL_CAINFO": ""}, "GIT_SSL_CAINFO", ".gitconfig"},
+		{"node openssl beside system CA", "npm", map[string]string{"NODE_OPTIONS": "--use-openssl-ca", "NODE_USE_SYSTEM_CA": "1"}, "NODE_OPTIONS", ".npmrc"},
+		{"npm exclusive options", "npm", map[string]string{"npm_config_save_dev": "true", "NPM_CONFIG_SAVE_PROD": "false"}, "npm_config_save_dev", ".npmrc"},
+		{"gomod empty store variable", "gomod", map[string]string{"SSL_CERT_FILE": ""}, "", ".config/go/env"},
+		{"npm empty selector", "npm", map[string]string{"npm_config_userconfig": "", "NODE_OPTIONS": ""}, "", ".npmrc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			release := filepath.Join(t.TempDir(), "os-release")
+			for file, body := range map[string][]byte{caFile: caPEM, release: []byte("ID=ubuntu\n")} {
+				if err := os.WriteFile(file, body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+			doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+			doctorRun = func(string, ...string) error {
+				bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+				if err := os.MkdirAll(filepath.Dir(bundle), 0755); err != nil {
+					return err
+				}
+				return os.WriteFile(bundle, caPEM, 0644)
+			}
+			t.Cleanup(func() {
+				doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+			})
+			for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+				out, err := runDoctor(t, append([]string{"--configure", tc.system, "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+				_, statErr := os.Stat(filepath.Join(home, tc.config))
+				switch {
+				case tc.names == "":
+					if err != nil && strings.Contains(err.Error(), "set and empty") {
+						t.Errorf("%v refused a variable its client reads as unset: %v\n%s", apply, err, out)
+					}
+				case err == nil || !strings.Contains(err.Error(), tc.names):
+					t.Errorf("%v accepted a policy its client cannot use; want a refusal naming %s: err=%v\n%s", apply, tc.names, err, out)
+				case !os.IsNotExist(statErr):
+					t.Errorf("%v wrote %s before refusing %s: %v", apply, tc.config, tc.names, statErr)
+				}
+			}
+		})
 	}
 }

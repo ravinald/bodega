@@ -87,9 +87,19 @@ type CAHost struct {
 	// name a configuration file a client reads in place of, or after, the
 	// one the plan writes. Nil is an environment naming none.
 	Getenv func(string) string
+	// LookupEnv says whether a variable Getenv reads as empty is set at all,
+	// as os.LookupEnv does: git, helm and OpenSSL each act on one set and
+	// empty. Nil is an environment in which no variable is.
+	LookupEnv func(string) (string, bool)
 	// PipPrefix is the sys.prefix of the interpreter pip runs under, "" when
 	// pip was not asked: its pip.conf outranks the global and per-user files.
 	PipPrefix string
+}
+
+// environ is the host's environment with presence kept, for the readers
+// whose client tells a variable set and empty from one unset.
+func (h CAHost) environ() Environ {
+	return NewEnviron(h.Getenv, h.LookupEnv)
 }
 
 // shadow is an existing configuration file, other than the one a plan
@@ -150,7 +160,7 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 		sel = env("GIT_CONFIG_SYSTEM")
 	case rec.System == manifest.TypeHelm:
 		// helm reads one repositories.yaml, which the environment can move.
-		sel = HelmRepositoryFile(h.Getenv, h.GOOS, h.Home)
+		sel = HelmRepositoryFileIn(h.environ(), h.GOOS, h.Home)
 	case rec.System == manifest.TypeGomod:
 		// GOENV=off reads no file, which the verdict reports; there is no
 		// file to edit in its place.
@@ -170,7 +180,7 @@ func (h CAHost) shadows(rec PlanRecord, target string, planned []byte) []shadow 
 	}
 	switch rec.System {
 	case manifest.TypeGit:
-		for _, f := range GitConfigFiles(h.Getenv, h.Home, h.Root) {
+		for _, f := range GitConfigFilesIn(h.environ(), h.Home, h.Root) {
 			info, ok := regularFile(f)
 			if !ok || same(f, info) {
 				continue
@@ -440,6 +450,10 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		if bad := NpmEnvInvalid(h.Getenv); bad != "" {
 			return npmWontStart(rec, bad)
 		}
+		// Options npm takes one of, each valid alone.
+		if bad := NpmExclusive(h.Getenv, append(slices.Clone(files), loaded...)); bad != "" {
+			return npmWontStart(rec, bad)
+		}
 		// What stands beside the CA list: a client certificate or key, and
 		// a NODE_OPTIONS doctor does not read whole. Each is left as it is.
 		unmodeled := NpmClientTLS(h.Getenv, append(slices.Clone(files), loaded...))
@@ -463,7 +477,13 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			return fmt.Errorf("%s: git does not start with %s, so it would read neither the rewrite nor the CA written to %s, and the install could not be verified. "+
 				"Nothing was written. Unset the variable or give it a value git reads as a boolean (true, false, 1, 0), then re-run", rec.System, bad, target)
 		}
-		files := append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)
+		// And an empty selector is taken as one: git then reads no per-user
+		// file, the one this plan writes included.
+		if none := GitEnvNoFile(h.environ()); user && none != "" {
+			return fmt.Errorf("%s: git reads %s. It would load neither the rewrite nor the CA written to %s, and the install could not be verified. "+
+				"Nothing was written. Unset GIT_CONFIG_GLOBAL or point it at a configuration file, then re-run", rec.System, none, target)
+		}
+		files := append(GitConfigFilesIn(h.environ(), h.Home, h.Root), target)
 		if bad := GitLoadError(files); bad != "" {
 			return fmt.Errorf("%s: git fetch and git clone do not run with %s. git stops on a variable it cannot convert, whichever section holds it, and doctor refuses one it does not interpret, so whether git would read the rewrite and the CA written to %s could not be verified. "+
 				"Nothing was written. Correct or remove that line (git config --file <file> --list names a line git cannot parse), then re-run", rec.System, bad, target)
@@ -476,7 +496,7 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so a setting there could outrank the CA written to %s unseen. "+
 				"Nothing was written. Unset the variable, move included settings into the file itself, or write the header as [name] or [name \"subsection\"] alone on its line and the value on one line, then re-run", rec.System, unread[0], target)
 		}
-		if unmodeled := GitEnvUnmodeled(h.Getenv); unmodeled != "" {
+		if unmodeled := GitEnvUnmodeledIn(h.environ()); unmodeled != "" {
 			return fmt.Errorf("%s: git reads %s, so whether git would accept bodega's certificate with the CA written to %s could not be verified. "+
 				"Nothing was written, and the variable is left as it is. Unset it where git should be certified for bodega, then re-run", rec.System, unmodeled, target)
 		}
@@ -515,7 +535,11 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		// The file helm reads and the file the plan edits, each loaded whole
 		// as helm loads it: a wrong type in a field no edit touches still
 		// stops helm, and the merge would carry it into the rewrite.
-		for _, f := range []string{HelmRepositoryFile(h.Getenv, h.GOOS, h.Home), target} {
+		if none := HelmEnvNoFile(h.environ()); none != "" {
+			return fmt.Errorf("%s: helm reads %s. It would load neither the repository written to %s nor verify bodega with the CA this command installs, and the install could not be verified. "+
+				"Nothing was written. Unset HELM_REPOSITORY_CONFIG or point it at a repository file, then re-run", rec.System, none, target)
+		}
+		for _, f := range []string{HelmRepositoryFileIn(h.environ(), h.GOOS, h.Home), target} {
 			if f == "" {
 				continue
 			}
@@ -547,7 +571,7 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 	// which this command rebuilds: a variable that has their TLS library
 	// read another file in its place leaves the anchor unread.
 	if !slices.Contains(ownStoreSystems, rec.System) {
-		if env := SystemStoreEnv(h.Getenv); env != "" {
+		if env := SystemStoreEnvIn(h.environ(), rec.System == manifest.TypeApt); env != "" {
 			return fmt.Errorf("%s: the client reads %s, so it would not load the CA this command adds to the system trust store, and the install could not be verified. "+
 				"Nothing was written. Unset the variable, or add the CA to the file or directory it names by hand, then re-run", rec.System, env)
 		}
