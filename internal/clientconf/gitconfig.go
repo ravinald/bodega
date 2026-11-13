@@ -289,8 +289,9 @@ func (e GitEntry) Key() string {
 // GitLoadError names the first of files git fetch and git clone do not run
 // with, or doctor cannot tell so of, as a phrase a diagnostic can carry: a
 // file git cannot parse, with the line it stops at, or one holding a variable
-// GitConvertError names, with that line and its message. "" when git loads
-// every one that can be read and converts each variable those commands read.
+// GitConvertError or GitTLSUnmodeled names, with that line and its message.
+// "" when git loads every one that can be read, converts each variable those
+// commands read, and takes its TLS policy from nothing but the roots.
 // git aborts on such a file whichever section the line sits in, so nothing
 // else it holds is configuration git runs with.
 func GitLoadError(files []string) string {
@@ -304,6 +305,9 @@ func GitLoadError(files []string) string {
 			return fmt.Sprintf("%s (bad config line %d, which git aborts every command on)", f, cfg.BadLine)
 		}
 		if line, msg := GitConvertError(cfg); msg != "" {
+			return fmt.Sprintf("%s (line %d: %s)", f, line, msg)
+		}
+		if line, msg := GitTLSUnmodeled(cfg); msg != "" {
 			return fmt.Sprintf("%s (line %d: %s)", f, line, msg)
 		}
 	}

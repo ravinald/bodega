@@ -2190,3 +2190,59 @@ func TestAudit33ContainerdProxyConstructionIsUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit34GitPinnedKeyIsUnchecked(t *testing.T) {
+	git := oracletest.Git(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	for _, scoped := range []bool{false, true} {
+		t.Run(map[bool]string{false: "global", true: "URL scoped"}[scoped], func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			ca := filepath.Join(root, "ca.pem")
+			writeTrustFile(t, ca, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
+			header := "[http]"
+			if scoped {
+				header = "[http \"" + srv.URL + "/\"]"
+			}
+			config := "[url \"" + srv.URL + "/git/\"]\n\tinsteadOf = https://upstream.invalid/\n" + header + "\n\tsslCAInfo = " + ca + "\n"
+			file := filepath.Join(home, ".gitconfig")
+			native := func() (string, error) {
+				cmd := exec.Command(git, "clone", "--bare", srv.URL+"/git/repo", filepath.Join(t.TempDir(), "repo"))
+				cmd.Dir = home
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_GLOBAL=" + file, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}
+				out, err := cmd.CombinedOutput()
+				return string(out), err
+			}
+			writeTrustFile(t, file, config)
+			requests.Store(0)
+			control, _ := native()
+			if requests.Load() == 0 {
+				t.Fatalf("native control did not accept the CA and reach HTTP: %s", control)
+			}
+			writeTrustFile(t, file, config+"\tpinnedPubkey = sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n")
+			requests.Store(0)
+			out, err := native()
+			if err == nil || !strings.Contains(strings.ToLower(out), "pinned") || requests.Load() != 0 {
+				t.Fatalf("native Git did not reject the mismatching pin before HTTP: err=%v requests=%d output=%s", err, requests.Load(), out)
+			}
+			t.Logf("native Git rejected the pin: %s", strings.TrimSpace(out))
+			p := TrustProbe{Root: root, Home: home, GOOS: "linux", Getenv: func(string) string { return "" }, System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }}
+			v, err := p.Judge([]string{"git-config"}, srv.URL)
+			if err != nil || len(v) != 1 {
+				t.Fatalf("Judge: %+v, %v", v, err)
+			}
+			if v[0].State == TrustVerified || v[0].State == TrustAbsent {
+				t.Errorf("doctor certified Git whose effective public-key pin rejects the served leaf: %+v", v[0])
+			}
+			rows := p.Apply(p.Rows(srv.URL), srv.URL)
+			if len(rows) != 1 || rows[0].Status == StatusOK {
+				t.Errorf("ordinary Git row certified a mismatching pin: %+v", rows)
+			}
+		})
+	}
+}

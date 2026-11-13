@@ -42,11 +42,12 @@ const (
 	gitAbbrev
 	// gitComment is core.commentchar and core.commentstring.
 	gitComment
-	// gitColor is a color git parses with color_parse, and gitBackend
-	// http.sslbackend, which git accepts only when the curl it was built
-	// against carries that backend. This port holds neither, so a value for
-	// one is refused as not interpreted.
+	// gitColor is a color git parses with color_parse. This port does not, so
+	// a value for one is refused as not interpreted.
 	gitColor
+	// gitBackend is http.sslbackend, which git accepts only when the curl it
+	// was built against carries that backend. Nothing is converted here:
+	// GitTLSUnmodeled refuses the variable at any value.
 	gitBackend
 	// gitAny is a variable git fetch and git clone read, or that Git
 	// documents in a section they read, and convert nothing in: no value
@@ -379,6 +380,112 @@ func GitConvertError(cfg GitConfig) (line int, msg string) {
 	return 0, ""
 }
 
+// gitHTTPModeled is every http variable of gitHTTPVars doctor certifies git
+// under at any value git converts: http.sslCAInfo, whose file is the root
+// pool the probe verifies bodega against, and the variables that change
+// nothing in the TLS handshake git-remote-https makes with the server
+// (request tuning, authentication, cookies, headers, and the proxy a request
+// is routed through, which doctor follows no more than it follows the
+// environment's https_proxy).
+var gitHTTPModeled = strings.Fields(`sslcainfo version ssltry minsessions maxrequests lowspeedlimit lowspeedtime
+	noepsv proxy proxyauthmethod cookiefile savecookies postbuffer useragent emptyauth delegation extraheader
+	followredirects proactiveauth keepaliveidle keepaliveinterval keepalivecount retryafter maxretries maxretrytime`)
+
+// gitHTTPDefault is how an http variable outside gitHTTPModeled is written
+// while it still leaves git at its default: a boolean at the value http.c
+// initializes it to, or one of the two strings http.c ignores when empty.
+// A variable with neither has no default but being unset.
+type gitHTTPDefault struct {
+	isBool, value bool
+	emptyIsUnset  bool
+	// effect is what a non-default value changes that the probe's
+	// verification against a root pool does not see.
+	effect string
+}
+
+// gitHTTPUnmodeled is every other variable of gitHTTPVars: each changes
+// which server certificate git accepts, what git presents in the handshake,
+// or which address or second TLS session the request goes through, and
+// doctor's verdict reads none of them. Git 2.54.0 hands them to curl in
+// get_curl_handle (http.c lines 1040-1260), where a pin that does not match
+// fails the handshake after the chain verified ("SSL: public key does not
+// match pinned public key").
+var gitHTTPUnmodeled = map[string]gitHTTPDefault{
+	"pinnedpubkey":                  {effect: "has git refuse a server whose public key does not match the pin, whatever CA signed its certificate"},
+	"sslverify":                     {isBool: true, value: true, effect: "turns certificate verification off, so no CA decides what git accepts"},
+	"sslcapath":                     {effect: "adds a directory of CA certificates to the roots git verifies with"},
+	"sslcert":                       {effect: "has git present a client certificate"},
+	"sslkey":                        {effect: "has git present a client key"},
+	"sslcerttype":                   {effect: "sets the format git reads its client certificate in"},
+	"sslkeytype":                    {effect: "sets the format git reads its client key in"},
+	"sslcertpasswordprotected":      {isBool: true, effect: "has git ask for the password of a client certificate"},
+	"sslversion":                    {emptyIsUnset: true, effect: "holds the handshake to one TLS version"},
+	"sslcipherlist":                 {emptyIsUnset: true, effect: "holds the handshake to the listed ciphers"},
+	"sslbackend":                    {effect: "selects the TLS library git verifies with, and git dies on one its curl was not built with"},
+	"schannelcheckrevoke":           {isBool: true, value: true, effect: "changes the revocation check of the Windows TLS library"},
+	"schannelusesslcainfo":          {isBool: true, effect: "changes which roots the Windows TLS library reads"},
+	"proxysslcert":                  {effect: "has git present a client certificate to an HTTPS proxy"},
+	"proxysslkey":                   {effect: "has git present a client key to an HTTPS proxy"},
+	"proxysslcainfo":                {effect: "names the roots git verifies an HTTPS proxy with"},
+	"proxysslcertpasswordprotected": {isBool: true, effect: "has git ask for the password of a proxy client certificate"},
+	"curloptresolve":                {effect: "has git connect to an address it names in place of the one the host resolves to"},
+}
+
+// gitTrue is git_config_bool for a value GitConvertError has already passed:
+// a name with no = is true, and "" false.
+func gitTrue(value string, has bool) bool {
+	if !has {
+		return true
+	}
+	switch strings.ToLower(value) {
+	case "true", "yes", "on":
+		return true
+	case "", "false", "no", "off":
+		return false
+	}
+	n, why := gitNumber(value, true, big.NewInt(math.MinInt32), big.NewInt(math.MaxInt32))
+	return why == "" && n.Sign() != 0
+}
+
+// GitTLSUnmodeled is the first http variable of a git configuration file
+// that constrains git's TLS handshake past the root pool doctor verifies
+// with, as the line it stands on and a message naming the section and the
+// variable. 0 and "" for a file whose every http variable is one of
+// gitHTTPModeled, a name git does not read, or at git's default.
+//
+// A CA file answers which roots git verifies with and nothing more. A
+// variable here can have git refuse a server those roots verify, so a
+// verdict that read only the roots would certify a git that cannot connect.
+// Like GitConvertError it reads every [http "<url>"] section whatever its
+// URL and every assignment whether or not a later one replaces it: which
+// remote git fetches is not known here, and that errs toward refusing.
+func GitTLSUnmodeled(cfg GitConfig) (line int, msg string) {
+	for _, e := range cfg.Entries {
+		if e.Section != "http" {
+			continue
+		}
+		if _, read := gitHTTPVars[e.Name]; !read || slices.Contains(gitHTTPModeled, e.Name) {
+			continue
+		}
+		// A variable git reads that neither list holds is refused as well.
+		d, listed := gitHTTPUnmodeled[e.Name]
+		switch {
+		case !listed:
+			d.effect = "is one doctor holds no reading of"
+		case d.isBool && gitTrue(e.Value, e.HasValue) == d.value:
+			continue
+		case d.emptyIsUnset && e.HasValue && e.Value == "":
+			continue
+		}
+		header := "[http]"
+		if e.Subsection != "" {
+			header = `[http "` + e.Subsection + `"]`
+		}
+		return e.Line, fmt.Sprintf("'http.%s' in the section %s %s, which the CA roots doctor verifies bodega against do not show and doctor does not interpret; git would refuse or accept bodega's certificate on it whatever CA is installed", e.Name, header, d.effect)
+	}
+	return 0, ""
+}
+
 // gitGlobRefspec is a refspec with one * on each side under refs/, in the
 // characters every ref name may hold.
 var gitGlobRefspec = regexp.MustCompile(`^\+?refs/[A-Za-z0-9_/-]*\*[A-Za-z0-9_/-]*:refs/[A-Za-z0-9_/-]*\*[A-Za-z0-9_/-]*$`)
@@ -493,7 +600,7 @@ func (v gitVar) refuses(name, value string, has bool) (msg string, own bool) {
 			msg = fmt.Sprintf("'%s' is %d, and git accepts %d through %d", name, n.Int64(), v.lo, v.hi)
 		}
 	}
-	return msg, msg != "" && (v.conv == gitColor || v.conv == gitBackend || strings.Contains(msg, "doctor does not look up"))
+	return msg, msg != "" && (v.conv == gitColor || strings.Contains(msg, "doctor does not look up"))
 }
 
 // converts is the conversion of one of the git_config_* helpers.
@@ -600,10 +707,6 @@ func (v gitVar) converts(name, value string, has bool) string {
 			return missing
 		}
 		return fmt.Sprintf("'%s' is a color git parses and dies on when it is malformed, which doctor does not interpret", name)
-	case gitBackend:
-		if has {
-			return fmt.Sprintf("'%s' selects the TLS library git verifies with, and git dies on one its curl was not built with, which doctor does not interpret", name)
-		}
 	}
 	return ""
 }

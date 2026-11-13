@@ -3816,3 +3816,31 @@ func TestAudit33ContainerdProxyConstructionRefusesBeforeWrites(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit34GitPinnedKeyRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".gitconfig")
+	before := "[user]\n\tname = Kept User\n[http \"" + srv.URL + "/\"]\n\tpinnedPubkey = sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "git", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "pinnedpubkey") {
+			t.Errorf("%s apply must refuse the unmodeled trust pin before writes, naming pinnedPubkey; got %v:\n%s", phase, err, out)
+		}
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != before {
+		t.Errorf("changed Git policy before refusing its trust pin: %v, %s", err, got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Errorf("wrote a CA before refusing Git's trust pin: %v", err)
+	}
+}

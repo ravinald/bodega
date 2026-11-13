@@ -4356,3 +4356,75 @@ func TestAudit33ContainerdProxyConstructionValidity(t *testing.T) {
 		})
 	}
 }
+
+// TestGitHTTPKeysAreModeledOrAtDefault holds the Git reader to one rule:
+// every http variable git reads is on gitHTTPModeled or gitHTTPUnmodeled and
+// never both, and a variable on the second passes GitLoadError only at git's
+// default. A non-default value refuses, in [http] and under a URL, naming the
+// file, the section and the variable.
+func TestGitHTTPKeysAreModeledOrAtDefault(t *testing.T) {
+	for name := range gitHTTPVars {
+		_, unmodeled := gitHTTPUnmodeled[name]
+		if modeled := slices.Contains(gitHTTPModeled, name); modeled == unmodeled {
+			t.Errorf("http.%s: on the modeled list %v and on the unmodeled list %v; want exactly one", name, modeled, unmodeled)
+		}
+	}
+	for _, name := range gitHTTPModeled {
+		if _, ok := gitHTTPVars[name]; !ok {
+			t.Errorf("gitHTTPModeled holds %s, which http_options does not read", name)
+		}
+	}
+	dir := t.TempDir()
+	load := func(body string) (string, string) {
+		file := filepath.Join(dir, "gitconfig")
+		if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return file, GitLoadError([]string{file})
+	}
+	const scope = `[http "https://bodega.example.com/"]`
+	for name, d := range gitHTTPUnmodeled {
+		if _, ok := gitHTTPVars[name]; !ok {
+			t.Errorf("gitHTTPUnmodeled holds %s, which http_options does not read", name)
+		}
+		set, unset := "/etc/x", ""
+		switch {
+		case d.isBool:
+			set, unset = strconv.FormatBool(!d.value), strconv.FormatBool(d.value)
+		case name == "sslversion":
+			set = "tlsv1.3"
+		}
+		for _, header := range []string{"[http]", scope} {
+			body := "[user]\n\tname = Kept\n" + header + "\n\tsslCAInfo = /etc/ca.pem\n\t" + name + " = " + set + "\n"
+			file, got := load(body)
+			for _, want := range []string{file + " (line 5: ", "'http." + name + "'", "the section " + header} {
+				if !strings.Contains(got, want) {
+					t.Errorf("%s under %s set to %q: GitLoadError = %q; want it to name %q", name, header, set, got, want)
+				}
+			}
+			if !d.isBool && !d.emptyIsUnset {
+				continue
+			}
+			if _, got := load(header + "\n\t" + name + " = " + unset + "\n"); got != "" {
+				t.Errorf("%s under %s at git's default %q is refused: %s", name, header, unset, got)
+			}
+		}
+	}
+	// A boolean with no = is true, which is the default of one and not of the other.
+	if _, got := load("[http]\n\tsslVerify\n"); got != "" {
+		t.Errorf("a bare http.sslVerify is true, git's default, and is refused: %s", got)
+	}
+	if _, got := load("[http]\n\tsslCertPasswordProtected\n"); !strings.Contains(got, "'http.sslcertpasswordprotected'") {
+		t.Errorf("a bare http.sslCertPasswordProtected is true and passes: %q", got)
+	}
+	// A later assignment at the default does not clear an earlier one doctor cannot follow.
+	if _, got := load("[http]\n\tsslVerify = false\n\tsslVerify = true\n"); !strings.Contains(got, "line 2: 'http.sslverify'") {
+		t.Errorf("an sslVerify = false ahead of a later true passes: %q", got)
+	}
+	// What bodega writes, beside settings that leave the handshake alone, stays accepted.
+	ok := "[url \"https://bodega.example.com/git/\"]\n\tinsteadOf = https://github.com/\n" + scope + "\n\tsslCAInfo = /home/u/.config/bodega/ca.pem\n" +
+		"[http]\n\tpostBuffer = 512m\n\tproxy = http://proxy.example:3128\n\tuserAgent = x\n\textraHeader = X-A: b\n\tsslVerify = yes\n\tsslVersion =\n\tnoSuchKey = 1\n"
+	if _, got := load(ok); got != "" {
+		t.Errorf("a configuration that sets bodega's URL and CA is refused: %s", got)
+	}
+}
