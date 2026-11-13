@@ -19,6 +19,7 @@ SITE = Path(__file__).resolve().parents[1]
 REPO = SITE.parent
 DEFAULT_CONFIG = REPO / 'docs-internal/site-deploy.json'
 # Every repository path the generator reads.
+TRUNK = 'main'
 RENDERED = ('site', 'docs', 'api', 'assets', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md')
 
 
@@ -111,17 +112,30 @@ def render(root, output, coverage, revision):
          '-coverage', str(coverage), '-version', version, '-commit', revision])
 
 
-def deploy(config):
-    revision = clean_revision()
+def extract(revision, destination):
+    destination.mkdir()
+    archive = run(['git', '-C', str(REPO), 'archive', revision, *RENDERED], capture_output=True).stdout
+    run(['tar', '-x', '-C', str(destination)], input=archive)
+
+
+def deploy(config, revision=None):
+    """Build and activate a release: of this clean checkout, or of revision taken from git without a checkout."""
+    archived = revision is not None
+    if not archived:
+        revision = clean_revision()
     release = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + revision[:12] + '-' + uuid.uuid4().hex[:8]
     with tempfile.TemporaryDirectory(prefix='bodega-site-') as temporary:
         staging = Path(temporary)
         coverage = staging / 'coverage.json'
         export_coverage(config, coverage)
         artifact = staging / 'artifact'
-        render(REPO, artifact, coverage, revision)
-        if clean_revision() != revision:
-            raise ValueError('Source revision changed during the build; nothing uploaded')
+        if archived:
+            extract(revision, staging / 'source')
+            render(staging / 'source', artifact, coverage, revision)
+        else:
+            render(REPO, artifact, coverage, revision)
+            if clean_revision() != revision:
+                raise ValueError('Source revision changed during the build; nothing uploaded')
         artifact_manifest(artifact, revision)
         # Hold the server-side lock through upload and activation, not just rename.
         remote(config, """set -eu
@@ -185,19 +199,39 @@ def publish_coverage(config):
         print('Public coverage feed updated')
 
         revision = deployed_revision(config)
-        source = staging / 'source'
-        source.mkdir()
-        archive = run(['git', '-C', str(REPO), 'archive', revision, *RENDERED], capture_output=True).stdout
-        run(['tar', '-x', '-C', str(source)], input=archive)
-        render(source, staging / 'site', output, revision)
+        extract(revision, staging / 'source')
+        render(staging / 'source', staging / 'site', output, revision)
         upload(config, staging / 'site/coverage.html', f'{config.remote_root}/data/{name}.html')
         remote(config, 'set -eu\nmv -f "$1/data/$2.html" "$1/data/coverage.html"\n', name)
     print(f'Public coverage page updated from release commit {revision[:12]}')
 
 
+def held(config):
+    return remote(config, 'set -eu\nif [ -e "$1/auto-deploy-hold" ]; then echo held; fi\n', capture=True).stdout.strip() == 'held'
+
+
+def sync(config):
+    """Deploy origin's trunk when the live release is behind it, then republish the coverage feed and page.
+
+    Only a strict ancestor of the trunk is replaced. A release built from a branch, or a
+    rollback held with <remote_root>/auto-deploy-hold, stays live until a person acts."""
+    git('fetch', '--quiet', 'origin', TRUNK)
+    target = git('rev-parse', f'origin/{TRUNK}^{{commit}}')
+    live = deployed_revision(config)
+    if live != target:
+        if held(config):
+            print(f'{config.remote_root}/auto-deploy-hold is present; {live[:12]} stays live, {TRUNK} is at {target[:12]}')
+        elif subprocess.run(['git', '-C', str(REPO), 'merge-base', '--is-ancestor', live, target]).returncode:
+            print(f'The live release {live[:12]} is not on {TRUNK}; not replacing it with {target[:12]}')
+        else:
+            print(f'Deploying {TRUNK} {target[:12]} over {live[:12]}')
+            deploy(config, target)
+    publish_coverage(config)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['deploy', 'coverage'])
+    parser.add_argument('command', choices=['deploy', 'coverage', 'sync'])
     parser.add_argument('--config', type=Path, default=os.environ.get('BODEGA_SITE_CONFIG', DEFAULT_CONFIG),
                         help='operator JSON config; defaults to docs-internal/site-deploy.json')
     parser.add_argument('--dry-run', action='store_true', help='validate config and print the plan; no build, SSH, or writes')
@@ -212,6 +246,8 @@ def main():
             # nginx serves /coverage.html from the data directory, so a new release
             # shows its own layout there only once the page is rendered again.
             publish_coverage(config)
+        elif args.command == 'sync':
+            sync(config)
         else:
             publish_coverage(config)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

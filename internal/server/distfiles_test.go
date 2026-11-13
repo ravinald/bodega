@@ -783,17 +783,23 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			}},
 		{name: "unlisted", path: "/distfiles/pcpustat/9.9.tar.bz2", code: http.StatusNotFound, logsRoot: true},
 		{name: "ambiguous digest", path: pcpustat, code: http.StatusNotFound, logsRoot: true,
-			setup: func(t *testing.T, f *fixture) {
-				put(t, f.root, "sysutils/pcpustat-devel/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %064d\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", 0, len(distfileBody)))
+			root: func(t *testing.T) string {
+				root := tree(t, marker+"-tree")
+				put(t, root, "sysutils/pcpustat-devel/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %064d\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", 0, len(distfileBody)))
+				return root
 			}},
 		{name: "unusable digest", path: "/distfiles/pcpustat/2.0.tar.bz2", code: http.StatusNotFound, logsRoot: true,
-			setup: func(t *testing.T, f *fixture) {
-				put(t, f.root, "sysutils/pcpustat-devel/distinfo", "SHA256 (pcpustat/2.0.tar.bz2) = not-hex\nSIZE (pcpustat/2.0.tar.bz2) = 1\n")
+			root: func(t *testing.T) string {
+				root := tree(t, marker+"-tree")
+				put(t, root, "sysutils/pcpustat-devel/distinfo", "SHA256 (pcpustat/2.0.tar.bz2) = not-hex\nSIZE (pcpustat/2.0.tar.bz2) = 1\n")
+				return root
 			}},
 		{name: "restricted", path: "/distfiles/nonfree.tar.gz", code: http.StatusUnavailableForLegalReasons},
 		{name: "restriction make reaches", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
-			setup: func(t *testing.T, f *fixture) {
-				writeMakeOnlyRestriction(t, f.root, makeOnlyRestrictions["undefined branch"])
+			root: func(t *testing.T) string {
+				root := tree(t, marker+"-tree")
+				writeMakeOnlyRestriction(t, root, makeOnlyRestrictions["undefined branch"])
+				return root
 			}},
 		{name: "restriction under a symlinked root", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
 			root: func(t *testing.T) string {
