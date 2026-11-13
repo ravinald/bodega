@@ -607,10 +607,8 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 //   - the port composes or validates it as containerd does: version,
 //     imports and the two plugin lists, which ResolveContainerdConfig and
 //     containerdPluginState follow; debug.level and debug.format, which
-//     command refuses as applyFlags does; a proxy plugin's type, which
-//     invalid refuses as LoadPlugins panics on it, and its address, which
-//     getClient hands to a client that dials nothing until a request; the
-//     keys the validators and initError methods above read;
+//     command refuses as applyFlags does; the keys the validators and
+//     initError methods above read;
 //   - startup reads it and no value fails: initPlatform
 //     (internal/cri/server/service_linux.go) warns on the selinux and oom
 //     keys, skips CDI when enable_cdi is off, and introspectRuntimeHandler
@@ -632,7 +630,6 @@ var containerdModeled = map[string][]string{
 	"": {
 		"version", "imports", "disabled_plugins", "required_plugins", "plugins",
 		"debug.level", "debug.format",
-		"proxy_plugins.*.type", "proxy_plugins.*.address",
 	},
 	containerdCRIPlugin: {"disable_tcp_service", "stream_idle_timeout"},
 	containerdImagesPlugin: {

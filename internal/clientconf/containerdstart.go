@@ -656,21 +656,15 @@ func (s *containerdStart) skip(uri string) (skipped, host string) {
 type containerdProvider struct{ skipped, host string }
 
 // providers is every plugin of type typ in the set an InitFn looks through,
-// by id: those the release builds in and those proxy_plugins declares, less
-// what disabled_plugins names. A proxy's InitFn dials nothing and loads
-// whatever its socket holds (LoadPlugins and getClient in
-// cmd/containerd/server/server.go, lines 548-609).
+// by id: those the release builds in, less what disabled_plugins names.
+// invalid refuses a configuration declaring a proxy plugin before any lookup
+// runs, so none is ever a provider here.
 func (s *containerdStart) providers(typ string, disabled []string) map[string]containerdProvider {
 	found := map[string]containerdProvider{}
 	for uri := range containerdPlugins {
 		if id, ok := strings.CutPrefix(uri, typ+"."); ok && !slices.Contains(disabled, uri) {
 			skipped, host := s.skip(uri)
 			found[id] = containerdProvider{skipped, host}
-		}
-	}
-	for name, proxy := range s.top.ProxyPlugins {
-		if containerdProxyTypes[proxy.Type] == typ && !slices.Contains(disabled, typ+"."+name) {
-			found[name] = containerdProvider{}
 		}
 	}
 	return found
@@ -801,8 +795,8 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 			return fmt.Sprintf("timeouts sets %s = %q, and containerd does not start: unable to parse %s into a time duration", key, value, value)
 		}
 	}
-	proxies := map[string]bool{}
-	for _, name := range slices.Sorted(maps.Keys(s.top.ProxyPlugins)) {
+	proxies := slices.Sorted(maps.Keys(s.top.ProxyPlugins))
+	for _, name := range proxies {
 		typ, ok := containerdProxyTypes[s.top.ProxyPlugins[name].Type]
 		switch {
 		case !ok:
@@ -814,7 +808,14 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 		if _, builtin := containerdPlugins[uri]; builtin {
 			return fmt.Sprintf("proxy_plugins.%s takes the name of a plugin containerd already holds, and it panics registering the plugin: %s: plugin id already registered", name, uri)
 		}
-		proxies[uri] = true
+	}
+	// A proxy's InitFn builds its gRPC client (getClient in
+	// cmd/containerd/server/server.go, lines 575-615), which rejects an
+	// address before it dials, and metadata loads every snapshotter whichever
+	// one the CRI names (plugins/metadata/plugin.go, lines 117-120). Nothing
+	// here ports gRPC's target parsing, so no proxy is certified.
+	if len(proxies) > 0 {
+		return fmt.Sprintf("[proxy_plugins.%s] declares a proxy plugin: containerd builds that proxy's client as it starts and exits when it cannot, with code doctor does not follow, so whether it serves a CRI pull is unknown", proxies[0])
 	}
 	for _, uri := range slices.Sorted(maps.Keys(s.tables)) {
 		if !slices.Contains(disabled, uri) {
@@ -835,7 +836,7 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 	for _, uri := range required {
 		_, builtin := containerdPlugins[uri]
 		switch {
-		case !builtin && !proxies[uri]:
+		case !builtin:
 			return fmt.Sprintf("required plugin [%s] not included: containerd v2.2.0 registers no plugin of that name, and does not start", uri)
 		case uri == containerdCRIPlugin || uri == containerdImagesPlugin || uri == containerdRuntimePlugin || slices.Contains(disabled, uri):
 			// The CRI plugins start on the tables containerdCRI validates, and

@@ -758,7 +758,7 @@ func TestContainerdDefaultWithOneUnlistedKeyIsRefused(t *testing.T) {
 		{name: "timeouts key nothing registers", old: "[timeouts]\n", new: "[timeouts]\n  'io.containerd.timeout.other' = '5s'\n", invalid: "[timeouts] sets io.containerd.timeout.other "},
 		{name: "stream_processors", old: "returns = 'application/vnd.oci.image.layer.v1.tar'\n    path = 'ctd-decoder'", new: "returns = 'application/vnd.oci.image.layer.v1.tar'\n    path = '/srv/decoder'", invalid: "[stream_processors] sets io.containerd.ocicrypt.decoder.v1.tar.path "},
 		{name: "stream_processors entry", old: "[stream_processors]\n", new: "[stream_processors]\n  [stream_processors.other]\n", invalid: "[stream_processors] sets other "},
-		{name: "proxy_plugins", old: "[cgroup]\n", new: "[proxy_plugins.stargz]\n  type = 'snapshot'\n  address = '/run/stargz.sock'\n  platform = 'linux/amd64'\n\n[cgroup]\n", invalid: "[proxy_plugins] sets stargz.platform "},
+		{name: "proxy_plugins", old: "[cgroup]\n", new: "[proxy_plugins.stargz]\n  type = 'snapshot'\n  address = '/run/stargz.sock'\n  platform = 'linux/amd64'\n\n[cgroup]\n", invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
 		{name: "plugins", old: overlayfs + "''", new: overlayfs + "'/srv/overlay'", invalid: "[plugins.\"io.containerd.snapshotter.v1.overlayfs\"] sets root_path "},
 		{name: "plugins, a CRI table", old: "stream_server_port = '0'", new: "stream_server_port = '10010'", invalid: "[plugins.\"io.containerd.grpc.v1.cri\"] sets stream_server_port "},
 		{name: "an import", imported: "version = 3\n[debug]\naddress = '/run/containerd/debug.sock'\n", invalid: "[debug] sets address "},
@@ -855,7 +855,7 @@ func TestContainerdStartupChecks(t *testing.T) {
 		{name: "a required plugin under its version 2 name", conf: "version = 2\nrequired_plugins = [\"io.containerd.monitor.v1.cgroups\"]\n", invalid: "not included"},
 		{name: "a required plugin whose start depends on the host", conf: "version = 3\nrequired_plugins = [\"io.containerd.snapshotter.v1.btrfs\"]\n", invalid: "doctor does not follow"},
 		{name: "a required proxy plugin", conf: "version = 3\nrequired_plugins = [\"io.containerd.snapshotter.v1.stargz\"]\n[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n", invalid: "doctor does not follow"},
-		{name: "a proxy plugin", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n"},
+		{name: "a proxy plugin", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"snapshot\"\naddress = \"/run/stargz.sock\"\n", invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
 		{name: "a proxy plugin of no type", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"snapshots\"\n", invalid: "no type for plugin"},
 		{name: "a proxy plugin under a registered name", conf: "version = 3\n[proxy_plugins.overlayfs]\ntype = \"snapshot\"\n", invalid: "already registered"},
 		{name: "a timeout", conf: "version = 3\n[timeouts]\n\"io.containerd.timeout.shim.load\" = \"5s\"\n"},
@@ -930,21 +930,28 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "an unknown policy of a disabled plugin", conf: "version = 3\ndisabled_plugins = [\"io.containerd.metadata.v1.bolt\"]\n" + bolt + "content_sharing_policy = \"private\"\n", invalid: "doctor does not follow"},
 
 		{name: "a built-in snapshotter", conf: "version = 3\n" + images + "snapshotter = \"native\"\n"},
-		{name: "a proxy snapshotter", conf: "version = 3\n" + stargz + images + "snapshotter = \"stargz\"\n"},
+		{name: "a proxy snapshotter", conf: "version = 3\n" + stargz + images + "snapshotter = \"stargz\"\n", invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
 		{name: "a snapshotter nothing provides", conf: "version = 3\n" + images + "snapshotter = \"stargz\"\n", invalid: "failed to find snapshotter \"stargz\""},
 		{name: "an empty snapshotter", conf: "version = 3\n" + images + "snapshotter = \"\"\n", invalid: "failed to find snapshotter \"\""},
-		{name: "a proxy of another type", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"diff\"\n" + images + "snapshotter = \"stargz\"\n", invalid: "failed to find snapshotter \"stargz\""},
-		{name: "a proxy snapshotter an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"stargz\"\n", imported: "version = 3\n" + stargz},
+		{name: "a proxy of another type", conf: "version = 3\n[proxy_plugins.stargz]\ntype = \"diff\"\n" + images + "snapshotter = \"stargz\"\n", invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
+		{name: "a proxy snapshotter an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"stargz\"\n", imported: "version = 3\n" + stargz, invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
 		{name: "a version 2 snapshotter nothing provides", conf: "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"stargz\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\n", invalid: "failed to find snapshotter \"stargz\""},
 		{name: "a runtime platform", conf: "version = 3\n" + images + "[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.kata]\nplatform = \"linux/arm64/v8\"\nsnapshotter = \"anything\"\n"},
 		{name: "a runtime platform with a wildcard", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.kata]\nplatform = \"linux/*\"\n", invalid: "wildcards not yet supported"},
 
+		// containerd v2.2.0 serves CRI on either: NewCRIService logs a runtime
+		// whose features it cannot read and goes on.
+		{name: "a runtime path that is no shim", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\nruntime_path = \"/usr/bin/yes\"\n"},
+		{name: "a runtime binary that is no runc", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runc.options]\nBinaryName = \"/usr/bin/yes\"\n"},
+		{name: "a drain timeout that is no duration", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\"]\ndrain_exec_sync_io_timeout = \"soon\"\n", invalid: "invalid `drain_exec_sync_io_timeout`"},
+		{name: "a registry auth key that is no URL", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\".registry.auths.\"%zz\"]\nusername = \"u\"\n", invalid: "failed to parse registry url"},
+
 		{name: "a task platform", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"arm64\"]\n"},
 		{name: "a task platform nothing knows", conf: "version = 3\n[plugins.\"io.containerd.runtime.v2.task\"]\nplatforms = [\"linux/amd64\", \"beos\"]\n", invalid: "invalid platform beos"},
-		{name: "a differ order", conf: "version = 3\n[proxy_plugins.zstd]\ntype = \"diff\"\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"zstd\", \"walking\"]\n"},
+		{name: "a differ order naming a proxy", conf: "version = 3\n[proxy_plugins.zstd]\ntype = \"diff\"\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"zstd\", \"walking\"]\n", invalid: "[proxy_plugins.zstd] declares a proxy plugin"},
 		{name: "a differ order naming one the host may skip", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"erofs\", \"walking\"]\n", invalid: "mkfs.erofs is installed and has a tar mode, which depends on this host"},
 		{name: "a differ order naming none", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = [\"walking\", \"zstd\"]\n", invalid: "needed differ not loaded: zstd"},
-		{name: "an unpack configuration", conf: "version = 3\n" + stargz + transfer + "platform = \"linux/amd64\"\nsnapshotter = \"stargz\"\ndiffer = \"walking\"\n"},
+		{name: "an unpack configuration naming a proxy", conf: "version = 3\n" + stargz + transfer + "platform = \"linux/amd64\"\nsnapshotter = \"stargz\"\ndiffer = \"walking\"\n", invalid: "[proxy_plugins.stargz] declares a proxy plugin"},
 		{name: "an unpack platform that does not parse", conf: "version = 3\n" + transfer + "platform = \"\"\nsnapshotter = \"overlayfs\"\n", invalid: "platform configuration  invalid"},
 		{name: "an unpack snapshotter nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", invalid: "snapshotter \"stargz\" not found"},
 		{name: "an unpack differ nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"zstd\"\n", invalid: "failed to get instance for diff plugin \"zstd\""},
@@ -978,10 +985,10 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "btrfs selected", conf: "version = 3\n" + images + "snapshotter = \"btrfs\"\n", invalid: "depends on this host"},
 		{name: "zfs configured and not selected", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.zfs\"]\nroot_path = \"/tank/containerd\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.zfs\"] sets root_path"},
 
-		// GetSingle needs exactly one plugin of the type; GetByType takes all.
-		{name: "a second content store", conf: "version = 3\n[proxy_plugins.remote]\ntype = \"content\"\naddress = \"/run/content.sock\"\n", invalid: "multiple plugins registered for io.containerd.content.v1 (content, remote)"},
-		{name: "a second content store an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[proxy_plugins.remote]\ntype = \"io.containerd.content.v1\"\n", invalid: "multiple plugins registered for io.containerd.content.v1"},
-		{name: "proxies of the collected types", conf: "version = 3\n" + stargz + "[proxy_plugins.zstd]\ntype = \"diff\"\n[proxy_plugins.kata]\ntype = \"sandbox\"\n"},
+		// A proxy would be a second provider of its type, and no proxy is followed.
+		{name: "a second content store", conf: "version = 3\n[proxy_plugins.remote]\ntype = \"content\"\naddress = \"/run/content.sock\"\n", invalid: "[proxy_plugins.remote] declares a proxy plugin"},
+		{name: "a second content store an import declares", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[proxy_plugins.remote]\ntype = \"io.containerd.content.v1\"\n", invalid: "[proxy_plugins.remote] declares a proxy plugin"},
+		{name: "proxies of the collected types", conf: "version = 3\n" + stargz + "[proxy_plugins.zstd]\ntype = \"diff\"\n[proxy_plugins.kata]\ntype = \"sandbox\"\n", invalid: "[proxy_plugins.kata] declares a proxy plugin"},
 
 		{name: "devmapper with no pool", conf: "version = 3\n" + devmapper + "fs_type = \"zfs\"\n"},
 		{name: "devmapper configured", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"xfs\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.devmapper\"] sets pool_name"},
@@ -1002,6 +1009,32 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "a version 2 cgroups table", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = true\n", invalid: "[plugins.\"io.containerd.monitor.task.v1.cgroups\"] sets no_prometheus"},
 		{name: "a table of a plugin the CRI service does not start through", conf: "version = 3\n[plugins.\"io.containerd.internal.v1.opt\"]\npath = \"/srv/opt\"\n[plugins.\"io.containerd.monitor.container.v1.restart\"]\ninterval = \"30s\"\n"},
 		{name: "an erofs default size with no number", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"large\"\n", invalid: "failed to parse default_size"},
+
+		// One value per followed key that containerd v2.2.0 was run on and
+		// served CRI with: none of these keys has a value its startup fails on.
+		{name: "the CRI service on TCP", conf: "version = 3\n[plugins.\"io.containerd.grpc.v1.cri\"]\ndisable_tcp_service = false\n"},
+		{name: "a negative stream idle timeout", conf: "version = 3\n[plugins.\"io.containerd.grpc.v1.cri\"]\nstream_idle_timeout = \"-1h\"\n"},
+		{name: "a pinned image that is no reference", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\"]\n[plugins.\"io.containerd.cri.v1.images\".pinned_images]\nsandbox = \"%%%bad ref\"\n"},
+		{name: "an unknown decryption key model", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\".image_decryption]\nkey_model = \"bogus\"\n"},
+		{name: "a negative pull progress timeout", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\"]\nimage_pull_progress_timeout = \"-5m\"\n"},
+		{name: "a negative fetch buffer", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\"]\nconcurrent_layer_fetch_buffer = -1\n"},
+		{name: "a runtime platform snapshotter nothing provides", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.images\".runtime_platforms.x]\nplatform = \"linux/arm64\"\nsnapshotter = \"nope\"\n"},
+		{name: "blockio and RDT errors ignored", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd]\nignore_blockio_not_enabled_errors = true\nignore_rdt_not_enabled_errors = true\n"},
+		{name: "a runtime of an unknown type", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\nruntime_type = \"bogus\"\n"},
+		{name: "a runtime with no keys", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\n"},
+		{name: "annotation patterns that do not parse", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\nruntime_type = \"io.containerd.runc.v2\"\npod_annotations = [\"[\"]\ncontainer_annotations = [\"[\"]\n"},
+		{name: "runtime options runc does not have", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\nruntime_type = \"io.containerd.runc.v2\"\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x.options]\nBogus = 1\nSystemdCgroup = \"yes\"\n"},
+		{name: "a sandboxer nothing provides", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\nruntime_type = \"io.containerd.runc.v2\"\nsandboxer = \"nope\"\n"},
+		{name: "both privileged device keys", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.x]\nruntime_type = \"io.containerd.runc.v2\"\nprivileged_without_host_devices = true\nprivileged_without_host_devices_all_devices_allowed = true\n"},
+		{name: "CNI keys read per sandbox", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\".cni]\nsetup_serially = true\nconf_template = \"/nonexistent\"\nip_pref = \"bogus\"\n"},
+		{name: "selinux with a negative category range", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\"]\nenable_selinux = true\nselinux_category_range = -5\n"},
+		{name: "runtime keys read per container", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\"]\nmax_container_log_line_size = -5\ndisable_apparmor = true\nrestrict_oom_score_adj = true\ndisable_proc_mount = true\nunset_seccomp_profile = \"bogus\"\ntolerate_missing_hugetlb_controller = false\ndisable_hugetlb_controller = false\ndevice_ownership_from_security_context = true\nignore_image_defined_volumes = true\nnetns_mounts_under_state_dir = true\nignore_deprecation_warnings = [\"x\"]\n"},
+		{name: "unprivileged ports, ICMP and CDI off", conf: "version = 3\n[plugins.\"io.containerd.cri.v1.runtime\"]\nenable_unprivileged_ports = false\nenable_unprivileged_icmp = false\nenable_cdi = false\n"},
+		{name: "an opt path that cannot be made", conf: "version = 3\n[plugins.\"io.containerd.internal.v1.opt\"]\npath = \"/proc/nope/x\"\n"},
+		{name: "a restart interval of a nanosecond", conf: "version = 3\n[plugins.\"io.containerd.monitor.container.v1.restart\"]\ninterval = \"1ns\"\n"},
+		{name: "a negative restart interval", conf: "version = 3\n[plugins.\"io.containerd.monitor.container.v1.restart\"]\ninterval = \"-1s\"\n"},
+		{name: "an empty differ order", conf: "version = 3\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = []\n"},
+		{name: "no unpack configuration", conf: "version = 3\n[plugins.\"io.containerd.transfer.v1.local\"]\nunpack_config = []\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
