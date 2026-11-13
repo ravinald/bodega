@@ -4428,3 +4428,160 @@ func TestGitHTTPKeysAreModeledOrAtDefault(t *testing.T) {
 		t.Errorf("a configuration that sets bodega's URL and CA is refused: %s", got)
 	}
 }
+
+func TestAudit35ContainerdConfigureWithoutCAKeepsCustomRoot(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "etc/containerd/config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "version = 2\nroot = \"/srv/containerd\"\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := ContainerdConfig("https://bodega.internal")
+	sum := sha256.Sum256([]byte(f.Content))
+	rec := PlanRecord{System: f.System, Action: PlanInstall, Path: "~/etc/containerd/config.toml", SHA256: hex.EncodeToString(sum[:])}
+	change, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil {
+		t.Fatalf("plain configure, with no CA request, rejected a valid custom root: %v", err)
+	}
+	if !strings.Contains(string(change.New), "root = \"/srv/containerd\"") || !strings.Contains(string(change.New), "config_path = \"/etc/containerd/certs.d\"") {
+		t.Fatalf("plain configure lost the custom root or did not set config_path:\n%s", change.New)
+	}
+	if _, err := Apply([]Change{change}, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewChange(rec, []byte(f.Content), home)
+	if err != nil || !again.Unchanged() {
+		t.Fatalf("plain configure is not idle: %v", err)
+	}
+}
+
+// F116 R1: a CA plan is refused, before any change is planned, for a client
+// given a TLS input other than the CA bundle the plan writes: a client
+// certificate or key, a revocation list, another root store, or an
+// environment selector the client stops on. Each refusal names the option
+// or the variable. The file that holds it loads, so the same host takes a
+// plan that installs no CA: caPlan builds it with the file in place.
+func TestUnmodeledTLSInputsRefuseCAPlan(t *testing.T) {
+	caPEM, leafPEM, keyPEM := testCA(t, "bodega.example.com")
+	ca, err := ParseCA(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apt := File{System: manifest.TypeApt, Paths: map[string]string{OSLinux: AptSourcesPath}, Content: "Types: deb\nURIs: " + testBase + "/apt\nSuites: stable\nComponents: main\n"}
+	git := Git(testBase, map[string]config.GitUpstream{"gh": {URL: "https://github.com/"}})
+	pair := map[string]string{"client.pem": string(leafPEM), "client.key": string(keyPEM)}
+	with := func(files map[string]string) map[string]string {
+		out := maps.Clone(pair)
+		maps.Copy(out, files)
+		return out
+	}
+	for _, tc := range []struct {
+		name  string
+		plan  File
+		files map[string]string
+		env   map[string]string
+		names string
+	}{
+		{name: "apt, a client certificate that loads", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::SslCert \"/client.pem\";\n"}), names: "Acquire::https::SslCert"},
+		{name: "apt, a client key scoped to bodega's host", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf.d/90tls": "Acquire::https::bodega.example.com::SslKey \"/client.key\";\n"}), names: "Acquire::https::SslKey"},
+		{name: "apt, a revocation list", plan: apt,
+			files: with(map[string]string{"etc/apt/apt.conf": "Acquire::https::CrlFile \"/client.pem\";\n"}), names: "Acquire::https::CrlFile"},
+		{name: "apt, another root store from the environment", plan: apt,
+			env: map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "gomod, another root directory from the environment", plan: Gomod(testBase),
+			env: map[string]string{"SSL_CERT_DIR": "/elsewhere/certs"}, names: "SSL_CERT_DIR"},
+		{name: "helm, another root store from the environment", plan: Helm(testBase),
+			env: map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "pypi, a client certificate under [global]", plan: Pip(testBase),
+			files: with(map[string]string{".config/pip/pip.conf": "[global]\nclient-cert = /client.pem\n"}), names: "client-cert under [global]"},
+		{name: "pypi, a client certificate from the environment", plan: Pip(testBase),
+			env: map[string]string{"PIP_CLIENT_CERT": "/client.pem"}, names: "PIP_CLIENT_CERT"},
+		{name: "npm, a registry's certfile", plan: Npm(testBase, nil),
+			files: with(map[string]string{".npmrc": "//bodega.example.com/:certfile=/client.pem\n"}), names: "//bodega.example.com/:certfile"},
+		{name: "npm, a registry's keyfile", plan: Npm(testBase, nil),
+			files: with(map[string]string{".npmrc": "//bodega.example.com/:keyfile=/client.key\n"}), names: "//bodega.example.com/:keyfile"},
+		{name: "npm, an inline key from the environment", plan: Npm(testBase, nil),
+			env: map[string]string{"NPM_CONFIG_KEY": "PEM"}, names: "npm_config_key"},
+		{name: "npm, a NODE_OPTIONS entry doctor does not read", plan: Npm(testBase, nil),
+			env: map[string]string{"NODE_OPTIONS": "--use-system-ca --require=/opt/hook.js"}, names: "NODE_OPTIONS"},
+		{name: "git, a client certificate from the environment", plan: git,
+			env: map[string]string{"GIT_SSL_CERT": "/client.pem"}, names: "GIT_SSL_CERT"},
+		{name: "git, a client key from the environment", plan: git,
+			env: map[string]string{"GIT_SSL_KEY": "/client.key"}, names: "GIT_SSL_KEY"},
+		{name: "git, verification turned off in the environment", plan: git,
+			env: map[string]string{"GIT_SSL_NO_VERIFY": "1"}, names: "GIT_SSL_NO_VERIFY"},
+		{name: "git, a client certificate in the file", plan: git,
+			files: with(map[string]string{".gitconfig": "[http]\n\tsslCert = /client.pem\n"}), names: "'http.sslcert'"},
+		{name: "git, a selector git stops on", plan: git,
+			env: map[string]string{"GIT_CONFIG_NOSYSTEM": "maybe"}, names: "GIT_CONFIG_NOSYSTEM"},
+		{name: "docker, a certificate for dockerd's own listener", plan: DockerDaemon(testBase, nil),
+			files: with(map[string]string{"etc/docker/daemon.json": `{"tlscert": "/client.pem"}`}), names: "tlscert"},
+		{name: "containerd, a certificate for its own listener", plan: ContainerdHosts(testBase, "docker.io", "https://registry-1.docker.io"),
+			files: with(map[string]string{"etc/containerd/config.toml": "version = 3\n[grpc]\n  tcp_tls_cert = \"/client.pem\"\n"}), names: "tcp_tls_cert"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			h := CAHost{Base: testBase, Home: home, Root: home, GOOS: OSLinux, OSRelease: []byte("ID=ubuntu\n"),
+				Getenv: func(key string) string { return tc.env[key] }}
+			clean := h
+			clean.Getenv = func(string) string { return "" }
+			if _, err := AddCA(caPlan(t, home, tc.plan), ca, clean); err != nil {
+				t.Fatalf("the plan is refused on a clean host: %v", err)
+			}
+			for name, body := range tc.files {
+				path := filepath.Join(home, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			in, err := AddCA(caPlan(t, home, tc.plan), ca, h)
+			if err == nil || !strings.Contains(err.Error(), tc.names) || len(in.Changes) != 0 || len(in.Step) != 0 {
+				t.Errorf("CA plan accepted: err=%v changes=%d step=%v; want a refusal naming %q", err, len(in.Changes), in.Step, tc.names)
+			}
+			if err != nil && (strings.Contains(err.Error(), string(keyPEM)) || strings.Contains(err.Error(), "/opt/hook.js")) {
+				t.Errorf("the refusal repeats a value it should only name the option of: %v", err)
+			}
+		})
+	}
+}
+
+// F116 R1, R2: GIT_CONFIG_NOSYSTEM is read by git's own boolean conversion,
+// the numeric spellings of false included, and a value git stops on is an
+// error rather than a truthy switch. Native git is the oracle for which
+// spellings drop the system file and which it dies on.
+func TestGitNoSystemMatchesNativeGit(t *testing.T) {
+	git := oracletest.Git(t)
+	dir := t.TempDir()
+	system := filepath.Join(dir, "system")
+	if err := os.WriteFile(system, []byte("[bodega]\n\tmarker = system\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"0", "00", "0k", "0x0", "false", "FALSE", "no", "off", "1", "2", "1k", "-1", "true", "Yes", "on", "maybe", "0z", "k", " 1", "1 "} {
+		cmd := exec.Command(git, "config", "--get", "bodega.marker")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GIT_CONFIG_SYSTEM=" + system, "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=" + value, "LC_ALL=C"}
+		out, _ := cmd.CombinedOutput()
+		dies := strings.Contains(string(out), "bad boolean environment value")
+		reads := strings.TrimSpace(string(out)) == "system"
+		getenv := func(key string) string {
+			return map[string]string{"GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": system, "GIT_CONFIG_GLOBAL": os.DevNull}[key]
+		}
+		if got := GitEnvError(getenv) != ""; got != dies {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: GitEnvError reports an error = %v, git dies = %v (%s)", value, got, dies, strings.TrimSpace(string(out)))
+		}
+		if dies {
+			continue
+		}
+		if got := slices.Contains(GitConfigFiles(getenv, dir, ""), system); got != reads {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: GitConfigFiles lists the system file = %v, git reads it = %v", value, got, reads)
+		}
+	}
+}

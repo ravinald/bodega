@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -2242,6 +2243,157 @@ func TestAudit34GitPinnedKeyIsUnchecked(t *testing.T) {
 			rows := p.Apply(p.Rows(srv.URL), srv.URL)
 			if len(rows) != 1 || rows[0].Status == StatusOK {
 				t.Errorf("ordinary Git row certified a mismatching pin: %+v", rows)
+			}
+		})
+	}
+}
+
+func TestAudit35GitInvalidNoSystemIsUnchecked(t *testing.T) {
+	git := oracletest.Git(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	ca := filepath.Join(root, "ca.pem")
+	writeTrustFile(t, ca, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
+	file := filepath.Join(home, ".gitconfig")
+	writeTrustFile(t, file, "[url \""+srv.URL+"/git/\"]\n\tinsteadOf = https://upstream.invalid/\n[http]\n\tsslCAInfo = "+ca+"\n")
+	native := func(value string) (string, error) {
+		cmd := exec.Command(git, "clone", "--bare", srv.URL+"/git/repo", filepath.Join(t.TempDir(), "repo"))
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "GIT_CONFIG_GLOBAL=" + file, "GIT_CONFIG_NOSYSTEM=" + value, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}
+		data, err := cmd.CombinedOutput()
+		return string(data), err
+	}
+	control, _ := native("1")
+	if requests.Load() == 0 {
+		t.Fatalf("native control did not accept the CA and reach HTTP: %s", control)
+	}
+	requests.Store(0)
+	output, err := native("maybe")
+	if err == nil || !strings.Contains(output, "bad boolean environment value") || !strings.Contains(output, "GIT_CONFIG_NOSYSTEM") || requests.Load() != 0 {
+		t.Fatalf("native Git did not reject invalid GIT_CONFIG_NOSYSTEM: err=%v requests=%d output=%s", err, requests.Load(), output)
+	}
+	t.Logf("native Git: %s", strings.TrimSpace(output))
+	p := TrustProbe{Root: root, Home: home, GOOS: "linux", Getenv: func(key string) string {
+		if key == "GIT_CONFIG_NOSYSTEM" {
+			return "maybe"
+		}
+		return ""
+	}, System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }}
+	verdicts, err := p.Judge([]string{"git-config"}, srv.URL)
+	if err != nil || len(verdicts) != 1 {
+		t.Fatalf("Judge: %+v, %v", verdicts, err)
+	}
+	if verdicts[0].State != TrustUnchecked || !strings.Contains(verdicts[0].Detail, "GIT_CONFIG_NOSYSTEM") {
+		t.Errorf("selected verdict certifies Git whose environment prevents startup: %+v", verdicts[0])
+	}
+	rows := p.Apply(p.Rows(srv.URL), srv.URL)
+	if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "GIT_CONFIG_NOSYSTEM") {
+		t.Errorf("ordinary row certifies Git whose environment prevents startup: %+v", rows)
+	}
+}
+
+func TestAudit35AptCRLRemainsUnchecked(t *testing.T) {
+	p, ca, base := reviewTrust(t)
+	file := filepath.Join(p.Root, "etc/apt/apt.conf")
+	writeTrustFile(t, filepath.Join(p.Root, "bad.crl"), "not a certificate revocation list\n")
+	writeTrustFile(t, file, "Acquire::https::CAInfo \""+ca+"\";\nAcquire::https::CrlFile \"/bad.crl\";\n")
+	writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt\nSuites: stable\nComponents: main\n")
+	vs, err := p.Judge([]string{"apt-sources"}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vs) != 1 || vs[0].State != TrustUnchecked || !strings.Contains(vs[0].Detail, "CrlFile") {
+		t.Errorf("selected verdict certifies apt with an unreadable CRL: %+v", vs)
+	}
+	row := p.Apply([]Finding{checkAptSources(p.Root, "linux")}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, "CrlFile") {
+		t.Errorf("ordinary row certifies apt with an unreadable CRL: %+v", row)
+	}
+}
+
+// F116 R2: a client given a TLS input other than its CA roots (a client
+// certificate or key, a revocation list, another root store, a NODE_OPTIONS
+// entry doctor does not read) is unchecked, naming the option or variable,
+// where the same configuration without it verifies.
+func TestUnmodeledTLSInputsAreUnchecked(t *testing.T) {
+	for _, tc := range []struct {
+		name, check string
+		files       map[string]string
+		// bad is appended to the file it names, set replaces it, and env
+		// joins the environment.
+		bad, set, env map[string]string
+		names         string
+	}{
+		{name: "apt, a client certificate", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": "Types: deb\nURIs: BASE/apt\nSuites: stable\nComponents: main\n", "etc/apt/apt.conf": "Acquire::https::CAInfo \"@CA@\";\n"},
+			bad:   map[string]string{"etc/apt/apt.conf": "Acquire::https::SslCert \"/client.pem\";\n", "client.pem": "PEM"}, names: "Acquire::https::SslCert"},
+		{name: "apt, a client key", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": "Types: deb\nURIs: BASE/apt\nSuites: stable\nComponents: main\n"},
+			bad:   map[string]string{"etc/apt/apt.conf": "Acquire::https::SslKey \"/client.key\";\n", "client.key": "x"}, names: "Acquire::https::SslKey"},
+		{name: "apt, another root store", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": "Types: deb\nURIs: BASE/apt\nSuites: stable\nComponents: main\n"},
+			env:   map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "gomod, another root directory", check: "goproxy-env",
+			env: map[string]string{"SSL_CERT_DIR": "/elsewhere/certs"}, names: "SSL_CERT_DIR"},
+		{name: "helm, another root store", check: "helm-repos",
+			files: map[string]string{"home/.config/helm/repositories.yaml": "apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: BASE/helm\n"},
+			env:   map[string]string{"SSL_CERT_FILE": "/elsewhere/roots.pem"}, names: "SSL_CERT_FILE"},
+		{name: "pip, a client certificate", check: "pip-config",
+			files: map[string]string{"home/.config/pip/pip.conf": "[global]\nindex-url = BASE/simple\ncert = @CA@\n"},
+			bad:   map[string]string{"home/.config/pip/pip.conf": "client-cert = /client.pem\n"}, names: "client-cert under [global]"},
+		{name: "pip, a client certificate from the environment", check: "pip-config",
+			files: map[string]string{"home/.config/pip/pip.conf": "[global]\nindex-url = BASE/simple\ncert = @CA@\n"},
+			env:   map[string]string{"PIP_CLIENT_CERT": "/client.pem"}, names: "PIP_CLIENT_CERT"},
+		{name: "npm, a registry's certfile", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=BASE/npm/\ncafile=@CA@\n"},
+			bad:   map[string]string{"home/.npmrc": "//HOST/:certfile=/client.pem\n"}, names: "//HOST/:certfile"},
+		{name: "npm, a NODE_OPTIONS entry doctor does not read", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=BASE/npm/\ncafile=@CA@\n"},
+			env:   map[string]string{"NODE_OPTIONS": "--tls-min-v1.3"}, names: "NODE_OPTIONS"},
+		{name: "git, a client key from the environment", check: "git-config",
+			files: map[string]string{"home/.gitconfig": "[url \"BASE/git/\"]\n\tinsteadOf = https://upstream.invalid/\n[http]\n\tsslCAInfo = @CA@\n"},
+			env:   map[string]string{"GIT_SSL_KEY": "/client.key"}, names: "GIT_SSL_KEY"},
+		{name: "docker, a key for dockerd's own listener", check: "oci-docker",
+			files: map[string]string{"etc/docker/daemon.json": `{"registry-mirrors":["BASE"]}`, "etc/docker/certs.d/HOST/ca.crt": "PEM"},
+			set:   map[string]string{"etc/docker/daemon.json": `{"registry-mirrors":["BASE"],"tlskey":"/client.key"}`}, names: "tlskey"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			data, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := strings.TrimPrefix(base, "https://")
+			r := strings.NewReplacer("BASE", base, "HOST", host, "PEM", string(data), "@CA@", ca)
+			for name, body := range tc.files {
+				writeTrustFile(t, filepath.Join(p.Root, r.Replace(name)), r.Replace(body))
+			}
+			env := map[string]string{}
+			if tc.check == "goproxy-env" {
+				env["GOPROXY"] = base
+			}
+			p.Getenv = func(key string) string { return env[key] }
+			if v := auditState(t, p, tc.check, base); v.State != TrustVerified {
+				t.Fatalf("control: the configuration without the input is not verified: %+v", v)
+			}
+			for name, body := range tc.bad {
+				path := filepath.Join(p.Root, r.Replace(name))
+				old, _ := os.ReadFile(path)
+				writeTrustFile(t, path, string(old)+r.Replace(body))
+			}
+			for name, body := range tc.set {
+				writeTrustFile(t, filepath.Join(p.Root, r.Replace(name)), r.Replace(body))
+			}
+			maps.Copy(env, tc.env)
+			names := r.Replace(tc.names)
+			if v := auditState(t, p, tc.check, base); v.State != TrustUnchecked || !strings.Contains(v.Detail, names) {
+				t.Errorf("selected verdict = %+v; want unchecked naming %q", v, names)
 			}
 		})
 	}

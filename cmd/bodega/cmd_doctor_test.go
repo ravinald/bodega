@@ -1090,6 +1090,9 @@ func clearClientEnv(t *testing.T) {
 		"PIP_CONFIG_FILE", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CERT", "PIP_USE_DEPRECATED", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
 		"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_SSL_CAINFO",
 		"HELM_REPOSITORY_CONFIG", "HELM_CONFIG_HOME", "GOPROXY", "GOENV", "APT_CONFIG",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "PIP_CLIENT_CERT", "npm_config_cert", "NPM_CONFIG_CERT", "npm_config_key", "NPM_CONFIG_KEY",
+		"GIT_SSL_NO_VERIFY", "GIT_SSL_CERT", "GIT_SSL_KEY", "GIT_SSL_CERT_TYPE", "GIT_SSL_KEY_TYPE", "GIT_SSL_CERT_PASSWORD_PROTECTED", "GIT_SSL_CAPATH",
+		"GIT_SSL_VERSION", "GIT_SSL_CIPHER_LIST", "GIT_PROXY_SSL_CERT", "GIT_PROXY_SSL_KEY", "GIT_PROXY_SSL_CAINFO", "GIT_PROXY_SSL_CERT_PASSWORD_PROTECTED",
 	} {
 		t.Setenv(key, "")
 	}
@@ -3842,5 +3845,112 @@ func TestAudit34GitPinnedKeyRefusesBeforeWrites(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
 		t.Errorf("wrote a CA before refusing Git's trust pin: %v", err)
+	}
+}
+
+func TestAudit35GitInvalidNoSystemRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "maybe")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".gitconfig")
+	before := "[user]\n\tname = Kept User\n"
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"first", "idle"} {
+		out, err := runDoctor(t, "--configure", "git", "--ca-file", caFile, "--url", srv.URL, "--apply")
+		if err == nil || !strings.Contains(err.Error(), "GIT_CONFIG_NOSYSTEM") {
+			t.Errorf("%s apply must refuse invalid GIT_CONFIG_NOSYSTEM before writes; got %v:\n%s", phase, err, out)
+		}
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != before {
+		t.Errorf("changed Git policy before refusing its invalid environment: %v, %s", err, got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+		t.Errorf("wrote a CA before refusing Git's invalid environment: %v", err)
+	}
+}
+
+func TestAudit35AptCRLRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t)
+	var srv *httptest.Server
+	var content string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /client/plan", func(w http.ResponseWriter, r *http.Request) {
+		sum := sha256.Sum256([]byte(content))
+		_ = json.NewEncoder(w).Encode(clientconf.Plan{Records: []clientconf.PlanRecord{{
+			System: manifest.TypeApt, Action: clientconf.PlanInstall, Path: "~" + clientconf.AptSourcesPath,
+			URL: srv.URL + "/client/apt", SHA256: hex.EncodeToString(sum[:]),
+		}}})
+	})
+	mux.HandleFunc("GET /client/apt", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, content) })
+	srv = httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	content = "Types: deb\nURIs: " + srv.URL + "/apt\nSuites: stable\nComponents: main\n"
+	caFile := filepath.Join(home, "issuer.pem")
+	bad := filepath.Join(home, "etc/apt/apt.conf")
+	release := filepath.Join(home, "os-release")
+	for file, body := range map[string][]byte{
+		caFile:                         pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}),
+		bad:                            []byte("Acquire::https::CrlFile \"/bad.crl\";\n"),
+		release:                        []byte("ID=ubuntu\n"),
+		filepath.Join(home, "bad.crl"): []byte("not a certificate revocation list\n"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldGOOS, oldRoot, oldRelease, oldRun, oldProbe, oldApt := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, doctorTrustProbe, aptSources
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, home, release
+	aptSources = &aptSourcesHost{goos: "linux", root: home, record: filepath.Join(home, "apt-ledger.json")}
+	doctorTrustProbe = func() host.TrustProbe {
+		return host.TrustProbe{Root: home, Home: home, GOOS: clientconf.OSLinux, Getenv: os.Getenv}
+	}
+	anchor := filepath.Join(home, "usr/local/share/ca-certificates/bodega-ca.crt")
+	ran := 0
+	doctorRun = func(name string, args ...string) error {
+		ran++
+		if name != "update-ca-certificates" {
+			t.Fatalf("unexpected command: %s %v", name, args)
+		}
+		data, err := os.ReadFile(anchor)
+		if err != nil {
+			return err
+		}
+		bundle := filepath.Join(home, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, data, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun, doctorTrustProbe, aptSources = oldGOOS, oldRoot, oldRelease, oldRun, oldProbe, oldApt
+	})
+	for phase, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		args := append([]string{"--configure", "apt", "--ca-file", caFile, "--url", srv.URL}, apply...)
+		out, err := runDoctor(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "CrlFile") {
+			t.Errorf("phase %d: err=%v; want refusal naming %s\n%s", phase, err, bad, out)
+		}
+		for _, path := range []string{anchor, filepath.Join(home, clientconf.AptSourcesPath)} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("phase %d wrote %s: %v", phase, path, err)
+			}
+		}
+		if ran != 0 {
+			t.Errorf("phase %d ran %d rebuild(s) before rejecting apt's configuration", phase, ran)
+		}
 	}
 }

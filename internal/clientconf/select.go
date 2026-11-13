@@ -111,8 +111,10 @@ func PipConfigFiles(h PipHost) (files []string, global int) {
 
 // GitConfigFiles lists the configuration files git reads outside a
 // repository, in the order it reads them: the system file, unless
-// GIT_CONFIG_NOSYSTEM turns it off, then the per-user files, the XDG one
-// ahead of ~/.gitconfig. GIT_CONFIG_SYSTEM and GIT_CONFIG_GLOBAL each name a
+// GIT_CONFIG_NOSYSTEM turns it off, read as git's own boolean conversion
+// reads it, then the per-user files, the XDG one ahead of ~/.gitconfig. A
+// GIT_CONFIG_NOSYSTEM git stops on is GitEnvError's to report, ahead of any
+// use of this list. GIT_CONFIG_SYSTEM and GIT_CONFIG_GLOBAL each name a
 // file read in place of those. A repository's own config, the entries
 // GIT_CONFIG_COUNT carries and files an [include] names are not listed;
 // GitUnread reports the last two.
@@ -124,9 +126,8 @@ func GitConfigFiles(getenv func(string) string, home, root string) []string {
 		return getenv(key)
 	}
 	var files []string
-	nosystem := strings.ToLower(env("GIT_CONFIG_NOSYSTEM"))
 	switch {
-	case nosystem != "" && !slices.Contains([]string{"0", "false", "no", "off"}, nosystem):
+	case gitNoSystem(getenv):
 	case env("GIT_CONFIG_SYSTEM") != "":
 		files = append(files, env("GIT_CONFIG_SYSTEM"))
 	default:

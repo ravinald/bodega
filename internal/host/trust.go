@@ -161,7 +161,7 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(set.reached, func(entry string) bool { return namesHost(entry, u.Host) }) {
 		return nil
 	}
-	return []trustStore{{name: systemStoreName, system: true}}
+	return []trustStore{t.systemStore()}
 }
 
 // trustRows maps a row's check name to its client.
@@ -189,6 +189,9 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd refuses to load its configuration (%v) and does not start, so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
 	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return mirrorIsBodega(m, u.Host) }):
 		return nil
+	}
+	if doc.TLSUnmodeled != "" {
+		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
 	}
 	dir := filepath.Join(t.Root, "/etc/docker/certs.d", u.Host)
 	if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
@@ -237,12 +240,28 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 			return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt's https method opens no TLS connection under this configuration (%v), so whether apt verifies bodega's certificate is unchecked", err)}}
 		}
 	}
+	if u.Scheme == "https" {
+		if unmodeled := conf.TLSUnmodeled(u.Hostname()); unmodeled != "" {
+			return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt's configuration sets %s, so whether apt accepts bodega's certificate is unchecked", unmodeled)}}
+		}
+	}
 	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
 		if v := conf[key]; v.Value != "" {
 			return []trustStore{*named(v.Value, "Acquire::https::CAInfo in "+v.File, true)}
 		}
 	}
-	return []trustStore{{name: systemStoreName, system: true}}
+	return []trustStore{t.systemStore()}
+}
+
+// systemStore is the operating system's trust store as apt, the go command
+// and helm read it: the store itself, or nothing doctor can speak for when
+// the environment has the client's TLS library read another file in its
+// place. Go's crypto/x509 takes no such variable on macOS.
+func (t TrustProbe) systemStore() trustStore {
+	if env := clientconf.SystemStoreEnv(t.Getenv); env != "" && t.GOOS != clientconf.OSDarwin {
+		return trustStore{name: systemStoreName, blind: fmt.Sprintf("the client reads %s, so whether it verifies bodega's certificate is unchecked", env)}
+	}
+	return trustStore{name: systemStoreName, system: true}
 }
 
 // certsDir is a certs.d directory for one registry host, whose *.crt files
@@ -347,6 +366,9 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	// is verified against a host pip never contacts.
 	if from := clientconf.PipNoIndex(layers, t.Getenv); from != "" {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip is told to use no index (%s), and with no-index set pip install drops the index naming bodega before its first request, so pip does not reach bodega and whether it would verify bodega's certificate is unchecked", from)}}
+	}
+	if from := clientconf.PipClientCert(layers, t.Getenv); from != "" {
+		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip is given a client certificate (%s), which it loads into every connection and fails each request on when the file or its key does not load; doctor does not interpret it, so whether pip accepts bodega's certificate is unchecked", from)}}
 	}
 	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
 		if v := t.env(key); v != "" {
@@ -591,6 +613,12 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	if bad := clientconf.NpmEnvInvalid(t.Getenv); bad != "" {
 		return wontStart(bad)
 	}
+	if unmodeled := clientconf.NpmClientTLS(t.Getenv, files); unmodeled != "" {
+		return blind(unmodeled)
+	}
+	if unmodeled := clientconf.NodeOptionsUnread(t.Getenv); unmodeled != "" {
+		return blind(unmodeled)
+	}
 	env := npmLayer{from: "the environment"}
 	if v, _ := clientconf.NpmEnv(t.Getenv, "cafile"); v != "" {
 		env.cafile, env.from = v, "the environment's npm_config_cafile"
@@ -670,6 +698,11 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 // git refuses to load, for a line in any section, leaves git unchecked: git
 // aborts on it, so nothing else it holds is configuration git runs with.
 func gitStores(t TrustProbe, u *url.URL) []trustStore {
+	// The environment that selects those files is converted first, as git
+	// converts it: a value git stops on leaves every file unread.
+	if bad := clientconf.GitEnvError(t.Getenv); bad != "" {
+		return []trustStore{{name: "git's environment", blind: fmt.Sprintf("git does not start with %s, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
+	}
 	files := clientconf.GitConfigFiles(t.Getenv, t.Home, t.Root)
 	if bad := clientconf.GitLoadError(files); bad != "" {
 		return []trustStore{{name: "git's configuration", blind: fmt.Sprintf("git fetch and git clone do not run with %s: git stops on a variable it cannot convert, whichever section holds it, and doctor does not vouch for one it does not interpret, so whether git reaches bodega or verifies its certificate is unchecked", bad)}}
@@ -708,6 +741,9 @@ func gitStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if len(prefixes) == 0 {
 		return nil
+	}
+	if unmodeled := clientconf.GitEnvUnmodeled(t.Getenv); unmodeled != "" {
+		return []trustStore{{name: "git's environment", blind: fmt.Sprintf("git reads %s, so whether git accepts bodega's certificate is unchecked", unmodeled)}}
 	}
 	if s := envCA(t, "GIT_SSL_CAINFO"); s != nil {
 		return []trustStore{*s}
@@ -764,7 +800,7 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		if err := r.ClientTLSError(r.CAFile != ""); err != nil {
 			return []trustStore{{name: "helm's configuration", blind: fmt.Sprintf("helm builds no client for a repository at bodega in %s (%v), so whether helm verifies bodega's certificate is unchecked", path, err)}}
 		}
-		s := trustStore{name: systemStoreName, system: true}
+		s := t.systemStore()
 		if r.CAFile != "" {
 			s = *named(r.CAFile, "caFile of the repository "+r.Name+" in "+path, true)
 		}

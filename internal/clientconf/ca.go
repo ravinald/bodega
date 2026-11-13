@@ -257,6 +257,10 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 		return fmt.Errorf("%s: pip is told to use no index (%s), and with no-index set pip install drops index-url and every extra-index-url before its first request, so it would never ask the bodega index this command writes to %s and the CA installed for it would verify nothing. "+
 			"Nothing was written, and no-index is left as it is. Remove no-index where pip should install from bodega, then re-run", rec.System, from, target)
 	}
+	if from := PipClientCert(layers, h.Getenv); from != "" {
+		return fmt.Errorf("%s: pip is given a client certificate (%s), which it loads into every connection and fails each request on when the file or its key does not load, so whether pip would connect to bodega with the CA written to %s could not be verified. "+
+			"Nothing was written, and client-cert is left as it is. Remove it where pip should be certified for bodega, or add the CA to pip's cert bundle by hand, then re-run", rec.System, from, target)
+	}
 	if from := PipIndexAlias(layers, h.Getenv); from != "" {
 		return fmt.Errorf("%s: pip's configuration sets pypi-url (%s), a second name for index-url that this command does not interpret, so which index pip install asks once index-url is written to %s cannot be told. "+
 			"Nothing was written. Write that index as index-url, or remove pypi-url, then re-run", rec.System, from, target)
@@ -436,6 +440,16 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		if bad := NpmEnvInvalid(h.Getenv); bad != "" {
 			return npmWontStart(rec, bad)
 		}
+		// What stands beside the CA list: a client certificate or key, and
+		// a NODE_OPTIONS doctor does not read whole. Each is left as it is.
+		unmodeled := NpmClientTLS(h.Getenv, append(slices.Clone(files), loaded...))
+		if unmodeled == "" {
+			unmodeled = NodeOptionsUnread(h.Getenv)
+		}
+		if unmodeled != "" {
+			return fmt.Errorf("%s: npm reads %s, so whether npm would connect to bodega with the CA written to %s could not be verified. "+
+				"Nothing was written, and that setting is left as it is. Remove it where npm should be certified for bodega, or add the CA to npm's cafile by hand, then re-run", rec.System, unmodeled, target)
+		}
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
 		}
@@ -443,6 +457,12 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		// The probe's own classifier over the probe's own file set, with the
 		// file the plan edits beside it: a construct that leaves the verdict
 		// unchecked after the write is refused before it.
+		// The environment that selects those files comes first: git converts
+		// it before it opens any of them.
+		if bad := GitEnvError(h.Getenv); bad != "" {
+			return fmt.Errorf("%s: git does not start with %s, so it would read neither the rewrite nor the CA written to %s, and the install could not be verified. "+
+				"Nothing was written. Unset the variable or give it a value git reads as a boolean (true, false, 1, 0), then re-run", rec.System, bad, target)
+		}
 		files := append(GitConfigFiles(h.Getenv, h.Home, h.Root), target)
 		if bad := GitLoadError(files); bad != "" {
 			return fmt.Errorf("%s: git fetch and git clone do not run with %s. git stops on a variable it cannot convert, whichever section holds it, and doctor refuses one it does not interpret, so whether git would read the rewrite and the CA written to %s could not be verified. "+
@@ -455,6 +475,10 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		if unread := GitUnread(h.Getenv, files); len(unread) > 0 {
 			return fmt.Errorf("%s: git takes configuration from %s, which this command does not read, so a setting there could outrank the CA written to %s unseen. "+
 				"Nothing was written. Unset the variable, move included settings into the file itself, or write the header as [name] or [name \"subsection\"] alone on its line and the value on one line, then re-run", rec.System, unread[0], target)
+		}
+		if unmodeled := GitEnvUnmodeled(h.Getenv); unmodeled != "" {
+			return fmt.Errorf("%s: git reads %s, so whether git would accept bodega's certificate with the CA written to %s could not be verified. "+
+				"Nothing was written, and the variable is left as it is. Unset it where git should be certified for bodega, then re-run", rec.System, unmodeled, target)
 		}
 		if user {
 			return selects("git", "GIT_CONFIG_GLOBAL")
@@ -475,6 +499,10 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			if err := conf.HTTPSError(base.Hostname(), h.Root); err != nil {
 				return fmt.Errorf("%s: apt's https method opens no TLS connection to bodega under apt's configuration (%w), so it would never verify bodega with the CA this command installs, and the install could not be verified. "+
 					"Nothing was written. Correct or remove the option the error names, then re-run", rec.System, err)
+			}
+			if unmodeled := conf.TLSUnmodeled(base.Hostname()); unmodeled != "" {
+				return fmt.Errorf("%s: apt's configuration sets %s, so whether apt would accept bodega's certificate with the CA this command installs could not be verified. "+
+					"Nothing was written, and the option is left as it is. Remove it where apt should be certified for bodega, or add the CA to apt's trust by hand, then re-run", rec.System, unmodeled)
 			}
 		}
 		// And its sources, the same way: an entry apt refuses in any file
@@ -513,6 +541,15 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 					return helmNoClient(rec, f, err)
 				}
 			}
+		}
+	}
+	// apt, the go command and helm verify through the system trust store,
+	// which this command rebuilds: a variable that has their TLS library
+	// read another file in its place leaves the anchor unread.
+	if !slices.Contains(ownStoreSystems, rec.System) {
+		if env := SystemStoreEnv(h.Getenv); env != "" {
+			return fmt.Errorf("%s: the client reads %s, so it would not load the CA this command adds to the system trust store, and the install could not be verified. "+
+				"Nothing was written. Unset the variable, or add the CA to the file or directory it names by hand, then re-run", rec.System, env)
 		}
 	}
 	return nil
@@ -573,7 +610,11 @@ func (h CAHost) dockerReads(changes []Change) error {
 	case os.IsNotExist(err):
 		return nil
 	case err == nil:
-		_, err = ParseDockerDaemonFile(data)
+		var doc *DockerDaemonFile
+		if doc, err = ParseDockerDaemonFile(data); err == nil && doc.TLSUnmodeled != "" {
+			return fmt.Errorf("%s: %s sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to use the CA this command installs could not be verified. "+
+				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.TLSUnmodeled)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("%s: dockerd refuses to load %s (%w) and does not start, so it would use neither the mirror nor the CA this command installs, and the install could not be verified. "+

@@ -370,11 +370,32 @@ type ContainerdRegistry struct {
 	// rather than an error so a caller can still say the CRI plugin is
 	// disabled, which is the more useful thing to tell whoever wrote
 	// disabled_plugins = ["cri"] under version = 2.
-	Invalid string
+	//
+	// Invalid is the bound on what a CA install and the trust verdict
+	// certify, so it also holds what doctor cannot say either way: a value
+	// the host decides, or one outside what the port follows to containerd's
+	// first CRI request. A file holding only that is one containerd may well
+	// run on. Refused is the part of Invalid that containerd itself refuses
+	// on the configuration alone, and the only part a plain configure, which
+	// certifies nothing, declines to edit.
+	Invalid, Refused string
 
 	// cri holds the CRI tables as this file decodes them, for
 	// ResolveContainerdConfig to load each import over.
 	cri *containerdCRI
+}
+
+// refuse records the first reason found: refused is what containerd refuses
+// on the configuration alone, and unmodeled what doctor cannot say of it. At
+// most one is set per call. Invalid keeps the first of either, and Refused
+// the first of its kind even behind an uncertainty.
+func (r *ContainerdRegistry) refuse(refused, unmodeled string) {
+	if r.Refused == "" {
+		r.Refused = refused
+	}
+	if r.Invalid == "" {
+		r.Invalid = refused + unmodeled
+	}
 }
 
 // ReadContainerdConfig decodes a config.toml and reports its CRI registry
@@ -422,7 +443,7 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	}
 	if _, declared := doc["version"]; declared && r.Version > 1 {
 		if err := cfg.validatePluginURIs(); err != nil {
-			r.Invalid = err.Error()
+			r.refuse(err.Error(), "")
 		}
 	}
 	// containerd 2.x migrates a version 1 or 2 file to version 3 before any
@@ -448,11 +469,13 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 	whole := version == 0 && len(cfg.Imports) == 0
 	r.cri = newContainerdCRI(r.Version, path[1])
 	err = r.cri.load(data)
-	if err == nil && whole {
-		err = r.cri.validate()
-	}
-	if err != nil && r.Invalid == "" {
-		r.Invalid = err.Error()
+	switch {
+	case err != nil:
+		r.refuse(err.Error(), "")
+	case whole:
+		if err := r.cri.validate(); err != nil {
+			r.refuse(containerdSplit(err.Error(), err))
+		}
 	}
 	// containerd 2.x migrates an import with no version from version 1 up to
 	// the main file's before merging it, so [plugins.cri] there becomes the
@@ -494,9 +517,9 @@ func readContainerdConfig(data []byte, version int) (ContainerdRegistry, error) 
 			}
 		}
 	}
-	var unmodeled string
-	if r.CRIDisabled, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole && r.Invalid == "" {
-		r.Invalid = unmodeled
+	var invalid, unmodeled string
+	if r.CRIDisabled, invalid, unmodeled = r.cri.pluginState(r.Disabled, r.Required); whole {
+		r.refuse(invalid, unmodeled)
 	}
 	table := tomlTable(doc, path)
 	_, r.SetsConfigPath = table["config_path"]
@@ -574,12 +597,15 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 			return eff, fmt.Errorf("its import %s cannot be judged: %w", p, err)
 		}
 		eff.Disabled, eff.Required = append(eff.Disabled, r.Disabled...), append(eff.Required, r.Required...)
+		if eff.Refused == "" {
+			eff.Refused = r.Refused
+		}
 		if eff.Invalid == "" {
 			eff.Invalid = r.Invalid
 		}
 		if eff.Invalid == "" {
 			if err := eff.cri.load(b); err != nil {
-				eff.Invalid = fmt.Sprintf("with its import %s: %v", p, err)
+				eff.refuse(fmt.Sprintf("with its import %s: %v", p, err), "")
 			}
 		}
 		if eff.Legacy == "" {
@@ -601,16 +627,14 @@ func ResolveContainerdConfig(root, path string, data []byte) (ContainerdEffectiv
 	// whether or not an import pattern matched a file: the checks a file with
 	// imports deferred run here, on the composed tables and plugin lists.
 	if len(main.Imports) > 0 {
-		var unmodeled string
-		eff.CRIDisabled, unmodeled = eff.cri.pluginState(eff.Disabled, eff.Required)
+		var invalid, unmodeled string
+		eff.CRIDisabled, invalid, unmodeled = eff.cri.pluginState(eff.Disabled, eff.Required)
 		if eff.Invalid == "" {
 			if err := eff.cri.validate(); err != nil {
-				eff.Invalid = err.Error()
+				eff.refuse(containerdSplit(err.Error(), err))
 			}
 		}
-		if eff.Invalid == "" {
-			eff.Invalid = unmodeled
-		}
+		eff.refuse(invalid, unmodeled)
 	}
 	if replaced != eff.ConfigPath {
 		return eff, fmt.Errorf("its import %s carries the CRI plugin table without config_path, so containerd 1.x reads none and 2.x keeps %q from %s; doctor cannot tell which runs here. Set config_path in %s", replacedFrom, eff.ConfigPath, eff.Source, replacedFrom)
@@ -648,14 +672,18 @@ func containerdImports(root, parent string, imports []string) ([]string, error) 
 // ContainerdEditEffective reports why config_path set to certs.d in merged,
 // the config.toml at path, would not be the one containerd reads: an import
 // that fails to load or cannot be judged, or one whose CRI table supersedes
-// the main file's with a config_path that leaves certs.d out.
+// the main file's with a config_path that leaves certs.d out. A file
+// containerd refuses on its own content is one of these. A value doctor does
+// not follow to containerd's first CRI request is not: that is a limit on
+// what a CA install certifies, which containerdReads enforces, and no reason
+// to refuse writing config_path into a configuration containerd loads.
 func ContainerdEditEffective(root, path string, merged []byte) error {
 	eff, err := ResolveContainerdConfig(root, path, merged)
 	if err != nil {
 		return err
 	}
-	if eff.Invalid != "" {
-		return fmt.Errorf("containerd refuses to load it (%s) and does not start; repair what the error names, then re-run. Nothing was written", eff.Invalid)
+	if eff.Refused != "" {
+		return fmt.Errorf("containerd refuses to load it (%s) and does not start; repair what the error names, then re-run. Nothing was written", eff.Refused)
 	}
 	if eff.Source != path && !slices.Contains(strings.Split(eff.ConfigPath, ":"), ContainerdCertsDir) {
 		return fmt.Errorf("its import %s sets config_path = %q, which containerd reads in place of this file's and which leaves out %s; add %s to config_path there, then re-run. Nothing was written", eff.Source, eff.ConfigPath, ContainerdCertsDir, ContainerdCertsDir)

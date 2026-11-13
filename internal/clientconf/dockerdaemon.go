@@ -418,6 +418,13 @@ type DockerDaemonFile struct {
 	// each as written.
 	Mirrors            []string
 	InsecureRegistries []string
+	// TLSUnmodeled names the first key that has dockerd load TLS files for
+	// its own API listeners (tls, tlsverify, tlscacert, tlscert, tlskey), ""
+	// for none. dockerd builds that TLS configuration as it starts and exits
+	// when the files do not load, which nothing here reads, so a CA is not
+	// certified for a dockerd holding one. It is no load error: a configure
+	// that installs no CA edits such a file as it stands.
+	TLSUnmodeled string
 }
 
 // ParseDockerDaemonFile loads a daemon.json as dockerd v28.5.2 does with no flag
@@ -475,7 +482,20 @@ func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 	if err := conf.validate(); err != nil {
 		return nil, err
 	}
-	return &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries}, nil
+	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries}
+	for _, k := range []struct {
+		key string
+		set bool
+	}{
+		{"tls", conf.TLS != nil && *conf.TLS}, {"tlsverify", conf.TLSVerify != nil && *conf.TLSVerify},
+		{"tlscacert", conf.CAFile != ""}, {"tlscert", conf.CertFile != ""}, {"tlskey", conf.KeyFile != ""},
+	} {
+		if k.set {
+			d.TLSUnmodeled = k.key
+			break
+		}
+	}
+	return d, nil
 }
 
 // LoadDockerDaemonFile reads the daemon.json at path. A missing file is a dockerd

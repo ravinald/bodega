@@ -353,13 +353,13 @@ func (c *containerdRuntimeConfig) validate() error {
 		r := c.Containerd.Runtimes[name]
 		switch {
 		case r.CgroupWritable:
-			return fmt.Errorf("runtime %s sets cgroup_writable, which containerd accepts only on a host under cgroup v2 and doctor does not interpret", name)
+			return &containerdHostError{fmt.Sprintf("runtime %s sets cgroup_writable, which containerd accepts only on a host under cgroup v2 and doctor does not interpret", name)}
 		case !r.PrivilegedWithoutHostDevices && r.PrivilegedWithoutHostDevicesAllDevicesAllowed:
 			return errors.New("`privileged_without_host_devices_all_devices_allowed` requires `privileged_without_host_devices` to be enabled")
 		case r.IOType != "" && r.IOType != "streaming" && r.IOType != "fifo":
 			return errors.New("`io_type` can only be `streaming` or `named_pipe`")
 		case r.BaseRuntimeSpec != "":
-			return fmt.Errorf("runtime %s sets base_runtime_spec, a file containerd loads as the plugin starts and doctor does not interpret", name)
+			return &containerdHostError{fmt.Sprintf("runtime %s sets base_runtime_spec, a file containerd loads as the plugin starts and doctor does not interpret", name)}
 		}
 	}
 	if c.DrainExecSyncIOTimeout != "" {
@@ -398,7 +398,7 @@ func (c *containerdCRIServerConfig) validate() error {
 	cert, key := c.X509KeyPair.TLSCertFile != "", c.X509KeyPair.TLSKeyFile != ""
 	switch {
 	case c.EnableTLSStreaming && cert && key:
-		return errors.New("x509_key_pair_streaming names a certificate and key containerd loads as the CRI plugin starts, which doctor does not interpret")
+		return &containerdHostError{"x509_key_pair_streaming names a certificate and key containerd loads as the CRI plugin starts, which doctor does not interpret"}
 	case c.EnableTLSStreaming && cert:
 		return errors.New("invalid stream server configuration: must set X509KeyPairStreaming.TLSKeyFile")
 	case c.EnableTLSStreaming && key:
@@ -572,20 +572,24 @@ func (c *containerdCRI) load(data []byte) error {
 // pluginState is containerdPluginState for the composed disabled_plugins and
 // required_plugins, and after it what containerdStart refuses: New's own
 // checks run on every plugin, not only those disabled_plugins names.
-func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bool, invalid string) {
-	criDisabled, invalid = containerdPluginState(disabled, required)
-	if invalid == "" {
-		invalid = c.start.invalid(disabled, required)
+//
+// The first thing found is returned, as invalid when containerd refuses the
+// configuration on what it holds, and as unmodeled when the host or code
+// doctor does not follow decides.
+func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bool, invalid, unmodeled string) {
+	criDisabled, invalid, unmodeled = containerdPluginState(disabled, required)
+	if invalid == "" && unmodeled == "" {
+		invalid, unmodeled = c.start.invalid(disabled, required)
 	}
-	if invalid == "" && !slices.Contains(disabled, containerdImagesPlugin) {
+	if invalid == "" && unmodeled == "" && !slices.Contains(disabled, containerdImagesPlugin) {
 		if err := c.imagesInit(disabled); err != nil {
-			invalid = containerdStartFailure("the CRI image plugin", err)
+			invalid, unmodeled = containerdSplit(containerdStartFailure("the CRI image plugin", err), err)
 		}
 	}
-	if invalid == "" {
-		invalid = c.unmodeled(disabled, criDisabled)
+	if invalid == "" && unmodeled == "" {
+		unmodeled = c.unmodeled(disabled, criDisabled)
 	}
-	return criDisabled, invalid
+	return criDisabled, invalid, unmodeled
 }
 
 // containerdModeled is the one list of keys in a composed containerd
@@ -965,7 +969,7 @@ var containerdOutsideCRI = []string{
 // type the CRI service's requirements reach, where whether the service
 // starts without it depends on which plugin of that type each requirement
 // takes, which doctor does not follow.
-func containerdPluginState(disabled, required []string) (criDisabled bool, invalid string) {
+func containerdPluginState(disabled, required []string) (criDisabled bool, invalid, unmodeled string) {
 	for _, p := range disabled {
 		switch {
 		// "cri" is the CRI plugin as a version 1 file names it. A later
@@ -982,10 +986,13 @@ func containerdPluginState(disabled, required []string) (criDisabled bool, inval
 				invalid = fmt.Sprintf("required plugin %s not included: disabled_plugins names it too", p)
 			}
 		case !slices.ContainsFunc(containerdOutsideCRI, func(prefix string) bool { return strings.HasPrefix(p, prefix) }):
-			if invalid == "" {
-				invalid = fmt.Sprintf("disabled_plugins names %s, a plugin of a type containerd's CRI service requires, and doctor does not follow whether the service starts without it", p)
+			if unmodeled == "" {
+				unmodeled = fmt.Sprintf("disabled_plugins names %s, a plugin of a type containerd's CRI service requires, and doctor does not follow whether the service starts without it", p)
 			}
 		}
 	}
-	return criDisabled, invalid
+	if invalid != "" {
+		unmodeled = ""
+	}
+	return criDisabled, invalid, unmodeled
 }

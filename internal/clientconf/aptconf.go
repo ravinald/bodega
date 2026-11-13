@@ -550,18 +550,15 @@ var aptZeroOrOne = regexp.MustCompile(`^[ \t\n\v\f\r]*([+-]?)(?:0[xX])?0*([01])$
 // must each load. Each option is looked up for host first and then for every
 // host, as CAInfo is. root is the directory absolute paths sit under.
 //
-// Whether a file that reads also parses is OpenSSL's to say, at the
-// handshake. CAInfo is the trust store, and is read where trust is judged.
+// Whether a file that reads also parses is OpenSSL's to say, and a CrlFile
+// that parses adds a revocation check, so a configuration that passes here
+// is still not one a CA is certified for: TLSUnmodeled refuses each of the
+// three set. CAInfo is the trust store, and is read where trust is judged.
 func (c AptConfig) HTTPSError(host, root string) error {
 	if v := c["acquire::allowtls"]; v.Value != "" && !aptBool(v.Value, true) {
 		return fmt.Errorf("TLS support has been disabled: Acquire::AllowTLS is false (%s)", v.File)
 	}
-	find := func(option string) AptOption {
-		if v := c["acquire::https::"+strings.ToLower(host)+"::"+option]; v.Value != "" {
-			return v
-		}
-		return c["acquire::https::"+option]
-	}
+	find := func(option string) AptOption { return c.https(host, option) }
 	for _, option := range []string{"IssuerCert", "SslForceVersion"} {
 		if v := find(strings.ToLower(option)); v.Value != "" {
 			return fmt.Errorf("the option '%s' is not supported anymore (%s)", option, v.File)

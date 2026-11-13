@@ -585,6 +585,18 @@ type containerdHostError struct{ needs string }
 
 func (e *containerdHostError) Error() string { return e.needs }
 
+// containerdSplit files msg, the reason built from err, as invalid when the
+// configuration alone decides it, and as unmodeled when err is, or wraps, a
+// containerdHostError: something the host or code doctor does not follow
+// decides.
+func containerdSplit(msg string, err error) (invalid, unmodeled string) {
+	var host *containerdHostError
+	if errors.As(err, &host) {
+		return "", msg
+	}
+	return msg, ""
+}
+
 // containerdStartFailure says why a plugin the CRI service starts through
 // does not initialize, or that the host decides whether it does.
 func containerdStartFailure(plugin string, err error) string {
@@ -785,14 +797,14 @@ func (s *containerdStart) command() error {
 // invalid is why containerd does not start on what the loaded files add up
 // to, or why doctor cannot say it does; "" for neither. disabled and required
 // are the composed disabled_plugins and required_plugins, by URI.
-func (s *containerdStart) invalid(disabled, required []string) string {
+func (s *containerdStart) invalid(disabled, required []string) (invalid, unmodeled string) {
 	if err := s.command(); err != nil {
-		return fmt.Sprintf("containerd does not start: %v", err)
+		return fmt.Sprintf("containerd does not start: %v", err), ""
 	}
 	for _, key := range slices.Sorted(maps.Keys(s.top.Timeouts)) {
 		value := s.top.Timeouts[key]
 		if _, err := time.ParseDuration(value); err != nil {
-			return fmt.Sprintf("timeouts sets %s = %q, and containerd does not start: unable to parse %s into a time duration", key, value, value)
+			return fmt.Sprintf("timeouts sets %s = %q, and containerd does not start: unable to parse %s into a time duration", key, value, value), ""
 		}
 	}
 	proxies := slices.Sorted(maps.Keys(s.top.ProxyPlugins))
@@ -800,13 +812,13 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 		typ, ok := containerdProxyTypes[s.top.ProxyPlugins[name].Type]
 		switch {
 		case !ok:
-			return fmt.Sprintf("proxy_plugins.%s has type %q, which containerd has no proxy for, and it panics registering the plugin: no type for plugin", name, s.top.ProxyPlugins[name].Type)
+			return fmt.Sprintf("proxy_plugins.%s has type %q, which containerd has no proxy for, and it panics registering the plugin: no type for plugin", name, s.top.ProxyPlugins[name].Type), ""
 		case name == "":
-			return "proxy_plugins holds an entry with an empty name, and containerd panics registering it: no plugin id"
+			return "proxy_plugins holds an entry with an empty name, and containerd panics registering it: no plugin id", ""
 		}
 		uri := typ + "." + name
 		if _, builtin := containerdPlugins[uri]; builtin {
-			return fmt.Sprintf("proxy_plugins.%s takes the name of a plugin containerd already holds, and it panics registering the plugin: %s: plugin id already registered", name, uri)
+			return fmt.Sprintf("proxy_plugins.%s takes the name of a plugin containerd already holds, and it panics registering the plugin: %s: plugin id already registered", name, uri), ""
 		}
 	}
 	// A proxy's InitFn builds its gRPC client (getClient in
@@ -815,11 +827,11 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 	// one the CRI names (plugins/metadata/plugin.go, lines 117-120). Nothing
 	// here ports gRPC's target parsing, so no proxy is certified.
 	if len(proxies) > 0 {
-		return fmt.Sprintf("[proxy_plugins.%s] declares a proxy plugin: containerd builds that proxy's client as it starts and exits when it cannot, with code doctor does not follow, so whether it serves a CRI pull is unknown", proxies[0])
+		return "", fmt.Sprintf("[proxy_plugins.%s] declares a proxy plugin: containerd builds that proxy's client as it starts and exits when it cannot, with code doctor does not follow, so whether it serves a CRI pull is unknown", proxies[0])
 	}
 	for _, uri := range slices.Sorted(maps.Keys(s.tables)) {
 		if !slices.Contains(disabled, uri) {
-			return fmt.Sprintf("plugin %s does not decode its table, and containerd does not start: %v", uri, s.tables[uri])
+			return fmt.Sprintf("plugin %s does not decode its table, and containerd does not start: %v", uri, s.tables[uri]), ""
 		}
 	}
 	// A plugin no file holds a table for starts on the Config it registers,
@@ -830,20 +842,20 @@ func (s *containerdStart) invalid(disabled, required []string) string {
 			continue
 		}
 		if err := check.initError(s, disabled); err != nil {
-			return containerdStartFailure("plugin "+uri, err)
+			return containerdSplit(containerdStartFailure("plugin "+uri, err), err)
 		}
 	}
 	for _, uri := range required {
 		_, builtin := containerdPlugins[uri]
 		switch {
 		case !builtin:
-			return fmt.Sprintf("required plugin [%s] not included: containerd v2.2.0 registers no plugin of that name, and does not start", uri)
+			return fmt.Sprintf("required plugin [%s] not included: containerd v2.2.0 registers no plugin of that name, and does not start", uri), ""
 		case uri == containerdCRIPlugin || uri == containerdImagesPlugin || uri == containerdRuntimePlugin || slices.Contains(disabled, uri):
 			// The CRI plugins start on the tables containerdCRI validates, and
 			// a plugin both required and disabled is containerdPluginState's.
 		default:
-			return fmt.Sprintf("required_plugins names %s, and containerd exits unless that plugin initializes, which depends on this host and doctor does not follow", uri)
+			return "", fmt.Sprintf("required_plugins names %s, and containerd exits unless that plugin initializes, which depends on this host and doctor does not follow", uri)
 		}
 	}
-	return ""
+	return "", ""
 }
