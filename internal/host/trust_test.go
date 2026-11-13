@@ -2663,3 +2663,195 @@ func TestDockerHostDecidedStartIsUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit38GoFlagsStartupIsUnchecked(t *testing.T) {
+	goBin := oracletest.Go(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	file := filepath.Join(root, "go.env")
+	for _, flags := range []string{"", "-bodega-unknown-flag"} {
+		writeTrustFile(t, file, "GOPROXY="+srv.URL+"\nGOFLAGS="+flags+"\n")
+		cmd := exec.Command(goBin, "mod", "download", "example.com/audit@v1.0.0")
+		cmd.Dir = root
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "GOENV=" + file, "GOTOOLCHAIN=go1.27.4", "GOSUMDB=off", "GOPATH=" + filepath.Join(root, "gopath"), "GOWORK=off"}
+		requests.Store(0)
+		out, err := cmd.CombinedOutput()
+		if flags == "" && requests.Load() == 0 {
+			t.Fatalf("native control reached no proxy: %v %s", err, out)
+		}
+		if flags != "" && (err == nil || !strings.Contains(string(out), "unknown flag -bodega-unknown-flag") || requests.Load() != 0) {
+			t.Fatalf("native failure: err=%v requests=%d out=%s", err, requests.Load(), out)
+		}
+		t.Logf("native GOFLAGS=%q: err=%v requests=%d out=%s", flags, err, requests.Load(), out)
+	}
+	p, _, base := auditTrust(t)
+	p.ConfigDir = func() (string, error) { return filepath.Join(p.Home, ".config"), nil }
+	file = filepath.Join(p.Home, ".config/go/env")
+	writeTrustFile(t, file, "GOPROXY="+base+"/go\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustVerified {
+		t.Fatalf("control: %+v", v)
+	}
+	writeTrustFile(t, file, "GOPROXY="+base+"/go\nGOFLAGS=-bodega-unknown-flag\n")
+	if v := auditState(t, p, "goproxy-env", base); v.State != TrustUnchecked || !strings.Contains(v.Detail, "GOFLAGS") {
+		t.Errorf("selected verdict certifies Go that exits before any request: %+v", v)
+	}
+	row := p.Apply([]Finding{checkGoproxy(p.Getenv, p.ConfigDir)}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, "GOFLAGS") {
+		t.Errorf("ordinary row certifies Go that exits before any request: %+v", row)
+	}
+}
+
+func TestAudit38TLSBypassIsUnchecked(t *testing.T) {
+	for _, tc := range []struct{ name, check, path, body, option string }{
+		{"npm", "npm-config", "home/.npmrc", "registry=BASE/npm/\ncafile=CA\nstrict-ssl=false\n", "strict-ssl"},
+		{"pip", "pip-config", "home/.config/pip/pip.conf", "[global]\nindex-url=BASE/simple\ncert=CA\ntrusted-host=bodega.internal\n", "trusted-host"},
+		{"apt", "apt-sources", "etc/apt/apt.conf", "Acquire::https::Verify-Peer \"false\";\n", "Verify-Peer"},
+		{"helm", "helm-repos", "home/.config/helm/repositories.yaml", "apiVersion: \"\"\nrepositories:\n- name: bodega\n  url: BASE/helm\n  caFile: CA\n  insecure_skip_tls_verify: true\n", "insecure_skip_tls_verify"},
+		{"containerd", "oci-containerd", "etc/containerd/certs.d/docker.io/hosts.toml", "server=\"https://registry-1.docker.io\"\n[host.\"BASE\"]\nca=\"CA\"\ncapabilities=[\"pull\",\"resolve\"]\nskip_verify=true\n", "skip_verify"},
+		{"docker", "oci-docker", "etc/docker/daemon.json", `{"registry-mirrors":["BASE"],"insecure-registries":["bodega.internal:8443"]}`, "insecure-registries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, "etc/apt/sources.list.d/bodega.sources"), "Types: deb\nURIs: "+base+"/apt\nSuites: stable\nComponents: main\n")
+			writeTrustFile(t, filepath.Join(p.Root, tc.path), strings.NewReplacer("BASE", base, "CA", ca).Replace(tc.body))
+			v := auditState(t, p, tc.check, base)
+			if v.State != TrustUnchecked || !strings.Contains(strings.ToLower(v.Detail), strings.ToLower(tc.option)) {
+				t.Errorf("selected verdict certifies a client whose TLS verification is disabled by %s: %+v", tc.option, v)
+			}
+			row := p.Apply([]Finding{{Check: tc.check, Status: StatusOK}}, base)[0]
+			if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+				t.Errorf("ordinary row certifies disabled TLS verification: %+v", row)
+			}
+		})
+	}
+}
+
+func TestAudit38NpmBypassMatchesNativeTLS(t *testing.T) {
+	npm := oracletest.Npm(t)
+	var requests atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	ca, _ := trustFixture(t)
+	file, wrong := filepath.Join(home, ".npmrc"), filepath.Join(home, "unrelated.pem")
+	writeTrustFile(t, wrong, string(ca))
+	for _, strict := range []string{"true", "false"} {
+		writeTrustFile(t, file, "registry="+srv.URL+"/\ncafile="+wrong+"\nstrict-ssl="+strict+"\nfetch-retries=0\n")
+		cmd := exec.Command(npm, "ping")
+		cmd.Dir = home
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "npm_config_userconfig=" + file, "npm_config_globalconfig=" + os.DevNull}
+		requests.Store(0)
+		out, err := cmd.CombinedOutput()
+		if strict == "true" && (err == nil || requests.Load() != 0) {
+			t.Fatalf("native verified with an unrelated CA: err=%v requests=%d out=%s", err, requests.Load(), out)
+		}
+		if strict == "false" && (err != nil || requests.Load() == 0) {
+			t.Fatalf("native did not bypass CA verification: err=%v requests=%d out=%s", err, requests.Load(), out)
+		}
+		t.Logf("native strict-ssl=%s: err=%v requests=%d out=%s", strict, err, requests.Load(), out)
+	}
+	p := TrustProbe{Root: home, Home: home, GOOS: "linux", Getenv: func(string) string { return "" }, System: func([]*x509.Certificate, string) error { return x509.UnknownAuthorityError{} }}
+	v, err := p.Judge([]string{"npm-config"}, srv.URL)
+	if err != nil || len(v) != 1 {
+		t.Fatalf("Judge: %v %v", v, err)
+	}
+	if v[0].State != TrustUnchecked || !strings.Contains(v[0].Detail, "strict-ssl") {
+		t.Errorf("native bypasses verification; doctor diagnoses the unused CA: %+v", v[0])
+	}
+}
+
+func TestAudit38PipEncodingFailureIsUnchecked(t *testing.T) {
+	python := oracletest.Pip(t)
+	p, ca, base := auditTrust(t)
+	file := filepath.Join(p.Home, ".config/pip/pip.conf")
+	before := "[global]\nindex-url=" + base + "/simple\ncert=" + ca + "\nunused=bad\xfftext\n"
+	writeTrustFile(t, file, before)
+	cmd := exec.Command(python, "-m", "pip", "config", "list")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + p.Home, "PIP_CONFIG_FILE=" + file}
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "invalid UTF-8") {
+		t.Fatalf("native pip did not reject invalid UTF-8: %v %s", err, out)
+	}
+	t.Logf("native pip: %v %s", err, out)
+	if v := auditState(t, p, "pip-config", base); v.State != TrustUnchecked {
+		t.Errorf("selected verdict certifies a pip file Python cannot decode: %+v", v)
+	}
+	row := p.Apply([]Finding{{Check: "pip-config", Status: StatusOK}}, base)[0]
+	if row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") {
+		t.Errorf("ordinary row certifies invalid UTF-8 pip policy: %+v", row)
+	}
+}
+
+// A configuration in the settings a modeled list holds is verified, by the
+// selected verdict and the ordinary row alike, and one setting outside the
+// list leaves both unchecked, naming it.
+func TestCommonConfigurationsVerifyAndAnUnlistedSettingIsUnchecked(t *testing.T) {
+	aptSource := "Types: deb\nURIs: BASE/apt\nSuites: stable\nComponents: main\n"
+	for _, tc := range []struct {
+		name, check string
+		files       map[string]string
+		// bad is appended to the file it names.
+		bad   map[string]string
+		names string
+	}{
+		{name: "npm", check: "npm-config",
+			files: map[string]string{"home/.npmrc": "registry=BASE/npm/\n//HOST/npm/:_authToken=tok-123\n@corp:registry=BASE/npm/\ncafile=@CA@\nfund=false\naudit=false\nsave-exact=true\nprogress=false\nloglevel=warn\n"},
+			bad:   map[string]string{"home/.npmrc": "offline=true\n"}, names: "offline"},
+		{name: "pip", check: "pip-config",
+			files: map[string]string{"home/.config/pip/pip.conf": "[global]\nindex-url = BASE/simple\nextra-index-url = https://pypi.corp.example/simple\ntrusted-host = pypi.corp.example\ntimeout = 30\nretries = 3\ncert = @CA@\ndisable-pip-version-check = true\nno-cache-dir = false\n"},
+			bad:   map[string]string{"home/.config/pip/pip.conf": "proxy = http://proxy.corp.example:3128\n"}, names: "proxy"},
+		{name: "go", check: "goproxy-env",
+			files: map[string]string{"home/.config/go/env": "GOPROXY=BASE/go,off\nGOPRIVATE=git.corp.example\nGONOPROXY=git.corp.example\nGONOSUMDB=git.corp.example\nGOSUMDB=sum.golang.org\nGOINSECURE=legacy.corp.example\nGOFLAGS=-mod=mod -modcacherw\n"},
+			bad:   map[string]string{"home/.config/go/env": "GOTOOLCHAIN=go1.99.0\n"}, names: "GOTOOLCHAIN"},
+		// What helm repo add --username --password --pass-credentials writes.
+		{name: "helm", check: "helm-repos",
+			files: map[string]string{"home/.config/helm/repositories.yaml": "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- caFile: \"\"\n  certFile: \"\"\n  insecure_skip_tls_verify: false\n  keyFile: \"\"\n  name: bodega\n  pass_credentials_all: true\n  password: s3cret\n  url: BASE/helm\n  username: deploy\n"},
+			bad:   map[string]string{"home/.config/helm/repositories.yaml": "  proxy: http://proxy.corp.example:3128\n"}, names: "proxy"},
+		{name: "apt", check: "apt-sources",
+			files: map[string]string{"etc/apt/sources.list.d/bodega.sources": aptSource,
+				"etc/apt/apt.conf.d/90corp": "Acquire::http::Proxy \"http://proxy.corp.example:3128\";\nAcquire::https::Proxy \"http://proxy.corp.example:3128\";\nAcquire::Retries \"3\";\nAPT::Install-Recommends \"false\";\nAPT::Get::Assume-Yes \"true\";\nAcquire::https::CaInfo \"@CA@\";\nAcquire::Languages \"none\";\nAcquire::http::Pipeline-Depth \"0\";\nAcquire::Changelogs::AlwaysOnline \"true\";\nAcquire::http::User-Agent-Non-Interactive \"true\";\nAPT::Periodic::Update-Package-Lists \"1\";\n"},
+			bad: map[string]string{"etc/apt/apt.conf.d/90corp": "Acquire::http::Dl-Limit \"70\";\n"}, names: "acquire::http::dl-limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ca, base := auditTrust(t)
+			p.ConfigDir = func() (string, error) { return filepath.Join(p.Home, ".config"), nil }
+			r := strings.NewReplacer("BASE", base, "HOST", strings.TrimPrefix(base, "https://"), "@CA@", ca)
+			for name, body := range tc.files {
+				writeTrustFile(t, filepath.Join(p.Root, name), r.Replace(body))
+			}
+			ordinary := func() Finding {
+				f := Finding{Check: tc.check, Status: StatusOK}
+				if tc.check == "goproxy-env" {
+					f = checkGoproxy(p.Getenv, p.ConfigDir)
+				}
+				return p.Apply([]Finding{f}, base)[0]
+			}
+			if v := auditState(t, p, tc.check, base); v.State != TrustVerified {
+				t.Fatalf("a common configuration is not verified: %+v", v)
+			}
+			if row := ordinary(); row.Status != StatusOK {
+				t.Fatalf("a common configuration's row is not OK: %+v", row)
+			}
+			for name, body := range tc.bad {
+				path := filepath.Join(p.Root, name)
+				old, _ := os.ReadFile(path)
+				writeTrustFile(t, path, string(old)+body)
+			}
+			if v := auditState(t, p, tc.check, base); v.State != TrustUnchecked || !strings.Contains(v.Detail, tc.names) {
+				t.Errorf("selected verdict = %+v; want unchecked naming %q", v, tc.names)
+			}
+			if row := ordinary(); row.Status != StatusWarn || !strings.Contains(row.Detail, "unchecked") || !strings.Contains(row.Detail, tc.names) {
+				t.Errorf("ordinary row = %+v; want a warning, unchecked, naming %q", row, tc.names)
+			}
+		})
+	}
+}

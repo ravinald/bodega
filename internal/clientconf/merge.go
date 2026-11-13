@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
@@ -500,6 +501,12 @@ func yamlKeeps(items string) func(old, merged, planned []byte) error {
 					continue
 				}
 				if seen[em["name"]] {
+					// A later entry of the name is no part of the edit: it
+					// stands as it stood.
+					now, _ := m[key].([]any)
+					if !slices.ContainsFunc(now, func(h any) bool { return reflect.DeepEqual(h, e) }) {
+						return fmt.Errorf("the merge would not keep a second entry named %v of %s", em["name"], key)
+					}
 					continue
 				}
 				seen[em["name"]] = true
@@ -824,7 +831,11 @@ func mergeYAMLItems(old, planned []string) []string {
 		case at < 0:
 			out = append(out, item...)
 			continue
-		case used[at], strings.TrimSpace(item[0]) == "-":
+		case used[at]:
+			// A later item of the name is not the plan's to edit or drop.
+			out = append(out, item...)
+			continue
+		case strings.TrimSpace(item[0]) == "-":
 			// A dash alone on its line opens a form this merge does not edit;
 			// dropping the item leaves the decode check to refuse the file.
 			continue
@@ -1110,6 +1121,25 @@ func readPipFile(data []byte) (pipFile, error) {
 		if first == nil {
 			first = fmt.Errorf("line %d: %s", n, fmt.Sprintf(format, args...))
 		}
+	}
+	// pip opens the file in the locale's encoding and aborts on bytes that
+	// do not decode, before it reads a line (_construct_parser,
+	// pip/_internal/configuration.py at pip 26.2.1). The encoding modeled is
+	// UTF-8, strict as Python's codec is; the byte order mark it leaves in
+	// the text is then no header, which the loop below refuses.
+	if !utf8.Valid(data) {
+		line := 1
+		for rest := data; len(rest) > 0; {
+			r, size := utf8.DecodeRune(rest)
+			if r == utf8.RuneError && size == 1 {
+				break
+			}
+			if r == '\n' {
+				line++
+			}
+			rest = rest[size:]
+		}
+		return f, fmt.Errorf("line %d: the file holds bytes that are not UTF-8, the encoding pip reads it in, and pip exits on it (Configuration file contains invalid UTF-8 characters)", line)
 	}
 	// Python opens the file with universal newlines.
 	text := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(string(data))

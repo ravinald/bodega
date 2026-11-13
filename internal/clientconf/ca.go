@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -275,6 +276,10 @@ func (h CAHost) pipCommandIndex(rec PlanRecord, target string, planned []byte) e
 		return fmt.Errorf("%s: pip's configuration sets pypi-url (%s), a second name for index-url that this command does not interpret, so which index pip install asks once index-url is written to %s cannot be told. "+
 			"Nothing was written. Write that index as index-url, or remove pypi-url, then re-run", rec.System, from, target)
 	}
+	base, _ := url.Parse(h.Base)
+	if u := PipUncertified(layers, h.Getenv, base); u != "" {
+		return uncertified(rec.System, "pip's configuration sets "+u, target)
+	}
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -304,6 +309,19 @@ func (h CAHost) goProxyRefused(rec PlanRecord, target string, planned []byte) er
 	env := GoEnv{Getenv: h.Getenv, ConfigDir: h.goConfigDir, Planned: map[string][]byte{target: planned}}
 	for _, s := range h.shadows(rec, target, planned) {
 		env.Planned[s.path] = planned
+	}
+	// The go env file as the host holds it, which the plan's merge keeps
+	// every other assignment of, and each file the plan writes.
+	base, _ := url.Parse(h.Base)
+	onDisk := GoEnv{Getenv: h.Getenv, ConfigDir: h.goConfigDir}
+	u := onDisk.Uncertified(base)
+	for _, file := range append([]string{target}, slices.Sorted(maps.Keys(env.Planned))...) {
+		if data, err := os.ReadFile(file); u == "" && err == nil {
+			u = GoEnvUncertified(file, data, base)
+		}
+	}
+	if u != "" {
+		return uncertified(rec.System, "the go env file sets "+u, target)
 	}
 	p := env.Proxy()
 	if p.Err == nil {
@@ -464,6 +482,9 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			return fmt.Errorf("%s: npm reads %s, so whether npm would connect to bodega with the CA written to %s could not be verified. "+
 				"Nothing was written, and that setting is left as it is. Remove it where npm should be certified for bodega, or add the CA to npm's cafile by hand, then re-run", rec.System, unmodeled, target)
 		}
+		if u := NpmUncertified(h.Getenv, append(slices.Clone(files), loaded...)); u != "" {
+			return uncertified(rec.System, "npm reads "+u, target)
+		}
 		if user {
 			return selects("npm", "npm_config_userconfig", "NPM_CONFIG_USERCONFIG")
 		}
@@ -524,6 +545,9 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 				return fmt.Errorf("%s: apt's configuration sets %s, so whether apt would accept bodega's certificate with the CA this command installs could not be verified. "+
 					"Nothing was written, and the option is left as it is. Remove it where apt should be certified for bodega, or add the CA to apt's trust by hand, then re-run", rec.System, unmodeled)
 			}
+			if u := conf.Uncertified(base.Hostname()); u != "" {
+				return uncertified(rec.System, "apt's configuration sets "+u, target)
+			}
 		}
 		// And its sources, the same way: an entry apt refuses in any file
 		// leaves it reading none of them, the one this plan writes included.
@@ -551,9 +575,14 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 			if doc == nil {
 				continue
 			}
+			base, _ := url.Parse(h.Base)
+			if data, err := os.ReadFile(f); err == nil {
+				if u := HelmUncertified(f, data, base); u != "" {
+					return uncertified(rec.System, "helm reads "+u, target)
+				}
+			}
 			// The repositories at bodega, which this plan gives a caFile:
 			// helm then loads each one's client certificate with it.
-			base, _ := url.Parse(h.Base)
 			for _, r := range doc.Repositories {
 				if r == nil || base == nil {
 					continue
@@ -577,6 +606,24 @@ func (h CAHost) ignored(rec PlanRecord, target string) error {
 		}
 	}
 	return nil
+}
+
+// uncertified is the refusal for a setting one of the modeled lists does not
+// hold, or one that turns verification off: what names it, and the file the
+// plan would have written.
+func uncertified(system, what, target string) error {
+	return fmt.Errorf("%s: %s, so a CA installed for it through %s could not be certified. Nothing was written, and the setting is left as it is. %s, then re-run", system, what, target, uncertifiedNextStep)
+}
+
+// helmDuplicate refuses a plan that edits a repository by a name the file at
+// path holds more than once.
+func helmDuplicate(rec PlanRecord, path string, old, planned []byte) error {
+	name := HelmDuplicate(old, planned)
+	if name == "" {
+		return nil
+	}
+	return fmt.Errorf("%s: %s holds more than one repository named %s, each with settings of its own, and this command edits a repository by its name, so which of them takes bodega's URL and which keep their credentials cannot be told. "+
+		"Nothing was written. Remove or rename all but one (helm repo remove %s, then helm repo add), then re-run", rec.System, path, name, name)
 }
 
 func helmNoClient(rec PlanRecord, file string, err error) error {
@@ -647,6 +694,9 @@ func (h CAHost) dockerReads(changes []Change) error {
 		case doc.TLSUnmodeled != "":
 			return fmt.Errorf("%s: %s sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to use the CA this command installs could not be verified. "+
 				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.TLSUnmodeled)
+		}
+		if base, perr := url.Parse(h.Base); err == nil && perr == nil && doc.Insecure(base) != "" {
+			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents, so no CA decides what it trusts", path, doc.Insecure(base)), filepath.Join(filepath.Dir(path), "certs.d"))
 		}
 	}
 	if err != nil {
@@ -735,6 +785,9 @@ func (h CAHost) containerdReads(changes []Change) error {
 		reaches := slices.Contains(planned, f) || doc != nil && slices.ContainsFunc(doc.Hosts, func(host ContainerdRegistryHost) bool { return host.Key == trim(h.Base) })
 		if !reaches {
 			continue
+		}
+		if key := doc.SkipsVerify(func(key string) bool { return key == trim(h.Base) }); key != "" {
+			return uncertified(manifest.TypeOCI, fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents, so no CA decides what it trusts", f, key), f)
 		}
 		if err := doc.TLSError(trim(h.Base)); err != nil {
 			return fmt.Errorf("%s: containerd cannot load a certificate %s names (%w) and resolves no host for that registry while it cannot, the bodega host included, so it would not use the ca this command writes, and the install could not be verified. "+
@@ -1042,6 +1095,22 @@ func AddCA(changes []Change, ca CA, h CAHost) (CAInstall, error) {
 				"It holds a form this merge does not edit, such as a value spanning several lines or a table spelled another way; move the file aside and re-run to have it written whole", rec.System, target, err)
 		}
 		if line == nil {
+			if rec.System == manifest.TypeHelm {
+				planned := c.planned
+				if planned == nil {
+					planned = c.New
+				}
+				if err := helmDuplicate(rec, c.Target, c.Old, planned); err != nil {
+					return CAInstall{}, err
+				}
+				for _, sh := range h.shadows(rec, c.Target, c.New) {
+					if old, err := os.ReadFile(sh.path); err == nil {
+						if err := helmDuplicate(rec, sh.path, old, planned); err != nil {
+							return CAInstall{}, err
+						}
+					}
+				}
+			}
 			switch {
 			case !c.Existed || c.Unchanged():
 			case kind.whole() && bytes.Equal(c.New, c.planned):

@@ -4173,3 +4173,226 @@ func TestDoctorCARefusesDockerHostDecidedStart(t *testing.T) {
 		}
 	}
 }
+
+func TestAudit38GoFlagsStartupRefusesBeforeWrites(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	unsetEnv(t, "GOFLAGS")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".config/go/env")
+	before := "GOFLAGS=-bodega-unknown-flag\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	release := filepath.Join(t.TempDir(), "os-release")
+	for f, b := range map[string][]byte{caFile: caPEM, release: []byte("ID=ubuntu\n")} {
+		if err := os.WriteFile(f, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	ran := 0
+	doctorRun = func(string, ...string) error {
+		ran++
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "gomod", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil || !strings.Contains(err.Error(), "GOFLAGS") {
+			t.Errorf("%v accepted Go's startup failure: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v wrote Go policy before refusal: %v %s", apply, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(root, "usr/local/share/ca-certificates/bodega-ca.crt")); !os.IsNotExist(err) {
+			t.Errorf("%v wrote a CA before refusal: %v", apply, err)
+		}
+		if ran != 0 {
+			t.Errorf("%v rebuilt the store %d times before refusing GOFLAGS", apply, ran)
+		}
+	}
+}
+
+func TestAudit38NpmTLSBypassRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, ".npmrc")
+	before := "strict-ssl=false\n"
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "npm", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil || !strings.Contains(err.Error(), "strict-ssl") {
+			t.Errorf("%v certified npm while verification stays off: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v changed npm policy before refusal: %v %s", apply, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Errorf("%v installed a CA while npm does not verify: %v", apply, err)
+		}
+	}
+}
+
+func TestAudit38PipEncodingFailureRefusesBeforeWrites(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/pip.conf")
+	before := "[global]\nunused=bad\xfftext\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "pypi", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil {
+			t.Errorf("%v certified a file pip cannot decode: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v changed pip policy before refusal: %v %q", apply, err, got)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config/bodega/ca.pem")); !os.IsNotExist(err) {
+			t.Errorf("%v wrote a CA before refusing invalid UTF-8: %v", apply, err)
+		}
+	}
+}
+
+// Configurations of the kind operators run, in the settings the modeled
+// lists hold, take the CA through preview, apply and an idle second apply,
+// and keep what they held.
+func TestDoctorCAInstallsOverCommonConfigurations(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	unsetEnv(t, "GOFLAGS")
+	srv, caPEM, _ := caPlanServer(t)
+	kept := map[string][]string{
+		".npmrc":                         {"//npm.corp.example/:_authToken=tok-123", "@corp:registry=https://npm.corp.example/", "fund=false", "audit=false", "save-exact=true", "progress=false", "loglevel=warn"},
+		"etc/pip.conf":                   {"trusted-host = pypi.corp.example", "timeout = 30", "retries = 3", "disable-pip-version-check = true", "no-cache-dir = false"},
+		".config/go/env":                 {"GOPRIVATE=git.corp.example", "GONOSUMDB=git.corp.example", "GOSUMDB=sum.golang.org", "GOFLAGS=-mod=mod -modcacherw"},
+		".config/helm/repositories.yaml": {"name: corp", "pass_credentials_all: true", "password: s3cret", "username: deploy"},
+	}
+	before := map[string]string{
+		".npmrc":                         "registry=https://registry.npmjs.org/\n//npm.corp.example/:_authToken=tok-123\n@corp:registry=https://npm.corp.example/\nfund=false\naudit=false\nsave-exact=true\nprogress=false\nloglevel=warn\n",
+		"etc/pip.conf":                   "[global]\nindex-url = https://pypi.org/simple\ntrusted-host = pypi.corp.example\ntimeout = 30\nretries = 3\ndisable-pip-version-check = true\nno-cache-dir = false\n",
+		".config/go/env":                 "GOPROXY=https://proxy.golang.org,direct\nGOPRIVATE=git.corp.example\nGONOSUMDB=git.corp.example\nGOSUMDB=sum.golang.org\nGOFLAGS=-mod=mod -modcacherw\n",
+		".config/helm/repositories.yaml": "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n- caFile: \"\"\n  certFile: \"\"\n  insecure_skip_tls_verify: false\n  keyFile: \"\"\n  name: corp\n  pass_credentials_all: true\n  password: s3cret\n  url: https://charts.corp.example\n  username: deploy\n",
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	release := filepath.Join(t.TempDir(), "os-release")
+	files := map[string][]byte{caFile: caPEM, release: []byte("ID=ubuntu\n")}
+	for name, body := range before {
+		files[filepath.Join(home, name)] = []byte(body)
+	}
+	for f, b := range files {
+		if err := os.MkdirAll(filepath.Dir(f), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevOS, prevRoot, prevRelease, prevRun := doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun
+	doctorCAGOOS, doctorOCIRoot, doctorOSRelease = clientconf.OSLinux, root, release
+	doctorRun = func(string, ...string) error {
+		bundle := filepath.Join(root, "etc/ssl/certs/ca-certificates.crt")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(bundle, caPEM, 0600)
+	}
+	t.Cleanup(func() {
+		doctorCAGOOS, doctorOCIRoot, doctorOSRelease, doctorRun = prevOS, prevRoot, prevRelease, prevRun
+	})
+	for i, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "npm,pypi,gomod,helm", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err != nil {
+			t.Fatalf("run %d %v refused a common configuration: %v\n%s", i, apply, err, out)
+		}
+		if i == 2 && !strings.Contains(out, "Nothing to change") {
+			t.Errorf("the second apply is not idle:\n%s", out)
+		}
+	}
+	for name, lines := range kept {
+		got, err := os.ReadFile(filepath.Join(home, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range lines {
+			if !strings.Contains(string(got), line) {
+				t.Errorf("%s lost %q:\n%s", name, line, got)
+			}
+		}
+	}
+}
+
+// F116 R4: the --ca-file section lists, per client, the settings doctor
+// models, and says what any other setting, or one that turns verification
+// off, does to the install and the report.
+func TestUsageDocListsModeledSettings(t *testing.T) {
+	data, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, caDoc, ok := strings.Cut(string(data), "`--ca-file <path>` adds a private CA to the plan")
+	if !ok {
+		t.Fatal("no --ca-file documentation")
+	}
+	caDoc, _, _ = strings.Cut(caDoc, "`--write-apt-sources` is")
+	for _, want := range []string{
+		"| System               | Modeled settings", "Refused as turning verification off", "Installing the CA by hand",
+		"refuse that client before anything is written", "`unchecked`", "name the file and the setting",
+		"`strict-ssl`", "`trusted-host` naming bodega's host", "`Acquire::https::Verify-Peer`", "`insecure_skip_tls_verify: true`",
+		"`skip_verify = true`", "`insecure-registries`", "`GOINSECURE` with a pattern matching bodega's host", "`http.sslVerify` false",
+	} {
+		if !strings.Contains(caDoc, want) {
+			t.Errorf("--ca-file documentation lacks %q", want)
+		}
+	}
+	for client, list := range map[string][]clientconf.ModeledSetting{"npm": clientconf.NpmModeled, "pypi": clientconf.PipModeled, "gomod": clientconf.GoEnvModeled, "helm": clientconf.HelmModeled} {
+		_, table, _ := strings.Cut(caDoc, "| Modeled settings")
+		table, _, _ = strings.Cut(table, "\n\n")
+		row := ""
+		for _, line := range strings.Split(table, "\n") {
+			if strings.HasPrefix(line, "| `"+client+"`") {
+				row = line
+			}
+		}
+		for _, m := range list {
+			if m.Name == "@scope:registry" || m.Name == "default-timeout" {
+				continue
+			}
+			if !strings.Contains(row, "`"+m.Name+"`") {
+				t.Errorf("the %s row of the modeled-settings table does not list %s", client, m.Name)
+			}
+		}
+	}
+}

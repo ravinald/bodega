@@ -165,7 +165,17 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(set.reached, func(entry string) bool { return namesHost(entry, u.Host) }) {
 		return nil
 	}
+	if what := (clientconf.GoEnv{Getenv: t.Getenv, ConfigDir: configDir}).Uncertified(u); what != "" {
+		return uncertified("the go command", "the go env file sets "+what)
+	}
 	return []trustStore{t.systemStore(false)}
+}
+
+// uncertified is the store of a client whose configuration holds a setting
+// outside what doctor models, or one that turns verification off: what names
+// the setting, which clientconf's lists decide for the CA install too.
+func uncertified(client, what string) []trustStore {
+	return []trustStore{{name: client + "'s configuration", blind: fmt.Sprintf("%s, so whether %s verifies bodega's certificate is unchecked; remove the setting or return it to the client's default, or leave it and add the CA to that client's trust by hand", what, client)}}
 }
 
 // trustRows maps a row's check name to its client.
@@ -203,6 +213,9 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if doc.TLSUnmodeled != "" {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
+	}
+	if entry := doc.Insecure(u); entry != "" {
+		return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents", entry))
 	}
 	dir := filepath.Join(t.Root, "/etc/docker/certs.d", u.Host)
 	if err := clientconf.DockerCertsDirError(dir, ""); err != nil {
@@ -254,6 +267,11 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 	if u.Scheme == "https" {
 		if unmodeled := conf.TLSUnmodeled(u.Hostname()); unmodeled != "" {
 			return []trustStore{{name: "apt's configuration", blind: fmt.Sprintf("apt's configuration sets %s, so whether apt accepts bodega's certificate is unchecked", unmodeled)}}
+		}
+	}
+	if u.Scheme == "https" {
+		if what := conf.Uncertified(u.Hostname()); what != "" {
+			return uncertified("apt", "apt's configuration sets "+what)
 		}
 	}
 	for _, key := range []string{"acquire::https::" + strings.ToLower(u.Hostname()) + "::cainfo", "acquire::https::cainfo"} {
@@ -388,6 +406,9 @@ func pipStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if from := clientconf.PipClientCert(layers, t.Getenv); from != "" {
 		return []trustStore{{name: "pip's configuration", blind: fmt.Sprintf("pip is given a client certificate (%s), which it loads into every connection and fails each request on when the file or its key does not load; doctor does not interpret it, so whether pip accepts bodega's certificate is unchecked", from)}}
+	}
+	if what := clientconf.PipUncertified(layers, t.Getenv, u); what != "" {
+		return uncertified("pip", "pip's configuration sets "+what)
 	}
 	for _, key := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
 		if v := t.env(key); v != "" {
@@ -637,6 +658,9 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	if unmodeled := clientconf.NodeOptionsUnread(t.Getenv); unmodeled != "" {
 		return blind(unmodeled)
 	}
+	if what := clientconf.NpmUncertified(t.Getenv, files); what != "" {
+		return uncertified("npm", "npm reads "+what)
+	}
 	env := npmLayer{from: "the environment"}
 	if v, _ := clientconf.NpmEnv(t.Getenv, "cafile"); v != "" {
 		env.cafile, env.from = v, "the environment's npm_config_cafile"
@@ -808,6 +832,15 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 		return nil
 	}
 	var out []trustStore
+	reaches := slices.ContainsFunc(doc.Repositories, func(r *clientconf.HelmEntry) bool {
+		p, err := url.Parse(r.URL)
+		return err == nil && p.Host == u.Host
+	})
+	if data, err := os.ReadFile(path); reaches && err == nil {
+		if what := clientconf.HelmUncertified(path, data, u); what != "" {
+			return uncertified("helm", "helm reads "+what)
+		}
+	}
 	for _, r := range doc.Repositories {
 		if r == nil {
 			continue
@@ -881,6 +914,9 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		}
 		if !slices.ContainsFunc(doc.Hosts, func(h clientconf.ContainerdRegistryHost) bool { return mirrorIsBodega(h.Key, u.Host) }) {
 			continue
+		}
+		if key := doc.SkipsVerify(func(key string) bool { return mirrorIsBodega(key, u.Host) }); key != "" {
+			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
 		}
 		if err := doc.TLSError(""); err != nil {
 			return []trustStore{{name: "containerd's configuration", blind: fmt.Sprintf("containerd cannot load a certificate %s names (%v) and resolves no host for that registry while it cannot, the bodega host included, so whether containerd reaches bodega or verifies its certificate is unchecked", path, err)}}
