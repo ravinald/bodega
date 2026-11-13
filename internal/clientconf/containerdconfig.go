@@ -484,6 +484,9 @@ func (c *containerdCRI) pluginState(disabled, required []string) (criDisabled bo
 			invalid = containerdStartFailure("the CRI image plugin", err)
 		}
 	}
+	if invalid == "" {
+		invalid = c.start.unmodeled(disabled)
+	}
 	return criDisabled, invalid
 }
 

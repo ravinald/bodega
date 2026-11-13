@@ -875,7 +875,16 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "an unpack platform that does not parse", conf: "version = 3\n" + transfer + "platform = \"\"\nsnapshotter = \"overlayfs\"\n", invalid: "platform configuration  invalid"},
 		{name: "an unpack snapshotter nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", invalid: "snapshotter \"stargz\" not found"},
 		{name: "an unpack differ nothing provides", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"zstd\"\n", invalid: "failed to get instance for diff plugin \"zstd\""},
-		{name: "an unpack configuration an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", imported: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"native\"\n"},
+		{name: "an unpack configuration an import replaces", conf: "version = 3\nimports = [\"extra.toml\"]\n" + transfer + "platform = \"linux\"\nsnapshotter = \"stargz\"\n", imported: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"native\"\ndiffer = \"walking\"\n"},
+		// With no differ named, containerd matches the entry's platform against
+		// what each loaded diff plugin advertises on the host.
+		{name: "an unpack configuration naming no differ", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"native\"\n", invalid: "sets no differ"},
+		{name: "an unpack configuration naming no differ in an import", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n" + transfer + "platform = \"windows/amd64\"\nsnapshotter = \"native\"\n", invalid: "sets no differ"},
+		// With no unpack_config at all the transfer plugin fills in the
+		// default snapshotter and differ by name, and one set empty stays empty.
+		{name: "the default unpack snapshotter disabled", conf: "version = 3\ndisabled_plugins = [\"io.containerd.snapshotter.v1.overlayfs\"]\n" + images + "snapshotter = \"native\"\n", invalid: "doctor does not follow whether the service starts without it"},
+		{name: "the default unpack differ disabled", conf: "version = 3\ndisabled_plugins = [\"io.containerd.differ.v1.walking\"]\n[plugins.\"io.containerd.service.v1.diff-service\"]\ndefault = []\n", invalid: "doctor does not follow whether the service starts without it"},
+		{name: "an empty unpack configuration", conf: "version = 3\n" + images + "snapshotter = \"native\"\n[plugins.\"io.containerd.transfer.v1.local\"]\nunpack_config = []\n"},
 
 		{name: "an unpack differ the host may skip", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"overlayfs\"\ndiffer = \"erofs\"\n", invalid: "depends on this host"},
 		{name: "an unpack snapshotter containerd skips", conf: "version = 3\n" + transfer + "platform = \"linux\"\nsnapshotter = \"devmapper\"\n", invalid: "snapshotter \"devmapper\" not found: containerd skips plugin"},
@@ -886,15 +895,15 @@ func TestContainerdInitChecks(t *testing.T) {
 		// the host decides the skip, doctor does not.
 		{name: "devmapper selected with no pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n", invalid: "failed to find snapshotter \"devmapper\": containerd skips plugin io.containerd.snapshotter.v1.devmapper while its table sets no pool_name"},
 		{name: "devmapper selected with an empty pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n" + devmapper + "pool_name = \"\"\nbase_image_size = \"10GB\"\n", invalid: "failed to find snapshotter \"devmapper\""},
-		{name: "devmapper selected with a pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n"},
-		{name: "devmapper selected with a pool an import sets", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"devmapper\"\n", imported: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n"},
+		{name: "devmapper selected with a pool", conf: "version = 3\n" + images + "snapshotter = \"devmapper\"\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.devmapper\"] sets pool_name"},
+		{name: "devmapper selected with a pool an import sets", conf: "version = 3\nimports = [\"extra.toml\"]\n" + images + "snapshotter = \"devmapper\"\n", imported: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.devmapper\"] sets pool_name"},
 		{name: "a version 2 devmapper with no pool", conf: "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd]\nsnapshotter = \"devmapper\"\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\nruntime_type = \"io.containerd.runc.v2\"\n", invalid: "failed to find snapshotter \"devmapper\""},
-		{name: "blockfile selected with a scratch file", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n[plugins.\"io.containerd.snapshotter.v1.blockfile\"]\nscratch_file = \"/opt/containerd/blockfile\"\n"},
+		{name: "blockfile selected with a scratch file", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n[plugins.\"io.containerd.snapshotter.v1.blockfile\"]\nscratch_file = \"/opt/containerd/blockfile\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.blockfile\"] sets scratch_file"},
 		{name: "blockfile selected with nothing to recreate from", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n[plugins.\"io.containerd.snapshotter.v1.blockfile\"]\nrecreate_scratch = true\n", invalid: "containerd skips plugin io.containerd.snapshotter.v1.blockfile"},
 		{name: "blockfile selected as registered", conf: "version = 3\n" + images + "snapshotter = \"blockfile\"\n", invalid: "a scratch file exists under the blockfile snapshotter's root, which depends on this host"},
 		{name: "zfs selected", conf: "version = 3\n" + images + "snapshotter = \"zfs\"\n", invalid: "depends on this host"},
 		{name: "btrfs selected", conf: "version = 3\n" + images + "snapshotter = \"btrfs\"\n", invalid: "depends on this host"},
-		{name: "zfs configured and not selected", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.zfs\"]\nroot_path = \"/tank/containerd\"\n"},
+		{name: "zfs configured and not selected", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.zfs\"]\nroot_path = \"/tank/containerd\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.zfs\"] sets root_path"},
 
 		// GetSingle needs exactly one plugin of the type; GetByType takes all.
 		{name: "a second content store", conf: "version = 3\n[proxy_plugins.remote]\ntype = \"content\"\naddress = \"/run/content.sock\"\n", invalid: "multiple plugins registered for io.containerd.content.v1 (content, remote)"},
@@ -902,10 +911,23 @@ func TestContainerdInitChecks(t *testing.T) {
 		{name: "proxies of the collected types", conf: "version = 3\n" + stargz + "[proxy_plugins.zstd]\ntype = \"diff\"\n[proxy_plugins.kata]\ntype = \"sandbox\"\n"},
 
 		{name: "devmapper with no pool", conf: "version = 3\n" + devmapper + "fs_type = \"zfs\"\n"},
-		{name: "devmapper configured", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"xfs\"\n"},
+		{name: "devmapper configured", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"xfs\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.devmapper\"] sets pool_name"},
 		{name: "devmapper with no image size", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\n", invalid: "failed to parse base image size"},
 		{name: "devmapper with an unknown filesystem", conf: "version = 3\n" + devmapper + "pool_name = \"containerd-pool\"\nbase_image_size = \"10GB\"\nfs_type = \"zfs\"\n", invalid: "unsupported Filesystem Type"},
-		{name: "an erofs default size", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"64 MiB\"\n"},
+		{name: "an erofs default size", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"64 MiB\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.erofs\"] sets default_size"},
+
+		// Past the keys above, a table of a plugin the CRI service starts
+		// through is certified only at the values containerd registers.
+		{name: "registered values written out", conf: "version = 3\n[plugins.\"io.containerd.gc.v1.scheduler\"]\npause_threshold = 0.02\nmutation_threshold = 100\nstartup_delay = \"100ms\"\nschedule_delay = \"0ms\"\n[plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\nroot_path = \"\"\nmount_options = []\n[plugins.\"io.containerd.transfer.v1.local\"]\nmax_concurrent_downloads = 3\n[plugins.\"io.containerd.nri.v1.nri\".default_validator]\nrequired_plugins = []\n"},
+		{name: "a garbage collector threshold", conf: "version = 3\n[plugins.\"io.containerd.gc.v1.scheduler\"]\npause_threshold = 0.5\n", invalid: "[plugins.\"io.containerd.gc.v1.scheduler\"] sets pause_threshold"},
+		{name: "an overlayfs mount option", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\nmount_options = [\"volatile\"]\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.overlayfs\"] sets mount_options"},
+		{name: "an overlayfs root in an import", conf: "version = 3\nimports = [\"extra.toml\"]\n", imported: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\nroot_path = \"/srv/overlay\"\n", invalid: "[plugins.\"io.containerd.snapshotter.v1.overlayfs\"] sets root_path"},
+		{name: "an overlayfs root an import resets", conf: "version = 3\nimports = [\"extra.toml\"]\n[plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\nroot_path = \"/srv/overlay\"\n", imported: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\nroot_path = \"\"\n"},
+		{name: "a transfer registry path", conf: "version = 3\n[plugins.\"io.containerd.transfer.v1.local\"]\nconfig_path = \"/etc/containerd/other.d\"\n", invalid: "[plugins.\"io.containerd.transfer.v1.local\"] sets config_path"},
+		{name: "an image verifier directory", conf: "version = 3\n[plugins.\"io.containerd.image-verifier.v1.bindir\"]\nbin_dir = \"/srv/verifiers\"\n", invalid: "[plugins.\"io.containerd.image-verifier.v1.bindir\"] sets bin_dir"},
+		{name: "an NRI validator", conf: "version = 3\n[plugins.\"io.containerd.nri.v1.nri\".default_validator]\nenable = true\n", invalid: "[plugins.\"io.containerd.nri.v1.nri\"] sets default_validator"},
+		{name: "a version 2 cgroups table", conf: "version = 2\n[plugins.\"io.containerd.monitor.v1.cgroups\"]\nno_prometheus = true\n", invalid: "[plugins.\"io.containerd.monitor.task.v1.cgroups\"] sets no_prometheus"},
+		{name: "a table of a plugin the CRI service does not start through", conf: "version = 3\n[plugins.\"io.containerd.internal.v1.opt\"]\npath = \"/srv/opt\"\n[plugins.\"io.containerd.monitor.container.v1.restart\"]\ninterval = \"30s\"\n"},
 		{name: "an erofs default size with no number", conf: "version = 3\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\ndefault_size = \"large\"\n", invalid: "failed to parse default_size"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

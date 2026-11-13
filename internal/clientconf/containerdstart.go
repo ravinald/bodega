@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -53,23 +54,24 @@ type (
 	// Config in internal/nri/config.go, with DefaultValidatorConfig of
 	// github.com/containerd/nri v0.10.0, the version containerd v2.2.0 pins.
 	containerdNRIConfig struct {
-		Disable                   bool               `toml:"disable"`
-		SocketPath                string             `toml:"socket_path"`
-		PluginPath                string             `toml:"plugin_path"`
-		PluginConfigPath          string             `toml:"plugin_config_path"`
-		PluginRegistrationTimeout containerdDuration `toml:"plugin_registration_timeout"`
-		PluginRequestTimeout      containerdDuration `toml:"plugin_request_timeout"`
-		DisableConnections        bool               `toml:"disable_connections"`
-		DefaultValidator          *struct {
-			Enable                                bool     `toml:"enable"`
-			RejectOCIHookAdjustment               bool     `toml:"reject_oci_hook_adjustment"`
-			RejectRuntimeDefaultSeccompAdjustment bool     `toml:"reject_runtime_default_seccomp_adjustment"`
-			RejectUnconfinedSeccompAdjustment     bool     `toml:"reject_unconfined_seccomp_adjustment"`
-			RejectCustomSeccompAdjustment         bool     `toml:"reject_custom_seccomp_adjustment"`
-			RejectNamespaceAdjustment             bool     `toml:"reject_namespace_adjustment"`
-			RequiredPlugins                       []string `toml:"required_plugins"`
-			TolerateMissingAnnotation             string   `toml:"tolerate_missing_plugins_annotation"`
-		} `toml:"default_validator"`
+		Disable                   bool                    `toml:"disable"`
+		SocketPath                string                  `toml:"socket_path"`
+		PluginPath                string                  `toml:"plugin_path"`
+		PluginConfigPath          string                  `toml:"plugin_config_path"`
+		PluginRegistrationTimeout containerdDuration      `toml:"plugin_registration_timeout"`
+		PluginRequestTimeout      containerdDuration      `toml:"plugin_request_timeout"`
+		DisableConnections        bool                    `toml:"disable_connections"`
+		DefaultValidator          *containerdNRIValidator `toml:"default_validator"`
+	}
+	containerdNRIValidator struct {
+		Enable                                bool     `toml:"enable"`
+		RejectOCIHookAdjustment               bool     `toml:"reject_oci_hook_adjustment"`
+		RejectRuntimeDefaultSeccompAdjustment bool     `toml:"reject_runtime_default_seccomp_adjustment"`
+		RejectUnconfinedSeccompAdjustment     bool     `toml:"reject_unconfined_seccomp_adjustment"`
+		RejectCustomSeccompAdjustment         bool     `toml:"reject_custom_seccomp_adjustment"`
+		RejectNamespaceAdjustment             bool     `toml:"reject_namespace_adjustment"`
+		RequiredPlugins                       []string `toml:"required_plugins"`
+		TolerateMissingAnnotation             string   `toml:"tolerate_missing_plugins_annotation"`
 	}
 	// Config in plugins/restart/monitor.go.
 	containerdRestartConfig struct {
@@ -113,19 +115,21 @@ type (
 	}
 	// transferConfig in plugins/transfer/plugin.go.
 	containerdTransferConfig struct {
-		MaxConcurrentDownloads      int  `toml:"max_concurrent_downloads"`
-		ConcurrentLayerFetchBuffer  int  `toml:"concurrent_layer_fetch_buffer"`
-		MaxConcurrentUploadedLayers int  `toml:"max_concurrent_uploaded_layers"`
-		CheckPlatformSupported      bool `toml:"check_platform_supported"`
-		UnpackConfiguration         []struct {
-			Platform    string   `toml:"platform"`
-			Snapshotter string   `toml:"snapshotter"`
-			Differ      string   `toml:"differ"`
-			ConfigType  string   `toml:"config_type"`
-			LayerTypes  []string `toml:"layer_types"`
-		} `toml:"unpack_config"`
-		RegistryConfigPath   string `toml:"config_path"`
-		MaxConcurrentUnpacks int    `toml:"max_concurrent_unpacks"`
+		MaxConcurrentDownloads      int                      `toml:"max_concurrent_downloads"`
+		ConcurrentLayerFetchBuffer  int                      `toml:"concurrent_layer_fetch_buffer"`
+		MaxConcurrentUploadedLayers int                      `toml:"max_concurrent_uploaded_layers"`
+		CheckPlatformSupported      bool                     `toml:"check_platform_supported"`
+		UnpackConfiguration         []containerdUnpackConfig `toml:"unpack_config"`
+		RegistryConfigPath          string                   `toml:"config_path"`
+		MaxConcurrentUnpacks        int                      `toml:"max_concurrent_unpacks"`
+	}
+	// unpackConfiguration in plugins/transfer/plugin.go.
+	containerdUnpackConfig struct {
+		Platform    string   `toml:"platform"`
+		Snapshotter string   `toml:"snapshotter"`
+		Differ      string   `toml:"differ"`
+		ConfigType  string   `toml:"config_type"`
+		LayerTypes  []string `toml:"layer_types"`
 	}
 	// Config in plugins/diff/erofs/plugin/plugin.go.
 	containerdErofsDiffConfig struct {
@@ -235,13 +239,27 @@ func (c *containerdDiffServiceConfig) initError(s *containerdStart, disabled []s
 	return nil
 }
 
-// The transfer plugin's InitFn (plugins/transfer/plugin.go, lines 94-170)
+// The transfer plugin's InitFn (plugins/transfer/plugin.go, lines 57-170)
 // for each unpack_config entry: the platform it parses, the snapshotter it
 // takes from those the metadata plugin collected, and the differ it looks up
-// by name, where GetByID hands it a skipped differ's error. Whether a differ
-// matches the platform when none is named is the host's.
+// by name, where GetByID hands it a skipped differ's error.
+//
+// With no unpack_config in any file the InitFn fills in defaultUnpackConfig
+// (plugin_defaults_other.go): the host's platform, the default snapshotter
+// and the default differ, both by name, so that entry owes the same two
+// lookups. An unpack_config a file sets empty stays empty.
+//
+// An entry naming no differ has containerd pick one by matching the entry's
+// platform against the platforms each loaded diff plugin advertises (lines
+// 124-162), which are the host's: walking advertises platforms.DefaultSpec().
+// The port does not resolve a platform against a host, so that entry is the
+// host's to decide and never passes as a lookup nobody owes.
 func (c *containerdTransferConfig) initError(s *containerdStart, disabled []string) error {
-	for _, uc := range c.UnpackConfiguration {
+	entries := c.UnpackConfiguration
+	if entries == nil {
+		entries = append(entries, containerdUnpackConfig{Platform: "linux", Snapshotter: containerdDefaultSnapshotter, Differ: containerdDefaultDiffer})
+	}
+	for _, uc := range entries {
 		if containerdPlatformError(uc.Platform) != nil {
 			return fmt.Errorf("io.containerd.transfer.v1: platform configuration %v invalid", uc.Platform)
 		}
@@ -249,7 +267,7 @@ func (c *containerdTransferConfig) initError(s *containerdStart, disabled []stri
 			return fmt.Errorf("snapshotter %q not found: %w", uc.Snapshotter, err)
 		}
 		if uc.Differ == "" {
-			continue
+			return &containerdHostError{fmt.Sprintf("a diff plugin advertises platform %q: an unpack_config entry of [plugins.%q] sets no differ, and containerd then picks one by the platforms its diff plugins advertise", uc.Platform, "io.containerd.transfer.v1.local")}
 		}
 		if err := s.named("io.containerd.differ.v1", uc.Differ, disabled); err != nil {
 			return fmt.Errorf("failed to get instance for diff plugin %q: %w", uc.Differ, err)
@@ -380,48 +398,59 @@ var containerdLogLevels = strings.Fields("panic fatal error warn warning info de
 // that release. The value makes the Config the plugin registers, nil for a
 // plugin that registers none and so decodes no table. Config.Decode fills that
 // struct, so a key the file leaves out keeps the registered value and one it
-// sets to "" does not; the two an InitFn below reads are made with theirs, new
-// on each call because a decode writes into the slice it finds. The three CRI plugins
-// are nil too: containerdCRI decodes and validates theirs.
+// sets to "" does not; each is made with the values its plugin registers,
+// which `containerd config default` prints, new on each call because a decode
+// writes into the slice it finds. The three CRI plugins are nil too:
+// containerdCRI decodes and validates theirs.
 //
 // A table under any other name is one no plugin decodes, and containerd
 // starts whatever it holds.
 var containerdPlugins = map[string]func() any{
-	"io.containerd.content.v1.content":                  nil,
-	"io.containerd.cri.v1.images":                       nil,
-	"io.containerd.cri.v1.runtime":                      nil,
-	"io.containerd.differ.v1.erofs":                     containerdTable[containerdErofsDiffConfig],
-	"io.containerd.differ.v1.walking":                   nil,
-	"io.containerd.event.v1.exchange":                   nil,
-	"io.containerd.gc.v1.scheduler":                     containerdTable[containerdGCConfig],
-	"io.containerd.grpc.v1.containers":                  nil,
-	"io.containerd.grpc.v1.content":                     nil,
-	"io.containerd.grpc.v1.cri":                         nil,
-	"io.containerd.grpc.v1.diff":                        nil,
-	"io.containerd.grpc.v1.events":                      nil,
-	"io.containerd.grpc.v1.healthcheck":                 nil,
-	"io.containerd.grpc.v1.images":                      nil,
-	"io.containerd.grpc.v1.introspection":               nil,
-	"io.containerd.grpc.v1.leases":                      nil,
-	"io.containerd.grpc.v1.mounts":                      nil,
-	"io.containerd.grpc.v1.namespaces":                  nil,
-	"io.containerd.grpc.v1.sandbox-controllers":         nil,
-	"io.containerd.grpc.v1.sandboxes":                   nil,
-	"io.containerd.grpc.v1.snapshots":                   nil,
-	"io.containerd.grpc.v1.streaming":                   nil,
-	"io.containerd.grpc.v1.tasks":                       nil,
-	"io.containerd.grpc.v1.transfer":                    nil,
-	"io.containerd.grpc.v1.version":                     nil,
-	"io.containerd.image-verifier.v1.bindir":            containerdTable[containerdVerifierConfig],
-	"io.containerd.internal.v1.opt":                     containerdTable[containerdOptConfig],
-	"io.containerd.internal.v1.tracing":                 containerdTable[containerdTraceConfig],
-	"io.containerd.lease.v1.manager":                    nil,
-	"io.containerd.metadata.v1.bolt":                    func() any { return &containerdBoltConfig{ContentSharingPolicy: "shared"} },
-	"io.containerd.monitor.container.v1.restart":        containerdTable[containerdRestartConfig],
-	"io.containerd.monitor.task.v1.cgroups":             containerdTable[containerdCgroupsConfig],
-	"io.containerd.mount-handler.v1.erofs":              containerdTable[containerdErofsMountConfig],
-	"io.containerd.mount-manager.v1.bolt":               nil,
-	"io.containerd.nri.v1.nri":                          containerdTable[containerdNRIConfig],
+	"io.containerd.content.v1.content": nil,
+	"io.containerd.cri.v1.images":      nil,
+	"io.containerd.cri.v1.runtime":     nil,
+	"io.containerd.differ.v1.erofs":    containerdTable[containerdErofsDiffConfig],
+	"io.containerd.differ.v1.walking":  nil,
+	"io.containerd.event.v1.exchange":  nil,
+	"io.containerd.gc.v1.scheduler": func() any {
+		return &containerdGCConfig{PauseThreshold: 0.02, MutationThreshold: 100, StartupDelay: containerdDuration(100 * time.Millisecond)}
+	},
+	"io.containerd.grpc.v1.containers":          nil,
+	"io.containerd.grpc.v1.content":             nil,
+	"io.containerd.grpc.v1.cri":                 nil,
+	"io.containerd.grpc.v1.diff":                nil,
+	"io.containerd.grpc.v1.events":              nil,
+	"io.containerd.grpc.v1.healthcheck":         nil,
+	"io.containerd.grpc.v1.images":              nil,
+	"io.containerd.grpc.v1.introspection":       nil,
+	"io.containerd.grpc.v1.leases":              nil,
+	"io.containerd.grpc.v1.mounts":              nil,
+	"io.containerd.grpc.v1.namespaces":          nil,
+	"io.containerd.grpc.v1.sandbox-controllers": nil,
+	"io.containerd.grpc.v1.sandboxes":           nil,
+	"io.containerd.grpc.v1.snapshots":           nil,
+	"io.containerd.grpc.v1.streaming":           nil,
+	"io.containerd.grpc.v1.tasks":               nil,
+	"io.containerd.grpc.v1.transfer":            nil,
+	"io.containerd.grpc.v1.version":             nil,
+	"io.containerd.image-verifier.v1.bindir": func() any {
+		return &containerdVerifierConfig{BinDir: "/opt/containerd/image-verifier/bin", MaxVerifiers: 10, PerVerifierTimeout: containerdDuration(10 * time.Second)}
+	},
+	"io.containerd.internal.v1.opt":              containerdTable[containerdOptConfig],
+	"io.containerd.internal.v1.tracing":          containerdTable[containerdTraceConfig],
+	"io.containerd.lease.v1.manager":             nil,
+	"io.containerd.metadata.v1.bolt":             func() any { return &containerdBoltConfig{ContentSharingPolicy: "shared"} },
+	"io.containerd.monitor.container.v1.restart": containerdTable[containerdRestartConfig],
+	"io.containerd.monitor.task.v1.cgroups":      containerdTable[containerdCgroupsConfig],
+	"io.containerd.mount-handler.v1.erofs":       containerdTable[containerdErofsMountConfig],
+	"io.containerd.mount-manager.v1.bolt":        nil,
+	"io.containerd.nri.v1.nri": func() any {
+		return &containerdNRIConfig{
+			SocketPath: "/var/run/nri/nri.sock", PluginPath: "/opt/nri/plugins", PluginConfigPath: "/etc/nri/conf.d",
+			PluginRegistrationTimeout: containerdDuration(5 * time.Second), PluginRequestTimeout: containerdDuration(2 * time.Second),
+			DefaultValidator: &containerdNRIValidator{},
+		}
+	},
 	"io.containerd.podsandbox.controller.v1.podsandbox": nil,
 	"io.containerd.runtime.v2.task":                     containerdTable[containerdTaskConfig],
 	"io.containerd.sandbox.controller.v1.shim":          nil,
@@ -444,9 +473,11 @@ var containerdPlugins = map[string]func() any{
 	"io.containerd.snapshotter.v1.zfs":                  containerdTable[containerdRootPathConfig],
 	"io.containerd.streaming.v1.manager":                nil,
 	"io.containerd.tracing.processor.v1.otlp":           containerdTable[containerdOTLPConfig],
-	"io.containerd.transfer.v1.local":                   containerdTable[containerdTransferConfig],
-	"io.containerd.ttrpc.v1.otelttrpc":                  nil,
-	"io.containerd.warning.v1.deprecations":             nil,
+	"io.containerd.transfer.v1.local": func() any {
+		return &containerdTransferConfig{MaxConcurrentDownloads: 3, MaxConcurrentUploadedLayers: 3, MaxConcurrentUnpacks: 1}
+	},
+	"io.containerd.ttrpc.v1.otelttrpc":      nil,
+	"io.containerd.warning.v1.deprecations": nil,
 }
 
 // containerdProxyTypes is the switch in LoadPlugins
@@ -729,6 +760,100 @@ func (s *containerdStart) collect(typ string, disabled []string) error {
 		return &containerdHostError{fmt.Sprintf("a plugin of type %s loads, and whether these do is the host's: %s", typ, strings.Join(host, ", "))}
 	}
 	return fmt.Errorf("no plugins registered for %s: plugin: not found", typ)
+}
+
+// containerdDefaultDiffer is DefaultDiffer in defaults/defaults_linux.go.
+const containerdDefaultDiffer = "walking"
+
+// containerdReached is every plugin with a table that containerd v2.2.0
+// initializes on the way to serving a CRI pull: the transitive Requires of
+// io.containerd.grpc.v1.cri and io.containerd.cri.v1.images in the Linux
+// release, which name types and so take in every plugin of each type. A
+// plugin outside it (opt, tracing, the restart monitor) can fail without
+// taking the CRI service with it.
+//
+// The value lists the keys of that table whose every value the port follows
+// to the end of the plugin's InitFn. Any other key is followed at one value
+// only, the one the plugin registers: what a snapshotter does with another
+// root, or a verifier with another directory, is decided by code and host
+// state nothing here reads.
+var containerdReached = map[string][]string{
+	"io.containerd.differ.v1.erofs":          nil,
+	"io.containerd.gc.v1.scheduler":          nil,
+	"io.containerd.image-verifier.v1.bindir": nil,
+	"io.containerd.metadata.v1.bolt":         {"content_sharing_policy"},
+	"io.containerd.monitor.task.v1.cgroups":  nil,
+	"io.containerd.mount-handler.v1.erofs":   nil,
+	"io.containerd.nri.v1.nri":               nil,
+	"io.containerd.runtime.v2.task":          {"platforms"},
+	"io.containerd.service.v1.diff-service":  {"default"},
+	"io.containerd.service.v1.tasks-service": nil,
+	"io.containerd.shim.v1.manager":          nil,
+	"io.containerd.snapshotter.v1.blockfile": nil,
+	"io.containerd.snapshotter.v1.btrfs":     nil,
+	"io.containerd.snapshotter.v1.devmapper": nil,
+	"io.containerd.snapshotter.v1.erofs":     nil,
+	"io.containerd.snapshotter.v1.native":    nil,
+	"io.containerd.snapshotter.v1.overlayfs": nil,
+	"io.containerd.snapshotter.v1.zfs":       nil,
+	"io.containerd.transfer.v1.local":        {"unpack_config"},
+}
+
+// containerdSameValue reports whether two decoded values are the same
+// configuration: an empty list is one a file left out, and a table behind a
+// pointer is compared by what it holds.
+func containerdSameValue(a, b reflect.Value) bool {
+	switch a.Kind() {
+	case reflect.Pointer:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() == b.IsNil()
+		}
+		return containerdSameValue(a.Elem(), b.Elem())
+	case reflect.Struct:
+		for i := range a.NumField() {
+			if !containerdSameValue(a.Field(i), b.Field(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Slice:
+		if a.Len() != b.Len() {
+			return false
+		}
+		for i := range a.Len() {
+			if !containerdSameValue(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	}
+	return a.Interface() == b.Interface()
+}
+
+// unmodeled is the first key of a table in containerdReached that holds a
+// value the port does not follow, as the reason doctor cannot say containerd
+// starts; "" when every such table holds what its plugin registers or a
+// value the port follows. It is the bound on what the checks above certify:
+// they follow named keys, and this refuses the rest instead of passing them.
+//
+// A disabled plugin decodes no table, and one its own table makes containerd
+// skip reads nothing past the key that skips it.
+func (s *containerdStart) unmodeled(disabled []string) string {
+	for _, uri := range slices.Sorted(maps.Keys(s.values)) {
+		followed, reached := containerdReached[uri]
+		if skipped, _ := s.skip(uri); !reached || skipped != "" || slices.Contains(disabled, uri) {
+			continue
+		}
+		got, registered := reflect.ValueOf(s.values[uri]).Elem(), reflect.ValueOf(containerdPlugins[uri]()).Elem()
+		for i := range got.NumField() {
+			key := got.Type().Field(i).Tag.Get("toml")
+			if slices.Contains(followed, key) || containerdSameValue(got.Field(i), registered.Field(i)) {
+				continue
+			}
+			return fmt.Sprintf("[plugins.%q] sets %s to a value other than the one containerd v2.2.0 registers, in a plugin the CRI service starts through: whether containerd starts on it depends on this host and that plugin, which doctor does not follow", uri, key)
+		}
+	}
+	return ""
 }
 
 // command is what the containerd command refuses in the loaded configuration
