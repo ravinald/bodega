@@ -21,6 +21,7 @@ import (
 // The releases the ports are of. .github/workflows/ci.yml installs the same
 // ones for the test job.
 const (
+	NodeVersion   = "v26.13.0"
 	NpmVersion    = "11.20.0"
 	GitVersion    = "2.54"
 	PipVersion    = "26.2.1"
@@ -71,6 +72,12 @@ func probe(bin, pin string, match func(string) bool, args []string) lookup {
 		return lookup{problem: fmt.Sprintf("the port is of %s, and %s %s answers %q (%v)", pin, path, strings.Join(args, " "), got, err)}
 	}
 	return lookup{path: path}
+}
+
+// Node returns the Node v26.13.0 the NODE_OPTIONS lexer is of.
+func Node(t testing.TB) string {
+	t.Helper()
+	return find(t, "node", "Node "+NodeVersion, func(out string) bool { return out == NodeVersion }, "--version")
 }
 
 // Npm returns the npm 11.20.0 the npmrc reader and the option types are of.

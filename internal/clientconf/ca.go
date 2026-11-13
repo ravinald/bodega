@@ -635,7 +635,16 @@ func (h CAHost) dockerReads(changes []Change) error {
 		return nil
 	case err == nil:
 		var doc *DockerDaemonFile
-		if doc, err = ParseDockerDaemonFile(data); err == nil && doc.TLSUnmodeled != "" {
+		doc, err = ParseDockerDaemonFile(data)
+		switch {
+		case err != nil:
+		case doc.StartError != "":
+			return fmt.Errorf("%s: dockerd loads %s and exits as it starts (%s), so it would use neither the mirror nor the CA this command installs, and the install could not be verified. "+
+				"Nothing was written. Repair what the error names (dockerd --validate does not repeat it; starting dockerd does), then re-run", manifest.TypeOCI, path, doc.StartError)
+		case doc.StartUnmodeled != "":
+			return fmt.Errorf("%s: %s sets %s, which dockerd acts on against this host as it starts and may exit over, and this command reads no such host state, so whether dockerd runs to use the CA this command installs could not be verified. "+
+				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.StartUnmodeled)
+		case doc.TLSUnmodeled != "":
 			return fmt.Errorf("%s: %s sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to use the CA this command installs could not be verified. "+
 				"Nothing was written, and the key is left as it is. Add the CA to /etc/docker/certs.d/<bodega host>/ca.crt by hand", manifest.TypeOCI, path, doc.TLSUnmodeled)
 		}

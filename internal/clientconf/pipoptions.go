@@ -428,6 +428,12 @@ func pySpace(r rune) bool { return unicode.IsSpace(r) || r >= 0x1c && r <= 0x1f 
 // pyFields is str.split with no argument.
 func pyFields(s string) []string { return strings.FieldsFunc(s, pySpace) }
 
+// PipWords is the values pip 26.2.1 takes from one setting of an option it
+// appends to, extra-index-url among them: str.split with no argument
+// (ConfigOptionParser._update_defaults). An option pip stores, index-url
+// among them, is one value however much white space it holds.
+func PipWords(val string) []string { return pyFields(val) }
+
 // pyNumeral is the ASCII text CPython's int and float constructors parse a
 // str from (_PyUnicode_TransformDecimalAndSpaceToASCII, then the white space
 // both constructors skip at either end): a decimal digit of any script is its

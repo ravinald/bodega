@@ -1157,3 +1157,73 @@ func TestContainerdCRITablesHoldDefaultsOrFollowedValues(t *testing.T) {
 		})
 	}
 }
+
+// F116 R1, R2: a daemon.json dockerd loads still has to get through NewDaemon.
+// What NewDaemon checks on the file alone (registry.NewService, then
+// verifyDaemonSettings, at moby v28.5.2) is a start error; a key dockerd acts
+// on against the host as it starts, set to other than its default, is
+// unmodeled; and neither stops a configure that installs no CA.
+func TestDockerStartValidityFollowsNewDaemon(t *testing.T) {
+	for _, c := range []struct {
+		name, body, startError, unmodeled string
+	}{
+		{"empty", ``, "", ""},
+		{"no key", `{}`, "", ""},
+		{"registries alone", `{"registry-mirrors":["https://bodega.internal"],"insecure-registries":["bodega.internal:8080","10.0.0.0/8","[::1]:5000","http://plain.internal"]}`, "", ""},
+		{"keys with no effect at start", `{"debug":true,"log-level":"warn","log-format":"json","raw-logs":true,"labels":["a=b"],"log-driver":"journald","max-concurrent-downloads":1,"max-concurrent-uploads":1,"max-download-attempts":1,"shutdown-timeout":-1,"experimental":true,"default-ipc-mode":"shareable","default-cgroupns-mode":"host","no-new-privileges":true}`, "", ""},
+		{"host-decided keys at their defaults", `{"iptables":true,"ip6tables":true,"ip-forward":true,"ip-masq":true,"icc":true,"userland-proxy":true,"data-root":"/var/lib/docker","exec-root":"/var/run/docker","pidfile":"/var/run/docker.pid","group":"docker","default-runtime":"runc","seccomp-profile":"builtin","containerd-namespace":"moby","containerd-plugins-namespace":"plugins.moby","mtu":1500,"network-control-plane-mtu":1500,"ip":"0.0.0.0","storage-driver":"","live-restore":false,"hosts":[],"features":{},"log-opts":{},"dns":null,"cpu-rt-period":0,"proxies":{"http-proxy":""}}`, "", ""},
+		{"cgroupfs", `{"exec-opts":["native.cgroupdriver=cgroupfs"],"cgroup-parent":"anything"}`, "", ""},
+		{"systemd with a slice", `{"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"docker.slice"}`, "", ""},
+		{"a slice under the host's driver", `{"cgroup-parent":"docker.slice"}`, "", ""},
+		{"the last driver wins", `{"exec-opts":["native.cgroupdriver=none"," Native.CgroupDriver = systemd "]}`, "", ""},
+
+		{"unknown cgroup driver", `{"exec-opts":["native.cgroupdriver=not-a-driver"]}`, "native.cgroupdriver option not-a-driver not supported", ""},
+		{"internal cgroup driver", `{"exec-opts":["native.cgroupdriver=none"]}`, "internally used", ""},
+		{"driver value is not folded", `{"exec-opts":["native.cgroupdriver=Systemd"]}`, "not supported", ""},
+		{"systemd without a slice", `{"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"invalid"}`, "valid slice", ""},
+		{"systemd with a bare suffix", `{"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":".slice"}`, "valid slice", ""},
+		{"bridge with bip", `{"bridge":"br0","bip":"192.0.2.1/24"}`, "-b & --bip,", "bip"},
+		{"bridge with bip6", `{"bridge":"br0","bip6":"2001:db8::1/64"}`, "-b & --bip6,", "bip6"},
+		{"icc off without iptables", `{"icc":false,"iptables":false}`, "--iptables=false with --icc=false", "icc"},
+		{"icc off without ip6tables", `{"icc":false,"ipv6":true,"ip6tables":false}`, "--ip6tables=false with --icc=false", "icc"},
+		{"one namespace for both", `{"containerd-namespace":"plugins.moby"}`, "cannot be the same", "containerd-namespace"},
+		{"insecure registry with a hyphen", `{"insecure-registries":["-bodega.internal"]}`, "Cannot begin or end with a hyphen", ""},
+		{"insecure registry with a scheme", `{"insecure-registries":["ftp://bodega.internal"]}`, "should not contain '://'", ""},
+		{"insecure registry host", `{"insecure-registries":["bodega_internal/path"]}`, "invalid host", ""},
+		{"insecure registry port", `{"insecure-registries":["[::1]:70000"]}`, "invalid port", ""},
+
+		{"icc off with iptables", `{"icc":false}`, "", "icc"},
+		{"ip6tables off with icc", `{"ipv6":true,"ip6tables":false}`, "", "ip6tables"},
+		{"parent under the host's driver", `{"cgroup-parent":"invalid"}`, "", "cgroup-parent"},
+		{"storage driver", `{"storage-driver":"overlay2"}`, "", "storage-driver"},
+		{"log options", `{"log-driver":"json-file","log-opts":{"max-size":"10m"}}`, "", "log-opts"},
+		{"live restore", `{"live-restore":true}`, "", "live-restore"},
+		{"data root", `{"data-root":"/srv/docker"}`, "", "data-root"},
+		{"rootless", `{"rootless":true,"exec-opts":["native.cgroupdriver=systemd"]}`, "", "rootless"},
+		{"a feature", `{"features":{"containerd-snapshotter":true}}`, "", "features"},
+		{"a listener", `{"hosts":["unix:///var/run/docker.sock"]}`, "", "hosts"},
+		{"a proxy in its group", `{"proxies":{"https-proxy":"http://proxy.internal:3128"}}`, "", "https-proxy"},
+		{"a default turned off", `{"userland-proxy":false}`, "", "userland-proxy"},
+		{"plugins namespace", `{"containerd-plugins-namespace":"moby","containerd-namespace":"plugins.moby"}`, "", "containerd-namespace"},
+		{"the first in name order", `{"storage-driver":"overlay2","data-root":"/srv/docker"}`, "", "data-root"},
+	} {
+		d, err := ParseDockerDaemonFile([]byte(c.body))
+		if err != nil {
+			t.Errorf("%s: dockerd loads it, and ParseDockerDaemonFile says %v", c.name, err)
+			continue
+		}
+		if (d.StartError == "") != (c.startError == "") || !strings.Contains(d.StartError, c.startError) {
+			t.Errorf("%s: StartError = %q, want %q", c.name, d.StartError, c.startError)
+		}
+		if d.StartUnmodeled != c.unmodeled {
+			t.Errorf("%s: StartUnmodeled = %q, want %q", c.name, d.StartUnmodeled, c.unmodeled)
+		}
+		if c.body == "" {
+			continue
+		}
+		out, err := MergeDockerDaemon([]byte(c.body), []byte(`{"registry-mirrors":["https://bodega.internal/"]}`))
+		if err != nil || !strings.Contains(string(out), "https://bodega.internal/") {
+			t.Errorf("%s: a configure that installs no CA must still edit the file: %v\n%s", c.name, err, out)
+		}
+	}
+}

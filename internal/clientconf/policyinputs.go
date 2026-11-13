@@ -258,14 +258,73 @@ func NpmClientTLS(getenv func(string) string, files []string) string {
 // the only ones doctor reads.
 var nodeCAOptions = []string{"--use-bundled-ca", "--use-openssl-ca", "--use-system-ca"}
 
-// NodeOptionsUnread is why NODE_OPTIONS leaves the Node npm runs under
+// NodeOptionsArgs splits a NODE_OPTIONS value into arguments as Node v26.13.0
+// does before it reads any of them as an option: ParseNodeOptionsEnvVar,
+// src/node_options.cc:2548-2587, byte for byte. An ASCII space outside double
+// quotes ends an argument and nothing else does, so a tab, a newline or a
+// no-break space stays in the argument beside it. A double quote opens or
+// closes a string and is dropped, and inside a string a backslash takes the
+// next byte as it is. bad is the error Node exits on, "" for none.
+func NodeOptionsArgs(value string) (args []string, bad string) {
+	// Bytes, not runes: Node appends each char to the argument as it is.
+	var raw [][]byte
+	collect := func() []string {
+		for _, arg := range raw {
+			args = append(args, string(arg))
+		}
+		return args
+	}
+	inString, startNew := false, true
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c == '\\' && inString:
+			if i+1 == len(value) {
+				return collect(), "invalid value for NODE_OPTIONS (invalid escape)"
+			}
+			i++
+			c = value[i]
+		case c == ' ' && !inString:
+			startNew = true
+			continue
+		case c == '"':
+			inString = !inString
+			continue
+		}
+		if startNew {
+			raw, startNew = append(raw, nil), false
+		}
+		raw[len(raw)-1] = append(raw[len(raw)-1], c)
+	}
+	if inString {
+		return collect(), "invalid value for NODE_OPTIONS (unterminated string)"
+	}
+	return collect(), ""
+}
+
+// NodeRoots is what NODE_OPTIONS and NODE_USE_SYSTEM_CA say about the root
+// store of the Node npm runs under.
+type NodeRoots struct {
+	// Bundled is --use-bundled-ca, OpenSSL --use-openssl-ca, which reads
+	// OpenSSL's store in place of the bundled roots, and System
+	// --use-system-ca or NODE_USE_SYSTEM_CA=1, which adds the system store
+	// to them.
+	Bundled, OpenSSL, System bool
+}
+
+// NodeOptions reads the environment's NODE_OPTIONS once, for the refusal and
+// for the root store alike. unread is why it leaves the Node npm runs under
 // unknown or unable to start, "" when it holds nothing but options that
-// choose a root store, in a combination Node starts on. Node exits before
-// npm starts on an option it does not allow there ("is not allowed in
-// NODE_OPTIONS"), and one it does allow can load code or change what TLS
-// accepts (--require, --tls-min-v1.3, --openssl-config). Telling those apart
-// is Node's option table, which nothing here ports, so anything else is
-// refused.
+// choose a root store, in a combination Node starts on; the roots mean
+// nothing beside a non-empty unread.
+//
+// The arguments are NodeOptionsArgs', never a broader split: Node exits
+// before npm starts on an argument it does not allow there ("is not allowed
+// in NODE_OPTIONS"), a flag with a tab after it among them, and one it does
+// allow can load code or change what TLS accepts (--require, --tls-min-v1.3,
+// --openssl-config). Telling those apart is Node's option table, which
+// nothing here ports, so any argument but the three is refused, in whatever
+// other spelling Node takes for it.
 //
 // The three that remain are each valid alone, and Node checks them together
 // before any script loads (PerProcessOptions::CheckOptions, src/node_options.cc
@@ -275,31 +334,45 @@ var nodeCAOptions = []string{"--use-bundled-ca", "--use-openssl-ca", "--use-syst
 // --use-system-ca, which NODE_USE_SYSTEM_CA=1 also turns on, in any order.
 // --use-bundled-ca with --use-system-ca is the one pair it starts on. The
 // value is never repeated.
-func NodeOptionsUnread(getenv func(string) string) string {
+func NodeOptions(getenv func(string) string) (roots NodeRoots, unread string) {
 	if getenv == nil {
-		return ""
+		return roots, ""
 	}
-	opts := strings.Fields(getenv("NODE_OPTIONS"))
+	opts, bad := NodeOptionsArgs(getenv("NODE_OPTIONS"))
+	if bad != "" {
+		return roots, "the environment's NODE_OPTIONS, which Node cannot split into options (" + bad + ") and exits on before npm starts"
+	}
 	for _, opt := range opts {
 		if !slices.Contains(nodeCAOptions, opt) {
-			return "the environment's NODE_OPTIONS, which holds an option other than " + strings.Join(nodeCAOptions, ", ") + ": Node exits on one it does not allow there and changes what it loads or verifies on others, and doctor interprets those three alone"
+			return roots, "the environment's NODE_OPTIONS, which holds an option other than " + strings.Join(nodeCAOptions, ", ") + ": Node splits it on spaces alone, exits on an option it does not allow there and changes what it loads or verifies on others, and doctor interprets those three alone"
 		}
 	}
-	if !slices.Contains(opts, "--use-openssl-ca") {
-		return ""
+	roots = NodeRoots{
+		Bundled: slices.Contains(opts, "--use-bundled-ca"),
+		OpenSSL: slices.Contains(opts, "--use-openssl-ca"),
+		System:  slices.Contains(opts, "--use-system-ca"),
 	}
 	// flag is the option Node's own message names, and beside how the
 	// environment turned it on.
 	flag, beside := "", ""
 	switch {
-	case slices.Contains(opts, "--use-bundled-ca"):
+	case !roots.OpenSSL:
+	case roots.Bundled:
 		flag, beside = "--use-bundled-ca", "--use-bundled-ca"
-	case slices.Contains(opts, "--use-system-ca"):
+	case roots.System:
 		flag, beside = "--use-system-ca", "--use-system-ca"
 	case getenv("NODE_USE_SYSTEM_CA") == "1":
 		flag, beside = "--use-system-ca", "NODE_USE_SYSTEM_CA=1, which turns --use-system-ca on"
-	default:
-		return ""
 	}
-	return "the environment's NODE_OPTIONS, which holds --use-openssl-ca beside " + beside + ": Node takes one root store of the two and exits on the pair before npm starts (either --use-openssl-ca or " + flag + " can be used, not both)"
+	if flag != "" {
+		return roots, "the environment's NODE_OPTIONS, which holds --use-openssl-ca beside " + beside + ": Node takes one root store of the two and exits on the pair before npm starts (either --use-openssl-ca or " + flag + " can be used, not both)"
+	}
+	roots.System = roots.System || getenv("NODE_USE_SYSTEM_CA") == "1"
+	return roots, ""
+}
+
+// NodeOptionsUnread is NodeOptions' refusal alone.
+func NodeOptionsUnread(getenv func(string) string) string {
+	_, unread := NodeOptions(getenv)
+	return unread
 }

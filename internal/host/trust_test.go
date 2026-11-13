@@ -2550,3 +2550,116 @@ func TestTrustProbeNpmCombinationsAreUnchecked(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit37NodeOptionsLexingIsUnchecked(t *testing.T) {
+	for _, options := range []string{"--use-system-ca\t", "--use-openssl-ca\n", "--use-bundled-ca\u00a0"} {
+		t.Run(options, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			writeTrustFile(t, filepath.Join(p.Root, p.Home, ".npmrc"), "registry="+base+"/npm/\ncafile="+ca+"\n")
+			p.Getenv = func(key string) string {
+				if key == "NODE_OPTIONS" {
+					return options
+				}
+				return ""
+			}
+			verdicts, err := p.Judge([]string{"npm-config"}, base)
+			if err != nil || len(verdicts) != 1 {
+				t.Fatalf("Judge: %v %v", verdicts, err)
+			}
+			if verdicts[0].State != TrustUnchecked || !strings.Contains(verdicts[0].Detail, "NODE_OPTIONS") {
+				t.Errorf("selected verdict certifies npm under NODE_OPTIONS Node rejects: %+v", verdicts[0])
+			}
+			row := p.Apply([]Finding{checkNpmConfig(p.Root, p.GOOS, p.Home)}, base)[0]
+			if row.Status != StatusWarn || !strings.Contains(row.Detail, "NODE_OPTIONS") || !strings.Contains(row.Detail, "unchecked") {
+				t.Errorf("ordinary row certifies npm under NODE_OPTIONS Node rejects: %+v", row)
+			}
+		})
+	}
+}
+
+func TestAudit37DockerStartupValidityIsUnchecked(t *testing.T) {
+	for _, policy := range []string{
+		`"exec-opts":["native.cgroupdriver=not-a-driver"]`,
+		`"exec-opts":["native.cgroupdriver=none"]`,
+		`"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"invalid"`,
+	} {
+		t.Run(policy, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			file := filepath.Join(p.Root, "etc/docker/daemon.json")
+			data, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", strings.TrimPrefix(base, "https://"), "ca.crt"), string(data))
+			writeTrustFile(t, file, `{"registry-mirrors":["`+base+`"]}`)
+			if v, err := p.Judge([]string{"oci-docker"}, base); err != nil || len(v) != 1 || v[0].State != TrustVerified {
+				t.Fatalf("control: %v %v", v, err)
+			}
+			writeTrustFile(t, file, `{"registry-mirrors":["`+base+`"],`+policy+`}`)
+			v, err := p.Judge([]string{"oci-docker"}, base)
+			if err != nil || len(v) != 1 {
+				t.Fatalf("Judge: %v %v", v, err)
+			}
+			if v[0].State != TrustUnchecked {
+				t.Errorf("selected verdict certifies a daemon NewDaemon rejects: %+v", v[0])
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "dockerd" {
+					return "/fixture/dockerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") {
+				t.Errorf("ordinary row certifies a daemon NewDaemon rejects: %+v", rows)
+			}
+		})
+	}
+}
+
+// F116 R2: a daemon.json key dockerd acts on against the host as it starts,
+// set to other than dockerd's default, leaves Docker Engine unchecked in the
+// selected verdict and the ordinary row, naming the key. Keys with no effect
+// at start beside the same mirror and CA stay verified.
+func TestDockerHostDecidedStartIsUnchecked(t *testing.T) {
+	for policy, key := range map[string]string{
+		`"storage-driver":"overlay2"`:              "storage-driver",
+		`"live-restore":true`:                      "live-restore",
+		`"cgroup-parent":"invalid"`:                "cgroup-parent",
+		`"log-opts":{"max-size":"10m"}`:            "log-opts",
+		`"insecure-registries":["ftp://internal"]`: "://",
+	} {
+		t.Run(key, func(t *testing.T) {
+			p, ca, base := reviewTrust(t)
+			file := filepath.Join(p.Root, "etc/docker/daemon.json")
+			data, err := os.ReadFile(ca)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTrustFile(t, filepath.Join(p.Root, "etc/docker/certs.d", strings.TrimPrefix(base, "https://"), "ca.crt"), string(data))
+			inert := `"registry-mirrors":["` + base + `"],"debug":true,"log-driver":"journald","iptables":true,"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"docker.slice"`
+			if key == "cgroup-parent" {
+				inert = `"registry-mirrors":["` + base + `"]`
+			}
+			writeTrustFile(t, file, `{`+inert+`}`)
+			if v, err := p.Judge([]string{"oci-docker"}, base); err != nil || len(v) != 1 || v[0].State != TrustVerified {
+				t.Fatalf("control: %v %v", v, err)
+			}
+			writeTrustFile(t, file, `{`+inert+`,`+policy+`}`)
+			v, err := p.Judge([]string{"oci-docker"}, base)
+			if err != nil || len(v) != 1 || v[0].State != TrustUnchecked || !strings.Contains(v[0].Detail, key) {
+				t.Errorf("selected verdict = %+v, %v; want unchecked naming %s", v, err, key)
+			}
+			rows := (OCIHost{Root: p.Root, LookPath: func(name string) (string, error) {
+				if name == "dockerd" {
+					return "/fixture/dockerd", nil
+				}
+				return "", os.ErrNotExist
+			}}).Check(base)
+			rows = p.Apply(rows, base)
+			if len(rows) != 1 || rows[0].Status == StatusOK || !strings.Contains(rows[0].Detail, "unchecked") || !strings.Contains(rows[0].Detail, key) {
+				t.Errorf("ordinary row = %+v; want unchecked naming %s", rows, key)
+			}
+		})
+	}
+}

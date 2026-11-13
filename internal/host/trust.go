@@ -185,14 +185,21 @@ var trustRows = map[string]trustRow{
 // registry-mirrors entry of the daemon.json it loads names that host. The
 // file is loaded whole, as dockerd loads it: one dockerd refuses, over any
 // key, is one it does not start with, so the mirror and the directory are
-// settings nothing runs with and Docker Engine is left unchecked.
+// settings nothing runs with and Docker Engine is left unchecked. A file it
+// loads and then exits on as it starts is the same, and so is one holding a
+// key whose effect at start is the host's to decide.
 func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	doc, err := clientconf.LoadDockerDaemonFile(filepath.Join(t.Root, clientconf.DockerDaemonPath))
 	switch {
 	case err != nil:
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd refuses to load its configuration (%v) and does not start, so whether dockerd reaches bodega or verifies its certificate is unchecked", err)}}
+	case doc != nil && doc.StartError != "":
+		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd loads its configuration and exits as it starts (%s), so whether dockerd reaches bodega or verifies its certificate is unchecked", doc.StartError)}}
 	case doc == nil || !slices.ContainsFunc(doc.Mirrors, func(m string) bool { return mirrorIsBodega(m, u.Host) }):
 		return nil
+	}
+	if doc.StartUnmodeled != "" {
+		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which dockerd acts on against this host as it starts and may exit over, and doctor reads no such host state, so whether dockerd runs to verify bodega's certificate is unchecked", doc.StartUnmodeled)}}
 	}
 	if doc.TLSUnmodeled != "" {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
@@ -487,33 +494,27 @@ func pipReaches(t TrustProbe, files []string, u *url.URL) bool {
 		if v == "" {
 			v = merged["global."+option]
 		}
-		if slices.ContainsFunc(strings.Fields(v), func(one string) bool { return clientconf.PipIndexURL(one) != nil && sameHost(one, u) }) {
+		// pip stores index-url whole and splits extra-index-url as str.split
+		// does; neither is Go's white space.
+		words := []string{v}
+		if option == "extra-index-url" {
+			words = clientconf.PipWords(v)
+		}
+		if slices.ContainsFunc(words, func(one string) bool { return clientconf.PipIndexURL(one) != nil && sameHost(one, u) }) {
 			return true
 		}
 	}
 	return false
 }
 
-// nodeCAFlags reads the options that choose Node's root store. Node exits
-// on --use-openssl-ca beside either of the other two, which
-// clientconf.NodeOptionsUnread reports before this is asked, so openssl is
-// true here only alone; --use-system-ca adds the system store to the bundled
-// roots.
+// nodeCAFlags reads the options that choose Node's root store, from the one
+// reading of NODE_OPTIONS that also refuses it: clientconf.NodeOptions. Node
+// exits on --use-openssl-ca beside either of the other two, which that
+// refusal reports before this is asked, so openssl is true here only alone;
+// --use-system-ca adds the system store to the bundled roots.
 func nodeCAFlags(t TrustProbe) (bundled, openssl, system bool) {
-	for _, opt := range strings.Fields(t.env("NODE_OPTIONS")) {
-		switch opt {
-		case "--use-bundled-ca":
-			bundled = true
-		case "--use-openssl-ca":
-			openssl = true
-		case "--use-system-ca":
-			system = true
-		}
-	}
-	if t.env("NODE_USE_SYSTEM_CA") == "1" {
-		system = true
-	}
-	return bundled, openssl, system
+	roots, _ := clientconf.NodeOptions(t.Getenv)
+	return roots.Bundled, roots.OpenSSL, roots.System
 }
 
 // npmLayer is what one source of npm's configuration, a file or the

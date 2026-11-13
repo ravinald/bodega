@@ -967,7 +967,7 @@ func stanzaWords(entry []string, field string) []string {
 		return nil
 	}
 	_, first, _ := strings.Cut(lines[0], ":")
-	return strings.Fields(first + " " + strings.Join(lines[1:], " "))
+	return AptWords(first + " " + strings.Join(lines[1:], " "))
 }
 
 // stanzaUnion is the plan's line for field carrying the host's words ahead

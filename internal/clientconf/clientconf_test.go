@@ -4836,3 +4836,80 @@ func TestContainerdUnfollowedMigrationIsUncertaintyNotLoadFailure(t *testing.T) 
 		t.Errorf("the CA plan certifies a migration doctor does not follow: err=%v changes=%d", err, len(in.Changes))
 	}
 }
+
+// F116 R1, R2: NODE_OPTIONS splits on ASCII spaces outside double quotes and
+// on nothing else, as ParseNodeOptionsEnvVar does at Node v26.13.0, so no
+// other whitespace turns an argument Node rejects into a flag doctor reads.
+func TestNodeOptionsArgsSplitOnSpacesAlone(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		args  []string
+		bad   string
+	}{
+		{"", nil, ""},
+		{"   ", nil, ""},
+		{"--use-system-ca", []string{"--use-system-ca"}, ""},
+		{"  --use-system-ca   --use-bundled-ca ", []string{"--use-system-ca", "--use-bundled-ca"}, ""},
+		{"--use-system-ca\t", []string{"--use-system-ca\t"}, ""},
+		{"--use-system-ca\n--use-bundled-ca", []string{"--use-system-ca\n--use-bundled-ca"}, ""},
+		{"--use-bundled-ca ", []string{"--use-bundled-ca "}, ""},
+		{`"--use-system-ca"`, []string{"--use-system-ca"}, ""},
+		{`--use-"system"-ca`, []string{"--use-system-ca"}, ""},
+		{`"--require a b"`, []string{"--require a b"}, ""},
+		{`"a\"b\\c"`, []string{`a"b\c`}, ""},
+		{`a\b`, []string{`a\b`}, ""},
+		{`"" --use-bundled-ca`, []string{"--use-bundled-ca"}, ""},
+		{`"--use-system-ca`, []string{"--use-system-ca"}, "unterminated string"},
+		{`"--use-system-ca\`, []string{"--use-system-ca"}, "invalid escape"},
+	} {
+		args, bad := NodeOptionsArgs(tc.value)
+		if !slices.Equal(args, tc.args) || (bad == "") != (tc.bad == "") || !strings.Contains(bad, tc.bad) {
+			t.Errorf("NodeOptionsArgs(%q) = %q, %q; want %q, %q", tc.value, args, bad, tc.args, tc.bad)
+		}
+	}
+	roots, unread := NodeOptions(func(key string) string {
+		return map[string]string{"NODE_OPTIONS": `"--use-bundled-ca" --use-system-ca`}[key]
+	})
+	if unread != "" || roots != (NodeRoots{Bundled: true, System: true}) {
+		t.Errorf("a quoted flag is the flag: roots = %+v, unread = %q", roots, unread)
+	}
+	for _, value := range []string{"--use-system-ca\t", "\n--use-openssl-ca", "--use-bundled-ca ", "--use-system-ca\v--use-bundled-ca", `"--use-system-ca`, `"--use-system-ca "`} {
+		roots, unread := NodeOptions(func(key string) string { return map[string]string{"NODE_OPTIONS": value}[key] })
+		if !strings.Contains(unread, "NODE_OPTIONS") || roots != (NodeRoots{}) {
+			t.Errorf("NODE_OPTIONS=%q: roots = %+v, unread = %q; want no root store read and a refusal naming the variable", value, roots, unread)
+		}
+	}
+}
+
+// F116 R1, R2: doctor refuses NODE_OPTIONS wherever Node exits on it, over
+// the bytes between and around the three flags it reads, and reads a flag
+// wherever Node takes one. An argument that is no option at all Node starts
+// on and takes no flag from; doctor refuses it as one it does not interpret.
+// The native client is the oracle.
+func TestNodeOptionsLexingMatchesNativeNode(t *testing.T) {
+	node := oracletest.Node(t)
+	for _, tc := range []struct {
+		value          string
+		starts, refuse bool
+	}{
+		{"", true, false}, {" ", true, false}, {"--use-system-ca", true, false}, {"  --use-system-ca  ", true, false},
+		{"--use-bundled-ca  --use-system-ca", true, false}, {`"--use-system-ca"`, true, false},
+		{`--use-"system"-ca`, true, false}, {`"" --use-bundled-ca`, true, false},
+		{`"--use-bundled-ca" --use-system-ca`, true, false}, {`"--use\-system-ca"`, true, false},
+
+		{"--use-system-ca\t", false, true}, {"--use-openssl-ca\n", false, true}, {"--use-bundled-ca\u00a0", false, true},
+		{"--use-system-ca\v", false, true}, {"--use-system-ca\t--use-bundled-ca", false, true}, {"--use-system-ca\r\n", false, true},
+		{`"--use-system-ca`, false, true}, {`"--use-system-ca\`, false, true}, {`--use-system-ca\`, false, true},
+		{`"--use-system-ca "`, false, true},
+
+		{"\t--use-system-ca", true, true}, {`" --use-system-ca"`, true, true},
+	} {
+		cmd := exec.Command(node, "--version")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "NODE_OPTIONS=" + tc.value}
+		out, err := cmd.CombinedOutput()
+		refused := NodeOptionsUnread(func(key string) string { return map[string]string{"NODE_OPTIONS": tc.value}[key] })
+		if (err == nil) != tc.starts || (refused != "") != tc.refuse {
+			t.Errorf("NODE_OPTIONS=%q: node err=%v (%s), want it to start = %v; doctor says %q, want a refusal = %v", tc.value, err, strings.TrimSpace(string(out)), tc.starts, refused, tc.refuse)
+		}
+	}
+}

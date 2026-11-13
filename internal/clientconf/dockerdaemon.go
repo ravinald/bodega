@@ -425,6 +425,19 @@ type DockerDaemonFile struct {
 	// certified for a dockerd holding one. It is no load error: a configure
 	// that installs no CA edits such a file as it stands.
 	TLSUnmodeled string
+	// StartError is the error dockerd exits on after it has loaded the file,
+	// "" for none: the checks NewDaemon runs on the configuration alone
+	// before it serves (dockerStartError). dockerd --validate does not run
+	// them, so it is no load error and a configure that installs no CA edits
+	// the file as it stands, but no mirror or certs.d directory is one a
+	// pull uses.
+	StartError string
+	// StartUnmodeled names the first key dockerd acts on between loading
+	// the file and serving in a way the host decides (its storage, network,
+	// cgroups, plugins, listeners), set to other than dockerd's default, ""
+	// for none. Nothing here reads that host state, so a CA is not certified
+	// for a dockerd holding one.
+	StartUnmodeled string
 }
 
 // ParseDockerDaemonFile loads a daemon.json as dockerd v28.5.2 does with no flag
@@ -434,9 +447,10 @@ type DockerDaemonFile struct {
 // decode, Validate and the label conflict check. Any error is one dockerd
 // exits on, so nothing in a file that fails here is a setting it runs with.
 //
-// Left out, because the file alone does not decide them: a key that repeats a
-// flag set on dockerd's command line, the userland-proxy binary dockerd looks
-// up on the host, and the cgroup and kernel checks made at daemon start.
+// Left out of the error, because the file alone does not decide them: a key
+// that repeats a flag set on dockerd's command line and the userland-proxy
+// binary dockerd looks up on the host. What dockerd does with a loaded file
+// as it starts is StartError and StartUnmodeled on the result.
 func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 	b, err := dockerDecodeBOM(data)
 	if err != nil {
@@ -483,6 +497,10 @@ func ParseDockerDaemonFile(data []byte) (*DockerDaemonFile, error) {
 		return nil, err
 	}
 	d := &DockerDaemonFile{Mirrors: conf.Mirrors, InsecureRegistries: conf.InsecureRegistries}
+	if err := conf.startError(set); err != nil {
+		d.StartError = err.Error()
+	}
+	d.StartUnmodeled = conf.startUnmodeled(set)
 	for _, k := range []struct {
 		key string
 		set bool
@@ -680,6 +698,202 @@ func (conf *dockerDaemonConfig) validate() error {
 		labels[key] = val
 	}
 	return nil
+}
+
+// dockerHostPortRe is validHostPortRegex in registry/config.go: DomainRegexp
+// of distribution/reference v0.6.0, the version moby v28.5.2 vendors,
+// anchored.
+var dockerHostPortRe = regexp.MustCompile(`^(?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*|\[(?:[a-fA-F0-9:]+)\])(?::[0-9]+)?$`)
+
+// dockerInsecureRegistry is the check loadInsecureRegistries in
+// registry/config.go runs on one insecure-registries entry, kept to its
+// errors: registry.NewService is the first thing NewDaemon builds.
+func dockerInsecureRegistry(r string) error {
+	if strings.HasPrefix(r, "-") || strings.HasSuffix(r, "-") {
+		return fmt.Errorf("invalid index name (%s). Cannot begin or end with a hyphen", r)
+	}
+	switch lower := strings.ToLower(r); {
+	case strings.HasPrefix(lower, "http://"):
+		r = r[7:]
+	case strings.HasPrefix(lower, "https://"):
+		r = r[8:]
+	case strings.Contains(r, "://"):
+		return fmt.Errorf("insecure registry %s should not contain '://'", r)
+	}
+	if _, _, err := net.ParseCIDR(r); err == nil {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(r)
+	if err != nil {
+		host, port = r, ""
+	}
+	if !dockerHostPortRe.MatchString(r) && net.ParseIP(host) == nil {
+		return fmt.Errorf("insecure registry %s is not valid: invalid host %q", r, host)
+	}
+	if port != "" {
+		v, err := strconv.Atoi(port)
+		if err != nil {
+			return fmt.Errorf("insecure registry %s is not valid: %w", r, err)
+		}
+		if v < 0 || v > 65535 {
+			return fmt.Errorf("insecure registry %s is not valid: invalid port %q", r, port)
+		}
+	}
+	return nil
+}
+
+// cgroupDriver is the native.cgroupdriver exec-opts names, "" for none:
+// GetExecOpt over parseExecOptions, where the last entry wins.
+func (conf *dockerDaemonConfig) cgroupDriver() string {
+	cd := ""
+	for _, keyValue := range conf.ExecOptions {
+		k, v, _ := strings.Cut(keyValue, "=")
+		if strings.ToLower(strings.TrimSpace(k)) == "native.cgroupdriver" {
+			cd = strings.TrimSpace(v)
+		}
+	}
+	return cd
+}
+
+// dockerSlice is the name verifyDaemonSettings takes for cgroup-parent under
+// systemd's cgroup driver.
+func dockerSlice(parent string) bool {
+	return len(parent) > 6 && strings.HasSuffix(parent, ".slice")
+}
+
+// startError is what NewDaemon in daemon/daemon.go at moby v28.5.2 checks on
+// the configuration alone before it serves, in its order: registry.NewService
+// over the insecure registries (the mirrors are validated on load), then
+// every check of verifyDaemonSettings in daemon/daemon_unix.go that reads no
+// host state. set is the file's keys, groups flattened, which is what tells
+// a key the file leaves at dockerd's default from one it turns off.
+//
+// The one check of verifyDaemonSettings left out reads the host's cgroup
+// version, for rootless under systemd's driver; startUnmodeled names rootless.
+func (conf *dockerDaemonConfig) startError(set map[string]any) error {
+	for _, r := range conf.InsecureRegistries {
+		if err := dockerInsecureRegistry(r); err != nil {
+			return err
+		}
+	}
+	on := func(key string, def bool) bool {
+		if v, ok := set[key].(bool); ok {
+			return v
+		}
+		return def
+	}
+	// The file spells the plugins namespace by its flag, which has no field
+	// tag to decode into; where it is set, startUnmodeled names it.
+	containers := conf.ContainerdNamespace
+	if containers == "" {
+		containers = dockerStartDefaults["containerd-namespace"].(string)
+	}
+	if _, named := set["containerd-plugins-namespace"]; !named && containers == dockerStartDefaults["containerd-plugins-namespace"] {
+		return errors.New("containers namespace and plugins namespace cannot be the same")
+	}
+	// dockerd's own sentences, as it prints them.
+	exclusive := ""
+	switch {
+	case conf.Iface != "" && conf.IP != "":
+		exclusive = "You specified -b & --bip, mutually exclusive options. Please specify only one"
+	case conf.Iface != "" && conf.IP6 != "":
+		exclusive = "You specified -b & --bip6, mutually exclusive options. Please specify only one"
+	case !on("icc", true) && !on("iptables", true):
+		exclusive = "You specified --iptables=false with --icc=false. ICC=false uses iptables to function. Please set --icc or --iptables to true"
+	case !on("icc", true) && on("ipv6", false) && !on("ip6tables", true):
+		exclusive = "You specified --ip6tables=false with --icc=false. ICC=false uses ip6tables to function. Please set --icc or --ip6tables to true"
+	}
+	if exclusive != "" {
+		return errors.New(exclusive)
+	}
+	switch cd := conf.cgroupDriver(); cd {
+	case "", "cgroupfs":
+	case "systemd":
+		if conf.CgroupParent != "" && !dockerSlice(conf.CgroupParent) {
+			return errors.New(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
+		}
+	case "none":
+		return fmt.Errorf("native.cgroupdriver option %s is internally used and cannot be specified manually", cd)
+	default:
+		return fmt.Errorf("native.cgroupdriver option %s not supported", cd)
+	}
+	return nil
+}
+
+// dockerStartModeled is every daemon.json key whose value cannot stop
+// dockerd v28.5.2 between loading the file and serving, past what validate
+// and startError check: the registry lists, logging of the daemon itself,
+// labels, the transfer limits, and the defaults a container is created with.
+// log-driver is one of those: defaultLogConfig in daemon/logs.go looks the
+// driver up only to validate log-opts, which is not here.
+// The TLS keys are TLSUnmodeled's. Any other key is acted on as dockerd starts
+// (cmd/dockerd/daemon.go start, then NewDaemon) against the host: a
+// directory, a listener, a storage or log driver, a network, a plugin, a
+// runtime binary, containerd, swarm state.
+var dockerStartModeled = map[string]bool{
+	"registry-mirrors": true, "insecure-registries": true,
+	"debug": true, "log-level": true, "log-format": true, "raw-logs": true, "labels": true, "log-driver": true,
+	"max-concurrent-downloads": true, "max-concurrent-uploads": true, "max-download-attempts": true,
+	"shutdown-timeout": true, "experimental": true,
+	"exec-opts": true, "cgroup-parent": true,
+	"default-ipc-mode": true, "default-cgroupns-mode": true, "no-new-privileges": true,
+	"tls": true, "tlsverify": true, "tlscacert": true, "tlscert": true, "tlskey": true,
+}
+
+// dockerStartDefaults is dockerd's default for each key outside
+// dockerStartModeled whose default is not its type's zero value: config.New
+// with setPlatformDefaults in daemon/config, and the flag defaults in
+// cmd/dockerd/config.go and config_unix.go, for a dockerd not under
+// RootlessKit.
+var dockerStartDefaults = map[string]any{
+	"iptables": true, "ip6tables": true, "ip-forward": true, "ip-masq": true, "icc": true,
+	"userland-proxy": true, "restart": true,
+	"data-root": "/var/lib/docker", "exec-root": "/var/run/docker", "pidfile": "/var/run/docker.pid",
+	"group": "docker", "default-runtime": "runc", "seccomp-profile": "builtin",
+	"containerd-namespace": "moby", "containerd-plugins-namespace": "plugins.moby",
+	"mtu": float64(1500), "network-control-plane-mtu": float64(1500), "ip": "0.0.0.0",
+}
+
+// startUnmodeled names the first key, in name order, that the file sets to
+// other than dockerd's default and dockerStartModeled does not hold, "" for
+// none. cgroup-parent is named where the file leaves the cgroup driver to
+// the host: dockerd picks systemd's on a cgroup v2 host running systemd
+// (UsingSystemd), and refuses a parent that is no slice only there.
+func (conf *dockerDaemonConfig) startUnmodeled(set map[string]any) string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if dockerStartModeled[key] {
+			continue
+		}
+		switch v := set[key].(type) {
+		case nil:
+			continue
+		case []any:
+			if len(v) == 0 {
+				continue
+			}
+		case map[string]any:
+			if len(v) == 0 {
+				continue
+			}
+		default:
+			if def, ok := dockerStartDefaults[key]; ok && v == def {
+				continue
+			}
+			if _, ok := dockerStartDefaults[key]; !ok && (v == false || v == "" || v == float64(0)) {
+				continue
+			}
+		}
+		return key
+	}
+	if conf.CgroupParent != "" && conf.cgroupDriver() == "" && !dockerSlice(conf.CgroupParent) {
+		return "cgroup-parent"
+	}
+	return ""
 }
 
 // dockerGenericResources is genericresource.Parse in swarmkit v2.0.0, kept

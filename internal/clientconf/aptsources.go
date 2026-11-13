@@ -224,9 +224,7 @@ func parseAptDeb822(file, text string) ([]AptSourceEntry, error) {
 	var out []AptSourceEntry
 	stanza, n := map[string]string{}, 0
 	last := ""
-	multi := func(field string) []string {
-		return strings.FieldsFunc(stanza[field], func(r rune) bool { return strings.ContainsRune(" \t\n\v\f\r", r) })
-	}
+	multi := func(field string) []string { return AptWords(stanza[field]) }
 	flush := func() error {
 		defer func() { stanza, last = map[string]string{}, "" }()
 		if len(stanza) == 0 {
@@ -348,4 +346,12 @@ func AptURIHost(uri string) (access, host string, port int) {
 		host = host[:pos]
 	}
 	return access, host, port
+}
+
+// AptWords splits the value of a sources field into words as apt 3.0.3 does:
+// on the six characters isspace_ascii names and no others, so a no-break
+// space stays inside the word it touches (apt-pkg/sourcelist.cc, which turns
+// each into a space before VectorizeString).
+func AptWords(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(" \t\n\v\f\r", r) })
 }

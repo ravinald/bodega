@@ -4064,3 +4064,112 @@ func TestDoctorCARefusesEnvironmentPresenceAndCombination(t *testing.T) {
 		})
 	}
 }
+
+func TestAudit37NodeOptionsLexingRefusesBeforeWrites(t *testing.T) {
+	for _, options := range []string{"--use-system-ca\t", "--use-openssl-ca\n", "--use-bundled-ca\u00a0"} {
+		t.Run(options, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			t.Setenv("NODE_OPTIONS", options)
+			srv, caPEM, _ := caPlanServer(t)
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+				out, err := runDoctor(t, append([]string{"--configure", "npm", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+				if err == nil || !strings.Contains(err.Error(), "NODE_OPTIONS") {
+					t.Errorf("%v accepted NODE_OPTIONS Node rejects: err=%v\n%s", apply, err, out)
+				}
+				for _, name := range []string{".npmrc", ".config/bodega/ca.pem"} {
+					if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
+						t.Errorf("%v wrote %s before refusing NODE_OPTIONS: %v", apply, name, err)
+					}
+				}
+			}
+		})
+	}
+}
+func TestAudit37DockerStartupValidityRefusesBeforeWrites(t *testing.T) {
+	for _, policy := range []string{
+		`"exec-opts":["native.cgroupdriver=not-a-driver"]`,
+		`"exec-opts":["native.cgroupdriver=none"]`,
+		`"exec-opts":["native.cgroupdriver=systemd"],"cgroup-parent":"invalid"`,
+	} {
+		t.Run(policy, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			clearClientEnv(t)
+			stubRuntimes(t, "dockerd")
+			srv, caPEM, _ := caPlanServer(t)
+			file := filepath.Join(home, "etc/docker/daemon.json")
+			before := "{" + policy + "}\n"
+			if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+				t.Fatal(err)
+			}
+			caFile := filepath.Join(t.TempDir(), "ca.pem")
+			if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+				t.Fatal(err)
+			}
+			old := doctorOCIRoot
+			doctorOCIRoot = home
+			t.Cleanup(func() { doctorOCIRoot = old })
+			for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+				out, err := runDoctor(t, append([]string{"--configure", "oci", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+				if err == nil {
+					t.Errorf("%v certified a daemon NewDaemon rejects:\n%s", apply, out)
+				}
+				if got, err := os.ReadFile(file); err != nil || string(got) != before {
+					t.Errorf("%v changed daemon.json before refusal: %v %s", apply, err, got)
+				}
+				caPath := filepath.Join(home, "etc/docker/certs.d", strings.TrimPrefix(srv.URL, "https://"), "ca.crt")
+				if _, err := os.Stat(caPath); !os.IsNotExist(err) {
+					t.Errorf("%v wrote ca.crt before refusal: %v", apply, err)
+				}
+			}
+		})
+	}
+}
+
+// F116 R1: --ca-file refuses Docker Engine before any write, on the preview,
+// the apply and a second apply, over a daemon.json key dockerd acts on
+// against the host as it starts, naming the key.
+func TestDoctorCARefusesDockerHostDecidedStart(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearClientEnv(t)
+	stubRuntimes(t, "dockerd")
+	srv, caPEM, _ := caPlanServer(t)
+	file := filepath.Join(home, "etc/docker/daemon.json")
+	before := "{\"storage-driver\":\"overlay2\"}\n"
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := doctorOCIRoot
+	doctorOCIRoot = home
+	t.Cleanup(func() { doctorOCIRoot = old })
+	for _, apply := range [][]string{nil, {"--apply"}, {"--apply"}} {
+		out, err := runDoctor(t, append([]string{"--configure", "oci", "--ca-file", caFile, "--url", srv.URL}, apply...)...)
+		if err == nil || !strings.Contains(err.Error(), "storage-driver") {
+			t.Errorf("%v certified a dockerd whose start the host decides: err=%v\n%s", apply, err, out)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != before {
+			t.Errorf("%v changed daemon.json before refusal: %v %s", apply, err, got)
+		}
+		caPath := filepath.Join(home, "etc/docker/certs.d", strings.TrimPrefix(srv.URL, "https://"), "ca.crt")
+		if _, err := os.Stat(caPath); !os.IsNotExist(err) {
+			t.Errorf("%v wrote ca.crt before refusal: %v", apply, err)
+		}
+	}
+}

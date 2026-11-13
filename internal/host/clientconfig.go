@@ -173,7 +173,7 @@ func deb822Stanzas(text string) []aptEntry {
 		}
 		if line[0] == ' ' || line[0] == '\t' {
 			if field == "uris" {
-				cur.uris = append(cur.uris, strings.Fields(line)...)
+				cur.uris = append(cur.uris, clientconf.AptWords(line)...)
 			}
 			continue
 		}
@@ -185,7 +185,7 @@ func deb822Stanzas(text string) []aptEntry {
 		field = strings.ToLower(strings.TrimSpace(name))
 		switch field {
 		case "uris":
-			cur.uris = append(cur.uris, strings.Fields(value)...)
+			cur.uris = append(cur.uris, clientconf.AptWords(value)...)
 		case "enabled":
 			cur.setsEnabled = true
 			cur.enabled = !aptFalse(strings.TrimSpace(value))
@@ -218,7 +218,7 @@ func oneLineEntries(text string) []aptEntry {
 	var out []aptEntry
 	for i, line := range strings.Split(text, "\n") {
 		line, _, _ = strings.Cut(line, "#")
-		fields := strings.Fields(line)
+		fields := clientconf.AptWords(line)
 		if len(fields) < 2 || (fields[0] != "deb" && fields[0] != "deb-src") {
 			continue
 		}
@@ -962,6 +962,8 @@ func checkDockerMirror(path, host string) Finding {
 		return Finding{Status: StatusSkip, Detail: path + " could not be read: " + err.Error(), Remediation: "run doctor as root, which owns " + path}
 	case err != nil:
 		return Finding{Status: StatusSkip, Detail: "dockerd refuses to load its configuration (" + err.Error() + ") and does not start, so where it pulls from is unchecked", Remediation: "repair what the error names in " + path + "; dockerd --validate repeats it"}
+	case doc != nil && doc.StartError != "":
+		return Finding{Status: StatusSkip, Detail: "dockerd loads its configuration and exits as it starts (" + doc.StartError + "), so where it pulls from is unchecked", Remediation: "repair what the error names in " + path + "; dockerd --validate does not repeat it, starting dockerd does"}
 	case doc == nil:
 		return Finding{Status: StatusWarn, Detail: "no " + path + ", so dockerd pulls Docker Hub images from Docker Hub; bypasses bodega's registry"}
 	}
