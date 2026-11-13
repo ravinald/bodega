@@ -139,3 +139,41 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(deploy, 'remote', return_value=reply):
             with self.assertRaisesRegex(ValueError, 'no full sourceRevision'):
                 deploy.deployed_revision(self.config)
+
+    def exercise_sync(self, live, target='f' * 40, ancestor=True, hold=False):
+        def git(*args):
+            return target if args[0] == 'rev-parse' else ''
+        merge_base = subprocess.CompletedProcess([], 0 if ancestor else 1)
+        with patch.object(deploy, 'git', side_effect=git) as fetch, patch.object(deploy, 'deployed_revision', return_value=live), \
+                patch.object(deploy, 'held', return_value=hold), patch.object(deploy.subprocess, 'run', return_value=merge_base), \
+                patch.object(deploy, 'deploy') as build, patch.object(deploy, 'publish_coverage') as publish:
+            deploy.sync(self.config)
+        self.assertEqual(fetch.call_args_list[0].args, ('fetch', '--quiet', 'origin', deploy.TRUNK))
+        publish.assert_called_once_with(self.config)
+        return build
+
+    def test_sync_deploys_a_trunk_ahead_of_the_live_release(self):
+        self.exercise_sync('e' * 40).assert_called_once_with(self.config, 'f' * 40)
+
+    def test_sync_leaves_a_current_release_alone(self):
+        self.exercise_sync('f' * 40).assert_not_called()
+
+    def test_sync_never_replaces_a_release_off_the_trunk(self):
+        self.exercise_sync('e' * 40, ancestor=False).assert_not_called()
+
+    def test_sync_respects_a_rollback_hold(self):
+        self.exercise_sync('e' * 40, hold=True).assert_not_called()
+
+    def test_archived_deploy_builds_the_commit_without_reading_the_checkout(self):
+        rendered = []
+
+        def render(root, output, coverage, revision):
+            rendered.append((root.name, revision))
+            output.mkdir()
+            (output / 'index.html').write_text('ready')
+        with patch.object(deploy, 'clean_revision') as clean, patch.object(deploy, 'extract', side_effect=lambda r, d: d.mkdir()), \
+                patch.object(deploy, 'export_coverage'), patch.object(deploy, 'render', side_effect=render), \
+                patch.object(deploy, 'remote'), patch.object(deploy, 'upload'):
+            deploy.deploy(self.config, 'f' * 40)
+        clean.assert_not_called()
+        self.assertEqual(rendered, [('source', 'f' * 40)])
