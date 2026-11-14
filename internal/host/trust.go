@@ -188,6 +188,9 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(set.reached, func(entry string) bool { return sameHost(entry, u) }) {
 		return nil
 	}
+	if route := plainRoute(set.reached, u); route != "" {
+		return plainUncertified("the go command", "GOPROXY", route)
+	}
 	if what := (clientconf.GoEnv{Getenv: t.Getenv, ConfigDir: configDir}).Uncertified(u); what != "" {
 		return uncertified("the go command", "the go env file sets "+what)
 	}
@@ -197,6 +200,27 @@ func goStores(t TrustProbe, u *url.URL) []trustStore {
 // uncertified is the store of a client whose configuration holds a setting
 // outside what doctor models, or one that turns verification off: what names
 // the setting, which clientconf's lists decide for the CA install too.
+// plainRoute is the first of routes that reaches bodega's host over plain
+// http, "" for none. The client checks no certificate on that route, so a
+// verdict reached over https for another route says nothing about it. A
+// loopback bodega is the operator's 2026-11-13 exception.
+func plainRoute(routes []string, u *url.URL) string {
+	if loopbackNote("", u) != "" {
+		return ""
+	}
+	for _, raw := range routes {
+		p, err := url.Parse(strings.TrimSpace(raw))
+		if err == nil && strings.EqualFold(p.Scheme, "http") && clientconf.NamesBodega(raw, u) {
+			return raw
+		}
+	}
+	return ""
+}
+
+func plainUncertified(client, setting, route string) []trustStore {
+	return uncertified(client, fmt.Sprintf("%s reaches bodega's host over plain http (%s), a route on which no certificate is checked", setting, route))
+}
+
 func uncertified(client, what string) []trustStore {
 	return []trustStore{{name: client + "'s configuration", blind: fmt.Sprintf("%s, so whether %s verifies bodega's certificate is unchecked; remove the setting or return it to the client's default, or leave it and add the CA to that client's trust by hand", what, client)}}
 }
@@ -236,6 +260,9 @@ func dockerStores(t TrustProbe, u *url.URL) []trustStore {
 	}
 	if doc.TLSUnmodeled != "" {
 		return []trustStore{{name: "dockerd's configuration", blind: fmt.Sprintf("dockerd's configuration sets %s, which has dockerd load TLS files for its own listeners as it starts and exit when they do not load, so whether dockerd runs to verify bodega's certificate is unchecked", doc.TLSUnmodeled)}}
+	}
+	if route := plainRoute(doc.Mirrors, u); route != "" {
+		return plainUncertified("dockerd", "a registry mirror", route)
 	}
 	if entry := doc.Insecure(u); entry != "" {
 		return uncertified("dockerd", fmt.Sprintf("dockerd's configuration lists %s under insecure-registries, which covers bodega's endpoint: dockerd then accepts any certificate that endpoint presents", entry))
@@ -292,6 +319,13 @@ func aptStores(t TrustProbe, u *url.URL) []trustStore {
 		})
 	}) {
 		return nil
+	}
+	var aptRoutes []string
+	for _, e := range entries {
+		aptRoutes = append(aptRoutes, e.URIs...)
+	}
+	if route := plainRoute(aptRoutes, u); route != "" {
+		return plainUncertified("apt", "a source apt reads", route)
 	}
 	conf, err := clientconf.LoadAptConfig(t.Root, t.Getenv)
 	if err != nil {
@@ -675,6 +709,13 @@ func npmStores(t TrustProbe, u *url.URL) []trustStore {
 	if !slices.ContainsFunc(regs, func(r clientconf.NpmRegistry) bool { return sameHost(r.Value, u) }) {
 		return nil
 	}
+	var npmRoutes []string
+	for _, r := range regs {
+		npmRoutes = append(npmRoutes, r.Value)
+	}
+	if route := plainRoute(npmRoutes, u); route != "" {
+		return plainUncertified("npm", "a registry npm reads", route)
+	}
 	var layers []npmLayer
 	for _, f := range files {
 		if unread := clientconf.NpmUnread(f); unread != "" {
@@ -881,6 +922,15 @@ func helmStores(t TrustProbe, u *url.URL) []trustStore {
 			return uncertified("helm", "helm reads "+what)
 		}
 	}
+	var helmRoutes []string
+	for _, r := range doc.Repositories {
+		if r != nil {
+			helmRoutes = append(helmRoutes, r.URL)
+		}
+	}
+	if route := plainRoute(helmRoutes, u); route != "" {
+		return plainUncertified("helm", "a repository in "+path, route)
+	}
 	for _, r := range doc.Repositories {
 		if r == nil {
 			continue
@@ -956,6 +1006,13 @@ func containerdStores(t TrustProbe, u *url.URL) []trustStore {
 		// directory, so its top-level table is bodega's when that names bodega.
 		atBodega := func(key string) bool {
 			return clientconf.NamesBodega(key, u) || key == "" && clientconf.NamesBodega(filepath.Base(filepath.Dir(path)), u)
+		}
+		var keys []string
+		for _, h := range doc.Hosts {
+			keys = append(keys, h.Key)
+		}
+		if route := plainRoute(keys, u); route != "" {
+			return plainUncertified("containerd", "a host in "+path, route)
 		}
 		if key := doc.SkipsVerify(atBodega); key != "" {
 			return uncertified("containerd", fmt.Sprintf("%s sets skip_verify = true for the host %s: containerd then accepts any certificate that host presents", path, key))
